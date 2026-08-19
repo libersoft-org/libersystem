@@ -24,6 +24,9 @@ pub struct JobInfo {
 	/// a pipeline rather than a command. The session needs it because signalling and waiting
 	/// take a different syscall for each, and a group is finished only once EVERY stage is,
 	/// so a partially exited pipeline stays a job.
+	///
+	/// Derived from the `job-target` the session was handed, never asserted alongside a handle:
+	/// this record travels without one, so there is nothing here for it to disagree with.
 	pub group: bool,
 }
 
@@ -83,6 +86,89 @@ impl JobInfo {
 	}
 }
 
+/// The live object a job names, WITH ITS KIND IN THE SAME VALUE.
+///
+/// A job is a single command or a whole pipeline, and the two take different syscalls to signal and
+/// to wait on. This used to be `handle<task>` plus a `bool` beside it, so a caller could hand over a
+/// group and call it a process - and the wire could not tell, because both spellings were the same
+/// type and the boolean was just another field. A variant makes the mismatch unrepresentable: the
+/// tag that says which one it is IS the thing that carries it.
+#[derive(Clone, Debug, PartialEq)]
+pub enum JobTarget {
+	Process(u64),
+	Group(u64),
+}
+
+impl JobTarget {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the length alone.
+		if w.has_handle() {
+			return None;
+		}
+		Some(w.pos())
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// A capability recorded here would be dropped by returning the bytes alone.
+		if !w.handles().is_empty() {
+			return None;
+		}
+		Some(w.into_inner())
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		let handles = Handles::try_from_slice(w.handles())?;
+		Some((w.into_inner(), handles))
+	}
+	pub fn decode(bytes: &[u8]) -> Option<JobTarget> {
+		let mut r = Reader::new(bytes);
+		let value = JobTarget::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<JobTarget> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = JobTarget::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		match self {
+			JobTarget::Process(v0) => {
+				w.u8(0)?;
+				w.set_handle(*v0)?;
+				w.u32(0)?;
+			}
+			JobTarget::Group(v1) => {
+				w.u8(1)?;
+				w.set_handle(*v1)?;
+				w.u32(0)?;
+			}
+		}
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<JobTarget> {
+		match r.u8()? {
+			0 => Some(JobTarget::Process({
+				let _ = r.u32()?;
+				r.take_handle()?
+			})),
+			1 => Some(JobTarget::Group({
+				let _ = r.u32()?;
+				r.take_handle()?
+			})),
+			_ => None,
+		}
+	}
+}
+
 /// A job handed back to a foregrounding shell: its info plus the live Process handle
 /// (transferred out-of-band as handle<task>), removed from the session's table by the act
 /// of taking it. The shell then drives the job in the foreground and re-registers it if it
@@ -90,7 +176,7 @@ impl JobInfo {
 #[derive(Clone, Debug, PartialEq)]
 pub struct JobEntry {
 	pub info: JobInfo,
-	pub proc: u64,
+	pub target: JobTarget,
 }
 
 impl JobEntry {
@@ -135,17 +221,13 @@ impl JobEntry {
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
 		self.info.write(w)?;
-		w.set_handle(self.proc)?;
-		w.u32(0)?;
+		self.target.write(w)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<JobEntry> {
 		let info = JobInfo::read(r)?;
-		let proc = {
-			let _ = r.u32()?;
-			r.take_handle()?
-		};
-		Some(JobEntry { info, proc })
+		let target = JobTarget::read(r)?;
+		Some(JobEntry { info, target })
 	}
 }
 
@@ -269,7 +351,7 @@ pub mod session {
 	pub trait Service {
 		fn cwd(&mut self) -> Result<String, Error>;
 		fn chdir(&mut self, path: String) -> Result<(), Error>;
-		fn job_register(&mut self, name: String, stopped: bool, group: bool, proc: u64) -> Result<u32, Error>;
+		fn job_register(&mut self, name: String, stopped: bool, target: JobTarget) -> Result<u32, Error>;
 		fn job_take(&mut self, id: u32) -> Result<JobEntry, Error>;
 		fn job_list(&mut self) -> Result<Vec<JobInfo>, Error>;
 		fn job_reap(&mut self) -> Result<Vec<JobInfo>, Error>;
@@ -323,13 +405,13 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v0) => {
+						Ok(v2) => {
 							w.u8(1)?;
-							w.bytes_lp(v0.as_bytes())?;
+							w.bytes_lp(v2.as_bytes())?;
 						}
-						Err(v1) => {
+						Err(v3) => {
 							w.u8(0)?;
-							v1.write(w)?;
+							v3.write(w)?;
 						}
 					}
 					Some(())
@@ -360,12 +442,12 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v2) => {
+						Ok(v4) => {
 							w.u8(1)?;
 						}
-						Err(v3) => {
+						Err(v5) => {
 							w.u8(0)?;
-							v3.write(w)?;
+							v5.write(w)?;
 						}
 					}
 					Some(())
@@ -390,25 +472,21 @@ pub mod session {
 			OP_JOB_REGISTER => {
 				let name = r.string_lp()?;
 				let stopped = r.boolean()?;
-				let group = r.boolean()?;
-				let proc = {
-					let _ = r.u32()?;
-					r.take_handle()?
-				};
+				let target = JobTarget::read(r)?;
 				r.finish()?;
 				request_handles.clear();
-				let result = service.job_register(name, stopped, group, proc);
+				let result = service.job_register(name, stopped, target);
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v4) => {
+						Ok(v6) => {
 							w.u8(1)?;
-							w.u32(*v4)?;
+							w.u32(*v6)?;
 						}
-						Err(v5) => {
+						Err(v7) => {
 							w.u8(0)?;
-							v5.write(w)?;
+							v7.write(w)?;
 						}
 					}
 					Some(())
@@ -439,13 +517,13 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v6) => {
+						Ok(v8) => {
 							w.u8(1)?;
-							v6.write(w)?;
+							v8.write(w)?;
 						}
-						Err(v7) => {
+						Err(v9) => {
 							w.u8(0)?;
-							v7.write(w)?;
+							v9.write(w)?;
 						}
 					}
 					Some(())
@@ -475,19 +553,19 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v8) => {
+						Ok(v10) => {
 							w.u8(1)?;
-							if v8.len() > u16::MAX as usize {
+							if v10.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v8.len() as u16)?;
-							for v10 in v8.iter() {
-								v10.write(w)?;
+							w.u16(v10.len() as u16)?;
+							for v12 in v10.iter() {
+								v12.write(w)?;
 							}
 						}
-						Err(v9) => {
+						Err(v11) => {
 							w.u8(0)?;
-							v9.write(w)?;
+							v11.write(w)?;
 						}
 					}
 					Some(())
@@ -517,19 +595,19 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v11) => {
+						Ok(v13) => {
 							w.u8(1)?;
-							if v11.len() > u16::MAX as usize {
+							if v13.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v11.len() as u16)?;
-							for v13 in v11.iter() {
-								v13.write(w)?;
+							w.u16(v13.len() as u16)?;
+							for v15 in v13.iter() {
+								v15.write(w)?;
 							}
 						}
-						Err(v12) => {
+						Err(v14) => {
 							w.u8(0)?;
-							v12.write(w)?;
+							v14.write(w)?;
 						}
 					}
 					Some(())
@@ -560,13 +638,13 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v14) => {
+						Ok(v16) => {
 							w.u8(1)?;
-							v14.write(w)?;
+							v16.write(w)?;
 						}
-						Err(v15) => {
+						Err(v17) => {
 							w.u8(0)?;
-							v15.write(w)?;
+							v17.write(w)?;
 						}
 					}
 					Some(())
@@ -597,13 +675,13 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v16) => {
+						Ok(v18) => {
 							w.u8(1)?;
-							w.bytes_lp(v16.as_bytes())?;
+							w.bytes_lp(v18.as_bytes())?;
 						}
-						Err(v17) => {
+						Err(v19) => {
 							w.u8(0)?;
-							v17.write(w)?;
+							v19.write(w)?;
 						}
 					}
 					Some(())
@@ -635,12 +713,12 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v18) => {
+						Ok(v20) => {
 							w.u8(1)?;
 						}
-						Err(v19) => {
+						Err(v21) => {
 							w.u8(0)?;
-							v19.write(w)?;
+							v21.write(w)?;
 						}
 					}
 					Some(())
@@ -671,12 +749,12 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v20) => {
+						Ok(v22) => {
 							w.u8(1)?;
 						}
-						Err(v21) => {
+						Err(v23) => {
 							w.u8(0)?;
-							v21.write(w)?;
+							v23.write(w)?;
 						}
 					}
 					Some(())
@@ -706,19 +784,19 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v22) => {
+						Ok(v24) => {
 							w.u8(1)?;
-							if v22.len() > u16::MAX as usize {
+							if v24.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v22.len() as u16)?;
-							for v24 in v22.iter() {
-								v24.write(w)?;
+							w.u16(v24.len() as u16)?;
+							for v26 in v24.iter() {
+								v26.write(w)?;
 							}
 						}
-						Err(v23) => {
+						Err(v25) => {
 							w.u8(0)?;
-							v23.write(w)?;
+							v25.write(w)?;
 						}
 					}
 					Some(())
@@ -750,13 +828,13 @@ pub mod session {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v25) => {
+						Ok(v27) => {
 							w.u8(1)?;
-							v25.write(w)?;
+							v27.write(w)?;
 						}
-						Err(v26) => {
+						Err(v28) => {
 							w.u8(0)?;
-							v26.write(w)?;
+							v28.write(w)?;
 						}
 					}
 					Some(())
@@ -912,7 +990,7 @@ pub mod session {
 			}
 			decoded
 		}
-		pub fn job_register(&mut self, name: &str, stopped: &bool, group: &bool, proc: &u64) -> Option<Result<u32, Error>> {
+		pub fn job_register(&mut self, name: &str, stopped: &bool, target: &JobTarget) -> Option<Result<u32, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -920,9 +998,7 @@ pub mod session {
 			w.u32(corr)?;
 			w.bytes_lp(name.as_bytes())?;
 			w.boolean(*stopped)?;
-			w.boolean(*group)?;
-			w.set_handle(*proc)?;
-			w.u32(0)?;
+			target.write(w)?;
 			let request_handles = Handles::try_from_slice(writer.handles())?;
 			let request = writer.into_inner();
 			let mut reply_handles = Handles::new();
@@ -1009,13 +1085,13 @@ pub mod session {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v27 = r.u16()? as usize;
-						let mut v28 = Vec::new();
-						v28.try_reserve_exact(v27).ok()?;
-						for _ in 0..v27 {
-							v28.push(JobInfo::read(r)?);
+						let v29 = r.u16()? as usize;
+						let mut v30 = Vec::new();
+						v30.try_reserve_exact(v29).ok()?;
+						for _ in 0..v29 {
+							v30.push(JobInfo::read(r)?);
 						}
-						v28
+						v30
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1054,13 +1130,13 @@ pub mod session {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v29 = r.u16()? as usize;
-						let mut v30 = Vec::new();
-						v30.try_reserve_exact(v29).ok()?;
-						for _ in 0..v29 {
-							v30.push(JobInfo::read(r)?);
+						let v31 = r.u16()? as usize;
+						let mut v32 = Vec::new();
+						v32.try_reserve_exact(v31).ok()?;
+						for _ in 0..v31 {
+							v32.push(JobInfo::read(r)?);
 						}
-						v30
+						v32
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1236,13 +1312,13 @@ pub mod session {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v31 = r.u16()? as usize;
-						let mut v32 = Vec::new();
-						v32.try_reserve_exact(v31).ok()?;
-						for _ in 0..v31 {
-							v32.push(EnvVar::read(r)?);
+						let v33 = r.u16()? as usize;
+						let mut v34 = Vec::new();
+						v34.try_reserve_exact(v33).ok()?;
+						for _ in 0..v33 {
+							v34.push(EnvVar::read(r)?);
 						}
-						v32
+						v34
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1312,9 +1388,9 @@ pub mod session {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_session_session_job_register")]
-	fn channel_invoke_job_register(chan: u64, name: &str, stopped: &bool, group: &bool, proc: &u64) -> Option<Result<u32, Error>> {
+	fn channel_invoke_job_register(chan: u64, name: &str, stopped: &bool, target: &JobTarget) -> Option<Result<u32, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
-		client.job_register(name, stopped, group, proc)
+		client.job_register(name, stopped, target)
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1465,6 +1541,66 @@ impl JobInfo {
 	}
 }
 
+impl JobTarget {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			JobTarget::Process(v35) => {
+				out.push_str("{\"process\":");
+				let _ = write!(out, "{}", v35);
+				out.push('}');
+			}
+			JobTarget::Group(v36) => {
+				out.push_str("{\"group\":");
+				let _ = write!(out, "{}", v36);
+				out.push('}');
+			}
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			JobTarget::Process(v37) => {
+				out.push_str("process(");
+				let _ = write!(out, "{}", v37);
+				out.push(')');
+			}
+			JobTarget::Group(v38) => {
+				out.push_str("group(");
+				let _ = write!(out, "{}", v38);
+				out.push(')');
+			}
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			JobTarget::Process(v39) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "process");
+				crate::codec::cbor::uint(out, *v39 as u64);
+			}
+			JobTarget::Group(v40) => {
+				crate::codec::cbor::map(out, 1);
+				crate::codec::cbor::text(out, "group");
+				crate::codec::cbor::uint(out, *v40 as u64);
+			}
+		}
+	}
+}
+
 impl JobEntry {
 	pub fn to_json(&self) -> String {
 		let mut s = String::new();
@@ -1486,8 +1622,8 @@ impl JobEntry {
 		out.push_str("\"info\":");
 		self.info.to_json_into(out);
 		out.push(',');
-		out.push_str("\"proc\":");
-		let _ = write!(out, "{}", self.proc);
+		out.push_str("\"target\":");
+		self.target.to_json_into(out);
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -1495,16 +1631,16 @@ impl JobEntry {
 		out.push_str("info=");
 		self.info.to_text_into(out);
 		out.push_str(", ");
-		out.push_str("proc=");
-		let _ = write!(out, "{}", self.proc);
+		out.push_str("target=");
+		self.target.to_text_into(out);
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
 		crate::codec::cbor::map(out, 2);
 		crate::codec::cbor::text(out, "info");
 		self.info.to_cbor_into(out);
-		crate::codec::cbor::text(out, "proc");
-		crate::codec::cbor::uint(out, self.proc as u64);
+		crate::codec::cbor::text(out, "target");
+		self.target.to_cbor_into(out);
 	}
 }
 

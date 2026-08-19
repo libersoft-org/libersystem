@@ -1,6 +1,7 @@
 package liber:process@1
 record process-info(koid:u64,name:string)
 resource task
+resource task-group
 record start-result(task:handle<task>,info:process-info)
 interface process
 method process.start op=1 (name:string:rights=) -> result<process-info, liber:base@1::error>

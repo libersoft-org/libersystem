@@ -16,7 +16,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
 use proto::codec::JsonMode;
-use proto::system::{Component, EnvVar, Error, JobEntry, JobInfo, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
+use proto::system::{Component, EnvVar, Error, JobEntry, JobInfo, JobTarget, LaunchContext, PipelineStage, TraceSpan, input, network, permission, process, session, system_graph, volume};
 use rt::*;
 use services::executable;
 use services::shell_language::{ExpandedStage, Expansion, ParseError, RedirectError, expand_redirects, parse_and_expand, parse_assignment, parse_pipeline, trim};
@@ -398,7 +398,10 @@ impl Jobs {
 			return None;
 		}
 		let name_str: &str = core::str::from_utf8(name).unwrap_or("");
-		match session::Client::new(ChannelTransport { chan: self.session }).job_register(name_str, &stopped, &group, &proc) {
+		// The kind travels WITH the handle now (P02M0102, IDL-003), so the session cannot be handed
+		// a group described as a process.
+		let target = if group { JobTarget::Group(proc) } else { JobTarget::Process(proc) };
+		match session::Client::new(ChannelTransport { chan: self.session }).job_register(name_str, &stopped, &target) {
 			Some(Ok(id)) => Some(id),
 			_ => None,
 		}
@@ -497,7 +500,10 @@ impl Jobs {
 				}
 			};
 			let stopped: bool = entry.info.stopped;
-			let job: Job = Job { proc: entry.proc, name: entry.info.name.into_bytes() };
+			let handle: u64 = match entry.target {
+				JobTarget::Process(handle) | JobTarget::Group(handle) => handle,
+			};
+			let job: Job = Job { proc: handle, name: entry.info.name.into_bytes() };
 			if stopped {
 				signal(job.proc, SIG_CONT);
 			}

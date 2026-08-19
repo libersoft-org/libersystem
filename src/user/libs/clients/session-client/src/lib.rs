@@ -17,7 +17,7 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::Error;
-use session_proto::generated::liber::session::v1::{JobInfo, JobSignalKind};
+use session_proto::generated::liber::session::v1::{JobInfo, JobSignalKind, JobTarget};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_session_session_job_list"]
@@ -25,7 +25,7 @@ unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_session_session_job_signal"]
 	fn session_job_signal(chan: u64, id: &u32, signal: &JobSignalKind) -> Option<Result<JobInfo, Error>>;
 	#[link_name = "liber_channel_liber_session_session_job_register"]
-	fn session_job_register(chan: u64, name: &str, stopped: &bool, group: &bool, proc: &u64) -> Option<Result<u32, Error>>;
+	fn session_job_register(chan: u64, name: &str, stopped: &bool, target: &JobTarget) -> Option<Result<u32, Error>>;
 }
 
 #[derive(Clone, Copy)]
@@ -58,7 +58,7 @@ impl SessionClient {
 	/// It gives the session something rather than taking something from it, which is what makes it
 	/// safe to hand a tool: a caller that could not start a program has nothing to register.
 	#[inline(always)]
-	pub fn job_register(&mut self, name: &str, stopped: bool, group: bool, task: u64) -> Option<Result<u32, Error>> {
-		unsafe { session_job_register(self.chan, name, &stopped, &group, &task) }
+	pub fn job_register(&mut self, name: &str, stopped: bool, target: JobTarget) -> Option<Result<u32, Error>> {
+		unsafe { session_job_register(self.chan, name, &stopped, &target) }
 	}
 }

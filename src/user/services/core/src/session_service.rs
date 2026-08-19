@@ -31,7 +31,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use proto::system::session::{self, Service};
-use proto::system::{EnvVar, Error, JobEntry, JobInfo, JobSignalKind};
+use proto::system::{EnvVar, Error, JobEntry, JobInfo, JobSignalKind, JobTarget};
 use rt::*;
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
@@ -55,13 +55,29 @@ fn default_path() -> &'static str {
 // currently stopped (suspended by Ctrl+Z).
 struct Job {
 	id: u32,
-	proc: u64,
 	name: String,
 	stopped: bool,
-	// Whether `proc` is a ProcessGroup rather than a single Process. The two are driven by
-	// different syscalls, and only the kernel can say a group is finished - which it does
-	// once every member has terminated, so a pipeline stays a job until its last stage goes.
-	group: bool,
+	// THE HANDLE AND WHAT IT IS, IN ONE VALUE (P02M0102, IDL-003).
+	//
+	// This was a `u64` and a `bool` beside it. The two are driven by different syscalls and only
+	// the kernel can say a group is finished - it does once every member has terminated, so a
+	// pipeline stays a job until its last stage goes - and a boolean that disagreed with the handle
+	// it described meant signalling the wrong kind of object. It arrived over the wire as a pair
+	// too, so nothing between the shell and here could catch a mismatch. Now the tag IS the thing
+	// that carries the handle, on the wire and in this table, and a mismatch cannot be written down.
+	target: JobTarget,
+}
+
+impl Job {
+	fn handle(&self) -> u64 {
+		match self.target {
+			JobTarget::Process(handle) | JobTarget::Group(handle) => handle,
+		}
+	}
+
+	fn is_group(&self) -> bool {
+		matches!(self.target, JobTarget::Group(_))
+	}
 }
 
 // One login session's state: its working directory, its environment variables (seeded
@@ -94,10 +110,10 @@ impl Service for Session {
 	// Register a background or stopped job: the request transferred us its live Process
 	// handle, which we keep so the job outlives the shell that started it. We assign and
 	// return the small id the shell shows the user.
-	fn job_register(&mut self, name: String, stopped: bool, group: bool, proc: u64) -> Result<u32, Error> {
+	fn job_register(&mut self, name: String, stopped: bool, target: JobTarget) -> Result<u32, Error> {
 		let id: u32 = self.next_id;
 		self.next_id = self.next_id.wrapping_add(1);
-		self.jobs.push(Job { id, proc, name, stopped, group });
+		self.jobs.push(Job { id, name, stopped, target });
 		Ok(id)
 	}
 
@@ -106,12 +122,13 @@ impl Service for Session {
 	fn job_take(&mut self, id: u32) -> Result<JobEntry, Error> {
 		let pos: usize = self.jobs.iter().position(|j: &Job| j.id == id).ok_or(Error::NotFound)?;
 		let job: Job = self.jobs.remove(pos);
-		Ok(JobEntry { info: JobInfo { id: job.id, name: job.name, stopped: job.stopped, group: job.group }, proc: job.proc })
+		let target = job.target;
+		Ok(JobEntry { info: JobInfo { id: job.id, name: job.name, stopped: job.stopped, group: matches!(target, JobTarget::Group(_)) }, target })
 	}
 
 	// List the tracked jobs for the shell's `jobs` command.
 	fn job_list(&mut self) -> Result<Vec<JobInfo>, Error> {
-		Ok(self.jobs.iter().map(|j: &Job| JobInfo { id: j.id, name: j.name.clone(), stopped: j.stopped, group: j.group }).collect())
+		Ok(self.jobs.iter().map(|j: &Job| JobInfo { id: j.id, name: j.name.clone(), stopped: j.stopped, group: j.is_group() }).collect())
 	}
 
 	// Reap finished jobs: poll each running (not stopped) job's Process handle - once it
@@ -121,10 +138,11 @@ impl Service for Session {
 		let mut done: Vec<JobInfo> = Vec::new();
 		let mut i: usize = 0;
 		while i < self.jobs.len() {
-			if !self.jobs[i].stopped && unsafe { poll_ready(self.jobs[i].proc) } {
+			if !self.jobs[i].stopped && unsafe { poll_ready(self.jobs[i].handle()) } {
 				let job: Job = self.jobs.remove(i);
-				unsafe { close(job.proc) };
-				done.push(JobInfo { id: job.id, name: job.name, stopped: job.stopped, group: job.group });
+				unsafe { close(job.handle()) };
+				let is_group = job.is_group();
+				done.push(JobInfo { id: job.id, name: job.name, stopped: job.stopped, group: is_group });
 			} else {
 				i += 1;
 			}
@@ -141,15 +159,15 @@ impl Service for Session {
 			// process signal to a group handle would simply be refused, leaving a pipeline
 			// stopped forever with the session believing it had resumed.
 			unsafe {
-				if self.jobs[pos].group {
-					process_group_signal(self.jobs[pos].proc, SIG_CONT);
+				if self.jobs[pos].is_group() {
+					process_group_signal(self.jobs[pos].handle(), SIG_CONT);
 				} else {
-					signal(self.jobs[pos].proc, SIG_CONT);
+					signal(self.jobs[pos].handle(), SIG_CONT);
 				}
 			}
 			self.jobs[pos].stopped = false;
 		}
-		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped, group: self.jobs[pos].group })
+		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped, group: self.jobs[pos].is_group() })
 	}
 
 	// Signal a job this session owns, without handing its Process handle to the caller.
@@ -177,10 +195,10 @@ impl Service for Session {
 		// A group signals every live stage; a single process signals itself. Sending the process
 		// signal to a group handle is refused, which is how `job-resume` learned the difference.
 		unsafe {
-			if self.jobs[pos].group {
-				process_group_signal(self.jobs[pos].proc, number);
+			if self.jobs[pos].is_group() {
+				process_group_signal(self.jobs[pos].handle(), number);
 			} else {
-				send_signal(self.jobs[pos].proc, number);
+				send_signal(self.jobs[pos].handle(), number);
 			}
 		}
 		// The session's idea of the job's state, updated to what the signal asked for: a stop
@@ -191,7 +209,7 @@ impl Service for Session {
 			JobSignalKind::Cont => self.jobs[pos].stopped = false,
 			_ => {}
 		}
-		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped, group: self.jobs[pos].group })
+		Ok(JobInfo { id: self.jobs[pos].id, name: self.jobs[pos].name.clone(), stopped: self.jobs[pos].stopped, group: self.jobs[pos].is_group() })
 	}
 
 	// Read one environment variable. NotFound if the session has no variable by that name.

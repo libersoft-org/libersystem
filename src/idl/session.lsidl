@@ -3,7 +3,7 @@
 package liber:session@1;
 
 use liber:base@1.{env-var, error};
-use liber:process@1.{task};
+use liber:process@1.{task, task-group};
 
 /// One tracked job in a session's job table: its small id (assigned by the session and
 /// stable across shell restarts), the program name shown by `jobs`, and whether it is
@@ -17,7 +17,22 @@ record job-info {
 	/// a pipeline rather than a command. The session needs it because signalling and waiting
 	/// take a different syscall for each, and a group is finished only once EVERY stage is,
 	/// so a partially exited pipeline stays a job.
+	///
+	/// Derived from the `job-target` the session was handed, never asserted alongside a handle:
+	/// this record travels without one, so there is nothing here for it to disagree with.
 	group:   bool,
+}
+
+/// The live object a job names, WITH ITS KIND IN THE SAME VALUE.
+///
+/// A job is a single command or a whole pipeline, and the two take different syscalls to signal and
+/// to wait on. This used to be `handle<task>` plus a `bool` beside it, so a caller could hand over a
+/// group and call it a process - and the wire could not tell, because both spellings were the same
+/// type and the boolean was just another field. A variant makes the mismatch unrepresentable: the
+/// tag that says which one it is IS the thing that carries it.
+variant job-target {
+	process(handle<task>),
+	group(handle<task-group>),
 }
 
 /// A job handed back to a foregrounding shell: its info plus the live Process handle
@@ -26,7 +41,7 @@ record job-info {
 /// is suspended again.
 record job-entry {
 	info: job-info,
-	proc: handle<task>,
+	target: job-target,
 }
 
 /// The SessionService contract: a login session is a long-lived object owning the
@@ -73,7 +88,7 @@ enum job-signal-kind {
 interface session {
 	@op(1)  cwd:          func() -> result<string, error>;
 	@op(2)  chdir:        func(path: string) -> result<unit, error>;
-	@op(3)  job-register: func(name: string, stopped: bool, group: bool, proc: handle<task>) -> result<u32, error>;
+	@op(3)  job-register: func(name: string, stopped: bool, target: job-target) -> result<u32, error>;
 	@op(4)  job-take:     func(id: u32) -> result<job-entry, error>;
 	@op(5)  job-list:     func() -> result<list<job-info>, error>;
 	@op(6)  job-reap:     func() -> result<list<job-info>, error>;

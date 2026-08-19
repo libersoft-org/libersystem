@@ -3,7 +3,7 @@
 package liber:security@1;
 
 use liber:base@1.{env-var, error};
-use liber:process@1.{start-result as process-start-result, task};
+use liber:process@1.{start-result as process-start-result, task, task-group};
 
 /// The kinds of capability a component may be declared to receive: a connection to one
 /// of the system services. The typed vocabulary a permission manifest is written in - a
@@ -114,7 +114,7 @@ record pipeline-stage {
 /// pipeline through the group - and naming the stages individually belongs with the per-stage
 /// completion records, which need a shape of their own rather than a bare list of numbers.
 record pipeline-result {
-	group: handle<task>,
+	group: handle<task-group>,
 	stages: u32,
 }
 
