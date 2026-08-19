@@ -856,8 +856,20 @@ fn process_service_lists_every_started_program() {
 	// hold just as well for a service that never removes anything, and two blocked processes would
 	// outlive the test.
 	drop(held);
-	sched::run_until_idle();
-	assert_eq!(process_service_list_len(&service_client, 14), 0, "letting go of both ends lets both finish");
+	// BOUNDED, NOT ONE DRAIN. A child observes peer-closed, wakes, returns from its blocking wait
+	// and exits - and how many scheduler passes that takes is not something this test controls. One
+	// `run_until_idle` is enough on x86_64 and is not on an emulated eight-core aarch64, where this
+	// asserted `left: 2, right: 0` while both children were on their way out. Asserting on a
+	// schedule is the same mistake the fixture above was written to remove, one layer up.
+	let mut listed = u16::MAX;
+	for attempt in 0..64u32 {
+		sched::run_until_idle();
+		listed = process_service_list_len(&service_client, 14 + attempt);
+		if listed == 0 {
+			break;
+		}
+	}
+	assert_eq!(listed, 0, "letting go of both ends lets both finish");
 }
 
 tagged_test!(process_service_drops_a_terminated_process_from_the_list, [Service, Process, ProcessService], id = "kernel.services.process_service_drops_a_terminated_process_from_the_list", covers = ["kernel"]);

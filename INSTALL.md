@@ -176,8 +176,6 @@ Every script is at the repository root and answers `--help`.
 | `./bench.sh [--suite N]` | Optimized host measurement (`audio`, `image`) and hostile-input runs (`image-mutate`). |
 
 There is no task runner and nothing to install for one: every command above is a script in this
-directory that takes flags and answers `--help`. There used to be a Justfile in `src/` holding the
-specialist recipes; it is gone, and `docs/todo/P02M0140.md` records where each of its thirty recipes
-went and how each replacement was shown to run the same command.
+directory that takes flags and answers `--help`.
 
 > `./format.sh` needs [`shfmt`](https://github.com/mvdan/sh) on your `PATH`.
