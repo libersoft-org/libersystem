@@ -128,6 +128,13 @@ interface permission {
 	/// a half-built pipeline is worse than none - a consumer whose producer never starts
 	/// blocks forever. `stdout` is the terminal end the LAST stage writes to; every earlier
 	/// stage writes into the edge the broker made for it.
+	///
+	/// "Starts none of them" rests on `process.release-group`, and it did not use to. The broker
+	/// released one koid at a time, so past the first release the transaction could not be unwound:
+	/// a stage that had run might already have written, sent or printed, and stopping it afterwards
+	/// is not the same as it never having started. The group primitive validates every token before
+	/// queueing any thread, so a refusal comes back with nothing started - which is what makes this
+	/// sentence a guarantee rather than an intention.
 	@op(4) run-pipeline: func(stages: list<pipeline-stage>, cwd: string, environment: list<env-var>, stdout: handle<channel>) -> result<pipeline-result, error>;
 
 	/// Start a program over ONE SELECTED FILE, with an attenuated grant instead of a volume bundle.

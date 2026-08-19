@@ -866,6 +866,53 @@ impl<'a> Service for Processes<'a> {
 		Ok(unsafe { spawned.release() })
 	}
 
+	// Start a whole prepared pipeline, or none of it.
+	//
+	// EVERY TOKEN IS CHECKED BEFORE ANY THREAD IS QUEUED, and that ordering is the entire primitive.
+	// `security.run-pipeline` promises that a failure at any stage starts none of them, and a caller
+	// releasing one koid at a time cannot keep it: past the first release a stage may already have
+	// written, sent or printed, so telling it to stop is not the same as it never having run. The
+	// broker had no way to ask for the group as a unit, which is why the promise was false exactly
+	// when it mattered.
+	//
+	// A koid this client does not own, one that was never prepared, one already released, and the
+	// same koid named twice all answer `false` with nothing started - the same answer `release`
+	// gives for a koid it cannot use, and for the same reason: a caller learns that its request was
+	// refused and nothing about whose koid it named.
+	fn release_group(&mut self, koids: Vec<u64>) -> Result<bool, Error> {
+		if koids.is_empty() {
+			return Ok(false);
+		}
+		let mut indices: Vec<usize> = Vec::new();
+		for koid in &koids {
+			let Some(index) = self.prepared.iter().position(|(owner, pending, _)| pending == koid && *owner == self.client) else {
+				return Ok(false);
+			};
+			// The same koid twice would resolve to one prepared launch and release it once while the
+			// caller believes two stages started.
+			if indices.contains(&index) {
+				return Ok(false);
+			}
+			indices.push(index);
+		}
+		// Taken high index first so the ones not yet removed keep their positions.
+		indices.sort_unstable();
+		let mut ready: Vec<Spawned> = Vec::new();
+		for index in indices.iter().rev() {
+			let (_, _, spawned) = self.prepared.remove(*index);
+			ready.push(spawned);
+		}
+		// PAST HERE IT IS NOT A POLICY DECISION ANY MORE. Queueing a thread that already exists is a
+		// local operation; if one refuses, the group is half-started and no answer this returns can
+		// make that untrue, so it is reported as a fault rather than as a refusal a caller could
+		// mistake for "nothing happened".
+		let mut queued = true;
+		for spawned in ready {
+			queued &= unsafe { spawned.release() };
+		}
+		if queued { Ok(true) } else { Err(Error::Invalid) }
+	}
+
 	fn launch_bounded(&mut self, name: String, memory_limit: u64, bootstrap: u64) -> Result<StartResult, Error> {
 		let domain = unsafe { self.bounded_domain(memory_limit)? };
 		let started = unsafe { self.spawn_program(&name, bootstrap, domain) };

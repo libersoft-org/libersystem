@@ -57,6 +57,18 @@ record start-result {
 /// launch would need two, but keeping the token here is the better answer anyway: a caller
 /// cannot hold a half-started process open indefinitely, and `release` names the koid it
 /// already has rather than a second capability to lose track of.
+///
+/// `release-group` is the same gate for a WHOLE pipeline, and it exists because releasing one koid
+/// at a time cannot keep the promise `security.run-pipeline` makes. Past the first release a
+/// transaction can no longer be unwound: a stage that has run may already have written, sent or
+/// printed, so telling it to stop afterwards is not the same as never having started it, and "a
+/// failure at any stage starts none of them" was false exactly when it mattered.
+///
+/// So this validates EVERY token first - every koid prepared, and every one of them this client's -
+/// and only then queues them. A caller naming one koid it does not own starts nothing at all, which
+/// is the transition the guarantee needs and which no sequence of single releases can provide.
+/// Queueing after validation is a local operation on threads that already exist; a failure there is
+/// a fault rather than a policy answer, and it is reported as an error rather than as `false`.
 interface process {
 	@op(1) start:  func(name: string) -> result<process-info, error>;
 	@op(2) list:   func() -> result<list<process-info>, error>;
@@ -65,4 +77,5 @@ interface process {
 	@op(5) accounting: func() -> result<list<budget>, error>;
 	@op(6) launch-prepared: func(name: string, bootstrap: handle<channel>) -> result<start-result, error>;
 	@op(7) release: func(koid: koid) -> result<bool, error>;
+	@op(8) release-group: func(koids: list<koid>) -> result<bool, error>;
 }

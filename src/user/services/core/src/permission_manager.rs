@@ -1009,23 +1009,34 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 			}
 			prepared.push((started, manager_side));
 		}
-		// Commit. Released in pipeline order so a producer is running before its consumer can
-		// find the pipe empty - not required for correctness, since a consumer blocks on an
-		// empty channel either way, but it keeps the common case from a needless wait.
+		// COMMIT, IN ONE TRANSITION (P02M0102, IDL-002).
+		//
+		// This released the stages one koid at a time, and the comment where the loop handled a
+		// refusal said what that cost: "past the first release the transaction can no longer be
+		// unwound cleanly: stages already running are told to stop rather than left orphaned". A
+		// stage that has run may already have written, sent or printed, so a `SIG_KILL` afterwards
+		// is not the same as it never having started - which made "a failure at any stage starts
+		// none of them" false exactly in the case the promise exists for.
+		//
+		// `release-group` is the primitive that was missing: ProcessService checks every token
+		// first - every koid prepared, and every one of them this client's - and only then queues
+		// them. A refusal therefore comes back with nothing started, and this can return having run
+		// nothing at all rather than having half-run a pipeline.
+		let koids: Vec<u64> = prepared.iter().map(|(result, _)| result.info.koid).collect();
+		let committed = matches!(process_client.release_group(&koids), Some(Ok(true)));
 		let mut started: Vec<StartResult> = Vec::new();
 		for (result, manager_side) in prepared {
-			if !matches!(process_client.release(&result.info.koid), Some(Ok(true))) {
-				// Past the first release the transaction can no longer be unwound cleanly:
-				// stages already running are told to stop rather than left orphaned.
-				close(manager_side);
-				close(result.task);
-				for earlier in &started {
-					signal(earlier.task, abi::SIG_KILL);
-				}
-				return None;
-			}
 			close(manager_side);
-			started.push(result);
+			if committed {
+				started.push(result);
+			} else {
+				// Nothing ran, so there is nothing to signal - only the handles this transaction
+				// opened, which go back the way a refused preparation's do.
+				close(result.task);
+			}
+		}
+		if !committed {
+			return None;
 		}
 		Some(started)
 	}

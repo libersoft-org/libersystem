@@ -10,3 +10,4 @@ method process.launch-bounded op=4 (name:string:rights=,memory-limit:u64:rights=
 method process.accounting op=5 () -> result<list<liber:resources@1::budget>, liber:base@1::error>
 method process.launch-prepared op=6 (name:string:rights=,bootstrap:handle<channel>:rights=) -> result<start-result, liber:base@1::error>
 method process.release op=7 (koid:u64:rights=) -> result<bool, liber:base@1::error>
+method process.release-group op=8 (koids:list<u64>:rights=) -> result<bool, liber:base@1::error>
