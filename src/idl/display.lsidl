@@ -73,6 +73,10 @@ interface display {
 /// exact process. Ordinary display clients never receive this interface and cannot
 /// bind themselves or another task; emergency revocation signals the bound task.
 interface display-admin {
-	@op(1) bind: func(task: handle<task>) -> result<handle<channel>, error>;
+	/// The task handle must already carry `manage`, which is what a `task` capability IS: the
+	/// process resource says the launcher receives it "carrying MANAGE" so it can do job control.
+	/// Binding a display to a process it cannot manage would hand out a connection whose emergency
+	/// revocation - signalling the bound task - could not be carried out.
+	@op(1) bind: func(@rights(manage) task: handle<task>) -> result<handle<channel>, error>;
 	@op(2) stats: func() -> presentation-stats;
 }

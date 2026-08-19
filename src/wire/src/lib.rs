@@ -882,5 +882,40 @@ pub mod cbor {
 	}
 }
 
+// AUTHORITY A RECEIVED HANDLE MUST ALREADY CARRY (P02M0102, IDL-004).
+//
+// A schema can declare `@rights(...)` on a handle parameter, and until now nothing read it: the
+// annotation reached the ABI signature and no generated code. So what a service was entitled to
+// assume about a handle it was sent lived in prose, and held for exactly as long as every caller
+// remembered - which is the shape of gap that is only discovered by something going wrong.
+//
+// The generated dispatch calls this before it calls the service. A handle the sender narrowed, or
+// one of a type this parameter is not for, is refused with the schema's own error rather than handed
+// over, so the declaration is the enforcement instead of a description of it.
+//
+// The runtime publishes the answer as one packed word because this crate has `abi` and nothing else
+// - no syscall wrapper, on purpose, since the codec is linked in places where issuing one would be
+// wrong. `u64::MAX` is an unknown handle and fails like any other missing authority.
+unsafe extern "C" {
+	fn liber_handle_authority(handle: u64) -> u64;
+}
+
+pub fn handle_carries(handle: u64, required_rights: u32, required_type: u64) -> bool {
+	let authority = unsafe { liber_handle_authority(handle) };
+	if authority == u64::MAX {
+		return false;
+	}
+	let rights = authority as u32;
+	let object_type = authority >> 32;
+	if required_type != NO_REQUIRED_TYPE && object_type != required_type {
+		return false;
+	}
+	rights & required_rights == required_rights
+}
+
+// A resource the schema names but the ABI has no type code for: the rights are still checked, the
+// type is not, and that is said here rather than left as a zero somebody reads as "Domain".
+pub const NO_REQUIRED_TYPE: u64 = u64::MAX;
+
 #[cfg(test)]
 mod tests;

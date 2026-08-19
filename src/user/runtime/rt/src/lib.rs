@@ -2010,6 +2010,24 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 	}
 }
 
+// THE RIGHTS AND TYPE BEHIND A HANDLE, AS ONE EXPORTED SYMBOL (P02M0102, IDL-004).
+//
+// The generated server dispatch has to be able to refuse a handle that does not carry the authority
+// its schema declares, and it lives in `wire`, which depends on `abi` alone - no syscall wrapper, and
+// deliberately so, since the codec is also linked where a syscall would be wrong. So the runtime
+// publishes the one question the codec needs to ask, the same way the channel stubs publish theirs.
+//
+// Packed rather than a struct: `rights` in the low 32 bits and the stable object-type code in the
+// high 32, so the codec can check both without a repr contract of its own. All ones means the handle
+// is unknown, which is refused for the same reason as insufficient rights.
+#[unsafe(no_mangle)]
+pub extern "C" fn liber_handle_authority(handle: u64) -> u64 {
+	match unsafe { object_info(handle) } {
+		Some(info) => (info.object_type << 32) | u64::from(info.rights),
+		None => u64::MAX,
+	}
+}
+
 // Read the live per-process counters and state behind a Process `handle` (the IPC
 // volume it has done, the handles and user memory it holds, and its liveness). The
 // handle must carry RIGHT_READ. Returns None if the handle is unknown or not a

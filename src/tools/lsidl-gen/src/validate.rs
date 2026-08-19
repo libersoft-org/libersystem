@@ -23,7 +23,11 @@ enum Kind {
 }
 
 // The capability rights `@rights(...)` may name (mirrors abi RIGHT_* bits).
-const RIGHTS: &[&str] = &["read", "write", "execute", "map", "send", "receive", "duplicate", "transfer", "revoke", "get-info", "manage", "wait"];
+// IN THE ABI'S ORDER, which is what lets the emitter turn a name into a bit without a second list:
+// `abi::RIGHT_READ` is `1 << 0` and each of these follows in the same order, so the index IS the
+// shift. Reordering this array changes what every `@rights` annotation enforces, which is why it
+// says so here rather than in the place that reads it.
+pub const RIGHTS: &[&str] = &["read", "write", "execute", "map", "send", "receive", "duplicate", "transfer", "revoke", "get-info", "manage", "wait"];
 
 // Resources the kernel provides without a declaration.
 const BUILTIN_RESOURCES: &[&str] = &["channel"];

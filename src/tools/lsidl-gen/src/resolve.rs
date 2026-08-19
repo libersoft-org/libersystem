@@ -85,6 +85,10 @@ pub struct ResolvedSymbol {
 	pub kind: SymbolKind,
 	pub cardinality: HandleCardinality,
 	pub contains_again: bool,
+	// Whether the error enum can say `denied`, which is what a generated `@rights` refusal answers
+	// with. Carried beside `contains_again` and for the same reason: the emitter has to know it
+	// about an IMPORTED enum too, and only the resolver has looked at that package.
+	pub contains_denied: bool,
 	pub wire_type: Option<Type>,
 }
 
@@ -106,6 +110,7 @@ struct Export {
 	kind: SymbolKind,
 	cardinality: HandleCardinality,
 	contains_again: bool,
+	contains_denied: bool,
 	wire_type: Option<Type>,
 }
 
@@ -162,7 +167,7 @@ pub fn resolve(files: &[File]) -> Result<Vec<ResolvedPackage>, Vec<ResolveError>
 					errors.push(ResolveError { file: index, error: Error::new(name.alias_span.unwrap_or(name.span), format!("imported name `{local}` is already defined")) });
 					continue;
 				}
-				imports.insert(local, ResolvedSymbol { package: ids[target].clone(), source_name: name.name.clone(), kind: export.kind, cardinality: export.cardinality, contains_again: export.contains_again, wire_type: export.wire_type.clone() });
+				imports.insert(local, ResolvedSymbol { package: ids[target].clone(), source_name: name.name.clone(), kind: export.kind, cardinality: export.cardinality, contains_again: export.contains_again, contains_denied: export.contains_denied, wire_type: export.wire_type.clone() });
 			}
 		}
 		if errors.is_empty() {
@@ -196,16 +201,16 @@ fn edit_distance(left: &str, right: &str) -> usize {
 fn base_exports(file: &File) -> HashMap<String, Export> {
 	let mut out = HashMap::new();
 	for item in &file.items {
-		let (name, kind, again, wire_type) = match item {
-			Item::Alias(item) => (&item.name, SymbolKind::Value, false, Some(item.ty.clone())),
-			Item::Record(item) => (&item.name, SymbolKind::Value, false, None),
-			Item::Enum(item) => (&item.name, SymbolKind::Value, item.cases.iter().any(|case| case.name == "again"), None),
-			Item::Variant(item) => (&item.name, SymbolKind::Value, false, None),
-			Item::Flags(item) => (&item.name, SymbolKind::Value, false, None),
-			Item::Resource(item) => (&item.name, SymbolKind::Resource, false, None),
-			Item::Interface(item) => (&item.name, SymbolKind::Interface, false, None),
+		let (name, kind, again, denied, wire_type) = match item {
+			Item::Alias(item) => (&item.name, SymbolKind::Value, false, false, Some(item.ty.clone())),
+			Item::Record(item) => (&item.name, SymbolKind::Value, false, false, None),
+			Item::Enum(item) => (&item.name, SymbolKind::Value, item.cases.iter().any(|case| case.name == "again"), item.cases.iter().any(|case| case.name == "denied"), None),
+			Item::Variant(item) => (&item.name, SymbolKind::Value, false, false, None),
+			Item::Flags(item) => (&item.name, SymbolKind::Value, false, false, None),
+			Item::Resource(item) => (&item.name, SymbolKind::Resource, false, false, None),
+			Item::Interface(item) => (&item.name, SymbolKind::Interface, false, false, None),
 		};
-		out.entry(name.clone()).or_insert(Export { kind, cardinality: HandleCardinality::ZERO, contains_again: again, wire_type });
+		out.entry(name.clone()).or_insert(Export { kind, cardinality: HandleCardinality::ZERO, contains_again: again, contains_denied: denied, wire_type });
 	}
 	out
 }

@@ -17,16 +17,23 @@ pub fn rust(file: &File, source: &str, imports: &HashMap<String, ResolvedSymbol>
 	// The enums that can express the dispatch overflow fallback: any error enum
 	// with an `again` case (the reply-too-big degradation needs a variant to name).
 	let mut again_enums: std::collections::HashSet<String> = std::collections::HashSet::new();
+	let mut denied_enums: std::collections::HashSet<String> = std::collections::HashSet::new();
 	for item in &file.items {
 		if let Item::Enum(e) = item {
 			if e.cases.iter().any(|c| c.name == "again") {
 				again_enums.insert(e.name.clone());
+			}
+			if e.cases.iter().any(|c| c.name == "denied") {
+				denied_enums.insert(e.name.clone());
 			}
 		}
 	}
 	for (local, symbol) in imports {
 		if symbol.contains_again {
 			again_enums.insert(local.clone());
+		}
+		if symbol.contains_denied {
+			denied_enums.insert(local.clone());
 		}
 	}
 	let mut aliases: HashMap<String, Type> = file.items.iter().filter_map(|item| if let Item::Alias(alias) = item { Some((alias.name.clone(), alias.ty.clone())) } else { None }).collect();
@@ -35,7 +42,7 @@ pub fn rust(file: &File, source: &str, imports: &HashMap<String, ResolvedSymbol>
 			aliases.insert(local.clone(), wire_type.clone());
 		}
 	}
-	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums, aliases };
+	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums, denied_enums, aliases };
 	cg.file(file, source);
 	cg.imports(imports);
 	for item in &file.items {
@@ -57,7 +64,7 @@ pub fn compat_rust(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> St
 			aliases.insert(local.clone(), wire_type.clone());
 		}
 	}
-	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums: std::collections::HashSet::new(), aliases };
+	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums: std::collections::HashSet::new(), denied_enums: std::collections::HashSet::new(), aliases };
 	cg.compat_tests(file);
 	cg.out
 }
@@ -74,6 +81,7 @@ struct Cg {
 	// Error-enum names that carry an `again` case, so a dispatch whose reply
 	// overflows the caller's buffer can degrade to a typed error.
 	again_enums: std::collections::HashSet<String>,
+	denied_enums: std::collections::HashSet<String>,
 	aliases: HashMap<String, Type>,
 }
 
@@ -131,6 +139,17 @@ fn write_markdown_doc(out: &mut String, docs: &[Doc]) {
 	if !docs.is_empty() {
 		let _ = writeln!(out, "{}\n", markdown_doc(docs));
 	}
+}
+
+// The kernel's rights, by the name a schema spells, as a bit.
+//
+// Derived from `validate::RIGHTS` rather than listed again: that array is in the ABI's order, where
+// `read` is `1 << 0` and each follows, so the index is the shift. A second copy here would be a
+// second thing to keep in step, and the failure mode is silent - a mask that enforces the wrong
+// right reads exactly like one that enforces the right one. Unknown names never reach this;
+// `validate` rejects them with a suggestion.
+fn right_bit(name: &str) -> Option<u32> {
+	crate::validate::RIGHTS.iter().position(|known| *known == name).map(|index| 1u32 << index)
 }
 
 impl Cg {
@@ -517,7 +536,46 @@ impl Cg {
 				// called at the codec boundary and at none of the framing boundaries.
 				self.line("\t\t\t\tr.finish()?;");
 				self.line("\t\t\t\trequest_handles.clear();");
-				self.line(&format!("\t\t\t\tlet result = service.{}({});", field_ident(&m.name), args.join(", ")));
+				// `@rights` ENFORCED HERE, between a well-formed request and the service seeing it.
+				//
+				// The annotation used to reach the ABI signature and no generated code, so what a
+				// service could assume about a handle it was sent was prose that held while every
+				// caller remembered. A handle that does not already carry what the schema declares
+				// is refused with the method's own error type; the service is not called at all.
+				let mut guards: Vec<String> = Vec::new();
+				for p in &m.params {
+					if p.rights.is_empty() || !matches!(p.ty, Type::Handle(_)) {
+						continue;
+					}
+					let mut mask: u32 = 0;
+					for right in &p.rights {
+						match right_bit(right) {
+							Some(bit) => mask |= bit,
+							None => return Err(Error::new(p.span, format!("@rights names '{right}', which is not a kernel right"))),
+						}
+					}
+					guards.push(format!("crate::codec::handle_carries({}, {mask}, crate::codec::NO_REQUIRED_TYPE)", field_ident(&p.name)));
+				}
+				let denied: Option<String> = if guards.is_empty() {
+					None
+				} else {
+					match &m.ret {
+						Type::Result(_, errty) => match errty.as_ref() {
+							Type::Named(n) if self.denied_enums.contains(n) => Some(camel(n)),
+							_ => None,
+						},
+						_ => None,
+					}
+				};
+				match &denied {
+					Some(error_type) => {
+						self.line(&format!("\t\t\t\tlet authorized = {};", guards.join(" && ")));
+						self.line(&format!("\t\t\t\tlet result = if authorized {{ service.{}({}) }} else {{ Err({error_type}::Denied) }};", field_ident(&m.name), args.join(", ")));
+					}
+					None => {
+						self.line(&format!("\t\t\t\tlet result = service.{}({});", field_ident(&m.name), args.join(", ")));
+					}
+				}
 				let code = self.write_place(&m.ret, "result", false).map_err(|e| Error::new(m.span, e))?;
 				// A result whose error enum carries an `again` case can degrade an
 				// oversized reply into a typed error instead of sending nothing

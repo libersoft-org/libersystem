@@ -820,6 +820,10 @@ pub mod display_admin {
 	pub const OP_STATS: u16 = 2;
 
 	pub trait Service {
+		/// The task handle must already carry `manage`, which is what a `task` capability IS: the
+		/// process resource says the launcher receives it "carrying MANAGE" so it can do job control.
+		/// Binding a display to a process it cannot manage would hand out a connection whose emergency
+		/// revocation - signalling the bound task - could not be carried out.
 		fn bind(&mut self, task: u64) -> Result<u64, Error>;
 		fn stats(&mut self) -> PresentationStats;
 	}
@@ -851,7 +855,8 @@ pub mod display_admin {
 				};
 				r.finish()?;
 				request_handles.clear();
-				let result = service.bind(task);
+				let authorized = crate::codec::handle_carries(task, 1024, crate::codec::NO_REQUIRED_TYPE);
+				let result = if authorized { service.bind(task) } else { Err(Error::Denied) };
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
