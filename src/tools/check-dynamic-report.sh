@@ -198,29 +198,55 @@ canonical_manifest_order() {
 	printf '%s.lslib\n' "${order[@]}"
 }
 
+# EVERY `llvm-readelf` READ GOES THROUGH HERE, and the reason is a defect this script had after the
+# milestone that was supposed to remove it.
+#
+# The segment and export readers fed their loops from `done < <(llvm-readelf ...)`. A process
+# substitution's exit status is not the enclosing command's under any setting - `pipefail` does not
+# reach it and `set -e` never sees it - so a reader that printed one plausible LOAD line and then
+# died returned 0 with a metric computed from the part that arrived. Measured: a shim printing one
+# `LOAD ... RW` line and exiting 37 produced status 0 and 4096 bytes, which is then published as a
+# tracked report row.
+#
+# So the output is CAPTURED FIRST and the status checked before anything reads it. The caller gets a
+# failure, and no partial metric exists to be defaulted, cached or written.
+read_elf() {
+	local what="$1"
+	shift
+	local output
+	if ! output="$(llvm-readelf "$@" 2>&1)"; then
+		echo "dynamic-report: llvm-readelf failed reading $what" >&2
+		printf '%s\n' "$output" >&2
+		return 1
+	fi
+	printf '%s\n' "$output"
+}
+
 writable_load_bytes() {
 	local image="$1"
 	local total=0
-	local kind offset address physical file_size memory_size flags
+	local kind offset address physical file_size memory_size flags listing
+	listing="$(read_elf "$image" -lW "$image")" || return 1
 	while read -r kind offset address physical file_size memory_size flags; do
 		[[ "$kind" == LOAD && "$flags" == *W* ]] || continue
 		local start=$((address & -4096))
 		local end=$(((address + memory_size + 4095) & -4096))
 		total=$((total + end - start))
-	done < <(llvm-readelf -lW "$image")
+	done <<<"$listing"
 	printf '%s\n' "$total"
 }
 
 immutable_load_bytes() {
 	local image="$1"
 	local total=0
-	local kind offset address physical file_size memory_size flags
+	local kind offset address physical file_size memory_size flags listing
+	listing="$(read_elf "$image" -lW "$image")" || return 1
 	while read -r kind offset address physical file_size memory_size flags; do
 		[[ "$kind" == LOAD && "$flags" != *W* ]] || continue
 		local start=$((address & -4096))
 		local end=$(((address + memory_size + 4095) & -4096))
 		total=$((total + end - start))
-	done < <(llvm-readelf -lW "$image")
+	done <<<"$listing"
 	printf '%s\n' "$total"
 }
 
@@ -263,12 +289,14 @@ current_object_bytes() {
 		echo "dynamic-report: current ET_REL hash differs for $target $tool" >&2
 		return 1
 	}
-	object_header="$(llvm-readelf -h "$object")" || object_header=""
+	object_header="$(read_elf "$object" -h "$object")" || return 1
 	grep -q 'Type:.*REL' <<<"$object_header" || {
 		echo "dynamic-report: current object is not ET_REL for $target $tool" >&2
 		return 1
 	}
-	definitions="$(llvm-readelf --wide --symbols "$object" | awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "" {print $8}' | sort -u)"
+	local symbols
+	symbols="$(read_elf "$object" --wide --symbols "$object")" || return 1
+	definitions="$(awk '$5 == "GLOBAL" && $7 != "UND" && $8 != "" {print $8}' <<<"$symbols" | sort -u)"
 	[[ "$definitions" == __user_main ]] || {
 		echo "dynamic-report: current ET_REL definitions differ for $target $tool" >&2
 		return 1
@@ -288,13 +316,15 @@ provider_metrics() {
 			echo "dynamic-report: missing $target provider $provider" >&2
 			return 1
 		}
+		local dyn_syms
+		dyn_syms="$(read_elf "$provider_file" --dyn-syms -W "$provider_file")" || return 1
 		provider_size_cache[$key]="$(stat -c %s "$provider_file")"
 		provider_private_cache[$key]="$(writable_load_bytes "$provider_file")"
 		provider_shared_cache[$key]="$(immutable_load_bytes "$provider_file")"
 		while IFS= read -r symbol; do
 			[[ -n "$symbol" ]] || continue
 			provider_exports["$target|$symbol"]+="$provider "
-		done < <(llvm-readelf --dyn-syms -W "$provider_file" | awk '$7 != "UND" && ($5 == "GLOBAL" || $5 == "WEAK") && ($4 == "NOTYPE" || $4 == "OBJECT" || $4 == "FUNC") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $8 != "" {print $8}' | sort -u)
+		done <<<"$(awk '$7 != "UND" && ($5 == "GLOBAL" || $5 == "WEAK") && ($4 == "NOTYPE" || $4 == "OBJECT" || $4 == "FUNC") && ($6 == "DEFAULT" || $6 == "PROTECTED") && $8 != "" {print $8}' <<<"$dyn_syms" | sort -u)"
 	fi
 	printf '%s %s %s\n' "${provider_size_cache[$key]}" "${provider_private_cache[$key]}" "${provider_shared_cache[$key]}"
 }
@@ -341,7 +371,7 @@ resolve_import_owners() {
 
 preload_metrics() {
 	local target tool provider
-	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
+	for target in "${TARGETS[@]}"; do
 		while IFS= read -r tool; do current_object_bytes "$target" "$tool" >/dev/null; done <<<"$manifest_tools"
 		while IFS= read -r provider; do provider_metrics "$target" "$provider" >/dev/null; done < <(jq -r '.libraries[].name' <<<"$manifest_json")
 	done
@@ -357,8 +387,8 @@ generate_report() {
 	printf 'format=liber-dynamic-executable-report-v4\n'
 	printf 'wave\ttarget\ttool\tundefined_imports\timport_owners\tgeneric_residuals\tdeclared_providers\tdt_needed\ttransitive_providers\tobject_bytes\tpie_bytes\tprovider_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
 	local target wave key provider_key image_provider_key tool candidate row providers artifact imports import_owners generic_residuals owner_record actual_needed declared transitive reversed_roots reversed_transitive object_bytes pie_bytes provider_bytes private_bytes shared_bytes provider provider_size provider_private provider_shared
-	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
-		for wave in 1 2 3 4 5 6; do
+	for target in "${TARGETS[@]}"; do
+		for wave in "${WAVES[@]}"; do
 			key="$target|$wave"
 			for tool in $(for candidate in "${!TOOL_WAVES[@]}"; do if [[ "${TOOL_WAVES[$candidate]}" == "$wave" ]]; then printf '%s\n' "$candidate"; fi; done | sort); do
 				row="$(jq -er --arg tool "$tool" '.programs[$tool] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | "dynamic \(.name) \(.owner) \(.stage) \(.providers | join(" "))"' <<<"$manifest_json")"
@@ -369,8 +399,11 @@ generate_report() {
 					echo "dynamic-report: missing $target artifact for $tool" >&2
 					return 1
 				}
-				imports="$(llvm-readelf --dyn-syms -W "$artifact" | awk '$7 == "UND" && $8 != "" {print $8}' | sort -u | join_lines)"
-				actual_needed="$(llvm-readelf -dW "$artifact" | sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' | sort -u)"
+				local artifact_dyn artifact_dynamic
+				artifact_dyn="$(read_elf "$artifact" --dyn-syms -W "$artifact")" || return 1
+				artifact_dynamic="$(read_elf "$artifact" -dW "$artifact")" || return 1
+				imports="$(awk '$7 == "UND" && $8 != "" {print $8}' <<<"$artifact_dyn" | sort -u | join_lines)"
+				actual_needed="$(sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' <<<"$artifact_dynamic" | sort -u)"
 				declared="$(for provider in $providers; do printf '%s.lslib\n' "$provider"; done | sort -u)"
 				if [[ "$actual_needed" != "$declared" ]]; then
 					echo "dynamic-report: $target $tool DT_NEEDED differs from its manifest" >&2
@@ -432,8 +465,8 @@ generate_wave_report() {
 	printf 'format=liber-dynamic-wave-report-v2\n'
 	printf 'target\twave\ttools\tobject_bytes\tpie_bytes\tunique_provider_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
 	local target wave key shared_bytes
-	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
-		for wave in 1 2 3 4 5 6; do
+	for target in "${TARGETS[@]}"; do
+		for wave in "${WAVES[@]}"; do
 			key="$target|$wave"
 			# A WAVE WITH NO TOOLS IS ZERO, not an unbound variable.
 			#
@@ -453,7 +486,7 @@ generate_image_report() {
 	printf 'format=liber-dynamic-image-report-v1\n'
 	printf 'target\ttools\tobject_bytes\tpie_bytes\tunique_provider_bytes\tstaged_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
 	local target staged_bytes shared_bytes
-	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
+	for target in "${TARGETS[@]}"; do
 		staged_bytes=$((${image_pie_bytes[$target]:-0} + ${image_provider_bytes[$target]:-0}))
 		shared_bytes=$((${image_shared_executable_bytes[$target]:-0} + ${image_provider_shared_bytes[$target]:-0}))
 		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "${image_tools_count[$target]:-0}" "${image_object_bytes[$target]:-0}" "${image_pie_bytes[$target]:-0}" "${image_provider_bytes[$target]:-0}" "$staged_bytes" "${image_private_bytes[$target]:-0}" "$shared_bytes" './check.sh --gate dynamic-report'
@@ -476,7 +509,7 @@ validate_detailed() {
 	local -A seen=()
 	awk -F '\t' -v what="$what" '
 		NR == 1 { if ($0 != "format=liber-dynamic-executable-report-v4") { printf "dynamic-report: %s has the wrong format header\n", what > "/dev/stderr"; exit 1 } ; next }
-		NR == 2 { if (NF != 15) { printf "dynamic-report: %s has a %d-column header, expected 15\n", what, NF > "/dev/stderr"; exit 1 } ; next }
+		NR == 2 { if ($0 != "wave\ttarget\ttool\tundefined_imports\timport_owners\tgeneric_residuals\tdeclared_providers\tdt_needed\ttransitive_providers\tobject_bytes\tpie_bytes\tprovider_bytes\tprivate_bytes\tshared_bytes\ttest_command") { printf "dynamic-report: %s has the wrong column header\n", what > "/dev/stderr"; exit 1 } ; next }
 		{
 			if (NF != 15) { printf "dynamic-report: %s row %d has %d columns, expected 15\n", what, NR, NF > "/dev/stderr"; exit 1 }
 			if ($1 !~ /^[0-9]+$/) { printf "dynamic-report: %s row %d has a non-numeric wave\n", what, NR > "/dev/stderr"; exit 1 }
@@ -520,12 +553,15 @@ validate_wave() {
 	local target wave rest
 	awk -F '\t' -v what="$what" '
 		NR == 1 { if ($0 != "format=liber-dynamic-wave-report-v2") { printf "dynamic-report: %s has the wrong format header\n", what > "/dev/stderr"; exit 1 } ; next }
-		NR == 2 { if (NF != 9) { printf "dynamic-report: %s has a %d-column header, expected 9\n", what, NF > "/dev/stderr"; exit 1 } ; next }
+		NR == 2 { if ($0 != "target\twave\ttools\tobject_bytes\tpie_bytes\tunique_provider_bytes\tprivate_bytes\tshared_bytes\ttest_command") { printf "dynamic-report: %s has the wrong column header\n", what > "/dev/stderr"; exit 1 } ; next }
 		{
 			if (NF != 9) { printf "dynamic-report: %s row %d has %d columns, expected 9\n", what, NR, NF > "/dev/stderr"; exit 1 }
 			for (column = 2; column <= 8; column++) {
 				if ($column !~ /^[0-9]+$/) { printf "dynamic-report: %s row %d column %d is not a number\n", what, NR, column > "/dev/stderr"; exit 1 }
 			}
+			key = $1 "|" $2
+			if (key in row) { printf "dynamic-report: %s repeats the key %s\n", what, key > "/dev/stderr"; exit 1 }
+			row[key] = 1
 		}
 	' "$file" || return 1
 	while IFS=$'\t' read -r target wave rest; do
@@ -554,12 +590,14 @@ validate_image() {
 	local target rest
 	awk -F '\t' -v what="$what" '
 		NR == 1 { if ($0 != "format=liber-dynamic-image-report-v1") { printf "dynamic-report: %s has the wrong format header\n", what > "/dev/stderr"; exit 1 } ; next }
-		NR == 2 { if (NF != 9) { printf "dynamic-report: %s has a %d-column header, expected 9\n", what, NF > "/dev/stderr"; exit 1 } ; next }
+		NR == 2 { if ($0 != "target\ttools\tobject_bytes\tpie_bytes\tunique_provider_bytes\tstaged_bytes\tprivate_bytes\tshared_bytes\ttest_command") { printf "dynamic-report: %s has the wrong column header\n", what > "/dev/stderr"; exit 1 } ; next }
 		{
 			if (NF != 9) { printf "dynamic-report: %s row %d has %d columns, expected 9\n", what, NR, NF > "/dev/stderr"; exit 1 }
 			for (column = 2; column <= 8; column++) {
 				if ($column !~ /^[0-9]+$/) { printf "dynamic-report: %s row %d column %d is not a number\n", what, NR, column > "/dev/stderr"; exit 1 }
 			}
+			if ($1 in row) { printf "dynamic-report: %s repeats the row for %s\n", what, $1 > "/dev/stderr"; exit 1 }
+			row[$1] = 1
 		}
 	' "$file" || return 1
 	while IFS=$'\t' read -r target rest; do
@@ -666,10 +704,18 @@ probe_report() {
 	for index in 0 1 2; do
 		local source_file="${candidates[$index]}"
 		[[ "$index" != "$which" ]] || source_file="$target"
-		compare_one "$source_file" "${expected[$index]}" "${expected[$index]}" quiet || probe_status=$?
+		local diagnostic
+		diagnostic="$(compare_one "$source_file" "${expected[$index]}" "${expected[$index]}" 2>&1)" || probe_status=$?
 		if [[ "$index" == "$which" ]]; then
 			if [[ "$probe_status" != 4 ]]; then
 				echo "dynamic-report: SELF-TEST FAILED - a mutated ${expected[$index]} was accepted with status $probe_status, so this gate is comparing nothing" >&2
+				return 1
+			fi
+			# AND IT SAID WHICH REPORT. A refusal that named the wrong file, or named none, would
+			# send a reader to the wrong place - and status alone cannot tell the three reports
+			# apart, which is the whole reason there is a probe per report rather than one.
+			if [[ "$diagnostic" != *"${expected[$index]} is stale"* ]]; then
+				echo "dynamic-report: SELF-TEST FAILED - a mutated ${expected[$index]} was refused without saying which report is stale" >&2
 				return 1
 			fi
 		elif [[ "$probe_status" != 0 ]]; then

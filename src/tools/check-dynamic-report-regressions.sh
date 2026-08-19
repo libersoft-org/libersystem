@@ -112,10 +112,22 @@ done
 cat >"$fixture/bin/llvm-readelf" <<'SHIM'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >>"$SHIM_CALLS"
-if [[ "${SHIM_FAIL:-0}" == 1 ]]; then
-	# Plausible partial output, then a failure - the shape that used to be read as a metric.
-	printf '  LOAD           0x000000 0x0000000000000000 0x0000000000000000 0x001000 0x001000 R   0x1000\n'
-	exit 3
+# WHICH QUESTION FAILS, not "the first one asked".
+#
+# `SHIM_FAIL=1` failed every invocation, so the run died on the very first `-h` and the check passed
+# without any of the segment or export readers ever being reached - which is exactly where the
+# swallowed-status defect lived. Every one of them fed a loop from `done < <(llvm-readelf ...)`,
+# whose exit status no bash setting propagates, and a reader that printed one plausible LOAD line
+# and then died produced a metric of 4096 with status 0. The test that was supposed to catch that
+# was green for a different reason, which is worse than not having it.
+#
+# `SHIM_FAIL` now names the flag whose read must fail, so each reader is proved separately.
+if [[ -n "${SHIM_FAIL:-}" ]]; then
+	if [[ "${SHIM_FAIL}" == 1 || "$*" == *"${SHIM_FAIL}"* ]]; then
+		# Plausible partial output, then a failure - the shape that used to be read as a metric.
+		printf '  LOAD           0x000000 0x0000000000000000 0x0000000000000000 0x001000 0x001000 RW  0x1000\n'
+		exit 3
+	fi
 fi
 case "$*" in
 *-h*) printf '  Type:                              REL (Relocatable file)\n' ;;
@@ -230,10 +242,42 @@ mv "$fixture/docs/detailed.keep" "$fixture/docs/DYNAMIC_EXECUTABLES.tsv"
 
 # And a subprocess that prints plausible partial output and then fails must stop the run before any
 # comparison or write. This is the shape that used to be read as a metric.
+#
+# ONE CASE PER READER. A blanket failure only ever proved that the FIRST call is checked; each of
+# these fails exactly one question and requires the run to refuse, so the segment readers and the
+# export reader - the three that fed loops from a process substitution and therefore could not see a
+# failure at all - are each shown to fail closed.
+for question in -h "--wide --symbols" --dyn-syms -dW -lW; do
+	SHIM_FAIL="$question" run --check
+	expect_status "a failing llvm-readelf for '$question'" 1 "$?"
+done
 SHIM_FAIL=1 run --check
 expect_status 'a failing llvm-readelf' 1 "$?"
 SHIM_FAIL=1 run --write
 expect_status 'a failing llvm-readelf on the write path' 1 "$?"
+SHIM_FAIL=-lW run --write
+expect_status 'a failing segment read on the write path' 1 "$?"
+
+# A row written twice is not a report. The wave and image validators kept a SET of keys and compared
+# its size, so a verbatim duplicate collapsed into the entry already there and the count still
+# matched - the one shape a per-row validator exists to catch and the one it could not see.
+for file in DYNAMIC_WAVES DYNAMIC_IMAGE DYNAMIC_EXECUTABLES; do
+	cp "$fixture/docs/$file.tsv" "$fixture/docs/$file.keep"
+	tail -1 "$fixture/docs/$file.tsv" >>"$fixture/docs/$file.tsv"
+	run --check
+	expect_status "a duplicated row in $file" 1 "$?"
+	mv "$fixture/docs/$file.keep" "$fixture/docs/$file.tsv"
+done
+
+# And the column header is checked by NAME, not by how many columns it happens to have: a renamed or
+# reordered column with the same count is a different report claiming to be this one.
+for file in DYNAMIC_WAVES DYNAMIC_IMAGE DYNAMIC_EXECUTABLES; do
+	cp "$fixture/docs/$file.tsv" "$fixture/docs/$file.keep"
+	sed -i '2s/target/subject/' "$fixture/docs/$file.tsv"
+	run --check
+	expect_status "a renamed column in $file" 1 "$?"
+	mv "$fixture/docs/$file.keep" "$fixture/docs/$file.tsv"
+done
 
 # --- the build wrapper's half of the contract -----------------------------------------------------
 #

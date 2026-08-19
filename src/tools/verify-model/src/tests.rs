@@ -1739,14 +1739,17 @@ pub(crate) const PERMISSION_COHORT: [(&str, PermissionCohort); 3] = [
 "#;
 
 const COHORT_CONSUMERS: &str = r#"
+tagged_test!(one, [Service], id = "kernel.applications.one", covers = ["bin.permission_manager", "kernel"]);
 fn one() {
 	declare_permission_cohort("kernel.applications.one", PermissionCohort::Base);
 	let result = permission_scenario_result(PermissionCohort::Base).expect("x");
 }
+tagged_test!(two, [Service], id = "kernel.applications.two", covers = ["bin.permission_manager", "kernel"]);
 fn two() {
 	declare_permission_cohort("kernel.applications.two", PermissionCohort::Base);
 	let result = permission_scenario_result(PermissionCohort::Base).expect("x");
 }
+tagged_test!(three, [Service], id = "kernel.applications.three", covers = ["bin.permission_manager", "kernel"]);
 fn three() {
 	declare_permission_cohort("kernel.applications.three", PermissionCohort::Scoped);
 	let result = permission_scenario_result(PermissionCohort::Scoped).expect("x");
@@ -1968,4 +1971,22 @@ fn every_selected_id_is_one_the_guest_runner_can_match() {
 	for id in selected_kernel_tests(&model, &plan) {
 		assert!(known.contains(id.as_str()), "the plan selected '{id}', which no test in the suite carries");
 	}
+}
+
+#[test]
+fn a_cohort_member_that_stops_covering_permission_manager_is_a_failure() {
+	// The planner regression writes its own suite, so it stays green when the real declaration is
+	// deleted. This is the check that does not: the marker names a stable id, and the tagged_test!
+	// carrying that id has to still claim the component.
+	let consumers = COHORT_CONSUMERS.replace(r#"id = "kernel.applications.two", covers = ["bin.permission_manager", "kernel"]"#, r#"id = "kernel.applications.two", covers = ["kernel"]"#);
+	let problems = crate::kerneltests::audit_permission_cohort(COHORT_MAP, &consumers);
+	assert_eq!(problems.len(), 1, "{problems:?}");
+	assert!(problems[0].contains("kernel.applications.two") && problems[0].contains("does not cover bin.permission_manager"), "{problems:?}");
+}
+
+#[test]
+fn a_marker_with_no_tagged_test_is_a_failure() {
+	let consumers = COHORT_CONSUMERS.replace(r#"tagged_test!(two, [Service], id = "kernel.applications.two", covers = ["bin.permission_manager", "kernel"]);"#, "");
+	let problems = crate::kerneltests::audit_permission_cohort(COHORT_MAP, &consumers);
+	assert!(problems.iter().any(|problem| problem.contains("no tagged_test! carries that id")), "{problems:?}");
 }

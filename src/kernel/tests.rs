@@ -703,15 +703,36 @@ fn reap_permission_fixture(domain: &alloc::sync::Arc<object::domain::Domain>, be
 	// So the bound is PER LINGERING PROCESS rather than a constant somebody once observed, which
 	// keeps it a real check: a fixture that leaked a megabyte, or that left a fifth process behind,
 	// still fails it.
+	// WHAT THE DOMAIN OWES BACK, AND WHAT IT CANNOT.
+	//
+	// Handles come back exactly, and that is the check with no excuse attached: every endpoint,
+	// memory object and capability this fixture opened is closed by the time its result is
+	// published, so a later consumer cannot be handed one.
+	//
+	// Memory and thread slots do NOT come back to zero. A terminated process refunds its charges in
+	// `Drop`, and the services linger as `killed=true live_threads=0` because their `Arc`s are still
+	// referenced from outside this domain, so the residue is owned by a refcount this fixture does
+	// not hold. The milestone's "counters against their captured pre-run values" cannot be met as
+	// written, and this is the strongest bound that is true instead.
+	//
+	// THE BOUND IS A CONSTANT, not the number of processes that happen to be left. It was
+	// `lingering * RESIDUE`, computed from the count measured after the run - so a sixth process
+	// raised its own allowance and the check could not fail on one, while the comment beside it
+	// claimed it could. Measured on this tree: five for the base scenario (four services and the
+	// shell) and four for the scoped one.
 	let lingering = domain.live_processes().len() as u64;
+	const MAX_LINGERING: u64 = 5;
 	const RESIDUE_BYTES_PER_PROCESS: u64 = 128 * 1024;
+	if lingering > MAX_LINGERING {
+		return Err("the permission fixture left more terminated processes behind than it starts");
+	}
 	if after.1 != before.1 {
 		return Err("the permission fixture's domain did not give back its handles");
 	}
-	if after.0 > before.0 + lingering * RESIDUE_BYTES_PER_PROCESS {
+	if after.0 > before.0 + MAX_LINGERING * RESIDUE_BYTES_PER_PROCESS {
 		return Err("the permission fixture's domain kept more memory than its terminated processes account for");
 	}
-	if after.2 > before.2 + lingering {
+	if after.2 > before.2 + MAX_LINGERING {
 		return Err("the permission fixture's domain kept more thread slots than its terminated processes account for");
 	}
 	Ok(())
@@ -817,7 +838,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
 	loader::spawn_elf_process(domain.clone(), process_elf, process_boot_user, Rights::ALL, 0).map_err(|_| "failed to load ProcessService")?;
 	let _time = spawn_dynamic_test_process(domain.clone(), time_elf, time_boot_user);
-	let _permission_manager = spawn_dynamic_test_process(domain, pm_elf, pm_boot_user);
+	let _permission_manager = spawn_dynamic_test_process(domain.clone(), pm_elf, pm_boot_user);
 
 	// StorageService: the ramdisk volume and its service channel.
 	send_ramdisk(&storage_boot_kernel, volume)?;
@@ -1251,7 +1272,13 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		// Required at bootstrap and unused by anything typed here. A dead peer is the honest stand-in:
 		// the net builtins would report the service unavailable, which is true.
 		let (_dead_net, shell_net) = Channel::create();
-		let _shell = spawn_dynamic_test_process(sched::root_domain(), shell_elf, shell_boot_user);
+		// THE SHELL BELONGS TO THE FIXTURE TOO (P02M0139). It was spawned into the root domain
+		// while the comment above the services claimed everything this scenario starts lands in the
+		// fixture's own - true of the tools, which ProcessService creates and which therefore
+		// inherit the caller's domain, and not true of this one, which the test starts itself. So
+		// the one process the milestone names explicitly was the one the teardown never reached: not
+		// killed with the group, not counted in the leak check, and still running afterwards.
+		let _shell = spawn_dynamic_test_process(domain.clone(), shell_elf, shell_boot_user);
 		send_cap(&shell_boot_kernel, b"STORAGE", shell_storage_client, Rights::ALL)?;
 		send_cap(&shell_boot_kernel, b"PROCESS", process_client_for_shell, Rights::ALL)?;
 		send_cap(&shell_boot_kernel, b"NET", shell_net, Rights::ALL)?;

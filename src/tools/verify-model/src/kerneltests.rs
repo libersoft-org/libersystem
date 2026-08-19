@@ -602,6 +602,29 @@ pub fn audit_permission_cohort(map_text: &str, consumer_text: &str) -> Vec<Strin
 		}
 	}
 
+	// EVERY COHORT MEMBER STILL DECLARES WHAT IT COVERS.
+	//
+	// The planner regression is hermetic - it writes its own suite and puts `bin.permission_manager`
+	// on it - which is what keeps it from agreeing with the declarations by construction, and also
+	// means deleting the real declaration from `applications.rs` leaves it green. Nothing else was
+	// checking the tracked file, so the zero-selected-tests defect P02M0138 exists to fix could have
+	// come back without a single test failing. This is the lock, and it reads the declaration where
+	// the planner reads it: the `tagged_test!` carrying that stable id.
+	for (id, _) in &declared {
+		let Some(at) = consumer_text.find(&format!("id = \"{id}\"")) else {
+			problems.push(format!("'{id}' declares a permission cohort and no tagged_test! carries that id"));
+			continue;
+		};
+		let tail = &consumer_text[at..];
+		let covers = match (tail.find("covers = ["), tail.find(']')) {
+			(Some(open), Some(close)) if close > open => &tail[open + "covers = [".len()..close],
+			_ => "",
+		};
+		if !covers.split(',').map(|item| item.trim().trim_matches('"')).any(|item| item == "bin.permission_manager") {
+			problems.push(format!("'{id}' drives the permission fixture and its tagged_test! does not cover bin.permission_manager"));
+		}
+	}
+
 	// One consumer of the fixture that classified itself nowhere. Counting is enough: any specific
 	// name this could report would be the helper-name oracle this check exists to avoid.
 	//
