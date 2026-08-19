@@ -289,9 +289,10 @@ transitive provider order, validated ET_REL object bytes, stripped PIE bytes, pr
 immutable shared bytes and the governed test command. `docs/DYNAMIC_WAVES.tsv` aggregates
 the same data with providers deduplicated inside each target/wave. Private image bytes are
 the page-rounded writable `PT_LOAD` ranges of the executable plus every provider in its
-closure; immutable ranges use the loader's shared-frame rule. `just dynamic-report-check` rebuilds
-the three target graphs and requires the report to reproduce byte for byte. It also fails
-if the five wave lists do not partition the manifest's tool inventory exactly, a direct
+closure; immutable ranges use the loader's shared-frame rule. `./check.sh --gate dynamic-report`
+regenerates the three target graphs from the BUILT artifacts - it reads them, it does not rebuild
+them - and requires the report to reproduce byte for byte. It also fails
+if the six wave lists do not partition the manifest's tool inventory exactly, a direct
 provider differs from `DT_NEEDED`, reversed-root derivation differs, or an
 artifact/provider is missing. `just dynamic-report-update` is the explicit regeneration
 command.

@@ -15,6 +15,10 @@ declare -A GATES=(
 	["development-gate"]="tools/check-development-gate.sh"
 	["artifact-metadata"]="tools/check-artifact-metadata.sh"
 	["dynamic-report"]="tools/check-dynamic-report.sh --check"
+	# The checker above decides whether the tracked reports still describe the tree, and it used to
+	# prove itself by re-invoking itself - a second full ELF sweep that accepted any nonzero status
+	# as proof. This tests its exit contract from outside, against a fixture, in seconds.
+	["dynamic-report-regressions"]="tools/check-dynamic-report-regressions.sh"
 	["test-tags"]="boot/check-test-tags.sh"
 	# The harness that decides whether every other test passed, tested against fakes. An audit found
 	# four of its oracles reporting success without measuring their subject; each looked correct on a

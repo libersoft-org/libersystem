@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 19] = [
+const GATES: [(&str, &str); 21] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -133,6 +133,16 @@ const GATES: [(&str, &str); 19] = [
 	// result taken on that artifact meaningless. Registered in `check.sh` on 2026-08-12 and not
 	// here, so `verify-model check` had been reporting it as unselectable ever since.
 	("targeted-cache", "harness.tools"),
+	// P02M0104's gate: the boot harness tested against fakes - the scenario oracles, the broker's
+	// reply framing, the instance identity records and the preflight producers. Its subject is the
+	// harness itself, so a harness change selects it, and it needs no guest and no QEMU.
+	//
+	// REGISTERED LATE, which is the drift the entries above keep describing: it went into `check.sh`
+	// first and `verify-model check` would have reported it as a gate nothing selects.
+	("boot-harness", "harness.tools"),
+	// P02M0137's gate: the dynamic-report checker's own exit contract, mode dispatch and refusal
+	// behaviour, against a disposable fixture. The subject is that checker, which is harness tooling.
+	("dynamic-report-regressions", "harness.tools"),
 	// P02M0133's second gate: a frame a page table ever pointed at goes back through `frame::retire`,
 	// and every plain `deallocate` says why no core can still translate it. Its subject is the
 	// kernel, so a kernel change selects it. Registered here in the same commit as `check.sh` this

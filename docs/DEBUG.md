@@ -315,7 +315,7 @@ releasing or how long any of them takes. Measured on the documented host:
 | `fmt-check`               |   12 s | formatting, all languages                             |
 | `source-hygiene`          |   18 s | tree hygiene and ownership rules                      |
 | `shared-libs-verify`      |  406 s | the whole image rebuilt from nothing and re-audited   |
-| `dynamic-report-check`    | ~500 s | the checked provider/consumer reports, three targets  |
+| `dynamic-report`          | ~400 s | the checked provider/consumer reports, three targets  |
 | `static-image-check`      | ~700 s | static injection audits, three targets                |
 | `fast-path-check`         |  ~20 m | targeted and authoritative builds produce equal bytes |
 | `test-all`                |      - | the QEMU suites on x86_64, aarch64 and riscv64        |

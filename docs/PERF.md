@@ -135,8 +135,11 @@ once. They share one `CARGO_TARGET_DIR`, and cargo locks it:
 The gain shrinks as more are added, which is what lock contention looks like. One cargo
 invocation building the same set instead measured 74 s of CPU in 25 s of wall time, since cargo
 schedules its own unit graph. The dependency graph does not stand in the way either: derived
-from the manifest, the 61 libraries are six levels deep (1, 14, 16, 16, 13, 1) and the 72 dynamic
-volume programs depend on no other program at all.
+from the manifest, the libraries are six levels deep and the 74 dynamic
+volume programs depend on no other program at all. The current structural counts are in
+`docs/DYNAMIC_EXECUTABLES.tsv` (74 tools x 3 targets), `docs/DYNAMIC_WAVES.tsv` (6 waves x 3
+targets) and `docs/DYNAMIC_IMAGE.tsv` (3 targets); the numbers that used to be written out here
+went stale the first time a tool was added, which is why they now name the file instead.
 
 ### The cold invalidation classes, measured
 
@@ -499,7 +502,12 @@ Cold start is measured from sending the ProcessService `launch` request to recei
 Process handle alive, so immutable provider pages are already in the physical-page
 cache; ProcessService still reads and parses all provider files from StorageService.
 
-| x86 KVM scenario | latency |
+A DATED SNAPSHOT, not a live table: these numbers were measured on 2026-07-14, on the host and tree
+of that day, and nothing regenerates them. They are kept because the RATIO is the finding - the
+repeated launch costs the same as the cold one - and that conclusion does not depend on the
+absolute values. Do not compare them against a current run without re-measuring both.
+
+| x86 KVM scenario (2026-07-14 snapshot) | latency |
 | --- | ---: |
 | static governed `graphics_probe` in the focused runs | 2.108-2.373 ms |
 | dynamic probe, cold | 95.176-209.965 ms |
