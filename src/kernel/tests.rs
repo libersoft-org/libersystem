@@ -352,6 +352,62 @@ enum PermissionScenario {
 	ScopedGrants,
 }
 
+// THE FROZEN PERMISSION FIXTURE COHORT (P02M0138).
+//
+// Twelve tests drive `run_permission_scenario`. Eleven take the same path through package parsing,
+// service creation, channel topology, governed launches, pipelines and a real shell session; the
+// twelfth continues into scoped graphics/audio grants. That split is about to matter - P02M0139
+// caches one result per class - and it is also the thing a reader most easily gets wrong, because
+// nothing in a test's body says which class it belongs to.
+//
+// So the classification is written down ONCE, here, keyed by stable ID rather than by function
+// name, and every consumer declares its own class in its own body. A host regression requires the
+// two to be one-to-one, which is what catches a thirteenth consumer nobody classified, a map entry
+// whose test was deleted, a duplicated ID and a class that drifted away from what the fixture
+// actually does.
+//
+// Keyed by ID and not by the helper's name on purpose: "every test that calls
+// `run_permission_scenario`" is a fact about today's spelling, and renaming the helper would empty
+// the cohort without failing anything.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PermissionCohort {
+	Base,
+	Scoped,
+}
+
+pub(crate) const PERMISSION_COHORT: [(&str, PermissionCohort); 12] = [
+	("kernel.applications.permission_manager_enforces_static_and_dynamic_probe_policy", PermissionCohort::Base),
+	("kernel.applications.permission_manager_runs_tools_with_minimal_grants", PermissionCohort::Base),
+	("kernel.applications.permission_manager_mints_scoped_application_grants", PermissionCohort::Scoped),
+	("kernel.applications.a_redirection_is_a_governed_pipeline_stage_and_the_consumer_holds_no_storage", PermissionCohort::Base),
+	("kernel.applications.a_migrated_stream_tool_reads_a_pipeline_the_way_it_reads_a_path", PermissionCohort::Base),
+	("kernel.applications.a_consumer_that_stops_early_ends_the_pipeline_instead_of_hanging_it", PermissionCohort::Base),
+	("kernel.applications.a_fan_out_stage_with_an_unwritable_destination_still_carries_the_stream", PermissionCohort::Base),
+	("kernel.applications.a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline", PermissionCohort::Base),
+	("kernel.applications.a_command_word_on_its_own_runs_the_command", PermissionCohort::Base),
+	("kernel.applications.merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge", PermissionCohort::Base),
+	("kernel.applications.a_governed_pipeline_starts_as_one_transaction_and_carries_data", PermissionCohort::Base),
+	("kernel.applications.the_command_tools_run_governed_and_read_in_windows", PermissionCohort::Base),
+];
+
+// The marker each consumer puts in its own body. It fails IN THE GUEST on a class that disagrees
+// with the map or on an ID the map does not know, so the classification cannot be wrong at runtime
+// while looking right to a source scan.
+pub(crate) fn declare_permission_cohort(id: &str, cohort: PermissionCohort) {
+	let mut found = false;
+	let mut index = 0;
+	while index < PERMISSION_COHORT.len() {
+		let (mapped_id, mapped_cohort) = PERMISSION_COHORT[index];
+		if mapped_id.as_bytes() == id.as_bytes() {
+			assert!(!found, "a stable ID appears twice in PERMISSION_COHORT: {id}");
+			assert!(mapped_cohort == cohort, "{id} declares a cohort its PERMISSION_COHORT entry disagrees with");
+			found = true;
+		}
+		index += 1;
+	}
+	assert!(found, "{id} drives the permission fixture without a PERMISSION_COHORT entry");
+}
+
 struct PermissionScenarioResult {
 	// What the last stage of a two-stage governed pipeline printed, and whether the broker
 	// started it at all - the transaction's observable result.

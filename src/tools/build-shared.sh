@@ -269,17 +269,49 @@ matches_line() {
 	grep -Fqx -- "$value" <<<"$output"
 }
 
+# What the inventory check said, for the summary line. `not-run` is the honest value for every build
+# that does not reach it - a targeted build, a kernel-only build, a failed build.
+inventory_state=not-run
+inventory_stage_ms=0
+
+# THE EXIT STATUS DECIDES, and only one value is a warning.
+#
+# This turned EVERY failure into the same warning: "the checked dynamic reports need refresh". A
+# report that is out of date and a checker that could not run at all - a missing tool, a manifest
+# that would not export, a parser that died on an artifact - produced identical output, and the
+# build went on to print `status=0`. So the one stage whose job is to notice that the tracked reports
+# no longer describe the tree could fail completely and say something reassuring.
+#
+# The checker's contract is closed: 0 match, 3 needs a refresh, everything else is broken. Only 3 is
+# a warning here. Status 4 in particular - a full report differing - cannot come from
+# `--check-inventory` at all, so seeing it means the checker is not the one this expects.
 check_dynamic_report_inventory() {
-	local report_started=$SECONDS
-	local diagnostics
-	if diagnostics="$("$root/tools/check-dynamic-report.sh" --check-inventory 2>&1)"; then
+	local started_ms finished_ms diagnostics inventory_status=0
+	started_ms=${EPOCHREALTIME//[^0-9]/}
+	diagnostics="$("$root/tools/check-dynamic-report.sh" --check-inventory 2>&1)" || inventory_status=$?
+	finished_ms=${EPOCHREALTIME//[^0-9]/}
+	inventory_stage_ms=$(((finished_ms - started_ms) / 1000))
+	report_seconds=$((inventory_stage_ms / 1000))
+	case "$inventory_status" in
+	0)
+		inventory_state=match
 		verbose_log "build-shared: $diagnostics"
-	else
+		return 0
+		;;
+	3)
+		inventory_state=refresh-required
 		echo "build-shared: checked dynamic reports need refresh after all target graphs are current" >&2
 		echo "build-shared: refresh with: cd $root && just dynamic-report-update" >&2
 		if [[ "$verbose" == 1 ]]; then printf '%s\n' "$diagnostics" >&2; fi
-	fi
-	report_seconds=$((SECONDS - report_started))
+		return 0
+		;;
+	*)
+		inventory_state=fatal
+		echo "build-shared: the dynamic-report inventory check failed with status $inventory_status, which is not a refresh - the check itself is broken" >&2
+		printf '%s\n' "$diagnostics" >&2
+		return 1
+		;;
+	esac
 }
 
 report_build_summary() {
@@ -307,9 +339,18 @@ report_build_summary() {
 	elif [[ $status != 0 && -n "$warm_snapshot_file" ]]; then
 		rm -f "$warm_snapshot_file"
 	fi
-	if [[ $status == 0 && -z "$selected_artifact" ]]; then check_dynamic_report_inventory; fi
+	# Only after a build that SUCCEEDED and was not targeted, and an earlier failure is never
+	# replaced: this can raise 0 to 1 and nothing else, so a real build failure keeps its own status
+	# and its own message.
+	if [[ $status == 0 && -z "$selected_artifact" ]]; then
+		check_dynamic_report_inventory || status=1
+	fi
 	timing_event build end
-	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) stages=source:$source_inventory_seconds,graph:$image_graph_seconds,providers:$provider_seconds,consumers:$consumer_seconds,reports:$report_seconds providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
+	echo "build-shared: summary target=$target seconds=$((SECONDS - build_started)) stages=source:$source_inventory_seconds,graph:$image_graph_seconds,providers:$provider_seconds,consumers:$consumer_seconds,reports:$report_seconds inventory_status=$inventory_state inventory_stage_ms=$inventory_stage_ms providers=$provider_cache_hits/$provider_cache_misses objects=$object_cache_hits/$object_cache_misses executables=$executable_cache_hits/$executable_cache_misses status=$status"
+	# AND THE PROCESS EXITS WITH WHAT IT JUST PRINTED. `status=` was the value the trap was entered
+	# with, so a fatal inventory result was announced and then not returned - the build reported
+	# success to its caller with a failure written on the line above it.
+	exit "$status"
 }
 
 trap report_build_summary EXIT

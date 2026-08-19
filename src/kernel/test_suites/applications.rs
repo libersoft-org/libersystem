@@ -412,6 +412,7 @@ fn powerbox_grants_a_picked_file_to_a_component() {
 
 tagged_test!(permission_manager_enforces_static_and_dynamic_probe_policy, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_enforces_static_and_dynamic_probe_policy", covers = ["kernel", "services"]);
 fn permission_manager_enforces_static_and_dynamic_probe_policy() {
+	declare_permission_cohort("kernel.applications.permission_manager_enforces_static_and_dynamic_probe_policy", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::Probes).expect("the permission probe scenario should run");
 	assert!(!result.expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(result.probe_read, result.expected, "the sandboxed component read its one granted file through the storage grant");
@@ -422,6 +423,7 @@ fn permission_manager_enforces_static_and_dynamic_probe_policy() {
 
 tagged_test!(permission_manager_runs_tools_with_minimal_grants, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_runs_tools_with_minimal_grants", covers = ["kernel", "services"]);
 fn permission_manager_runs_tools_with_minimal_grants() {
+	declare_permission_cohort("kernel.applications.permission_manager_runs_tools_with_minimal_grants", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	assert_eq!(result.date_read.len(), 21, "date rendered a 20-byte ISO-8601 UTC instant and newline");
 	assert_eq!(result.date_read[4], b'-', "date separates the year and month");
@@ -439,6 +441,7 @@ fn permission_manager_runs_tools_with_minimal_grants() {
 
 tagged_test!(permission_manager_mints_scoped_application_grants, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_mints_scoped_application_grants", covers = ["kernel", "services"]);
 fn permission_manager_mints_scoped_application_grants() {
+	declare_permission_cohort("kernel.applications.permission_manager_mints_scoped_application_grants", PermissionCohort::Scoped);
 	let result = run_permission_scenario(PermissionScenario::ScopedGrants).expect("the scoped application grant scenario should run");
 	assert_eq!(result.graphics_read.as_slice(), b"graphics grants\n", "the graphics probe received process-bound display, key-only input and playback-only audio grants");
 	assert!(result.graphics_start_ns != 0, "the governed app cold-start path is measured");
@@ -499,6 +502,7 @@ fn a_redirection_is_a_governed_pipeline_stage_and_the_consumer_holds_no_storage(
 	// - `readln`'s manifest grants nothing at all - so bytes reaching it can only have come through
 	// the pipe. A redirection implemented inside the shell would have had to hand the child a file
 	// capability or pump it from a process that has one; this is the reason it is not.
+	declare_permission_cohort("kernel.applications.a_redirection_is_a_governed_pipeline_stage_and_the_consumer_holds_no_storage", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	assert!(!result.redirect_read.is_empty(), "the redirected pipeline produced output at all");
 	// `readln` prefixes each line it reads with `in> `, which is what tells the file's bytes
@@ -531,6 +535,7 @@ fn a_migrated_stream_tool_reads_a_pipeline_the_way_it_reads_a_path() {
 	// got no path, because a path was the only input it had. What makes this pass is `Source`
 	// answering "stdin" when there is a stdin - and the only thing that tells it so is the presence
 	// of the endpoint, which is a capability the launch either carried or did not.
+	declare_permission_cohort("kernel.applications.a_migrated_stream_tool_reads_a_pipeline_the_way_it_reads_a_path", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	let counted: &[u8] = &result.stream_reads[2];
 	assert!(!counted.is_empty(), "the counting pipeline produced output at all");
@@ -546,6 +551,7 @@ fn a_consumer_that_stops_early_ends_the_pipeline_instead_of_hanging_it() {
 	// the producer discovers it at its next write and stops. Nothing in `head` asks for that - it
 	// falls out of owning the endpoint - and if it did not work the producer would sit blocked on
 	// a consumer that is gone and this scenario would never return.
+	declare_permission_cohort("kernel.applications.a_consumer_that_stops_early_ends_the_pipeline_instead_of_hanging_it", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	let taken: &[u8] = &result.stream_reads[1];
 	assert!(taken.windows(5).any(|window| window == b"MOTD:"), "head printed the first line: {:?}", core::str::from_utf8(taken));
@@ -566,6 +572,7 @@ fn a_fan_out_stage_with_an_unwritable_destination_still_carries_the_stream() {
 	//
 	// Three stages, so it is also the multi-stage transaction: two edges allocated in one request,
 	// and the middle stage both reading and writing.
+	declare_permission_cohort("kernel.applications.a_fan_out_stage_with_an_unwritable_destination_still_carries_the_stream", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	let counted: &[u8] = &result.stream_reads[0];
 	// The destination really was refused - otherwise this test would be measuring the ordinary
@@ -592,6 +599,7 @@ fn a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline() {
 	// lexed, expanded into stages, launched as one transaction through the broker, the bytes
 	// carried down an edge, and the last stage's output printed on the terminal the shell was
 	// given.
+	declare_permission_cohort("kernel.applications.a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	let out: &[u8] = &result.shell_read;
 	let says = |needle: &[u8]| out.windows(needle.len()).any(|window| window == needle);
@@ -633,6 +641,7 @@ fn a_command_word_on_its_own_runs_the_command() {
 	// the file manager was the one spelling that did not work. The interactive shapes cannot be
 	// typed here - they take the terminal, and this would be reading their redraws - so this drives
 	// the same matcher through `which`, whose bare form prints its own usage.
+	declare_permission_cohort("kernel.applications.a_command_word_on_its_own_runs_the_command", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	let out: &[u8] = &result.shell_read;
 	let says = |needle: &[u8]| out.windows(needle.len()).any(|window| window == needle);
@@ -644,6 +653,7 @@ fn a_command_word_on_its_own_runs_the_command() {
 
 tagged_test!(merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge, [Service, Process, PermissionService], id = "kernel.applications.merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge", covers = ["kernel", "services"]);
 fn merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge() {
+	declare_permission_cohort("kernel.applications.merging_the_error_stream_sends_a_stages_diagnostics_down_its_own_edge", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	assert!(result.merged_read.windows(4).any(|window| window == b"in> "), "the consumer read something: `readln` only prints its prefix for a line it took off its input, got {:?}", core::str::from_utf8(&result.merged_read));
 	assert!(result.merged_read.windows(4).any(|window| window == b"cat:"), "and what it read is the PRODUCER'S DIAGNOSTIC, which without the flag goes to the terminal instead: {:?}", core::str::from_utf8(&result.merged_read));
@@ -656,6 +666,7 @@ fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 	// together. `readln` prefixes what it reads with `in> `, so this distinguishes a consumer
 	// that actually read its producer's bytes from a producer whose output merely reached the
 	// terminal - which is what a pipeline that was never really wired would look like.
+	declare_permission_cohort("kernel.applications.a_governed_pipeline_starts_as_one_transaction_and_carries_data", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	assert!(result.pipeline_started, "the broker started the two-stage pipeline");
 	// Asserted as "the prefix immediately precedes the payload" rather than as an exact
@@ -825,6 +836,7 @@ fn the_command_tools_run_governed_and_read_in_windows() {
 	// `wc` and `head` prove the other half: they read `hello.txt` through the BOUNDED `volume.read`
 	// window rather than mapping the whole file, which is what makes them usable on a file that
 	// does not fit in memory.
+	declare_permission_cohort("kernel.applications.the_command_tools_run_governed_and_read_in_windows", PermissionCohort::Base);
 	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("the governed tool scenario should run");
 	let printed = alloc::string::String::from_utf8_lossy(&result.command_read).into_owned();
 	assert!(printed.contains("vol://system"), "pwd printed the working directory it inherited, got {printed:?}");

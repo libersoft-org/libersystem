@@ -1,58 +1,96 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# The provider/consumer report for the dynamic command graph: what each tool imports, who owns each
+# import, and what the whole image costs. Three tracked TSVs, one generator, three modes.
+#
+# THE EXIT CONTRACT, because the caller acts on it:
+#
+#   0  the requested check matched, or the write completed
+#   1  tool, manifest, parser, I/O or other internal failure
+#   2  invalid mode or surplus arguments
+#   3  the name-only inventory differs from the tracked detailed report and needs a refresh
+#   4  a full generated report differs from its tracked report
+#
+# Only 3 is a nonfatal post-build warning. `build-shared.sh` treats everything else as fatal, which
+# is what makes the difference between "the report is out of date" and "the gate is broken" visible
+# from outside.
+
+usage() {
+	echo "usage: $0 [--check|--check-inventory|--write]" >&2
+}
+
+# THE MODE IS DECIDED BEFORE ANY WORK, and that ordering is the point rather than tidiness.
+#
+# This used to load the manifest (a cargo subprocess), source `lib.sh`, locate five tools, create
+# three temporary files and - worst - run a RECURSIVE SELF-TEST that invoked this script's own
+# `--check`, generating all three reports and sweeping the whole ELF graph, before it looked at
+# which mode had been asked for. So `--check-inventory`, the mode whose entire purpose is to be
+# cheap enough to run after every build, paid for a full sweep of 2,352 `llvm-readelf` processes
+# first. Measured on this tree: a warm shared-library build that compiled nothing spent 210 of its
+# 210 seconds in that stage.
+#
+# A usage error now performs no manifest export, no temporary file and no ELF read at all.
+mode="${1:---check}"
+case "$mode" in
+--check | --check-inventory | --write) ;;
+*)
+	usage
+	exit 2
+	;;
+esac
+if (($# > 1)); then
+	echo "dynamic-report: $# arguments; this takes exactly one mode" >&2
+	usage
+	exit 2
+fi
+
 root="$(cd "$(dirname "$0")/.." && pwd)"
 build_root="$root/../.build"
-manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 report="$root/../docs/DYNAMIC_EXECUTABLES.tsv"
 wave_report="$root/../docs/DYNAMIC_WAVES.tsv"
 image_report="$root/../docs/DYNAMIC_IMAGE.tsv"
 source "$root/../lib.sh"
-# Prove the comparison REFUSES before trusting it to approve.
-#
-# `--check` regenerates the report and compares it against the stored TSVs, and its whole value is
-# that a difference fails. A `diff` that stopped comparing - a changed variable name, a redirection,
-# an `exit 0` - would report a clean tree just as convincingly, and nothing about a currently-valid
-# tree can tell the two apart. So the gate hands itself a corrupted report and requires itself to
-# notice.
-#
-# It compares against a COPY. The first version of this mutated the tracked file in place and
-# restored it afterwards, which is fine until it is not: a kill, a crash or a concurrent run leaves
-# `docs/DYNAMIC_EXECUTABLES.tsv` corrupted in the working tree, and that happened once here. A
-# self-test that can damage the repository is a worse hazard than the defect it guards against.
-self_test() {
-	local scratch status=0
-	scratch="$(mktemp -d)"
-	[[ -f "$report" ]] || {
-		rm -rf "$scratch"
-		return 0
-	}
-	sed '2s/$/ MUTATED/' "$report" >"$scratch/report.tsv"
-	if DYNAMIC_REPORT_SELF_TEST=1 DYNAMIC_REPORT_OVERRIDE="$scratch/report.tsv" "$0" --check >/dev/null 2>&1; then
-		echo "dynamic-report: SELF-TEST FAILED - a mutated report was accepted, so this gate is comparing nothing" >&2
-		status=1
-	fi
-	rm -rf "$scratch"
-	return "$status"
-}
+manifest_json="$("$root/tools/system-manifest.sh" export-json)"
 
-# The report this run compares against. Overridden only by the self-test, and only ever pointed at a
-# temporary copy - the tracked file is never written by a check.
-report="${DYNAMIC_REPORT_OVERRIDE:-$report}"
+# The shape of the reports, in one place. Every loop, row count and message below is derived from
+# these rather than restated - the success line used to claim "15 waves" while the report holds six
+# logical waves and 18 target-wave rows, which is what happens when a number is typed twice.
+TARGETS=(x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf)
+WAVES=(1 2 3 4 5 6)
 
-if [[ "${DYNAMIC_REPORT_SELF_TEST:-}" != "1" ]]; then
-	self_test || exit 1
+manifest_tools="$(jq -r '.programs[] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | .name' <<<"$manifest_json" | sort)"
+wave_tools="$(printf '%s\n' "${!TOOL_WAVES[@]}" | sort)"
+if [[ "$manifest_tools" != "$wave_tools" ]]; then
+	echo "dynamic-report: wave inventory differs from the manifest tools" >&2
+	diff -u <(printf '%s\n' "$manifest_tools") <(printf '%s\n' "$wave_tools") >&2 || true
+	exit 1
 fi
+tool_count="$(wc -l <<<"$manifest_tools")"
 
-mode="${1:---check}"
-
-case "$mode" in
---check | --check-inventory | --write) ;;
-*)
-	echo "usage: $0 [--check|--check-inventory|--write]" >&2
-	exit 2
-	;;
-esac
+# NAME-ONLY, and it reads three things: the manifest's tool names, the wave table's keys, and the
+# x86_64 tool column of the tracked detailed report.
+#
+# It does not locate `llvm-readelf`, open an artifact, generate a report or run a probe. A tool that
+# has been added or removed since the report was written is the one thing this can see, and it is
+# the thing a build wants to know about; anything deeper is what `--check` is for.
+if [[ "$mode" == --check-inventory ]]; then
+	[[ -f "$report" ]] || {
+		echo "dynamic-report: no tracked report at $report; run (cd src && just dynamic-report-update)" >&2
+		exit 3
+	}
+	checked_tools="$(awk -F '\t' '$1 ~ /^[0-9]+$/ && $2 == "x86_64-unknown-none" {print $3}' "$report" | sort)" || {
+		echo "dynamic-report: could not read the tracked report" >&2
+		exit 1
+	}
+	if [[ "$manifest_tools" != "$checked_tools" ]]; then
+		echo "dynamic-report: the tracked report's tool inventory differs from the manifest" >&2
+		diff -u <(printf '%s\n' "$checked_tools") <(printf '%s\n' "$manifest_tools") >&2 || true
+		exit 3
+	fi
+	echo "dynamic-report: $tool_count checked tools match the manifest"
+	exit 0
+fi
 
 command -v cmp >/dev/null
 command -v diff >/dev/null
@@ -85,29 +123,6 @@ declare -A provider_size_cache=()
 declare -A provider_private_cache=()
 declare -A provider_shared_cache=()
 declare -A provider_exports=()
-
-manifest_tools="$(jq -r '.programs[] | select(.role == "tool" and .linkage == "dynamic" and .stage == "volume") | .name' <<<"$manifest_json" | sort)"
-wave_tools="$(printf '%s\n' "${!TOOL_WAVES[@]}" | sort)"
-if [[ "$manifest_tools" != "$wave_tools" ]]; then
-	echo "dynamic-report: wave inventory differs from the manifest tools" >&2
-	diff -u <(printf '%s\n' "$manifest_tools") <(printf '%s\n' "$wave_tools") >&2 || true
-	exit 1
-fi
-if [[ "$mode" == --check-inventory ]]; then
-	[[ -f "$report" ]] || {
-		echo "dynamic-report: missing checked report" >&2
-		exit 1
-	}
-	checked_tools="$(awk -F '\t' '$1 ~ /^[0-9]+$/ && $2 == "x86_64-unknown-none" {print $3}' "$report" | sort)"
-	if [[ "$manifest_tools" != "$checked_tools" ]]; then
-		echo "dynamic-report: checked tool inventory differs from the manifest" >&2
-		diff -u <(printf '%s\n' "$checked_tools") <(printf '%s\n' "$manifest_tools") >&2 || true
-		exit 1
-	fi
-	checked_tool_count="$(wc -l <<<"$manifest_tools")"
-	echo "dynamic-report: $checked_tool_count checked tools match the manifest"
-	exit 0
-fi
 
 library_file() {
 	local target="$1"
@@ -420,8 +435,16 @@ generate_wave_report() {
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
 		for wave in 1 2 3 4 5 6; do
 			key="$target|$wave"
-			shared_bytes=$((${wave_shared_executable_bytes[$key]} + ${wave_provider_shared_bytes[$key]}))
-			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "$wave" "${wave_tools_count[$key]}" "${wave_object_bytes[$key]}" "${wave_pie_bytes[$key]}" "${wave_provider_bytes[$key]}" "${wave_private_bytes[$key]}" "$shared_bytes" "./test.sh --tags ${WAVE_TAGS[$wave]}"
+			# A WAVE WITH NO TOOLS IS ZERO, not an unbound variable.
+			#
+			# Every one of these was read without a default, and the accumulators are only created
+			# when a tool lands in that wave - so a wave whose last tool is removed, or renamed into
+			# another wave, made this line die with `wave_shared_executable_bytes[...]: unbound
+			# variable` under `set -u`. In this tree all six waves have tools, so it has never
+			# fired; a fixture with two waves finds it immediately. The values are identical
+			# wherever a key exists, so no tracked report changes.
+			shared_bytes=$((${wave_shared_executable_bytes[$key]:-0} + ${wave_provider_shared_bytes[$key]:-0}))
+			printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "$wave" "${wave_tools_count[$key]:-0}" "${wave_object_bytes[$key]:-0}" "${wave_pie_bytes[$key]:-0}" "${wave_provider_bytes[$key]:-0}" "${wave_private_bytes[$key]:-0}" "$shared_bytes" "./test.sh --tags ${WAVE_TAGS[$wave]}"
 		done
 	done
 }
@@ -431,61 +454,235 @@ generate_image_report() {
 	printf 'target\ttools\tobject_bytes\tpie_bytes\tunique_provider_bytes\tstaged_bytes\tprivate_bytes\tshared_bytes\ttest_command\n'
 	local target staged_bytes shared_bytes
 	for target in x86_64-unknown-none aarch64-unknown-none riscv64gc-unknown-none-elf; do
-		staged_bytes=$((${image_pie_bytes[$target]} + ${image_provider_bytes[$target]}))
-		shared_bytes=$((${image_shared_executable_bytes[$target]} + ${image_provider_shared_bytes[$target]}))
-		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "${image_tools_count[$target]}" "${image_object_bytes[$target]}" "${image_pie_bytes[$target]}" "${image_provider_bytes[$target]}" "$staged_bytes" "${image_private_bytes[$target]}" "$shared_bytes" './check.sh --gate dynamic-report'
+		staged_bytes=$((${image_pie_bytes[$target]:-0} + ${image_provider_bytes[$target]:-0}))
+		shared_bytes=$((${image_shared_executable_bytes[$target]:-0} + ${image_provider_shared_bytes[$target]:-0}))
+		printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$target" "${image_tools_count[$target]:-0}" "${image_object_bytes[$target]:-0}" "${image_pie_bytes[$target]:-0}" "${image_provider_bytes[$target]:-0}" "$staged_bytes" "${image_private_bytes[$target]:-0}" "$shared_bytes" './check.sh --gate dynamic-report'
 	done
 }
+
+# --- validation and comparison ------------------------------------------------------------------
+#
+# Three local validators, one per report. Deliberately not a schema framework: there are three
+# formats, they change when this file changes, and a generic validator would be more code than the
+# thing it validates.
+#
+# BOTH SIDES ARE VALIDATED. Comparing a candidate against a tracked file establishes that they are
+# equal; it establishes nothing about whether either is a report. Two identically malformed files
+# compare equal and would have been reported as a match.
+
+validate_detailed() {
+	local file="$1" what="$2"
+	local -a keys=()
+	local -A seen=()
+	awk -F '\t' -v what="$what" '
+		NR == 1 { if ($0 != "format=liber-dynamic-executable-report-v4") { printf "dynamic-report: %s has the wrong format header\n", what > "/dev/stderr"; exit 1 } ; next }
+		NR == 2 { if (NF != 15) { printf "dynamic-report: %s has a %d-column header, expected 15\n", what, NF > "/dev/stderr"; exit 1 } ; next }
+		{
+			if (NF != 15) { printf "dynamic-report: %s row %d has %d columns, expected 15\n", what, NR, NF > "/dev/stderr"; exit 1 }
+			if ($1 !~ /^[0-9]+$/) { printf "dynamic-report: %s row %d has a non-numeric wave\n", what, NR > "/dev/stderr"; exit 1 }
+			for (column = 10; column <= 14; column++) {
+				if ($column !~ /^[0-9]+$/) { printf "dynamic-report: %s row %d column %d is not a byte count\n", what, NR, column > "/dev/stderr"; exit 1 }
+			}
+			key = $2 "|" $3
+			if (key in row) { printf "dynamic-report: %s repeats the key %s\n", what, key > "/dev/stderr"; exit 1 }
+			row[key] = 1
+		}
+	' "$file" || return 1
+	# The key set is exactly targets x manifest tools, and every row's wave is the table's wave.
+	local target tool wave line
+	for target in "${TARGETS[@]}"; do
+		while IFS= read -r tool; do keys+=("$target|$tool"); done <<<"$manifest_tools"
+	done
+	while IFS=$'\t' read -r wave target tool _rest; do
+		[[ "$wave" =~ ^[0-9]+$ ]] || continue
+		seen["$target|$tool"]=1
+		if [[ "${TOOL_WAVES[$tool]:-}" != "$wave" ]]; then
+			echo "dynamic-report: $what places $tool in wave $wave; the wave table says ${TOOL_WAVES[$tool]:-none}" >&2
+			return 1
+		fi
+	done <"$file"
+	for line in "${keys[@]}"; do
+		[[ -n "${seen[$line]:-}" ]] || {
+			echo "dynamic-report: $what is missing the row for $line" >&2
+			return 1
+		}
+	done
+	if ((${#seen[@]} != ${#keys[@]})); then
+		echo "dynamic-report: $what has ${#seen[@]} rows, expected ${#keys[@]}" >&2
+		return 1
+	fi
+	return 0
+}
+
+validate_wave() {
+	local file="$1" what="$2"
+	local -A seen=()
+	local target wave rest
+	awk -F '\t' -v what="$what" '
+		NR == 1 { if ($0 != "format=liber-dynamic-wave-report-v2") { printf "dynamic-report: %s has the wrong format header\n", what > "/dev/stderr"; exit 1 } ; next }
+		NR == 2 { if (NF != 9) { printf "dynamic-report: %s has a %d-column header, expected 9\n", what, NF > "/dev/stderr"; exit 1 } ; next }
+		{
+			if (NF != 9) { printf "dynamic-report: %s row %d has %d columns, expected 9\n", what, NR, NF > "/dev/stderr"; exit 1 }
+			for (column = 2; column <= 8; column++) {
+				if ($column !~ /^[0-9]+$/) { printf "dynamic-report: %s row %d column %d is not a number\n", what, NR, column > "/dev/stderr"; exit 1 }
+			}
+		}
+	' "$file" || return 1
+	while IFS=$'\t' read -r target wave rest; do
+		[[ "$wave" =~ ^[0-9]+$ ]] || continue
+		seen["$target|$wave"]=1
+	done <"$file"
+	local expected=$((${#TARGETS[@]} * ${#WAVES[@]}))
+	for target in "${TARGETS[@]}"; do
+		for wave in "${WAVES[@]}"; do
+			[[ -n "${seen["$target|$wave"]:-}" ]] || {
+				echo "dynamic-report: $what is missing the row for $target wave $wave" >&2
+				return 1
+			}
+		done
+	done
+	((${#seen[@]} == expected)) || {
+		echo "dynamic-report: $what has ${#seen[@]} target/wave rows, expected $expected" >&2
+		return 1
+	}
+	return 0
+}
+
+validate_image() {
+	local file="$1" what="$2"
+	local -A seen=()
+	local target rest
+	awk -F '\t' -v what="$what" '
+		NR == 1 { if ($0 != "format=liber-dynamic-image-report-v1") { printf "dynamic-report: %s has the wrong format header\n", what > "/dev/stderr"; exit 1 } ; next }
+		NR == 2 { if (NF != 9) { printf "dynamic-report: %s has a %d-column header, expected 9\n", what, NF > "/dev/stderr"; exit 1 } ; next }
+		{
+			if (NF != 9) { printf "dynamic-report: %s row %d has %d columns, expected 9\n", what, NR, NF > "/dev/stderr"; exit 1 }
+			for (column = 2; column <= 8; column++) {
+				if ($column !~ /^[0-9]+$/) { printf "dynamic-report: %s row %d column %d is not a number\n", what, NR, column > "/dev/stderr"; exit 1 }
+			}
+		}
+	' "$file" || return 1
+	while IFS=$'\t' read -r target rest; do
+		[[ "$target" == *-* && "$target" != format=* && "$target" != target ]] || continue
+		seen["$target"]=1
+	done <"$file"
+	for target in "${TARGETS[@]}"; do
+		[[ -n "${seen[$target]:-}" ]] || {
+			echo "dynamic-report: $what is missing the row for $target" >&2
+			return 1
+		}
+	done
+	((${#seen[@]} == ${#TARGETS[@]})) || {
+		echo "dynamic-report: $what has ${#seen[@]} target rows, expected ${#TARGETS[@]}" >&2
+		return 1
+	}
+	return 0
+}
+
+# One report against its tracked file. Returns 4 - not 1 - so the caller can tell "the report is out
+# of date" from "the gate could not run".
+compare_one() {
+	local candidate="$1" tracked="$2" name="$3" quiet="${4:-loud}"
+	if cmp -s "$candidate" "$tracked"; then
+		return 0
+	fi
+	if [[ "$quiet" != quiet ]]; then
+		echo "dynamic-report: $name is stale" >&2
+		diff -u "$tracked" "$candidate" >&2 || true
+	fi
+	return 4
+}
+
+# --- one generation, then compare -----------------------------------------------------------------
 
 temporary="$(mktemp)"
 wave_temporary="$(mktemp)"
 image_temporary="$(mktemp)"
-trap 'rm -f "$temporary" "$wave_temporary" "$image_temporary"' EXIT
+probe_dir="$(mktemp -d)"
+trap 'rm -f "$temporary" "$wave_temporary" "$image_temporary"; rm -rf "$probe_dir"' EXIT
 preload_metrics
 generate_report >"$temporary"
 generate_wave_report >"$wave_temporary"
 generate_image_report >"$image_temporary"
-tool_count="$(wc -l <<<"$manifest_tools")"
-target_count=3
-expected_report_lines=$((2 + tool_count * target_count))
-if [[ "$(wc -l <"$temporary")" != "$expected_report_lines" ]]; then
-	echo "dynamic-report: expected format, header and $((tool_count * target_count)) target/tool rows" >&2
-	exit 1
-fi
-if [[ "$(wc -l <"$wave_temporary")" != 20 ]]; then
-	echo "dynamic-report: expected format, header and 18 target/wave rows" >&2
-	exit 1
-fi
-if [[ "$(wc -l <"$image_temporary")" != 5 ]]; then
-	echo "dynamic-report: expected format, header and three target image rows" >&2
-	exit 1
-fi
+
+validate_detailed "$temporary" "the generated report" || exit 1
+validate_wave "$wave_temporary" "the generated wave report" || exit 1
+validate_image "$image_temporary" "the generated image report" || exit 1
 
 if [[ "$mode" == --write ]]; then
 	mv "$temporary" "$report"
 	mv "$wave_temporary" "$wave_report"
 	mv "$image_temporary" "$image_report"
-	trap - EXIT
+	trap 'rm -rf "$probe_dir"' EXIT
 	echo "dynamic-report: wrote $report, $wave_report and $image_report"
-else
-	[[ -f "$report" && -f "$wave_report" && -f "$image_report" ]] || {
-		echo "dynamic-report: missing checked report; run $0 --write" >&2
-		exit 1
-	}
-	if ! cmp -s "$temporary" "$report"; then
-		echo "dynamic-report: $report is stale" >&2
-		diff -u "$report" "$temporary" >&2 || true
-		exit 1
-	fi
-	if ! cmp -s "$wave_temporary" "$wave_report"; then
-		echo "dynamic-report: $wave_report is stale" >&2
-		diff -u "$wave_report" "$wave_temporary" >&2 || true
-		exit 1
-	fi
-	if ! cmp -s "$image_temporary" "$image_report"; then
-		echo "dynamic-report: $image_report is stale" >&2
-		diff -u "$image_report" "$image_temporary" >&2 || true
-		exit 1
-	fi
-	echo "dynamic-report: $tool_count tools x $target_count targets, 15 waves and three whole images match"
+	exit 0
 fi
+
+for tracked in "$report" "$wave_report" "$image_report"; do
+	[[ -f "$tracked" ]] || {
+		echo "dynamic-report: no tracked report at $tracked; run (cd src && just dynamic-report-update)" >&2
+		exit 3
+	}
+done
+validate_detailed "$report" "$report" || exit 1
+validate_wave "$wave_report" "$wave_report" || exit 1
+validate_image "$image_report" "$image_report" || exit 1
+
+status=0
+compare_one "$temporary" "$report" "$report" || status=$?
+[[ "$status" == 0 ]] || exit "$status"
+compare_one "$wave_temporary" "$wave_report" "$wave_report" || status=$?
+[[ "$status" == 0 ]] || exit "$status"
+compare_one "$image_temporary" "$image_report" "$image_report" || status=$?
+[[ "$status" == 0 ]] || exit "$status"
+
+# PROVE THE COMPARISON REFUSES, without generating anything a second time.
+#
+# The whole value of `--check` is that a difference fails, and a `diff` that stopped comparing - a
+# changed variable name, a redirection, an `exit 0` - would report a clean tree just as convincingly.
+# So the gate hands itself a corrupted report and requires itself to notice.
+#
+# It used to do that by RE-INVOKING ITSELF with an environment override, which regenerated every
+# report and swept the whole ELF graph a second time, and accepted ANY nonzero status as proof -
+# including the status of a script that failed to start. And it mutated only the detailed report, so
+# the wave and image comparisons were never shown to refuse anything at all.
+#
+# Three probes now, one per report, against copies of the candidates that were just generated: each
+# changes one non-key numeric value while leaving the format valid and the other two files
+# byte-identical, and each must produce exactly status 4.
+probe_report() {
+	local which="$1" line_field="$2"
+	local -a files=("$probe_dir/detailed.tsv" "$probe_dir/wave.tsv" "$probe_dir/image.tsv")
+	cp "$temporary" "${files[0]}"
+	cp "$wave_temporary" "${files[1]}"
+	cp "$image_temporary" "${files[2]}"
+	local target="${files[$which]}"
+	# One numeric column of the last row, incremented. Valid format, different bytes.
+	awk -F '\t' -v OFS='\t' -v field="$line_field" 'NR == FNR { last = FNR; next } { if (FNR == last) { $field = $field + 1 } ; print }' "$target" "$target" >"$target.mutated"
+	mv "$target.mutated" "$target"
+	local expected=("$report" "$wave_report" "$image_report")
+	local candidates=("$temporary" "$wave_temporary" "$image_temporary")
+	local index probe_status=0
+	for index in 0 1 2; do
+		local source_file="${candidates[$index]}"
+		[[ "$index" != "$which" ]] || source_file="$target"
+		compare_one "$source_file" "${expected[$index]}" "${expected[$index]}" quiet || probe_status=$?
+		if [[ "$index" == "$which" ]]; then
+			if [[ "$probe_status" != 4 ]]; then
+				echo "dynamic-report: SELF-TEST FAILED - a mutated ${expected[$index]} was accepted with status $probe_status, so this gate is comparing nothing" >&2
+				return 1
+			fi
+		elif [[ "$probe_status" != 0 ]]; then
+			echo "dynamic-report: SELF-TEST FAILED - probing ${expected[$which]} disturbed ${expected[$index]}" >&2
+			return 1
+		fi
+		probe_status=0
+	done
+	return 0
+}
+
+probe_report 0 10 || exit 1
+probe_report 1 3 || exit 1
+probe_report 2 2 || exit 1
+
+echo "dynamic-report: $tool_count tools x ${#TARGETS[@]} targets, ${#WAVES[@]} waves and ${#TARGETS[@]} whole images match"

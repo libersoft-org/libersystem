@@ -235,6 +235,70 @@ expect_status 'a failing llvm-readelf' 1 "$?"
 SHIM_FAIL=1 run --write
 expect_status 'a failing llvm-readelf on the write path' 1 "$?"
 
+# --- the build wrapper's half of the contract -----------------------------------------------------
+#
+# The checker's status only matters because a caller acts on it, and that caller used to turn EVERY
+# nonzero result into the same warning and then print `status=0`. So `check_dynamic_report_inventory`
+# is exercised here too - read out of the tracked `build-shared.sh` rather than copied, so this tests
+# the shipped text and cannot drift from it.
+wrapper="$root/tools/build-shared.sh"
+inventory_function="$(awk '/^check_dynamic_report_inventory\(\) \{$/, /^\}$/' "$wrapper")"
+cases=$((cases + 1))
+if [[ -z "$inventory_function" ]]; then
+	fail 'check_dynamic_report_inventory was not found in build-shared.sh'
+else
+	# One stub checker whose exit status is dictated by the case, standing in for the real one.
+	mkdir -p "$fixture/wrapper/tools"
+	cat >"$fixture/wrapper/tools/check-dynamic-report.sh" <<'STUB'
+#!/usr/bin/env bash
+echo "stub: mode $*"
+exit "${STUB_STATUS:-0}"
+STUB
+	chmod +x "$fixture/wrapper/tools/check-dynamic-report.sh"
+
+	# status -> expected state, expected return. Only 3 is a warning; every other nonzero value is
+	# the check itself being broken, including 4, which `--check-inventory` cannot legitimately
+	# produce and which therefore means the caller is talking to the wrong script.
+	while read -r stub_status expected_state expected_return; do
+		[[ -n "$stub_status" ]] || continue
+		observed="$(
+			set +u
+			root="$fixture/wrapper"
+			verbose=0
+			verbose_log() { :; }
+			eval "$inventory_function"
+			STUB_STATUS="$stub_status" check_dynamic_report_inventory >/dev/null 2>&1
+			printf '%s %s %s\n' "$?" "$inventory_state" "$((inventory_stage_ms >= 0))"
+		)"
+		read -r got_return got_state got_timed <<<"$observed"
+		cases=$((cases + 1))
+		if [[ "$got_return" != "$expected_return" || "$got_state" != "$expected_state" ]]; then
+			fail "an inventory status of $stub_status gave return $got_return/state $got_state, expected $expected_return/$expected_state"
+		elif [[ "$got_timed" != 1 ]]; then
+			fail "an inventory status of $stub_status produced no stage timing"
+		fi
+	done <<'MATRIX'
+0 match 0
+3 refresh-required 0
+1 fatal 1
+4 fatal 1
+9 fatal 1
+MATRIX
+
+	# And the summary must exit with what it printed. This is a claim about the tracked script's
+	# text: `report_build_summary` computes `status` and, before P02M0137, returned from the EXIT
+	# trap without it - so a build that announced `status=1` exited 0.
+	cases=$((cases + 1))
+	summary_function="$(awk '/^report_build_summary\(\) \{$/, /^\}$/' "$wrapper")"
+	if [[ "$summary_function" != *'exit "$status"'* ]]; then
+		fail 'report_build_summary does not exit with the status it prints'
+	fi
+	cases=$((cases + 1))
+	if [[ "$summary_function" != *'inventory_status=$inventory_state'* || "$summary_function" != *'inventory_stage_ms=$inventory_stage_ms'* ]]; then
+		fail 'the build summary does not report the inventory state and stage time'
+	fi
+fi
+
 # Nothing above touched the tracked files.
 cases=$((cases + 1))
 if [[ "$before_hashes" != "$(sha256sum "${tracked[@]}")" ]]; then

@@ -551,3 +551,104 @@ pub fn launched_but_not_covered(test: &KernelTest, touched: &BTreeSet<String>, g
 	}
 	touched.iter().filter(|component| component.starts_with("bin.") && graph.contains(component) && !test.covers.contains(component)).cloned().collect()
 }
+
+// THE PERMISSION FIXTURE'S COHORT, audited from the kernel test sources (P02M0138).
+//
+// Twelve tests drive one expensive fixture and split into two classes. The classification lives in
+// `PERMISSION_COHORT` in `src/kernel/tests.rs` and each consumer repeats its own class in its own
+// body; this is the check that the two agree, and it is a HOST check because a guest run only
+// exercises the tests it happened to select.
+//
+// It deliberately does not derive the cohort from "everything that calls the helper". That is a fact
+// about today's spelling: rename the helper and the cohort silently empties. The consumer count is
+// still read, but only to catch a consumer nobody classified - it is a lower bound on the
+// declarations, never their source.
+pub fn audit_permission_cohort(map_text: &str, consumer_text: &str) -> Vec<String> {
+	let mut problems = Vec::new();
+	let mapped = parse_cohort_entries(map_text, "PERMISSION_COHORT");
+	let declared = parse_cohort_entries(consumer_text, "declare_permission_cohort");
+
+	let mut seen: BTreeMap<&str, usize> = BTreeMap::new();
+	for (id, _) in &mapped {
+		*seen.entry(id.as_str()).or_default() += 1;
+	}
+	for (id, count) in &seen {
+		if *count > 1 {
+			problems.push(format!("PERMISSION_COHORT lists '{id}' {count} times"));
+		}
+	}
+	let mut declared_seen: BTreeMap<&str, usize> = BTreeMap::new();
+	for (id, _) in &declared {
+		*declared_seen.entry(id.as_str()).or_default() += 1;
+	}
+	for (id, count) in &declared_seen {
+		if *count > 1 {
+			problems.push(format!("'{id}' declares its permission cohort {count} times"));
+		}
+	}
+
+	let map: BTreeMap<&str, &str> = mapped.iter().map(|(id, class)| (id.as_str(), class.as_str())).collect();
+	let declarations: BTreeMap<&str, &str> = declared.iter().map(|(id, class)| (id.as_str(), class.as_str())).collect();
+	for (id, class) in &declarations {
+		match map.get(id) {
+			None => problems.push(format!("'{id}' declares permission cohort {class} and PERMISSION_COHORT does not list it")),
+			Some(mapped_class) if mapped_class != class => problems.push(format!("'{id}' declares permission cohort {class} and PERMISSION_COHORT says {mapped_class}")),
+			Some(_) => {}
+		}
+	}
+	for id in map.keys() {
+		if !declarations.contains_key(id) {
+			problems.push(format!("PERMISSION_COHORT lists '{id}', which declares no cohort - the entry outlived its test"));
+		}
+	}
+
+	// One consumer of the fixture that classified itself nowhere. Counting is enough: any specific
+	// name this could report would be the helper-name oracle this check exists to avoid.
+	let consumers = consumer_text.matches("run_permission_scenario(").count();
+	if consumers > declarations.len() {
+		problems.push(format!("{consumers} tests drive the permission fixture and {} declare a cohort", declarations.len()));
+	}
+	problems
+}
+
+// `("<id>", PermissionCohort::<Class>)` and `<marker>("<id>", PermissionCohort::<Class>)` have the
+// same shape, so one reader serves the map and the declarations. Anchoring on the keyword keeps an
+// unrelated tuple of a string and a cohort out of the result.
+fn parse_cohort_entries(text: &str, keyword: &str) -> Vec<(String, String)> {
+	let mut found = Vec::new();
+	let mut rest = text;
+	while let Some(index) = rest.find(keyword) {
+		rest = &rest[index + keyword.len()..];
+		// The map is one bracketed literal; each declaration is one call. Either way the entries
+		// run until the construct closes, and for the map that is the first `];`.
+		let region = if keyword == "PERMISSION_COHORT" {
+			match rest.find("];") {
+				Some(end) => &rest[..end],
+				None => continue,
+			}
+		} else {
+			match rest.find(");") {
+				Some(end) => &rest[..end],
+				None => continue,
+			}
+		};
+		let mut tail = region;
+		while let Some(quote) = tail.find('"') {
+			let after = &tail[quote + 1..];
+			let Some(close) = after.find('"') else { break };
+			let id = &after[..close];
+			let remainder = &after[close + 1..];
+			let Some(at) = remainder.find("PermissionCohort::") else { break };
+			let class: String = remainder[at + "PermissionCohort::".len()..].chars().take_while(char::is_ascii_alphanumeric).collect();
+			if !id.is_empty() && !class.is_empty() {
+				found.push((id.to_string(), class));
+			}
+			tail = remainder;
+		}
+		if keyword == "PERMISSION_COHORT" {
+			// The map is read once; a second mention is the type annotation or a use of it.
+			break;
+		}
+	}
+	found
+}

@@ -1726,3 +1726,78 @@ fn the_edges_a_component_is_evidence_about_are_the_ones_walked_out_of_it() {
 	let union: BTreeSet<&String> = plan.component_edge_kinds.values().flatten().collect();
 	assert!(union.iter().all(|kind| plan.edge_kinds.contains(*kind)));
 }
+
+// The permission fixture's cohort audit (P02M0138). Text in, problems out - so every defect the
+// audit exists to catch is written here as a fixture rather than waiting for someone to make the
+// mistake in the tree.
+const COHORT_MAP: &str = r#"
+pub(crate) const PERMISSION_COHORT: [(&str, PermissionCohort); 3] = [
+	("kernel.applications.one", PermissionCohort::Base),
+	("kernel.applications.two", PermissionCohort::Base),
+	("kernel.applications.three", PermissionCohort::Scoped),
+];
+"#;
+
+const COHORT_CONSUMERS: &str = r#"
+fn one() {
+	declare_permission_cohort("kernel.applications.one", PermissionCohort::Base);
+	let result = run_permission_scenario(PermissionScenario::Probes).expect("x");
+}
+fn two() {
+	declare_permission_cohort("kernel.applications.two", PermissionCohort::Base);
+	let result = run_permission_scenario(PermissionScenario::GovernedTools).expect("x");
+}
+fn three() {
+	declare_permission_cohort("kernel.applications.three", PermissionCohort::Scoped);
+	let result = run_permission_scenario(PermissionScenario::ScopedGrants).expect("x");
+}
+"#;
+
+#[test]
+fn a_matching_cohort_map_and_declaration_set_is_clean() {
+	assert!(crate::kerneltests::audit_permission_cohort(COHORT_MAP, COHORT_CONSUMERS).is_empty());
+}
+
+#[test]
+fn an_unclassified_fixture_consumer_is_a_failure() {
+	// A thirteenth consumer arrives and nobody classifies it. The count is the only thing that can
+	// see this, which is exactly why it is read.
+	let consumers = format!("{COHORT_CONSUMERS}\nfn four() {{\n\tlet result = run_permission_scenario(PermissionScenario::Probes).expect(\"x\");\n}}\n");
+	let problems = crate::kerneltests::audit_permission_cohort(COHORT_MAP, &consumers);
+	assert_eq!(problems.len(), 1, "{problems:?}");
+	assert!(problems[0].contains("4 tests drive the permission fixture and 3 declare a cohort"), "{problems:?}");
+}
+
+#[test]
+fn an_orphan_map_entry_is_a_failure() {
+	let map = COHORT_MAP.replace("];", "\t(\"kernel.applications.gone\", PermissionCohort::Base),\n];");
+	let problems = crate::kerneltests::audit_permission_cohort(&map, COHORT_CONSUMERS);
+	assert_eq!(problems.len(), 1, "{problems:?}");
+	assert!(problems[0].contains("kernel.applications.gone"), "{problems:?}");
+	assert!(problems[0].contains("outlived its test"), "{problems:?}");
+}
+
+#[test]
+fn a_duplicate_id_is_a_failure() {
+	let map = COHORT_MAP.replace("];", "\t(\"kernel.applications.one\", PermissionCohort::Base),\n];");
+	let problems = crate::kerneltests::audit_permission_cohort(&map, COHORT_CONSUMERS);
+	assert!(problems.iter().any(|problem| problem.contains("lists 'kernel.applications.one' 2 times")), "{problems:?}");
+}
+
+#[test]
+fn a_drifted_class_is_a_failure() {
+	// The map and the test body disagree about which cached result this consumer may use. Nothing
+	// about the test's name, tags or assertions changes, which is what makes this worth a check.
+	let consumers = COHORT_CONSUMERS.replace("(\"kernel.applications.three\", PermissionCohort::Scoped)", "(\"kernel.applications.three\", PermissionCohort::Base)");
+	let problems = crate::kerneltests::audit_permission_cohort(COHORT_MAP, &consumers);
+	assert_eq!(problems.len(), 1, "{problems:?}");
+	assert!(problems[0].contains("declares permission cohort Base and PERMISSION_COHORT says Scoped"), "{problems:?}");
+}
+
+#[test]
+fn a_declaration_the_map_does_not_know_is_a_failure() {
+	let consumers = COHORT_CONSUMERS.replace("kernel.applications.two", "kernel.applications.invented");
+	let problems = crate::kerneltests::audit_permission_cohort(COHORT_MAP, &consumers);
+	assert!(problems.iter().any(|problem| problem.contains("kernel.applications.invented") && problem.contains("does not list it")), "{problems:?}");
+	assert!(problems.iter().any(|problem| problem.contains("kernel.applications.two") && problem.contains("outlived its test")), "{problems:?}");
+}

@@ -1354,6 +1354,20 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 		Err(error) => failures.push(format!("lib.sh: {error}")),
 	}
 
+	// The permission fixture's twelve consumers against the map that classifies them (P02M0138).
+	// The classification decides which cached result a consumer may use, so a consumer nobody
+	// classified, an entry whose test was deleted, a duplicate or a drifted class is a real defect
+	// and not a bookkeeping detail.
+	{
+		let map_path = model.repo_root.join("src/kernel/tests.rs");
+		let consumer_path = model.repo_root.join("src/kernel/test_suites/applications.rs");
+		match (std::fs::read_to_string(&map_path), std::fs::read_to_string(&consumer_path)) {
+			(Ok(map_text), Ok(consumer_text)) => failures.extend(verify_model::kerneltests::audit_permission_cohort(&map_text, &consumer_text)),
+			(Err(error), _) => failures.push(format!("{}: {error}", map_path.display())),
+			(_, Err(error)) => failures.push(format!("{}: {error}", consumer_path.display())),
+		}
+	}
+
 	// A risk class naming a path that no longer exists is a plan for a tree that has moved on.
 	for rule in &model.registry.risk_classes {
 		if !model.repo_root.join(&rule.path).exists() {
