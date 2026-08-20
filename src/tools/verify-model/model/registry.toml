@@ -202,6 +202,10 @@ path = ".gitignore"
 reason = "version control configuration; no build step reads it"
 
 [[non_code]]
+path = ".gitattributes"
+reason = "version control configuration; it tells `git diff --check` that the WebAssembly specification fixture's trailing tabs are a column rather than whitespace, and no build step reads it"
+
+[[non_code]]
 path = ".editorconfig"
 reason = "editor configuration"
 

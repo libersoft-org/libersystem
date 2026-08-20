@@ -86,54 +86,51 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	use core::sync::atomic::{AtomicU64, Ordering};
 	static RAN_AT: AtomicU64 = AtomicU64::new(0);
 	extern "C" fn stamp(_arg: u64) {
-		RAN_AT.store(arch::tsc::now().max(1), Ordering::SeqCst);
+		RAN_AT.store(1, Ordering::SeqCst);
 	}
 	if smp::cpu_count() < 2 {
 		return;
 	}
-	// Without the wake IPI a halted AP only notices queued work on its next 100 Hz
-	// timer tick, so each spawn-to-run trip averages about 5 ms. With the IPI the
-	// trip is microseconds, leaving generous headroom for host jitter.
-	const TRIP_BOUND_NS: u64 = 4_000_000;
-	// A warmup trip whose latency is not asserted: the first cross-core spawn pays
-	// one-time costs that can exceed the per-trip bound on a slow emulator.
+	// MEASURED IN TICKS, NOT NANOSECONDS.
+	//
+	// The property is "a queued thread does not wait for the next tick", and it used to be checked
+	// by timing the trip and comparing against 4 ms - a number chosen because a halted core without
+	// the IPI waits for its next 100 Hz tick, so its trips average about 5 ms, while a woken one is
+	// microseconds. That gap is real on x86_64 and aarch64 and it CLOSES under emulation: measured
+	// on riscv64 on 2026-08-20, a woken trip costs 3.3-3.6 ms with excursions past 5.7, because
+	// every guest instruction costs about twenty-five times what it does natively. Against a 4 ms
+	// bound that is a coin toss, and the coin decides whether 165 later tests run at all.
+	//
+	// Counting TICK BOUNDARIES instead measures the property directly and cares nothing for how
+	// long the emulator takes to get there: a trip that crossed no tick boundary did not wait for
+	// one. Without the IPI every trip waits for the next tick and therefore crosses one, so the
+	// discrimination is exact rather than a margin - which is what the old bound had stopped being.
+	//
+	// The IPI itself was verified separately and works on all three: instrumenting
+	// `sbi_send_ipi` and the `code == 1` handler on riscv64 showed 203 sent, 0 errors, 203 received.
+	//
+	// A warmup trip whose result is not counted: the first cross-core spawn pays one-time costs.
 	RAN_AT.store(0, Ordering::SeqCst);
 	sched::spawn_on(1, stamp, 0);
 	while RAN_AT.load(Ordering::SeqCst) == 0 {
 		core::hint::spin_loop();
 	}
-	// The BEST of five trips, not every one of them.
-	//
-	// The property is "a queued thread does not wait for the next tick", and one trip cannot show it
-	// on a machine the test does not own: this suite runs under emulation on a shared host, and a
-	// single trip can lose milliseconds to the host's scheduler with the wake IPI working perfectly.
-	// It did exactly that on riscv64, where every guest instruction costs about twenty-five times
-	// what it does natively.
-	//
-	// Taking the minimum keeps the discrimination intact rather than widening the bound to hide the
-	// jitter. Without the IPI EVERY trip waits out a tick, so the fastest of five is still ~5 ms;
-	// with it, a trip is microseconds and only a host that stalls all five in a row could disguise
-	// that - and such a host has stopped being a place to measure anything at all.
-	// TWENTY, not five.
-	//
-	// The best of five was enough on an idle host and not on this one: with three emulated guests
-	// and a fuzzer sharing the machine, five trips can all lose milliseconds to the host's scheduler
-	// and the best of them comes in at 4.06 ms against a 4 ms bound. Widening the BOUND would blunt
-	// the test - without the IPI a trip is a full tick, and the gap between 4 ms and 10 ms is the
-	// whole measurement. Widening the SAMPLE does not: a trip is microseconds when the host lets it
-	// run, and twenty of them cost nothing.
+	// The BEST of twenty, not every one of them. A trip that costs a third of a tick period crosses
+	// a boundary about a third of the time by luck alone, and this suite runs under emulation on a
+	// shared host where that fraction is not stable. Twenty trips make "every single one of them
+	// happened to straddle a tick" the only way to pass wrongly, and that is what a broken IPI
+	// looks like: without it, crossing is not luck but the mechanism.
 	let mut best = u64::MAX;
 	for _ in 0..20 {
 		RAN_AT.store(0, Ordering::SeqCst);
-		let start = arch::tsc::now();
+		let start = arch::apic::ticks();
 		sched::spawn_on(1, stamp, 0);
 		while RAN_AT.load(Ordering::SeqCst) == 0 {
 			core::hint::spin_loop();
 		}
-		let elapsed = arch::tsc::cycles_to_ns(RAN_AT.load(Ordering::SeqCst).wrapping_sub(start));
-		best = best.min(elapsed);
+		best = best.min(arch::apic::ticks().wrapping_sub(start));
 	}
-	assert!(best < TRIP_BOUND_NS, "a remote spawn waited out the tick ({best} ns at best): the wake IPI did not reach the halted core");
+	assert_eq!(best, 0, "every one of twenty remote spawns crossed a tick boundary: the wake IPI did not reach the halted core");
 }
 
 crate::tagged_test!(scheduler_runs_across_cores, [Scheduler], id = "kernel.sched.scheduler_runs_across_cores", covers = ["kernel"]);
