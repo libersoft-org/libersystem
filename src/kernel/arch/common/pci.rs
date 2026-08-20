@@ -140,6 +140,15 @@ pub trait ConfigAccess {
 	fn alloc_mmio(_size: u64) -> Option<u64> {
 		None
 	}
+
+	// Take a span the FIRMWARE already placed out of the window, before anything is allocated
+	// from it (KERN-ARCH-015). A retained BAR was left where it was and never told to the
+	// allocator, so the next unprogrammed BAR could be handed the same addresses - two devices
+	// decoding one aperture, which is not a fault either of them can report.
+	//
+	// Provided by the same ECAM platforms as `alloc_mmio`; a backend that allocates nothing has
+	// nothing to reserve.
+	fn reserve_mmio(_base: u64, _size: u64) {}
 }
 
 // One discovered PCI function.
@@ -385,46 +394,105 @@ pub fn bar_size<A: ConfigAccess>(d: &PciDevice, bar_idx: usize) -> Option<u64> {
 // kernel's boot stub maps (a UEFI boot may assign the 64-bit window at 512 GB, which
 // the direct map does not cover) - so devices land in the mapped low window regardless
 // of how the kernel was booted. Memory decode is turned off while the BARs move.
+// What one BAR slot is: how many of the six slots it consumes, and - when it is an implemented
+// memory BAR - whether it is 64-bit, the address the firmware left in it, and its size.
+//
+// Probing means writing all-ones and reading the mask back, so it is only safe while memory
+// decoding is off; both passes below run inside that window and the original value is always
+// restored.
+fn probe_bar<A: ConfigAccess>(d: &PciDevice, i: usize) -> (usize, Option<(bool, u64, u64)>) {
+	let off = 0x10 + (i as u16) * 4;
+	let bar = A::read32(d.bus, d.dev, d.func, off);
+	if bar & 1 != 0 {
+		return (1, None); // an I/O BAR - not used here
+	}
+	let is64 = (bar >> 1) & 3 == 2;
+	let step = if is64 { 2 } else { 1 };
+	A::write32(d.bus, d.dev, d.func, off, 0xFFFF_FFFF);
+	let mask_lo = A::read32(d.bus, d.dev, d.func, off);
+	A::write32(d.bus, d.dev, d.func, off, bar);
+	let (mask, cur, probed) = if is64 {
+		let bar_hi = A::read32(d.bus, d.dev, d.func, off + 4);
+		A::write32(d.bus, d.dev, d.func, off + 4, 0xFFFF_FFFF);
+		let mask_hi = A::read32(d.bus, d.dev, d.func, off + 4);
+		A::write32(d.bus, d.dev, d.func, off + 4, bar_hi);
+		(((mask_hi as u64) << 32) | (mask_lo & 0xFFFF_FFF0) as u64, ((bar_hi as u64) << 32) | (bar & 0xFFFF_FFF0) as u64, ((mask_hi as u64) << 32) | (mask_lo & 0xFFFF_FFF0) as u64)
+	} else {
+		((mask_lo & 0xFFFF_FFF0) as u64 | 0xFFFF_FFFF_0000_0000, (bar & 0xFFFF_FFF0) as u64, (mask_lo & 0xFFFF_FFF0) as u64)
+	};
+	// AN UNIMPLEMENTED BAR READS BACK ZERO from the all-ones write, and there is no other way to
+	// tell: `size` for a 32-bit slot then works out to a nominal 4 GiB, which the old loop tried to
+	// allocate, failed, and skipped in silence. That silence is gone now - a BAR that cannot be
+	// placed stops the device being enabled - so the difference between "this device has three
+	// BARs" and "this device cannot be placed" has to be stated here.
+	let _ = probed;
+	let size = (!mask).wrapping_add(1);
+	if size == 0 || mask == !0u64 {
+		return (step, None); // nothing this kernel can place
+	}
+	(step, Some((is64, cur, size)))
+}
+
+// Whether a BAR the firmware left at `cur` is one this kernel keeps: inside the low window the
+// boot stub maps, and actually programmed.
+fn is_retained<A: ConfigAccess>(cur: u64) -> bool {
+	cur != 0 && cur < A::MMIO_WINDOW_END
+}
+
 pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
 	// Disable memory-space decoding while the BARs move (the firmware may have enabled it).
 	A::update32(d.bus, d.dev, d.func, 0x04, |dword| ((dword as u16) & !CMD_MEMORY_SPACE) as u32);
+
+	// PASS ONE: EVERY SPAN THE FIRMWARE ALREADY PLACED, RESERVED BEFORE ANYTHING IS ALLOCATED
+	// (KERN-ARCH-015). A retained BAR was left alone and never handed to the allocator, so a later
+	// unprogrammed BAR - on this device or the next one enumerated - could be given the same
+	// addresses. Two functions then decode one aperture, and neither of them can tell.
 	let mut i = 0usize;
 	while i < 6 {
-		let off = 0x10 + (i as u16) * 4;
-		let bar = A::read32(d.bus, d.dev, d.func, off);
-		if bar & 1 != 0 {
-			i += 1; // I/O BAR - not used here
-			continue;
+		let (step, bar) = probe_bar::<A>(d, i);
+		if let Some((_, cur, size)) = bar
+			&& is_retained::<A>(cur)
+		{
+			A::reserve_mmio(cur, size);
 		}
-		let is64 = (bar >> 1) & 3 == 2;
-		// Probe the size (write all-ones, read back the mask, restore).
-		A::write32(d.bus, d.dev, d.func, off, 0xFFFF_FFFF);
-		let mask_lo = A::read32(d.bus, d.dev, d.func, off);
-		A::write32(d.bus, d.dev, d.func, off, bar);
-		let (mask, cur) = if is64 {
-			let bar_hi = A::read32(d.bus, d.dev, d.func, off + 4);
-			A::write32(d.bus, d.dev, d.func, off + 4, 0xFFFF_FFFF);
-			let mask_hi = A::read32(d.bus, d.dev, d.func, off + 4);
-			A::write32(d.bus, d.dev, d.func, off + 4, bar_hi);
-			(((mask_hi as u64) << 32) | (mask_lo & 0xFFFF_FFF0) as u64, ((bar_hi as u64) << 32) | (bar & 0xFFFF_FFF0) as u64)
-		} else {
-			((mask_lo & 0xFFFF_FFF0) as u64 | 0xFFFF_FFFF_0000_0000, (bar & 0xFFFF_FFF0) as u64)
-		};
-		let size = (!mask).wrapping_add(1);
-		let step = if is64 { 2 } else { 1 };
-		if size == 0 || mask == !0u64 {
-			i += step;
-			continue;
-		}
-		if cur == 0 || cur >= A::MMIO_WINDOW_END {
-			if let Some(base) = A::alloc_mmio(size) {
-				A::write32(d.bus, d.dev, d.func, off, (base as u32 & 0xFFFF_FFF0) | (bar & 0xF));
-				if is64 {
-					A::write32(d.bus, d.dev, d.func, off + 4, (base >> 32) as u32);
+		i += step;
+	}
+
+	// PASS TWO: place what is missing, and remember whether all of it was placed.
+	let mut all_placed = true;
+	i = 0;
+	while i < 6 {
+		let (step, bar) = probe_bar::<A>(d, i);
+		if let Some((is64, cur, size)) = bar
+			&& !is_retained::<A>(cur)
+		{
+			match A::alloc_mmio(size) {
+				Some(base) => {
+					let off = 0x10 + (i as u16) * 4;
+					let raw = A::read32(d.bus, d.dev, d.func, off);
+					A::write32(d.bus, d.dev, d.func, off, (base as u32 & 0xFFFF_FFF0) | (raw & 0xF));
+					if is64 {
+						A::write32(d.bus, d.dev, d.func, off + 4, (base >> 32) as u32);
+					}
+				}
+				None => {
+					all_placed = false;
+					crate::serial_println!("pci: {:02x}:{:02x}.{} BAR{i} needs {size} bytes and the MMIO window has none left", d.bus, d.dev, d.func);
 				}
 			}
 		}
 		i += step;
+	}
+
+	// A DEVICE WITH A BAR THAT WAS NOT PLACED IS NOT ENABLED (KERN-ARCH-015).
+	//
+	// Decode and bus-master used to be turned on regardless: an exhausted window left the BAR
+	// reading zero, and the device was then told to respond at address zero and to master the bus.
+	// A device that cannot be addressed is a device that stays off, and the line above says which
+	// one and why.
+	if !all_placed {
+		crate::serial_println!("pci: {:02x}:{:02x}.{} left disabled - a BAR could not be placed", d.bus, d.dev, d.func);
+		return;
 	}
 	// Enable memory space (bit 1) + bus master (bit 2) for the device to respond + DMA.
 	A::update32(d.bus, d.dev, d.func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
@@ -580,3 +648,6 @@ pub fn msix_enable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
 pub fn enable_mem_and_master<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
 	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
 }
+
+#[cfg(test)]
+mod tests;

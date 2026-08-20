@@ -58,3 +58,48 @@ fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
 	unbind(vector);
 	unsafe { frame::deallocate(table) };
 }
+
+crate::tagged_test!(a_gicv2m_spi_above_255_keeps_its_identity, [Interrupt, Drivers, ArchAarch64], id = "kernel.arch.aarch64.interrupts.a_gicv2m_spi_above_255_keeps_its_identity", covers = ["kernel"]);
+fn a_gicv2m_spi_above_255_keeps_its_identity() {
+	// KERN-ARCH-017. GICv2m's MSI_TYPER gives a TEN-BIT base SPI and count, and the backend
+	// programmed the full `u32` into the device's message data - then returned it as a `u8`. On a
+	// frame based at 256 or above the device's interrupt stayed armed under the real SPI while the
+	// registry, the bind, the teardown and `lsirq` all named `spi & 0xff`: a different, possibly
+	// another device's, identifier.
+	//
+	// QEMU virt's frame starts at SPI 80, so the range is stood up here instead. Every result is
+	// taken BEFORE the frame's real range is put back, so a failing assertion cannot leave the
+	// following tests looking at a machine that does not exist.
+	use core::sync::atomic::Ordering;
+	let base = super::BASE_SPI.load(Ordering::Relaxed);
+	let len = super::MSI_LEN.load(Ordering::Relaxed);
+	super::BASE_SPI.store(256, Ordering::Relaxed);
+	super::MSI_LEN.store(64, Ordering::Relaxed);
+	// The whole path, not just the arithmetic: acquire a slot from the stood-up frame and see
+	// which identifier comes back. Truncated, the first slot of a frame based at 256 answers 0 -
+	// SGI 0, the cross-core wake IPI, which is emphatically not this device's interrupt.
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	let acquired = acquire_msi(table, 0, 7);
+	if let Some(vector) = acquired {
+		super::release_unused_msi(vector);
+	}
+	let first = super::spi_slot(256);
+	let middle = super::spi_slot(300);
+	let below = super::spi_slot(255);
+	let past = super::spi_slot(320);
+	let recognised = super::is_msi(300);
+	let carried = Interrupt::new(300).map(|intr| intr.vector());
+	super::BASE_SPI.store(base, Ordering::Relaxed);
+	super::MSI_LEN.store(len, Ordering::Relaxed);
+
+	// SAFETY: the frame allocated above, used only as a stand-in MSI-X table and never mapped.
+	// NEVER-MAPPED: a plain frame written through the direct map by `program_msix_entry`.
+	unsafe { frame::deallocate(table) };
+	assert_eq!(acquired, Some(256), "the frame's first slot is SPI 256, not SPI 256 truncated to a byte");
+	assert_eq!(first, Some(0), "the frame's first SPI is its first slot");
+	assert_eq!(middle, Some(44), "and SPI 300 is slot 44, not slot 300 & 0xff");
+	assert_eq!(below, None, "an INTID below the frame is not one of its MSIs");
+	assert_eq!(past, None, "nor one past its count");
+	assert!(recognised, "SPI 300 reads as an MSI vector");
+	assert_eq!(carried, Some(300), "and the identifier survives the object that carries it");
+}

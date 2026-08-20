@@ -71,6 +71,26 @@ impl common::ConfigAccess for Access {
 		common::assign_bars_ecam::<Self>(d);
 	}
 
+	// Take a span the firmware already placed out of the window (KERN-ARCH-015).
+	//
+	// The window is handed out by a BUMP, so reserving means pushing the cursor past the span's
+	// end - which also gives away whatever gap lies below it. That is the price of a bump
+	// allocator and it is the safe direction: the alternative is handing the same addresses to a
+	// second device. Spans outside the window are not its business.
+	fn reserve_mmio(base: u64, size: u64) {
+		let end = base.saturating_add(size);
+		if end <= MMIO_WINDOW_BASE || base >= MMIO_WINDOW_END {
+			return;
+		}
+		let mut cur = MMIO_NEXT.load(Ordering::Relaxed);
+		while cur < end {
+			match MMIO_NEXT.compare_exchange(cur, end, Ordering::AcqRel, Ordering::Relaxed) {
+				Ok(_) => return,
+				Err(now) => cur = now,
+			}
+		}
+	}
+
 	// Allocate a size-aligned span from the PCIe MMIO window, or None if exhausted.
 	fn alloc_mmio(size: u64) -> Option<u64> {
 		let size = size.max(0x1000);

@@ -412,7 +412,7 @@ fn driver_crash_is_cleaned_up_and_notified() {
 	sched::run_until_idle();
 	// The IRQ binding is gone, and the DMA and handle quotas are back to zero: the
 	// crashed driver's resources were reclaimed by the kernel.
-	assert!(!arch::interrupts::is_bound(DRIVER_IRQ_VECTOR as u8), "the driver's IRQ should be detached");
+	assert!(!arch::interrupts::is_bound(DRIVER_IRQ_VECTOR as u32), "the driver's IRQ should be detached");
 	assert_eq!(domain.account().dma().used(), 0, "the driver's DMA should be refunded");
 	assert_eq!(domain.account().handles().used(), 0, "the driver's handles should be removed");
 	// A crash record naming the driver process was delivered to the supervisor.
