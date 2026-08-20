@@ -148,11 +148,11 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0081 - Filesystem stack unification and performance](P02M0081.md)
 - [x] [P02M0082 - Shell, tools, and renderer cleanup](P02M0082.md)
 - [x] [P02M0083 - Wasm: indirect calls and tables](P02M0083.md)
-- [ ] [P02M0084 - Own UEFI-only bootloader (x86_64 / aarch64 / riscv64)](P02M0084.md) - UEFI-005 closed; UEFI-003 (write-back mappings over reserved memory and holes) is the sparse direct map, deliberately not attempted piecemeal
+- [x] [P02M0084 - Own UEFI-only bootloader (x86_64 / aarch64 / riscv64)](P02M0084.md)
 - [x] [P02M0085 - Architecture abstraction layer (the HAL boundary)](P02M0085.md)
 - [x] [P02M0086 - aarch64 (ARM64) kernel + loader port](P02M0086.md)
 - [x] [P02M0087 - riscv64 (RISC-V) kernel + loader port](P02M0087.md)
-- [ ] [P02M0088 - Multi-arch track follow-ups (the P02M0085-P02M0087 loose ends)](P02M0088.md)
+- [ ] [P02M0088 - Multi-arch track follow-ups (the P02M0085-P02M0087 loose ends)](P02M0088.md) - every audit finding closed; open over one observation found on the way: two ring-3 children blocked in `wait` are not woken by their peer closing, on aarch64 only, while a kernel thread in the same position is
 - [x] [P02M0089 - Pre-phase-3 hardening (finish before the server platform)](P02M0089.md)
 - [x] [P02M0090 - LSIDL package imports, modular generation, and language hardening](P02M0090.md)
 - [x] [P02M0091 - Application graphics, raw input, and PCM audio (the app-platform layer)](P02M0091.md)
@@ -166,7 +166,7 @@ observability, persistent storage and multi-architecture support.
 - [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md)
 - [ ] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [ ] [P02M0101 - Additional system utilities](P02M0101.md)
-- [ ] [P02M0102 - Capability-native pipes and redirection](P02M0102.md) - every audit finding closed; two items stay PARTIAL by decision (IDL-001's move-only token, IDL-005's declarable list and string bounds), each needing a schema or language feature of its own
+- [x] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)
 - [ ] [P02M0103 - The graphics platform desktop and mobile applications are built on](P02M0103.md)
 - [x] [P02M0104 - Incremental development and persistent QEMU test loop](P02M0104.md)
 - [ ] [P02M0105 - Locales: language, region, time zone, keyboard and formats](P02M0105.md)
@@ -193,7 +193,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0126 - What the ISO9660 backend accepts, and the threat model it states](P02M0126.md)
 - [x] [P02M0127 - The ABI's own guarantee, which is the one thing it cannot get wrong](P02M0127.md)
 - [x] [P02M0128 - The terminal's state machine, and the one safe function that is not safe](P02M0128.md)
-- [ ] [P02M0129 - What the loader assumes about the machine it is running on](P02M0129.md) - every audit finding closed except the sparse per-descriptor direct map (LDR-010/-012, the same change as P02M0084's UEFI-003), which is one loader-and-kernel change across three architectures or none
+- [x] [P02M0129 - What the loader assumes about the machine it is running on](P02M0129.md)
 - [x] [P02M0130 - What the component SDK is, and what its milestone says it is](P02M0130.md)
 - [x] [P02M0131 - What LiberMemFS's capacity actually bounds](P02M0131.md)
 - [x] [P02M0132 - The gap between what fsck can see and what a writable mount will accept](P02M0132.md)
