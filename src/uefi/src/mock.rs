@@ -64,6 +64,8 @@ pub struct State {
 	// The memory behind a forced address is NOT real, so only a caller that decides on the address
 	// without writing to it may be tested this way.
 	pub forced_pages: Vec<u64>,
+	// A memory type `allocate_pages` refuses, standing in for firmware that will not take one.
+	pub refuse_memory_type: Option<MemoryType>,
 	// The file the `FileProtocol` mock serves: its declared size, its bytes, and how many bytes each
 	// `read` call may return (0 = as many as asked for).
 	pub file_bytes: Vec<u8>,
@@ -90,7 +92,7 @@ pub struct GopConfig {
 
 impl State {
 	const fn new() -> State {
-		State { disks: Vec::new(), descriptors: Vec::new(), map_key: 1, key_changes: 0, exit_status: crate::STATUS_SUCCESS, exit_refusals: 0, exit_attempts: 0, allocations: Vec::new(), handle_buffers: Vec::new(), frees: Vec::new(), forced_pages: Vec::new(), file_bytes: Vec::new(), file_declared_size: 0, file_read_chunk: 0, file_reads_before_failure: usize::MAX, file_reads: 0, file_opened: Vec::new(), gop: None }
+		State { disks: Vec::new(), descriptors: Vec::new(), refuse_memory_type: None, map_key: 1, key_changes: 0, exit_status: crate::STATUS_SUCCESS, exit_refusals: 0, exit_attempts: 0, allocations: Vec::new(), handle_buffers: Vec::new(), frees: Vec::new(), forced_pages: Vec::new(), file_bytes: Vec::new(), file_declared_size: 0, file_read_chunk: 0, file_reads_before_failure: usize::MAX, file_reads: 0, file_opened: Vec::new(), gop: None }
 	}
 }
 
@@ -140,6 +142,11 @@ pub fn state() -> &'static mut State {
 
 unsafe extern "efiapi" fn allocate_pages(_ty: AllocateType, _mt: MemoryType, pages: usize, out: *mut PhysicalAddress) -> Status {
 	if pages == 0 {
+		return crate::STATUS_INVALID_PARAMETER;
+	}
+	// A FIRMWARE THAT REFUSES A MEMORY TYPE, which is not hypothetical: one refused the loader's own
+	// scratch type and ended the boot in a panic (LDR-012). A test can stand that firmware up here.
+	if state().refuse_memory_type == Some(_mt) {
 		return crate::STATUS_INVALID_PARAMETER;
 	}
 	if !state().forced_pages.is_empty() {

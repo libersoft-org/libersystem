@@ -35,6 +35,12 @@ mod firmware {
 	pub fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize, desc_size: usize, regions: *mut MemRegion) -> Option<usize> {
 		unsafe { memory::translate_map(buf, map_size, desc_size, regions) }
 	}
+	pub fn alloc_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
+		unsafe { memory::alloc_pages(bs, pages) }
+	}
+	pub fn alloc_scratch_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
+		unsafe { memory::alloc_scratch_pages(bs, pages) }
+	}
 	pub fn staging_clear_of(bs: *mut BootServices, pages: usize, dest_low: u64, dest_high: u64) -> Option<u64> {
 		unsafe { memory::staging_clear_of(bs, pages, dest_low, dest_high) }
 	}
@@ -1043,4 +1049,28 @@ fn loader_scratch_is_handed_over_as_reclaimable_and_the_kernels_own_memory_is_no
 	assert_eq!((regions[1].base, regions[1].kind), (0x2000, bootproto::MEM_BOOTLOADER_RECLAIMABLE), "and what died at the handoff is not");
 	assert_eq!((regions[2].base, regions[2].kind), (0x3000, bootproto::MEM_USABLE));
 	unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
+}
+
+// A firmware that will not take the scratch type still gets its buffer.
+#[test]
+fn a_refused_scratch_type_falls_back_to_a_retained_allocation_rather_than_ending_the_boot() {
+	// LDR-012, and the reason this fallback exists rather than trusting the specification. The
+	// scratch type started in the OEM-reserved range by mistake and one firmware refused it: the
+	// riscv64 boot PANICKED in the loader, at the allocation of the buffer it reads the memory map
+	// into. Ending a boot over an attribute is a far worse trade than the leak the attribute fixes.
+	let _guard = guard();
+	// The right type is taken when it is accepted.
+	let normal = firmware::alloc_scratch_pages(mock::boot_services(), 1).expect("a scratch page");
+	assert!(normal != 0);
+
+	// And a firmware that refuses it still answers, out of the retained class.
+	state().refuse_memory_type = Some(crate::OS_LOADER_SCRATCH);
+	let fallback = firmware::alloc_scratch_pages(mock::boot_services(), 1).expect("a page, from somewhere");
+	assert!(fallback != 0, "the boot continues");
+	assert_ne!(fallback, normal, "and it is a page of its own");
+
+	// And a firmware that refuses the RETAINED type too has nothing left to give: a real
+	// out-of-memory is still `None` rather than a page from nowhere.
+	state().refuse_memory_type = Some(crate::LOADER_DATA);
+	assert_eq!(firmware::alloc_pages(mock::boot_services(), 1), None, "the fallback's own allocation can fail");
 }

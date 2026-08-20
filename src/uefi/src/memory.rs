@@ -58,7 +58,17 @@ pub unsafe fn alloc_scratch_pages(bs: *mut BootServices, pages: usize) -> Option
 	let mut addr: u64 = if ceiling == 0 { 0 } else { ceiling };
 	let policy = if ceiling == 0 { uefi::ALLOCATE_ANY_PAGES } else { uefi::ALLOCATE_MAX_ADDRESS };
 	let status = unsafe { ((*bs).allocate_pages)(policy, uefi::OS_LOADER_SCRATCH, pages, &mut addr) };
-	if uefi::is_error(status) { None } else { Some(addr) }
+	if !uefi::is_error(status) {
+		return Some(addr);
+	}
+	// A FIRMWARE THAT WILL NOT TAKE THE TYPE STILL GETS ITS BUFFER.
+	//
+	// The specification reserves this range for OS loaders and every firmware is meant to accept
+	// it; one did not, and the boot PANICKED here - the loader could not allocate the buffer it
+	// reads the memory map into, which ends the boot over an attribute. A retained allocation is
+	// the old behaviour: the kernel does not reclaim those pages, which is the leak LDR-012 is
+	// about, and losing them is strictly better than not booting.
+	unsafe { alloc_pages(bs, pages) }
 }
 
 // The highest physical address a retained loader allocation may occupy, or 0 for no limit.
