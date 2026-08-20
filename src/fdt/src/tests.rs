@@ -939,3 +939,106 @@ fn a_tree_without_the_subtree_reports_nothing_and_completes() {
 	assert!(complete);
 	assert!(seen.is_empty());
 }
+
+#[test]
+fn the_cpu_nodes_yield_hardware_ids_rather_than_a_count_to_iterate() {
+	// KERN-ARCH-008. The walk counted `cpu@` nodes and threw away the `reg` that says WHICH core
+	// each one is, so both non-x86 backends started ids `0..cpu_count`: dense, zero-based and in
+	// tree order, none of which a device tree promises. A board whose harts are 0, 1, 4, 5 had two
+	// targets that are not cores, and two cores that never started.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0);
+	for id in [0u32, 1, 4, 5] {
+		builder.begin("cpu@x").prop("device_type", b"cpu\0").prop_u32("reg", id).end();
+	}
+	builder.end().end();
+	let info = at(builder.finish()).parse().expect("the machine parses");
+	assert_eq!(info.cpu_count, 4);
+	assert_eq!(&info.cpu_ids[..4], &[0, 1, 4, 5], "the ids are the tree's, not the enumeration order");
+	assert_eq!(info.cpu_nodes, 4);
+}
+
+#[test]
+fn a_disabled_cpu_is_not_a_bring_up_target() {
+	// The `/memory` reader has honoured `status` since FDT-004; the cpu reader did not read it at
+	// all, so a core the firmware still owns - or one that does not physically exist on this SKU -
+	// was sent a `CPU_ON`/`hart_start` like any other. `cpu_nodes` still counts it, so the
+	// difference between what the tree declares and what the kernel may use stays visible.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0);
+	builder.begin("cpu@0").prop_u32("reg", 0).prop_str("status", "okay").end();
+	builder.begin("cpu@1").prop_u32("reg", 1).prop_str("status", "disabled").end();
+	// STATUS AFTER REG, which is the order that catches a reader deciding too early.
+	builder.begin("cpu@2").prop_u32("reg", 2).prop_str("status", "fail").end();
+	builder.begin("cpu@3").prop_u32("reg", 3).end();
+	builder.end().end();
+	let info = at(builder.finish()).parse().expect("the machine parses");
+	assert_eq!(info.cpu_count, 2, "two usable cores");
+	assert_eq!(&info.cpu_ids[..2], &[0, 3], "and they are the ones the tree left enabled");
+	assert_eq!(info.cpu_nodes, 4, "while the tree's own declaration is still reported");
+}
+
+#[test]
+fn a_cpu_id_is_read_in_the_cells_the_cpus_node_declares() {
+	// `/cpus` carries its own `#address-cells`; the root's describe the root's children. An MPIDR
+	// wide enough to need two cells - a clustered aarch64 machine - is the case where reading the
+	// root's count, or assuming one, produces the wrong core.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 2).prop_u32("#size-cells", 0);
+	let mut reg = 0u32.to_be_bytes().to_vec();
+	reg.extend_from_slice(&0x0000_0100u32.to_be_bytes());
+	builder.begin("cpu@100").prop("reg", &reg).end();
+	builder.end().end();
+	let info = at(builder.finish()).parse().expect("the machine parses");
+	assert_eq!(info.cpu_count, 1);
+	assert_eq!(info.cpu_ids[0], 0x100, "both cells, folded in tree order");
+}
+
+#[test]
+fn more_cores_than_the_table_holds_are_capped_and_counted() {
+	// Capped rather than refused: the backends have a fixed per-CPU pool, and a machine with more
+	// cores than it holds is still a machine. `cpu_nodes` is what makes the cap sayable - the
+	// caller can report "N of M" instead of silently describing a sixteen-core board as an
+	// eight-core one.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0);
+	for id in 0..16u32 {
+		builder.begin("cpu@x").prop_u32("reg", id).end();
+	}
+	builder.end().end();
+	let info = at(builder.finish()).parse().expect("the machine parses");
+	assert_eq!(info.cpu_count as usize, super::MAX_CPUS, "the table is full and not overrun");
+	assert_eq!(info.cpu_nodes, 16, "and the machine's real width is still reported");
+	assert_eq!(info.cpu_ids[super::MAX_CPUS - 1], (super::MAX_CPUS - 1) as u64);
+}
+
+#[test]
+fn a_cpu_node_without_a_reg_names_no_core() {
+	// The specification requires `reg` on a cpu node. Without one there is nothing to send a
+	// `CPU_ON` to, and inventing an id from the enumeration order is the dense assumption this
+	// whole finding is about - so the node is counted and not recorded.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0);
+	builder.begin("cpu@0").prop_u32("reg", 0).end();
+	builder.begin("cpu@1").prop("device_type", b"cpu\0").end();
+	builder.end().end();
+	let info = at(builder.finish()).parse().expect("the machine parses");
+	assert_eq!(info.cpu_count, 1);
+	assert_eq!(info.cpu_ids[0], 0);
+	assert_eq!(info.cpu_nodes, 2);
+}

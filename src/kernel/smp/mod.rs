@@ -164,13 +164,26 @@ pub fn init(boot_info: &BootInfo) {
 	// the loader reserved a low page for. Nothing to do (and nowhere to land the
 	// trampoline) on a single-core machine.
 	let tramp_phys = boot_info.smp_trampoline;
-	if total > 1 && tramp_phys != 0 {
+	// THE COUNT THAT IS PUBLISHED IS THE COUNT THAT CAME ONLINE (KERN-ARCH-009).
+	//
+	// This starts at the boot processor, which is the only core known to be running, and rises only
+	// as an AP reports in. It used to be declared inside the bring-up branch, so every path that
+	// skipped bring-up - no trampoline page from the loader, or a root the trampoline cannot load -
+	// left the firmware's discovered total published. The scheduler, the shootdown and the IPI
+	// paths all read that number, and would then wait on and dispatch to cores that were never
+	// started.
+	let mut online = 1usize;
+	if let Some(reason) = ap_boot_refusal(total, tramp_phys, arch::context::read_cr3()) {
+		if total > 1 {
+			crate::serial_println!("smp: WARNING: {reason}; running on the boot processor alone");
+		}
+	} else {
 		let tramp = (mem::hhdm_offset() + tramp_phys) as *mut u8;
 		let vector = (tramp_phys >> 12) as u8;
 		// The trampoline runs on the shared page tables (our CR3) and calls ap_entry.
-		unsafe { arch::apboot::install(tramp, arch::context::read_cr3(), ap_entry as *const () as u64) };
+		let installed = unsafe { arch::apboot::install(tramp, arch::context::read_cr3(), ap_entry as *const () as u64) };
+		debug_assert!(installed, "ap_boot_refusal already established the root is loadable");
 
-		let mut online = 1usize; // the BSP
 		for &lapic in &lapics {
 			if lapic == bsp_lapic_id {
 				continue;
@@ -203,8 +216,28 @@ pub fn init(boot_info: &BootInfo) {
 				crate::serial_println!("smp: WARNING: AP lapic_id {} did not come online", lapic);
 			}
 		}
-		CPU_COUNT.store(online, Ordering::Relaxed);
 	}
+	// Narrowed to what is confirmed, on every path through the branch above.
+	CPU_COUNT.store(online, Ordering::Relaxed);
+}
+
+// Why application processors cannot be started here, or None when they can.
+//
+// The three conditions are separated from `init` so they can be stated once and asked about
+// directly: a discovered total of one is nothing to do, a trampoline of zero is the loader
+// reporting it reserved no low page, and a root above 4 GB is one the 32-bit CR3 load in the
+// trampoline would truncate (KERN-ARCH-009, KERN-ARCH-010).
+fn ap_boot_refusal(total: usize, trampoline: u64, cr3: u64) -> Option<&'static str> {
+	if total <= 1 {
+		return Some("the firmware reports a single core");
+	}
+	if trampoline == 0 {
+		return Some("the loader reserved no real-mode trampoline page, so no application processor can be started");
+	}
+	if !arch::apboot::cr3_is_reachable(cr3) {
+		return Some("the page-table root is above 4 GB and the trampoline loads CR3 with a 32-bit register");
+	}
+	None
 }
 
 // Entry point each application processor reaches from the trampoline, in 64-bit

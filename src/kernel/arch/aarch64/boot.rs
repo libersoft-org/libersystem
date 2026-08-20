@@ -572,7 +572,17 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 
 	// Wake the secondary cores via PSCI CPU_ON (each brings up its own per-CPU
 	// block + local GIC/timer, then idles).
-	super::psci::bring_up_secondaries(cpu_count, arg);
+	// THE TREE'S OWN IDS, not a range (KERN-ARCH-008). `cpu_count` is how many entries of
+	// `cpu_ids` are usable cores; `cpu_nodes` is every `cpu@` node the tree declared, so the two
+	// differing is a fact worth saying out loud rather than a silent narrowing.
+	let (cpu_ids, cpu_nodes) = match boot_info {
+		Some(bi) => (bi.cpu_ids, bi.cpu_nodes),
+		None => ([0u64; fdt::MAX_CPUS], 0),
+	};
+	if cpu_nodes > cpu_count {
+		crate::serial_println!("aarch64: SMP - the tree declares {cpu_nodes} cpu node(s), {cpu_count} of them usable (disabled, without a reg, or past the {} this kernel holds)", fdt::MAX_CPUS);
+	}
+	let cpu_count = super::psci::bring_up_secondaries(&cpu_ids[..cpu_count as usize], arg) as u32;
 
 	// W^X ACROSS THE DIRECT MAP, once every core that needs the boot stub has used it
 	// (KERN-ARCH-006). The stub maps 1-4 GiB with 1 GiB blocks that are writable AND executable,

@@ -128,13 +128,14 @@ fn sbi_hart_start(hartid: u64, start_addr: u64, opaque: u64) -> i64 {
 	err
 }
 
-// Wake every secondary hart via SBI HSM hart_start and wait for them to report in. The
-// OpenSBI boot hart is not necessarily hart 0 (QEMU virt often boots on hart 1), so the
-// boot hart id is skipped and the remaining harts get contiguous cpu ids 1.. (the boot
-// hart is cpu id 0). On QEMU virt the hart ids are 0..cpu_count-1.
-pub fn bring_up_secondaries(cpu_count: u32, boot_hartid: u64) {
-	if cpu_count <= 1 {
-		return;
+// Wake every secondary hart the device tree names, via SBI HSM hart_start, and wait for each to
+// report in before starting the next. The OpenSBI boot hart is not necessarily hart 0 (QEMU virt
+// often boots on hart 1), so the boot hart id is skipped and the harts that answer get contiguous
+// cpu ids 1.. (the boot hart is cpu id 0). Returns how many cores are online, the boot hart
+// included - which is the number the rest of the kernel may use.
+pub fn bring_up_secondaries(hart_ids: &[u64], boot_hartid: u64) -> usize {
+	if hart_ids.len() <= 1 {
+		return 1;
 	}
 
 	// Allocate the secondary stacks as a single zeroed, 16-byte-aligned heap block: u128
@@ -143,7 +144,7 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_hartid: u64) {
 	// would blow it. Index 0 (the boot hart) is left unused; the stacks scale with the
 	// hart count, no compile-time cap. Publish the higher-half base to the boot stub
 	// through the shared data word before any secondary reads it.
-	let words = cpu_count as usize * (SEC_STACK_SIZE / 16);
+	let words = hart_ids.len() * (SEC_STACK_SIZE / 16);
 	// ALLOC-OK: boot, the AP stacks, allocated once before the APs start
 	let stacks: Vec<u128> = alloc::vec![0u128; words];
 	let base = Vec::leak(stacks).as_mut_ptr() as u64;
@@ -157,29 +158,43 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_hartid: u64) {
 	// tables. High kernel code cannot address the low symbol directly, so its address
 	// is read from a linker-filled data word.
 	let entry = unsafe { riscv64_secondary_entry };
-	let mut cpu_id = 1u64;
-	for hartid in 0..cpu_count as u64 {
+
+	// THE IDS THE TREE GAVE, AND ONE LOGICAL ID PER HART THAT ANSWERS (KERN-ARCH-008).
+	//
+	// This used to start harts `0..cpu_count` - dense, zero-based and in tree order, none of which
+	// a device tree promises - and hand out a logical id per attempt whether or not the hart behind
+	// it existed. A board whose harts are 0, 1, 4, 5, or whose middle hart is `disabled`, had ids
+	// pointing at harts that never started, and the count published afterwards described neither.
+	//
+	// The logical id - the index into the per-CPU table, the scheduler's run queues and the stack
+	// block - is now handed out only to a hart that has REPORTED IN, so a failure consumes no id
+	// and leaves no gap behind it.
+	let mut online = 1usize;
+	for &hartid in hart_ids {
 		if hartid == boot_hartid {
-			continue;
+			continue; // the hart this code is running on
 		}
+		let cpu_id = online as u64;
 		let status = sbi_hart_start(hartid, entry, cpu_id);
 		if status != 0 {
 			crate::serial_println!("riscv64: hart_start hart {hartid} failed (SBI {status})");
+			continue;
 		}
-		cpu_id += 1;
+		// A BOUND, NOT A MEASUREMENT: long enough that a working hart always arrives first, short
+		// enough that one which never will does not hold the boot. Waiting for THIS hart before
+		// starting the next is what keeps the logical ids contiguous.
+		let mut spins: u64 = 0;
+		while SMP_ONLINE.load(Ordering::Acquire) < online as u32 && spins < 500_000_000 {
+			core::hint::spin_loop();
+			spins += 1;
+		}
+		if SMP_ONLINE.load(Ordering::Acquire) < online as u32 {
+			crate::serial_println!("riscv64: hart {hartid} took hart_start and never reported in");
+			continue;
+		}
+		crate::serial_println!("riscv64:   cpu {cpu_id} up (hart {hartid})");
+		online += 1;
 	}
-	let want = cpu_count - 1;
-
-	// Wait for the secondaries to come online.
-	let mut spins: u64 = 0;
-	while SMP_ONLINE.load(Ordering::Acquire) < want && spins < 2_000_000_000 {
-		core::hint::spin_loop();
-		spins += 1;
-	}
-
-	let online = SMP_ONLINE.load(Ordering::Acquire);
-	crate::serial_println!("riscv64: SMP - {}/{} secondary harts online", online, want);
-	for cpu in 1..=want as usize {
-		crate::serial_println!("riscv64:   cpu {} up (hart {})", cpu, crate::smp::lapic_id(cpu));
-	}
+	crate::serial_println!("riscv64: SMP - {} of {} declared harts online", online, hart_ids.len());
+	online
 }

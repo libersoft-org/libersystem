@@ -31,10 +31,28 @@ fn mailbox_offset() -> usize {
 	(&raw const ap_mailbox as usize) - (&raw const ap_tramp_start as usize)
 }
 
+// The page-table root an application processor can actually be given (KERN-ARCH-010).
+//
+// The trampoline reaches CR3 in 32-BIT protected mode and loads it with a 32-bit register, so a
+// root above 4 GB arrives truncated: the AP enables paging on whatever the low dword happens to
+// name and faults before it reaches any code that could report it. The loader allocates its tables
+// under `TABLE_CEILING` for exactly this reason - and that is the loader's promise, checked HERE,
+// where the value is used, because the kernel's own root is not required to have come from it.
+pub fn cr3_is_reachable(cr3: u64) -> bool {
+	cr3 <= u32::MAX as u64
+}
+
 // Copy the trampoline blob to `dst` (the HHDM virtual address of the reserved low
 // page) and fill the constant mailbox fields (CR3 and the 64-bit entry). The
 // per-AP stack is written separately before each wake.
-pub unsafe fn install(dst: *mut u8, cr3: u64, entry: u64) {
+//
+// Returns false, having installed nothing, when the root cannot be expressed in the 32-bit CR3
+// load; the caller then runs on the boot processor alone rather than sending APs to a fault.
+#[must_use]
+pub unsafe fn install(dst: *mut u8, cr3: u64, entry: u64) -> bool {
+	if !cr3_is_reachable(cr3) {
+		return false;
+	}
 	let src = &raw const ap_tramp_start as *const u8;
 	unsafe {
 		core::ptr::copy_nonoverlapping(src, dst, trampoline_len());
@@ -42,6 +60,7 @@ pub unsafe fn install(dst: *mut u8, cr3: u64, entry: u64) {
 		mb.add(0).write_volatile(cr3);
 		mb.add(1).write_volatile(entry);
 	}
+	true
 }
 
 // Write the AP stack top into the mailbox of the trampoline at `dst` (HHDM virtual

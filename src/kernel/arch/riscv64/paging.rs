@@ -419,6 +419,14 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), (
 			created[created_len] = (unsafe { table.add(idx) }, frame);
 			created_len += 1;
 			frame
+		} else if desc & PTE_RWX != 0 {
+			// A valid LEAF, not a pointer (KERN-ARCH-021). Sv39 puts 1 GiB and 2 MiB mappings at
+			// exactly these levels, and its physical field names MEMORY - so descending into it
+			// writes a page-table entry into whatever lives there, which after `harden_direct_map`
+			// is any 2 MiB of the direct map. Refuse: a caller that asked for one 4 kB page has no
+			// business re-cutting somebody else's large mapping.
+			unsafe { unwind_created(&created, created_len) };
+			return Err(());
 		} else {
 			pte_pa(desc)
 		};

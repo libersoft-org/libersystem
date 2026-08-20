@@ -197,6 +197,9 @@ fn active_pml4_phys() -> u64 {
 }
 
 // Index into the table at the given level for a virtual address.
+// Bit 7 of a PDPT or PD entry: the entry is a 1 GiB or 2 MiB mapping rather than a table pointer.
+const HUGE: u64 = 1 << 7;
+
 fn table_index(virt: u64, shift: u32) -> usize {
 	((virt >> shift) & 0x1ff) as usize
 }
@@ -241,6 +244,13 @@ unsafe fn next_table_create(table: *mut u64, index: usize, parent_flags: u64) ->
 			}
 			entry.write_volatile((new & ADDR_MASK) | PRESENT | WRITABLE | parent_flags);
 			Some(new)
+		} else if value & HUGE != 0 {
+			// A present HUGE leaf, not a table (KERN-ARCH-021). At the PDPT and PD levels bit 7
+			// means "this entry IS the mapping", and its address field names MEMORY - so treating
+			// it as a table writes a page-table entry into whatever lives there. The loader builds
+			// the whole direct map out of 2 MiB leaves, so every HHDM address reaches one. Refuse:
+			// re-cutting a large mapping is not something a one-page map may decide to do.
+			None
 		} else {
 			// Widen an existing intermediate to also grant the requested bits.
 			if value & parent_flags != parent_flags {

@@ -353,17 +353,50 @@ fn leaf_bits(flags: u64) -> u64 {
 // Map one 4 kB page `va -> pa` in the table tree rooted at `root` (a physical L0
 // table address), allocating any missing intermediate tables from the frame
 // allocator, then invalidate the TLB for that VA.
+// Give back the intermediate tables THIS call created, innermost first (KERN-ARCH-019). Without
+// it a walk that got one or two levels in and then could not allocate the next returned `Err` with
+// fresh page-table frames attached to the address space, while the fallible mapper's own comment
+// promised nothing was left behind - true of the leaf, and not of the metadata. The entry is
+// cleared BEFORE the frame is retired, so nothing can reach it in between.
+unsafe fn unwind_created(created: &[(*mut u64, u64); 3], len: usize) {
+	for &(entry, phys) in created.iter().take(len).rev() {
+		unsafe { core::ptr::write_volatile(entry, 0) };
+		unsafe { crate::mem::frame::retire(&[phys]) };
+	}
+	if len > 0 {
+		// Drained here: this is the out-of-memory path, and leaving the frames in quarantine holds
+		// the memory that would satisfy the caller's next attempt.
+		unsafe { crate::mem::frame::drain_quarantine() };
+	}
+}
+
 unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), ()> {
 	let _guard = PT_LOCK.lock();
 	let mut table = phys_to_virt(root) as *mut u64;
+	let mut created: [(*mut u64, u64); 3] = [(core::ptr::null_mut(), 0); 3];
+	let mut created_len = 0usize;
 	for level in 0..3u64 {
 		let shift = 39 - level * 9; // L0=39, L1=30, L2=21
 		let idx = ((va >> shift) & 0x1ff) as usize;
 		let desc = unsafe { core::ptr::read_volatile(table.add(idx)) };
 		let next = if desc & VALID == 0 {
-			let frame = alloc_frame().ok_or(())?;
+			let Some(frame) = alloc_frame() else {
+				unsafe { unwind_created(&created, created_len) };
+				return Err(());
+			};
 			unsafe { core::ptr::write_volatile(table.add(idx), frame | VALID | TABLE) };
+			created[created_len] = (unsafe { table.add(idx) }, frame);
+			created_len += 1;
 			frame
+		} else if desc & TABLE == 0 {
+			// A valid BLOCK, not a table (KERN-ARCH-021). Its output address names MEMORY, not a
+			// page table, so descending into it writes a table entry into whatever lives there -
+			// which after `harden_direct_map` is any 2 MiB of the direct map, and before it was
+			// the whole gigabyte. REFUSING is the only safe answer: splitting the block here would
+			// have to reproduce its attributes across 512 leaves under a caller that asked for one
+			// page, and the callers that legitimately reach a block-mapped range do not exist.
+			unsafe { unwind_created(&created, created_len) };
+			return Err(());
 		} else {
 			desc & ADDR_MASK
 		};
@@ -374,6 +407,7 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), (
 		// see the note on the x86_64 port: replacing a live mapping loses the frame that
 		// was there, with nothing to report it.
 		if core::ptr::read_volatile(table.add(idx)) & VALID != 0 {
+			unwind_created(&created, created_len);
 			return Err(());
 		}
 		core::ptr::write_volatile(table.add(idx), (pa & ADDR_MASK) | leaf_bits(flags));

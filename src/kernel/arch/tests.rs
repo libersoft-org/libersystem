@@ -248,3 +248,21 @@ fn the_direct_map_has_no_writable_executable_alias() {
 		panic!("the direct map is still writable and executable at {at:#x}");
 	}
 }
+
+crate::tagged_test!(mapping_a_4_kb_page_over_a_large_leaf_is_refused, [Paging, Memory, Kernel], id = "kernel.arch.mapping_a_4_kb_page_over_a_large_leaf_is_refused", covers = ["kernel"]);
+fn mapping_a_4_kb_page_over_a_large_leaf_is_refused() {
+	// KERN-ARCH-021. Every 4 kB mapper walked its levels reading "valid" as "table" and following
+	// the address field down. At the 1 GiB and 2 MiB levels a valid entry can just as well BE the
+	// mapping, and then that address field names ordinary memory - so the walk wrote a page-table
+	// entry into it and mapped the caller's page into a table that was never a table.
+	//
+	// The direct map is where every target keeps such leaves: 2 MiB pages from the loader on
+	// x86_64, and 2 MiB blocks from `harden_direct_map` on the other two. This asks for one 4 kB
+	// page at the direct-map address of physical 0 - covered by a large leaf on all three - and
+	// requires a refusal rather than a walk into the memory that leaf describes.
+	let over_a_large_leaf = crate::mem::hhdm_offset();
+	let frame = crate::mem::frame::allocate().expect("a frame to try to map");
+	let result = crate::arch::paging::try_map_page(over_a_large_leaf, frame, crate::arch::paging::WRITABLE | crate::arch::paging::NO_EXECUTE);
+	unsafe { crate::mem::frame::deallocate(frame) };
+	assert!(result.is_err(), "a 4 kB map at {over_a_large_leaf:#x} walked into a large leaf instead of refusing");
+}

@@ -96,3 +96,31 @@ fn the_global_clock_advances_once_per_period_however_many_cores_tick() {
 	cold.advance(1_000_000, 0);
 	assert_eq!(cold.ticks(), 0, "no frequency, no ticks");
 }
+
+crate::tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	the_published_core_count_is_the_one_that_came_online,
+	[Smp, Kernel],
+	id = "kernel.smp.the_published_core_count_is_the_one_that_came_online",
+	covers = ["kernel"]
+);
+#[cfg(target_arch = "x86_64")]
+fn the_published_core_count_is_the_one_that_came_online() {
+	// KERN-ARCH-009 and -010. The firmware's core count was published before anything had been
+	// started, and narrowed to the confirmed count only INSIDE the branch that starts application
+	// processors. Every way of skipping that branch - the loader reserving no trampoline page, or a
+	// page-table root the trampoline's 32-bit CR3 load cannot express - therefore left the machine
+	// claiming cores that were never woken, which the scheduler dispatches to and the shootdown
+	// waits on.
+	//
+	// The three conditions are asked about directly here; the narrowing itself is now unconditional
+	// (one `store` after the branch, on the online counter that only an AP report-in raises), which
+	// is what the invariant below measures on the machine actually running.
+	assert_eq!(super::ap_boot_refusal(1, 0x8000, 0x1000), Some("the firmware reports a single core"));
+	assert!(super::ap_boot_refusal(4, 0, 0x1000).is_some(), "no trampoline page means no AP can be started");
+	assert!(super::ap_boot_refusal(4, 0x8000, 0x1_0000_0000).is_some(), "a root above 4 GB does not survive a 32-bit CR3 load");
+	assert_eq!(super::ap_boot_refusal(4, 0x8000, 0xFFFF_F000), None, "a root at the very top of the low 4 GB is still loadable");
+	assert_eq!(super::ap_boot_refusal(4, 0x8000, 0x1000), None, "and an ordinary multi-core machine boots its APs");
+	assert!(!crate::arch::apboot::cr3_is_reachable(u64::MAX), "the bound is on the whole 64-bit value, not its low half");
+	assert_eq!(cpu_count(), online_count(), "the count the rest of the kernel reads is the confirmed one");
+}

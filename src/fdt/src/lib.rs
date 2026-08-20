@@ -43,7 +43,20 @@ pub struct BootInfo {
 	// worse answer than sixteen banks of a seventeen-bank machine.
 	pub ram_regions: [(u64, u64); MAX_RAM_REGIONS],
 	pub ram_region_count: usize,
+	// CPUs THE TREE DECLARES USABLE, and their HARDWARE ids - not a count to iterate from zero.
+	//
+	// `cpu_count` was every `cpu@` node the walk saw, disabled ones included, and the `reg` that
+	// says WHICH core each one is was discarded. Both backends then started ids `0..cpu_count`:
+	// dense, zero-based and in tree order, none of which a device tree promises. A machine whose
+	// harts are 0, 1, 4, 5 - or whose middle CPU is marked `disabled` - had cores addressed that do
+	// not exist and cores that do never started.
+	//
+	// `cpu_count` is now the number of entries in `cpu_ids`, which are the hardware ids of the
+	// nodes that are enabled AND carry a readable `reg`, in tree order. `cpu_nodes` is every
+	// `cpu@` node seen, so a caller can report the difference rather than leaving it invisible.
 	pub cpu_count: u32,
+	pub cpu_ids: [u64; MAX_CPUS],
+	pub cpu_nodes: u32,
 	// PCIe ECAM config-space base (0 if the tree has no pcie node).
 	pub pcie_ecam: u64,
 	// PLIC (RISC-V platform interrupt controller) base (0 if none / not RISC-V).
@@ -80,6 +93,14 @@ const MAX_CELLS: u32 = 2;
 // How many separate RAM banks the reader will carry. Boards in this tree declare one or two; the
 // array is generous so the cap is not a limit anyone meets.
 pub const MAX_RAM_REGIONS: usize = 16;
+
+// How many CPUs the logical-to-hardware id table holds (KERN-ARCH-008).
+//
+// Eight, because that is the aarch64 per-CPU pool - the smallest backend limit in the tree, and the
+// one a larger table would only postpone hitting. A machine with more cores than this boots on the
+// first eight and SAYS so; refusing the tree the way an over-long `/memory` does would turn a
+// sixteen-core machine into no machine at all, which is the worse of the two answers here.
+pub const MAX_CPUS: usize = 8;
 
 const FDT_MAGIC: u32 = 0xd00d_feed;
 const FDT_BEGIN_NODE: u32 = 1;
@@ -505,6 +526,16 @@ impl Fdt {
 			let mut ram_regions = [(0u64, 0u64); MAX_RAM_REGIONS];
 			let mut ram_region_count = 0usize;
 			let mut cpu_count: u32 = 0;
+			let mut cpu_ids = [0u64; MAX_CPUS];
+			let mut cpu_nodes: u32 = 0;
+			// `/cpus` carries its own `#address-cells` (one on both QEMU machines, two where an
+			// MPIDR needs it); the root's cell counts do not describe a hart id.
+			let mut cpus_addr_cells: u32 = 1;
+			let mut in_cpu = false;
+			// Decided at the node's END, because a tree does not promise property order: `status`
+			// may follow `reg`, and both decide whether this hart is a bring-up target.
+			let mut cpu_ok = true;
+			let mut cpu_reg: Option<(u64, u32)> = None;
 			let mut pcie_ecam: u64 = 0;
 			let mut plic_base: u64 = 0;
 			let mut fwcfg_base: u64 = 0;
@@ -535,7 +566,10 @@ impl Fdt {
 							d1_cpus = self.str_eq(name, "cpus");
 							d1_chosen = self.str_eq(name, "chosen");
 						} else if depth == 2 && d1_cpus && self.str_starts(name, "cpu@") {
-							cpu_count += 1;
+							in_cpu = true;
+							cpu_nodes += 1;
+							cpu_ok = true;
+							cpu_reg = None;
 						}
 						if in_pcie < 0 && (self.str_starts(name, "pcie") || self.str_starts(name, "pci@")) {
 							in_pcie = depth;
@@ -548,6 +582,24 @@ impl Fdt {
 						}
 					}
 					FDT_END_NODE => {
+						if depth == 2 && in_cpu {
+							// THIS HART'S VERDICT, NOW THAT THE WHOLE NODE HAS BEEN SEEN. A node
+							// without a readable `reg` names no core - the specification requires
+							// one, and inventing an id from the enumeration order is the dense
+							// assumption this finding is about - so it is counted and not recorded.
+							if cpu_ok
+								&& let Some((val, len)) = cpu_reg
+								&& let Some(id) = self.read_cells_property(val, len, cpus_addr_cells)
+							{
+								if (cpu_count as usize) < MAX_CPUS {
+									cpu_ids[cpu_count as usize] = id;
+									cpu_count += 1;
+								}
+							}
+							in_cpu = false;
+							cpu_ok = true;
+							cpu_reg = None;
+						}
 						if depth == 1 {
 							// THE MEMORY NODE'S BANKS, COMMITTED NOW THAT IT IS FINISHED.
 							//
@@ -629,6 +681,19 @@ impl Fdt {
 								}
 								size_cells = cells;
 							}
+						} else if depth == 1 && d1_cpus && self.str_eq(pname, "#address-cells") && len == 4 {
+							let cells = self.be32(val);
+							if cells > MAX_CELLS {
+								return None;
+							}
+							cpus_addr_cells = cells;
+						} else if depth == 2 && in_cpu && self.str_eq(pname, "reg") {
+							cpu_reg = Some((val, len));
+						} else if depth == 2 && in_cpu && self.str_eq(pname, "status") {
+							// Same rule as `/memory`: `okay` or absent means usable, `disabled` and
+							// `fail` mean not, and anything unrecognised is treated as not - the
+							// direction that cannot send a `CPU_ON` to a core the firmware owns.
+							cpu_ok = (len >= 5 && self.str_eq(val, "okay")) || (len >= 3 && self.str_eq(val, "ok"));
 						} else if depth == 1 && d1_memory && self.str_eq(pname, "reg") {
 							// REMEMBERED, NOT PARSED HERE. `device_type` and `status` decide whether
 							// this node is memory at all and either may come after `reg`, so the
@@ -766,7 +831,7 @@ impl Fdt {
 			if ram_size == 0 {
 				return None;
 			}
-			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, cpu_count: cpu_count.max(1), pcie_ecam, plic_base, fwcfg_base, modules_start, modules_end })
+			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, cpu_count: cpu_count.max(1), cpu_ids, cpu_nodes, pcie_ecam, plic_base, fwcfg_base, modules_start, modules_end })
 		}
 	}
 }

@@ -330,7 +330,13 @@ pub mod apboot {
 	pub fn trampoline_len() -> usize {
 		0
 	}
-	pub unsafe fn install(_dst: *mut u8, _ttbr: u64, _entry: u64) {
+	// No 32-bit CR3 load on this port, so no root is out of reach; the portable name exists
+	// because the SMP path asks before it installs anything (KERN-ARCH-010).
+	pub fn cr3_is_reachable(_root: u64) -> bool {
+		true
+	}
+	#[must_use]
+	pub unsafe fn install(_dst: *mut u8, _ttbr: u64, _entry: u64) -> bool {
 		todo!("aarch64 PSCI wake")
 	}
 	pub unsafe fn set_stack(_dst: *mut u8, _stack_top: u64) {

@@ -335,11 +335,11 @@ extern "C" fn secondary_idle(cpu_id: u64) -> ! {
 	crate::sched::cpu_idle_loop()
 }
 
-// Wake every secondary core (cpu ids 1..cpu_count) via PSCI CPU_ON and wait for
+// Wake every secondary core named by the device tree via PSCI CPU_ON and wait for
 // them to report in. On QEMU virt the MPIDR affinity of cpu N is simply N.
-pub fn bring_up_secondaries(cpu_count: u32, boot_arg: u64) {
-	if cpu_count <= 1 {
-		return;
+pub fn bring_up_secondaries(cpu_ids: &[u64], boot_arg: u64) -> usize {
+	if cpu_ids.len() <= 1 {
+		return 1;
 	}
 	// NO CONDUIT, NO SECONDARIES - and a line saying so, rather than a fault into somebody else's
 	// exception vectors. A single-core boot is a working system; a machine that dies bringing up its
@@ -350,7 +350,7 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_arg: u64) {
 		bootproto::PSCI_HVC | bootproto::PSCI_SMC => {}
 		_ => {
 			crate::serial_println!("aarch64: SMP - no PSCI conduit below this kernel; running on one core");
-			return;
+			return 1;
 		}
 	}
 
@@ -359,27 +359,66 @@ pub fn bring_up_secondaries(cpu_count: u32, boot_arg: u64) {
 	// page tables the primary already built. High kernel code cannot `adrp` the
 	// low symbol directly, so its address is read from a linker-filled data word.
 	let entry = unsafe { aarch64_secondary_entry };
-	let want = (cpu_count - 1).min((MAX_CPUS - 1) as u32);
-	for cpu_id in 1..=want as u64 {
-		let status = cpu_on(conduit, cpu_id, entry, cpu_id);
-		if status != 0 {
-			crate::serial_println!("aarch64: CPU_ON core {cpu_id} failed (PSCI {status})");
+
+	// THE IDS THE TREE GAVE, AND ONE LOGICAL ID PER CORE THAT ANSWERS (KERN-ARCH-008).
+	//
+	// This used to call `CPU_ON` on targets `1..cpu_count` - the dense, zero-based, tree-ordered
+	// assumption - and then wait for all of them at once, handing every id out whether or not the
+	// core behind it existed. A machine whose cores are 0x0, 0x1, 0x100, 0x101 had two targets that
+	// are not cores and two cores never started, and the count published afterwards described
+	// neither.
+	//
+	// So: the target is the MPIDR affinity value out of the device tree, and the logical id - the
+	// index into the per-CPU pool, the scheduler's run queues and the stack array - is handed out
+	// only to a core that has REPORTED IN. A core that fails `CPU_ON`, or that takes it and never
+	// arrives, consumes no id and leaves no gap behind it.
+	let boot = boot_mpidr();
+	let mut online = 1usize;
+	for &target in cpu_ids {
+		if target & MPIDR_AFFINITY == boot {
+			continue; // the core this code is running on
 		}
+		if online >= MAX_CPUS {
+			crate::serial_println!("aarch64: SMP - the tree declares more cores than the per-CPU pool holds ({MAX_CPUS}); the rest stay parked");
+			break;
+		}
+		let cpu_id = online as u64;
+		let status = cpu_on(conduit, target, entry, cpu_id);
+		if status != 0 {
+			crate::serial_println!("aarch64: CPU_ON mpidr {target:#x} failed (PSCI {status})");
+			continue;
+		}
+		// A BOUND, NOT A MEASUREMENT: long enough that a working core always arrives first, short
+		// enough that a core which never will does not hold the boot. Waiting for THIS core before
+		// starting the next is what keeps the logical ids contiguous.
+		let mut spins: u64 = 0;
+		while SMP_ONLINE.load(Ordering::Acquire) < online as u32 && spins < 500_000_000 {
+			core::hint::spin_loop();
+			spins += 1;
+		}
+		if SMP_ONLINE.load(Ordering::Acquire) < online as u32 {
+			crate::serial_println!("aarch64: core mpidr {target:#x} took CPU_ON and never reported in");
+			continue;
+		}
+		crate::serial_println!("aarch64:   cpu {} up (mpidr={:#x})", cpu_id, SEC_MPIDR[cpu_id as usize].load(Ordering::Relaxed) & 0xff_ffff);
+		online += 1;
 	}
+	crate::serial_println!("aarch64: SMP - {} of {} declared cores online", online, cpu_ids.len());
+	online
+}
 
-	// Wait for the secondaries to come online.
-	let mut spins: u64 = 0;
-	while SMP_ONLINE.load(Ordering::Acquire) < want && spins < 2_000_000_000 {
-		core::hint::spin_loop();
-		spins += 1;
-	}
+// The affinity bits of MPIDR_EL1, which is what a PSCI `target_cpu` and a device tree's `cpu@reg`
+// both are: Aff0..Aff2 in the low three bytes and Aff3 at bits 39:32. The other bits (U, MT, and
+// the RES1 at 31) describe the core rather than name it, and comparing them would make a core fail
+// to match itself.
+const MPIDR_AFFINITY: u64 = 0x0000_00ff_00ff_ffff;
 
-	let online = SMP_ONLINE.load(Ordering::Acquire);
-	crate::serial_println!("aarch64: SMP - {}/{} secondary cores online", online, want);
-	for cpu_id in 1..=want as usize {
-		let mpidr = SEC_MPIDR[cpu_id].load(Ordering::Relaxed);
-		crate::serial_println!("aarch64:   core {} up (mpidr={:#x})", cpu_id, mpidr & 0xff_ffff);
+fn boot_mpidr() -> u64 {
+	let mpidr: u64;
+	unsafe {
+		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
 	}
+	mpidr & MPIDR_AFFINITY
 }
 
 // Declared so the assembly entry point is referenced from Rust.

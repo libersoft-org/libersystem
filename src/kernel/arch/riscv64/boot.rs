@@ -417,7 +417,21 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 
 	// Wake the secondary harts via SBI HSM hart_start (each brings up its own per-CPU
 	// block, trap vector, and local timer, then idles until the scheduler is ready).
-	super::smp::bring_up_secondaries(cpu_count, hartid);
+	// THE TREE'S OWN HART IDS, not a range (KERN-ARCH-008). `cpu_count` is how many entries of
+	// `cpu_ids` are usable harts; `cpu_nodes` is every `cpu@` node the tree declared, so the two
+	// differing is a fact worth saying out loud rather than a silent narrowing.
+	let (cpu_ids, cpu_nodes) = match boot_info {
+		Some(bi) => (bi.cpu_ids, bi.cpu_nodes),
+		None => ([0u64; fdt::MAX_CPUS], 0),
+	};
+	if cpu_nodes > cpu_count {
+		crate::serial_println!("riscv64: SMP - the tree declares {cpu_nodes} cpu node(s), {cpu_count} of them usable (disabled, without a reg, or past the {} this kernel holds)", fdt::MAX_CPUS);
+	}
+	// NARROWED TO WHAT CAME ONLINE. The count published above sizes the per-CPU id table before any
+	// hart can record itself in it; this one is what the scheduler, the IPI paths and the shootdown
+	// read from here on, and it counts only harts that reported in.
+	let cpu_count = super::smp::bring_up_secondaries(&cpu_ids[..cpu_count as usize], hartid) as u32;
+	crate::smp::set_cpu_count(cpu_count as usize);
 
 	// W^X ACROSS THE DIRECT MAP, once every hart that needs the identity window has used it
 	// (KERN-ARCH-006). The stub maps it and the whole high direct map with 1 GiB leaves carrying
