@@ -1976,6 +1976,48 @@ extern "C" fn user_nx_thread_body(_arg: u64) {
 	unsafe { frame::deallocate(stack) };
 }
 
+// Where an exception probe's recorded fault lands (KERN-ARCH-003, -004).
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+static EXC_GOT: core::sync::atomic::AtomicI64 = core::sync::atomic::AtomicI64::new(0);
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+static EXC_KIND: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// Run one ring-3 program that raises a synchronous exception, and record what the kernel made of
+// it. `arg` selects the probe: 0 is `ud2`, 1 is a divide by zero.
+//
+// The whole point is that reaching the end of this function AT ALL is the result: before
+// KERN-ARCH-004 the exception took the fatal halt path and no core ran again.
+#[cfg(any(target_arch = "x86_64", target_arch = "riscv64"))]
+extern "C" fn user_exception_thread_body(arg: u64) {
+	use core::sync::atomic::Ordering;
+	use mem::frame::{self, PAGE_SIZE};
+	let code = frame::allocate().expect("user code frame");
+	let stack = frame::allocate().expect("user stack frame");
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	arch::paging::map_page(USER_CODE_VA, code, flags);
+	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
+	#[cfg(target_arch = "x86_64")]
+	let program = if arg == 0 { arch::usermode::program_ud2_bytes() } else { arch::usermode::program_divide_bytes() };
+	#[cfg(target_arch = "riscv64")]
+	let program = match arg {
+		0 => arch::usermode::program_illegal_bytes(),
+		1 => arch::usermode::program_ebreak_bytes(),
+		_ => arch::usermode::program_compressed_ebreak_bytes(),
+	};
+	unsafe {
+		arch::paging::copy_to_user_page(USER_CODE_VA, program);
+		arch::usermode::enter(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, 0);
+	}
+	let mut info = fault::FaultInfo { kind: 0, error_code: 0, address: 0, instruction_pointer: 0 };
+	let got = unsafe { arch::syscall::invoke(syscall::SYS_FAULT_INFO_GET, &mut info as *mut fault::FaultInfo as u64, core::mem::size_of::<fault::FaultInfo>() as u64, 0, 0) };
+	EXC_GOT.store(got as i64, Ordering::SeqCst);
+	EXC_KIND.store(info.kind, Ordering::SeqCst);
+	arch::paging::unmap_page(USER_CODE_VA);
+	arch::paging::unmap_page(USER_STACK_VA);
+	unsafe { frame::deallocate(code) };
+	unsafe { frame::deallocate(stack) };
+}
+
 // A DeviceManager privilege in the calling thread's handle table.
 //
 // `SYS_DEVICE_ACQUIRE`, `SYS_DEVICE_MSIX_ACQUIRE` and `SYS_INTERRUPT_BIND` require one: ungated,

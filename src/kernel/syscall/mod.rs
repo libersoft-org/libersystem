@@ -1469,6 +1469,32 @@ fn sys_process_load_module(process_handle: u64, elf_ptr: u64, elf_len: u64, bias
 // thread in rdi - the way a process is endowed with its initial capability.
 // Requires the MANAGE right on the process handle (and TRANSFER on the bootstrap).
 fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_handle: u64) -> i64 {
+	// WHERE THE THREAD WILL START, CHECKED BEFORE IT EXISTS (KERN-ARCH-005).
+	//
+	// `entry` and `stack_top` were stored as given and reached the ring transition unexamined. The
+	// kernel builds an IRET frame from them and executes `iretq` at CPL0: a NONCANONICAL RIP or RSP
+	// raises #GP or #SS *before* the privilege transition completes, so the handler sees a
+	// kernel-origin fault and halts the machine. That is a global failure any process could cause
+	// by asking for a thread at a bad address.
+	//
+	// `USER_VA_END` is the exclusive top of the low canonical half on every architecture here, so
+	// one comparison answers both halves of it: an address below it is canonical by construction
+	// and is not in the kernel's half. A stack TOP may equal it - a stack grows down from its top
+	// and the top itself is never dereferenced - which is why the two bounds differ by one
+	// comparison.
+	//
+	// The rest of what an address could be wrong about - unmapped, no-execute, supervisor-only,
+	// read-only - stays a RECOVERABLE ring-3 page fault on the first fetch or push, which kills the
+	// child and nothing else. Those are already right; this is the class that was not.
+	if entry >= crate::memlayout::USER_VA_END || stack_top > crate::memlayout::USER_VA_END {
+		return ERR_INVALID;
+	}
+	// AND ALIGNED, so a bad start fails here rather than somewhere inside the child. Sixteen is the
+	// SysV stack alignment every ABI in this tree uses; `USER_STACK_TOP` and every page-aligned
+	// stack a test hands over already satisfy it.
+	if stack_top % 16 != 0 {
+		return ERR_INVALID;
+	}
 	let thread = current_thread!();
 	let process = match current_typed::<Process>(process_handle, ObjectType::Process, Rights::MANAGE) {
 		Ok(o) => o,

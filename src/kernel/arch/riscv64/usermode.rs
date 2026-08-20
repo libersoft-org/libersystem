@@ -54,6 +54,14 @@ riscv64_enter_umode:                // a0=entry a1=user_sp a2=arg a3=resume_slot
 	fsd     fs10, 23*8(sp)
 	fsd     fs11, 24*8(sp)
 	sd      sp, 0(a3)               // *resume_slot = kernel resume sp
+	// A TRUSTED `tp` FOR THE TRAP PATH TO FIND (KERN-ARCH-001).
+	//
+	// `tp` is an ordinary register in U-mode, so the value the trap entry inherits is one ring 3
+	// chose - and the kernel dereferenced it to reach per-CPU state. The kernel's own `tp` is right
+	// here, in S-mode, so it is parked eight bytes below the trap sp; `__trap_entry` loads it back
+	// before any Rust runs. Eight bytes below is inside the tail of the frame the trap will push
+	// (544 bytes, of which the top 16 hold no register), so nothing else claims it.
+	sd      tp, -8(sp)
 	csrw    sscratch, sp            // kernel trap sp for the U-mode trap path
 	csrr    t0, sstatus
 	li      t1, 0x100
@@ -142,6 +150,15 @@ pub fn program_yield_bytes() -> &'static [u8] {
 }
 pub fn program_nx_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_NX)
+}
+pub fn program_ebreak_bytes() -> &'static [u8] {
+	as_bytes(&PROGRAM_EBREAK)
+}
+pub fn program_compressed_ebreak_bytes() -> &'static [u8] {
+	as_bytes(&PROGRAM_C_EBREAK)
+}
+pub fn program_illegal_bytes() -> &'static [u8] {
+	as_bytes(&PROGRAM_ILLEGAL)
 }
 pub fn program_stack_probe_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_STACK_PROBE)
@@ -279,6 +296,25 @@ static PROGRAM_NX: [u32; 3] = [
 	jr(A0),            // fetch from a NO_EXECUTE page -> instruction page fault
 	J_SELF,
 ];
+
+// Breakpoint probes, 32-bit and 16-bit (KERN-ARCH-003).
+//
+// Trap entry clears `sstatus.SUM`, and the breakpoint handler used to read the instruction at
+// `sepc` to work out its length BEFORE asking which privilege level raised it - a supervisor read
+// of a U-mapped page, which faults, nested, with no fixup, onto the fatal path. Both encodings are
+// probed because the length calculation was the whole reason for that read: `ebreak` is four bytes
+// and `c.ebreak` is two, and the audit asks for each.
+//
+// `C_EBREAK_PAIR` packs the two-byte `c.ebreak` (0x9002) with a following `c.j 0` (0xa001) so the
+// word is a legal pair either way - the process is expected to end on the first halfword.
+const EBREAK: u32 = 0x0010_0073;
+const C_EBREAK_PAIR: u32 = 0xa001_9002;
+
+static PROGRAM_EBREAK: [u32; 2] = [EBREAK, J_SELF];
+static PROGRAM_C_EBREAK: [u32; 2] = [C_EBREAK_PAIR, J_SELF];
+
+// An instruction the hart will not execute at all, for the illegal-instruction cause.
+static PROGRAM_ILLEGAL: [u32; 2] = [0x0000_0000, J_SELF];
 
 // Stack-growth probe: a0 = page count. Store one qword per page walking DOWN from the
 // entry stack pointer, then exit cleanly (or fault at the Domain's stack floor). RV64

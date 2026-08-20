@@ -55,6 +55,10 @@ unsafe extern "C" {
 	fn user_fault_program_end();
 	fn user_nx_program_start();
 	fn user_nx_program_end();
+	fn user_ud2_program_start();
+	fn user_ud2_program_end();
+	fn user_divide_program_start();
+	fn user_divide_program_end();
 	fn user_stack_probe_program_start();
 	fn user_stack_probe_program_end();
 	fn user_spin_program_start();
@@ -113,6 +117,19 @@ pub fn program_bytes() -> &'static [u8] {
 pub fn program_fault_bytes() -> &'static [u8] {
 	let start = user_fault_program_start as *const () as usize;
 	let end = user_fault_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
+// The bytes of the two exception probes above (see KERN-ARCH-004).
+pub fn program_ud2_bytes() -> &'static [u8] {
+	let start = user_ud2_program_start as *const () as usize;
+	let end = user_ud2_program_end as *const () as usize;
+	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
+}
+
+pub fn program_divide_bytes() -> &'static [u8] {
+	let start = user_divide_program_start as *const () as usize;
+	let end = user_divide_program_end as *const () as usize;
 	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
@@ -316,6 +333,17 @@ global_asm!(
 	"user_fault_program_end:",
 	addr = const FAULT_PROBE_ADDR,
 );
+
+// Embedded ring-3 exception probes, one per vector this kernel used to halt on (KERN-ARCH-004).
+//
+// `ud2` is the architecture's own guaranteed invalid opcode, and `div` by a zeroed register is the
+// divide error. Neither writes anything and neither needs an address: the point is that an ordinary
+// unprivileged instruction raised an ordinary exception, and that the machine survived it. The
+// trailing spin is a guard against running off the end, exactly as in the fault probe above - the
+// kernel is expected to terminate the process before it is reached.
+global_asm!(".text", ".global user_ud2_program_start", "user_ud2_program_start:", "ud2", "2:", "jmp 2b", ".global user_ud2_program_end", "user_ud2_program_end:",);
+
+global_asm!(".text", ".global user_divide_program_start", "user_divide_program_start:", "xor rdx, rdx", "xor rcx, rcx", "mov rax, 1", "div rcx", "2:", "jmp 2b", ".global user_divide_program_end", "user_divide_program_end:",);
 
 // Embedded ring-3 no-execute probe. Position-independent: it jumps to an address
 // inside its own (writable, no-execute) stack page. The instruction fetch there

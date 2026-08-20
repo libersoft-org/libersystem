@@ -27,6 +27,20 @@ use alloc::vec::Vec;
 // than an enum) so a FaultInfo marshals cleanly across the syscall boundary.
 pub const FAULT_PAGE: u64 = 1;
 pub const FAULT_GENERAL_PROTECTION: u64 = 2;
+// EVERY OTHER SYNCHRONOUS EXCEPTION A RING-3 INSTRUCTION CAN RAISE (KERN-ARCH-004).
+//
+// Page faults and #GP were the only two that looked at where the fault came from; a divide by zero,
+// a `ud2`, a bound-range or alignment or SIMD fault took the fatal path whatever the privilege
+// level. So any unprivileged process could stop every CPU with one instruction.
+//
+// `FAULT_EXCEPTION` is the catch-all for the vectors with no name of their own, and it carries the
+// vector number in `FaultInfo::address` - which is otherwise CR2 for a page fault and 0 for a #GP -
+// because "which exception" is the first thing a reader of a crash record wants and there is
+// nowhere else in the record to put it without changing its shape.
+pub const FAULT_DIVIDE: u64 = 3;
+pub const FAULT_INVALID_OPCODE: u64 = 4;
+pub const FAULT_BREAKPOINT: u64 = 5;
+pub const FAULT_EXCEPTION: u64 = 6;
 
 // Page-fault error-code bit 0: set when the fault is a protection violation on a
 // PRESENT page (never stack growth), clear when the page was simply not mapped.
@@ -130,7 +144,8 @@ pub fn grow_user_stack(address: u64, error_code: u64) -> bool {
 pub struct FaultInfo {
 	pub kind: u64,
 	pub error_code: u64,
-	// Faulting address: CR2 for a page fault, 0 for a general-protection fault.
+	// Faulting address: CR2 for a page fault, the exception vector for `FAULT_EXCEPTION`, and 0
+	// for everything else.
 	pub address: u64,
 	pub instruction_pointer: u64,
 }
@@ -239,7 +254,14 @@ pub fn terminate_user(info: FaultInfo) -> ! {
 			// clearly faulted. And only here is the process in hand, so only here can the
 			// message say which one it was: an instruction pointer alone is unattributable
 			// when every EXEC image shares a load base.
-			let kind = if info.kind == FAULT_PAGE { "page fault" } else { "general protection fault" };
+			let kind = match info.kind {
+				FAULT_PAGE => "page fault",
+				FAULT_GENERAL_PROTECTION => "general protection fault",
+				FAULT_DIVIDE => "divide error",
+				FAULT_INVALID_OPCODE => "invalid opcode",
+				FAULT_BREAKPOINT => "breakpoint",
+				_ => "exception",
+			};
 			// BORROWED. This used to be `header().name()`, which clones the label into a fresh
 			// `String` - an allocation taken while handling a ring-3 fault, which is the moment a
 			// short heap is most likely and least survivable.

@@ -907,6 +907,132 @@ fn writable_pages_are_not_executable() {
 	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
 }
 
+tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	an_ordinary_ring_three_exception_kills_the_process_and_not_the_machine,
+	[Kernel, ArchX86_64],
+	id = "kernel.kernel.an_ordinary_ring_three_exception_kills_the_process_and_not_the_machine",
+	covers = ["kernel"]
+);
+#[cfg(target_arch = "x86_64")]
+fn an_ordinary_ring_three_exception_kills_the_process_and_not_the_machine() {
+	use core::sync::atomic::Ordering;
+	use object::domain::Domain;
+	// KERN-ARCH-004. Page faults and #GP asked which privilege level raised them; nothing else did.
+	// A ring-3 `ud2` or divide by zero took the fatal halt path and stopped every CPU - so any
+	// unprivileged process could end the machine with one instruction.
+	//
+	// THE TEST RETURNING IS HALF THE ASSERTION. On the tree before the fix this function does not
+	// report a failure: the suite stops, because there is nothing left running to report it with.
+	for (probe, name, kind) in [(0u64, "ud2", fault::FAULT_INVALID_OPCODE), (1u64, "divide by zero", fault::FAULT_DIVIDE)] {
+		EXC_GOT.store(0, Ordering::SeqCst);
+		EXC_KIND.store(0, Ordering::SeqCst);
+		let domain = Domain::new(1 << 20, 8, 4);
+		sched::spawn_in(domain.clone(), user_exception_thread_body, probe).expect("spawn exception probe thread");
+		sched::run_until_idle();
+		assert_eq!(EXC_GOT.load(Ordering::SeqCst), 1, "{name}: the kernel recorded a fault for the process it killed");
+		assert_eq!(EXC_KIND.load(Ordering::SeqCst), kind, "{name}: and recorded which exception it was");
+		// AND THE PROCESS ALONE. Its Domain's thread slot comes back, which is teardown having run
+		// for that process and nothing else.
+		assert_eq!(domain.account().threads().used(), 0, "{name}: the thread slot is refunded");
+	}
+	// And the kernel is still scheduling: a plain kernel thread runs to completion afterwards.
+	static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+	extern "C" fn after(_arg: u64) {
+		RAN.store(true, Ordering::SeqCst);
+	}
+	RAN.store(false, Ordering::SeqCst);
+	sched::spawn(after, 0);
+	sched::run_until_idle();
+	assert!(RAN.load(Ordering::SeqCst), "the scheduler still runs threads after two ring-3 exceptions");
+}
+
+tagged_test!(a_thread_cannot_be_started_at_an_address_the_ring_transition_would_fault_on, [Kernel, Process], id = "kernel.kernel.a_thread_cannot_be_started_at_an_address_the_ring_transition_would_fault_on", covers = ["kernel"]);
+fn a_thread_cannot_be_started_at_an_address_the_ring_transition_would_fault_on() {
+	use core::sync::atomic::{AtomicI64, Ordering};
+	// KERN-ARCH-005. `entry` and `stack_top` were stored as given and reached the ring transition
+	// unexamined. The kernel builds an IRET frame from them and executes `iretq` at CPL0, so a
+	// NONCANONICAL value raises #GP or #SS *before* the privilege change completes - a
+	// kernel-origin fault, on the fatal path, from a syscall any process may make.
+	//
+	// Refused up front now, and this asks for each shape that would have got there: a noncanonical
+	// entry, a noncanonical stack, a kernel-half entry, a kernel-half stack, and a misaligned
+	// stack. The addresses beyond the canonical hole are written out rather than derived, because
+	// the point is the number the CPU would have rejected.
+	static RESULTS: [AtomicI64; 6] = [const { AtomicI64::new(0) }; 6];
+	extern "C" fn prober(_arg: u64) {
+		unsafe {
+			let child = arch::syscall::invoke(syscall::SYS_PROCESS_CREATE, 0, 0, 0, 0);
+			assert!((child as i64) > 0, "process_create");
+			let top = memlayout::USER_STACK_TOP;
+			// Noncanonical: inside the hole no 48-bit (or Sv39) address space can name.
+			let noncanonical: u64 = 0x0001_0000_0000_0000;
+			let kernel_half = memlayout::USER_VA_END;
+			let probes = [
+				(noncanonical, top),            // noncanonical entry
+				(0x1000, noncanonical),         // noncanonical stack
+				(kernel_half, top),             // kernel-half entry
+				(0x1000, kernel_half + 0x1000), // kernel-half stack
+				(0x1000, top - 1),              // misaligned stack
+				(0x1000, top),                  // and one that is fine, so the refusals are about the address
+			];
+			for (index, (entry, stack)) in probes.iter().enumerate() {
+				let got = arch::syscall::invoke(syscall::SYS_THREAD_CREATE, child, *entry, *stack, 0);
+				RESULTS[index].store(got as i64, Ordering::SeqCst);
+			}
+		}
+	}
+	sched::spawn(prober, 0);
+	sched::run_until_idle();
+	for (index, what) in ["a noncanonical entry", "a noncanonical stack", "a kernel-half entry", "a kernel-half stack", "a misaligned stack"].iter().enumerate() {
+		assert_eq!(RESULTS[index].load(Ordering::SeqCst), abi::ERR_INVALID, "{what} is refused before the thread exists");
+	}
+	// THE CONTROL. Without it every assertion above would hold for a `thread_create` that refused
+	// everything, which is not the property - the property is that it refuses THESE.
+	assert!(RESULTS[5].load(Ordering::SeqCst) > 0, "a lower-half, aligned start is still accepted");
+}
+
+tagged_test!(
+	#[cfg(target_arch = "riscv64")]
+	a_user_breakpoint_kills_the_process_and_not_the_machine,
+	[Kernel],
+	id = "kernel.kernel.a_user_breakpoint_kills_the_process_and_not_the_machine",
+	covers = ["kernel"]
+);
+#[cfg(target_arch = "riscv64")]
+fn a_user_breakpoint_kills_the_process_and_not_the_machine() {
+	use core::sync::atomic::Ordering;
+	use object::domain::Domain;
+	// KERN-ARCH-003. The breakpoint branch decided the instruction's length by READING it at
+	// `sepc`, before asking which privilege level raised the trap. Trap entry clears
+	// `sstatus.SUM`, so for a U-mapped page that supervisor read faults - nested, with no usercopy
+	// fixup, onto the fatal path. Any RISC-V user process could stop the machine with one `ebreak`.
+	//
+	// Both encodings, because the length calculation was the reason for the read: `ebreak` is four
+	// bytes, `c.ebreak` is two. And an illegal instruction beside them, which reaches the same
+	// U-mode path and is the RISC-V counterpart of the x86 `ud2` case.
+	//
+	// THE TEST RETURNING IS HALF THE ASSERTION: before the fix the suite stops here instead.
+	for (probe, name, kind) in [(0u64, "illegal instruction", fault::FAULT_INVALID_OPCODE), (1u64, "ebreak", fault::FAULT_BREAKPOINT), (2u64, "c.ebreak", fault::FAULT_BREAKPOINT)] {
+		EXC_GOT.store(0, Ordering::SeqCst);
+		EXC_KIND.store(0, Ordering::SeqCst);
+		let domain = Domain::new(1 << 20, 8, 4);
+		sched::spawn_in(domain.clone(), user_exception_thread_body, probe).expect("spawn exception probe thread");
+		sched::run_until_idle();
+		assert_eq!(EXC_GOT.load(Ordering::SeqCst), 1, "{name}: the kernel recorded a fault for the process it killed");
+		assert_eq!(EXC_KIND.load(Ordering::SeqCst), kind, "{name}: and recorded which exception it was");
+		assert_eq!(domain.account().threads().used(), 0, "{name}: the thread slot is refunded");
+	}
+	static RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+	extern "C" fn after(_arg: u64) {
+		RAN.store(true, Ordering::SeqCst);
+	}
+	RAN.store(false, Ordering::SeqCst);
+	sched::spawn(after, 0);
+	sched::run_until_idle();
+	assert!(RAN.load(Ordering::SeqCst), "the scheduler still runs threads after three ring-3 exceptions");
+}
+
 // The aarch64 counterpart: aarch64 has no x86 page-fault error code (the NX bit + the
 // `& 0x10` fetch bit above are x86-specific). It encodes W^X with the UXN descriptor
 // bit and reports the fault in ESR_EL1, so the same NX probe is checked through the

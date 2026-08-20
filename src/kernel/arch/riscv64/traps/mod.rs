@@ -57,6 +57,27 @@ __trap_entry:
 	csrw    sscratch, zero          // S-mode convention while the handler runs
 	sd      x3,  3*8(sp)
 	sd      x4,  4*8(sp)
+	// THE KERNEL'S OWN `tp`, ESTABLISHED BEFORE ANY RUST RUNS (KERN-ARCH-001).
+	//
+	// `tp` is x4, an ordinary register in U-mode, and the line above has just saved the user's
+	// value into the frame - so from here it may be replaced. It must be: every per-CPU access in
+	// the kernel reads `tp` and dereferences it, and until now that was an address RING 3 CHOSE.
+	// `percpu::set_from_user` WROTE through it on the syscall path, which is an arbitrary S-mode
+	// write from an unprivileged process.
+	//
+	// The trusted value is parked eight bytes below the trap sp - by `riscv64_enter_umode` for the
+	// first excursion and by `__trap_return` for every one after it, each time by the hart that is
+	// about to return, so a thread resumed on a different hart gets THAT hart's pointer. `sp` is
+	// 544 below the trap sp here, so the word is at 536(sp): inside the frame, in the sixteen bytes
+	// at its top that hold no register.
+	//
+	// Only for a trap from U-mode. An S-mode trap already has the kernel's `tp` in `tp`, and
+	// 536(sp) then belongs to the frame it interrupted.
+	csrr    t0, sstatus
+	andi    t0, t0, 0x100
+	bnez    t0, 4f
+	ld      tp, 536(sp)
+4:
 	sd      x6,  6*8(sp)
 	sd      x7,  7*8(sp)
 	sd      x8,  8*8(sp)
@@ -172,6 +193,10 @@ __trap_entry:
 	andi    t0, t1, 0x100
 	bnez    t0, 3f
 	addi    t0, sp, 544
+	// AND PARK THIS HART'S `tp` WHERE THE NEXT TRAP WILL LOOK (KERN-ARCH-001). Written by the hart
+	// that is returning, so a user thread resumed on a different hart from the one it trapped on
+	// finds the right pointer. `tp` is still the kernel's here - the frame's copy is restored below.
+	sd      tp, -8(t0)
 	csrw    sscratch, t0
 3:
 	ld      x1,  1*8(sp)
@@ -216,6 +241,9 @@ unsafe extern "C" {
 // SCAUSE bit 63 = interrupt (vs exception); the low bits are the cause code.
 const CAUSE_INTERRUPT: u64 = 1 << 63;
 // Exception cause codes.
+// An instruction the hart will not execute: `unimp`, or a privileged one from U-mode. Named so a
+// crash record can say "invalid opcode" rather than falling into the general-protection bucket.
+const EXC_ILLEGAL_INSTRUCTION: u64 = 2;
 const EXC_BREAKPOINT: u64 = 3;
 const EXC_ECALL_U: u64 = 8;
 const EXC_INSTR_PAGE_FAULT: u64 = 12;
@@ -283,21 +311,30 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 	}
 	let code = scause & 0xff;
 
-	// Breakpoint (ebreak): a resumable trap - advance SEPC past the instruction
+	let sepc = unsafe { *frame.add(FRAME_SEPC) };
+	let sstatus = unsafe { *frame.add(FRAME_SSTATUS) };
+	let from_user = sstatus & SSTATUS_SPP == 0;
+
+	// Breakpoint (ebreak) IN S-MODE: a resumable trap - advance SEPC past the instruction
 	// (2 bytes if compressed, else 4) and return via sret.
-	if code == EXC_BREAKPOINT {
+	//
+	// WHERE IT CAME FROM IS ASKED FIRST NOW (KERN-ARCH-003). This branch used to run before the
+	// `from_user` line above and read the instruction at `sepc` with `read_volatile` to decide its
+	// length. Trap entry clears `sstatus.SUM`, so for a U-mapped page that supervisor read FAULTS -
+	// a nested page fault with no usercopy fixup, which reaches the fatal supervisor path. Any
+	// RISC-V user process could stop the machine with one `ebreak`.
+	//
+	// A U-mode breakpoint is handled below with every other user fault: this kernel attaches no
+	// debugger, so the process that executed it ends, and nothing dereferences its PC to find out
+	// how long the instruction was.
+	if code == EXC_BREAKPOINT && !from_user {
 		unsafe {
-			let sepc = *frame.add(FRAME_SEPC);
 			let half = core::ptr::read_volatile(sepc as *const u16);
 			let len = if half & 3 == 3 { 4 } else { 2 };
 			*frame.add(FRAME_SEPC) = sepc + len;
 		}
 		return;
 	}
-
-	let sepc = unsafe { *frame.add(FRAME_SEPC) };
-	let sstatus = unsafe { *frame.add(FRAME_SSTATUS) };
-	let from_user = sstatus & SSTATUS_SPP == 0;
 
 	// A U-mode trap is either a system call (ecall) or a fault that terminates only the
 	// faulting process (a store/load fault inside a stack span is demand-paged growth).
@@ -320,6 +357,8 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 		// Any other U-mode fault tears down just this process.
 		let kind = match code {
 			EXC_INSTR_PAGE_FAULT | EXC_LOAD_PAGE_FAULT | EXC_STORE_PAGE_FAULT => crate::fault::FAULT_PAGE,
+			EXC_BREAKPOINT => crate::fault::FAULT_BREAKPOINT,
+			EXC_ILLEGAL_INSTRUCTION => crate::fault::FAULT_INVALID_OPCODE,
 			_ => crate::fault::FAULT_GENERAL_PROTECTION,
 		};
 		crate::fault::terminate_user(crate::fault::FaultInfo { kind, error_code: scause, address: stval, instruction_pointer: sepc });

@@ -71,7 +71,13 @@ struct DescriptorPointer {
 }
 
 // Architectural exception vectors that push a hardware error code.
-const fn has_error_code(vector: usize) -> bool {
+//
+// The two tables at the bottom of this file split the generic vectors by exactly this, and a vector
+// filed on the wrong side reads the frame at the wrong offset - a fault whose handler then reports
+// nonsense or faults itself. So this stays as the architecture's own answer and
+// `every_vector_is_filed_by_whether_it_pushes_a_code` compares the tables against it rather than
+// against a second reading of the manual.
+pub(super) const fn has_error_code(vector: usize) -> bool {
 	matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30)
 }
 
@@ -79,16 +85,20 @@ pub fn init() {
 	unsafe {
 		let idt = &mut *addr_of_mut!(IDT);
 
-		// Default every architectural exception first, then override the ones we
-		// give dedicated handlers.
-		let mut v = 0;
-		while v < 32 {
-			if has_error_code(v) {
-				idt[v].set_with_code(generic_with_code, 0);
-			} else {
-				idt[v].set(generic, 0);
-			}
-			v += 1;
+		// Every architectural vector gets a handler that knows its own number; the six below then
+		// override the ones with a dedicated one. Nothing is left on a shared handler that cannot
+		// say what it was.
+		let mut i = 0;
+		while i < GENERIC_NO_CODE.len() {
+			let (vector, handler) = GENERIC_NO_CODE[i];
+			idt[vector].set(handler, 0);
+			i += 1;
+		}
+		let mut i = 0;
+		while i < GENERIC_WITH_CODE.len() {
+			let (vector, handler) = GENERIC_WITH_CODE[i];
+			idt[vector].set_with_code(handler, 0);
+			i += 1;
 		}
 
 		idt[0].set(divide_error, 0);
@@ -121,19 +131,50 @@ pub fn set_gate(vector: usize, handler: extern "x86-interrupt" fn(InterruptStack
 	}
 }
 
-extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
-	crate::serial_println!("EXCEPTION: divide error at {:#x}", frame.instruction_pointer);
+// WHERE THE FAULT CAME FROM, ASKED ONCE (KERN-ARCH-004).
+//
+// Only the page-fault and #GP handlers looked at the privilege level; every other vector called the
+// fatal halt path whatever raised it. So `ud2`, a divide by zero, a bound-range check or an
+// alignment fault from ring 3 stopped every CPU rather than the one process that executed it -
+// which is the property P02M0119 established for user copies and had never held for user faults.
+//
+// The low two bits of the saved code selector are the CPL, so this is one comparison, and it
+// belongs in front of every vector rather than in the two that happened to have it.
+//
+// `clac_on_entry` first, for the same reason `general_protection_fault` does it: a gate does not
+// clear `EFLAGS.AC`, and the terminate path longjmps into a kernel thread that must not inherit a
+// user-set alignment-check flag.
+fn from_ring_three(frame: &InterruptStackFrame) -> bool {
+	super::paging::clac_on_entry();
+	frame.code_segment & 3 == 3
+}
+
+// Terminate the faulting process, or halt if the fault was the kernel's own.
+fn user_fault_or_halt(frame: &InterruptStackFrame, kind: u64, error_code: u64, address: u64, name: &str) {
+	if from_ring_three(frame) {
+		crate::fault::terminate_user(crate::fault::FaultInfo { kind, error_code, address, instruction_pointer: frame.instruction_pointer });
+	}
+	crate::serial_println!("EXCEPTION: {name} (code {:#x}) at {:#x}", error_code, frame.instruction_pointer);
 	super::halt_loop();
 }
 
-// Breakpoint is recoverable: report and return so execution continues past int3.
+extern "x86-interrupt" fn divide_error(frame: InterruptStackFrame) {
+	user_fault_or_halt(&frame, crate::fault::FAULT_DIVIDE, 0, 0, "divide error");
+}
+
+// A ring-0 `int3` is recoverable and stays that way: report and return so execution continues past
+// it, which is what a kernel breakpoint is for. A ring-3 one is not a debugger request - nothing in
+// this system attaches one - so it ends the process that executed it rather than printing a line
+// per iteration for a program that loops over `int3`.
 extern "x86-interrupt" fn breakpoint(frame: InterruptStackFrame) {
+	if from_ring_three(&frame) {
+		crate::fault::terminate_user(crate::fault::FaultInfo { kind: crate::fault::FAULT_BREAKPOINT, error_code: 0, address: 0, instruction_pointer: frame.instruction_pointer });
+	}
 	crate::serial_println!("EXCEPTION: breakpoint at {:#x} (continuing)", frame.instruction_pointer);
 }
 
 extern "x86-interrupt" fn invalid_opcode(frame: InterruptStackFrame) {
-	crate::serial_println!("EXCEPTION: invalid opcode at {:#x}", frame.instruction_pointer);
-	super::halt_loop();
+	user_fault_or_halt(&frame, crate::fault::FAULT_INVALID_OPCODE, 0, 0, "invalid opcode");
 }
 
 extern "x86-interrupt" fn double_fault(frame: InterruptStackFrame, error_code: u64) -> ! {
@@ -208,15 +249,60 @@ extern "x86-interrupt" fn page_fault(mut frame: InterruptStackFrame, error_code:
 	super::halt_loop();
 }
 
-extern "x86-interrupt" fn generic(frame: InterruptStackFrame) {
-	crate::serial_println!("EXCEPTION: unhandled fault at {:#x}", frame.instruction_pointer);
-	super::halt_loop();
+// ONE HANDLER PER VECTOR, so a crash record can say WHICH exception (KERN-ARCH-004).
+//
+// The vectors without a handler of their own shared two functions - one with a hardware error code
+// and one without - and neither could name itself, because the `x86-interrupt` ABI has no room for
+// an extra argument. A generated trampoline per vector has: each is three lines and closes over its
+// own number, and the number reaches userspace in `FaultInfo::address`.
+macro_rules! generic_vectors {
+	($($name:ident = $vector:expr),* $(,)?) => {
+		$(
+			extern "x86-interrupt" fn $name(frame: InterruptStackFrame) {
+				user_fault_or_halt(&frame, crate::fault::FAULT_EXCEPTION, 0, $vector, "unhandled fault");
+			}
+		)*
+	};
 }
 
-extern "x86-interrupt" fn generic_with_code(frame: InterruptStackFrame, error_code: u64) {
-	crate::serial_println!("EXCEPTION: unhandled fault (code {:#x}) at {:#x}", error_code, frame.instruction_pointer);
-	super::halt_loop();
+macro_rules! generic_vectors_with_code {
+	($($name:ident = $vector:expr),* $(,)?) => {
+		$(
+			extern "x86-interrupt" fn $name(frame: InterruptStackFrame, error_code: u64) {
+				user_fault_or_halt(&frame, crate::fault::FAULT_EXCEPTION, error_code, $vector, "unhandled fault");
+			}
+		)*
+	};
 }
+
+generic_vectors!(generic_v1 = 1, generic_v2 = 2, generic_v4 = 4, generic_v5 = 5, generic_v7 = 7, generic_v9 = 9, generic_v15 = 15, generic_v16 = 16, generic_v18 = 18, generic_v19 = 19, generic_v20 = 20, generic_v22 = 22, generic_v23 = 23, generic_v24 = 24, generic_v25 = 25, generic_v26 = 26, generic_v27 = 27, generic_v28 = 28, generic_v31 = 31,);
+
+generic_vectors_with_code!(generic_v10 = 10, generic_v11 = 11, generic_v12 = 12, generic_v17 = 17, generic_v21 = 21, generic_v29 = 29, generic_v30 = 30,);
+
+// The table the initialiser walks, so adding a vector is one line in one place.
+pub(super) const GENERIC_NO_CODE: [(usize, extern "x86-interrupt" fn(InterruptStackFrame)); 19] = [
+	(1, generic_v1),
+	(2, generic_v2),
+	(4, generic_v4),
+	(5, generic_v5),
+	(7, generic_v7),
+	(9, generic_v9),
+	(15, generic_v15),
+	(16, generic_v16),
+	(18, generic_v18),
+	(19, generic_v19),
+	(20, generic_v20),
+	(22, generic_v22),
+	(23, generic_v23),
+	(24, generic_v24),
+	(25, generic_v25),
+	(26, generic_v26),
+	(27, generic_v27),
+	(28, generic_v28),
+	(31, generic_v31),
+];
+
+pub(super) const GENERIC_WITH_CODE: [(usize, extern "x86-interrupt" fn(InterruptStackFrame, u64)); 7] = [(10, generic_v10), (11, generic_v11), (12, generic_v12), (17, generic_v17), (21, generic_v21), (29, generic_v29), (30, generic_v30)];
 
 #[cfg(test)]
 mod tests;
