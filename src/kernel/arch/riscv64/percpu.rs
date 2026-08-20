@@ -73,25 +73,23 @@ pub fn init(cpu_id: usize, hartid: u32) {
 	}
 }
 
-// `tp` IS NOT TRUSTED, AND THAT IS A MITIGATION RATHER THAN THE FIX.
+// `tp` IS ESTABLISHED BY THE TRAP PATH, AND THIS IS THE ASSERTION THAT IT WAS (KERN-ARCH-001).
 //
-// U-mode may put any value in `tp` - it is an ordinary register there - and `__trap_entry` saves
-// the user's `x4` into the frame and never establishes a kernel one before calling Rust. So every
-// reader below used to dereference an address the USER chose, and `set_from_user` WROTE through it
-// on the syscall path: an arbitrary S-mode write from ring 3.
+// U-mode may put any value in `tp` - it is an ordinary register there - and `__trap_entry` used to
+// save the user's `x4` into the frame and call Rust with it still in the register. So every reader
+// below dereferenced an address the USER chose, and `set_from_user` WROTE through it on the syscall
+// path: an arbitrary S-mode write from ring 3, and the most serious thing in the audit set.
 //
-// What this check does is bound the damage: the pointer must be the base of one of the slots in the
-// block this kernel allocated, so the worst a user can now select is a DIFFERENT HART'S block
-// rather than any address in the address space. That turns memory-unsafety into a wrong answer,
-// which is not the same as correct.
+// `__trap_entry` now loads the kernel's own pointer immediately after saving the user's, from a
+// word parked eight bytes below the trap sp - written by `riscv64_enter_umode` for the first
+// excursion and by `__trap_return` for every one after it, each time by the hart that is about to
+// return, so a thread resumed on a different hart gets THAT hart's block. The user's value goes
+// back from the frame on the way out, so U-mode keeps its own `tp` and never sees the kernel's.
 //
-// THE ACTUAL FIX is to establish a trusted per-hart pointer on every trap before any Rust runs, the
-// way `sp` already is. `sscratch` cannot simply be shared: it holds the kernel trap stack for the
-// U-mode path and zero while an S-mode handler runs, which is what tells the two apart. The
-// conventional shape - the one Linux uses on this architecture - is to put the PER-CPU POINTER in
-// `sscratch` and derive the trap stack from the block it names, which is a restructuring of
-// `__trap_entry`, `riscv64_enter_umode` and the nested-trap discriminator together. That wants its
-// own round and a riscv64 guest run; this bound is what stands until then.
+// The check below stays, and its job has changed with the fix: it is no longer a bound on what ring
+// 3 can select but a statement that the establishment happened. A `tp` that is not exactly a slot
+// base means the trap path did not run, or ran and did not park the right word - a kernel defect,
+// caught here rather than dereferenced.
 fn trusted_tp() -> *mut PerCpu {
 	let raw: u64;
 	unsafe {

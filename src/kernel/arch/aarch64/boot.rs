@@ -574,6 +574,19 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// block + local GIC/timer, then idles).
 	super::psci::bring_up_secondaries(cpu_count, arg);
 
+	// W^X ACROSS THE DIRECT MAP, once every core that needs the boot stub has used it
+	// (KERN-ARCH-006). The stub maps 1-4 GiB with 1 GiB blocks that are writable AND executable,
+	// so every page of RAM is executable through the direct map and the kernel's own text is
+	// writable through it. This replaces them with 2 MiB blocks: read-execute over `.text` and
+	// `.rodata`, write-no-execute over everything else.
+	//
+	// AFTER the secondaries, and that ordering is the whole reason this is not in the stub. A
+	// secondary enables its MMU and then keeps executing at its LOW physical PC through the same
+	// tables - inside the boot section - so marking that section execute-never before they are up
+	// would fault each of them on the instruction after `msr sctlr_el1`. Nothing re-enters
+	// `.text.boot` afterwards, so from here it is data like any other.
+	super::paging::harden_direct_map();
+
 	// The portable scheduler on top of the arch context/percpu contract, sized for
 	// every online core so a secondary's timer tick indexes its own (empty) run queue
 	// rather than running off the end. The same scheduler the x86_64/riscv64 kernels

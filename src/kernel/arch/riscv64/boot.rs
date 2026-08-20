@@ -419,6 +419,17 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// block, trap vector, and local timer, then idles until the scheduler is ready).
 	super::smp::bring_up_secondaries(cpu_count, hartid);
 
+	// W^X ACROSS THE DIRECT MAP, once every hart that needs the identity window has used it
+	// (KERN-ARCH-006). The stub maps it and the whole high direct map with 1 GiB leaves carrying
+	// `V|R|W|X`, so every page of RAM is executable through them and the kernel's own text is
+	// writable through them. This replaces them with 2 MiB leaves: read-execute over `.text` and
+	// `.rodata`, read-write-no-execute over everything else.
+	//
+	// AFTER the secondaries, and that ordering is the reason it is not in the stub: a hart keeps
+	// executing at its LOW physical PC once `satp` is set, so taking execute off the identity
+	// window before they are up would fault each of them on the instruction after `csrw satp`.
+	super::paging::harden_direct_map();
+
 	// The portable scheduler on top of the arch context/percpu contract.
 	crate::sched::allocate(cpu_count as usize);
 	crate::sched::init();

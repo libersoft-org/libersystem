@@ -38,10 +38,27 @@ SECTIONS
 		. += 3 * 4096; /* BOOT_L1, BOOT_L0_LOW, BOOT_L0_HIGH */
 		. = ALIGN(4096);
 	} :boot
+	/* TWO-MEGABYTE BOUNDARY, so the direct map can be split here (KERN-ARCH-006).
+	 *
+	 * The kernel runs out of the direct map - virtual = physical | KOFF - and the boot stub maps
+	 * that with 1 GiB blocks, which are writable AND executable: every page of RAM is executable
+	 * through it and the kernel's own text is writable through it. `harden_direct_map` replaces
+	 * those blocks with 2 MiB ones and gives each the permissions its contents want, and it can
+	 * only do that where a permission boundary IS a 2 MiB boundary.
+	 *
+	 * This one separates the boot section - which holds the page tables themselves and must stay
+	 * writable - from `.text`, which must not be. OUTSIDE the section, so the gap is between two
+	 * loadable segments and costs address space rather than a megabyte and a half of zeros in the
+	 * image. */
+	. = ALIGN(2M);
 	__boot_phys_end = .;
 
 	/* Higher-half kernel: virtual = KOFF + physical (load address). */
 	. = __boot_phys_end + KOFF;
+	/* The read-execute span, as HIGHER-HALF addresses: the kernel that reads them runs there, and
+	 * a low symbol is out of range of an `adrp` from the higher half. `harden_direct_map` masks
+	 * KOFF off, the way `usable_region` already does for `__kernel_end`. */
+	__kernel_rx_start = .;
 
 	.text : AT(ADDR(.text) - KOFF) {
 		*(.text .text.*)
@@ -66,7 +83,10 @@ SECTIONS
 		__extable_end = .;
 	} :rodata
 
-	. = ALIGN(CONSTANT(MAXPAGESIZE));
+	/* And the second boundary: everything above here is written, so nothing above here may be
+	 * executable. `__kernel_rx_end` is the physical address the split stops treating as text. */
+	. = ALIGN(2M);
+	__kernel_rx_end = .;
 
 	.data : AT(ADDR(.data) - KOFF) {
 		*(.data .data.*)

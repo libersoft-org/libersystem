@@ -38,6 +38,7 @@ const PTE_R: u64 = 1 << 1; // readable
 const PTE_W: u64 = 1 << 2; // writable
 const PTE_X: u64 = 1 << 3; // executable
 const PTE_U: u64 = 1 << 4; // user-accessible
+const PTE_G: u64 = 1 << 5; // global - the same translation in every address space, which the direct map is
 const PTE_A: u64 = 1 << 6; // accessed
 const PTE_D: u64 = 1 << 7; // dirty
 // A leaf PTE has at least one of R/W/X set; a pointer (non-leaf) has R=W=X=0.
@@ -209,6 +210,117 @@ pub fn usable_region(ram_top: u64) -> (u64, u64) {
 }
 
 // Allocate one zeroed 4 kB physical frame from the portable pool, or None if exhausted.
+// SPLIT THE DIRECT MAP AND GIVE EACH PART THE PERMISSIONS ITS CONTENTS WANT (KERN-ARCH-006).
+//
+// The boot stub maps the high direct map with 1 GiB leaves carrying `V|R|W|X|G|A|D` and the low
+// identity window with one more. The kernel runs out of the direct map - virtual = physical | KOFF
+// - so two things follow that the tree advertises as impossible: every page of RAM is executable
+// through it, and the kernel's own text is writable through it.
+//
+// Each of those leaves becomes a table of 2 MiB leaves:
+//
+//   [__kernel_rx_start, __kernel_rx_end)   read + execute        - `.text`, `.rodata`, `.extable`
+//   everything else                        read + write, no exec - all other RAM
+//
+// The low identity window loses execute entirely: it exists so the boot stub keeps running when
+// paging turns on, and nothing re-enters it afterwards.
+//
+// The linker script aligns both boundaries to 2 MiB for exactly this. A permission boundary inside
+// a leaf would force the leaf to be the union of what its two halves need, which is where W^X goes
+// to die.
+//
+// Called once, on the boot hart, after the frame allocator is up and after every secondary has
+// adopted these tables - a secondary keeps executing at its LOW physical PC once `satp` is set, so
+// taking execute off the identity window before they are up would fault each of them.
+pub fn harden_direct_map() {
+	unsafe extern "C" {
+		static __kernel_rx_start: u8;
+		static __kernel_rx_end: u8;
+	}
+	const TWO_MB: u64 = 2 * 1024 * 1024;
+	const GIB: u64 = 1024 * 1024 * 1024;
+	let rx_start = (&raw const __kernel_rx_start as u64) & !KERNEL_VA_OFFSET;
+	let rx_end = (&raw const __kernel_rx_end as u64) & !KERNEL_VA_OFFSET;
+
+	let root = current_satp_root();
+	let _guard = PT_LOCK.lock();
+	// The high direct map is root[256..264] - 0..8 GiB at KERNEL_VA_OFFSET - and root[2] is the low
+	// identity window the stub runs in. Every other root slot is a user mapping or absent.
+	let mut split = |slot: usize, base: u64, allow_execute: bool| -> bool {
+		let entry = (phys_to_virt(root) as *mut u64).wrapping_add(slot);
+		let descriptor = unsafe { core::ptr::read_volatile(entry) };
+		// Only a valid LEAF is split: a pointer here means somebody has already been finer than the
+		// stub, and replacing it would throw their mappings away.
+		if descriptor & PTE_V == 0 || descriptor & PTE_RWX == 0 {
+			return true;
+		}
+		let Some(table) = alloc_frame() else {
+			return false;
+		};
+		for index in 0..512usize {
+			let leaf_pa = base + index as u64 * TWO_MB;
+			let executable = allow_execute && leaf_pa >= rx_start && leaf_pa + TWO_MB <= rx_end;
+			let permissions = if executable { PTE_R | PTE_X } else { PTE_R | PTE_W };
+			let bits = ((leaf_pa >> 12) << 10) | permissions | PTE_V | PTE_G | PTE_A | PTE_D;
+			unsafe { core::ptr::write_volatile((phys_to_virt(table) as *mut u64).wrapping_add(index), bits) };
+		}
+		// A pointer entry has R, W and X all clear; the permissions live in the leaves it names.
+		unsafe { core::ptr::write_volatile(entry, ((table >> 12) << 10) | PTE_V) };
+		true
+	};
+	let mut complete = true;
+	for gib in 0..8usize {
+		complete &= split(256 + gib, gib as u64 * GIB, true);
+	}
+	// The identity window: the same RAM, and nothing executes there once the harts are up.
+	complete &= split(2, 2 * GIB, false);
+	unsafe {
+		asm!("sfence.vma", options(nostack, preserves_flags));
+	}
+	if !complete {
+		crate::serial_println!("riscv64: not enough frames to split the whole direct map - part of it stays writable-executable");
+		return;
+	}
+	crate::serial_println!("riscv64: direct map split at 2 MiB - text {rx_start:#x}..{rx_end:#x} is read-execute, the rest is write-no-execute");
+}
+
+// Whether the direct map still carries a writable-executable alias, for the test that asks.
+pub fn writable_executable_block() -> Option<u64> {
+	const TWO_MB: u64 = 2 * 1024 * 1024;
+	const GIB: u64 = 1024 * 1024 * 1024;
+	let root = current_satp_root();
+	let check = |slot: usize, base: u64| -> Option<u64> {
+		let descriptor = unsafe { core::ptr::read_volatile((phys_to_virt(root) as *const u64).add(slot)) };
+		if descriptor & PTE_V == 0 {
+			return None;
+		}
+		if descriptor & PTE_RWX != 0 {
+			// Still a 1 GiB leaf: writable and executable together is the defect.
+			if descriptor & PTE_W != 0 && descriptor & PTE_X != 0 {
+				return Some(base);
+			}
+			return None;
+		}
+		let table = ((descriptor >> 10) & 0xFFF_FFFF_FFFF) << 12;
+		for index in 0..512usize {
+			let leaf = unsafe { core::ptr::read_volatile((phys_to_virt(table) as *const u64).add(index)) };
+			if leaf & PTE_V == 0 || leaf & PTE_RWX == 0 {
+				continue;
+			}
+			if leaf & PTE_W != 0 && leaf & PTE_X != 0 {
+				return Some(base + index as u64 * TWO_MB);
+			}
+		}
+		None
+	};
+	for gib in 0..8usize {
+		if let Some(at) = check(256 + gib, gib as u64 * GIB) {
+			return Some(at);
+		}
+	}
+	check(2, 2 * GIB)
+}
+
 pub fn alloc_frame() -> Option<u64> {
 	let pa = crate::mem::frame::allocate()?;
 	unsafe {

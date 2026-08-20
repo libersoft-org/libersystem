@@ -225,3 +225,26 @@ fn ring_three_cannot_write_the_gs_base() {
 	// The other two backends reach per-CPU state through TPIDR_EL1 and the `sscratch`/`tp` pair,
 	// neither of which ring 3 can write, so there is no equivalent bit to establish.
 }
+
+crate::tagged_test!(
+	#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+	the_direct_map_has_no_writable_executable_alias,
+	[Paging, Memory, Kernel],
+	id = "kernel.arch.the_direct_map_has_no_writable_executable_alias",
+	covers = ["kernel"]
+);
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+fn the_direct_map_has_no_writable_executable_alias() {
+	// KERN-ARCH-006. Both boot stubs map RAM with 1 GiB blocks that are writable AND executable,
+	// and the kernel runs out of that map - so W^X, which this tree advertises, held on one target
+	// of three: every page of RAM was executable through the direct map, and the kernel's own text
+	// was writable through it.
+	//
+	// `harden_direct_map` splits those blocks at 2 MiB and gives each part the permissions its
+	// contents want. This walks the LIVE tables afterwards and requires that no leaf is both - the
+	// property itself, read out of the hardware's own descriptors rather than out of the code that
+	// wrote them.
+	if let Some(at) = crate::arch::paging::writable_executable_block() {
+		panic!("the direct map is still writable and executable at {at:#x}");
+	}
+}

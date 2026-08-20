@@ -157,6 +157,131 @@ pub fn usable_region(ram_top: u64) -> (u64, u64) {
 	(base, top.saturating_sub(base))
 }
 
+// SPLIT THE DIRECT MAP AND GIVE EACH PART THE PERMISSIONS ITS CONTENTS WANT (KERN-ARCH-006).
+//
+// The boot stub maps 1-4 GiB with three 1 GiB Normal blocks, and a block descriptor with AP=00 and
+// no PXN/UXN is READABLE, WRITABLE AND EXECUTABLE. The kernel runs out of that map - virtual =
+// physical | KOFF - so two things follow that the tree advertises as impossible: every page of RAM
+// is executable through the direct map, and the kernel's own text is writable through it.
+//
+// This replaces each of those blocks with a table of 2 MiB blocks and gives each block one of two
+// shapes:
+//
+//   [__boot_phys_end, __kernel_rx_end)   read-only, executable   - `.text`, `.rodata`, `.extable`
+//   everything else                      writable, execute-never - all other RAM, including the
+//                                                                  boot section that holds these
+//                                                                  very tables
+//
+// The linker script aligns both boundaries to 2 MiB for exactly this, which is what makes a block
+// granularity enough: a permission boundary that fell inside a block would force the block to be
+// the union of what its two halves need, which is where W^X goes to die.
+//
+// WHY NOT 4 kB: nothing here needs it. Splitting further would separate `.rodata` from `.text` -
+// worth having, and a different property from the one the finding names. Executable read-only data
+// is not a writable-executable alias.
+//
+// Called once, on the boot hart, after the frame allocator is up (it allocates the tables) and
+// before any secondary hart is started or any userspace runs. The secondaries load the same TTBR1.
+// The L1 the boot stub filled with 1 GiB blocks. TTBR1 holds the L0 - with T1SZ=16 the kernel's
+// whole half sits under L0[0] - so a walk of the direct map starts one level DOWN from the root.
+fn boot_l1() -> Option<u64> {
+	let l0 = current_ttbr1();
+	let root = unsafe { core::ptr::read_volatile(phys_to_virt(l0) as *const u64) };
+	if root & VALID == 0 || root & TABLE == 0 {
+		return None;
+	}
+	Some(root & ADDR_MASK)
+}
+
+pub fn harden_direct_map() {
+	unsafe extern "C" {
+		static __kernel_rx_start: u8;
+		static __kernel_rx_end: u8;
+	}
+	const TWO_MB: u64 = 2 * 1024 * 1024;
+	const GIB: u64 = 1024 * 1024 * 1024;
+	// HIGHER-HALF SYMBOLS, masked down. The linker places them in the kernel's own half because a
+	// low symbol is out of `adrp` range from code that runs there; `usable_region` does the same
+	// with `__kernel_end`.
+	let rx_start = (&raw const __kernel_rx_start as u64) & !KERNEL_VA_OFFSET;
+	let rx_end = (&raw const __kernel_rx_end as u64) & !KERNEL_VA_OFFSET;
+
+	let Some(l1) = boot_l1() else {
+		crate::serial_println!("aarch64: TTBR1 has no L1 under L0[0] - the direct map is not the stub's, leaving it alone");
+		return;
+	};
+	let _guard = PT_LOCK.lock();
+	// L1 indices 1, 2 and 3 are the three DRAM gigabytes the stub mapped as blocks; index 0 is the
+	// device gigabyte and 256 the high ECAM, both of which stay exactly as they are.
+	for index in 1..4usize {
+		let entry = (phys_to_virt(l1) as *mut u64).wrapping_add(index);
+		let descriptor = unsafe { core::ptr::read_volatile(entry) };
+		// Only a valid BLOCK is split. A table here means somebody has already been finer than the
+		// stub, and replacing it would throw their mappings away.
+		if descriptor & VALID == 0 || descriptor & TABLE != 0 {
+			continue;
+		}
+		let Some(table) = alloc_frame() else {
+			crate::serial_println!("aarch64: no frame to split the direct map at {} GiB - it stays writable-executable", index);
+			return;
+		};
+		let base = index as u64 * GIB;
+		for slot in 0..512usize {
+			let block = base + slot as u64 * TWO_MB;
+			// A block is text ONLY if it lies wholly inside the read-execute span. The bounds are
+			// 2 MiB aligned, so "wholly inside" and "overlaps" are the same question here - stated
+			// as containment because that is the property being relied on.
+			let executable = block >= rx_start && block + TWO_MB <= rx_end;
+			let mut bits = VALID | AF | ATTR_NORMAL | SH_INNER | block;
+			if executable {
+				bits |= 1 << 7; // AP[2] - read-only at EL1
+			} else {
+				bits |= PXN | UXN;
+			}
+			unsafe { core::ptr::write_volatile((phys_to_virt(table) as *mut u64).wrapping_add(slot), bits) };
+		}
+		unsafe { core::ptr::write_volatile(entry, table | VALID | TABLE) };
+	}
+	// The new tables must be visible before the old translations are dropped, and the old
+	// translations must be gone before the next instruction is fetched through one.
+	unsafe {
+		asm!("dsb ishst", "tlbi vmalle1is", "dsb ish", "isb", options(nostack, preserves_flags));
+	}
+	crate::serial_println!("aarch64: direct map split at 2 MiB - text {rx_start:#x}..{rx_end:#x} is read-execute, the rest is write-no-execute");
+}
+
+// Whether the direct map still carries a writable-executable alias, for the test that asks. Walks
+// the live tables and reports the first 2 MiB block that is both.
+pub fn writable_executable_block() -> Option<u64> {
+	const TWO_MB: u64 = 2 * 1024 * 1024;
+	const GIB: u64 = 1024 * 1024 * 1024;
+	let l1 = boot_l1()?;
+	for index in 1..4usize {
+		let descriptor = unsafe { core::ptr::read_volatile((phys_to_virt(l1) as *const u64).add(index)) };
+		if descriptor & VALID == 0 {
+			continue;
+		}
+		if descriptor & TABLE == 0 {
+			// Still a 1 GiB block: writable (AP[2] clear) and executable (PXN clear) is the defect.
+			if descriptor & (1 << 7) == 0 && descriptor & PXN == 0 {
+				return Some(index as u64 * GIB);
+			}
+			continue;
+		}
+		let table = descriptor & ADDR_MASK;
+		for slot in 0..512usize {
+			let block = unsafe { core::ptr::read_volatile((phys_to_virt(table) as *const u64).add(slot)) };
+			if block & VALID == 0 || block & TABLE != 0 {
+				continue;
+			}
+			if block & (1 << 7) == 0 && block & PXN == 0 {
+				return Some(index as u64 * GIB + slot as u64 * TWO_MB);
+			}
+		}
+	}
+	None
+}
+
 // Allocate one zeroed 4 kB physical frame from the portable pool, or None when
 // memory is exhausted.
 pub fn alloc_frame() -> Option<u64> {

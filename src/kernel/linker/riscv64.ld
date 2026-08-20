@@ -40,10 +40,22 @@ SECTIONS
 		. += 4096; /* one Sv39 root table (512 * 8 B) */
 		. = ALIGN(4096);
 	} :boot
+	/* TWO-MEGABYTE BOUNDARY, so the direct map can be split here (KERN-ARCH-006).
+	 *
+	 * The kernel runs out of the direct map - virtual = KOFF + physical - and the boot stub maps it
+	 * with 1 GiB leaves carrying V|R|W|X: every page of RAM is executable through it and the
+	 * kernel's own text is writable through it. `harden_direct_map` replaces those leaves with
+	 * 2 MiB ones and gives each the permissions its contents want, which needs each permission
+	 * boundary to BE a 2 MiB boundary. Outside the section, so the gap costs address space rather
+	 * than image bytes. */
+	. = ALIGN(2M);
 	__boot_phys_end = .;
 
 	/* Higher-half kernel: virtual = KOFF + physical (load address). */
 	. = __boot_phys_end + KOFF;
+	/* The read-execute span, as higher-half addresses - `harden_direct_map` masks KOFF off, the way
+	 * `usable_region` already does for `__kernel_end`. */
+	__kernel_rx_start = .;
 
 	.text : AT(ADDR(.text) - KOFF) {
 		*(.text .text.*)
@@ -69,7 +81,10 @@ SECTIONS
 		__extable_end = .;
 	} :rodata
 
-	. = ALIGN(4096);
+	/* And the second boundary: everything above here is written, so nothing above here may be
+	 * executable. */
+	. = ALIGN(2M);
+	__kernel_rx_end = .;
 
 	.data : AT(ADDR(.data) - KOFF) {
 		*(.data .data.*)
