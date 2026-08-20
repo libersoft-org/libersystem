@@ -186,13 +186,9 @@ pub fn setup_ramfb(fwcfg_base: u64, width: u32, height: u32, p2v: fn(u64) -> u64
 	let result = unsafe { probe_and_program(&fw, dma_pa, buf_pa, buf_cap, width, height) };
 
 	// The scratch pages are only needed during setup.
-	for i in 0..SCRATCH_PAGES as u64 {
-		// SAFETY: pages of the contiguous scratch span allocated for this setup and used
-		// by nothing else once `probe_and_program` has returned.
-		// NEVER-MAPPED: firmware scratch reached through the physical map only - it is never
-		// entered into a page table, and this runs at boot before any other core is up.
-		unsafe { crate::mem::frame::deallocate(scratch + i * 4096) };
-	}
+	// SAFETY: the contiguous scratch span allocated for this setup and used by nothing else once
+	// `probe_and_program` has returned.
+	unsafe { release_span(scratch, SCRATCH_PAGES) };
 	result
 }
 
@@ -257,15 +253,32 @@ unsafe fn probe_and_program(fw: &FwCfg, dma_pa: u64, buf_pa: u64, buf_cap: u64, 
 		fw.put_be32(buf_pa + 20, height);
 		fw.put_be32(buf_pa + 24, stride);
 		if !fw.dma(dma_pa, (ramfb_sel as u32) << 16 | DMA_SELECT | DMA_WRITE, 28, buf_pa) {
-			// SAFETY: the framebuffer span this call allocated, never published - the DMA
-			// that would have handed it to the device is what just failed.
-			// NEVER-MAPPED: allocated for the device and never entered into a page table; the DMA
-			// that would have published it is what failed.
-			crate::mem::frame::deallocate(fb_phys); // the run stays contiguous
+			// THE WHOLE SPAN, NOT ITS FIRST PAGE (KERN-ARCH-022).
+			//
+			// `deallocate` releases exactly one frame - the comment beside it said "the run stays
+			// contiguous", which is true of the memory and says nothing about how much of it comes
+			// back. A 1920x1080 framebuffer is 2025 pages, so this failure path leaked 2024 of them
+			// and the boot carried on with that memory simply gone.
+			release_span(fb_phys, fb_pages);
 			return None;
 		}
 
 		Some(RamFb { phys: fb_phys, width, height, stride })
+	}
+}
+
+// Give back a contiguous span this module allocated and never published.
+//
+// # Safety
+//
+// `phys` must be the base of a `pages`-page `allocate_contiguous` span still owned by the caller,
+// freed exactly once, and not mapped anywhere.
+pub(crate) unsafe fn release_span(phys: u64, pages: usize) {
+	for i in 0..pages as u64 {
+		// SAFETY: a page of the caller's own contiguous span, per this function's contract.
+		// NEVER-MAPPED: these spans are firmware buffers reached through the physical map; none of
+		// them is ever entered into a page table.
+		unsafe { crate::mem::frame::deallocate(phys + i * 4096) };
 	}
 }
 
@@ -282,3 +295,6 @@ unsafe fn name_eq(fw: &FwCfg, name_pa: u64, want: &[u8]) -> bool {
 		read_volatile((fw.p2v)(name_pa + want.len() as u64) as *const u8) == 0
 	}
 }
+
+#[cfg(test)]
+mod tests;

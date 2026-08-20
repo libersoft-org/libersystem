@@ -18,7 +18,12 @@ use crate::sched;
 
 pub struct Interrupt {
 	header: ObjectHeader,
-	vector: u8,
+	// THE ARCHITECTURAL INTERRUPT ID, at the width the architecture uses (KERN-ARCH-017).
+	//
+	// An x86 IDT vector fits a byte; a GICv2m SPI is ten bits and an IMSIC EID is eleven, so on two
+	// of three ports a `u8` was a truncation - the hardware stayed armed under one identifier while
+	// the kernel's registry, bind, cleanup and reporting paths all named another.
+	vector: u32,
 	// Set when the IRQ has fired and not yet been cleared; the wait readiness.
 	pending: AtomicBool,
 	// Set once this Interrupt actually owns its vector's binding, so only the owner
@@ -28,11 +33,11 @@ pub struct Interrupt {
 
 impl Interrupt {
 	// FALLIBLY: `SYS_IRQ_BIND` and `SYS_DEVICE_MSIX_ACQUIRE` reach this.
-	pub fn new(vector: u8) -> Option<Arc<Self>> {
+	pub fn new(vector: u32) -> Option<Arc<Self>> {
 		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), vector, pending: AtomicBool::new(false), bound: AtomicBool::new(false) })
 	}
 
-	pub fn vector(&self) -> u8 {
+	pub fn vector(&self) -> u32 {
 		self.vector
 	}
 

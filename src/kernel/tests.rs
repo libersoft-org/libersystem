@@ -1948,6 +1948,48 @@ extern "C" fn user_stack_probe_thread_body(pages: u64) {
 	}
 }
 
+// Where the register-scrub probe's outcome lands: the OR of every user-visible register the ring-3
+// program could see, and the bitmask of kernel FP canaries the excursion failed to give back.
+#[cfg(target_arch = "aarch64")]
+static SCRUB_SEEN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+#[cfg(target_arch = "aarch64")]
+static SCRUB_FP: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(u64::MAX);
+
+// Kernel-thread body for the register-scrub probe (KERN-ARCH-002). It maps a third page the ring-3
+// program can write its verdict into, enters EL0 with canaries in the kernel's callee-saved FP
+// registers, and records both halves of the measurement: what ring 3 could see of the kernel, and
+// what the kernel got back from ring 3.
+#[cfg(target_arch = "aarch64")]
+extern "C" fn user_register_scrub_thread_body(_arg: u64) {
+	use core::sync::atomic::Ordering;
+	use mem::frame::{self, PAGE_SIZE};
+	// Above the code and stack pages, and clear of the spin probe's flag page.
+	const SCRUB_DATA_VA: u64 = 0x0000_0000_4000_3000;
+	let code = frame::allocate().expect("user code frame");
+	let stack = frame::allocate().expect("user stack frame");
+	let data = frame::allocate().expect("user data frame");
+	// Zeroed, so a recycled frame cannot pass for a clean verdict.
+	unsafe { core::ptr::write_bytes((mem::hhdm_offset() + data) as *mut u8, 0, PAGE_SIZE as usize) };
+	let flags = arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER;
+	arch::paging::map_page(USER_CODE_VA, code, flags);
+	arch::paging::map_page(USER_STACK_VA, stack, flags | arch::paging::NO_EXECUTE);
+	arch::paging::map_page(SCRUB_DATA_VA, data, flags | arch::paging::NO_EXECUTE);
+	let program = arch::usermode::program_register_scrub_bytes();
+	let mismatch = unsafe {
+		arch::paging::copy_to_user_page(USER_CODE_VA, program);
+		arch::usermode::enter_measuring_fp(USER_CODE_VA, USER_STACK_VA + PAGE_SIZE, SCRUB_DATA_VA)
+	};
+	let seen = unsafe { core::ptr::read_volatile((mem::hhdm_offset() + data) as *const u64) };
+	SCRUB_SEEN.store(seen, Ordering::SeqCst);
+	SCRUB_FP.store(mismatch, Ordering::SeqCst);
+	arch::paging::unmap_page(USER_CODE_VA);
+	arch::paging::unmap_page(USER_STACK_VA);
+	arch::paging::unmap_page(SCRUB_DATA_VA);
+	unsafe { frame::deallocate(code) };
+	unsafe { frame::deallocate(stack) };
+	unsafe { frame::deallocate(data) };
+}
+
 // Kernel-thread body that drops to ring 3 running the no-execute probe: the
 // program jumps into its writable, no-execute stack page, so the instruction
 // fetch itself must page-fault (W^X). Mirrors user_fault_thread_body.

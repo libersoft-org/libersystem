@@ -1142,10 +1142,12 @@ fn sys_interrupt_bind(vector: u64, privilege: u64) -> i64 {
 		return error;
 	}
 	let thread = current_thread!();
-	if vector > u8::MAX as u64 || !arch::interrupts::is_bindable(vector as u8) {
+	// The bound is the identifier's width, and the backend decides what is bindable inside it -
+	// a byte was the x86 IDT's limit standing in for every architecture's (KERN-ARCH-017).
+	if vector > u32::MAX as u64 || !arch::interrupts::is_bindable(vector as u32) {
 		return ERR_INVALID;
 	}
-	let v = vector as u8;
+	let v = vector as u32;
 	let Some(interrupt) = Interrupt::new(v) else { return ERR_RESOURCE_EXHAUSTED };
 	if !arch::interrupts::bind(v, &interrupt) {
 		return ERR_RESOURCE_EXHAUSTED;

@@ -5,6 +5,26 @@
 // disciplines it against NTP and combines it with the monotonic clock.
 
 use super::port::{inb, outb};
+use crate::sync::SpinLock;
+
+// THE INDEX/DATA PAIR IS ONE PIECE OF STATE, AND EVERY CPU SHARES IT (KERN-ARCH-023).
+//
+// A CMOS read is two port accesses - select at 0x70, then read at 0x71 - and nothing held them
+// together. Another core selecting its own register in between meant the first core read whatever
+// the second had selected: a minute where the hour should be, or a status byte, silently and with
+// the right shape. Every access below goes through this.
+static CMOS: SpinLock<()> = SpinLock::new(());
+
+// AND EVERY WAIT IS BOUNDED (KERN-ARCH-023).
+//
+// The update-in-progress wait and the two-agreeing-snapshots loop were both unbounded. An RTC that
+// is absent, or wedged with `UIP` stuck, or ticking faster than the reads, spins forever - and
+// `SYS_CLOCK_RTC` reaches here from a syscall entry with interrupts masked, so ring 3 could wedge a
+// core with no timer left to take it back. The numbers are budgets, not measurements: one update
+// takes under 2 ms and the registers change once a second, so a clock behaving as specified is
+// nowhere near either.
+const UIP_SPINS: u32 = 5_000_000;
+const SNAPSHOT_TRIES: u32 = 16;
 
 // CMOS register indices.
 const REG_SECONDS: u8 = 0x00;
@@ -25,17 +45,17 @@ const STATUS_B_24H: u8 = 0x02;
 const STATUS_B_BINARY: u8 = 0x04;
 const HOURS_PM: u8 = 0x80;
 
-// Read one CMOS register.
+// Read one CMOS register. The caller holds `CMOS`.
+//
+// Bit 7 of the index port is the NMI MASK: a one there disables non-maskable interrupts until
+// something writes a zero. Every register index here is below 0x80, so the old code left NMI
+// enabled by arithmetic rather than by decision. Stated, because a future index with the high bit
+// set would silently turn NMI off for the life of the machine.
 unsafe fn read_reg(reg: u8) -> u8 {
 	unsafe {
-		outb(0x70, reg);
+		outb(0x70, reg & 0x7f); // high bit clear: NMI stays enabled
 		inb(0x71)
 	}
-}
-
-// Whether the RTC is mid-update (its time registers should not be read now).
-unsafe fn updating() -> bool {
-	unsafe { read_reg(REG_STATUS_A) & STATUS_A_UPDATING != 0 }
 }
 
 // Decode a BCD byte (each nibble a decimal digit) to binary.
@@ -55,33 +75,48 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 	era * 146097 + doe - 719468
 }
 
-// Read the wall clock as a Unix timestamp (seconds since 1970-01-01 UTC), or 0 if
-// the RTC reports an implausible date. The fields are read twice and re-read until
-// two consecutive snapshots agree, so a read straddling an RTC update is rejected.
-pub fn read_unix() -> u64 {
-	unsafe {
-		// Take a stable snapshot: wait out any in-progress update, read the fields,
-		// then re-read until two passes match (the registers did not tick mid-read).
-		let mut prev: [u8; 7] = [0xff; 7];
-		loop {
-			while updating() {}
-			let snap: [u8; 7] = [read_reg(REG_SECONDS), read_reg(REG_MINUTES), read_reg(REG_HOURS), read_reg(REG_DAY), read_reg(REG_MONTH), read_reg(REG_YEAR), read_reg(REG_CENTURY)];
-			if snap == prev {
-				break;
+// A stable reading of the seven time registers, or None if the clock never settled.
+//
+// Two consecutive passes must agree, which is what rejects a read straddling an RTC update. Both
+// the wait for `UIP` to clear and the number of passes are bounded, so a clock that is absent,
+// wedged or changing continuously ends this function instead of owning the core.
+//
+// `read` is a parameter so the loop can be driven by something other than the ports: the bound is
+// the property worth testing, and a test that needed real CMOS hardware could not test it.
+pub(crate) fn snapshot(read: impl Fn(u8) -> u8, uip_spins: u32, tries: u32) -> Option<[u8; 7]> {
+	let mut prev: Option<[u8; 7]> = None;
+	for _ in 0..tries {
+		let mut spins: u32 = 0;
+		while read(REG_STATUS_A) & STATUS_A_UPDATING != 0 {
+			spins += 1;
+			if spins >= uip_spins {
+				return None;
 			}
-			prev = snap;
 		}
-		let status_b: u8 = read_reg(REG_STATUS_B);
+		let snap: [u8; 7] = [read(REG_SECONDS), read(REG_MINUTES), read(REG_HOURS), read(REG_DAY), read(REG_MONTH), read(REG_YEAR), read(REG_CENTURY)];
+		if prev == Some(snap) {
+			return Some(snap);
+		}
+		prev = Some(snap);
+	}
+	None
+}
+
+// Turn a stable snapshot and the status B byte into a Unix timestamp, or 0 for a date the clock
+// cannot plausibly be reporting. Split out for the same reason as `snapshot`: BCD, the 12-hour PM
+// flag and the century register are decisions worth testing, and none of them needs a port.
+pub(crate) fn decode(snap: [u8; 7], status_b: u8) -> u64 {
+	{
 		let binary: bool = status_b & STATUS_B_BINARY != 0;
 		let h24: bool = status_b & STATUS_B_24H != 0;
 
-		let mut second: u8 = prev[0];
-		let mut minute: u8 = prev[1];
-		let raw_hours: u8 = prev[2];
-		let mut day: u8 = prev[3];
-		let mut month: u8 = prev[4];
-		let mut year: u8 = prev[5];
-		let mut century: u8 = prev[6];
+		let mut second: u8 = snap[0];
+		let mut minute: u8 = snap[1];
+		let raw_hours: u8 = snap[2];
+		let mut day: u8 = snap[3];
+		let mut month: u8 = snap[4];
+		let mut year: u8 = snap[5];
+		let mut century: u8 = snap[6];
 		// The PM flag rides bit 7 of the hours register in 12-hour mode; strip it
 		// before decoding the hour value, then re-apply after.
 		let mut hour: u8 = raw_hours & !HOURS_PM;
@@ -113,3 +148,20 @@ pub fn read_unix() -> u64 {
 		if secs < 0 { 0 } else { secs as u64 }
 	}
 }
+
+// Read the wall clock as a Unix timestamp (seconds since 1970-01-01 UTC), or 0 if the RTC reports
+// an implausible date or never gives a stable reading.
+pub fn read_unix() -> u64 {
+	// HELD ACROSS THE WHOLE SNAPSHOT, not per register: the point is that no other core selects a
+	// CMOS register between this core's select and its read, and that has to hold for the status
+	// byte read afterwards too, or the decode is done against somebody else's format bits.
+	let _guard = CMOS.lock();
+	let read = |reg: u8| unsafe { read_reg(reg) };
+	let Some(snap) = snapshot(&read, UIP_SPINS, SNAPSHOT_TRIES) else {
+		return 0;
+	};
+	decode(snap, read(REG_STATUS_B))
+}
+
+#[cfg(test)]
+mod tests;

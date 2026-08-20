@@ -44,7 +44,7 @@ pub const MSI_COUNT: usize = 192;
 // idle loop then finds the queued thread.
 pub const WAKE_VECTOR: u8 = 0xf0;
 
-pub type HandlerFn = fn(u8);
+pub type HandlerFn = fn(u32);
 
 static HANDLERS: [AtomicUsize; IRQ_COUNT] = [const { AtomicUsize::new(0) }; IRQ_COUNT];
 
@@ -58,11 +58,33 @@ static BOUND: [SpinLock<Option<Weak<Interrupt>>>; IRQ_COUNT] = [const { SpinLock
 static REGISTRY: MsiRegistry<MSI_COUNT> = MsiRegistry::new();
 
 // Kernel virtual base for mapping device MSI-X tables (uncacheable), clear of the
-// LAPIC (0xffff_f100) / IOAPIC (0xffff_f200) MMIO windows. One page per MSI slot; the
-// page-table chain is materialised at init (kernel PML4 active, before any process
-// address space exists) so runtime per-device mappings under it propagate to every
-// address space's shared kernel half.
+// LAPIC (0xffff_f100) / IOAPIC (0xffff_f200) MMIO windows. TWO pages per MSI slot (see
+// `msix_pages_for_entry`); the page-table chain is materialised at init (kernel PML4 active,
+// before any process address space exists) so runtime per-device mappings under it propagate to
+// every address space's shared kernel half.
 const MSIX_VIRT_BASE: u64 = 0xffff_f300_0000_0000;
+
+// An MSI-X table entry is sixteen bytes.
+const MSIX_ENTRY_BYTES: u64 = 16;
+
+// TWO PAGES OF ADDRESS SPACE PER SLOT, because one entry can need two (KERN-ARCH-016).
+const MSIX_SLOT_STRIDE: u64 = 0x2000;
+
+// Where this slot's table mapping starts.
+fn msix_virt(slot: usize) -> u64 {
+	MSIX_VIRT_BASE + slot as u64 * MSIX_SLOT_STRIDE
+}
+
+// How many pages must be mapped for an entry beginning `offset` bytes into its page.
+//
+// The MSI-X table's offset within its BAR is 8-BYTE aligned - the low three bits of the capability
+// field hold the BIR - so a sixteen-byte entry may legally begin at 0xff8 and end in the next page.
+// The backend mapped exactly one page and wrote four dwords at the offset, so for such a device the
+// last two - message data and vector control - went to an unmapped address: a kernel page fault
+// while programming an interrupt, and the same one page assumed again at teardown when masking.
+fn msix_pages_for_entry(offset: u64) -> u64 {
+	if offset + MSIX_ENTRY_BYTES > 0x1000 { 2 } else { 1 }
+}
 
 // Where each slot's MSI-X entry sits inside its mapped page, recorded when the entry is programmed
 // so the teardown masks the same words rather than guessing offset 0.
@@ -71,20 +93,23 @@ const NO_OFFSET: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::
 static MSIX_ENTRY_OFFSET: [core::sync::atomic::AtomicU32; MSI_COUNT] = [NO_OFFSET; MSI_COUNT];
 
 // Whether `vector` is a kernel MSI-X vector.
-fn is_msi(vector: u8) -> bool {
-	vector >= MSI_BASE && (vector as usize) < MSI_BASE as usize + MSI_COUNT
+fn is_msi(vector: u32) -> bool {
+	vector >= MSI_BASE as u32 && (vector as usize) < MSI_BASE as usize + MSI_COUNT
 }
 
 // Whether `vector` is a device-IRQ vector a driver may bind. The timer vector
 // (IRQ_BASE) is the kernel's own and is never handed out.
-pub fn is_bindable(vector: u8) -> bool {
-	vector > IRQ_BASE && vector < IRQ_BASE + IRQ_COUNT as u8
+pub fn is_bindable(vector: u32) -> bool {
+	vector > IRQ_BASE as u32 && vector < IRQ_BASE as u32 + IRQ_COUNT as u32
 }
 
 // Bind `intr` to `vector` so the dispatch path wakes it when the vector fires.
 // Returns false if the vector is already bound to a live Interrupt.
-pub fn bind(vector: u8, intr: &Arc<Interrupt>) -> bool {
-	let index = (vector - IRQ_BASE) as usize;
+pub fn bind(vector: u32, intr: &Arc<Interrupt>) -> bool {
+	if !is_bindable(vector) {
+		return false;
+	}
+	let index = (vector - IRQ_BASE as u32) as usize;
 	let mut slot = BOUND[index].lock();
 	if slot.as_ref().and_then(Weak::upgrade).is_some() {
 		return false;
@@ -95,7 +120,7 @@ pub fn bind(vector: u8, intr: &Arc<Interrupt>) -> bool {
 }
 
 // Remove any binding for `vector` (called from an Interrupt's Drop).
-pub fn unbind(vector: u8) {
+pub fn unbind(vector: u32) {
 	if is_msi(vector) {
 		// MASK the device's table entry, then unmap its page, and only then free the vector.
 		//
@@ -105,7 +130,7 @@ pub fn unbind(vector: u8) {
 		// infallible entry point turns into a panic. And nothing stopped the departing device from
 		// raising the vector, so the next driver to be given it could be woken by the last one's
 		// hardware: ownership confusion with no way for either side to notice.
-		let slot = (vector - MSI_BASE) as usize;
+		let slot = (vector - MSI_BASE as u32) as usize;
 		mask_and_unmap_msix_entry(slot);
 		// RETIRED, NOT FREED. The mask stops the next message; it says nothing about one the device
 		// has already sent, so a vector reused now can wake its next owner with the last owner's
@@ -114,7 +139,7 @@ pub fn unbind(vector: u8) {
 		REGISTRY.retire(slot);
 		return;
 	}
-	let index = vector.wrapping_sub(IRQ_BASE) as usize;
+	let index = vector.wrapping_sub(IRQ_BASE as u32) as usize;
 	if index < IRQ_COUNT {
 		*BOUND[index].lock() = None;
 	}
@@ -129,11 +154,11 @@ pub fn unbind(vector: u8) {
 // on the device, nothing can have been sent, and there is no owner to quiesce it. Retiring those
 // left the slot waiting for a message from a driver that was never created - repeatable, one slot
 // of a fixed table per failed acquire.
-pub fn release_unused_msi(vector: u8) {
+pub fn release_unused_msi(vector: u32) {
 	if !is_msi(vector) {
 		return;
 	}
-	let slot = (vector - MSI_BASE) as usize;
+	let slot = (vector - MSI_BASE as u32) as usize;
 	mask_and_unmap_msix_entry(slot);
 	REGISTRY.free(slot);
 }
@@ -156,7 +181,7 @@ pub fn release_unused_msi(vector: u8) {
 // Returns the vector; None if every MSI slot is taken OR this device already holds one. The caller
 // enables MSI-X on the device and binds an Interrupt to the returned vector with bind_msi. `owner`
 // is the discovered-device index the vector is acquired for, retained for the `lsirq` inventory.
-pub fn acquire_msi(table_phys: u64, dest: u8, owner: u32) -> Option<u8> {
+pub fn acquire_msi(table_phys: u64, dest: u8, owner: u32) -> Option<u32> {
 	program_acquired(REGISTRY.acquire(owner, MSI_COUNT)?, table_phys, dest)
 }
 
@@ -165,14 +190,16 @@ pub fn acquire_msi(table_phys: u64, dest: u8, owner: u32) -> Option<u8> {
 // See `MsiRegistry::acquire_unique_live`. This is what `sys_device_msix_acquire` calls; the form
 // above stays for the kernel's own bring-up test, which stands in for DeviceManager on a device the
 // booted system has already claimed.
-pub fn acquire_msi_unique(table_phys: u64, dest: u8, owner: u32) -> Option<u8> {
+pub fn acquire_msi_unique(table_phys: u64, dest: u8, owner: u32) -> Option<u32> {
 	program_acquired(REGISTRY.acquire_unique_live(owner, MSI_COUNT)?, table_phys, dest)
 }
 
-fn program_acquired(slot: usize, table_phys: u64, dest: u8) -> Option<u8> {
+fn program_acquired(slot: usize, table_phys: u64, dest: u8) -> Option<u32> {
+	// The IDT vector stays a byte - that is what an x86 gate index IS - and widens on the way out
+	// to the portable identifier every backend now speaks (KERN-ARCH-017).
 	let vector = MSI_BASE + slot as u8;
 	program_msix_entry(slot, table_phys, vector, dest);
-	Some(vector)
+	Some(vector as u32)
 }
 
 // The state of the device-interrupt vector at `index` over both windows: the fixed
@@ -185,15 +212,15 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 		// The timer vector has a dedicated IDT gate (not a HANDLERS entry), so it is
 		// reported in use explicitly - it is always the kernel's own.
 		let handled = vector == TIMER_VECTOR || HANDLERS[index].load(Ordering::SeqCst) != 0;
-		let bound = handled || is_bound(vector);
+		let bound = handled || is_bound(vector as u32);
 		return Some(abi::IrqInfo { vector: vector as u32, kind: abi::IRQ_KIND_FIXED, bound: bound as u32, device: abi::IRQ_NO_DEVICE });
 	}
 	let slot = index - IRQ_COUNT;
 	if slot >= MSI_COUNT {
 		return None;
 	}
-	let vector = MSI_BASE + slot as u8;
-	Some(abi::IrqInfo { vector: vector as u32, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector) as u32, device: REGISTRY.owner(slot) })
+	let vector = MSI_BASE as u32 + slot as u32;
+	Some(abi::IrqInfo { vector, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector) as u32, device: REGISTRY.owner(slot) })
 }
 
 // Free every MSI vector that is masked and waiting for `device` to be confirmed stopped, and answer
@@ -212,13 +239,18 @@ pub fn irq_info_len() -> usize {
 // allocated vector (edge-triggered), vector control = 0 (unmasked). A driver must
 // never write its own MSI-X table; only the kernel programs it here.
 fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
-	let virt = MSIX_VIRT_BASE + slot as u64 * 0x1000;
-	// Where in the page this device's entry sits, kept so the teardown can mask the SAME words.
-	// The table is page-mapped but the entry need not be at offset 0, and a mask written at a
-	// guessed offset would corrupt whatever the device keeps there instead.
-	MSIX_ENTRY_OFFSET[slot].store((table_phys & 0xfff) as u32, Ordering::Release);
-	super::paging::map_page(virt, table_phys & !0xfff, super::paging::WRITABLE | super::paging::NO_CACHE | super::paging::NO_EXECUTE);
-	let entry = (virt + (table_phys & 0xfff)) as *mut u32;
+	let virt = msix_virt(slot);
+	let offset = table_phys & 0xfff;
+	// Where in the page this device's entry sits, kept so the teardown can mask the SAME words -
+	// and so it knows whether the entry crossed into a second page. The table is page-mapped but
+	// the entry need not be at offset 0, and a mask written at a guessed offset would corrupt
+	// whatever the device keeps there instead.
+	MSIX_ENTRY_OFFSET[slot].store(offset as u32, Ordering::Release);
+	let flags = super::paging::WRITABLE | super::paging::NO_CACHE | super::paging::NO_EXECUTE;
+	for page in 0..msix_pages_for_entry(offset) {
+		super::paging::map_page(virt + page * 0x1000, (table_phys & !0xfff) + page * 0x1000, flags);
+	}
+	let entry = (virt + offset) as *mut u32;
 	let msg_addr: u32 = 0xFEE0_0000 | ((dest as u32) << 12);
 	unsafe {
 		entry.add(0).write_volatile(msg_addr); // message address low
@@ -235,38 +267,46 @@ fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
 // Then the page is unmapped, which is what makes the slot reusable - `program_msix_entry` maps at a
 // fixed per-slot address and mapping over a live leaf is refused.
 fn mask_and_unmap_msix_entry(slot: usize) {
-	let virt = MSIX_VIRT_BASE + slot as u64 * 0x1000;
+	let virt = msix_virt(slot);
 	// Only if this slot actually has a page mapped: `free` can be reached for a slot that was
 	// acquired and never programmed.
 	if super::paging::translate(virt).is_some() {
-		let entry = (virt + MSIX_ENTRY_OFFSET[slot].load(Ordering::Acquire) as u64) as *mut u32;
+		let offset = MSIX_ENTRY_OFFSET[slot].load(Ordering::Acquire) as u64;
+		let entry = (virt + offset) as *mut u32;
 		unsafe {
 			// Vector control bit 0 = masked. The device may still have a message in flight; masking
 			// stops the next one, which is all this can promise without the driver's cooperation.
 			entry.add(3).write_volatile(1);
 		}
-		super::paging::unmap_page(virt);
+		// EVERY PAGE THIS SLOT MAPPED, in reverse - the mask above is written through the second
+		// one when the entry straddles, so it has to go last.
+		for page in (0..msix_pages_for_entry(offset)).rev() {
+			super::paging::unmap_page(virt + page * 0x1000);
+		}
 	}
 }
 
 // Bind `intr` to an MSI `vector` so dispatch wakes it when the vector fires (the MSI
 // sibling of bind()). Returns false if the vector is already bound to a live Interrupt.
-pub fn bind_msi(vector: u8, intr: &Arc<Interrupt>) -> bool {
-	REGISTRY.bind((vector - MSI_BASE) as usize, intr)
+pub fn bind_msi(vector: u32, intr: &Arc<Interrupt>) -> bool {
+	if !is_msi(vector) {
+		return false;
+	}
+	REGISTRY.bind((vector - MSI_BASE as u32) as usize, intr)
 }
 
 // End-of-interrupt for a serviced vector. x86 MSI is edge-triggered and the LAPIC EOI
 // is issued from the ISR stub, so there is no source to complete here: a no-op, kept for
 // the portable SYS_INTERRUPT_ACK path (the riscv PLIC completes its level source here).
-pub fn eoi(_vector: u8) {}
+pub fn eoi(_vector: u32) {}
 
 // Whether `vector` currently has a live driver binding. Used to confirm that a
 // crashed driver's IRQ was detached during cleanup.
-pub fn is_bound(vector: u8) -> bool {
+pub fn is_bound(vector: u32) -> bool {
 	if is_msi(vector) {
-		return REGISTRY.is_bound((vector - MSI_BASE) as usize);
+		return REGISTRY.is_bound((vector - MSI_BASE as u32) as usize);
 	}
-	let index = vector.wrapping_sub(IRQ_BASE) as usize;
+	let index = vector.wrapping_sub(IRQ_BASE as u32) as usize;
 	if index >= IRQ_COUNT {
 		return false;
 	}
@@ -274,8 +314,8 @@ pub fn is_bound(vector: u8) -> bool {
 }
 
 // Register `handler` for a device-interrupt `vector` (IRQ_BASE..IRQ_BASE+IRQ_COUNT).
-pub fn register(vector: u8, handler: HandlerFn) {
-	let index = (vector - IRQ_BASE) as usize;
+pub fn register(vector: u32, handler: HandlerFn) {
+	let index = (vector - IRQ_BASE as u32) as usize;
 	HANDLERS[index].store(handler as usize, Ordering::SeqCst);
 }
 
@@ -289,7 +329,7 @@ fn dispatch(vector: u8) {
 	let raw = HANDLERS[index].load(Ordering::SeqCst);
 	if raw != 0 {
 		let handler: HandlerFn = unsafe { core::mem::transmute::<usize, HandlerFn>(raw) };
-		handler(vector);
+		handler(vector as u32);
 	}
 	// Deliver to a userspace driver bound to this vector, if any.
 	if let Some(intr) = BOUND[index].lock().as_ref().and_then(Weak::upgrade) {

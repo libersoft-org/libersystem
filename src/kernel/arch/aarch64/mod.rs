@@ -402,6 +402,25 @@ pub mod usermode {
 		}
 	}
 
+	// `enter`, with canaries in the kernel's callee-saved FP registers. Returns a bitmask of the
+	// ones the excursion did not give back (bit 0 = d8 .. bit 7 = d15), which is zero when the ABI
+	// this port claims is actually held. Test-only: it exists to measure KERN-ARCH-002.
+	#[cfg(test)]
+	pub unsafe fn enter_measuring_fp(entry: u64, user_stack: u64, arg: u64) -> u64 {
+		unsafe extern "C" {
+			fn aarch64_el0_fp_probe(entry: u64, user_sp: u64, arg: u64, resume_slot: *mut u64) -> u64;
+		}
+		let slot = match crate::sched::current_thread() {
+			Some(thread) => thread.syscall_rsp_addr(),
+			None => return u64::MAX,
+		};
+		let mismatch = unsafe { aarch64_el0_fp_probe(entry, user_stack, arg, slot) };
+		if let Some(thread) = crate::sched::current_thread() {
+			thread.set_syscall_rsp(0);
+		}
+		mismatch
+	}
+
 	// Unwind from an EL0 syscall back to the kernel that called `enter`, using the
 	// current thread's parked resume pointer.
 	pub fn exit_to_kernel() -> ! {
@@ -457,6 +476,10 @@ pub mod usermode {
 	}
 	pub fn program_spin_bytes() -> &'static [u8] {
 		as_bytes(&PROGRAM_SPIN)
+	}
+	#[cfg(test)]
+	pub fn program_register_scrub_bytes() -> &'static [u8] {
+		as_bytes(&PROGRAM_REGISTER_SCRUB)
 	}
 
 	// Reinterpret a program's instruction words as the little-endian byte slice the
@@ -514,6 +537,21 @@ pub mod usermode {
 	}
 	const fn br(rn: u32) -> u32 {
 		0xD61F_0000 | (rn << 5)
+	}
+	// orr rd, rn, rm - the general form `mov_reg` is the xzr special case of.
+	const fn orr_reg(rd: u32, rn: u32, rm: u32) -> u32 {
+		0xAA00_0000 | (rm << 16) | (rn << 5) | rd
+	}
+	// fmov xd, dn / fmov dd, xn - the low 64 bits of a SIMD register, moved either way.
+	const fn fmov_x_from_d(rd: u32, vn: u32) -> u32 {
+		0x9E66_0000 | (vn << 5) | rd
+	}
+	const fn fmov_d_from_x(vd: u32, rn: u32) -> u32 {
+		0x9E67_0000 | (rn << 5) | vd
+	}
+	// umov xd, vn.d[1] - the HIGH 64 bits, which `fmov` cannot reach.
+	const fn umov_x_from_high(rd: u32, vn: u32) -> u32 {
+		0x4E18_3C00 | (vn << 5) | rd
 	}
 	const B_SELF: u32 = 0x1400_0000; // b . (guard against running off the end)
 
@@ -593,6 +631,58 @@ pub mod usermode {
 		movz(8, SYS_USER_EXIT as u16, 0),
 		SVC0,
 	];
+
+	// Register-scrub probe: x0 = a shared data page. Folds every user-visible register except x0
+	// itself - x1..x30 and both halves of v0..v31 - into x1, stores it at [x0], then writes
+	// garbage into d8..d15 and exits. The kernel reads that word and requires zero.
+	//
+	// x0 is excluded because it is the argument this program was given, and SP because it is the
+	// stack it was given; both are values the kernel means to hand over. Everything else is a
+	// register whose contents ring 3 has no business seeing (KERN-ARCH-002).
+	#[cfg(test)]
+	const fn register_scrub_program() -> [u32; 170] {
+		let mut out = [B_SELF; 170];
+		let mut at = 0usize;
+		// x1 is the accumulator AND one of the registers under test: it starts as whatever it
+		// arrived with, and every other one is folded into it.
+		let mut n = 2u32;
+		while n <= 30 {
+			out[at] = orr_reg(1, 1, n);
+			at += 1;
+			n += 1;
+		}
+		// x2 has been folded in by now, so it is free to use as the scratch the SIMD reads need.
+		let mut v = 0u32;
+		while v < 32 {
+			out[at] = fmov_x_from_d(2, v);
+			at += 1;
+			out[at] = orr_reg(1, 1, 2);
+			at += 1;
+			out[at] = umov_x_from_high(2, v);
+			at += 1;
+			out[at] = orr_reg(1, 1, 2);
+			at += 1;
+			v += 1;
+		}
+		out[at] = str_off(1, 0, 0); // [x0] = everything this program could see
+		at += 1;
+		// And now clobber the kernel's callee-saved FP halves, which an EL0 program is entitled to
+		// do. What comes back on the kernel side is the other half of this measurement.
+		out[at] = movz(9, 0x0bad, 0);
+		at += 1;
+		let mut d = 8u32;
+		while d <= 15 {
+			out[at] = fmov_d_from_x(d, 9);
+			at += 1;
+			d += 1;
+		}
+		out[at] = movz(8, SYS_USER_EXIT as u16, 0);
+		at += 1;
+		out[at] = SVC0;
+		out
+	}
+	#[cfg(test)]
+	static PROGRAM_REGISTER_SCRUB: [u32; 170] = register_scrub_program();
 
 	// CPU-bound spinner: x0 = shared data page. [x0] is a stop flag another thread
 	// raises through the frame's kernel mapping, [x0 + 8] a counter this loop bumps so

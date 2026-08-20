@@ -29,7 +29,7 @@ use crate::object::interrupt::Interrupt;
 // live on aarch64).
 pub const IRQ_BASE: u8 = 32;
 
-pub type HandlerFn = fn(u8);
+pub type HandlerFn = fn(u32);
 
 // The GICv2m frame on QEMU's `virt` machine (gic-version=2), fixed just above the GIC
 // CPU interface at 0x0801_0000. Its MSI_TYPER reports the SPI range the frame owns; a
@@ -60,17 +60,17 @@ fn spi_slot(intid: u32) -> Option<usize> {
 }
 
 // Whether `vector` (an SPI INTID) is a kernel MSI vector.
-fn is_msi(vector: u8) -> bool {
-	spi_slot(vector as u32).is_some()
+fn is_msi(vector: u32) -> bool {
+	spi_slot(vector).is_some()
 }
 
 // No legacy-INTx binding on aarch64: every driver that needs an interrupt uses MSI-X.
-pub fn is_bindable(_vector: u8) -> bool {
+pub fn is_bindable(_vector: u32) -> bool {
 	false
 }
 
 // The INTx bind path is unused on aarch64 (see is_bindable); it always refuses.
-pub fn bind(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
+pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
 	false
 }
 
@@ -79,8 +79,8 @@ pub fn bind(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
 // The SPI is retired rather than freed, for the reason the x86 backend spells out: the device's
 // MSI-X entry was programmed to write the GICv2m frame, and nothing here can prove a write already
 // on its way will not land. The SPI waits for `SYS_DEVICE_QUIESCED`.
-pub fn unbind(vector: u8) {
-	if let Some(slot) = spi_slot(vector as u32) {
+pub fn unbind(vector: u32) {
+	if let Some(slot) = spi_slot(vector) {
 		REGISTRY.retire(slot);
 	}
 }
@@ -96,8 +96,8 @@ pub fn unbind(vector: u8) {
 // core.
 // Give back a vector whose Interrupt never reached its owner - see the x86_64 `release_unused_msi`
 // for why this is a free rather than a retire.
-pub fn release_unused_msi(vector: u8) {
-	if let Some(slot) = spi_slot(vector as u32) {
+pub fn release_unused_msi(vector: u32) {
+	if let Some(slot) = spi_slot(vector) {
 		REGISTRY.free(slot);
 	}
 }
@@ -105,7 +105,7 @@ pub fn release_unused_msi(vector: u8) {
 // One vector per device, entry 0 - see the x86_64 `acquire_msi`, which states the limit and why
 // `MsiRegistry::acquire_unique_live` refuses a device that already holds a live slot - `acquire`
 // itself does not, which this comment used to claim.
-pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
+pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u32> {
 	let len = MSI_LEN.load(Ordering::Relaxed);
 	program_acquired(REGISTRY.acquire(owner, len)?, table_phys)
 }
@@ -113,16 +113,19 @@ pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
 // The same, and ONLY IF the device holds no live vector already - see
 // `MsiRegistry::acquire_unique_live`. This is what `sys_device_msix_acquire` calls; the form above
 // stays for the kernel's own bring-up test.
-pub fn acquire_msi_unique(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
+pub fn acquire_msi_unique(table_phys: u64, _dest: u8, owner: u32) -> Option<u32> {
 	let len = MSI_LEN.load(Ordering::Relaxed);
 	program_acquired(REGISTRY.acquire_unique_live(owner, len)?, table_phys)
 }
 
-fn program_acquired(slot: usize, table_phys: u64) -> Option<u8> {
+fn program_acquired(slot: usize, table_phys: u64) -> Option<u32> {
 	let spi = BASE_SPI.load(Ordering::Relaxed) + slot as u32;
 	program_msix_entry(table_phys, spi);
 	super::gic::enable_msi_spi(spi);
-	Some(spi as u8)
+	// THE WHOLE SPI (KERN-ARCH-017). GICv2m's base and count are ten-bit fields, so a frame
+	// starting at SPI 256 or above returned an identifier that wrapped: the hardware stayed armed
+	// under the real SPI while the registry, the bind, the teardown and `lsirq` all named another.
+	Some(spi)
 }
 
 // Write a device's MSI-X table entry 0 (reached through the physical direct map): the
@@ -143,8 +146,8 @@ fn program_msix_entry(table_phys: u64, spi: u32) {
 
 // Bind `intr` to an MSI `vector` (an SPI INTID) so dispatch wakes it when the SPI
 // fires. Returns false if the vector is already bound to a live Interrupt.
-pub fn bind_msi(vector: u8, intr: &Arc<Interrupt>) -> bool {
-	match spi_slot(vector as u32) {
+pub fn bind_msi(vector: u32, intr: &Arc<Interrupt>) -> bool {
+	match spi_slot(vector) {
 		Some(slot) => REGISTRY.bind(slot, intr),
 		None => false,
 	}
@@ -152,8 +155,8 @@ pub fn bind_msi(vector: u8, intr: &Arc<Interrupt>) -> bool {
 
 // Whether `vector` currently has a live driver binding. Used to confirm a crashed
 // driver's IRQ was detached during cleanup.
-pub fn is_bound(vector: u8) -> bool {
-	match spi_slot(vector as u32) {
+pub fn is_bound(vector: u32) -> bool {
+	match spi_slot(vector) {
 		Some(slot) => REGISTRY.is_bound(slot),
 		None => false,
 	}
@@ -162,7 +165,7 @@ pub fn is_bound(vector: u8) -> bool {
 // End-of-interrupt for a serviced vector. MSI on aarch64 is edge-triggered and
 // unshared, so there is no level source to complete: a no-op, kept for the portable
 // SYS_INTERRUPT_ACK path (the riscv PLIC completes its level source here).
-pub fn eoi(_vector: u8) {}
+pub fn eoi(_vector: u32) {}
 
 // Deliver a fired GIC INTID to a bound MSI driver, if it is one of the frame's SPIs.
 // Returns true when the INTID was an MSI vector (handled here), so gic::handle_irq can
@@ -199,7 +202,7 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 		return None;
 	}
 	let vector = BASE_SPI.load(Ordering::Relaxed) + slot as u32;
-	Some(abi::IrqInfo { vector, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector as u8) as u32, device: REGISTRY.owner(slot) })
+	Some(abi::IrqInfo { vector, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector) as u32, device: REGISTRY.owner(slot) })
 }
 
 // The number of vectors irq_info reports over (the timer entry plus the frame's MSI SPIs).
@@ -208,7 +211,7 @@ pub fn irq_info_len() -> usize {
 }
 
 // No kernel-side INTx handlers on aarch64 (the timer is handled in gic::handle_irq).
-pub fn register(_vector: u8, _handler: HandlerFn) {}
+pub fn register(_vector: u32, _handler: HandlerFn) {}
 
 // Read the GICv2m frame's MSI SPI range (base SPI + count) so acquire_msi/dispatch can
 // map slots to SPI INTIDs. Called once, after the GIC is up.

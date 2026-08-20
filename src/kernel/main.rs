@@ -558,7 +558,7 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: 
 // prompt nudge). Runs on the BSP (the UART's legacy IRQ is routed there); the
 // channel send inside feed() wakes the shell's waiter on this same core.
 #[cfg(not(test))]
-fn serial_rx_interrupt(_vector: u8) {
+fn serial_rx_interrupt(_vector: u32) {
 	while let Some(byte) = arch::serial::read_byte() {
 		console_input::feed_serial(byte);
 	}
@@ -581,7 +581,7 @@ fn boot_userspace_with_recovery() {
 	// Serial input goes interrupt-driven: route the UART's legacy IRQ (COM1 = ISA
 	// IRQ 4) to the BSP and enable the receive interrupt, so a typed byte reaches
 	// the shell at once rather than on the next tick-quantized poll.
-	arch::interrupts::register(arch::interrupts::IRQ_BASE + 4, serial_rx_interrupt);
+	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
 	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0));
 	arch::serial::enable_rx_irq();
 	let (crash_tx, crash_rx) = object::channel::Channel::create();

@@ -908,6 +908,39 @@ fn writable_pages_are_not_executable() {
 }
 
 tagged_test!(
+	#[cfg(target_arch = "aarch64")]
+	a_fresh_user_context_carries_no_kernel_register_state_either_way,
+	[Kernel, ArchAarch64],
+	id = "kernel.kernel.a_fresh_user_context_carries_no_kernel_register_state_either_way",
+	covers = ["kernel"]
+);
+#[cfg(target_arch = "aarch64")]
+fn a_fresh_user_context_carries_no_kernel_register_state_either_way() {
+	use core::sync::atomic::Ordering;
+	use object::domain::Domain;
+	// KERN-ARCH-002, both directions across the same excursion.
+	//
+	// OUT: the first `eret` to EL0 handed over every register untouched - x1 the user stack
+	// pointer, x3 the SPSR, x4 the address of the thread's resume slot and x5 the parked kernel
+	// stack pointer, two kernel POINTERS, plus x6..x30 and the whole SIMD file holding whatever the
+	// kernel last computed. The probe folds all of it together and requires zero, so a leak in any
+	// one register fails this whether or not anyone thought to name that register.
+	//
+	// BACK: AAPCS64 makes d8..d15 callee-saved, and the `SYS_USER_EXIT` return path restored GPRs
+	// only - so a user program writing to them, which it is entitled to do, corrupted the kernel's
+	// own callee-saved state on the way out. The probe leaves canaries there and the program
+	// deliberately clobbers all eight.
+	let domain = Domain::new(1 << 20, 8, 4);
+	sched::spawn_in(domain.clone(), user_register_scrub_thread_body, 0).expect("spawn register scrub thread");
+	sched::run_until_idle();
+	let seen = SCRUB_SEEN.load(Ordering::SeqCst);
+	assert_eq!(seen, 0, "ring 3 could see {seen:#x} in registers the kernel handed it");
+	let fp = SCRUB_FP.load(Ordering::SeqCst);
+	assert_eq!(fp, 0, "the excursion did not give back d8..d15 (bit 0 = d8): {fp:#010b}");
+	assert_eq!(domain.account().threads().used(), 0, "thread slot refunded");
+}
+
+tagged_test!(
 	#[cfg(target_arch = "x86_64")]
 	an_ordinary_ring_three_exception_kills_the_process_and_not_the_machine,
 	[Kernel, ArchX86_64],

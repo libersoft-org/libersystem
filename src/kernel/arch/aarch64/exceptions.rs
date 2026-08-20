@@ -264,18 +264,108 @@ global_asm!(
 .section .text, "ax"
 .global aarch64_enter_el0
 aarch64_enter_el0:
-	stp     x19, x20, [sp, #-96]!
+	stp     x19, x20, [sp, #-160]!
 	stp     x21, x22, [sp, #16]
 	stp     x23, x24, [sp, #32]
 	stp     x25, x26, [sp, #48]
 	stp     x27, x28, [sp, #64]
 	stp     x29, x30, [sp, #80]
+	// AND THE KERNEL'S CALLEE-SAVED FP HALVES (KERN-ARCH-002).
+	//
+	// AAPCS64 makes the low 64 bits of v8..v15 callee-saved, and this pair of trampolines is a
+	// callee like any other: `enter` is an ordinary call, and `SYS_USER_EXIT` returns through
+	// `exit` by unwinding to its caller. Only the GPRs were saved - so an EL0 program writing to
+	// d8..d15, which it is entitled to do, handed those values back to the kernel as its own.
+	// The frame is 160 bytes because 96 + 64 is, and it stays 16-byte aligned.
+	stp     d8,  d9,  [sp, #96]
+	stp     d10, d11, [sp, #112]
+	stp     d12, d13, [sp, #128]
+	stp     d14, d15, [sp, #144]
 	mov     x5, sp
 	str     x5, [x4]           // *resume_slot = resume stack pointer
 	msr     sp_el0,   x1
 	msr     elr_el1,  x0
 	msr     spsr_el1, x3
 	mov     x0, x2
+	// NOTHING BUT x0 CROSSES INTO EL0 (KERN-ARCH-002).
+	//
+	// The first entry to a user context used to `eret` with every register holding whatever the
+	// kernel last left in it: x1 the user stack pointer, x3 the SPSR, x4 the address of this
+	// thread's resume slot and x5 the parked kernel stack pointer - two kernel POINTERS handed to
+	// ring 3 - and x6..x30 plus all of v0..v31 whatever the kernel's own code had been computing.
+	// Later entries are fine (the trap frame restores what the user itself last had); this is the
+	// one path that decides what a fresh context starts with, and it decided nothing.
+	//
+	// x0 is the argument the caller asked for. Everything else is zero.
+	mov     x1,  xzr
+	mov     x2,  xzr
+	mov     x3,  xzr
+	mov     x4,  xzr
+	mov     x5,  xzr
+	mov     x6,  xzr
+	mov     x7,  xzr
+	mov     x8,  xzr
+	mov     x9,  xzr
+	mov     x10, xzr
+	mov     x11, xzr
+	mov     x12, xzr
+	mov     x13, xzr
+	mov     x14, xzr
+	mov     x15, xzr
+	mov     x16, xzr
+	mov     x17, xzr
+	mov     x18, xzr
+	mov     x19, xzr
+	mov     x20, xzr
+	mov     x21, xzr
+	mov     x22, xzr
+	mov     x23, xzr
+	mov     x24, xzr
+	mov     x25, xzr
+	mov     x26, xzr
+	mov     x27, xzr
+	mov     x28, xzr
+	mov     x29, xzr
+	mov     x30, xzr
+	// The whole SIMD file, both halves of each register - the kernel uses FP/SIMD for bulk memory
+	// work, so these hold whatever it last moved through them. d8..d15 are already on the stack
+	// above, so zeroing them here costs the kernel nothing.
+	movi    v0.2d,  #0
+	movi    v1.2d,  #0
+	movi    v2.2d,  #0
+	movi    v3.2d,  #0
+	movi    v4.2d,  #0
+	movi    v5.2d,  #0
+	movi    v6.2d,  #0
+	movi    v7.2d,  #0
+	movi    v8.2d,  #0
+	movi    v9.2d,  #0
+	movi    v10.2d, #0
+	movi    v11.2d, #0
+	movi    v12.2d, #0
+	movi    v13.2d, #0
+	movi    v14.2d, #0
+	movi    v15.2d, #0
+	movi    v16.2d, #0
+	movi    v17.2d, #0
+	movi    v18.2d, #0
+	movi    v19.2d, #0
+	movi    v20.2d, #0
+	movi    v21.2d, #0
+	movi    v22.2d, #0
+	movi    v23.2d, #0
+	movi    v24.2d, #0
+	movi    v25.2d, #0
+	movi    v26.2d, #0
+	movi    v27.2d, #0
+	movi    v28.2d, #0
+	movi    v29.2d, #0
+	movi    v30.2d, #0
+	movi    v31.2d, #0
+	// The status and control registers too: FPSR carries the cumulative exception flags of
+	// whatever the kernel last computed, and zero is FPCR's architectural reset state.
+	msr     fpsr, xzr
+	msr     fpcr, xzr
 	eret
 
 .global aarch64_exit_el0
@@ -287,7 +377,97 @@ aarch64_exit_el0:
 	ldp     x25, x26, [sp, #48]
 	ldp     x27, x28, [sp, #64]
 	ldp     x29, x30, [sp, #80]
-	add     sp, sp, #96
+	ldp     d8,  d9,  [sp, #96]
+	ldp     d10, d11, [sp, #112]
+	ldp     d12, d13, [sp, #128]
+	ldp     d14, d15, [sp, #144]
+	add     sp, sp, #160
+	ret
+"#
+);
+
+// The FP half of KERN-ARCH-002, measured rather than reasoned about.
+//
+// `aarch64_el0_fp_probe(entry, user_sp, arg, resume_slot)` writes a distinct canary into each of
+// d8..d15, makes the SAME call into EL0 that `usermode::enter` makes, and after the excursion
+// returns a bitmask of the canaries that did not come back - bit 0 for d8 up to bit 7 for d15.
+//
+// In assembly because that is the only way to hold a value in a specific register across a call
+// the compiler is also allowed to keep values in: an `asm!` block declaring d8..d15 as clobbered
+// would make the compiler spill its OWN values around the measurement, which is precisely the
+// behaviour under test.
+#[cfg(test)]
+global_asm!(
+	r#"
+.section .text, "ax"
+.global aarch64_el0_fp_probe
+aarch64_el0_fp_probe:
+	stp     x29, x30, [sp, #-32]!
+	mov     x29, sp
+	str     x19, [sp, #16]
+	mov     x4, x3             // resume slot
+	mov     x3, xzr            // SPSR: EL0t, interrupts enabled - what `enter` passes
+	movz    x9, #0xd8d8
+	fmov    d8, x9
+	movz    x9, #0xd9d9
+	fmov    d9, x9
+	movz    x9, #0xdada
+	fmov    d10, x9
+	movz    x9, #0xdbdb
+	fmov    d11, x9
+	movz    x9, #0xdcdc
+	fmov    d12, x9
+	movz    x9, #0xdddd
+	fmov    d13, x9
+	movz    x9, #0xdede
+	fmov    d14, x9
+	movz    x9, #0xdfdf
+	fmov    d15, x9
+	bl      aarch64_enter_el0
+	mov     x19, xzr
+	movz    x9, #0xd8d8
+	fmov    x10, d8
+	cmp     x10, x9
+	cset    x11, ne
+	orr     x19, x19, x11
+	movz    x9, #0xd9d9
+	fmov    x10, d9
+	cmp     x10, x9
+	cset    x11, ne
+	orr     x19, x19, x11, lsl #1
+	movz    x9, #0xdada
+	fmov    x10, d10
+	cmp     x10, x9
+	cset    x11, ne
+	orr     x19, x19, x11, lsl #2
+	movz    x9, #0xdbdb
+	fmov    x10, d11
+	cmp     x10, x9
+	cset    x11, ne
+	orr     x19, x19, x11, lsl #3
+	movz    x9, #0xdcdc
+	fmov    x10, d12
+	cmp     x10, x9
+	cset    x11, ne
+	orr     x19, x19, x11, lsl #4
+	movz    x9, #0xdddd
+	fmov    x10, d13
+	cmp     x10, x9
+	cset    x11, ne
+	orr     x19, x19, x11, lsl #5
+	movz    x9, #0xdede
+	fmov    x10, d14
+	cmp     x10, x9
+	cset    x11, ne
+	orr     x19, x19, x11, lsl #6
+	movz    x9, #0xdfdf
+	fmov    x10, d15
+	cmp     x10, x9
+	cset    x11, ne
+	orr     x19, x19, x11, lsl #7
+	mov     x0, x19
+	ldr     x19, [sp, #16]
+	ldp     x29, x30, [sp], #32
 	ret
 "#
 );

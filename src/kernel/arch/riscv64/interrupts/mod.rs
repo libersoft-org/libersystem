@@ -24,7 +24,7 @@ use crate::object::interrupt::Interrupt;
 // The device-IRQ vector window base (mirrors the contract; only the MSI window is live).
 pub const IRQ_BASE: u8 = 32;
 
-pub type HandlerFn = fn(u8);
+pub type HandlerFn = fn(u32);
 
 // Device EIDs run 1..=MAX_MSI (EID 0 is "no interrupt"; the IMSIC EIE0 register holds
 // EIDs 0..63 on RV64, so a single register covers them). Slot i (in the registry) maps
@@ -42,12 +42,12 @@ fn eid_slot(eid: u32) -> Option<usize> {
 }
 
 // No legacy-INTx binding on riscv: every driver that needs an interrupt uses MSI-X.
-pub fn is_bindable(_vector: u8) -> bool {
+pub fn is_bindable(_vector: u32) -> bool {
 	false
 }
 
 // The INTx bind path is unused (see is_bindable); it always refuses.
-pub fn bind(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
+pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
 	false
 }
 
@@ -56,8 +56,8 @@ pub fn bind(_vector: u8, _intr: &Arc<Interrupt>) -> bool {
 // STAYS UNOWNED. Reallocate the EID and that same stray message wakes its next owner, which is the
 // defect the x86 backend spells out; so the slot is retired rather than freed and waits for
 // `SYS_DEVICE_QUIESCED`.
-pub fn unbind(vector: u8) {
-	if let Some(slot) = eid_slot(vector as u32) {
+pub fn unbind(vector: u32) {
+	if let Some(slot) = eid_slot(vector) {
 		super::imsic::disable_eid(vector as u32);
 		REGISTRY.retire(slot);
 	}
@@ -73,8 +73,8 @@ pub fn unbind(vector: u8) {
 // is unused - IMSIC targets the current hart.
 // Give back a vector whose Interrupt never reached its owner - see the x86_64 `release_unused_msi`
 // for why this is a free rather than a retire.
-pub fn release_unused_msi(vector: u8) {
-	if let Some(slot) = eid_slot(vector as u32) {
+pub fn release_unused_msi(vector: u32) {
+	if let Some(slot) = eid_slot(vector) {
 		super::imsic::disable_eid(vector as u32);
 		REGISTRY.free(slot);
 	}
@@ -83,23 +83,25 @@ pub fn release_unused_msi(vector: u8) {
 // One vector per device, entry 0 - see the x86_64 `acquire_msi`, which states the limit and why it
 // exists. `MsiRegistry::acquire` does NOT enforce it, which this comment used to claim: the form that
 // does is `acquire_unique_live`, reached through `acquire_msi_unique` below.
-pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
+pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u32> {
 	program_acquired(REGISTRY.acquire(owner, MAX_MSI)?, table_phys)
 }
 
 // The same, and ONLY IF the device holds no live vector already - see
 // `MsiRegistry::acquire_unique_live`. This is what `sys_device_msix_acquire` calls; the form above
 // stays for the kernel's own bring-up test.
-pub fn acquire_msi_unique(table_phys: u64, _dest: u8, owner: u32) -> Option<u8> {
+pub fn acquire_msi_unique(table_phys: u64, _dest: u8, owner: u32) -> Option<u32> {
 	program_acquired(REGISTRY.acquire_unique_live(owner, MAX_MSI)?, table_phys)
 }
 
-fn program_acquired(slot: usize, table_phys: u64) -> Option<u8> {
+fn program_acquired(slot: usize, table_phys: u64) -> Option<u32> {
 	let eid = EID_BASE + slot as u32;
 	let hart = super::percpu::this_cpu().lapic_id() as u64;
 	program_msix_entry(table_phys, super::imsic::msi_address(hart), eid);
 	super::imsic::enable_eid(eid);
-	Some(eid as u8)
+	// The whole EID (KERN-ARCH-017): IMSIC identifiers are eleven bits, so narrowing one here
+	// would arm the hardware under an identifier the kernel never records.
+	Some(eid)
 }
 
 // Write a device's MSI-X table entry 0 (reached through the physical direct map): the
@@ -118,16 +120,16 @@ fn program_msix_entry(table_phys: u64, msg_addr: u64, eid: u32) {
 
 // Bind `intr` to an MSI `vector` (an EID) so dispatch wakes it when the EID fires.
 // Returns false if the vector is already bound to a live Interrupt.
-pub fn bind_msi(vector: u8, intr: &Arc<Interrupt>) -> bool {
-	match eid_slot(vector as u32) {
+pub fn bind_msi(vector: u32, intr: &Arc<Interrupt>) -> bool {
+	match eid_slot(vector) {
 		Some(slot) => REGISTRY.bind(slot, intr),
 		None => false,
 	}
 }
 
 // Whether `vector` (an EID) currently has a live driver binding.
-pub fn is_bound(vector: u8) -> bool {
-	match eid_slot(vector as u32) {
+pub fn is_bound(vector: u32) -> bool {
+	match eid_slot(vector) {
 		Some(slot) => REGISTRY.is_bound(slot),
 		None => false,
 	}
@@ -136,7 +138,7 @@ pub fn is_bound(vector: u8) -> bool {
 // End-of-interrupt for a serviced vector. IMSIC MSI is edge-triggered and unshared, so
 // there is no level source to complete: a no-op (the stopei claim in handle_external
 // already cleared the EID's pending bit), kept for the portable SYS_INTERRUPT_ACK path.
-pub fn eoi(_vector: u8) {}
+pub fn eoi(_vector: u32) {}
 
 // Deliver a fired EID to its bound MSI driver. Returns true when the EID was a bound MSI
 // vector (signaled here). Edge-triggered: just wake the bound driver.
@@ -170,7 +172,7 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 		return None;
 	}
 	let eid = EID_BASE + slot as u32;
-	Some(abi::IrqInfo { vector: eid, kind: abi::IRQ_KIND_MSI, bound: is_bound(eid as u8) as u32, device: REGISTRY.owner(slot) })
+	Some(abi::IrqInfo { vector: eid, kind: abi::IRQ_KIND_MSI, bound: is_bound(eid) as u32, device: REGISTRY.owner(slot) })
 }
 
 // The number of vectors irq_info reports over (the timer entry plus the MSI window).
@@ -180,7 +182,7 @@ pub fn irq_info_len() -> usize {
 
 // No kernel-side INTx handler registration on riscv (device interrupts are MSI; the
 // timer is the S-mode timer, not an external source).
-pub fn register(_vector: u8, _handler: HandlerFn) {}
+pub fn register(_vector: u32, _handler: HandlerFn) {}
 
 // The IMSIC is brought up per hart in boot.rs / smp.rs (imsic::init_hart), so there is
 // nothing left to initialize here.
