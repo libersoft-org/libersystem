@@ -205,6 +205,9 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0138 - PermissionManager changes must select the tests that exercise them](P02M0138.md)
 - [x] [P02M0139 - Reuse the PermissionManager test fixture without sharing test state](P02M0139.md)
 - [x] [P02M0140 - Retire `just`: one way to run things, and it is a script with flags](P02M0140.md)
+- [ ] [P02M0141 - Close the architecture of the production reference appliance](P02M0141.md)
+- [ ] [P02M0142 - General platform and server architecture](P02M0142.md) - future product-profile track; not a phase-2 completion gate
+- [ ] [P02M0143 - Desktop profile, portals and the application ecosystem](P02M0143.md) - future product-profile track; not a phase-2 completion gate
 
 ### Definition of done (phase 2)
 
@@ -212,3 +215,6 @@ Done when the capability-scoped appliance provides networking, wall-clock time,
 interactive console and audio, policy and observability services, supervised
 components, writable persistent storage and the complete filesystem set. The
 kernel and UEFI loader must pass the QEMU suite on x86_64, aarch64 and riscv64.
+That is the functional phase-2 gate; calling the reference VM appliance
+production-ready additionally requires P02M0141. The future server and desktop
+profiles in P02M0142-P02M0143 do not gate phase-2 completion.
