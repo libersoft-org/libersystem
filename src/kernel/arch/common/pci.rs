@@ -224,7 +224,10 @@ pub struct VirtioDevice {
 	pub common: VirtioCap,
 	pub notify: VirtioCap,
 	pub isr: VirtioCap,
-	pub device: VirtioCap,
+	// OPTIONAL, AND SAID SO (KERN-ARCH-014). It used to be a `VirtioCap::default()` when the device
+	// had none - offset zero, length zero - which is indistinguishable from a real structure at the
+	// start of the window.
+	pub device: Option<VirtioCap>,
 	// MSI-X (when present): the config-space offset of the MSI-X capability (0 = none),
 	// the number of table entries, and the physical address of the MSI-X table. The
 	// kernel programs table entry 0 and enables MSI-X for an interrupt-driven driver.
@@ -425,7 +428,9 @@ fn probe_bar<A: ConfigAccess>(d: &PciDevice, i: usize) -> (usize, Option<(bool, 
 	// allocate, failed, and skipped in silence. That silence is gone now - a BAR that cannot be
 	// placed stops the device being enabled - so the difference between "this device has three
 	// BARs" and "this device cannot be placed" has to be stated here.
-	let _ = probed;
+	if probed == 0 {
+		return (step, None);
+	}
 	let size = (!mask).wrapping_add(1);
 	if size == 0 || mask == !0u64 {
 		return (step, None); // nothing this kernel can place
@@ -566,17 +571,50 @@ fn resolve_virtio<A: ConfigAccess>(d: &PciDevice) -> Option<VirtioDevice> {
 	let common = common?;
 	let notify = notify?;
 	let isr = isr?;
-	let device = device.unwrap_or_default();
 	let bar = common.bar;
-	let bar_phys = bar_address::<A>(d, bar as usize)?;
-	// The window the driver maps is the BAR holding the common-config structure;
-	// its length is the furthest end of any virtio structure in that same BAR,
-	// rounded up to a page.
-	let mut end: u64 = 0;
-	for cap in [common, notify, isr, device] {
-		if cap.bar == bar {
-			end = end.max(cap.offset as u64 + cap.length as u64);
+
+	// ONE BAR, OR THIS IS NOT A DEVICE THIS KERNEL CAN DESCRIBE (KERN-ARCH-014).
+	//
+	// Each virtio capability names its own BAR, and a spec-valid device may spread them. What is
+	// handed to a driver is ONE physical window plus four offsets into it, and the driver adds each
+	// offset to that one base - so a structure living in another BAR was read at the right offset
+	// of the WRONG aperture. Silently: the addresses are mapped and the reads succeed.
+	//
+	// Refusing is the honest answer while the hand-off is one window. Claiming the device and
+	// driving it through the wrong registers is not, and neither is inventing a second window the
+	// driver ABI has nowhere to put.
+	if notify.bar != bar || isr.bar != bar {
+		crate::serial_println!("pci: virtio {:02x}:{:02x}.{} spreads its configuration over BARs {} (common), {} (notify) and {} (isr); a driver is handed one window, so this device is left unclaimed", d.bus, d.dev, d.func, bar, notify.bar, isr.bar);
+		return None;
+	}
+	// The optional structure is dropped rather than the device refused when it is the odd one out:
+	// it is the only one a driver can work without.
+	let device = match device {
+		Some(cap) if cap.bar != bar => {
+			crate::serial_println!("pci: virtio {:02x}:{:02x}.{} keeps its device configuration in BAR {} rather than BAR {bar}; it is not reported", d.bus, d.dev, d.func, cap.bar);
+			None
 		}
+		other => other,
+	};
+
+	let bar_phys = bar_address::<A>(d, bar as usize)?;
+	// AND INSIDE THE BAR IT NAMES. `offset` and `length` come from the device's own config space,
+	// so a structure running past the end of the aperture is a device describing memory the BAR
+	// does not decode - which the driver would then map and read.
+	let bar_len = bar_size::<A>(d, bar as usize)?;
+	for cap in [Some(common), Some(notify), Some(isr), device].into_iter().flatten() {
+		let end = cap.offset as u64 + cap.length as u64;
+		if end > bar_len {
+			crate::serial_println!("pci: virtio {:02x}:{:02x}.{} declares a structure ending at {end:#x} in a BAR {bar_len:#x} bytes long; the device is left unclaimed", d.bus, d.dev, d.func);
+			return None;
+		}
+	}
+
+	// The window the driver maps is the BAR holding the common-config structure;
+	// its length is the furthest end of any virtio structure in it, rounded up to a page.
+	let mut end: u64 = 0;
+	for cap in [Some(common), Some(notify), Some(isr), device].into_iter().flatten() {
+		end = end.max(cap.offset as u64 + cap.length as u64);
 	}
 	let region_len = end.div_ceil(0x1000) * 0x1000;
 	Some(VirtioDevice { pci: *d, virtio_type, bar, bar_phys, region_len, common, notify, isr, device, msix_cap, msix_count, msix_table_phys })

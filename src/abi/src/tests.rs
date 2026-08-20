@@ -605,19 +605,24 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		isr_offset => 28,
 
 		device_offset => 32,
-		bus => 36,
-		dev => 37,
-		func => 38,
+		// The optional device-config structure's length, which is how its absence is expressed.
+		// It took four of the six tail padding bytes, so nothing before it moved and the struct is
+		// still 48 (KERN-ARCH-014).
+		device_len => 36,
+		bus => 40,
+		dev => 41,
+		func => 42,
 		// The three the standards identity added. They took the struct from 40 bytes to 48 - there
 		// was no tail padding to use, since 40 is already 8-aligned - and nothing BEFORE them moved,
 		// which is the half of the old claim here that was true. The struct's own comment corrected
 		// the other half and this copy of it was left behind.
-		class => 39,
-		subclass => 40,
-		prog_if => 41,
-		// And the six bytes the growth created, named rather than implicit: this struct is copied
-		// to userspace with `size_of::<T>()` from a value built on the kernel stack.
-		_pad1 => 42,
+		class => 43,
+		subclass => 44,
+		prog_if => 45,
+		// And the tail bytes, named rather than implicit: this struct is copied to userspace with
+		// `size_of::<T>()` from a value built on the kernel stack. Six of them once; `device_len`
+		// took four, so two are left and the struct is the same 48 bytes.
+		_pad1 => 46,
 	);
 
 	assert_layout!(

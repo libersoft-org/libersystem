@@ -168,7 +168,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	for i in 0..device::count() {
 		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
 		if entry.0 as u32 == abi::DEVICE_TYPE_XHCI {
-			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, _pad1: [0; 6] }).unwrap();
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, _pad1: [0; 2] }).unwrap();
 			found = Some((info, entry.1, entry.2, i));
 			break;
 		}

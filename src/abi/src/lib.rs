@@ -475,6 +475,13 @@ pub struct DeviceInfo {
 	pub notify_multiplier: u32,
 	pub isr_offset: u32,
 	pub device_offset: u32,
+	// THE LENGTH OF THE DEVICE-SPECIFIC CONFIGURATION, and how its ABSENCE is said (KERN-ARCH-014).
+	//
+	// That structure is optional in the virtio specification, and it used to be reported as offset
+	// zero when a device had none - which is also a legal offset for one that does. A driver could
+	// not tell the two apart, so "no device config" and "device config at the start of the window"
+	// read identically. A length of zero is the absence, and cannot be mistaken for a structure.
+	pub device_len: u32,
 	// The device's PCI address. Two devices of one type are otherwise indistinguishable
 	// to userspace, so this is what lets a second instance of a device class be bound to
 	// a different program than the first without relying on enumeration order.
@@ -521,7 +528,9 @@ pub struct DeviceInfo {
 	//
 	// Not `repr(packed)`: that would make `bar_len` unaligned and trade a disclosure for a soundness
 	// problem.
-	pub _pad1: [u8; 6],
+	//
+	// TWO BYTES NOW, not six: `device_len` took four of them, which is why the struct is still 48.
+	pub _pad1: [u8; 2],
 }
 
 // The framebuffer geometry framebuffer_map writes into the caller's buffer (the

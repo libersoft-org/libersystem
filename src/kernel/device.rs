@@ -25,7 +25,10 @@ pub struct DeviceEntry {
 	pub notify_offset: u32,
 	pub notify_multiplier: u32,
 	pub isr_offset: u32,
+	// The optional device-specific structure. A length of zero is how "this device has none" is
+	// said, because offset zero is also a legal offset for one that does (KERN-ARCH-014).
 	pub device_offset: u32,
+	pub device_len: u32,
 	// MSI-X (when present): the config-space offset of the device's MSI-X capability
 	// (0 = none) and the physical address of its MSI-X table. The kernel programs table
 	// entry 0 and enables MSI-X so a driver gets its own per-device edge-triggered
@@ -69,7 +72,7 @@ pub fn init() {
 		// I/O APIC by construction.
 		crate::arch::pci::set_intx_disabled(v.pci.bus, v.pci.dev, v.pci.func, true);
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.offset, msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if });
+		table.push(DeviceEntry { device_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if });
 	}
 	for x in crate::arch::pci::scan_xhci() {
 		// The xHCI controller joins the same table: its whole register file lives in
@@ -77,7 +80,7 @@ pub fn init() {
 		// operational/runtime/doorbell offsets from the capability registers at the base.
 		crate::arch::pci::set_intx_disabled(x.pci.bus, x.pci.dev, x.pci.func, true);
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if });
+		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if });
 	}
 }
 
