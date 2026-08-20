@@ -107,6 +107,19 @@ pub const MEMORY_MAPPED_IO_PORT_SPACE: MemoryType = 12;
 pub const PAL_CODE: MemoryType = 13;
 pub const PERSISTENT_MEMORY: MemoryType = 14;
 
+// LOADER SCRATCH THAT DIES AT THE HANDOFF (LDR-012).
+//
+// The specification reserves `0x7000_0000..0x7fff_ffff` for the OS loader's own use, and this is
+// what that range is for: memory the loader needs up to and past `ExitBootServices` but which
+// nothing owns once the kernel is entered. The final memory-map buffer is the case that cannot be
+// solved any other way - it is READ at exit, so it cannot be freed before, and there is no firmware
+// left to free it after.
+//
+// One type for both is what LDR-012 is about: `LOADER_DATA` becomes `MEM_BOOTLOADER`, which the
+// kernel never seeds, so scratch and the kernel image were retained alike and every boot lost the
+// difference permanently. This type translates to a kind the kernel DOES seed.
+pub const OS_LOADER_SCRATCH: MemoryType = 0x7000_0000;
+
 // EFI_ALLOCATE_TYPE passed to AllocatePages.
 pub type AllocateType = u32;
 pub const ALLOCATE_ANY_PAGES: AllocateType = 0;

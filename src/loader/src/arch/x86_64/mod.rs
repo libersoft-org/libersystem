@@ -14,7 +14,7 @@ use core::arch::asm;
 
 use bootproto::{BootInfo, Framebuffer, MemRegion, Module};
 
-use crate::{align_down, alloc_pages, read_file};
+use crate::{align_down, alloc_pages, alloc_scratch_pages, read_file};
 use paging::{HHDM_OFFSET, PAGE_2MB, PAGE_SIZE, PageTables};
 use uefi::{self, BootServices, Handle, SystemTable};
 
@@ -166,13 +166,16 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// WRITE-BACK mapping laid over device memory is not: a speculative fetch or an evicted line
 	// through it reaches a device, and this loader gives `PCD | PWT` only to the framebuffer.
 	//
-	// So the interval stays and the MMIO descriptors inside it are re-mapped uncacheable. That is
-	// deliberately not the redesign the finding describes - a per-descriptor map with per-type
-	// attributes and unmapped holes - and the reason is that the contiguous map is now load-bearing
+	// So the interval stays and everything in it that is NOT MEMORY is re-mapped uncacheable: the
+	// MMIO descriptors, and the physical space no descriptor describes at all (UEFI-003, LDR-010).
+	//
+	// The interval rather than a per-descriptor map, because the contiguous map is load-bearing
 	// twice: the kernel derives its `DIRECT_MAP_LIMIT` from the top of the same memory map and
-	// bounds every firmware pointer against it (P02M0133), which a sparse map would make wrong
-	// rather than stricter. Making both sparse together is one change, and it is not this one.
-	map_mmio_uncacheable(bs, &mut tables, ram_top);
+	// bounds every firmware pointer against it (P02M0133). Leaving holes UNMAPPED would make that
+	// bound describe addresses that fault; mapping them uncacheable keeps the bound exactly true
+	// while removing the write-back mapping over things that are not memory, which is the part of
+	// the finding that is an architecture violation rather than waste.
+	map_non_memory_uncacheable(bs, &mut tables, ram_top);
 	if fb.present {
 		let fb_base = align_down(fb.phys, PAGE_2MB);
 		let fb_end = align_up(fb.phys.saturating_add(fb.size), PAGE_2MB);
@@ -381,7 +384,7 @@ fn alloc_low_page(bs: *mut BootServices) -> u64 {
 // Best effort by design: a failure here leaves the write-back mapping the HHDM already made, which
 // is what this boot had before, so it says so and carries on rather than refusing to boot over an
 // attribute.
-fn map_mmio_uncacheable(bs: *mut BootServices, tables: &mut PageTables, ram_top: u64) {
+fn map_non_memory_uncacheable(bs: *mut BootServices, tables: &mut PageTables, ram_top: u64) {
 	let Some((buf, pages, map_size, desc_size)) = (unsafe { uefi::memory::memory_map_snapshot(bs) }) else {
 		// NO MAP AT ALL IS A REFUSAL. The loader knows it is about to hand the kernel a direct map
 		// it could not check, and "no worse than the bug" is a reason not to panic over a cosmetic
@@ -417,6 +420,41 @@ fn map_mmio_uncacheable(bs: *mut BootServices, tables: &mut PageTables, ram_top:
 			serial::write_str(" uncacheable in the direct map; it stays write-back\n");
 		}
 	}
+
+	// AND THE HOLES (UEFI-003). A physical range no descriptor describes is not memory and not a
+	// device: it is nothing, and the direct map covered it write-back because the map is one
+	// interval. A write-back mapping over absent space is the same class of wrongness as one over
+	// device space - a speculative fetch or an evicted line through it is an access to nothing,
+	// which on some machines aborts and on others silently reads garbage - and it is an
+	// architecture violation outright on AArch64.
+	//
+	// Uncacheable rather than unmapped, for the reason the caller states: the kernel's direct-map
+	// bound is one interval derived from the same map, and unmapping inside it would make that
+	// bound describe addresses that fault.
+	//
+	// A 2 MiB frame that any descriptor touches at all is left alone: the map is 2 MiB granular and
+	// a page that is part memory must stay memory.
+	let mut base = 0u64;
+	while base < ram_top {
+		let frame_end = base.saturating_add(PAGE_2MB);
+		let mut touched = false;
+		for i in 0..entries {
+			let d = unsafe { &*((buf as *const u8).add(i * desc_size) as *const uefi::MemoryDescriptor) };
+			let Some(bytes) = d.page_count.checked_mul(PAGE_SIZE) else { continue };
+			let start = d.phys_start;
+			let end = d.phys_start.saturating_add(bytes);
+			if start < frame_end && base < end {
+				touched = true;
+				break;
+			}
+		}
+		if !touched && tables.map_hhdm(base, PAGE_2MB, true).is_none() {
+			serial::write_str("loader: WARNING - could not mark the hole at ");
+			serial::write_hex(base);
+			serial::write_str(" uncacheable in the direct map; it stays write-back\n");
+		}
+		base = frame_end;
+	}
 	unsafe { ((*bs).free_pages)(buf as u64, pages) };
 }
 
@@ -443,7 +481,11 @@ fn finalize_and_exit(bs: *mut BootServices, image_handle: Handle, regions: *mut 
 	let Some(cap) = desc_size.checked_mul(16).and_then(|margin| map_size.checked_add(margin)) else {
 		panic!("loader: the firmware's memory-map dimensions do not fit an allocation");
 	};
-	let buf = unsafe { alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)) }.expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
+	// SCRATCH, not retained (LDR-012): this buffer is read AT `ExitBootServices` and owned by
+	// nothing afterwards. Allocated in the loader's own reclaimable class so the map it produces
+	// describes it as memory the kernel may have back, instead of `MEM_BOOTLOADER` - which the
+	// kernel never seeds, so every boot lost it for the life of the system.
+	let buf = unsafe { alloc_scratch_pages(bs, cap.div_ceil(PAGE_SIZE as usize)) }.expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
 	// GIVE THE HEAP BACK, and do it AFTER the buffer above rather than before it.
 	//
 	// The arenas are the loader's own working memory, and left alone they reach the kernel as

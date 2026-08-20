@@ -40,7 +40,7 @@ use uefi::{BootServices, Handle, Status, SystemTable};
 // code and never run.
 use uefi::file::read_file;
 pub(crate) use uefi::gop::locate_framebuffer;
-use uefi::memory::alloc_pages;
+use uefi::memory::{alloc_pages, alloc_scratch_pages};
 
 // The kernel filename on the boot volume's root (mkimage lays it there). Both
 // architectures read the kernel; the init/volume package filenames are x86-only (the

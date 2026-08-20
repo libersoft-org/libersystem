@@ -602,6 +602,45 @@ unsafe fn next_table_walk(table: *mut u64, index: usize) -> Option<u64> {
 //
 // On a hierarchy the effective permission is the AND of every level's bits, because a
 // cleared USER or WRITABLE anywhere above the leaf denies it. That is what this returns.
+// The RAW flags of the leaf that maps `virt`, with nothing combined across levels.
+//
+// `translate_flags` answers the EFFECTIVE permission - the AND down the walk - which is the right
+// question for "may this be read" and the wrong one for cache attributes: `PCD` and `PWT` live on
+// the leaf and the tables above it carry neither, so the AND erases exactly the bits a caller
+// asking about cacheability needs (UEFI-003).
+pub fn leaf_flags(virt: u64) -> Option<u64> {
+	const PS: u64 = 1 << 7;
+	unsafe {
+		let pml4 = table_ptr(active_pml4_phys());
+		let pml4_e = pml4.add(table_index(virt, 39)).read_volatile();
+		if pml4_e & PRESENT == 0 {
+			return None;
+		}
+		let pdpt = table_ptr(pml4_e & ADDR_MASK);
+		let pdpt_e = pdpt.add(table_index(virt, 30)).read_volatile();
+		if pdpt_e & PRESENT == 0 {
+			return None;
+		}
+		if pdpt_e & PS != 0 {
+			return Some(pdpt_e);
+		}
+		let pd = table_ptr(pdpt_e & ADDR_MASK);
+		let pd_e = pd.add(table_index(virt, 21)).read_volatile();
+		if pd_e & PRESENT == 0 {
+			return None;
+		}
+		if pd_e & PS != 0 {
+			return Some(pd_e);
+		}
+		let pt = table_ptr(pd_e & ADDR_MASK);
+		let pt_e = pt.add(table_index(virt, 12)).read_volatile();
+		if pt_e & PRESENT == 0 {
+			return None;
+		}
+		Some(pt_e)
+	}
+}
+
 pub fn translate_flags(virt: u64) -> Option<u64> {
 	const PS: u64 = 1 << 7;
 	unsafe {

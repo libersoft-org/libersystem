@@ -569,7 +569,11 @@ fn exit_boot_services(bs: *mut BootServices, image_handle: Handle, regions: *mut
 	let Some(cap) = desc_size.checked_mul(16).and_then(|margin| map_size.checked_add(margin)) else {
 		panic!("loader: the firmware's memory-map dimensions do not fit an allocation");
 	};
-	let buf = unsafe { crate::alloc_pages(bs, cap.div_ceil(PAGE_SIZE as usize)) }.expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
+	// SCRATCH, not retained (LDR-012): this buffer is read AT `ExitBootServices` and owned by
+	// nothing afterwards. Allocated in the loader's own reclaimable class so the map it produces
+	// describes it as memory the kernel may have back, instead of `MEM_BOOTLOADER` - which the
+	// kernel never seeds, so every boot lost it for the life of the system.
+	let buf = unsafe { crate::alloc_scratch_pages(bs, cap.div_ceil(PAGE_SIZE as usize)) }.expect("loader: cannot allocate memory map buffer") as *mut uefi::MemoryDescriptor;
 	// GIVE THE HEAP BACK, and do it AFTER the buffer above rather than before it.
 	//
 	// The arenas are the loader's own working memory, and left alone they reach the kernel as

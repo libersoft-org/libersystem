@@ -88,6 +88,9 @@ pub struct Record {
 pub struct Field {
 	pub name: String,
 	pub ty: Type,
+	// `@bound(n)`: the most items a `list` may carry, or the most bytes a `string` may hold, that
+	// this field is willing to decode (IDL-005). `None` is "whatever the frame allows".
+	pub bound: Option<u32>,
 	pub doc: Vec<Doc>,
 	pub evolution: Evolution,
 	pub span: Span,
@@ -171,6 +174,10 @@ pub struct Method {
 	pub op: u32,
 	pub params: Vec<Param>,
 	pub ret: Type,
+	// `@bound(n)` on the method bounds what it RETURNS - the list or string the caller decodes,
+	// inside its `result<..>` if it has one. A caller is as exposed to a service's reply as a
+	// service is to a request (IDL-005).
+	pub ret_bound: Option<u32>,
 	pub doc: Vec<Doc>,
 	pub evolution: Evolution,
 	pub span: Span,
@@ -180,6 +187,8 @@ pub struct Method {
 pub struct Param {
 	pub name: String,
 	pub ty: Type,
+	// `@bound(n)` - see `Field::bound`.
+	pub bound: Option<u32>,
 	pub rights: Vec<String>,
 	pub doc: Vec<Doc>,
 	pub evolution: Evolution,

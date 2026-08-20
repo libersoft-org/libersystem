@@ -584,6 +584,7 @@ pub mod permission {
 			OP_RUN_PIPELINE => {
 				let stages = {
 					let v12 = r.u16()? as usize;
+					let v12 = (v12 <= 8).then_some(v12)?;
 					let mut v13 = Vec::new();
 					v13.try_reserve_exact(v12).ok()?;
 					for _ in 0..v12 {

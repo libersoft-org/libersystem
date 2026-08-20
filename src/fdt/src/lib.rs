@@ -514,10 +514,15 @@ impl Fdt {
 			let mut d1_memory_reg: Option<(u64, u32)> = None;
 			let mut d1_cpus = false; //   inside the depth-1 "cpus" node
 			// The pcie/pci and plic nodes sit at the root on aarch64 virt but under /soc
-			// (depth 2) on riscv64 virt, so track them by the depth at which we entered.
-			let mut in_pcie: i32 = -1;
-			let mut in_plic: i32 = -1;
-			let mut in_fwcfg: i32 = -1;
+			// (depth 2) on riscv64 virt, so each is tracked by the depth at which we entered.
+			let mut pcie = Device::new();
+			let mut plic = Device::new();
+			let mut fwcfg = Device::new();
+			// What each depth declares for its children, and its `ranges` - so a device's `reg` is
+			// read in its PARENT's cells and translated up the buses it sits behind (FDT-003). The
+			// root's own defaults are the specification's.
+			let mut cells_at = [(2u32, 2u32); MAX_DEPTH + 1];
+			let mut buses = [Bus::root(); MAX_DEPTH + 1];
 			let mut d1_chosen = false;
 			let mut addr_cells: u32 = 2;
 			let mut size_cells: u32 = 2;
@@ -550,6 +555,17 @@ impl Fdt {
 						depth += 1;
 						let (name, next) = self.node_name_in(p, &b)?; // name + NUL, padded to 4
 						p = next;
+						if depth as usize > MAX_DEPTH {
+							return None;
+						}
+						if depth == 0 {
+							buses[0] = Bus::root();
+						} else {
+							cells_at[depth as usize] = cells_at[depth as usize - 1];
+							// A node that declares no `ranges` does not make its children reachable
+							// from its parent; inheriting the parent's would invent a mapping.
+							buses[depth as usize] = Bus { cells: cells_at[depth as usize], ranges: None };
+						}
 						if depth == 1 {
 							// A UNIT NAME OF EXACTLY `memory` OR `memory@...`, not a prefix.
 							//
@@ -571,14 +587,14 @@ impl Fdt {
 							cpu_ok = true;
 							cpu_reg = None;
 						}
-						if in_pcie < 0 && (self.str_starts(name, "pcie") || self.str_starts(name, "pci@")) {
-							in_pcie = depth;
+						if pcie.depth < 0 && (self.str_starts(name, "pcie") || self.str_starts(name, "pci@")) {
+							pcie.enter(depth);
 						}
-						if in_plic < 0 && self.str_starts(name, "plic") {
-							in_plic = depth;
+						if plic.depth < 0 && self.str_starts(name, "plic") {
+							plic.enter(depth);
 						}
-						if in_fwcfg < 0 && self.str_starts(name, "fw-cfg") {
-							in_fwcfg = depth;
+						if fwcfg.depth < 0 && self.str_starts(name, "fw-cfg") {
+							fwcfg.enter(depth);
 						}
 					}
 					FDT_END_NODE => {
@@ -641,20 +657,59 @@ impl Fdt {
 							d1_cpus = false;
 							d1_chosen = false;
 						}
-						if depth == in_pcie {
-							in_pcie = -1;
+						// EACH PLATFORM DEVICE'S VERDICT, NOW THAT ITS NODE IS FINISHED. `reg`,
+						// `compatible` and `status` may appear in any order, and all three decide
+						// whether this address may be used. The FIRST usable node of a kind wins,
+						// so an unrelated later one cannot overwrite it (FDT-003).
+						if depth == pcie.depth {
+							if pcie_ecam == 0
+								&& pcie.usable() && let Some((val, len)) = pcie.reg
+								&& let Some(child) = self.read_cells_property(val, len, cells_at[depth as usize - 1].0)
+								&& let Some(physical) = self.translate_to_root(&buses, depth as usize - 1, child)
+							{
+								pcie_ecam = physical;
+							}
+							pcie.leave();
 						}
-						if depth == in_plic {
-							in_plic = -1;
+						if depth == plic.depth {
+							if plic_base == 0
+								&& plic.usable() && let Some((val, len)) = plic.reg
+								&& let Some(child) = self.read_cells_property(val, len, cells_at[depth as usize - 1].0)
+								&& let Some(physical) = self.translate_to_root(&buses, depth as usize - 1, child)
+							{
+								plic_base = physical;
+							}
+							plic.leave();
 						}
-						if depth == in_fwcfg {
-							in_fwcfg = -1;
+						if depth == fwcfg.depth {
+							if fwcfg_base == 0
+								&& fwcfg.usable() && let Some((val, len)) = fwcfg.reg
+								&& let Some(child) = self.read_cells_property(val, len, cells_at[depth as usize - 1].0)
+								&& let Some(physical) = self.translate_to_root(&buses, depth as usize - 1, child)
+							{
+								fwcfg_base = physical;
+							}
+							fwcfg.leave();
 						}
 						depth -= 1;
 					}
 					FDT_PROP => {
 						let (pname, len, val, next) = self.prop_in(p, &b)?;
 						p = next;
+						// What this node declares for its CHILDREN, at every depth - recorded as
+						// declared and bounded where it is used, so a PCIe node's three address
+						// cells do not refuse a tree the rest of which is readable (FDT-006).
+						if depth >= 0 && (depth as usize) <= MAX_DEPTH {
+							if len == 4 && self.str_eq(pname, "#address-cells") {
+								cells_at[depth as usize].0 = self.be32(val);
+								buses[depth as usize].cells.0 = cells_at[depth as usize].0;
+							} else if len == 4 && self.str_eq(pname, "#size-cells") {
+								cells_at[depth as usize].1 = self.be32(val);
+								buses[depth as usize].cells.1 = cells_at[depth as usize].1;
+							} else if self.str_eq(pname, "ranges") {
+								buses[depth as usize].ranges = Some((val, len));
+							}
+						}
 						if depth == 0 {
 							// FOUR BYTES, BECAUSE THAT IS WHAT THE PROPERTY IS. `prop_in` proves the
 							// declared value lies inside the structure block; it does not prove the
@@ -718,20 +773,8 @@ impl Fdt {
 							// treated as unusable, which is the direction that cannot hand out
 							// memory the firmware still owns.
 							d1_memory_ok = (len >= 5 && self.str_eq(val, "okay")) || (len >= 3 && self.str_eq(val, "ok"));
-						} else if in_pcie == depth && self.str_eq(pname, "reg") {
-							// The pcie node's reg is <ecam_base ecam_size> in root cells.
-							// Through the bounded reader: a short `reg` leaves the previous value
-							// rather than adopting the bytes after it.
-							if let Some(base) = self.read_cells_property(val, len, addr_cells) {
-								pcie_ecam = base;
-							}
-						} else if in_plic == depth && self.str_eq(pname, "reg") {
-							// The plic node's reg is <plic_base plic_size> in root cells.
-							// Through the bounded reader: a short `reg` leaves the previous value
-							// rather than adopting the bytes after it.
-							if let Some(base) = self.read_cells_property(val, len, addr_cells) {
-								plic_base = base;
-							}
+						} else if pcie.depth == depth && self.record_device(&mut pcie, pname, val, len, &["pci-host-ecam-generic"]) {
+						} else if plic.depth == depth && self.record_device(&mut plic, pname, val, len, &["sifive,plic-1.0.0", "riscv,plic0"]) {
 						} else if depth == 1 && d1_chosen && (self.str_eq(pname, "linux,initrd-start") || self.str_eq(pname, "linux,initrd-end")) {
 							// QEMU writes these as one or two cells depending on the machine, so
 							// the width is taken from the property length rather than assumed -
@@ -749,13 +792,7 @@ impl Fdt {
 							} else {
 								modules_end = value;
 							}
-						} else if in_fwcfg == depth && self.str_eq(pname, "reg") {
-							// The fw-cfg node's reg is <fwcfg_base size> in root cells.
-							// Through the bounded reader: a short `reg` leaves the previous value
-							// rather than adopting the bytes after it.
-							if let Some(base) = self.read_cells_property(val, len, addr_cells) {
-								fwcfg_base = base;
-							}
+						} else if fwcfg.depth == depth && self.record_device(&mut fwcfg, pname, val, len, &["qemu,fw-cfg-mmio"]) {
 						}
 					}
 					FDT_NOP => {}
@@ -873,6 +910,11 @@ pub struct Console {
 	// getting it wrong writes the baud divisor where the character should go. Always 0 for PL011,
 	// whose registers are at fixed offsets.
 	pub reg_shift: u32,
+	// MMIO transaction width in bytes, from `reg-io-width` (FDT-006). One when the tree says
+	// nothing, which is the 16550's own default; a part wired for 32-bit access rejects or faults
+	// on byte transactions, and the loader's access layer already takes a width - it was simply
+	// never told this one.
+	pub reg_io_width: u32,
 }
 
 // A device-tree path is short and this reader does not allocate, so it goes in a fixed buffer. The
@@ -883,7 +925,148 @@ const MAX_PATH: usize = 128;
 // depth, so this bounds it. Deeper than this answers "no console".
 const MAX_DEPTH: usize = 12;
 
+// The register spacing this reader will accept (FDT-006). `reg-shift` names a power-of-two byte
+// spacing between a 16550's registers; 3 is already eight bytes each, and every part in the wild
+// declares 0, 1 or 2. It was taken as any `u32` and handed to the loader, which evaluates
+// `5 << reg_shift` for the line-status register - a panic under checked arithmetic, or a masked
+// offset into an unrelated register in release.
+const MAX_REG_SHIFT: u32 = 3;
+
+// One node on the path from the root, as far as addressing is concerned (FDT-003).
+#[derive(Clone, Copy)]
+struct Bus {
+	// What this node declares for its CHILDREN.
+	cells: (u32, u32),
+	// This node's own `ranges`, as (value, len) into the blob. A MISSING `ranges` is not an empty
+	// one: empty means the child address space IS the parent's, and missing means the child address
+	// space is not reachable from the parent at all - which is what the specification says and what
+	// this reader used to answer with the untranslated child address.
+	ranges: Option<(u64, u32)>,
+}
+
+// One of the three platform devices `parse` resolves, remembered until its node CLOSES (FDT-003).
+//
+// The old walk entered a node on its unit-name prefix alone, at any depth, read its `reg` with the
+// ROOT's cell counts, and committed the address there and then. So a node called `pcie-phy`, or one
+// the firmware had marked `disabled`, could overwrite a real one; a node under a bus with different
+// cell counts was read at the wrong width; and no address was ever translated through the bus it
+// sits behind. The verdict is taken at the node's end now, with everything about it in hand.
+#[derive(Clone, Copy)]
+struct Device {
+	// The depth the node was entered at, or -1 when not inside one.
+	depth: i32,
+	reg: Option<(u64, u32)>,
+	// `status`, and whether `compatible` named something this reader knows. Both default to the
+	// permissive answer for `status` and the refusing one for `compatible`, which is what each
+	// property's absence means.
+	enabled: bool,
+	known: bool,
+}
+
+impl Device {
+	const fn new() -> Self {
+		Device { depth: -1, reg: None, enabled: true, known: false }
+	}
+	fn enter(&mut self, depth: i32) {
+		*self = Device { depth, reg: None, enabled: true, known: false };
+	}
+	fn leave(&mut self) {
+		self.depth = -1;
+	}
+	// Whether this node's address may be used.
+	fn usable(&self) -> bool {
+		self.enabled && self.known
+	}
+}
+
+impl Bus {
+	const fn root() -> Self {
+		// The specification's own defaults for a node that declares nothing, and what every tree
+		// this system meets writes explicitly anyway. The root needs no `ranges`: nothing is above
+		// it to translate into.
+		Bus { cells: (2, 2), ranges: Some((0, 0)) }
+	}
+}
+
 impl Fdt {
+	// Walk `address` - expressed in the address space of the node at `depth` - up to a root physical
+	// address, through each ancestor's `ranges` (FDT-003).
+	//
+	// A `ranges` entry is `<child-address> <parent-address> <length>`, in the child bus's address
+	// cells, the parent's address cells, and the child bus's size cells respectively. An empty
+	// `ranges` is the identity. A missing one means the address does not translate, and an address
+	// that falls in no entry does not translate either - both are refusals here rather than the
+	// untranslated number, which is an address on a different bus.
+	//
+	// # Safety
+	//
+	// `buses[..=depth]` must hold values read out of this tree's own struct block.
+	unsafe fn translate_to_root(&self, buses: &[Bus; MAX_DEPTH + 1], depth: usize, address: u64) -> Option<u64> {
+		let mut address = address;
+		let mut at = depth;
+		while at > 0 {
+			let bus = buses[at];
+			let parent_cells = buses[at - 1].cells.0;
+			let (value, len) = bus.ranges?;
+			if len == 0 {
+				at -= 1;
+				continue; // an empty `ranges` is the identity mapping
+			}
+			// The counts this walk is about to fold into a `u64`, bounded here because they were
+			// recorded as the tree declared them (FDT-006).
+			if bus.cells.0 == 0 || bus.cells.0 > MAX_CELLS || parent_cells == 0 || parent_cells > MAX_CELLS || bus.cells.1 > MAX_CELLS {
+				return None;
+			}
+			let entry = 4 * (bus.cells.0 as u64 + parent_cells as u64 + bus.cells.1 as u64);
+			let mut q = value;
+			let end = value + len as u64;
+			let mut mapped: Option<u64> = None;
+			while q + entry <= end {
+				// SAFETY: inside the property this walk read out of the struct block.
+				let (child, parent, size) = unsafe { (self.read_cells(&mut q, bus.cells.0), self.read_cells(&mut q, parent_cells), self.read_cells(&mut q, bus.cells.1)) };
+				if address >= child && address - child < size {
+					mapped = parent.checked_add(address - child);
+					break;
+				}
+			}
+			address = mapped?;
+			at -= 1;
+		}
+		Some(address)
+	}
+
+	// Record one property of a platform device node, and answer whether it was one of the three
+	// this reader cares about (FDT-003).
+	//
+	// `compatible` is checked against the bindings this reader actually knows rather than trusted
+	// from the unit name: `pcie-phy`, `plic-sw` and anything else starting with those letters is a
+	// node, and reading its `reg` as a controller's base address programs the wrong device.
+	//
+	// # Safety
+	//
+	// `name` and `value` must point into this tree's struct block, with `len` bytes of value.
+	unsafe fn record_device(&self, device: &mut Device, name: u64, value: u64, len: u32, compatible: &[&str]) -> bool {
+		unsafe {
+			if self.str_eq(name, "reg") {
+				device.reg = Some((value, len));
+				return true;
+			}
+			if self.str_eq(name, "status") {
+				device.enabled = (len >= 5 && self.str_eq(value, "okay")) || (len >= 3 && self.str_eq(value, "ok"));
+				return true;
+			}
+			if self.str_eq(name, "compatible") {
+				for want in compatible {
+					if self.stringlist_contains(value, len, want.as_bytes()) {
+						device.known = true;
+					}
+				}
+				return true;
+			}
+		}
+		false
+	}
+
 	// The console the firmware described, or None when the tree does not name one this system can
 	// drive.
 	//
@@ -1004,8 +1187,15 @@ impl Fdt {
 		let mut uart: Option<Uart> = None;
 		let mut base: Option<u64> = None;
 		let mut reg_shift = 0u32;
+		let mut reg_io_width = 1u32;
+		// The node's own verdict on whether it may be used at all. Absent means enabled.
+		let mut enabled = true;
+		// Whether anything the node said was outside what this reader can represent. A tree that
+		// says something impossible gets NO console rather than an address assembled out of
+		// whatever followed the property (FDT-006).
+		let mut refused = false;
 		unsafe {
-			self.walk_node(&parts[..count], |name, value, len, cells| {
+			self.walk_node(&parts[..count], |name, value, len, cells, buses, depth| {
 				if self.str_eq(name, "compatible") {
 					// A `compatible` is a list, most specific first, and a machine may name a chip
 					// this system does not know followed by one it does. So every entry is tried
@@ -1014,23 +1204,53 @@ impl Fdt {
 						uart = self.uart_from_compatible(value, len);
 					}
 				} else if self.str_eq(name, "reg") && base.is_none() {
-					// The cell count comes from the tree, so it is bounded before it is used as a
-					// read length: four 32-bit cells is a 128-bit address and there is no such
-					// machine, while a garbage value would walk this read off the end of the
-					// property. A tree that says something impossible gets no console rather than
-					// an address assembled out of whatever followed.
+					// ONE RULE FOR CELL COUNTS, EVERYWHERE (FDT-006). This path allowed one through
+					// FOUR while the reader folds cells into a `u64`, so a bus declaring three cells
+					// produced a low 64-bit suffix of a 96-bit address - a number that looks like a
+					// valid physical address and is not one. `MAX_CELLS` is the rule the root parser
+					// already applied.
 					let mut at = value;
-					if (1..=4).contains(&cells.0) && len >= 4 * cells.0 {
-						base = Some(self.read_cells(&mut at, cells.0));
+					if !(1..=MAX_CELLS).contains(&cells.0) || len < 4 * cells.0 {
+						refused = true;
+						return;
+					}
+					let child = self.read_cells(&mut at, cells.0);
+					// AND TRANSLATED UP THE BUSES IT SITS BEHIND (FDT-003). `reg` is an address on
+					// the parent bus, not a physical one; the console used to be reached at the raw
+					// child address, which is the right offset on the wrong bus.
+					match self.translate_to_root(buses, depth - 1, child) {
+						Some(physical) => base = Some(physical),
+						None => refused = true,
 					}
 				} else if self.str_eq(name, "reg-shift") && len == 4 {
-					reg_shift = self.be32(value);
+					let shift = self.be32(value);
+					if shift > MAX_REG_SHIFT {
+						refused = true;
+						return;
+					}
+					reg_shift = shift;
+				} else if self.str_eq(name, "reg-io-width") && len == 4 {
+					// Only the widths the loader's access layer implements. A part that needs a
+					// width this system cannot issue is a console it cannot drive, and saying so is
+					// better than byte-poking a register file that will not answer.
+					let width = self.be32(value);
+					if !matches!(width, 1 | 2 | 4) {
+						refused = true;
+						return;
+					}
+					reg_io_width = width;
+				} else if self.str_eq(name, "status") {
+					// The same rule as `/memory` and the cpu nodes: `okay` or absent means usable.
+					enabled = (len >= 5 && self.str_eq(value, "okay")) || (len >= 3 && self.str_eq(value, "ok"));
 				}
 			});
 		}
+		if refused || !enabled {
+			return None;
+		}
 		let uart = uart?;
 		let base = base.filter(|address| *address != 0)?;
-		Some(Console { uart, base, reg_shift: if uart == Uart::Pl011 { 0 } else { reg_shift } })
+		Some(Console { uart, base, reg_shift: if uart == Uart::Pl011 { 0 } else { reg_shift }, reg_io_width })
 	}
 
 	// Which of the two drivers, if either, a `compatible` stringlist names.
@@ -1060,13 +1280,13 @@ impl Fdt {
 	// Visit every property of the node named by `parts`, with the parent's `(#address-cells,
 	// #size-cells)` - which is what `reg` is expressed in, and which is NOT the root's on riscv64,
 	// where the console lives under `/soc`.
-	unsafe fn walk_node(&self, parts: &[&[u8]], visit: impl FnMut(u64, u64, u32, (u32, u32))) {
+	unsafe fn walk_node(&self, parts: &[&[u8]], visit: impl FnMut(u64, u64, u32, (u32, u32), &[Bus; MAX_DEPTH + 1], usize)) {
 		// A malformed record stops the walk, which for this one means "no more properties" - its
 		// callers already treat an absent property as the answer.
 		let _ = unsafe { self.walk_node_inner(parts, visit) };
 	}
 
-	unsafe fn walk_node_inner(&self, parts: &[&[u8]], mut visit: impl FnMut(u64, u64, u32, (u32, u32))) -> Option<()> {
+	unsafe fn walk_node_inner(&self, parts: &[&[u8]], mut visit: impl FnMut(u64, u64, u32, (u32, u32), &[Bus; MAX_DEPTH + 1], usize)) -> Option<()> {
 		// The root has no parent to take its `reg` cells from, and every caller here names at least
 		// one component. Stated rather than assumed, because the alternative is an index of -1.
 		if parts.is_empty() {
@@ -1079,6 +1299,9 @@ impl Fdt {
 			// says nothing is the parent's value; the root's own default is 2/2 here, which is what
 			// every tree this system meets writes explicitly anyway.
 			let mut cells = [(2u32, 2u32); MAX_DEPTH + 1];
+			// Each node on the current path, so a matched node's `reg` can be walked up through the
+			// buses it sits behind (FDT-003).
+			let mut buses = [Bus::root(); MAX_DEPTH + 1];
 			let mut depth: i32 = -1;
 			// The depth of the deepest node on `parts` we are currently inside; 0 is the root.
 			let mut matched: i32 = -1;
@@ -1095,8 +1318,13 @@ impl Fdt {
 						}
 						if depth == 0 {
 							matched = 0;
+							buses[0] = Bus::root();
 						} else {
 							cells[depth as usize] = cells[depth as usize - 1];
+							// A node that declares no `ranges` is one whose children are not
+							// addressable from its parent; inheriting the parent's would be
+							// inventing a mapping the tree does not state.
+							buses[depth as usize] = Bus { cells: cells[depth as usize], ranges: None };
 							let index = depth as usize - 1;
 							if matched == depth - 1 && index < parts.len() && self.name_matches(name, parts[index]) {
 								matched = depth;
@@ -1122,12 +1350,23 @@ impl Fdt {
 						// properties of a node precede its children in the token stream - so by the
 						// time a child's `reg` is read, its parent's cells are known.
 						if len == 4 && self.str_eq(pname, "#address-cells") {
+							// RECORDED AS DECLARED, and bounded where it is USED (FDT-006).
+							//
+							// Refusing the whole walk here would be wrong: a PCIe node declares
+							// three address cells on every machine, and it is a sibling of the
+							// console rather than an ancestor of it. What must not happen is a cell
+							// count wider than a `u64` reaching the folding reader, so `console_at`
+							// and `translate_to_root` each check the counts they are about to use.
 							cells[depth as usize].0 = self.be32(value);
+							buses[depth as usize].cells.0 = cells[depth as usize].0;
 						} else if len == 4 && self.str_eq(pname, "#size-cells") {
 							cells[depth as usize].1 = self.be32(value);
+							buses[depth as usize].cells.1 = cells[depth as usize].1;
+						} else if self.str_eq(pname, "ranges") {
+							buses[depth as usize].ranges = Some((value, len));
 						}
 						if matched == depth && depth as usize == parts.len() {
-							visit(pname, value, len, cells[depth as usize - 1]);
+							visit(pname, value, len, cells[depth as usize - 1], &buses, depth as usize);
 						}
 					}
 					FDT_NOP => {}
@@ -1143,7 +1382,7 @@ impl Fdt {
 	// caring, that one wants every property of a node at once.
 	unsafe fn walk_to(&self, parts: &[&[u8]], mut found: impl FnMut(u64, u32, (u32, u32)), want: &[u8]) {
 		unsafe {
-			self.walk_node(parts, |name, value, len, cells| {
+			self.walk_node(parts, |name, value, len, cells, _buses, _depth| {
 				if self.str_eq_bytes(name, want) {
 					found(value, len, cells);
 				}
@@ -1285,7 +1524,21 @@ impl Fdt {
 	//
 	// Bounded by the blob's own total size and by a hard entry cap: the terminator comes off the
 	// same untrusted bytes as everything else, and a list that never terminates must not spin.
+	// ALL OR NOTHING, AND NOTHING IS COMMITTED UNTIL THE WHOLE LIST HAS VALIDATED (FDT-005).
+	//
+	// This used to hand each entry to the caller as it read it, and answer `false` afterwards if the
+	// list turned out to be unterminated or over the cap - so a caller that treated the answer as a
+	// diagnostic (which the one in this tree did) had already carved a PREFIX of a list it could not
+	// read, and went on using the rest of RAM as though the list had been empty. A zero-size or
+	// end-overflowing entry was skipped without even marking the list incomplete.
+	//
+	// The entries are collected into a fixed array first. If anything about the list is wrong - a
+	// truncated pair, a zero-size non-terminator, an end that overflows, no terminator within the
+	// cap - the caller sees NO entries and a `false`, and can decide about the whole tree rather
+	// than about a prefix it has already committed.
 	pub fn for_each_reserved_region(&self, mut visit: impl FnMut(u64, u64)) -> bool {
+		let mut entries = [(0u64, 0u64); MAX_RESERVED_REGIONS];
+		let mut count = 0usize;
 		unsafe {
 			if self.be32(self.base) != FDT_MAGIC {
 				return false;
@@ -1297,7 +1550,10 @@ impl Fdt {
 			}
 			let mut p = self.base + off;
 			let end = self.base + total;
-			for _ in 0..MAX_RESERVED_REGIONS {
+			let mut terminated = false;
+			// ONE MORE ITERATION THAN THE ARRAY HOLDS, so a FULL list followed by its terminator is
+			// a list that terminated rather than one that ran out.
+			for _ in 0..=MAX_RESERVED_REGIONS {
 				if p.checked_add(16).is_none_or(|next| next > end) {
 					return false;
 				}
@@ -1305,20 +1561,32 @@ impl Fdt {
 				let size = ((self.be32(p + 8) as u64) << 32) | self.be32(p + 12) as u64;
 				p += 16;
 				if address == 0 && size == 0 {
-					return true;
+					terminated = true;
+					break;
 				}
-				// A reservation whose end overflows is the tree contradicting itself; skipped
-				// rather than carved, because carving a saturated range would take the whole
-				// address space out of the allocator.
+				// A zero-size entry, or one whose end overflows, is the tree contradicting itself.
+				// Carving a saturated range would take the whole address space out of the
+				// allocator, and skipping it quietly is how a reservation stops being one - so the
+				// list is refused instead, and with it the tree's account of memory.
 				if size == 0 || address.checked_add(size).is_none() {
-					continue;
+					return false;
 				}
-				visit(address, size);
+				if count == MAX_RESERVED_REGIONS {
+					return false; // more reservations than this reader carries
+				}
+				entries[count] = (address, size);
+				count += 1;
 			}
-			// The list did not terminate within the cap: refused, because a client that carried on
-			// would be using memory the firmware reserved.
-			false
+			if !terminated {
+				// The list did not terminate within the cap: refused, because a client that carried
+				// on would be using memory the firmware reserved.
+				return false;
+			}
 		}
+		for &(address, size) in &entries[..count] {
+			visit(address, size);
+		}
+		true
 	}
 
 	// Every range the `/reserved-memory` subtree declares, which nothing read (FDT-001).

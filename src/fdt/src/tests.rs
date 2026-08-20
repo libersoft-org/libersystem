@@ -305,10 +305,10 @@ fn the_console_of_each_real_machine_is_found_at_the_address_that_was_hard_coded(
 	// answer on the machine the constant was right for. If these two lines ever disagree with the
 	// backends' fallbacks, one of the two is describing a machine that no longer exists.
 	let arm = at(AARCH64).console().expect("aarch64 virt names its console");
-	assert_eq!(arm, Console { uart: Uart::Pl011, base: 0x0900_0000, reg_shift: 0 });
+	assert_eq!(arm, Console { uart: Uart::Pl011, base: 0x0900_0000, reg_shift: 0, reg_io_width: 1 });
 
 	let risc = at(RISCV64).console().expect("riscv64 virt names its console");
-	assert_eq!(risc, Console { uart: Uart::Ns16550, base: 0x1000_0000, reg_shift: 0 });
+	assert_eq!(risc, Console { uart: Uart::Ns16550, base: 0x1000_0000, reg_shift: 0, reg_io_width: 1 });
 }
 
 #[test]
@@ -386,13 +386,76 @@ fn a_bus_with_its_own_address_cells_decides_how_its_children_are_read() {
 	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
 	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
 	builder.begin("chosen").prop_str("stdout-path", "/soc/serial@10000000").end();
-	builder.begin("soc").prop_u32("#address-cells", 1).prop_u32("#size-cells", 1);
+	// An empty `ranges` - the identity mapping - because a bus that declares none does not make its
+	// children reachable from its parent at all (FDT-003), which the test below covers.
+	builder.begin("soc").prop_u32("#address-cells", 1).prop_u32("#size-cells", 1).prop("ranges", &[]);
 	let mut reg = 0x1000_0000u32.to_be_bytes().to_vec();
 	reg.extend_from_slice(&0x1000u32.to_be_bytes());
 	builder.begin("serial@10000000").prop_str("compatible", "ns16550a").prop("reg", &reg).end();
 	builder.end().end();
 	let blob = builder.finish();
 	assert_eq!(at(blob).console().map(|console| console.base), Some(0x1000_0000), "one cell means one cell");
+}
+
+// A machine whose console sits behind `bus`, built by `bus_props`, at child address `child`.
+fn console_behind_bus(bus_props: impl FnOnce(&mut Builder), child: u64) -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("chosen").prop_str("stdout-path", "/soc/serial@1000").end();
+	builder.begin("soc");
+	bus_props(&mut builder);
+	let mut reg = child.to_be_bytes().to_vec();
+	reg.extend_from_slice(&0x1000u64.to_be_bytes());
+	builder.begin("serial@1000").prop_str("compatible", "ns16550a").prop("reg", &reg).end();
+	builder.end().end();
+	builder.finish()
+}
+
+#[test]
+fn a_device_behind_a_bus_is_reached_at_the_address_the_bus_translates_it_to() {
+	// FDT-003. A `reg` is an address on the PARENT BUS, and `ranges` is how that bus says where its
+	// children land in ITS parent's space. This reader returned the raw child address - the right
+	// offset on the wrong bus - so a UART at child 0x1000 behind a window based at 0x9000_0000 was
+	// driven at physical 0x1000, which on most machines is RAM.
+	let mapped = console_behind_bus(
+		|builder| {
+			builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+			// <child 0x0 -> parent 0x9000_0000, 0x1_0000 long>
+			let mut ranges = 0u64.to_be_bytes().to_vec();
+			ranges.extend_from_slice(&0x9000_0000u64.to_be_bytes());
+			ranges.extend_from_slice(&0x1_0000u64.to_be_bytes());
+			builder.prop("ranges", &ranges);
+		},
+		0x1000,
+	);
+	assert_eq!(at(mapped).console().map(|console| console.base), Some(0x9000_1000), "the child address is translated through the bus window");
+
+	// An address outside every window the bus declares does not translate, and an untranslatable
+	// address is not a console: answering the raw number would be answering with an address on a
+	// different bus.
+	let outside = console_behind_bus(
+		|builder| {
+			builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+			let mut ranges = 0u64.to_be_bytes().to_vec();
+			ranges.extend_from_slice(&0x9000_0000u64.to_be_bytes());
+			ranges.extend_from_slice(&0x800u64.to_be_bytes()); // the window ends before 0x1000
+			builder.prop("ranges", &ranges);
+		},
+		0x1000,
+	);
+	assert_eq!(at(outside).console(), None, "an address in no window of its bus does not translate");
+
+	// And a bus with NO `ranges` does not make its children reachable at all. This is the case the
+	// old reader answered with the untranslated address.
+	let unreachable = console_behind_bus(
+		|builder| {
+			builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+		},
+		0x1000,
+	);
+	assert_eq!(at(unreachable).console(), None, "a bus that declares no ranges does not translate its children");
 }
 
 #[test]
@@ -404,7 +467,7 @@ fn a_dw_apb_uart_carries_its_register_spacing() {
 		builder.begin("chosen").prop_str("stdout-path", "/serial@10000000").end();
 		builder.begin("serial@10000000").prop_str("compatible", "snps,dw-apb-uart").prop_reg64(0x1000_0000, 0x1000).prop_u32("reg-shift", 2).end();
 	});
-	assert_eq!(at(blob).console(), Some(Console { uart: Uart::Ns16550, base: 0x1000_0000, reg_shift: 2 }));
+	assert_eq!(at(blob).console(), Some(Console { uart: Uart::Ns16550, base: 0x1000_0000, reg_shift: 2, reg_io_width: 1 }));
 }
 
 #[test]
@@ -1041,4 +1104,218 @@ fn a_cpu_node_without_a_reg_names_no_core() {
 	assert_eq!(info.cpu_count, 1);
 	assert_eq!(info.cpu_ids[0], 0);
 	assert_eq!(info.cpu_nodes, 2);
+}
+
+#[test]
+fn a_console_the_reader_cannot_represent_is_not_a_console() {
+	// FDT-006. The console path accepted one through FOUR address cells while every reader in this
+	// crate folds cells into a `u64`, so a bus declaring three produced the low 64 bits of a 96-bit
+	// address - a number that looks like a valid physical address and names nothing. The root
+	// parser had applied `MAX_CELLS` since it was written; this path had its own rule.
+	for cells in [0u32, 1, 2, 3, 4] {
+		let mut builder = Builder::new();
+		builder.begin("");
+		builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+		builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+		builder.begin("chosen").prop_str("stdout-path", "/soc/serial@10000000").end();
+		builder.begin("soc").prop_u32("#address-cells", cells).prop_u32("#size-cells", 1).prop("ranges", &[]);
+		// The address written in `cells` cells, followed by a one-cell size.
+		let mut reg: Vec<u8> = Vec::new();
+		for index in (0..cells).rev() {
+			// The address, big-endian, in as many cells as this bus declares; cells above the
+			// value's own width are zero.
+			let cell = if index == 0 { 0x1000_0000u32 } else { 0 };
+			reg.extend_from_slice(&cell.to_be_bytes());
+		}
+		reg.extend_from_slice(&0x1000u32.to_be_bytes());
+		builder.begin("serial@10000000").prop_str("compatible", "ns16550a").prop("reg", &reg).end();
+		builder.end().end();
+		let base = at(builder.finish()).console().map(|console| console.base);
+		match cells {
+			1 | 2 => assert_eq!(base, Some(0x1000_0000), "{cells} cells is a width this reader represents"),
+			_ => assert_eq!(base, None, "{cells} cells is not, so there is no console rather than a truncated address"),
+		}
+	}
+}
+
+#[test]
+fn the_register_spacing_and_access_width_are_bounded_by_what_the_loader_can_issue() {
+	// FDT-006. `reg-shift` was taken as any `u32` and handed to the loader, which evaluates
+	// `5 << reg_shift` for the line-status register: a panic under checked arithmetic, or a masked
+	// offset into an unrelated register in release. And `reg-io-width` was not read at all, so a
+	// part wired for 32-bit access was byte-poked - after `ExitBootServices`, where a lost console
+	// is also a lost diagnosis.
+	let with = |name: &'static str, value: u32| {
+		machine(|builder| {
+			builder.begin("chosen").prop_str("stdout-path", "/serial@10000000").end();
+			builder.begin("serial@10000000").prop_str("compatible", "ns16550a").prop_reg64(0x1000_0000, 0x1000).prop_u32(name, value).end();
+		})
+	};
+	for shift in [0u32, 1, 2, 3] {
+		assert_eq!(at(with("reg-shift", shift)).console().map(|console| console.reg_shift), Some(shift), "a spacing of {shift} is one a 16550 has");
+	}
+	for shift in [4u32, 63, 64, u32::MAX] {
+		assert_eq!(at(with("reg-shift", shift)).console(), None, "a spacing of {shift} is not a register file, so there is no console");
+	}
+	for width in [1u32, 2, 4] {
+		assert_eq!(at(with("reg-io-width", width)).console().map(|console| console.reg_io_width), Some(width), "a width the access layer implements is carried");
+	}
+	for width in [0u32, 3, 8, u32::MAX] {
+		assert_eq!(at(with("reg-io-width", width)).console(), None, "a width it cannot issue is a console it cannot drive");
+	}
+	// And the default, which is what every tree in this repository actually says.
+	let plain = machine(|builder| {
+		builder.begin("chosen").prop_str("stdout-path", "/serial@10000000").end();
+		builder.begin("serial@10000000").prop_str("compatible", "ns16550a").prop_reg64(0x1000_0000, 0x1000).end();
+	});
+	assert_eq!(at(plain).console().map(|console| (console.reg_shift, console.reg_io_width)), Some((0, 1)));
+}
+
+#[test]
+fn a_disabled_console_is_not_the_console() {
+	// The node `/chosen` points at can be marked unusable like any other, and the reader did not
+	// look. Driving a UART the firmware has disabled is writing to a device that may be powered
+	// down or handed to something else.
+	let disabled = machine(|builder| {
+		builder.begin("chosen").prop_str("stdout-path", "/serial@10000000").end();
+		builder.begin("serial@10000000").prop_str("compatible", "ns16550a").prop_reg64(0x1000_0000, 0x1000).prop_str("status", "disabled").end();
+	});
+	assert_eq!(at(disabled).console(), None, "a disabled node is not a console");
+	let okay = machine(|builder| {
+		builder.begin("chosen").prop_str("stdout-path", "/serial@10000000").end();
+		builder.begin("serial@10000000").prop_str("compatible", "ns16550a").prop_reg64(0x1000_0000, 0x1000).prop_str("status", "okay").end();
+	});
+	assert_eq!(at(okay).console().map(|console| console.base), Some(0x1000_0000), "and an enabled one is");
+}
+
+// A machine with a `/soc` bus carrying whatever `body` adds, so the platform-device cases below
+// differ by one node each.
+fn machine_with_soc(bus_props: impl FnOnce(&mut Builder), body: impl FnOnce(&mut Builder)) -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.begin("soc");
+	bus_props(&mut builder);
+	body(&mut builder);
+	builder.end().end();
+	builder.finish()
+}
+
+#[test]
+fn a_platform_device_is_the_one_its_compatible_names_and_not_the_one_its_name_starts_like() {
+	// FDT-003. The walk entered these nodes on a unit-name PREFIX at any depth, read the `reg`
+	// there and then, and let the last one win. So `plic-sw` - a real node on several boards -
+	// overwrote the interrupt controller's base with its own, and the kernel then programmed a
+	// different device. `compatible` is what a binding is; the name only says where to look.
+	let blob = machine_with_soc(
+		|builder| {
+			builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop("ranges", &[]);
+		},
+		|builder| {
+			// The decoy FIRST, which is the ordering that catches a reader taking the name for the
+			// binding: last-one-wins and first-one-wins both give the right answer otherwise.
+			builder.begin("plic-sw@d000000").prop_str("compatible", "sifive,plic-sw").prop_reg64(0x0d00_0000, 0x1000).end();
+			builder.begin("plic@c000000").prop_str("compatible", "sifive,plic-1.0.0").prop_reg64(0x0c00_0000, 0x60_0000).end();
+		},
+	);
+	let info = at(blob).parse().expect("the machine parses");
+	assert_eq!(info.plic_base, 0x0c00_0000, "the controller, not the node whose name starts the same way");
+
+	// And a node the firmware disabled is not the controller either.
+	let disabled = machine_with_soc(
+		|builder| {
+			builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop("ranges", &[]);
+		},
+		|builder| {
+			builder.begin("plic@c000000").prop_str("compatible", "sifive,plic-1.0.0").prop_reg64(0x0c00_0000, 0x60_0000).prop_str("status", "disabled").end();
+		},
+	);
+	assert_eq!(at(disabled).parse().expect("the machine parses").plic_base, 0, "a disabled controller is not a controller");
+}
+
+#[test]
+fn a_platform_device_behind_a_bus_is_read_in_that_buss_cells_and_translated_through_it() {
+	// FDT-003, the other half: these `reg`s were decoded with the ROOT's cell counts even under a
+	// bus that declares its own, and the address was never translated through the bus's `ranges`.
+	// One reads the wrong number of cells; the other returns an address on the wrong bus. Both
+	// point PCI enumeration or an interrupt controller at whatever happens to live there.
+	let blob = machine_with_soc(
+		|builder| {
+			// A one-cell bus whose window is based a long way up.
+			builder.prop_u32("#address-cells", 1).prop_u32("#size-cells", 1);
+			let mut ranges = 0x1000u32.to_be_bytes().to_vec(); // child 0x1000
+			ranges.extend_from_slice(&0x3000_0000u64.to_be_bytes()); // -> parent 0x3000_0000
+			ranges.extend_from_slice(&0x1_0000u32.to_be_bytes()); // 64 kB long
+			builder.prop("ranges", &ranges);
+		},
+		|builder| {
+			let mut reg = 0x2000u32.to_be_bytes().to_vec();
+			reg.extend_from_slice(&0x1000u32.to_be_bytes());
+			builder.begin("pcie@2000").prop_str("compatible", "pci-host-ecam-generic").prop("reg", &reg).end();
+		},
+	);
+	let info = at(blob).parse().expect("the machine parses");
+	assert_eq!(info.pcie_ecam, 0x3000_1000, "one cell read as one cell, then translated through the bus window");
+}
+
+// The reservation block of `blob`, and whether the reader accepted it whole.
+fn reservations_of(blob: &'static [u8]) -> (Vec<(u64, u64)>, bool) {
+	let mut seen: Vec<(u64, u64)> = Vec::new();
+	let complete = at(blob).for_each_reserved_region(|base, size| seen.push((base, size)));
+	(seen, complete)
+}
+
+// A machine whose reservation block holds exactly `entries`.
+fn machine_reserving(entries: &[(u64, u64)]) -> &'static [u8] {
+	let mut builder = Builder::new();
+	for &(base, size) in entries {
+		builder.reserve(base, size);
+	}
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.end();
+	builder.finish()
+}
+
+#[test]
+fn a_reservation_list_is_read_whole_or_not_at_all() {
+	// FDT-005. Entries were handed to the caller as they were read, and the "could this list be
+	// read?" answer came afterwards - so a caller that treated it as a diagnostic, which the one in
+	// this tree did, had already carved a PREFIX and then used the rest of RAM as though the list
+	// had been empty. Firmware memory, in the allocator, on a machine whose tree is malformed.
+	//
+	// A good list is still read.
+	let (seen, complete) = reservations_of(machine_reserving(&[(0x4000_0000, 0x1000), (0x8000_0000, 0x2000)]));
+	assert!(complete);
+	assert_eq!(seen, vec![(0x4000_0000, 0x1000), (0x8000_0000, 0x2000)]);
+
+	// A zero-size entry is the tree contradicting itself. It used to be skipped without even
+	// marking the list incomplete, so the entries AFTER it were carved and the list read as good.
+	let (seen, complete) = reservations_of(machine_reserving(&[(0x4000_0000, 0x1000), (0x5000_0000, 0), (0x8000_0000, 0x2000)]));
+	assert!(!complete, "a malformed entry is not a list that was read");
+	assert!(seen.is_empty(), "and nothing before it was committed");
+
+	// An entry whose end overflows: same treatment, for the same reason.
+	let (seen, complete) = reservations_of(machine_reserving(&[(0x4000_0000, 0x1000), (u64::MAX - 4, 64)]));
+	assert!(!complete);
+	assert!(seen.is_empty(), "nothing is committed from a list that does not validate");
+}
+
+#[test]
+fn a_reservation_list_that_does_not_terminate_reserves_nothing() {
+	// The terminator comes off the same untrusted bytes as everything else. A list that runs to the
+	// cap without one, or past it, is a list this reader cannot say it has read - and the entries it
+	// did read are not a safe subset, because the ones it did not are exactly the unknown.
+	let full: Vec<(u64, u64)> = (0..super::MAX_RESERVED_REGIONS as u64).map(|i| (0x4000_0000 + i * 0x2000, 0x1000)).collect();
+	let (seen, complete) = reservations_of(machine_reserving(&full));
+	assert!(complete, "a full list followed by its terminator is a list that terminated");
+	assert_eq!(seen.len(), super::MAX_RESERVED_REGIONS);
+
+	let over: Vec<(u64, u64)> = (0..super::MAX_RESERVED_REGIONS as u64 + 1).map(|i| (0x4000_0000 + i * 0x2000, 0x1000)).collect();
+	let (seen, complete) = reservations_of(machine_reserving(&over));
+	assert!(!complete, "one more than this reader carries is a list it cannot carry");
+	assert!(seen.is_empty(), "and it commits none of it");
 }

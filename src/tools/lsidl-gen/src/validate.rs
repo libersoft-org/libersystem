@@ -125,6 +125,27 @@ fn check_record(r: &Record, package_version: u32, names: &HashMap<String, Kind>,
 			errs.push(Error::new(f.span, format!("duplicate field `{}` in record `{}`", f.name, r.name)));
 		}
 		check_type(&f.ty, f.span, names, errs);
+		check_bound(f.bound, &f.ty, f.span, &format!("field `{}`", f.name), errs);
+	}
+}
+
+// `@bound(n)` says how many ITEMS a list may carry or how many BYTES a string may hold, so it has
+// to be attached to one of those (IDL-005). On anything else it would read like a rule and enforce
+// nothing, which is the failure `@rights` had before IDL-004 closed it.
+fn check_bound(bound: Option<u32>, ty: &Type, span: Span, what: &str, errs: &mut Vec<Error>) {
+	let Some(bound) = bound else { return };
+	// Through `option<..>` and `result<..>`, because a bounded list is still a bounded list when it
+	// is optional or carried in a result - which is how nearly every method returns one.
+	fn bearer(ty: &Type) -> Option<&Type> {
+		match ty {
+			Type::List(_) | Type::String => Some(ty),
+			Type::Option(inner) => bearer(inner),
+			Type::Result(ok, _) => bearer(ok),
+			_ => None,
+		}
+	}
+	if bearer(ty).is_none() {
+		errs.push(Error::new(span, format!("`@bound({bound})` on {what}, whose type is not a list or a string - there is nothing for it to bound")));
 	}
 }
 
@@ -209,8 +230,10 @@ fn check_interface(i: &Interface, package_version: u32, names: &HashMap<String, 
 				}
 			}
 			check_type(&p.ty, p.span, names, errs);
+			check_bound(p.bound, &p.ty, p.span, &format!("parameter `{}`", p.name), errs);
 		}
 		check_type(&m.ret, m.span, names, errs);
+		check_bound(m.ret_bound, &m.ret, m.span, &format!("the return of `{}`", m.name), errs);
 	}
 	for r in &i.reserved {
 		if used_ops.contains_key(r) {

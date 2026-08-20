@@ -1021,3 +1021,26 @@ fn a_region_whose_end_leaves_the_address_space_is_refused() {
 	assert!(firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).is_none(), "a region that leaves the address space is refused");
 	unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
 }
+
+// The loader's own scratch class reaches the kernel as memory it may reclaim.
+#[test]
+fn loader_scratch_is_handed_over_as_reclaimable_and_the_kernels_own_memory_is_not() {
+	// LDR-012. One memory type covered both the objects the kernel must retain - its image, the
+	// packages, the page tables, `BootInfo`, the boot stack, the AP trampoline - and scratch whose
+	// life ends at the handoff. `LOADER_DATA` translates to `MEM_BOOTLOADER`, which the frame
+	// allocator never seeds, so every boot permanently lost the difference.
+	//
+	// The final memory-map buffer is the case that cannot be solved by freeing earlier: it is READ
+	// at `ExitBootServices`, and there is no firmware afterwards to free it. It is allocated in the
+	// OS-loader range the specification reserves for exactly this, and the translation says so.
+	let _guard = guard();
+	state().descriptors = vec![descriptor(crate::LOADER_DATA, 0x1000, 1), descriptor(crate::OS_LOADER_SCRATCH, 0x2000, 1), descriptor(crate::CONVENTIONAL_MEMORY, 0x3000, 1)];
+	let (buf, pages, map_size, desc_size) = firmware::memory_map_snapshot(mock::boot_services()).expect("the map is taken");
+	let mut regions = vec![bootproto::MemRegion { base: 0, length: 0, kind: 0, _pad: 0 }; memory::MAX_REGIONS];
+	let n = firmware::translate_map(buf, map_size, desc_size, regions.as_mut_ptr()).expect("the map translates");
+	assert_eq!(n, 3, "three kinds, three regions - none of them merge");
+	assert_eq!((regions[0].base, regions[0].kind), (0x1000, bootproto::MEM_BOOTLOADER), "what the kernel must keep is retained");
+	assert_eq!((regions[1].base, regions[1].kind), (0x2000, bootproto::MEM_BOOTLOADER_RECLAIMABLE), "and what died at the handoff is not");
+	assert_eq!((regions[2].base, regions[2].kind), (0x3000, bootproto::MEM_USABLE));
+	unsafe { ((*mock::boot_services()).free_pages)(buf as u64, pages) };
+}

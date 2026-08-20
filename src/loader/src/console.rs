@@ -146,7 +146,7 @@ pub(crate) fn discover(system_table: *mut uefi::SystemTable) {
 			}
 		}
 	}
-	let from_tree = (dtb != 0).then(|| unsafe { fdt::Fdt::new(dtb, identity) }.console()).flatten().map(|console| PostEbs { pl011: console.uart == fdt::Uart::Pl011, base: console.base, reg_shift: console.reg_shift, access_width: 1 });
+	let from_tree = (dtb != 0).then(|| unsafe { fdt::Fdt::new(dtb, identity) }.console()).flatten().map(|console| PostEbs { pl011: console.uart == fdt::Uart::Pl011, base: console.base, reg_shift: console.reg_shift, access_width: console.reg_io_width });
 	// The device tree first: a machine that has one is describing the hardware it actually has,
 	// while SPCR describes what the firmware was using - which is the same thing on every machine
 	// this has met, and the tree is the more specific of the two.

@@ -1678,6 +1678,7 @@ where
 					if idx == 0 {
 						break;
 					}
+					announce_disconnect(chan, request, reply, &mut handle_request);
 					close(chan);
 					chans.swap_remove(idx);
 				}
@@ -1723,10 +1724,39 @@ where
 					if idx == 0 {
 						break;
 					}
+					announce_disconnect(chan, request, reply, &mut handle_request);
 					close(chan);
 					chans.swap_remove(idx);
 				}
 			}
+		}
+	}
+}
+
+// Tell the handler that `chan`'s client is gone, before the channel is closed (IDL-001).
+//
+// A service that keeps per-client state - a prepared launch, a lease, a scope - could not learn
+// that a client had left: `serve_multi` closed the channel and dropped it from the set, and the
+// handler was never called again for it. What that state was holding stayed held, and for a
+// prepared launch that means a process loaded, stopped, and never released or torn down.
+//
+// Synthesised as a REQUEST with the reserved `DISCONNECT_OP`, rather than as a second closure,
+// because the handler owns the service's state mutably and two closures cannot both borrow it.
+// Any reply is discarded: the channel is already gone.
+unsafe fn announce_disconnect<F>(chan: u64, request: &mut [u8], reply: &mut [u8], handle_request: &mut F)
+where
+	F: FnMut(u64, &[u8], &mut wire::Handles, &mut [u8], &mut wire::Handles) -> Option<usize>,
+{
+	if request.len() < 2 {
+		return;
+	}
+	request[..2].copy_from_slice(&DISCONNECT_OP.to_le_bytes());
+	let mut handles = wire::Handles::new();
+	let mut reply_handles = wire::Handles::new();
+	let _ = handle_request(chan, &request[..2], &mut handles, reply, &mut reply_handles);
+	for &leftover in reply_handles.as_slice() {
+		if leftover != 0 {
+			unsafe { close(leftover) };
 		}
 	}
 }

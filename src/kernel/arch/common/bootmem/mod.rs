@@ -254,17 +254,25 @@ mod tests;
 // `frame` init. So the pages holding the device tree, firmware runtime data and whatever a board
 // reserves could be allocated and zeroed while still live.
 //
-// Appended to whatever the loader reservations already wrote, and returns the new total. A blob
-// this cannot read reserves nothing and says so; refusing the boot over an unreadable reservation
-// list would take a machine down over a list that is usually empty.
-pub unsafe fn devicetree_reservations(fdt: &fdt::Fdt, out: &mut [Hole], written: usize) -> usize {
+// Appended to whatever the loader reservations already wrote. Returns the new total AND whether
+// every reservation the tree declares was carried (FDT-005).
+//
+// A blob this cannot read reserves nothing and says so; refusing the boot over an unreadable
+// reservation list would take a machine down over a list that is usually empty. What the caller
+// must NOT do is take the tree's account of RAM while ignoring its account of what is reserved -
+// the two come off the same bytes, and half of them is worse than neither. The second half of the
+// answer is what lets the caller fall back to the conservative region instead.
+pub unsafe fn devicetree_reservations(fdt: &fdt::Fdt, out: &mut [Hole], written: usize) -> (usize, bool) {
 	let mut written = written;
-	let mut push = |start: u64, length: u64, written: &mut usize| {
+	// Set by anything that stopped a reservation from being carried, wherever it happened.
+	let mut complete = true;
+	let mut push = |start: u64, length: u64, written: &mut usize, complete: &mut bool| {
 		if length == 0 {
 			return;
 		}
 		if *written >= out.len() {
 			crate::serial_println!("bootmem: NO ROOM to reserve {start:#x}..{:#x} - the hole list holds {} and the allocator may hand this range out", start + length, out.len());
+			*complete = false;
 			return;
 		}
 		out[*written] = Hole { start, end: start + length };
@@ -272,15 +280,17 @@ pub unsafe fn devicetree_reservations(fdt: &fdt::Fdt, out: &mut [Hole], written:
 	};
 	// The blob's own pages first: it is the one this kernel is certain to keep reading.
 	if let Some((base, len)) = fdt.extent() {
-		push(base, len, &mut written);
+		push(base, len, &mut written, &mut complete);
 	}
 	let mut entries = 0usize;
-	let complete = fdt.for_each_reserved_region(|base, len| {
+	// All or nothing on the reader's side now: an unreadable list hands over no entries at all, so
+	// this either carves the whole thing or carves none of it.
+	if !fdt.for_each_reserved_region(|base, len| {
 		entries += 1;
-		push(base, len, &mut written);
-	});
-	if !complete {
-		crate::serial_println!("bootmem: the device tree's reservation block could not be read to its end - {entries} entr(ies) carved out, and anything past them is NOT reserved");
+		push(base, len, &mut written, &mut complete);
+	}) {
+		crate::serial_println!("bootmem: the device tree's reservation block does not read as a list - nothing from it is reserved, and this tree's account of memory is not used");
+		complete = false;
 	}
 	// AND THE OTHER PLACE THE TREE SAYS "DO NOT USE THIS" (FDT-001).
 	//
@@ -295,12 +305,13 @@ pub unsafe fn devicetree_reservations(fdt: &fdt::Fdt, out: &mut [Hole], written:
 	let mut nodes = 0usize;
 	let subtree = fdt.for_each_reserved_memory_node(|base, len| {
 		nodes += 1;
-		push(base, len, &mut written);
+		push(base, len, &mut written, &mut complete);
 	});
 	if !subtree {
 		crate::serial_println!("bootmem: the device tree's /reserved-memory subtree could not be read to its end - {nodes} range(s) carved out, and anything past them is NOT reserved");
+		complete = false;
 	}
-	written
+	(written, complete)
 }
 
 // THE FIRMWARE'S OWN MAP, when the loader handed one over.

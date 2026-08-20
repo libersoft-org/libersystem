@@ -615,6 +615,39 @@ fn signal_terminate_wakes_a_blocked_thread() {
 	assert_eq!(victim_thread.state(), ThreadState::Exited, "the victim thread has exited");
 }
 
+tagged_test!(a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops, [Ipc, Scheduler, Kernel], id = "kernel.kernel.a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops", covers = ["kernel"]);
+fn a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops() {
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static BLOCKED: AtomicBool = AtomicBool::new(false);
+	static RESUMED: AtomicBool = AtomicBool::new(false);
+	// P02M0088's open observation, reduced to the two objects it is about. `Channel::is_readable`
+	// is "inbox non-empty OR peer closed", so dropping the last peer handle must make a blocked
+	// wait ready - a thread that waits forever on a channel whose peer is gone is a hang with no
+	// error, and the shape this tree has closed several times elsewhere.
+	//
+	// It was seen through `process_service_lists_every_started_program`, where two launched
+	// children blocked on bootstrap channels the test held and did not return within sixty-four
+	// scheduler passes on aarch64. This is the same event without the service, the package loader
+	// or ring 3 in the way.
+	extern "C" fn waiter(handle: u64) {
+		unsafe {
+			BLOCKED.store(true, Ordering::SeqCst);
+			arch::syscall::invoke(syscall::SYS_WAIT, handle, 0, 0, 0);
+			RESUMED.store(true, Ordering::SeqCst);
+		}
+	}
+	BLOCKED.store(false, Ordering::SeqCst);
+	RESUMED.store(false, Ordering::SeqCst);
+	let (theirs, ours) = object::channel::Channel::create();
+	let _thread = sched::spawn_with_object(waiter, theirs, object::rights::Rights::ALL, 0);
+	sched::run_until_idle();
+	assert!(BLOCKED.load(Ordering::SeqCst), "the waiter ran");
+	assert!(!RESUMED.load(Ordering::SeqCst), "and is blocked while this test holds the peer");
+	drop(ours);
+	sched::run_until_idle();
+	assert!(RESUMED.load(Ordering::SeqCst), "dropping the last peer handle wakes the thread blocked on the other end");
+}
+
 tagged_test!(a_clean_exit_releases_the_process_channel_endpoints, [Process], id = "kernel.kernel.a_clean_exit_releases_the_process_channel_endpoints", covers = ["kernel"]);
 fn a_clean_exit_releases_the_process_channel_endpoints() {
 	use object::channel::Channel;

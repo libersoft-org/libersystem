@@ -46,6 +46,11 @@ pub const MEM_BAD: u32 = 4;
 pub const MEM_BOOTLOADER: u32 = 5;
 pub const MEM_KERNEL: u32 = 6;
 pub const MEM_FRAMEBUFFER: u32 = 7;
+// Loader memory whose life ended at the handoff: the final memory-map buffer and anything else the
+// loader could not free before `ExitBootServices` and nothing owns after it (LDR-012). Seeded as
+// usable, unlike `MEM_BOOTLOADER`, which holds the kernel image, the packages, the page tables,
+// `BootInfo`, the boot stack and the AP trampoline.
+pub const MEM_BOOTLOADER_RECLAIMABLE: u32 = 8;
 
 // One physical memory-map region: its physical base, byte length, and kind (a
 // MEM_* code above). The loader sorts these ascending by base and coalesces

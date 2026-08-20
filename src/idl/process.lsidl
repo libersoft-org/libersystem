@@ -63,10 +63,20 @@ record start-result {
 /// queues it. The caller gets the same `start-result` an ordinary launch returns, so job
 /// control is identical - what differs is only that the program has not begun.
 ///
-/// The start token itself never leaves this service. A reply carries one handle and a prepared
-/// launch would need two, but keeping the token here is the better answer anyway: a caller
-/// cannot hold a half-started process open indefinitely, and `release` names the koid it
-/// already has rather than a second capability to lose track of.
+/// The start token itself never leaves this service, and a prepared launch is keyed by the CHANNEL
+/// it was prepared on as well as its koid - so naming another client's koid answers exactly as
+/// naming one that does not exist, which is the truth from where that caller stands.
+///
+/// A move-only handle would be the other way to say that, and it does not fit: `release-group` takes
+/// one token per stage and a message carries at most `abi::MAX_MESSAGE_CAPS` (four) capabilities,
+/// while a pipeline may have eight stages. A token per stage would make the all-or-none group
+/// release - the thing `security.run-pipeline` promises - unexpressible.
+///
+/// `cancel` is the other end of `release`: it drops a prepared launch and tears the loaded process
+/// down. Without it the only ways out of a prepared launch were to start it or to leave it - and
+/// PermissionManager has several early returns that abandon a pipeline midway, which left a process
+/// loaded, stopped, and holding its Domain forever. A client that simply GOES is cancelled too: the
+/// service is told when a client's channel closes and abandons everything that client prepared.
 ///
 /// `release-group` is the same gate for a WHOLE pipeline, and it exists because releasing one koid
 /// at a time cannot keep the promise `security.run-pipeline` makes. Past the first release a
@@ -87,5 +97,6 @@ interface process {
 	@op(5) accounting: func() -> result<list<budget>, error>;
 	@op(6) launch-prepared: func(name: string, bootstrap: handle<channel>) -> result<start-result, error>;
 	@op(7) release: func(koid: koid) -> result<bool, error>;
-	@op(8) release-group: func(koids: list<koid>) -> result<bool, error>;
+	@op(8) release-group: func(@bound(8) koids: list<koid>) -> result<bool, error>;
+	@op(9) cancel: func(koid: koid) -> result<bool, error>;
 }

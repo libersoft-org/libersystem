@@ -492,3 +492,97 @@ fn a_refused_free_leaves_the_ownership_record_it_found() {
 		super::set_owned_bit_for_test(frame, false);
 	}
 }
+
+crate::tagged_test!(the_loaders_scratch_becomes_the_kernels_memory_and_what_it_must_keep_does_not, [Memory, Kernel], id = "kernel.mem.frame.the_loaders_scratch_becomes_the_kernels_memory_and_what_it_must_keep_does_not", covers = ["kernel"]);
+fn the_loaders_scratch_becomes_the_kernels_memory_and_what_it_must_keep_does_not() {
+	// LDR-012. The loader had ONE memory type for two lifetimes: the objects the kernel must retain
+	// - its image, the packages, the page tables, `BootInfo`, the boot stack, the AP trampoline -
+	// and scratch whose life ends at the handoff. Both arrived as `MEM_BOOTLOADER`, which this
+	// allocator never seeds, so every boot lost the second kind for the life of the system.
+	assert!(super::seeds_the_pool(bootproto::MEM_USABLE), "the machine's free RAM");
+	assert!(super::seeds_the_pool(bootproto::MEM_BOOTLOADER_RECLAIMABLE), "and the loader's scratch, which nothing owns once this runs");
+	assert!(!super::seeds_the_pool(bootproto::MEM_BOOTLOADER), "what the kernel is standing on is not free memory");
+	for kind in [bootproto::MEM_RESERVED, bootproto::MEM_ACPI_RECLAIMABLE, bootproto::MEM_ACPI_NVS, bootproto::MEM_BAD, bootproto::MEM_KERNEL, bootproto::MEM_FRAMEBUFFER] {
+		assert!(!super::seeds_the_pool(kind), "kind {kind} is not the kernel's to hand out");
+	}
+
+	// AND THE LOADER REALLY USES IT. On a UEFI boot the retained map carries the class the final
+	// memory-map buffer was allocated in - the assertion that makes this end-to-end rather than a
+	// statement about a `match`.
+	#[cfg(target_arch = "x86_64")]
+	{
+		let mut reclaimable = 0usize;
+		for index in 0..crate::mem::memmap_len() {
+			if let Some(region) = crate::mem::memmap_get(index)
+				&& region.kind == bootproto::MEM_BOOTLOADER_RECLAIMABLE as u32
+			{
+				reclaimable += 1;
+			}
+		}
+		assert!(reclaimable > 0, "the loader handed over at least one reclaimable scratch region");
+	}
+}
+
+crate::tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	nothing_that_is_not_memory_is_mapped_write_back_in_the_direct_map,
+	[Memory, Paging, Kernel],
+	id = "kernel.mem.frame.nothing_that_is_not_memory_is_mapped_write_back_in_the_direct_map",
+	covers = ["kernel"]
+);
+#[cfg(target_arch = "x86_64")]
+fn nothing_that_is_not_memory_is_mapped_write_back_in_the_direct_map() {
+	// UEFI-003 / LDR-010. The direct map is one interval from 0 to the top of the firmware's map,
+	// and it was built write-back throughout - over device windows, and over physical space no
+	// descriptor describes at all. A write-back mapping over something that is not memory is not
+	// cosmetic: a speculative fetch or an evicted line through it is an access to nothing or to a
+	// device, and on AArch64 it is an architecture violation outright.
+	//
+	// The MMIO half was closed first; this is the holes. Checked from inside the running kernel
+	// against the LIVE tables, which is the only place the answer is a fact rather than a claim
+	// about the code that wrote them.
+	use crate::arch::paging::{NO_CACHE, leaf_flags};
+	const TWO_MB: u64 = 2 * 1024 * 1024;
+	let hhdm = crate::mem::hhdm_offset();
+	let mut top = 0u64;
+	for index in 0..crate::mem::memmap_len() {
+		if let Some(region) = crate::mem::memmap_get(index) {
+			top = top.max(region.base.saturating_add(region.length));
+		}
+	}
+	assert!(top > 0, "the boot memory map is retained");
+
+	// Every 2 MiB frame no region touches is a hole. The map is 2 MiB granular, so a frame that is
+	// PART memory stays memory - only wholly untouched frames are the question.
+	let mut holes = 0usize;
+	let mut cached_holes = 0usize;
+	let mut first_bad = 0u64;
+	let mut base = 0u64;
+	while base < top {
+		let frame_end = base + TWO_MB;
+		let mut touched = false;
+		for index in 0..crate::mem::memmap_len() {
+			if let Some(region) = crate::mem::memmap_get(index) {
+				let end = region.base.saturating_add(region.length);
+				if region.base < frame_end && base < end {
+					touched = true;
+					break;
+				}
+			}
+		}
+		if !touched {
+			holes += 1;
+			if let Some(flags) = leaf_flags(hhdm + base)
+				&& flags & NO_CACHE == 0
+			{
+				cached_holes += 1;
+				if first_bad == 0 {
+					first_bad = base;
+				}
+			}
+		}
+		base = frame_end;
+	}
+	assert_eq!(cached_holes, 0, "{cached_holes} of {holes} holes are still mapped write-back, first at {first_bad:#x}");
+	assert!(holes > 0, "this machine's memory map has holes inside the direct map, so the check above measured something");
+}

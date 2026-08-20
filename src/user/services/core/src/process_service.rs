@@ -765,6 +765,48 @@ impl Spawned {
 	}
 }
 
+impl Processes<'_> {
+	// Abandon every prepared launch belonging to `client`. Called when its channel closes.
+	fn abandon_prepared_of(&mut self, client: u64) {
+		let mut index = 0usize;
+		while index < self.prepared.len() {
+			if self.prepared[index].0 == client {
+				let (_, koid, spawned) = self.prepared.remove(index);
+				unsafe { spawned.abandon() };
+				self.forget(koid);
+			} else {
+				index += 1;
+			}
+		}
+	}
+
+	// Drop this service's OWN record of a launch that never ran.
+	//
+	// `record` keeps a read duplicate of the process so `list` can report it and `reap` can tell
+	// when it ends. For a cancelled launch that duplicate is the last thing holding the kernel
+	// object alive - closing the caller's handle and the start token frees neither the address
+	// space nor the frames while this one lives. A launch that never started has nothing to report
+	// and nothing to reap, so the entry goes with it (IDL-001).
+	fn forget(&mut self, koid: u64) {
+		let mut index = 0usize;
+		while index < self.started.len() {
+			if self.started[index].info.koid == koid {
+				let entry = self.started.remove(index);
+				unsafe {
+					if entry.handle != 0 {
+						close(entry.handle);
+					}
+					if entry.domain != 0 {
+						close(entry.domain);
+					}
+				}
+			} else {
+				index += 1;
+			}
+		}
+	}
+}
+
 impl<'a> Service for Processes<'a> {
 	fn start(&mut self, name: String) -> Result<ProcessInfo, Error> {
 		// spawn with no bootstrap capability (phase 1: started processes run
@@ -864,6 +906,23 @@ impl<'a> Service for Processes<'a> {
 		};
 		let (_, _, spawned) = self.prepared.remove(index);
 		Ok(unsafe { spawned.release() })
+	}
+
+	// The other end of `release`: drop a prepared launch and tear the loaded process down.
+	//
+	// Without this the only ways out of a prepared launch were to start it or to leave it, and
+	// leaving it means a process that is loaded, stopped, holding its Domain and its bootstrap
+	// channel, forever - which is what PermissionManager's early returns produced whenever a
+	// pipeline failed to assemble (IDL-001). `false` is "no such prepared launch of yours", the
+	// same answer `release` gives and for the same reason.
+	fn cancel(&mut self, koid: u64) -> Result<bool, Error> {
+		let Some(index) = self.prepared.iter().position(|(owner, pending, _)| *pending == koid && *owner == self.client) else {
+			return Ok(false);
+		};
+		let (_, _, spawned) = self.prepared.remove(index);
+		unsafe { spawned.abandon() };
+		self.forget(koid);
+		Ok(true)
 	}
 
 	// Start a whole prepared pipeline, or none of it.
@@ -971,6 +1030,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// the generated trait's shape is fixed, and the serve loop is the only place that knows
 			// which channel a request arrived on.
 			procs.client = chan;
+			// A CLIENT THAT SIMPLY GOES (IDL-001). `serve_multi` synthesises this when a client's
+			// channel closes; everything that client prepared and never released is abandoned here,
+			// which is the difference between a transaction that was dropped and a process loaded,
+			// stopped and holding its Domain for the life of the system.
+			if req.len() == 2 && u16::from_le_bytes([req[0], req[1]]) == abi::DISCONNECT_OP {
+				procs.abandon_prepared_of(chan);
+				return None;
+			}
 			process::dispatch(&mut procs, req, handle, out, reply_handle)
 		});
 	}

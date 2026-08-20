@@ -258,12 +258,13 @@ impl Parser {
 		while !self.is(&Tok::RBrace) {
 			let fdoc = self.doc_comments();
 			let anns = self.annotations()?;
-			reject_anns_except(&anns, &["since", "deprecated"])?;
+			reject_anns_except(&anns, &["bound", "since", "deprecated"])?;
 			let evolution = parse_evolution(&anns)?;
+			let bound = parse_bound(&anns)?;
 			let (fname, fsp) = self.ident()?;
 			self.eat(&Tok::Colon)?;
 			let ty = self.ty()?;
-			fields.push(Field { name: fname, ty, doc: fdoc, evolution, span: fsp });
+			fields.push(Field { name: fname, ty, bound, doc: fdoc, evolution, span: fsp });
 			if self.is(&Tok::Comma) {
 				self.bump();
 			} else {
@@ -385,9 +386,10 @@ impl Parser {
 	}
 
 	fn method(&mut self, doc: Vec<Doc>, anns: Vec<Ann>) -> Result<Method, Error> {
-		reject_anns_except(&anns, &["op", "since", "deprecated"])?;
+		reject_anns_except(&anns, &["op", "bound", "since", "deprecated"])?;
 		let evolution = parse_evolution(&anns)?;
 		let op = self.require_op(&anns)?;
+		let ret_bound = parse_bound(&anns)?;
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::Colon)?;
 		self.keyword("func")?;
@@ -407,7 +409,7 @@ impl Parser {
 		self.eat(&Tok::Arrow)?;
 		let ret = self.ty()?;
 		self.eat(&Tok::Semi)?;
-		Ok(Method { name, op, params, ret, doc, evolution, span })
+		Ok(Method { name, op, params, ret, ret_bound, doc, evolution, span })
 	}
 
 	fn require_op(&self, anns: &[Ann]) -> Result<u32, Error> {
@@ -430,13 +432,14 @@ impl Parser {
 	fn param(&mut self) -> Result<Param, Error> {
 		let pdoc = self.doc_comments();
 		let anns = self.annotations()?;
-		reject_anns_except(&anns, &["rights", "since", "deprecated"])?;
+		reject_anns_except(&anns, &["rights", "bound", "since", "deprecated"])?;
 		let evolution = parse_evolution(&anns)?;
 		let rights = collect_rights(&anns);
+		let bound = parse_bound(&anns)?;
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::Colon)?;
 		let ty = self.ty()?;
-		Ok(Param { name, ty, rights, doc: pdoc, evolution, span })
+		Ok(Param { name, ty, bound, rights, doc: pdoc, evolution, span })
 	}
 
 	fn ty(&mut self) -> Result<Type, Error> {
@@ -528,6 +531,35 @@ fn reserved_value(a: &Ann) -> Result<u32, Error> {
 	match &a.args[0] {
 		Arg::Num(n) => u32::try_from(*n).map_err(|_| Error::new(a.span, "reserved value must fit in u32")),
 		Arg::Name(_) => Err(Error::new(a.span, "`@reserved` takes a number, not a name")),
+	}
+}
+
+// `@bound(n)`: at most `n` items in a list, or `n` bytes in a string (IDL-005).
+//
+// One per target and a number, so a schema cannot say two different things about the same list and
+// leave a reader to pick. Zero is refused because a list that may hold nothing is a field that
+// should not be there; the ceiling is what the wire's own `u16` length prefix can express, above
+// which the annotation would state a bound the format cannot exceed anyway.
+fn parse_bound(anns: &[Ann]) -> Result<Option<u32>, Error> {
+	let bounds: Vec<&Ann> = anns.iter().filter(|a| a.name == "bound").collect();
+	match bounds.as_slice() {
+		[] => Ok(None),
+		[a] => {
+			if a.args.len() != 1 {
+				return Err(Error::new(a.span, "`@bound` takes exactly one number, e.g. `@bound(64)`"));
+			}
+			match &a.args[0] {
+				Arg::Num(n) => {
+					let n = u32::try_from(*n).map_err(|_| Error::new(a.span, "`@bound` must fit in u32"))?;
+					if n == 0 || n > u16::MAX as u32 {
+						return Err(Error::new(a.span, format!("`@bound({n})` is outside 1..={} - a list or string is length-prefixed with a `u16`", u16::MAX)));
+					}
+					Ok(Some(n))
+				}
+				Arg::Name(_) => Err(Error::new(a.span, "`@bound` takes a number, not a name")),
+			}
+		}
+		_ => Err(Error::new(bounds[1].span, "more than one `@bound` on the same declaration")),
 	}
 }
 

@@ -319,7 +319,7 @@ impl Cg {
 		self.line("\t}");
 		self.line(&format!("\tpub fn read(r: &mut Reader) -> Option<{ty}> {{"));
 		for f in &r.fields {
-			let expr = self.read_value(&f.ty).map_err(|m| Error::new(f.span, m))?;
+			let expr = self.read_value_bounded(&f.ty, f.bound).map_err(|m| Error::new(f.span, m))?;
 			self.line(&format!("\t\tlet {} = {expr};", field_ident(&f.name)));
 		}
 		let inits: Vec<String> = r.fields.iter().map(|f| field_ident(&f.name)).collect();
@@ -528,7 +528,7 @@ impl Cg {
 				self.line(&format!("\t\t\tOP_{} => {{", screaming(&m.name)));
 				let mut args: Vec<String> = Vec::new();
 				for p in &m.params {
-					let expr = self.read_value(&p.ty).map_err(|e| Error::new(p.span, e))?;
+					let expr = self.read_value_bounded(&p.ty, p.bound).map_err(|e| Error::new(p.span, e))?;
 					let pn = field_ident(&p.name);
 					self.line(&format!("\t\t\t\tlet {pn} = {expr};"));
 					args.push(pn);
@@ -655,7 +655,7 @@ impl Cg {
 				self.line("\t\tlet corr = r.u32()?;");
 				let mut args: Vec<String> = Vec::new();
 				for p in &m.params {
-					let expr = self.read_value(&p.ty).map_err(|e| Error::new(p.span, e))?;
+					let expr = self.read_value_bounded(&p.ty, p.bound).map_err(|e| Error::new(p.span, e))?;
 					let pn = field_ident(&p.name);
 					self.line(&format!("\t\tlet {pn} = {expr};"));
 					args.push(pn);
@@ -924,7 +924,7 @@ impl Cg {
 			self.line("\t\t\tlet mut reply_handles = Handles::new();");
 			self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline).map_err(|e| { self.last_error = Some(e); e }).ok()?;");
 			self.line("\t\t\tlet mut reader = Reader::with_handle_list(&reply, &reply_handles);");
-			let retexpr = self.read_value(&m.ret).map_err(|e| Error::new(m.span, e))?;
+			let retexpr = self.read_value_bounded(&m.ret, m.ret_bound).map_err(|e| Error::new(m.span, e))?;
 			self.line("\t\t\tlet decoded = (|| {");
 			self.line("\t\t\t\tlet r = &mut reader;");
 			self.line("\t\t\t\tif r.u32()? != corr { return None; }");
@@ -1024,6 +1024,41 @@ impl Cg {
 	}
 
 	// Emit an expression that reads an owned value of `ty` from the reader `r`.
+	// `read_value`, with the schema's `@bound(n)` applied to the list or string this type carries
+	// (IDL-005).
+	//
+	// The bound is a property of the OCCURRENCE - this field, this parameter, this return - not of
+	// the type, which is why it is threaded through here rather than living in `Type`. It descends
+	// through `option` and `result` because a bounded list is still bounded when it is optional or
+	// carried in a result, which is how nearly every method returns one.
+	//
+	// The refusal is `?` on an `Option` rather than a `return`, so it works in every context these
+	// expressions are emitted into - the same mechanism `r.u16()?` beside it already relies on.
+	fn read_value_bounded(&mut self, ty: &Type, bound: Option<u32>) -> Result<String, String> {
+		let Some(limit) = bound else { return self.read_value(ty) };
+		Ok(match ty {
+			Type::String => {
+				let v = self.fresh();
+				format!("{{ let {v} = r.string_lp()?; ({v}.len() <= {limit}).then_some({v})? }}")
+			}
+			Type::List(inner) => {
+				let n = self.fresh();
+				let acc = self.fresh();
+				let elem = self.read_value(inner)?;
+				format!("{{ let {n} = r.u16()? as usize; let {n} = ({n} <= {limit}).then_some({n})?; let mut {acc} = Vec::new(); {acc}.try_reserve_exact({n}).ok()?; for _ in 0..{n} {{ {acc}.push({elem}); }} {acc} }}")
+			}
+			Type::Option(inner) => format!("if r.tag()? {{ Some({}) }} else {{ None }}", self.read_value_bounded(inner, bound)?),
+			Type::Result(okty, errty) => format!("if r.tag()? {{ Ok({}) }} else {{ Err({}) }}", self.read_value_bounded(okty, bound)?, self.read_value(errty)?),
+			Type::Named(name) => match self.aliases.get(name).cloned() {
+				Some(alias) => self.read_value_bounded(&alias, bound)?,
+				None => self.read_value(ty)?,
+			},
+			// Validation refuses `@bound` on anything else, so this is unreachable from a schema
+			// that passed it; reading it unbounded is the answer that cannot be wrong.
+			_ => self.read_value(ty)?,
+		})
+	}
+
 	fn read_value(&mut self, ty: &Type) -> Result<String, String> {
 		Ok(match ty {
 			Type::Bool => "r.boolean()?".into(),
@@ -1845,7 +1880,7 @@ pub fn abi_manifest(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> S
 				manifest_meta(&mut out, &format!("alias {}", alias.name), alias.evolution);
 			}
 			Item::Record(record) => {
-				let fields: Vec<String> = record.fields.iter().map(|field| format!("{}:{}", field.name, abi_type(&field.ty, &aliases, imports, 0))).collect();
+				let fields: Vec<String> = record.fields.iter().map(|field| format!("{}:{}{}", field.name, abi_type(&field.ty, &aliases, imports, 0), abi_bound(field.bound))).collect();
 				let _ = writeln!(out, "record {}({})", record.name, fields.join(","));
 				manifest_meta(&mut out, &format!("record {}", record.name), record.evolution);
 				for field in &record.fields {
@@ -1881,8 +1916,8 @@ pub fn abi_manifest(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> S
 				let _ = writeln!(out, "interface {}", item.name);
 				manifest_meta(&mut out, &format!("interface {}", item.name), item.evolution);
 				for method in &item.methods {
-					let params: Vec<String> = method.params.iter().map(|param| format!("{}:{}:rights={}", param.name, abi_type(&param.ty, &aliases, imports, 0), param.rights.join("+"))).collect();
-					let _ = writeln!(out, "method {}.{} op={} ({}) -> {}", item.name, method.name, method.op, params.join(","), abi_type(&method.ret, &aliases, imports, 0));
+					let params: Vec<String> = method.params.iter().map(|param| format!("{}:{}{}:rights={}", param.name, abi_type(&param.ty, &aliases, imports, 0), abi_bound(param.bound), param.rights.join("+"))).collect();
+					let _ = writeln!(out, "method {}.{} op={} ({}) -> {}{}", item.name, method.name, method.op, params.join(","), abi_type(&method.ret, &aliases, imports, 0), abi_bound(method.ret_bound));
 					manifest_meta(&mut out, &format!("method {}.{}", item.name, method.name), method.evolution);
 					for param in &method.params {
 						manifest_meta(&mut out, &format!("param {}.{}.{}", item.name, method.name, param.name), param.evolution);
@@ -1895,6 +1930,12 @@ pub fn abi_manifest(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> S
 		}
 	}
 	out
+}
+
+// How `@bound(n)` appears in an ABI signature (IDL-005). It is part of the contract: tightening a
+// bound refuses messages a peer was entitled to send, which the ABI check must be able to see.
+fn abi_bound(bound: Option<u32>) -> String {
+	bound.map(|n| format!(":bound={n}")).unwrap_or_default()
 }
 
 fn abi_type(ty: &Type, aliases: &HashMap<&str, &Type>, imports: &HashMap<String, ResolvedSymbol>, depth: usize) -> String {

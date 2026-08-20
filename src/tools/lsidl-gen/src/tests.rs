@@ -134,13 +134,13 @@ fn rejects_duplicate_opcode() {
 
 #[test]
 fn rejects_opcode_zero() {
-	assert_err_contains(&wrap("enum error { x }\ninterface i { @op(0) m: func() -> result<unit, error>; }"), "1..=65530");
+	assert_err_contains(&wrap("enum error { x }\ninterface i { @op(0) m: func() -> result<unit, error>; }"), "1..=65529");
 }
 
 #[test]
 fn rejects_runtime_control_opcodes() {
 	for op in [abi::GOODBYE_OP, abi::RESOLVE_OP, abi::HEARTBEAT_OP, abi::CONNECT_OP] {
-		assert_err_contains(&wrap(&format!("enum error {{ x }}\ninterface i {{ @op({op}) m: func() -> result<unit, error>; }}")), "1..=65530");
+		assert_err_contains(&wrap(&format!("enum error {{ x }}\ninterface i {{ @op({op}) m: func() -> result<unit, error>; }}")), "1..=65529");
 	}
 }
 
@@ -742,4 +742,59 @@ fn an_imported_two_capability_record_is_counted_as_two() {
 	let app = packages.iter().find(|package| package.id.display() == "liber:app@1").unwrap();
 	let errors = validate::validate_resolved(&files[app.file], &app.imports);
 	assert!(errors.iter().any(|error| error.msg.contains('6')), "and six is refused with the number it computed: {errors:?}");
+}
+
+#[test]
+fn a_bounded_list_or_string_refuses_more_than_the_schema_declares() {
+	// IDL-005. A list's count and a string's length came off the wire and were believed: the only
+	// ceilings were the `u16` prefix and the message size, so a schema could not say "this holds at
+	// most eight" and have anything enforce it. A service that expects a handful of stages, or a
+	// name, was handed whatever fitted in a frame.
+	let src = wrap(
+		r#"
+enum error { denied, not-found, invalid, again, closed }
+
+record request {
+	@bound(8) tags: list<u32>,
+	@bound(32) name: string,
+	rest: list<u32>,
+}
+
+interface bounded {
+	@op(1) submit: func(@bound(4) items: list<u32>) -> result<bool, error>;
+	@op(2) @bound(16) fetch: func() -> result<list<u32>, error>;
+}
+"#,
+	);
+	let file = parse_ok(&src);
+	let rust = crate::codegen::rust(&file, "bound.lsidl", &std::collections::HashMap::new()).unwrap();
+	// The count is checked BEFORE the reservation, which is the whole point: refusing after
+	// allocating what the count asked for is not refusing.
+	assert!(rust.contains("<= 8usize).then_some") || rust.contains("<= 8).then_some"), "the record's list bound reaches the decoder:\n{rust}");
+	assert!(rust.contains("<= 32).then_some"), "the record's string bound reaches the decoder");
+	assert!(rust.contains("<= 4).then_some"), "the parameter's bound reaches the request decoder");
+	assert!(rust.contains("<= 16).then_some"), "the method's bound reaches the reply decoder");
+	// And an unbounded field is still unbounded - the annotation is opt-in, not a global cap.
+	let reserves = rust.matches("try_reserve_exact").count();
+	assert!(reserves >= 3, "every list still reserves what it is about to read: {reserves}");
+
+	// The ABI signature carries it, because tightening a bound refuses messages a peer was
+	// entitled to send.
+	let abi = crate::codegen::abi_manifest(&file, &std::collections::HashMap::new());
+	assert!(abi.contains("tags:list<u32>:bound=8"), "the record field's bound is in the ABI:\n{abi}");
+	assert!(abi.contains("items:list<u32>:bound=4"), "and the parameter's");
+	assert!(abi.contains("-> result<list<u32>, error>:bound=16"), "and the return's");
+}
+
+#[test]
+fn a_bound_on_something_that_is_not_a_list_or_a_string_is_refused() {
+	// The failure `@rights` had before IDL-004 closed it: an annotation that reads like a rule and
+	// enforces nothing. A bound on a `u32` has nothing to bound.
+	assert_err_contains(&wrap("record r { @bound(4) count: u32 }"), "there is nothing for it to bound");
+	// Zero is not a bound, and neither is a number the wire's own length prefix cannot express.
+	assert_err_contains(&wrap("record r { @bound(0) tags: list<u32> }"), "outside 1..=65535");
+	assert_err_contains(&wrap("record r { @bound(70000) tags: list<u32> }"), "outside 1..=65535");
+	assert_err_contains(&wrap("record r { @bound(4) @bound(8) tags: list<u32> }"), "more than one `@bound`");
+	// And it is accepted through the wrappers a list actually arrives in.
+	parse_ok(&wrap("record r { @bound(4) tags: option<list<u32>> }"));
 }

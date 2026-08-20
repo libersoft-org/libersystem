@@ -852,17 +852,98 @@ fn process_service_lists_every_started_program() {
 		held.push(bootstrap_kernel);
 	}
 	assert_eq!(process_service_list_len(&service_client, 13), 2, "both launched processes are listed");
-	// THE OTHER DIRECTION IS `process_service_drops_a_terminated_process_from_the_list`, beside this
-	// one: it launches one program, terminates it and requires the list to go to zero. So "a service
-	// that never removes anything" is already refused, and this test does not need to assert it
-	// again - which matters, because asserting it HERE means asserting that two children blocked in
-	// `wait` observe their peer closing and exit within some number of scheduler passes. On aarch64
-	// they do not, within sixty-four, and that is a finding about waking a blocked thread rather
-	// than about what ProcessService lists (P02M0088).
+	// AND THEY LEAVE IT WHEN THE ENDS THIS TEST HOLDS GO. Both children are blocked in `wait` on
+	// those channels, `Channel::is_readable` is "inbox non-empty OR peer closed", and `sys_wait`
+	// re-checks it on every wake - so dropping the ends must let both return, exit, and be reaped
+	// out of the list.
 	//
-	// The ends are dropped at the end of the scope either way, which is what lets the children go.
+	// This assertion was removed once, on 2026-08-19, because the children did not go within
+	// sixty-four passes on aarch64 (P02M0088). What that finding turned out to be is recorded
+	// there; the assertion is back because the property is worth pinning and the loop below is
+	// bounded, so a regression is a failure rather than a hang.
 	drop(held);
+	let mut remaining = u16::MAX;
+	for _ in 0..64 {
+		sched::run_until_idle();
+		remaining = process_service_list_len(&service_client, 14);
+		if remaining == 0 {
+			break;
+		}
+	}
+	assert_eq!(remaining, 0, "both children observed their peer closing and left the list");
+}
+
+tagged_test!(a_prepared_launch_can_be_cancelled_and_a_client_that_leaves_cancels_its_own, [Service, Process, ProcessService], id = "kernel.services.a_prepared_launch_can_be_cancelled_and_a_client_that_leaves_cancels_its_own", covers = ["kernel"]);
+fn a_prepared_launch_can_be_cancelled_and_a_client_that_leaves_cancels_its_own() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	// IDL-001. A prepared launch is a loaded process whose first thread exists and has not been
+	// queued. There were exactly two ways out of one: release it, or leave it - and "leave it"
+	// means a process loaded, stopped, holding its address space, its stacks, its Domain and its
+	// bootstrap channel, for the life of the system. PermissionManager takes that path on every
+	// early return in pipeline assembly, which a mistyped shell line reaches.
+	//
+	// So: `cancel`, and a client that simply GOES is cancelled too.
+	let (_boot_kernel, service_client) = spawn_service_with_package(b"process_service");
+
+	// One prepared launch on this client, cancelled by name.
+	let prepare = |client: &alloc::sync::Arc<Channel>, correlation: u32| -> u64 {
+		let (bootstrap_kernel, bootstrap_user) = Channel::create();
+		let name: &[u8] = b"holdopen";
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&6u16.to_le_bytes()); // launch-prepared
+		request.extend_from_slice(&correlation.to_le_bytes());
+		request.extend_from_slice(&(name.len() as u16).to_le_bytes());
+		request.extend_from_slice(name);
+		request.extend_from_slice(&0u32.to_le_bytes()); // the bootstrap handle's in-stream placeholder
+		send_cap(client, &request, bootstrap_user, Rights::ALL).expect("prepare request");
+		sched::run_until_idle();
+		let reply = client.recv().expect("prepare reply");
+		assert_eq!(le_u32(&reply.bytes, 0), correlation, "the reply echoes the correlation id");
+		assert_eq!(reply.bytes[4], 1, "the prepare succeeded");
+		// `start-result` is the task handle's placeholder then `process-info`, whose first field
+		// is the koid: [corr u32][ok u8][handle u32][koid u64].
+		let koid = u64::from_le_bytes(reply.bytes[9..17].try_into().expect("a koid in the reply"));
+		// The end this test keeps, so the prepared program has a bootstrap channel that outlives
+		// the request - the same shape a pipeline stage has.
+		core::mem::forget(bootstrap_kernel);
+		koid
+	};
+	let cancel = |client: &alloc::sync::Arc<Channel>, correlation: u32, koid: u64| -> bool {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&9u16.to_le_bytes()); // cancel
+		request.extend_from_slice(&correlation.to_le_bytes());
+		request.extend_from_slice(&koid.to_le_bytes());
+		client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("cancel request");
+		sched::run_until_idle();
+		let reply = client.recv().expect("cancel reply");
+		assert_eq!(le_u32(&reply.bytes, 0), correlation, "the reply echoes the correlation id");
+		assert_eq!(reply.bytes[4], 1, "cancel answered");
+		reply.bytes[5] != 0
+	};
+
+	let koid = prepare(&service_client, 41);
+	assert!(cancel(&service_client, 42, koid), "the launch this client prepared is its to cancel");
+	assert!(!cancel(&service_client, 43, koid), "and once cancelled there is nothing left to cancel");
+
+	// AND A CLIENT THAT LEAVES WITHOUT SAYING SO. `serve_multi` used to close the channel and drop
+	// it from its set without telling the handler, so nothing here could learn that the client was
+	// gone - and everything it had prepared stayed prepared. Measured on the frame allocator,
+	// because what is being held is a loaded program: its image, its stacks and its page tables.
+	let before = mem::frame::free_count();
+	service_client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("connect request");
 	sched::run_until_idle();
+	let connected = service_client.recv().expect("connect reply");
+	let sub: alloc::sync::Arc<Channel> = connected.caps.first().expect("a minted client channel").object().into_any_arc().downcast::<Channel>().expect("the mint is a channel");
+	let _ = prepare(&sub, 44);
+	let loaded = mem::frame::free_count();
+	assert!(loaded < before, "a prepared launch holds the frames of a loaded program: {before} -> {loaded}");
+	drop(sub);
+	drop(connected);
+	sched::run_until_idle();
+	let after = mem::frame::free_count();
+	assert!(after > loaded, "the client left, so what it prepared was abandoned: {loaded} -> {after}");
 }
 
 tagged_test!(process_service_drops_a_terminated_process_from_the_list, [Service, Process, ProcessService], id = "kernel.services.process_service_drops_a_terminated_process_from_the_list", covers = ["kernel"]);

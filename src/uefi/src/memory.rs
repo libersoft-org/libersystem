@@ -42,6 +42,25 @@ pub unsafe fn alloc_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
 	if uefi::is_error(status) { None } else { Some(addr) }
 }
 
+// The same, in the loader's own SCRATCH class: memory the kernel may reclaim the moment it runs
+// (LDR-012).
+//
+// For allocations whose life ends at the handoff and which cannot be freed before it - the final
+// memory-map buffer is read AT `ExitBootServices`, and there is no firmware afterwards to free it.
+// `alloc_pages` above is for what the kernel must KEEP; this is for what it must not have to keep.
+//
+// # Safety
+//
+// Same contract as `alloc_pages`: `bs` must be the live `BootServices` table, before
+// `ExitBootServices`.
+pub unsafe fn alloc_scratch_pages(bs: *mut BootServices, pages: usize) -> Option<u64> {
+	let ceiling = ALLOC_CEILING.load(core::sync::atomic::Ordering::Relaxed);
+	let mut addr: u64 = if ceiling == 0 { 0 } else { ceiling };
+	let policy = if ceiling == 0 { uefi::ALLOCATE_ANY_PAGES } else { uefi::ALLOCATE_MAX_ADDRESS };
+	let status = unsafe { ((*bs).allocate_pages)(policy, uefi::OS_LOADER_SCRATCH, pages, &mut addr) };
+	if uefi::is_error(status) { None } else { Some(addr) }
+}
+
 // The highest physical address a retained loader allocation may occupy, or 0 for no limit.
 //
 // Set once by an architecture whose kernel enters on a fixed early direct map, BEFORE any handoff
@@ -276,6 +295,9 @@ fn region_kind(ty: u32) -> u32 {
 	match ty {
 		uefi::CONVENTIONAL_MEMORY | uefi::BOOT_SERVICES_CODE | uefi::BOOT_SERVICES_DATA => bootproto::MEM_USABLE,
 		uefi::LOADER_CODE | uefi::LOADER_DATA => bootproto::MEM_BOOTLOADER,
+		// The loader's own scratch class: retained through the exit and free the moment the kernel
+		// is running (LDR-012).
+		uefi::OS_LOADER_SCRATCH => bootproto::MEM_BOOTLOADER_RECLAIMABLE,
 		uefi::ACPI_RECLAIM_MEMORY => bootproto::MEM_ACPI_RECLAIMABLE,
 		uefi::ACPI_MEMORY_NVS => bootproto::MEM_ACPI_NVS,
 		uefi::UNUSABLE_MEMORY => bootproto::MEM_BAD,

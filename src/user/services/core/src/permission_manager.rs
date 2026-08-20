@@ -935,10 +935,17 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 		let mut prepared: Vec<(StartResult, u64)> = Vec::new();
 		// Unwind that runs on every early return: abandoning a prepared launch is how this
 		// transaction rolls back, because a stage that was never released never ran.
+		//
+		// AND THE SERVICE HAS TO BE TOLD (IDL-001). Closing `started.task` drops the BROKER's
+		// handle and says nothing to ProcessService, which is still holding the prepared launch -
+		// the loaded process, its stopped first thread, its Domain and its bootstrap channel - with
+		// no way left to reach it. Every early return here leaked one of those, and a shell that
+		// mistypes a pipeline takes that path. `cancel` is the operation that was missing.
 		macro_rules! abandon {
 			($built:expr) => {{
 				for (started, manager_side) in $built {
 					close(manager_side);
+					let _ = process_client.cancel(&started.info.koid);
 					close(started.task);
 				}
 				return None;
@@ -964,6 +971,7 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 				Some(name) => String::from(name),
 				None => {
 					close(manager_side);
+					let _ = process_client.cancel(&started.info.koid);
 					close(started.task);
 					abandon!(prepared);
 				}
@@ -972,6 +980,7 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 				Some(manifest) => manifest,
 				None => {
 					close(manager_side);
+					let _ = process_client.cancel(&started.info.koid);
 					close(started.task);
 					abandon!(prepared);
 				}
@@ -982,11 +991,13 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 			let installed: bool = send_blocking(manager_side, CAP_STDOUT, stage.stdout) && (stage.stdin == 0 || send_blocking(manager_side, CAP_STDIN, stage.stdin)) && (stage.stderr == 0 || send_blocking(manager_side, CAP_STDERR, stage.stderr)) && send_ready(manager_side);
 			if !installed {
 				close(manager_side);
+				let _ = process_client.cancel(&started.info.koid);
 				close(started.task);
 				abandon!(prepared);
 			}
 			if !send_launch_context(manager_side, stage.args, cwd, environment) {
 				close(manager_side);
+				let _ = process_client.cancel(&started.info.koid);
 				close(started.task);
 				abandon!(prepared);
 			}
@@ -1001,6 +1012,7 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 					};
 					if !ok {
 						close(manager_side);
+						let _ = process_client.cancel(&started.info.koid);
 						close(started.task);
 						abandon!(prepared);
 					}

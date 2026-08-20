@@ -135,7 +135,7 @@ interface permission {
 	/// is not the same as it never having started. The group primitive validates every token before
 	/// queueing any thread, so a refusal comes back with nothing started - which is what makes this
 	/// sentence a guarantee rather than an intention.
-	@op(4) run-pipeline: func(stages: list<pipeline-stage>, cwd: string, environment: list<env-var>, stdout: handle<channel>) -> result<pipeline-result, error>;
+	@op(4) run-pipeline: func(@bound(8) stages: list<pipeline-stage>, cwd: string, environment: list<env-var>, stdout: handle<channel>) -> result<pipeline-result, error>;
 
 	/// Start a program over ONE SELECTED FILE, with an attenuated grant instead of a volume bundle.
 	///

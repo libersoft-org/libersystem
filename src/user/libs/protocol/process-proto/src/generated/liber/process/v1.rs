@@ -154,10 +154,20 @@ impl StartResult {
 /// queues it. The caller gets the same `start-result` an ordinary launch returns, so job
 /// control is identical - what differs is only that the program has not begun.
 ///
-/// The start token itself never leaves this service. A reply carries one handle and a prepared
-/// launch would need two, but keeping the token here is the better answer anyway: a caller
-/// cannot hold a half-started process open indefinitely, and `release` names the koid it
-/// already has rather than a second capability to lose track of.
+/// The start token itself never leaves this service, and a prepared launch is keyed by the CHANNEL
+/// it was prepared on as well as its koid - so naming another client's koid answers exactly as
+/// naming one that does not exist, which is the truth from where that caller stands.
+///
+/// A move-only handle would be the other way to say that, and it does not fit: `release-group` takes
+/// one token per stage and a message carries at most `abi::MAX_MESSAGE_CAPS` (four) capabilities,
+/// while a pipeline may have eight stages. A token per stage would make the all-or-none group
+/// release - the thing `security.run-pipeline` promises - unexpressible.
+///
+/// `cancel` is the other end of `release`: it drops a prepared launch and tears the loaded process
+/// down. Without it the only ways out of a prepared launch were to start it or to leave it - and
+/// PermissionManager has several early returns that abandon a pipeline midway, which left a process
+/// loaded, stopped, and holding its Domain forever. A client that simply GOES is cancelled too: the
+/// service is told when a client's channel closes and abandons everything that client prepared.
 ///
 /// `release-group` is the same gate for a WHOLE pipeline, and it exists because releasing one koid
 /// at a time cannot keep the promise `security.run-pipeline` makes. Past the first release a
@@ -184,6 +194,7 @@ pub mod process {
 	pub const OP_LAUNCH_PREPARED: u16 = 6;
 	pub const OP_RELEASE: u16 = 7;
 	pub const OP_RELEASE_GROUP: u16 = 8;
+	pub const OP_CANCEL: u16 = 9;
 
 	pub trait Service {
 		fn start(&mut self, name: String) -> Result<ProcessInfo, Error>;
@@ -194,6 +205,7 @@ pub mod process {
 		fn launch_prepared(&mut self, name: String, bootstrap: u64) -> Result<StartResult, Error>;
 		fn release(&mut self, koid: Koid) -> Result<bool, Error>;
 		fn release_group(&mut self, koids: Vec<Koid>) -> Result<bool, Error>;
+		fn cancel(&mut self, koid: Koid) -> Result<bool, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -501,6 +513,7 @@ pub mod process {
 			OP_RELEASE_GROUP => {
 				let koids = {
 					let v16 = r.u16()? as usize;
+					let v16 = (v16 <= 8).then_some(v16)?;
 					let mut v17 = Vec::new();
 					v17.try_reserve_exact(v16).ok()?;
 					for _ in 0..v16 {
@@ -522,6 +535,43 @@ pub mod process {
 						Err(v19) => {
 							w.u8(0)?;
 							v19.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_CANCEL => {
+				let koid = r.u64()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.cancel(koid);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v20) => {
+							w.u8(1)?;
+							w.boolean(*v20)?;
+						}
+						Err(v21) => {
+							w.u8(0)?;
+							v21.write(w)?;
 						}
 					}
 					Some(())
@@ -671,13 +721,13 @@ pub mod process {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v20 = r.u16()? as usize;
-						let mut v21 = Vec::new();
-						v21.try_reserve_exact(v20).ok()?;
-						for _ in 0..v20 {
-							v21.push(ProcessInfo::read(r)?);
+						let v22 = r.u16()? as usize;
+						let mut v23 = Vec::new();
+						v23.try_reserve_exact(v22).ok()?;
+						for _ in 0..v22 {
+							v23.push(ProcessInfo::read(r)?);
 						}
-						v21
+						v23
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -789,13 +839,13 @@ pub mod process {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v22 = r.u16()? as usize;
-						let mut v23 = Vec::new();
-						v23.try_reserve_exact(v22).ok()?;
-						for _ in 0..v22 {
-							v23.push(Budget::read(r)?);
+						let v24 = r.u16()? as usize;
+						let mut v25 = Vec::new();
+						v25.try_reserve_exact(v24).ok()?;
+						for _ in 0..v24 {
+							v25.push(Budget::read(r)?);
 						}
-						v23
+						v25
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -889,9 +939,43 @@ pub mod process {
 				return None;
 			}
 			w.u16(koids.len() as u16)?;
-			for v24 in koids.iter() {
-				w.u64(*v24)?;
+			for v26 in koids.iter() {
+				w.u64(*v26)?;
 			}
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.boolean()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn cancel(&mut self, koid: &Koid) -> Option<Result<bool, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_CANCEL)?;
+			w.u32(corr)?;
+			w.u64(*koid)?;
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
@@ -983,6 +1067,14 @@ pub mod process {
 	fn channel_invoke_release_group(chan: u64, koids: &Vec<Koid>) -> Option<Result<bool, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.release_group(koids)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_process_cancel")]
+	fn channel_invoke_cancel(chan: u64, koid: &Koid) -> Option<Result<bool, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.cancel(koid)
 	}
 }
 

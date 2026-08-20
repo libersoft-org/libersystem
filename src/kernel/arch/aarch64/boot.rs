@@ -346,7 +346,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// ELF, so the parser scans for it) to learn the real RAM size and CPU count
 	// instead of hard-coding them.
 	let boot_info = unsafe { super::dtb::parse(dtb) };
-	let ram_banks = boot_info.map(|bi| (bi.ram_regions, bi.ram_region_count));
+	let mut ram_banks = boot_info.map(|bi| (bi.ram_regions, bi.ram_region_count));
 	let (ram_top, cpu_count, fwcfg_base) = match boot_info {
 		Some(bi) => {
 			crate::serial_println!("aarch64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s)", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count);
@@ -415,7 +415,18 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// client not to overwrite it or use the reservation block's regions. See
 	// `bootmem::devicetree_reservations`.
 	if let Some(tree) = (unsafe { super::dtb::located(dtb) }) {
-		hole_count = unsafe { crate::arch::common::bootmem::devicetree_reservations(&tree, &mut holes, hole_count) };
+		let (count, complete) = unsafe { crate::arch::common::bootmem::devicetree_reservations(&tree, &mut holes, hole_count) };
+		hole_count = count;
+		// THE TREE'S ACCOUNT OF RAM IS ONLY GOOD WHILE ITS ACCOUNT OF WHAT IS RESERVED IS (FDT-005).
+		//
+		// Both come off the same bytes. Taking the banks while dropping part of the reservation
+		// list hands the allocator memory the firmware still owns, so a list that did not read
+		// whole drops the banks with it and this boot falls back to the conservative region above
+		// the kernel image - less memory, and none of it somebody else's.
+		if !complete {
+			crate::serial_println!("aarch64: the device tree's reservations did not read whole, so its /memory banks are not used either");
+			ram_banks = None;
+		}
 	}
 	// AND THE DIRECT BOOT'S ARCHIVE. Nothing else carves it: `loader_reservations` reads a hand-off
 	// this boot does not have, and the device tree reserves its own blob and its reservation block
@@ -516,7 +527,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	let virtio = super::pci::scan_virtio();
 	crate::serial_println!("aarch64: virtio - {} device(s) resolved", virtio.len());
 	for v in &virtio {
-		crate::serial_println!("aarch64:   {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x}(x{}) isr+{:#x} device+{:#x}", super::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.offset);
+		crate::serial_println!("aarch64:   {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x}(x{}) isr+{:#x} device+{:#x}", super::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.map_or(0, |cap| cap.offset));
 	}
 
 	// If a virtio-blk device is present, read sector 0 to confirm the driver works.

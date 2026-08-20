@@ -404,8 +404,11 @@ interface log {
   conventionally a `result<T, error>`.
 - A method that returns nothing meaningful uses `result<unit, error>`.
 - The opcode `@op(n)` is **mandatory**, must be unique within the interface, and
-	must be in `1..=abi::TYPED_OP_MAX`, which is `1..=65530` (`0xfffa`). Above it are
+	must be in `1..=abi::TYPED_OP_MAX`, which is `1..=65529` (`0xfff9`). Above it are
 	the reserved opcodes, by name from `abi` rather than as a range to remember:
+	`DISCONNECT_OP` (`0xfffa`, synthesised by `serve_multi` for the handler when a
+	client's channel closes, so a service holding per-client state learns the client
+	is gone),
 	`PROTOCOL_INFO_OP` (`0xfffb`, answered by the generated dispatch),
 	`GOODBYE_OP` (`0xfffc`),
 	`RESOLVE_OP` (`0xfffd`),

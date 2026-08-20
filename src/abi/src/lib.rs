@@ -49,7 +49,14 @@ pub const ABI_VERSION: u32 = 1;
 //
 // Lowering TYPED_OP_MAX from 0xfffb to 0xfffa to make room is safe as of 2026-08-01 and was
 // checked rather than assumed: the highest `@op` across all 15 `.lsidl` schemas is 16.
-pub const TYPED_OP_MAX: u16 = 0xfffa;
+//
+// DISCONNECT_OP took 0xfffa the same way on 2026-08-20, and the same check still holds: the highest
+// `@op` across the sixteen schemas is 16. It is the one control message a service RECEIVES without
+// a client having sent it - `serve_multi` synthesises it for the handler when a client's channel
+// closes, because a service that holds per-client state (a prepared launch, a lease, a scope) has
+// no other way to learn that the client is gone (IDL-001).
+pub const TYPED_OP_MAX: u16 = 0xfff9;
+pub const DISCONNECT_OP: u16 = 0xfffa;
 pub const PROTOCOL_INFO_OP: u16 = 0xfffb;
 pub const GOODBYE_OP: u16 = 0xfffc;
 pub const RESOLVE_OP: u16 = 0xfffd;

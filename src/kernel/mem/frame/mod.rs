@@ -624,10 +624,23 @@ static ALLOCATOR: SpinLock<FrameAllocator> = SpinLock::new(FrameAllocator::new()
 // Populate the run table from the usable regions of the loader's memory map.
 // Physical frame 0 is never handed out (0 doubles as "no frame" in several
 // interfaces), so a region starting there is trimmed by one page.
+// Whether the loader's map says a region's frames are the kernel's to hand out.
+//
+// `MEM_USABLE` is the machine's free RAM. `MEM_BOOTLOADER_RECLAIMABLE` is the loader's own scratch,
+// which is usable the moment this runs (LDR-012): the loader cannot free the buffer it reads the
+// memory map out of - it is read AT `ExitBootServices`, and there is no firmware afterwards - so it
+// says so in the map instead, and this is the side that acts on it.
+//
+// `MEM_BOOTLOADER` is not seeded and must not be: that one holds the kernel image, the packages,
+// the page tables, `BootInfo`, the boot stack and the AP trampoline.
+pub fn seeds_the_pool(kind: u32) -> bool {
+	kind == bootproto::MEM_USABLE || kind == bootproto::MEM_BOOTLOADER_RECLAIMABLE
+}
+
 pub fn init(regions: &[MemRegion]) {
 	let mut allocator = ALLOCATOR.lock();
 	for region in regions {
-		if region.kind != bootproto::MEM_USABLE {
+		if !seeds_the_pool(region.kind) {
 			continue;
 		}
 		let mut base = align_up(region.base, PAGE_SIZE);
