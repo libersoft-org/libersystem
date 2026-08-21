@@ -30,8 +30,22 @@ def normalise(params):
 	return [p.replace("crate::codec::", "").replace("crate::", "") for p in params]
 
 
+# Split a parameter list at the commas that separate PARAMETERS, not the ones inside a generic
+# argument: `Option<Result<T, E>>` is one type and a plain `split(",")` makes it two, which would
+# report a mismatch against a signature that is identical. No such parameter exists today; the point
+# is that a gate whose failures cannot be trusted is one people learn to re-run until it passes.
 def parameter_types(text):
-	return [part.split(":", 1)[1].strip() for part in text.split(",") if ":" in part]
+	parts, depth, start = [], 0, 0
+	for index, character in enumerate(text):
+		if character in "<([":
+			depth += 1
+		elif character in ">)]":
+			depth -= 1
+		elif character == "," and depth == 0:
+			parts.append(text[start:index])
+			start = index + 1
+	parts.append(text[start:])
+	return [part.split(":", 1)[1].strip() for part in parts if ":" in part]
 
 
 def rust_files(*roots):
@@ -42,10 +56,15 @@ def rust_files(*roots):
 					yield os.path.join(directory, name)
 
 
+# Two kinds of definition answer a `liber_channel_*` declaration, and both are reached without the
+# compiler ever comparing signatures: the generated `liber_channel_impl_*`, which a provider crate
+# forwards to with a bare jump, and the handful the provider crates write by hand and export under
+# the forwarded name directly. The second kind is smaller and no safer - it is a symbol resolved by
+# name across a crate boundary either way.
 implementations = {}
-for path in rust_files(os.path.join(root, "user", "libs", "protocol")):
+for path in rust_files(os.path.join(root, "user")):
 	source = open(path, encoding="utf-8").read()
-	for match in re.finditer(r'export_name = "(liber_channel_impl_[a-z0-9_]+)"\)\]\s*\n\s*(?:pub )?(?:unsafe )?fn \w+\(([^)]*)\)', source):
+	for match in re.finditer(r'export_name = "(liber_channel_[a-z0-9_]+)"\)\]\s*\n\s*(?:pub )?(?:unsafe )?fn \w+\(([^)]*)\)', source):
 		implementations[match.group(1).replace("liber_channel_impl_", "liber_channel_")] = parameter_types(match.group(2))
 
 if not implementations:
@@ -73,7 +92,7 @@ for path, symbol, declared, implemented in mismatches:
 	print(f"  implemented ({', '.join(implemented)})", file=sys.stderr)
 
 if mismatches:
-	print(f"check-forwarded-abi: {len(mismatches)} declaration(s) disagree with the generated function they jump to", file=sys.stderr)
+	print(f"check-forwarded-abi: {len(mismatches)} declaration(s) disagree with the function they resolve to", file=sys.stderr)
 	sys.exit(1)
 
-print(f"check-forwarded-abi: {declarations} forwarded declaration(s) match their generated implementations")
+print(f"check-forwarded-abi: {declarations} forwarded declaration(s) match the functions they resolve to")

@@ -136,10 +136,25 @@ Annotations attach metadata to declarations. They begin with `@`:
 | Annotation | Applies to | Meaning |
 | --- | --- | --- |
 | `@op(n)` | method | the method's stable opcode (required) |
+| `@bound(n)` | field, param, return | the most elements a `list<T>` may carry, or bytes a `string` may hold |
 | `@reserved(n)` | interface, enum | a retired opcode or ordinal that must never be reused |
 | `@rights(r, ...)` | `handle<T>` param | validated contract metadata; runtime enforcement is not generated yet |
 | `@since(v)` | declaration/member | package version where it was added; stored, validated, and emitted |
 | `@deprecated(v)` | declaration/member | package version where it was deprecated; the adjacent doc comment carries the reason |
+
+`@bound(n)` is enforced where the value is READ, so a receiver refuses an over-long list
+rather than allocating for it. It is a property of the occurrence - this field, this
+parameter, this return - not of the type, and it passes through `option` and `result`
+because a bounded list is still bounded when it is optional.
+
+**A bound is what lets a server size its receive buffer.** Without one the only limit is
+the `u16` count, and a server that reads requests into anything smaller has a size its own
+protocol accepts and it cannot receive - which is not an error it can report, because the
+message is refused before any code that could answer it runs, and it stays in the queue
+while the caller waits. `storage.writer.write` was exactly that: described as carrying up
+to 65535 bytes against a service reading 1024, so four clients each guessed a chunk size
+and the three larger ones had never worked. Bound the list, derive the buffer from it, and
+the two cannot drift.
 
 ### Keywords
 
