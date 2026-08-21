@@ -834,6 +834,7 @@ fn process_service_lists_every_started_program() {
 
 	let (_boot_kernel, service_client) = spawn_service_with_package(b"process_service");
 	let mut held: alloc::vec::Vec<alloc::sync::Arc<Channel>> = alloc::vec::Vec::new();
+	let mut children: alloc::vec::Vec<alloc::sync::Arc<object::process::Process>> = alloc::vec::Vec::new();
 	for correlation in [11u32, 12u32] {
 		let (bootstrap_kernel, bootstrap_user) = Channel::create();
 		let name: &[u8] = b"holdopen";
@@ -848,6 +849,9 @@ fn process_service_lists_every_started_program() {
 		let reply = service_client.recv().expect("launch reply");
 		assert_eq!(le_u32(&reply.bytes, 0), correlation, "the reply echoes the correlation id");
 		assert_eq!(reply.bytes[4], 1, "the launch succeeded");
+		// The live process the launch handed back, kept so the state of each child can be READ
+		// rather than inferred from the list (P02M0088's open observation).
+		children.push(reply.caps[0].object().into_any_arc().downcast::<object::process::Process>().expect("the launch reply carries a Process"));
 		// The end this test keeps. While it lives, the child's blocking receive cannot return.
 		held.push(bootstrap_kernel);
 	}
@@ -868,7 +872,24 @@ fn process_service_lists_every_started_program() {
 	// milestone rather than left as a red test.
 	//
 	// The ends are dropped at the end of the scope either way, which is what lets the children go.
+	//
+	// WHAT EACH CHILD IS DOING, PRINTED RATHER THAN GUESSED. Three things can keep a launched
+	// program in the list and they need telling apart: a thread that never RAN (`Ready` - the
+	// service keeps such an entry on purpose, so this would not be a wake defect at all), one that
+	// ran and is `Blocked` (the wake never arrived), and one that has `Exited` with a status (the
+	// reap rule is what holds it). One line per child says which.
 	drop(held);
+	for _ in 0..8 {
+		sched::run_until_idle();
+	}
+	use crate::object::KernelObject;
+	for (index, child) in children.iter().enumerate() {
+		let threads = child.live_threads();
+		crate::serial_println!("holdopen[{index}]: koid={} exit={:?} live_threads={}", child.header().koid(), child.exit_status(), threads.len());
+		for thread in threads.iter() {
+			crate::serial_println!("holdopen[{index}]:   thread {} state={:?}", thread.header().koid(), thread.state());
+		}
+	}
 	sched::run_until_idle();
 }
 

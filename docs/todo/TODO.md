@@ -65,6 +65,11 @@ Phase 2 turns the VM into an appliance/edge platform, beginning with shared even
 streams and a network stack over virtio-net, then adding local I/O, policy,
 observability, persistent storage and multi-architecture support.
 
+The only active product profile in this phase is `ManagedReferenceVM v1`, a
+bounded, host-managed reference VM. Server, general real-hardware, desktop and
+AI directions remain vision in the [Concept roadmap](../CONCEPT_EN.md#roadmap),
+not active product-profile milestones.
+
 - [x] [P02M0001 - Event streams in the IDL toolchain (the P01M0008-deferred `stream<T>`)](P02M0001.md)
 - [x] [P02M0002 - Interrupt-driven I/O + virtio-input keyboard (the driver-framework gap for RX devices)](P02M0002.md)
 - [x] [P02M0003 - virtio-net receive path + the link/IP layer (Ethernet, ARP, IPv4, ICMP)](P02M0003.md)
@@ -205,9 +210,7 @@ observability, persistent storage and multi-architecture support.
 - [x] [P02M0138 - PermissionManager changes must select the tests that exercise them](P02M0138.md)
 - [x] [P02M0139 - Reuse the PermissionManager test fixture without sharing test state](P02M0139.md)
 - [x] [P02M0140 - Retire `just`: one way to run things, and it is a script with flags](P02M0140.md)
-- [ ] [P02M0141 - Close the architecture of the production reference appliance](P02M0141.md)
-- [ ] [P02M0142 - General platform and server architecture](P02M0142.md) - future product-profile track; not a phase-2 completion gate
-- [ ] [P02M0143 - Desktop profile, portals and the application ecosystem](P02M0143.md) - future product-profile track; not a phase-2 completion gate
+- [ ] [P02M0141 - ManagedReferenceVM v1](P02M0141.md)
 
 ### Definition of done (phase 2)
 
@@ -215,6 +218,9 @@ Done when the capability-scoped appliance provides networking, wall-clock time,
 interactive console and audio, policy and observability services, supervised
 components, writable persistent storage and the complete filesystem set. The
 kernel and UEFI loader must pass the QEMU suite on x86_64, aarch64 and riscv64.
-That is the functional phase-2 gate; calling the reference VM appliance
-production-ready additionally requires P02M0141. The future server and desktop
-profiles in P02M0142-P02M0143 do not gate phase-2 completion.
+
+Phase 2 additionally requires
+[P02M0141 - ManagedReferenceVM v1](P02M0141.md) to satisfy its own acceptance
+criteria for the bounded managed-reference profile. This makes no autonomous
+edge, server, general-hardware or desktop product claim; those remain vision in
+the [Concept roadmap](../CONCEPT_EN.md#roadmap).
