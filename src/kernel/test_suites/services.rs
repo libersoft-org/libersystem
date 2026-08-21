@@ -856,41 +856,33 @@ fn process_service_lists_every_started_program() {
 		held.push(bootstrap_kernel);
 	}
 	assert_eq!(process_service_list_len(&service_client, 13), 2, "both launched processes are listed");
-	// THE OTHER DIRECTION IS `process_service_drops_a_terminated_process_from_the_list`, beside this
-	// one: it launches one program, terminates it and requires the list to go to zero. So "a service
-	// that never removes anything" is already refused, and this test does not need to assert it
-	// again - which matters, because asserting it HERE means asserting that two children blocked in
-	// `wait` observe their peer closing and exit within some number of scheduler passes. On aarch64
-	// they do not, within sixty-four, and that is a finding about waking a blocked RING-3 process
-	// rather than about what ProcessService lists (P02M0088).
+	// AND THEY LEAVE IT WHEN THE ENDS THIS TEST HOLDS GO. Both children are blocked in `wait` on
+	// those channels, `Channel::is_readable` is "inbox non-empty OR peer closed", and `sys_wait`
+	// re-checks it on every wake - so dropping the ends must let both return, exit, and be reaped
+	// out of the list.
 	//
-	// TRIED AGAIN ON 2026-08-20 AND STILL RED. The assertion was put back after
-	// `kernel.kernel.a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops` showed
-	// the wake itself works on all three targets - and it failed here on aarch64 exactly as before,
-	// `left: 2, right: 0`. So the two are not the same event: a kernel thread blocked in `SYS_WAIT`
-	// wakes, and these children do not. That is the sharper boundary, and it is recorded in the
-	// milestone rather than left as a red test.
+	// THIS ASSERTION WAS RED FOR TWO DAYS ON aarch64 AND THE READING OF IT WAS WRONG. It was
+	// recorded as "a blocked ring-3 child is not woken", and the child was woken all along: it ran,
+	// returned from `wait`, and exited. What never happened was the RECORDING of its exit status -
+	// `SYS_USER_EXIT` is short-circuited in the aarch64 and riscv64 trap paths before it reaches
+	// the arm that latches it - and ProcessService keeps a stopped process with no status, because
+	// that is exactly what a launch which has not started yet looks like. So the children stayed
+	// listed forever on two ports of three, and this is the test that says they do not.
 	//
-	// The ends are dropped at the end of the scope either way, which is what lets the children go.
-	//
-	// WHAT EACH CHILD IS DOING, PRINTED RATHER THAN GUESSED. Three things can keep a launched
-	// program in the list and they need telling apart: a thread that never RAN (`Ready` - the
-	// service keeps such an entry on purpose, so this would not be a wake defect at all), one that
-	// ran and is `Blocked` (the wake never arrived), and one that has `Exited` with a status (the
-	// reap rule is what holds it). One line per child says which.
+	// Bounded rather than unbounded: a regression here is a failure, not a hang.
 	drop(held);
-	for _ in 0..8 {
+	let mut remaining = u16::MAX;
+	for _ in 0..64 {
 		sched::run_until_idle();
-	}
-	use crate::object::KernelObject;
-	for (index, child) in children.iter().enumerate() {
-		let threads = child.live_threads();
-		crate::serial_println!("holdopen[{index}]: koid={} exit={:?} live_threads={}", child.header().koid(), child.exit_status(), threads.len());
-		for thread in threads.iter() {
-			crate::serial_println!("holdopen[{index}]:   thread {} state={:?}", thread.header().koid(), thread.state());
+		remaining = process_service_list_len(&service_client, 14);
+		if remaining == 0 {
+			break;
 		}
 	}
-	sched::run_until_idle();
+	assert_eq!(remaining, 0, "both children observed their peer closing, exited, and left the list");
+	for (index, child) in children.iter().enumerate() {
+		assert_eq!(child.exit_status(), Some(0), "child {index} recorded the status it exited with");
+	}
 }
 
 tagged_test!(a_prepared_launch_can_be_cancelled_and_a_client_that_leaves_cancels_its_own, [Service, Process, ProcessService], id = "kernel.services.a_prepared_launch_can_be_cancelled_and_a_client_that_leaves_cancels_its_own", covers = ["kernel"]);

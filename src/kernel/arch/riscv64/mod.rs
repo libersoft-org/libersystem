@@ -474,6 +474,24 @@ pub mod syscall {
 	pub unsafe fn dispatch(frame: *mut u64) -> bool {
 		let num = unsafe { *frame.add(17) }; // a7
 		if num == abi::SYS_USER_EXIT {
+			// THE STATUS IS LATCHED HERE, because this is where the syscall ENDS.
+			//
+			// `SYS_USER_EXIT` does not go through `syscall_dispatch`: its portable arm never
+			// returns - it unwinds to the kernel thread that entered EL0 - and this trap path has
+			// to do that unwinding itself, from its caller, with the trap frame still on the stack.
+			// So the shortcut is right. What it lost is the one thing that arm does BEFORE
+			// unwinding: latching the status the program is reporting.
+			//
+			// The effect was that NO program on this port ever recorded an exit status. A waiter
+			// could see that a process had finished and never whether it succeeded, and
+			// ProcessService - which keeps an entry that is stopped with no status, because that is
+			// what a launch which has not started yet looks like - held every program it ever
+			// launched for the life of the system. That is the observation P02M0088 carried as "a
+			// ring-3 child is not woken on aarch64": the child woke, ran and exited exactly as it
+			// should, and the bookkeeping never learned it had.
+			if let Some(thread) = crate::sched::current_thread() {
+				thread.process().set_exit_status(unsafe { *frame.add(10) });
+			}
 			return true;
 		}
 		let (a0, a1, a2, a3) = unsafe { (*frame.add(10), *frame.add(11), *frame.add(12), *frame.add(13)) };

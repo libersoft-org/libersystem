@@ -161,7 +161,7 @@ or preventing further development of `v1`.
 - [x] [P02M0085 - Architecture abstraction layer (the HAL boundary)](P02M0085.md)
 - [x] [P02M0086 - aarch64 (ARM64) kernel + loader port](P02M0086.md)
 - [x] [P02M0087 - riscv64 (RISC-V) kernel + loader port](P02M0087.md)
-- [ ] [P02M0088 - Multi-arch track follow-ups (the P02M0085-P02M0087 loose ends)](P02M0088.md) - every audit finding closed; open over one observation found on the way: two ring-3 children blocked in `wait` are not woken by their peer closing, on aarch64 only, while a kernel thread in the same position is
+- [x] [P02M0088 - Multi-arch track follow-ups (the P02M0085-P02M0087 loose ends)](P02M0088.md)
 - [x] [P02M0089 - Pre-phase-3 hardening (finish before the server platform)](P02M0089.md)
 - [x] [P02M0090 - LSIDL package imports, modular generation, and language hardening](P02M0090.md)
 - [x] [P02M0091 - Application graphics, raw input, and PCM audio (the app-platform layer)](P02M0091.md)
@@ -214,12 +214,6 @@ or preventing further development of `v1`.
 - [x] [P02M0138 - PermissionManager changes must select the tests that exercise them](P02M0138.md)
 - [x] [P02M0139 - Reuse the PermissionManager test fixture without sharing test state](P02M0139.md)
 - [x] [P02M0140 - Retire `just`: one way to run things, and it is a script with flags](P02M0140.md)
-
-### Foundational system architecture
-
-These milestones strengthen the shared architecture of the current development
-system. They are not product, release or update gates and do not close `v1`.
-
 - [ ] [P02M0141 - One system model: components, identities, and dependencies](P02M0141.md)
 - [ ] [P02M0142 - Generated wiring: typed bootstrap, grants, and Domains](P02M0142.md)
 - [ ] [P02M0143 - Runtime ownership: lifecycle, state, and fail-closed recovery](P02M0143.md)
