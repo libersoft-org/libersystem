@@ -173,7 +173,7 @@ or preventing further development of `v1`.
 - [x] [P02M0097 - Userspace source and system-volume layout cleanup](P02M0097.md)
 - [ ] [P02M0098 - Declarative driver binding and lifecycle core](P02M0098.md)
 - [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md)
-- [ ] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
+- [x] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [ ] [P02M0101 - Additional system utilities](P02M0101.md)
 - [x] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)
 - [ ] [P02M0103 - The graphics platform desktop and mobile applications are built on](P02M0103.md)
