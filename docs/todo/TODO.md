@@ -65,10 +65,14 @@ Phase 2 turns the VM into an appliance/edge platform, beginning with shared even
 streams and a network stack over virtio-net, then adding local I/O, policy,
 observability, persistent storage and multi-architecture support.
 
-The only active product profile in this phase is `ManagedReferenceVM v1`, a
-bounded, host-managed reference VM. Server, general real-hardware, desktop and
-AI directions remain vision in the [Concept roadmap](../CONCEPT_EN.md#roadmap),
-not active product-profile milestones.
+**Version ownership rule:** `v1` remains open until the project owner explicitly
+says otherwise. Completing a milestone records that its current acceptance
+criteria pass; it never freezes an API, ABI, schema, file format, machine
+description, product profile or release line. Coordinated breaking changes may
+continue inside `v1`, and only the project owner may close it or start a
+successor version. Any older roadmap wording such as "freeze" or "finalize" is
+therefore interpreted only as recording the current contract, never as closing
+or preventing further development of `v1`.
 
 - [x] [P02M0001 - Event streams in the IDL toolchain (the P01M0008-deferred `stream<T>`)](P02M0001.md)
 - [x] [P02M0002 - Interrupt-driven I/O + virtio-input keyboard (the driver-framework gap for RX devices)](P02M0002.md)
@@ -210,7 +214,16 @@ not active product-profile milestones.
 - [x] [P02M0138 - PermissionManager changes must select the tests that exercise them](P02M0138.md)
 - [x] [P02M0139 - Reuse the PermissionManager test fixture without sharing test state](P02M0139.md)
 - [x] [P02M0140 - Retire `just`: one way to run things, and it is a script with flags](P02M0140.md)
-- [ ] [P02M0141 - ManagedReferenceVM v1](P02M0141.md)
+
+### Foundational system architecture
+
+These milestones strengthen the shared architecture of the current development
+system. They are not product, release or update gates and do not close `v1`.
+
+- [ ] [P02M0141 - One system model: components, identities, and dependencies](P02M0141.md)
+- [ ] [P02M0142 - Generated wiring: typed bootstrap, grants, and Domains](P02M0142.md)
+- [ ] [P02M0143 - Runtime ownership: lifecycle, state, and fail-closed recovery](P02M0143.md)
+- [ ] [P02M0144 - Truthful System Graph and architecture conformance](P02M0144.md)
 
 ### Definition of done (phase 2)
 
@@ -219,8 +232,9 @@ interactive console and audio, policy and observability services, supervised
 components, writable persistent storage and the complete filesystem set. The
 kernel and UEFI loader must pass the QEMU suite on x86_64, aarch64 and riscv64.
 
-Phase 2 additionally requires
-[P02M0141 - ManagedReferenceVM v1](P02M0141.md) to satisfy its own acceptance
-criteria for the bounded managed-reference profile. This makes no autonomous
-edge, server, general-hardware or desktop product claim; those remain vision in
-the [Concept roadmap](../CONCEPT_EN.md#roadmap).
+Phase 2 additionally requires the foundational architecture gates in
+P02M0141-P02M0144. Their completion means that the current development system
+has one composition model, generated wiring, explicit runtime ownership and a
+truthful live projection. It does not freeze or release `v1`. Server, general
+real-hardware, desktop and AI directions remain vision in the
+[Concept roadmap](../CONCEPT_EN.md#roadmap), not active product milestones.
