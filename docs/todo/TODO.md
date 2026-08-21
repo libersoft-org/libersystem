@@ -214,10 +214,7 @@ or preventing further development of `v1`.
 - [x] [P02M0138 - PermissionManager changes must select the tests that exercise them](P02M0138.md)
 - [x] [P02M0139 - Reuse the PermissionManager test fixture without sharing test state](P02M0139.md)
 - [x] [P02M0140 - Retire `just`: one way to run things, and it is a script with flags](P02M0140.md)
-- [ ] [P02M0141 - One system model: components, identities, and dependencies](P02M0141.md)
-- [ ] [P02M0142 - Generated wiring: typed bootstrap, grants, and Domains](P02M0142.md)
-- [ ] [P02M0143 - Runtime ownership: lifecycle, state, and fail-closed recovery](P02M0143.md)
-- [ ] [P02M0144 - Truthful System Graph and architecture conformance](P02M0144.md)
+- [ ] [P02M0141 - Wiring the system can re-run, and authority it can prove](P02M0141.md)
 
 ### Definition of done (phase 2)
 
@@ -226,9 +223,11 @@ interactive console and audio, policy and observability services, supervised
 components, writable persistent storage and the complete filesystem set. The
 kernel and UEFI loader must pass the QEMU suite on x86_64, aarch64 and riscv64.
 
-Phase 2 additionally requires the foundational architecture gates in
-P02M0141-P02M0144. Their completion means that the current development system
-has one composition model, generated wiring, explicit runtime ownership and a
-truthful live projection. It does not freeze or release `v1`. Server, general
-real-hardware, desktop and AI directions remain vision in the
-[Concept roadmap](../CONCEPT_EN.md#roadmap), not active product milestones.
+Phase 2 additionally requires P02M0141, which is where the system stops being one
+a crash can only be recovered from by rebooting and stops handing its broadest
+capability to device drivers: a bootstrap that can be re-run, boot authority
+checked against what was declared, an owner for every long-lived branch, and a
+graph that shows the declared system beside the running one. It does not freeze
+or release `v1`. Server, general real-hardware, desktop and AI directions remain
+vision in the [Concept roadmap](../CONCEPT_EN.md#roadmap), not active product
+milestones.
