@@ -1,20 +1,20 @@
 format=liber-dynamic-wave-report-v2
 target	wave	tools	object_bytes	pie_bytes	unique_provider_bytes	private_bytes	shared_bytes	test_command
 x86_64-unknown-none	1	12	77072	86056	486456	356352	507904	./test.sh --tags service,process,storage
-x86_64-unknown-none	2	11	165816	147712	635688	614400	675840	./test.sh --tags service,process,storage
+x86_64-unknown-none	2	11	166136	148000	635640	614400	675840	./test.sh --tags service,process,storage
 x86_64-unknown-none	3	14	96160	122880	833960	692224	905216	./test.sh --tags service,process,storage
 x86_64-unknown-none	4	9	95592	94680	622800	450560	622592	./test.sh --tags service,process
-x86_64-unknown-none	5	8	463424	311360	2643096	774144	2682880	./test.sh --tags image,audio,service,process,storage
-x86_64-unknown-none	6	20	357496	323144	965016	1118208	1183744	./test.sh --tags service,process,storage,permission-service
+x86_64-unknown-none	5	8	471360	314608	2643048	774144	2686976	./test.sh --tags image,audio,service,process,storage
+x86_64-unknown-none	6	20	358176	324008	964968	1118208	1183744	./test.sh --tags service,process,storage,permission-service
 aarch64-unknown-none	1	12	90520	94784	559128	409600	540672	./test.sh --tags service,process,storage
-aarch64-unknown-none	2	11	181648	155968	728336	782336	724992	./test.sh --tags service,process,storage
-aarch64-unknown-none	3	14	104160	128224	946280	937984	937984	./test.sh --tags service,process,storage
+aarch64-unknown-none	2	11	181648	155968	728112	782336	724992	./test.sh --tags service,process,storage
+aarch64-unknown-none	3	14	104160	128224	946304	937984	937984	./test.sh --tags service,process,storage
 aarch64-unknown-none	4	9	105104	100904	714128	643072	659456	./test.sh --tags service,process
-aarch64-unknown-none	5	8	465200	312896	2922448	1163264	2777088	./test.sh --tags image,audio,service,process,storage
-aarch64-unknown-none	6	20	373232	332320	1142176	1519616	1273856	./test.sh --tags service,process,storage,permission-service
+aarch64-unknown-none	5	8	474280	316424	2922248	1163264	2781184	./test.sh --tags image,audio,service,process,storage
+aarch64-unknown-none	6	20	374016	333040	1141976	1527808	1273856	./test.sh --tags service,process,storage,permission-service
 riscv64gc-unknown-none-elf	1	12	96040	102488	566824	409600	462848	./test.sh --tags service,process,storage
-riscv64gc-unknown-none-elf	2	11	192776	175032	726400	790528	602112	./test.sh --tags service,process,storage
-riscv64gc-unknown-none-elf	3	14	104928	136528	951192	929792	815104	./test.sh --tags service,process,storage
+riscv64gc-unknown-none-elf	2	11	192840	175096	726200	790528	602112	./test.sh --tags service,process,storage
+riscv64gc-unknown-none-elf	3	14	104928	136528	951176	929792	815104	./test.sh --tags service,process,storage
 riscv64gc-unknown-none-elf	4	9	110408	111640	716432	602112	561152	./test.sh --tags service,process
-riscv64gc-unknown-none-elf	5	8	507128	355112	2756720	1167360	2154496	./test.sh --tags image,audio,service,process,storage
-riscv64gc-unknown-none-elf	6	20	396232	359952	1062344	1531904	1019904	./test.sh --tags service,process,storage,permission-service
+riscv64gc-unknown-none-elf	5	8	517384	361096	2756504	1171456	2150400	./test.sh --tags image,audio,service,process,storage
+riscv64gc-unknown-none-elf	6	20	397232	360808	1062128	1531904	1019904	./test.sh --tags service,process,storage,permission-service

@@ -225,9 +225,9 @@ kernel and UEFI loader must pass the QEMU suite on x86_64, aarch64 and riscv64.
 
 Phase 2 additionally requires P02M0141, which is where the system stops being one
 a crash can only be recovered from by rebooting and stops handing its broadest
-capability to device drivers: a bootstrap that can be re-run, boot authority
+capability to keyboard drivers: a bootstrap that can be re-run, boot authority
 checked against what was declared, an owner for every long-lived branch, and a
-graph that shows the declared system beside the running one. It does not freeze
-or release `v1`. Server, general real-hardware, desktop and AI directions remain
+fault matrix that shows the recovery paths work. It does not freeze or release
+`v1`. Server, general real-hardware, desktop and AI directions remain
 vision in the [Concept roadmap](../CONCEPT_EN.md#roadmap), not active product
 milestones.
