@@ -22,7 +22,7 @@ use proto::system::{FileInfo, LaunchContext, SelectedFile, WriterMode};
 use rt::*;
 use storage_proto::path;
 use tools::{ConsoleWriter, VolumeSet, read_volume_file};
-use volume_client::VolumeClient;
+use volume_client::{VolumeClient, WRITER_CHUNK};
 use volume_client_provider as _;
 
 const MAX_EDIT_BYTES: usize = 512 * 1024;
@@ -965,7 +965,7 @@ impl Editor {
 		// The buffer is handed over in bounded pieces rather than as one message, because the
 		// staging accepts what one reply may carry and a whole file is not that.
 		let mut published = true;
-		for chunk in self.buffers[self.active].text.bytes().chunks(4096) {
+		for chunk in self.buffers[self.active].text.bytes().chunks(WRITER_CHUNK) {
 			if !matches!(writer.write(chunk), Some(Ok(_))) {
 				published = false;
 				break;

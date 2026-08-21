@@ -34,9 +34,9 @@ use rt::*;
 use storage_proto::path;
 use volume_client::VolumeClient;
 
-// One receive per chunk. The writer's own wire bound is 65535 bytes per call; this is the shell's
-// relay size, which is what the producers on the other end of the pipe send.
-const CHUNK: usize = 4096;
+// One receive per chunk. This is the shell's relay size - what the producers on the other end of
+// the pipe send - and it is also the writer's own bound, so a full window is exactly one request.
+const CHUNK: usize = volume_client::WRITER_CHUNK;
 
 // The flag the shell passes for `>>`. A word rather than a mode byte in the argument string,
 // because the launch contract carries arguments as text and a tool that parses its own flags is
@@ -87,7 +87,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				exit();
 			}
 		};
-		let storage: u64 = path::volume_client(cwd_str, target, system, media, iso, udf, usb);
+		let storage: u64 = path::volume_client(cwd_str, target, system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
 		pump(storage, &uri, append);
 	}
 	exit();

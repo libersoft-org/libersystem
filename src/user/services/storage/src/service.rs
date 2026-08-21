@@ -319,7 +319,7 @@ impl WriterSession {
 	// Grow the staged file to `len` with zeros, refusing rather than growing past the ceiling.
 	fn reserve_to(&mut self, len: usize) -> Result<(), Error> {
 		if len > self.limit {
-			return Err(if self.limit_is_policy { Error::Invalid } else { Error::Again });
+			return Err(ceiling_error(self.limit_is_policy));
 		}
 		if len > self.staged.len() {
 			self.staged.try_reserve(len - self.staged.len()).map_err(|_| Error::Again)?;
@@ -570,7 +570,7 @@ impl volume::Service for VolumeCall<'_> {
 				Err(e) => return Err(e),
 			}
 			if staged.len() > limit {
-				return Err(if limit_is_policy { Error::Invalid } else { Error::Again });
+				return Err(ceiling_error(limit_is_policy));
 			}
 		}
 		let session = WriterSession { name: to_string(core::str::from_utf8(name).map_err(|_| Error::Invalid)?)?, path: to_string(&path)?, staged, cursor, limit, limit_is_policy, closed: false };
@@ -868,7 +868,7 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 			return StreamStep::Done(Ok(()));
 		}
 		if want > room {
-			return StreamStep::Done(Err(if p.limit_is_policy { Error::Invalid } else { Error::Again }));
+			return StreamStep::Done(Err(ceiling_error(p.limit_is_policy)));
 		}
 		let offered = want;
 		// Whether an offer was actually opened. A backend that does not implement `stream_spare`
@@ -946,7 +946,7 @@ fn take_chunk(vol: &mut Volume, p: &mut PendingWrite) -> StreamStep {
 		}
 		// The sender is done. The only ending that means the file is whole.
 		BoundedVec::PeerClosed => StreamStep::Done(Ok(())),
-		BoundedVec::TooLarge { .. } => StreamStep::Done(Err(if p.limit_is_policy { Error::Invalid } else { Error::Again })),
+		BoundedVec::TooLarge { .. } => StreamStep::Done(Err(ceiling_error(p.limit_is_policy))),
 		BoundedVec::NoMemory { .. } => StreamStep::Done(Err(Error::Again)),
 		BoundedVec::ReceiveError => StreamStep::Done(Err(Error::Invalid)),
 		// Nothing there after all - the wait said readable, so this is a race with another reader
@@ -1160,7 +1160,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 	let mut stream_chan: u64 = 0;
 	let mut stream_koid: u64 = 0;
 
-	let mut request: [u8; 1024] = [0u8; 1024];
+	let mut request: [u8; REQUEST_MAX] = [0u8; REQUEST_MAX];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	// At most one at a time. The memory filesystem accumulates a stream in the volume itself and
 	// has room for one such write; a second would have to fall back to accumulating in this heap,
@@ -2199,6 +2199,35 @@ struct Volume {
 	events: Vec<FileEvent>,
 }
 
+// THE LARGEST REQUEST THIS SERVICE'S OWN PROTOCOL ALLOWS, which is what a receive buffer has to
+// be and was not. It was 1024 while `writer.write-at` accepts a 4096-byte chunk - so every write
+// past about a kilobyte was refused BY THE RECEIVE, before any code that could answer it ran, and
+// `recv` leaves an oversized message in the queue rather than truncating it: the caller waited on
+// a reply that could not be composed because the request was never taken. Nothing reported it,
+// which is why four separate tools each carried a chunk size that had never worked.
+//
+// The arithmetic, so it can be checked against `storage.lsidl` rather than trusted: two bytes of
+// op, four of correlation, eight for `write-at`'s offset, two for the list count and the bounded
+// 4096 of payload is 4112. The rest is headroom for the path-carrying ops, whose strings are
+// shorter than that and are refused by the same receive if they ever are not.
+const REQUEST_MAX: usize = 4608;
+
+// WHICH CEILING WAS HIT, in the protocol's own words.
+//
+// A filesystem's `max_len` is the room left ON THE MEDIUM, so passing it is `no-space` - free
+// something and it fits. `STREAM_ACCUMULATION` is THIS SERVICE'S staging ceiling, so passing that
+// is `exhausted` - a resource limit was reached, which is exactly the distinction `base.error`
+// draws between the two and says so in as many words.
+//
+// Both used to be `again` and `invalid`: "try again" for a volume with no room, which never
+// becomes true, and "your request was wrong" for a file that is simply larger than this service
+// stages, which says nothing a caller can act on. The distinction was already computed and carried
+// this far - `limit_is_policy` exists for no other purpose - and then spent on two words that do
+// not draw it.
+fn ceiling_error(limit_is_policy: bool) -> Error {
+	if limit_is_policy { Error::Exhausted } else { Error::NoSpace }
+}
+
 // The most events one request may leave behind. Two is what the largest mutation (a rename)
 // produces; the rest is headroom for a request that mutates more than once, and the ceiling
 // exists so a backend that started emitting per-block events could not grow this without bound.
@@ -2294,8 +2323,11 @@ impl volume::Service for Volume {
 		// there is nothing for this service to be protected from, and applying it was the
 		// regression that refused a 20 MiB disk write for a limit invented on behalf of streaming.
 		if allowed.is_some_and(|allowed| data.len as usize > allowed) {
-			// The volume cannot take this now; the request itself was well formed.
-			return Err(Error::Again);
+			// The medium's own ceiling, so the answer is `no-space` - the same word the writer
+			// session and the stream give for the same ceiling, through `ceiling_error`. This said
+			// `again`, meaning "the volume cannot take this NOW", which reads as a wait when the
+			// truth is that the volume has no room and waiting changes nothing.
+			return Err(Error::NoSpace);
 		}
 		let buffer = unsafe { map_buffer(&Buffer { handle: owned.release(), len: data.len }) }.ok_or(Error::Invalid)?;
 		let name: &[u8] = self.writable_name(&path)?;
@@ -3185,27 +3217,36 @@ impl FileSystem for ArchiveFs {
 fn map_fs_err(e: FsError) -> Error {
 	match e {
 		FsError::NotFound => Error::NotFound,
-		FsError::NoSpace => Error::Again,
-		// The service is short of MEMORY, not the volume of space. Both are worth retrying and the
-		// caller's next move differs: `NoSpace` says free something on the volume, `NoMemory` says
-		// wait for this service. They arrive here as one `Again` because the Storage protocol has
-		// no finer word yet - what matters is that the filesystems no longer conflate them, so the
-		// distinction exists to be surfaced when the protocol grows one.
-		FsError::NoMemory => Error::Again,
+		// THE VOLUME IS FULL, AND THE PROTOCOL CAN SAY SO NOW.
+		//
+		// This was `Again`, which means "try again, it may work later" - and a full volume will not
+		// work later, so every caller that honoured the retry was told to spin against a wall. The
+		// comment beside it said the protocol had no finer word yet and that the distinction was
+		// there to be surfaced when it grew one. IDL-006 grew all of them (P02M0102) and this
+		// mapping was not revisited: the note was left for a collector who never came.
+		//
+		// `no-space` says the medium is out of room, which is a thing the person can act on -
+		// delete something - and `exhausted` says this SERVICE hit a limit of its own, which is a
+		// thing they wait out. `fs-core` has kept them apart since it existed; this is the boundary
+		// that flattened them.
+		FsError::NoSpace => Error::NoSpace,
+		FsError::NoMemory => Error::Exhausted,
 		// A file too large to return in one buffer, which is a ranged read away from working - not
 		// a damaged volume, which is what it used to be reported as.
 		FsError::TooLarge => Error::Invalid,
 		// the malformed-request family: bad or overlong names, wrong kinds, a non-empty
 		// directory, a duplicate snapshot name, an impossible operation.
 		FsError::TooLong | FsError::BadName | FsError::IsDir | FsError::NotDir | FsError::NotEmpty | FsError::Exists | FsError::Invalid => Error::Invalid,
-		// on-disk corruption caught by a block checksum: the data cannot be trusted.
-		FsError::Corrupt => Error::Invalid,
-		FsError::Io => Error::Again,
+		// on-disk corruption caught by a block checksum: the data cannot be trusted. `invalid` said
+		// "your request was wrong" about a medium that is damaged, which sends the reader to look
+		// at their own path.
+		FsError::Corrupt => Error::Corrupt,
+		FsError::Io => Error::Io,
 		// A commit that MAY have landed. NOT `Again`: retrying is exactly the wrong response - the
 		// write the caller thinks it lost may already be on the medium, and the volume is read-only
-		// from here on, so a retry can only fail or duplicate. `Denied` says "this mount will not
-		// take another write", which is the true statement this protocol can make today.
-		FsError::CommitUncertain => Error::Denied,
+		// from here on, so a retry can only fail or duplicate. It said `Denied` for the same reason
+		// `NoSpace` said `Again` - the word did not exist - and it does now.
+		FsError::CommitUncertain => Error::CommitUncertain,
 		// a read-only mount (a snapshot, or a volume degraded by a corrupt snapshot
 		// table) refuses mutations, like any other read-only volume.
 		FsError::ReadOnly => Error::Denied,

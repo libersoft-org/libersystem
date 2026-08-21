@@ -48,8 +48,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		let Some(input_uri) = path::resolve(cwd, config.input.as_bytes()) else { fail(Error::InvalidOptions) };
 		let Some(output_uri) = path::resolve(cwd, config.output.as_bytes()) else { fail(Error::InvalidOptions) };
-		let input_storage = path::volume_client(cwd, config.input.as_bytes(), system, media, iso, udf, usb);
-		let output_storage = path::volume_client(cwd, config.output.as_bytes(), system, media, iso, udf, usb);
+		let input_storage = path::volume_client(cwd, config.input.as_bytes(), system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
+		let output_storage = path::volume_client(cwd, config.output.as_bytes(), system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
 		if input_storage == 0 || output_storage == 0 {
 			eprint(b"audioconv: volume unavailable\n");
 			exit();

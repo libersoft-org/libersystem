@@ -21,7 +21,7 @@ use cli::{Arg, classify};
 use proto::system::{LaunchContext, WriterMode};
 use rt::*;
 use tools::{VolumeSet, push_decimal, split_args};
-use volume_client::{VolumeClient, WriterClient};
+use volume_client::{VolumeClient, WRITER_CHUNK, WriterClient};
 
 // One transfer. The writer's `write` carries a length-prefixed list, so a chunk may not exceed what
 // that length can express; 32 KiB leaves room and keeps the round trips few.
@@ -128,7 +128,7 @@ unsafe fn copy(from: u64, source: &str, to: u64, destination: &str, force: bool)
 				break;
 			}
 			offset = offset.saturating_add(window.len() as u64);
-			for chunk in window.chunks(CHUNK as usize) {
+			for chunk in window.chunks(WRITER_CHUNK) {
 				if !matches!(writer.write(chunk), Some(Ok(_))) {
 					let _ = writer.abort();
 					close(writer.handle());

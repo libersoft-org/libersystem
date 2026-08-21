@@ -1615,10 +1615,22 @@ fn type_codec_ok(ty: &Type) -> bool {
 	}
 }
 
-// A by-reference Rust type for a client parameter (`string` -> `&str`).
+// A by-reference Rust type for a client parameter (`string` -> `&str`, `list<T>` -> `&[T]`).
+//
+// THE LIST CASE IS NOT COSMETIC. It used to be `&Vec<T>`, which is a THIN pointer, while every
+// hand-written declaration of the same symbol spelled the natural Rust type `&[T]`, which is a FAT
+// one - and the two are connected by a bare `jmp` in the provider crates, so nothing checks that
+// they agree. A caller passing a slice put (pointer, length) in two registers and the callee read
+// the first as the address of a `Vec`, taking its length out of the caller's DATA. The storage
+// writer's `write` is where this was found: it returned "no answer" for every payload, because the
+// length it decoded was made of the bytes being written.
+//
+// A borrowed list is a slice for the same reason a borrowed string is a `str`, and the generated
+// bodies only ever ask a list parameter for `len()` and `iter()`, both of which a slice has.
 fn param_ref_ty(ty: &Type) -> Result<String, String> {
 	Ok(match ty {
 		Type::String => "&str".into(),
+		Type::List(inner) => format!("&[{}]", rust_ty(inner)?),
 		_ => format!("&{}", rust_ty(ty)?),
 	})
 }

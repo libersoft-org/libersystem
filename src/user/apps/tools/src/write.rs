@@ -64,7 +64,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 		};
 		// route the path to the client for the volume it names.
-		let storage: u64 = path::volume_client(cwd_str, path_arg, system, media, iso, udf, usb);
+		let storage: u64 = path::volume_client(cwd_str, path_arg, system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
 		write(storage, &uri, text);
 	}
 	exit();

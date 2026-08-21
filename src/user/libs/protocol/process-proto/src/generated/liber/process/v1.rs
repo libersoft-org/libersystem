@@ -929,7 +929,7 @@ pub mod process {
 			}
 			decoded
 		}
-		pub fn release_group(&mut self, koids: &Vec<Koid>) -> Option<Result<bool, Error>> {
+		pub fn release_group(&mut self, koids: &[Koid]) -> Option<Result<bool, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -1064,7 +1064,7 @@ pub mod process {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_process_process_release_group")]
-	fn channel_invoke_release_group(chan: u64, koids: &Vec<Koid>) -> Option<Result<bool, Error>> {
+	fn channel_invoke_release_group(chan: u64, koids: &[Koid]) -> Option<Result<bool, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.release_group(koids)
 	}

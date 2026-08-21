@@ -36,8 +36,8 @@ method volume.watch op=22 (path:string:rights=) -> result<stream<file-event>, li
 method volume.open-writer op=23 (path:string:rights=,mode:writer-mode:rights=) -> result<handle<channel>, liber:base@1::error>
 method volume.connect op=24 () -> result<handle<channel>, liber:base@1::error>
 interface writer
-method writer.write op=1 (data:list<u8>:rights=) -> result<u64, liber:base@1::error>
-method writer.write-at op=2 (offset:u64:rights=,data:list<u8>:rights=) -> result<unit, liber:base@1::error>
+method writer.write op=1 (data:list<u8>:bound=4096:rights=) -> result<u64, liber:base@1::error>
+method writer.write-at op=2 (offset:u64:rights=,data:list<u8>:bound=4096:rights=) -> result<unit, liber:base@1::error>
 method writer.truncate op=3 (length:u64:rights=) -> result<unit, liber:base@1::error>
 method writer.flush op=4 () -> result<u64, liber:base@1::error>
 method writer.commit op=5 () -> result<u64, liber:base@1::error>

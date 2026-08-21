@@ -66,7 +66,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				exit();
 			}
 		};
-		let storage: u64 = path::volume_client(cwd_str, arg, system, media, iso, udf, usb);
+		let storage: u64 = path::volume_client(cwd_str, arg, system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
 		pump(storage, uri.as_bytes());
 	}
 	exit();

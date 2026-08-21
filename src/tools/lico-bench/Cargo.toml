@@ -1,0 +1,7 @@
+[package]
+name = "lico-bench"
+edition = "2024"
+description = "Host-only release measurement of the LiberCommander core at the sizes a person actually meets"
+
+[dependencies]
+lico = { path = "../../user/libs/terminal/lico" }

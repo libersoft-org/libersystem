@@ -3003,6 +3003,15 @@ pub mod writer {
 	pub trait Service {
 		/// Append `data` at the cursor and return the staged length. The cursor starts at zero for a
 		/// `replace` session and at the file's current length for an `append` one.
+		///
+		/// THE BOUND IS THE CONTRACT'S, not a suggestion, and it exists because it was missing. This
+		/// carried "at most 65535 bytes - the wire's list length", which is what a `u16` count allows
+		/// rather than anything anyone had agreed to serve: StorageService reads requests into a
+		/// buffer a quarter that size, so every write above about a kilobyte was refused by the
+		/// RECEIVE and left its caller with no answer at all. Four tools had each picked their own
+		/// chunk - 4096, 8192 and 32768 - and none of the larger ones ever worked. 4096 is the block
+		/// size everywhere else in this system, and stating it here is what keeps the service's buffer
+		/// and the client's chunk from drifting apart again.
 		fn write(&mut self, data: Vec<u8>) -> Result<u64, Error>;
 		/// Write `data` at `offset`, extending the staged file with zeros if it starts beyond the end -
 		/// the same zero-extension promise `volume.truncate` makes, for the same reason: a gap that
@@ -3048,6 +3057,7 @@ pub mod writer {
 			OP_WRITE => {
 				let data = {
 					let v53 = r.u16()? as usize;
+					let v53 = (v53 <= 4096).then_some(v53)?;
 					let mut v54 = Vec::new();
 					v54.try_reserve_exact(v53).ok()?;
 					for _ in 0..v53 {
@@ -3094,6 +3104,7 @@ pub mod writer {
 				let offset = r.u64()?;
 				let data = {
 					let v57 = r.u16()? as usize;
+					let v57 = (v57 <= 4096).then_some(v57)?;
 					let mut v58 = Vec::new();
 					v58.try_reserve_exact(v57).ok()?;
 					for _ in 0..v57 {
@@ -3347,7 +3358,7 @@ pub mod writer {
 			r.finish()?;
 			Some((package, version))
 		}
-		pub fn write(&mut self, data: &Vec<u8>) -> Option<Result<u64, Error>> {
+		pub fn write(&mut self, data: &[u8]) -> Option<Result<u64, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -3387,7 +3398,7 @@ pub mod writer {
 			}
 			decoded
 		}
-		pub fn write_at(&mut self, offset: &u64, data: &Vec<u8>) -> Option<Result<(), Error>> {
+		pub fn write_at(&mut self, offset: &u64, data: &[u8]) -> Option<Result<(), Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -3566,7 +3577,7 @@ pub mod writer {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_storage_writer_write")]
-	fn channel_invoke_write(chan: u64, data: &Vec<u8>) -> Option<Result<u64, Error>> {
+	fn channel_invoke_write(chan: u64, data: &[u8]) -> Option<Result<u64, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.write(data)
 	}
@@ -3574,7 +3585,7 @@ pub mod writer {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_storage_writer_write_at")]
-	fn channel_invoke_write_at(chan: u64, offset: &u64, data: &Vec<u8>) -> Option<Result<(), Error>> {
+	fn channel_invoke_write_at(chan: u64, offset: &u64, data: &[u8]) -> Option<Result<(), Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.write_at(offset, data)
 	}

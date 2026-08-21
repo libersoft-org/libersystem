@@ -48,6 +48,241 @@ fn lico_restores_the_terminal_when_it_is_interrupted() {
 	run_lico_interrupt_harness(lico_elf, &mut system);
 }
 
+tagged_test!(licoedit_publishes_what_was_typed_through_the_transactional_writer, [Lico, Process, Service, Storage, Filesystem], id = "kernel.applications.licoedit_publishes_what_was_typed_through_the_transactional_writer", covers = ["bin.licoedit", "lico", "libermemfs", "storage", "volume-client"]);
+fn licoedit_publishes_what_was_typed_through_the_transactional_writer() {
+	// THE SAVE, END TO END, WHICH NOTHING HAD EVER RUN.
+	//
+	// `licoedit` publishes through the transactional writer: staged in the service, visible under
+	// the file's name only at `commit`, so an editor that dies half way leaves the file as it was.
+	// That is the right design and it was never exercised - the terminal-lifecycle scenario opens
+	// the editor and leaves with `F10` - which is how the writer could be broken for every program
+	// in the system, by an argument-register mismatch in the client stub, and stay broken.
+	//
+	// The refusing half of the same path is covered by the manager's copy onto a full volume. This
+	// is the half that has to WORK: bytes typed at the terminal reach the medium under the name
+	// they were typed into.
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let editor_elf = program_elf(&package, volume, b"licoedit").expect("licoedit tool");
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let mut scratch = StorageHarness::start_memory(storage_elf, b"TMPVOL", 16 * 1024);
+	assert!(scratch.write(b"vol://tmp/note.txt", b"before", 0x7b01), "the file starts with something to replace");
+
+	let (terminal, terminal_child) = object::channel::Channel::create();
+	let process = spawn_terminal_app_on(editor_elf, terminal_child, b"SELECTED_FILE", b"vol://tmp/note.txt", &mut system, b"vol://tmp", &mut [(b"TMP", &mut scratch)]);
+
+	// Wait for the file to be on the screen, which is the editor saying it read the volume.
+	let mut opened = false;
+	for _ in 0..200_000 {
+		system.pump();
+		scratch.pump();
+		while let Ok(message) = terminal.recv() {
+			opened |= message.bytes.windows(b"before".len()).any(|window| window == b"before");
+		}
+		if opened {
+			break;
+		}
+	}
+	assert!(opened, "licoedit opens the file it was launched over");
+
+	// Type at the end of the line, then `^S`. The cursor starts at the beginning, so `End` first -
+	// this is about the SAVE, and a test that typed into the middle would be about the buffer.
+	lico_type(&terminal, b"\x1b[F");
+	lico_type(&terminal, b" and after");
+	lico_type(&terminal, b"\x13");
+	let saved = lico_await(&terminal, b"saved", &mut [&mut system, &mut scratch]);
+	assert!(saved.is_some(), "the editor reports the save");
+
+	// AND THE BYTES ARE ON THE VOLUME, read back through the service rather than believed from the
+	// status line. `^S` says "saved" from the moment the commit returns, so a commit that published
+	// nothing would say exactly the same thing.
+	lico_type(&terminal, b"\x1b[21~");
+	for _ in 0..200_000 {
+		system.pump();
+		scratch.pump();
+		while terminal.recv().is_ok() {}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	assert!(process.is_terminated(), "licoedit exits on F10");
+	assert_eq!(scratch.open(b"vol://tmp/note.txt", 0x7b02), Some(b"before and after".to_vec()), "what was typed is what the volume holds");
+}
+
+tagged_test!(lico_exits_on_a_pointer_press_delivered_by_the_real_console, [Lico, Process, Service, Storage, Console, Display, Mouse], id = "kernel.applications.lico_exits_on_a_pointer_press_delivered_by_the_real_console", covers = ["bin.lico", "keys", "lico", "term"]);
+fn lico_exits_on_a_pointer_press_delivered_by_the_real_console() {
+	// THE POINTER EXITS, THROUGH THE TERMINAL THAT MAKES THE REPORTS.
+	//
+	// The other `lico` tests hand the program a plain channel and write escape sequences into it by
+	// hand, which measures the program's decoder against the test's own idea of the encoding. A
+	// mouse report is not the test's to invent: ConsoleService builds it from a raw device event,
+	// the grid geometry, and the mouse modes the program asked for by printing them - and if the
+	// console's cell arithmetic and the program's disagree by one, every click lands on the wrong
+	// control while both halves pass their own tests.
+	//
+	// So there is no escape sequence anywhere below. What goes in is what the pointer driver sends:
+	// a position over the normalized span and a button bit. Everything from there to `lico`'s input
+	// is the real path, which is also what makes this the test that proves the program ever enabled
+	// tracking at all - the console reports NOTHING to a program that did not.
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	// `lico`'s layout is fixed at 80 columns and puts its function-key row at cell row 20, so the
+	// grid has to be at least that. 80x24 at the console's 8x16 font is 640x384.
+	const COLS: usize = 80;
+	const ROWS: usize = 24;
+	// The clickable function-key row, and the two labels on it this test presses. `lico` divides
+	// the row into nine-column slots over the keys 1, 3, 4, 5, 6, 7, 8, 9, 10 - so slot 8 is F10
+	// (exit) and slot 7 is F9 (the menu). Named by CELL, which is what a mouse report carries.
+	const FKEY_ROW: usize = 20;
+	const F10_COLUMN: usize = 75;
+	const F9_COLUMN: usize = 67;
+
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let lico_elf = program_elf(&package, volume, b"lico").expect("lico tool");
+	let display_elf = program_elf(&package, volume, b"display_service").expect("display service");
+	let console_elf = program_elf(&package, volume, b"console_service").expect("console service");
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let mut console = ConsoleHarness::start(display_elf, console_elf, COLS, ROWS);
+
+	// FIRST: THE FUNCTION-KEY ROW. `lico` on VT 1, holding the channel a program holds.
+	let program = console.program.clone();
+	let process = spawn_lico_on(lico_elf, program, &mut system, b"vol://system", &mut []);
+	assert!(console.settle(&mut system), "lico draws its first frame on the real terminal");
+
+	// A press inside the panel, which moves the selection and must NOT end anything. It is the
+	// control for the two that follow: without it, a test where every click exits would pass.
+	console.click(&mut system, 10, 6);
+	assert!(!process.is_terminated(), "a press inside the panel does not end the program");
+
+	console.click(&mut system, F10_COLUMN, FKEY_ROW);
+	for _ in 0..2_000 {
+		system.pump();
+		console.pump();
+		if process.is_terminated() {
+			break;
+		}
+	}
+	assert!(process.is_terminated(), "a press on the F10 label exits");
+
+	// SECOND: THE MENU'S OWN QUIT, opened by pointer and chosen by pointer. A separate instance,
+	// because the first one is gone - and this is the exit that goes through two clicks, so a
+	// console that reported only the first press in a session would be caught here.
+	let program = console.program.clone();
+	let menu = spawn_lico_on(lico_elf, program, &mut system, b"vol://system", &mut []);
+	assert!(console.settle(&mut system), "the second instance draws");
+	console.click(&mut system, F9_COLUMN, FKEY_ROW);
+	assert!(!menu.is_terminated(), "opening the menu by pointer does not end the program");
+	// `Quit` is the thirteenth row of the menu, drawn from cell row 3 - so cell row 15.
+	console.click(&mut system, 10, 15);
+	for _ in 0..2_000 {
+		system.pump();
+		console.pump();
+		if menu.is_terminated() {
+			break;
+		}
+	}
+	assert!(menu.is_terminated(), "a press on the menu's Quit row exits");
+}
+
+tagged_test!(lico_names_a_full_volume_when_a_copy_runs_out_of_room, [Lico, Process, Service, Storage, Filesystem], id = "kernel.applications.lico_names_a_full_volume_when_a_copy_runs_out_of_room", covers = ["bin.lico", "lico", "libermemfs", "storage", "volume-client"]);
+fn lico_names_a_full_volume_when_a_copy_runs_out_of_room() {
+	// THE CASE THAT NEEDS TWO WRITABLE VOLUMES, and could not be written until there were two:
+	// everything inside one volume shares its space, so a destination that runs out of room while
+	// the source still has plenty only exists ACROSS a boundary.
+	//
+	// What it measures is the whole chain, one end to the other: a memory filesystem that knows it
+	// is out of blocks, a service that puts the right word on the wire, and a file manager that
+	// tells the person WHICH of the things that can go wrong went wrong. Each link dropped it
+	// before this test - the service answered `again` and the manager counted refusals without
+	// keeping a single one of their reasons - and each of the three looks identical from the two
+	// others' side.
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let lico_elf = program_elf(&package, volume, b"lico").expect("lico tool");
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+
+	// The source, with room to spare, and a destination that holds one of the two files on it.
+	//
+	// `small.txt` is deliberately larger than `WRITER_CHUNK`, so the copy that SUCCEEDS spans more
+	// than one request and covers the chunking loop; `big.txt` is larger than the whole destination.
+	let mut source = StorageHarness::start_memory(storage_elf, b"RAMVOL", 64 * 1024);
+	assert!(source.write(b"vol://ram/big.txt", &alloc::vec![b'b'; 16 * 1024], 0x7a01), "the source volume takes the file that will not fit");
+	assert!(source.write(b"vol://ram/small.txt", &alloc::vec![b's'; 6 * 1024], 0x7a06), "and the one that will");
+	let mut destination = StorageHarness::start_memory(storage_elf, b"TMPVOL", 16 * 1024);
+	assert!(destination.write(b"vol://tmp/keep.txt", b"keep me", 0x7a02), "the destination starts with a file of its own");
+
+	let (process, terminal, initial) = {
+		let (process, terminal, output) = start_lico_with(lico_elf, &mut system, b"vol://ram", &mut [(b"RAM", &mut source), (b"TMP", &mut destination)]);
+		let initial: alloc::vec::Vec<u8> = output.iter().flat_map(|line| line.iter().copied()).collect();
+		(process, terminal, initial)
+	};
+	assert!(initial.windows(b">vol://ram".len()).any(|window| window == b">vol://ram"), "the panel opens on the granted source volume");
+	assert!(initial.windows(b"big.txt".len()).any(|window| window == b"big.txt"), "and lists the file to be copied");
+
+	// FIRST THE COPY THAT WORKS, because a suite that only ever saw a refusal would pass with the
+	// whole path broken - which is the state this case was written in.
+	//
+	// Tag by NAME rather than by cursor position, for the same reason the delete case does: the
+	// test should not depend on where the cursor landed or how the panel is sorted. F5 opens the
+	// copy prompt pre-filled with the OTHER panel's directory - the same volume here, so it is
+	// erased before the destination is typed.
+	let copy_to_tmp = |terminal: &alloc::sync::Arc<object::channel::Channel>, name: &[u8]| {
+		lico_type(terminal, b"+");
+		lico_type(terminal, name);
+		lico_type(terminal, b"\r");
+		lico_type(terminal, b"\x1b[15~");
+		for _ in 0..40 {
+			lico_type(terminal, b"\x7f");
+		}
+		lico_type(terminal, b"vol://tmp");
+		lico_type(terminal, b"\r");
+	};
+
+	copy_to_tmp(&terminal, b"small.txt");
+	let done = lico_await(&terminal, b" refused", &mut [&mut system, &mut source, &mut destination]).expect("the first copy job reaches its report");
+	let done = done.rsplit(|byte| *byte == b'\n').next().unwrap_or(&done).to_vec();
+	assert!(done.windows(b"1 done, 0 refused".len()).any(|window| window == b"1 done, 0 refused"), "a copy that fits is done rather than refused: {:?}", core::str::from_utf8(&done));
+
+	// UNTAG IT AGAIN, or the second operation copies both.
+	lico_type(&terminal, b"-");
+	lico_type(&terminal, b"small.txt");
+	lico_type(&terminal, b"\r");
+	copy_to_tmp(&terminal, b"big.txt");
+
+	// A DIFFERENT NEEDLE for the second job, because the status line STAYS on the screen: every
+	// frame drawn after the first copy still carries "1 done, 0 refused", so waiting for the same
+	// text again would match the answer to the previous question.
+	let settled = lico_await(&terminal, b"1 refused", &mut [&mut system, &mut source, &mut destination]).expect("the copy job reaches its report");
+	let report = settled.rsplit(|byte| *byte == b'\n').next().unwrap_or(&settled);
+	assert!(report.windows(b"0 done, 1 refused".len()).any(|window| window == b"0 done, 1 refused"), "the copy is refused rather than reported done: {:?}", core::str::from_utf8(report));
+	assert!(report.windows(b"the volume is full".len()).any(|window| window == b"the volume is full"), "and the report NAMES the reason a person can act on: {:?}", core::str::from_utf8(report));
+
+	// Exit before reading the volumes back. `lico` holds the same channel ends this harness does,
+	// so a query issued while it runs is a second speaker on one wire.
+	lico_type(&terminal, b"\x1b[21~");
+	for _ in 0..200_000 {
+		system.pump();
+		source.pump();
+		destination.pump();
+		while terminal.recv().is_ok() {}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	assert!(process.is_terminated(), "lico exits on F10");
+
+	// WHAT THE REPORT PROMISED, CHECKED RATHER THAN TAKEN: nothing half-written under the
+	// destination's name, and the file that was already there untouched. A copy that published a
+	// partial file would be the worst outcome of the three, and it is the one the status line
+	// cannot show.
+	assert_eq!(destination.open(b"vol://tmp/small.txt", 0x7a07).map(|bytes| bytes.len()), Some(6 * 1024), "the copy that fitted is on the destination, whole");
+	assert_eq!(destination.open(b"vol://tmp/big.txt", 0x7a03), None, "the refused copy left nothing under the destination name");
+	assert_eq!(destination.open(b"vol://tmp/keep.txt", 0x7a04), Some(b"keep me".to_vec()), "and the file the destination already held is intact");
+	assert_eq!(source.open(b"vol://ram/big.txt", 0x7a05).map(|bytes| bytes.len()), Some(16 * 1024), "the source is untouched");
+}
+
 tagged_test!(imgconv_cross_volume_and_failed_overwrite_preserve_destination, [Image, Service, Storage, Process, Filesystem], id = "kernel.applications.imgconv_cross_volume_and_failed_overwrite_preserve_destination", covers = ["bin.imgconv", "imgconv", "storage", "volume-client"]);
 fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
@@ -1102,6 +1337,40 @@ fn the_memory_volumes_bound_and_answer_streams() {
 	assert_eq!(ram.open(b"vol://ram/state", 0x7102), Some(b"reserved".to_vec()));
 	assert_eq!(ram.open(b"vol://tmp/hello", 0x7103), None, "the two volumes are separate");
 }
+
+tagged_test!(a_full_volume_says_it_is_full_rather_than_asking_for_a_retry, [Service, Storage, Filesystem], id = "kernel.applications.a_full_volume_says_it_is_full_rather_than_asking_for_a_retry", covers = ["libermemfs", "storage"]);
+fn a_full_volume_says_it_is_full_rather_than_asking_for_a_retry() {
+	// The test beside this one already proves a full volume REFUSES the next write. What it cannot
+	// see is what the refusal says, because it reads a bool - and for every volume in this system
+	// the answer was `again`, "try again, it may work later", which on a volume with no room left
+	// is advice that leads nowhere. `fs-core` has told `no-space` and `no-memory` apart since it
+	// existed; the service boundary flattened both into one retry, with a comment saying it did so
+	// because the protocol had no finer word. IDL-006 gave it every one of them.
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let mut ram = StorageHarness::start_memory(storage_elf, b"RAMVOL", 4096);
+
+	assert!(ram.write(b"vol://ram/kept", b"written before the volume filled up", 0x7401), "the volume takes a first write");
+	let payload = alloc::vec![b'f'; 4096];
+	assert_eq!(ram.write_result(b"vol://ram/toobig", &payload, 0x7402), Some(Err(NO_SPACE)), "a write past the end of the volume is refused AS OUT OF SPACE");
+
+	// AND NOTHING ELSE CHANGED. A refusal that took the earlier file with it, or left the service
+	// unable to answer, would be a worse failure than the wrong error code - and both are what an
+	// out-of-space path is most likely to get wrong, because it fails halfway through its work.
+	assert_eq!(ram.open(b"vol://ram/kept", 0x7403), Some(b"written before the volume filled up".to_vec()), "the write that came before is intact");
+	assert_eq!(ram.open(b"vol://ram/toobig", 0x7404), None, "the write that was refused left nothing behind");
+	assert!(ram.write(b"vol://ram/small", b"x", 0x7405), "the service still takes a write that fits");
+
+	// The name is not the reason. An unusable name is `invalid`, not `no-space`, and a mapping that
+	// answered `no-space` for everything would pass every assertion above.
+	let overlong: alloc::vec::Vec<u8> = b"vol://ram/".iter().copied().chain(core::iter::repeat(b'n').take(300)).collect();
+	assert_eq!(ram.write_result(&overlong, b"x", 0x7406), Some(Err(INVALID)), "a name too long for the volume is still refused as a bad name");
+}
+
+// The two `base.error` codes this file asserts on, as the bytes they travel as. Named here because
+// `8` in an assertion says nothing about what it means.
+const NO_SPACE: u8 = 8;
+const INVALID: u8 = 2;
 
 // The stream cases that cost real time under emulation.
 //

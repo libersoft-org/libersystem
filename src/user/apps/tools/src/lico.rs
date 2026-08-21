@@ -22,7 +22,7 @@ use rt::*;
 use security_client::PermissionClient;
 use storage_proto::path;
 use tools::{ConsoleWriter, ListDirectoryError, VolumeSet, list_volume_directory, read_volume_window};
-use volume_client::VolumeClient;
+use volume_client::{VolumeClient, WRITER_CHUNK};
 use volume_client_provider as _;
 
 const PANEL_WIDTH: usize = 38;
@@ -331,6 +331,11 @@ struct Job {
 	bytes: u64,
 	paused: bool,
 	operation: Operation,
+	// WHY THE FIRST REFUSAL HAPPENED, kept because a count cannot be acted on. "1 refused" is the
+	// same sentence for a full volume, a read-only one and a source that vanished, and only one of
+	// those three is something the reader can fix in the next ten seconds. The FIRST is kept rather
+	// than the last: it is the one that explains a run that went wrong from a particular point.
+	reason: Option<&'static [u8]>,
 }
 
 impl Job {
@@ -1019,7 +1024,7 @@ impl Manager {
 		}
 		// STARTED, NOT RUN. The steps are advanced a few at a time by the input loop, so the panels
 		// stay navigable and pause, resume and cancel are decisions the reader makes while it runs.
-		self.job = Some(Job { plan: planned, at: 0, done: 0, refused: 0, bytes: 0, paused: false, operation });
+		self.job = Some(Job { plan: planned, at: 0, done: 0, refused: 0, bytes: 0, paused: false, operation, reason: None });
 		self.say(b"^P pauses, ^C cancels - what is done stays done and what is not started is untouched");
 		ManagerAction::Redraw
 	}
@@ -1034,14 +1039,25 @@ impl Manager {
 			return false;
 		}
 		if job.finished() {
-			let (done, refused) = (job.done, job.refused);
+			let (done, refused, reason) = (job.done, job.refused, job.reason);
 			self.job = None;
 			let mut message: Vec<u8> = Vec::new();
 			if message.try_reserve(112).is_ok() {
 				append_decimal(&mut message, done);
 				message.extend_from_slice(b" done, ");
 				append_decimal(&mut message, refused);
-				message.extend_from_slice(b" refused - a refusal leaves the source and any existing destination as they were");
+				message.extend_from_slice(b" refused");
+				// THE TAIL ONLY WHEN THERE WAS A REFUSAL, and it names the reason.
+				//
+				// It used to be one fixed sentence, appended whether anything was refused or not,
+				// and at 89 bytes against this line's 80 it was CUT MID-WORD - so the safety
+				// statement it existed to make, that a refusal leaves both sides as they were,
+				// reached the screen as "as t". The reason plus the short form of that promise fits.
+				if let Some(reason) = reason {
+					message.extend_from_slice(b" - ");
+					message.extend_from_slice(reason);
+					message.extend_from_slice(b", nothing was half-written");
+				}
 				self.status = message;
 			}
 			for index in 0..2 {
@@ -1057,7 +1073,7 @@ impl Manager {
 			}
 			let step = &job.plan.steps[job.at];
 			let (source, destination, is_dir, size) = (step.source.clone(), step.destination.clone(), step.is_dir, step.size);
-			let ok = unsafe {
+			let outcome = unsafe {
 				match operation {
 					Operation::Delete => remove_entry(volumes, &source, is_dir),
 					Operation::Copy => copy_entry(volumes, &source, &destination, is_dir),
@@ -1065,11 +1081,15 @@ impl Manager {
 				}
 			};
 			let Some(job) = self.job.as_mut() else { return true };
-			if ok {
-				job.done += 1;
-				job.bytes = job.bytes.saturating_add(size);
-			} else {
-				job.refused += 1;
+			match outcome {
+				Ok(()) => {
+					job.done += 1;
+					job.bytes = job.bytes.saturating_add(size);
+				}
+				Err(reason) => {
+					job.refused += 1;
+					job.reason.get_or_insert(reason);
+				}
 			}
 			job.at += 1;
 		}
@@ -1671,18 +1691,55 @@ unsafe fn peek(volumes: &VolumeSet, uri: &str, limit: u32) -> Vec<u8> {
 // Copy one entry through the transactional writer. A directory becomes a directory and its
 // contents are separate steps of the same plan - the walk expanded them before anything was
 // touched, so this never has to decide what is inside one.
-unsafe fn copy_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_dir: bool) -> bool {
+// THE VOLUME'S ANSWER IN WORDS A PERSON CAN ACT ON, which is the whole reason these codes are
+// carried this far. The distinctions decide what the reader does next: "full" is fixed by deleting
+// something, "would not take it" cannot be fixed from here at all, and "damaged" is a reason to
+// stop copying anything else off that volume. Until IDL-006 several of them arrived as `again` -
+// "try again" - which is advice that leads nowhere on a volume with no room left.
+fn volume_words(error: Error) -> &'static [u8] {
+	match error {
+		Error::NoSpace => b"the volume is full",
+		Error::Denied => b"the volume would not take it",
+		Error::NotFound => b"it is not there any more",
+		Error::Corrupt => b"the volume is damaged",
+		Error::Io => b"the medium failed",
+		Error::CommitUncertain => b"the volume stopped taking writes",
+		Error::Exhausted => b"the volume service has no room to work",
+		Error::Again => b"the volume was busy",
+		Error::TimedOut => b"the volume did not answer in time",
+		Error::Closed => b"the volume closed the connection",
+		Error::Cancelled => b"the volume cancelled it",
+		Error::Invalid | Error::Unsupported => b"the volume refused it",
+	}
+}
+
+// The same, for a call that produced no answer at all: `None` is the transport failing, which is a
+// different thing from the volume saying no and is worth its own words.
+fn answer_words(answer: Option<Result<(), Error>>) -> Result<(), &'static [u8]> {
+	match answer {
+		Some(Ok(())) => Ok(()),
+		Some(Err(error)) => Err(volume_words(error)),
+		None => Err(b"the volume did not answer"),
+	}
+}
+
+// A STEP'S OUTCOME, not a yes-or-no. Each of these used to return `bool`, so a job could count its
+// refusals and never say what any of them was; the reason is available at every one of these call
+// sites and was being dropped one line after it arrived.
+unsafe fn copy_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_dir: bool) -> Result<(), &'static [u8]> {
 	let (Ok(source), Ok(destination)) = (core::str::from_utf8(source), core::str::from_utf8(destination)) else {
-		return false;
+		return Err(b"that name is not text");
 	};
 	if is_dir {
 		let storage = volumes.client_for(destination, destination.as_bytes());
-		return matches!(VolumeClient::new(storage).mkdir(destination), Some(Ok(_)));
+		return answer_words(VolumeClient::new(storage).mkdir(destination));
 	}
 	let reader = volumes.client_for(source, source.as_bytes());
 	let mut writer_client = VolumeClient::new(volumes.client_for(destination, destination.as_bytes()));
-	let Some(Ok(mut writer)) = writer_client.open_writer(destination, WriterMode::Replace) else {
-		return false;
+	let mut writer = match writer_client.open_writer(destination, WriterMode::Replace) {
+		Some(Ok(writer)) => writer,
+		Some(Err(error)) => return Err(volume_words(error)),
+		None => return Err(b"the volume did not answer"),
 	};
 	let mut offset: u64 = 0;
 	loop {
@@ -1691,47 +1748,61 @@ unsafe fn copy_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_
 			Err(_) => {
 				let _ = writer.abort();
 				unsafe { close(writer.handle()) };
-				return false;
+				return Err(b"the source could not be read");
 			}
 		};
 		if window.is_empty() {
 			break;
 		}
 		offset += window.len() as u64;
-		if !matches!(writer.write(&window), Some(Ok(_))) {
-			let _ = writer.abort();
-			unsafe { close(writer.handle()) };
-			return false;
+		// THE STEP THAT REPORTS A FULL VOLUME. A write is where the destination runs out of room,
+		// and the abort below is what keeps that from leaving a partial file behind.
+		//
+		// The read window is larger than one request may carry, so it goes in `WRITER_CHUNK`
+		// pieces - the protocol's own bound, named rather than guessed. This wrote the whole
+		// window in one call, which is a size the service cannot receive.
+		for piece in window.chunks(WRITER_CHUNK) {
+			if let Err(reason) = answer_words(writer.write(piece).map(|answer| answer.map(|_| ()))) {
+				let _ = writer.abort();
+				unsafe { close(writer.handle()) };
+				return Err(reason);
+			}
 		}
 	}
 	// NOTHING IS VISIBLE UNDER THE DESTINATION'S NAME UNTIL HERE, so a copy that failed at any
 	// point above leaves whatever was there before exactly as it was.
-	let committed = matches!(writer.commit(), Some(Ok(_)));
+	let committed = answer_words(writer.commit().map(|answer| answer.map(|_| ())));
 	unsafe { close(writer.handle()) };
 	committed
 }
 
 // Move: `rename` within a volume, copy-then-remove across one - and the source is removed only
 // after the destination has been published, so an interruption leaves two files rather than none.
-unsafe fn move_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_dir: bool) -> bool {
+unsafe fn move_entry(volumes: &VolumeSet, source: &[u8], destination: &[u8], is_dir: bool) -> Result<(), &'static [u8]> {
 	let (Ok(source_text), Ok(destination_text)) = (core::str::from_utf8(source), core::str::from_utf8(destination)) else {
-		return false;
+		return Err(b"that name is not text");
 	};
 	if same_volume(source, destination) {
 		let storage = volumes.client_for(source_text, source);
 		if matches!(VolumeClient::new(storage).rename(source_text, destination_text), Some(Ok(_))) {
-			return true;
+			return Ok(());
 		}
 	}
-	unsafe { copy_entry(volumes, source, destination, is_dir) && remove_entry(volumes, source, is_dir) }
+	// A rename that did not take is not reported: the copy-then-remove below is the answer for
+	// every cross-volume move, and it reaches the same destination by the long road. What it
+	// reports is what the reader sees.
+	unsafe {
+		copy_entry(volumes, source, destination, is_dir)?;
+		remove_entry(volumes, source, is_dir)
+	}
 }
 
-unsafe fn remove_entry(volumes: &VolumeSet, target: &[u8], is_dir: bool) -> bool {
-	let Ok(uri) = core::str::from_utf8(target) else { return false };
+unsafe fn remove_entry(volumes: &VolumeSet, target: &[u8], is_dir: bool) -> Result<(), &'static [u8]> {
+	let Ok(uri) = core::str::from_utf8(target) else { return Err(b"that name is not text") };
 	let storage = volumes.client_for(uri, target);
 	let mut client = VolumeClient::new(storage);
 	let answer = if is_dir { client.rmdir(uri) } else { client.remove(uri) };
-	matches!(answer, Some(Ok(_)))
+	answer_words(answer)
 }
 
 // Whether two URIs name the same volume, which is what decides whether a move can be a rename.

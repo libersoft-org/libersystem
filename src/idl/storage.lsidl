@@ -321,12 +321,21 @@ interface volume {
 interface writer {
 	/// Append `data` at the cursor and return the staged length. The cursor starts at zero for a
 	/// `replace` session and at the file's current length for an `append` one.
-	@op(1) write:    func(data: list<u8>) -> result<u64, error>;
+	///
+	/// THE BOUND IS THE CONTRACT'S, not a suggestion, and it exists because it was missing. This
+	/// carried "at most 65535 bytes - the wire's list length", which is what a `u16` count allows
+	/// rather than anything anyone had agreed to serve: StorageService reads requests into a
+	/// buffer a quarter that size, so every write above about a kilobyte was refused by the
+	/// RECEIVE and left its caller with no answer at all. Four tools had each picked their own
+	/// chunk - 4096, 8192 and 32768 - and none of the larger ones ever worked. 4096 is the block
+	/// size everywhere else in this system, and stating it here is what keeps the service's buffer
+	/// and the client's chunk from drifting apart again.
+	@op(1) write:    func(@bound(4096) data: list<u8>) -> result<u64, error>;
 	/// Write `data` at `offset`, extending the staged file with zeros if it starts beyond the end -
 	/// the same zero-extension promise `volume.truncate` makes, for the same reason: a gap that
 	/// reads as whatever memory held is a leak with a length. The cursor is left after the bytes
 	/// written, so a positioned write followed by sequential ones continues from there.
-	@op(2) write-at: func(offset: u64, data: list<u8>) -> result<unit, error>;
+	@op(2) write-at: func(offset: u64, @bound(4096) data: list<u8>) -> result<unit, error>;
 	/// Set the staged length - shorter drops the tail, longer zero-extends - and move the cursor
 	/// back if it is now past the end.
 	@op(3) truncate: func(length: u64) -> result<unit, error>;

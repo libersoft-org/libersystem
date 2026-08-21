@@ -851,7 +851,7 @@ pub mod permission {
 			}
 			Some(reply_handles.first())
 		}
-		pub fn run(&mut self, name: &str, args: &str, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
+		pub fn run(&mut self, name: &str, args: &str, cwd: &str, environment: &[EnvVar], stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -896,7 +896,7 @@ pub mod permission {
 			}
 			decoded
 		}
-		pub fn run_pipeline(&mut self, stages: &Vec<PipelineStage>, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<PipelineResult, Error>> {
+		pub fn run_pipeline(&mut self, stages: &[PipelineStage], cwd: &str, environment: &[EnvVar], stdout: &u64) -> Option<Result<PipelineResult, Error>> {
 			let corr = self.next_corr();
 			let mut writer = VecWriter::new();
 			let w = &mut writer;
@@ -1007,7 +1007,7 @@ pub mod permission {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_security_permission_run")]
-	fn channel_invoke_run(chan: u64, name: &str, args: &str, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
+	fn channel_invoke_run(chan: u64, name: &str, args: &str, cwd: &str, environment: &[EnvVar], stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.run(name, args, cwd, environment, stdout)
 	}
@@ -1015,7 +1015,7 @@ pub mod permission {
 	#[cfg(feature = "channel-client-impl")]
 	#[inline(never)]
 	#[unsafe(export_name = "liber_channel_impl_liber_security_permission_run_pipeline")]
-	fn channel_invoke_run_pipeline(chan: u64, stages: &Vec<PipelineStage>, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<PipelineResult, Error>> {
+	fn channel_invoke_run_pipeline(chan: u64, stages: &[PipelineStage], cwd: &str, environment: &[EnvVar], stdout: &u64) -> Option<Result<PipelineResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.run_pipeline(stages, cwd, environment, stdout)
 	}

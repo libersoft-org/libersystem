@@ -224,6 +224,14 @@ impl PendingWrite {
 	}
 }
 
+/// The most one `write` or `write-at` may carry, which is `storage.lsidl`'s `@bound` on those two
+/// ops and NOT a number a caller may pick for itself.
+///
+/// It is here so that clients name it instead of guessing: four tools had each chosen their own
+/// chunk (4096, 8192 and 32768) and the three larger ones could never have worked, because the
+/// service reads requests into a buffer smaller than any of them.
+pub const WRITER_CHUNK: usize = 4096;
+
 /// A transactional writer session over one path, from `VolumeClient::open_writer`.
 ///
 /// The session stages bytes in StorageService and publishes them only on `commit`, so a client
@@ -247,15 +255,25 @@ impl WriterClient {
 		self.chan
 	}
 
-	/// Append at the cursor, returning the staged length. One call carries at most 65535 bytes -
-	/// the wire's list length - so a large file is written by repeating it.
+	/// Append at the cursor, returning the staged length. One call carries at most `WRITER_CHUNK`
+	/// bytes, so a large file is written by repeating it.
+	///
+	/// REFUSED HERE rather than sent, because an over-long request is the one failure the service
+	/// cannot report: it is rejected by the receive, stays in the queue, and the caller waits for a
+	/// reply nobody can compose. `invalid` is the true answer and it arrives immediately.
 	#[inline(always)]
 	pub fn write(&mut self, data: &[u8]) -> Option<Result<u64, Error>> {
+		if data.len() > WRITER_CHUNK {
+			return Some(Err(Error::Invalid));
+		}
 		unsafe { writer_write(self.chan, data) }
 	}
 
 	#[inline(always)]
 	pub fn write_at(&mut self, offset: u64, data: &[u8]) -> Option<Result<(), Error>> {
+		if data.len() > WRITER_CHUNK {
+			return Some(Err(Error::Invalid));
+		}
 		unsafe { writer_write_at(self.chan, &offset, data) }
 	}
 

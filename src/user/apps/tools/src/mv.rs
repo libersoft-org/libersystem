@@ -20,7 +20,7 @@ use cli::{Arg, classify};
 use proto::system::{LaunchContext, WriterMode};
 use rt::*;
 use tools::{VolumeSet, split_args};
-use volume_client::{VolumeClient, WriterClient};
+use volume_client::{VolumeClient, WRITER_CHUNK, WriterClient};
 
 const CHUNK: u32 = 32 * 1024;
 
@@ -150,7 +150,7 @@ unsafe fn transfer(from: u64, source: &str, to: u64, destination: &str) {
 				break;
 			}
 			offset = offset.saturating_add(window.len() as u64);
-			for chunk in window.chunks(CHUNK as usize) {
+			for chunk in window.chunks(WRITER_CHUNK) {
 				if !matches!(writer.write(chunk), Some(Ok(_))) {
 					let _ = writer.abort();
 					close(writer.handle());

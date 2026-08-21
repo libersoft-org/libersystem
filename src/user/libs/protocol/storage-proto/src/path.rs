@@ -71,12 +71,32 @@ pub fn volume<'a>(cwd: &'a str, arg: &'a [u8]) -> Option<&'a [u8]> {
 	if volume.is_empty() { None } else { Some(volume) }
 }
 
-pub fn volume_client(cwd: &str, arg: &[u8], system: u64, media: u64, iso: u64, udf: u64, usb: u64) -> u64 {
+/// What a caller passes for a volume it holds no grant for.
+///
+/// Named because the shell's tools pass it twice: their handshake carries five volumes and the two
+/// memory ones are not among them, so `vol://tmp/...` typed at that shell reaches nothing. Two bare
+/// zeros at eighteen call sites would read as an oversight, and the distinction between "not
+/// granted" and "forgotten" is the whole subject of the function below.
+pub const NOT_GRANTED: u64 = 0;
+
+/// Route one path to the client for the volume it names.
+///
+/// EVERY VOLUME THAT EXISTS HAS TO BE HERE, and `ram` and `tmp` were not: a caller holding all
+/// seven grants had `vol://ram/...` and `vol://tmp/...` fall through to `system`, so the two memory
+/// volumes were mounted, served, granted and unreachable. The storage service checks that a path
+/// names the volume it is - `target.volume != self.name()` - so what came back was "not found",
+/// which reads as an empty volume rather than as a request sent to the wrong one.
+///
+/// A caller without a grant passes 0, which is what "not granted" is everywhere else here: the
+/// call then fails as a missing capability instead of quietly reaching a volume it did not name.
+pub fn volume_client(cwd: &str, arg: &[u8], system: u64, media: u64, iso: u64, udf: u64, usb: u64, ram: u64, tmp: u64) -> u64 {
 	match volume(cwd, arg) {
 		Some(b"media") => media,
 		Some(b"iso") => iso,
 		Some(b"udf") => udf,
 		Some(b"usb") => usb,
+		Some(b"ram") => ram,
+		Some(b"tmp") => tmp,
 		_ => system,
 	}
 }

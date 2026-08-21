@@ -48,6 +48,11 @@ declare -A GATES=(
 	# comment said so and the next round still wrote a rollback that unmapped a page and called
 	# `deallocate` - a rule in a comment is a rule the next diff does not read.
 	["frame-retirement"]="tools/check-frame-retirement.sh"
+	# A hand-written `extern` declaration and the generated function it is forwarded to are joined
+	# by a bare jump, so a signature that disagrees is a silent argument-register mismatch rather
+	# than a link error. One such pair made every transactional write in the system return "no
+	# answer", and it compiled without a warning.
+	["forwarded-abi"]="tools/check-forwarded-abi.py"
 	# The `--artifact` fast path knows a library's DEPENDENCIES, or it reports an artifact as
 	# current after a crate it compiles against changed - which makes every test result taken on
 	# that artifact meaningless. Its own family's `quick` and `provider` modes are not gates because

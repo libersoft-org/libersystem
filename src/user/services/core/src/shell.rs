@@ -1993,7 +1993,7 @@ fn completion_dir_entries(cwd: &str, token: &[u8], storage: u64, media: u64, iso
 		Some(t) => t,
 		None => return Vec::new(),
 	};
-	let chan: u64 = path::volume_client(cwd, dir_arg, storage, media, iso, udf, usb);
+	let chan: u64 = path::volume_client(cwd, dir_arg, storage, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
 	let mut client = volume::Client::new(ChannelTransport { chan });
 	let mut names: Vec<Vec<u8>> = Vec::new();
 	if let Some(Ok(consumer)) = client.list(&target) {

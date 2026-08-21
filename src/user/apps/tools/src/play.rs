@@ -101,7 +101,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			eprint(b"play: invalid path\n");
 			exit();
 		};
-		let storage = path::volume_client(cwd, arg, system, media, iso, udf, usb);
+		let storage = path::volume_client(cwd, arg, system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
 		if storage == 0 || audio_channel == 0 {
 			eprint(b"play: capability unavailable\n");
 			exit();

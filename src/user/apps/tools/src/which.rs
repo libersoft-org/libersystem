@@ -71,7 +71,7 @@ unsafe fn resolve(name: &[u8], search: &str, cwd: &str, system: u64, media: u64,
 		// AN EXPLICIT PATH IS NOT SEARCHED FOR. `which vol://system/bin/ls.lsexe` asks about that
 		// artifact, and answering with something from PATH would name a different program.
 		if let Some((full, _)) = executable::explicit_path(name) {
-			let client = storage_proto::path::volume_client(cwd, full.as_bytes(), system, media, iso, udf, usb);
+			let client = storage_proto::path::volume_client(cwd, full.as_bytes(), system, media, iso, udf, usb, storage_proto::path::NOT_GRANTED, storage_proto::path::NOT_GRANTED);
 			if exists(client, full) {
 				print(full.as_bytes());
 				print(b"\n");
@@ -102,7 +102,7 @@ unsafe fn resolve(name: &[u8], search: &str, cwd: &str, system: u64, media: u64,
 					full.push('/');
 				}
 				full.push_str(candidate);
-				let client = storage_proto::path::volume_client(cwd, full.as_bytes(), system, media, iso, udf, usb);
+				let client = storage_proto::path::volume_client(cwd, full.as_bytes(), system, media, iso, udf, usb, storage_proto::path::NOT_GRANTED, storage_proto::path::NOT_GRANTED);
 				if exists(client, &full) {
 					print(full.as_bytes());
 					print(b"\n");

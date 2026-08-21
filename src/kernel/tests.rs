@@ -4575,6 +4575,14 @@ impl StorageHarness {
 	}
 
 	fn write(&mut self, path: &[u8], data: &[u8], corr: u32) -> bool {
+		matches!(self.write_result(path, data, corr), Some(Ok(())))
+	}
+
+	// The same write, KEEPING THE ANSWER instead of flattening it to yes-or-no. `Ok` is the
+	// service's success flag and `Err` is the `base.error` byte it refused with, which is the whole
+	// point of a case that asks WHY a write failed: through `write` above, a full volume, a
+	// read-only one and a bad name are the same `false`. `None` is no reply at all.
+	fn write_result(&mut self, path: &[u8], data: &[u8], corr: u32) -> Option<Result<(), u8>> {
 		use object::memory_object::MemoryObject;
 		use object::rights::Rights;
 		let buffer = MemoryObject::create(data.len().max(1)).expect("storage write buffer");
@@ -4589,10 +4597,20 @@ impl StorageHarness {
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = self.client.recv() {
-				return le_u32(&reply.bytes, 0) == corr && reply.bytes.get(4) == Some(&1);
+				if le_u32(&reply.bytes, 0) != corr {
+					continue;
+				}
+				return match reply.bytes.get(4) {
+					Some(1) => Some(Ok(())),
+					// The reply is `[corr][ok][error]`, so the refusal's code is the byte after the
+					// flag - and a reply that stops before it is a malformed one rather than a
+					// refusal with a reason, which `None` says and a defaulted zero would not.
+					Some(0) => reply.bytes.get(5).map(|code| Err(*code)),
+					_ => None,
+				};
 			}
 		}
-		false
+		None
 	}
 }
 
@@ -5000,35 +5018,28 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 // everything written so far, so one caller can assert on the startup sequence and drive the
 // program while another takes it straight to an exit it has to survive.
 fn start_lico(lico_elf: &[u8], system: &mut StorageHarness) -> (alloc::sync::Arc<object::process::Process>, alloc::sync::Arc<object::channel::Channel>, alloc::vec::Vec<alloc::vec::Vec<u8>>) {
-	use object::channel::{Channel, Message};
-	use object::rights::Rights;
+	start_lico_with(lico_elf, system, b"vol://system", &mut [])
+}
 
-	let (bootstrap, child) = Channel::create();
+// The same start, with a working directory of the caller's choosing and REAL clients for volumes
+// the plain form grants as bare tags.
+//
+// A SECOND WRITABLE VOLUME is the only way to reach a whole class of behaviour, because everything
+// inside one volume shares its space and therefore its answer: a copy that has to CROSS a boundary,
+// a destination that runs out of room while the source has plenty, and the reporting that tells
+// those apart. `start_lico` grants exactly one, so none of it was reachable.
+fn start_lico_with(lico_elf: &[u8], system: &mut StorageHarness, working: &[u8], extra: &mut [(&[u8], &mut StorageHarness)]) -> (alloc::sync::Arc<object::process::Process>, alloc::sync::Arc<object::channel::Channel>, alloc::vec::Vec<alloc::vec::Vec<u8>>) {
+	use object::channel::Channel;
+
 	let (terminal, terminal_child) = Channel::create();
-	let process = spawn_dynamic_test_process(sched::root_domain(), lico_elf, child);
-	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("lico terminal bootstrap");
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
-	bootstrap.send(Message::new(launch_context(b"", b"vol://system"), alloc::vec::Vec::new(), 0)).expect("lico empty arguments");
-	// IN THE ORDER THE VOCABULARY SENDS THEM: the launch broker before the volumes, the asset
-	// directory after. `recv_tagged` blocks, so a tag read out of turn consumes the message that was
-	// actually next - and this staging is hand-written, which is exactly where that goes unnoticed.
-	bootstrap.send(Message::new(b"PERMISSION".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent launch broker");
-	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("lico system volume");
-	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
-		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent volume");
-	}
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
-	// THE TWO GRANTS THIS HARNESS WITHHOLDS, sent as bare messages so the tag arrives and the
-	// capability does not. `lico` takes a launch broker and its own asset directory from
-	// PermissionManager; here it gets neither, which is a state it has to run in - a manager that
-	// blocked forever waiting for a grant nobody sent would be one that could not start on a boot
-	// that granted less than the full set.
-	bootstrap.send(Message::new(b"APP_ASSETS".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico absent asset directory");
-
+	let process = spawn_lico_on(lico_elf, terminal_child, system, working, extra);
 	let mut output = alloc::vec::Vec::new();
 	let mut rendered = false;
 	for _ in 0..100_000 {
 		system.pump();
+		for (_, volume) in extra.iter_mut() {
+			volume.pump();
+		}
 		while let Ok(message) = terminal.recv() {
 			rendered |= message.bytes.starts_with(b"\x1b[H\x1b[2J\x1b[1mlico\x1b[0m");
 			output.push(message.bytes);
@@ -5039,6 +5050,222 @@ fn start_lico(lico_elf: &[u8], system: &mut StorageHarness) -> (alloc::sync::Arc
 	}
 	assert!(rendered, "lico renders both panels before waiting for input");
 	(process, terminal, output)
+}
+
+// A REAL TERMINAL, not a channel standing in for one.
+//
+// Every terminal test in this file hands the program a plain channel and writes escape sequences
+// into it by hand. That proves the program's DECODER and nothing about the encoder on the other
+// side - and a pointer report is generated by ConsoleService, from a raw device event, through the
+// grid geometry and the mouse modes the program itself asked for. If the two disagree the feature
+// is broken in front of a person while both halves pass their own tests.
+//
+// This is the other end: DisplayService over a stand-in scanout so VT 1 has a grid at all, a live
+// ConsoleService over it, and the pointer channel InputService would feed. The test plays the
+// pointer driver; everything between the device event and the program's input is the real thing.
+struct ConsoleHarness {
+	gpu: alloc::sync::Arc<object::channel::Channel>,
+	focus: alloc::sync::Arc<object::channel::Channel>,
+	pointer: alloc::sync::Arc<object::channel::Channel>,
+	// VT 1's PROGRAM end: what a program writes its output to and reads its input from.
+	program: alloc::sync::Arc<object::channel::Channel>,
+	cols: usize,
+	rows: usize,
+	// The ends that must stay open for the services to keep running, held rather than used.
+	_open: alloc::vec::Vec<alloc::sync::Arc<object::channel::Channel>>,
+}
+
+impl ConsoleHarness {
+	// `cols` by `rows` text cells, at the 8x16 font the console renders with.
+	fn start(display_elf: &[u8], console_elf: &[u8], cols: usize, rows: usize) -> ConsoleHarness {
+		use object::channel::{Channel, Message};
+		use object::dma_buffer::DmaBuffer;
+		use object::rights::Rights;
+
+		let (display_boot, display_boot_user) = Channel::create();
+		let (display_server, display_client) = Channel::create();
+		let (gpu, gpu_user) = Channel::create();
+		let (focus, focus_display) = Channel::create();
+		let (kill_keep, kill_display) = Channel::create();
+		spawn_dynamic_test_process(sched::root_domain(), display_elf, display_boot_user);
+		send_cap(&display_boot, b"GPU", gpu_user, Rights::ALL).expect("gpu bootstrap");
+		send_cap(&display_boot, b"FOCUS", focus_display, Rights::ALL).expect("focus bootstrap");
+		send_cap(&display_boot, b"KILL", kill_display, Rights::ALL).expect("kill bootstrap");
+		let (display_admin_keep, display_admin) = Channel::create();
+		send_cap(&display_boot, b"ADMIN", display_admin, Rights::ALL).expect("display admin bootstrap");
+		send_cap(&display_boot, b"SERVE", display_server, Rights::ALL).expect("serve bootstrap");
+		display_boot.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new(), 0)).expect("display capability bootstrap");
+
+		let width: u32 = (cols * 8) as u32;
+		let height: u32 = (rows * 16) as u32;
+		sched::run_until_idle();
+		let fb_request = gpu.recv().expect("framebuffer request");
+		assert_eq!(&fb_request.bytes[..], b"FB", "DisplayService requests the scanout");
+		let Ok(scanout) = DmaBuffer::create_in(&sched::root_domain(), (width * height * 4) as usize) else { panic!("stand-in scanout") };
+		let fb = abi::Framebuffer { width, height, pitch: width * 4, bytes_per_pixel: 4, red_shift: 16, red_size: 8, green_shift: 8, green_size: 8, blue_shift: 0, blue_size: 8, _pad: [0; 2] };
+		let mut fb_reply = unsafe { core::slice::from_raw_parts(&fb as *const abi::Framebuffer as *const u8, core::mem::size_of::<abi::Framebuffer>()) }.to_vec();
+		fb_reply.extend_from_slice(&width.to_le_bytes());
+		fb_reply.extend_from_slice(&height.to_le_bytes());
+		send_cap(&gpu, &fb_reply, scanout, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER).expect("framebuffer response");
+		sched::run_until_idle();
+		let online = display_boot.recv().expect("DisplayService online report");
+		assert_eq!(&online.bytes[..], b"DisplayService: online", "DisplayService reports in");
+
+		let (console_boot, console_boot_user) = Channel::create();
+		let (vt1_console, vt1_program) = Channel::create();
+		let (ctl_console, ctl_keep) = Channel::create();
+		let (dummy, dummy_keep) = Channel::create();
+		let (pointer_console, pointer) = Channel::create();
+		spawn_dynamic_test_process(sched::root_domain(), console_elf, console_boot_user);
+		send_cap(&console_boot, b"CLIENT", vt1_console, Rights::ALL).expect("CLIENT bootstrap");
+		send_cap(&console_boot, b"CONTROL", ctl_console, Rights::ALL).expect("CONTROL bootstrap");
+		for tag in [&b"FSTORAGE"[..], &b"FLOG"[..], &b"FDEVICE"[..], &b"FPROCESS"[..], &b"FCONFIG"[..], &b"FTIME"[..], &b"FAUDIO"[..], &b"FSESSION"[..], &b"FPERM"[..], &b"FNET"[..]] {
+			send_cap(&console_boot, tag, dummy.clone(), Rights::ALL).expect("factory bootstrap");
+		}
+		send_cap(&console_boot, b"DISPLAY", display_client, Rights::ALL).expect("DISPLAY bootstrap");
+		// THE CAPABILITY THIS HARNESS EXISTS FOR. Every other console test sends this tag as a bare
+		// message, so there is no pointer device and `handle_pointer` is never reached.
+		send_cap(&console_boot, b"POINTER", pointer_console, Rights::ALL).expect("POINTER bootstrap");
+		console_boot.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("READY bootstrap");
+
+		let mut harness = ConsoleHarness { gpu, focus, pointer, program: vt1_program, cols, rows, _open: alloc::vec![kill_keep, display_admin_keep, ctl_keep, dummy_keep] };
+		// SEVERAL SETTLES, not one: bring-up crosses timed waits (the bounded wait for a
+		// ConfigService that is not there, and the display round trips), and `run_until_idle`
+		// returns while a thread is parked on a deadline.
+		for _ in 0..8 {
+			harness.pump();
+		}
+		let online = console_boot.recv().expect("ConsoleService online report");
+		assert_eq!(&online.bytes[..], b"ConsoleService: online", "ConsoleService reports in");
+		harness
+	}
+
+	// One pass of the whole system, answering what the services block on. Returns how many frames
+	// were presented, which is the only outside sign that the program on VT 1 drew anything: its
+	// output goes to the console, not to this test.
+	fn pump(&mut self) -> usize {
+		let mut presented = 0;
+		sched::run_until_idle();
+		while let Ok(command) = self.focus.recv() {
+			let _ = command;
+			self.focus.send(object::channel::Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("focus acknowledgement");
+			sched::run_until_idle();
+		}
+		while let Ok(message) = self.gpu.recv() {
+			if message.bytes.starts_with(b"PRESENT") {
+				presented += 1;
+				self.gpu.send(object::channel::Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("present acknowledgement");
+			}
+			sched::run_until_idle();
+		}
+		presented
+	}
+
+	// Pump until a frame has been presented and the next pass presents nothing, so the program has
+	// drawn AND settled. A fixed number of passes would race the program's first frame.
+	fn settle(&mut self, storage: &mut StorageHarness) -> bool {
+		let mut drew = false;
+		for _ in 0..2_000 {
+			storage.pump();
+			let presented = self.pump();
+			if presented > 0 {
+				drew = true;
+			} else if drew {
+				return true;
+			}
+		}
+		false
+	}
+
+	// Press and release the left button over one text cell, as the pointer driver reports it:
+	// `[x u16][y u16][buttons u8][wheel i8]` over the normalized 0..0x10000 span. The cell is
+	// 1-BASED, the way a mouse report names it, so a test can use the coordinates it asserts on.
+	fn click(&mut self, storage: &mut StorageHarness, column: usize, row: usize) {
+		let x = ((column.saturating_sub(1) * 0x1_0000 + 0x8000) / self.cols) as u16;
+		let y = ((row.saturating_sub(1) * 0x1_0000 + 0x8000) / self.rows) as u16;
+		for buttons in [1u8, 0u8] {
+			let mut bytes = alloc::vec::Vec::new();
+			bytes.extend_from_slice(&x.to_le_bytes());
+			bytes.extend_from_slice(&y.to_le_bytes());
+			bytes.push(buttons);
+			bytes.push(0);
+			self.pointer.send(object::channel::Message::new(bytes, alloc::vec::Vec::new(), 0)).expect("pointer event");
+			for _ in 0..64 {
+				storage.pump();
+				self.pump();
+			}
+		}
+	}
+}
+
+// The grants PermissionManager would send, onto a terminal the caller chose. Split out so `lico`
+// can be started on a REAL one - a VT belonging to a live ConsoleService - as easily as on a plain
+// channel: everything about the bootstrap is the same, and the terminal is the whole difference.
+fn spawn_lico_on(lico_elf: &[u8], terminal_child: alloc::sync::Arc<object::channel::Channel>, system: &mut StorageHarness, working: &[u8], extra: &mut [(&[u8], &mut StorageHarness)]) -> alloc::sync::Arc<object::process::Process> {
+	// `lico` reads its launch broker where the other two read their selected file: one tag, in the
+	// same position, before the volume bundle.
+	spawn_terminal_app_on(lico_elf, terminal_child, b"PERMISSION", b"", system, working, extra)
+}
+
+// The governed launch bundle for a terminal application, onto a terminal the caller chose.
+//
+// `first` is the one tag that differs between the three: `lico` takes a launch broker there and the
+// viewer and the editor take a selected file. Everything after it is the vocabulary, IN ITS ORDER -
+// `recv_tagged` blocks, so a tag read out of turn consumes the message that was actually next, and
+// this staging is hand-written, which is exactly where that goes unnoticed.
+fn spawn_terminal_app_on(elf: &[u8], terminal_child: alloc::sync::Arc<object::channel::Channel>, first: &[u8], arguments: &[u8], system: &mut StorageHarness, working: &[u8], extra: &mut [(&[u8], &mut StorageHarness)]) -> alloc::sync::Arc<object::process::Process> {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+
+	let (bootstrap, child) = Channel::create();
+	let process = spawn_dynamic_test_process(sched::root_domain(), elf, child);
+	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("terminal bootstrap");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
+	bootstrap.send(Message::new(launch_context(arguments, working), alloc::vec::Vec::new(), 0)).expect("launch arguments");
+	bootstrap.send(Message::new(first.to_vec(), alloc::vec::Vec::new(), 0)).expect("absent first grant");
+	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("system volume");
+	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
+		match extra.iter_mut().find(|(name, _)| *name == tag) {
+			Some((_, volume)) => send_cap(&bootstrap, tag, volume.client.clone(), Rights::ALL).expect("extra volume"),
+			None => bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("absent volume"),
+		}
+	}
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
+	// THE TWO GRANTS THIS HARNESS WITHHOLDS, sent as bare messages so the tag arrives and the
+	// capability does not. These programs take a launch broker or a selected file and their own
+	// asset directory from PermissionManager; here they get neither, which is a state they have to
+	// run in - a program that blocked forever waiting for a grant nobody sent would be one that
+	// could not start on a boot that granted less than the full set.
+	bootstrap.send(Message::new(b"APP_ASSETS".to_vec(), alloc::vec::Vec::new(), 0)).expect("absent asset directory");
+	process
+}
+
+// Type at `lico`'s terminal, one message per call.
+//
+// A RUN OF BYTES RATHER THAN ONE PER BYTE, which is both what a terminal delivers and what the
+// channel can hold: the decoder is a byte-stream state machine, so the framing is not its business,
+// and a test that erases a pre-filled prompt sends forty backspaces before the program is given a
+// turn to read any of them. One message each filled the queue and the send was refused.
+fn lico_type(terminal: &alloc::sync::Arc<object::channel::Channel>, keys: &[u8]) {
+	use object::channel::Message;
+	terminal.send(Message::new(keys.to_vec(), alloc::vec::Vec::new(), 0)).expect("lico typed input");
+}
+
+// Pump every service `lico` was granted until a frame contains `needle`, and hand that frame back.
+// The frame rather than a flag: a status line is worth asserting on twice, once for the counts and
+// once for the reason, and a caller that got only `true` would have to drive the loop again.
+fn lico_await(terminal: &alloc::sync::Arc<object::channel::Channel>, needle: &[u8], volumes: &mut [&mut StorageHarness]) -> Option<alloc::vec::Vec<u8>> {
+	for _ in 0..400_000 {
+		for volume in volumes.iter_mut() {
+			volume.pump();
+		}
+		while let Ok(message) = terminal.recv() {
+			if message.bytes.windows(needle.len()).any(|window| window == needle) {
+				return Some(message.bytes);
+			}
+		}
+	}
+	None
 }
 
 fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# The optimized host runs: measure a decoder against real time, profile the image codecs, and drive
-# every image leaf through deliberately hostile input.
+# The optimized host runs: measure a decoder against real time, profile the image codecs, drive
+# every image leaf through deliberately hostile input, and put the file manager's core through the
+# sizes a person actually meets.
 #
-# All three are `cargo run --release` on a tool in src/tools, and all three are things a person runs
+# All of them are `cargo run --release` on a tool in src/tools, and all of them are things a person runs
 # when they want the number - not part of `./check.sh`, which has to be runnable in a minute on a
 # machine with nothing built. `image-mutate` is here rather than beside the gates for that reason
 # alone: it is a robustness run and it is a release build of twelve codecs, so putting it in the
@@ -15,6 +16,7 @@ declare -A SUITES=(
 	["audio"]="tools/audio-bench"
 	["image"]="tools/image-bench"
 	["image-mutate"]="tools/image-mutate"
+	["lico"]="tools/lico-bench"
 )
 
 help() {

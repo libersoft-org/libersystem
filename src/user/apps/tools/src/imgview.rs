@@ -306,7 +306,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			eprint(b"imgview: invalid path\n");
 			exit();
 		};
-		let storage = path::volume_client(cwd, arg, system, media, iso, udf, usb);
+		let storage = path::volume_client(cwd, arg, system, media, iso, udf, usb, path::NOT_GRANTED, path::NOT_GRANTED);
 		let Some(image) = load_image(storage, &uri) else {
 			close_if_present(display_channel);
 			close_if_present(input_channel);

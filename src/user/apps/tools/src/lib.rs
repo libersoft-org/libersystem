@@ -67,7 +67,7 @@ impl VolumeSet {
 	/// Route one path argument to its already-granted volume client.
 	#[inline(always)]
 	pub fn client_for(&self, cwd: &str, argument: &[u8]) -> u64 {
-		path::volume_client(cwd, argument, self.system, self.media, self.iso, self.udf, self.usb)
+		path::volume_client(cwd, argument, self.system, self.media, self.iso, self.udf, self.usb, self.ram, self.tmp)
 	}
 }
 

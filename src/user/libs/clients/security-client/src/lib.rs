@@ -14,7 +14,7 @@ unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_security_permission_audit"]
 	fn permission_audit(chan: u64) -> Option<u64>;
 	#[link_name = "liber_channel_liber_security_permission_run"]
-	fn permission_run(chan: u64, name: &str, args: &str, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<StartResult, Error>>;
+	fn permission_run(chan: u64, name: &str, args: &str, cwd: &str, environment: &[EnvVar], stdout: &u64) -> Option<Result<StartResult, Error>>;
 	#[link_name = "liber_channel_liber_security_permission_run_with_file"]
 	fn permission_run_with_file(chan: u64, name: &str, args: &str, cwd: &str, file: &str, writable: &bool, stdout: &u64) -> Option<Result<StartResult, Error>>;
 }
@@ -48,7 +48,7 @@ impl PermissionClient {
 	/// wrapper - so a caller that started using it would have passed five arguments to a symbol
 	/// that takes six, which links by name and goes wrong at the call rather than at the build.
 	#[inline(always)]
-	pub fn run(&mut self, name: &str, args: &str, cwd: &str, environment: &Vec<EnvVar>, stdout: &u64) -> Option<Result<StartResult, Error>> {
+	pub fn run(&mut self, name: &str, args: &str, cwd: &str, environment: &[EnvVar], stdout: &u64) -> Option<Result<StartResult, Error>> {
 		unsafe { permission_run(self.chan, name, args, cwd, environment, stdout) }
 	}
 
