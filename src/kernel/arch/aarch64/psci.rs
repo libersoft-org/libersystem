@@ -426,3 +426,38 @@ unsafe extern "C" {
 	// The low physical address of the secondary boot stub, filled in by the linker.
 	static aarch64_secondary_entry: u64;
 }
+
+// The deepest point a secondary core's stack reached, and its size. Asked by the thread tests
+// that check the boot stacks have headroom; the running kernel never measures itself.
+#[cfg(test)]
+// How deep anything has ever gone on secondary `cpu`'s idle stack, MEASURED rather than assumed.
+//
+// `SEC_STACKS` is in `.bss` and therefore zeroed before any core runs, so the lowest non-zero byte
+// is the deepest point reached - the same technique the per-thread stacks use, and for the same
+// reason: this size had never been checked against anything, and when it turned out to be too small
+// the failure was not a fault but another core's memory quietly changing underneath it.
+//
+// A lower bound, deliberately: a frame that stored only zeroes leaves no trace. That is the right
+// direction for the error to lean - it can say a stack is too small and cannot say one is safe.
+pub fn secondary_stack_used(cpu: usize) -> usize {
+	if cpu >= MAX_CPUS {
+		return 0;
+	}
+	// SAFETY: taking the ADDRESS of the slice, not a reference into it - every read below goes
+	// through the raw pointer one byte at a time, so no `&` to memory other cores are using is ever
+	// created.
+	let base = unsafe { (&raw const SEC_STACKS[cpu]) as *const u8 };
+	for offset in 0..SEC_STACK_SIZE as usize {
+		// SAFETY: inside a static array that lives for the whole life of the kernel, read one byte
+		// at a time as a plain integer.
+		if unsafe { core::ptr::read_volatile(base.add(offset)) } != 0 {
+			return SEC_STACK_SIZE as usize - offset;
+		}
+	}
+	0
+}
+
+#[cfg(test)]
+pub fn secondary_stack_capacity() -> usize {
+	SEC_STACK_SIZE as usize
+}

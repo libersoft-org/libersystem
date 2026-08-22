@@ -13,6 +13,7 @@ use core::fmt::{self, Write};
 const UART_BASE: u64 = 0x0900_0000;
 const UARTDR: u64 = 0x00; // data register
 const UARTFR: u64 = 0x18; // flag register
+#[cfg(not(test))]
 const FR_RXFE: u32 = 1 << 4; // receive FIFO empty
 const FR_TXFF: u32 = 1 << 5; // transmit FIFO full
 
@@ -45,12 +46,14 @@ pub fn write_bytes(bytes: &[u8]) -> usize {
 	bytes.len()
 }
 
+#[cfg(not(test))]
 pub fn read_byte() -> Option<u8> {
 	unsafe { if core::ptr::read_volatile(reg(UARTFR)) & FR_RXFE != 0 { None } else { Some(core::ptr::read_volatile(reg(UARTDR)) as u8) } }
 }
 
 // The interrupt / async-TX surface (used by the portable console path); these
 // become real once the GIC is up. Polled transmit needs none of them.
+#[cfg(not(test))]
 pub fn enable_rx_irq() {}
 
 pub fn enable_async() {}

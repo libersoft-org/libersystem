@@ -25,8 +25,10 @@ use crate::object::interrupt::Interrupt;
 
 // The device-IRQ vector window base (mirrors the contract; only the MSI window is
 // live on aarch64).
+#[cfg(not(test))]
 pub const IRQ_BASE: u8 = 32;
 
+#[cfg(not(test))]
 pub type HandlerFn = fn(u32);
 
 // The GICv2m frame on QEMU's `virt` machine (gic-version=2), fixed just above the GIC
@@ -211,6 +213,7 @@ pub fn irq_info_len() -> usize {
 }
 
 // No kernel-side INTx handlers on aarch64 (the timer is handled in gic::handle_irq).
+#[cfg(not(test))]
 pub fn register(_vector: u32, _handler: HandlerFn) {}
 
 // Read the GICv2m frame's MSI SPI range (base SPI + count) so acquire_msi/dispatch can

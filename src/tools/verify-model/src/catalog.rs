@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 26] = [
+const GATES: [(&str, &str); 27] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -133,6 +133,10 @@ const GATES: [(&str, &str); 26] = [
 	// result taken on that artifact meaningless. Registered in `check.sh` on 2026-08-12 and not
 	// here, so `verify-model check` had been reporting it as unselectable ever since.
 	("targeted-cache", "harness.tools"),
+	// P02M0144's gate: a warning answered by switching the lint off. Its subject is every crate
+	// under `src/`, so it belongs to the harness and every change selects it - which is right, since
+	// the attribute it refuses can be added anywhere and costs milliseconds to look for.
+	("no-suppression", "harness.tools"),
 	// P02M0104's gate: the boot harness tested against fakes - the scenario oracles, the broker's
 	// reply framing, the instance identity records and the preflight producers. Its subject is the
 	// harness itself, so a harness change selects it, and it needs no guest and no QEMU.

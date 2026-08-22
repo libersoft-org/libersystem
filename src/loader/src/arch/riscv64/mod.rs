@@ -172,7 +172,7 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 		// alloc_pages(..))` evaluated the allocation either way, so a boot with no package leaked a
 		// page - and the `(Some, None)` arm produced a `BootInfo` with `modules_len = 0`, which is
 		// a boot that will not work reported as one that will.
-		let module_page = init_pkg.and_then(|_| unsafe { crate::alloc_pages(bs, 1) });
+		let module_page = init_pkg.and_then(|_| crate::alloc_pages(bs, 1));
 		if init_pkg.is_some() && module_page.is_none() {
 			panic!("loader: cannot allocate the module array for the bootstrap package");
 		}

@@ -167,14 +167,14 @@ pub(crate) fn discover(system_table: *mut uefi::SystemTable) {
 }
 
 // The device tree and RSDP physical addresses the firmware published, or 0 for one it did not.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn firmware_tables() -> (u64, u64) {
 	unsafe { FIRMWARE_TABLES }
 }
 
 // Physical addresses are reachable as themselves in the loader; exposed so the backends can read
 // the same tables through the same translation this module uses.
-#[cfg(not(target_arch = "x86_64"))]
+#[cfg(target_arch = "aarch64")]
 pub(crate) fn identity_map(address: u64) -> u64 {
 	identity(address)
 }

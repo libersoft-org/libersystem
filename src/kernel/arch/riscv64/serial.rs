@@ -26,6 +26,7 @@ use core::fmt::{self, Write};
 const UART_BASE: u64 = 0x1000_0000;
 const RBR_THR: u64 = 0x00; // receive buffer (read) / transmit holding (write)
 const LSR: u64 = 0x05; // line status
+#[cfg(not(test))]
 const LSR_DATA_READY: u8 = 1 << 0;
 const LSR_THR_EMPTY: u8 = 1 << 5;
 
@@ -38,6 +39,7 @@ fn reg(off: u64) -> *mut u8 {
 // firmware. Divisor and line-control setup belongs with a machine that boots the kernel cold.
 pub fn init() {}
 
+#[cfg(not(test))]
 pub fn enable_rx_irq() {}
 
 pub fn enable_async() {}
@@ -68,6 +70,7 @@ pub fn write_bytes(bytes: &[u8]) -> usize {
 }
 
 // Read one input byte if available (polled).
+#[cfg(not(test))]
 pub fn read_byte() -> Option<u8> {
 	unsafe {
 		if core::ptr::read_volatile(reg(LSR)) & LSR_DATA_READY == 0 {

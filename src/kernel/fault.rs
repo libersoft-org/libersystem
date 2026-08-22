@@ -196,13 +196,13 @@ fn notify_crash(koid: u64, kind: u64) {
 // the fault's error code, and retires the probing kernel thread instead of halting
 // the machine. The probe body must hold nothing that needs dropping across the
 // faulting access (the handler exits the thread, abandoning its frames).
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 static SMAP_PROBE_ADDR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 static SMAP_PROBE_CODE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // Arm the probe for one expected ring-0 fault at `addr`.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub fn arm_smap_probe(addr: u64) {
 	SMAP_PROBE_CODE.store(0, core::sync::atomic::Ordering::SeqCst);
 	SMAP_PROBE_ADDR.store(addr, core::sync::atomic::Ordering::SeqCst);
@@ -211,7 +211,7 @@ pub fn arm_smap_probe(addr: u64) {
 // Called from the ring-0 page-fault branch: true if this fault is the armed probe
 // (recording its error code and disarming), in which case the handler retires the
 // probing thread rather than halting.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub fn smap_probe_trip(cr2: u64, error_code: u64) -> bool {
 	use core::sync::atomic::Ordering;
 	let armed = SMAP_PROBE_ADDR.load(Ordering::SeqCst);
@@ -225,7 +225,7 @@ pub fn smap_probe_trip(cr2: u64, error_code: u64) -> bool {
 }
 
 // The recorded probe fault: Some(error_code) once the armed access faulted.
-#[cfg(test)]
+#[cfg(all(test, target_arch = "x86_64"))]
 pub fn smap_probe_hit() -> Option<u64> {
 	let code = SMAP_PROBE_CODE.load(core::sync::atomic::Ordering::SeqCst);
 	if code == 0 { None } else { Some(code - 1) }

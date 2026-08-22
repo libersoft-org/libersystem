@@ -20,8 +20,10 @@ use crate::arch::common::msi::MsiRegistry;
 use crate::object::interrupt::Interrupt;
 
 // The device-IRQ vector window base (mirrors the contract; only the MSI window is live).
+#[cfg(not(test))]
 pub const IRQ_BASE: u8 = 32;
 
+#[cfg(not(test))]
 pub type HandlerFn = fn(u32);
 
 // Device EIDs run 1..=MAX_MSI (EID 0 is "no interrupt"; the IMSIC EIE0 register holds
@@ -181,6 +183,7 @@ pub fn irq_info_len() -> usize {
 
 // No kernel-side INTx handler registration on riscv (device interrupts are MSI; the
 // timer is the S-mode timer, not an external source).
+#[cfg(not(test))]
 pub fn register(_vector: u32, _handler: HandlerFn) {}
 
 #[cfg(test)]

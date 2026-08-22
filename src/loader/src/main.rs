@@ -650,14 +650,16 @@ const MAX_KERNEL_SPANS: usize = 16;
 impl ReservedKernel {
 	const EMPTY: Self = Self { spans: [(0, 0); MAX_KERNEL_SPANS], count: 0, complete: true };
 
-	// Did this loader reserve exactly this span?
+	// Did this loader reserve exactly this span? Asked by the aarch64 backend at placement.
+	#[cfg(target_arch = "aarch64")]
 	pub fn owns(&self, base: u64, pages: u64) -> bool {
 		self.spans[..self.count].iter().any(|&(reserved_base, reserved_pages)| reserved_base == base && reserved_pages == pages)
 	}
 
 	// Whether the whole image is accounted for. The riscv64 backend asks before it stages: an
 	// incomplete reservation there is a note, not a refusal, because its overlap check is what
-	// guards the copy.
+	// guards the copy. aarch64 does not ask - it refuses per span at placement instead.
+	#[cfg(target_arch = "riscv64")]
 	pub fn is_complete(&self) -> bool {
 		self.complete
 	}

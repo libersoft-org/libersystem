@@ -116,13 +116,12 @@ fn flush_tlb() {
 // request was not honoured.
 //
 // Refusing the mapping instead was tried and is worse: it takes every device on the port
-// with it, turning a case that works into a boot that does not. What is done here is to
-// make the gap ASKABLE rather than implied - a caller or a test can find out - and to
-// leave the real answer (Svpbmt, or a platform PMA check) as work this port still owes.
-#[cfg(test)]
-pub fn no_cache_supported() -> bool {
-	svpbmt()
-}
+// with it, turning a case that works into a boot that does not. The real answer - Svpbmt, or a
+// platform PMA check - is work this port still owes.
+//
+// IT USED TO BE ASKABLE. A `no_cache_supported()` stood here "so a caller or a test can find out",
+// and in the life of the port neither ever did: no caller, no test, on either build. The gap is
+// written down here instead, where the mapper that has it is.
 
 fn leaf_bits(flags: u64) -> u64 {
 	// `NO_CACHE` becomes a PBMT=IO leaf where Svpbmt is available, and is dropped where it is

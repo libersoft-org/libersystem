@@ -255,6 +255,7 @@ pub mod tsc {
 
 // ------------------------------------------------------------------ ioapic
 pub mod ioapic {
+	#[cfg(not(test))]
 	pub fn route(_gsi: u32, _vector: u8, _dest: u32) {
 		todo!("aarch64 GIC routing")
 	}
