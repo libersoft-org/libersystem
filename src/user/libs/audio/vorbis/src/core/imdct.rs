@@ -722,6 +722,7 @@ pub fn inverse_mdct(cached_bd: &CachedBlocksizeDerived, buffer: &mut [f32], bs: 
 	}
 }
 
+#[cfg(test)]
 pub fn inverse_mdct_naive(cached_bd: &CachedBlocksizeDerived, buffer: &mut [f32]) {
 	let n = buffer.len();
 	let n2 = n >> 1;

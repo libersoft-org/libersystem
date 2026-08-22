@@ -112,7 +112,7 @@ unsafe fn live_view(procsvc: u64, ressvc: u64) {
 		// so `cat` on a file holding them reconfigured the terminal. `tty_set_mode` goes over the
 		// control channel the shell hands to an interactive foreground job; false means there is no
 		// terminal to ask, and the program runs cooked rather than failing.
-		let owns_tty: bool = unsafe { tty_set_mode(true, false) };
+		tty_set_mode(true, false);
 		let Some(_terminal) = TerminalGuard::enter(&mut output, options) else {
 			query_processes(procsvc, None);
 			return;

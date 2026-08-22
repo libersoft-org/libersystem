@@ -27,7 +27,7 @@ fn device_memory_maps_mmio_region() {
 	let phys = mem::frame::allocate().expect("a frame for the stand-in MMIO region");
 	let device = DeviceMemory::new(phys, mem::frame::PAGE_SIZE as usize).expect("a test device memory");
 	// Hand the capability to the driver thread as its bootstrap handle.
-	sched::spawn_with_object(body, device, Rights::ALL, 0);
+	sched::spawn_with_object(body, device, Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "device-memory mapping thread did not finish");
 	// The thread (and its handle table) is reaped by run_until_idle, dropping the
@@ -187,7 +187,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	arch::pci::msix_enable(bus, dev, func, msix_cap);
 
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL, 0).expect("the xhci driver should load");
+	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the xhci driver should load");
 	let mut msg = alloc::vec::Vec::with_capacity(6 + core::mem::size_of::<abi::DeviceInfo>());
 	msg.extend_from_slice(b"DEVICE");
 	msg.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
@@ -204,13 +204,13 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	// business stopping the machine, so it sends a message carrying nothing rather than a
 	// real root-Domain handle - the shape of the handoff is what bring-up needs, not the
 	// authority behind it.
-	kernel_ep.send(object::channel::Message::new(b"POWER".to_vec(), alloc::vec::Vec::new(), 0)).expect("the POWER handoff should send");
+	kernel_ep.send(object::channel::Message::new(b"POWER".to_vec(), alloc::vec::Vec::new())).expect("the POWER handoff should send");
 	// And the console-input capability is the fifth, for exactly the same reason the two
 	// above spell out: the driver tolerates handle 0 (its keystrokes go nowhere) and blocks
 	// for the message. This is the cost of a positional bootstrap - every launcher owes every
 	// message - and it is why the capability was added at the END of the sequence, where it
 	// disturbs nothing that reads before it.
-	kernel_ep.send(object::channel::Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new(), 0)).expect("the CONSOLE handoff should send");
+	kernel_ep.send(object::channel::Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("the CONSOLE handoff should send");
 	sched::run_until_idle();
 
 	let report = kernel_ep.recv().expect("the xhci driver should report in");
@@ -232,7 +232,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let mut list = alloc::vec::Vec::new();
 	list.extend_from_slice(&1u16.to_le_bytes()); // OP_LIST
 	list.extend_from_slice(&1u32.to_le_bytes()); // correlation id
-	usbq.send(Message::new(list, alloc::vec::Vec::new(), 0)).expect("the usb.list request should send");
+	usbq.send(Message::new(list, alloc::vec::Vec::new())).expect("the usb.list request should send");
 	sched::run_until_idle();
 	let inventory = usbq.recv().expect("the usb.list reply should arrive");
 	assert!(inventory.bytes.len() >= 5 && inventory.bytes[4] == 1, "the inventory query should succeed");
@@ -250,7 +250,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	capacity.extend_from_slice(&2u32.to_le_bytes()); // op = capacity
 	capacity.extend_from_slice(&0u64.to_le_bytes());
 	capacity.extend_from_slice(&0u32.to_le_bytes());
-	blk.send(Message::new(capacity, alloc::vec::Vec::new(), 0)).expect("the capacity request should send");
+	blk.send(Message::new(capacity, alloc::vec::Vec::new())).expect("the capacity request should send");
 	sched::run_until_idle();
 	let cap_reply = blk.recv().expect("the capacity reply should arrive");
 	assert_eq!(&cap_reply.bytes[..4], &0u32.to_le_bytes(), "the capacity query should succeed");
@@ -260,7 +260,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	request.extend_from_slice(&0u32.to_le_bytes()); // op = read
 	request.extend_from_slice(&0u64.to_le_bytes()); // lba 0
 	request.extend_from_slice(&1u32.to_le_bytes()); // one sector
-	blk.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("the block request should send");
+	blk.send(Message::new(request, alloc::vec::Vec::new())).expect("the block request should send");
 	sched::run_until_idle();
 	let reply = blk.recv().expect("the block reply should arrive");
 	assert_eq!(&reply.bytes[..4], &0u32.to_le_bytes(), "the USB read should succeed");
@@ -278,7 +278,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let service_elf = package.lookup(b"storage_service.lsexe").expect("storage_service.lsexe should be in the init package");
 	let (service_boot_kernel, service_boot_user) = object::channel::Channel::create();
 	let (service_server, service_client) = object::channel::Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, service_boot_user, Rights::ALL, 0).expect("the StorageService should load");
+	loader::spawn_elf_process(sched::root_domain(), service_elf, service_boot_user, Rights::ALL).expect("the StorageService should load");
 	send_cap(&service_boot_kernel, b"USBBLOCK", blk, Rights::ALL).expect("the USBBLOCK handoff should send");
 	send_cap(&service_boot_kernel, b"SERVE", service_server, Rights::ALL).expect("the SERVE handoff should send");
 	sched::run_until_idle();
@@ -294,8 +294,8 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	open.extend_from_slice(uri);
 	open.push(0); // write = false
 	open.push(0); // create = false
-	service_client.send(Message::new(open, alloc::vec::Vec::new(), 0)).expect("the open request should send");
-	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("the quit sentinel should send");
+	service_client.send(Message::new(open, alloc::vec::Vec::new())).expect("the open request should send");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("the quit sentinel should send");
 	sched::run_until_idle();
 	let reply = service_client.recv().expect("the open reply should arrive");
 	assert!(reply.bytes.len() >= 17 && reply.bytes[4] == 1, "the usb volume should resolve the seeded file");
@@ -365,8 +365,8 @@ fn device_service_lists_devices() {
 	let mut req = alloc::vec::Vec::new();
 	req.extend_from_slice(&1u16.to_le_bytes());
 	req.extend_from_slice(&corr.to_le_bytes());
-	service_client.send(Message::new(req, alloc::vec::Vec::new(), 0)).expect("list request");
-	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	service_client.send(Message::new(req, alloc::vec::Vec::new())).expect("list request");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("quit sentinel");
 
 	sched::run_until_idle();
 
@@ -523,7 +523,7 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 				use object::privilege::{Privilege, PrivilegeKind};
 				let thread = sched::current_thread().expect("a current thread");
 				let privilege = Privilege::create(PrivilegeKind::ConsoleSink).expect("a test privilege");
-				thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL, 0).expect("installs").raw()
+				thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL).expect("installs").raw()
 			};
 			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, wrong, 0, 0) as i64, syscall::ERR_ACCESS_DENIED, "a console authority does not open a device");
 
@@ -536,7 +536,7 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
 }

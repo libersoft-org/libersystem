@@ -16,7 +16,6 @@ use volume_client::VolumeClient;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buffer = [0u8; 1024];
 	unsafe {
 		inherit_stdout(bootstrap);
 		set_alloc_error_message(b"imgconv: out of memory\n");

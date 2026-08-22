@@ -28,7 +28,7 @@ fn start_process_service(storage: &mut StorageHarness, package: &pkg::Package<'s
 	let process_elf = package.lookup(b"process_service.lsexe").expect("ProcessService image");
 	let (boot, boot_user) = Channel::create();
 	let (server, client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), process_elf, boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	loader::spawn_elf_process(sched::root_domain(), process_elf, boot_user, Rights::ALL).expect("spawn ProcessService");
 	send_package(&boot, init).expect("ProcessService package bootstrap");
 	send_cap(&boot, b"STORAGE", storage.connect(), Rights::ALL).expect("ProcessService storage bootstrap");
 	// The development registry, with its far end dropped: nothing answers, so every
@@ -85,7 +85,7 @@ fn start_log_service(storage: &mut StorageHarness, package: &pkg::Package<'stati
 	let log_elf = package.lookup(b"log_service.lsexe").expect("LogService image");
 	let (boot, boot_user) = Channel::create();
 	let (server, client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), log_elf, boot_user, Rights::ALL, 0).expect("spawn LogService");
+	loader::spawn_elf_process(sched::root_domain(), log_elf, boot_user, Rights::ALL).expect("spawn LogService");
 	// Narrowed as the supervisor narrows it: LogService checks its serve root against the generated
 	// plan, and a role carrying more than the plan allows is refused rather than quietly accepted.
 	send_cap(&boot, b"SERVE", server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("LogService serve bootstrap");
@@ -108,7 +108,7 @@ fn emit_persistent_log_entry(storage: &mut StorageHarness, log_client: &object::
 	request.extend_from_slice(&1u16.to_le_bytes());
 	request.extend_from_slice(&correlation.to_le_bytes());
 	request.extend_from_slice(&entry[..len]);
-	log_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("LogService emit request");
+	log_client.send(Message::new(request, alloc::vec::Vec::new())).expect("LogService emit request");
 	let reply = wait_message(storage, log_client, "LogService did not acknowledge the persistent entry");
 	assert_eq!(le_u32(&reply.bytes, 0), correlation, "LogService emit echoes its correlation id");
 	assert_eq!(reply.bytes.get(4), Some(&1), "an error entry flushes to the system journal");
@@ -123,7 +123,7 @@ fn query_previous_log_boot(storage: &mut StorageHarness, log_client: &object::ch
 	request.extend_from_slice(&[0, 0, 0, 1]);
 	request.extend_from_slice(&boot.to_le_bytes());
 	request.extend_from_slice(&0u32.to_le_bytes());
-	log_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("LogService boot query request");
+	log_client.send(Message::new(request, alloc::vec::Vec::new())).expect("LogService boot query request");
 	wait_message(storage, log_client, "LogService did not answer the previous-boot query")
 }
 
@@ -241,8 +241,8 @@ fn fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state() {
 	let (echo_boot, echo_process) = launch_volume_program(&mut storage, &process_client, "echo", 0xd320);
 	let (echo_stdout, echo_stdout_child) = Channel::create();
 	send_cap(&echo_boot, b"STDOUT", echo_stdout_child, Rights::ALL).expect("echo stdout bootstrap");
-	echo_boot.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
-	echo_boot.send(Message::new(crate::tests::launch_context(b"fresh volume command", b""), alloc::vec::Vec::new(), 0)).expect("echo argument bootstrap");
+	echo_boot.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	echo_boot.send(Message::new(crate::tests::launch_context(b"fresh volume command", b""), alloc::vec::Vec::new())).expect("echo argument bootstrap");
 	assert_eq!(&wait_message(&mut storage, &echo_stdout, "echo did not print its command result").bytes[..], b"fresh volume command", "a tool launches from bin through ProcessService");
 	assert_eq!(&wait_message(&mut storage, &echo_stdout, "echo did not print its newline").bytes[..], b"\n");
 	wait_terminated(&mut storage, &echo_process, "echo did not exit");
@@ -257,13 +257,13 @@ fn fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state() {
 	set.extend_from_slice(key);
 	set.extend_from_slice(&(value.len() as u16).to_le_bytes());
 	set.extend_from_slice(value);
-	config_client.send(Message::new(set, alloc::vec::Vec::new(), 0)).expect("ConfigService set request");
+	config_client.send(Message::new(set, alloc::vec::Vec::new())).expect("ConfigService set request");
 	let set_reply = wait_message(&mut storage, &config_client, "ConfigService did not acknowledge the set");
 	assert_eq!(le_u32(&set_reply.bytes, 0), 1);
 	assert_eq!(set_reply.bytes.get(4), Some(&1), "ConfigService persists through its directory scope");
 	let config_uri = alloc::format!("vol://system/{config_tree}");
 	assert!(storage.open(config_uri.as_bytes(), 0xd331).is_some(), "ConfigService writes its tree beside its libexec artifact");
-	config_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("ConfigService quit sentinel");
+	config_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("ConfigService quit sentinel");
 	wait_terminated(&mut storage, &config_process, "the first ConfigService did not exit");
 
 	let (config_client, config_process) = start_config_service(&mut storage, &process_client, 0xd332);
@@ -272,13 +272,13 @@ fn fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state() {
 	get.extend_from_slice(&2u32.to_le_bytes());
 	get.extend_from_slice(&(key.len() as u16).to_le_bytes());
 	get.extend_from_slice(key);
-	config_client.send(Message::new(get, alloc::vec::Vec::new(), 0)).expect("ConfigService persisted get request");
+	config_client.send(Message::new(get, alloc::vec::Vec::new())).expect("ConfigService persisted get request");
 	let get_reply = wait_message(&mut storage, &config_client, "the replacement ConfigService did not answer");
 	assert_eq!(le_u32(&get_reply.bytes, 0), 2);
 	assert_eq!(get_reply.bytes.get(4), Some(&1), "the replacement ConfigService found the persisted key");
 	let value_len = le_u16(&get_reply.bytes, 5) as usize;
 	assert_eq!(&get_reply.bytes[7..7 + value_len], value, "ConfigService reloads the exact persisted value");
-	config_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("replacement ConfigService quit sentinel");
+	config_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("replacement ConfigService quit sentinel");
 	wait_terminated(&mut storage, &config_process, "the replacement ConfigService did not exit");
 
 	let (log_boot, log_client) = start_log_service(&mut storage, &package);
@@ -307,7 +307,7 @@ fn fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state() {
 	assert!(storage.open_from(&component_scope, config_uri.as_bytes(), 0xd353).is_none(), "a component-owned scope cannot open ConfigService state");
 	assert!(storage.open_from(&component_scope, journal_uri.as_bytes(), 0xd354).is_none(), "a component-owned scope cannot open the system journal");
 
-	log_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("first LogService quit sentinel");
+	log_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("first LogService quit sentinel");
 	for _ in 0..100_000 {
 		storage.pump();
 		if log_client.is_peer_closed() {
@@ -322,7 +322,7 @@ fn fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state() {
 	assert!(le_u16(&reply.bytes, 5) >= 1, "the reopened journal has at least the flushed error entry");
 	assert!(reply.bytes.windows(b"volume-layout".len()).any(|window| window == b"volume-layout"), "the reopened journal preserves the structured error entry");
 
-	replacement_log_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("replacement LogService quit sentinel");
-	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("ProcessService quit sentinel");
+	replacement_log_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("replacement LogService quit sentinel");
+	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("ProcessService quit sentinel");
 	let _ = log_boot;
 }

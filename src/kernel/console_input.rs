@@ -62,7 +62,7 @@ pub fn feed(byte: u8) -> bool {
 	let channel = CONSOLE.lock().clone();
 	match channel {
 		Some(channel) => match try_one(byte) {
-			Some(bytes) => channel.send(Message::new(bytes, Vec::new(), 0)).is_ok(),
+			Some(bytes) => channel.send(Message::new(bytes, Vec::new())).is_ok(),
 			// A short heap: the keystroke is dropped, which is what a full queue already does here.
 			None => false,
 		},
@@ -75,7 +75,7 @@ pub fn feed_serial(byte: u8) -> bool {
 	let channel = CONSOLE.lock().clone();
 	match channel {
 		Some(channel) => match try_two(SERIAL_INPUT_MARKER, byte) {
-			Some(bytes) => channel.send(Message::new(bytes, Vec::new(), 0)).is_ok(),
+			Some(bytes) => channel.send(Message::new(bytes, Vec::new())).is_ok(),
 			None => false,
 		},
 		None => false,

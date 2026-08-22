@@ -398,8 +398,8 @@ pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> 
 // Create a kernel thread on the current core, pre-seeded with a handle to
 // `object` (delivered to the thread as its bootstrap-handle argument).
 #[cfg(test)]
-pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
-	let thread = prepare_with_object(entry, object, rights, badge);
+pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights) -> Arc<Thread> {
+	let thread = prepare_with_object(entry, object, rights);
 	start_thread(&thread);
 	thread
 }
@@ -409,9 +409,9 @@ pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject
 // of them runs. Split out of `spawn_with_object` rather than added beside it, so the two cannot
 // drift in how a thread is constructed.
 #[cfg(test)]
-pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
+pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
-	let arg = process.install(object, rights, badge).expect("out of memory for a kernel thread's bootstrap handle");
+	let arg = process.install(object, rights).expect("out of memory for a kernel thread's bootstrap handle");
 	Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack")
 }
 

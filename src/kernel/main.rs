@@ -460,7 +460,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	let package = pkg::Package::parse(bytes).ok_or("init package is malformed")?;
 	let elf_image = package.lookup(b"system_manager.lsexe").ok_or("system_manager.lsexe missing from init package")?;
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
-	let process = loader::spawn_elf_process(sched::root_domain(), elf_image, user_ep, Rights::ALL, 0).map_err(|_| "failed to load SystemManager")?;
+	let process = loader::spawn_elf_process(sched::root_domain(), elf_image, user_ep, Rights::ALL).map_err(|_| "failed to load SystemManager")?;
 	// The one process nothing else can name. The loader takes a name from a staged image's
 	// identity note, and the static init-package programs carry none; every other one of them
 	// is launched through ProcessService, which labels it from the package entry it was looked
@@ -484,9 +484,9 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	msg.extend_from_slice(b"PACKAGE");
 	// ALLOC-OK: the boot chain's own hand-off message, built before userspace exists.
 	msg.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-	let cap = Capability::new(package_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER | Rights::DUPLICATE, 0);
+	let cap = Capability::new(package_obj as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER | Rights::DUPLICATE);
 	// ALLOC-OK: boot, as above
-	kernel_ep.send(Message::new(msg, alloc::vec![cap], 0)).map_err(|_| "failed to hand SystemManager the init package")?;
+	kernel_ep.send(Message::new(msg, alloc::vec![cap])).map_err(|_| "failed to hand SystemManager the init package")?;
 
 	// Hand SystemManager the ramdisk volume the same way, so it can be delegated
 	// down to the StorageService the boot chain brings up. "RAMDISK" + length with a
@@ -517,9 +517,9 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	rdmsg.extend_from_slice(tag);
 	// ALLOC-OK: the boot chain's own hand-off message, built before userspace exists.
 	rdmsg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
-	let rdcap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
+	let rdcap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER);
 	// ALLOC-OK: boot, as above
-	kernel_ep.send(Message::new(rdmsg, alloc::vec![rdcap], 0)).map_err(|_| "failed to hand SystemManager the ramdisk")?;
+	kernel_ep.send(Message::new(rdmsg, alloc::vec![rdcap])).map_err(|_| "failed to hand SystemManager the ramdisk")?;
 
 	// Hand SystemManager the power capability: a handle to the root Domain carrying MANAGE,
 	// which is what `SYS_SYSTEM_POWER` checks. Stopping the machine used to need no capability
@@ -536,10 +536,10 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// Sent AFTER the ramdisk because that is the order SystemManager reads its handoffs in,
 	// and a bootstrap read consumes whatever arrived: out of order, its RAMDISK read takes
 	// this message instead and the whole boot chain stops before the first service starts.
-	let power_cap = Capability::new(sched::root_domain() as Arc<dyn KernelObject>, Rights::MANAGE, 0);
+	let power_cap = Capability::new(sched::root_domain() as Arc<dyn KernelObject>, Rights::MANAGE);
 	// ALLOC-OK: boot, as above
 	// ALLOC-OK: boot, before userspace exists - a four-byte tag on the handover path.
-	kernel_ep.send(Message::new(b"POWER".to_vec(), alloc::vec![power_cap], 0)).map_err(|_| "failed to hand SystemManager the power capability")?;
+	kernel_ep.send(Message::new(b"POWER".to_vec(), alloc::vec![power_cap])).map_err(|_| "failed to hand SystemManager the power capability")?;
 
 	// Tell the boot chain which kind of boot this is: "MODE" + one byte, 1 in a test
 	// build and 0 in a production one. ServiceManager runs its bring-up self-tests
@@ -547,7 +547,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// so a production system never deliberately faults a process or stops a service.
 	let mode: u8 = if cfg!(test) { 1 } else { 0 };
 	// ALLOC-OK: boot, as above
-	kernel_ep.send(Message::new(alloc::vec![b'M', b'O', b'D', b'E', mode], alloc::vec::Vec::new(), 0)).map_err(|_| "failed to hand SystemManager the boot mode")?;
+	kernel_ep.send(Message::new(alloc::vec![b'M', b'O', b'D', b'E', mode], alloc::vec::Vec::new())).map_err(|_| "failed to hand SystemManager the boot mode")?;
 
 	// Hand SystemManager the three console/display capabilities, in ONE message carrying three
 	// capabilities rather than three messages - the bootstrap is a strictly ordered sequence and
@@ -559,9 +559,9 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// minted exactly here and nowhere else - no syscall creates one - so the three that exist
 	// after this line are the four that will ever exist.
 	// ALLOC-OK: boot, minting the four privilege capabilities before userspace exists.
-	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink, PrivilegeKind::DeviceManager].into_iter().map(|kind| Capability::new(Privilege::create(kind).expect("the four privilege capabilities, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE, 0)).collect();
+	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink, PrivilegeKind::DeviceManager].into_iter().map(|kind| Capability::new(Privilege::create(kind).expect("the four privilege capabilities, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE)).collect();
 	// ALLOC-OK: boot, before userspace exists - a tag on the same handover path.
-	kernel_ep.send(Message::new(b"CONSOLECAPS".to_vec(), privileges, 0)).map_err(|_| "failed to hand SystemManager the console capabilities")?;
+	kernel_ep.send(Message::new(b"CONSOLECAPS".to_vec(), privileges)).map_err(|_| "failed to hand SystemManager the console capabilities")?;
 	Ok((kernel_ep, process))
 }
 

@@ -262,7 +262,6 @@ fn map_header(error: header::HeaderReadError) -> Error {
 fn map_audio(error: audio::AudioReadError) -> Error {
 	match error {
 		audio::AudioReadError::EndOfPacket => Error::Truncated,
-		audio::AudioReadError::BufferNotAddressable => Error::TooLarge,
 		_ => Error::Invalid,
 	}
 }

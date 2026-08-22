@@ -534,7 +534,7 @@ impl Source {
 	// nothing the tool could be lied to about by a caller that cannot forge a capability.
 	#[inline(always)]
 	pub unsafe fn from_stdin() -> Option<Self> {
-		let input: u64 = unsafe { rt::stdin() };
+		let input: u64 = rt::stdin();
 		if input == 0 { None } else { Some(Source::Stream(rt::stream::Reader::new(input), Vec::new())) }
 	}
 

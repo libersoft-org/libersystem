@@ -8,9 +8,9 @@
 // retries.
 //
 // A message carries a small byte payload plus zero or more transferred
-// capabilities (moved out of the sender's handle table and into the receiver's),
-// and the badge of the endpoint handle it was sent through, so a server sharing
-// one endpoint among several clients can tell them apart.
+// capabilities (moved out of the sender's handle table and into the receiver's).
+// WHO SENT IT is answered by which channel it arrived on: a server here mints a
+// separate connection per client rather than sharing one endpoint among them.
 
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -49,7 +49,7 @@ pub enum ChannelError {
 // costs one relaxed increment per send. It starts at 1 so that 0 is never a real message.
 static NEXT_MESSAGE_ID: AtomicU64 = AtomicU64::new(1);
 
-// A unit of IPC: a byte payload, transferred capabilities, and a sender badge.
+// A unit of IPC: a byte payload and the capabilities it transfers.
 pub struct Message {
 	// What makes "take THIS message" expressible.
 	//
@@ -61,7 +61,6 @@ pub struct Message {
 	pub id: u64,
 	pub bytes: Vec<u8>,
 	pub caps: Vec<Capability>,
-	pub badge: u64,
 	// The sender's Domain charged for this message's queued bytes (and the amount),
 	// refunded when the message is taken (recv) or dropped (channel close). None when
 	// the send was not accounted (internal kernel IPC).
@@ -83,8 +82,8 @@ pub struct Message {
 }
 
 impl Message {
-	pub fn new(bytes: Vec<u8>, caps: Vec<Capability>, badge: u64) -> Self {
-		Self { id: NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed), bytes, caps, badge, queue_charge: None, slot_reserved: false }
+	pub fn new(bytes: Vec<u8>, caps: Vec<Capability>) -> Self {
+		Self { id: NEXT_MESSAGE_ID.fetch_add(1, Ordering::Relaxed), bytes, caps, queue_charge: None, slot_reserved: false }
 	}
 
 	// Charge this message's byte length to `domain`'s in-transit IPC quota, to be

@@ -157,7 +157,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if let Some(opened) = opened.as_ref() {
 			let uri = String::from(opened.uri.as_str());
 			let existing = VolumeClient::new(selected).stat(&uri).and_then(|answer| answer.ok());
-			let file = unsafe { read_volume_file(selected, &uri, MAX_EDIT_BYTES) }.unwrap_or_default();
+			let file = read_volume_file(selected, &uri, MAX_EDIT_BYTES).unwrap_or_default();
 			match TextBuffer::from_bytes(&file, MAX_EDIT_BYTES) {
 				Ok(text) => {
 					let mut name: Vec<u8> = Vec::new();

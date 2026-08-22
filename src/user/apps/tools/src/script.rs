@@ -12,7 +12,6 @@ use rt::*;
 // it is not the hardware console for, exactly as a future ssh would.
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
 		// The shell hands us our stdout (the real console), then the command line to record
 		// plus the pty master channel.

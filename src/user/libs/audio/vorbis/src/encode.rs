@@ -25,7 +25,6 @@
 //! Every one of those is a ratio decision. None of them changes whether the stream decodes, which is
 //! what makes them safe to improve later behind the same interface.
 
-use crate::header;
 use alloc::vec::Vec;
 
 /// A Vorbis packet, built bit by bit.
@@ -872,7 +871,7 @@ pub fn encode(pcm: &[Vec<f32>], rate: u32, blocksize_log2: u8, serial: u32) -> O
 	// out. A stream one packet short ends a full block early, which is a tail nobody hears going
 	// missing until they compare lengths.
 	let packets = frames.div_ceil(n) + 2;
-	let mut spectrum_of = |index: usize, channel: &Vec<f32>, block: &mut Vec<f32>| -> Option<Vec<f32>> {
+	let spectrum_of = |index: usize, channel: &Vec<f32>, block: &mut Vec<f32>| -> Option<Vec<f32>> {
 		let start: isize = index as isize * n as isize - n as isize;
 		block.clear();
 		for offset in 0..n * 2 {

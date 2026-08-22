@@ -80,9 +80,6 @@ fn test_read_header_ident() {
 	let hdr = read_header_ident(test_arr).unwrap();
 	assert_eq!(hdr.audio_channels, 2);
 	assert_eq!(hdr.audio_sample_rate, 0x0000ac44);
-	assert_eq!(hdr.bitrate_maximum, 0);
-	assert_eq!(hdr.bitrate_nominal, 0x0001b580);
-	assert_eq!(hdr.bitrate_minimum, 0);
 	assert_eq!(hdr.blocksize_0, 8);
 	assert_eq!(hdr.blocksize_1, 11);
 }

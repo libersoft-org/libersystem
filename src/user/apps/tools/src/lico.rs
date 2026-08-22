@@ -1440,7 +1440,9 @@ impl Manager {
 		// on, so a command run from the bar sees the same variables one typed at the shell would -
 		// and the child holds the values with no capability to the session, so it can read what it
 		// inherited and cannot change what its parent will see.
-		let started = match client.run(program, args, &cwd, &self.environment, &write_end) {
+		// Bound rather than discarded so it lives as long as it used to: this scope hands the
+		// terminal over below and the launch must not be dropped before that.
+		let _started = match client.run(program, args, &cwd, &self.environment, &write_end) {
 			Some(Ok(started)) => started,
 			_ => {
 				unsafe { close(read_end) };

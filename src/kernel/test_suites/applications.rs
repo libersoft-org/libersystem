@@ -1055,7 +1055,7 @@ fn a_volume_reads_windows_watches_changes_and_publishes_transactions() {
 	finish.extend_from_slice(&0x8408u32.to_le_bytes());
 	assert!(vol.writer_op(&appender, finish, 0x8408).is_some(), "and commits");
 	assert_eq!(vol.open(b"vol://tmp/keep", 0x8409), Some(b"original more".to_vec()), "which extended the file rather than replacing it");
-	let _ = Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0);
+	let _ = Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new());
 }
 
 tagged_test!(

@@ -436,7 +436,7 @@ fn a_spawn_that_passes_a_bootstrap_returns_the_slot_and_the_quota() {
 	for _ in 0..32 {
 		let (parent, child) = Channel::create();
 		let process = crate::object::process::Process::new(crate::object::address_space::AddressSpace::create().expect("an address space"), domain.clone()).expect("a test process");
-		let handle = process.install(child, Rights::ALL, 0).expect("a handle for the child");
+		let handle = process.install(child, Rights::ALL).expect("a handle for the child");
 		assert!(handle != 0, "the bootstrap is installed in the child");
 		process.terminate();
 		drop(process);

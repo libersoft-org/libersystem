@@ -1,5 +1,7 @@
 # Bugs / changes
 
+- src/boot doesn't contain bootloader, but QEMU/lab testing harness, bootloader is in src/uefi, src/loader and src/bootproto
+
 vol://system> exit
 shell: exiting
 

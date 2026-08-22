@@ -14,10 +14,10 @@ fn a_service_reports_a_bootstrap_failure() {
 	let package = pkg::Package::parse(init).expect("init package parses");
 	let device_elf = package.lookup(b"device_manager.lsexe").expect("device_manager.lsexe in the init package");
 	let (boot_kernel, boot_user) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), device_elf, boot_user, Rights::ALL, 0).expect("spawn device_manager");
+	loader::spawn_elf_process(sched::root_domain(), device_elf, boot_user, Rights::ALL).expect("spawn device_manager");
 	// Where the "PACKAGE" grant should be, hand it a plain message with no transferred
 	// object: recv_package rejects it and the service reports the failing step.
-	boot_kernel.send(Message::new(b"NOTAPACKAGE".to_vec(), alloc::vec::Vec::new(), 0)).expect("bogus bootstrap");
+	boot_kernel.send(Message::new(b"NOTAPACKAGE".to_vec(), alloc::vec::Vec::new())).expect("bogus bootstrap");
 
 	sched::run_until_idle();
 
@@ -49,7 +49,7 @@ fn log_service_speaks_generated_bindings() {
 		msg.extend_from_slice(&1u16.to_le_bytes());
 		msg.extend_from_slice(&corr.to_le_bytes());
 		msg.extend_from_slice(&wire[..n]);
-		service_client.send(Message::new(msg, alloc::vec::Vec::new(), 0)).expect("emit");
+		service_client.send(Message::new(msg, alloc::vec::Vec::new())).expect("emit");
 	};
 	emit(1, 10, Severity::Info, b"storage_service", &[(b"event" as &[u8], b"online" as &[u8])]);
 	emit(2, 11, Severity::Error, b"device_manager", &[(b"code" as &[u8], b"5" as &[u8])]);
@@ -61,8 +61,8 @@ fn log_service_speaks_generated_bindings() {
 	q.extend_from_slice(&2u16.to_le_bytes());
 	q.extend_from_slice(&7u32.to_le_bytes());
 	q.extend_from_slice(&[0u8; 8]);
-	service_client.send(Message::new(q, alloc::vec::Vec::new(), 0)).expect("query");
-	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	service_client.send(Message::new(q, alloc::vec::Vec::new())).expect("query");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("quit sentinel");
 
 	sched::run_until_idle();
 
@@ -115,11 +115,11 @@ fn input_service_streams_pointer_events() {
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	send_cap(&boot_kernel, b"INPUT", raw_consumer, Rights::ALL).expect("input raw bootstrap");
 	// no USB pointer in this scenario: the second raw channel is absent (handle 0).
-	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new(), 0)).expect("input2 raw bootstrap");
+	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new())).expect("input2 raw bootstrap");
 	send_cap(&boot_kernel, b"FORWARD", forward_input, Rights::ALL).expect("forward raw bootstrap");
 	send_cap(&boot_kernel, b"KEYS", key_consumer, Rights::ALL).expect("key raw bootstrap");
 	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
-	boot_kernel.send(Message::new(b"KILL".to_vec(), alloc::vec::Vec::new(), 0)).expect("kill bootstrap");
+	boot_kernel.send(Message::new(b"KILL".to_vec(), alloc::vec::Vec::new())).expect("kill bootstrap");
 	let (_admin_peer, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("input admin bootstrap");
 
@@ -132,7 +132,7 @@ fn input_service_streams_pointer_events() {
 		bytes.extend_from_slice(&x.to_le_bytes());
 		bytes.extend_from_slice(&y.to_le_bytes());
 		bytes.push(buttons);
-		Message::new(bytes, alloc::vec::Vec::new(), 0)
+		Message::new(bytes, alloc::vec::Vec::new())
 	};
 	raw_producer.send(raw_event(0x8000, 0x8000, 1)).expect("first pointer event");
 	raw_producer.send(raw_event(0, 0, 0)).expect("second pointer event");
@@ -142,7 +142,7 @@ fn input_service_streams_pointer_events() {
 	let mut req = alloc::vec::Vec::new();
 	req.extend_from_slice(&1u16.to_le_bytes());
 	req.extend_from_slice(&corr.to_le_bytes());
-	service_client.send(Message::new(req, alloc::vec::Vec::new(), 0)).expect("subscribe request");
+	service_client.send(Message::new(req, alloc::vec::Vec::new())).expect("subscribe request");
 
 	sched::run_until_idle();
 
@@ -199,7 +199,7 @@ fn input_service_streams_keys_only_with_display_focus() {
 	let _input_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 	send_cap(&boot_kernel, b"INPUT", pointer_b, Rights::ALL).expect("pointer bootstrap");
-	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new(), 0)).expect("second pointer bootstrap");
+	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new())).expect("second pointer bootstrap");
 	send_cap(&boot_kernel, b"FORWARD", forward_b, Rights::ALL).expect("forward bootstrap");
 	send_cap(&boot_kernel, b"KEYS", keys_input, Rights::ALL).expect("keys bootstrap");
 	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
@@ -212,14 +212,14 @@ fn input_service_streams_keys_only_with_display_focus() {
 	let mut open_keys = alloc::vec::Vec::new();
 	open_keys.extend_from_slice(&1u16.to_le_bytes());
 	open_keys.extend_from_slice(&40u32.to_le_bytes());
-	input_admin.send(Message::new(open_keys, alloc::vec::Vec::new(), 0)).expect("open key-only connection");
+	input_admin.send(Message::new(open_keys, alloc::vec::Vec::new())).expect("open key-only connection");
 	sched::run_until_idle();
 	let reply = input_admin.recv().expect("key-only connection reply");
 	let scoped = reply.caps.first().expect("key-only connection").object().into_any_arc().downcast::<Channel>().expect("key-only grant is a channel");
 	let mut pointer_request = alloc::vec::Vec::new();
 	pointer_request.extend_from_slice(&1u16.to_le_bytes());
 	pointer_request.extend_from_slice(&41u32.to_le_bytes());
-	scoped.send(Message::new(pointer_request, alloc::vec::Vec::new(), 0)).expect("forbidden pointer snapshot");
+	scoped.send(Message::new(pointer_request, alloc::vec::Vec::new())).expect("forbidden pointer snapshot");
 	sched::run_until_idle();
 	let denied = scoped.recv().expect("pointer scope denial");
 	assert!(denied.caps.is_empty(), "key-only connection cannot open a pointer stream");
@@ -236,10 +236,10 @@ fn input_service_streams_keys_only_with_display_focus() {
 	assert_eq!(&focus_ack.bytes[..], b"OK");
 	let suppressed = console_focus.recv().expect("console focus suppression");
 	assert_eq!(&suppressed.bytes[..], b"KEYFOCUS\0");
-	keys_driver.send(Message::new(alloc::vec![0x04, 0, 1], alloc::vec::Vec::new(), 0)).expect("A down");
-	keys_driver.send(Message::new(alloc::vec![0x04, 0, 1], alloc::vec::Vec::new(), 0)).expect("duplicate A down");
+	keys_driver.send(Message::new(alloc::vec![0x04, 0, 1], alloc::vec::Vec::new())).expect("A down");
+	keys_driver.send(Message::new(alloc::vec![0x04, 0, 1], alloc::vec::Vec::new())).expect("duplicate A down");
 	sched::run_until_idle();
-	focus_display.send(Message::new(b"CLEAR".to_vec(), alloc::vec::Vec::new(), 0)).expect("revoke focus");
+	focus_display.send(Message::new(b"CLEAR".to_vec(), alloc::vec::Vec::new())).expect("revoke focus");
 	sched::run_until_idle();
 	let clear_ack = focus_display.recv().expect("clear acknowledgement");
 	assert_eq!(&clear_ack.bytes[..], b"OK");
@@ -250,9 +250,9 @@ fn input_service_streams_keys_only_with_display_focus() {
 	assert_eq!((le_u16(&down.bytes, 4), down.bytes[6]), (0x04, 1), "canonical HID A down");
 	assert_eq!((le_u16(&up.bytes, 4), up.bytes[6]), (0x04, 0), "focus loss releases held A");
 	assert!(stream.recv().is_err(), "focus loss closes the key stream");
-	keys_driver.send(Message::new(alloc::vec![0x04, 0, 0], alloc::vec::Vec::new(), 0)).expect("physical A up");
+	keys_driver.send(Message::new(alloc::vec![0x04, 0, 0], alloc::vec::Vec::new())).expect("physical A up");
 	sched::run_until_idle();
-	focus_display.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new(), 0)).expect("restore console focus");
+	focus_display.send(Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("restore console focus");
 	sched::run_until_idle();
 	let console_ack = focus_display.recv().expect("console focus acknowledgement");
 	assert_eq!(&console_ack.bytes[..], b"OK");
@@ -266,7 +266,7 @@ fn input_service_streams_keys_only_with_display_focus() {
 	let second_ack = focus_display.recv().expect("second focus acknowledgement");
 	assert_eq!(&second_ack.bytes[..], b"OK");
 	for event in [[0xe0, 0, 1], [0xe2, 0, 1], [0x29, 0, 1]] {
-		keys_driver.send(Message::new(event.to_vec(), alloc::vec::Vec::new(), 0)).expect("kill chord key");
+		keys_driver.send(Message::new(event.to_vec(), alloc::vec::Vec::new())).expect("kill chord key");
 	}
 	sched::run_until_idle();
 	let kill = kill_display.recv().expect("kill chord reaches DisplayService");
@@ -294,11 +294,11 @@ fn display_service_restores_the_console_surface() {
 		for value in args {
 			bytes.extend_from_slice(&value.to_le_bytes());
 		}
-		Message::new(bytes, alloc::vec::Vec::new(), 0)
+		Message::new(bytes, alloc::vec::Vec::new())
 	}
 
 	fn connect(root: &Channel) -> alloc::sync::Arc<Channel> {
-		root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("connect request");
+		root.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("connect request");
 		sched::run_until_idle();
 		let reply = root.recv().expect("connect reply");
 		let cap = reply.caps.first().expect("connected display channel");
@@ -309,7 +309,7 @@ fn display_service_restores_the_console_surface() {
 		sched::run_until_idle();
 		let command = focus.recv().expect("focus command");
 		assert_eq!(&command.bytes[..], expected, "expected focus transition");
-		focus.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("focus acknowledgement");
+		focus.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
 	}
 
 	fn acquire(client: &Channel, focus: &Channel, expected_focus: &[u8], corr: u32, width: u32, height: u32) -> alloc::sync::Arc<MemoryObject> {
@@ -368,7 +368,7 @@ fn display_service_restores_the_console_surface() {
 		sched::run_until_idle();
 		let present = gpu.recv().expect("synchronous PRESENT reaches the gpu");
 		assert_eq!(&present.bytes[..7], b"PRESENT", "DisplayService uses the acknowledged present path");
-		gpu.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("present acknowledgement");
+		gpu.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("present acknowledgement");
 		sched::run_until_idle();
 		if let Some((channel, corr)) = client {
 			let reply = channel.recv().expect("typed display reply");
@@ -382,7 +382,7 @@ fn display_service_restores_the_console_surface() {
 		let mut request = alloc::vec::Vec::new();
 		request.extend_from_slice(&2u16.to_le_bytes());
 		request.extend_from_slice(&corr.to_le_bytes());
-		admin.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("display stats request");
+		admin.send(Message::new(request, alloc::vec::Vec::new())).expect("display stats request");
 		sched::run_until_idle();
 		let reply = admin.recv().expect("display stats reply");
 		assert_eq!(le_u32(&reply.bytes, 0), corr);
@@ -409,7 +409,7 @@ fn display_service_restores_the_console_surface() {
 	// (it takes no boot framebuffer and relies on the GPU scanout, which is what this test
 	// gives it) but it BLOCKS for the message, so a launcher that omits it wedges bring-up
 	// before the FB handshake below - which is what a positional bootstrap costs.
-	boot_kernel.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new(), 0)).expect("display capability bootstrap");
+	boot_kernel.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new())).expect("display capability bootstrap");
 
 	// Answer the driver's FB handshake with a 4x4 B8G8R8X8 DMA scanout.
 	sched::run_until_idle();
@@ -447,7 +447,7 @@ fn display_service_restores_the_console_surface() {
 	let mut resize = b"RESIZE".to_vec();
 	resize.extend_from_slice(&4u32.to_le_bytes());
 	resize.extend_from_slice(&4u32.to_le_bytes());
-	gpu_kernel.send(Message::new(resize, alloc::vec::Vec::new(), 0)).expect("gpu resize event");
+	gpu_kernel.send(Message::new(resize, alloc::vec::Vec::new())).expect("gpu resize event");
 	acknowledge_present(&gpu_kernel, None);
 	let resize_event = events.recv().expect("typed display resize event");
 	assert_eq!(le_u32(&resize_event.bytes, 4), 4, "resize event width");
@@ -501,14 +501,14 @@ fn display_service_restores_the_console_surface() {
 	let bind_reply = display_admin.recv().expect("bound display reply");
 	assert_eq!(bind_reply.bytes[4], 1, "display-admin bind succeeds");
 	let frozen = bind_reply.caps.first().expect("bound display connection").object().into_any_arc().downcast::<Channel>().expect("bound display is a channel");
-	frozen.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("bound factory escape attempt");
+	frozen.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("bound factory escape attempt");
 	sched::run_until_idle();
 	assert!(frozen.recv().is_err(), "process-bound display connection cannot mint an unbound child");
 	let frozen_surface = acquire(&frozen, &focus_input, b"SET", 9, 2, 2);
 	fill(&frozen_surface, 0x0000_77dd, 4);
 	frozen.send(request(2, 10, &[0, 0, 2, 2])).expect("frozen app present");
 	acknowledge_present(&gpu_kernel, Some((&frozen, 10)));
-	kill_input.send(Message::new(b"KILL".to_vec(), alloc::vec::Vec::new(), 0)).expect("emergency display revoke");
+	kill_input.send(Message::new(b"KILL".to_vec(), alloc::vec::Vec::new())).expect("emergency display revoke");
 	acknowledge_focus(&focus_input, b"CONSOLE");
 	acknowledge_present(&gpu_kernel, None);
 	assert!(frozen.is_peer_closed(), "emergency revoke closes the foreground display connection");
@@ -646,7 +646,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 		f.extend_from_slice(&((8 + bootp.len()) as u16).to_be_bytes());
 		f.extend_from_slice(&[0, 0]); // checksum: unverified
 		f.extend_from_slice(&bootp);
-		Message::new(f, alloc::vec::Vec::new(), 0)
+		Message::new(f, alloc::vec::Vec::new())
 	};
 	// Decode a frame from the service: a DHCP client message's (type, ciaddr,
 	// unicast Ethernet destination, server-id option present), or None.
@@ -686,7 +686,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	send_cap(&boot_kernel, b"FRAMES", frames_user, Rights::ALL).expect("frames bootstrap");
 	// no config tree serves this scenario: CONFIG with no handle tells the service
 	// to fall back to its compiled-in defaults (the neighbor-cache size).
-	boot_kernel.send(Message::new(b"CONFIG".to_vec(), alloc::vec::Vec::new(), 0)).expect("config bootstrap");
+	boot_kernel.send(Message::new(b"CONFIG".to_vec(), alloc::vec::Vec::new())).expect("config bootstrap");
 	send_cap(&boot_kernel, b"SERVE", serve_user, Rights::ALL).expect("serve bootstrap");
 	// Pre-queue the whole bind conversation (the kernel test thread cannot answer
 	// mid-wait): the MAC lead-in, the OFFER and the clock-carrying ACK the handshake
@@ -695,7 +695,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	let mut mac_msg = alloc::vec::Vec::new();
 	mac_msg.extend_from_slice(b"MAC");
 	mac_msg.extend_from_slice(&our_mac);
-	frames_kernel.send(Message::new(mac_msg, alloc::vec::Vec::new(), 0)).expect("MAC handoff");
+	frames_kernel.send(Message::new(mac_msg, alloc::vec::Vec::new())).expect("MAC handoff");
 	frames_kernel.send(reply(2, [255; 4], [0xff; 6])).expect("the OFFER should queue");
 	frames_kernel.send(reply(5, [255; 4], [0xff; 6])).expect("the ACK should queue");
 	let mut arp_reply = alloc::vec::Vec::new();
@@ -707,7 +707,7 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	arp_reply.extend_from_slice(&server);
 	arp_reply.extend_from_slice(&our_mac);
 	arp_reply.extend_from_slice(&leased);
-	frames_kernel.send(Message::new(arp_reply, alloc::vec::Vec::new(), 0)).expect("the ARP reply should queue");
+	frames_kernel.send(Message::new(arp_reply, alloc::vec::Vec::new())).expect("the ARP reply should queue");
 	sched::run_until_idle();
 
 	// The service binds and reports in; its side of the conversation arrives in
@@ -927,7 +927,7 @@ fn a_prepared_launch_can_be_cancelled_and_a_client_that_leaves_cancels_its_own()
 		request.extend_from_slice(&9u16.to_le_bytes()); // cancel
 		request.extend_from_slice(&correlation.to_le_bytes());
 		request.extend_from_slice(&koid.to_le_bytes());
-		client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("cancel request");
+		client.send(Message::new(request, alloc::vec::Vec::new())).expect("cancel request");
 		sched::run_until_idle();
 		let reply = client.recv().expect("cancel reply");
 		assert_eq!(le_u32(&reply.bytes, 0), correlation, "the reply echoes the correlation id");
@@ -944,7 +944,7 @@ fn a_prepared_launch_can_be_cancelled_and_a_client_that_leaves_cancels_its_own()
 	// gone - and everything it had prepared stayed prepared. Measured on the frame allocator,
 	// because what is being held is a loaded program: its image, its stacks and its page tables.
 	let before = mem::frame::free_count();
-	service_client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("connect request");
+	service_client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("connect request");
 	sched::run_until_idle();
 	let connected = service_client.recv().expect("connect reply");
 	let sub: alloc::sync::Arc<Channel> = connected.caps.first().expect("a minted client channel").object().into_any_arc().downcast::<Channel>().expect("the mint is a channel");
@@ -1062,13 +1062,13 @@ fn process_service_resolves_one_final_executable_suffix() {
 
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), process_elf, boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	loader::spawn_elf_process(sched::root_domain(), process_elf, boot_user, Rights::ALL).expect("spawn ProcessService");
 	send_package(&boot_kernel, &repeated_package).expect("custom package bootstrap");
-	boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec::Vec::new(), 0)).expect("empty storage bootstrap");
+	boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec::Vec::new())).expect("empty storage bootstrap");
 	// Likewise an empty "REGISTRY": absent, but still handed over, because the
 	// bootstrap consumes one message per handoff in order and a skipped handoff
 	// swallows the next message instead of being skipped.
-	boot_kernel.send(Message::new(b"REGISTRY".to_vec(), alloc::vec::Vec::new(), 0)).expect("empty registry bootstrap");
+	boot_kernel.send(Message::new(b"REGISTRY".to_vec(), alloc::vec::Vec::new())).expect("empty registry bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
 
 	for (corr, name) in [(1u32, &b"ping"[..]), (2, &b"ping.lsexe"[..]), (3, &b"ping.lsexe.lsexe"[..])] {
@@ -1077,9 +1077,9 @@ fn process_service_resolves_one_final_executable_suffix() {
 		start.extend_from_slice(&corr.to_le_bytes());
 		start.extend_from_slice(&(name.len() as u16).to_le_bytes());
 		start.extend_from_slice(name);
-		service_client.send(Message::new(start, alloc::vec::Vec::new(), 0)).expect("start request");
+		service_client.send(Message::new(start, alloc::vec::Vec::new())).expect("start request");
 	}
-	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("quit sentinel");
 	sched::run_until_idle();
 
 	assert_eq!(&boot_kernel.recv().expect("ProcessService online report").bytes, b"ProcessService: online");
@@ -1115,13 +1115,13 @@ fn config_service_serves_the_tree() {
 		m.extend_from_slice(key);
 		m
 	};
-	service_client.send(Message::new(get(1, b"system.name"), alloc::vec::Vec::new(), 0)).expect("get");
+	service_client.send(Message::new(get(1, b"system.name"), alloc::vec::Vec::new())).expect("get");
 
 	// LIST: [op = 2 u16][corr u32].
 	let mut list = alloc::vec::Vec::new();
 	list.extend_from_slice(&2u16.to_le_bytes());
 	list.extend_from_slice(&2u32.to_le_bytes());
-	service_client.send(Message::new(list, alloc::vec::Vec::new(), 0)).expect("list");
+	service_client.send(Message::new(list, alloc::vec::Vec::new())).expect("list");
 
 	// SET demo.key = hi: [op = 3 u16][corr u32][config-entry: key string + value string].
 	let (k, v): (&[u8], &[u8]) = (b"demo.key", b"hi");
@@ -1132,9 +1132,9 @@ fn config_service_serves_the_tree() {
 	set.extend_from_slice(k);
 	set.extend_from_slice(&(v.len() as u16).to_le_bytes());
 	set.extend_from_slice(v);
-	service_client.send(Message::new(set, alloc::vec::Vec::new(), 0)).expect("set");
-	service_client.send(Message::new(get(4, b"demo.key"), alloc::vec::Vec::new(), 0)).expect("get-back");
-	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	service_client.send(Message::new(set, alloc::vec::Vec::new())).expect("set");
+	service_client.send(Message::new(get(4, b"demo.key"), alloc::vec::Vec::new())).expect("get-back");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("quit sentinel");
 
 	sched::run_until_idle();
 
@@ -1195,7 +1195,7 @@ fn config_set_survives_a_service_reboot() {
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
 	let (storage_server, storage_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
+	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL).expect("spawn StorageService");
 	send_cap(&storage_boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("BLOCK bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("SERVE bootstrap");
 	let mut disk: BTreeMap<u64, alloc::vec::Vec<u8>> = crate::tests::whole_device_volume(CAPACITY as usize);
@@ -1215,7 +1215,7 @@ fn config_set_survives_a_service_reboot() {
 	// factory), pumping block traffic while the service answers.
 	fn mint_volume(storage_client: &alloc::sync::Arc<object::channel::Channel>, blk_host: &alloc::sync::Arc<object::channel::Channel>, disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<u8>>, capacity: u64) -> alloc::sync::Arc<object::channel::Channel> {
 		use object::channel::{Channel, Message};
-		storage_client.send(Message::new(0xffffu16.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("connect request");
+		storage_client.send(Message::new(0xffffu16.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("connect request");
 		for _ in 0..100_000 {
 			sched::run_until_idle();
 			pump_block_stand_in(blk_host, disk, capacity);
@@ -1245,7 +1245,7 @@ fn config_set_survives_a_service_reboot() {
 	set.extend_from_slice(k);
 	set.extend_from_slice(&(v.len() as u16).to_le_bytes());
 	set.extend_from_slice(v);
-	cfg1_client.send(Message::new(set, alloc::vec::Vec::new(), 0)).expect("set request");
+	cfg1_client.send(Message::new(set, alloc::vec::Vec::new())).expect("set request");
 	let mut set_ok = false;
 	for _ in 0..100_000 {
 		sched::run_until_idle();
@@ -1259,7 +1259,7 @@ fn config_set_survives_a_service_reboot() {
 	}
 	assert!(set_ok, "the set should be answered");
 	// End the first instance: the quit sentinel breaks its serve loop and it exits.
-	cfg1_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	cfg1_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("quit sentinel");
 	sched::run_until_idle();
 
 	// The second instance over the SAME volume: the persisted tree loads back.
@@ -1277,8 +1277,8 @@ fn config_set_survives_a_service_reboot() {
 		m.extend_from_slice(key);
 		m
 	};
-	cfg2_client.send(Message::new(get(1, b"persist.key"), alloc::vec::Vec::new(), 0)).expect("get persisted");
-	cfg2_client.send(Message::new(get(2, b"system.name"), alloc::vec::Vec::new(), 0)).expect("get seeded");
+	cfg2_client.send(Message::new(get(1, b"persist.key"), alloc::vec::Vec::new())).expect("get persisted");
+	cfg2_client.send(Message::new(get(2, b"system.name"), alloc::vec::Vec::new())).expect("get seeded");
 	let mut replies: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
 	for _ in 0..100_000 {
 		sched::run_until_idle();
@@ -1298,7 +1298,7 @@ fn config_set_survives_a_service_reboot() {
 	assert_eq!(replies[1][4], 1, "a seeded default still serves");
 	let nlen = le_u16(&replies[1], 5) as usize;
 	assert_eq!(&replies[1][7..7 + nlen], b"LiberSystem", "the persisted tree overlays, not replaces, the defaults");
-	cfg2_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel 2");
+	cfg2_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("quit sentinel 2");
 	sched::run_until_idle();
 }
 
@@ -1488,7 +1488,7 @@ fn a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind() {
 	let channel_cap = |rights: Rights| -> object::handle::Capability {
 		let (_keep, far) = Channel::create();
 		core::mem::forget(_keep);
-		object::handle::Capability::new(far as alloc::sync::Arc<dyn object::KernelObject>, rights, 0)
+		object::handle::Capability::new(far as alloc::sync::Arc<dyn object::KernelObject>, rights)
 	};
 	let serving: Rights = Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER;
 
@@ -1497,15 +1497,15 @@ fn a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind() {
 	//    would be one that cannot start on a smaller machine.
 	let all = drive(0, &|parent| {
 		for tag in [b"SERVE".as_slice(), b"STORAGE".as_slice()] {
-			parent.send(Message::new(tag.to_vec(), alloc::vec![channel_cap(serving)], 0)).expect("role");
+			parent.send(Message::new(tag.to_vec(), alloc::vec![channel_cap(serving)])).expect("role");
 		}
-		parent.send(Message::new(b"MEDIA".to_vec(), alloc::vec::Vec::new(), 0)).expect("absent optional role");
+		parent.send(Message::new(b"MEDIA".to_vec(), alloc::vec::Vec::new())).expect("absent optional role");
 	});
 	assert_eq!(all.as_slice(), b"ok 2", "every declared role is accepted, and the absent optional one is not an error");
 
 	// 2. A REQUIRED ROLE THAT NEVER ARRIVES. The peer closes instead of sending it.
 	let missing = drive(1, &|parent| {
-		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![channel_cap(serving)], 0)).expect("first role");
+		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![channel_cap(serving)])).expect("first role");
 	});
 	assert_eq!(missing.as_slice(), b"STORAGE:role never arrived 0", "the missing role is named, and the one already taken is closed rather than kept");
 
@@ -1513,8 +1513,8 @@ fn a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind() {
 	//    channel, and the kernel will say so - which is the whole of what this layer can check.
 	let wrong = drive(2, &|parent| {
 		let object = MemoryObject::create(4096).expect("probe memory object");
-		let cap = object::handle::Capability::new(object as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
-		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![cap], 0)).expect("wrong-type role");
+		let cap = object::handle::Capability::new(object as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER);
+		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![cap])).expect("wrong-type role");
 	});
 	assert_eq!(wrong.as_slice(), b"SERVE:role carried the wrong kind of object 0", "a memory object under a channel role is refused, and nothing is kept");
 
@@ -1523,7 +1523,7 @@ fn a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind() {
 	//    bootstrap is the difference between a service that fails to start and one that starts
 	//    broken.
 	let thin = drive(3, &|parent| {
-		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![channel_cap(Rights::SEND | Rights::TRANSFER)], 0)).expect("thin role");
+		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![channel_cap(Rights::SEND | Rights::TRANSFER)])).expect("thin role");
 	});
 	assert_eq!(thin.as_slice(), b"SERVE:role carried fewer rights than it needs 0", "a channel without RECEIVE cannot be served on, and is refused before ready");
 
@@ -1534,14 +1534,14 @@ fn a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind() {
 	//    rather than trimmed: a receiver that quietly narrowed what it was handed would hide the
 	//    sender, and the sender is where it has to be fixed.
 	let broad = drive(3, &|parent| {
-		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![channel_cap(Rights::ALL)], 0)).expect("over-granted role");
+		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![channel_cap(Rights::ALL)])).expect("over-granted role");
 	});
 	assert_eq!(broad.as_slice(), b"SERVE:role carried more rights than it is allowed 0", "a serve root carrying every right is refused");
 
 	// 6. A ROLE ARRIVING OUT OF POSITION. The sequence is the contract: a tag in the wrong place
 	//    has already displaced every read after it, so it is refused here rather than consumed.
 	let disordered = drive(0, &|parent| {
-		parent.send(Message::new(b"STORAGE".to_vec(), alloc::vec![channel_cap(serving)], 0)).expect("role out of order");
+		parent.send(Message::new(b"STORAGE".to_vec(), alloc::vec![channel_cap(serving)])).expect("role out of order");
 	});
 	assert_eq!(disordered.as_slice(), b"SERVE:a different role arrived in this position 0", "a tag out of order is refused rather than silently consumed");
 }
@@ -1579,7 +1579,7 @@ fn pty_hosts_a_program() {
 	// ProcessService below can load the ptyecho slave from vol://system/bin/ptyecho.lsexe.
 	let (storage_boot_kernel, storage_boot_user) = Channel::create();
 	let (storage_server, storage_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
+	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL).expect("spawn StorageService");
 	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
 
@@ -1588,7 +1588,7 @@ fn pty_hosts_a_program() {
 	// StorageService client.
 	let (proc_boot_kernel, proc_boot_user) = Channel::create();
 	let (proc_server, proc_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), process_elf, proc_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	loader::spawn_elf_process(sched::root_domain(), process_elf, proc_boot_user, Rights::ALL).expect("spawn ProcessService");
 	send_package(&proc_boot_kernel, init).expect("process package bootstrap");
 	send_cap(&proc_boot_kernel, b"STORAGE", storage_client, Rights::ALL).expect("process storage bootstrap");
 	// The development registry with its far end dropped, so nothing answers and every
@@ -1605,13 +1605,13 @@ fn pty_hosts_a_program() {
 		let factory: alloc::sync::Arc<dyn object::KernelObject> = if tag == b"FPROCESS" { proc_client.clone() } else { dummy_a.clone() };
 		send_cap(&boot_kernel, tag, factory, Rights::ALL).expect("factory bootstrap");
 	}
-	boot_kernel.send(Message::new(b"GPU".to_vec(), alloc::vec::Vec::new(), 0)).expect("GPU bootstrap");
-	boot_kernel.send(Message::new(b"POINTER".to_vec(), alloc::vec::Vec::new(), 0)).expect("POINTER bootstrap");
-	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("READY bootstrap");
+	boot_kernel.send(Message::new(b"GPU".to_vec(), alloc::vec::Vec::new())).expect("GPU bootstrap");
+	boot_kernel.send(Message::new(b"POINTER".to_vec(), alloc::vec::Vec::new())).expect("POINTER bootstrap");
+	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("READY bootstrap");
 
 	// stand in for the shell's PTY_OPEN request: ask the console to host a `ptyecho` slave
 	// on a new pty.
-	ctl_shell.send(Message::new(b"PTY_OPENptyecho".to_vec(), alloc::vec::Vec::new(), 0)).expect("PTY_OPEN request");
+	ctl_shell.send(Message::new(b"PTY_OPENptyecho".to_vec(), alloc::vec::Vec::new())).expect("PTY_OPEN request");
 
 	sched::run_until_idle();
 
@@ -1623,7 +1623,7 @@ fn pty_hosts_a_program() {
 
 	// drive the slave: a line through the master is cooked and delivered, the slave echoes
 	// it back prefixed, and the prefixed line is forwarded out the master back to us.
-	master.send(Message::new(b"hello\n".to_vec(), alloc::vec::Vec::new(), 0)).expect("write to the pty master");
+	master.send(Message::new(b"hello\n".to_vec(), alloc::vec::Vec::new())).expect("write to the pty master");
 	sched::run_until_idle();
 
 	let mut captured = alloc::vec::Vec::new();
@@ -1671,7 +1671,7 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	let (_display_admin, admin) = Channel::create();
 	send_cap(&display_boot_kernel, b"ADMIN", admin, Rights::ALL).expect("display admin bootstrap");
 	send_cap(&display_boot_kernel, b"SERVE", display_server, Rights::ALL).expect("serve bootstrap");
-	display_boot_kernel.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new(), 0)).expect("display capability bootstrap");
+	display_boot_kernel.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new())).expect("display capability bootstrap");
 
 	// 160x64 B8G8R8X8: 20 columns by 4 rows at this font, which is a grid a query can be asked on.
 	const FB_W: u32 = 160;
@@ -1698,7 +1698,7 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	let ack_presents = |gpu: &Channel| {
 		while let Ok(message) = gpu.recv() {
 			if message.bytes.starts_with(b"PRESENT") {
-				gpu.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("present acknowledgement");
+				gpu.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("present acknowledgement");
 			}
 			sched::run_until_idle();
 		}
@@ -1710,7 +1710,7 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	// anything the console did.
 	let ack_focus = |focus: &Channel| {
 		while let Ok(_command) = focus.recv() {
-			focus.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("focus acknowledgement");
+			focus.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
 			sched::run_until_idle();
 		}
 	};
@@ -1727,8 +1727,8 @@ fn the_console_answers_a_program_through_its_own_channel() {
 		send_cap(&console_boot_kernel, tag, dummy.clone(), Rights::ALL).expect("factory bootstrap");
 	}
 	send_cap(&console_boot_kernel, b"DISPLAY", display_client, Rights::ALL).expect("DISPLAY bootstrap");
-	console_boot_kernel.send(Message::new(b"POINTER".to_vec(), alloc::vec::Vec::new(), 0)).expect("POINTER bootstrap");
-	console_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("READY bootstrap");
+	console_boot_kernel.send(Message::new(b"POINTER".to_vec(), alloc::vec::Vec::new())).expect("POINTER bootstrap");
+	console_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("READY bootstrap");
 	// SEVERAL SETTLES, not one. `run_until_idle` returns when nothing is RUNNABLE, and bring-up
 	// crosses timed waits - the bounded wait for a ConfigService that is not there, and the display
 	// round trips - so a thread parked on a deadline leaves the loop with the work unfinished. The
@@ -1750,7 +1750,7 @@ fn the_console_answers_a_program_through_its_own_channel() {
 
 	// Print bytes as a program would, then read what the console owes it back.
 	let print = |bytes: &[u8]| {
-		vt1_program.send(Message::new(bytes.to_vec(), alloc::vec::Vec::new(), 0)).expect("program output");
+		vt1_program.send(Message::new(bytes.to_vec(), alloc::vec::Vec::new())).expect("program output");
 		settle(&gpu_kernel, &focus_input);
 	};
 	let read_input = || -> alloc::vec::Vec<u8> {
@@ -1818,8 +1818,8 @@ fn ps_live_view_drives_the_terminal_contract() {
 	let (proc_host, proc_child) = Channel::create();
 	let _ps = spawn_dynamic_test_process(sched::root_domain(), ps_elf, boot_user);
 	send_cap(&boot_kernel, b"STDOUT", console_child, Rights::ALL).expect("STDOUT bootstrap");
-	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
-	boot_kernel.send(Message::new(crate::tests::launch_context(b"-i", b""), alloc::vec::Vec::new(), 0)).expect("argv bootstrap");
+	boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	boot_kernel.send(Message::new(crate::tests::launch_context(b"-i", b""), alloc::vec::Vec::new())).expect("argv bootstrap");
 	send_cap(&boot_kernel, b"RESOURCE", res_child, Rights::ALL).expect("RESOURCE bootstrap");
 	send_cap(&boot_kernel, b"PROCESS", proc_child, Rights::ALL).expect("PROCESS bootstrap");
 	sched::run_until_idle();
@@ -1827,11 +1827,11 @@ fn ps_live_view_drives_the_terminal_contract() {
 	// the first frame queries the process list; answer garbage so it renders the
 	// unavailable row, queue the quitting keystroke, then answer the budgets query.
 	let _list_req = proc_host.recv().expect("the live view should query the process list");
-	proc_host.send(Message::new(b"?".to_vec(), alloc::vec::Vec::new(), 0)).expect("the garbage list reply should send");
-	console_host.send(Message::new(b"q".to_vec(), alloc::vec::Vec::new(), 0)).expect("the raw q keystroke should send");
+	proc_host.send(Message::new(b"?".to_vec(), alloc::vec::Vec::new())).expect("the garbage list reply should send");
+	console_host.send(Message::new(b"q".to_vec(), alloc::vec::Vec::new())).expect("the raw q keystroke should send");
 	sched::run_until_idle();
 	let _usage_req = res_host.recv().expect("the live view should query the budgets");
-	res_host.send(Message::new(b"?".to_vec(), alloc::vec::Vec::new(), 0)).expect("the garbage usage reply should send");
+	res_host.send(Message::new(b"?".to_vec(), alloc::vec::Vec::new())).expect("the garbage usage reply should send");
 	sched::run_until_idle();
 
 	let mut captured = alloc::vec::Vec::new();

@@ -34,7 +34,7 @@ fn object_property_set_bounds_a_domain() {
 		DONE.store(true, Ordering::SeqCst);
 	}
 	let domain = Domain::new(UNLIMITED, UNLIMITED, UNLIMITED);
-	crate::sched::spawn_with_object(body, domain.clone(), crate::object::rights::Rights::ALL, 0);
+	crate::sched::spawn_with_object(body, domain.clone(), crate::object::rights::Rights::ALL);
 	crate::sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst));
 	assert_eq!(domain.account().memory().limit(), 8192);

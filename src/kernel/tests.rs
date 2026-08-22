@@ -121,8 +121,8 @@ pub(crate) fn launch_context(arguments: &[u8], cwd: &[u8]) -> alloc::vec::Vec<u8
 }
 
 fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> Result<(), &'static str> {
-	let cap = object::handle::Capability::new(object, rights, 0);
-	channel.send(object::channel::Message::new(payload.to_vec(), alloc::vec![cap], 0)).map_err(|_| "bootstrap capability send failed")
+	let cap = object::handle::Capability::new(object, rights);
+	channel.send(object::channel::Message::new(payload.to_vec(), alloc::vec![cap])).map_err(|_| "bootstrap capability send failed")
 }
 
 // Create a ramdisk MemoryObject from `volume`, fill it, and hand it to a service's
@@ -177,7 +177,7 @@ fn run_storage_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>), 
 
 	// spawn the two processes with their bootstrap endpoints
 	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain.clone(), service_elf, service_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain.clone(), service_elf, service_boot_user, Rights::ALL).map_err(|_| "failed to load StorageService")?;
 	let _client = spawn_dynamic_test_process(domain, client_elf, client_boot_user);
 
 	// hand the service its ramdisk (with the volume length) and its service
@@ -265,7 +265,7 @@ fn run_wasi_scenario_on(serve: Option<&[u8]>) -> Result<WasiRun, &'static str> {
 	let (service_server, service_client) = Channel::create();
 
 	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL).map_err(|_| "failed to load StorageService")?;
 	let _host = spawn_dynamic_test_process(domain, host_elf, host_boot_user);
 
 	// storage bootstrap: the ramdisk volume and its service channel; the host gets
@@ -323,7 +323,7 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 	let (picker_server, picker_client) = Channel::create();
 
 	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL).map_err(|_| "failed to load StorageService")?;
 	let _picker = spawn_dynamic_test_process(domain.clone(), picker_elf, picker_boot_user);
 	let _host = spawn_dynamic_test_process(domain, host_elf, host_boot_user);
 
@@ -834,8 +834,8 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	// the CALLER'S, so ProcessService - itself started here - creates the governed tools and the
 	// real shell inside this domain too, however many levels down the request came from.
 	let domain = fixture_domain.clone();
-	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
-	loader::spawn_elf_process(domain.clone(), process_elf, process_boot_user, Rights::ALL, 0).map_err(|_| "failed to load ProcessService")?;
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain.clone(), process_elf, process_boot_user, Rights::ALL).map_err(|_| "failed to load ProcessService")?;
 	let _time = spawn_dynamic_test_process(domain.clone(), time_elf, time_boot_user);
 	let _permission_manager = spawn_dynamic_test_process(domain.clone(), pm_elf, pm_boot_user);
 
@@ -898,7 +898,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	// everything after it - which is exactly how this failed when the pair was added to the
 	// manager and not here. Kept because the scenario is more faithful for sending them.
 	for tag in [b"STORAGE_RAM".as_slice(), b"STORAGE_TMP".as_slice()] {
-		pm_boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not hand PermissionManager a memory volume slot")?;
+		pm_boot_kernel.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).map_err(|_| "could not hand PermissionManager a memory volume slot")?;
 	}
 	send_cap(&pm_boot_kernel, b"SERVICES", services_client, Rights::ALL)?;
 	send_cap(&pm_boot_kernel, b"USBBUS", usb_client, Rights::ALL)?;
@@ -909,7 +909,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	// never comes and does nothing at all - which is how this harness first failed after that
 	// migration. Being a hand-written third sender of a handshake is exactly why the ordered
 	// version of it kept drifting.
-	pm_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not end PermissionManager's bootstrap")?;
+	pm_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).map_err(|_| "could not end PermissionManager's bootstrap")?;
 
 	sched::run_until_idle();
 	let open_request = net_server.recv().map_err(|_| "PermissionManager did not request a fresh NetworkService client")?;
@@ -936,7 +936,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	info_reply.extend_from_slice(&1500u16.to_le_bytes());
 	info_reply.extend_from_slice(&[10, 0, 2, 2]);
 	info_reply.extend_from_slice(&0u16.to_le_bytes());
-	tool_net_server.send(Message::new(info_reply, alloc::vec::Vec::new(), 0)).map_err(|_| "could not answer governed ip NetworkService request")?;
+	tool_net_server.send(Message::new(info_reply, alloc::vec::Vec::new())).map_err(|_| "could not answer governed ip NetworkService request")?;
 	sched::run_until_idle();
 
 	// A two-stage pipeline through the SAME broker: `echo` writes into the edge and `readln`
@@ -1284,7 +1284,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		send_cap(&shell_boot_kernel, b"PERM", perm_client_for_shell, Rights::ALL)?;
 		send_cap(&shell_boot_kernel, b"CONSOLE", shell_console, Rights::ALL)?;
 		send_cap(&shell_boot_kernel, b"CONTROL", shell_control, Rights::ALL)?;
-		shell_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not end the shell's bootstrap")?;
+		shell_boot_kernel.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).map_err(|_| "could not end the shell's bootstrap")?;
 		sched::run_until_idle();
 		// WHAT THE SHELL SAID ON ITS BOOTSTRAP, kept for the failure message. A shell that could not
 		// start writes the reason there and exits, and without this a missing capability looks
@@ -1335,7 +1335,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 			// merely that a particular error went missing.
 			&b"which\n"[..],
 		] {
-			terminal.send(Message::new(line.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "could not type at the shell")?;
+			terminal.send(Message::new(line.to_vec(), alloc::vec::Vec::new())).map_err(|_| "could not type at the shell")?;
 			for _ in 0..24 {
 				sched::run_until_idle();
 				match terminal.recv() {
@@ -1457,7 +1457,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		return Err("imgview presented a blank decoded image");
 	}
 	let present_corr = le_u32(&present.bytes, 2);
-	view_display_server.send(Message::new([present_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview present reply failed")?;
+	view_display_server.send(Message::new([present_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview present reply failed")?;
 	sched::run_until_idle();
 
 	let focus_request = view_display_server.recv().map_err(|_| "imgview did not request input focus")?;
@@ -1491,32 +1491,32 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	// the viewport, so asserting a pan present without zooming first asked for the impossible -
 	// which is what this scenario did, and why it had never passed.
 	let zoom_frame = [0, 0, 0, 0, 0x2e, 0, 1];
-	key_producer.send(Message::new(zoom_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send imgview zoom key")?;
+	key_producer.send(Message::new(zoom_frame.to_vec(), alloc::vec::Vec::new())).map_err(|_| "failed to send imgview zoom key")?;
 	sched::run_until_idle();
 	let zoom_present = view_display_server.recv().map_err(|_| "imgview did not present after zoom-in")?;
 	let zoom_corr = le_u32(&zoom_present.bytes, 2);
-	view_display_server.send(Message::new([zoom_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview zoom-present reply failed")?;
+	view_display_server.send(Message::new([zoom_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview zoom-present reply failed")?;
 	sched::run_until_idle();
 
 	let pan_frame = [0, 0, 0, 0, 0x4f, 0, 1];
-	key_producer.send(Message::new(pan_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send imgview pan key")?;
+	key_producer.send(Message::new(pan_frame.to_vec(), alloc::vec::Vec::new())).map_err(|_| "failed to send imgview pan key")?;
 	sched::run_until_idle();
 	let pan_present = view_display_server.recv().map_err(|_| "imgview did not present after arrow-key pan")?;
 	if pan_present.bytes.len() < 22 || le_u16(&pan_present.bytes, 0) != 2 || le_u32(&pan_present.bytes, 14) != 1 || le_u32(&pan_present.bytes, 18) != 1 {
 		return Err("imgview sent an invalid pan present");
 	}
 	let pan_corr = le_u32(&pan_present.bytes, 2);
-	view_display_server.send(Message::new([pan_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview pan-present reply failed")?;
+	view_display_server.send(Message::new([pan_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview pan-present reply failed")?;
 	sched::run_until_idle();
 	// Release the arrow, because panning is continuous while a key is held: a press that is
 	// never released keeps producing presents, and how many arrive before the next step is a
 	// matter of how fast the target runs. Emulated riscv64 is roughly twenty-five times slower
 	// than x86_64 here, which is enough for the difference to change what the next receive sees.
 	let pan_release = [0, 0, 0, 0, 0x4f, 0, 0];
-	key_producer.send(Message::new(pan_release.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to release imgview pan key")?;
+	key_producer.send(Message::new(pan_release.to_vec(), alloc::vec::Vec::new())).map_err(|_| "failed to release imgview pan key")?;
 	sched::run_until_idle();
 	let quit_frame = [1, 0, 0, 0, 0x14, 0, 1];
-	key_producer.send(Message::new(quit_frame.to_vec(), alloc::vec::Vec::new(), 0)).map_err(|_| "failed to send imgview quit key")?;
+	key_producer.send(Message::new(quit_frame.to_vec(), alloc::vec::Vec::new())).map_err(|_| "failed to send imgview quit key")?;
 	sched::run_until_idle();
 
 	// Answer any presents still in flight before the release. Requiring the release to be the
@@ -1531,11 +1531,11 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 			return Err("imgview sent an invalid release request");
 		}
 		let corr = le_u32(&message.bytes, 2);
-		view_display_server.send(Message::new([corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview trailing-present reply failed")?;
+		view_display_server.send(Message::new([corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview trailing-present reply failed")?;
 		sched::run_until_idle();
 	};
 	let release_corr = le_u32(&release.bytes, 2);
-	view_display_server.send(Message::new([release_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "imgview release reply failed")?;
+	view_display_server.send(Message::new([release_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "imgview release reply failed")?;
 	core::mem::drop(view_output);
 	sched::run_until_idle();
 	if !view_process.is_terminated() {
@@ -1588,7 +1588,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 			}
 		}
 		let correlation = le_u32(&write.bytes, 2);
-		mp3_stream_server.send(Message::new([correlation.to_le_bytes().as_slice(), &[1], &1_024u32.to_le_bytes()].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "MP3 PCM reply failed")?;
+		mp3_stream_server.send(Message::new([correlation.to_le_bytes().as_slice(), &[1], &1_024u32.to_le_bytes()].concat(), alloc::vec::Vec::new())).map_err(|_| "MP3 PCM reply failed")?;
 		sched::run_until_idle();
 		if heard_audio {
 			break;
@@ -1599,7 +1599,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	}
 	let mp3_close = mp3_stream_server.recv().map_err(|_| "MP3 play did not close")?;
 	let mp3_close_corr = le_u32(&mp3_close.bytes, 2);
-	mp3_stream_server.send(Message::new([mp3_close_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).map_err(|_| "MP3 close reply failed")?;
+	mp3_stream_server.send(Message::new([mp3_close_corr.to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).map_err(|_| "MP3 close reply failed")?;
 	core::mem::drop(mp3_output);
 	sched::run_until_idle();
 	if !mp3_process.is_terminated() {
@@ -1639,8 +1639,8 @@ fn run_component_scenario() -> Result<ComponentRun, &'static str> {
 	let (log_server, log_client) = Channel::create();
 
 	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
-	loader::spawn_elf_process(domain.clone(), log_elf, log_boot_user, Rights::ALL, 0).map_err(|_| "failed to load LogService")?;
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(domain.clone(), log_elf, log_boot_user, Rights::ALL).map_err(|_| "failed to load LogService")?;
 	let _host = spawn_dynamic_test_process(domain, host_elf, host_boot_user);
 
 	// StorageService: the ramdisk volume and its service channel. LogService: its
@@ -1790,16 +1790,16 @@ fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 	let (service_boot_kernel, service_boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 
-	loader::spawn_elf_process(sched::root_domain(), service_elf, service_boot_user, Rights::ALL, 0).map_err(|_| "failed to load StorageService")?;
+	loader::spawn_elf_process(sched::root_domain(), service_elf, service_boot_user, Rights::ALL).map_err(|_| "failed to load StorageService")?;
 
 	// bootstrap the service: the ramdisk (with its length) and the service endpoint
 	let mut ramdisk_msg = alloc::vec::Vec::with_capacity(7 + 8);
 	ramdisk_msg.extend_from_slice(b"RAMDISK");
 	ramdisk_msg.extend_from_slice(&(volume.len() as u64).to_le_bytes());
-	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP, 0);
-	service_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap], 0)).map_err(|_| "service ramdisk bootstrap failed")?;
-	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL, 0);
-	service_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap], 0)).map_err(|_| "service serve bootstrap failed")?;
+	let ramdisk_cap = Capability::new(ramdisk as Arc<dyn KernelObject>, Rights::READ | Rights::MAP);
+	service_boot_kernel.send(Message::new(ramdisk_msg, alloc::vec![ramdisk_cap])).map_err(|_| "service ramdisk bootstrap failed")?;
+	let service_server_cap = Capability::new(service_server as Arc<dyn KernelObject>, Rights::ALL);
+	service_boot_kernel.send(Message::new(b"SERVE".to_vec(), alloc::vec![service_server_cap])).map_err(|_| "service serve bootstrap failed")?;
 
 	// the generated volume.open request - [op u16][corr u32][open-opts] where
 	// open-opts = [path: [len u16][utf8]][write u8][create u8] - then an empty quit
@@ -1812,8 +1812,8 @@ fn storage_read(uri: &[u8]) -> Result<alloc::vec::Vec<u8>, &'static str> {
 	request.extend_from_slice(uri);
 	request.push(0); // write = false
 	request.push(0); // create = false
-	service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).map_err(|_| "open request failed")?;
-	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).map_err(|_| "quit sentinel failed")?;
+	service_client.send(Message::new(request, alloc::vec::Vec::new())).map_err(|_| "open request failed")?;
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).map_err(|_| "quit sentinel failed")?;
 
 	sched::run_until_idle();
 
@@ -2074,7 +2074,7 @@ fn device_privilege() -> u64 {
 	use object::privilege::{Privilege, PrivilegeKind};
 	let thread = sched::current_thread().expect("a current thread");
 	let privilege = Privilege::create(PrivilegeKind::DeviceManager).expect("a test privilege");
-	thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL, 0).expect("the privilege installs").raw()
+	thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL).expect("the privilege installs").raw()
 }
 
 // Kernel-thread body for the driver-crash test: it acquires real driver resources
@@ -2463,7 +2463,7 @@ fn spawn_service(name: &[u8]) -> (alloc::sync::Arc<object::channel::Channel>, al
 	let _service = if bootproto::elf::Elf::parse(service_elf).is_some_and(|elf| elf.image_type == bootproto::elf::ET_DYN) {
 		Some(spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user))
 	} else {
-		loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn service");
+		loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL).expect("spawn service");
 		None
 	};
 	// THE RIGHTS THE SUPERVISOR HANDS. A serve root reaches a real service narrowed to send,
@@ -2487,7 +2487,7 @@ fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel:
 	let service_elf = program_elf(&package, volume, name).expect("service in the init package or volume");
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn service");
+	loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL).expect("spawn service");
 	let pkg_obj = object::memory_object::MemoryObject::create(init.len()).expect("memory for the package");
 	copy_into_object(&pkg_obj, init);
 	let mut pkg_msg = alloc::vec::Vec::new();
@@ -2496,12 +2496,12 @@ fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel:
 	send_cap(&boot_kernel, &pkg_msg, pkg_obj, Rights::READ | Rights::MAP | Rights::TRANSFER).expect("package bootstrap");
 	// A "STORAGE" message carrying no client (handle 0): ProcessService reads it, finds
 	// no storage client, and loads programs from the package instead.
-	boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec::Vec::new(), 0)).expect("storage bootstrap");
+	boot_kernel.send(Message::new(b"STORAGE".to_vec(), alloc::vec::Vec::new())).expect("storage bootstrap");
 	// The same for "REGISTRY": no development registry answers here, so every launch
 	// reads the volume. The message still has to arrive - the bootstrap reads its
 	// handoffs in order and each read consumes whatever arrived, so a skipped one is
 	// not skipped at all, it swallows the next message and then blocks forever.
-	boot_kernel.send(Message::new(b"REGISTRY".to_vec(), alloc::vec::Vec::new(), 0)).expect("registry bootstrap");
+	boot_kernel.send(Message::new(b"REGISTRY".to_vec(), alloc::vec::Vec::new())).expect("registry bootstrap");
 	// THE RIGHTS THE SUPERVISOR HANDS. A serve root reaches a real service narrowed to send,
 	// receive, wait and transfer, and a service that checks its bootstrap against the generated
 	// plan refuses anything wider - correctly. A harness standing in for the supervisor has to
@@ -2540,7 +2540,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		request.extend_from_slice(&corr.to_le_bytes());
 		request.extend_from_slice(&rate.to_le_bytes());
 		request.push(channels);
-		root.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("open-stream request");
+		root.send(Message::new(request, alloc::vec::Vec::new())).expect("open-stream request");
 		sched::run_until_idle();
 		let reply = root.recv().expect("open-stream reply");
 		assert_eq!(le_u32(&reply.bytes, 0), corr);
@@ -2555,7 +2555,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		let mut request = alloc::vec::Vec::new();
 		request.extend_from_slice(&1u16.to_le_bytes());
 		request.extend_from_slice(&corr.to_le_bytes());
-		admin.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("open playback-only connection");
+		admin.send(Message::new(request, alloc::vec::Vec::new())).expect("open playback-only connection");
 		sched::run_until_idle();
 		let reply = admin.recv().expect("playback-only connection reply");
 		assert_eq!(le_u32(&reply.bytes, 0), corr);
@@ -2580,15 +2580,15 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		assert_eq!(reply.bytes[4], 1, "dynamic play loaded with its providers");
 		let process = reply.caps[0].object().into_any_arc().downcast::<object::process::Process>().expect("play launch returns a Process");
 		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("play stdout bootstrap");
-		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
-		bootstrap.send(Message::new(launch_context(argument, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("play argument bootstrap");
+		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+		bootstrap.send(Message::new(launch_context(argument, b"vol://system"), alloc::vec::Vec::new())).expect("play argument bootstrap");
 		send_cap(&bootstrap, b"SYSTEM", storage, Rights::ALL).expect("play system volume bootstrap");
 		for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
-			bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("play absent volume bootstrap");
+			bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("play absent volume bootstrap");
 		}
-		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
+		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("volume bundle terminator");
 		send_cap(&bootstrap, b"AUDIO_STREAM", audio, Rights::ALL).expect("play audio-stream bootstrap");
-		bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new(), 0)).expect("play cwd bootstrap");
+		bootstrap.send(Message::new(b"vol://system".to_vec(), alloc::vec::Vec::new())).expect("play cwd bootstrap");
 		(stdout, process)
 	}
 
@@ -2621,7 +2621,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 		let mut request = alloc::vec::Vec::new();
 		request.extend_from_slice(&2u16.to_le_bytes());
 		request.extend_from_slice(&corr.to_le_bytes());
-		stream.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("PCM close request");
+		stream.send(Message::new(request, alloc::vec::Vec::new())).expect("PCM close request");
 	}
 
 	fn sample(message: &Message) -> i16 {
@@ -2641,8 +2641,8 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	let (boot_kernel, boot_user) = Channel::create();
 	let (service_server, service_client) = Channel::create();
 	let (snd_host, snd_service) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
-	loader::spawn_elf_process(sched::root_domain(), process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	loader::spawn_elf_process(sched::root_domain(), storage_elf, storage_boot_user, Rights::ALL).expect("spawn StorageService");
+	loader::spawn_elf_process(sched::root_domain(), process_elf, process_boot_user, Rights::ALL).expect("spawn ProcessService");
 	let _audio_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
 	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
@@ -2677,7 +2677,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			denied_beep.extend_from_slice(&31u32.to_le_bytes());
 			denied_beep.extend_from_slice(&440u16.to_le_bytes());
 			denied_beep.extend_from_slice(&10u32.to_le_bytes());
-			scoped.send(Message::new(denied_beep, alloc::vec::Vec::new(), 0)).expect("scoped beep request");
+			scoped.send(Message::new(denied_beep, alloc::vec::Vec::new())).expect("scoped beep request");
 			sched::run_until_idle();
 			let denied = scoped.recv().expect("scoped beep denial");
 			assert_eq!(denied.bytes[4], 0, "audio-stream scope denies beep");
@@ -2699,17 +2699,17 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			beep.extend_from_slice(&6u32.to_le_bytes());
 			beep.extend_from_slice(&1_000u16.to_le_bytes());
 			beep.extend_from_slice(&30u32.to_le_bytes());
-			service_client.send(Message::new(beep, alloc::vec::Vec::new(), 0)).expect("beep request");
+			service_client.send(Message::new(beep, alloc::vec::Vec::new())).expect("beep request");
 			sched::run_until_idle();
 			write_reply(&mono, 5, 512);
 			let beep_reply = service_client.recv().expect("beep reply");
 			assert_eq!(beep_reply.bytes[4], 1, "beep queues into the mixer");
 
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("first period ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("first period ACK");
 			sched::run_until_idle();
 			let second = snd_host.recv().expect("mixed second period");
 			assert_eq!(sample(&second), i16::MAX, "two streams plus beep saturate instead of wrapping");
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("second period ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("second period ACK");
 			sched::run_until_idle();
 			let third = snd_host.recv().expect("resampled third period");
 			assert_eq!(sample(&third), 27_000, "24 kHz mono is duplicated and survives for two output periods");
@@ -2719,15 +2719,15 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			sched::run_until_idle();
 			assert_eq!(stereo.recv().expect("stereo close reply").bytes[4], 1);
 			assert_eq!(mono.recv().expect("mono close reply").bytes[4], 1);
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("third period ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("third period ACK");
 			sched::run_until_idle();
 			let fourth = snd_host.recv().expect("beep tail period");
 			assert_eq!(sample(&fourth), 6_000, "beep continues through the shared mixer after streams drain");
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("fourth period ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("fourth period ACK");
 			sched::run_until_idle();
 			let stop = snd_host.recv().expect("hardware stop sentinel");
 			assert!(stop.bytes.is_empty(), "idle mixer releases the hardware stream");
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("stop ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("stop ACK");
 			sched::run_until_idle();
 		}
 		AudioServiceScenario::Backpressure => {
@@ -2743,22 +2743,22 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			send_write(&bounded, 12, &pcm(512, 2, 100));
 			sched::run_until_idle();
 			assert!(bounded.recv().is_err(), "full queue defers the write reply");
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period one ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("bounded period one ACK");
 			sched::run_until_idle();
 			let period = snd_host.recv().expect("bounded period two");
 			assert_eq!(sample(&period), 100);
 			assert!(bounded.recv().is_err(), "one ACK has not yet made bounded capacity visible");
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period two ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("bounded period two ACK");
 			sched::run_until_idle();
 			write_reply(&bounded, 12, 512);
 			let period = snd_host.recv().expect("bounded period three");
 			assert_eq!(sample(&period), 100);
 			drop(bounded);
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("bounded period three ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("bounded period three ACK");
 			sched::run_until_idle();
 			let stop = snd_host.recv().expect("peer-close stop sentinel");
 			assert!(stop.bytes.is_empty(), "peer-close drops queued source frames before another period");
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("peer-close stop ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("peer-close stop ACK");
 			sched::run_until_idle();
 		}
 		AudioServiceScenario::Mp3Continuity => {
@@ -2769,7 +2769,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			assert!(!mp3_period.bytes.is_empty(), "MP3 starts with an audio period");
 			let mut mp3_periods = 1u32;
 			while mp3_periods < 12 {
-				snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 period ACK");
+				snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("MP3 period ACK");
 				sched::run_until_idle();
 				mp3_period = snd_host.recv().expect("next MP3 period");
 				assert!(!mp3_period.bytes.is_empty(), "MP3 queue underrun stopped the hardware stream");
@@ -2781,7 +2781,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 			}
 			let mut mp3_tail = 0u32;
 			loop {
-				snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 tail ACK");
+				snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("MP3 tail ACK");
 				sched::run_until_idle();
 				mp3_period = snd_host.recv().expect("MP3 tail period or stop");
 				if mp3_period.bytes.is_empty() {
@@ -2790,7 +2790,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 				mp3_tail += 1;
 				assert!(mp3_tail <= 64, "interrupted MP3 leaves at most the bounded accepted queue tail");
 			}
-			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("MP3 stop ACK");
+			snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("MP3 stop ACK");
 			sched::run_until_idle();
 			assert!(mp3_process.is_terminated(), "interrupted MP3 player closes and exits");
 		}
@@ -2819,15 +2819,15 @@ fn run_process_service_requests(starts: &[(u32, &[u8])], list_correlation: Optio
 		request.extend_from_slice(&correlation.to_le_bytes());
 		request.extend_from_slice(&(name.len() as u16).to_le_bytes());
 		request.extend_from_slice(name);
-		service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("start request");
+		service_client.send(Message::new(request, alloc::vec::Vec::new())).expect("start request");
 	}
 	if let Some(correlation) = list_correlation {
 		let mut request = alloc::vec::Vec::new();
 		request.extend_from_slice(&2u16.to_le_bytes());
 		request.extend_from_slice(&correlation.to_le_bytes());
-		service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("list request");
+		service_client.send(Message::new(request, alloc::vec::Vec::new())).expect("list request");
 	}
-	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	service_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("quit sentinel");
 	sched::run_until_idle();
 	let online = boot_kernel.recv().expect("ProcessService online report");
 	assert_eq!(&online.bytes[..], b"ProcessService: online", "ProcessService reports in");
@@ -2846,7 +2846,7 @@ fn process_service_list_len(service_client: &alloc::sync::Arc<object::channel::C
 	let mut request = alloc::vec::Vec::new();
 	request.extend_from_slice(&2u16.to_le_bytes());
 	request.extend_from_slice(&correlation.to_le_bytes());
-	service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("list request");
+	service_client.send(Message::new(request, alloc::vec::Vec::new())).expect("list request");
 	sched::run_until_idle();
 	let reply = service_client.recv().expect("list reply").bytes;
 	assert_eq!(le_u32(&reply, 0), correlation, "list reply echoes the correlation id");
@@ -2866,7 +2866,7 @@ fn process_service_accounting(service_client: &alloc::sync::Arc<object::channel:
 	let mut request = alloc::vec::Vec::new();
 	request.extend_from_slice(&5u16.to_le_bytes());
 	request.extend_from_slice(&correlation.to_le_bytes());
-	service_client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("accounting request");
+	service_client.send(Message::new(request, alloc::vec::Vec::new())).expect("accounting request");
 	sched::run_until_idle();
 	let reply = service_client.recv().expect("accounting reply").bytes;
 	assert_eq!(le_u32(&reply, 0), correlation, "accounting reply echoes the correlation id");
@@ -2917,8 +2917,8 @@ fn start_process_service_from_volume(volume: &[u8]) -> (alloc::sync::Arc<object:
 	let (process_server, process_client) = Channel::create();
 
 	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
-	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL).expect("spawn StorageService");
+	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL).expect("spawn ProcessService");
 	send_ramdisk(&storage_boot_kernel, volume).expect("storage ramdisk bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
 	send_package(&process_boot_kernel, init).expect("process package bootstrap");
@@ -3224,8 +3224,8 @@ fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::c
 	let (process_server, process_client) = Channel::create();
 	let (_, bootstrap) = Channel::create();
 	let domain = sched::root_domain();
-	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL, 0).expect("spawn StorageService");
-	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL, 0).expect("spawn ProcessService");
+	loader::spawn_elf_process(domain.clone(), storage_elf, storage_boot_user, Rights::ALL).expect("spawn StorageService");
+	loader::spawn_elf_process(domain, process_elf, process_boot_user, Rights::ALL).expect("spawn ProcessService");
 	send_ramdisk(&storage_boot_kernel, volume).expect("test storage ramdisk bootstrap");
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL).expect("storage serve bootstrap");
 	send_package(&process_boot_kernel, init).expect("process package bootstrap");
@@ -3247,7 +3247,7 @@ fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::c
 	sched::run_until_idle();
 	assert_eq!(&process_boot_kernel.recv().expect("ProcessService online report").bytes, b"ProcessService: online");
 	let reply = process_client.recv().expect("dynamic test launch reply");
-	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("quit sentinel");
+	process_client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("quit sentinel");
 	sched::run_until_idle();
 	reply
 }
@@ -3356,18 +3356,18 @@ fn pump_block_stand_in(blk_host: &object::channel::Channel, disk: &mut alloc::co
 				for s in 0..count as u64 {
 					disk.insert(lba + s, data[s as usize * SECTOR..(s as usize + 1) * SECTOR].to_vec());
 				}
-				blk_host.send(Message::new(0u32.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("the write reply should send");
+				blk_host.send(Message::new(0u32.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("the write reply should send");
 			}
 			2 => {
 				// capacity: the sparse disk's size in bytes.
 				let mut reply = alloc::vec::Vec::with_capacity(12);
 				reply.extend_from_slice(&0u32.to_le_bytes());
 				reply.extend_from_slice(&capacity.to_le_bytes());
-				blk_host.send(Message::new(reply, alloc::vec::Vec::new(), 0)).expect("the capacity reply should send");
+				blk_host.send(Message::new(reply, alloc::vec::Vec::new())).expect("the capacity reply should send");
 			}
 			3 => {
 				// flush: the in-memory disk is trivially durable; acknowledge the barrier.
-				blk_host.send(Message::new(0u32.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("the flush reply should send");
+				blk_host.send(Message::new(0u32.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("the flush reply should send");
 			}
 			other => panic!("unexpected block op {}", other),
 		}
@@ -3517,7 +3517,7 @@ fn prepared_volume(first_lba: u64, blocks: u64) -> alloc::collections::BTreeMap<
 // is a second image written over this one, and an intact magic moves the fault out of memory and
 // into the loader. It costs nothing on the path that works, which is every path but one.
 fn spawn_harness(storage_elf: &[u8], boot_user: alloc::sync::Arc<dyn object::KernelObject>) -> alloc::sync::Arc<object::process::Process> {
-	match loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, object::rights::Rights::ALL, 0) {
+	match loader::spawn_elf_process(sched::root_domain(), storage_elf, boot_user, object::rights::Rights::ALL) {
 		Ok(process) => process,
 		Err(error) => {
 			let head = &storage_elf[..16.min(storage_elf.len())];
@@ -3716,7 +3716,7 @@ impl StorageHarness {
 		let process = spawn_harness(storage_elf, boot_user);
 		let mut request: alloc::vec::Vec<u8> = tag.to_vec();
 		request.extend_from_slice(alloc::format!("{bytes}").as_bytes());
-		boot.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("memory volume bootstrap");
+		boot.send(Message::new(request, alloc::vec::Vec::new())).expect("memory volume bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
 		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: bytes as u64, process: Some(process), backing: Backing::Memory { tag: tag.to_vec(), bytes } };
@@ -3749,8 +3749,8 @@ impl StorageHarness {
 		let mut request = alloc::vec::Vec::with_capacity(7 + 8);
 		request.extend_from_slice(b"RAMDISK");
 		request.extend_from_slice(&(volume.len() as u64).to_le_bytes());
-		let cap = object::handle::Capability::new(ramdisk as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP, 0);
-		boot.send(Message::new(request, alloc::vec![cap], 0)).expect("archive volume bootstrap");
+		let cap = object::handle::Capability::new(ramdisk as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP);
+		boot.send(Message::new(request, alloc::vec![cap])).expect("archive volume bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
 		// Restarting this one is not expressible: the volume is a MemoryObject handed over at
@@ -3778,7 +3778,7 @@ impl StorageHarness {
 	// not what the caller is being told about.
 	fn kill_service(&mut self) {
 		use object::channel::Message;
-		self.client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("storage shutdown request");
+		self.client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("storage shutdown request");
 		for _ in 0..100_000 {
 			self.pump();
 			if self.client.is_peer_closed() {
@@ -3798,7 +3798,7 @@ impl StorageHarness {
 	// disk-backed volume must read its files back, and a memory-backed one must not.
 	fn restart(mut self, storage_elf: &[u8]) -> Self {
 		use object::channel::Message;
-		self.client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("storage shutdown request");
+		self.client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("storage shutdown request");
 		for _ in 0..100_000 {
 			self.pump();
 			if self.client.is_peer_closed() {
@@ -3827,7 +3827,7 @@ impl StorageHarness {
 
 	fn connect_from(&mut self, client: &alloc::sync::Arc<object::channel::Channel>) -> alloc::sync::Arc<object::channel::Channel> {
 		use object::channel::{Channel, Message};
-		client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("storage connect request");
+		client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("storage connect request");
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = client.recv() {
@@ -3846,7 +3846,7 @@ impl StorageHarness {
 		request.extend_from_slice(&corr.to_le_bytes());
 		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
 		request.extend_from_slice(path);
-		self.admin.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage directory request");
+		self.admin.send(Message::new(request, alloc::vec::Vec::new())).expect("storage directory request");
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = self.admin.recv() {
@@ -3870,7 +3870,7 @@ impl StorageHarness {
 		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
 		request.extend_from_slice(path);
 		request.push(u8::from(writable));
-		self.admin.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage file request");
+		self.admin.send(Message::new(request, alloc::vec::Vec::new())).expect("storage file request");
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = self.admin.recv() {
@@ -3893,7 +3893,7 @@ impl StorageHarness {
 		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
 		request.extend_from_slice(path);
 		request.push(0);
-		client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage writer request");
+		client.send(Message::new(request, alloc::vec::Vec::new())).expect("storage writer request");
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = client.recv() {
@@ -3918,7 +3918,7 @@ impl StorageHarness {
 		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
 		request.extend_from_slice(path);
 		request.extend_from_slice(&[0, 0]);
-		client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage open request");
+		client.send(Message::new(request, alloc::vec::Vec::new())).expect("storage open request");
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = client.recv() {
@@ -3958,11 +3958,11 @@ impl StorageHarness {
 			self.pump();
 		}
 		for chunk in chunks {
-			let _ = our_side.send(Message::new(chunk.to_vec(), alloc::vec::Vec::new(), 0));
+			let _ = our_side.send(Message::new(chunk.to_vec(), alloc::vec::Vec::new()));
 			self.pump();
 		}
 		if let Some(len) = oversized {
-			let _ = our_side.send(Message::new(alloc::vec![b'!'; len], alloc::vec::Vec::new(), 0));
+			let _ = our_side.send(Message::new(alloc::vec![b'!'; len], alloc::vec::Vec::new()));
 			self.pump();
 		}
 		drop(our_side);
@@ -4025,7 +4025,7 @@ impl StorageHarness {
 		request.extend_from_slice(&0u32.to_le_bytes());
 		send_cap(&self.client, &request, service_side, Rights::ALL).expect("storage write-stream request");
 		for _ in 0..drips {
-			let _ = our_side.send(Message::new(alloc::vec![b'.'], alloc::vec::Vec::new(), 0));
+			let _ = our_side.send(Message::new(alloc::vec![b'.'], alloc::vec::Vec::new()));
 			for _ in 0..pumps_per_drip {
 				self.pump();
 				if let Ok(reply) = self.client.recv() {
@@ -4060,8 +4060,8 @@ impl StorageHarness {
 		let mut request = alloc::vec::Vec::with_capacity(7 + 8);
 		request.extend_from_slice(b"LIVEVOL");
 		request.extend_from_slice(&(image.len() as u64).to_le_bytes());
-		let cap = object::handle::Capability::new(buffer as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP, 0);
-		boot.send(Message::new(request, alloc::vec![cap], 0)).expect("live volume bootstrap");
+		let cap = object::handle::Capability::new(buffer as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP);
+		boot.send(Message::new(request, alloc::vec![cap])).expect("live volume bootstrap");
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
 		// As above: the live image arrives as a MemoryObject, so there is no backing to restart from.
@@ -4110,7 +4110,7 @@ impl StorageHarness {
 		request.extend_from_slice(&corr.to_le_bytes());
 		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
 		request.extend_from_slice(path);
-		second.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage list request");
+		second.send(Message::new(request, alloc::vec::Vec::new())).expect("storage list request");
 		// Gone before the service can answer.
 		drop(second);
 		for _ in 0..512 {
@@ -4178,7 +4178,7 @@ impl StorageHarness {
 	fn stream_finish(&mut self, sender: alloc::sync::Arc<object::channel::Channel>, chunks: &[&[u8]], corr: u32) -> bool {
 		use object::channel::Message;
 		for chunk in chunks {
-			let _ = sender.send(Message::new(chunk.to_vec(), alloc::vec::Vec::new(), 0));
+			let _ = sender.send(Message::new(chunk.to_vec(), alloc::vec::Vec::new()));
 			self.pump();
 		}
 		drop(sender);
@@ -4216,7 +4216,7 @@ impl StorageHarness {
 		for _ in 0..64 {
 			self.pump();
 		}
-		let _ = our_side.send(Message::new(b"half a file".to_vec(), alloc::vec::Vec::new(), 0));
+		let _ = our_side.send(Message::new(b"half a file".to_vec(), alloc::vec::Vec::new()));
 		self.pump();
 		// ONLY the request channel goes. The stream stays open on purpose: closing it too would
 		// end the stream cleanly, the file would be committed for good reason, and the test would
@@ -4263,7 +4263,7 @@ impl StorageHarness {
 		// answer is blocking well before this ends. Every iteration is a full scheduler pass, which
 		// under emulation is the most expensive thing this test does.
 		for _ in 0..80 {
-			let _ = sub.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0));
+			let _ = sub.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new()));
 			self.pump();
 		}
 		advance_clock(skip);
@@ -4294,7 +4294,7 @@ impl StorageHarness {
 		// queue is full there is no way to ask for one.
 		let prober = self.connect();
 		for _ in 0..80 {
-			let _ = self.client.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0));
+			let _ = self.client.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new()));
 			self.pump();
 		}
 		advance_clock(skip);
@@ -4308,7 +4308,7 @@ impl StorageHarness {
 		request.extend_from_slice(&corr.to_le_bytes());
 		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
 		request.extend_from_slice(path);
-		let _ = self.client.send(Message::new(request, alloc::vec::Vec::new(), 0));
+		let _ = self.client.send(Message::new(request, alloc::vec::Vec::new()));
 		for _ in 0..64 {
 			self.pump();
 		}
@@ -4323,7 +4323,7 @@ impl StorageHarness {
 		// that stopped reading.
 		let mut heartbeat = alloc::vec::Vec::new();
 		heartbeat.extend_from_slice(&abi::HEARTBEAT_OP.to_le_bytes());
-		if prober.send(Message::new(heartbeat, alloc::vec::Vec::new(), 0)).is_err() {
+		if prober.send(Message::new(heartbeat, alloc::vec::Vec::new())).is_err() {
 			return false;
 		}
 		for _ in 0..4_000 {
@@ -4351,7 +4351,7 @@ impl StorageHarness {
 		while asked < crowd {
 			let batch = BATCH.min(crowd - asked);
 			for _ in 0..batch {
-				self.client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("connect");
+				self.client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("connect");
 			}
 			asked += batch;
 			let mut answered = 0usize;
@@ -4373,7 +4373,7 @@ impl StorageHarness {
 		let prober = held.last().cloned().unwrap_or_else(|| self.client.clone());
 		let started = arch::tsc::now();
 		for _ in 0..rounds {
-			prober.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("heartbeat");
+			prober.send(Message::new(abi::HEARTBEAT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("heartbeat");
 			let mut answered = false;
 			for _ in 0..10_000 {
 				self.pump();
@@ -4396,7 +4396,7 @@ impl StorageHarness {
 		use object::channel::{Channel, Message};
 		let mut granted: Vec<alloc::sync::Arc<Channel>> = alloc::vec::Vec::new();
 		for _ in 0..limit {
-			self.client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new(), 0)).expect("storage connect request");
+			self.client.send(Message::new(abi::CONNECT_OP.to_le_bytes().to_vec(), alloc::vec::Vec::new())).expect("storage connect request");
 			let mut answered = false;
 			for _ in 0..2_000 {
 				self.pump();
@@ -4455,7 +4455,7 @@ impl StorageHarness {
 		request.extend_from_slice(&corr.to_le_bytes());
 		request.extend_from_slice(&(path.len() as u16).to_le_bytes());
 		request.extend_from_slice(path);
-		self.client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage list request");
+		self.client.send(Message::new(request, alloc::vec::Vec::new())).expect("storage list request");
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = self.client.recv() {
@@ -4576,7 +4576,7 @@ impl StorageHarness {
 	// Drive one op on an open writer session and report whether it succeeded.
 	fn writer_op(&mut self, session: &alloc::sync::Arc<object::channel::Channel>, request: alloc::vec::Vec<u8>, corr: u32) -> Option<alloc::vec::Vec<u8>> {
 		use object::channel::Message;
-		session.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("writer request");
+		session.send(Message::new(request, alloc::vec::Vec::new())).expect("writer request");
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = session.recv() {
@@ -4596,7 +4596,7 @@ impl StorageHarness {
 	// landing first is not this call's failure.
 	fn request(&mut self, request: alloc::vec::Vec<u8>, corr: u32) -> Option<object::channel::Message> {
 		use object::channel::Message;
-		self.client.send(Message::new(request, alloc::vec::Vec::new(), 0)).expect("storage request");
+		self.client.send(Message::new(request, alloc::vec::Vec::new())).expect("storage request");
 		for _ in 0..100_000 {
 			self.pump();
 			if let Ok(reply) = self.client.recv() {
@@ -4749,7 +4749,7 @@ fn spawn_dynamic_test_process(domain: alloc::sync::Arc<object::domain::Domain>, 
 		load(&package, &process, dependency, &mut loaded, &mut visiting);
 	}
 	let entry = loader::load_image_into(&process, main).expect("load dynamic test main");
-	let bootstrap = process.install(bootstrap, object::rights::Rights::ALL, 0).expect("a bootstrap handle");
+	let bootstrap = process.install(bootstrap, object::rights::Rights::ALL).expect("a bootstrap handle");
 	let thread = loader::create_user_thread(&process, entry, memlayout::USER_STACK_TOP, bootstrap).expect("create dynamic test thread");
 	assert!(sched::thread_start(thread), "start dynamic test thread");
 	process
@@ -4767,14 +4767,14 @@ fn run_volume_tool_result(domain: alloc::sync::Arc<object::domain::Domain>, tool
 	let (stdout, child_stdout) = Channel::create();
 	let process = spawn_dynamic_test_process(domain.clone(), tool_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the tool's stdout");
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
-	bootstrap.send(Message::new(launch_context(args, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("the tool's arguments");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	bootstrap.send(Message::new(launch_context(args, b"vol://system"), alloc::vec::Vec::new())).expect("the tool's arguments");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("the tool's system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("the tool's media volume");
 	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
-		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("an absent volume");
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("an absent volume");
 	}
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("volume bundle terminator");
 	let mut line = None;
 	for _ in 0..100_000 {
 		system.pump();
@@ -4816,17 +4816,17 @@ fn run_imgview_help_harness(imgview_elf: &[u8], system: &mut StorageHarness, med
 	let (stdout, child_stdout) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), imgview_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview help stdout");
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
-	bootstrap.send(Message::new(crate::tests::launch_context(b"--help", b"vol://system"), alloc::vec::Vec::new(), 0)).expect("imgview help args");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	bootstrap.send(Message::new(crate::tests::launch_context(b"--help", b"vol://system"), alloc::vec::Vec::new())).expect("imgview help args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview help system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview help media volume");
 	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
-		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help absent capability");
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("imgview help absent capability");
 	}
 	// The bundle ends here; DISPLAY and INPUT_KEYS are separate grants that follow it.
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("volume bundle terminator");
 	for tag in [b"DISPLAY".as_slice(), b"INPUT_KEYS".as_slice()] {
-		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview help absent capability");
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("imgview help absent capability");
 	}
 	let output = loop {
 		system.pump();
@@ -4868,14 +4868,14 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	let (input, input_client) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), imgview_elf, child);
 	send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("imgview stdout");
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
-	bootstrap.send(Message::new(launch_context(path, b"vol://system"), alloc::vec::Vec::new(), 0)).expect("imgview args");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	bootstrap.send(Message::new(launch_context(path, b"vol://system"), alloc::vec::Vec::new())).expect("imgview args");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("imgview system volume");
 	send_cap(&bootstrap, b"MEDIA", media.client.clone(), Rights::ALL).expect("imgview media volume");
 	for tag in [b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
-		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("imgview absent volume");
+		bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("imgview absent volume");
 	}
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("volume bundle terminator");
 	send_cap(&bootstrap, b"DISPLAY", display_client, Rights::ALL).expect("imgview display");
 	send_cap(&bootstrap, b"INPUT_KEYS", input_client, Rights::ALL).expect("imgview input");
 
@@ -4907,7 +4907,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	};
 	assert_eq!(le_u16(&present.bytes, 0), 2, "imgview presents converted image");
 	assert_eq!(read_from_object(&surface, 16), expected, "imgview presents the expected alpha-converted composited frame");
-	display.send(Message::new([le_u32(&present.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview present reply");
+	display.send(Message::new([le_u32(&present.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview present reply");
 
 	let focus = loop {
 		system.pump();
@@ -4936,17 +4936,17 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 	send_cap(&input, &le_u32(&subscribe.bytes, 2).to_le_bytes(), key_consumer, Rights::ALL).expect("imgview key stream");
 	match exit {
 		ImgviewExit::KeyQ => {
-			keys.send(Message::new(alloc::vec![0, 0, 0, 0, 0x14, 0, 1], alloc::vec::Vec::new(), 0)).expect("imgview q key");
+			keys.send(Message::new(alloc::vec![0, 0, 0, 0, 0x14, 0, 1], alloc::vec::Vec::new())).expect("imgview q key");
 		}
 		ImgviewExit::KeyEscape => {
-			keys.send(Message::new(alloc::vec![0, 0, 0, 0, 0x29, 0, 1], alloc::vec::Vec::new(), 0)).expect("imgview escape key");
+			keys.send(Message::new(alloc::vec![0, 0, 0, 0, 0x29, 0, 1], alloc::vec::Vec::new())).expect("imgview escape key");
 		}
 		ImgviewExit::RawEscape => {
-			stdout.send(Message::new(alloc::vec![0x1b], alloc::vec::Vec::new(), 0)).expect("imgview raw escape");
+			stdout.send(Message::new(alloc::vec![0x1b], alloc::vec::Vec::new())).expect("imgview raw escape");
 		}
 		ImgviewExit::ZoomAndHold => {
 			let send_key = |code: u16, pressed: bool| {
-				keys.send(Message::new(alloc::vec![0, 0, 0, 0, code as u8, (code >> 8) as u8, pressed as u8], alloc::vec::Vec::new(), 0)).expect("imgview interaction key");
+				keys.send(Message::new(alloc::vec![0, 0, 0, 0, code as u8, (code >> 8) as u8, pressed as u8], alloc::vec::Vec::new())).expect("imgview interaction key");
 			};
 			send_key(0x4f, true);
 			system.pump();
@@ -4964,7 +4964,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 					}
 				};
 				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction redraws with a present request");
-				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview interaction present reply");
+				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview interaction present reply");
 				send_key(zoom_in_code, false);
 			}
 			for zoom_out_code in [0x56, 0x2d] {
@@ -4977,7 +4977,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 					}
 				};
 				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction zooms out with a present request");
-				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview zoom-out present reply");
+				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview zoom-out present reply");
 				send_key(zoom_out_code, false);
 			}
 			for _ in 0..20 {
@@ -4990,10 +4990,10 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 					}
 				};
 				assert_eq!(le_u16(&request.bytes, 0), 2, "imgview interaction zooms with keypad plus");
-				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview keypad zoom present reply");
+				display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview keypad zoom present reply");
 				send_key(0x57, false);
 			}
-			stdout.send(Message::new(alloc::vec![0x1b, b'[', b'C'], alloc::vec::Vec::new(), 0)).expect("imgview serial right arrow");
+			stdout.send(Message::new(alloc::vec![0x1b, b'[', b'C'], alloc::vec::Vec::new())).expect("imgview serial right arrow");
 			let request = loop {
 				system.pump();
 				media.pump();
@@ -5002,7 +5002,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 				}
 			};
 			assert_eq!(le_u16(&request.bytes, 0), 2, "imgview serial arrow redraws with a present request");
-			display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview serial-arrow present reply");
+			display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview serial-arrow present reply");
 			send_key(0x4f, true);
 			let mut repeat_presents = 0usize;
 			for _ in 0..1_000 {
@@ -5010,7 +5010,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 				media.pump();
 				while let Ok(request) = display.recv() {
 					assert_eq!(le_u16(&request.bytes, 0), 2, "imgview held arrow redraws with a present request");
-					display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview held-arrow present reply");
+					display.send(Message::new([le_u32(&request.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview held-arrow present reply");
 					repeat_presents += 1;
 				}
 				if repeat_presents >= 2 {
@@ -5025,7 +5025,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 				media.pump();
 				assert!(display.recv().is_err(), "released arrow must stop repeated pan redraws");
 			}
-			stdout.send(Message::new(alloc::vec![0x1b], alloc::vec::Vec::new(), 0)).expect("imgview serial escape");
+			stdout.send(Message::new(alloc::vec![0x1b], alloc::vec::Vec::new())).expect("imgview serial escape");
 		}
 	}
 
@@ -5037,7 +5037,7 @@ fn run_imgview_harness_with_exit(imgview_elf: &[u8], path: &[u8], expected: &[u8
 		}
 	};
 	assert_eq!(le_u16(&release.bytes, 0), 3, "imgview releases its surface");
-	display.send(Message::new([le_u32(&release.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new(), 0)).expect("imgview release reply");
+	display.send(Message::new([le_u32(&release.bytes, 2).to_le_bytes().as_slice(), &[1]].concat(), alloc::vec::Vec::new())).expect("imgview release reply");
 	for _ in 0..100_000 {
 		system.pump();
 		media.pump();
@@ -5129,7 +5129,7 @@ impl ConsoleHarness {
 		let (display_admin_keep, display_admin) = Channel::create();
 		send_cap(&display_boot, b"ADMIN", display_admin, Rights::ALL).expect("display admin bootstrap");
 		send_cap(&display_boot, b"SERVE", display_server, Rights::ALL).expect("serve bootstrap");
-		display_boot.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new(), 0)).expect("display capability bootstrap");
+		display_boot.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new())).expect("display capability bootstrap");
 
 		let width: u32 = (cols * 8) as u32;
 		let height: u32 = (rows * 16) as u32;
@@ -5161,7 +5161,7 @@ impl ConsoleHarness {
 		// THE CAPABILITY THIS HARNESS EXISTS FOR. Every other console test sends this tag as a bare
 		// message, so there is no pointer device and `handle_pointer` is never reached.
 		send_cap(&console_boot, b"POINTER", pointer_console, Rights::ALL).expect("POINTER bootstrap");
-		console_boot.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("READY bootstrap");
+		console_boot.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("READY bootstrap");
 
 		let mut harness = ConsoleHarness { gpu, focus, pointer, program: vt1_program, cols, rows, _open: alloc::vec![kill_keep, display_admin_keep, ctl_keep, dummy_keep] };
 		// SEVERAL SETTLES, not one: bring-up crosses timed waits (the bounded wait for a
@@ -5183,13 +5183,13 @@ impl ConsoleHarness {
 		sched::run_until_idle();
 		while let Ok(command) = self.focus.recv() {
 			let _ = command;
-			self.focus.send(object::channel::Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("focus acknowledgement");
+			self.focus.send(object::channel::Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("focus acknowledgement");
 			sched::run_until_idle();
 		}
 		while let Ok(message) = self.gpu.recv() {
 			if message.bytes.starts_with(b"PRESENT") {
 				presented += 1;
-				self.gpu.send(object::channel::Message::new(b"OK".to_vec(), alloc::vec::Vec::new(), 0)).expect("present acknowledgement");
+				self.gpu.send(object::channel::Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("present acknowledgement");
 			}
 			sched::run_until_idle();
 		}
@@ -5224,7 +5224,7 @@ impl ConsoleHarness {
 			bytes.extend_from_slice(&y.to_le_bytes());
 			bytes.push(buttons);
 			bytes.push(0);
-			self.pointer.send(object::channel::Message::new(bytes, alloc::vec::Vec::new(), 0)).expect("pointer event");
+			self.pointer.send(object::channel::Message::new(bytes, alloc::vec::Vec::new())).expect("pointer event");
 			for _ in 0..64 {
 				storage.pump();
 				self.pump();
@@ -5255,23 +5255,23 @@ fn spawn_terminal_app_on(elf: &[u8], terminal_child: alloc::sync::Arc<object::ch
 	let (bootstrap, child) = Channel::create();
 	let process = spawn_dynamic_test_process(sched::root_domain(), elf, child);
 	send_cap(&bootstrap, b"STDOUT", terminal_child, Rights::ALL).expect("terminal bootstrap");
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("endpoint run terminator");
-	bootstrap.send(Message::new(launch_context(arguments, working), alloc::vec::Vec::new(), 0)).expect("launch arguments");
-	bootstrap.send(Message::new(first.to_vec(), alloc::vec::Vec::new(), 0)).expect("absent first grant");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+	bootstrap.send(Message::new(launch_context(arguments, working), alloc::vec::Vec::new())).expect("launch arguments");
+	bootstrap.send(Message::new(first.to_vec(), alloc::vec::Vec::new())).expect("absent first grant");
 	send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("system volume");
 	for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
 		match extra.iter_mut().find(|(name, _)| *name == tag) {
 			Some((_, volume)) => send_cap(&bootstrap, tag, volume.client.clone(), Rights::ALL).expect("extra volume"),
-			None => bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new(), 0)).expect("absent volume"),
+			None => bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("absent volume"),
 		}
 	}
-	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new(), 0)).expect("volume bundle terminator");
+	bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("volume bundle terminator");
 	// THE TWO GRANTS THIS HARNESS WITHHOLDS, sent as bare messages so the tag arrives and the
 	// capability does not. These programs take a launch broker or a selected file and their own
 	// asset directory from PermissionManager; here they get neither, which is a state they have to
 	// run in - a program that blocked forever waiting for a grant nobody sent would be one that
 	// could not start on a boot that granted less than the full set.
-	bootstrap.send(Message::new(b"APP_ASSETS".to_vec(), alloc::vec::Vec::new(), 0)).expect("absent asset directory");
+	bootstrap.send(Message::new(b"APP_ASSETS".to_vec(), alloc::vec::Vec::new())).expect("absent asset directory");
 	process
 }
 
@@ -5283,7 +5283,7 @@ fn spawn_terminal_app_on(elf: &[u8], terminal_child: alloc::sync::Arc<object::ch
 // turn to read any of them. One message each filled the queue and the send was refused.
 fn lico_type(terminal: &alloc::sync::Arc<object::channel::Channel>, keys: &[u8]) {
 	use object::channel::Message;
-	terminal.send(Message::new(keys.to_vec(), alloc::vec::Vec::new(), 0)).expect("lico typed input");
+	terminal.send(Message::new(keys.to_vec(), alloc::vec::Vec::new())).expect("lico typed input");
 }
 
 // Pump every service `lico` was granted until a frame contains `needle`, and hand that frame back.
@@ -5320,7 +5320,7 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	let initial: alloc::vec::Vec<u8> = output.iter().flat_map(|line| line.iter().copied()).collect();
 	assert!(initial.windows(b">vol://system".len()).any(|window| window == b">vol://system"), "left panel begins active");
 
-	terminal.send(Message::new(b"\t".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico tab focus input");
+	terminal.send(Message::new(b"\t".to_vec(), alloc::vec::Vec::new())).expect("lico tab focus input");
 	let mut switched = false;
 	for _ in 0..100_000 {
 		system.pump();
@@ -5339,11 +5339,11 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	// prompt mode, the volume client the panel's own URI names, and the refresh afterwards - and a
 	// manager that drew a directory it had not created, or created one and did not show it, would
 	// look identical from any one of those three alone.
-	terminal.send(Message::new(b"\x1b[18~".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico F7 input");
+	terminal.send(Message::new(b"\x1b[18~".to_vec(), alloc::vec::Vec::new())).expect("lico F7 input");
 	for byte in b"licodir" {
-		terminal.send(Message::new(alloc::vec![*byte], alloc::vec::Vec::new(), 0)).expect("lico directory name");
+		terminal.send(Message::new(alloc::vec![*byte], alloc::vec::Vec::new())).expect("lico directory name");
 	}
-	terminal.send(Message::new(b"\r".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico confirms the name");
+	terminal.send(Message::new(b"\r".to_vec(), alloc::vec::Vec::new())).expect("lico confirms the name");
 	let mut created = false;
 	for _ in 0..200_000 {
 		system.pump();
@@ -5365,16 +5365,16 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	// The entry is named rather than pointed at - `+` tags by pattern, so the test does not depend
 	// on where the cursor landed or on how the panel happens to be sorted. Then the typed
 	// confirmation, which the delete requires and a keystroke cannot give.
-	terminal.send(Message::new(b"+".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico tag-by-pattern input");
+	terminal.send(Message::new(b"+".to_vec(), alloc::vec::Vec::new())).expect("lico tag-by-pattern input");
 	for byte in b"licodir" {
-		terminal.send(Message::new(alloc::vec![*byte], alloc::vec::Vec::new(), 0)).expect("lico tag pattern");
+		terminal.send(Message::new(alloc::vec![*byte], alloc::vec::Vec::new())).expect("lico tag pattern");
 	}
-	terminal.send(Message::new(b"\r".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico confirms the pattern");
-	terminal.send(Message::new(b"\x1b[19~".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico F8 input");
+	terminal.send(Message::new(b"\r".to_vec(), alloc::vec::Vec::new())).expect("lico confirms the pattern");
+	terminal.send(Message::new(b"\x1b[19~".to_vec(), alloc::vec::Vec::new())).expect("lico F8 input");
 	for byte in b"yes" {
-		terminal.send(Message::new(alloc::vec![*byte], alloc::vec::Vec::new(), 0)).expect("lico delete confirmation");
+		terminal.send(Message::new(alloc::vec![*byte], alloc::vec::Vec::new())).expect("lico delete confirmation");
 	}
-	terminal.send(Message::new(b"\r".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico confirms the delete");
+	terminal.send(Message::new(b"\r".to_vec(), alloc::vec::Vec::new())).expect("lico confirms the delete");
 	// The completed frame is the one to read, and it carries BOTH halves of the claim: the job ran
 	// to its end, and the refreshed panel no longer lists what it removed. A count alone would pass
 	// for an operation that reported success and deleted nothing.
@@ -5394,7 +5394,7 @@ fn run_lico_harness(lico_elf: &[u8], system: &mut StorageHarness) {
 	let settled = settled.expect("F8 advances the delete job to completion and reports one entry done");
 	assert!(!settled.windows(b"licodir/".len()).any(|window| window == b"licodir/"), "the panel refreshed after the delete no longer lists the directory it removed");
 
-	terminal.send(Message::new(b"\x1b[21~".to_vec(), alloc::vec::Vec::new(), 0)).expect("lico F10 input");
+	terminal.send(Message::new(b"\x1b[21~".to_vec(), alloc::vec::Vec::new())).expect("lico F10 input");
 	for _ in 0..100_000 {
 		system.pump();
 		while let Ok(message) = terminal.recv() {

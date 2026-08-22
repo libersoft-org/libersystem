@@ -171,7 +171,7 @@ fn a_spawned_thread_can_create_a_child_process_and_let_it_go() {
 	}
 
 	let (_kernel_ep, user_ep) = crate::object::channel::Channel::create();
-	crate::sched::spawn_with_object(body, user_ep, crate::object::rights::Rights::ALL, 0);
+	crate::sched::spawn_with_object(body, user_ep, crate::object::rights::Rights::ALL);
 	crate::sched::run_until_idle();
 
 	let child = CHILD.load(Ordering::SeqCst);

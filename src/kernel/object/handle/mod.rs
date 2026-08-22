@@ -55,19 +55,26 @@ impl Handle {
 	}
 }
 
-// A capability = a reference to a kernel object + a set of rights + a badge.
+// A capability = a reference to a kernel object + a set of rights.
+//
+// NO BADGE. One was carried here, stamped onto every message the handle sent, and read by nothing:
+// there was no syscall that could set it, so it was zero for every capability in every table, and
+// no syscall that could read it back, so a receiver could not have used it either. It was half of a
+// design this system does not use - servers here give each client its own channel and know who is
+// speaking from which channel the message arrived on, which is the same question answered without
+// the kernel labelling anything. If the other design is ever wanted, it arrives with the two
+// syscalls that were always missing.
 // Held only inside the kernel (in a handle table or a message in transit).
 pub struct Capability {
 	object: Arc<dyn KernelObject>,
 	rights: Rights,
-	badge: u64,
 	generation: u32,
 }
 
 impl Capability {
-	pub fn new(object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Self {
+	pub fn new(object: Arc<dyn KernelObject>, rights: Rights) -> Self {
 		let generation = object.header().generation();
-		Self { object, rights, badge, generation }
+		Self { object, rights, generation }
 	}
 
 	pub fn object_type(&self) -> ObjectType {
@@ -96,7 +103,6 @@ pub struct HandleInfo {
 	pub koid: u64,
 	pub object_type: ObjectType,
 	pub rights: Rights,
-	pub badge: u64,
 	pub generation: u32,
 }
 
@@ -104,7 +110,7 @@ impl HandleInfo {
 	// Snapshot a capability's introspection fields, so the info / entries queries
 	// map them in exactly one place.
 	fn from_cap(cap: &Capability) -> HandleInfo {
-		HandleInfo { koid: cap.object.header().koid(), object_type: cap.object_type(), rights: cap.rights, badge: cap.badge, generation: cap.object.header().generation() }
+		HandleInfo { koid: cap.object.header().koid(), object_type: cap.object_type(), rights: cap.rights, generation: cap.object.header().generation() }
 	}
 }
 
@@ -283,11 +289,11 @@ impl HandleTable {
 		}
 	}
 
-	// Mint a fresh capability for `object` with `rights`/`badge` and install it.
-	pub fn insert_object(&mut self, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Handle {
+	// Mint a fresh capability for `object` with `rights` and install it.
+	pub fn insert_object(&mut self, object: Arc<dyn KernelObject>, rights: Rights) -> Handle {
 		// ALLOC-OK: `HandleTable::insert`, not a collection insert - and it books its slot through
 		// `try_place`, refunding the Domain charge when the table cannot grow.
-		self.insert(Capability::new(object, rights, badge))
+		self.insert(Capability::new(object, rights))
 	}
 
 	// Install a capability, enforcing the Domain's handle quota. Returns None
@@ -420,8 +426,8 @@ impl HandleTable {
 	}
 
 	// Mint and install a fresh capability under the Domain's handle quota.
-	pub fn try_insert_object(&mut self, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Option<Handle> {
-		self.try_insert(Capability::new(object, rights, badge))
+	pub fn try_insert_object(&mut self, object: Arc<dyn KernelObject>, rights: Rights) -> Option<Handle> {
+		self.try_insert(Capability::new(object, rights))
 	}
 
 	fn cap_of(&self, handle: Handle) -> Result<&Capability, HandleError> {
@@ -465,7 +471,7 @@ impl HandleTable {
 	// match its generation AND the object must not have been revoked.
 	//
 	// `cap_of` alone answers only the first, and the introspection accessors used it
-	// directly - so a revoked handle still reported its rights and its badge, and still
+	// directly - so a revoked handle still reported its rights and still
 	// appeared alive in the System Graph. One validation, used by everything, is the only
 	// way those two answers stay the same answer.
 	fn live_cap_of(&self, handle: Handle) -> Result<&Capability, HandleError> {
@@ -481,22 +487,8 @@ impl HandleTable {
 		Ok(self.live_cap_of(handle)?.rights)
 	}
 
-	// The object AND its badge, from ONE look at the table.
-	//
-	// A send resolved the object under one lock and then took the badge under another. A sibling
-	// thread closing or transferring the handle in between left the send authorized - the `Arc` was
-	// already retained - while the second lookup failed and the caller's `unwrap_or(0)` stamped the
-	// message with badge ZERO. A legitimate operation was then attributed to the wrong authority,
-	// which is what server-side routing and audit policy are built on.
-	pub fn lookup_typed_with_badge(&self, handle: Handle, kind: ObjectType, rights: Rights) -> Result<(Arc<dyn KernelObject>, u64), HandleError> {
-		let object = self.lookup_typed(handle, kind, rights)?;
-		// Cannot fail: `lookup_typed` just proved this handle live, under this same borrow.
-		let badge = self.live_cap_of(handle)?.badge;
-		Ok((object, badge))
-	}
-
 	// Introspect a handle: the identity, type, rights, and badge behind it. Like
-	// rights_of/badge_of this is a get_info-style query; it underlies the
+	// rights_of this is a get_info-style query; it underlies the
 	// object_info_get syscall. Returns None for a bad or stale handle.
 	pub fn info(&self, handle: Handle) -> Option<HandleInfo> {
 		let cap = self.live_cap_of(handle).ok()?;
@@ -525,7 +517,7 @@ impl HandleTable {
 	// Derive a weaker handle to the same object. Requires the DUPLICATE right,
 	// and `new_rights` must be a subset of the original's (attenuation only).
 	pub fn duplicate(&mut self, handle: Handle, new_rights: Rights) -> Result<Handle, HandleError> {
-		let (object, badge) = {
+		let object = {
 			let cap = self.cap_of(handle)?;
 			if !cap.is_valid() {
 				return Err(HandleError::Revoked);
@@ -536,13 +528,13 @@ impl HandleTable {
 			if !cap.rights.contains(new_rights) {
 				return Err(HandleError::AccessDenied);
 			}
-			(cap.object.clone(), cap.badge)
+			cap.object.clone()
 		};
 		// Through the QUOTA, like every other user-reachable install. This was the
 		// unbounded `insert`, so a process holding one duplicable handle could pass
 		// `PROP_HANDLE_LIMIT` indefinitely by asking - and other checks that bound
 		// themselves by "how many handles the caller holds" were bounded by nothing.
-		self.try_insert(Capability::new(object, new_rights, badge)).ok_or(HandleError::LimitReached)
+		self.try_insert(Capability::new(object, new_rights)).ok_or(HandleError::LimitReached)
 	}
 
 	// Close a handle: drop its capability (releasing one object reference) and

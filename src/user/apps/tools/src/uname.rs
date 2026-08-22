@@ -24,7 +24,6 @@ const ARCH: &str = "riscv64";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buf: [u8; 64] = [0u8; 64];
 	unsafe {
 		// 1. adopt the forwarded stdout console (the first bootstrap message), so our
 		//    output renders on the same terminal as the shell that launched us.

@@ -87,7 +87,7 @@ fn image_artifact_name(elf_image: &[u8]) -> Option<&str> {
 	core::str::from_utf8(value).ok().filter(|name| !name.is_empty())
 }
 
-pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Result<Arc<Process>, LoadError> {
+pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<dyn KernelObject>, rights: Rights) -> Result<Arc<Process>, LoadError> {
 	let address_space = AddressSpace::create().ok_or(LoadError::OutOfMemory)?;
 	let mut frames: Vec<u64> = Vec::new();
 	let mut shared = Vec::new();
@@ -128,7 +128,7 @@ pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<d
 	// REFUSED RATHER THAN STARTED WITHOUT IT. A spawn whose bootstrap capability cannot be installed
 	// is not a spawn: the child would run with nothing to talk to and the parent would be told it
 	// succeeded.
-	let Some(handle) = process.install(bootstrap, rights, badge) else {
+	let Some(handle) = process.install(bootstrap, rights) else {
 		process.terminate();
 		return Err(LoadError::OutOfMemory);
 	};

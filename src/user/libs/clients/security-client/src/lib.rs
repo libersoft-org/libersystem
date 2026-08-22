@@ -2,7 +2,6 @@
 
 extern crate alloc;
 
-use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::EnvVar;
 use base_proto::generated::liber::base::v1::Error;
 use process_proto::generated::liber::process::v1::StartResult;

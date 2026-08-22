@@ -423,7 +423,7 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 		// holding them reconfigured the terminal. `tty_set_mode` goes over the control channel the
 		// shell hands to an interactive foreground job; false means there is no terminal to ask, and
 		// the keys still arrive from the surface either way.
-		let owns_tty: bool = stdin_channel != 0 && unsafe { tty_set_mode(true, true) };
+		let owns_tty: bool = stdin_channel != 0 && tty_set_mode(true, true);
 		let mut key_frame: [u8; 32] = [0; 32];
 		let mut stdin_frame: [u8; 32] = [0; 32];
 		let mut held: u8 = 0;
@@ -524,7 +524,7 @@ unsafe fn show(display_channel: u64, input_channel: u64, image: DecodedImage) {
 		if stdin_channel != 0 {
 			// Back to line-edited input, through the same request path.
 			if owns_tty {
-				unsafe { tty_set_mode(false, true) };
+				tty_set_mode(false, true);
 			}
 			set_stdin(0);
 		}
@@ -537,7 +537,8 @@ fn target(data: &mut [u8], framebuffer: Framebuffer) -> Target<'_> {
 }
 
 unsafe fn present_view(display: &surface::Client, surface: &surface::Mapping, framebuffer: Framebuffer, target_len: usize, image: &DecodedImage, viewport: &Viewport) -> bool {
-	let output = core::slice::from_raw_parts_mut(surface.addr() as *mut u8, target_len);
+	// SAFETY: the caller's contract - `surface` is a live mapping of at least `target_len` bytes.
+	let output = unsafe { core::slice::from_raw_parts_mut(surface.addr() as *mut u8, target_len) };
 	let Some(blit) = pix::blit_view(Image { data: &image.pixels, width: image.width, height: image.height, pitch: image.pitch }, target(output, framebuffer), viewport.width, viewport.height, viewport.pan_x, viewport.pan_y) else {
 		return false;
 	};

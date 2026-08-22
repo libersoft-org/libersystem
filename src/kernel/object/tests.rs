@@ -42,7 +42,7 @@ crate::tagged_test!(handle_create_lookup_close, [Handle, Object, Kernel, Smoke],
 fn handle_create_lookup_close() {
 	let mut table = HandleTable::new();
 	let obj = TestObject::new(42);
-	let handle = table.insert_object(obj, Rights::READ | Rights::WRITE, 0);
+	let handle = table.insert_object(obj, Rights::READ | Rights::WRITE);
 	assert_eq!(table.len(), 1);
 	let looked = table.lookup(handle, Rights::READ).expect("lookup");
 	assert_eq!(looked.as_any().downcast_ref::<TestObject>().unwrap().value(), 42);
@@ -54,7 +54,7 @@ fn handle_create_lookup_close() {
 crate::tagged_test!(handle_rights_enforced, [Handle, Object, Kernel], id = "kernel.object.handle_rights_enforced", covers = ["kernel"]);
 fn handle_rights_enforced() {
 	let mut table = HandleTable::new();
-	let handle = table.insert_object(TestObject::new(7), Rights::READ, 0);
+	let handle = table.insert_object(TestObject::new(7), Rights::READ);
 	assert!(table.lookup(handle, Rights::READ).is_ok());
 	assert!(matches!(table.lookup(handle, Rights::WRITE), Err(HandleError::AccessDenied)));
 }
@@ -62,12 +62,12 @@ fn handle_rights_enforced() {
 crate::tagged_test!(handle_duplicate_attenuates, [Handle, Object, Kernel], id = "kernel.object.handle_duplicate_attenuates", covers = ["kernel"]);
 fn handle_duplicate_attenuates() {
 	let mut table = HandleTable::new();
-	let handle = table.insert_object(TestObject::new(1), Rights::READ | Rights::WRITE | Rights::DUPLICATE, 0);
+	let handle = table.insert_object(TestObject::new(1), Rights::READ | Rights::WRITE | Rights::DUPLICATE);
 	let weak = table.duplicate(handle, Rights::READ).expect("duplicate");
 	assert!(table.lookup(weak, Rights::READ).is_ok());
 	assert!(matches!(table.lookup(weak, Rights::WRITE), Err(HandleError::AccessDenied)));
 	assert!(matches!(table.duplicate(handle, Rights::EXECUTE), Err(HandleError::AccessDenied)));
-	let plain = table.insert_object(TestObject::new(2), Rights::READ, 0);
+	let plain = table.insert_object(TestObject::new(2), Rights::READ);
 	assert!(matches!(table.duplicate(plain, Rights::READ), Err(HandleError::AccessDenied)));
 }
 
@@ -75,7 +75,7 @@ crate::tagged_test!(handle_revocation_invalidates, [Handle, Object, Kernel], id 
 fn handle_revocation_invalidates() {
 	let mut table = HandleTable::new();
 	let obj = TestObject::new(99);
-	let handle = table.insert_object(obj.clone(), Rights::READ, 0);
+	let handle = table.insert_object(obj.clone(), Rights::READ);
 	assert!(table.lookup(handle, Rights::READ).is_ok());
 	obj.header.revoke();
 	assert!(matches!(table.lookup(handle, Rights::READ), Err(HandleError::Revoked)));
@@ -84,7 +84,7 @@ fn handle_revocation_invalidates() {
 crate::tagged_test!(handle_type_sealing, [Handle, Object, Kernel], id = "kernel.object.handle_type_sealing", covers = ["kernel"]);
 fn handle_type_sealing() {
 	let mut table = HandleTable::new();
-	let handle = table.insert_object(TestObject::new(5), Rights::READ, 0);
+	let handle = table.insert_object(TestObject::new(5), Rights::READ);
 	assert!(table.lookup_typed(handle, ObjectType::Event, Rights::READ).is_ok());
 	assert!(matches!(table.lookup_typed(handle, ObjectType::Channel, Rights::READ), Err(HandleError::WrongType)));
 }
@@ -94,7 +94,7 @@ fn handle_refcount_lifetime() {
 	let mut table = HandleTable::new();
 	let obj = TestObject::new(3);
 	assert_eq!(Arc::strong_count(&obj), 1);
-	let handle = table.insert_object(obj.clone(), Rights::READ, 0);
+	let handle = table.insert_object(obj.clone(), Rights::READ);
 	assert_eq!(Arc::strong_count(&obj), 2);
 	let looked = table.lookup(handle, Rights::READ).expect("lookup");
 	assert_eq!(Arc::strong_count(&obj), 3);
@@ -118,8 +118,8 @@ fn a_message_carries_several_capabilities() {
 	let second = Event::create().expect("a test event");
 	let (first_koid, second_koid) = (first.header().koid(), second.header().koid());
 
-	let caps = alloc::vec![super::handle::Capability::new(first as Arc<dyn KernelObject>, Rights::ALL, 0), super::handle::Capability::new(second as Arc<dyn KernelObject>, Rights::ALL, 0),];
-	sender.send(Message::new(b"two".to_vec(), caps, 0)).expect("a two-capability message sends");
+	let caps = alloc::vec![super::handle::Capability::new(first as Arc<dyn KernelObject>, Rights::ALL), super::handle::Capability::new(second as Arc<dyn KernelObject>, Rights::ALL),];
+	sender.send(Message::new(b"two".to_vec(), caps)).expect("a two-capability message sends");
 
 	let message = receiver.recv().expect("it arrives");
 	assert_eq!(message.caps.len(), 2, "both capabilities survive the queue");
@@ -148,7 +148,7 @@ fn a_prepared_thread_does_not_run_until_released() {
 		RAN.store(true, Ordering::SeqCst);
 	}
 
-	let thread = crate::sched::prepare_with_object(body, Event::create().expect("a test event"), Rights::ALL, 0);
+	let thread = crate::sched::prepare_with_object(body, Event::create().expect("a test event"), Rights::ALL);
 
 	// The scheduler is given every chance to run it. Without this the test would pass over an
 	// implementation that merely deferred the start by a tick.
@@ -265,7 +265,7 @@ fn system_power_refuses_a_caller_without_the_root_domain() {
 	}
 
 	let child = Domain::new_child(&crate::sched::root_domain(), UNLIMITED, UNLIMITED, UNLIMITED).expect("a live parent takes a child");
-	crate::sched::spawn_with_object(body, child, Rights::ALL, 0);
+	crate::sched::spawn_with_object(body, child, Rights::ALL);
 	crate::sched::run_until_idle();
 	assert!(NO_HANDLE.load(Ordering::SeqCst) < 0, "a caller holding no capability is refused");
 	assert_eq!(WRONG_DOMAIN.load(Ordering::SeqCst), crate::syscall::ERR_ACCESS_DENIED, "a caller holding a non-root Domain is refused by identity, not merely by type");
@@ -287,7 +287,7 @@ fn object_property_set_names_an_object() {
 	let event = Event::create().expect("a test event");
 	// The driver thread holds a handle to this same Event; the test keeps an Arc to
 	// read the label back after the thread names it.
-	crate::sched::spawn_with_object(body, event.clone(), Rights::ALL, 0);
+	crate::sched::spawn_with_object(body, event.clone(), Rights::ALL);
 	crate::sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst));
 	event.header().with_name(|name| assert_eq!(name, Some("irq-driver")));
@@ -318,7 +318,7 @@ fn a_group_handle_becomes_waitable_only_once_every_stage_ends() {
 	let group = ProcessGroup::create(&stages).expect("a two-stage group");
 
 	READY.store(true, Ordering::SeqCst);
-	crate::sched::spawn_with_object(probe, group.clone(), Rights::ALL, 0);
+	crate::sched::spawn_with_object(probe, group.clone(), Rights::ALL);
 	crate::sched::run_until_idle();
 	assert!(!READY.load(Ordering::SeqCst), "a group with live stages is not ready");
 
@@ -326,13 +326,13 @@ fn a_group_handle_becomes_waitable_only_once_every_stage_ends() {
 	// first exit would announce a pipeline finished while a stage was still producing.
 	stages[0].terminate();
 	READY.store(true, Ordering::SeqCst);
-	crate::sched::spawn_with_object(probe, group.clone(), Rights::ALL, 0);
+	crate::sched::spawn_with_object(probe, group.clone(), Rights::ALL);
 	crate::sched::run_until_idle();
 	assert!(!READY.load(Ordering::SeqCst), "a partly exited group is still not ready");
 
 	stages[1].terminate();
 	READY.store(false, Ordering::SeqCst);
-	crate::sched::spawn_with_object(probe, group.clone(), Rights::ALL, 0);
+	crate::sched::spawn_with_object(probe, group.clone(), Rights::ALL);
 	crate::sched::run_until_idle();
 	assert!(READY.load(Ordering::SeqCst), "the group is ready once every stage has ended");
 }
@@ -371,14 +371,14 @@ fn signalling_a_job_reaches_a_group_the_same_way_it_reaches_a_process() {
 	// than the absence: the fallback above must not have widened what a group handle can be used
 	// for, and the way to be sure is to hold one without the authority and be refused. A handle
 	// with READ can be asked what the job did and cannot end it.
-	crate::sched::spawn_with_object(stop_the_group, group.clone(), Rights::READ | Rights::WAIT, 0);
+	crate::sched::spawn_with_object(stop_the_group, group.clone(), Rights::READ | Rights::WAIT);
 	crate::sched::run_until_idle();
 	assert_eq!(RESULT.load(Ordering::SeqCst), crate::syscall::ERR_ACCESS_DENIED, "a group handle without MANAGE cannot signal the job");
 	for (index, stage) in stages.iter().enumerate() {
 		assert!(!stage.is_stopped(), "stage {index} was not stopped by the refused signal");
 	}
 
-	crate::sched::spawn_with_object(stop_the_group, group.clone(), Rights::ALL, 0);
+	crate::sched::spawn_with_object(stop_the_group, group.clone(), Rights::ALL);
 	crate::sched::run_until_idle();
 	assert_eq!(RESULT.load(Ordering::SeqCst), 0, "the process-signal syscall accepted a group handle");
 	// EVERY member, not the first one. A fan-out that stopped at the first process would leave a
@@ -551,7 +551,7 @@ fn the_console_and_display_syscalls_refuse_a_caller_without_the_capability() {
 	}
 
 	let feed = Privilege::create(PrivilegeKind::ConsoleInputSource).expect("a test privilege");
-	crate::sched::spawn_with_object(body, feed, Rights::ALL, 0);
+	crate::sched::spawn_with_object(body, feed, Rights::ALL);
 	crate::sched::run_until_idle();
 
 	for (index, name) in ["console_feed", "console_attach", "framebuffer_map"].iter().enumerate() {
@@ -573,7 +573,7 @@ fn a_transfer_that_is_never_committed_is_a_leak_the_table_can_see() {
 	//
 	// Both endings are exercised here, because the defect was that one of them was missing.
 	let mut table = HandleTable::new();
-	let handle = table.insert_object(TestObject::new(7), Rights::ALL, 0);
+	let handle = table.insert_object(TestObject::new(7), Rights::ALL);
 	assert_eq!(table.len(), 1);
 
 	// Taken: the slot holds nothing, and the handle names nothing.
@@ -584,7 +584,7 @@ fn a_transfer_that_is_never_committed_is_a_leak_the_table_can_see() {
 	// Committed: the slot goes back into circulation under a new generation, so the OLD handle
 	// value stays dead and the index is available again.
 	table.commit_taken(handle);
-	let reused = table.insert_object(TestObject::new(9), Rights::ALL, 0);
+	let reused = table.insert_object(TestObject::new(9), Rights::ALL);
 	assert!(table.lookup(reused, Rights::READ).is_ok(), "the slot is usable again after a committed transfer");
 	assert!(table.lookup(handle, Rights::READ).is_err(), "the old handle value must not come back to life");
 
@@ -603,14 +603,14 @@ fn a_table_torn_down_mid_transfer_does_not_hand_the_slot_out_twice() {
 	// transfer - so the `restore_taken` that followed wrote a live capability into a slot that was
 	// simultaneously free, and the next insert could hand the same index to somebody else.
 	let mut table = HandleTable::new();
-	let keep = table.insert_object(TestObject::new(1), Rights::ALL, 0);
-	let moving = table.insert_object(TestObject::new(2), Rights::ALL, 0);
+	let keep = table.insert_object(TestObject::new(1), Rights::ALL);
+	let moving = table.insert_object(TestObject::new(2), Rights::ALL);
 	let cap = table.take_for_transfer(moving, Rights::TRANSFER).expect("taken for transfer");
 
 	table.close_all();
 
 	// The reserved index is not in circulation, so a fresh insert cannot collide with it.
-	let fresh = table.insert_object(TestObject::new(3), Rights::ALL, 0);
+	let fresh = table.insert_object(TestObject::new(3), Rights::ALL);
 	assert_ne!(fresh.raw(), moving.raw(), "close_all must not hand out a slot with a transfer in flight");
 	assert!(table.lookup(fresh, Rights::READ).is_ok(), "the fresh handle is live");
 
@@ -627,7 +627,7 @@ fn a_table_torn_down_mid_transfer_does_not_hand_the_slot_out_twice() {
 
 	// The reservation is resolved either way, so the slot is not left in the state that has no exit:
 	// reserved, empty, and skipped by everything.
-	let after = table.insert_object(TestObject::new(4), Rights::ALL, 0);
+	let after = table.insert_object(TestObject::new(4), Rights::ALL);
 	assert!(table.lookup(after, Rights::READ).is_ok(), "the table still works after the transfer ended");
 }
 
@@ -642,7 +642,7 @@ fn a_transfer_that_can_no_longer_be_resolved_gives_the_slot_back() {
 	let mut table = HandleTable::new();
 	table.set_domain(domain.clone());
 	let before = domain.account().handles().used();
-	let moving = table.insert_object(TestObject::new(1), Rights::ALL, 0);
+	let moving = table.insert_object(TestObject::new(1), Rights::ALL);
 	assert_eq!(domain.account().handles().used(), before + 1, "the handle is charged");
 	let cap = table.take_for_transfer(moving, Rights::TRANSFER).expect("taken for transfer");
 	drop(cap); // the capability is gone: neither party has it, which is the case with no outcome
@@ -651,7 +651,7 @@ fn a_transfer_that_can_no_longer_be_resolved_gives_the_slot_back() {
 	assert_eq!(domain.account().handles().used(), before, "the quota comes back");
 	assert!(table.lookup(moving, Rights::READ).is_err(), "and the handle value is dead");
 	// The slot is back in circulation rather than stranded - the whole cost of the missing outcome.
-	let reused = table.insert_object(TestObject::new(2), Rights::ALL, 0);
+	let reused = table.insert_object(TestObject::new(2), Rights::ALL);
 	assert_eq!(reused.raw() as u32, moving.raw() as u32, "the slot is reusable again");
 	assert_ne!(reused.raw(), moving.raw(), "under a new generation, so the old value stays dead");
 }
@@ -704,7 +704,7 @@ fn a_returned_message_is_still_charged_to_the_sender() {
 	let payload = alloc::vec![7u8; 64];
 	let bytes = payload.len() as u64;
 	let before = domain.account().ipc_queue().used();
-	a.send_charged(Message::new(payload, alloc::vec::Vec::new(), 0), &domain).expect("the send is accepted and charged");
+	a.send_charged(Message::new(payload, alloc::vec::Vec::new()), &domain).expect("the send is accepted and charged");
 	let charged = domain.account().ipc_queue().used();
 	assert_eq!(charged, before + bytes, "the sender is charged for what is queued");
 
@@ -746,7 +746,7 @@ fn the_committed_receive_refunds_what_it_takes() {
 	let (a, b) = Channel::create();
 	let before = domain.account().ipc_queue().used();
 	for _ in 0..16 {
-		a.send_charged(Message::new(alloc::vec![7u8; 64], alloc::vec::Vec::new(), 0), &domain).expect("the send is accepted and charged");
+		a.send_charged(Message::new(alloc::vec![7u8; 64], alloc::vec::Vec::new()), &domain).expect("the send is accepted and charged");
 	}
 	assert_eq!(domain.account().ipc_queue().used(), before + 16 * 64, "the sender is charged for what is queued");
 	while let Ok(message) = b.recv() {
@@ -756,7 +756,7 @@ fn the_committed_receive_refunds_what_it_takes() {
 
 	// And the structural half: a message dropped without any explicit release refunds itself, so no
 	// future path can lose a charge by returning early.
-	a.send_charged(Message::new(alloc::vec![7u8; 64], alloc::vec::Vec::new(), 0), &domain).expect("charged again");
+	a.send_charged(Message::new(alloc::vec![7u8; 64], alloc::vec::Vec::new()), &domain).expect("charged again");
 	let (id, _, _) = b.peek_identified().expect("queued");
 	let Ok(taken) = b.recv_identified(id, usize::MAX, abi::MAX_MESSAGE_CAPS) else {
 		panic!("taken transactionally, and never committed");

@@ -294,7 +294,7 @@ fn system_volume_spans_the_disks_capacity() {
 	let (boot_kernel, boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
 	let (serve_server, _serve_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the StorageService should load");
+	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL).expect("the StorageService should load");
 	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
 
@@ -322,7 +322,7 @@ fn system_volume_spans_the_disks_capacity() {
 	// The typed volume health/policy ops over the serve channel. Send a generated
 	// request ([op u16][corr u32][args]) and pump block traffic until the reply lands.
 	let mut request = |body: &[u8]| -> alloc::vec::Vec<u8> {
-		_serve_client.send(Message::new(body.to_vec(), alloc::vec::Vec::new(), 0)).expect("the typed request should send");
+		_serve_client.send(Message::new(body.to_vec(), alloc::vec::Vec::new())).expect("the typed request should send");
 		for _ in 0..100_000 {
 			sched::run_until_idle();
 			pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
@@ -410,7 +410,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 	let (boot_kernel, boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
 	let (serve_server, _serve_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the StorageService should load");
+	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL).expect("the StorageService should load");
 	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
 
@@ -470,7 +470,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	let (boot_kernel, boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
 	let (serve_server, _serve_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the StorageService should load");
+	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL).expect("the StorageService should load");
 	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
 
@@ -508,7 +508,7 @@ fn storage_on_disk(disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<
 	let (boot_kernel, boot_user) = Channel::create();
 	let (blk_host, blk_child) = Channel::create();
 	let (serve_server, _serve_client) = Channel::create();
-	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL, 0).expect("the StorageService should load");
+	loader::spawn_elf_process(sched::root_domain(), elf, boot_user, Rights::ALL).expect("the StorageService should load");
 	send_cap(&boot_kernel, b"BLOCK", blk_child, Rights::ALL).expect("the BLOCK handoff should send");
 	send_cap(&boot_kernel, b"SERVE", serve_server, Rights::ALL).expect("the SERVE handoff should send");
 	for _ in 0..100_000 {

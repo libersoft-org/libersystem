@@ -230,8 +230,8 @@ impl Process {
 	// STARTED, was reported as spawned, and had no bootstrap capability - a failure the parent
 	// could not detect and the child could not name. The quota leak on that path was fixed a round
 	// earlier; the failure semantics were not, because the type could not express them.
-	pub fn install(&self, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Option<u64> {
-		match self.handles.lock().insert_object(object, rights, badge).raw() {
+	pub fn install(&self, object: Arc<dyn KernelObject>, rights: Rights) -> Option<u64> {
+		match self.handles.lock().insert_object(object, rights).raw() {
 			0 => None,
 			handle => Some(handle),
 		}

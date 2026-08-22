@@ -12,25 +12,15 @@ Traits for sample formats
 
 use alloc::vec::Vec;
 
-/// Trait for a packet of multiple samples
+/// Trait for a packet of multiple samples.
+///
+/// IT USED TO ASK TWO MORE QUESTIONS - `num_samples` and `truncate` - and nothing ever asked them:
+/// the decoder hands its `samples` vector straight to the caller, which counts and trims it itself.
 pub trait Samples {
-	fn num_samples(&self) -> usize;
-	fn truncate(&mut self, limit: usize);
 	fn from_floats(floats: Vec<Vec<f32>>) -> Self;
 }
 
 impl<S: Sample> Samples for Vec<Vec<S>> {
-	fn num_samples(&self) -> usize {
-		self[0].len()
-	}
-	fn truncate(&mut self, limit: usize) {
-		for ch in self.iter_mut() {
-			if limit < ch.len() {
-				ch.truncate(limit);
-			}
-		}
-	}
-
 	fn from_floats(floats: Vec<Vec<f32>>) -> Self {
 		floats.into_iter().map(|samples| samples.into_iter().map(S::from_float).collect()).collect()
 	}
@@ -39,16 +29,9 @@ impl<S: Sample> Samples for Vec<Vec<S>> {
 /// A packet of multi-channel interleaved samples
 pub struct InterleavedSamples<S: Sample> {
 	pub samples: Vec<S>,
-	pub channel_count: usize,
 }
 
 impl<S: Sample> Samples for InterleavedSamples<S> {
-	fn num_samples(&self) -> usize {
-		self.samples.len() / self.channel_count
-	}
-	fn truncate(&mut self, limit: usize) {
-		self.samples.truncate(limit * self.channel_count);
-	}
 	fn from_floats(floats: Vec<Vec<f32>>) -> Self {
 		let channel_count = floats.len();
 		// Note that a channel count of 0 is forbidden
@@ -68,7 +51,7 @@ impl<S: Sample> Samples for InterleavedSamples<S> {
 			}
 			samples
 		};
-		Self { samples: samples_interleaved, channel_count }
+		Self { samples: samples_interleaved }
 	}
 }
 

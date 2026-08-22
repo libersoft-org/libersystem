@@ -30,16 +30,6 @@ pub enum AudioReadError {
 	EndOfPacket,
 	AudioBadFormat,
 	AudioIsHeader,
-	/// If the needed memory isn't addressable by us
-	///
-	/// This error is returned if a calculation yielded a higher value for
-	/// an internal buffer size that doesn't fit into the platform's address range.
-	/// Note that if we "simply" encounter an allocation failure (OOM, etc),
-	/// we do what libstd does in these cases: crash.
-	///
-	/// This error is not automatically an error of the format,
-	/// but rather is due to insufficient decoder hardware.
-	BufferNotAddressable,
 }
 
 // For the () error type returned by the bitpacking layer
@@ -59,7 +49,6 @@ impl fmt::Display for AudioReadError {
 			AudioReadError::EndOfPacket => "End of packet reached.",
 			AudioReadError::AudioBadFormat => "Invalid audio packet",
 			AudioReadError::AudioIsHeader => "The vorbis version is not supported",
-			AudioReadError::BufferNotAddressable => "Requested to create buffer of non-addressable size",
 		};
 		write!(fmt, "{}", description)
 	}
@@ -847,6 +836,7 @@ fn dual_mut_idx<T>(v: &mut [T], idx_a: usize, idx_b: usize) -> (&mut T, &mut T) 
 	(first, last)
 }
 
+#[cfg(test)]
 fn dct_iv_slow(buffer: &mut [f32]) {
 	let x = buffer.to_vec();
 	let n = buffer.len();
@@ -861,6 +851,7 @@ fn dct_iv_slow(buffer: &mut [f32]) {
 	}
 }
 
+#[cfg(test)]
 fn inverse_mdct_slow(buffer: &mut [f32]) {
 	let n = buffer.len();
 	let n4 = n >> 2;
@@ -891,10 +882,6 @@ impl PreviousWindowRight {
 	/// Initialisation for new streams
 	pub fn new() -> Self {
 		return PreviousWindowRight { data: None };
-	}
-	/// If the state is still uninitialized
-	pub fn is_empty(&self) -> bool {
-		self.data.is_none()
 	}
 }
 
@@ -1066,7 +1053,7 @@ pub fn read_audio_packet_generic<S: Samples>(ident: &IdentHeader, setup: &SetupH
 
 	// Compute windowing info for left window
 	let window_center = n >> 1;
-	let (left_win_start, left_win_end, left_n, left_n_use_bs1) = if previous_next_window_flag.map_or(true, |(prev_win_flag, _)| prev_win_flag) {
+	let (left_win_start, _left_win_end, _left_n, left_n_use_bs1) = if previous_next_window_flag.map_or(true, |(prev_win_flag, _)| prev_win_flag) {
 		(0, window_center, n >> 1, mode.mode_blockflag)
 	} else {
 		let bs_0_exp = 1 << ident.blocksize_0;
@@ -1175,10 +1162,6 @@ Pass your info to this function to get your raw packet data decoded.
 Panics if the passed PreviousWindowRight struct doesn't match the info
 from the ident header.
 */
-pub fn read_audio_packet(ident: &IdentHeader, setup: &SetupHeader, packet: &[u8], pwr: &mut PreviousWindowRight) -> Result<Vec<Vec<i16>>, AudioReadError> {
-	read_audio_packet_generic(ident, setup, packet, pwr)
-}
-
 #[cfg(test)]
 #[path = "audio/tests.rs"]
 mod tests;

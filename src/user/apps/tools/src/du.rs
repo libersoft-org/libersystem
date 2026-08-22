@@ -50,7 +50,6 @@ struct DirUsage {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buf: [u8; 256] = [0u8; 256];
 	unsafe {
 		// 1. adopt the forwarded stdout console (the first bootstrap message).
 		inherit_stdout(bootstrap);

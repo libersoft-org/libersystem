@@ -186,7 +186,7 @@ fn notify_crash(koid: u64, kind: u64) {
 		}
 		bytes.extend_from_slice(&koid.to_le_bytes());
 		bytes.extend_from_slice(&kind.to_le_bytes());
-		let _ = channel.send(Message::new(bytes, Vec::new(), 0));
+		let _ = channel.send(Message::new(bytes, Vec::new()));
 	}
 }
 

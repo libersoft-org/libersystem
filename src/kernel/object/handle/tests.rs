@@ -19,7 +19,7 @@ fn capability_grants_no_operation_beyond_rights() {
 	for _ in 0..512 {
 		let granted = Rights::from_bits(next() as u32);
 		let probe = Rights::from_bits(next() as u32);
-		let handle = table.insert_object(TestObject::new(1), granted, 0);
+		let handle = table.insert_object(TestObject::new(1), granted);
 		assert_eq!(table.lookup(handle, probe).is_ok(), granted.contains(probe), "a lookup must succeed iff the probe rights are a subset of the granted rights");
 		table.close(handle).expect("close");
 	}
@@ -43,7 +43,7 @@ fn capability_attenuation_only_narrows() {
 	for _ in 0..512 {
 		let granted = Rights::from_bits(next() as u32) | Rights::DUPLICATE;
 		let requested = Rights::from_bits(next() as u32);
-		let handle = table.insert_object(TestObject::new(2), granted, 0);
+		let handle = table.insert_object(TestObject::new(2), granted);
 		match table.duplicate(handle, requested) {
 			Ok(duplicate) => {
 				// Duplication is allowed only when the request is within the grant...
@@ -97,8 +97,8 @@ fn a_close_all_racing_a_transfer_never_frees_the_same_slot_twice() {
 	// take a capability for transfer, close the table underneath it, complete the transfer, and
 	// look at the free list.
 	let mut table = HandleTable::new();
-	let keep = table.insert_object(TestObject::new(1), Rights::ALL, 0);
-	let moving = table.insert_object(TestObject::new(2), Rights::ALL, 0);
+	let keep = table.insert_object(TestObject::new(1), Rights::ALL);
+	let moving = table.insert_object(TestObject::new(2), Rights::ALL);
 	assert!(table.lookup(keep, Rights::NONE).is_ok() && table.lookup(moving, Rights::NONE).is_ok(), "both handles are installed");
 
 	let taken = table.take_for_transfer(moving, Rights::ALL).expect("the capability is taken for transfer");
@@ -114,8 +114,8 @@ fn a_close_all_racing_a_transfer_never_frees_the_same_slot_twice() {
 		seen.push(index);
 	}
 	// And the slot really is reusable exactly once.
-	let reused = table.insert_object(TestObject::new(3), Rights::ALL, 0);
-	let again = table.insert_object(TestObject::new(4), Rights::ALL, 0);
+	let reused = table.insert_object(TestObject::new(3), Rights::ALL);
+	let again = table.insert_object(TestObject::new(4), Rights::ALL);
 	assert!(reused != again, "two inserts must not answer with the same handle");
 }
 
@@ -131,7 +131,7 @@ fn closing_a_handle_never_needs_an_allocation() {
 	// `free.capacity() >= slots.len()` after every insertion means no closing push can ever grow it.
 	let mut table = HandleTable::new();
 	for n in 1..=64u64 {
-		let _ = table.insert_object(TestObject::new(n), Rights::ALL, 0);
+		let _ = table.insert_object(TestObject::new(n), Rights::ALL);
 		assert!(table.free_capacity_for_test() >= table.slot_count_for_test(), "after {n} inserts the free list has room for {} of {} slots: closing one would allocate", table.free_capacity_for_test(), table.slot_count_for_test());
 	}
 
@@ -139,7 +139,7 @@ fn closing_a_handle_never_needs_an_allocation() {
 	// comment described and the only one it was true for.
 	let mut handles = alloc::vec::Vec::new();
 	for n in 100..=120u64 {
-		handles.push(table.insert_object(TestObject::new(n), Rights::ALL, 0));
+		handles.push(table.insert_object(TestObject::new(n), Rights::ALL));
 	}
 	for handle in handles {
 		table.close(handle).expect("an installed handle closes");

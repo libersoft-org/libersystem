@@ -139,7 +139,7 @@ unsafe fn report_missing(name: &str) {
 // wants one name and has no use for the rest, and a directory it may not list is one it can still
 // be told about a single file in.
 unsafe fn exists(storage: u64, path: &str) -> bool {
-	unsafe {
+	{
 		if storage == 0 {
 			return false;
 		}

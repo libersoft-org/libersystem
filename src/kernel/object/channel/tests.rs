@@ -43,8 +43,8 @@ fn channel_message_and_capability_transfer() {
 		}
 	}
 	let (sender_end, receiver_end) = Channel::create();
-	sched::spawn_with_object(sender, sender_end, Rights::ALL, 0);
-	sched::spawn_with_object(receiver, receiver_end, Rights::ALL, 0);
+	sched::spawn_with_object(sender, sender_end, Rights::ALL);
+	sched::spawn_with_object(receiver, receiver_end, Rights::ALL);
 	sched::run_until_idle();
 	assert!(OK.load(Ordering::SeqCst));
 	assert_eq!(MARKER.load(Ordering::SeqCst), 0x5151_5151);
@@ -89,10 +89,10 @@ fn a_sender_on_a_full_channel_blocks_and_wakes_on_drain() {
 		}
 	}
 	let (sender_end, receiver_end) = Channel::try_create_with_depth(2).expect("a channel pair");
-	sched::spawn_with_object(sender, sender_end, Rights::ALL, 0);
+	sched::spawn_with_object(sender, sender_end, Rights::ALL);
 	sched::run_until_idle();
 	assert!(SENDER_REFUSED.load(Ordering::SeqCst), "the depth-2 queue refused the third send");
-	sched::spawn_with_object(receiver, receiver_end, Rights::ALL, 0);
+	sched::spawn_with_object(receiver, receiver_end, Rights::ALL);
 	sched::run_until_idle();
 	assert!(SENDER_DONE.load(Ordering::SeqCst), "the drain woke the blocked sender");
 	assert_eq!(RECEIVED.load(Ordering::SeqCst), 3, "every message was delivered");
@@ -102,10 +102,9 @@ crate::tagged_test!(channel_endpoint_semantics, [Channel, Ipc], id = "kernel.obj
 fn channel_endpoint_semantics() {
 	let (sender, receiver) = Channel::create();
 	assert!(matches!(receiver.recv(), Err(ChannelError::Empty)));
-	sender.send(Message::new(alloc::vec![1, 2, 3], alloc::vec::Vec::new(), 0x99)).unwrap();
+	sender.send(Message::new(alloc::vec![1, 2, 3], alloc::vec::Vec::new())).unwrap();
 	let message = receiver.recv().unwrap();
 	assert_eq!(message.bytes, alloc::vec![1, 2, 3]);
-	assert_eq!(message.badge, 0x99);
 	drop(sender);
 	assert!(receiver.is_peer_closed());
 	assert!(matches!(receiver.recv(), Err(ChannelError::PeerClosed)));
@@ -116,8 +115,8 @@ fn channel_peek_reports_the_pending_length() {
 	let (sender, receiver) = Channel::create();
 	assert!(matches!(receiver.peek_len(), Err(ChannelError::Empty)));
 	let big: alloc::vec::Vec<u8> = (0..20_000u32).map(|value| value as u8).collect();
-	sender.send(Message::new(big.clone(), alloc::vec::Vec::new(), 0)).unwrap();
-	sender.send(Message::new(alloc::vec![7u8; 3], alloc::vec::Vec::new(), 0)).unwrap();
+	sender.send(Message::new(big.clone(), alloc::vec::Vec::new())).unwrap();
+	sender.send(Message::new(alloc::vec![7u8; 3], alloc::vec::Vec::new())).unwrap();
 	assert_eq!(receiver.peek_len().unwrap(), 20_000);
 	assert_eq!(receiver.peek_len().unwrap(), 20_000, "peek does not dequeue");
 	let first = receiver.recv().unwrap();
@@ -155,8 +154,8 @@ fn blocking_wait_wakes_on_message() {
 		}
 	}
 	let (server_end, client_end) = Channel::create();
-	sched::spawn_with_object(server, server_end, Rights::ALL, 0);
-	sched::spawn_with_object(client, client_end, Rights::ALL, 0);
+	sched::spawn_with_object(server, server_end, Rights::ALL);
+	sched::spawn_with_object(client, client_end, Rights::ALL);
 	sched::run_until_idle();
 	assert!(OK.load(Ordering::SeqCst));
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0);
@@ -191,10 +190,10 @@ fn wait_any_wakes_on_the_ready_handle() {
 	let (second_server_end, second_client_end) = Channel::create();
 	// Spawn the server with the first channel, then install the second channel as a
 	// second handle and record it for the server.
-	let server = sched::spawn_with_object(server, first_server_end, Rights::ALL, 0);
-	let second_handle = server.handles().lock().insert(Capability::new(second_server_end, Rights::ALL, 0)).raw();
+	let server = sched::spawn_with_object(server, first_server_end, Rights::ALL);
+	let second_handle = server.handles().lock().insert(Capability::new(second_server_end, Rights::ALL)).raw();
 	SECOND_HANDLE.store(second_handle, Ordering::SeqCst);
-	sched::spawn_with_object(client, second_client_end, Rights::ALL, 0);
+	sched::spawn_with_object(client, second_client_end, Rights::ALL);
 	// Hold the first channel's peer open so that handle stays silent; otherwise its
 	// peer-close would make it ready and wait_any could return 0.
 	let _keep_first_client_end = first_client_end;
@@ -208,10 +207,10 @@ fn channel_round_trip_delivers_request_and_reply() {
 	// A request and a reply each deliver their exact bytes through the channel
 	// primitive, the path the latency benchmark times.
 	let (client, server) = Channel::create();
-	client.send(Message::new(alloc::vec::Vec::from(*b"req"), alloc::vec::Vec::new(), 0)).unwrap();
+	client.send(Message::new(alloc::vec::Vec::from(*b"req"), alloc::vec::Vec::new())).unwrap();
 	let request = server.recv().unwrap();
 	assert_eq!(&request.bytes[..], b"req");
-	server.send(Message::new(alloc::vec::Vec::from(*b"reply"), alloc::vec::Vec::new(), 0)).unwrap();
+	server.send(Message::new(alloc::vec::Vec::from(*b"reply"), alloc::vec::Vec::new())).unwrap();
 	let reply = client.recv().unwrap();
 	assert_eq!(&reply.bytes[..], b"reply");
 }
@@ -275,7 +274,7 @@ fn receives_in_flight_never_let_the_queue_pass_its_limit() {
 
 	let fill = |n: usize| {
 		let mut sent = 0;
-		while sent < n && a.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).is_ok() {
+		while sent < n && a.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).is_ok() {
 			sent += 1;
 		}
 		sent

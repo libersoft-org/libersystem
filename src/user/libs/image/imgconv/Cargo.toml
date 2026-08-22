@@ -17,3 +17,14 @@ ppm = { path = "../ppm" }
 qoi = { path = "../qoi" }
 tga = { path = "../tga" }
 webp = { path = "../webp" }
+
+# A WARNING IS AN ERROR HERE. P02M0144 took ninety-one `allow` attributes out of this tree and found
+# a hundred and twenty warnings underneath them - a duplicate register read a driver was told to
+# call, a field whose comment said it kept a DMA buffer alive and which nothing read, a HAL entry
+# all three backends declared and none called. None of that was reported, because the reporting had
+# been switched off file by file over years, unevenly, and nobody had decided it.
+#
+# `[lints]` rather than `RUSTFLAGS`: this denies in THIS package only. RUSTFLAGS would deny inside
+# `build-std`'s `core` and `compiler_builtins` too, where a warning is not ours to answer.
+[lints.rust]
+warnings = "deny"

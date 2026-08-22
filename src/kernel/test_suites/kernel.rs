@@ -81,7 +81,7 @@ fn a_capability_transfer_moves_it_exactly_once() {
 
 	let mut table = HandleTable::new();
 	let (carried, _peer) = Channel::create();
-	let handle = table.insert_object(carried, Rights::ALL, 0);
+	let handle = table.insert_object(carried, Rights::ALL);
 
 	// Taking it MOVES it: the handle is dead immediately, with no window in which it
 	// still names anything.
@@ -149,7 +149,7 @@ fn duplicating_a_handle_is_charged_like_any_other_install() {
 	let mut table = HandleTable::new();
 	table.set_domain(domain);
 	let (channel, _peer) = Channel::create();
-	let first = table.try_insert_object(channel, Rights::ALL, 0).expect("the first handle fits");
+	let first = table.try_insert_object(channel, Rights::ALL).expect("the first handle fits");
 
 	// duplicate until the quota says no, and it must say no rather than growing forever.
 	let mut made = 0;
@@ -349,7 +349,7 @@ fn process_isolation_and_per_process_tables() {
 	// Handle tables are per-process: a capability installed in one process is
 	// invisible to the other.
 	let (endpoint, _peer) = object::channel::Channel::create();
-	p1.install(endpoint, Rights::ALL, 0).expect("a handle in a test process");
+	p1.install(endpoint, Rights::ALL).expect("a handle in a test process");
 	assert_eq!(p1.handles().lock().len(), 1);
 	assert_eq!(p2.handles().lock().len(), 0);
 
@@ -563,17 +563,17 @@ fn waiting_on_a_process_handle_wakes_when_it_exits() {
 		}
 	}
 	let (rel0, rel1) = object::channel::Channel::create();
-	let subject_thread = sched::spawn_with_object(subject, rel0, object::rights::Rights::ALL, 0);
+	let subject_thread = sched::spawn_with_object(subject, rel0, object::rights::Rights::ALL);
 	let subject_process = subject_thread.process().clone();
 	// The waiter gets a handle to the subject's process as its argument (installed by
 	// spawn_with_object), carrying the WAIT right.
-	let _waiter = sched::spawn_with_object(waiter, subject_process.clone(), object::rights::Rights::ALL, 0);
+	let _waiter = sched::spawn_with_object(waiter, subject_process.clone(), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	// Both are blocked now: the subject on the release channel, the waiter on the
 	// not-yet-terminated process handle.
 	assert!(!DONE.load(Ordering::SeqCst), "the waiter blocks while the subject still runs");
 	// Release the subject so it returns and exits.
-	rel1.send(object::channel::Message::new(alloc::vec![1], alloc::vec::Vec::new(), 0)).unwrap();
+	rel1.send(object::channel::Message::new(alloc::vec![1], alloc::vec::Vec::new())).unwrap();
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the waiter wakes once the subject exits");
 	assert_eq!(WAIT_RET.load(Ordering::SeqCst), 0, "the process handle became ready on exit");
@@ -600,7 +600,7 @@ fn signal_terminate_wakes_a_blocked_thread() {
 	}
 	let (a, b) = object::channel::Channel::create();
 	let _keep = b; // hold the peer so the channel never becomes ready by itself
-	let victim_thread = sched::spawn_with_object(victim, a, object::rights::Rights::ALL, 0);
+	let victim_thread = sched::spawn_with_object(victim, a, object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(RAN.load(Ordering::SeqCst), "the victim ran and blocked");
 	assert!(!PAST_WAIT.load(Ordering::SeqCst), "the victim is blocked in the wait");
@@ -639,7 +639,7 @@ fn a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops() {
 	BLOCKED.store(false, Ordering::SeqCst);
 	RESUMED.store(false, Ordering::SeqCst);
 	let (theirs, ours) = object::channel::Channel::create();
-	let _thread = sched::spawn_with_object(waiter, theirs, object::rights::Rights::ALL, 0);
+	let _thread = sched::spawn_with_object(waiter, theirs, object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(BLOCKED.load(Ordering::SeqCst), "the waiter ran");
 	assert!(!RESUMED.load(Ordering::SeqCst), "and is blocked while this test holds the peer");
@@ -665,7 +665,7 @@ fn a_clean_exit_releases_the_process_channel_endpoints() {
 	let (ours, theirs) = Channel::create();
 	// park the peer endpoint in the child's handle table, standing in for a tool's
 	// inherited stdout.
-	process.install(theirs, Rights::ALL, 0).expect("a handle in a test process");
+	process.install(theirs, Rights::ALL).expect("a handle in a test process");
 	// the child's single thread exits cleanly at once.
 	extern "C" fn clean_body(_arg: u64) {}
 	let thread = sched::thread_create(process.clone(), clean_body, 0);
@@ -707,7 +707,7 @@ fn userspace_spawn_syscalls_start_a_second_process() {
 	ELF_PTR.store(elf.as_ptr() as u64, Ordering::SeqCst);
 	ELF_LEN.store(elf.len() as u64, Ordering::SeqCst);
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
-	sched::spawn_with_object(spawner, user_ep, object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(spawner, user_ep, object::rights::Rights::ALL);
 	sched::run_until_idle();
 	let message = kernel_ep.recv().expect("the spawned process should report in over IPC");
 	assert_eq!(&message.bytes[..], b"LogService: online");
@@ -800,14 +800,14 @@ fn system_graph_reflects_live_state() {
 	use object::{KernelObject, ObjectType};
 	// A standalone Domain with one process holding two handles. Collecting the
 	// graph from that Domain must reflect the live structure exactly: one process
-	// with two handles, one of them the channel we installed - with its koid, type,
-	// rights, and badge intact. Dropping the process removes it from the graph.
+	// with two handles, one of them the channel we installed - with its koid, type
+	// and rights intact. Dropping the process removes it from the graph.
 	let domain = Domain::new(1 << 20, 16, 8);
 	let process = Process::new(AddressSpace::kernel(), domain.clone()).expect("a test process");
 	let (endpoint, _peer) = Channel::create();
 	let channel_koid = endpoint.header().koid();
-	process.install(endpoint, Rights::READ | Rights::WRITE, 42).expect("a handle in a test process");
-	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0).expect("a handle in a test process");
+	process.install(endpoint, Rights::READ | Rights::WRITE).expect("a handle in a test process");
+	process.install(object::event::Event::create().expect("a test event"), Rights::ALL).expect("a handle in a test process");
 
 	let node = graph::collect_from(&domain);
 	assert_eq!(node.koid, domain.header().koid());
@@ -818,7 +818,6 @@ fn system_graph_reflects_live_state() {
 	let channel_handle = proc_node.handles.iter().find(|h| h.koid == channel_koid).expect("the channel handle should appear in the graph");
 	assert_eq!(channel_handle.object_type, ObjectType::Channel);
 	assert_eq!(channel_handle.rights, Rights::READ | Rights::WRITE);
-	assert_eq!(channel_handle.badge, 42);
 
 	// Dropping the process removes it from the live graph.
 	drop(process);
@@ -849,8 +848,8 @@ fn process_counters_track_ipc_and_resources() {
 	assert_eq!(process.messages_sent(), 2, "two sends counted");
 	assert_eq!(process.messages_received(), 1, "one recv counted");
 
-	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0).expect("a handle in a test process");
-	process.install(object::event::Event::create().expect("a test event"), Rights::ALL, 0).expect("a handle in a test process");
+	process.install(object::event::Event::create().expect("a test event"), Rights::ALL).expect("a handle in a test process");
+	process.install(object::event::Event::create().expect("a test event"), Rights::ALL).expect("a handle in a test process");
 	assert_eq!(process.handle_count(), 2, "two installed handles");
 
 	// Liveness the stats syscall reports: not killed here, killed after terminate().
@@ -867,7 +866,7 @@ fn userspace_runs_and_ipcs() {
 	// channel send (a syscall from userspace) and exits; the kernel reads the
 	// message back through the peer endpoint it kept.
 	let (ep0, ep1) = Channel::create();
-	sched::spawn_with_object(user_thread_body, ep0, object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(user_thread_body, ep0, object::rights::Rights::ALL);
 	sched::run_until_idle();
 	let message = ep1.recv().expect("ring-3 program sent a message");
 	assert_eq!(&message.bytes[..], b"OK");
@@ -884,8 +883,8 @@ fn userspace_yields_cooperatively() {
 	// arriving proves the save path is per-thread.
 	let (k0, u0) = Channel::create();
 	let (k1, u1) = Channel::create();
-	sched::spawn_with_object(user_yield_thread_body, u0, object::rights::Rights::ALL, 0);
-	sched::spawn_with_object(user_yield_thread_body, u1, object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(user_yield_thread_body, u0, object::rights::Rights::ALL);
+	sched::spawn_with_object(user_yield_thread_body, u1, object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert_eq!(&k0.recv().expect("first ring-3 thread sent a message").bytes[..], b"OK");
 	assert_eq!(&k1.recv().expect("second ring-3 thread sent a message").bytes[..], b"OK");
@@ -1319,7 +1318,7 @@ fn domain_kill_frees_subtree() {
 	// objects and park, and only then does the killer tear the subtree down.
 	sched::spawn_in(child.clone(), domain_parker, 0).expect("spawn parker 0");
 	sched::spawn_in(child.clone(), domain_parker, 0).expect("spawn parker 1");
-	sched::spawn_with_object(killer, parent.clone(), Rights::MANAGE, 0);
+	sched::spawn_with_object(killer, parent.clone(), Rights::MANAGE);
 	sched::run_until_idle();
 	// The kill syscall succeeded and the subtree was fully reclaimed: the killed
 	// processes' handles (and the memory those objects pinned) were freed eagerly,
@@ -1466,7 +1465,7 @@ fn a_refused_capability_send_leaves_every_handle_with_the_sender() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the transfer thread ran to completion");
 }
@@ -1503,7 +1502,7 @@ fn a_receiver_too_small_for_a_message_keeps_it_queued() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the receive thread ran to completion");
 }
@@ -1539,7 +1538,7 @@ fn a_batch_naming_one_handle_twice_is_refused_whole() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the batch thread ran to completion");
 }
@@ -1630,7 +1629,7 @@ fn a_terminating_process_takes_no_new_mappings() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the termination thread ran to completion");
 }
@@ -1658,7 +1657,7 @@ fn a_timer_armed_after_the_wait_began_still_wakes_it() {
 	WOKE.store(false, Ordering::SeqCst);
 	RESULT.store(u64::MAX, Ordering::SeqCst);
 	let timer = object::timer::Timer::create().expect("a test timer");
-	let thread = sched::spawn_with_object(waiter, timer.clone(), object::rights::Rights::ALL, 0);
+	let thread = sched::spawn_with_object(waiter, timer.clone(), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(!WOKE.load(Ordering::SeqCst), "the waiter must not return while the timer is unarmed");
 	assert_eq!(thread.state(), object::thread::ThreadState::Blocked, "the waiter must be parked, not spinning - otherwise this proves nothing about the wake");
@@ -1689,7 +1688,7 @@ fn wait_any_on_only_a_timer_returns_when_it_fires() {
 	WOKE.store(false, Ordering::SeqCst);
 	RESULT.store(u64::MAX, Ordering::SeqCst);
 	let timer = object::timer::Timer::create().expect("a test timer");
-	let thread = sched::spawn_with_object(waiter, timer.clone(), object::rights::Rights::ALL, 0);
+	let thread = sched::spawn_with_object(waiter, timer.clone(), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(!WOKE.load(Ordering::SeqCst), "the waiter must not return while the timer is unarmed");
 	assert_eq!(thread.state(), object::thread::ThreadState::Blocked, "the waiter must be parked");
@@ -1779,7 +1778,7 @@ fn a_fuzzed_capability_batch_never_mints_a_capability() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the capability fuzz ran to completion");
 }
@@ -1840,7 +1839,7 @@ fn handle_churn_never_resurrects_a_closed_capability() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the handle churn ran to completion");
 }
@@ -1914,7 +1913,7 @@ fn fuzzed_map_and_unmap_sequences_round_trip_the_window() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the map/unmap fuzz ran to completion");
 }
@@ -1956,7 +1955,7 @@ fn a_refused_single_capability_send_leaves_the_handle_where_it_was() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the transfer thread ran to completion");
 }
@@ -1994,7 +1993,7 @@ fn a_receive_takes_a_message_only_if_it_fits() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the receive thread ran to completion");
 }
@@ -2156,7 +2155,7 @@ fn a_set_that_was_told_it_joined_is_a_set_that_will_be_woken() {
 			WOKEN.store(all, Ordering::SeqCst);
 		}
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert_eq!(REFUSED.load(Ordering::SeqCst), syscall::ERR_RESOURCE_EXHAUSTED, "a set past what a wake can reach must be refused at the ADD, not silently left unwoken");
 	assert!(WOKEN.load(Ordering::SeqCst), "and every set inside the limit still answers for the member");
@@ -2264,7 +2263,7 @@ fn a_wait_set_registers_its_members_once_and_wakes_on_any_of_them() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the wait-set thread ran to completion");
 }
@@ -2304,7 +2303,7 @@ fn a_wait_set_member_whose_peer_closes_reports_rather_than_vanishing() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the lifetime thread ran to completion");
 }
@@ -2326,7 +2325,7 @@ fn a_wait_set_has_a_ceiling_and_says_so() {
 				let handle = {
 					let thread = sched::current_thread().expect("a current thread");
 					let event = object::event::Event::create().expect("a test event");
-					match thread.handles().lock().try_insert_object(event, object::rights::Rights::ALL, 0) {
+					match thread.handles().lock().try_insert_object(event, object::rights::Rights::ALL) {
 						Some(h) => h.raw(),
 						None => break,
 					}
@@ -2342,7 +2341,7 @@ fn a_wait_set_has_a_ceiling_and_says_so() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the ceiling thread ran to completion");
 }
@@ -2386,7 +2385,7 @@ fn a_secure_random_syscall_refuses_rather_than_answering_from_a_formula() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the random thread ran to completion");
 }
@@ -2459,7 +2458,7 @@ fn a_typed_receive_keeps_every_capability_a_client_sent() {
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
-	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL, 0);
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the capability-count thread ran to completion");
 }

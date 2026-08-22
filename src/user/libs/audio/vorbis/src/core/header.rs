@@ -186,7 +186,6 @@ impl<'a> ByteCursor<'a> {
 }
 
 /// The set of the three Vorbis headers
-pub type HeaderSet = (IdentHeader, CommentHeader, SetupHeader);
 
 /**
 Representation for the identification header
@@ -201,21 +200,6 @@ pub struct IdentHeader {
 	pub audio_channels: u8,
 	/// The sample rate of the stream
 	pub audio_sample_rate: u32,
-	/// The maximum bit rate of the stream
-	///
-	/// Note that this value is only a hint
-	/// and may be off by a large amount.
-	pub bitrate_maximum: i32,
-	/// The nominal bit rate of the stream
-	///
-	/// Note that this value is only a hint
-	/// and may be off by a large amount.
-	pub bitrate_nominal: i32,
-	/// The minimum bit rate of the stream
-	///
-	/// Note that this value is only a hint
-	/// and may be off by a large amount.
-	pub bitrate_minimum: i32,
 	pub blocksize_0: u8,
 	pub blocksize_1: u8,
 	pub(crate) cached_bs_derived: [CachedBlocksizeDerived; 2],
@@ -241,16 +225,19 @@ pub fn read_header_ident(packet: &[u8]) -> Result<IdentHeader, HeaderReadError> 
 	}
 	let audio_channels = try_old!(rdr.read_u8());
 	let audio_sample_rate = try_old!(rdr.read_u32());
-	let bitrate_maximum = try_old!(rdr.read_i32());
-	let bitrate_nominal = try_old!(rdr.read_i32());
-	let bitrate_minimum = try_old!(rdr.read_i32());
+	// THE THREE BIT-RATE HINTS, READ AND DISCARDED. The header must be consumed in order, so they
+	// are read; nothing in this decoder consults them, and the specification calls them hints that
+	// "may be off by a large amount". They were kept in `IdentHeader` and only a test ever looked.
+	let _bitrate_maximum = try_old!(rdr.read_i32());
+	let _bitrate_nominal = try_old!(rdr.read_i32());
+	let _bitrate_minimum = try_old!(rdr.read_i32());
 	let blocksize_0 = try_old!(rdr.read_u4());
 	let blocksize_1 = try_old!(rdr.read_u4());
 	let framing = try_old!(rdr.read_u8());
 	if blocksize_0 < 6 || blocksize_0 > 13 || blocksize_1 < 6 || blocksize_1 > 13 || (framing != 1) || blocksize_0 > blocksize_1 || audio_channels == 0 || audio_sample_rate == 0 {
 		try_old!(Err(HeaderReadError::HeaderBadFormat));
 	}
-	let hdr: IdentHeader = IdentHeader { audio_channels, audio_sample_rate, bitrate_maximum, bitrate_nominal, bitrate_minimum, blocksize_0, blocksize_1, cached_bs_derived: [CachedBlocksizeDerived::from_blocksize(blocksize_0), CachedBlocksizeDerived::from_blocksize(blocksize_1)] };
+	let hdr: IdentHeader = IdentHeader { audio_channels, audio_sample_rate, blocksize_0, blocksize_1, cached_bs_derived: [CachedBlocksizeDerived::from_blocksize(blocksize_0), CachedBlocksizeDerived::from_blocksize(blocksize_1)] };
 	return Ok(hdr);
 }
 
@@ -338,7 +325,6 @@ pub fn read_header_comment(packet: &[u8]) -> Result<CommentHeader, HeaderReadErr
 
 pub(crate) struct Codebook {
 	pub codebook_dimensions: u16,
-	pub codebook_entries: u32,
 
 	// None if codebook_lookup_type == 0
 	pub codebook_vq_lookup_vec: Option<Vec<f32>>,
@@ -357,7 +343,6 @@ pub(crate) struct Residue {
 }
 
 pub(crate) struct Mapping {
-	pub mapping_submaps: u8,
 	pub mapping_magnitudes: Vec<u8>,
 	pub mapping_angles: Vec<u8>,
 	pub mapping_mux: Vec<u8>,
@@ -377,8 +362,6 @@ pub(crate) enum Floor {
 
 pub(crate) struct FloorTypeZero {
 	pub floor0_order: u8,
-	pub floor0_rate: u16,
-	pub floor0_bark_map_size: u16,
 	pub floor0_amplitude_bits: u8,
 	pub floor0_amplitude_offset: u8,
 	pub floor0_number_of_books: u8,
@@ -757,7 +740,7 @@ fn read_codebook(rdr: &mut BitpackCursor, budget: &mut SetupBudget) -> Result<Co
 	};
 	let codebook_vq_lookup_vec = codebook_lookup.as_ref().map(|lup| lookup_vec_val_decode(lup, codebook_entries, codebook_dimensions));
 
-	return Ok(Codebook { codebook_dimensions, codebook_entries, codebook_vq_lookup_vec, codebook_huffman_tree: try_old!(VorbisHuffmanTree::load_from_array(&codebook_codeword_lengths)) });
+	return Ok(Codebook { codebook_dimensions, codebook_vq_lookup_vec, codebook_huffman_tree: try_old!(VorbisHuffmanTree::load_from_array(&codebook_codeword_lengths)) });
 }
 
 /// Reads a Floor which is part of the setup header packet.
@@ -790,8 +773,6 @@ fn read_floor(rdr: &mut BitpackCursor, codebook_cnt: u16, blocksizes: (u8, u8)) 
 			}
 			Ok(Floor::TypeZero(FloorTypeZero {
 				floor0_order,
-				floor0_rate,
-				floor0_bark_map_size,
 				floor0_amplitude_bits,
 				floor0_amplitude_offset,
 				floor0_number_of_books,
@@ -1011,7 +992,7 @@ fn read_mapping(rdr: &mut BitpackCursor, audio_chan_ilog: u8, audio_channels: u8
 		mapping_submap_floors.push(cur_floor);
 		mapping_submap_residues.push(cur_residue);
 	}
-	return Ok(Mapping { mapping_submaps, mapping_magnitudes, mapping_angles, mapping_mux, mapping_submap_floors, mapping_submap_residues });
+	return Ok(Mapping { mapping_magnitudes, mapping_angles, mapping_mux, mapping_submap_floors, mapping_submap_residues });
 }
 
 /// Reads a ModeInfo which is part of the setup header packet.

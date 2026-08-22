@@ -219,7 +219,7 @@ fn a_process_load_of_a_fully_mapped_image_answers_without_faulting() {
 	});
 
 	let (_kernel_ep, user_ep) = crate::object::channel::Channel::create();
-	crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL, 0);
+	crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL);
 	crate::sched::run_until_idle();
 
 	// Four bytes of magic and eight kilobytes of zeroes is not a loadable image, so the loader
@@ -285,7 +285,7 @@ fn a_process_load_whose_image_goes_away_is_an_error_rather_than_a_dead_kernel() 
 	});
 
 	let (_kernel_ep, user_ep) = crate::object::channel::Channel::create();
-	crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL, 0);
+	crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL);
 	crate::sched::run_until_idle();
 
 	assert!(ANSWER.load(Ordering::SeqCst) < 0, "a load whose image is half absent must answer with an error - and the kernel must still be running to answer");

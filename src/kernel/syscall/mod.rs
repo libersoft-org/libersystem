@@ -374,11 +374,11 @@ macro_rules! current_thread {
 	};
 }
 
-// Install `object` into `thread`'s handle table with `rights` and `badge`,
+// Install `object` into `thread`'s handle table with `rights`,
 // returning the new handle's raw value, or ERR_RESOURCE_EXHAUSTED if the table (or
 // the Domain's handle quota) is full. The shared tail of the create handlers.
-fn install_object(thread: &Thread, object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> i64 {
-	match thread.handles().lock().try_insert_object(object, rights, badge) {
+fn install_object(thread: &Thread, object: Arc<dyn KernelObject>, rights: Rights) -> i64 {
+	match thread.handles().lock().try_insert_object(object, rights) {
 		Some(handle) => handle.raw() as i64,
 		None => ERR_RESOURCE_EXHAUSTED,
 	}
@@ -581,7 +581,7 @@ fn sys_memory_object_create(size: u64) -> i64 {
 		Err(MemoryError::QuotaExceeded) => return ERR_RESOURCE_EXHAUSTED,
 		Err(MemoryError::OutOfMemory) => return ERR_NO_MEMORY,
 	};
-	install_object(&thread, object, Rights::ALL, 0)
+	install_object(&thread, object, Rights::ALL)
 }
 
 // Create a DmaBuffer - pinned DMA memory charged to the caller's Domain DMA quota
@@ -622,7 +622,7 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	if !guard.record_dma_buffer(&object) {
 		return ERR_NO_MEMORY;
 	}
-	install_object(&thread, object, Rights::ALL, 0)
+	install_object(&thread, object, Rights::ALL)
 }
 
 // Map a DmaBuffer into the caller's address space. One mapping per address space;
@@ -1061,7 +1061,7 @@ fn sys_device_acquire(index: u64, privilege: u64) -> i64 {
 		Some(None) => return ERR_RESOURCE_EXHAUSTED,
 		None => return ERR_INVALID,
 	};
-	install_object(&thread, memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER, 0)
+	install_object(&thread, memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)
 }
 
 // "I have stopped this device": release the DMA frames held for it.
@@ -1179,7 +1179,7 @@ fn sys_interrupt_bind(vector: u64, privilege: u64) -> i64 {
 	}
 	// On a failed install the Interrupt is dropped here, and its Drop unbinds the
 	// vector, so no explicit rollback is needed.
-	install_object(&thread, interrupt, Rights::ALL, 0)
+	install_object(&thread, interrupt, Rights::ALL)
 }
 
 // Acquire an MSI-X Interrupt for the discovered device at `index`: allocate a
@@ -1274,7 +1274,7 @@ fn sys_device_msix_acquire(index: u64, privilege: u64) -> i64 {
 	// Turn on MSI-X now that its table entry is programmed; the device's INTx pin stays
 	// disabled (MSI-X is its interrupt source from here on).
 	arch::pci::msix_enable(bus, dev, func, cap);
-	thread.handles().lock().insert_reserved(Capability::new(interrupt, Rights::ALL, 0)).raw() as i64
+	thread.handles().lock().insert_reserved(Capability::new(interrupt, Rights::ALL)).raw() as i64
 }
 
 // Acknowledge a serviced interrupt: clear the Interrupt's pending flag so the driver's
@@ -1417,7 +1417,7 @@ fn sys_process_create(domain_handle: u64) -> i64 {
 		Some(p) => p,
 		None => return ERR_NO_MEMORY,
 	};
-	install_object(&thread, process, Rights::ALL, 0)
+	install_object(&thread, process, Rights::ALL)
 }
 
 // Load an ELF image into a process created by process_create and return its entry
@@ -1623,7 +1623,7 @@ fn sys_thread_create(process_handle: u64, entry: u64, stack_top: u64, bootstrap_
 	// committing before it would leave the bootstrap capability gone from the caller and the
 	// caller told the call failed. Doing it after means a failure here still has somewhere to put
 	// everything back.
-	let installed = install_object(&thread, new_thread, Rights::ALL, 0);
+	let installed = install_object(&thread, new_thread, Rights::ALL);
 	if installed < 0 {
 		if child_bootstrap != 0 {
 			match process.handles().lock().take(Handle::from_raw(child_bootstrap), Rights::NONE) {
@@ -1749,7 +1749,7 @@ fn sys_process_group_create(handles_ptr: u64, count: u64) -> i64 {
 	// foreground pipeline never returned a prompt.
 	//
 	// A job you may signal and may not wait for is not a job control handle.
-	install_object(&thread, group, Rights::MANAGE | Rights::READ | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE, 0)
+	install_object(&thread, group, Rights::MANAGE | Rights::READ | Rights::WAIT | Rights::TRANSFER | Rights::DUPLICATE)
 }
 
 // Deliver `signal` to every live member of a group. Authority is the group handle carrying
@@ -2087,11 +2087,11 @@ fn sys_channel_create(out0_ptr: u64, out1_ptr: u64, depth: u64) -> i64 {
 		let mut table = thread.handles().lock();
 		// Enforce the Domain's handle quota for both endpoints; if the second
 		// does not fit, roll the first back so neither is left half-created.
-		let h0 = match table.try_insert_object(ep0, Rights::ALL, 0) {
+		let h0 = match table.try_insert_object(ep0, Rights::ALL) {
 			Some(h) => h,
 			None => return ERR_RESOURCE_EXHAUSTED,
 		};
-		let h1 = match table.try_insert_object(ep1, Rights::ALL, 0) {
+		let h1 = match table.try_insert_object(ep1, Rights::ALL) {
 			Some(h) => h,
 			None => {
 				let _ = table.close(h0);
@@ -2120,7 +2120,6 @@ fn sys_channel_create(out0_ptr: u64, out1_ptr: u64, depth: u64) -> i64 {
 }
 
 // Send a message (byte payload + optionally one transferred handle) to the peer.
-// The message is stamped with the badge of the channel handle used. The
 // transferred handle is consumed only on a successful send (left intact on
 // failure, so the caller can retry on WOULD_BLOCK).
 fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
@@ -2130,13 +2129,10 @@ fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
 		return ERR_INVALID;
 	}
 	let thread = current_thread!();
-	// ONE LOOK for the authority and the badge alike. Two lookups let a sibling thread close the
-	// handle in between: the send stayed authorized through the retained `Arc` while the badge fell
-	// back to zero, attributing a valid message to the wrong authority.
-	let (object, badge) = {
+	let object = {
 		let table = thread.handles().lock();
-		match table.lookup_typed_with_badge(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
-			Ok(pair) => pair,
+		match table.lookup_typed(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
+			Ok(object) => object,
 			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
 			Err(_) => return ERR_BAD_HANDLE,
 		}
@@ -2181,7 +2177,7 @@ fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
 			Err(_) => return ERR_BAD_HANDLE,
 		}
 	}
-	match channel.send_charged_or_return(Message::new(bytes, caps, badge), thread.domain()) {
+	match channel.send_charged_or_return(Message::new(bytes, caps), thread.domain()) {
 		Ok(()) => {
 			// Delivered: the handle value dies now, and its quota is refunded.
 			if xfer != 0 {
@@ -2261,11 +2257,10 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 		*slot = read_user::<u64>(caps_ptr + ((index + 1) * 8) as u64);
 	}
 
-	// ONE LOOK for the authority and the badge - see `sys_channel_send` for why two was a defect.
-	let (object, badge) = {
+	let object = {
 		let table = thread.handles().lock();
-		match table.lookup_typed_with_badge(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
-			Ok(pair) => pair,
+		match table.lookup_typed(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
+			Ok(object) => object,
 			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
 			Err(_) => return ERR_BAD_HANDLE,
 		}
@@ -2328,7 +2323,7 @@ fn sys_channel_send_caps(ch: u64, bytes_ptr: u64, bytes_len: u64, caps_ptr: u64)
 			}
 		}
 	}
-	match channel.send_charged_or_return(Message::new(bytes, caps, badge), thread.domain()) {
+	match channel.send_charged_or_return(Message::new(bytes, caps), thread.domain()) {
 		Ok(()) => {
 			// Delivered: the handle values die now, and their quota is refunded.
 			let mut table = thread.handles().lock();
@@ -2801,7 +2796,7 @@ fn sys_wait_any(handles_ptr: u64, count: u64, deadline: u64, flags: u64) -> i64 
 fn sys_waitset_create() -> i64 {
 	let thread = current_thread!();
 	let Some(set) = WaitSet::create_in(thread.domain().clone()) else { return ERR_RESOURCE_EXHAUSTED };
-	install_object(&thread, set, Rights::ALL, 0)
+	install_object(&thread, set, Rights::ALL)
 }
 
 // Add the object behind `object_handle` to the set behind `set_handle`.
@@ -3079,7 +3074,7 @@ fn sys_domain_create(memory_limit: u64, handle_limit: u64, thread_limit: u64) ->
 	let Some(child) = Domain::new_child(thread.domain(), memory_limit, handle_limit, thread_limit) else {
 		return ERR_INVALID;
 	};
-	install_object(&thread, child, Rights::ALL, 0)
+	install_object(&thread, child, Rights::ALL)
 }
 
 // Read the live resource counters of the Domain named by `handle` into the caller's
@@ -3123,7 +3118,7 @@ fn sys_domain_kill(handle: u64) -> i64 {
 fn sys_event_create() -> i64 {
 	let thread = current_thread!();
 	let Some(event) = Event::create() else { return ERR_RESOURCE_EXHAUSTED };
-	install_object(&thread, event, Rights::ALL, 0)
+	install_object(&thread, event, Rights::ALL)
 }
 
 // Raise an event's signal.
@@ -3149,7 +3144,7 @@ fn sys_event_poll(handle: u64) -> i64 {
 fn sys_timer_create() -> i64 {
 	let thread = current_thread!();
 	let Some(timer) = Timer::create() else { return ERR_RESOURCE_EXHAUSTED };
-	install_object(&thread, timer, Rights::ALL, 0)
+	install_object(&thread, timer, Rights::ALL)
 }
 
 // Arm a timer to fire at an absolute tick deadline.

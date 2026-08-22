@@ -227,17 +227,6 @@ macro_rules! ik_reader {
 	};
 }
 
-macro_rules! ik_dynamic_reader {
-	( $fnname:ident, $rettype:ident, $bitnum_of_rettype:expr) => {
-		#[inline]
-		pub fn $fnname(&mut self, bit_num: u8) -> Result<$rettype, ()> {
-			let octet_num: usize = (bit_num / 8) as usize;
-			assert!(bit_num <= $bitnum_of_rettype);
-			Ok(sign_extend!(try_old!(bpc_read_body!($rettype, bit_num, octet_num, self)), $rettype, $bitnum_of_rettype, bit_num))
-		}
-	};
-}
-
 macro_rules! uk_dynamic_reader {
 	( $fnname:ident, $rettype:ident, $bit_num_max:expr) => {
 		#[inline]
@@ -286,12 +275,10 @@ impl<'a> BitpackCursor<'a> {
 	uk_reader!(read_u16, u16, 16, 2);
 
 	// TODO add here if needed
-	uk_reader!(read_u13, u16, 13, 1);
 	// TODO add here if needed
 
 	// u8 based
 	uk_reader!(read_u8, u8, 8, 1);
-	uk_reader!(read_u7, u8, 7, 0);
 	uk_reader!(read_u6, u8, 6, 0);
 	uk_reader!(read_u5, u8, 5, 0);
 	uk_reader!(read_u4, u8, 4, 0);
@@ -309,7 +296,6 @@ impl<'a> BitpackCursor<'a> {
 	// They panic if you give them invalid params
 	// (bit_num larger than maximum allowed bit number for the type)
 	uk_dynamic_reader!(read_dyn_u8, u8, 8);
-	uk_dynamic_reader!(read_dyn_u16, u16, 16);
 	uk_dynamic_reader!(read_dyn_u32, u32, 32);
 	uk_dynamic_reader!(read_dyn_u64, u64, 64);
 
@@ -318,16 +304,11 @@ impl<'a> BitpackCursor<'a> {
 	ik_reader!(read_i32, i32, 32, 32, 4);
 	// TODO add here if needed
 
-	ik_reader!(read_i8, i8, 8, 8, 1);
-	ik_reader!(read_i7, i8, 8, 7, 0);
 	// TODO add here if needed
 
 	// Signed dynamic reader methods
 	// They panic if you give them invalid params
 	// (bit_num larger than maximum allowed bit number for the type)
-	ik_dynamic_reader!(read_dyn_i8, i8, 8);
-	ik_dynamic_reader!(read_dyn_i16, i16, 16);
-	ik_dynamic_reader!(read_dyn_i32, i32, 32);
 
 	// Float reading methods
 

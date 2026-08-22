@@ -59,7 +59,7 @@ fn the_deepest_kernel_path_leaves_headroom_on_its_stack() {
 	});
 
 	let (_kernel_ep, user_ep) = crate::object::channel::Channel::create();
-	let thread = crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL, 0);
+	let thread = crate::sched::spawn_with_object(spawner, user_ep, crate::object::rights::Rights::ALL);
 	crate::sched::run_until_idle();
 
 	assert!(ANSWER.load(Ordering::SeqCst) < 0, "a malformed image must be refused, so the whole loader path really ran");
