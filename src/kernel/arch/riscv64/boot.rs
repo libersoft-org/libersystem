@@ -179,7 +179,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	}
 
 	// Prove the higher half is live: read back the VA this function is linked at.
-	let here = riscv64_main as usize;
+	let here = riscv64_main as *const () as usize;
 	crate::serial_println!("riscv64: _main VA = {here:#x} (KERNEL_VA_OFFSET high half)");
 
 	// Confirm a high-half RAM read/write works through the Sv39 direct map.

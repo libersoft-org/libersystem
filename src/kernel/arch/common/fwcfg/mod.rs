@@ -34,7 +34,6 @@ const MAX_DIR_ENTRIES: u32 = 256;
 // FWCfgDmaAccess.control bits (the whole struct is big-endian in guest memory).
 const DMA_ERROR: u32 = 0x01;
 const DMA_READ: u32 = 0x02;
-const DMA_SKIP: u32 = 0x04;
 const DMA_SELECT: u32 = 0x08; // control >> 16 = selector to (re)select
 const DMA_WRITE: u32 = 0x10;
 

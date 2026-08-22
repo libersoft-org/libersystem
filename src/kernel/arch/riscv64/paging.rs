@@ -500,12 +500,6 @@ pub fn unmap_page(virt: u64) -> Option<u64> {
 	unsafe { unmap_page_root(current_satp_root(), virt) }
 }
 
-pub fn unmap_pages(base: u64, count: usize) {
-	for i in 0..count {
-		unmap_page(base + i as u64 * 4096);
-	}
-}
-
 pub fn unmap_page_in(satp_root: u64, virt: u64) -> Option<u64> {
 	unsafe { unmap_page_root(satp_root, virt) }
 }

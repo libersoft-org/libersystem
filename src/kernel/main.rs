@@ -1,6 +1,6 @@
 #![no_std]
 #![no_main]
-#![feature(abi_x86_interrupt)]
+#![cfg_attr(target_arch = "x86_64", feature(abi_x86_interrupt))]
 // `Arc::try_new`, for `heap::try_arc`. Almost every kernel object is an `Arc` and almost every one
 // of them is built on a syscall path, so "an allocation ring 3 can trigger must be able to refuse"
 // is not a rule this kernel can keep without it.

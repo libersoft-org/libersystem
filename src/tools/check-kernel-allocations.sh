@@ -5,7 +5,7 @@
 # collection past its capacity all abort the kernel when the heap is short. On a path userspace can
 # drive, that is a denial of service needing no privilege at all: exhaust the heap, then make the
 # ordinary syscall. The fallible forms answer instead of halting - `try_reserve`, `try_reserve_exact`,
-# and the `heap::try_box` / `try_arc` / `try_push` / `try_extend` / `try_string` / `try_vec` helpers.
+# and the `heap::try_box` / `try_arc` / `try_push` / `try_string` helpers.
 #
 # THIS EXISTS BECAUSE THE CLASS WAS CLOSED BY ENUMERATION THREE TIMES. Each audit of the kernel's
 # lifetimes named a handful of call sites, each was fixed, and the next audit found the next

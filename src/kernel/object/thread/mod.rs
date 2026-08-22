@@ -64,10 +64,14 @@ impl ThreadState {
 	}
 }
 
+#[cfg(test)]
 static NEXT_TID: AtomicU64 = AtomicU64::new(1);
 
 pub struct Thread {
 	header: ObjectHeader,
+	// A second identity beside the header's koid, asserted on by the thread tests and asked for
+	// by nothing else.
+	#[cfg(test)]
 	tid: u64,
 	state: AtomicU32,
 	// Saved stack pointer while the thread is not running on a core.
@@ -211,7 +215,8 @@ impl KernelStack {
 	}
 
 	// One past the highest mapped byte - what a stack pointer starts at.
-	#[cfg(test)]
+	// The secondary-core bring-up on both device-tree backends parks its idle stack by top.
+	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	pub fn top(&self) -> u64 {
 		self.usable_base() + self.capacity() as u64
 	}
@@ -282,7 +287,18 @@ impl Thread {
 		let mut stack = KernelStack::allocate()?;
 		let sp = arch::context::init_thread_stack(stack.as_mut_slice(), entry, arg);
 		// FALLIBLY: `SYS_THREAD_CREATE` reaches this, and `build` already answers `Option`.
-		let thread = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), tid: NEXT_TID.fetch_add(1, Ordering::Relaxed), state: AtomicU32::new(ThreadState::Ready as u32), kstack_ptr: AtomicU64::new(sp), syscall_rsp: AtomicU64::new(0), stack, started: AtomicBool::new(false), process, run_link: SpinLock::new(None) })?;
+		let thread = crate::mem::heap::try_arc(Self {
+			header: ObjectHeader::new(),
+			#[cfg(test)]
+			tid: NEXT_TID.fetch_add(1, Ordering::Relaxed),
+			state: AtomicU32::new(ThreadState::Ready as u32),
+			kstack_ptr: AtomicU64::new(sp),
+			syscall_rsp: AtomicU64::new(0),
+			stack,
+			started: AtomicBool::new(false),
+			process,
+			run_link: SpinLock::new(None),
+		})?;
 		// Forward-link the thread to its process so signal delivery can reach it - and refuse to
 		// build the thread at all if the process is already tearing down. A thread that cannot be
 		// registered is a thread nothing can signal, reap or account, inside a process whose handles

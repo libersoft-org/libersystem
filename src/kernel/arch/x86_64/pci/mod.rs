@@ -106,16 +106,6 @@ pub fn scan_xhci() -> Vec<XhciDevice> {
 	common::scan_xhci::<Access>()
 }
 
-// Decode a memory BAR's physical base (live), handling 64-bit BARs.
-pub fn bar_address(d: &PciDevice, bar_idx: usize) -> Option<u64> {
-	common::bar_address::<Access>(d, bar_idx)
-}
-
-// Measure a memory BAR's window size with the standard all-ones probe.
-pub fn bar_size(d: &PciDevice, bar_idx: usize) -> Option<u64> {
-	common::bar_size::<Access>(d, bar_idx)
-}
-
 // Set or clear a function's PCI command-register Interrupt Disable bit (bit 10).
 pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 	common::set_intx_disabled::<Access>(bus, dev, func, disabled);

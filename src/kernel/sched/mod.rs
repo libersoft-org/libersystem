@@ -317,6 +317,7 @@ static PREEMPTION_ENABLED: AtomicBool = AtomicBool::new(false);
 // address space captured, and preemption armed. A secondary core spins on this before
 // entering cpu_idle_loop, so it never indexes the scheduler before it exists (the x86
 // APs are started after init(); the aarch64 secondaries come up before it).
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn is_initialized() -> bool {
 	PREEMPTION_ENABLED.load(Ordering::Acquire)
 }

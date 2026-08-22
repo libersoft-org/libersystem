@@ -414,7 +414,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// This kernel keeps reading the tree after the allocator is up, and the specification requires a
 	// client not to overwrite it or use the reservation block's regions. See
 	// `bootmem::devicetree_reservations`.
-	if let Some(tree) = (unsafe { super::dtb::located(dtb) }) {
+	if let Some(tree) = unsafe { super::dtb::located(dtb) } {
 		let (count, complete) = unsafe { crate::arch::common::bootmem::devicetree_reservations(&tree, &mut holes, hole_count) };
 		hole_count = count;
 		// THE TREE'S ACCOUNT OF RAM IS ONLY GOOD WHILE ITS ACCOUNT OF WHAT IS RESERVED IS (FDT-005).
@@ -573,7 +573,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// Bounding it here means the exception entry REPORTS the next one instead of the kernel
 	// discovering it three subsystems later. The stack below `__boot_stack_bottom` is `.bss`, so
 	// there is nothing to fault on and nothing else would ever say so.
-	unsafe {
+	{
 		let bottom = (&raw const __boot_stack_bottom) as u64;
 		let top = (&raw const __boot_stack_top) as u64;
 		super::percpu::record_idle_stack(bottom, (top - bottom) as usize);

@@ -439,16 +439,6 @@ pub fn try_push<T>(vec: &mut alloc::vec::Vec<T>, value: T) -> Result<(), T> {
 	Ok(())
 }
 
-// Append a slice FALLIBLY, reserving the whole extension before any of it is copied - so a refusal
-// leaves the vector exactly as it was rather than partly grown.
-pub fn try_extend<T: Clone>(vec: &mut alloc::vec::Vec<T>, items: &[T]) -> bool {
-	if vec.try_reserve(items.len()).is_err() {
-		return false;
-	}
-	vec.extend_from_slice(items);
-	true
-}
-
 // Copy a `&str` onto the heap FALLIBLY. `String::from` and `format!` both abort.
 pub fn try_string(text: &str) -> Option<alloc::string::String> {
 	let mut out: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -456,13 +446,6 @@ pub fn try_string(text: &str) -> Option<alloc::string::String> {
 	out.extend_from_slice(text.as_bytes());
 	// SAFETY: the bytes came from a `&str`, so they are valid UTF-8.
 	Some(unsafe { alloc::string::String::from_utf8_unchecked(out) })
-}
-
-// A vector with room for `capacity`, FALLIBLY - `Vec::with_capacity` aborts.
-pub fn try_vec<T>(capacity: usize) -> Option<alloc::vec::Vec<T>> {
-	let mut out: alloc::vec::Vec<T> = alloc::vec::Vec::new();
-	out.try_reserve_exact(capacity).ok()?;
-	Some(out)
 }
 
 pub fn try_box<T>(value: T) -> Option<alloc::boxed::Box<T>> {

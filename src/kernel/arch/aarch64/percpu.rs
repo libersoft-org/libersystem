@@ -169,12 +169,6 @@ pub fn set_kernel_rsp(value: u64) {
 	unsafe { (*this_cpu_mut()).kernel_sp = value };
 }
 
-// Record where this core's EL0-entry kernel stack slot lives (the aarch64
-// analogue of the x86 TSS.RSP0 slot).
-pub fn set_tss_rsp0_slot(addr: u64) {
-	unsafe { (*this_cpu_mut()).entry_sp_slot = addr };
-}
-
 // Point this core's EL0-entry kernel stack at `value` - the incoming thread's
 // parked kernel stack position. A zero value (a thread that never entered EL0)
 // leaves the slot untouched.

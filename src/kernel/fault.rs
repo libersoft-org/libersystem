@@ -40,6 +40,8 @@ pub const FAULT_GENERAL_PROTECTION: u64 = 2;
 pub const FAULT_DIVIDE: u64 = 3;
 pub const FAULT_INVALID_OPCODE: u64 = 4;
 pub const FAULT_BREAKPOINT: u64 = 5;
+// The catch-all vector number, which only the x86_64 IDT macro reports.
+#[cfg(target_arch = "x86_64")]
 pub const FAULT_EXCEPTION: u64 = 6;
 
 // Page-fault error-code bit 0: set when the fault is a protection violation on a

@@ -23,7 +23,6 @@ use abi::{VIRTIO_CFG_DEVICE_FEATURE as CFG_DEVICE_FEATURE, VIRTIO_CFG_DEVICE_FEA
 
 // virtio_blk request types (device-specific).
 const VIRTIO_BLK_T_IN: u32 = 0; // read (device -> memory)
-const VIRTIO_BLK_T_OUT: u32 = 1; // write (memory -> device)
 
 const SECTOR_SIZE: usize = 512;
 unsafe fn r8(a: u64) -> u8 {
@@ -184,11 +183,5 @@ impl BlkDevice {
 			}
 			_ => false,
 		}
-	}
-
-	// Write one 512-byte sector from `buf`.
-	pub fn write(&mut self, sector: u64, buf: &[u8; SECTOR_SIZE]) -> bool {
-		unsafe { core::ptr::copy_nonoverlapping(buf.as_ptr(), phys_to_virt(self.req + 512) as *mut u8, SECTOR_SIZE) };
-		matches!(self.submit(VIRTIO_BLK_T_OUT, sector, false), Some(0))
 	}
 }

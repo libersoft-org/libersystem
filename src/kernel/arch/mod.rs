@@ -13,7 +13,7 @@
 //               exit_qemu (cfg(test))
 //   paging:     PRESENT / WRITABLE / USER / NO_CACHE / NO_EXECUTE, map_page,
 //               map_page_in, try_map_page, try_map_page_in, unmap_page,
-//               unmap_pages, unmap_page_in, translate,
+//               unmap_page_in, translate,
 //               new_address_space, free_address_space, user_access,
 //               copy_to_user_page, enable_nx, enable_smap_smep, nx_enabled,
 //               smap_enabled, smep_enabled, clac_on_entry, remove_bootstrap_identity

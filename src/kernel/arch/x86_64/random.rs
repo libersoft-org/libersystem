@@ -45,16 +45,6 @@ fn fallback_u64() -> u64 {
 	out
 }
 
-// Draw the next 64-bit random value (RDRAND if available, else the fallback).
-fn next_u64() -> u64 {
-	if has_rdrand() {
-		// SAFETY: has_rdrand() confirmed the CPU supports RDRAND.
-		unsafe { rdrand64() }.unwrap_or_else(fallback_u64)
-	} else {
-		fallback_u64()
-	}
-}
-
 // Whether this machine has a source fit for a key.
 pub fn secure_available() -> bool {
 	has_rdrand()

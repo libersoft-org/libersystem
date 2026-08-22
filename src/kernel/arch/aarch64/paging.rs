@@ -252,6 +252,7 @@ pub fn harden_direct_map() {
 
 // Whether the direct map still carries a writable-executable alias, for the test that asks. Walks
 // the live tables and reports the first 2 MiB block that is both.
+#[cfg(test)]
 pub fn writable_executable_block() -> Option<u64> {
 	const TWO_MB: u64 = 2 * 1024 * 1024;
 	const GIB: u64 = 1024 * 1024 * 1024;
@@ -434,31 +435,14 @@ fn current_ttbr0() -> u64 {
 
 // ---- the rest of the paging contract (fills in as the port matures) ----
 
-pub fn enable_nx() {}
-pub fn enable_smap_smep() {}
-pub fn smap_enabled() -> bool {
-	false
-}
-pub fn smep_enabled() -> bool {
-	false
-}
-// Whether mappings carry execute-never. On this port they always do: `leaf_bits` sets
-// the XN attributes for every non-executable page unconditionally, with no CPU feature to
-// enable and nothing to turn it off.
-//
-// Reporting `false` was a plain contradiction of the mapper beside it, and the kind that
-// hides rather than breaks: a test asking whether NX is active would skip its own check,
-// and an operator reading the report would be told a protection is off while every leaf
-// in the tables is using it.
-pub fn nx_enabled() -> bool {
-	true
-}
-pub fn clac_on_entry() {}
-
+// THE SANCTIONED WINDOW, which on this port is not a window at all: cortex-a72 is ARMv8.0 and has
+// no PAN, so there is nothing to open and nothing to close. The name exists because the portable
+// callers ask for it, and the passthrough is what says the protection is absent rather than off.
 pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
 	f()
 }
 
+#[cfg(test)]
 pub unsafe fn copy_to_user_page(dst: u64, bytes: &[u8]) {
 	// cortex-a72 (ARMv8.0) has no PAN, so the kernel writes the USER-mapped page
 	// directly - no sanctioned window is needed (user_access is a passthrough). The
@@ -484,6 +468,7 @@ pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
 	unsafe { map_page_root(map_root_for(virt), virt, phys, flags) }
 }
 
+#[cfg(test)]
 pub fn map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) {
 	unsafe { map_page_root(root_in(ttbr, virt), virt, phys, flags).expect("aarch64 map_page: out of frames") }
 }
@@ -562,11 +547,6 @@ pub fn unmap_page(virt: u64) -> Option<u64> {
 	// active TTBR0 tree - mirror map_page's routing so a high mapping is actually found.
 	let root = if virt >> 63 == 1 { current_ttbr1() } else { current_ttbr0() };
 	unsafe { unmap_page_root(root, virt) }
-}
-pub fn unmap_pages(base: u64, count: usize) {
-	for i in 0..count {
-		unmap_page(base + i as u64 * 4096);
-	}
 }
 pub fn unmap_page_in(ttbr: u64, virt: u64) -> Option<u64> {
 	unsafe { unmap_page_root(root_in(ttbr, virt), virt) }

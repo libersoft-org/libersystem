@@ -44,11 +44,6 @@ pub fn attach(channel: Arc<Channel>) {
 	*CONSOLE.lock() = Some(channel);
 }
 
-// Drop the registration.
-pub fn detach() {
-	*CONSOLE.lock() = None;
-}
-
 // Whether a shell is attached and still listening (its peer endpoint is alive).
 // False once the shell exits and drops its end.
 pub fn shell_listening() -> bool {

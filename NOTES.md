@@ -1,5 +1,23 @@
 # Bugs / changes
 
+vol://system> exit
+shell: exiting
+
++------------------------------------------------------------+
+| LiberSystem 0.0.1                                          |
+|                                                            |
+| Web:          https://libersystem.com                      |
+| GitHub:       https://github.com/libersoft-org/libersystem |
+| by LiberSoft: https://libersoft.org                        |
++------------------------------------------------------------+
+vol://system> shutdown
+power: no supervisor connection; cannot stop the machine from here
+poweroff: failed
+vol://system> 
+
+
+
+
 - architecture audit (!!!)
 - for testing of one utility, it builds the whole system from scratch (./build.sh --arch x86_64) - we should not build everything from scratch, only parts that are are not built in its current version - this command took a long time: ./build.sh --arch x86_64 >/dev/null 2>&1; ./test.sh --arch x86_64 --tags kernel,memory,component,service --timeout 1500 2>&1 | tail -4
 - create SDK not just for WASM, but for Rust and other languages too

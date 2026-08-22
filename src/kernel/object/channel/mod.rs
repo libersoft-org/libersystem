@@ -433,8 +433,8 @@ impl Channel {
 				// Somebody else took it, or it was never the head. Not an error: the caller peeks
 				// again and decides about whatever is there now.
 				Some(msg) if msg.id != id => return Err(RecvRefusal::Superseded),
-				Some(msg) if msg.bytes.len() > bytes_cap => return Err(RecvRefusal::TooLarge(msg.bytes.len())),
-				Some(msg) if msg.caps.len() > cap_slots => return Err(RecvRefusal::TooManyCaps(msg.caps.len())),
+				Some(msg) if msg.bytes.len() > bytes_cap => return Err(RecvRefusal::TooLarge),
+				Some(msg) if msg.caps.len() > cap_slots => return Err(RecvRefusal::TooManyCaps),
 				Some(_) => inbox.pop_front().map(|mut msg| {
 					// The slot goes with it. Nothing is announced as free here: the message can
 					// still come back, and a sender told there is room would be told the truth for
@@ -479,12 +479,16 @@ impl Channel {
 	}
 }
 
-// Why `recv_identified` did not take the message. `TooLarge` and `TooManyCaps` carry what the head
-// of the queue actually needs, so a caller can size a second attempt - and the message is still
-// there to be taken, which is what makes the answer worth carrying.
+// Why `recv_identified` did not take the message. The message is still there to be taken, which is
+// what makes the answer worth carrying at all.
+//
+// `TooLarge` AND `TooManyCaps` USED TO CARRY THE SIZE THE HEAD OF THE QUEUE NEEDS, "so a caller can
+// size a second attempt". The one caller is `sys_channel_recv`, which matches both with `_` and
+// answers `ERR_INVALID` - so the size was measured on every refusal and discarded. Handing it back
+// needs a syscall that can return a size alongside an error, which is an ABI change and not this.
 pub enum RecvRefusal {
-	TooLarge(usize),
-	TooManyCaps(usize),
+	TooLarge,
+	TooManyCaps,
 	// The message the caller inspected is no longer at the head: another receiver on this endpoint
 	// took it. Nothing is wrong and nothing was destroyed - look again.
 	Superseded,

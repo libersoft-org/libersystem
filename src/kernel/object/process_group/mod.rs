@@ -77,6 +77,7 @@ pub struct ProcessGroup {
 	// The membership count, which is also the slot count: slots are never removed, so this cannot
 	// drift from the vector the way the pruned member list did. Stored so `size()` answers without
 	// taking the lock.
+	#[cfg(test)]
 	original_size: usize,
 }
 
@@ -123,8 +124,14 @@ impl ProcessGroup {
 		for member in members {
 			slots.push(MemberSlot { koid: member.header().koid(), process: Arc::downgrade(member), record: None });
 		}
+		#[cfg(test)]
 		let original_size = slots.len();
-		let group = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), slots: SpinLock::new(slots), original_size })?;
+		let group = crate::mem::heap::try_arc(Self {
+			header: ObjectHeader::new(),
+			slots: SpinLock::new(slots),
+			#[cfg(test)]
+			original_size,
+		})?;
 		// THE BACK-LINK, and it is what makes a finished stage answerable for. Each member takes a
 		// weak reference to this group so that when it reaches a terminal state it can say what it
 		// finished as - see `MemberSlot::record`. A member that cannot take one fails the whole

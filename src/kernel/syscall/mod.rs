@@ -2418,7 +2418,7 @@ fn receive_transactionally(thread: &crate::object::thread::Thread, channel: &Cha
 					// The message went to another receiver between the look and the take. Nothing
 					// was destroyed and nothing is wrong: look at whatever is there now.
 					RecvRefusal::Superseded => continue,
-					RecvRefusal::TooLarge(_) | RecvRefusal::TooManyCaps(_) => return Err(ERR_INVALID),
+					RecvRefusal::TooLarge | RecvRefusal::TooManyCaps => return Err(ERR_INVALID),
 					RecvRefusal::Gone(ChannelError::PeerClosed) => return Err(ERR_PEER_CLOSED),
 					RecvRefusal::Gone(_) => return Err(ERR_WOULD_BLOCK),
 				}

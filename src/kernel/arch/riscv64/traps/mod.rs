@@ -258,7 +258,7 @@ const FRAME_SSTATUS: usize = 33;
 // Point STVEC at `__trap_entry` in direct mode (low 2 bits = 0), and clear SSCRATCH
 // (the S-mode convention; the U-mode trap path will use it later). Call once per hart.
 pub fn init() {
-	let stvec = __trap_entry as usize as u64;
+	let stvec = __trap_entry as *const () as usize as u64;
 	unsafe {
 		core::arch::asm!(
 			"csrw stvec, {0}",

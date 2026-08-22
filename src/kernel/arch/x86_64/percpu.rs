@@ -158,10 +158,6 @@ pub fn set_from_user(value: bool) {
 // leave alone here is that these two have not shown it, not that they cannot.
 pub fn set_stack_bounds(_base: u64, _len: usize) {}
 
-// The idle/boot stack twin of `set_stack_bounds`, for the same reason and with the same status
-// here: recorded nowhere, so nothing to restore.
-pub fn record_idle_stack(_base: u64, _len: usize) {}
-
 pub fn use_idle_stack() {}
 
 // No bounds are recorded here, so nothing can be checked against them. `(0, 0)` is the agreed

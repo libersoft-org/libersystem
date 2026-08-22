@@ -65,7 +65,7 @@ impl<const N: usize> MsiRegistry<N> {
 	// frame owns only the SPIs its TYPER reports); pass `N` to use them all. The caller
 	// then programs the device's MSI-X table for the slot's hardware vector and binds
 	// an Interrupt with `bind`.
-	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+	#[cfg(any(test, target_arch = "riscv64"))]
 	pub fn acquire(&self, owner: u32, limit: usize) -> Option<usize> {
 		let _claim = self.claim.lock();
 		self.claim_free_slot(owner, limit)

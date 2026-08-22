@@ -70,6 +70,7 @@ pub trait ConfigAccess {
 	// The end of the low 32-bit MMIO window that `assign_bars` reassigns BARs into,
 	// used to decide whether a firmware-placed BAR sits outside the mapped window.
 	// Only consulted by ECAM platforms that override `assign_bars`; 0 otherwise.
+	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	const MMIO_WINDOW_END: u64 = 0;
 
 	// Read / write a 32-bit config-space dword for one bus/device/function.
@@ -135,6 +136,7 @@ pub trait ConfigAccess {
 
 	// Allocate a size-aligned span from the platform's low MMIO window, or None when
 	// exhausted. Provided by ECAM platforms whose `assign_bars` reprograms BARs.
+	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	fn alloc_mmio(_size: u64) -> Option<u64> {
 		None
 	}
@@ -146,6 +148,7 @@ pub trait ConfigAccess {
 	//
 	// Provided by the same ECAM platforms as `alloc_mmio`; a backend that allocates nothing has
 	// nothing to reserve.
+	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	fn reserve_mmio(_base: u64, _size: u64) {}
 }
 
@@ -162,7 +165,6 @@ pub struct PciDevice {
 	pub prog_if: u8,
 	pub header_type: u8,
 	// The six 32-bit base address registers (raw; only meaningful for header type 0).
-	pub bars: [u32; 6],
 }
 
 impl PciDevice {
@@ -216,6 +218,9 @@ pub struct VirtioCap {
 pub struct VirtioDevice {
 	pub pci: PciDevice,
 	pub virtio_type: u16,
+	// The BAR all three configuration structures share. Checked from a local while the device is
+	// resolved; kept on the device only for the boot print that names it.
+	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	pub bar: u8,
 	pub bar_phys: u64,
 	pub region_len: u64,
@@ -230,7 +235,6 @@ pub struct VirtioDevice {
 	// the number of table entries, and the physical address of the MSI-X table. The
 	// kernel programs table entry 0 and enables MSI-X for an interrupt-driven driver.
 	pub msix_cap: u16,
-	pub msix_count: u16,
 	pub msix_table_phys: u64,
 }
 
@@ -244,17 +248,12 @@ pub struct XhciDevice {
 	pub bar_phys: u64,
 	pub bar_len: u64,
 	pub msix_cap: u16,
-	pub msix_count: u16,
 	pub msix_table_phys: u64,
 }
 
 // Read the full identity of one present function.
 fn read_function<A: ConfigAccess>(bus: u8, dev: u8, func: u8) -> PciDevice {
-	let mut bars = [0u32; 6];
-	for (i, bar) in bars.iter_mut().enumerate() {
-		*bar = A::read32(bus, dev, func, 0x10 + (i as u16) * 4);
-	}
-	PciDevice { bus, dev, func, vendor: A::read16(bus, dev, func, 0x00), device_id: A::read16(bus, dev, func, 0x02), class: A::read8(bus, dev, func, 0x0b), subclass: A::read8(bus, dev, func, 0x0a), prog_if: A::read8(bus, dev, func, 0x09), header_type: A::read8(bus, dev, func, 0x0e), bars }
+	PciDevice { bus, dev, func, vendor: A::read16(bus, dev, func, 0x00), device_id: A::read16(bus, dev, func, 0x02), class: A::read8(bus, dev, func, 0x0b), subclass: A::read8(bus, dev, func, 0x0a), prog_if: A::read8(bus, dev, func, 0x09), header_type: A::read8(bus, dev, func, 0x0e) }
 }
 
 // A PCI-to-PCI bridge's header type (bits 0-6 of the header-type byte), and the config offset of
@@ -508,9 +507,9 @@ pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
 // Walk a device's PCI capability list and resolve its MSI-X capability: the
 // capability's config-space offset (0 = none), the table entry count, and the
 // physical address of the MSI-X table. Shared by the virtio and xHCI paths.
-fn resolve_msix<A: ConfigAccess>(d: &PciDevice) -> (u16, u16, u64) {
+fn resolve_msix<A: ConfigAccess>(d: &PciDevice) -> (u16, u64) {
 	if A::read16(d.bus, d.dev, d.func, 0x06) & STATUS_CAP_LIST == 0 {
-		return (0, 0, 0);
+		return (0, 0);
 	}
 	let mut ptr: u16 = (A::read8(d.bus, d.dev, d.func, 0x34) & 0xFC) as u16;
 	// Bound the walk so a malformed (cyclic) list cannot spin forever.
@@ -521,17 +520,16 @@ fn resolve_msix<A: ConfigAccess>(d: &PciDevice) -> (u16, u16, u64) {
 		let cap_id = A::read8(d.bus, d.dev, d.func, ptr);
 		let next = (A::read8(d.bus, d.dev, d.func, ptr + 1) & 0xFC) as u16;
 		if cap_id == MSIX_CAP_ID {
-			let mc = A::read16(d.bus, d.dev, d.func, ptr + 2);
 			let table_off_bir = A::read32(d.bus, d.dev, d.func, ptr + 4);
 			let bir = (table_off_bir & 7) as usize;
 			let table_offset = (table_off_bir & !7) as u64;
 			if let Some(base) = bar_address::<A>(d, bir) {
-				return (ptr, (mc & 0x7ff) + 1, base + table_offset);
+				return (ptr, base + table_offset);
 			}
 		}
 		ptr = next;
 	}
-	(0, 0, 0)
+	(0, 0)
 }
 
 // Walk a device's PCI capability list and resolve its virtio configuration
@@ -569,7 +567,7 @@ fn resolve_virtio<A: ConfigAccess>(d: &PciDevice) -> Option<VirtioDevice> {
 		}
 		ptr = next;
 	}
-	let (msix_cap, msix_count, msix_table_phys) = resolve_msix::<A>(d);
+	let (msix_cap, msix_table_phys) = resolve_msix::<A>(d);
 	let common = common?;
 	let notify = notify?;
 	let isr = isr?;
@@ -619,7 +617,20 @@ fn resolve_virtio<A: ConfigAccess>(d: &PciDevice) -> Option<VirtioDevice> {
 		end = end.max(cap.offset as u64 + cap.length as u64);
 	}
 	let region_len = end.div_ceil(0x1000) * 0x1000;
-	Some(VirtioDevice { pci: *d, virtio_type, bar, bar_phys, region_len, common, notify, isr, device, msix_cap, msix_count, msix_table_phys })
+	Some(VirtioDevice {
+		pci: *d,
+		virtio_type,
+		#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+		bar,
+		bar_phys,
+		region_len,
+		common,
+		notify,
+		isr,
+		device,
+		msix_cap,
+		msix_table_phys,
+	})
 }
 
 // Scan the bus and resolve every modern virtio device's MMIO layout.
@@ -639,8 +650,8 @@ fn resolve_xhci<A: ConfigAccess>(d: &PciDevice) -> Option<XhciDevice> {
 	A::assign_bars(d);
 	let bar_phys = bar_address::<A>(d, 0)?;
 	let bar_len = bar_size::<A>(d, 0)?;
-	let (msix_cap, msix_count, msix_table_phys) = resolve_msix::<A>(d);
-	Some(XhciDevice { pci: *d, bar_phys, bar_len, msix_cap, msix_count, msix_table_phys })
+	let (msix_cap, msix_table_phys) = resolve_msix::<A>(d);
+	Some(XhciDevice { pci: *d, bar_phys, bar_len, msix_cap, msix_table_phys })
 }
 
 // Scan the bus and resolve every xHCI USB host controller's MMIO window.

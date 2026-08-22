@@ -357,7 +357,7 @@ unsafe fn place_and_enter(staged: &Staged, hartid: u64, boot_info: u64) -> ! {
 			"mv sp, {stack}",
 			"jalr {routine}",
 			stack = in(reg) stack_top,
-			routine = in(reg) place_on_own_stack as usize,
+			routine = in(reg) place_on_own_stack as *const () as usize,
 			in("a0") plan,
 			options(noreturn),
 		);

@@ -37,11 +37,6 @@ pub fn halt_loop() -> ! {
 	}
 }
 
-// install the CPU exception vectors and enable memory-protection features
-pub fn init() {
-	todo!("aarch64: VBAR_EL1 + MMU protection bits")
-}
-
 pub fn init_interrupts() {
 	todo!("aarch64: GIC + generic timer")
 }
@@ -56,10 +51,6 @@ pub fn init_tsc() {
 
 pub fn init_bsp_percpu(_mpidr: u32) {
 	todo!("aarch64: TPIDR_EL1 for the boot core")
-}
-
-pub fn init_ap(_cpu_id: usize, _mpidr: u32) {
-	todo!("aarch64: secondary-core bring-up")
 }
 
 // enable maskable interrupts on the current core (clear DAIF.I)
@@ -189,6 +180,15 @@ pub mod percpu;
 // -------------------------------------------------------------- interrupts
 pub mod interrupts;
 
+// install the CPU exception vectors and enable memory-protection features
+pub fn init() {
+	todo!("aarch64: VBAR_EL1 + MMU protection bits")
+}
+
+pub fn init_ap(_cpu_id: usize, _mpidr: u32) {
+	todo!("aarch64: secondary-core bring-up")
+}
+
 // -------------------------------------------------------------------- apic
 // (the aarch64 interrupt controller is the GIC; the module keeps the portable
 // `apic` name for the contract until the ports rename it.)
@@ -200,9 +200,6 @@ pub mod apic {
 			core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
 		}
 		(mpidr & 0xff_ffff) as u32
-	}
-	pub fn eoi() {
-		// aarch64 signals end-of-interrupt per IRQ inside gic::handle_irq (GICC_EOIR).
 	}
 	pub fn send_wake_ipi(dest: u32) {
 		// Bounce a halted core out of WFI so its idle loop re-checks its run queue: send
@@ -227,12 +224,6 @@ pub mod apic {
 		{
 			base
 		}
-	}
-	pub fn init() {
-		todo!("aarch64 GIC + timer")
-	}
-	pub fn init_ap() {
-		todo!("aarch64 GIC per-core")
 	}
 }
 
@@ -266,12 +257,6 @@ pub mod tsc {
 pub mod ioapic {
 	pub fn route(_gsi: u32, _vector: u8, _dest: u32) {
 		todo!("aarch64 GIC routing")
-	}
-	pub fn init() {
-		todo!("aarch64 GIC distributor")
-	}
-	pub fn mask(_gsi: u32) {
-		todo!("aarch64 GIC mask")
 	}
 }
 
@@ -327,9 +312,6 @@ pub mod random {
 // (aarch64 wakes secondaries via PSCI CPU_ON, not a real-mode trampoline; these
 // keep the portable names so smp.rs links until the real wake path replaces them.)
 pub mod apboot {
-	pub fn trampoline_len() -> usize {
-		0
-	}
 	// No 32-bit CR3 load on this port, so no root is out of reach; the portable name exists
 	// because the SMP path asks before it installs anything (KERN-ARCH-010).
 	pub fn cr3_is_reachable(_root: u64) -> bool {
@@ -346,9 +328,7 @@ pub mod apboot {
 
 // ----------------------------------------------------------------- syscall
 pub mod syscall {
-	pub fn init() {
-		todo!("aarch64 SVC wiring")
-	}
+	#[cfg(test)]
 	pub unsafe fn invoke(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 		// A ring-0 (kernel-context) system call: route straight to the portable syscall
 		// table, the way the in-kernel callers and the test harness use it. Mark this a
@@ -397,6 +377,7 @@ pub mod syscall {
 
 // ---------------------------------------------------------------- usermode
 pub mod usermode {
+	#[cfg(test)]
 	pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;
 
 	unsafe extern "C" {
@@ -477,21 +458,27 @@ pub mod usermode {
 	// The embedded ring-3 probe programs the kernel test suite runs at EL0 (mirrors the
 	// x86_64 usermode probes). Each returns its position-independent A64 instruction
 	// bytes, copied into a USER page before entering EL0.
+	#[cfg(test)]
 	pub fn program_bytes() -> &'static [u8] {
 		as_bytes(&PROGRAM_BASIC)
 	}
+	#[cfg(test)]
 	pub fn program_fault_bytes() -> &'static [u8] {
 		as_bytes(&PROGRAM_FAULT)
 	}
+	#[cfg(test)]
 	pub fn program_yield_bytes() -> &'static [u8] {
 		as_bytes(&PROGRAM_YIELD)
 	}
+	#[cfg(test)]
 	pub fn program_nx_bytes() -> &'static [u8] {
 		as_bytes(&PROGRAM_NX)
 	}
+	#[cfg(test)]
 	pub fn program_stack_probe_bytes() -> &'static [u8] {
 		as_bytes(&PROGRAM_STACK_PROBE)
 	}
+	#[cfg(test)]
 	pub fn program_spin_bytes() -> &'static [u8] {
 		as_bytes(&PROGRAM_SPIN)
 	}
@@ -503,6 +490,7 @@ pub mod usermode {
 	// Reinterpret a program's instruction words as the little-endian byte slice the
 	// test harness copies into a USER page (aarch64 is little-endian, so the u32
 	// words are already in instruction-fetch order).
+	#[cfg(test)]
 	fn as_bytes(words: &'static [u32]) -> &'static [u8] {
 		unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, core::mem::size_of_val(words)) }
 	}
@@ -512,71 +500,92 @@ pub mod usermode {
 	// and XZR in the MOVZ/MOVK/ORR destination/source position. These build the tiny
 	// position-independent ring-3 probe programs the kernel test suite runs at EL0;
 	// they mirror the x86_64 usermode probe programs one to one.
+	#[cfg(test)]
 	const SVC0: u32 = 0xD400_0001; // svc #0
+	#[cfg(test)]
 	const fn movz(rd: u32, imm: u16, hw: u32) -> u32 {
 		0xD280_0000 | (hw << 21) | ((imm as u32) << 5) | rd
 	}
+	#[cfg(test)]
 	const fn movk(rd: u32, imm: u16, hw: u32) -> u32 {
 		0xF280_0000 | (hw << 21) | ((imm as u32) << 5) | rd
 	}
+	#[cfg(test)]
 	const fn mov_reg(rd: u32, rm: u32) -> u32 {
 		0xAA00_03E0 | (rm << 16) | rd // orr rd, xzr, rm
 	}
+	#[cfg(test)]
 	const fn mov_from_sp(rd: u32) -> u32 {
 		0x9100_03E0 | rd // add rd, sp, #0
 	}
+	#[cfg(test)]
 	const fn sub_imm(rd: u32, rn: u32, imm12: u32, shift12: u32) -> u32 {
 		0xD100_0000 | (shift12 << 22) | (imm12 << 10) | (rn << 5) | rd
 	}
+	#[cfg(test)]
 	const fn add_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
 		0x9100_0000 | (imm12 << 10) | (rn << 5) | rd
 	}
+	#[cfg(test)]
 	const fn subs_imm(rd: u32, rn: u32, imm12: u32) -> u32 {
 		0xF100_0000 | (imm12 << 10) | (rn << 5) | rd
 	}
+	#[cfg(test)]
 	const fn str_off(rt: u32, rn: u32, byte_off: u32) -> u32 {
 		0xF900_0000 | ((byte_off / 8) << 10) | (rn << 5) | rt
 	}
+	#[cfg(test)]
 	const fn ldr_off(rt: u32, rn: u32, byte_off: u32) -> u32 {
 		0xF940_0000 | ((byte_off / 8) << 10) | (rn << 5) | rt
 	}
+	#[cfg(test)]
 	const fn strh_off(rt: u32, rn: u32, byte_off: u32) -> u32 {
 		0x7900_0000 | ((byte_off / 2) << 10) | (rn << 5) | rt
 	}
+	#[cfg(test)]
 	const fn cbz(rt: u32, insns_back: u32) -> u32 {
 		// Branch to a label `insns_back` instructions earlier (imm19 is a signed
 		// instruction count).
 		let imm19 = (0u32.wrapping_sub(insns_back)) & 0x7ffff;
 		0xB400_0000 | (imm19 << 5) | rt
 	}
+	#[cfg(test)]
 	const fn b_ne(insns_back: u32) -> u32 {
 		let imm19 = (0u32.wrapping_sub(insns_back)) & 0x7ffff;
 		0x5400_0000 | (imm19 << 5) | 1 // cond = NE
 	}
+	#[cfg(test)]
 	const fn br(rn: u32) -> u32 {
 		0xD61F_0000 | (rn << 5)
 	}
 	// orr rd, rn, rm - the general form `mov_reg` is the xzr special case of.
+	#[cfg(test)]
 	const fn orr_reg(rd: u32, rn: u32, rm: u32) -> u32 {
 		0xAA00_0000 | (rm << 16) | (rn << 5) | rd
 	}
 	// fmov xd, dn / fmov dd, xn - the low 64 bits of a SIMD register, moved either way.
+	#[cfg(test)]
 	const fn fmov_x_from_d(rd: u32, vn: u32) -> u32 {
 		0x9E66_0000 | (vn << 5) | rd
 	}
+	#[cfg(test)]
 	const fn fmov_d_from_x(vd: u32, rn: u32) -> u32 {
 		0x9E67_0000 | (rn << 5) | vd
 	}
 	// umov xd, vn.d[1] - the HIGH 64 bits, which `fmov` cannot reach.
+	#[cfg(test)]
 	const fn umov_x_from_high(rd: u32, vn: u32) -> u32 {
 		0x4E18_3C00 | (vn << 5) | rd
 	}
+	#[cfg(test)]
 	const B_SELF: u32 = 0x1400_0000; // b . (guard against running off the end)
 
+	#[cfg(test)]
 	use crate::syscall::{SYS_CHANNEL_SEND, SYS_DEBUG_WRITE, SYS_USER_EXIT, SYS_YIELD};
 
 	// Basic ring-3 probe: SYS_CHANNEL_SEND(x0 = handle, "OK", 2, 0), SYS_DEBUG_WRITE('U'),
 	// SYS_USER_EXIT. x0 arrives as the bootstrap Channel handle.
+	#[cfg(test)]
 	static PROGRAM_BASIC: [u32; 17] = [
 		mov_reg(19, 0),         // x19 = handle (svc preserves it via the trap frame)
 		sub_imm(31, 31, 16, 0), // sp -= 16 (scratch for "OK")
@@ -599,6 +608,7 @@ pub mod usermode {
 
 	// Cooperative-yield probe: save the handle, SYS_YIELD x3 (so two instances on one
 	// core interleave), then send "OK" and exit.
+	#[cfg(test)]
 	static PROGRAM_YIELD: [u32; 20] = [
 		mov_reg(19, 0), // x19 = handle
 		movz(8, SYS_YIELD as u16, 0),
@@ -623,6 +633,7 @@ pub mod usermode {
 	];
 
 	// Fault probe: write to FAULT_PROBE_ADDR (unmapped) to raise a page fault from EL0.
+	#[cfg(test)]
 	static PROGRAM_FAULT: [u32; 4] = [
 		movz(0, (FAULT_PROBE_ADDR & 0xffff) as u16, 0),         // x0 low  = 0xd000
 		movk(0, ((FAULT_PROBE_ADDR >> 16) & 0xffff) as u16, 1), // x0 high = 0x0dea
@@ -632,6 +643,7 @@ pub mod usermode {
 
 	// No-execute probe: jump into the writable, no-execute stack page. The instruction
 	// fetch there aborts (W^X) before a byte executes.
+	#[cfg(test)]
 	static PROGRAM_NX: [u32; 3] = [
 		sub_imm(0, 31, 64, 0), // x0 = sp - 64 (inside the stack page)
 		br(0),                 // fetch from a NO_EXECUTE page -> instruction abort
@@ -640,6 +652,7 @@ pub mod usermode {
 
 	// Stack-growth probe: x0 = page count. Store one qword per page walking DOWN from
 	// the entry stack pointer, then exit cleanly (or fault at the Domain's stack floor).
+	#[cfg(test)]
 	static PROGRAM_STACK_PROBE: [u32; 7] = [
 		mov_from_sp(1),      // x1 = sp
 		sub_imm(1, 1, 1, 1), // x1 -= 4096 (imm 1, shift 12)
@@ -705,6 +718,7 @@ pub mod usermode {
 	// CPU-bound spinner: x0 = shared data page. [x0] is a stop flag another thread
 	// raises through the frame's kernel mapping, [x0 + 8] a counter this loop bumps so
 	// an observer sees it running. It makes no syscall until the flag is set.
+	#[cfg(test)]
 	static PROGRAM_SPIN: [u32; 7] = [
 		ldr_off(1, 0, 8), // x1 = [x0 + 8]
 		add_imm(1, 1, 1), // x1 += 1
