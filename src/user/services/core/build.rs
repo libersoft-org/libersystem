@@ -2,10 +2,11 @@
 #[path = "../../build.rs"]
 mod common;
 
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use system_manifest::{DriverLifecycle, Manifest, MatchPriority, Restart, Stage};
+use system_manifest::{DriverLifecycle, Manifest, MatchPriority, Presence, Restart, RoleKind, Stage};
 
 fn main() {
 	common::configure();

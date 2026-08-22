@@ -772,6 +772,16 @@ impl Manifest {
 				}
 				if !services.contains_key(&role.provider) {
 					push_error(&mut errors, format!("services.{}.roles.{}.provider", service.name, role.tag), format!("unknown role provider {provider}"));
+					continue;
+				}
+				// A CAPABILITY FROM A SERVICE IS A DEPENDENCY ON IT, and saying so is what makes the
+				// start order a consequence of the declaration rather than of the resolver's habits.
+				// Thirteen roles were being handed over without one when this check was written -
+				// the manifest already carried a comment about the last time that happened, where
+				// the session service came up first on one machine and second on another and the
+				// difference was a boot with no shell.
+				if !service.dependencies.contains(&role.provider) {
+					push_error(&mut errors, format!("services.{}.roles.{}.provider", service.name, role.tag), format!("{} supplies this role but is not a declared dependency, so nothing orders it first", provider));
 				}
 			}
 		}

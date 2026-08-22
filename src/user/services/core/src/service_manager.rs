@@ -75,7 +75,39 @@ enum Restart {
 // and others are listed before LogService though all depend on it, so the dependency
 // resolver derives the real order (proving it is driven by declared deps, not position).
 // (A fixed size keeps the state arrays on the stack.)
+// THE CAPABILITY ROLES ONE SERVICE MUST BE HANDED, generated beside the manifest table from the
+// same declaration. `ROLES[i]` belongs to `MANIFEST[i]`, in the order the bootstrap must send it.
+//
+// Order is contract, not presentation: a receiver checks the tag of the NEXT message rather than
+// searching for one, so a role inserted in the middle shifts every read after it.
+#[derive(Clone, Copy)]
+struct Role {
+	tag: &'static [u8],
+	kind: RoleKind,
+	// The service that supplies it, `self` for a channel made for this service to serve on, or
+	// `kernel` for what the boot chain was handed.
+	provider: &'static [u8],
+	// False for a role whose tag is always sent and whose handle may legitimately be zero - an
+	// absent disk, an absent device. The TAG still arrives; only the capability is missing.
+	required: bool,
+}
+
+// How a role is delivered, which is also what decides whether it can be delivered AGAIN.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RoleKind {
+	ServeRoot,
+	Client,
+	Factory,
+	Privilege,
+	Power,
+	Package,
+	Device,
+	Payload,
+}
+
 include!(concat!(env!("OUT_DIR"), "/manifest.rs"));
+// One set of tag constants, read by the sender here and by every receiver.
+include!(concat!(env!("OUT_DIR"), "/role_tags.rs"));
 // The driver names, from the same manifest rows DeviceManager binds from. See `build.rs`.
 include!(concat!(env!("OUT_DIR"), "/driver_names.rs"));
 

@@ -1632,7 +1632,7 @@ interface = "liber:audio@1/audio"
 name = "config_service"
 program = "config_service"
 restart = "transparent"
-dependencies = ["log_service", "process_service"]
+dependencies = ["log_service", "process_service", "storage_service"]
 
 [[services.roles]]
 tag = "STORAGE"
@@ -1659,6 +1659,11 @@ dependencies = [
 	"session_service",
 	"process_service",
 	"permission_manager",
+	"storage_service",
+	"device_service",
+	"config_service",
+	"network_service",
+	"device_manager",
 ]
 
 [[services.roles]]
@@ -1978,6 +1983,11 @@ dependencies = [
 	"process_service",
 	"resource_manager",
 	"session_service",
+	"display_service",
+	"input_service",
+	"ram_storage",
+	"tmp_storage",
+	"device_manager",
 ]
 
 [[services.roles]]
@@ -2223,6 +2233,7 @@ dependencies = [
 	"resource_manager",
 	"system_graph_service",
 	"session_service",
+	"log_service",
 ]
 
 [[services.roles]]
@@ -2493,7 +2504,7 @@ interface = "liber:storage@1/volume"
 name = "usb_storage"
 program = "storage_service"
 restart = "escalate"
-dependencies = ["log_service", "storage_service"]
+dependencies = ["log_service", "storage_service", "device_manager"]
 
 [[services.roles]]
 tag = "USBBLOCK"
