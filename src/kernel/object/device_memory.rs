@@ -62,21 +62,6 @@ impl DeviceMemory {
 		self.index
 	}
 
-	#[cfg(test)]
-	pub fn phys_base(&self) -> u64 {
-		self.phys_base
-	}
-
-	#[cfg(test)]
-	pub fn len(&self) -> usize {
-		self.len
-	}
-
-	#[cfg(test)]
-	pub fn is_empty(&self) -> bool {
-		self.len == 0
-	}
-
 	// Number of pages the region spans (at least one), counted from the aligned base so an
 	// unaligned region still covers its own tail.
 	pub fn pages(&self) -> usize {
@@ -85,16 +70,6 @@ impl DeviceMemory {
 
 	// The sentinel a claim holds between `claim_mapping` and `set_mapped_in`.
 	const RESERVED: u64 = 1;
-
-	#[cfg(test)]
-	pub fn mapped_at(&self) -> u64 {
-		match self.mapped_at.load(Ordering::Acquire) {
-			// A claim in flight is not an address, and a teardown that saw it would unmap a
-			// mapping that does not exist yet.
-			Self::RESERVED => 0,
-			virt => virt,
-		}
-	}
 
 	// Claim the right to map this region, once.
 	//

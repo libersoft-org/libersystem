@@ -97,12 +97,6 @@ fn hold(device: u32, frames: Vec<u64>) {
 	// Dropped here: the `Vec` goes, the frames stay out of circulation. Deliberately NOT retired.
 }
 
-// How many frames have been leaked because the hold table was full.
-#[cfg(test)]
-pub fn leaked_frames() -> usize {
-	LEAKED.load(Ordering::Relaxed)
-}
-
 // A driver has reset `device`, so nothing it was pointed at is in flight any more: retire every
 // frame held for it. Returns how many frames were released.
 //
@@ -213,12 +207,6 @@ impl DmaBuffer {
 		self.size
 	}
 
-	// The device this buffer was created for, if any.
-	#[cfg(test)]
-	pub fn device(&self) -> Option<u32> {
-		self.device
-	}
-
 	// "This buffer's owner did not say it was done with it." Called by process teardown, for every
 	// DmaBuffer the dying process holds, BEFORE its handles are closed - so the drop that follows
 	// knows which of the two cases it is in.
@@ -239,11 +227,6 @@ impl DmaBuffer {
 	#[cfg(test)]
 	pub fn phys_base(&self) -> u64 {
 		self.frames.first().copied().unwrap_or(0)
-	}
-
-	#[cfg(test)]
-	pub fn is_mapped_in(&self, cr3: u64) -> bool {
-		self.mappings.lock().iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3)
 	}
 
 	// Claim the right to map this buffer into `cr3`, under one lock - see the note on
@@ -280,12 +263,6 @@ impl DmaBuffer {
 
 	pub fn abandon_reservation(&self, cr3: u64) {
 		self.mappings.lock().retain(|(mapped_cr3, base)| !(*mapped_cr3 == cr3 && *base == 0));
-	}
-
-	#[cfg(test)]
-	pub fn add_mapping(&self, cr3: u64, base: u64) {
-		// ALLOC-OK: one entry per address space this buffer is mapped into, bounded by the process count the Domain quota allows.
-		self.mappings.lock().push((cr3, base));
 	}
 
 	// Take this buffer's mapping out of `space`. The address space, not a bare cr3, because

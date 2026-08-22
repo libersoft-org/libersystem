@@ -282,16 +282,4 @@ impl ProcessGroup {
 	pub fn size(&self) -> usize {
 		self.original_size
 	}
-
-	// Wake anyone waiting on this group. Called when a member reaches a terminal state.
-	//
-	// A waiter registers on the GROUP's koid while a process termination wakes only the
-	// process's own, and nothing connected the two - so a group could report `finished()`
-	// while a waiter without a timeout stayed parked forever. The group has to be told.
-	// Kept for callers that hold a group and no process. `Process::record_in_groups` does this
-	// inline, outside its own lock, because it already has to collect the koids there.
-	#[cfg(test)]
-	pub fn notify_member_terminated(&self) {
-		crate::sched::wake_object(self.header.koid());
-	}
 }

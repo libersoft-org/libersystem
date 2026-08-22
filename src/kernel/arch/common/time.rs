@@ -96,11 +96,4 @@ impl TickClock {
 			self.ticks.fetch_add(periods, Ordering::Relaxed);
 		}
 	}
-
-	// The harness reads the clock through the arch `ticks()`, which adds a test skew; this is the
-	// raw counter, for a test that wants to measure the RATE.
-	#[cfg(test)]
-	pub fn raw_for_test(&self) -> u64 {
-		self.ticks()
-	}
 }

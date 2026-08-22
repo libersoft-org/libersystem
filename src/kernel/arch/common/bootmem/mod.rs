@@ -39,6 +39,7 @@ const PAGE: u64 = 4096;
 // not reserved, and the frame allocator was free to hand out the page an ELF archive was sitting in.
 // That is the flaky `BadImage` this milestone already fixed once, reachable again by staging more
 // modules, and nothing would have said so.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub const MAX_MODULES: usize = 64;
 
 // Cut `holes` out of `[base, base + len)` and write what survives into `out`, returning how many
@@ -62,6 +63,7 @@ pub const MAX_MODULES: usize = 64;
 // rest dropped in silence, and a module buffer that is not carved out of free RAM is a page the
 // allocator may hand out with an ELF archive still in it. That is the flaky `BadImage` this
 // milestone already fixed once, reachable again by staging more modules.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub const MAX_HOLES: usize = 2 + MAX_MODULES;
 
 // Carve EVERY RAM bank against the loader's reservations, into one region array.
@@ -98,6 +100,7 @@ pub const MAX_HOLES: usize = 2 + MAX_MODULES;
 //
 // The remainder is REPORTED rather than dropped in silence - losing memory is recoverable by
 // somebody who reads the boot log, and it is the only way anyone learns the map wants widening.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn carve_banks(banks: &[(u64, u64)], floor: u64, ceiling: u64, holes: &[Hole], out: &mut [MemRegion]) -> usize {
 	let mut written = 0usize;
 	for &(base, len) in banks {
@@ -199,6 +202,7 @@ pub fn carve(base: u64, len: u64, holes: &mut [Hole], out: &mut [MemRegion]) -> 
 //
 // `arg` is either zero or a physical address the boot handed over; `to_virt` must map a physical
 // address to somewhere readable.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub unsafe fn loader_reservations(arg: u64, to_virt: impl Fn(u64) -> u64, out: &mut [Hole]) -> usize {
 	if arg == 0 || out.is_empty() {
 		return 0;
@@ -262,6 +266,7 @@ mod tests;
 // must NOT do is take the tree's account of RAM while ignoring its account of what is reserved -
 // the two come off the same bytes, and half of them is worse than neither. The second half of the
 // answer is what lets the caller fall back to the conservative region instead.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub unsafe fn devicetree_reservations(fdt: &fdt::Fdt, out: &mut [Hole], written: usize) -> (usize, bool) {
 	let mut written = written;
 	// Set by anything that stopped a reservation from being carried, wherever it happened.
@@ -324,6 +329,7 @@ pub unsafe fn devicetree_reservations(fdt: &fdt::Fdt, out: &mut [Hole], written:
 //
 // `None` when there is none - a QEMU `-kernel` boot, which has no firmware at all - and the caller
 // falls back to the device tree, which is the right source when there is no better one.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub unsafe fn handed_memmap(arg: u64, to_virt: impl Fn(u64) -> u64) -> Option<(*const MemRegion, usize)> {
 	if arg == 0 {
 		return None;

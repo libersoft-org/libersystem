@@ -388,19 +388,6 @@ const fn align_up(value: usize, align: usize) -> usize {
 	(value + align - 1) & !(align - 1)
 }
 
-// Ask the allocator for memory and get back null on failure, instead of the abort that `Box` and
-// `Vec` take on OOM. Deliberately test-only: production code that cannot get memory has nothing
-// useful to do with the news, and the whole point of the growth path is that it is invisible.
-#[cfg(test)]
-pub fn try_alloc(layout: Layout) -> *mut u8 {
-	unsafe { ALLOCATOR.alloc(layout) }
-}
-
-#[cfg(test)]
-pub fn dealloc(pointer: *mut u8, layout: Layout) {
-	unsafe { ALLOCATOR.dealloc(pointer, layout) }
-}
-
 #[cfg(test)]
 mod tests;
 

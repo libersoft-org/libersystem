@@ -273,6 +273,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// could not have been given one when it started.
 				#[cfg(feature = "development")]
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DEVPERM" => dev.hold_launcher(handle),
+				// A SHIPPING BOOT STILL RECEIVES BOTH. ServiceManager sends them whenever
+				// PermissionManager comes up and its own comment says a boot with no agent ignores
+				// them - so they are consumed and closed here. Without this arm they fall through
+				// to the catch-all below, which reads any other message as "stop" and takes
+				// DeviceManager down with the first one.
+				#[cfg(not(feature = "development"))]
+				Received::Message { len, handle } if (len >= 7 && &buf[..7] == b"DEVPERM") || (len >= 6 && &buf[..6] == b"DEVREG") => {
+					if handle != 0 {
+						close(handle);
+					}
+				}
 				// The other end of the channel ProcessService already holds, so a launch can
 				// ask the registry whether it has a generation of the artifact it is about to
 				// read off the volume.

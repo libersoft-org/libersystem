@@ -70,16 +70,6 @@ impl Capability {
 		Self { object, rights, badge, generation }
 	}
 
-	#[cfg(test)]
-	pub fn rights(&self) -> Rights {
-		self.rights
-	}
-
-	#[cfg(test)]
-	pub fn badge(&self) -> u64 {
-		self.badge
-	}
-
 	pub fn object_type(&self) -> ObjectType {
 		self.object.object_type()
 	}
@@ -206,11 +196,6 @@ impl HandleTable {
 	// Number of live handles in the table.
 	pub fn len(&self) -> usize {
 		self.slots.iter().filter(|s| s.cap.is_some()).count()
-	}
-
-	#[cfg(test)]
-	pub fn is_empty(&self) -> bool {
-		self.len() == 0
 	}
 
 	// Place a capability into a free or fresh slot and return its handle, or give it back when
@@ -494,12 +479,6 @@ impl HandleTable {
 	// Inspect the rights a handle carries (a get_info-style query).
 	pub fn rights_of(&self, handle: Handle) -> Result<Rights, HandleError> {
 		Ok(self.live_cap_of(handle)?.rights)
-	}
-
-	// Inspect the badge a handle carries (stamped onto messages it sends).
-	#[cfg(test)]
-	pub fn badge_of(&self, handle: Handle) -> Result<u64, HandleError> {
-		Ok(self.live_cap_of(handle)?.badge)
 	}
 
 	// The object AND its badge, from ONE look at the table.

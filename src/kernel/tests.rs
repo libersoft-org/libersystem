@@ -347,7 +347,6 @@ fn run_powerbox_scenario() -> Result<(alloc::vec::Vec<u8>, alloc::vec::Vec<u8>),
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PermissionScenario {
-	Probes,
 	GovernedTools,
 	ScopedGrants,
 }
@@ -435,7 +434,7 @@ pub(crate) fn declare_permission_cohort(id: &str, cohort: PermissionCohort) {
 	assert!(found, "{id} drives the permission fixture without a PERMISSION_COHORT entry");
 }
 
-struct PermissionScenarioResult {
+pub(crate) struct PermissionScenarioResult {
 	// What the last stage of a two-stage governed pipeline printed, and whether the broker
 	// started it at all - the transaction's observable result.
 	pipeline_read: alloc::vec::Vec<u8>,
@@ -513,7 +512,7 @@ struct PermissionScenarioResult {
 // observe - or disturb - anything the earlier one left running. That is the difference between
 // reusing setup and sharing test state, and it is why this is a cache of observations rather than a
 // long-lived topology with twelve tenants.
-enum PermissionFixture {
+pub(crate) enum PermissionFixture {
 	Empty,
 	// Some consumer is running the scenario right now. It is not a result and it is not an error;
 	// it is a state a second consumer must not wait inside, because waiting here means spinning in
@@ -2207,7 +2206,6 @@ define_test_tags! {
 }
 
 pub(crate) struct TaggedTest {
-	pub(crate) name: &'static str,
 	// The identity everything OUTSIDE the guest keys on: age, cost, shadow and regression history.
 	//
 	// It defaults to the function name and can be overridden with `id = "..."`, and the difference
@@ -2295,12 +2293,12 @@ macro_rules! tagged_test {
 	(@build $(#[$attr:meta])* $name:ident, [$first_tag:ident $(, $tag:ident)* $(,)?], $id:expr, $covers:expr) => {
 		$(#[$attr])*
 		mod $name {
-			// Named and unused: it makes the covers literals part of the compile, so a malformed
-			// list is a build error here rather than a parse failure on the host.
-			const COVERS: &[&str] = $covers;
+			// ANONYMOUS AND DELIBERATE: it makes the covers literals part of the compile, so a
+			// malformed list is a build error here rather than a parse failure on the host. It had
+			// a name once, which made it look like something a reader could reach.
+			const _: &[&str] = $covers;
 			#[test_case]
 			static CASE: $crate::tests::TaggedTest = $crate::tests::TaggedTest {
-				name: stringify!($name),
 				id: $id,
 				tags: &[$crate::tests::TestTag::$first_tag $(, $crate::tests::TestTag::$tag)*],
 				run: super::$name,

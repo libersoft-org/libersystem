@@ -124,12 +124,6 @@ pub fn set_kernel_rsp(value: u64) {
 	unsafe { (*this_cpu_mut()).kernel_sp = value };
 }
 
-// Record where this hart's U-mode-entry kernel stack slot lives (the riscv analogue
-// of the x86 TSS.RSP0 slot).
-pub fn set_tss_rsp0_slot(addr: u64) {
-	unsafe { (*this_cpu_mut()).entry_sp_slot = addr };
-}
-
 // Point this hart's U-mode-entry kernel stack at `value` (the incoming thread's parked
 // kernel stack position). A zero value leaves the slot untouched.
 pub fn set_rsp0(value: u64) {
@@ -162,10 +156,6 @@ pub fn set_from_user(from_user: bool) {
 // port whose exception entry writes to the stack before it can validate it. What makes it cheap to
 // leave alone here is that these two have not shown it, not that they cannot.
 pub fn set_stack_bounds(_base: u64, _len: usize) {}
-
-// The idle/boot stack twin of `set_stack_bounds`, for the same reason and with the same status
-// here: recorded nowhere, so nothing to restore.
-pub fn record_idle_stack(_base: u64, _len: usize) {}
 
 pub fn use_idle_stack() {}
 

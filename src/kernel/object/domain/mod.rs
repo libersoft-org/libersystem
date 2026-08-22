@@ -289,11 +289,6 @@ impl Domain {
 		self.parent.as_ref().and_then(Weak::upgrade)
 	}
 
-	#[cfg(test)]
-	pub fn is_killed(&self) -> bool {
-		self.killed.load(Ordering::Acquire)
-	}
-
 	// Register a process as accounted to this Domain so it can be terminated when
 	// the Domain is killed. Dead weak entries are pruned on the way in so the list
 	// stays bounded to live processes.
@@ -319,17 +314,6 @@ impl Domain {
 		}
 		list.push(Arc::downgrade(process));
 		true
-	}
-
-	// A snapshot of this Domain's live child Domains (for the System Graph). The
-	// children are owned strongly, so each is guaranteed live.
-	//
-	#[cfg(test)]
-	pub fn child_domains(&self) -> Vec<Arc<Domain>> {
-		// ALLOC-OK: the System Graph dump, which runs from the kernel test suites and from nothing a
-		// ring-3 caller can reach - `graph::collect_from` has no syscall behind it. `kill` walks the
-		// same two lists without allocating, because that one does.
-		self.children.lock().iter().cloned().collect()
 	}
 
 	// A snapshot of the processes currently accounted to this Domain (for the

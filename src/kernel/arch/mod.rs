@@ -82,12 +82,13 @@ pub mod riscv64;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::*;
 
-// The human-readable name of the compile-target architecture, for the boot log.
-#[cfg(target_arch = "x86_64")]
+// The human-readable name of the compile-target architecture, for the boot log. Only the boot log
+// asks, and the test build has no boot.
+#[cfg(all(not(test), target_arch = "x86_64"))]
 pub const NAME: &str = "x86_64";
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(not(test), target_arch = "aarch64"))]
 pub const NAME: &str = "aarch64";
-#[cfg(target_arch = "riscv64")]
+#[cfg(all(not(test), target_arch = "riscv64"))]
 pub const NAME: &str = "riscv64";
 
 #[cfg(test)]

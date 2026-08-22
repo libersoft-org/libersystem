@@ -29,14 +29,6 @@ const REG_REDTBL: u32 = 0x10; // GSI n: low dword at REG_REDTBL + 2n, high at +1
 // Redirection-entry low-dword bit we use: every entry is left masked.
 const MASKED: u32 = 1 << 16;
 
-// Route a GSI to `vector` on the core with LAPIC id `dest_lapic` and unmask it:
-// fixed delivery, physical destination, edge-triggered, active-high (the ISA
-// defaults - the serial UART's legacy IRQ is the one line the kernel routes).
-pub fn route(gsi: u32, vector: u8, dest_lapic: u32) {
-	write(REG_REDTBL + 2 * gsi + 1, dest_lapic << 24);
-	write(REG_REDTBL + 2 * gsi, vector as u32);
-}
-
 // Virtual base of the mapped MMIO page (0 until init maps it).
 static BASE: AtomicUsize = AtomicUsize::new(0);
 
@@ -69,6 +61,15 @@ pub fn init() {
 
 // Mask `gsi`'s redirection entry, leaving its routing intact (used at init to silence
 // every entry, since the kernel takes all device interrupts via MSI-X).
+// Route a GSI to `vector` on the core with LAPIC id `dest_lapic` and unmask it: fixed delivery,
+// physical destination, edge-triggered, active-high (the ISA defaults - the serial UART's legacy
+// IRQ is the one line the kernel routes). The boot tail routes it, so a test build never asks.
+#[cfg(not(test))]
+pub fn route(gsi: u32, vector: u8, dest_lapic: u32) {
+	write(REG_REDTBL + 2 * gsi + 1, dest_lapic << 24);
+	write(REG_REDTBL + 2 * gsi, vector as u32);
+}
+
 pub fn mask(gsi: u32) {
 	if BASE.load(Ordering::Relaxed) == 0 {
 		return;

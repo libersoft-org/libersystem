@@ -81,6 +81,7 @@ pub fn release_unused_msi(vector: u32) {
 // One vector per device, entry 0 - see the x86_64 `acquire_msi`, which states the limit and why it
 // exists. `MsiRegistry::acquire` does NOT enforce it, which this comment used to claim: the form that
 // does is `acquire_unique_live`, reached through `acquire_msi_unique` below.
+#[cfg(test)]
 pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u32> {
 	program_acquired(REGISTRY.acquire(owner, MAX_MSI)?, table_phys)
 }
@@ -181,10 +182,6 @@ pub fn irq_info_len() -> usize {
 // No kernel-side INTx handler registration on riscv (device interrupts are MSI; the
 // timer is the S-mode timer, not an external source).
 pub fn register(_vector: u32, _handler: HandlerFn) {}
-
-// The IMSIC is brought up per hart in boot.rs / smp.rs (imsic::init_hart), so there is
-// nothing left to initialize here.
-pub fn init() {}
 
 #[cfg(test)]
 mod tests;

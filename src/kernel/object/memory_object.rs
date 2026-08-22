@@ -86,11 +86,6 @@ impl MemoryObject {
 		&self.frames
 	}
 
-	#[cfg(test)]
-	pub fn is_mapped_in(&self, cr3: u64) -> bool {
-		self.mappings.lock().iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3)
-	}
-
 	// Claim the right to map this object into `cr3`, under one lock. Returns false if
 	// another caller already holds the claim or the mapping already exists.
 	//
@@ -153,12 +148,6 @@ impl MemoryObject {
 	#[cfg(test)]
 	pub fn mapping_count_for_test(&self) -> usize {
 		self.mappings.lock().len()
-	}
-
-	#[cfg(test)]
-	pub fn add_mapping(&self, cr3: u64, base: u64) {
-		// ALLOC-OK: one entry per address space this object is mapped into, bounded by the process count the Domain quota allows.
-		self.mappings.lock().push((cr3, base));
 	}
 
 	// Take this object's mapping out of `space`. The address space, not a bare cr3, because

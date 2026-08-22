@@ -44,8 +44,11 @@ pub fn attach(channel: Arc<Channel>) {
 	*CONSOLE.lock() = Some(channel);
 }
 
-// Whether a shell is attached and still listening (its peer endpoint is alive).
-// False once the shell exits and drops its end.
+// Send one input byte to the attached shell. Returns false if no shell is attached
+// or its endpoint has closed (it exited).
+// Whether a shell is attached and still listening (its peer endpoint is alive). False once the
+// shell exits and drops its end. Asked by the boot tail's shell loop, which the test build has not.
+#[cfg(not(test))]
 pub fn shell_listening() -> bool {
 	match &*CONSOLE.lock() {
 		Some(channel) => !channel.is_peer_closed(),
@@ -53,8 +56,6 @@ pub fn shell_listening() -> bool {
 	}
 }
 
-// Send one input byte to the attached shell. Returns false if no shell is attached
-// or its endpoint has closed (it exited).
 pub fn feed(byte: u8) -> bool {
 	// ALLOC-OK: the guard holds an `Option<Arc<Channel>>`, so this is a refcount bump and not a
 	// copy - taken out of the lock because the send below must not run under it.

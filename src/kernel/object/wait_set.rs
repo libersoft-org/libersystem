@@ -53,12 +53,6 @@ pub struct WaitSet {
 }
 
 impl WaitSet {
-	// FALLIBLY, here and in `create_in`: `SYS_WAITSET_CREATE` reaches them.
-	#[cfg(test)]
-	pub fn create() -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()), domain: None })
-	}
-
 	// The same, charging its memberships to `domain`. What `sys_waitset_create` builds.
 	pub fn create_in(domain: Arc<super::domain::Domain>) -> Option<Arc<Self>> {
 		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()), domain: Some(domain) })
@@ -144,16 +138,6 @@ impl WaitSet {
 	// caller has to keep it that way.
 	pub fn with_members<R>(&self, f: impl FnOnce(&[Arc<dyn KernelObject>]) -> R) -> R {
 		f(&self.members.lock())
-	}
-
-	#[cfg(test)]
-	pub fn len(&self) -> usize {
-		self.members.lock().len()
-	}
-
-	#[cfg(test)]
-	pub fn is_empty(&self) -> bool {
-		self.len() == 0
 	}
 }
 

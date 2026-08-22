@@ -17,7 +17,8 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 // QEMU virt (aia=aplic-imsic): the S-mode IMSIC files start at 0x2800_0000, one 4 KiB
 // page per hart, HART_STRIDE apart. A device MSI targets hart H by writing its EID to
-// that hart's page. Overridable via set_base from the device tree.
+// that hart's page. FIXED: the device tree is not consulted - `boot.rs` says the same thing at
+// the call site, and the setter that would have taken a tree value had no caller.
 const IMSIC_S_DEFAULT: usize = 0x2800_0000;
 const HART_STRIDE: usize = 0x1000;
 static IMSIC_S_BASE: AtomicUsize = AtomicUsize::new(IMSIC_S_DEFAULT);
@@ -27,19 +28,8 @@ const EIDELIVERY: usize = 0x70; // interrupt delivery enable
 const EITHRESHOLD: usize = 0x72; // priority threshold (0 = accept all)
 const EIE0: usize = 0xC0; // enable bits for EIDs 0..63 (RV64: one 64-bit register)
 
-// Record the S-mode IMSIC base (from the device tree; defaults to the QEMU virt layout).
-pub fn set_base(addr: u64) {
-	if addr != 0 {
-		IMSIC_S_BASE.store(addr as usize, Ordering::Relaxed);
-	}
-}
-
 fn base() -> usize {
 	IMSIC_S_BASE.load(Ordering::Relaxed)
-}
-
-pub fn ready() -> bool {
-	base() != 0
 }
 
 // The physical MSI target address for hart `hart`'s S-mode interrupt file - what a

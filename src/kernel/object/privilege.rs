@@ -44,17 +44,7 @@ pub enum PrivilegeKind {
 	DeviceManager,
 }
 
-impl PrivilegeKind {
-	#[cfg(test)]
-	pub fn name(self) -> &'static str {
-		match self {
-			PrivilegeKind::DisplayController => "DisplayController",
-			PrivilegeKind::ConsoleInputSource => "ConsoleInputSource",
-			PrivilegeKind::ConsoleSink => "ConsoleSink",
-			PrivilegeKind::DeviceManager => "DeviceManager",
-		}
-	}
-}
+impl PrivilegeKind {}
 
 pub struct Privilege {
 	header: ObjectHeader,

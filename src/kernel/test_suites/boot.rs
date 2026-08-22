@@ -653,7 +653,6 @@ fn a_raw_foreign_filesystem_past_the_first_sector_is_not_formatted() {
 
 tagged_test!(system_manager_recovery_escalates_after_repeated_crashes, [Process], id = "kernel.boot.system_manager_recovery_escalates_after_repeated_crashes", covers = ["kernel", "liberfs"]);
 fn system_manager_recovery_escalates_after_repeated_crashes() {
-	use object::KernelObject;
 	// The kernel supervises SystemManager: if it faults, the kernel starts a
 	// recovery SystemManager, up to a limit, then escalates (it reboots in
 	// production). Here the "SystemManager" faults on every attempt (a ring-3 page

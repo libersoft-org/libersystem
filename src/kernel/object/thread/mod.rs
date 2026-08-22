@@ -215,8 +215,8 @@ impl KernelStack {
 	}
 
 	// One past the highest mapped byte - what a stack pointer starts at.
-	// The secondary-core bring-up on both device-tree backends parks its idle stack by top.
-	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+	// The aarch64 secondary-core bring-up parks its idle stack by top.
+	#[cfg(target_arch = "aarch64")]
 	pub fn top(&self) -> u64 {
 		self.usable_base() + self.capacity() as u64
 	}

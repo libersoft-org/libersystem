@@ -25,10 +25,10 @@
 // `rng`: the SplitMix64 mixer the arch random fallbacks share (no arch guarantees a
 // hardware RNG on the bring-up core).
 
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod bootmem;
 pub mod context;
-#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub mod fwcfg;
 pub mod msi;
 pub mod paging;

@@ -66,11 +66,6 @@ impl RunQueue {
 		self.head.is_none()
 	}
 
-	#[cfg(test)]
-	fn len(&self) -> usize {
-		self.len
-	}
-
 	// The queue holds `head` strongly and each thread's link holds the next, so the chain keeps
 	// every queued thread alive without a second list to keep in step.
 	fn push_back(&mut self, thread: Arc<Thread>) {
@@ -795,47 +790,6 @@ fn drain_bucket_into_run_queue(koid: u64) {
 	}
 }
 
-// EVERY BLOCKED THREAD AND WHAT IT IS WAITING FOR, on the serial line.
-//
-// The scheduler knows this and nothing could ask it. When a thread does not come back, the only
-// evidence available was the absence of whatever it was supposed to do next - so the question "is
-// it blocked, and on what" was answered by adding a print somewhere and rebuilding, once per
-// hypothesis. That is the cost this exists to remove: one call says which threads are parked, on
-// which object's koid, in which process, and which core's queue they left.
-//
-// The waiters are registered by koid rather than by thread, so this walks the buckets the wake path
-// itself uses - if a thread is here, a `wake_object` for that koid would reach it, and if it is not
-// here, no wake ever will. That distinction is the whole diagnostic value.
-//
-// Locks are taken one bucket at a time and released before printing, because the serial write is
-// slow and a bucket lock is on the wake path.
-pub fn dump_blocked(reason: &str) {
-	crate::serial_println!("sched: blocked threads ({reason}):");
-	let mut total = 0usize;
-	for bucket in WAIT_BUCKETS.iter() {
-		// Copied out under the lock, printed after it: a serial write with a wake-path lock held
-		// would be a stall every core could see.
-		// ALLOC-OK: a diagnostic, called by hand from a test or a debug path.
-		let entries: Vec<(u64, u64, u64, ThreadState)> = bucket.lock().iter().map(|w| (w.thread.header().koid(), w.koid, w.thread.process().header().koid(), w.thread.state())).collect();
-		for (thread, waits_on, process, state) in entries {
-			crate::serial_println!("sched:   thread {thread} of process {process} waits on koid {waits_on} ({state:?})");
-			total += 1;
-		}
-	}
-	// The timed list is the other place a thread can be parked, and a thread in BOTH is waiting for
-	// whichever comes first - so it is named twice on purpose rather than deduplicated into a
-	// half-truth.
-	// ALLOC-OK: as above.
-	let timed: Vec<(u64, u64, u64, bool)> = TIMED_WAITERS.lock().iter().map(|w| (w.thread.header().koid(), w.thread.process().header().koid(), w.deadline, w.periodic)).collect();
-	for (thread, process, deadline, periodic) in timed {
-		crate::serial_println!("sched:   thread {thread} of process {process} waits until tick {deadline}{}", if periodic { " (periodic)" } else { "" });
-		total += 1;
-	}
-	if total == 0 {
-		crate::serial_println!("sched:   none");
-	}
-}
-
 pub fn wake_object(koid: u64) {
 	// The sets watching this object, collected before anything is woken and NOT removed - an
 	// observer outlives the wake, which is the whole difference between it and a waiter.
@@ -974,6 +928,50 @@ fn enqueue(thread: Arc<Thread>) {
 static IDLE_HOOK: AtomicU64 = AtomicU64::new(0);
 
 // Register the idle hook the BSP runs while spinning for the next deadline.
+// Called from the panic handler, which the test build replaces with its own.
+#[cfg(not(test))]
+// EVERY BLOCKED THREAD AND WHAT IT IS WAITING FOR, on the serial line.
+//
+// The scheduler knows this and nothing could ask it. When a thread does not come back, the only
+// evidence available was the absence of whatever it was supposed to do next - so the question "is
+// it blocked, and on what" was answered by adding a print somewhere and rebuilding, once per
+// hypothesis. That is the cost this exists to remove: one call says which threads are parked, on
+// which object's koid, in which process, and which core's queue they left.
+//
+// The waiters are registered by koid rather than by thread, so this walks the buckets the wake path
+// itself uses - if a thread is here, a `wake_object` for that koid would reach it, and if it is not
+// here, no wake ever will. That distinction is the whole diagnostic value.
+//
+// Locks are taken one bucket at a time and released before printing, because the serial write is
+// slow and a bucket lock is on the wake path.
+pub fn dump_blocked(reason: &str) {
+	crate::serial_println!("sched: blocked threads ({reason}):");
+	let mut total = 0usize;
+	for bucket in WAIT_BUCKETS.iter() {
+		// Copied out under the lock, printed after it: a serial write with a wake-path lock held
+		// would be a stall every core could see.
+		// ALLOC-OK: a diagnostic, called by hand from a test or a debug path.
+		let entries: Vec<(u64, u64, u64, ThreadState)> = bucket.lock().iter().map(|w| (w.thread.header().koid(), w.koid, w.thread.process().header().koid(), w.thread.state())).collect();
+		for (thread, waits_on, process, state) in entries {
+			crate::serial_println!("sched:   thread {thread} of process {process} waits on koid {waits_on} ({state:?})");
+			total += 1;
+		}
+	}
+	// The timed list is the other place a thread can be parked, and a thread in BOTH is waiting for
+	// whichever comes first - so it is named twice on purpose rather than deduplicated into a
+	// half-truth.
+	// ALLOC-OK: as above.
+	let timed: Vec<(u64, u64, u64, bool)> = TIMED_WAITERS.lock().iter().map(|w| (w.thread.header().koid(), w.thread.process().header().koid(), w.deadline, w.periodic)).collect();
+	for (thread, process, deadline, periodic) in timed {
+		crate::serial_println!("sched:   thread {thread} of process {process} waits until tick {deadline}{}", if periodic { " (periodic)" } else { "" });
+		total += 1;
+	}
+	if total == 0 {
+		crate::serial_println!("sched:   none");
+	}
+}
+
+#[cfg(not(test))]
 pub fn set_idle_hook(hook: fn()) {
 	IDLE_HOOK.store(hook as usize as u64, Ordering::Release);
 }

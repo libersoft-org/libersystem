@@ -57,6 +57,12 @@ fn spi_slot(intid: u32) -> Option<usize> {
 	if intid >= base && ((intid - base) as usize) < len { Some((intid - base) as usize) } else { None }
 }
 
+// Whether `vector` (an SPI INTID) is a kernel MSI vector. Only the bring-up test asks.
+#[cfg(test)]
+fn is_msi(vector: u32) -> bool {
+	spi_slot(vector).is_some()
+}
+
 // No legacy-INTx binding on aarch64: every driver that needs an interrupt uses MSI-X.
 pub fn is_bindable(_vector: u32) -> bool {
 	false
@@ -93,6 +99,15 @@ pub fn release_unused_msi(vector: u32) {
 	if let Some(slot) = spi_slot(vector) {
 		REGISTRY.free(slot);
 	}
+}
+
+// One vector per device, entry 0. `MsiRegistry::acquire` does not refuse a device that already
+// holds a live slot - `acquire_unique_live` below is the form that does, and it is what the syscall
+// path uses. This one stays for the kernel's own bring-up test, which is its only caller.
+#[cfg(test)]
+pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u32> {
+	let len = MSI_LEN.load(Ordering::Relaxed);
+	program_acquired(REGISTRY.acquire(owner, len)?, table_phys)
 }
 
 // The same, and ONLY IF the device holds no live vector already - see

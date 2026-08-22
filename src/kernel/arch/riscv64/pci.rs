@@ -127,12 +127,6 @@ pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 }
 
 // The device's PCI Interrupt Pin (config byte 0x3D): 0 = none, 1..4 = INTA..INTD.
-// The riscv interrupt path swizzles it with the device's slot to pick the PLIC source
-// the wired INTx line lands on.
-pub fn interrupt_pin(bus: u8, dev: u8, func: u8) -> u8 {
-	let dword = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(cfg_phys(bus, dev, func, 0x3C)) as *const u32) };
-	((dword >> 8) & 0xff) as u8
-}
 
 // With QEMU's `virt,aia=aplic-imsic` the PCIe host bridge delivers MSI-X to the AIA
 // IMSIC, so - like x86 and aarch64 - each device gets its own edge-triggered vector

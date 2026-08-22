@@ -56,27 +56,6 @@ pub enum ObjectType {
 }
 
 impl ObjectType {
-	// A short, stable name for this type (used by introspection and the graph).
-	#[cfg(test)]
-	pub fn name(self) -> &'static str {
-		match self {
-			ObjectType::WaitSet => "WaitSet",
-			ObjectType::Domain => "Domain",
-			ObjectType::Process => "Process",
-			ObjectType::Thread => "Thread",
-			ObjectType::AddressSpace => "AddressSpace",
-			ObjectType::MemoryObject => "MemoryObject",
-			ObjectType::Channel => "Channel",
-			ObjectType::Event => "Event",
-			ObjectType::Timer => "Timer",
-			ObjectType::Interrupt => "Interrupt",
-			ObjectType::DeviceMemory => "DeviceMemory",
-			ObjectType::DmaBuffer => "DmaBuffer",
-			ObjectType::ProcessGroup => "ProcessGroup",
-			ObjectType::Privilege => "Privilege",
-		}
-	}
-
 	// A stable numeric code for this type, carried across the syscall boundary by
 	// object_info_get (the wire-stable index, distinct from the in-memory enum).
 	pub fn code(self) -> u64 {

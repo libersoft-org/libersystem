@@ -411,11 +411,6 @@ impl Process {
 		self.dynamic_modules.store(biases.len(), Ordering::Release);
 	}
 
-	#[cfg(test)]
-	pub fn release_dynamic_module(&self) {
-		self.dynamic_modules.fetch_sub(1, Ordering::AcqRel);
-	}
-
 	pub fn has_dynamic_modules(&self) -> bool {
 		self.dynamic_modules.load(Ordering::Acquire) != 0
 	}
@@ -967,11 +962,6 @@ pub struct ExtendGuard<'a> {
 }
 
 impl ExtendGuard<'_> {
-	#[cfg(test)]
-	pub fn process(&self) -> &Process {
-		self.process
-	}
-
 	#[must_use]
 	pub fn record_memory_mapping(&self, object: Arc<MemoryObject>) -> bool {
 		let mut mapped = self.process.mapped_memory.lock();

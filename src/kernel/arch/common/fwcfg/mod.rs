@@ -15,33 +15,51 @@
 // through the backend's `phys_to_virt`. QEMU-only: the MMIO is reached through a
 // normal-memory direct-map mapping, which is fine under QEMU's IO dispatch.
 
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use core::ptr::{read_volatile, write_volatile};
 
 // fw-cfg MMIO register offsets (QEMU "qemu,fw-cfg-mmio").
+// EVERYTHING BUT `release_span` IS FOR THE TWO DEVICE-TREE BACKENDS. x86_64 has no fw-cfg path -
+// it reads its boot profile from its own `arch/x86_64/fwcfg` - and the one portable thing here is
+// giving a contiguous span back whole, which its test asserts on every target.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const REG_SELECTOR: u64 = 8; // u16, big-endian
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const REG_DATA: u64 = 0; // the selected entry, read a byte at a time
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const REG_DMA: u64 = 16; // u64, big-endian: writing it triggers a DMA
 
 // fw-cfg well-known selectors.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const SEL_SIGNATURE: u16 = 0x0000; // reads "QEMU"
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const SEL_FILE_DIR: u16 = 0x0019; // the file directory
 
 // One directory entry: big-endian size and selector, two reserved bytes, then a NUL-padded name.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const DIR_ENTRY_BYTES: usize = 64;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const DIR_NAME_OFFSET: usize = 8;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const MAX_DIR_ENTRIES: u32 = 256;
 
 // FWCfgDmaAccess.control bits (the whole struct is big-endian in guest memory).
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const DMA_ERROR: u32 = 0x01;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const DMA_READ: u32 = 0x02;
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const DMA_SELECT: u32 = 0x08; // control >> 16 = selector to (re)select
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const DMA_WRITE: u32 = 0x10;
 
 // DRM_FORMAT_XRGB8888 - a 32-bit pixel `0x00RRGGBB` (byte order B,G,R,X in memory).
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 const FOURCC_XRGB8888: u32 = 0x3432_5258; // 'X','R','2','4'
 
 // The ramfb framebuffer this module set up, for the caller to wire into the console.
 #[derive(Clone, Copy)]
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub struct RamFb {
 	pub phys: u64,   // physical base (draw through phys_to_virt)
 	pub width: u32,  // pixels
@@ -50,11 +68,13 @@ pub struct RamFb {
 }
 
 // One fw-cfg session: the MMIO base plus the backend's direct-map accessor.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 struct FwCfg {
 	base: u64,
 	p2v: fn(u64) -> u64,
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 impl FwCfg {
 	// Select an entry. The selector register is big-endian on the MMIO interface, unlike the
 	// x86 port interface where it is little-endian.
@@ -125,6 +145,7 @@ impl FwCfg {
 //
 // Nothing is trusted before the signature matches. An absent device reads back whatever the bus
 // floats, which is exactly the case that must report no file rather than a plausible one.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn read_file(fwcfg_base: u64, name: &[u8], out: &mut [u8], p2v: fn(u64) -> u64) -> Option<usize> {
 	if fwcfg_base == 0 {
 		return None;
@@ -166,6 +187,7 @@ pub fn read_file(fwcfg_base: u64, name: &[u8], out: &mut [u8], p2v: fn(u64) -> u
 	None
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn setup_ramfb(fwcfg_base: u64, width: u32, height: u32, p2v: fn(u64) -> u64) -> Option<RamFb> {
 	if fwcfg_base == 0 {
 		return None;
@@ -191,6 +213,7 @@ pub fn setup_ramfb(fwcfg_base: u64, width: u32, height: u32, p2v: fn(u64) -> u64
 
 // The unsafe core of setup_ramfb: verify the signature, walk the file directory for
 // `etc/ramfb`, allocate + zero the framebuffer, and write the ramfb config.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 unsafe fn probe_and_program(fw: &FwCfg, dma_pa: u64, buf_pa: u64, buf_cap: u64, width: u32, height: u32) -> Option<RamFb> {
 	unsafe {
 		// Signature: select 0x0000 reads the ASCII "QEMU". Guards against programming a
@@ -280,6 +303,7 @@ pub(crate) unsafe fn release_span(phys: u64, pages: usize) {
 }
 
 // Compare a fw-cfg file-directory name (null-padded to 56 bytes) against `want`.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 unsafe fn name_eq(fw: &FwCfg, name_pa: u64, want: &[u8]) -> bool {
 	unsafe {
 		for (i, &c) in want.iter().enumerate() {

@@ -68,6 +68,16 @@ static TX: SpinLock<TxRing> = SpinLock::new(TxRing::new());
 static ASYNC: AtomicBool = AtomicBool::new(false);
 
 // UART init: 38400 baud, 8N1, FIFO enabled.
+// Enable the receive-data-available interrupt (IER bit 0), so typed input raises the UART's legacy
+// IRQ instead of waiting for the next poll. Called once the kernel has routed that IRQ; transmit
+// stays poll-driven (the async ring). The routing is the boot tail's, so a test build never asks.
+#[cfg(not(test))]
+pub fn enable_rx_irq() {
+	unsafe {
+		outb(COM1 + 1, 0x01);
+	}
+}
+
 pub fn init() {
 	unsafe {
 		outb(COM1 + 1, 0x00);
@@ -77,15 +87,6 @@ pub fn init() {
 		outb(COM1 + 3, 0x03);
 		outb(COM1 + 2, 0xC7);
 		outb(COM1 + 4, 0x0B);
-	}
-}
-
-// Enable the receive-data-available interrupt (IER bit 0), so typed input raises
-// the UART's legacy IRQ instead of waiting for the next poll. Called once the
-// kernel has routed that IRQ; transmit stays poll-driven (the async ring).
-pub fn enable_rx_irq() {
-	unsafe {
-		outb(COM1 + 1, 0x01);
 	}
 }
 

@@ -65,7 +65,7 @@ impl<const N: usize> MsiRegistry<N> {
 	// frame owns only the SPIs its TYPER reports); pass `N` to use them all. The caller
 	// then programs the device's MSI-X table for the slot's hardware vector and binds
 	// an Interrupt with `bind`.
-	#[cfg(any(test, target_arch = "riscv64"))]
+	#[cfg(test)]
 	pub fn acquire(&self, owner: u32, limit: usize) -> Option<usize> {
 		let _claim = self.claim.lock();
 		self.claim_free_slot(owner, limit)
@@ -139,26 +139,6 @@ impl<const N: usize> MsiRegistry<N> {
 			return false;
 		}
 		(0..N).any(|slot| self.used[slot].load(Ordering::Acquire) && !self.pending[slot].load(Ordering::Acquire) && self.owner[slot].load(Ordering::Acquire) == owner)
-	}
-
-	// Reserve one SPECIFIC slot for device `owner`, for a backend whose slot is fixed by
-	// the hardware rather than freely chosen: on riscv a device's PLIC INTx source is
-	// determined by its PCI slot + pin, so the source id IS the slot and the caller
-	// cannot pick a different free one. Returns false if the slot is already reserved.
-	// only the riscv INTx-over-PLIC backend fixes its slot this way
-	#[cfg(any(test, target_arch = "riscv64"))]
-	pub fn acquire_at(&self, slot: usize, owner: u32) -> bool {
-		if slot >= N {
-			return false;
-		}
-		// Under the same lock as the searching form, so `acquire_unique_live`'s check cannot be
-		// overtaken by a fixed-slot claim for the same owner.
-		let _claim = self.claim.lock();
-		if self.used[slot].compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire).is_err() {
-			return false;
-		}
-		self.owner[slot].store(owner, Ordering::Release);
-		true
 	}
 
 	// Bind `intr` to `slot` so `dispatch` wakes it when the slot's vector fires.

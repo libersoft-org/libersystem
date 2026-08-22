@@ -264,9 +264,6 @@ pub mod apic {
 		BOOT_HART.load(Ordering::Relaxed) as u32
 	}
 
-	// The timer is re-armed inside its interrupt handler, so EOI is a no-op.
-	pub fn eoi() {}
-
 	pub fn send_wake_ipi(dest: u32) {
 		// SBI IPI extension (EID 0x735049 "sPI", FID 0): raise a supervisor software
 		// interrupt on the target hart so it leaves wfi and re-checks the run queue.
@@ -372,12 +369,6 @@ pub mod ioapic {
 	pub fn route(_gsi: u32, _vector: u8, _dest: u32) {
 		todo!("riscv64 PLIC routing")
 	}
-	pub fn init() {
-		todo!("riscv64 PLIC")
-	}
-	pub fn mask(_gsi: u32) {
-		todo!("riscv64 PLIC mask")
-	}
 }
 
 // --------------------------------------------------------------------- rtc
@@ -434,9 +425,6 @@ pub mod random {
 // real-mode trampoline; these keep the portable names so smp.rs links until
 // the real wake path replaces them.)
 pub mod apboot {
-	pub fn trampoline_len() -> usize {
-		0
-	}
 	// No 32-bit CR3 load on this port, so no root is out of reach; the portable name exists
 	// because the SMP path asks before it installs anything (KERN-ARCH-010).
 	pub fn cr3_is_reachable(_root: u64) -> bool {
@@ -457,6 +445,7 @@ pub mod syscall {
 	// __trap_entry -> riscv64_trap -> dispatch. Nothing extra to program here.
 	pub fn init() {}
 
+	#[cfg(test)]
 	pub unsafe fn invoke(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 		// A ring-0 (kernel-context) system call: route straight to the portable syscall
 		// table, the way the in-kernel callers and the test harness use it. Mark this a

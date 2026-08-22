@@ -17,6 +17,7 @@
 
 use core::arch::global_asm;
 
+#[cfg(test)]
 pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;
 
 global_asm!(
@@ -137,30 +138,39 @@ pub fn exit_to_kernel() -> ! {
 // The embedded ring-3 probe programs the kernel test suite runs in U-mode (mirrors the
 // x86_64 / aarch64 usermode probes). Each returns its position-independent RV64GC
 // instruction bytes, copied into a USER page before entering U-mode.
+#[cfg(test)]
 pub fn program_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_BASIC)
 }
+#[cfg(test)]
 pub fn program_fault_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_FAULT)
 }
+#[cfg(test)]
 pub fn program_yield_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_YIELD)
 }
+#[cfg(test)]
 pub fn program_nx_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_NX)
 }
+#[cfg(test)]
 pub fn program_ebreak_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_EBREAK)
 }
+#[cfg(test)]
 pub fn program_compressed_ebreak_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_C_EBREAK)
 }
+#[cfg(test)]
 pub fn program_illegal_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_ILLEGAL)
 }
+#[cfg(test)]
 pub fn program_stack_probe_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_STACK_PROBE)
 }
+#[cfg(test)]
 pub fn program_spin_bytes() -> &'static [u8] {
 	as_bytes(&PROGRAM_SPIN)
 }
@@ -168,68 +178,94 @@ pub fn program_spin_bytes() -> &'static [u8] {
 // Reinterpret a program's 32-bit instruction words as the little-endian byte slice the
 // test harness copies into a USER page (RISC-V is little-endian, so the words are
 // already in instruction-fetch order).
+#[cfg(test)]
 fn as_bytes(words: &'static [u32]) -> &'static [u8] {
 	unsafe { core::slice::from_raw_parts(words.as_ptr() as *const u8, core::mem::size_of_val(words)) }
 }
 
 // RV64 register ABI numbers used below.
+#[cfg(test)]
 const ZERO: u32 = 0;
+#[cfg(test)]
 const SP: u32 = 2;
+#[cfg(test)]
 const T0: u32 = 5;
+#[cfg(test)]
 const S1: u32 = 9;
+#[cfg(test)]
 const A0: u32 = 10;
+#[cfg(test)]
 const A1: u32 = 11;
+#[cfg(test)]
 const A2: u32 = 12;
+#[cfg(test)]
 const A3: u32 = 13;
+#[cfg(test)]
 const A7: u32 = 17;
 
 // RV32I/RV64I instruction encoders (const, so the syscall numbers and immediates bake
 // in at compile time). The syscall ABI: a7 = number, a0..a3 = arguments, a0 = result.
+#[cfg(test)]
 const fn addi(rd: u32, rs1: u32, imm: i32) -> u32 {
 	(((imm as u32) & 0xfff) << 20) | (rs1 << 15) | (rd << 7) | 0x13
 }
+#[cfg(test)]
 const fn li(rd: u32, imm: i32) -> u32 {
 	addi(rd, ZERO, imm)
 }
+#[cfg(test)]
 const fn mv(rd: u32, rs: u32) -> u32 {
 	addi(rd, rs, 0)
 }
+#[cfg(test)]
 const fn lui(rd: u32, imm20: u32) -> u32 {
 	((imm20 & 0xf_ffff) << 12) | (rd << 7) | 0x37
 }
+#[cfg(test)]
 const fn store(rs2: u32, rs1: u32, off: i32, funct3: u32) -> u32 {
 	let o = off as u32;
 	((o >> 5 & 0x7f) << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | ((o & 0x1f) << 7) | 0x23
 }
+#[cfg(test)]
 const fn sb(rs2: u32, rs1: u32, off: i32) -> u32 {
 	store(rs2, rs1, off, 0b000)
 }
+#[cfg(test)]
 const fn sd(rs2: u32, rs1: u32, off: i32) -> u32 {
 	store(rs2, rs1, off, 0b011)
 }
+#[cfg(test)]
 const fn ld(rd: u32, rs1: u32, off: i32) -> u32 {
 	(((off as u32) & 0xfff) << 20) | (rs1 << 15) | (0b011 << 12) | (rd << 7) | 0x03
 }
+#[cfg(test)]
 const fn jr(rs1: u32) -> u32 {
 	(rs1 << 15) | 0x67 // jalr x0, rs1, 0
 }
+#[cfg(test)]
 const fn branch(rs1: u32, rs2: u32, off: i32, funct3: u32) -> u32 {
 	let o = off as u32;
 	((o >> 12 & 1) << 31) | ((o >> 5 & 0x3f) << 25) | (rs2 << 20) | (rs1 << 15) | (funct3 << 12) | ((o >> 1 & 0xf) << 8) | ((o >> 11 & 1) << 7) | 0x63
 }
+#[cfg(test)]
 const fn bne(rs1: u32, rs2: u32, off: i32) -> u32 {
 	branch(rs1, rs2, off, 0b001)
 }
+#[cfg(test)]
 const fn beq(rs1: u32, rs2: u32, off: i32) -> u32 {
 	branch(rs1, rs2, off, 0b000)
 }
+#[cfg(test)]
 const ECALL: u32 = 0x0000_0073;
+#[cfg(test)]
 const J_SELF: u32 = 0x0000_006f; // jal x0, 0 -> spin in place
 
+#[cfg(test)]
 use crate::syscall::{SYS_CHANNEL_SEND, SYS_DEBUG_WRITE, SYS_USER_EXIT, SYS_YIELD};
 
 // Basic ring-3 probe: SYS_CHANNEL_SEND(a0 = handle, "OK", 2, 0), SYS_DEBUG_WRITE('U'),
 // SYS_USER_EXIT. a0 arrives as the bootstrap Channel handle.
+#[cfg(test)]
 static PROGRAM_BASIC: [u32; 19] = [
 	mv(S1, A0),        // s1 = handle
 	addi(SP, SP, -16), // scratch for "OK"
@@ -254,6 +290,7 @@ static PROGRAM_BASIC: [u32; 19] = [
 
 // Cooperative-yield probe: save the handle, SYS_YIELD x3 (so two instances on one core
 // interleave), then send "OK" and exit.
+#[cfg(test)]
 static PROGRAM_YIELD: [u32; 22] = [
 	mv(S1, A0),
 	li(A7, SYS_YIELD as i32),
@@ -281,6 +318,7 @@ static PROGRAM_YIELD: [u32; 22] = [
 
 // Fault probe: store to FAULT_PROBE_ADDR (unmapped) to raise a store page fault from
 // U-mode. FAULT_PROBE_ADDR = 0x0dead000, so `lui` alone materializes it (low 12 = 0).
+#[cfg(test)]
 static PROGRAM_FAULT: [u32; 3] = [
 	lui(A0, 0x0dead), // a0 = 0x0dead000
 	sd(A0, A0, 0),    // [a0] = a0 -> store page fault
@@ -289,6 +327,7 @@ static PROGRAM_FAULT: [u32; 3] = [
 
 // No-execute probe: jump into the writable, no-execute stack page. The instruction
 // fetch there faults (W^X) before a byte executes.
+#[cfg(test)]
 static PROGRAM_NX: [u32; 3] = [
 	addi(A0, SP, -64), // a0 = sp - 64 (inside the stack page)
 	jr(A0),            // fetch from a NO_EXECUTE page -> instruction page fault
@@ -305,18 +344,24 @@ static PROGRAM_NX: [u32; 3] = [
 //
 // `C_EBREAK_PAIR` packs the two-byte `c.ebreak` (0x9002) with a following `c.j 0` (0xa001) so the
 // word is a legal pair either way - the process is expected to end on the first halfword.
+#[cfg(test)]
 const EBREAK: u32 = 0x0010_0073;
+#[cfg(test)]
 const C_EBREAK_PAIR: u32 = 0xa001_9002;
 
+#[cfg(test)]
 static PROGRAM_EBREAK: [u32; 2] = [EBREAK, J_SELF];
+#[cfg(test)]
 static PROGRAM_C_EBREAK: [u32; 2] = [C_EBREAK_PAIR, J_SELF];
 
 // An instruction the hart will not execute at all, for the illegal-instruction cause.
+#[cfg(test)]
 static PROGRAM_ILLEGAL: [u32; 2] = [0x0000_0000, J_SELF];
 
 // Stack-growth probe: a0 = page count. Store one qword per page walking DOWN from the
 // entry stack pointer, then exit cleanly (or fault at the Domain's stack floor). RV64
 // addi cannot encode -4096, so each step subtracts 2048 twice.
+#[cfg(test)]
 static PROGRAM_STACK_PROBE: [u32; 8] = [
 	mv(A1, SP),          // a1 = sp
 	addi(A1, A1, -2048), // a1 -= 4096 (two steps)
@@ -331,6 +376,7 @@ static PROGRAM_STACK_PROBE: [u32; 8] = [
 // CPU-bound spinner: a0 = shared data page. [a0] is a stop flag another thread raises
 // through the frame's kernel mapping, [a0 + 8] a counter this loop bumps so an observer
 // sees it running. It makes no syscall until the flag is set.
+#[cfg(test)]
 static PROGRAM_SPIN: [u32; 7] = [
 	ld(A1, A0, 8),      // a1 = [a0 + 8]
 	addi(A1, A1, 1),    // a1 += 1

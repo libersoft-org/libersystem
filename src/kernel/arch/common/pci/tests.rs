@@ -131,7 +131,7 @@ impl ConfigAccess for Fake {
 	}
 }
 
-const DEVICE: PciDevice = PciDevice { bus: 0, dev: 0, func: 0, vendor: 0x1af4, device_id: 0x1000, class: 0x02, subclass: 0x00, prog_if: 0x00, header_type: 0, bars: [0; 6] };
+const DEVICE: PciDevice = PciDevice { bus: 0, dev: 0, func: 0, vendor: 0x1af4, device_id: 0x1000, class: 0x02, subclass: 0x00, prog_if: 0x00, header_type: 0 };
 
 // A 32-bit memory BAR of `size` bytes: the mask a probe reads back.
 const fn mask32(size: u32) -> u32 {

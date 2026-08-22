@@ -119,6 +119,7 @@ fn flush_tlb() {
 // with it, turning a case that works into a boot that does not. What is done here is to
 // make the gap ASKABLE rather than implied - a caller or a test can find out - and to
 // leave the real answer (Svpbmt, or a platform PMA check) as work this port still owes.
+#[cfg(test)]
 pub fn no_cache_supported() -> bool {
 	svpbmt()
 }
@@ -246,7 +247,7 @@ pub fn harden_direct_map() {
 	let _guard = PT_LOCK.lock();
 	// The high direct map is root[256..264] - 0..8 GiB at KERNEL_VA_OFFSET - and root[2] is the low
 	// identity window the stub runs in. Every other root slot is a user mapping or absent.
-	let mut split = |slot: usize, base: u64, allow_execute: bool| -> bool {
+	let split = |slot: usize, base: u64, allow_execute: bool| -> bool {
 		let entry = (phys_to_virt(root) as *mut u64).wrapping_add(slot);
 		let descriptor = unsafe { core::ptr::read_volatile(entry) };
 		// Only a valid LEAF is split: a pointer here means somebody has already been finer than the
@@ -285,6 +286,7 @@ pub fn harden_direct_map() {
 }
 
 // Whether the direct map still carries a writable-executable alias, for the test that asks.
+#[cfg(test)]
 pub fn writable_executable_block() -> Option<u64> {
 	const TWO_MB: u64 = 2 * 1024 * 1024;
 	const GIB: u64 = 1024 * 1024 * 1024;
@@ -455,6 +457,7 @@ pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
 	unsafe { map_page_root(current_satp_root(), virt, phys, flags) }
 }
 
+#[cfg(test)]
 pub fn map_page_in(satp_root: u64, virt: u64, phys: u64, flags: u64) {
 	unsafe { map_page_root(satp_root, virt, phys, flags).expect("riscv64 map_page: out of frames") }
 }
@@ -595,17 +598,6 @@ unsafe fn free_table_level(phys: u64, level: u32) {
 
 // ---- the rest of the paging contract ----
 
-pub fn enable_nx() {}
-pub fn enable_smap_smep() {}
-pub fn smap_enabled() -> bool {
-	false
-}
-pub fn smep_enabled() -> bool {
-	false
-}
-pub fn nx_enabled() -> bool {
-	false
-}
 // SSTATUS.SUM, the bit that lets S-mode touch a U-mapped page. x86 has SMAP and `stac`/`clac`;
 // this is the same window, and until now it was open for the whole life of the kernel.
 const SSTATUS_SUM: u64 = 1 << 18;
@@ -643,6 +635,7 @@ pub fn user_access<R>(f: impl FnOnce() -> R) -> R {
 // The copy runs inside a `user_access` window - SUM is no longer set for the kernel's whole life,
 // so this is where it opens - and the page holds U-mode code, so `fence.i` makes the freshly
 // written bytes coherent with the instruction fetch.
+#[cfg(test)]
 pub unsafe fn copy_to_user_page(dst: u64, bytes: &[u8]) {
 	user_access(|| unsafe {
 		core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len());

@@ -284,7 +284,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// This kernel keeps reading the tree after the allocator is up, and the specification requires a
 	// client not to overwrite it or use the reservation block's regions. See
 	// `bootmem::devicetree_reservations`.
-	if let Some(tree) = (unsafe { super::dtb::located(dtb) }) {
+	if let Some(tree) = unsafe { super::dtb::located(dtb) } {
 		let (count, complete) = unsafe { crate::arch::common::bootmem::devicetree_reservations(&tree, &mut holes, hole_count) };
 		hole_count = count;
 		// THE TREE'S ACCOUNT OF RAM IS ONLY GOOD WHILE ITS ACCOUNT OF WHAT IS RESERVED IS (FDT-005).

@@ -220,7 +220,7 @@ pub struct VirtioDevice {
 	pub virtio_type: u16,
 	// The BAR all three configuration structures share. Checked from a local while the device is
 	// resolved; kept on the device only for the boot print that names it.
-	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+	#[cfg(any(test, target_arch = "aarch64"))]
 	pub bar: u8,
 	pub bar_phys: u64,
 	pub region_len: u64,
@@ -333,7 +333,7 @@ fn scan_bus<A: ConfigAccess>(bus: u8, seen: &mut [bool; 256], out: &mut Vec<PciD
 }
 
 // The human name of a virtio device type, for the boot log.
-#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+#[cfg(target_arch = "aarch64")]
 pub fn virtio_type_name(virtio_type: u16) -> &'static str {
 	match virtio_type as u32 {
 		abi::VIRTIO_TYPE_NET => "net",
@@ -620,7 +620,7 @@ fn resolve_virtio<A: ConfigAccess>(d: &PciDevice) -> Option<VirtioDevice> {
 	Some(VirtioDevice {
 		pci: *d,
 		virtio_type,
-		#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
+		#[cfg(any(test, target_arch = "aarch64"))]
 		bar,
 		bar_phys,
 		region_len,
@@ -696,7 +696,7 @@ pub fn msix_enable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
 // QEMU virt the PLIC receives only wired INTx, so a device switched to MSI-X would send
 // a message nothing receives. This keeps the device on its INTx pin.
 // only the riscv INTx-over-PLIC backend keeps devices off MSI-X
-#[cfg(any(test, target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 pub fn enable_mem_and_master<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
 	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
 }

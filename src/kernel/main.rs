@@ -421,6 +421,7 @@ static RESIDENT_MANAGER: crate::sync::SpinLock<Option<alloc::sync::Arc<object::p
 // SystemManager that ends is the ladder's business and a restart is the right answer; after it,
 // the same ending means the control plane is ownerless and the only honest answer is a reboot. One
 // flag separates the two, and nothing clears it.
+#[cfg(not(test))]
 static SYSTEM_IS_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 // Whether the control plane has lost its owner.
@@ -440,6 +441,7 @@ pub(crate) fn control_plane_lost(system_up: bool, manager: Option<&alloc::sync::
 	system_up && manager.is_some_and(|process| process.is_terminated())
 }
 
+#[cfg(not(test))]
 fn resident_manager_lost() -> bool {
 	let manager = RESIDENT_MANAGER.lock();
 	control_plane_lost(SYSTEM_IS_UP.load(core::sync::atomic::Ordering::Relaxed), manager.as_ref())
