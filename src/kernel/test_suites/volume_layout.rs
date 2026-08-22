@@ -86,7 +86,9 @@ fn start_log_service(storage: &mut StorageHarness, package: &pkg::Package<'stati
 	let (boot, boot_user) = Channel::create();
 	let (server, client) = Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), log_elf, boot_user, Rights::ALL, 0).expect("spawn LogService");
-	send_cap(&boot, b"SERVE", server, Rights::ALL).expect("LogService serve bootstrap");
+	// Narrowed as the supervisor narrows it: LogService checks its serve root against the generated
+	// plan, and a role carrying more than the plan allows is refused rather than quietly accepted.
+	send_cap(&boot, b"SERVE", server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("LogService serve bootstrap");
 	let online = wait_message(storage, &boot, "LogService did not report online");
 	assert_eq!(&online.bytes[..], b"LogService: online", "LogService reports in");
 	send_cap(&boot, b"STORAGE", storage.open_directory(b"vol://system/log"), Rights::ALL).expect("LogService journal scope bootstrap");

@@ -180,6 +180,8 @@ struct RawRole {
 	interface: String,
 	#[serde(default)]
 	source: String,
+	#[serde(default)]
+	exclusive: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -490,6 +492,19 @@ pub struct Role {
 	/// different authority over the same volume. Until now the difference lived only in which local
 	/// variable a hand-written bootstrap function happened to pass.
 	pub source: Name,
+	/// WHETHER THE RECEIVER IS THE ONLY HOLDER, which decides whether its death is observable.
+	///
+	/// An ordinary client role is a DUPLICATE: the supervisor keeps the end it copied, so several
+	/// services can hold one provider's channel and none of them closing it means anything. An
+	/// exclusive one is HANDED OVER: the supervisor keeps nothing, so when the receiver ends, the
+	/// provider's end really does see its peer close.
+	///
+	/// The shell's console channels are why this exists. ConsoleService reloads the shell on a VT
+	/// when that VT's channel closes - a logout returning a fresh login prompt - and it can only
+	/// see the close if nobody else is holding the other copy. Delivered as an ordinary duplicate,
+	/// the shell exits and the console waits forever for a peer that is still open in the
+	/// supervisor's handle table.
+	pub exclusive: bool,
 }
 
 /// How a role is delivered - which is also what decides whether it can be delivered AGAIN, and
@@ -500,9 +515,10 @@ pub enum RoleKind {
 	/// One end of a channel pair the supervisor made; the service serves its clients on it and the
 	/// supervisor keeps the other end. Re-creatable: the supervisor simply makes another pair.
 	ServeRoot,
-	/// A duplicate of another service's client end. Re-creatable while that service lives AND the
-	/// supervisor still holds the end it duplicates from - which is why it duplicates rather than
-	/// transferring, and says so at the call site.
+	/// Another service's client end: a duplicate by default, or the end itself when the role is
+	/// `exclusive`. A duplicate is re-creatable while that service lives AND the supervisor still
+	/// holds the end it copies from; an exclusive one is not re-creatable at all, because the
+	/// supervisor gave away the only end it had.
 	Client,
 	/// A fresh connection minted from another service's serve root. Re-creatable while it lives.
 	Factory,
@@ -811,7 +827,14 @@ impl Manifest {
 						None => continue,
 					}
 				};
-				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface, source });
+				// EXCLUSIVITY IS A PROPERTY OF A DUPLICATE, so it can only be said where duplication
+				// is what happens. A serve root is made for this service alone, a factory mints a
+				// fresh connection per caller, and the rest carry no client end to hand over -
+				// marking any of them exclusive would be a word with nothing behind it.
+				if raw_role.exclusive && raw_role.kind != RoleKind::Client {
+					push_error(&mut errors, format!("{where_role}.exclusive"), "only a client role is delivered as a duplicate, so only a client role can be handed over instead");
+				}
+				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface, source, exclusive: raw_role.exclusive });
 			}
 			// A CLASS AND A PLACE MUST AGREE. Durable means written down, so it has to say where;
 			// anything else means not written down, so a path would be a claim about a file that
@@ -882,6 +905,29 @@ impl Manifest {
 				}
 				if !service.dependencies.contains(&role.provider) {
 					push_error(&mut errors, format!("services.{}.roles.{}.provider", service.name, role.tag), format!("{} supplies this role but is not a declared dependency, so nothing orders it first", provider));
+				}
+			}
+		}
+
+		// AN EXCLUSIVE CLIENT IS THE ONLY CLIENT. The supervisor has one end of each serve root and
+		// hands it over whole for an exclusive role, so anyone else declaring a client of the same
+		// root would be promised a handle that is already gone - and, worse, would break the
+		// exclusivity the first one depends on. Order does not save it: the second delivery would
+		// succeed or fail depending on which service the resolver happened to start first, which is
+		// the class of bug this whole milestone exists to remove.
+		for service in services.values() {
+			for role in &service.roles {
+				if !role.exclusive {
+					continue;
+				}
+				for other in services.values() {
+					for candidate in &other.roles {
+						let same_root = candidate.provider == role.provider && candidate.source == role.source;
+						let same_role = other.name == service.name && candidate.tag == role.tag;
+						if same_root && !same_role && matches!(candidate.kind, RoleKind::Client) {
+							push_error(&mut errors, format!("services.{}.roles.{}", other.name, candidate.tag), format!("{}.{} is handed this serve root exclusively, so nothing else can be a client of it", service.name, role.tag));
+						}
+					}
 				}
 			}
 		}

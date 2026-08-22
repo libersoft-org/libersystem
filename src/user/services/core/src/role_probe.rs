@@ -68,7 +68,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// did not work", and one that says which side of the line the request is on.
 				Some(Err(error)) => {
 					out.extend_from_slice(b"err ");
-					out.push(b'0' + error as u8);
+					// IN DECIMAL, because the enum reaches two digits. `b'0' + code` is fine while
+					// every answer is single-digit and silently prints punctuation the moment one
+					// is not - and the answer this case exists to tell apart from `again` is
+					// `commit-uncertain`, which is 12.
+					let code: u8 = error as u8;
+					if code >= 10 {
+						out.push(b'0' + code / 10);
+					}
+					out.push(b'0' + code % 10);
 				}
 				Some(Ok(())) => out.extend_from_slice(b"ok"),
 				None => out.extend_from_slice(b"none"),

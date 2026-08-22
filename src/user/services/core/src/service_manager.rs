@@ -94,6 +94,11 @@ struct Role {
 	// False for a role whose tag is always sent and whose handle may legitimately be zero - an
 	// absent disk, an absent device. The TAG still arrives; only the capability is missing.
 	required: bool,
+	// Whether the receiver is the ONLY holder. An ordinary client role is a duplicate and this
+	// supervisor keeps the end it copied; an exclusive one is handed over whole, so the provider
+	// really sees its peer close when the receiver ends. ConsoleService reloading the shell on a
+	// logout depends on exactly that.
+	exclusive: bool,
 }
 
 // How a role is delivered, which is also what decides whether it can be delivered AGAIN.
@@ -534,9 +539,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// bring-up waits for the report, but it is the honest name for the window between
 				// a process existing and a service answering, and it is what a later non-blocking
 				// bring-up would sit in.
-				lifecycle.record(i, state[i], State::Starting, unsafe { epoch_of(procs[i]) }, Reason::Started);
+				//
+				// THE EPOCH OF THE INSTANCE THESE RECORDS ARE ABOUT, which is the one just started
+				// and not the one in `procs[i]`. That slot still holds the PREVIOUS instance here -
+				// zero on a first start - so both records carried epoch 0 and the identity M2 added
+				// to tell instances apart was absent from the first two entries of every service's
+				// history.
+				let epoch: u64 = unsafe { epoch_of(proc_handle) };
+				lifecycle.record(i, state[i], State::Starting, epoch, Reason::Started);
 				state[i] = State::Starting;
-				lifecycle.record(i, State::Starting, started, unsafe { epoch_of(procs[i]) }, if started == State::Ready { Reason::ReportedReady } else { Reason::NoReport });
+				lifecycle.record(i, State::Starting, started, epoch, if started == State::Ready { Reason::ReportedReady } else { Reason::NoReport });
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -1128,8 +1140,15 @@ unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N
 		sup[idx].failure = Failure::Crashed;
 		// THE INSTANCE BEING REPLACED IS RECORDED BEFORE IT IS GONE, with its own epoch, so a late
 		// report from it can be matched to the instance it belongs to rather than to its successor.
-		broker.lifecycle.record(idx, state[idx], State::Stopping, epoch_of(procs[idx]), Reason::Replaced);
-		state[idx] = State::Failed;
+		//
+		// AND THE STATE IT RECORDS IS ENTERED. This wrote the transition to `Stopping` and then set
+		// `Failed`, so the history named a state the service was never in and `Stopping` had no
+		// producer anywhere in the system - a lifecycle value that could not occur, in a record
+		// whose whole purpose is to say what occurred. Reaping the endpoints is the window it
+		// describes, so the state is held across exactly that.
+		let epoch: u64 = epoch_of(procs[idx]);
+		broker.lifecycle.record(idx, state[idx], State::Stopping, epoch, Reason::Replaced);
+		state[idx] = State::Stopping;
 		// Reap every endpoint of the dead instance: the control channel, our Process
 		// handle, and the broker's serve root (it died with the instance).
 		drain_closed(channels[idx], buf);
@@ -1141,6 +1160,8 @@ unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N
 			close(procs[idx]);
 			procs[idx] = 0;
 		}
+		broker.lifecycle.record(idx, State::Stopping, State::Failed, epoch, Reason::Replaced);
+		state[idx] = State::Failed;
 		if !restartable(idx) {
 			return false;
 		}
@@ -1179,10 +1200,16 @@ unsafe fn start_stopped_service(broker: &mut Broker, idx: usize, state: &mut [St
 // Whether this ladder can bring a service back at all. It can when the supervisor holds a
 // serve root for it and knows how to re-run its bootstrap, which is the same thing as the
 // service being resolvable by name: a client of anything else holds the channel it was handed
-// at bring-up, and a replacement would leave that channel dead. The list therefore grows with
-// the broker and not before it.
+// at bring-up, and a replacement would leave that channel dead.
+//
+// READ FROM THE DECLARATION, NOT WRITTEN OUT AGAIN. This was a hand-written list of three names
+// beside a manifest column that already named the same three - two editable sources for one fact,
+// which is what P02M0141 exists to remove, sitting inside the milestone that removes it. The
+// mechanism is still `relaunch_service` below, which knows how to re-run one bootstrap per name;
+// `check-bootstrap-plan` compares the two so the policy cannot come to claim a service the
+// mechanism cannot bring back.
 fn restartable(idx: usize) -> bool {
-	matches!(MANIFEST[idx].name, b"config_service" | b"device_service" | b"system_graph_service")
+	MANIFEST[idx].restart == Restart::Transparent
 }
 
 // Launch a fresh instance from the volume and re-run the bootstrap that brought the first one
@@ -1481,7 +1508,7 @@ unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; 
 				}
 				2 => {
 					// The shell asked to stop a service; tear down its dependents first.
-					if !handle_admin(admin, power, broker, state, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin, power, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
 						admin = 0;
 					}
 				}
@@ -1494,7 +1521,7 @@ unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; 
 				4 => {
 					// The sandboxed `stop` tool (granted the supervisor capability) asked to
 					// stop a service over its own admin channel; tear down its dependents first.
-					if !handle_admin(admin2, power, broker, state, channels, sup, procs, &mut stats, log_client, buf) {
+					if !handle_admin(admin2, power, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
 						admin2 = 0;
 					}
 				}
@@ -1515,7 +1542,7 @@ unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; 
 // its dependents are torn down and the newline-joined list of what stopped is replied
 // for the shell to print. Returns false once the admin channel's peer (the shell) is
 // gone, so the supervisor drops it from its wait set.
-unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
+unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &mut [u64; N], stats_server: &mut u64, log_client: u64, buf: &mut [u8]) -> bool {
 	unsafe {
 		let len: usize = match recv_blocking(admin, buf) {
 			Received::Message { len, .. } => len,
@@ -1554,6 +1581,11 @@ unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut 
 		if let Some(wanted) = name.strip_prefix(b"+") {
 			match index_of(wanted) {
 				Some(target) if start_stopped_service(broker, target, state, channels, procs, sup, stats_server, buf) => {
+					// WHAT WAS ASKED FOR, recorded beside what was observed. The operator asking for
+					// a service back is the only thing that can undo the `stopped` the stop below
+					// set; without this the two fields disagree for the rest of the boot, and the
+					// disagreement is what a drift check would report as a fault.
+					desired[target] = Desired::Running;
 					emit_event(log_client, MANIFEST[target].name, b"started");
 					console_report(MANIFEST[target].name, b"started");
 					let mut reply: Vec<u8> = Vec::new();
@@ -1569,7 +1601,7 @@ unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut 
 		}
 		match index_of(name) {
 			Some(target) if state[target] == State::Ready => {
-				let stopped: Vec<u8> = stop_subtree(target, state, channels, sup, procs, log_client, buf);
+				let stopped: Vec<u8> = stop_subtree(target, state, desired, &mut broker.lifecycle, channels, sup, procs, log_client, buf);
 				let mut reply: Vec<u8> = Vec::new();
 				reply.extend_from_slice(b"STOPPED\n");
 				reply.extend_from_slice(&stopped);
@@ -1593,7 +1625,7 @@ unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut 
 // their bootstrap, so the cooperative STOP protocol does not reach them) and draining
 // its control channel to the peer-close. Returns the newline-joined names of everything
 // stopped, in teardown order.
-unsafe fn stop_subtree(target: usize, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) -> Vec<u8> {
+unsafe fn stop_subtree(target: usize, state: &mut [State; N], desired: &mut [Desired; N], lifecycle: &mut LifecycleLog, channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) -> Vec<u8> {
 	unsafe {
 		let mut scope: [bool; N] = [false; N];
 		scope[target] = true;
@@ -1632,6 +1664,13 @@ unsafe fn stop_subtree(target: usize, state: &mut [State; N], channels: &mut [u6
 						close(channels[i]);
 						channels[i] = 0;
 					}
+					// ASKED FOR, AND SO RECORDED. A service the operator deliberately stopped is not
+					// a service that went missing, and the two are indistinguishable unless the
+					// desired state says which - which is the whole reason M8 keeps it apart from
+					// the observed one. Only the shell's own logout path was setting it, so every
+					// `stop <service>` left a service reading `desired: running, state: stopped`.
+					lifecycle.record(i, state[i], State::Stopped, epoch_of(procs[i]), Reason::StopRequested);
+					desired[i] = Desired::Stopped;
 					state[i] = State::Stopped;
 					sup[i].failure = Failure::Stopped;
 					emit_event(log_client, MANIFEST[i].name, b"stopped");

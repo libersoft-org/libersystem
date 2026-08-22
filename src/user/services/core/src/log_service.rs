@@ -35,6 +35,7 @@ use proto::system::{Entry, Error, OpenOpts, Query, Severity, config, volume};
 use rt::*;
 
 include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/roles_log_service.rs"));
 
 // The bounded in-memory journal: at most this many records, newest dropping
 // oldest - deep enough to diagnose well past the last minute. The depth is the
@@ -331,16 +332,22 @@ impl Journal {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buf: [u8; 256] = [0u8; 256];
-
 	// 1. report in to the supervisor that started us.
 	unsafe {
 		send_blocking(bootstrap, b"LogService: online", 0);
 	}
 
-	// 2. wait for the serve channel clients reach us on. If the supervisor drops
-	//    the bootstrap channel first (no clients this boot), we are done.
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
+	// 2. take the roles the plan says this service is handed - here one, the channel clients
+	//    reach us on. Checked against the GENERATED list rather than read by hand: the tag,
+	//    the kernel object type and the rights are all things a receiver can check, and a
+	//    bootstrap that is wrong is better refused by name than served with the wrong
+	//    handle. A supervisor that dropped the channel instead (no clients this boot)
+	//    reports as a missing role, and there is nothing left to serve either way.
+	let mut roles: [u64; BOOTSTRAP_ROLES.len()] = [0; BOOTSTRAP_ROLES.len()];
+	if let Err(error) = unsafe { receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) } {
+		unsafe { fail_bootstrap(bootstrap, error.tag(), error.reason()) };
+	}
+	let service: u64 = roles[0];
 
 	// 3. serve generated emit/query requests until the client side closes. Each
 	//    request is dispatched into the journal; the reply it produces is sent back

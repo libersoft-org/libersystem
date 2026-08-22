@@ -93,7 +93,7 @@ fn init_package_starts_system_manager() {
 	// DeviceManager's virtio-blk backs), the graceful-shutdown ordering check
 	// (ServiceManager confirms the reverse-dependency teardown order the `poweroff`
 	// path uses is valid against the live manifest), followed by the two managers.
-	let (kernel_ep, _koid) = spawn_system_manager().expect("SystemManager should start from the init package");
+	let (kernel_ep, _manager) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
 	// Seven StorageService instances: the system volume, media, iso, udf, usb, and the two
 	// memory volumes (ram and tmp). They report the same line, so the count is what says the
@@ -661,26 +661,67 @@ fn system_manager_recovery_escalates_after_repeated_crashes() {
 	// exhausts its restarts, and reports failure - the trigger for escalation.
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
+	let mut attempts: u32 = 0;
 	let up = supervise(&crash_rx, 3, || {
-		let thread = sched::spawn(user_fault_thread_body, 0);
-		thread.process().header().koid()
+		attempts += 1;
+		Some(sched::spawn(user_fault_thread_body, 0).process().clone())
 	});
 	fault::clear_crash_notify();
 	assert!(!up, "a SystemManager that faults on every attempt must exhaust recovery and escalate");
+	// EVERY ATTEMPT, and the count says so. The ladder stops early once a control-plane branch
+	// exists, which is right at boot and would be silent here: a test that only asserted `!up`
+	// would pass just as well after one attempt, and could not tell the two reasons apart.
+	assert_eq!(attempts, 4, "the original attempt plus three restarts must all be made");
 }
 
 tagged_test!(system_manager_recovery_survives_a_clean_start, [Process], id = "kernel.boot.system_manager_recovery_survives_a_clean_start", covers = ["kernel", "liberfs"]);
 fn system_manager_recovery_survives_a_clean_start() {
+	// A SystemManager that comes up and STAYS UP survives on the first attempt, so supervision
+	// returns "up" without starting a recovery SystemManager.
+	//
+	// STAYING UP IS THE WHOLE OF IT, and this test used to prove the opposite. Its stand-in body
+	// returned immediately - a process that had already ended - and the assertion was that
+	// supervision called that a success. It did, because supervision looked only at the crash
+	// channel, and a clean exit sends nothing to it. Since M11 the manager is resident and owns the
+	// control-plane branch, so an ended one is precisely the failure, and both cases are asserted
+	// here against the same rule.
 	use object::KernelObject;
-	// A SystemManager that does not fault must survive on the first attempt, so
-	// supervision returns "up" without starting a recovery SystemManager.
-	extern "C" fn clean_body(_arg: u64) {}
+	extern "C" fn resident_body(_arg: u64) {
+		// BLOCKED ON ITS OWN PROCESS KOID, which is both halves of what this stand-in needs. It is
+		// not runnable, so the round still reaches idle with it alive; and `terminate` wakes
+		// exactly that koid, so the test can take it away again rather than leaving a process
+		// parked in the root Domain for whatever runs next - which a later test counts.
+		let Some(thread) = sched::current_thread() else { return };
+		let process = thread.process().clone();
+		let koid = process.header().koid();
+		while !process.is_terminated() {
+			sched::block_on(koid, sched::NO_DEADLINE);
+		}
+	}
+	extern "C" fn departed_body(_arg: u64) {}
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
+	let mut resident: Option<alloc::sync::Arc<object::process::Process>> = None;
 	let up = supervise(&crash_rx, 3, || {
-		let thread = sched::spawn(clean_body, 0);
-		thread.process().header().koid()
+		let process = sched::spawn(resident_body, 0).process().clone();
+		resident = Some(process.clone());
+		Some(process)
+	});
+	assert!(up, "a SystemManager that is still running should survive without recovery");
+	// AND IT LEAVES WITH THE TEST. A stand-in that stays alive by design has to be taken away by
+	// hand, or it is a process in the root Domain that outlives the assertion it was made for.
+	if let Some(process) = resident.take() {
+		process.terminate();
+	}
+	sched::run_until_idle();
+	// AND THE SAME LADDER MUST REFUSE ONE THAT LEFT. Nothing faults here either; the difference is
+	// only that the process is gone, which is exactly the case the crash channel cannot report.
+	let mut attempts: u32 = 0;
+	let departed = supervise(&crash_rx, 3, || {
+		attempts += 1;
+		Some(sched::spawn(departed_body, 0).process().clone())
 	});
 	fault::clear_crash_notify();
-	assert!(up, "a SystemManager that does not fault should survive without recovery");
+	assert!(!departed, "a SystemManager that ended cleanly is as gone as one that faulted, and must not be reported up");
+	assert_eq!(attempts, 4, "an ending is a failed attempt, so the ladder runs out rather than stopping at the first");
 }

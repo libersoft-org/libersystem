@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 25] = [
+const GATES: [(&str, &str); 26] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -172,6 +172,11 @@ const GATES: [(&str, &str); 25] = [
 	// target either.
 	("source-hygiene", "harness.tools"),
 	("source-history-hygiene", "harness.tools"),
+	// P02M0141's second gate: every LSIDL interface a manifest role names must be one LSIDL
+	// defines. Its subject is the manifest and the IDL, neither of which is a crate, and it reads
+	// declarations rather than generated bindings - so it takes the always-selected label for the
+	// same reason `milestone-index` and `forwarded-abi` do, and costs milliseconds.
+	("declared-interfaces", "harness.tools"),
 ];
 
 // check.sh's gate names, read from the script. Parsing a shell array is crude and correct here:

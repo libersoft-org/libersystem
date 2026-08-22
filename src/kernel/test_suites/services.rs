@@ -1385,6 +1385,65 @@ fn a_call_that_never_left_is_told_apart_from_one_that_may_have_landed() {
 	assert_eq!(answer.as_slice(), b"err 3", "a call whose request never left is answered `again`, which says retrying is safe: {:?}", core::str::from_utf8(&answer));
 }
 
+tagged_test!(a_call_that_may_have_landed_is_answered_commit_uncertain, [Service, Storage], id = "kernel.services.a_call_that_may_have_landed_is_answered_commit_uncertain", covers = ["kernel", "services"]);
+fn a_call_that_may_have_landed_is_answered_commit_uncertain() {
+	// THE OTHER HALF OF THE SAME ROW, and the half that decides whether the distinction is worth
+	// anything. Its neighbour proves that a request which never left is answered `again`; on its
+	// own that proves only that failures have a name. What a caller needs is the LINE: this side of
+	// it, retrying is safe; the other side, retrying is how a transfer happens twice.
+	//
+	// Same probe, same generated client, same op. The ONLY difference is choreography - here the
+	// far end is alive when the request goes out and gone before any reply comes back, which is
+	// exactly the position a client is in when the service it is calling dies mid-call.
+	use object::channel::Channel;
+	use object::rights::Rights;
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let probe_elf = program_elf(&package, _volume, b"role_probe").expect("role_probe");
+
+	let (parent, child) = Channel::create();
+	let (report, report_child) = Channel::create();
+	let process = spawn_dynamic_test_process(sched::root_domain(), probe_elf, child);
+	send_cap(&parent, &[5u8], report_child, Rights::ALL).expect("case selector and report channel");
+	// ALIVE AT SEND TIME. The far end is held here, so the probe's request is accepted and queued
+	// rather than refused - which is the whole difference from the test above.
+	let (near, far) = Channel::create();
+	send_cap(&parent, b"LIVE", near, Rights::ALL).expect("channel with a live peer");
+
+	// AND IT REALLY LANDED, asserted rather than assumed. Receiving the request here is the proof
+	// that this is not the `again` case wearing a different name: if the send had been refused the
+	// probe would already have answered, and the answer would be the neighbouring row's.
+	let mut landed = false;
+	for _ in 0..200_000 {
+		sched::run_until_idle();
+		if far.recv().is_ok() {
+			landed = true;
+			break;
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	assert!(landed, "the request must reach the far end, or this measures the `again` case again");
+
+	// NOW THE SERVICE DIES, with the request received and no reply sent. Nobody - not the caller,
+	// not this test - knows whether it acted on it first. That is the state the answer has to name.
+	core::mem::drop(far);
+	let mut answer = alloc::vec::Vec::new();
+	for _ in 0..200_000 {
+		sched::run_until_idle();
+		if let Ok(reply) = report.recv() {
+			answer = reply.bytes;
+			break;
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	// `commit-uncertain`, which is 12 in `base.error` - and NOT `again`, which is 3. A caller told
+	// `again` here would retry a write that may already have been made.
+	assert_eq!(answer.as_slice(), b"err 12", "a call that may have been acted on is answered `commit-uncertain`, which says retrying is not safe: {:?}", core::str::from_utf8(&answer));
+}
+
 tagged_test!(a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind, [Service, Process], id = "kernel.services.a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind", covers = ["kernel", "services"]);
 fn a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind() {
 	use object::channel::{Channel, Message};

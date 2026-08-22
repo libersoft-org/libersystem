@@ -104,6 +104,29 @@ for service, sequence in sorted(ladder.items()):
 	if actual != expected:
 		mismatches.append((service, "the ladder and the plan disagree", actual, expected))
 
+# A SERVICE THE POLICY SAYS COMES BACK MUST BE ONE THE MECHANISM CAN BRING BACK.
+#
+# `restartable()` used to be a hand-written list of three names beside a manifest column naming the
+# same three - two editable sources for one fact, inside the milestone that exists to remove those.
+# The policy now reads the manifest, and the mechanism is still `relaunch_service`, which knows how
+# to re-run one bootstrap per name. Nothing in the compiler joins them: a fourth `transparent` row
+# would make the supervisor promise a restart it cannot perform, spend a restart budget, reap the
+# endpoints and then fail - which looks like a crash-loop rather than a wiring mistake. So they are
+# compared here, where the rest of this milestone's two-sided facts are compared.
+supervisor = open(os.path.join(root, "user", "services", "core", "src", "service_manager.rs"), encoding="utf-8").read()
+relaunch = re.search(r"unsafe fn relaunch_service\(.*?\n\t\t\};", supervisor, re.S)
+if not relaunch:
+	print("check-bootstrap-plan: cannot find relaunch_service's broker-root table", file=sys.stderr)
+	sys.exit(1)
+can_relaunch = set(re.findall(r'b"(\w+)" => &mut broker\.\w+', relaunch.group(0)))
+declared_transparent = {service["name"] for service in tomllib.load(open(manifest_path, "rb"))["services"] if service.get("restart") == "transparent"}
+if can_relaunch != declared_transparent:
+	for name in sorted(declared_transparent - can_relaunch):
+		print(f"{name}: the manifest says `transparent` but relaunch_service cannot re-run its bootstrap", file=sys.stderr)
+	for name in sorted(can_relaunch - declared_transparent):
+		print(f"{name}: relaunch_service can re-run its bootstrap but the manifest does not say `transparent`", file=sys.stderr)
+	mismatches.append(("restartable", "the restart policy and the restart mechanism cover different services", sorted(can_relaunch), sorted(declared_transparent)))
+
 for service, why, actual, expected in mismatches:
 	print(f"{service}: {why}", file=sys.stderr)
 	if actual or expected:
@@ -116,3 +139,4 @@ if mismatches:
 
 migrated = sorted(set(declared) - set(ladder))
 print(f"check-bootstrap-plan: {compared} service(s) still wired by hand agree with the plan; {len(migrated)} migrated" + (f" ({', '.join(migrated)})" if migrated else ""))
+print(f"check-bootstrap-plan: {len(declared_transparent)} service(s) declared restartable, and the supervisor can re-run every one of them")

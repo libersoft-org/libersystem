@@ -61,6 +61,21 @@ impl Kept {
 		}
 		0
 	}
+
+	// The same end, GIVEN UP: returned and forgotten, so nothing here holds it any more. What an
+	// exclusive role needs, and the reason it is a separate call - a `take` that read like a `get`
+	// would be a handle two places believe they own.
+	pub(super) fn take_end_of(&mut self, provider: &[u8], tag: &[u8]) -> u64 {
+		let Some(index) = index_of(provider) else { return 0 };
+		for (slot, role) in ROLES[index].iter().enumerate() {
+			if role.tag == tag && role.kind == RoleKind::ServeRoot && slot < MAX_ROLES {
+				let end: u64 = self.ends[index][slot];
+				self.ends[index][slot] = 0;
+				return end;
+			}
+		}
+		0
+	}
 }
 
 // Send one service the roles the plan declares for it, resolving what can be resolved and taking
@@ -97,20 +112,51 @@ pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut K
 					ok
 				}
 				RoleKind::Client => {
+					// EXCLUSIVE MEANS THE END ITSELF, NOT A COPY OF IT. A duplicate leaves this
+					// supervisor holding the other copy for the life of the system, and a channel
+					// whose peer is still open never reports its peer closed - so the provider
+					// cannot tell that the service it handed the channel to has ended.
+					//
+					// That is not theoretical. ConsoleService reloads the shell on a VT when that
+					// VT's channel closes, which is what makes `exit` on a console return a fresh
+					// login prompt; handed a duplicate, the shell exits and the console waits for
+					// a peer this process is still holding.
 					let root: u64 = kept.end_of(role.provider, role.source);
 					if root == 0 {
 						// An absent provider is not a failure when the role is optional: a boot
 						// with no second disk still sends the tag, carrying nothing.
 						!role.required && send_blocking(manager_side, role.tag, 0)
 					} else {
+						// NARROWED EITHER WAY, and the exclusive one gives up the end it copied
+						// from. Rights are the same question for both - a client role's ceiling is
+						// send, receive, wait and transfer, and a receiver checking that would
+						// refuse a raw end carrying everything the pair was made with. What
+						// exclusivity changes is only how many handles are left afterwards: one,
+						// held by the service, so its closing is the peer's to see.
 						let copy: i64 = duplicate(root, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+						// AFTER THE COPY EXISTS, NOT BEFORE. A failed duplicate leaves the
+						// supervisor holding what it held, rather than holding nothing and having
+						// nothing to hand over.
+						if copy > 0 && role.exclusive {
+							kept.take_end_of(role.provider, role.source);
+							close(root);
+						}
 						copy > 0 && send_blocking(manager_side, role.tag, copy as u64)
 					}
 				}
 				RoleKind::Factory => {
 					let root: u64 = kept.end_of(role.provider, role.source);
 					match if root == 0 { None } else { service_connect(root) } {
-						Some(connection) => send_blocking(manager_side, role.tag, connection),
+						// NARROWED LIKE EVERY OTHER CHANNEL ROLE. A minted connection comes back
+						// carrying every right its pair was made with, because the provider made
+						// the pair - and a receiver checking the ceiling refuses that, correctly.
+						// The provider decides that a connection exists; the supervisor decides
+						// what the holder may do with it, and those are different questions.
+						Some(connection) => {
+							let copy: i64 = duplicate(connection, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+							close(connection);
+							copy > 0 && send_blocking(manager_side, role.tag, copy as u64)
+						}
 						None => !role.required && send_blocking(manager_side, role.tag, 0),
 					}
 				}
@@ -525,35 +571,6 @@ pub(super) unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> Stat
 		State::Stopped
 	}
 }
-
-// Grant the shell a capability by DUPLICATING the supervisor's client and transferring
-// the copy, so the supervisor keeps the original (the serve root's client end) alive for
-// the life of the system - the shell exiting then closes only its copy and the service
-// survives, so a logout reloads a fresh shell instead of tearing the system down. An
-// absent capability (client 0) is sent as a bare tag with no handle (the shell reads it
-// as "not granted"). Returns false only if duplicating a real client fails.
-unsafe fn send_shell_cap(manager_side: u64, tag: &[u8], client: u64) -> bool {
-	unsafe {
-		if client == 0 {
-			return send_blocking(manager_side, tag, 0);
-		}
-		let dup: i64 = duplicate(client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if dup < 0 {
-			return false;
-		}
-		send_blocking(manager_side, tag, dup as u64)
-	}
-}
-
-// Hand the shell the client channels it needs: the StorageService one (so its
-// `cat` round-trips to storage over IPC), a LogService one (so its `log` command
-// can query the journal), the DeviceService one (`dev`), the ProcessService one
-// (`ps`/`run`), and the ConfigService one (`config`/`set`). All but the LogService
-// client are transferred (the shell becomes their sole owner); the LogService
-// client is *duplicated* and the copy transferred, since the supervisor keeps
-// emitting on the original. Finally the supervisor mints a fresh ADMIN channel and
-// transfers the client end to the shell (so its `stop <service>` command can drive
-// reverse-dependency teardown), keeping the server end in `*admin_server` to serve.
 
 // Register every observed component with SystemGraphService and hand it the live data
 // sources for the graph: one "NODE" message per Running component (excluding the shell
@@ -1227,27 +1244,6 @@ unsafe fn bootstrap_network_service(manager_side: u64, net_frames: u64, config_c
 			return false;
 		}
 		bootstrap_serve(manager_side, net_client)
-	}
-}
-
-// Hand TimeService its own NetworkService client (for the SNTP query) and the channel
-// its clients reach it on. The network client is minted from the multi-client
-// `network.open()` on the supervisor's NetworkService channel and transferred as
-// "NET"; then "SERVE" transfers one end of a fresh service channel, the other kept in
-// `*time_client` and later handed to the shell for the `date` command and `log`
-// wall-clock rendering. (TimeService depends on network_service, so `net_client` is
-// already set by the time this runs.)
-unsafe fn bootstrap_time_service(manager_side: u64, net_client: u64, time_client: &mut u64) -> bool {
-	unsafe {
-		let mut net = network::Client::new(ChannelTransport { chan: net_client });
-		let time_net: u64 = match net.open() {
-			Some(Ok(h)) => h,
-			_ => return false,
-		};
-		if !send_blocking(manager_side, b"NET", time_net) {
-			return false;
-		}
-		bootstrap_serve(manager_side, time_client)
 	}
 }
 

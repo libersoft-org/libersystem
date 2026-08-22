@@ -58,6 +58,11 @@ declare -A GATES=(
 	# than a link error. One such pair made every transactional write in the system return "no
 	# answer", and it compiled without a warning.
 	["forwarded-abi"]="tools/check-forwarded-abi.py"
+	# A manifest role naming an LSIDL interface that does not exist. The field is a reference and
+	# nothing resolved it, so four of the twenty names in the file were wrong from the day they
+	# were written - harmlessly, because no generator reads it yet, which is exactly how a
+	# declaration rots: it is read by people, who believe it.
+	["declared-interfaces"]="tools/check-declared-interfaces.py"
 	# The `--artifact` fast path knows a library's DEPENDENCIES, or it reports an artifact as
 	# current after a crate it compiles against changed - which makes every test result taken on
 	# that artifact meaningless. Its own family's `quick` and `provider` modes are not gates because

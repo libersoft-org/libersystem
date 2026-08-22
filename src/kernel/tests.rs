@@ -866,8 +866,8 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	// TimeService: its (dead-peer) network client and its service channel. It seeds its
 	// wall clock from the RTC and serves it; the governed `date` command reads it through
 	// the grant PermissionManager hands on.
-	send_cap(&time_boot_kernel, b"NET", time_net_client, Rights::ALL)?;
-	send_cap(&time_boot_kernel, b"SERVE", time_server, Rights::ALL)?;
+	send_cap(&time_boot_kernel, b"NET", time_net_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER)?;
+	send_cap(&time_boot_kernel, b"SERVE", time_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER)?;
 
 	// PermissionManager: the grantable clients (storage + log, both duplicable, and time, plus
 	// dead-peer config / device / audio / resource / process-grant / supervisor / media-iso-udf
@@ -1649,7 +1649,11 @@ fn run_component_scenario() -> Result<ComponentRun, &'static str> {
 	// client - exactly the two capabilities its world is wired to, and nothing else.
 	send_ramdisk(&storage_boot_kernel, volume)?;
 	send_cap(&storage_boot_kernel, b"SERVE", storage_server, Rights::ALL)?;
-	send_cap(&log_boot_kernel, b"SERVE", log_server, Rights::ALL)?;
+	// THE RIGHTS THE SUPERVISOR HANDS, not everything the pair was made with. A serve root reaches
+	// a real service narrowed to send, receive, wait and transfer, and LogService now checks that -
+	// so a harness granting `ALL` is refused, correctly, and the component behind it reads nothing.
+	// This is the harness standing in for a supervisor, so it stands in accurately.
+	send_cap(&log_boot_kernel, b"SERVE", log_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER)?;
 	send_cap(&host_boot_kernel, b"STORAGE", storage_client, Rights::ALL)?;
 	send_cap(&host_boot_kernel, b"LOG", log_client, Rights::ALL)?;
 
@@ -2465,7 +2469,11 @@ fn spawn_service(name: &[u8]) -> (alloc::sync::Arc<object::channel::Channel>, al
 		loader::spawn_elf_process(sched::root_domain(), service_elf, boot_user, Rights::ALL, 0).expect("spawn service");
 		None
 	};
-	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	// THE RIGHTS THE SUPERVISOR HANDS. A serve root reaches a real service narrowed to send,
+	// receive, wait and transfer, and a service that checks its bootstrap against the generated
+	// plan refuses anything wider - correctly. A harness standing in for the supervisor has to
+	// stand in accurately, or the test agrees with nothing that happens on a real boot.
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("serve bootstrap");
 	(boot_kernel, service_client)
 }
 
@@ -2497,7 +2505,11 @@ fn spawn_service_with_package(name: &[u8]) -> (alloc::sync::Arc<object::channel:
 	// handoffs in order and each read consumes whatever arrived, so a skipped one is
 	// not skipped at all, it swallows the next message and then blocks forever.
 	boot_kernel.send(Message::new(b"REGISTRY".to_vec(), alloc::vec::Vec::new(), 0)).expect("registry bootstrap");
-	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	// THE RIGHTS THE SUPERVISOR HANDS. A serve root reaches a real service narrowed to send,
+	// receive, wait and transfer, and a service that checks its bootstrap against the generated
+	// plan refuses anything wider - correctly. A harness standing in for the supervisor has to
+	// stand in accurately, or the test agrees with nothing that happens on a real boot.
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("serve bootstrap");
 	(boot_kernel, service_client)
 }
 
@@ -2649,7 +2661,11 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	send_cap(&boot_kernel, b"SND", snd_service, Rights::ALL).expect("snd bootstrap");
 	let (audio_admin, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("audio admin bootstrap");
-	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
+	// THE RIGHTS THE SUPERVISOR HANDS. A serve root reaches a real service narrowed to send,
+	// receive, wait and transfer, and a service that checks its bootstrap against the generated
+	// plan refuses anything wider - correctly. A harness standing in for the supervisor has to
+	// stand in accurately, or the test agrees with nothing that happens on a real boot.
+	send_cap(&boot_kernel, b"SERVE", service_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("serve bootstrap");
 	sched::run_until_idle();
 	let storage_online = storage_boot_kernel.recv().expect("StorageService online report");
 	assert_eq!(&storage_online.bytes[..], b"StorageService: online");

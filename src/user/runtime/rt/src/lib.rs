@@ -2888,6 +2888,17 @@ pub unsafe fn domain_create(memory: u64, handles: u64, threads: u64) -> i64 {
 	unsafe { syscall(SYS_DOMAIN_CREATE, memory, handles, threads, 0) as i64 }
 }
 
+// Kill a Domain and everything beneath it: every process accounted to it and to its child
+// Domains is terminated. The handle must carry MANAGE, which only its owner has.
+//
+// BULK TERMINATION IS WHAT A DOMAIN IS FOR. The alternative is a supervisor holding a Process
+// handle per member and walking them by hand, which is a list that can be wrong; a Domain cannot
+// be missing one of its own members. SystemManager tears down the control-plane branch this way
+// when the branch loses its supervisor.
+pub unsafe fn domain_kill(domain: u64) -> i64 {
+	unsafe { syscall(SYS_DOMAIN_KILL, domain, 0, 0, 0) as i64 }
+}
+
 // Set one resource counter's limit on a Domain (handle must carry the MANAGE right):
 // `prop` is one of the PROP_*_LIMIT selectors and `limit` the new cap (u64::MAX =
 // uncapped). Returns 0 on success or a negative error. The cap takes effect at once -

@@ -328,6 +328,34 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 				let chan: u64 = clients[slot];
 				match recv_caps_blocking(chan, &mut req) {
 					ReceivedCaps::Message { len, handles: mut caps } => {
+						// A FRESH CONNECTION PER CALLER, answered here because it cannot be
+						// answered generically.
+						//
+						// This service is not built on `serve_multi` - it stands on the driver's
+						// frame channel, every client, every socket and every listener at once -
+						// so the reserved connect request has to be handled by hand, as
+						// InputService, DisplayService and the audio engine already do. Without
+						// it `service_connect` waits forever against this service and no other,
+						// and a `factory` role in the bootstrap plan would mean one thing here
+						// and another everywhere else.
+						if len >= 2 && u16::from_le_bytes([req[0], req[1]]) == CONNECT_OP {
+							for &unclaimed in caps.as_slice() {
+								close(unclaimed);
+							}
+							match channel() {
+								Some((mine, theirs)) => {
+									place_client(&mut clients, mine);
+									send_blocking(chan, &[], theirs);
+								}
+								// Refused by replying with no capability: a caller that gets none
+								// knows it has no connection, which is better than a channel
+								// nobody is waiting on.
+								None => {
+									send_blocking(chan, &[], 0);
+								}
+							}
+							continue;
+						}
 						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
 						// over the single-handle receive, which keeps the first and drops the rest - so a
 						// client sending stdin, stdout and stderr had two destroyed before dispatch.

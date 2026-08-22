@@ -140,7 +140,7 @@ fn generate_services(manifest: &Manifest) {
 					RoleKind::Payload => "RoleKind::Payload",
 				};
 				let required = role.presence == Presence::Required;
-				format!("Role {{ tag: b\"{}\", kind: {kind}, provider: b\"{}\", source: b\"{}\", required: {required} }}", role.tag, role.provider, role.source)
+				format!("Role {{ tag: b\"{}\", kind: {kind}, provider: b\"{}\", source: b\"{}\", required: {required}, exclusive: {} }}", role.tag, role.provider, role.source, role.exclusive)
 			})
 			.collect::<Vec<_>>()
 			.join(", ");
@@ -153,6 +153,46 @@ fn generate_services(manifest: &Manifest) {
 	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst N: usize = {};\nconst MANIFEST: [Service; N] = [\n{entries}];\nconst ROLES: [&[Role]; N] = [\n{plans}];\n", manifest.services.len());
 	write_generated("manifest.rs", &generated);
 	generate_role_tags(manifest);
+	generate_receive_plans(manifest);
+}
+
+// THE SAME PLAN, WRITTEN FOR THE RECEIVING END.
+//
+// `manifest.rs` above is what the supervisor SENDS; this is what each service EXPECTS, generated
+// from the identical rows so the two cannot disagree. A service that reads its bootstrap by hand
+// agrees with the sender only because somebody keeps them agreeing - and when three programs once
+// read theirs in an order the sender does not use, a blocking tagged read consumed the message
+// that was actually next and then waited forever for one nobody sends. It surfaced 170 tests away.
+//
+// One file per service rather than one table for all of them: a service includes its own list
+// under a fixed name and cannot reach anybody else's, and nothing is compiled into a binary that
+// has no use for it.
+fn generate_receive_plans(manifest: &Manifest) {
+	for service in manifest.services.values() {
+		let roles = service
+			.roles
+			.iter()
+			.map(|role| {
+				let kind = match role.kind {
+					RoleKind::ServeRoot => "ServeRoot",
+					RoleKind::Client => "Client",
+					RoleKind::Factory => "Factory",
+					RoleKind::Privilege => "Privilege",
+					RoleKind::Power => "Power",
+					RoleKind::Package => "Package",
+					RoleKind::Device => "Device",
+					RoleKind::Payload => "Payload",
+				};
+				let required = role.presence == Presence::Required;
+				format!("\trt::Role {{ tag: b\"{}\", kind: rt::RoleKind::{kind}, required: {required} }},\n", role.tag)
+			})
+			.collect::<String>();
+		// Fully qualified, because a service that includes this may have types of its own by these
+		// names - the supervisor does - and a generated file must not depend on what is in scope
+		// where it lands.
+		let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst BOOTSTRAP_ROLES: [rt::Role; {}] = [\n{roles}];\n", service.roles.len());
+		write_generated(&format!("roles_{}.rs", service.name), &generated);
+	}
 }
 
 // THE ROLE TAGS, AS ONE SET OF CONSTANTS BOTH ENDS READ.

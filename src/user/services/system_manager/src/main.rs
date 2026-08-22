@@ -170,7 +170,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// drivers. A manager that relayed reports first and served afterwards would be a manager
 	// nobody could reach during the one phase that needs it - which is a deadlock, and it is
 	// exactly what the first version of this did.
-	unsafe { serve_system_power(power, power_server, sm_side, bootstrap, &mut buf) };
+	unsafe { serve_system_power(power, power_server, sm_side, bootstrap, branch_domain as u64, &mut buf) };
 
 	// 5. STAY. This process used to exit here, which left the ServiceManager branch with no owner
 	//    for the whole life of the system - and left the root-Domain handle needing a home, which
@@ -191,31 +191,32 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 //
 // TWO CHANNELS, ONE LOOP. A request to stop the machine and the death of ServiceManager are both
 // things this process must notice, and a blocking wait on either alone would miss the other.
-unsafe fn serve_system_power(power: u64, requests: u64, branch: u64, up: u64, buf: &mut [u8]) {
+unsafe fn serve_system_power(power: u64, requests: u64, branch: u64, up: u64, domain: u64, buf: &mut [u8]) {
 	unsafe {
+		// THE BRANCH GOES DOWN WITH ITS SUPERVISOR, through the Domain that contains it.
+		//
+		// Whichever way this loop ends, what is left below is a set of processes whose supervisor
+		// has gone, and this process is the only holder of `MANAGE` on the Domain they all live
+		// in - which is the entire reason M12 put them in one. One syscall ends every one of them,
+		// where a list of Process handles kept by hand could be missing a member and never say so.
+		//
+		// The kernel reboots after this, having seen this process end; the teardown still happens
+		// first, because "the owner tears down what it owns" is the property, not "something
+		// eventually stops the machine".
+		let _guard = BranchGuard { domain };
+		// NO FALLBACK WITHOUT A WAIT SET, and the one that was here was worse than none.
+		//
+		// It served the requests alone, on the theory that a machine which cannot be turned off is
+		// worse than one whose branch death is noticed late. It could not: minting a per-holder
+		// channel calls `waitset_add`, which fails on a zero handle, so every connect request was
+		// refused - and the loop polled only the root channel, so a minted connection would never
+		// have been read anyway. A comment promising a working power path over code that had none
+		// is worse than the honest failure, which is this: the boot chain stops here and the kernel
+		// escalates, as it does for any other way this process fails to come up.
 		let created: i64 = waitset_create();
 		if created < 0 {
-			// Without a wait set there is nothing to multiplex with. Serve the requests alone
-			// rather than exiting: a machine that cannot be turned off is worse than one whose
-			// branch death is noticed a moment later by the kernel instead.
-			let mut lone: [(u64, u64); MAX_POWER_CLIENTS] = [(0, 0); MAX_POWER_CLIENTS];
-			loop {
-				match try_recv(branch, buf) {
-					Polled::Closed => return,
-					Polled::Message { len, .. } => {
-						let report: &[u8] = &buf[..len];
-						let terminal: bool = report == b"ServiceManager: online";
-						send_blocking(up, report, 0);
-						if terminal {
-							send_blocking(up, b"SystemManager: online", 0);
-						}
-					}
-					Polled::Empty => {}
-				}
-				if matches!(serve_power_once(power, requests, 0, &mut lone, buf), PowerStep::Gone) {
-					return;
-				}
-			}
+			print(b"SystemManager: cannot create the power wait set; boot chain stops here\n");
+			return;
 		}
 		let set: u64 = created as u64;
 		if waitset_add(set, requests) < 0 || waitset_add(set, branch) < 0 {
@@ -279,6 +280,21 @@ unsafe fn serve_system_power(power: u64, requests: u64, branch: u64, up: u64, bu
 				}
 			}
 		}
+	}
+}
+
+// Tears down the control-plane branch when the serving loop ends, by any of the ways it can end.
+//
+// A GUARD RATHER THAN A LINE AT THE BOTTOM, because that loop returns from five places - a wait
+// that fails, a member that cannot be added, the branch closing, the request channel closing - and
+// four of them would have been easy to miss.
+struct BranchGuard {
+	domain: u64,
+}
+
+impl Drop for BranchGuard {
+	fn drop(&mut self) {
+		unsafe { domain_kill(self.domain) };
 	}
 }
 

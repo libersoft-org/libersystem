@@ -21,6 +21,8 @@ use proto::system::device::{self, Service};
 use proto::system::{DeviceEntry, DeviceType, Error};
 use rt::*;
 
+include!(concat!(env!("OUT_DIR"), "/roles_device_service.rs"));
+
 // The kernel device table, behind the generated Device contract.
 struct Devices;
 
@@ -68,16 +70,22 @@ fn type_of(device_type: u32) -> DeviceType {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
-	let mut buf: [u8; 256] = [0u8; 256];
-
 	// 1. report in to the supervisor that started us.
 	unsafe {
 		send_blocking(bootstrap, b"DeviceService: online", 0);
 	}
 
-	// 2. wait for the serve channel clients reach us on. If the supervisor drops the
-	//    bootstrap channel first (no clients this boot), we are done.
-	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| exit());
+	// 2. take the roles the plan says this service is handed - here one, the channel clients
+	//    reach us on. Checked against the GENERATED list rather than read by hand: the tag,
+	//    the kernel object type and the rights are all things a receiver can check, and a
+	//    bootstrap that is wrong is better refused by name than served with the wrong
+	//    handle. A supervisor that dropped the channel instead (no clients this boot)
+	//    reports as a missing role, and there is nothing left to serve either way.
+	let mut roles: [u64; BOOTSTRAP_ROLES.len()] = [0; BOOTSTRAP_ROLES.len()];
+	if let Err(error) = unsafe { receive_roles(bootstrap, &BOOTSTRAP_ROLES, &mut roles) } {
+		unsafe { fail_bootstrap(bootstrap, error.tag(), error.reason()) };
+	}
+	let service: u64 = roles[0];
 
 	// 3. serve generated list/get requests until the client side closes.
 	let mut devices: Devices = Devices;

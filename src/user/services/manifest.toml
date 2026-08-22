@@ -1650,8 +1650,14 @@ dependencies = ["log_service", "process_service", "storage_service"]
 
 [[services.roles]]
 tag = "STORAGE"
-kind = "client"
+# MINTED FROM THE ADMIN ROOT, not duplicated from the ordinary one. What ConfigService is handed is
+# a volume client confined to its own persistence directory, which is why the supervisor keeps a
+# StorageService ADMIN endpoint at all - and why a restarted instance can be given a fresh one.
+# The confinement itself is a fact the plan cannot carry yet; the endpoint it comes from is not,
+# and saying `client of SERVE` said the wrong one of the two.
+kind = "factory"
 provider = "storage_service"
+source = "ADMIN"
 interface = "liber:storage@1/volume"
 
 [[services.roles]]
@@ -2120,7 +2126,7 @@ interface = "liber:audio@1/audio-admin"
 tag = "RESOURCE"
 kind = "client"
 provider = "resource_manager"
-interface = "liber:resources@1/resource"
+interface = "liber:resources@1/resources"
 
 [[services.roles]]
 tag = "PROCESS_GRANT"
@@ -2249,7 +2255,7 @@ provider = "service_manager"
 tag = "SERVE"
 kind = "serve-root"
 provider = "self"
-interface = "liber:resources@1/resource"
+interface = "liber:resources@1/resources"
 
 [[services.roles]]
 tag = "PROCESS"
@@ -2399,7 +2405,7 @@ interface = "liber:security@1/permission"
 tag = "RESOURCE"
 kind = "client"
 provider = "resource_manager"
-interface = "liber:resources@1/resource"
+interface = "liber:resources@1/resources"
 
 [[services.roles]]
 tag = "SESSION"
@@ -2412,18 +2418,26 @@ tag = "CONSOLE"
 kind = "client"
 provider = "console_service"
 source = "CLIENT"
+# HANDED OVER, NOT COPIED. ConsoleService reloads the shell on a VT when that VT's channel
+# closes - which is what makes `exit` return a fresh login prompt - and it can only see the
+# close if this supervisor kept no copy of the other end.
+exclusive = true
 
 [[services.roles]]
 tag = "CONTROL"
 kind = "client"
 provider = "console_service"
 source = "CONTROL"
+exclusive = true
 
 [[services.roles]]
 tag = "ADMIN"
+# A PAIR THE SUPERVISOR MAKES, and on this one the supervisor is the side that answers: the shell
+# drives `stop <service>` over it. Which end serves is the pair's business - the role says only
+# that the channel is created for this service and that this service receives one end.
 kind = "serve-root"
 provider = "self"
-interface = "liber:process@1/supervisor"
+interface = "liber:observability@1/supervisor"
 
 [[services.roles]]
 tag = "READY"
@@ -2510,7 +2524,10 @@ dependencies = ["log_service", "network_service", "process_service"]
 
 [[services.roles]]
 tag = "NET"
-kind = "client"
+# A CONNECTION OF ITS OWN, because two callers sharing one channel take each other's replies -
+# NetworkService says exactly that beside the op that exists to prevent it. TimeService reports
+# online before its SNTP query, so anything else on a shared channel would be racing it.
+kind = "factory"
 provider = "network_service"
 presence = "optional"
 interface = "liber:network@1/network"

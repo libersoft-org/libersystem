@@ -444,7 +444,7 @@ fn resident_manager_lost() -> bool {
 	control_plane_lost(SYSTEM_IS_UP.load(core::sync::atomic::Ordering::Relaxed), manager.as_ref())
 }
 
-fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>, u64), &'static str> {
+fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>), &'static str> {
 	use alloc::sync::Arc;
 	use object::KernelObject;
 	use object::channel::Message;
@@ -463,7 +463,6 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// is launched through ProcessService, which labels it from the package entry it was looked
 	// up by. This one the kernel launches itself, so the kernel labels it.
 	process.header().set_name("system_manager");
-	let sm_koid = process.header().koid();
 	// Kept so the ending can be seen. Replaced on each attempt of the pre-online ladder, so what is
 	// watched afterwards is the instance that actually came up.
 	*RESIDENT_MANAGER.lock() = Some(process.clone());
@@ -522,17 +521,19 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// Hand SystemManager the power capability: a handle to the root Domain carrying MANAGE,
 	// which is what `SYS_SYSTEM_POWER` checks. Stopping the machine used to need no capability
 	// at all, so every process in the system had it; it now travels the boot chain like any
-	// other authority, from here to ServiceManager and on to the two components that must be
-	// able to stop the machine - the supervisor's graceful shutdown, and the keyboard driver's
-	// Power key, which exists precisely to work when the supervisor does not.
+	// other authority - and travels exactly one hop, to the one process that keeps it.
 	//
-	// DUPLICATE is included because it is delegated onward more than once; TRANSFER because
-	// the first hop hands it over rather than sharing it.
+	// MANAGE ALONE, AND THAT IS THE WHOLE GRANT. It carried TRANSFER and DUPLICATE while it was
+	// delegated onward - ServiceManager to DeviceManager to two keyboard drivers - and since M11
+	// it is not delegated at all: SystemManager stays resident and holds it, and what goes down
+	// the chain in its place is a client of the narrow SystemPower service, which can ask for a
+	// reboot and can do nothing else. Rights nobody exercises are rights that only widen what a
+	// mistake can reach.
 	//
 	// Sent AFTER the ramdisk because that is the order SystemManager reads its handoffs in,
 	// and a bootstrap read consumes whatever arrived: out of order, its RAMDISK read takes
 	// this message instead and the whole boot chain stops before the first service starts.
-	let power_cap = Capability::new(sched::root_domain() as Arc<dyn KernelObject>, Rights::MANAGE | Rights::TRANSFER | Rights::DUPLICATE, 0);
+	let power_cap = Capability::new(sched::root_domain() as Arc<dyn KernelObject>, Rights::MANAGE, 0);
 	// ALLOC-OK: boot, as above
 	// ALLOC-OK: boot, before userspace exists - a four-byte tag on the handover path.
 	kernel_ep.send(Message::new(b"POWER".to_vec(), alloc::vec![power_cap], 0)).map_err(|_| "failed to hand SystemManager the power capability")?;
@@ -558,7 +559,7 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink, PrivilegeKind::DeviceManager].into_iter().map(|kind| Capability::new(Privilege::create(kind).expect("the four privilege capabilities, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE, 0)).collect();
 	// ALLOC-OK: boot, before userspace exists - a tag on the same handover path.
 	kernel_ep.send(Message::new(b"CONSOLECAPS".to_vec(), privileges, 0)).map_err(|_| "failed to hand SystemManager the console capabilities")?;
-	Ok((kernel_ep, sm_koid))
+	Ok((kernel_ep, process))
 }
 
 // Drain the crash-notify channel and report whether the process `koid` faulted.
@@ -576,32 +577,78 @@ fn crash_seen(crash_rx: &object::channel::Channel, koid: u64) -> bool {
 	found
 }
 
+// How many child Domains the root Domain has.
+//
+// THE POINT WHERE THE RETRY LADDER STOPS APPLYING is a CHANGE in this number. SystemManager creates
+// one child Domain and spawns ServiceManager into it, early - so a manager that faults after that
+// leaves a branch full of running processes with no owner. Starting a replacement beside it would
+// be two managers over one tree, which is worse than starting again, and P02M0141's M11 says so in
+// as many words: the pre-online ladder applies only BEFORE the control-plane Domain exists.
+//
+// Counted rather than tested for emptiness, and compared against what was there when the ladder
+// began, so the rule says "the last attempt built a branch" and not "somebody, at some point, made
+// a Domain". Read-only on purpose: the kernel decides to escalate; it does not go tidying userspace
+// up, and the branch's owner is the one that tears it down.
+fn root_child_domains() -> usize {
+	let mut total: usize = 0;
+	let mut at: usize = 0;
+	loop {
+		let mut batch: [Option<alloc::sync::Arc<object::domain::Domain>>; 8] = [const { None }; _];
+		let (written, next) = sched::root_domain().children_from(at, &mut batch);
+		total += written;
+		if written == 0 && next == at {
+			return total;
+		}
+		at = next;
+	}
+}
+
 // Supervise a critical process (SystemManager) through the recovery ladder: each
-// round, `spawn` it (returning its process koid, or 0 if it could not be spawned),
-// run the system to a quiescent point, and check the crash channel. Returns true
-// as soon as a round completes without the process faulting (the system is up), or
-// false once every attempt - the original plus `max_restarts` recovery restarts -
-// has faulted, at which point the caller escalates (reboot as the last resort).
-// This is the kernel's one minimal rescue mechanism, the single exception to
-// "the kernel is pure mechanism".
-fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: impl FnMut() -> u64) -> bool {
+// round, `spawn` it (returning its process, or None if it could not be spawned),
+// run the system to a quiescent point, and check that it neither faulted nor ended.
+// Returns true as soon as a round completes with the process still running (the
+// system is up), or false once every attempt - the original plus `max_restarts`
+// recovery restarts - has failed, at which point the caller escalates (reboot as
+// the last resort). This is the kernel's one minimal rescue mechanism, the single
+// exception to "the kernel is pure mechanism".
+fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: impl FnMut() -> Option<alloc::sync::Arc<object::process::Process>>) -> bool {
+	use object::KernelObject;
+	let branches_before: usize = root_child_domains();
 	for attempt in 0..=max_restarts {
-		let koid = spawn();
-		sched::run_until_idle();
-		// A KOID OF ZERO IS A SPAWN THAT DID NOT HAPPEN, not a process that behaved.
+		// A RETRY IS ONLY HONEST WHILE THERE IS NOTHING TO RETRY BESIDE. See above: once the last
+		// attempt built the control-plane branch, the ladder is over and the caller reboots.
+		if attempt > 0 && root_child_domains() > branches_before {
+			serial_println!("recovery: a control-plane branch is already running - not starting a second SystemManager beside it");
+			return false;
+		}
+		// NO PROCESS IS A SPAWN THAT DID NOT HAPPEN, not a process that behaved.
 		//
 		// This read `koid == 0 || !crash_seen(..)` and returned true for both, so the one gate the
 		// recovery ladder has reported SUCCESS when nothing had been started - and the boot then
 		// carried on as though userspace were up. A failed spawn is a failed attempt: retry it like
 		// a crash, and let the ladder run out if it keeps failing.
-		if koid == 0 {
+		let Some(process) = spawn() else {
 			serial_println!("recovery: SystemManager did not start (attempt {} of {})", attempt + 1, max_restarts + 1);
 			continue;
+		};
+		let koid = process.header().koid();
+		sched::run_until_idle();
+		if crash_seen(crash_rx, koid) {
+			serial_println!("recovery: SystemManager (koid {}) faulted - starting a recovery SystemManager (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
+			continue;
 		}
-		if !crash_seen(crash_rx, koid) {
-			return true;
+		// ENDED IS AS GONE AS FAULTED, and the crash channel only reports the second.
+		//
+		// Since M11 SystemManager is RESIDENT: it owns the control-plane branch for the life of the
+		// system and is not supposed to end at all. A round that leaves it terminated is therefore
+		// a failed round, not a quiet success - and reported as success it would put the machine
+		// into exactly the state the resident-manager watch exists to catch, one step earlier and
+		// with nothing watching yet.
+		if process.is_terminated() {
+			serial_println!("recovery: SystemManager (koid {}) ended before the system was up (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
+			continue;
 		}
-		serial_println!("recovery: SystemManager (koid {}) faulted - starting a recovery SystemManager (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
+		return true;
 	}
 	false
 }
@@ -642,13 +689,13 @@ fn boot_userspace_with_recovery() {
 	fault::set_crash_notify(crash_tx);
 	let mut kernel_ep: Option<Arc<object::channel::Channel>> = None;
 	let up = supervise(&crash_rx, MAX_RESTARTS, || match spawn_system_manager() {
-		Ok((ep, koid)) => {
+		Ok((ep, process)) => {
 			kernel_ep = Some(ep);
-			koid
+			Some(process)
 		}
 		Err(reason) => {
 			serial_println!("recovery: could not start SystemManager: {}", reason);
-			0
+			None
 		}
 	});
 	if up {

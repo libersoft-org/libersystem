@@ -781,7 +781,14 @@ fn run_system_manager() {
 	publish_embedded_boot_info();
 
 	match crate::spawn_system_manager() {
-		Ok((ep, koid)) => {
+		Ok((ep, manager)) => {
+			// The process itself, not just its id: `spawn_system_manager` hands it back so the
+			// recovery ladder can see an ENDING rather than only a fault, and this path names it
+			// the same way rather than keeping a second spelling of the same handover.
+			let koid: u64 = {
+				use crate::object::KernelObject;
+				manager.header().koid()
+			};
 			crate::serial_println!("aarch64: system - SystemManager spawned (koid {koid}), bringing up userspace");
 			// Drive the boot chain until the interactive shell attaches (the last
 			// component to come up), draining its reports as they arrive: run the
