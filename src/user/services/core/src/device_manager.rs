@@ -19,7 +19,7 @@ use ipc_client::ChannelTransport;
 use proto::system::{OpenOpts, volume};
 use rt::*;
 
-include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/program_path.rs"));
 
 // The state DeviceManager tracks per discovered device.
 // PRESENCE IS NOT ACTIVATION, and the states say which is which.
@@ -55,7 +55,7 @@ const MAX_DRIVER_RESTARTS: u32 = 3;
 //
 // In a shipping build none of this is reachable: the device is not bound, no agent is
 // started, and the capabilities below are never delivered.
-#[cfg_attr(not(feature = "development"), allow(dead_code))]
+#[cfg(feature = "development")]
 #[derive(Default)]
 struct DevAgent {
 	// The agent's bootstrap. It is both how capabilities reach the agent and how this program
@@ -81,6 +81,7 @@ struct DevAgent {
 	nonce: [u8; 8],
 }
 
+#[cfg(feature = "development")]
 impl DevAgent {
 	// Retain a capability and pass the live agent a copy of it. A copy rather than the handle
 	// itself: this program has to be able to give the same capability to the next agent, and
@@ -220,6 +221,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// What this program holds on behalf of the development agent: its bootstrap, so the
 		// launcher can be handed to it once PermissionManager exists - which is after this
 		// program has finished starting drivers - and so its death is noticed and answered.
+		#[cfg(feature = "development")]
 		let mut dev: DevAgent = DevAgent::default();
 		launch_boot_drivers(&package, power, console_input, device_privilege, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
 
@@ -248,7 +250,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
+					#[cfg(feature = "development")]
 					launch_volume_drivers(handle, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev);
+					#[cfg(not(feature = "development"))]
+					launch_volume_drivers(handle, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys);
 					if handle != 0 {
 						close(handle);
 					}
@@ -266,10 +271,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// The development agent's launcher, delivered once PermissionManager is up.
 				// Forwarded rather than held: this program has no use for it, and the agent
 				// could not have been given one when it started.
+				#[cfg(feature = "development")]
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DEVPERM" => dev.hold_launcher(handle),
 				// The other end of the channel ProcessService already holds, so a launch can
 				// ask the registry whether it has a generation of the artifact it is about to
 				// read off the volume.
+				#[cfg(feature = "development")]
 				Received::Message { len, handle } if len >= 6 && &buf[..6] == b"DEVREG" => dev.hold_registry(handle),
 				Received::Message { .. } => {
 					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
@@ -305,7 +312,7 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 				i += 1;
 				continue;
 			};
-			if entry.lifecycle != Lifecycle::BootCritical {
+			if !entry.boot_critical {
 				i += 1;
 				continue;
 			}
@@ -347,7 +354,7 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg_attr(not(feature = "development"), allow(unused_variables))] dev: &mut DevAgent) {
+unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -375,7 +382,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 				i += 1;
 				continue;
 			}
-			if candidates[0].lifecycle == Lifecycle::BootCritical {
+			if candidates[0].boot_critical {
 				// bound in phase 1, before there was a volume to load from; count them as online.
 				state[idx] = STATE_ONLINE;
 				i += 1;
@@ -747,25 +754,6 @@ unsafe fn print_count(n: u32) {
 // answer, and a boot-critical driver staged on the volume it exists to mount, all before this table
 // is emitted.
 
-// What kind of thing an entry binds to. Carried through selection because supervision and start
-// order depend on it, which a `&'static [u8]` name could not express.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Lifecycle {
-	BootCritical,
-	Controller,
-	Function,
-	Interface,
-}
-
-// How specific a match is. Ordered: a quirk outranks an exact match, which outranks the generic
-// path. The registry refuses two entries that tie, so ordering is total where it is consulted.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum Priority {
-	Generic,
-	Exact,
-	Quirk,
-}
-
 // ONE RULE IS A CONJUNCTION: every predicate that is present must hold, and `None` means "do not
 // ask" rather than "must be absent". A driver's rule list is the disjunction.
 //
@@ -820,8 +808,13 @@ struct Entry {
 	// The staged file, which is what the loader asks for - not derived from the name, because the
 	// two differ for a pinned driver and deriving it is how they drift.
 	artifact: &'static [u8],
-	lifecycle: Lifecycle,
-	priority: Priority,
+	// WHETHER THE VOLUME CANNOT BE MOUNTED WITHOUT IT, which is the only thing selection asks of
+	// the manifest's four lifecycle classes: a boot-critical driver is staged in `init.pkg` and
+	// bound in phase one, and everything else waits for a volume.
+	boot_critical: bool,
+	// How specific the match is, as a rank: generic 0, exact 1, quirk 2. Only compared, never
+	// named - the names are the manifest's and `system-manifest` is what checks them.
+	priority: u8,
 	rules: &'static [Rule],
 }
 

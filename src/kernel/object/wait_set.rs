@@ -54,6 +54,7 @@ pub struct WaitSet {
 
 impl WaitSet {
 	// FALLIBLY, here and in `create_in`: `SYS_WAITSET_CREATE` reaches them.
+	#[cfg(test)]
 	pub fn create() -> Option<Arc<Self>> {
 		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), members: SpinLock::new(Vec::new()), domain: None })
 	}
@@ -145,10 +146,12 @@ impl WaitSet {
 		f(&self.members.lock())
 	}
 
+	#[cfg(test)]
 	pub fn len(&self) -> usize {
 		self.members.lock().len()
 	}
 
+	#[cfg(test)]
 	pub fn is_empty(&self) -> bool {
 		self.len() == 0
 	}

@@ -29,8 +29,6 @@
 // path, a shell command or a capability request, and an artifact name is a bounded
 // identifier checked character by character rather than anything the guest resolves.
 
-#![allow(dead_code)]
-
 extern crate alloc;
 
 use alloc::string::String;
@@ -42,7 +40,7 @@ use proto::generated::liber::security::v1 as security;
 use proto::system::{OpenOpts, volume};
 use rt::*;
 
-include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/program_path.rs"));
 include!(concat!(env!("OUT_DIR"), "/library_paths.rs"));
 
 // The protocol's identifying prefix ("LD" on the wire) and the version this guest speaks. A

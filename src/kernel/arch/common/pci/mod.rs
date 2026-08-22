@@ -14,8 +14,6 @@
 // resolved device tables are handed to DeviceManager, which maps each BAR to a
 // userspace driver via a DeviceMemory capability.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 // virtio's PCI vendor id (Red Hat / virtio).
@@ -336,6 +334,7 @@ fn scan_bus<A: ConfigAccess>(bus: u8, seen: &mut [bool; 256], out: &mut Vec<PciD
 }
 
 // The human name of a virtio device type, for the boot log.
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn virtio_type_name(virtio_type: u16) -> &'static str {
 	match virtio_type as u32 {
 		abi::VIRTIO_TYPE_NET => "net",
@@ -403,6 +402,7 @@ pub fn bar_size<A: ConfigAccess>(d: &PciDevice, bar_idx: usize) -> Option<u64> {
 // Probing means writing all-ones and reading the mask back, so it is only safe while memory
 // decoding is off; both passes below run inside that window and the original value is always
 // restored.
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 fn probe_bar<A: ConfigAccess>(d: &PciDevice, i: usize) -> (usize, Option<(bool, u64, u64)>) {
 	let off = 0x10 + (i as u16) * 4;
 	let bar = A::read32(d.bus, d.dev, d.func, off);
@@ -440,10 +440,12 @@ fn probe_bar<A: ConfigAccess>(d: &PciDevice, i: usize) -> (usize, Option<(bool, 
 
 // Whether a BAR the firmware left at `cur` is one this kernel keeps: inside the low window the
 // boot stub maps, and actually programmed.
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 fn is_retained<A: ConfigAccess>(cur: u64) -> bool {
 	cur != 0 && cur < A::MMIO_WINDOW_END
 }
 
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
 	// Disable memory-space decoding while the BARs move (the firmware may have enabled it).
 	A::update32(d.bus, d.dev, d.func, 0x04, |dword| ((dword as u16) & !CMD_MEMORY_SPACE) as u32);
@@ -682,7 +684,8 @@ pub fn msix_enable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
 // the device BARs and the device DMAs its virtqueues) but must NOT enable MSI-X: on
 // QEMU virt the PLIC receives only wired INTx, so a device switched to MSI-X would send
 // a message nothing receives. This keeps the device on its INTx pin.
-#[allow(dead_code)] // only the riscv INTx-over-PLIC backend keeps devices off MSI-X
+// only the riscv INTx-over-PLIC backend keeps devices off MSI-X
+#[cfg(any(test, target_arch = "riscv64"))]
 pub fn enable_mem_and_master<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
 	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
 }

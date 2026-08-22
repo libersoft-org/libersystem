@@ -9,7 +9,6 @@
 // drop. A lock holder therefore can never be preempted by the timer, so an
 // interrupt handler that needs the same lock can never deadlock against a holder
 // it interrupted. Nested locks restore correctly (only the outermost re-enables).
-#![allow(dead_code)]
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};

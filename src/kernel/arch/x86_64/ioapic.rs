@@ -11,8 +11,6 @@
 // fuller implementation would enumerate them (and their GSI bases) from the ACPI
 // MADT.
 
-#![allow(dead_code)]
-
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::paging;

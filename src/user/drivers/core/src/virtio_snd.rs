@@ -22,12 +22,10 @@
 #![no_std]
 #![no_main]
 
-mod common;
-mod virtio;
-
 use rt::*;
 
 use crate::virtio::{Queue, Virtio};
+use drivers::{common, virtio};
 
 // virtio-sound control requests (the PCM subset) and the success status.
 const R_PCM_INFO: u32 = 0x0100;

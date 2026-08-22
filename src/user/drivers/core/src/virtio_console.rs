@@ -8,12 +8,10 @@
 #![no_std]
 #![no_main]
 
-mod common;
-mod virtio;
-
 use rt::*;
 
 use crate::virtio::Queue;
+use drivers::{common, virtio};
 
 // The line the driver writes over the console transmit queue.
 const BANNER: &[u8] = b"virtio-console driver online: console output over the virtqueue\n";

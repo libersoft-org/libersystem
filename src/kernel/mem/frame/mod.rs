@@ -32,8 +32,6 @@
 // The allocator is global and guarded by a SpinLock, so it is safe to call from
 // any core.
 
-#![allow(dead_code)]
-
 use bootproto::MemRegion;
 
 use alloc::vec::Vec;
@@ -924,6 +922,7 @@ static DOUBLE_ALLOCATIONS: core::sync::atomic::AtomicU64 = core::sync::atomic::A
 // allocator cannot repair this - by the time it is noticed both owners hold the address - so the
 // counter exists to make it VISIBLE rather than to recover, and the test that reads it is the only
 // thing between a bitmap bug and a corruption that surfaces somewhere else entirely.
+#[cfg(test)]
 pub fn double_allocations() -> u64 {
 	DOUBLE_ALLOCATIONS.load(core::sync::atomic::Ordering::Acquire)
 }
@@ -1396,6 +1395,7 @@ pub fn set_owned_bit_for_test(phys: u64, owned: bool) {
 	allocator.mark_owned(phys, 1, owned);
 }
 
+#[cfg(test)]
 pub fn audit() -> Option<(u64, u64)> {
 	let allocator = ALLOCATOR.lock();
 	let buddy = allocator.buddy.as_ref()?;

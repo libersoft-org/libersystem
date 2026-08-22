@@ -14,7 +14,7 @@ use core::arch::asm;
 
 use bootproto::{BootInfo, Framebuffer, MemRegion, Module};
 
-use crate::{align_down, alloc_pages, alloc_scratch_pages, read_file};
+use crate::{align_down, alloc_pages, alloc_scratch_pages};
 use paging::{HHDM_OFFSET, PAGE_2MB, PAGE_SIZE, PageTables};
 use uefi::{self, BootServices, Handle, SystemTable};
 
@@ -61,7 +61,7 @@ pub fn halt() -> ! {
 // volume (the kernel gets them as boot-protocol modules), loads the kernel ELF,
 // gathers the framebuffer + RSDP, builds the page tables + BootInfo, snapshots the
 // memory map, exits boot services, and switches to the kernel's page tables.
-pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8], _reserved: &crate::ReservedKernel) -> ! {
+pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut SystemTable, root: Option<*mut uefi::FileProtocol>, kernel: &[u8]) -> ! {
 	// Already read in `main`, where it also supplied the bootstrap set: exactly one of the two is
 	// present - a test medium carries the archive, a live medium the volume, and an installed
 	// system neither, because its volume is on the disk.

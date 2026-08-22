@@ -5,8 +5,6 @@
 // original's rights. This is the structural basis for least privilege when
 // capabilities are passed around the system.
 
-#![allow(dead_code)]
-
 use core::ops::{BitAnd, BitOr};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -17,13 +15,16 @@ impl Rights {
 
 	pub const READ: Rights = Rights(abi::RIGHT_READ);
 	pub const WRITE: Rights = Rights(abi::RIGHT_WRITE);
+	#[cfg(test)]
 	pub const EXECUTE: Rights = Rights(abi::RIGHT_EXECUTE);
 	pub const MAP: Rights = Rights(abi::RIGHT_MAP);
 	pub const SEND: Rights = Rights(abi::RIGHT_SEND);
 	pub const RECEIVE: Rights = Rights(abi::RIGHT_RECEIVE);
 	pub const DUPLICATE: Rights = Rights(abi::RIGHT_DUPLICATE);
 	pub const TRANSFER: Rights = Rights(abi::RIGHT_TRANSFER);
+	#[cfg(test)]
 	pub const REVOKE: Rights = Rights(abi::RIGHT_REVOKE);
+	#[cfg(test)]
 	pub const GET_INFO: Rights = Rights(abi::RIGHT_GET_INFO);
 	pub const MANAGE: Rights = Rights(abi::RIGHT_MANAGE);
 	pub const WAIT: Rights = Rights(abi::RIGHT_WAIT);
@@ -41,6 +42,7 @@ impl Rights {
 		Rights(bits & Self::ALL.0)
 	}
 
+	#[cfg(test)]
 	pub const fn is_empty(self) -> bool {
 		self.0 == 0
 	}

@@ -11,8 +11,6 @@
 // injects the resulting bytes with `console_feed`. Keeping it shared means a key
 // behaves identically no matter which keyboard produced it.
 
-#![allow(dead_code)]
-
 use rt::*;
 
 // Keycodes for the navigation and edit keys (all above the 64-entry ASCII KEYMAP),
@@ -66,9 +64,8 @@ pub const KEY_F24: u16 = 194;
 
 // Keycodes for the keypad block: the operator keys, KP Enter, and the digit /
 // navigation island KP7..KP0 + KP dot (which NumLock switches between digits and
-// navigation). KP* (55) sits inside the main KEYMAP; KP = and KP , appear on
-// extended and Brazilian keypads.
-pub const KEY_KPASTERISK: u16 = 55;
+// navigation). KP* (55) is in the main KEYMAP and needs no name here; KP = and KP ,
+// appear on extended and Brazilian keypads.
 pub const KEY_KP7: u16 = 71;
 pub const KEY_KP8: u16 = 72;
 pub const KEY_KP9: u16 = 73;
@@ -103,12 +100,10 @@ pub const KEY_RIGHTMETA: u16 = 126;
 pub const KEY_NUMLOCK: u16 = 69;
 pub const KEY_SCROLLLOCK: u16 = 70;
 
-// The remaining standard-keyboard keys: the Menu (context) key, Print Screen /
-// SysRq and Pause carry no terminal byte and are recognized but inert; the ISO
-// 102nd key (next to the left Shift) types as a second backslash on the US layout.
-pub const KEY_COMPOSE: u16 = 127;
-pub const KEY_SYSRQ: u16 = 99;
-pub const KEY_PAUSE: u16 = 119;
+// The remaining standard-keyboard keys. Menu (127), Print Screen / SysRq (99) and Pause
+// (119) carry no terminal byte and nothing names them - they fall through the keymap as
+// the inert codes they are. The ISO 102nd key (next to the left Shift) types as a second
+// backslash on the US layout, so it does have a name.
 pub const KEY_102ND: u16 = 86;
 const KEY_BACKSLASH: u16 = 43;
 

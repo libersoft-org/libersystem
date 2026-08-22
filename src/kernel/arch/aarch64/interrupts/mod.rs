@@ -16,8 +16,6 @@
 // through the higher-half physical direct map (phys_to_virt), so - unlike x86 - no
 // separate uncacheable mapping is set up here.
 
-#![allow(dead_code)]
-
 use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use alloc::sync::Arc;

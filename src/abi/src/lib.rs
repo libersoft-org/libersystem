@@ -9,7 +9,6 @@
 //! build-std) and for the host (as a build-dependency) alike.
 
 #![no_std]
-#![allow(dead_code)]
 
 extern crate alloc;
 

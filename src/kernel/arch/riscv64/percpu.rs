@@ -7,8 +7,6 @@
 // hart initializes its slot), and indexed by our contiguous CPU id (the boot hart is
 // 0) - no compile-time hart cap.
 
-#![allow(dead_code)]
-
 use core::arch::asm;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};

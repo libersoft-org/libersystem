@@ -6,8 +6,6 @@
 // (cooperatively yielding between checks); a true blocking wait is layered on top
 // later without changing this object.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -34,6 +32,7 @@ impl Event {
 	}
 
 	// Lower the signal.
+	#[cfg(test)]
 	pub fn clear(&self) {
 		self.signaled.store(false, Ordering::Release);
 	}

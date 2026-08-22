@@ -8,8 +8,6 @@
 // `wait` rather than busy-polling a syscall) without yet needing a UART RX
 // interrupt or a console driver process.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 

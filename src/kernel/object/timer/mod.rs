@@ -5,8 +5,6 @@
 // a blocking wait that sleeps the caller until expiry is layered on top once the
 // scheduler can block a thread, without changing this object.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -42,6 +40,7 @@ impl Timer {
 	//
 	// Also a wake: a waiter blocked on a deadline that has just been withdrawn has to be
 	// let go rather than left waiting for a moment that will not come.
+	#[cfg(test)]
 	pub fn cancel(&self) {
 		self.armed.store(false, Ordering::Release);
 		crate::sched::wake_object(self.header.koid());

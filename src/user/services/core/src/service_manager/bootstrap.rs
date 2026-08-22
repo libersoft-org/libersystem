@@ -261,11 +261,11 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
-			None => return State::Failed,
+			None => return (State::Failed, Reason::BootstrapRefused),
 		};
 		// The pinned bootstrap set is raw-spawned from the init package (it is on the path
 		// to mounting the system volume, so it cannot load from it); every other service is
@@ -276,13 +276,13 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			artifact.extend_from_slice(services::executable::SUFFIX.as_bytes());
 			match package.lookup(&artifact) {
 				Some(elf) => spawn(elf, service_side),
-				None => return State::Failed,
+				None => return (State::Failed, Reason::BootstrapRefused),
 			}
 		} else {
 			launch_from_volume(*process_client, program, service_side)
 		};
 		if proc < 0 {
-			return State::Failed;
+			return (State::Failed, Reason::BootstrapRefused);
 		}
 		// Keep the spawned Process handle so SystemGraphService can be handed a read-only
 		// duplicate of it (the live data source for this component's graph node).
@@ -318,7 +318,7 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 		if !hand_wired {
 			let index: usize = match index_of(name) {
 				Some(index) => index,
-				None => return State::Failed,
+				None => return (State::Failed, Reason::BootstrapRefused),
 			};
 			// THE ONE FACT THE PLAN CANNOT CARRY YET, supplied here rather than hidden in a branch.
 			//
@@ -500,7 +500,7 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				None
 			};
 			if !deliver_roles(manager_side, index, kept, &mut external) {
-				return State::Failed;
+				return (State::Failed, Reason::BootstrapRefused);
 			}
 			// THE ENDS THIS SUPERVISOR KEEPS, copied out of the plan's own table into the names the
 			// remaining hand-written branches still read. Every line here goes when the branch that
@@ -555,10 +555,10 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 		// bootstrap is read positionally, so `recv_tagged` checks the tag of the next message rather
 		// than searching for one, and anything inserted in the middle shifts every read after it.
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
-			return State::Failed;
+			return (State::Failed, Reason::BootstrapRefused);
 		}
 		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
-			return State::Failed;
+			return (State::Failed, Reason::BootstrapRefused);
 		}
 		match recv_blocking(manager_side, buf) {
 			Received::Message { len, handle } => {
@@ -570,7 +570,7 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 					let start: usize = (BOOTSTRAP_FAILURE.len() + 1).min(len);
 					*failure_out = String::from_utf8_lossy(&buf[start..len]).into_owned();
 					emit_event(*log_client, name, failure_out.as_bytes());
-					return State::Failed;
+					return (State::Failed, Reason::BootstrapRefused);
 				}
 				// DeviceManager hands its block-read service channel up with its report;
 				// keep it so StorageService can be bootstrapped against the disk.
@@ -642,14 +642,14 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 					b"permission_manager" => kept.register(name, CAP_SERVE, *perm_client),
 					_ => {}
 				}
-				State::Ready
+				(State::Ready, Reason::ReportedReady)
 			}
 			Received::Closed => {
 				// The service closed its bootstrap channel without reporting - it crashed during
 				// bring-up before it could send a failure report. Record that so the status view
 				// still carries a reason rather than a bare "failed".
 				*failure_out = String::from("bootstrap channel closed without a report");
-				State::Failed
+				(State::Failed, Reason::NoReport)
 			}
 		}
 	}

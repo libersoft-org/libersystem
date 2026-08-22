@@ -18,7 +18,6 @@ pub struct GopFb {
 	pub phys: u64,
 	// Read only by the x86 backend (to map the framebuffer into the HHDM); the
 	// device-tree arches pass the physical base straight through and never map it.
-	#[allow(dead_code)]
 	pub size: u64,
 	pub width: u32,
 	pub height: u32,

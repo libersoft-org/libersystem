@@ -89,7 +89,6 @@ pub fn enable_interrupts() {
 	}
 }
 
-#[allow(dead_code)]
 pub fn disable_interrupts() {
 	unsafe {
 		asm!("cli", options(nomem, nostack, preserves_flags));

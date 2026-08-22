@@ -12,8 +12,6 @@
 // D extension, so these are preserved across a switch). SSTATUS.FS is enabled at boot
 // so the fsd / fld here do not trap.
 
-#![allow(dead_code)]
-
 use core::arch::{asm, global_asm};
 
 unsafe extern "C" {

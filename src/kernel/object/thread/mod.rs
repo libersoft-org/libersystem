@@ -6,8 +6,6 @@
 // way in. The thread owns its stack memory, which is freed when the last Arc to
 // the thread is dropped (after it has exited and been switched away from).
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -188,6 +186,7 @@ impl KernelStack {
 	// A LOWER BOUND, deliberately: a frame that stored only zeroes leaves no trace, so the true
 	// figure can be higher. That is the right direction for the error to lean - it can say a stack
 	// is too small and cannot say a stack is safe.
+	#[cfg(test)]
 	pub fn used_bytes(&self) -> usize {
 		let start = self.base + crate::mem::frame::PAGE_SIZE;
 		let len = self.pages * crate::mem::frame::PAGE_SIZE as usize;
@@ -212,6 +211,7 @@ impl KernelStack {
 	}
 
 	// One past the highest mapped byte - what a stack pointer starts at.
+	#[cfg(test)]
 	pub fn top(&self) -> u64 {
 		self.usable_base() + self.capacity() as u64
 	}
@@ -306,6 +306,7 @@ impl Thread {
 		self.run_link.lock()
 	}
 
+	#[cfg(test)]
 	pub fn tid(&self) -> u64 {
 		self.tid
 	}
@@ -357,6 +358,7 @@ impl Thread {
 	// The high-water mark of this thread's kernel stack, and what it had to spend. Read from
 	// outside the thread (the spawner keeps an `Arc`), so the measurement does not itself deepen
 	// the stack it is measuring.
+	#[cfg(test)]
 	pub fn kstack_used(&self) -> usize {
 		self.stack.used_bytes()
 	}
@@ -370,6 +372,7 @@ impl Thread {
 		(self.stack.usable_base(), self.stack.capacity())
 	}
 
+	#[cfg(test)]
 	pub fn kstack_capacity(&self) -> usize {
 		self.stack.capacity()
 	}

@@ -6,8 +6,6 @@
 // need. Its frequency is calibrated once against the PIT so a raw cycle count
 // can be reported as nanoseconds.
 
-#![allow(dead_code)]
-
 use super::pit;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};

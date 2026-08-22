@@ -23,7 +23,7 @@ use proto::system::{config, network, process};
 use services::executable;
 use surface::{Client as DisplayClient, Mapping, Rect};
 
-include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/runtime_path.rs"));
 
 // The shell's command vocabulary, shared with the shell itself: the line discipline
 // completes the command word on Tab, and the shell prints the matches on a double Tab.

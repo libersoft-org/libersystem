@@ -28,7 +28,6 @@ pub struct Package {
 	pub path: Vec<String>,
 	pub version: u32,
 	// Kept for diagnostics once the generator reports package-level issues.
-	#[allow(dead_code)]
 	pub span: Span,
 }
 

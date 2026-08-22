@@ -41,7 +41,7 @@ use alloc::vec::Vec;
 mod tests;
 
 mod dir;
-use dir::{Location, Raw, Understanding, build_entries, build_exfat_set, check_name, dos_datetime, exfat_free_run, exfat_mark_unlinked, exfat_set_checksum, free_run, mark_unlinked, parse_exfat_dir, parse_fat_dir, scrub_after_terminator, split_parent, writable_name};
+use dir::{Raw, Understanding, build_entries, build_exfat_set, check_name, dos_datetime, exfat_free_run, exfat_mark_unlinked, exfat_set_checksum, free_run, mark_unlinked, parse_exfat_dir, parse_fat_dir, scrub_after_terminator, split_parent, writable_name};
 #[cfg(test)]
 use dir::{existing_shorts, short_char, trim_spaces};
 

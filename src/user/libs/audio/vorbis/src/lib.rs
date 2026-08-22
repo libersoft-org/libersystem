@@ -34,13 +34,11 @@ macro_rules! record_post_mdct {
 }
 
 #[path = "core/audio.rs"]
-#[allow(dead_code)]
 mod audio;
 #[path = "core/bitpacking.rs"]
 mod bitpacking;
 pub mod encode;
 #[path = "core/header.rs"]
-#[allow(dead_code)]
 mod header;
 #[path = "core/header_cached.rs"]
 mod header_cached;
@@ -52,7 +50,6 @@ mod imdct;
 #[path = "core/imdct_test.rs"]
 mod imdct_test;
 #[path = "core/samples.rs"]
-#[allow(dead_code)]
 mod samples;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

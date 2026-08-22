@@ -20,12 +20,10 @@
 #![no_std]
 #![no_main]
 
-mod common;
-mod virtio;
-
 use rt::*;
 
 use crate::virtio::{Queue, Virtio};
+use drivers::{common, virtio};
 
 // virtio-gpu control commands (the 2D subset) and the two responses we check.
 const CMD_GET_DISPLAY_INFO: u32 = 0x0100;

@@ -1514,7 +1514,6 @@ fn validate_descriptor(block: &[u8], expected_tag: u16, expected_location: u32) 
 // property and were left on `38` and `216`: a forged `DescriptorCRCLength` could cover the fixed part
 // and leave the name, or the descriptors this reader then follows to read data, outside the range the
 // CRC vouches for.
-#[cfg_attr(test, allow(dead_code))]
 fn validate_descriptor_covering(block: &[u8], expected_tag: u16, expected_location: Option<u32>, end: usize, must_cover: usize) -> bool {
 	if !validate_descriptor_within(block, expected_tag, expected_location, end) {
 		return false;

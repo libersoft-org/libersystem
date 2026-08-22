@@ -8,7 +8,6 @@
 // and each caller keeps its own mapping. ET_DYN metadata is exposed through a bounded
 // PT_DYNAMIC iterator; relocation policy remains the kernel loader's responsibility.
 // The machine constants for the other architectures are unused on any single build.
-#![allow(dead_code)]
 // ELF identification / header fields validated on parse.
 const ELF_MAGIC: [u8; 4] = [0x7f, b'E', b'L', b'F'];
 const ELFCLASS64: u8 = 2;
@@ -19,6 +18,7 @@ const ELFDATA2LSB: u8 = 1;
 // is fail-open on the field whose entire job is to say which layout follows.
 const EV_CURRENT: u8 = 1;
 const EI_VERSION: usize = 6;
+#[cfg(test)]
 const SHT_STRTAB: u32 = 3;
 const SHT_NOTE: u32 = 7;
 const SHF_ALLOC: u64 = 1 << 1;

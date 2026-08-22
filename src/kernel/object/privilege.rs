@@ -17,8 +17,6 @@
 // different authorities held by different components, and a single "console capability" would
 // mean whoever may type into the console may also take the screen.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use core::any::Any;
 
@@ -47,6 +45,7 @@ pub enum PrivilegeKind {
 }
 
 impl PrivilegeKind {
+	#[cfg(test)]
 	pub fn name(self) -> &'static str {
 		match self {
 			PrivilegeKind::DisplayController => "DisplayController",

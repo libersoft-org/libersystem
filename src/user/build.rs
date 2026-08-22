@@ -10,7 +10,9 @@ use std::env;
 use std::fs;
 use std::path::PathBuf;
 
-fn main() {
+// PUBLIC because one crate includes this file as a module and calls it rather than being built by
+// it: services/core has generation of its own to do after the shared configuration.
+pub fn main() {
 	configure();
 }
 

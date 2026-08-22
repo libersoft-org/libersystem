@@ -47,7 +47,7 @@ const IMAGE_TARGET: &str = "aarch64-unknown-none";
 const IMAGE_TARGET: &str = "riscv64gc-unknown-none-elf";
 
 include!(concat!(env!("OUT_DIR"), "/library_paths.rs"));
-include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/program_path.rs"));
 
 struct MappedFile {
 	handle: u64,

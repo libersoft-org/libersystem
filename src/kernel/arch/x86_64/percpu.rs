@@ -7,8 +7,6 @@
 // included - initializes its slot), and indexed by our contiguous CPU id (the
 // BSP is 0).
 
-#![allow(dead_code)]
-
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, Ordering};
 
@@ -144,6 +142,7 @@ pub fn in_user_syscall() -> bool {
 // assembly) and by the kernel's own `invoke` (to false), which is the only other way into
 // the syscall table. The other two ports have always had this; x86_64 did not, because it
 // inferred the answer from the caller's return address - see the note on `syscall_entry`.
+#[cfg(test)]
 pub fn set_from_user(value: bool) {
 	let base = msr::read(IA32_GS_BASE);
 	unsafe { (*(base as *mut PerCpu)).from_user = u64::from(value) };

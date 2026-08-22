@@ -8,8 +8,6 @@
 // not cover it). Each core's LAPIC lives at the same physical address, so the
 // single mapping serves every core.
 
-#![allow(dead_code)]
-
 use super::port::outb;
 use super::{msr, paging, pit};
 use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};

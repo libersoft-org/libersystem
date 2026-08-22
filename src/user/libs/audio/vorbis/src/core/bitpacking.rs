@@ -265,7 +265,6 @@ fn float32_unpack(val: u32) -> f32 {
 }
 
 // allow some code that is only used in the tests
-#[allow(dead_code)]
 impl<'a> BitpackCursor<'a> {
 	/// Creates a new `BitpackCursor` for the given data array
 	pub fn new(arr: &'a [u8]) -> BitpackCursor<'a> {

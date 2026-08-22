@@ -15,7 +15,6 @@ This module decodes the audio packets given to it.
 use crate::bitpacking::BitpackCursor;
 use crate::header::{Codebook, Floor, FloorTypeOne, FloorTypeZero, HuffmanVqReadErr, IdentHeader, Mapping, Residue, SetupHeader};
 use crate::ilog;
-#[allow(unused_imports)]
 use crate::imdct;
 use crate::samples::Samples;
 use alloc::vec;
@@ -862,7 +861,6 @@ fn dct_iv_slow(buffer: &mut [f32]) {
 	}
 }
 
-#[allow(dead_code)]
 fn inverse_mdct_slow(buffer: &mut [f32]) {
 	let n = buffer.len();
 	let n4 = n >> 2;
@@ -941,7 +939,6 @@ pub fn get_decoded_sample_count(ident: &IdentHeader, setup: &SetupHeader, packet
 	Ok((right_win_start - left_win_start) as usize)
 }
 
-#[allow(unused_variables)]
 /**
 Main audio packet decoding function
 

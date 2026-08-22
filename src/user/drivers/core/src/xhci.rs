@@ -23,7 +23,6 @@
 extern crate alloc;
 
 mod hid;
-mod keys;
 mod usb_hid;
 mod usb_storage;
 
@@ -36,6 +35,7 @@ use rt::*;
 
 use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, configure_hid, handle_hid_event, post_reports};
 use crate::usb_storage::{STATUS_ERR, Storage, configure_storage, reply_block, serve_block_request};
+use drivers::keys;
 
 // Capability registers (at the mapped BAR base).
 const CAP_CAPLENGTH: u64 = 0x00; // u8: operational-register offset

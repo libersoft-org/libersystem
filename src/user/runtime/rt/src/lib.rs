@@ -11,7 +11,6 @@
 //     pub extern "C" fn __user_main(bootstrap: u64) -> ! { ... }
 
 #![no_std]
-#![allow(dead_code)]
 #![cfg_attr(feature = "shared-image", no_builtins)]
 
 extern crate alloc;
@@ -140,6 +139,7 @@ pub unsafe extern "C" fn liber_memcpy_impl(destination: *mut u8, source: *const 
 	destination
 }
 
+#[cfg(feature = "shared-image")]
 unsafe fn move_bytes(destination: *mut u8, source: *const u8, len: usize) {
 	let destination_address = destination as usize;
 	let source_address = source as usize;

@@ -7,8 +7,6 @@
 // timestamp counter; that fallback is NOT cryptographic and only covers
 // environments without RDRAND (e.g. an old QEMU CPU model) - real targets have it.
 
-#![allow(dead_code)]
-
 use core::arch::x86_64::{__cpuid, _rdrand64_step};
 use core::sync::atomic::{AtomicU64, Ordering};
 

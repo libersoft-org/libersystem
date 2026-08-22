@@ -18,6 +18,7 @@ mod device;
 mod elf;
 mod extable;
 mod fault;
+#[cfg(test)]
 mod graph;
 mod loader;
 mod mem;

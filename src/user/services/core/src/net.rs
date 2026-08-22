@@ -6,8 +6,6 @@
 // any reply back to the driver to transmit. It carries no device knowledge - the
 // driver owns the NIC; the service owns the protocol.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 // EtherType values (the 2-byte type field of an Ethernet II frame).
@@ -285,8 +283,9 @@ impl DhcpLease {
 #[derive(Clone, Copy)]
 pub enum Event {
 	None,
-	// We learned a neighbor's MAC (from an ARP reply for an address we asked about).
-	Learned(Ipv4Addr, MacAddr),
+	// We learned a neighbor's MAC (from an ARP reply for an address we asked about). The pair
+	// itself goes into the stack's neighbour table, which is where a reader takes it from.
+	Learned,
 	// An ICMP echo reply arrived (a `ping` we sent was answered): the responder's
 	// address, the reply packet's IP TTL, and the echoed sequence number.
 	EchoReply(Ipv4Addr, u8, u16),
@@ -596,7 +595,7 @@ impl Stack {
 			return Outcome { reply_len: len, event: Event::None };
 		}
 		if op == ARP_OP_REPLY {
-			return Outcome { reply_len: 0, event: Event::Learned(sender_ip, sender_mac) };
+			return Outcome { reply_len: 0, event: Event::Learned };
 		}
 		Outcome { reply_len: 0, event: Event::None }
 	}
@@ -1032,19 +1031,6 @@ impl Stack {
 	// Whether the peer has closed its half of connection `ci` (sent a FIN).
 	pub fn tcp_peer_fin(&self, ci: usize) -> bool {
 		self.conns[ci].peer_fin
-	}
-
-	// Drain buffered received data from connection `ci` into `dst`, returning the byte
-	// count moved.
-	pub fn tcp_take_rx(&mut self, ci: usize, dst: &mut [u8]) -> usize {
-		let rx_len: usize = self.conns[ci].rx_len;
-		let n: usize = rx_len.min(dst.len());
-		dst[..n].copy_from_slice(&self.conns[ci].rx[..n]);
-		if n < rx_len {
-			self.conns[ci].rx.copy_within(n..rx_len, 0);
-		}
-		self.conns[ci].rx_len -= n;
-		n
 	}
 
 	// Drain EVERYTHING buffered on connection `ci` in one move: the chunk is as

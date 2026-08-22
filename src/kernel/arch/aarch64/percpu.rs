@@ -5,8 +5,6 @@
 // static pool (no heap dependency during early bring-up) indexed by our
 // contiguous CPU id (the BSP is 0); `allocate` records how many the machine has.
 
-#![allow(dead_code)]
-
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};

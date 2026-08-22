@@ -15,8 +15,6 @@
 // through the backend's `phys_to_virt`. QEMU-only: the MMIO is reached through a
 // normal-memory direct-map mapping, which is fine under QEMU's IO dispatch.
 
-#![allow(dead_code)]
-
 use core::ptr::{read_volatile, write_volatile};
 
 // fw-cfg MMIO register offsets (QEMU "qemu,fw-cfg-mmio").

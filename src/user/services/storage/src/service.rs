@@ -1119,14 +1119,14 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 	let set: i64 = unsafe { waitset_create() };
 	if set < 0 {
 		unsafe { print(b"storage: cannot create the wait set; the service cannot serve\n") };
-		unsafe { exit() };
+		exit();
 	}
 	let set: u64 = set as u64;
 
 	let mut clients: Vec<Client> = Vec::new();
 	if !admit_client(set, &mut clients, Client { chan: root, koid: 0, scope: Scope::Full, quiet: false, writer: None }) {
 		unsafe { print(b"storage: cannot admit the root client; the service cannot serve\n") };
-		unsafe { exit() };
+		exit();
 	}
 	// The admin joins once too, and leaves when its peer closes. Its koid is kept beside the handle
 	// because the wait answers with koids and this comparison happens every pass.
@@ -1135,7 +1135,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		let koid = unsafe { waitset_add(set, admin) };
 		if koid <= 0 {
 			unsafe { print(b"storage: cannot watch the admin channel; the service cannot serve\n") };
-			unsafe { exit() };
+			exit();
 		}
 		admin_koid = koid as u64;
 	}
@@ -1272,7 +1272,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		}
 		if admin != 0 && ready == admin_koid {
 			match unsafe { recv_caps_blocking(admin, &mut request) } {
-				ReceivedCaps::Message { len, handles: mut caps } => {
+				ReceivedCaps::Message { len, handles: caps } => {
 					let mut reply_handle = proto::codec::Handles::new();
 					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
 					// over the single-handle receive, which keeps the first and drops the rest - so a
@@ -1342,7 +1342,7 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 				release_client(set, &mut clients, index);
 				unsafe { close(chan) };
 			}
-			ReceivedCaps::Message { len, handles: mut caps } => {
+			ReceivedCaps::Message { len, handles: caps } => {
 				// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
 				// over the single-handle receive, which keeps the first and drops the rest - so a
 				// client sending stdin, stdout and stderr had two destroyed before dispatch.
@@ -2957,7 +2957,7 @@ impl BlockDevice for ImageDevice {
 // Sized from the image rather than from the scratch sizes the other memory volumes carry: a live
 // session's system volume holds what the medium shipped, plus room to work in.
 unsafe fn live_volume(handle: u64) -> Option<LiberMemFs> {
-	let image = unsafe { read_buffer(&Buffer { handle, len: unsafe { object_info(handle) }?.size }) }?;
+	let image = unsafe { read_buffer(&Buffer { handle, len: object_info(handle)?.size }) }?;
 	// Sized from what the image HOLDS, not from how big the image is: a compressed source expands,
 	// names cost, and a buffer keeps the capacity it grew to. Guessing from the image size is how
 	// a copy runs out of room half way through.
@@ -3052,7 +3052,7 @@ fn copy_tree(source: &mut LiberFs<ImageDevice>, live: &mut LiberMemFs, dir: &[u8
 // how a system quietly runs out of memory later.
 fn mem_capacity(bytes: &[u8]) -> usize {
 	let text = core::str::from_utf8(bytes).unwrap_or("");
-	text.trim().parse::<usize>().unwrap_or_else(|_| unsafe { exit() })
+	text.trim().parse::<usize>().unwrap_or_else(|_| exit())
 }
 
 // LAZY, like `FatBacking` above and for the same reason.
@@ -3832,7 +3832,6 @@ unsafe fn map_buffer(data: &Buffer) -> Option<MappedBuffer> {
 // Copy the bytes behind a zero-copy `data` buffer out into a Vec and release the
 // transferred buffer handle. Always consumes the handle. Returns None on failure or
 // if the claimed length exceeds the transferred object's real size.
-#[allow(dead_code)]
 unsafe fn read_buffer(data: &Buffer) -> Option<Vec<u8>> {
 	unsafe {
 		if data.handle == 0 {

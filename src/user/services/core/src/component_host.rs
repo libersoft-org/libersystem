@@ -38,7 +38,8 @@ use service_logic::world_errors::{log_failure, read_failure, write_failure};
 use wasm::module::FuncType;
 use wasm::{Instance, Module, ValidatedModule, Value};
 
-include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/factory_path.rs"));
+include!(concat!(env!("OUT_DIR"), "/runtime_path.rs"));
 
 // The world itself - which imports are granted and how a `(ptr, len)` becomes a memory window -
 // lives in `component-world`, beside its tests. This binary is built for `*-unknown-none`, so

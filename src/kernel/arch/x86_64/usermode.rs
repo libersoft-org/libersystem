@@ -25,8 +25,6 @@
 // pointer from there. `paging::establish_cr4_policy` clears it on every core, and
 // `kernel.arch.ring_three_cannot_write_the_gs_base` is what keeps it cleared.
 
-#![allow(dead_code)]
-
 use core::arch::global_asm;
 
 use super::gdt;
@@ -47,6 +45,14 @@ pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;
 unsafe extern "C" {
 	fn user_enter(entry: u64, user_stack: u64, arg: u64, ksave: u64);
 	fn user_return() -> !;
+}
+
+// THE EMBEDDED RING-3 PROBE PROGRAMS, and they are the suite's fixtures rather than the kernel's.
+// Nothing in a running system enters ring 3 at a program the kernel carries - userspace arrives
+// through the loader - so these symbols and the eight accessors below are compiled with the tests
+// that copy them into a USER page. aarch64 and riscv64 carry the same set for the same tests.
+#[cfg(test)]
+unsafe extern "C" {
 	fn user_program_start();
 	fn user_program_end();
 	fn user_yield_program_start();
@@ -105,6 +111,7 @@ pub fn exit_to_kernel() -> ! {
 
 // The bytes of the embedded ring-3 test program (position-independent machine
 // code, copied into a USER page before entering).
+#[cfg(test)]
 pub fn program_bytes() -> &'static [u8] {
 	let start = user_program_start as *const () as usize;
 	let end = user_program_end as *const () as usize;
@@ -114,6 +121,7 @@ pub fn program_bytes() -> &'static [u8] {
 // The bytes of the embedded ring-3 fault-probe program (position-independent
 // machine code, copied into a USER page before entering). It writes to an
 // unmapped address to raise a page fault from ring 3.
+#[cfg(test)]
 pub fn program_fault_bytes() -> &'static [u8] {
 	let start = user_fault_program_start as *const () as usize;
 	let end = user_fault_program_end as *const () as usize;
@@ -121,12 +129,14 @@ pub fn program_fault_bytes() -> &'static [u8] {
 }
 
 // The bytes of the two exception probes above (see KERN-ARCH-004).
+#[cfg(test)]
 pub fn program_ud2_bytes() -> &'static [u8] {
 	let start = user_ud2_program_start as *const () as usize;
 	let end = user_ud2_program_end as *const () as usize;
 	unsafe { core::slice::from_raw_parts(start as *const u8, end - start) }
 }
 
+#[cfg(test)]
 pub fn program_divide_bytes() -> &'static [u8] {
 	let start = user_divide_program_start as *const () as usize;
 	let end = user_divide_program_end as *const () as usize;
@@ -137,6 +147,7 @@ pub fn program_divide_bytes() -> &'static [u8] {
 // independent machine code, copied into a USER page before entering). It yields a
 // few times - forcing it to interleave with a sibling ring-3 thread - then sends
 // "OK" over its bootstrap channel and exits.
+#[cfg(test)]
 pub fn program_yield_bytes() -> &'static [u8] {
 	let start = user_yield_program_start as *const () as usize;
 	let end = user_yield_program_end as *const () as usize;
@@ -146,6 +157,7 @@ pub fn program_yield_bytes() -> &'static [u8] {
 // The bytes of the embedded ring-3 no-execute probe (position-independent machine
 // code, copied into a USER page before entering). It jumps into its own stack
 // page; with W^X enforced the instruction fetch page-faults before anything runs.
+#[cfg(test)]
 pub fn program_nx_bytes() -> &'static [u8] {
 	let start = user_nx_program_start as *const () as usize;
 	let end = user_nx_program_end as *const () as usize;
@@ -155,6 +167,7 @@ pub fn program_nx_bytes() -> &'static [u8] {
 // The bytes of the embedded ring-3 stack-growth probe (position-independent
 // machine code, copied into a USER page before entering). It touches one page per
 // count walking down from its entry stack pointer, then exits cleanly.
+#[cfg(test)]
 pub fn program_stack_probe_bytes() -> &'static [u8] {
 	let start = user_stack_probe_program_start as *const () as usize;
 	let end = user_stack_probe_program_end as *const () as usize;
@@ -166,6 +179,7 @@ pub fn program_stack_probe_bytes() -> &'static [u8] {
 // syscall until released: it increments a counter and polls a stop flag in a
 // shared data page, so only timer-driven ring-3 preemption can let the thread
 // that sets the flag run on the same core.
+#[cfg(test)]
 pub fn program_spin_bytes() -> &'static [u8] {
 	let start = user_spin_program_start as *const () as usize;
 	let end = user_spin_program_end as *const () as usize;

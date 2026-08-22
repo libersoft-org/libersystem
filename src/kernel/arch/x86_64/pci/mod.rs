@@ -6,8 +6,6 @@
 // firmware assigns the BARs, so this backend probes bus 0 only and needs no BAR
 // allocator (`assign_bars` stays the common no-op).
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 
 use super::port::{inl, outl};
@@ -16,8 +14,7 @@ use crate::sync::SpinLock;
 
 // The PCI surface every backend re-exports (the HAL contract); not every type is
 // named directly in this backend's code.
-#[allow(unused_imports)]
-pub use common::{PciDevice, VirtioCap, VirtioDevice, XhciDevice, virtio_type_name};
+pub use common::{PciDevice, VirtioDevice, XhciDevice};
 
 // The PCI configuration mechanism #1 ports.
 const CONFIG_ADDRESS: u16 = 0xCF8;

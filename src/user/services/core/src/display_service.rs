@@ -611,7 +611,7 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 			let admin_index: usize = gpu_first as usize + kill_present as usize;
 			if ready as usize == admin_index {
 				match recv_caps_blocking(admin, &mut request) {
-					ReceivedCaps::Message { len, handles: mut caps } => {
+					ReceivedCaps::Message { len, handles: caps } => {
 						let mut reply_handle = proto::codec::Handles::new();
 						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
 						// over the single-handle receive, which keeps the first and drops the rest - so a
@@ -640,7 +640,7 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 			let client_index: usize = ready as usize - admin_index - 1;
 			let chan: u64 = clients[client_index].chan;
 			match recv_caps_blocking(chan, &mut request) {
-				ReceivedCaps::Message { len, handles: mut caps } if len == 0 => {
+				ReceivedCaps::Message { len, handles: caps } if len == 0 => {
 					for &leftover in caps.as_slice() {
 						close(leftover);
 					}
@@ -651,7 +651,7 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 					close(chan);
 					clients.swap_remove(client_index);
 				}
-				ReceivedCaps::Message { len, handles: mut caps } => {
+				ReceivedCaps::Message { len, handles: caps } => {
 					// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
 					// over the single-handle receive, which keeps the first and drops the rest - so a
 					// client sending stdin, stdout and stderr had two destroyed before dispatch.

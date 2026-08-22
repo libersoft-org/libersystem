@@ -11,8 +11,6 @@
 // is gone. A forward process-to-threads list for bulk termination arrives with
 // fault handling and the Domain hierarchy.
 
-#![allow(dead_code)]
-
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::sync::Weak;
@@ -331,6 +329,7 @@ impl Process {
 	// match while its own contract asked for uniqueness, so an ambiguous suffix silently
 	// resolved to whichever symbol the map happened to yield first - a different one after
 	// any change to the registry, with nothing to say the answer was a choice.
+	#[cfg(test)]
 	pub fn resolve_dynamic_symbol_by_suffix(&self, suffix: &str) -> Option<u64> {
 		let registry = self.dynamic_symbols.lock();
 		let mut matches = registry.iter().filter(|(name, _)| name.ends_with(suffix));
@@ -412,6 +411,7 @@ impl Process {
 		self.dynamic_modules.store(biases.len(), Ordering::Release);
 	}
 
+	#[cfg(test)]
 	pub fn release_dynamic_module(&self) {
 		self.dynamic_modules.fetch_sub(1, Ordering::AcqRel);
 	}
@@ -686,6 +686,7 @@ impl Process {
 	// ask whether any thread is left, so a short heap turned either syscall into a kernel abort. The
 	// allocation gate does not look at `collect` at all, which is how it stayed. Kept for the test
 	// suites, which are the callers that want an owned list and are not reachable from ring 3.
+	#[cfg(test)]
 	pub fn live_threads(&self) -> Vec<Arc<Thread>> {
 		let mut threads = self.threads.lock();
 		threads.retain(|w: &Weak<Thread>| w.strong_count() > 0);
@@ -801,10 +802,12 @@ impl Process {
 		self.user_frames.lock().len() as u64 * crate::mem::frame::PAGE_SIZE
 	}
 
+	#[cfg(test)]
 	pub fn private_image_pages(&self) -> usize {
 		self.user_frames.lock().len()
 	}
 
+	#[cfg(test)]
 	pub fn shared_image_pages(&self) -> usize {
 		self.shared_image_pages.lock().len()
 	}
@@ -964,6 +967,7 @@ pub struct ExtendGuard<'a> {
 }
 
 impl ExtendGuard<'_> {
+	#[cfg(test)]
 	pub fn process(&self) -> &Process {
 		self.process
 	}

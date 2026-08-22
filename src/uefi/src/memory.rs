@@ -274,7 +274,6 @@ pub unsafe fn translate_map(buf: *const uefi::MemoryDescriptor, map_size: usize,
 		if restrictive(cur.kind) && !restrictive(last.kind) {
 			// The restrictive descriptor takes the contested bytes: the usable one gives up its
 			// tail, and disappears entirely if that was all of it.
-			last.base = last.base;
 			last.length = cur.base - last.base;
 			if last.length == 0 {
 				// It contributed nothing; overwrite it rather than keeping an empty region.

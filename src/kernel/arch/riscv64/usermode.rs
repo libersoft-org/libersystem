@@ -15,8 +15,6 @@
 // interrupt cannot fire in the window where SSCRATCH is armed but the hart is still
 // in S-mode; `sret` restores SIE from SPIE = 1, so U-mode itself is preemptible.
 
-#![allow(dead_code)]
-
 use core::arch::global_asm;
 
 pub const FAULT_PROBE_ADDR: u64 = 0x0dea_d000;

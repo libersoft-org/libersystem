@@ -34,7 +34,7 @@ use proto::system::session::{self, Service};
 use proto::system::{EnvVar, Error, JobEntry, JobInfo, JobSignalKind, JobTarget};
 use rt::*;
 
-include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/runtime_path.rs"));
 include!(concat!(env!("OUT_DIR"), "/roles_session_service.rs"));
 
 // The default working directory a fresh session starts in: the root of the system

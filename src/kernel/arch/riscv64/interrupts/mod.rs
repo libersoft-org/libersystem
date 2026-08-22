@@ -14,8 +14,6 @@
 // delivery. The MSI-X table lives in a device BAR reached through the higher-half direct
 // map (phys_to_virt), so no separate uncacheable mapping is needed.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 
 use crate::arch::common::msi::MsiRegistry;

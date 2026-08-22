@@ -11,8 +11,6 @@
 // a higher-half kernel address - whose top bit is set - without it being mistaken
 // for an error.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 

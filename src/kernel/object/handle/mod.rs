@@ -8,8 +8,6 @@
 // A HandleTable is owned by a process. It is not internally locked; the owner
 // wraps it in a SpinLock when it is shared between a process's threads.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 
@@ -72,10 +70,12 @@ impl Capability {
 		Self { object, rights, badge, generation }
 	}
 
+	#[cfg(test)]
 	pub fn rights(&self) -> Rights {
 		self.rights
 	}
 
+	#[cfg(test)]
 	pub fn badge(&self) -> u64 {
 		self.badge
 	}
@@ -208,6 +208,7 @@ impl HandleTable {
 		self.slots.iter().filter(|s| s.cap.is_some()).count()
 	}
 
+	#[cfg(test)]
 	pub fn is_empty(&self) -> bool {
 		self.len() == 0
 	}
@@ -496,6 +497,7 @@ impl HandleTable {
 	}
 
 	// Inspect the badge a handle carries (stamped onto messages it sends).
+	#[cfg(test)]
 	pub fn badge_of(&self, handle: Handle) -> Result<u64, HandleError> {
 		Ok(self.live_cap_of(handle)?.badge)
 	}
@@ -524,6 +526,7 @@ impl HandleTable {
 
 	// A snapshot of every live handle in the table, for enumeration by the System
 	// Graph. Order follows the slot indices.
+	#[cfg(test)]
 	pub fn entries(&self) -> Vec<HandleInfo> {
 		let mut out = Vec::new();
 		for slot in &self.slots {
@@ -598,6 +601,7 @@ impl HandleTable {
 	// it returns is a NEW one - the old raw value died with its slot generation - which is
 	// why the rollback path has to hand the caller its new handles rather than pretending
 	// nothing happened.
+	#[cfg(test)]
 	pub fn put_back(&mut self, cap: Capability) -> Handle {
 		// ALLOC-OK: `HandleTable::insert`, not a collection insert - the table's own growth is reserved by its callers and checked where it happens.
 		self.insert(cap)
@@ -724,6 +728,7 @@ impl HandleTable {
 		self.slots.len()
 	}
 
+	#[cfg(test)]
 	pub fn free_indices_for_test(&self) -> alloc::vec::Vec<u32> {
 		// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed. The gate
 		// exempts test code by PATH, which does not reach a test helper living in a source file.

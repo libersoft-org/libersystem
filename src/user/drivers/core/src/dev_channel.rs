@@ -24,13 +24,11 @@
 
 extern crate alloc;
 
-mod common;
-mod virtio;
-
 use alloc::vec::Vec;
 use rt::*;
 
 use crate::virtio::{Queue, Virtio};
+use drivers::{common, virtio};
 
 // The receive pool: enough slots that a burst of host writes is absorbed without the device
 // running out of buffers between two interrupts, each large enough that an ordinary control

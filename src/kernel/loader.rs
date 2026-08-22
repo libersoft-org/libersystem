@@ -4,8 +4,6 @@
 // a stack into it, endows the process with a bootstrap capability, and queues a
 // thread that drops to ring 3 at the program's entry point.
 
-#![allow(dead_code)]
-
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use alloc::vec::Vec;

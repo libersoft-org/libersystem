@@ -14,14 +14,11 @@
 #![no_std]
 #![no_main]
 
-mod common;
-mod keys;
-mod virtio;
-
 use rt::*;
 
 use crate::keys::Mods;
 use crate::virtio::{Queue, Virtio};
+use drivers::{common, keys, virtio};
 
 // virtio_input_event record: { type: u16, code: u16, value: u32 } little-endian,
 // 8 bytes. `type` EV_KEY carries a key event; `value` is 1 (press), 2 (autorepeat)

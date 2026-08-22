@@ -184,9 +184,3 @@ pub fn try_claim() -> bool {
 pub fn release_claim() {
 	DISABLED.store(false, Ordering::Release);
 }
-
-// Whether the framebuffer has been handed to userspace (so a second framebuffer_map
-// is refused - the first mapper owns the display).
-pub fn is_disabled() -> bool {
-	DISABLED.load(Ordering::Acquire)
-}

@@ -22,12 +22,13 @@ use services::executable;
 use services::shell_language::{ExpandedStage, Expansion, ParseError, RedirectError, expand_redirects, parse_and_expand, parse_assignment, parse_pipeline, trim};
 use storage_proto::path;
 
-include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/runtime_path.rs"));
 
 // The shell's builtins, shared with ConsoleService's line discipline: Tab completes the
 // command word over the builtins plus the live bin/ listing, and the shell prints the
 // matches on a double Tab - the way bash completes its builtins plus $PATH.
 mod commands;
+mod synopses;
 
 // the working directory the shell starts in - the persistent system volume, so the
 // prompt sits in real storage and relative paths resolve against it
@@ -897,7 +898,7 @@ fn strip_word_or_bare<'a>(line: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
 unsafe fn print_help(cmd: Option<&[u8]>) {
 	unsafe {
 		if let Some(cmd) = cmd {
-			match commands::synopsis(cmd) {
+			match synopses::synopsis(cmd) {
 				Some(text) => {
 					print(text.as_bytes());
 					print(b"\n");
@@ -910,7 +911,7 @@ unsafe fn print_help(cmd: Option<&[u8]>) {
 			}
 			return;
 		}
-		let mut rows: Vec<&'static str> = commands::SYNOPSES.iter().map(|&(_, text)| text).collect();
+		let mut rows: Vec<&'static str> = synopses::SYNOPSES.iter().map(|&(_, text)| text).collect();
 		rows.sort_unstable();
 		for text in rows {
 			print(text.as_bytes());

@@ -102,13 +102,17 @@ struct Role {
 }
 
 // How a role is delivered, which is also what decides whether it can be delivered AGAIN.
+//
+// NO `Power`. The manifest schema still has that kind and `system-manifest` still understands it -
+// as the tripwire that REFUSES it, since the list of services allowed to hold the root Domain is
+// empty. P02M0141 converted the last one, so no manifest row can produce it and this executor has
+// no arm to deliver it with. `build.rs` fails the build rather than emitting one.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RoleKind {
 	ServeRoot,
 	Client,
 	Factory,
 	Privilege,
-	Power,
 	Package,
 	Device,
 	Payload,
@@ -160,11 +164,13 @@ enum Desired {
 // an instance that no longer exists rather than applied to its replacement. The sequence orders
 // transitions within a boot; the boot id says which boot they belong to, and it comes from the
 // kernel so it survives the first userspace process being replaced.
+//
+// IT DOES NOT STORE `from` AND `to`. Both were written and neither was read: the state a service is
+// in is `state[i]`, which the status view already reports, and it is by construction the `to` of
+// the newest transition. What only this record can answer is WHY, and for WHICH INSTANCE.
 #[derive(Clone, Copy)]
 struct Transition {
 	service: usize,
-	from: State,
-	to: State,
 	// The KOID of the process this is about, or 0 before one exists. Used AS the instance epoch:
 	// koids are handed out by a monotonic counter that never reuses a value, so an epoch needs no
 	// allocator of its own.
@@ -174,6 +180,11 @@ struct Transition {
 }
 
 // Why a transition happened. A count of restarts says how often; this says what for.
+//
+// NO `Unresponsive`. The watchdog watches the canary and nothing else - `watchdog_trips` is
+// incremented for `watchdog_probe` alone - and the canary has no row in this log. Naming a reason
+// no transition can carry is the same defect as a field nothing reads, and giving managed services
+// a watchdog is a feature, not a warning to silence.
 #[derive(Clone, Copy, PartialEq)]
 enum Reason {
 	// Its dependencies came up and the supervisor started it.
@@ -186,8 +197,6 @@ enum Reason {
 	NoReport,
 	// The process faulted or exited.
 	Faulted,
-	// It missed its watchdog deadline.
-	Unresponsive,
 	// A stop was asked for.
 	StopRequested,
 	// It was restarted and this record is about the instance that was replaced.
@@ -202,16 +211,18 @@ enum Reason {
 // diagnosed from.
 const TRANSITIONS_KEPT: usize = 64;
 
+// NO BOOT ID. The log lives in this process and dies with it, nothing reports it and nothing
+// compares two boots, so the field was written once and read never. Attributing transitions to a
+// boot needs a reader before it needs a field, and `rt::boot_id()` is still there when one exists.
 struct LifecycleLog {
-	boot: u64,
 	sequence: u64,
 	entries: [Option<Transition>; TRANSITIONS_KEPT],
 	next: usize,
 }
 
 impl LifecycleLog {
-	fn new(boot: u64) -> LifecycleLog {
-		LifecycleLog { boot, sequence: 0, entries: [None; TRANSITIONS_KEPT], next: 0 }
+	fn new() -> LifecycleLog {
+		LifecycleLog { sequence: 0, entries: [None; TRANSITIONS_KEPT], next: 0 }
 	}
 
 	// Record one transition. A no-op when nothing changed, so a poll that finds a service where it
@@ -221,7 +232,7 @@ impl LifecycleLog {
 			return;
 		}
 		self.sequence += 1;
-		self.entries[self.next] = Some(Transition { service, from, to, epoch, reason, sequence: self.sequence });
+		self.entries[self.next] = Some(Transition { service, epoch, reason, sequence: self.sequence });
 		self.next = (self.next + 1) % TRANSITIONS_KEPT;
 	}
 
@@ -419,7 +430,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// deliberately stopped and one that never came up are the same observation.
 	let mut desired: [Desired; N] = [Desired::Running; N];
 	// The lifecycle record: which boot, which instance, in what order, and why.
-	let mut lifecycle = LifecycleLog::new(unsafe { boot_id() });
+	let mut lifecycle = LifecycleLog::new();
 	// The client ends kept from every serve root, so a service the plan wires can be a client of a
 	// provider a hand-written branch still wires. One table for the whole bring-up, because a role
 	// resolves against what was kept BEFORE it, which is what the start order already guarantees.
@@ -534,7 +545,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Absent && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
 				// bring-up waits for the report, but it is the honest name for the window between
 				// a process existing and a service answering, and it is what a later non-blocking
@@ -548,7 +559,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				let epoch: u64 = unsafe { epoch_of(proc_handle) };
 				lifecycle.record(i, state[i], State::Starting, epoch, Reason::Started);
 				state[i] = State::Starting;
-				lifecycle.record(i, State::Starting, started, epoch, if started == State::Ready { Reason::ReportedReady } else { Reason::NoReport });
+				lifecycle.record(i, State::Starting, started, epoch, why);
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -1160,13 +1171,19 @@ unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N
 			close(procs[idx]);
 			procs[idx] = 0;
 		}
-		broker.lifecycle.record(idx, State::Stopping, State::Failed, epoch, Reason::Replaced);
+		// WHY IT IS FAILED, and the two answers are not the same fact. A service whose budget is
+		// spent stays down deliberately; one that is about to be relaunched is merely being
+		// replaced. This recorded `Replaced` either way, so `last_reason` - which goes out over the
+		// supervisor stat contract - could never say "restart budget spent" about a service that
+		// had just spent it, which is the first thing anyone looks for.
+		let budget_spent: bool = restartable(idx) && sup[idx].restarts >= budget;
+		broker.lifecycle.record(idx, State::Stopping, State::Failed, epoch, if budget_spent { Reason::BudgetSpent } else { Reason::Replaced });
 		state[idx] = State::Failed;
 		if !restartable(idx) {
 			return false;
 		}
 		// Spend from the restart budget; once exhausted, escalate rather than restart.
-		if sup[idx].restarts >= budget {
+		if budget_spent {
 			return false;
 		}
 		sleep_ticks(park, RESTART_BACKOFF_TICKS * (sup[idx].restarts as u64 + 1));

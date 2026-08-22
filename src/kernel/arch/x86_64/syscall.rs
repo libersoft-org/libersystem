@@ -19,8 +19,6 @@
 //   rax = syscall number          rax = return value
 //   rdi, rsi, rdx, r10 = args 0..3 (r10 not rcx, since `syscall` clobbers rcx)
 
-#![allow(dead_code)]
-
 use core::arch::global_asm;
 
 use super::msr;
@@ -135,6 +133,7 @@ pub fn init() {
 // SAFETY: kept `unsafe` for its callers' sake - the syscall table it reaches expects the
 // arguments a syscall's ABI defines, and passing the wrong ones is as unsound here as it
 // would be from ring 3.
+#[cfg(test)]
 pub unsafe fn invoke(num: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> u64 {
 	super::percpu::set_from_user(false);
 	crate::syscall::syscall_dispatch(num, a0, a1, a2, a3)

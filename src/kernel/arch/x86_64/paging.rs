@@ -8,8 +8,6 @@
 // Scope: 4 kB pages only, no huge pages, and unmapping does not reclaim
 // now-empty intermediate tables (a deliberate, documented simplification).
 
-#![allow(dead_code)]
-
 use core::arch::asm;
 
 use crate::mem::frame;
@@ -99,6 +97,7 @@ pub fn establish_cr4_policy() {
 
 // Whether ring 3 can write the GS base on this core. Always false after
 // `establish_cr4_policy`, and read by the test that pins it.
+#[cfg(test)]
 pub fn user_can_write_gs_base() -> bool {
 	const CR4_FSGSBASE: u64 = 1 << 16;
 	let cr4: u64;
@@ -137,6 +136,7 @@ pub fn smap_enabled() -> bool {
 	SMAP_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
 
+#[cfg(test)]
 pub fn smep_enabled() -> bool {
 	SMEP_ENABLED.load(core::sync::atomic::Ordering::Acquire)
 }
@@ -177,6 +177,7 @@ pub fn clac_on_entry() {
 // the test scaffolds stage their embedded ring-3 programs this way.
 //
 // SAFETY: `dst` must be a mapped, writable destination for `bytes.len()` bytes.
+#[cfg(test)]
 pub unsafe fn copy_to_user_page(dst: u64, bytes: &[u8]) {
 	user_access(|| unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), dst as *mut u8, bytes.len()) });
 }
@@ -608,6 +609,7 @@ unsafe fn next_table_walk(table: *mut u64, index: usize) -> Option<u64> {
 // question for "may this be read" and the wrong one for cache attributes: `PCD` and `PWT` live on
 // the leaf and the tables above it carry neither, so the AND erases exactly the bits a caller
 // asking about cacheability needs (UEFI-003).
+#[cfg(test)]
 pub fn leaf_flags(virt: u64) -> Option<u64> {
 	const PS: u64 = 1 << 7;
 	unsafe {

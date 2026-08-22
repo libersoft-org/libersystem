@@ -316,7 +316,6 @@ fn imdct_step3_inner_s_loop_ld654(n: usize, e: &mut [f32], i_off: usize, a: &[f3
 	}
 }
 
-#[allow(dead_code)]
 pub fn inverse_mdct(cached_bd: &CachedBlocksizeDerived, buffer: &mut [f32], bs: u8) {
 	let n = buffer.len();
 	// Pre-condition.
@@ -723,7 +722,6 @@ pub fn inverse_mdct(cached_bd: &CachedBlocksizeDerived, buffer: &mut [f32], bs: 
 	}
 }
 
-#[allow(dead_code)]
 pub fn inverse_mdct_naive(cached_bd: &CachedBlocksizeDerived, buffer: &mut [f32]) {
 	let n = buffer.len();
 	let n2 = n >> 1;

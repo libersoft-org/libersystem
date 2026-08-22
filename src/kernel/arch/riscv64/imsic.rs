@@ -13,8 +13,6 @@
 // EID is claimed through stopei (0x15C). Each hart programs only its own file, so a
 // device's MSI targets the hart that acquired it (the one running the setup syscall).
 
-#![allow(dead_code)]
-
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 // QEMU virt (aia=aplic-imsic): the S-mode IMSIC files start at 0x2800_0000, one 4 KiB

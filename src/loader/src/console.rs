@@ -96,6 +96,11 @@ pub(crate) fn write_byte(byte: u8) -> bool {
 // AND WHEN NEITHER ANSWERS, NOTHING IS PRINTED. That is the whole change: a machine this loader
 // cannot identify gets silence for six diagnostic lines instead of a store to an address somebody
 // wrote down while looking at an emulator.
+// EVERYTHING BELOW IS FOR THE TWO BACKENDS THAT HAVE NO CONSOLE ADDRESS A PRIORI. x86_64 writes
+// COM1 at 0x3F8 after ExitBootServices and never asks these tables, so on that target this
+// discovery ran, found the firmware's console, and printed a line naming a UART the loader was
+// about to not use.
+#[cfg(not(target_arch = "x86_64"))]
 #[derive(Clone, Copy)]
 pub(crate) struct PostEbs {
 	pl011: bool,
@@ -106,6 +111,7 @@ pub(crate) struct PostEbs {
 	access_width: u32,
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 static mut POST_EBS: Option<PostEbs> = None;
 
 // The two firmware descriptions of the machine, as the configuration table published them.
@@ -113,16 +119,19 @@ static mut POST_EBS: Option<PostEbs> = None;
 // Kept because the console is not the only question they answer: `build_boot_info` asks them which
 // instruction reaches PSCI, which it used to infer from its own exception level. Read once here,
 // while the configuration table is still there.
+#[cfg(not(target_arch = "x86_64"))]
 static mut FIRMWARE_TABLES: (u64, u64) = (0, 0);
 
 // Physical addresses are reachable as themselves here: UEFI identity-maps memory for the loader,
 // and this runs before anything changes that.
+#[cfg(not(target_arch = "x86_64"))]
 fn identity(address: u64) -> u64 {
 	address
 }
 
 // Ask the machine where its console is. Called from `efi_main`, while the configuration table is
 // still there to be read.
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn discover(system_table: *mut uefi::SystemTable) {
 	let (mut dtb, mut rsdp) = (0u64, 0u64);
 	unsafe {
@@ -158,17 +167,20 @@ pub(crate) fn discover(system_table: *mut uefi::SystemTable) {
 }
 
 // The device tree and RSDP physical addresses the firmware published, or 0 for one it did not.
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn firmware_tables() -> (u64, u64) {
 	unsafe { FIRMWARE_TABLES }
 }
 
 // Physical addresses are reachable as themselves in the loader; exposed so the backends can read
 // the same tables through the same translation this module uses.
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn identity_map(address: u64) -> u64 {
 	identity(address)
 }
 
 // What was discovered, for the backends' post-ExitBootServices output.
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn post_ebs() -> Option<PostEbs> {
 	unsafe { POST_EBS }
 }
@@ -176,6 +188,7 @@ pub(crate) fn post_ebs() -> Option<PostEbs> {
 // One line saying what the machine said, printed while the firmware console still works - so a
 // boot on unfamiliar hardware says which console its later lines will go to, or that there will not
 // be any.
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn report() {
 	match post_ebs() {
 		Some(console) => {
@@ -203,6 +216,7 @@ pub(crate) fn report() {
 
 // Transmit one byte to the discovered console. False when there is none, which is the signal to
 // print nothing rather than to reach for a fallback address.
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) fn write_byte_post_ebs(byte: u8) -> bool {
 	let Some(console) = post_ebs() else { return false };
 	// THE WAIT IS BOUNDED, and that is not tidiness. These addresses now come from a table the
@@ -247,6 +261,7 @@ pub(crate) fn write_byte_post_ebs(byte: u8) -> bool {
 
 // Read and write a 16550 register at the width its table declares. Anything unrecognised is a byte,
 // which is what every 16550 answers.
+#[cfg(not(target_arch = "x86_64"))]
 #[inline]
 unsafe fn read_reg(address: u64, width: u32) -> u8 {
 	unsafe {
@@ -259,6 +274,7 @@ unsafe fn read_reg(address: u64, width: u32) -> u8 {
 	}
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 #[inline]
 unsafe fn write_reg(address: u64, byte: u8, width: u32) {
 	unsafe {

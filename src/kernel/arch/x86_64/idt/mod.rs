@@ -77,6 +77,7 @@ struct DescriptorPointer {
 // nonsense or faults itself. So this stays as the architecture's own answer and
 // `every_vector_is_filed_by_whether_it_pushes_a_code` compares the tables against it rather than
 // against a second reading of the manual.
+#[cfg(test)]
 pub(super) const fn has_error_code(vector: usize) -> bool {
 	matches!(vector, 8 | 10 | 11 | 12 | 13 | 14 | 17 | 21 | 29 | 30)
 }

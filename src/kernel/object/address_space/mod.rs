@@ -7,8 +7,6 @@
 // mapped) and whose user half is private - the basis for per-process isolation.
 // Threads reach their address space through their Process and hold it alive.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use core::any::Any;
 
@@ -74,6 +72,7 @@ impl AddressSpace {
 	// a bound that only one of two doors enforces is a bound with a door beside it. Every
 	// caller of this one is kernel-internal with an address it computed itself, so
 	// reaching this is a kernel bug and says so.
+	#[cfg(test)]
 	pub fn map(&self, virt: u64, phys: u64, flags: u64) {
 		assert!(flags & arch::paging::USER == 0 || user_range_ok(virt), "USER mapping outside the user half: {virt:#x}");
 		arch::paging::map_page_in(self.cr3, virt, phys, flags);

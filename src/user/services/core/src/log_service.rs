@@ -34,7 +34,7 @@ use proto::system::log::{self, Service};
 use proto::system::{Entry, Error, OpenOpts, Query, Severity, config, volume};
 use rt::*;
 
-include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/runtime_path.rs"));
 include!(concat!(env!("OUT_DIR"), "/roles_log_service.rs"));
 
 // The bounded in-memory journal: at most this many records, newest dropping

@@ -8,8 +8,6 @@
 // `driver_ok`. After that it drives each queue with `Queue::submit` (a descriptor
 // chain, a notify, and a poll of the used ring).
 
-#![allow(dead_code)]
-
 use core::sync::atomic::{Ordering, fence};
 
 use rt::*;
@@ -17,10 +15,8 @@ use rt::*;
 // The virtio-pci wire format (common-config register offsets, device_status bits,
 // descriptor + available-ring flags) is the shared `abi` source of truth (re-exported
 // through `rt::*`), aliased here to this transport's short names. VIRTIO_MSI_NO_VECTOR
-// keeps its canonical name and comes straight through the glob above. Not every field
-// is used by every path, so the unused-import lint is allowed.
-#[allow(unused_imports)]
-use rt::{VIRTIO_AVAIL_F_NO_INTERRUPT as VIRTQ_AVAIL_F_NO_INTERRUPT, VIRTIO_CFG_CONFIG_MSIX_VECTOR as CFG_CONFIG_MSIX_VECTOR, VIRTIO_CFG_DEVICE_FEATURE as CFG_DEVICE_FEATURE, VIRTIO_CFG_DEVICE_FEATURE_SELECT as CFG_DEVICE_FEATURE_SELECT, VIRTIO_CFG_DEVICE_STATUS as CFG_DEVICE_STATUS, VIRTIO_CFG_DRIVER_FEATURE as CFG_DRIVER_FEATURE, VIRTIO_CFG_DRIVER_FEATURE_SELECT as CFG_DRIVER_FEATURE_SELECT, VIRTIO_CFG_NUM_QUEUES as CFG_NUM_QUEUES, VIRTIO_CFG_QUEUE_DESC as CFG_QUEUE_DESC, VIRTIO_CFG_QUEUE_DEVICE as CFG_QUEUE_DEVICE, VIRTIO_CFG_QUEUE_DRIVER as CFG_QUEUE_DRIVER, VIRTIO_CFG_QUEUE_ENABLE as CFG_QUEUE_ENABLE, VIRTIO_CFG_QUEUE_MSIX_VECTOR as CFG_QUEUE_MSIX_VECTOR, VIRTIO_CFG_QUEUE_NOTIFY_OFF as CFG_QUEUE_NOTIFY_OFF, VIRTIO_CFG_QUEUE_SELECT as CFG_QUEUE_SELECT, VIRTIO_CFG_QUEUE_SIZE as CFG_QUEUE_SIZE, VIRTIO_DESC_F_NEXT as DESC_NEXT, VIRTIO_DESC_F_WRITE as DESC_WRITE, VIRTIO_F_VERSION_1 as FEATURE_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE as STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER as STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK as STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED as STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK as STATUS_FEATURES_OK};
+// keeps its canonical name and comes straight through the glob above.
+use rt::{VIRTIO_AVAIL_F_NO_INTERRUPT as VIRTQ_AVAIL_F_NO_INTERRUPT, VIRTIO_CFG_CONFIG_MSIX_VECTOR as CFG_CONFIG_MSIX_VECTOR, VIRTIO_CFG_DEVICE_FEATURE as CFG_DEVICE_FEATURE, VIRTIO_CFG_DEVICE_FEATURE_SELECT as CFG_DEVICE_FEATURE_SELECT, VIRTIO_CFG_DEVICE_STATUS as CFG_DEVICE_STATUS, VIRTIO_CFG_DRIVER_FEATURE as CFG_DRIVER_FEATURE, VIRTIO_CFG_DRIVER_FEATURE_SELECT as CFG_DRIVER_FEATURE_SELECT, VIRTIO_CFG_QUEUE_DESC as CFG_QUEUE_DESC, VIRTIO_CFG_QUEUE_DEVICE as CFG_QUEUE_DEVICE, VIRTIO_CFG_QUEUE_DRIVER as CFG_QUEUE_DRIVER, VIRTIO_CFG_QUEUE_ENABLE as CFG_QUEUE_ENABLE, VIRTIO_CFG_QUEUE_MSIX_VECTOR as CFG_QUEUE_MSIX_VECTOR, VIRTIO_CFG_QUEUE_NOTIFY_OFF as CFG_QUEUE_NOTIFY_OFF, VIRTIO_CFG_QUEUE_SELECT as CFG_QUEUE_SELECT, VIRTIO_CFG_QUEUE_SIZE as CFG_QUEUE_SIZE, VIRTIO_DESC_F_NEXT as DESC_NEXT, VIRTIO_DESC_F_WRITE as DESC_WRITE, VIRTIO_F_VERSION_1 as FEATURE_VERSION_1, VIRTIO_STATUS_ACKNOWLEDGE as STATUS_ACKNOWLEDGE, VIRTIO_STATUS_DRIVER as STATUS_DRIVER, VIRTIO_STATUS_DRIVER_OK as STATUS_DRIVER_OK, VIRTIO_STATUS_FAILED as STATUS_FAILED, VIRTIO_STATUS_FEATURES_OK as STATUS_FEATURES_OK};
 
 unsafe fn r8(addr: u64) -> u8 {
 	unsafe { (addr as *const u8).read_volatile() }
@@ -92,8 +88,6 @@ pub struct Queue {
 	// The used-ring index consumed so far, so `take_used` knows what is new (the RX
 	// flow; unused by the synchronous `submit` path).
 	last_used: u16,
-	// Keeps the ring DMA buffer alive (the handle stays open).
-	handle: u64,
 	// The device this queue belongs to, so a driver holding only a `Queue` can still name the
 	// device its data buffers are for - see `Virtio::capability`.
 	pub capability: u64,
@@ -267,7 +261,12 @@ impl Virtio {
 			let avail_off: u64 = 16 * size as u64;
 			let used_off: u64 = align_up(avail_off + 6 + 2 * size as u64, 4);
 			let ring_bytes: u64 = used_off + 6 + 8 * size as u64;
-			let (handle, virt, phys): (u64, u64, u64) = match dma_buffer_for(self.capability, ring_bytes) {
+			// THE RING HANDLE IS DELIBERATELY NOT KEPT, the way every other `dma_buffer_for` call
+			// in this crate does not keep it. `Queue` held it in a field with the comment "keeps
+			// the ring DMA buffer alive" - which nothing enforced: no `Drop` closed it, so the
+			// buffer lives for the driver process either way and the field only stored a number
+			// nobody read.
+			let (_handle, virt, phys): (u64, u64, u64) = match dma_buffer_for(self.capability, ring_bytes) {
 				Some(t) => t,
 				None => return None,
 			};
@@ -282,7 +281,7 @@ impl Virtio {
 			let notify_off: u16 = r16(self.common + CFG_QUEUE_NOTIFY_OFF);
 			w16(self.common + CFG_QUEUE_ENABLE, 1);
 
-			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, last_used: 0, handle, capability: self.capability })
+			Some(Queue { index, notify_addr: self.notify + notify_off as u64 * self.notify_multiplier as u64, size, virt, avail_off, used_off, last_used: 0, capability: self.capability })
 		}
 	}
 
@@ -294,15 +293,11 @@ impl Virtio {
 		}
 	}
 
-	// Whether the device reports DRIVER_OK.
-	pub fn is_live(&self) -> bool {
-		unsafe { r8(self.common + CFG_DEVICE_STATUS) & STATUS_DRIVER_OK != 0 }
-	}
-
 	// Read the ISR-status register: returns the pending-interrupt reason bits and, on a
 	// level-triggered INTx line (the riscv PLIC path), deasserts the device's interrupt
 	// so the kernel can complete the source. An interrupt-driven driver reads it once per
-	// IRQ before acking. Harmless on MSI-X (edge-triggered), where it reads back zero.
+	// IRQ, and must: on INTx the line stays asserted until it is read, and the IRQ storms.
+	// Harmless on MSI-X (edge-triggered), where it reads back zero.
 	pub unsafe fn read_isr(&self) -> u8 {
 		unsafe { r8(self.isr) }
 	}
@@ -316,13 +311,6 @@ impl Virtio {
 	// pair that chooses which config block the next reads return).
 	pub unsafe fn config_write(&self, offset: u64, value: u8) {
 		unsafe { w8(self.device + offset, value) }
-	}
-
-	// Read (and so acknowledge) the ISR-status register, deasserting the device's
-	// level-triggered INTx line. An interrupt-driven driver must do this each time it
-	// services an interrupt, or the line stays asserted and the IRQ storms.
-	pub unsafe fn isr_ack(&self) -> u8 {
-		unsafe { r8(self.isr) }
 	}
 }
 

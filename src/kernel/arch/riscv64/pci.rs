@@ -16,8 +16,7 @@ use crate::arch::common::pci as common;
 
 // The PCI surface every backend re-exports (the HAL contract); not every type is named
 // directly in this backend's code.
-#[allow(unused_imports)]
-pub use common::{PciDevice, VirtioCap, VirtioDevice, XhciDevice, virtio_type_name};
+pub use common::{PciDevice, VirtioDevice, XhciDevice};
 
 // PCIe ECAM base (set from the device tree at boot) and the number of buses to probe.
 static ECAM_BASE: AtomicUsize = AtomicUsize::new(0);

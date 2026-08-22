@@ -11,8 +11,6 @@
 // the AP idle loop) is the fallback that runs when no thread is ready. Its stack
 // pointer is saved in CpuSched::idle_sp on the way out and restored on the way in.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
@@ -22,6 +20,7 @@ use crate::object::KernelObject;
 use crate::object::address_space::AddressSpace;
 use crate::object::domain::Domain;
 use crate::object::process::Process;
+#[cfg(test)]
 use crate::object::rights::Rights;
 use crate::object::thread::{Thread, ThreadState};
 use crate::sync::SpinLock;
@@ -67,6 +66,7 @@ impl RunQueue {
 		self.head.is_none()
 	}
 
+	#[cfg(test)]
 	fn len(&self) -> usize {
 		self.len
 	}
@@ -346,12 +346,14 @@ pub fn root_domain() -> Arc<Domain> {
 }
 
 // A handle to the kernel address space (shared higher-half kernel mappings).
+#[cfg(test)]
 fn kernel_as() -> Arc<AddressSpace> {
 	// ALLOC-OK: an `Option<Arc<AddressSpace>>` out of the guard - a refcount bump.
 	KERNEL_AS.lock().clone().expect("scheduler not initialized")
 }
 
 // Create a kernel thread on the current core's run queue.
+#[cfg(test)]
 pub fn spawn(entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 	spawn_on(current_cpu_id(), entry, arg)
 }
@@ -382,6 +384,7 @@ fn start_and_enqueue(cpu: usize, thread: Arc<Thread>) -> bool {
 	true
 }
 
+#[cfg(test)]
 pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
 	// A KERNEL thread. Nothing here has a caller that could carry a refusal back to
@@ -398,6 +401,7 @@ pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> 
 
 // Create a kernel thread on the current core, pre-seeded with a handle to
 // `object` (delivered to the thread as its bootstrap-handle argument).
+#[cfg(test)]
 pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
 	let thread = prepare_with_object(entry, object, rights, badge);
 	start_thread(&thread);
@@ -408,6 +412,7 @@ pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject
 // (`process_prepare` / `process_release`), where a pipeline's stages must all exist before any
 // of them runs. Split out of `spawn_with_object` rather than added beside it, so the two cannot
 // drift in how a thread is constructed.
+#[cfg(test)]
 pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, badge: u64) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
 	let arg = process.install(object, rights, badge).expect("out of memory for a kernel thread's bootstrap handle");
@@ -415,6 +420,7 @@ pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObje
 }
 
 // Release a prepared thread onto the run queue.
+#[cfg(test)]
 pub fn start_thread(thread: &Arc<Thread>) {
 	start_and_enqueue(current_cpu_id(), thread.clone());
 }
@@ -422,6 +428,7 @@ pub fn start_thread(thread: &Arc<Thread>) {
 // Create a kernel thread accounted to `domain` on the current core, enforcing the
 // Domain's thread quota. Returns None (spawning nothing) if the Domain is at its
 // thread cap - a clean refusal rather than a crash.
+#[cfg(test)]
 pub fn spawn_in(domain: Arc<Domain>, entry: extern "C" fn(u64), arg: u64) -> Option<Arc<Thread>> {
 	let process = Process::new(kernel_as(), domain)?;
 	let thread = Thread::new_in(entry, arg, process)?;

@@ -8,8 +8,6 @@
 // a function pointer, and dispatch only loads one, so it is safe to call from
 // interrupt context without risking a deadlock against a held lock.
 
-#![allow(dead_code)]
-
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::sync::{Arc, Weak};
@@ -181,6 +179,7 @@ pub fn release_unused_msi(vector: u32) {
 // Returns the vector; None if every MSI slot is taken OR this device already holds one. The caller
 // enables MSI-X on the device and binds an Interrupt to the returned vector with bind_msi. `owner`
 // is the discovered-device index the vector is acquired for, retained for the `lsirq` inventory.
+#[cfg(test)]
 pub fn acquire_msi(table_phys: u64, dest: u8, owner: u32) -> Option<u32> {
 	program_acquired(REGISTRY.acquire(owner, MSI_COUNT)?, table_phys, dest)
 }

@@ -431,7 +431,7 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 			}
 			if ready_chan == admin {
 				match recv_caps_blocking(admin, &mut request) {
-					ReceivedCaps::Message { len, handles: mut caps } => {
+					ReceivedCaps::Message { len, handles: caps } => {
 						let mut reply_handle = proto::codec::Handles::new();
 						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
 						// over the single-handle receive, which keeps the first and drops the rest - so a
@@ -460,7 +460,7 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 			if let Some(index) = clients.iter().position(|client| client.chan == ready_chan) {
 				let scope: Scope = clients[index].scope;
 				match recv_caps_blocking(ready_chan, &mut request) {
-					ReceivedCaps::Message { len, handles: mut caps } => {
+					ReceivedCaps::Message { len, handles: caps } => {
 						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
 						// over the single-handle receive, which keeps the first and drops the rest - so a
 						// client sending stdin, stdout and stderr had two destroyed before dispatch.

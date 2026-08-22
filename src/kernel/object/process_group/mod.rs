@@ -177,6 +177,7 @@ impl ProcessGroup {
 	/// answering how many slots were written. `None` for a stage still running.
 	///
 	/// `out` should be `MAX_GROUP_MEMBERS` long, which covers any group in one pass.
+	#[cfg(test)]
 	pub fn records_into(&self, out: &mut [Option<StageRecord>]) -> usize {
 		let slots = self.slots.lock();
 		let mut written = 0;
@@ -223,6 +224,7 @@ impl ProcessGroup {
 
 	// The members still alive, as owning references. Dead slots are skipped and never removed, so
 	// the living keep the positions they were created at.
+	#[cfg(test)]
 	pub fn live(&self) -> Vec<Arc<Process>> {
 		let slots = self.slots.lock();
 		// ALLOC-OK: the owned-list form, kept for the test suites. Every ring-3 path goes through
@@ -269,6 +271,7 @@ impl ProcessGroup {
 	}
 
 	// How many processes this group was created over, live or not.
+	#[cfg(test)]
 	pub fn size(&self) -> usize {
 		self.original_size
 	}
@@ -280,6 +283,7 @@ impl ProcessGroup {
 	// while a waiter without a timeout stayed parked forever. The group has to be told.
 	// Kept for callers that hold a group and no process. `Process::record_in_groups` does this
 	// inline, outside its own lock, because it already has to collect the koids there.
+	#[cfg(test)]
 	pub fn notify_member_terminated(&self) {
 		crate::sched::wake_object(self.header.koid());
 	}

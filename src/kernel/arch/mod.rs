@@ -31,7 +31,7 @@
 //   ioapic:     route, init, mask
 //   serial:     SerialWriter, init, enable_rx_irq, enable_async, drain_tx,
 //               flush_sync, write_bytes, read_byte
-//   pci:        PciDevice / VirtioDevice / XhciDevice / VirtioCap, scan,
+//   pci:        PciDevice / VirtioDevice / XhciDevice, scan,
 //               scan_virtio, scan_xhci, set_intx_disabled, msix_enable
 //   syscall:    init, invoke        usermode: enter, exit_to_kernel,
 //               FAULT_PROBE_ADDR, program_*_bytes

@@ -126,7 +126,7 @@ unsafe impl GlobalAlloc for Heap {
 			};
 			let bytes = if want > ARENA_BYTES { want } else { ARENA_BYTES };
 			let pages = bytes.div_ceil(crate::PAGE_SIZE as usize);
-			let Some(addr) = (unsafe { crate::alloc_pages(services, pages) }) else {
+			let Some(addr) = crate::alloc_pages(services, pages) else {
 				return ptr::null_mut();
 			};
 			// The PRODUCT first: `checked_add` cannot save a multiplication that already wrapped,

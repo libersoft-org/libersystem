@@ -2297,7 +2297,6 @@ macro_rules! tagged_test {
 		mod $name {
 			// Named and unused: it makes the covers literals part of the compile, so a malformed
 			// list is a build error here rather than a parse failure on the host.
-			#[allow(dead_code)]
 			const COVERS: &[&str] = $covers;
 			#[test_case]
 			static CASE: $crate::tests::TaggedTest = $crate::tests::TaggedTest {

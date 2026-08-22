@@ -158,13 +158,11 @@ static CRASH_NOTIFY: SpinLock<Option<Arc<Channel>>> = SpinLock::new(None);
 
 // Register the endpoint the kernel sends crash records on (the kernel-held sender
 // of a channel whose peer the supervisor receives on). Replaces any previous one.
-#[allow(dead_code)]
 pub fn set_crash_notify(channel: Arc<Channel>) {
 	*CRASH_NOTIFY.lock() = Some(channel);
 }
 
 // Clear the crash-notify registration.
-#[allow(dead_code)]
 pub fn clear_crash_notify() {
 	*CRASH_NOTIFY.lock() = None;
 }

@@ -6,8 +6,6 @@
 // (through Arc) governs the memory's lifetime. This supports at most one active
 // mapping per object (tracked in `mapped_at`); richer sharing arrives with IPC.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -88,6 +86,7 @@ impl MemoryObject {
 		&self.frames
 	}
 
+	#[cfg(test)]
 	pub fn is_mapped_in(&self, cr3: u64) -> bool {
 		self.mappings.lock().iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3)
 	}
@@ -156,6 +155,7 @@ impl MemoryObject {
 		self.mappings.lock().len()
 	}
 
+	#[cfg(test)]
 	pub fn add_mapping(&self, cr3: u64, base: u64) {
 		// ALLOC-OK: one entry per address space this object is mapped into, bounded by the process count the Domain quota allows.
 		self.mappings.lock().push((cr3, base));

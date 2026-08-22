@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 #[path = "../../build.rs"]
 mod common;
 
@@ -9,7 +8,7 @@ use std::path::PathBuf;
 use system_manifest::{DriverLifecycle, Manifest, MatchPriority, Presence, Restart, RoleKind, Stage};
 
 fn main() {
-	common::configure();
+	common::main();
 	let crate_root = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
 	let workspace = crate_root.join("../../..");
 	println!("cargo:rerun-if-changed={}", workspace.join("user/services/manifest.toml").display());
@@ -44,16 +43,15 @@ fn generate_driver_registry(manifest: &Manifest) {
 		if program.development && !development {
 			continue;
 		}
-		let lifecycle = match driver.lifecycle {
-			DriverLifecycle::BootCritical => "Lifecycle::BootCritical",
-			DriverLifecycle::Controller => "Lifecycle::Controller",
-			DriverLifecycle::Function => "Lifecycle::Function",
-			DriverLifecycle::Interface => "Lifecycle::Interface",
-		};
+		// THE ANSWER, NOT THE VOCABULARY. Selection asks whether a driver is needed to mount the
+		// volume and how specific its match is; it never names a lifecycle or a priority. Emitting
+		// the enums instead put four lifecycle names and three priority names in every image, of
+		// which a shipping manifest constructs two and one.
+		let boot_critical = matches!(driver.lifecycle, DriverLifecycle::BootCritical);
 		let priority = match driver.priority {
-			MatchPriority::Generic => "Priority::Generic",
-			MatchPriority::Exact => "Priority::Exact",
-			MatchPriority::Quirk => "Priority::Quirk",
+			MatchPriority::Generic => "0 /* generic */",
+			MatchPriority::Exact => "1 /* exact */",
+			MatchPriority::Quirk => "2 /* quirk */",
 		};
 		let rules = driver
 			.rules
@@ -68,7 +66,7 @@ fn generate_driver_registry(manifest: &Manifest) {
 			.collect::<Vec<_>>()
 			.join(", ");
 		entries.push_str(&format!(
-			"\tEntry {{ name: b\"{}\", artifact: b\"{}\", lifecycle: {lifecycle}, priority: {priority}, rules: &[{rules}] }},\n",
+			"\tEntry {{ name: b\"{}\", artifact: b\"{}\", boot_critical: {boot_critical}, priority: {priority}, rules: &[{rules}] }},\n",
 			program.name,
 			// The staged file name. A pinned driver is looked up in `init.pkg` by this rather than
 			// by its program name, and deriving one from the other is how the two come to disagree.
@@ -134,7 +132,9 @@ fn generate_services(manifest: &Manifest) {
 					RoleKind::Client => "RoleKind::Client",
 					RoleKind::Factory => "RoleKind::Factory",
 					RoleKind::Privilege => "RoleKind::Privilege",
-					RoleKind::Power => "RoleKind::Power",
+					// The validator refuses a power role outright, so reaching here means that check
+					// was weakened without this generator being told.
+					RoleKind::Power => panic!("services/manifest.toml declares a power role, which the executor has no way to deliver"),
 					RoleKind::Package => "RoleKind::Package",
 					RoleKind::Device => "RoleKind::Device",
 					RoleKind::Payload => "RoleKind::Payload",
@@ -178,7 +178,7 @@ fn generate_receive_plans(manifest: &Manifest) {
 					RoleKind::Client => "Client",
 					RoleKind::Factory => "Factory",
 					RoleKind::Privilege => "Privilege",
-					RoleKind::Power => "Power",
+					RoleKind::Power => panic!("services/manifest.toml declares a power role, which the executor has no way to deliver"),
 					RoleKind::Package => "Package",
 					RoleKind::Device => "Device",
 					RoleKind::Payload => "Payload",
@@ -240,8 +240,13 @@ fn generate_program_paths(manifest: &Manifest) {
 	for runtime_path in manifest.runtime_paths.values() {
 		runtime_arms.push_str(&format!("\t\"{}\" => Some(\"vol://system/{}\"),\n", runtime_path.name, runtime_path.destination.as_str()));
 	}
-	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\n#[allow(dead_code)]\nfn program_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{arms}\t\t_ => None,\n\t}}\n}}\n\n#[allow(dead_code)]\nfn factory_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{factory_arms}\t\t_ => None,\n\t}}\n}}\n\n#[allow(dead_code)]\nfn runtime_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{runtime_arms}\t\t_ => None,\n\t}}\n}}\n");
-	write_generated("program_paths.rs", &generated);
+	// ONE FILE PER LOOKUP, because a consumer includes what it asks and nothing else. As one file
+	// holding all three, every consumer got two functions it does not call - which is dead code in
+	// nine binaries, reported nine times, and nothing a reader could do about it.
+	let header = "// @generated from services/manifest.toml by build.rs - do not edit.\n";
+	write_generated("program_path.rs", &format!("{header}fn program_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{arms}\t\t_ => None,\n\t}}\n}}\n"));
+	write_generated("factory_path.rs", &format!("{header}fn factory_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{factory_arms}\t\t_ => None,\n\t}}\n}}\n"));
+	write_generated("runtime_path.rs", &format!("{header}fn runtime_path(name: &str) -> Option<&'static str> {{\n\tmatch name {{\n{runtime_arms}\t\t_ => None,\n\t}}\n}}\n"));
 }
 
 fn write_generated(name: &str, contents: &str) {

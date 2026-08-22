@@ -527,7 +527,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	let virtio = super::pci::scan_virtio();
 	crate::serial_println!("aarch64: virtio - {} device(s) resolved", virtio.len());
 	for v in &virtio {
-		crate::serial_println!("aarch64:   {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x}(x{}) isr+{:#x} device+{:#x}", super::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.map_or(0, |cap| cap.offset));
+		crate::serial_println!("aarch64:   {} @ BAR{} phys={:#x} len={:#x} | common+{:#x} notify+{:#x}(x{}) isr+{:#x} device+{:#x}", crate::arch::common::pci::virtio_type_name(v.virtio_type), v.bar, v.bar_phys, v.region_len, v.common.offset, v.notify.offset, v.notify.notify_multiplier, v.isr.offset, v.device.map_or(0, |cap| cap.offset));
 	}
 
 	// If a virtio-blk device is present, read sector 0 to confirm the driver works.

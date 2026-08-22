@@ -8,8 +8,6 @@
 // reports in, and then stands holding its device. This is the isolated,
 // capability-scoped shell each driver runs inside.
 
-#![allow(dead_code)]
-
 use rt::*;
 
 use crate::virtio::{self, Virtio};

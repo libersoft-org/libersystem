@@ -149,19 +149,18 @@ pub fn fixup_for(pc: u64, fault_address: u64) -> Option<u64> {
 }
 
 // How many faults have been fixed up since boot.
-#[cfg_attr(not(test), allow(dead_code))]
 // Fixups refused because the fault address was not userspace's. Zero is the only healthy value.
 pub fn refused() -> u64 {
 	REFUSED.load(Ordering::Acquire)
 }
 
+#[cfg(test)]
 pub fn caught() -> u64 {
 	CAUGHT.load(Ordering::Acquire)
 }
 
 // How many instructions this build declares may fault. Zero means the mechanism is not in the
 // binary at all, which is a thing a test should be able to notice.
-#[cfg_attr(not(test), allow(dead_code))]
 // The first declared faulting address, for the test that pins the user-address condition. It needs
 // a PC the table really contains, and which one is an accident of link order.
 #[cfg(test)]
@@ -169,6 +168,7 @@ pub fn first_entry() -> Option<u64> {
 	entries().first().map(|entry| entry.fault)
 }
 
+#[cfg(test)]
 pub fn declared() -> usize {
 	entries().len()
 }

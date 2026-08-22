@@ -9,8 +9,6 @@
 // Every buffer uses one physically contiguous frame run, so a device receives a
 // single physical span for a virtqueue ring, block-data stage or jumbo frame.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::any::Any;
@@ -100,6 +98,7 @@ fn hold(device: u32, frames: Vec<u64>) {
 }
 
 // How many frames have been leaked because the hold table was full.
+#[cfg(test)]
 pub fn leaked_frames() -> usize {
 	LEAKED.load(Ordering::Relaxed)
 }
@@ -167,6 +166,7 @@ impl DmaBuffer {
 	// jumbo frame all ride it whole). The quota is charged before any frame is
 	// taken, so an over-cap request fails cleanly (QuotaExceeded) with nothing
 	// allocated or charged, and an out-of-memory rolls the charge back.
+	#[cfg(test)]
 	pub fn create_in(domain: &Arc<Domain>, size: usize) -> Result<Arc<Self>, MemoryError> {
 		Self::create_for(domain, size, None)
 	}
@@ -214,6 +214,7 @@ impl DmaBuffer {
 	}
 
 	// The device this buffer was created for, if any.
+	#[cfg(test)]
 	pub fn device(&self) -> Option<u32> {
 		self.device
 	}
@@ -235,10 +236,12 @@ impl DmaBuffer {
 	}
 
 	// The physical address a driver hands its device for DMA (the first frame).
+	#[cfg(test)]
 	pub fn phys_base(&self) -> u64 {
 		self.frames.first().copied().unwrap_or(0)
 	}
 
+	#[cfg(test)]
 	pub fn is_mapped_in(&self, cr3: u64) -> bool {
 		self.mappings.lock().iter().any(|(mapped_cr3, _)| *mapped_cr3 == cr3)
 	}
@@ -279,6 +282,7 @@ impl DmaBuffer {
 		self.mappings.lock().retain(|(mapped_cr3, base)| !(*mapped_cr3 == cr3 && *base == 0));
 	}
 
+	#[cfg(test)]
 	pub fn add_mapping(&self, cr3: u64, base: u64) {
 		// ALLOC-OK: one entry per address space this buffer is mapped into, bounded by the process count the Domain quota allows.
 		self.mappings.lock().push((cr3, base));

@@ -32,7 +32,7 @@ use proto::system::config::{self, Service};
 use proto::system::{ConfigEntry, Error, OpenOpts, volume};
 use rt::*;
 
-include!(concat!(env!("OUT_DIR"), "/program_paths.rs"));
+include!(concat!(env!("OUT_DIR"), "/runtime_path.rs"));
 
 // The persisted tree's format magic (a structured, versioned binary - never parsed
 // text): the magic, a count, then per entry a length-prefixed key and value.

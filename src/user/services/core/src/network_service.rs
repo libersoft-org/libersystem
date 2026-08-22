@@ -327,7 +327,7 @@ unsafe fn serve(frames: u64, client: u64, stack: &mut Stack, mut lease: LeaseClo
 				let slot: usize = slot_of[ready];
 				let chan: u64 = clients[slot];
 				match recv_caps_blocking(chan, &mut req) {
-					ReceivedCaps::Message { len, handles: mut caps } => {
+					ReceivedCaps::Message { len, handles: caps } => {
 						// A FRESH CONNECTION PER CALLER, answered here because it cannot be
 						// answered generically.
 						//
@@ -439,7 +439,7 @@ unsafe fn serve_socket(slot: &mut SockSlot, frames: u64, stack: &mut Stack, rx: 
 		let chan: u64 = slot.chan;
 		let ci: usize = slot.ci;
 		match recv_caps_blocking(chan, req) {
-			ReceivedCaps::Message { len, handles: mut caps } => {
+			ReceivedCaps::Message { len, handles: caps } => {
 				// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`
 				// over the single-handle receive, which keeps the first and drops the rest - so a
 				// client sending stdin, stdout and stderr had two destroyed before dispatch.

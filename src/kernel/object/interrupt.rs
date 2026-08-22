@@ -7,8 +7,6 @@
 // the handle (or the driver dying) drops the Interrupt, which unbinds its vector -
 // the kernel stops delivering to a driver that is gone.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicBool, Ordering};

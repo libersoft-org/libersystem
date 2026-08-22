@@ -5,8 +5,6 @@
 // some handle table) or a message in transit holds a reference. Revocation is
 // O(1) via a generation counter in the header, compared at capability lookup.
 
-#![allow(dead_code)]
-
 pub mod address_space;
 pub mod channel;
 pub mod device_memory;
@@ -59,6 +57,7 @@ pub enum ObjectType {
 
 impl ObjectType {
 	// A short, stable name for this type (used by introspection and the graph).
+	#[cfg(test)]
 	pub fn name(self) -> &'static str {
 		match self {
 			ObjectType::WaitSet => "WaitSet",
@@ -160,6 +159,7 @@ impl ObjectHeader {
 	}
 
 	// Invalidate all existing capabilities to this object (O(1) revocation).
+	#[cfg(test)]
 	pub fn revoke(&self) {
 		self.generation.fetch_add(1, Ordering::AcqRel);
 	}

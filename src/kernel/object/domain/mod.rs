@@ -29,8 +29,6 @@
 // cores. Cleanup is automatic: dropping an object refunds its charge, so a
 // crashed thread's resources are returned without its cooperation.
 
-#![allow(dead_code)]
-
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::any::Any;
@@ -291,6 +289,7 @@ impl Domain {
 		self.parent.as_ref().and_then(Weak::upgrade)
 	}
 
+	#[cfg(test)]
 	pub fn is_killed(&self) -> bool {
 		self.killed.load(Ordering::Acquire)
 	}
@@ -325,6 +324,7 @@ impl Domain {
 	// A snapshot of this Domain's live child Domains (for the System Graph). The
 	// children are owned strongly, so each is guaranteed live.
 	//
+	#[cfg(test)]
 	pub fn child_domains(&self) -> Vec<Arc<Domain>> {
 		// ALLOC-OK: the System Graph dump, which runs from the kernel test suites and from nothing a
 		// ring-3 caller can reach - `graph::collect_from` has no syscall behind it. `kill` walks the
@@ -336,6 +336,7 @@ impl Domain {
 	// System Graph). Dead weak references are skipped, so only live processes are
 	// returned.
 	//
+	#[cfg(test)]
 	pub fn live_processes(&self) -> Vec<Arc<Process>> {
 		// ALLOC-OK: the System Graph dump, as above.
 		self.processes.lock().iter().filter_map(Weak::upgrade).collect()

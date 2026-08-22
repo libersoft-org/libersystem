@@ -8,8 +8,6 @@
 // The 512-byte FXSAVE image preserves x87, MMX, XMM0..15 and MXCSR eagerly on every
 // switch; it travels on the thread's own kernel stack, including across preemption.
 
-#![allow(dead_code)]
-
 use core::arch::{asm, global_asm};
 
 unsafe extern "C" {

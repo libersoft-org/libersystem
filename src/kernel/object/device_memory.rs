@@ -8,8 +8,6 @@
 // driver may reach which device. DeviceManager (later) mints these for the devices
 // it discovers and hands each driver only its own.
 
-#![allow(dead_code)]
-
 use alloc::sync::Arc;
 use core::any::Any;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -49,6 +47,7 @@ pub struct DeviceMemory {
 impl DeviceMemory {
 	// A capability to the physical MMIO region [phys_base, phys_base + len), naming no device.
 	// FALLIBLY, here and in `for_device`: `sys_device_acquire` mints them.
+	#[cfg(test)]
 	pub fn new(phys_base: u64, len: usize) -> Option<Arc<Self>> {
 		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
 	}
@@ -63,14 +62,17 @@ impl DeviceMemory {
 		self.index
 	}
 
+	#[cfg(test)]
 	pub fn phys_base(&self) -> u64 {
 		self.phys_base
 	}
 
+	#[cfg(test)]
 	pub fn len(&self) -> usize {
 		self.len
 	}
 
+	#[cfg(test)]
 	pub fn is_empty(&self) -> bool {
 		self.len == 0
 	}
@@ -84,6 +86,7 @@ impl DeviceMemory {
 	// The sentinel a claim holds between `claim_mapping` and `set_mapped_in`.
 	const RESERVED: u64 = 1;
 
+	#[cfg(test)]
 	pub fn mapped_at(&self) -> u64 {
 		match self.mapped_at.load(Ordering::Acquire) {
 			// A claim in flight is not an address, and a teardown that saw it would unmap a

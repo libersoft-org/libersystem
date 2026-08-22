@@ -11,11 +11,8 @@
 use std::collections::BTreeSet;
 use std::env;
 use std::fs;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 // Check that every artifact the manifest names has actually been built, BEFORE assembling
 // anything. This is the whole point of packaging being its own phase: it verifies and then
@@ -375,13 +372,6 @@ fn write_if_changed(path: &Path, bytes: &[u8]) {
 	let temporary = path.with_file_name(format!("{file_name}.{}.tmp", std::process::id()));
 	fs::write(&temporary, bytes).unwrap_or_else(|error| panic!("cannot write {}: {error}", temporary.display()));
 	fs::rename(&temporary, path).unwrap_or_else(|error| panic!("cannot publish {}: {error}", path.display()));
-}
-
-fn timing_event(phase: &str, event: &str) {
-	let Ok(path) = env::var("LIBER_TIMING_LOG") else { return };
-	let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else { return };
-	let timestamp_ns: u128 = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos();
-	let _ = writeln!(file, "{timestamp_ns}\t{phase}\t{event}");
 }
 
 // The userspace target triple matching the kernel's target arch.

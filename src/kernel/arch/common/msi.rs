@@ -65,6 +65,7 @@ impl<const N: usize> MsiRegistry<N> {
 	// frame owns only the SPIs its TYPER reports); pass `N` to use them all. The caller
 	// then programs the device's MSI-X table for the slot's hardware vector and binds
 	// an Interrupt with `bind`.
+	#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 	pub fn acquire(&self, owner: u32, limit: usize) -> Option<usize> {
 		let _claim = self.claim.lock();
 		self.claim_free_slot(owner, limit)
@@ -144,7 +145,8 @@ impl<const N: usize> MsiRegistry<N> {
 	// the hardware rather than freely chosen: on riscv a device's PLIC INTx source is
 	// determined by its PCI slot + pin, so the source id IS the slot and the caller
 	// cannot pick a different free one. Returns false if the slot is already reserved.
-	#[allow(dead_code)] // only the riscv INTx-over-PLIC backend fixes its slot this way
+	// only the riscv INTx-over-PLIC backend fixes its slot this way
+	#[cfg(any(test, target_arch = "riscv64"))]
 	pub fn acquire_at(&self, slot: usize, owner: u32) -> bool {
 		if slot >= N {
 			return false;
@@ -242,6 +244,7 @@ impl<const N: usize> MsiRegistry<N> {
 	}
 
 	// Whether `slot` is masked and waiting for its device to be confirmed stopped.
+	#[cfg(test)]
 	pub fn is_pending(&self, slot: usize) -> bool {
 		self.pending[slot].load(Ordering::Acquire)
 	}

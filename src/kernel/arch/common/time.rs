@@ -37,6 +37,7 @@ pub fn cycles_to_ns(cycles: u64, hz: u64) -> u64 {
 // interrupt - which would replay a stall at the interrupt rate times the core count.
 //
 // This is that mechanism, in the portable file, because three backends needed the same one.
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 pub struct TickClock {
 	ticks: core::sync::atomic::AtomicU64,
 	// The cycle count the last tick was claimed at, and the period in cycles. A period of 0 means
@@ -45,6 +46,7 @@ pub struct TickClock {
 	cycles_per_tick: core::sync::atomic::AtomicU64,
 }
 
+#[cfg(any(test, target_arch = "aarch64", target_arch = "riscv64"))]
 impl TickClock {
 	pub const fn new() -> TickClock {
 		TickClock { ticks: core::sync::atomic::AtomicU64::new(0), anchor: core::sync::atomic::AtomicU64::new(0), cycles_per_tick: core::sync::atomic::AtomicU64::new(0) }

@@ -217,6 +217,7 @@ or preventing further development of `v1`.
 - [x] [P02M0141 - Wiring the system can re-run, and authority it can prove](P02M0141.md)
 - [ ] [P02M0142 - One boot tail for three architectures, and a HAL surface that means what it says](P02M0142.md)
 - [ ] [P02M0143 - Five holes an outside audit found that are worth closing, and the ones that are not](P02M0143.md)
+- [ ] [P02M0144 - The build says nothing it cannot back up](P02M0144.md)
 
 ### Definition of done (phase 2)
 

@@ -13,13 +13,11 @@
 
 extern crate alloc;
 
-mod common;
-mod virtio;
-
 use alloc::vec::Vec;
 use rt::*;
 
 use crate::virtio::{Queue, Virtio};
+use drivers::{common, virtio};
 
 // The virtio_net_hdr prepended to every frame on both queues (VERSION_1: 12 bytes).
 const NET_HDR_LEN: u64 = 12;

@@ -5,8 +5,6 @@
 // address space; segment contents and relocations are written through the HHDM, since
 // the target address space is not active.
 
-#![allow(dead_code)]
-
 use alloc::string::String;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;

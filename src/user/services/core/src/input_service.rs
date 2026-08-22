@@ -371,7 +371,7 @@ unsafe fn serve(service: u64, admin: u64, raws: [u64; 2], forward: u64, keys: u6
 			}
 			if admin != 0 && ready_handle == admin {
 				match recv_caps_blocking(admin, &mut req) {
-					ReceivedCaps::Message { len, handles: mut caps } => {
+					ReceivedCaps::Message { len, handles: caps } => {
 						let mut reply: [u8; 64] = [0; 64];
 						let mut reply_handle = proto::codec::Handles::new();
 						// EVERY CAPABILITY THE MESSAGE CARRIED. This was `Handles::from_slice(&[handle])`

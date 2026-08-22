@@ -104,11 +104,13 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// And ask the machine where its console is, while the configuration table is still readable.
 	// What comes out of this is what the loader prints to AFTER `ExitBootServices` - or nothing,
 	// on a machine that names no console this loader can drive.
+	#[cfg(not(target_arch = "x86_64"))]
 	console::discover(system_table);
 	arch::serial::init();
 	arch::serial::write_str("\nLiberSystem UEFI loader\n");
 	// AFTER the banner, because it is a line about this loader rather than a line from the
 	// firmware, and a diagnostic printed before the program names itself reads as stray output.
+	#[cfg(not(target_arch = "x86_64"))]
 	console::report();
 
 	let bs = unsafe { (*system_table).boot_services };
@@ -186,12 +188,10 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// seeds, so it is lost for the life of the system. Today's artifact has high `p_paddr` values so
 	// the fixed requests fail and the leak is zero; a valid low-physical layout would strand the
 	// whole image.
-	#[cfg(target_arch = "x86_64")]
-	let reserved = ReservedKernel::EMPTY;
 	#[cfg(not(target_arch = "x86_64"))]
 	let reserved = reserve_kernel(bs, kernel);
 	// And the source may not sit in the destination.
-	let kernel = stage_kernel_clear_of_destination(bs, kernel, &reserved);
+	let kernel = stage_kernel_clear_of_destination(bs, kernel);
 
 	// The BOOT medium as the last source, when no system volume answered. A machine whose volume is
 	// missing or unreadable still boots, and it boots the same way as every other machine - the
@@ -320,6 +320,9 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		// taking a slower path. The kernel is loaded and will say the same thing again.
 		None => arch::serial::write_str("loader: NO bootstrap list on the system volume, the live image or the boot medium\n"),
 	}
+	#[cfg(target_arch = "x86_64")]
+	arch::hand_off(bs, image_handle, system_table, root, kernel);
+	#[cfg(not(target_arch = "x86_64"))]
 	arch::hand_off(bs, image_handle, system_table, root, kernel, &reserved);
 }
 
@@ -532,7 +535,7 @@ pub(crate) const VOLUME_PKG_FILE: &str = "volume.pkg";
 // is larger than one page, and its size is available exactly - so the approximation was a hole in
 // the one check whose whole job is to notice that the loader is about to overwrite itself.
 // Only the riscv64 backend's overlap check needs this today; the other two never move themselves.
-#[cfg_attr(not(target_arch = "riscv64"), allow(dead_code))]
+#[cfg(target_arch = "riscv64")]
 pub(crate) fn loader_image_extent(bs: *mut BootServices, image_handle: Handle) -> Option<(u64, u64)> {
 	let mut li: *mut core::ffi::c_void = core::ptr::null_mut();
 	let status = unsafe { ((*bs).handle_protocol)(image_handle, &uefi::LOADED_IMAGE_PROTOCOL_GUID, &mut li) };
@@ -628,6 +631,7 @@ pub(crate) fn align_down(v: u64, align: u64) -> u64 {
 // So the reservation returns what it owns. A backend asks this value rather than re-asking the
 // firmware a question whose answer it cannot interpret, and a span that is not in here is fatal at
 // placement - the old panic, restored deliberately rather than by omission.
+#[cfg(not(target_arch = "x86_64"))]
 struct ReservedKernel {
 	// (page-aligned base, page count) per PT_LOAD segment this loader reserved.
 	spans: [(u64, u64); MAX_KERNEL_SPANS],
@@ -639,8 +643,10 @@ struct ReservedKernel {
 
 // Sixteen, matching the x86 backend's `MAX_SEGMENTS`. A kernel with more LOAD segments than this is
 // refused at placement rather than partially reserved.
+#[cfg(not(target_arch = "x86_64"))]
 const MAX_KERNEL_SPANS: usize = 16;
 
+#[cfg(not(target_arch = "x86_64"))]
 impl ReservedKernel {
 	const EMPTY: Self = Self { spans: [(0, 0); MAX_KERNEL_SPANS], count: 0, complete: true };
 
@@ -649,21 +655,15 @@ impl ReservedKernel {
 		self.spans[..self.count].iter().any(|&(reserved_base, reserved_pages)| reserved_base == base && reserved_pages == pages)
 	}
 
-	// Does `[addr, addr+len)` fall inside any reserved span? For the source buffer, which must not
-	// sit in the destination it is about to be copied out of.
-	pub fn overlaps(&self, addr: u64, len: u64) -> bool {
-		let end = addr.saturating_add(len);
-		self.spans[..self.count].iter().any(|&(base, pages)| {
-			let span_end = base.saturating_add(pages.saturating_mul(PAGE_SIZE));
-			addr < span_end && base < end
-		})
-	}
-
+	// Whether the whole image is accounted for. The riscv64 backend asks before it stages: an
+	// incomplete reservation there is a note, not a refusal, because its overlap check is what
+	// guards the copy.
 	pub fn is_complete(&self) -> bool {
 		self.complete
 	}
 }
 
+#[cfg(not(target_arch = "x86_64"))]
 fn reserve_kernel(bs: *mut uefi::BootServices, kernel: &[u8]) -> ReservedKernel {
 	let mut reserved = ReservedKernel::EMPTY;
 	let Some(image) = elf::Elf::parse(kernel) else {
@@ -709,7 +709,7 @@ fn reserve_kernel(bs: *mut uefi::BootServices, kernel: &[u8]) -> ReservedKernel 
 // A fresh allocation cannot land in the destination now, because the destination is reserved: this
 // is called after `reserve_kernel`. If it somehow still overlaps, the boot stops rather than
 // copying a buffer onto itself.
-fn stage_kernel_clear_of_destination(bs: *mut uefi::BootServices, kernel: &'static [u8], reserved: &ReservedKernel) -> &'static [u8] {
+fn stage_kernel_clear_of_destination(bs: *mut uefi::BootServices, kernel: &'static [u8]) -> &'static [u8] {
 	// THE DESTINATION SPANS, not the reserved ones.
 	//
 	// This asked `reserved.overlaps(...)`, and `ReservedKernel` holds only spans whose
@@ -724,7 +724,6 @@ fn stage_kernel_clear_of_destination(bs: *mut uefi::BootServices, kernel: &'stat
 	if !destination_overlaps(kernel) {
 		return kernel;
 	}
-	let _ = reserved;
 	arch::serial::write_str(
 		"loader: the kernel file was read into its own destination; staging it clear
 ",

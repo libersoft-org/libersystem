@@ -12,8 +12,6 @@
 // and the badge of the endpoint handle it was sent through, so a server sharing
 // one endpoint among several clients can tell them apart.
 
-#![allow(dead_code)]
-
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
@@ -234,6 +232,7 @@ impl Channel {
 	// Like `send`, but charge the queued bytes to `sender`'s in-transit IPC quota
 	// (refunded when the message is received or the channel closes). Returns Full -
 	// the backpressure signal - if `sender` is at its queue cap.
+	#[cfg(test)]
 	pub fn send_charged(&self, msg: Message, sender: &Arc<Domain>) -> Result<(), ChannelError> {
 		self.send_inner(msg, Some(sender)).map_err(|(err, _)| err)
 	}

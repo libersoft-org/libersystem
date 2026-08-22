@@ -6,8 +6,6 @@
 // at your option. Please see the LICENSE file
 // attached to this source distribution for details.
 
-#![allow(dead_code)]
-
 use alloc::vec::Vec;
 use std::println;
 

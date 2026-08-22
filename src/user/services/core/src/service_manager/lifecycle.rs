@@ -134,7 +134,6 @@ fn reason_name(reason: Reason) -> &'static str {
 		Reason::BootstrapRefused => "bootstrap refused",
 		Reason::NoReport => "no report",
 		Reason::Faulted => "faulted",
-		Reason::Unresponsive => "unresponsive",
 		Reason::StopRequested => "stop requested",
 		Reason::Replaced => "replaced",
 		Reason::BudgetSpent => "restart budget spent",
@@ -147,8 +146,17 @@ impl supervisor::Service for StatsApi<'_> {
 		let mut i: usize = 0;
 		while i < N {
 			let last_failure: String = if self.reason[i].is_empty() { String::from_utf8_lossy(self.sup[i].failure.as_bytes()).into_owned() } else { self.reason[i].clone() };
-			let last_reason: String = self.lifecycle.latest(i).map_or_else(String::new, |t| String::from(reason_name(t.reason)));
-			out.push(SupervisorStat { name: String::from_utf8_lossy(MANIFEST[i].name).into_owned(), state: String::from(state_name(self.state[i])), desired: String::from(desired_name(self.desired[i])), epoch: unsafe { epoch_of(self.procs[i]) }, last_reason, restarts: self.sup[i].restarts, watchdog_trips: self.sup[i].watchdog_trips, last_failure });
+			let latest: Option<Transition> = self.lifecycle.latest(i);
+			let last_reason: String = latest.map_or_else(String::new, |t| String::from(reason_name(t.reason)));
+			// THE INSTANCE THIS ROW IS ABOUT. A running service answers with its own process. A
+			// failed or stopped one has no process left, and answering 0 there threw away the
+			// identity of the instance the last transition was about - which is the instance
+			// somebody reading a failure is asking after.
+			let epoch: u64 = match unsafe { epoch_of(self.procs[i]) } {
+				0 => latest.map_or(0, |t| t.epoch),
+				live => live,
+			};
+			out.push(SupervisorStat { name: String::from_utf8_lossy(MANIFEST[i].name).into_owned(), state: String::from(state_name(self.state[i])), desired: String::from(desired_name(self.desired[i])), epoch, last_reason, restarts: self.sup[i].restarts, watchdog_trips: self.sup[i].watchdog_trips, last_failure });
 			i += 1;
 		}
 		// The canary and the drivers are not managed deployments: they have no declared desired

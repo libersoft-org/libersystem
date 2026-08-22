@@ -8,12 +8,10 @@
 #![no_std]
 #![no_main]
 
-mod common;
-mod virtio;
-
 use rt::*;
 
 use crate::virtio::Queue;
+use drivers::{common, virtio};
 
 // One disk sector.
 const SECTOR: u32 = 512;

@@ -6,8 +6,6 @@
 // given a fabricated stack frame (see init_thread_stack) whose return address is
 // thread_trampoline, so the first switch into it lands in Rust at thread_bootstrap.
 
-#![allow(dead_code)]
-
 use core::arch::{asm, global_asm};
 
 unsafe extern "C" {
