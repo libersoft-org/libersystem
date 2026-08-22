@@ -122,6 +122,28 @@ const KEY_BACKSLASH: u16 = 43;
 static POWER: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 // Record the power capability this driver was handed at bootstrap.
+// ASK, DO NOT ACT. This driver used to hold the root-Domain handle and call `SYS_SYSTEM_POWER`
+// itself - a capability that can kill every process on the machine, held by a keyboard driver so
+// that Ctrl+Alt+Del would work. What it holds now is a SystemPower connection: two ops, no
+// arguments, and the authority stays in SystemManager where the request is answered.
+//
+// A driver handed no connection finds the chord inert, which is the same posture the console
+// capability takes: a key that does nothing is better than one that acts on authority the driver
+// was not given.
+fn request_reboot() {
+	let chan: u64 = POWER.load(core::sync::atomic::Ordering::Relaxed);
+	if chan != 0 {
+		let _ = proto::system::system_power::Client::new(ipc_client::ChannelTransport { chan }).reboot();
+	}
+}
+
+fn request_power_off() {
+	let chan: u64 = POWER.load(core::sync::atomic::Ordering::Relaxed);
+	if chan != 0 {
+		let _ = proto::system::system_power::Client::new(ipc_client::ChannelTransport { chan }).power_off();
+	}
+}
+
 pub fn set_power(handle: u64) {
 	POWER.store(handle, core::sync::atomic::Ordering::Relaxed);
 }
@@ -335,7 +357,7 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		// held reboots the machine. The keyboard is interrupt-driven, so it fires and
 		// interrupts whatever userspace is doing, even if the shell is wedged.
 		if code == KEY_DELETE && value == 1 && mods.ctrl && mods.alt {
-			system_power(POWER.load(core::sync::atomic::Ordering::Relaxed), POWER_REBOOT);
+			request_reboot();
 		}
 		// The Power key shuts the machine down (interrupt-driven like the reboot chord,
 		// so it works even when userspace is wedged).
@@ -348,7 +370,7 @@ pub unsafe fn feed_key(code: u16, value: u32, mods: &mut Mods) {
 		// while there is still a console to name it on.
 		if code == KEY_POWER {
 			debug_write(b"driver.keys: KEY_POWER - powering off\n");
-			system_power(POWER.load(core::sync::atomic::Ordering::Relaxed), POWER_OFF);
+			request_power_off();
 			return;
 		}
 		// The recognized keys whose subsystem does not exist yet: consumed, no bytes.

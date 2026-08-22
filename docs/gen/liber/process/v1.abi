@@ -13,3 +13,6 @@ method process.launch-prepared op=6 (name:string:rights=,bootstrap:handle<channe
 method process.release op=7 (koid:u64:rights=) -> result<bool, liber:base@1::error>
 method process.release-group op=8 (koids:list<u64>:bound=8:rights=) -> result<bool, liber:base@1::error>
 method process.cancel op=9 (koid:u64:rights=) -> result<bool, liber:base@1::error>
+interface system-power
+method system-power.reboot op=1 () -> result<unit, liber:base@1::error>
+method system-power.power-off op=2 () -> result<unit, liber:base@1::error>

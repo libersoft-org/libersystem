@@ -100,3 +100,26 @@ interface process {
 	@op(8) release-group: func(@bound(8) koids: list<koid>) -> result<bool, error>;
 	@op(9) cancel: func(koid: koid) -> result<bool, error>;
 }
+
+/// THE NARROW DOOR TO STOPPING THE MACHINE.
+///
+/// Before this, the Power key worked by handing its driver the root-Domain handle - and whoever
+/// holds that can already `sys_domain_kill` the whole system and rewrite the root Domain's resource
+/// limits. The kernel says so itself beside `sys_system_power`. So a keyboard driver held the
+/// broadest capability in the system in order to answer Ctrl+Alt+Del, and so did the device manager
+/// that passed it on and the supervisor that passed it to them.
+///
+/// Two ops and no arguments is the whole of what that path ever needed. The authority stays with
+/// SystemManager, which is the one process resident for the life of the system; everything else
+/// asks. A client of this interface can stop the machine and can do NOTHING ELSE, which is the
+/// difference between a capability and a key to the building.
+///
+/// Deliberately not here: a graceful shutdown that stops services in order first. That is a
+/// feature, this is an authority narrowing, and attaching one to the other delays the narrowing
+/// behind work that has nothing to do with it.
+interface system-power {
+	/// Restart the machine. Returns only if the request was refused.
+	@op(1) reboot: func() -> result<unit, error>;
+	/// Power the machine off. Returns only if the request was refused.
+	@op(2) power-off: func() -> result<unit, error>;
+}

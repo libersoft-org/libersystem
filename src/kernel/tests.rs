@@ -3759,6 +3759,28 @@ impl StorageHarness {
 		self.process.as_ref().expect("this harness did not keep the service process").handle_count()
 	}
 
+	// END THE SERVICE AND WAIT UNTIL ITS END OF THE CHANNEL IS GONE, so a call made afterwards is
+	// one whose peer does not exist. Asking it to shut down rather than killing the process: the
+	// point is a client left holding an endpoint to a service that has ended, and how it ended is
+	// not what the caller is being told about.
+	fn kill_service(&mut self) {
+		use object::channel::Message;
+		self.client.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new(), 0)).expect("storage shutdown request");
+		for _ in 0..100_000 {
+			self.pump();
+			if self.client.is_peer_closed() {
+				return;
+			}
+		}
+		panic!("StorageService harness did not shut down");
+	}
+
+	// Whether this harness's end of the service channel has lost its peer - which is how a
+	// supervisor learns a service ended without having to call it.
+	fn client_peer_closed(&self) -> bool {
+		self.client.is_peer_closed()
+	}
+
 	// Restart the service over the SAME backing, which is the only restart that means anything: a
 	// disk-backed volume must read its files back, and a memory-backed one must not.
 	fn restart(mut self, storage_elf: &[u8]) -> Self {

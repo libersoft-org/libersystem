@@ -388,7 +388,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// Power key. `SYS_SYSTEM_POWER` requires it; a driver handed none finds the key
 		// inert rather than halting the machine on a right it does not hold.
 		let power: u64 = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if len >= 5 && &buf[..5] == b"POWER" => handle,
+			Received::Message { len, handle } if len >= 8 && &buf[..8] == b"SYSPOWER" => handle,
 			_ => 0,
 		};
 		keys::set_power(power);

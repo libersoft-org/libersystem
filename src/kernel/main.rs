@@ -290,6 +290,16 @@ fn boot_main() {
 #[cfg(not(test))]
 fn serial_console_pump() {
 	use core::sync::atomic::{AtomicBool, Ordering};
+	// THE CONTROL PLANE HAS NO OWNER, SO THE MACHINE DOES NOT KEEP RUNNING AS THOUGH IT HAS ONE.
+	//
+	// Checked here because this hook runs on every idle pass whatever the shell is doing, and a
+	// dead SystemManager is not something to discover the next time somebody types. There is no
+	// in-place resurrection: bringing back a manager whose branch is still full of the processes
+	// it owned would be a second manager beside an orphan, which is worse than a reboot.
+	if resident_manager_lost() {
+		serial_println!("recovery: SystemManager ended after the system was up - the control plane has no owner, rebooting");
+		arch::reset();
+	}
 	static NUDGED: AtomicBool = AtomicBool::new(false);
 	if !NUDGED.load(Ordering::Relaxed) && console_input::shell_listening() {
 		NUDGED.store(true, Ordering::Relaxed);
@@ -393,6 +403,47 @@ fn volume_package_bytes() -> Option<&'static [u8]> {
 // supervises. Returns the kernel-held peer endpoint (on which the boot chain's
 // reports arrive) and the SystemManager process's koid (which the recovery
 // supervisor watches for a fault). Shared by the boot path and the test.
+// THE RESIDENT MANAGER, WATCHED AFTER THE SYSTEM IS UP.
+//
+// The recovery ladder below supervises SystemManager only until the system comes up: `supervise`
+// returns on the first round that completes without a fault and stops looking. That was right while
+// SystemManager relayed the boot reports and exited, because after that there was nothing to watch.
+// It stays resident now and owns the control-plane branch, so its LATER death leaves that branch
+// with no owner - and nothing would have noticed.
+//
+// The crash channel alone is not enough either: it reports FAULTS, and a manager that returns
+// cleanly is just as gone. So the process itself is watched, and any ending - fault or clean exit -
+// after the system is up reaches the same place a lost control plane has to reach.
+static RESIDENT_MANAGER: crate::sync::SpinLock<Option<alloc::sync::Arc<object::process::Process>>> = crate::sync::SpinLock::new(None);
+
+// Set once the pre-online ladder has finished and the system is up. BEFORE this point a
+// SystemManager that ends is the ladder's business and a restart is the right answer; after it,
+// the same ending means the control plane is ownerless and the only honest answer is a reboot. One
+// flag separates the two, and nothing clears it.
+static SYSTEM_IS_UP: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// Whether the control plane has lost its owner.
+//
+// TAKEN AS ARGUMENTS RATHER THAN READ FROM STATICS, so the decision can be tested with a process
+// that really has ended instead of by reasoning about it. The three cases it separates are the
+// whole of the rule:
+//
+//   before the system is up   the pre-online ladder owns the outcome, and a manager that ends
+//                             there is restarted rather than mourned
+//   after, still alive        nothing to do
+//   after, ended              the branch below has no owner and the machine reboots
+//
+// "Ended" and not "faulted": a manager that returns or calls `exit` cleanly is exactly as gone as
+// one that faulted, and the crash channel only reports the second.
+pub(crate) fn control_plane_lost(system_up: bool, manager: Option<&alloc::sync::Arc<object::process::Process>>) -> bool {
+	system_up && manager.is_some_and(|process| process.is_terminated())
+}
+
+fn resident_manager_lost() -> bool {
+	let manager = RESIDENT_MANAGER.lock();
+	control_plane_lost(SYSTEM_IS_UP.load(core::sync::atomic::Ordering::Relaxed), manager.as_ref())
+}
+
 fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>, u64), &'static str> {
 	use alloc::sync::Arc;
 	use object::KernelObject;
@@ -413,6 +464,9 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	// up by. This one the kernel launches itself, so the kernel labels it.
 	process.header().set_name("system_manager");
 	let sm_koid = process.header().koid();
+	// Kept so the ending can be seen. Replaced on each attempt of the pre-online ladder, so what is
+	// watched afterwards is the instance that actually came up.
+	*RESIDENT_MANAGER.lock() = Some(process.clone());
 
 	// Hand SystemManager the init package as a read-only shared buffer: the kernel
 	// copies the package bytes into a MemoryObject and sends "PACKAGE" + length
@@ -598,6 +652,9 @@ fn boot_userspace_with_recovery() {
 		}
 	});
 	if up {
+		// From here a SystemManager that ends is a control plane with no owner, and the idle hook
+		// reboots rather than letting the machine run on as though somebody were still supervising.
+		SYSTEM_IS_UP.store(true, core::sync::atomic::Ordering::Relaxed);
 		// SystemManager came up without faulting: print the boot-chain reports and
 		// hand control to the interactive shell it started.
 		if let Some(ep) = &kernel_ep {

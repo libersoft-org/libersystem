@@ -515,6 +515,21 @@ pub mod display {
 		Some(value)
 	}
 
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
 	pub struct Client<T: Transport> {
 		transport: T,
 		corr: u32,
@@ -586,14 +601,13 @@ pub mod display {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -623,14 +637,13 @@ pub mod display {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -656,14 +669,13 @@ pub mod display {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -714,14 +726,13 @@ pub mod display {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -901,6 +912,21 @@ pub mod display_admin {
 		Some(writer.pos())
 	}
 
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
 	pub struct Client<T: Transport> {
 		transport: T,
 		corr: u32,
@@ -972,14 +998,13 @@ pub mod display_admin {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;

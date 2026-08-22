@@ -1302,6 +1302,191 @@ fn config_set_survives_a_service_reboot() {
 	sched::run_until_idle();
 }
 
+tagged_test!(a_service_that_cannot_be_restarted_is_left_failed_rather_than_reported_up, [Service, Process], id = "kernel.services.a_service_that_cannot_be_restarted_is_left_failed_rather_than_reported_up", covers = ["kernel", "storage"]);
+fn a_service_that_cannot_be_restarted_is_left_failed_rather_than_reported_up() {
+	// THE FAULT-MATRIX ROW FOR A SERVICE NOBODY CAN BRING BACK.
+	//
+	// Detector: the supervisor, when the service's channel closes.
+	// Owner:    ServiceManager.
+	// Outcome:  the service is recorded FAILED and dropped from the wait set. It is NOT restarted,
+	//           and - the part that matters - it is not left being reported as running either.
+	//
+	// Twenty of twenty-three services are in this class today, because their bootstrap cannot be
+	// re-run: `relaunch_service` says so in as many words. P02M0141 is what shrinks that number,
+	// and until it reaches zero the honest answer for the rest is a state that says so.
+	//
+	// Driven at the harness rather than through a whole boot: what is being measured is that a
+	// service which ENDS is observable as ended, and a storage instance ending is the cheapest
+	// truthful version of that.
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let mut ram = StorageHarness::start_memory(storage_elf, b"RAMVOL", 8 * 1024);
+	assert!(ram.write(b"vol://ram/live", b"answered while it was there", 0x7d01), "the service answers while it is running");
+
+	ram.kill_service();
+
+	// THE STATE IS OBSERVABLE FROM OUTSIDE. A client that kept calling would find out; the point of
+	// a supervisor is that somebody finds out WITHOUT calling. The channel's peer being gone is
+	// that signal, and it is what the supervise loop selects on.
+	assert!(ram.client_peer_closed(), "the ended service is observable as ended rather than silently absent");
+
+	// WHAT A CALL AFTERWARDS ANSWERS is the neighbouring row of this matrix and is measured there,
+	// through the generated client rather than through this harness - which speaks the wire by hand
+	// and would prove nothing about the code every real caller goes through. See
+	// `a_call_that_never_left_is_told_apart_from_one_that_may_have_landed`.
+}
+
+tagged_test!(a_call_that_never_left_is_told_apart_from_one_that_may_have_landed, [Service, Storage], id = "kernel.services.a_call_that_never_left_is_told_apart_from_one_that_may_have_landed", covers = ["kernel", "services"]);
+fn a_call_that_never_left_is_told_apart_from_one_that_may_have_landed() {
+	// THE ONE DISTINCTION A CLIENT CANNOT DO WITHOUT, and the one every generated client used to
+	// throw away.
+	//
+	// The transport has always known it: `SendRefused` when the request never went out, and
+	// `PeerClosed` or `TimedOut` when it did and no reply came. Every client method then collapsed
+	// both to `None`, so a caller could not tell a write that never reached the medium from one
+	// that may have landed - and there is no safe move that covers both. Retrying the first is
+	// correct; retrying the second is how a transfer happens twice.
+	//
+	// It is answered in the protocol's own words rather than a new channel: `again` for a request
+	// that never left, and `commit-uncertain` - the answer `base.error` grew for exactly this - for
+	// one whose outcome nobody knows.
+	// DRIVEN THROUGH THE GENERATED CLIENT, because that is where the answer was being lost. This
+	// suite's storage harness speaks the wire by hand, so it would prove nothing about the code
+	// every real caller goes through.
+	use object::channel::Channel;
+	use object::rights::Rights;
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let probe_elf = program_elf(&package, _volume, b"role_probe").expect("role_probe");
+
+	let (parent, child) = Channel::create();
+	let (report, report_child) = Channel::create();
+	let process = spawn_dynamic_test_process(sched::root_domain(), probe_elf, child);
+	send_cap(&parent, &[5u8], report_child, Rights::ALL).expect("case selector and report channel");
+	// A channel whose FAR END IS DROPPED BEFORE THE CALL. No service ever existed on it, which is
+	// the same position as one that has ended: the request cannot be delivered and cannot have
+	// been acted on.
+	let (near, far) = Channel::create();
+	core::mem::drop(far);
+	send_cap(&parent, b"DEAD", near, Rights::ALL).expect("dead channel");
+	let mut answer = alloc::vec::Vec::new();
+	for _ in 0..200_000 {
+		sched::run_until_idle();
+		if let Ok(reply) = report.recv() {
+			answer = reply.bytes;
+			break;
+		}
+		if process.is_terminated() {
+			break;
+		}
+	}
+	// `again` and not a bare failure. The request never left this process, so retrying it is safe
+	// - and a caller told only "it did not work" has to guess between that and an operation that
+	// may already have happened.
+	assert_eq!(answer.as_slice(), b"err 3", "a call whose request never left is answered `again`, which says retrying is safe: {:?}", core::str::from_utf8(&answer));
+}
+
+tagged_test!(a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind, [Service, Process], id = "kernel.services.a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind", covers = ["kernel", "services"]);
+fn a_bootstrap_role_is_refused_by_name_and_leaves_nothing_behind() {
+	use object::channel::{Channel, Message};
+	use object::memory_object::MemoryObject;
+	use object::rights::Rights;
+
+	// THE RECEIVING HALF OF A BOOTSTRAP, WHICH NOTHING WAS TESTING. Every service reads its
+	// capabilities as a fixed sequence of tagged messages, by hand, and the two ends agree only
+	// because somebody keeps them agreeing. When three programs once read theirs in an order the
+	// sender does not use, a blocking tagged read consumed the message that was actually next and
+	// then waited forever for one nobody sends - and it surfaced 170 tests away.
+	//
+	// `rt::receive_roles` checks what a receiver CAN check: that every required role arrived, that
+	// the tag in each position is the one declared, that a handle is the kernel object type its
+	// role is, and that it carries the rights that role needs. It cannot check which protocol
+	// answers on a channel, and does not pretend to.
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let probe_elf = program_elf(&package, volume, b"role_probe").expect("role_probe");
+
+	// Drive one case and read the probe's verdict: `tag:reason count`, where the count is how many
+	// capabilities the probe still holds. A refusal must leave zero.
+	let drive = |case: u8, send: &dyn Fn(&alloc::sync::Arc<Channel>)| -> alloc::vec::Vec<u8> {
+		let (parent, child) = Channel::create();
+		let (report, report_child) = Channel::create();
+		let process = spawn_dynamic_test_process(sched::root_domain(), probe_elf, child);
+		send_cap(&parent, &[case], report_child, Rights::ALL).expect("case selector and report channel");
+		send(&parent);
+		// DROPPED, so a role the caller chose not to send never arrives rather than never being
+		// waited for. The probe answers on its own channel, which is why this can be let go.
+		core::mem::drop(parent);
+		for _ in 0..100_000 {
+			sched::run_until_idle();
+			if let Ok(reply) = report.recv() {
+				return reply.bytes;
+			}
+			if process.is_terminated() {
+				break;
+			}
+		}
+		alloc::vec::Vec::new()
+	};
+	let channel_cap = |rights: Rights| -> object::handle::Capability {
+		let (_keep, far) = Channel::create();
+		core::mem::forget(_keep);
+		object::handle::Capability::new(far as alloc::sync::Arc<dyn object::KernelObject>, rights, 0)
+	};
+	let serving: Rights = Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER;
+
+	// 1. EVERY ROLE PRESENT, including the optional one sent as a bare tag with no capability -
+	//    which is the ordinary shape of a boot with no second disk, and a receiver that refused it
+	//    would be one that cannot start on a smaller machine.
+	let all = drive(0, &|parent| {
+		for tag in [b"SERVE".as_slice(), b"STORAGE".as_slice()] {
+			parent.send(Message::new(tag.to_vec(), alloc::vec![channel_cap(serving)], 0)).expect("role");
+		}
+		parent.send(Message::new(b"MEDIA".to_vec(), alloc::vec::Vec::new(), 0)).expect("absent optional role");
+	});
+	assert_eq!(all.as_slice(), b"ok 2", "every declared role is accepted, and the absent optional one is not an error");
+
+	// 2. A REQUIRED ROLE THAT NEVER ARRIVES. The peer closes instead of sending it.
+	let missing = drive(1, &|parent| {
+		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![channel_cap(serving)], 0)).expect("first role");
+	});
+	assert_eq!(missing.as_slice(), b"STORAGE:role never arrived 0", "the missing role is named, and the one already taken is closed rather than kept");
+
+	// 3. THE WRONG KIND OF OBJECT under a role that must be a channel. A memory object is not a
+	//    channel, and the kernel will say so - which is the whole of what this layer can check.
+	let wrong = drive(2, &|parent| {
+		let object = MemoryObject::create(4096).expect("probe memory object");
+		let cap = object::handle::Capability::new(object as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP | Rights::TRANSFER, 0);
+		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![cap], 0)).expect("wrong-type role");
+	});
+	assert_eq!(wrong.as_slice(), b"SERVE:role carried the wrong kind of object 0", "a memory object under a channel role is refused, and nothing is kept");
+
+	// 4. THE RIGHT OBJECT WITH TOO FEW RIGHTS. A channel that cannot be received on is not one a
+	//    service can serve its clients over, and finding that out at the first call rather than at
+	//    bootstrap is the difference between a service that fails to start and one that starts
+	//    broken.
+	let thin = drive(3, &|parent| {
+		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![channel_cap(Rights::SEND | Rights::TRANSFER)], 0)).expect("thin role");
+	});
+	assert_eq!(thin.as_slice(), b"SERVE:role carried fewer rights than it needs 0", "a channel without RECEIVE cannot be served on, and is refused before ready");
+
+	// 5. MORE RIGHTS THAN THE ROLE IS ALLOWED, which is the half that catches over-granting rather
+	//    than under-granting - and it caught the system as it stood. A fresh channel end carries
+	//    every right, and the supervisor transferred serve roots exactly as the kernel minted them,
+	//    so every service held MANAGE, DUPLICATE and REVOKE over its own service channel. Refused
+	//    rather than trimmed: a receiver that quietly narrowed what it was handed would hide the
+	//    sender, and the sender is where it has to be fixed.
+	let broad = drive(3, &|parent| {
+		parent.send(Message::new(b"SERVE".to_vec(), alloc::vec![channel_cap(Rights::ALL)], 0)).expect("over-granted role");
+	});
+	assert_eq!(broad.as_slice(), b"SERVE:role carried more rights than it is allowed 0", "a serve root carrying every right is refused");
+
+	// 6. A ROLE ARRIVING OUT OF POSITION. The sequence is the contract: a tag in the wrong place
+	//    has already displaced every read after it, so it is refused here rather than consumed.
+	let disordered = drive(0, &|parent| {
+		parent.send(Message::new(b"STORAGE".to_vec(), alloc::vec![channel_cap(serving)], 0)).expect("role out of order");
+	});
+	assert_eq!(disordered.as_slice(), b"SERVE:a different role arrived in this position 0", "a tag out of order is refused rather than silently consumed");
+}
+
 tagged_test!(pty_hosts_a_program, [Service, Shell, Console], id = "kernel.services.pty_hosts_a_program", covers = ["kernel", "services", "term"]);
 fn pty_hosts_a_program() {
 	use object::channel::{Channel, Message};

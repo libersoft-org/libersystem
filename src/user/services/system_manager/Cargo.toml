@@ -16,5 +16,9 @@ path = "src/main.rs"
 # the syscall/IPC/volume helpers); it re-exports the abi constants.
 rt = { path = "../../runtime/rt" }
 
+# The generated SystemPower contract this process serves: two ops, and the root-Domain handle that
+# answers them never leaves here.
+proto = { path = "../../../proto" }
+
 # Note: the x86_64-unknown-none target is panic-strategy = "abort" by default, so
 # we do not set `panic = "abort"` per-profile (same reasoning as the kernel).

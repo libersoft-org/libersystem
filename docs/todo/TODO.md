@@ -214,7 +214,7 @@ or preventing further development of `v1`.
 - [x] [P02M0138 - PermissionManager changes must select the tests that exercise them](P02M0138.md)
 - [x] [P02M0139 - Reuse the PermissionManager test fixture without sharing test state](P02M0139.md)
 - [x] [P02M0140 - Retire `just`: one way to run things, and it is a script with flags](P02M0140.md)
-- [ ] [P02M0141 - Wiring the system can re-run, and authority it can prove](P02M0141.md)
+- [x] [P02M0141 - Wiring the system can re-run, and authority it can prove](P02M0141.md)
 
 ### Definition of done (phase 2)
 

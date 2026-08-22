@@ -1185,6 +1185,15 @@ destination = "libexec/sandbox_probe.lsexe"
 providers = ["base-proto", "storage-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
+name = "role_probe"
+owner = "services"
+role = "probe"
+linkage = "dynamic"
+stage = "volume"
+destination = "libexec/role_probe.lsexe"
+providers = ["base-proto", "ipc-client", "wire", "lsrt"]
+
+[[programs]]
 name = "script"
 owner = "tools"
 role = "tool"
@@ -1608,6 +1617,8 @@ destination = "log"
 name = "audio_service"
 program = "audio_service"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "session"
 dependencies = ["log_service", "device_manager", "process_service"]
 
 [[services.roles]]
@@ -1632,6 +1643,9 @@ interface = "liber:audio@1/audio"
 name = "config_service"
 program = "config_service"
 restart = "transparent"
+state_class = "durable"
+state_scope = "service"
+state_storage = "vol://system/libexec/config_service/config.tree"
 dependencies = ["log_service", "process_service", "storage_service"]
 
 [[services.roles]]
@@ -1650,6 +1664,8 @@ interface = "liber:config@1/config"
 name = "console_service"
 program = "console_service"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "session"
 dependencies = [
 	"log_service",
 	"time_service",
@@ -1757,10 +1773,17 @@ kind = "device"
 provider = "device_manager"
 presence = "optional"
 
+[[services.roles]]
+tag = "READY"
+kind = "payload"
+provider = "service_manager"
+
 [[services]]
 name = "device_manager"
 program = "device_manager"
 restart = "escalate"
+state_class = "reconstructible"
+state_scope = "service"
 dependencies = ["log_service"]
 
 [[services.roles]]
@@ -1769,9 +1792,10 @@ kind = "package"
 provider = "service_manager"
 
 [[services.roles]]
-tag = "POWER"
-kind = "power"
-provider = "kernel"
+tag = "SYSPOWER"
+kind = "client"
+provider = "service_manager"
+interface = "liber:process@1/system-power"
 
 [[services.roles]]
 tag = "CONSOLE"
@@ -1789,6 +1813,8 @@ presence = "optional"
 name = "device_service"
 program = "device_service"
 restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
 dependencies = ["log_service", "process_service"]
 
 [[services.roles]]
@@ -1801,6 +1827,8 @@ interface = "liber:device@1/device"
 name = "display_service"
 program = "display_service"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "session"
 dependencies = ["log_service", "device_manager", "process_service", "input_service"]
 
 [[services.roles]]
@@ -1813,11 +1841,13 @@ presence = "optional"
 tag = "FOCUS"
 kind = "client"
 provider = "input_service"
+source = "FOCUS"
 
 [[services.roles]]
 tag = "KILL"
 kind = "client"
 provider = "input_service"
+source = "KILL"
 
 [[services.roles]]
 tag = "ADMIN"
@@ -1841,6 +1871,8 @@ presence = "optional"
 name = "input_service"
 program = "input_service"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "session"
 dependencies = ["log_service", "device_manager", "process_service"]
 
 [[services.roles]]
@@ -1892,6 +1924,9 @@ interface = "liber:input@1/input-admin"
 name = "iso_storage"
 program = "storage_service"
 restart = "escalate"
+state_class = "durable"
+state_scope = "external"
+state_storage = "vol://iso"
 dependencies = ["log_service", "device_manager"]
 
 [[services.roles]]
@@ -1910,6 +1945,9 @@ interface = "liber:storage@1/volume"
 name = "log_service"
 program = "log_service"
 restart = "escalate"
+state_class = "durable"
+state_scope = "service"
+state_storage = "vol://system/log/"
 dependencies = []
 
 [[services.roles]]
@@ -1922,6 +1960,9 @@ interface = "liber:log@1/log"
 name = "media_storage"
 program = "storage_service"
 restart = "escalate"
+state_class = "durable"
+state_scope = "external"
+state_storage = "vol://media"
 dependencies = ["log_service", "device_manager"]
 
 [[services.roles]]
@@ -1940,6 +1981,8 @@ interface = "liber:storage@1/volume"
 name = "network_service"
 program = "network_service"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "external"
 dependencies = ["log_service", "device_manager", "process_service", "config_service"]
 
 [[services.roles]]
@@ -1964,6 +2007,8 @@ interface = "liber:network@1/network"
 name = "permission_manager"
 program = "permission_manager"
 restart = "escalate"
+state_class = "reconstructible"
+state_scope = "service"
 # Every service whose client this manager holds and grants onward. `session_service` is here
 # because the manager mints a session client for the governed `kill` command, and a dependency that
 # is not declared is a start order that happens to work: on one machine the session was up first
@@ -1994,6 +2039,7 @@ dependencies = [
 tag = "STORAGE_ADMIN"
 kind = "client"
 provider = "storage_service"
+source = "ADMIN"
 interface = "liber:storage@1/volume-admin"
 
 [[services.roles]]
@@ -2050,6 +2096,7 @@ interface = "liber:audio@1/audio"
 tag = "DISPLAY_ADMIN"
 kind = "client"
 provider = "display_service"
+source = "ADMIN"
 presence = "optional"
 interface = "liber:display@1/display-admin"
 
@@ -2057,6 +2104,7 @@ interface = "liber:display@1/display-admin"
 tag = "INPUT_ADMIN"
 kind = "client"
 provider = "input_service"
+source = "ADMIN"
 presence = "optional"
 interface = "liber:input@1/input-admin"
 
@@ -2064,6 +2112,7 @@ interface = "liber:input@1/input-admin"
 tag = "AUDIO_ADMIN"
 kind = "client"
 provider = "audio_service"
+source = "ADMIN"
 presence = "optional"
 interface = "liber:audio@1/audio-admin"
 
@@ -2147,10 +2196,17 @@ kind = "serve-root"
 provider = "self"
 interface = "liber:security@1/permission"
 
+[[services.roles]]
+tag = "READY"
+kind = "payload"
+provider = "service_manager"
+
 [[services]]
 name = "process_service"
 program = "process_service"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "service"
 dependencies = ["log_service", "storage_service"]
 
 [[services.roles]]
@@ -2180,6 +2236,8 @@ interface = "liber:process@1/process"
 name = "resource_manager"
 program = "resource_manager"
 restart = "escalate"
+state_class = "reconstructible"
+state_scope = "service"
 dependencies = ["log_service", "process_service"]
 
 [[services.roles]]
@@ -2203,6 +2261,8 @@ interface = "liber:process@1/process"
 name = "session_service"
 program = "session_service"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "session"
 dependencies = ["log_service", "process_service"]
 
 [[services.roles]]
@@ -2215,6 +2275,8 @@ interface = "liber:session@1/session"
 name = "shell"
 program = "shell"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "session"
 dependencies = [
 	"storage_service",
 	"media_storage",
@@ -2341,7 +2403,7 @@ interface = "liber:resources@1/resource"
 
 [[services.roles]]
 tag = "SESSION"
-kind = "client"
+kind = "factory"
 provider = "session_service"
 interface = "liber:session@1/session"
 
@@ -2349,11 +2411,13 @@ interface = "liber:session@1/session"
 tag = "CONSOLE"
 kind = "client"
 provider = "console_service"
+source = "CLIENT"
 
 [[services.roles]]
 tag = "CONTROL"
 kind = "client"
 provider = "console_service"
+source = "CONTROL"
 
 [[services.roles]]
 tag = "ADMIN"
@@ -2361,10 +2425,18 @@ kind = "serve-root"
 provider = "self"
 interface = "liber:process@1/supervisor"
 
+[[services.roles]]
+tag = "READY"
+kind = "payload"
+provider = "service_manager"
+
 [[services]]
 name = "storage_service"
 program = "storage_service"
 restart = "escalate"
+state_class = "durable"
+state_scope = "external"
+state_storage = "vol://system"
 dependencies = ["log_service", "device_manager"]
 
 [[services.roles]]
@@ -2388,6 +2460,8 @@ interface = "liber:storage@1/volume"
 name = "system_graph_service"
 program = "system_graph_service"
 restart = "transparent"
+state_class = "reconstructible"
+state_scope = "service"
 dependencies = [
 	"log_service",
 	"device_manager",
@@ -2430,6 +2504,8 @@ interface = "liber:observability@1/system-graph"
 name = "time_service"
 program = "time_service"
 restart = "escalate"
+state_class = "reconstructible"
+state_scope = "external"
 dependencies = ["log_service", "network_service", "process_service"]
 
 [[services.roles]]
@@ -2449,6 +2525,9 @@ interface = "liber:time@1/time"
 name = "udf_storage"
 program = "storage_service"
 restart = "escalate"
+state_class = "durable"
+state_scope = "external"
+state_storage = "vol://udf"
 dependencies = ["log_service", "device_manager"]
 
 [[services.roles]]
@@ -2470,6 +2549,8 @@ interface = "liber:storage@1/volume"
 name = "ram_storage"
 program = "storage_service"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "service"
 dependencies = ["log_service"]
 
 [[services.roles]]
@@ -2487,6 +2568,8 @@ interface = "liber:storage@1/volume"
 name = "tmp_storage"
 program = "storage_service"
 restart = "escalate"
+state_class = "ephemeral"
+state_scope = "service"
 dependencies = ["log_service"]
 
 [[services.roles]]
@@ -2504,6 +2587,9 @@ interface = "liber:storage@1/volume"
 name = "usb_storage"
 program = "storage_service"
 restart = "escalate"
+state_class = "durable"
+state_scope = "external"
+state_storage = "vol://usb"
 dependencies = ["log_service", "storage_service", "device_manager"]
 
 [[services.roles]]

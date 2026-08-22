@@ -48,6 +48,11 @@ declare -A GATES=(
 	# comment said so and the next round still wrote a rollback that unmapped a page and called
 	# `deallocate` - a rule in a comment is a rule the next diff does not read.
 	["frame-retirement"]="tools/check-frame-retirement.sh"
+	# The hand-written bootstrap ladder and the generated role plan describe the same wiring while
+	# P02M0141 migrates from one to the other, and two descriptions of one fact is what that
+	# milestone exists to remove. Until the ladder is empty they are compared, tag by tag and in
+	# order - a role in the wrong position has already displaced every read after it.
+	["bootstrap-plan"]="tools/check-bootstrap-plan.py"
 	# A hand-written `extern` declaration and the generated function it is forwarded to are joined
 	# by a bare jump, so a signature that disagrees is a silent argument-register mismatch rather
 	# than a link error. One such pair made every transactional write in the system return "no

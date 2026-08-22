@@ -2,6 +2,136 @@ use super::*;
 use ipc_client::ChannelTransport;
 use proto::system::volume_admin;
 
+// THE PLAN EXECUTOR: hand one service its declared roles, in the declared order.
+//
+// This is what the twenty-three hand-written branches below are being replaced by, one service at a
+// time. Each branch encodes in code what the manifest now says as data - which capabilities a
+// service is given, where each comes from, and in what order - and the two must agree, so the
+// executor is COMPARED against the branch before either is switched over.
+//
+// Three of the eight kinds resolve entirely from the plan, and they are most of every service:
+//
+//   serve-root  create a channel pair, send the service end, keep the client end under this
+//               service's name and this role's tag - which is what makes the next two work
+//   client      a duplicate of the client end kept from the provider's serve root named by
+//               `source`, narrowed to what a client needs
+//   factory     a fresh connection minted from that same kept end
+//
+// The rest - a driver's handle, a privileged capability from the kernel, a message of bytes - come
+// from outside the service graph, and the executor takes them from the caller rather than
+// inventing a way to derive what is not derivable.
+pub(super) struct Kept {
+	// One kept client end per serve root, indexed the same way `MANIFEST` is, so a lookup is a
+	// walk over one service's roles rather than a map.
+	pub ends: [[u64; MAX_ROLES]; N],
+}
+
+// The most roles any one service declares. The plan is generated, so this is checked at build time
+// by the array it sizes rather than believed.
+pub(super) const MAX_ROLES: usize = 32;
+
+impl Kept {
+	pub(super) fn new() -> Kept {
+		Kept { ends: [[0; MAX_ROLES]; N] }
+	}
+
+	// Record a client end a hand-written branch kept, so a MIGRATED service can be a client of a
+	// provider that has not been migrated yet.
+	//
+	// THE BRIDGE, AND IT IS TEMPORARY BY CONSTRUCTION. Every call here is a serve root the executor
+	// would have kept itself; each disappears with the branch that made it, and when the ladder is
+	// empty this method has no callers.
+	pub(super) fn register(&mut self, service: &[u8], tag: &[u8], client: u64) {
+		let Some(index) = index_of(service) else { return };
+		for (slot, role) in ROLES[index].iter().enumerate() {
+			if role.tag == tag && role.kind == RoleKind::ServeRoot && slot < MAX_ROLES {
+				self.ends[index][slot] = client;
+				return;
+			}
+		}
+	}
+
+	// The client end kept from `provider`'s serve root called `tag`, or 0 when there is none.
+	pub(super) fn end_of(&self, provider: &[u8], tag: &[u8]) -> u64 {
+		let Some(index) = index_of(provider) else { return 0 };
+		for (slot, role) in ROLES[index].iter().enumerate() {
+			if role.tag == tag && role.kind == RoleKind::ServeRoot && slot < MAX_ROLES {
+				return self.ends[index][slot];
+			}
+		}
+		0
+	}
+}
+
+// Send one service the roles the plan declares for it, resolving what can be resolved and taking
+// the rest from `external`. Returns false at the first role that cannot be delivered.
+//
+// EXTERNAL IS A FUNCTION, NOT A TABLE, because what it answers is held in the supervisor's own
+// locals - a block device's channel, the console-input privilege, the bytes a memory volume is
+// sized with. Threading fifty named variables through here would be the ladder again with one more
+// level of indirection.
+pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, external: &mut dyn FnMut(&Role) -> Option<(alloc::vec::Vec<u8>, u64)>) -> bool {
+	unsafe {
+		for (slot, role) in ROLES[index].iter().enumerate() {
+			// THE CALLER GETS FIRST REFUSAL ON EVERY ROLE, not only the kinds the plan cannot
+			// resolve. A role can be exactly what the plan says and still need a handle the
+			// supervisor already holds for a reason the plan does not carry - the shell's session
+			// is minted ONCE and reused for the life of the system, so its working directory
+			// survives a logout, and a freshly minted one would quietly lose that.
+			//
+			// The override is where the model is not finished yet. Each one names a fact the
+			// manifest cannot say, which is the list of what it would have to grow to say it.
+			if let Some((bytes, handle)) = external(role) {
+				if !send_blocking(manager_side, &bytes, handle) {
+					return false;
+				}
+				continue;
+			}
+			let delivered: bool = match role.kind {
+				RoleKind::ServeRoot => {
+					let mut client: u64 = 0;
+					let ok = serve_root(manager_side, role.tag, &mut client);
+					if ok && slot < MAX_ROLES {
+						kept.ends[index][slot] = client;
+					}
+					ok
+				}
+				RoleKind::Client => {
+					let root: u64 = kept.end_of(role.provider, role.source);
+					if root == 0 {
+						// An absent provider is not a failure when the role is optional: a boot
+						// with no second disk still sends the tag, carrying nothing.
+						!role.required && send_blocking(manager_side, role.tag, 0)
+					} else {
+						let copy: i64 = duplicate(root, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+						copy > 0 && send_blocking(manager_side, role.tag, copy as u64)
+					}
+				}
+				RoleKind::Factory => {
+					let root: u64 = kept.end_of(role.provider, role.source);
+					match if root == 0 { None } else { service_connect(root) } {
+						Some(connection) => send_blocking(manager_side, role.tag, connection),
+						None => !role.required && send_blocking(manager_side, role.tag, 0),
+					}
+				}
+				// A MESSAGE OF BYTES IS ALWAYS SENT, with or without content. `READY` is the plainest
+				// case and the one that matters most: it ends the sequence, and a receiver that
+				// never sees it waits forever for a send nobody will make. The tag alone is a
+				// complete message when the caller supplied no bytes.
+				RoleKind::Payload => send_blocking(manager_side, role.tag, 0),
+				// A driver's handle or a privileged capability comes from outside the service
+				// graph, and the caller was already asked above. Reaching here means it had none,
+				// which for an optional role is the ordinary shape of a smaller boot.
+				_ => !role.required && send_blocking(manager_side, role.tag, 0),
+			};
+			if !delivered {
+				return false;
+			}
+		}
+		true
+	}
+}
+
 // Load a non-pinned service from its manifest-declared system-volume path through ProcessService,
 // handing the new process `bootstrap` as its bootstrap channel. Mints a dedicated
 // launcher connection to the `process` factory (so the client end kept for the shell
@@ -85,7 +215,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8], pinned: bool, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
+pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> State {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -111,8 +241,59 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		// Keep the spawned Process handle so SystemGraphService can be handed a read-only
 		// duplicate of it (the live data source for this component's graph node).
 		*proc_out = proc as u64;
-		if name == b"log_service" && !bootstrap_serve(manager_side, log_client) {
-			return State::Failed;
+
+		// MIGRATED TO THE PLAN. These three declare nothing but a serve root, which the executor
+		// resolves entirely from the manifest - it creates the pair, sends the service end and
+		// keeps the client end. There is nothing left for a branch to say about them, so they have
+		// none, and `check-bootstrap-plan` no longer compares them because there is nothing to
+		// compare against.
+		//
+		// One at a time, and the comparison first: the gate proved the executor's sequence equal to
+		// the branch's before the branch was deleted. That order is the whole discipline - a
+		// migration that switches and then checks has already lost the thing it would check
+		// against.
+		let migrated: Option<&mut u64> = match name {
+			b"log_service" => Some(log_client),
+			b"device_service" => Some(device_client),
+			b"session_service" => Some(session_client),
+			b"time_service" => Some(time_client),
+			b"shell" => Some(admin_server),
+			_ => None,
+		};
+		if let Some(client) = migrated {
+			let index: usize = match index_of(name) {
+				Some(index) => index,
+				None => return State::Failed,
+			};
+			// THE ONE FACT THE PLAN CANNOT CARRY YET, supplied here rather than hidden in a branch.
+			//
+			// The shell's session is minted ONCE and reused for the life of the system, so its
+			// working directory survives a logout and a reload; a fresh connection per shell would
+			// lose it silently. The plan says the role is a factory of SessionService, which is
+			// true - what it cannot say is that this one is cached, and that is the whole content
+			// of the branch this replaces.
+			// Read before the closure borrows `kept`: the executor needs it mutably to record the
+			// serve roots it creates, and a closure holding a reference alongside would be two
+			// borrows of one table.
+			let session_root: u64 = kept.end_of(b"session_service", CAP_SERVE);
+			let mut external = |role: &Role| -> Option<(alloc::vec::Vec<u8>, u64)> {
+				if name != b"shell" || role.tag != CAP_SESSION {
+					return None;
+				}
+				if *session1 == 0 {
+					*session1 = service_connect(session_root)?;
+				}
+				let copy: i64 = duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+				if copy < 0 {
+					return None;
+				}
+				Some((role.tag.to_vec(), copy as u64))
+			};
+			if !deliver_roles(manager_side, index, kept, &mut external) {
+				return State::Failed;
+			}
+			// The shell's own serve root is its ADMIN channel, which this supervisor answers on.
+			*client = kept.end_of(name, if name == b"shell" { b"ADMIN" } else { CAP_SERVE });
 		}
 		// DeviceManager also carries the power capability, because it is what starts the
 		// keyboard drivers and the Power key must keep working when this supervisor does not -
@@ -144,9 +325,6 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 		if name == b"usb_storage" && !bootstrap_usb_storage(manager_side, *block5_client, usb_client) {
 			return State::Failed;
 		}
-		if name == b"device_service" && !bootstrap_serve(manager_side, device_client) {
-			return State::Failed;
-		}
 		if name == b"process_service" && !bootstrap_process_service(manager_side, pkg_handle, pkg_len, *storage_client, *registry_far, process_client, buf) {
 			return State::Failed;
 		}
@@ -154,9 +332,6 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 			return State::Failed;
 		}
 		if name == b"network_service" && !bootstrap_network_service(manager_side, *net_frames, *config_client, net_client) {
-			return State::Failed;
-		}
-		if name == b"time_service" && !bootstrap_time_service(manager_side, *net_client, time_client) {
 			return State::Failed;
 		}
 		if name == b"audio_service" && !bootstrap_audio_service(manager_side, *snd_client, audio_client, audio_admin) {
@@ -178,12 +353,6 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 			return State::Failed;
 		}
 		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, *process_client, pkg_handle, pkg_len, buf) {
-			return State::Failed;
-		}
-		if name == b"session_service" && !bootstrap_serve(manager_side, session_client) {
-			return State::Failed;
-		}
-		if name == b"shell" && !bootstrap_shell(manager_side, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *log_client, *device_client, *process_client, *config_client, *net_client, *time_client, *audio_client, *input_client, *console_client, *console_control, *graph_client, *perm_client, *res_client, *session_client, session1, admin_server) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -256,7 +425,51 @@ pub(super) unsafe fn start_service(package: &Package, name: &[u8], program: &[u8
 				if name == b"resource_manager" {
 					let _ = recv_blocking(manager_side, buf);
 				}
-				State::Running
+				// THE BRIDGE, WHILE BOTH DESCRIPTIONS EXIST. A hand-written branch keeps its serve
+				// roots in named locals; a migrated service resolves its clients out of `Kept`. So
+				// every end a branch keeps is recorded here under the name and tag the plan calls
+				// it, and a service can be migrated before the ones it is a client of.
+				//
+				// TEMPORARY BY CONSTRUCTION: each line goes with the branch that made it, and when
+				// the ladder is empty this block is empty too.
+				match name {
+					b"storage_service" => {
+						kept.register(name, CAP_SERVE, *storage_client);
+						kept.register(name, b"ADMIN", *storage_admin);
+					}
+					b"media_storage" => kept.register(name, CAP_SERVE, *media_client),
+					b"iso_storage" => kept.register(name, CAP_SERVE, *iso_client),
+					b"udf_storage" => kept.register(name, CAP_SERVE, *udf_client),
+					b"usb_storage" => kept.register(name, CAP_SERVE, *usb_client),
+					b"ram_storage" => kept.register(name, CAP_SERVE, *ram_client),
+					b"tmp_storage" => kept.register(name, CAP_SERVE, *tmp_client),
+					b"process_service" => kept.register(name, CAP_SERVE, *process_client),
+					b"config_service" => kept.register(name, CAP_SERVE, *config_client),
+					b"resource_manager" => kept.register(name, CAP_SERVE, *res_client),
+					b"network_service" => kept.register(name, CAP_SERVE, *net_client),
+					b"audio_service" => {
+						kept.register(name, CAP_SERVE, *audio_client);
+						kept.register(name, b"ADMIN", *audio_admin);
+					}
+					b"input_service" => {
+						kept.register(name, CAP_SERVE, *input_client);
+						kept.register(name, b"ADMIN", *input_admin);
+						kept.register(name, b"FOCUS", *input_focus);
+						kept.register(name, b"KILL", *input_kill);
+					}
+					b"display_service" => {
+						kept.register(name, CAP_SERVE, *display_client);
+						kept.register(name, b"ADMIN", *display_admin);
+					}
+					b"console_service" => {
+						kept.register(name, b"CLIENT", *console_client);
+						kept.register(name, b"CONTROL", *console_control);
+					}
+					b"system_graph_service" => kept.register(name, CAP_SERVE, *graph_client),
+					b"permission_manager" => kept.register(name, CAP_SERVE, *perm_client),
+					_ => {}
+				}
+				State::Ready
 			}
 			Received::Closed => {
 				// The service closed its bootstrap channel without reporting - it crashed during
@@ -341,140 +554,6 @@ unsafe fn send_shell_cap(manager_side: u64, tag: &[u8], client: u64) -> bool {
 // emitting on the original. Finally the supervisor mints a fresh ADMIN channel and
 // transfers the client end to the shell (so its `stop <service>` command can drive
 // reverse-dependency teardown), keeping the server end in `*admin_server` to serve.
-unsafe fn bootstrap_shell(manager_side: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, time_client: u64, audio_client: u64, input_client: u64, console_client: u64, console_control: u64, graph_client: u64, perm_client: u64, res_client: u64, session_client: u64, session1: &mut u64, admin_server: &mut u64) -> bool {
-	unsafe {
-		// Every service client the shell is handed is a DUPLICATE (see send_shell_cap): the
-		// supervisor keeps every serve root's client end alive for the life of the system, so
-		// a shell exit / logout closes only its copies and reloads a fresh shell rather than
-		// tearing the running system down. The volume clients that are absent this boot
-		// (media / iso / udf / usb with no disk) arrive as 0 and are sent as a bare tag.
-		if !send_shell_cap(manager_side, CAP_STORAGE, storage_client) {
-			return false;
-		}
-		if !send_shell_cap(manager_side, CAP_MEDIA, media_client) {
-			return false;
-		}
-		if !send_shell_cap(manager_side, CAP_ISO, iso_client) {
-			return false;
-		}
-		if !send_shell_cap(manager_side, CAP_UDF, udf_client) {
-			return false;
-		}
-		if !send_shell_cap(manager_side, CAP_USB, usb_client) {
-			return false;
-		}
-		let log_dup: i64 = duplicate(log_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if log_dup < 0 {
-			return false;
-		}
-		if !send_blocking(manager_side, CAP_LOG, log_dup as u64) {
-			return false;
-		}
-		// The device / config / time / audio / resource clients are the serve ROOTS of
-		// their services (`serve_multi` ends when the root closes), and the thin-launcher
-		// shell closes them on receipt (governed tools reach these services through
-		// PermissionManager's sub-connections instead). Hand the shell duplicates - like
-		// LOG above - so the supervisor keeps every root alive for the life of the system;
-		// transferring the originals let the shell's close tear the services down.
-		let device_dup: i64 = duplicate(device_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if device_dup < 0 {
-			return false;
-		}
-		if !send_blocking(manager_side, CAP_DEVICE, device_dup as u64) {
-			return false;
-		}
-		if !send_shell_cap(manager_side, CAP_PROCESS, process_client) {
-			return false;
-		}
-		let config_dup: i64 = duplicate(config_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if config_dup < 0 {
-			return false;
-		}
-		if !send_blocking(manager_side, CAP_CONFIG, config_dup as u64) {
-			return false;
-		}
-		if !send_shell_cap(manager_side, CAP_NET, net_client) {
-			return false;
-		}
-		let time_dup: i64 = duplicate(time_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if time_dup < 0 {
-			return false;
-		}
-		if !send_blocking(manager_side, CAP_TIME, time_dup as u64) {
-			return false;
-		}
-		let audio_dup: i64 = duplicate(audio_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if audio_dup < 0 {
-			return false;
-		}
-		if !send_blocking(manager_side, CAP_AUDIO, audio_dup as u64) {
-			return false;
-		}
-		if !send_shell_cap(manager_side, CAP_INPUT, input_client) {
-			return false;
-		}
-		// The SystemGraphService client, so the shell's `graph` command can render the live
-		// system graph.
-		if !send_shell_cap(manager_side, CAP_GRAPH, graph_client) {
-			return false;
-		}
-		// The PermissionManager client, so the shell's `perm` command can render the
-		// permission audit trail.
-		if !send_shell_cap(manager_side, CAP_PERM, perm_client) {
-			return false;
-		}
-		// The ResourceManager client, so the shell's `usage` command can render the live
-		// per-Domain budgets - a
-		// duplicate, like the other launcher-dropped clients above, so the supervisor keeps
-		// the serve root.
-		let res_dup: i64 = duplicate(res_client, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if res_dup < 0 {
-			return false;
-		}
-		if !send_blocking(manager_side, CAP_RESOURCE, res_dup as u64) {
-			return false;
-		}
-		// VT 1's session capability. The session is minted once from the session factory
-		// and kept in `*session1` for the life of the system, so it - and thus the cwd -
-		// survives a restart of the VT 1 shell; each (re)started shell receives a fresh
-		// transferable duplicate. Sent right after RESOURCE to match the shell's receive
-		// order.
-		if *session1 == 0 {
-			*session1 = match service_connect(session_client) {
-				Some(h) => h,
-				None => return false,
-			};
-		}
-		let session_dup: i64 = duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-		if session_dup < 0 {
-			return false;
-		}
-		if !send_blocking(manager_side, CAP_SESSION, session_dup as u64) {
-			return false;
-		}
-		if !send_blocking(manager_side, CAP_CONSOLE, console_client) {
-			return false;
-		}
-		// VT 1's control channel to ConsoleService (the shell end; the console holds the
-		// other end). Carries SET_FG / CLEAR_FG out and JOB_STOPPED back for job-control
-		// signals.
-		if !send_blocking(manager_side, CAP_CONTROL, console_control) {
-			return false;
-		}
-		// A fresh ADMIN channel the shell drives `stop <service>` over: the supervisor
-		// keeps the server end (in `*admin_server`) and stands on it in the supervise
-		// loop; the client end is transferred to the shell, which receives it last.
-		let (admin_srv, admin_cli): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, CAP_ADMIN, admin_cli) {
-			return false;
-		}
-		*admin_server = admin_srv;
-		send_ready(manager_side)
-	}
-}
 
 // Register every observed component with SystemGraphService and hand it the live data
 // sources for the graph: one "NODE" message per Running component (excluding the shell
@@ -493,7 +572,7 @@ pub(super) unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[
 		let mut i: usize = 0;
 		while i < N {
 			let name: &[u8] = MANIFEST[i].name;
-			if state[i] == State::Running && procs[i] != 0 && name != b"shell" && name != b"system_graph_service" {
+			if state[i] == State::Ready && procs[i] != 0 && name != b"shell" && name != b"system_graph_service" {
 				let dup: i64 = duplicate(procs[i], RIGHT_READ | RIGHT_TRANSFER);
 				if dup < 0 {
 					return false;
@@ -842,12 +921,33 @@ unsafe fn bootstrap_package_rights(manager_side: u64, pkg_handle: u64, pkg_len: 
 // the supervisor to later hand to the shell. The shared bootstrap for every SERVE-
 // only service (Log, Device, Config) and the tail of Storage and Process.
 pub(super) unsafe fn bootstrap_serve(manager_side: u64, client: &mut u64) -> bool {
+	unsafe { serve_root(manager_side, CAP_SERVE, client) }
+}
+
+// Hand over one end of a fresh channel pair as a serve root, NARROWED TO WHAT SERVING NEEDS.
+//
+// A fresh channel end carries `RIGHTS_ALL`, and this used to transfer it exactly as the kernel
+// minted it - so every service was handed MANAGE, DUPLICATE and REVOKE over the channel its
+// clients reach it on. None of the three is used by serving, and REVOKE over one's own service
+// channel is authority nobody asked for and nothing needs.
+//
+// Send, receive and wait are what a serve loop does. TRANSFER is unavoidable: a capability that
+// cannot be transferred cannot be delivered, so it is in the grant by construction rather than by
+// choice.
+pub(super) unsafe fn serve_root(manager_side: u64, tag: &[u8], client: &mut u64) -> bool {
 	unsafe {
 		let (service_server, service_client): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => return false,
 		};
-		if !send_blocking(manager_side, CAP_SERVE, service_server) {
+		let narrowed: i64 = duplicate(service_server, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		close(service_server);
+		if narrowed < 0 {
+			close(service_client);
+			return false;
+		}
+		if !send_blocking(manager_side, tag, narrowed as u64) {
+			close(service_client);
 			return false;
 		}
 		*client = service_client;
@@ -1304,8 +1404,15 @@ unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_
 // DeviceManager pass it on to the driver, DUPLICATE lets it serve more than one keyboard.
 pub(super) unsafe fn send_power(manager_side: u64, power: u64) -> bool {
 	unsafe {
-		let copy: i64 = duplicate(power, RIGHT_MANAGE | RIGHT_TRANSFER | RIGHT_DUPLICATE);
-		copy > 0 && send_blocking(manager_side, b"POWER", copy as u64)
+		// A CONNECTION, NOT A COPY OF THE AUTHORITY. This duplicated the root-Domain handle with
+		// `MANAGE`, so DeviceManager - and then two keyboard drivers - each held a capability the
+		// kernel's own comment describes as able to `sys_domain_kill` the whole system. What
+		// travels now is a fresh SystemPower connection: it can ask for a reboot and nothing else,
+		// and it is its own channel so two holders cannot take each other's replies.
+		match service_connect(power) {
+			Some(connection) => send_blocking(manager_side, b"SYSPOWER", connection),
+			None => false,
+		}
 	}
 }
 

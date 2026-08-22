@@ -162,6 +162,10 @@ struct RawService {
 	dependencies: Vec<String>,
 	#[serde(default)]
 	roles: Vec<RawRole>,
+	state_class: StateClass,
+	state_scope: StateScope,
+	#[serde(default)]
+	state_storage: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -174,6 +178,8 @@ struct RawRole {
 	presence: Presence,
 	#[serde(default)]
 	interface: String,
+	#[serde(default)]
+	source: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -422,6 +428,41 @@ pub struct Service {
 	/// inserted in the middle shifts every read after it. `bootstrap.rs` says exactly that beside
 	/// DeviceManager's branch, having learned it the hard way.
 	pub roles: Vec<Role>,
+	/// WHAT SURVIVES, which is not the same question as who it belongs to.
+	pub state_class: StateClass,
+	/// WHO IT BELONGS TO. Kept apart from the class because one service can hold durable files and
+	/// ephemeral sessions at the same time, and a single enum mixing the two cannot say so.
+	pub state_scope: StateScope,
+	/// Where durable state lives. Empty for every other class - a path on a service that keeps
+	/// nothing is a claim nobody checks.
+	pub state_storage: String,
+}
+
+/// What a restart of the process, and a reboot of the guest, do to a service's state.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateClass {
+	/// Gone on a process restart. Nothing is written down and nothing is rebuilt: what the service
+	/// held is lost, and its clients are told so rather than handed something that looks live.
+	Ephemeral,
+	/// Rebuilt after a restart from a source outside the service - the manifest, the devices
+	/// present, the kernel's own tables. Not preserved; DERIVED again.
+	Reconstructible,
+	/// Written to a medium and read back. Survives a process restart and a guest reboot, and is
+	/// the only class that does.
+	Durable,
+}
+
+/// Who a service's state belongs to.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateScope {
+	/// The service's own, for as long as it runs.
+	Service,
+	/// A session's: it belongs to whoever is logged in on a terminal, and ends when they do.
+	Session,
+	/// Not the system's at all - the medium, the device, the far end of a network connection.
+	External,
 }
 
 /// One capability a service is handed at bootstrap: what it is called, what shape it is, and who
@@ -441,6 +482,14 @@ pub struct Role {
 	/// The LSIDL interface a channel role speaks, empty for the kinds that carry no protocol. A
 	/// REFERENCE, never a copy: what the interface means is LSIDL's to say.
 	pub interface: String,
+	/// WHICH OF THE PROVIDER'S SERVE ROOTS THIS IS A CLIENT OF, for the kinds that are clients of
+	/// something. Empty means `SERVE`, which is what nearly every one of them is.
+	///
+	/// It has to be said because it cannot be guessed: PermissionManager's `STORAGE_ADMIN` is a
+	/// client of StorageService's `ADMIN` root and not of its `SERVE` root, and the two grant
+	/// different authority over the same volume. Until now the difference lived only in which local
+	/// variable a hand-written bootstrap function happened to pass.
+	pub source: Name,
 }
 
 /// How a role is delivered - which is also what decides whether it can be delivered AGAIN, and
@@ -754,12 +803,51 @@ impl Manifest {
 				if !raw_role.interface.is_empty() && matches!(raw_role.kind, RoleKind::Package | RoleKind::Payload | RoleKind::Power) {
 					push_error(&mut errors, format!("{where_role}.interface"), "this role carries no channel, so it speaks no interface");
 				}
-				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface });
+				let source = if raw_role.source.is_empty() {
+					Name(String::from("SERVE"))
+				} else {
+					match validate_tag(&raw_role.source, &format!("{where_role}.source"), &mut errors) {
+						Some(tag) => tag,
+						None => continue,
+					}
+				};
+				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface, source });
 			}
-			if services.insert(name.clone(), Service { name, program, restart: raw_service.restart, dependencies, roles }).is_some() {
+			// A CLASS AND A PLACE MUST AGREE. Durable means written down, so it has to say where;
+			// anything else means not written down, so a path would be a claim about a file that
+			// does not exist and nothing would ever notice.
+			if raw_service.state_class == StateClass::Durable && raw_service.state_storage.is_empty() {
+				push_error(&mut errors, format!("{location}.state_storage"), "durable state has to say where it lives");
+			}
+			if raw_service.state_class != StateClass::Durable && !raw_service.state_storage.is_empty() {
+				push_error(&mut errors, format!("{location}.state_storage"), "only durable state has a place - this service keeps nothing across a restart");
+			}
+			if services.insert(name.clone(), Service { name, program, restart: raw_service.restart, dependencies, roles, state_class: raw_service.state_class, state_scope: raw_service.state_scope, state_storage: raw_service.state_storage }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate service name");
 			}
 		}
+		// WHO MAY HOLD THE ROOT DOMAIN, COUNTED FROM THE DECLARATION RATHER THAN FOUND BY READING.
+		//
+		// The root-Domain handle carries `MANAGE`, and the kernel's own comment beside
+		// `sys_system_power` says what that means: whoever holds it can already `sys_domain_kill`
+		// the whole system. It reaches DeviceManager so the Power key works, and DeviceManager
+		// passes it on to the two keyboard drivers. That is the authority leak P02M0141 exists to
+		// close, and until M11 replaces it with a narrow SystemPower service this list is what
+		// stops a THIRD holder appearing unnoticed.
+		//
+		// M11 LANDED AND THE LIST IS EMPTY. The root Domain stays in SystemManager, which is not a
+		// managed service and has no row here; everything that used to hold it - this supervisor,
+		// DeviceManager, and one instance each of `virtio_input` and `xhci` - now holds a
+		// SystemPower connection instead, which can ask for a reboot and can do nothing else.
+		const MAY_HOLD_ROOT_DOMAIN: [&str; 0] = [];
+		for service in services.values() {
+			for role in &service.roles {
+				if role.kind == RoleKind::Power && !MAY_HOLD_ROOT_DOMAIN.contains(&service.name.as_str()) {
+					push_error(&mut errors, format!("services.{}.roles.{}", service.name, role.tag), "this service is not on the short list allowed to hold the root Domain - whoever holds it can kill the whole system");
+				}
+			}
+		}
+
 		// A provider has to exist and has to be something that can supply a capability: another
 		// declared service, or `kernel` for what the boot chain was handed, or `service_manager`
 		// for what the supervisor itself holds. Checked after the loop because a service may name
@@ -780,6 +868,18 @@ impl Manifest {
 				// the manifest already carried a comment about the last time that happened, where
 				// the session service came up first on one machine and second on another and the
 				// difference was a boot with no shell.
+				// A CLIENT IS A CLIENT OF SOMETHING THAT EXISTS. The source names one of the
+				// provider's serve roots; naming one it does not offer is a wiring that cannot be
+				// carried out, and until now nothing could say so because the wiring was a variable
+				// name in a hand-written function.
+				if matches!(role.kind, RoleKind::Client | RoleKind::Factory) {
+					if let Some(provider_service) = services.get(&role.provider) {
+						let offered = provider_service.roles.iter().any(|candidate| candidate.kind == RoleKind::ServeRoot && candidate.tag == role.source);
+						if !offered {
+							push_error(&mut errors, format!("services.{}.roles.{}.source", service.name, role.tag), format!("{} offers no serve root called {}", role.provider, role.source));
+						}
+					}
+				}
 				if !service.dependencies.contains(&role.provider) {
 					push_error(&mut errors, format!("services.{}.roles.{}.provider", service.name, role.tag), format!("{} supplies this role but is not a declared dependency, so nothing orders it first", provider));
 				}

@@ -8,7 +8,7 @@ pub(super) fn depends_on_scoped(i: usize, scope: &[bool; N]) -> bool {
 // Whether any in-scope Running component still depends on component `i` - i.e. `i` is
 // not yet a leaf of the scoped subgraph and must not be stopped this round.
 pub(super) fn has_running_dependent(i: usize, scope: &[bool; N], state: &[State; N]) -> bool {
-	services::service_lifecycle::has_active_dependent(i, N, |node| scope[node] && state[node] == State::Running, index_of_dep)
+	services::service_lifecycle::has_active_dependent(i, N, |node| scope[node] && state[node] == State::Ready, index_of_dep)
 }
 
 // Whether component `j` declares component `i` among its dependencies.
@@ -27,7 +27,7 @@ fn index_of_dep(j: usize, i: usize) -> bool {
 // declares. Computed by repeatedly taking the current leaves of the scoped subgraph.
 pub(super) fn shutdown_order(state: &[State; N]) -> Vec<usize> {
 	let shell = index_of(b"shell");
-	services::service_lifecycle::reverse_dependency_order(N, |node| state[node] == State::Running && Some(node) != shell, index_of_dep).unwrap_or_default()
+	services::service_lifecycle::reverse_dependency_order(N, |node| state[node] == State::Ready && Some(node) != shell, index_of_dep).unwrap_or_default()
 }
 
 // Tear the whole service tree down for a graceful power-off. LogService flushes first;
@@ -36,13 +36,13 @@ pub(super) fn shutdown_order(state: &[State; N]) -> Vec<usize> {
 pub(super) unsafe fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], procs: &[u64; N], log_client: u64, buf: &mut [u8]) {
 	unsafe {
 		if let Some(log) = index_of(b"log_service") {
-			if state[log] == State::Running && channels[log] != 0 {
+			if state[log] == State::Ready && channels[log] != 0 {
 				send_blocking(channels[log], b"FLUSH", 0);
 			}
 		}
 		let order: Vec<usize> = shutdown_order(state);
 		for &idx in &order {
-			if state[idx] != State::Running {
+			if state[idx] != State::Ready {
 				continue;
 			}
 			if procs[idx] != 0 {
@@ -65,18 +65,18 @@ pub(super) unsafe fn shutdown_all(state: &mut [State; N], channels: &mut [u64; N
 // and each dependent appears before every dependency that is also in the order.
 pub(super) fn verify_shutdown_order(order: &[usize], state: &[State; N]) -> bool {
 	let shell: Option<usize> = index_of(b"shell");
-	services::service_lifecycle::verify_reverse_dependency_order(order, N, |node| state[node] == State::Running && Some(node) != shell, index_of_dep)
+	services::service_lifecycle::verify_reverse_dependency_order(order, N, |node| state[node] == State::Ready && Some(node) != shell, index_of_dep)
 }
 
 // Answer one request on a supervisor stats channel. Returns false once the peer is
 // gone, so the standing supervisor drops that channel from its wait set.
-pub(super) unsafe fn serve_stats_once(stats: u64, state: &[State; N], sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
+pub(super) unsafe fn serve_stats_once(stats: u64, state: &[State; N], desired: &[Desired; N], procs: &[u64; N], lifecycle: &LifecycleLog, sup: &[Supervised; N], reason: &[String; N], canary_sup: &Supervised, drivers: &[(&'static [u8], bool)], buf: &mut [u8]) -> bool {
 	unsafe {
 		let (len, mut handle) = match recv_caps_blocking(stats, buf) {
 			ReceivedCaps::Message { len, handles } => (len, handles),
 			ReceivedCaps::Closed => return false,
 		};
-		let mut api = StatsApi { state, sup, reason, canary_sup, drivers };
+		let mut api = StatsApi { state, desired, procs, lifecycle, sup, reason, canary_sup, drivers };
 		let mut reply: [u8; 4096] = [0u8; 4096];
 		let mut reply_handle = proto::codec::Handles::new();
 		if let Some(n) = supervisor::dispatch(&mut api, &buf[..len], &mut handle, &mut reply, &mut reply_handle) {
@@ -93,10 +93,15 @@ pub(super) unsafe fn serve_stats_once(stats: u64, state: &[State; N], sup: &[Sup
 	}
 }
 
+// The name a reader sees. `starting` and `stopping` are new words for states that always existed
+// and had no name: a process that had been launched and had not reported in was called `running`,
+// which is the one thing it certainly was not.
 fn state_name(state: State) -> &'static str {
 	match state {
-		State::Pending => "pending",
-		State::Running => "running",
+		State::Absent => "pending",
+		State::Starting => "starting",
+		State::Ready => "running",
+		State::Stopping => "stopping",
 		State::Stopped => "stopped",
 		State::Failed => "failed",
 	}
@@ -104,10 +109,36 @@ fn state_name(state: State) -> &'static str {
 
 struct StatsApi<'a> {
 	state: &'a [State; N],
+	desired: &'a [Desired; N],
+	procs: &'a [u64; N],
+	lifecycle: &'a LifecycleLog,
 	sup: &'a [Supervised; N],
 	reason: &'a [String; N],
 	canary_sup: &'a Supervised,
 	drivers: &'a [(&'static [u8], bool)],
+}
+
+// What the supervisor WANTS, as one word.
+fn desired_name(desired: Desired) -> &'static str {
+	match desired {
+		Desired::Running => "running",
+		Desired::Stopped => "stopped",
+	}
+}
+
+// Why the last transition happened. A restart count says how often; this says what for.
+fn reason_name(reason: Reason) -> &'static str {
+	match reason {
+		Reason::Started => "started",
+		Reason::ReportedReady => "reported ready",
+		Reason::BootstrapRefused => "bootstrap refused",
+		Reason::NoReport => "no report",
+		Reason::Faulted => "faulted",
+		Reason::Unresponsive => "unresponsive",
+		Reason::StopRequested => "stop requested",
+		Reason::Replaced => "replaced",
+		Reason::BudgetSpent => "restart budget spent",
+	}
 }
 
 impl supervisor::Service for StatsApi<'_> {
@@ -116,12 +147,16 @@ impl supervisor::Service for StatsApi<'_> {
 		let mut i: usize = 0;
 		while i < N {
 			let last_failure: String = if self.reason[i].is_empty() { String::from_utf8_lossy(self.sup[i].failure.as_bytes()).into_owned() } else { self.reason[i].clone() };
-			out.push(SupervisorStat { name: String::from_utf8_lossy(MANIFEST[i].name).into_owned(), state: String::from(state_name(self.state[i])), restarts: self.sup[i].restarts, watchdog_trips: self.sup[i].watchdog_trips, last_failure });
+			let last_reason: String = self.lifecycle.latest(i).map_or_else(String::new, |t| String::from(reason_name(t.reason)));
+			out.push(SupervisorStat { name: String::from_utf8_lossy(MANIFEST[i].name).into_owned(), state: String::from(state_name(self.state[i])), desired: String::from(desired_name(self.desired[i])), epoch: unsafe { epoch_of(self.procs[i]) }, last_reason, restarts: self.sup[i].restarts, watchdog_trips: self.sup[i].watchdog_trips, last_failure });
 			i += 1;
 		}
-		out.push(SupervisorStat { name: String::from("watchdog_probe"), state: String::from("running"), restarts: self.canary_sup.restarts, watchdog_trips: self.canary_sup.watchdog_trips, last_failure: String::from_utf8_lossy(self.canary_sup.failure.as_bytes()).into_owned() });
+		// The canary and the drivers are not managed deployments: they have no declared desired
+		// state and no instance epoch this supervisor assigns. Reported as blank rather than
+		// invented, because a made-up epoch is worse than none.
+		out.push(SupervisorStat { name: String::from("watchdog_probe"), state: String::from("running"), desired: String::new(), epoch: 0, last_reason: String::new(), restarts: self.canary_sup.restarts, watchdog_trips: self.canary_sup.watchdog_trips, last_failure: String::from_utf8_lossy(self.canary_sup.failure.as_bytes()).into_owned() });
 		for &(name, online) in self.drivers {
-			out.push(SupervisorStat { name: String::from_utf8_lossy(name).into_owned(), state: String::from(if online { "running" } else { "pending" }), restarts: 0, watchdog_trips: 0, last_failure: String::new() });
+			out.push(SupervisorStat { name: String::from_utf8_lossy(name).into_owned(), state: String::from(if online { "running" } else { "pending" }), desired: String::new(), epoch: 0, last_reason: String::new(), restarts: 0, watchdog_trips: 0, last_failure: String::new() });
 		}
 		Ok(out)
 	}

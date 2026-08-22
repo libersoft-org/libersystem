@@ -13,6 +13,7 @@
 
 // The ring-3 entry stub, syscall wrapper, panic handler, spawn/IPC helpers, and
 // ABI constants all come from the shared userspace runtime crate.
+use proto::system::{Error, system_power};
 use rt::*;
 
 // `rt`'s `_start` enters here with the bootstrap channel handle in rdi.
@@ -59,9 +60,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	};
 
 	// 1b2. receive the power capability - a root-Domain handle carrying MANAGE, which is what
-	//     `SYS_SYSTEM_POWER` now checks. This process never stops the machine itself; it holds
-	//     the capability only to pass it to ServiceManager, which is where the graceful
-	//     shutdown lives and which delegates it onward to the keyboard driver.
+	//     `SYS_SYSTEM_POWER` checks.
+	//
+	//     IT STOPS HERE. It used to be passed down to ServiceManager, on to DeviceManager, and on
+	//     again to the two keyboard drivers - four more holders of a capability the kernel's own
+	//     comment describes as being able to `sys_domain_kill` the whole system, all so that
+	//     Ctrl+Alt+Del would work. What goes down the chain now is a client of the SystemPower
+	//     service below, which can stop the machine and can do nothing else.
 	let power: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle, .. } if len == 5 && &buf[..5] == b"POWER" && handle != 0 => handle,
 		_ => exit(),
@@ -99,7 +104,31 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Some(pair) => pair,
 		None => exit(),
 	};
-	if unsafe { spawn(svc_elf, svc_side) } < 0 {
+	// The SystemPower pair: this process serves on one end and the other travels down the boot
+	// chain in place of the root-Domain handle.
+	let (power_server, power_client): (u64, u64) = match unsafe { channel() } {
+		Some(pair) => pair,
+		None => exit(),
+	};
+	// ONE CHILD DOMAIN FOR THE WHOLE CONTROL PLANE, and this process owns it.
+	//
+	// ServiceManager and every service it starts live inside it, because `SYS_PROCESS_CREATE` puts
+	// a new process in the CALLER'S domain when it is given handle 0 - which is what ServiceManager
+	// and ProcessService already pass. So the branch forms itself: nothing downstream has to be
+	// told which Domain it belongs to, and nothing downstream holds a Domain handle at all.
+	//
+	// THAT IS THE POINT. A ServiceManager holding `MANAGE` on its own subtree could
+	// `sys_domain_kill` the branch it lives in; it does not need to, and it now cannot. Tearing the
+	// branch down is this process's, because this process is the one that outlives it.
+	//
+	// NOT resource-bounded here. Limits are ResourceManager's subject and this milestone says so;
+	// a number invented at this line would be a policy nobody declared.
+	let branch_domain: i64 = unsafe { domain_create(u64::MAX, u64::MAX, u64::MAX) };
+	if branch_domain < 0 {
+		unsafe { print(b"SystemManager: cannot create the control-plane Domain; boot chain stops here\n") };
+		exit();
+	}
+	if unsafe { spawn_in(svc_elf, svc_side, branch_domain as u64) } < 0 {
 		exit();
 	}
 
@@ -117,7 +146,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		rd_msg[..7].copy_from_slice(&volume_tag);
 		rd_msg[7..].copy_from_slice(&(ramdisk_len as u64).to_le_bytes());
 		send_blocking(sm_side, &rd_msg, ramdisk_handle);
-		send_blocking(sm_side, b"POWER", power);
+		// The narrow door, in the position the root-Domain handle used to travel in. One end is
+		// kept here and served for the life of the system; the other goes down the chain to
+		// whoever owns the Power key.
+		send_blocking(sm_side, b"SYSPOWER", power_client);
 		let mode_msg: [u8; 5] = [b'M', b'O', b'D', b'E', mode];
 		send_blocking(sm_side, &mode_msg, 0);
 		// The three console/display capabilities, last, in the order they arrived.
@@ -131,23 +163,205 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    we have relayed it the set is up, so we stop and report in ourselves. Using
 	//    that explicit marker (rather than waiting for ServiceManager to close its
 	//    end) keeps the hand-off deterministic under the cooperative scheduler.
-	loop {
-		match unsafe { recv_blocking(sm_side, &mut buf) } {
-			Received::Message { len, .. } => {
-				let report: &[u8] = &buf[..len];
-				let terminal: bool = report == b"ServiceManager: online";
-				unsafe {
-					send_blocking(bootstrap, report, 0);
+	// RELAYING AND SERVING ARE ONE LOOP, and they have to be.
+	//
+	// SystemPower cannot wait until the boot chain is up: ServiceManager asks for its connection
+	// WHILE it is bringing the system up, and DeviceManager asks for two more for the keyboard
+	// drivers. A manager that relayed reports first and served afterwards would be a manager
+	// nobody could reach during the one phase that needs it - which is a deadlock, and it is
+	// exactly what the first version of this did.
+	unsafe { serve_system_power(power, power_server, sm_side, bootstrap, &mut buf) };
+
+	// 5. STAY. This process used to exit here, which left the ServiceManager branch with no owner
+	//    for the whole life of the system - and left the root-Domain handle needing a home, which
+	//    is why it was handed down to a keyboard driver.
+	//
+	//    What it does from here is narrow on purpose: it serves SystemPower and it watches the
+	//    branch it owns. It takes no part in per-service wiring, application policy or driver
+	//    policy - ServiceManager remains the one service supervisor - because a manager that
+	//    absorbed those would be a second supervisor with the broadest capability in the system.
+	//
+	//    If it ends, the kernel reboots: the branch below it is full of processes nobody is
+	//    supervising, and starting a replacement beside them would be two managers over one
+	//    orphaned tree.
+	exit();
+}
+
+// Serve SystemPower, and watch the branch this process owns, until one of them ends.
+//
+// TWO CHANNELS, ONE LOOP. A request to stop the machine and the death of ServiceManager are both
+// things this process must notice, and a blocking wait on either alone would miss the other.
+unsafe fn serve_system_power(power: u64, requests: u64, branch: u64, up: u64, buf: &mut [u8]) {
+	unsafe {
+		let created: i64 = waitset_create();
+		if created < 0 {
+			// Without a wait set there is nothing to multiplex with. Serve the requests alone
+			// rather than exiting: a machine that cannot be turned off is worse than one whose
+			// branch death is noticed a moment later by the kernel instead.
+			let mut lone: [(u64, u64); MAX_POWER_CLIENTS] = [(0, 0); MAX_POWER_CLIENTS];
+			loop {
+				match try_recv(branch, buf) {
+					Polled::Closed => return,
+					Polled::Message { len, .. } => {
+						let report: &[u8] = &buf[..len];
+						let terminal: bool = report == b"ServiceManager: online";
+						send_blocking(up, report, 0);
+						if terminal {
+							send_blocking(up, b"SystemManager: online", 0);
+						}
+					}
+					Polled::Empty => {}
 				}
-				if terminal {
+				if matches!(serve_power_once(power, requests, 0, &mut lone, buf), PowerStep::Gone) {
+					return;
+				}
+			}
+		}
+		let set: u64 = created as u64;
+		if waitset_add(set, requests) < 0 || waitset_add(set, branch) < 0 {
+			return;
+		}
+		// ONE CHANNEL PER HOLDER, minted on request. Two callers sharing a channel take each
+		// other's replies - this system has a comment about that beside the op that exists to stop
+		// it - and the Power key is owned by two keyboard drivers at once.
+		// EACH CONNECTION WITH THE KOID THE WAIT SET KNOWS IT BY. A member is removed by koid and
+		// not by handle - and a member left behind when its peer closes is permanently readable,
+		// which turns this loop into a spin that starves the whole system. That is not a
+		// hypothetical: it is what the first version of this did, sixteen million times.
+		let mut connections: [(u64, u64); MAX_POWER_CLIENTS] = [(0, 0); MAX_POWER_CLIENTS];
+		connections[0] = (requests, koid_of(requests));
+		loop {
+			if waitset_wait(set, 0, 0) < 0 {
+				return;
+			}
+			// The branch first: what arrives on it is a boot report to relay, and a CLOSED end is
+			// the event that ends this loop - answering a power request from a system whose
+			// supervisor has gone is no better than letting the kernel reboot.
+			// ONE REPORT PER PASS, NOT A DRAIN. Draining the branch in an inner loop pushes reports
+			// at the reader back to back, and that reader is a channel with a bounded queue:
+			// filling it makes `send_blocking` wait, and when the writable wait is refused it
+			// SPINS - which keeps this process runnable, stops the scheduler ever going idle, and
+			// so stops the very reader that would drain the queue. The system deadlocked on its own
+			// last boot report. One at a time paces the writer to the reader, which is what the
+			// blocking-receive loop this replaced did by construction.
+			match try_recv(branch, buf) {
+				Polled::Closed => return,
+				Polled::Message { len, .. } => {
+					let report: &[u8] = &buf[..len];
+					let terminal: bool = report == b"ServiceManager: online";
+					send_blocking(up, report, 0);
+					// The boot chain's terminal report. This process reports in behind it and then
+					// keeps going: it owns the branch below for the life of the system.
+					if terminal {
+						send_blocking(up, b"SystemManager: online", 0);
+					}
+				}
+				Polled::Empty => {}
+			}
+			for index in 0..MAX_POWER_CLIENTS {
+				let (chan, koid) = connections[index];
+				if chan == 0 {
+					continue;
+				}
+				match serve_power_once(power, chan, set, &mut connections, buf) {
+					PowerStep::Continue => {}
+					PowerStep::Gone => {
+						// THE SET FIRST, THE HANDLE AFTER. A closed peer is permanently readable,
+						// so a member left behind wakes this loop every pass forever - which keeps
+						// the process runnable, stops the scheduler going idle, and starves the
+						// very reader that would drain what this one is trying to send. The
+						// storage service carries the same note beside `release_client`, having
+						// found it as a test that never finished.
+						waitset_remove(set, koid);
+						close(chan);
+						connections[index] = (0, 0);
+					}
+				}
+			}
+		}
+	}
+}
+
+// The most holders of the Power key at once. Two keyboard drivers, the device manager that
+// launches them and one spare: a bound rather than a guess, because a service that minted a channel
+// per request would be one a caller could exhaust.
+const MAX_POWER_CLIENTS: usize = 4;
+
+// The kernel object id behind a handle, which is what a wait set names its members by.
+unsafe fn koid_of(handle: u64) -> u64 {
+	let mut info = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
+	let read: i64 = unsafe { syscall(SYS_OBJECT_INFO_GET, handle, &mut info as *mut ObjectInfo as u64, core::mem::size_of::<ObjectInfo>() as u64, 0) } as i64;
+	if read < 0 { 0 } else { info.koid }
+}
+
+enum PowerStep {
+	Continue,
+	Gone,
+}
+
+// Answer at most one SystemPower request on one connection.
+//
+// THE AUTHORITY NEVER LEAVES THIS PROCESS. What a caller gets back is whether the request was
+// accepted; the syscall is made here, with the handle that stayed here.
+unsafe fn serve_power_once(power: u64, requests: u64, set: u64, connections: &mut [(u64, u64); MAX_POWER_CLIENTS], buf: &mut [u8]) -> PowerStep {
+	unsafe {
+		let len: usize = match try_recv(requests, buf) {
+			Polled::Message { len, .. } => len,
+			Polled::Empty => return PowerStep::Continue,
+			Polled::Closed => return PowerStep::Gone,
+		};
+		// A connect request gets its own channel, so no two holders share a queue.
+		if len >= 2 && u16::from_le_bytes([buf[0], buf[1]]) == CONNECT_OP {
+			let mut slot: Option<usize> = None;
+			for (index, entry) in connections.iter().enumerate() {
+				if entry.0 == 0 {
+					slot = Some(index);
 					break;
 				}
 			}
-			Received::Closed => break,
+			match (slot, channel()) {
+				(Some(index), Some((server, client))) if waitset_add(set, server) >= 0 => {
+					connections[index] = (server, koid_of(server));
+					send_blocking(requests, &[], client);
+				}
+				// Refused by sending nothing back with the reply: a caller that gets no capability
+				// knows it has no connection, which is true and is better than a channel nobody
+				// polls.
+				(_, pair) => {
+					if let Some((server, client)) = pair {
+						close(server);
+						close(client);
+					}
+					send_blocking(requests, &[], 0);
+				}
+			}
+			return PowerStep::Continue;
 		}
+		let mut reply: [u8; 64] = [0u8; 64];
+		let mut reply_handle = proto::codec::Handles::new();
+		let mut api = PowerApi { power };
+		if let Some(n) = system_power::dispatch(&mut api, &buf[..len], &mut proto::codec::Handles::new(), &mut reply, &mut reply_handle) {
+			send_blocking(requests, &reply[..n], 0);
+		}
+		PowerStep::Continue
 	}
-	unsafe {
-		send_blocking(bootstrap, b"SystemManager: online", 0);
+}
+
+// The two ops, and nothing else. A client of this can stop the machine and can do NOTHING further -
+// which is the whole difference between this and the handle it replaced.
+struct PowerApi {
+	power: u64,
+}
+
+impl system_power::Service for PowerApi {
+	fn reboot(&mut self) -> Result<(), Error> {
+		// Returns only if the kernel refused: a reboot that happens does not come back.
+		let result: i64 = unsafe { syscall(SYS_SYSTEM_POWER, self.power, POWER_REBOOT, 0, 0) } as i64;
+		if result < 0 { Err(Error::Denied) } else { Ok(()) }
 	}
-	exit();
+
+	fn power_off(&mut self) -> Result<(), Error> {
+		let result: i64 = unsafe { syscall(SYS_SYSTEM_POWER, self.power, POWER_OFF, 0, 0) } as i64;
+		if result < 0 { Err(Error::Denied) } else { Ok(()) }
+	}
 }

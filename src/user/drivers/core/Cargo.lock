@@ -51,6 +51,7 @@ dependencies = [
 name = "drivers"
 version = "0.0.0"
 dependencies = [
+ "ipc-client",
  "proto",
  "rt",
 ]
@@ -60,6 +61,14 @@ name = "input-proto"
 version = "0.0.0"
 dependencies = [
  "base-proto",
+ "wire",
+]
+
+[[package]]
+name = "ipc-client"
+version = "0.0.0"
+dependencies = [
+ "rt",
  "wire",
 ]
 

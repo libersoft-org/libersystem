@@ -181,11 +181,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. receive the init package shared buffer (to spawn drivers from) and map it.
 		let (_pkg_handle, archive): (u64, &[u8]) = recv_package(bootstrap, &mut buf).unwrap_or_else(|| fail_bootstrap(bootstrap, b"package", b"init package not delivered"));
 		let package: Package = Package::parse(archive).unwrap_or_else(|| fail_bootstrap(bootstrap, b"package", b"init package malformed"));
-		// 1b. receive the power capability - a root-Domain handle carrying MANAGE - which this
-		//     service holds only to delegate to the keyboard drivers. `SYS_SYSTEM_POWER`
+		// 1b. receive the SystemPower connection - the narrow door to stopping the machine, which
+		//     this service holds only to mint one per keyboard driver. It used to be the
+		//     root-Domain handle itself. `SYS_SYSTEM_POWER`
 		//     checks it, and the Power key is the one path to stopping the machine that must
 		//     survive a wedged supervisor, so it cannot be routed through ServiceManager.
-		let power: u64 = recv_tagged(bootstrap, &mut buf, b"POWER").unwrap_or_else(|| fail_bootstrap(bootstrap, b"power", b"missing power capability"));
+		let power: u64 = recv_tagged(bootstrap, &mut buf, b"SYSPOWER").unwrap_or_else(|| fail_bootstrap(bootstrap, b"power", b"missing SystemPower connection"));
 		// 1b2. and the ConsoleInputSource capability, held only to delegate to the same two
 		//      keyboard drivers. `SYS_CONSOLE_FEED` requires it: a keyboard without one types
 		//      nothing rather than typing on an authority it does not hold. Optional, like the
@@ -634,9 +635,18 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 				// The same two drivers own the Power key, so they get the capability that
 				// makes it work. A duplicate per driver: two keyboards each hold their own,
 				// and this service keeps the one it was handed.
-				let grant: i64 = duplicate(power, RIGHT_MANAGE | RIGHT_TRANSFER);
-				if grant < 0 || !send_blocking(dm_side, b"POWER", grant as u64) {
-					return false;
+				// A CONNECTION OF ITS OWN, not a copy of an authority. These two used to be handed
+				// a duplicate of the root-Domain handle - which can kill every process on the
+				// machine - so that the Power key would work. What they get now can ask for a
+				// reboot and nothing else, on a channel nobody else answers on.
+				let grant: Option<u64> = service_connect(power);
+				match grant {
+					Some(connection) if send_blocking(dm_side, b"SYSPOWER", connection) => {}
+					Some(connection) => {
+						close(connection);
+						return false;
+					}
+					None => return false,
 				}
 				// The capability that lets those keystrokes reach the console at all. A
 				// duplicate per driver, for the same reason as POWER.

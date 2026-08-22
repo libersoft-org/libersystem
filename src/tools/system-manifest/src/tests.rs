@@ -47,6 +47,11 @@ destination = "components/liber_component/app.wasm"
 name = "tool_service"
 program = "tool"
 restart = "escalate"
+# Every service says what a restart does to its state. Required rather than defaulted: a default
+# would let a new service arrive unclassified, and the classification exists because nobody could
+# otherwise say what a restart loses.
+state_class = "ephemeral"
+state_scope = "service"
 dependencies = []
 
 # An image without a kernel or a loader does not boot, so `Manifest::parse` requires all four

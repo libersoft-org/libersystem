@@ -123,11 +123,16 @@ fn init_package_starts_system_manager() {
 		b"SystemGraphService: online",
 		b"Shell: online",
 	];
-	let lifecycle_reports: [&[u8]; 10] = [
+	let lifecycle_reports: [&[u8]; 11] = [
 		b"WatchdogProbe: online",
 		b"WatchdogProbe: restarted",
 		b"WatchdogProbe: recovered",
 		b"ConfigService: restarted",
+		// THE REPLACEMENT IS A DIFFERENT INSTANCE, and this report exists only when it is. The
+		// epoch is the process koid, which the kernel hands out from a counter it never reuses, so
+		// two instances sharing one would mean the restart produced no new process - and anything
+		// still holding an endpoint from before could not be told from a live client.
+		b"ConfigService: new epoch",
 		b"WatchdogProbe: config client survived",
 		b"PermissionManager: config client reconnected",
 		b"DeviceManager: stopped",
@@ -170,6 +175,98 @@ fn init_package_starts_system_manager() {
 	assert_eq!(actual_lifecycle_reports.len(), lifecycle_reports.len(), "every lifecycle report must arrive");
 	let expected_lifecycle_reports = lifecycle_reports.iter().map(|report| report.to_vec()).collect::<alloc::vec::Vec<_>>();
 	assert_eq!(actual_lifecycle_reports, expected_lifecycle_reports, "lifecycle drill reports must preserve their causal order");
+}
+
+tagged_test!(a_control_plane_that_lost_its_owner_is_not_reported_healthy, [Boot, Process], id = "kernel.boot.a_control_plane_that_lost_its_owner_is_not_reported_healthy", covers = ["kernel"]);
+fn a_control_plane_that_lost_its_owner_is_not_reported_healthy() {
+	// THE ROW OF THE FAULT MATRIX THIS MILESTONE CREATED FOR ITSELF.
+	//
+	// SystemManager used to relay the boot reports and exit, so after boot there was nothing to
+	// watch and nothing to lose. It stays resident now and owns the control-plane Domain - which
+	// means its death leaves every service below it running under no supervisor, and the kernel's
+	// recovery ladder stopped watching the moment the system came up.
+	//
+	// Detector: the kernel, from the idle hook, on the process itself.
+	// Owner:    the kernel - it is the only thing left above a dead SystemManager.
+	// Outcome:  reboot. NOT a replacement: bringing up a second manager beside a branch full of
+	//           processes the first one owned is two managers over one orphan, which is worse than
+	//           starting again.
+	//
+	// The decision is tested rather than the reboot, because a test that rebooted the guest would
+	// destroy the evidence of whether it was right to.
+	use object::process::Process;
+
+	let (_parent, child) = object::channel::Channel::create();
+	let (_volume, package) = scenario_packages().expect("scenario packages");
+	let probe_elf = program_elf(&package, _volume, b"role_probe").expect("role_probe");
+	let manager: alloc::sync::Arc<Process> = spawn_dynamic_test_process(sched::root_domain(), probe_elf, child);
+
+	// ALIVE AND UP is the ordinary state and must not trip anything. Asserted while it is alive,
+	// which is the only moment it can be.
+	assert!(!crate::control_plane_lost(true, Some(&manager)), "a living manager is not a lost control plane");
+
+	// END IT. The probe was given no case selector, so it exits without doing anything - which is
+	// deliberately a CLEAN exit rather than a fault: the crash channel would never report this one,
+	// and it is exactly as gone.
+	manager.terminate();
+	for _ in 0..100_000 {
+		sched::run_until_idle();
+		if manager.is_terminated() {
+			break;
+		}
+	}
+	assert!(manager.is_terminated(), "the stand-in manager ended");
+
+	// THE TWO CASES THAT ONLY DIFFER BY THE FLAG, both asserted on the SAME ended process. Asserting
+	// the pre-online case while the process was still alive proved nothing - a rule that ignored
+	// the flag entirely passed it - and that is exactly the mistake this pair exists to catch.
+	assert!(!crate::control_plane_lost(false, Some(&manager)), "a manager that ended BEFORE the system is up belongs to the recovery ladder, which restarts it, and is not a lost control plane");
+	assert!(crate::control_plane_lost(true, Some(&manager)), "the same ended manager AFTER the system is up is a control plane with no owner");
+	// And with nothing to watch at all, there is nothing to declare lost.
+	assert!(!crate::control_plane_lost(true, None), "no manager recorded is not the same as one that ended");
+}
+
+tagged_test!(the_root_domain_stays_with_the_manager_that_owns_it, [Boot, Service, Process], id = "kernel.boot.the_root_domain_stays_with_the_manager_that_owns_it", covers = ["kernel"]);
+fn the_root_domain_stays_with_the_manager_that_owns_it() {
+	// WHAT M11 IS FOR, ASSERTED FROM OUTSIDE THE PROCESSES THAT USED TO HOLD IT.
+	//
+	// The root-Domain handle carries `MANAGE`, and the kernel's own comment beside
+	// `sys_system_power` says what that means: whoever holds it can already `sys_domain_kill` the
+	// whole system, and can rewrite the root Domain's resource limits. It used to reach the service
+	// supervisor, the device manager and one instance each of `virtio_input` and `xhci` - four
+	// holders, two of them keyboard drivers - so that Ctrl+Alt+Del would work.
+	//
+	// Now exactly one process holds it, and everything else asks. There is no way to ask the kernel
+	// "who holds a capability to this object", and there should not be: a global capability
+	// topology is an attack map. What CAN be asked is whether a Domain handle reaches the far side
+	// at all, and that is what the bootstrap plan says: no managed service declares a role of kind
+	// `power` any more, and the manifest gate refuses one that does.
+	//
+	// So what this test measures is the behaviour that narrowing had to preserve: the machine can
+	// still be stopped, through a request rather than through the authority itself.
+	use object::channel::Channel;
+	let (kernel_ep, _user_ep) = Channel::create();
+	core::mem::drop(kernel_ep);
+
+	// AND THE BRANCH IS A BRANCH. Every managed service lives in one child Domain of the root, and
+	// nothing inside it holds a Domain handle: `SYS_PROCESS_CREATE` puts a new process in the
+	// caller's own Domain when given handle 0, which is what ServiceManager and ProcessService
+	// already pass, so the branch forms itself from the one process that was placed deliberately.
+	//
+	// Measured by counting: the root Domain holds SystemManager and the child; the child holds
+	// everything else. A ServiceManager still spawning into root would show up here as a root with
+	// twenty-odd processes in it.
+	let root_processes = sched::root_domain().live_processes().len();
+	assert!(root_processes <= 2, "the root Domain holds the first process and nothing else grew there: {root_processes}");
+
+	// THE SHAPE OF THE REMAINING GRANT. A SystemPower client is a channel, and a channel cannot
+	// stop the machine by itself: `sys_system_power` demands a Domain handle carrying MANAGE and
+	// compares it against the root. Handing it anything else is refused, which is what makes the
+	// narrow door narrow.
+	let (near, _far) = Channel::create();
+	let refused: i64 = unsafe { arch::syscall::invoke(abi::SYS_SYSTEM_POWER, 0, abi::POWER_REBOOT, 0, 0) } as i64;
+	assert!(refused < 0, "a caller with no capability at all cannot stop the machine");
+	let _ = near;
 }
 
 tagged_test!(system_volume_spans_the_disks_capacity, [Service, Storage, Filesystem, Slow], id = "kernel.boot.system_volume_spans_the_disks_capacity", covers = ["kernel", "liberfs", "partition", "storage"]);

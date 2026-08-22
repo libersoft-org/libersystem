@@ -1417,6 +1417,221 @@ pub const CAP_SYSTEM: &[u8] = b"SYSTEM";
 pub const CAP_RAM: &[u8] = b"RAM";
 pub const CAP_TMP: &[u8] = b"TMP";
 
+// WHAT A BOOTSTRAP ROLE IS, AND WHAT A RECEIVER CAN ACTUALLY CHECK ABOUT ONE.
+//
+// A service is handed its capabilities as a fixed sequence of tagged messages. Until now each
+// receiver read that sequence by hand, and the two ends agreed only because somebody kept them
+// agreeing: three programs once read their tags in an order the sender does not use, which made a
+// blocking tagged read consume the message that was actually next and then wait forever for one
+// nobody sends. It surfaced 170 tests away in an unrelated service.
+//
+// THE LIMIT OF THIS CHECK IS THE KERNEL'S. From a handle the kernel will say what object type it
+// is and what rights it carries. It will NOT say which protocol answers on the far end of a
+// channel - that is a declared contract, and no amount of introspection here can stand in for it.
+// So this refuses a missing role, a repeated role, a handle of the wrong object type and a handle
+// carrying less than the role needs, all before the service reports ready, and it claims nothing
+// about what the far end speaks.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoleKind {
+	/// One end of a channel pair the supervisor made for this service to serve its clients on.
+	ServeRoot,
+	/// A duplicate of another service's client end.
+	Client,
+	/// A fresh connection minted from another service's serve root.
+	Factory,
+	/// A privileged handle the kernel gave the boot chain, duplicated onward. Its object type
+	/// depends on the facility, so this kind fixes neither type nor rights.
+	Privilege,
+	/// The root-Domain handle: whoever holds it can stop the machine and kill every process on it.
+	Power,
+	/// The init package, as a read-only memory object.
+	Package,
+	/// A handle produced by a driver and passed on through DeviceManager.
+	Device,
+	/// A tagged message carrying bytes and no capability at all.
+	Payload,
+}
+
+impl RoleKind {
+	/// The kernel object type a handle of this kind must be, or `None` when the kind does not fix
+	/// one. DERIVED from the kind rather than declared beside it: the same fact written twice is
+	/// the fact whose copy goes stale.
+	pub const fn object_type(self) -> Option<u64> {
+		match self {
+			RoleKind::ServeRoot | RoleKind::Client | RoleKind::Factory | RoleKind::Device => Some(OBJECT_TYPE_CHANNEL),
+			RoleKind::Package => Some(OBJECT_TYPE_MEMORY_OBJECT),
+			RoleKind::Power => Some(OBJECT_TYPE_DOMAIN),
+			RoleKind::Privilege | RoleKind::Payload => None,
+		}
+	}
+
+	/// The MOST a handle of this kind may arrive carrying, or 0 when the kind does not fix a
+	/// ceiling.
+	///
+	/// THIS IS THE HALF THAT CATCHES OVER-GRANTING, and it caught the system as it stood: a fresh
+	/// channel end carries `RIGHTS_ALL`, and the supervisor transferred serve roots exactly as the
+	/// kernel minted them - so every service was handed MANAGE, DUPLICATE and REVOKE over the
+	/// channel its clients reach it on, when serving needs send, receive and wait.
+	///
+	/// TRANSFER is in every ceiling that has one because a capability that could not be transferred
+	/// could not have been delivered at all. It is the one right the delivery itself requires.
+	pub const fn maximum_rights(self) -> u32 {
+		match self {
+			RoleKind::ServeRoot | RoleKind::Client | RoleKind::Factory | RoleKind::Device => RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER,
+			RoleKind::Package => RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER,
+			RoleKind::Power => RIGHT_MANAGE | RIGHT_TRANSFER | RIGHT_DUPLICATE,
+			// A privilege handle is whatever the kernel minted for that facility, so there is no
+			// one ceiling to state. `Payload` carries nothing at all.
+			RoleKind::Privilege | RoleKind::Payload => 0,
+		}
+	}
+
+	/// The rights a handle of this kind must arrive carrying. A FLOOR, and `maximum_rights` is the
+	/// ceiling: between them they say a role arrived with what it needs and nothing more.
+	pub const fn required_rights(self) -> u32 {
+		match self {
+			RoleKind::ServeRoot | RoleKind::Client | RoleKind::Factory | RoleKind::Device => RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT,
+			RoleKind::Package => RIGHT_READ | RIGHT_MAP,
+			RoleKind::Power => RIGHT_MANAGE,
+			RoleKind::Privilege | RoleKind::Payload => 0,
+		}
+	}
+}
+
+/// One capability a service must be handed before it can run.
+#[derive(Clone, Copy, Debug)]
+pub struct Role {
+	pub tag: &'static [u8],
+	pub kind: RoleKind,
+	/// False for a role whose tag is always sent and whose handle may legitimately be zero - an
+	/// absent disk, an absent device. THE TAG STILL ARRIVES; only the capability is missing, and a
+	/// receiver that treated the empty tag as an error would refuse to start on a smaller boot.
+	pub required: bool,
+}
+
+/// Why a bootstrap was refused. Each names the role it was refused over, so the failure report
+/// says which one rather than that something was wrong.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RoleError {
+	/// The sequence ended, or the peer closed, before this role arrived.
+	Missing(&'static [u8]),
+	/// The tag that arrived is not the one this position expects. Positional by construction: the
+	/// sequence is a contract and a message out of order has already displaced every read after it.
+	Unexpected(&'static [u8]),
+	/// A required role arrived carrying no capability.
+	NoHandle(&'static [u8]),
+	/// The handle is not the kernel object type this kind of role is.
+	WrongType(&'static [u8]),
+	/// The handle carries less than this kind of role needs.
+	MissingRights(&'static [u8]),
+	/// The handle carries MORE than this kind of role is allowed. Refused rather than trimmed: a
+	/// receiver that quietly narrowed what it was handed would hide a sender granting too much,
+	/// and the sender is where that has to be fixed.
+	TooManyRights(&'static [u8]),
+}
+
+impl RoleError {
+	pub const fn tag(self) -> &'static [u8] {
+		match self {
+			RoleError::Missing(tag) | RoleError::Unexpected(tag) | RoleError::NoHandle(tag) | RoleError::WrongType(tag) | RoleError::MissingRights(tag) | RoleError::TooManyRights(tag) => tag,
+		}
+	}
+
+	pub const fn reason(self) -> &'static [u8] {
+		match self {
+			RoleError::Missing(_) => b"role never arrived",
+			RoleError::Unexpected(_) => b"a different role arrived in this position",
+			RoleError::NoHandle(_) => b"required role carried no capability",
+			RoleError::WrongType(_) => b"role carried the wrong kind of object",
+			RoleError::MissingRights(_) => b"role carried fewer rights than it needs",
+			RoleError::TooManyRights(_) => b"role carried more rights than it is allowed",
+		}
+	}
+}
+
+/// Receive one service's declared roles in order, checking each before the next.
+///
+/// FAIL-CLOSED, AND IT CLEANS UP AFTER ITSELF. On any refusal every handle taken so far is closed,
+/// including the one that caused it: a bootstrap that half-succeeded and left capabilities in a
+/// process that then reported failure is a leak with authority in it.
+///
+/// `into` receives one entry per role, zero where the role legitimately carried none. It must be
+/// at least as long as `roles`.
+///
+/// # Safety
+/// `bootstrap` must be a channel this process may receive on.
+pub unsafe fn receive_roles(bootstrap: u64, roles: &[Role], into: &mut [u64]) -> Result<(), RoleError> {
+	unsafe {
+		let mut buf = [0u8; 128];
+		let mut taken = 0usize;
+		for (index, role) in roles.iter().enumerate() {
+			let (len, handle) = match recv_blocking(bootstrap, &mut buf) {
+				Received::Message { len, handle } => (len, handle),
+				Received::Closed => {
+					close_taken(into, taken);
+					return Err(RoleError::Missing(role.tag));
+				}
+			};
+			// The tag is a PREFIX, not the whole message: several roles carry a payload behind it
+			// (the package's length, a memory volume's capacity).
+			if len < role.tag.len() || &buf[..role.tag.len()] != role.tag {
+				if handle != 0 {
+					close(handle);
+				}
+				close_taken(into, taken);
+				return Err(RoleError::Unexpected(role.tag));
+			}
+			if let Err(error) = check_role(role, handle) {
+				if handle != 0 {
+					close(handle);
+				}
+				close_taken(into, taken);
+				return Err(error);
+			}
+			into[index] = handle;
+			taken = index + 1;
+		}
+		Ok(())
+	}
+}
+
+// What the kernel can be asked about one delivered handle.
+unsafe fn check_role(role: &Role, handle: u64) -> Result<(), RoleError> {
+	if handle == 0 {
+		// An absent optional role is the ordinary case on a smaller boot, and a payload role never
+		// carries a handle at all.
+		return if role.required && role.kind != RoleKind::Payload { Err(RoleError::NoHandle(role.tag)) } else { Ok(()) };
+	}
+	let mut info = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
+	let read: i64 = unsafe { syscall(SYS_OBJECT_INFO_GET, handle, &mut info as *mut ObjectInfo as u64, core::mem::size_of::<ObjectInfo>() as u64, 0) } as i64;
+	if read < 0 {
+		return Err(RoleError::WrongType(role.tag));
+	}
+	if let Some(expected) = role.kind.object_type() {
+		if info.object_type != expected {
+			return Err(RoleError::WrongType(role.tag));
+		}
+	}
+	let needed = role.kind.required_rights();
+	if info.rights & needed != needed {
+		return Err(RoleError::MissingRights(role.tag));
+	}
+	let allowed = role.kind.maximum_rights();
+	if allowed != 0 && info.rights & !allowed != 0 {
+		return Err(RoleError::TooManyRights(role.tag));
+	}
+	Ok(())
+}
+
+unsafe fn close_taken(into: &mut [u64], taken: usize) {
+	for slot in into.iter_mut().take(taken) {
+		if *slot != 0 {
+			unsafe { close(*slot) };
+			*slot = 0;
+		}
+	}
+}
+
 // A received bootstrap capability set: every named capability the parent sent
 // before READY, taken by name. Whatever the receiver does not take is closed when
 // the set drops, so an unused grant never lingers as an open handle.

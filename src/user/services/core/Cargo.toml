@@ -105,6 +105,10 @@ name = "sandbox_probe"
 path = "src/sandbox_probe.rs"
 
 [[bin]]
+name = "role_probe"
+path = "src/role_probe.rs"
+
+[[bin]]
 name = "request_probe"
 path = "src/request_probe.rs"
 

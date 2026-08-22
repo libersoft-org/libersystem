@@ -174,9 +174,9 @@ fn graph_wire_is_stable() {
 }
 #[test]
 fn supervisor_stat_wire_is_stable() {
-	let sample = SupervisorStat { name: String::from("x"), state: String::from("x"), restarts: 7, watchdog_trips: 7, last_failure: String::from("x") };
+	let sample = SupervisorStat { name: String::from("x"), state: String::from("x"), desired: String::from("x"), epoch: 7, last_reason: String::from("x"), restarts: 7, watchdog_trips: 7, last_failure: String::from("x") };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[1, 0, 120, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120];
+	let golden: &[u8] = &[1, 0, 120, 1, 0, 120, 1, 0, 120, 7, 0, 0, 0, 0, 0, 0, 0, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120];
 	assert_eq!(bytes, golden);
 	assert_eq!(SupervisorStat::decode(&bytes).unwrap(), sample);
 }

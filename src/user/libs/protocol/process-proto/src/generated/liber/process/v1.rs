@@ -602,6 +602,21 @@ pub mod process {
 		Some(writer.pos())
 	}
 
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
 	pub struct Client<T: Transport> {
 		transport: T,
 		corr: u32,
@@ -672,14 +687,13 @@ pub mod process {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -705,14 +719,13 @@ pub mod process {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -753,14 +766,13 @@ pub mod process {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -790,14 +802,13 @@ pub mod process {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -823,14 +834,13 @@ pub mod process {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -871,14 +881,13 @@ pub mod process {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -905,14 +914,13 @@ pub mod process {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -945,14 +953,13 @@ pub mod process {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -979,14 +986,13 @@ pub mod process {
 			// One call for both halves: the bytes cannot be taken without them.
 			let (request, request_handles) = writer.into_message();
 			let mut reply_handles = Handles::new();
-			let reply = self
-				.transport
-				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
-				.map_err(|e| {
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
 					self.last_error = Some(e);
-					e
-				})
-				.ok()?;
+					return Some(Err(transport_outcome(e)));
+				}
+			};
 			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
 			let decoded = (|| {
 				let r = &mut reader;
@@ -1075,6 +1081,295 @@ pub mod process {
 	fn channel_invoke_cancel(chan: u64, koid: &Koid) -> Option<Result<bool, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.cancel(koid)
+	}
+}
+
+/// THE NARROW DOOR TO STOPPING THE MACHINE.
+///
+/// Before this, the Power key worked by handing its driver the root-Domain handle - and whoever
+/// holds that can already `sys_domain_kill` the whole system and rewrite the root Domain's resource
+/// limits. The kernel says so itself beside `sys_system_power`. So a keyboard driver held the
+/// broadest capability in the system in order to answer Ctrl+Alt+Del, and so did the device manager
+/// that passed it on and the supervisor that passed it to them.
+///
+/// Two ops and no arguments is the whole of what that path ever needed. The authority stays with
+/// SystemManager, which is the one process resident for the life of the system; everything else
+/// asks. A client of this interface can stop the machine and can do NOTHING ELSE, which is the
+/// difference between a capability and a key to the building.
+///
+/// Deliberately not here: a graceful shutdown that stops services in order first. That is a
+/// feature, this is an authority narrowing, and attaching one to the other delays the narrowing
+/// behind work that has nothing to do with it.
+// interface `system-power` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod system_power {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_REBOOT: u16 = 1;
+	pub const OP_POWER_OFF: u16 = 2;
+
+	pub trait Service {
+		/// Restart the machine. Returns only if the request was refused.
+		fn reboot(&mut self) -> Result<(), Error>;
+		/// Power the machine off. Returns only if the request was refused.
+		fn power_off(&mut self) -> Result<(), Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:process")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_REBOOT => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.reboot();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v27) => {
+							w.u8(1)?;
+						}
+						Err(v28) => {
+							w.u8(0)?;
+							v28.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_POWER_OFF => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.power_off();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v29) => {
+							w.u8(1)?;
+						}
+						Err(v30) => {
+							w.u8(0)?;
+							v30.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn reboot(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_REBOOT)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn power_off(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_POWER_OFF)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_system_power_reboot")]
+	fn channel_invoke_reboot(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.reboot()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_process_system_power_power_off")]
+	fn channel_invoke_power_off(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.power_off()
 	}
 }
 

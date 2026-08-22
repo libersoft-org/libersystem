@@ -44,7 +44,7 @@ mod bootstrap;
 #[path = "service_manager/lifecycle.rs"]
 mod lifecycle;
 
-use bootstrap::{bootstrap_serve, bootstrap_system_graph_service, console_report, drive_runtime_drivers, emit_event, launch_from_volume, open_storage_directory, start_service, stop_service};
+use bootstrap::{Kept, bootstrap_serve, bootstrap_system_graph_service, console_report, drive_runtime_drivers, emit_event, launch_from_volume, open_storage_directory, start_service, stop_service};
 use lifecycle::{depends_on_scoped, has_running_dependent, serve_stats_once, shutdown_all, shutdown_order, verify_shutdown_order};
 
 // A service in the boot manifest: its package entry name, the supervisor's crash
@@ -87,6 +87,10 @@ struct Role {
 	// The service that supplies it, `self` for a channel made for this service to serve on, or
 	// `kernel` for what the boot chain was handed.
 	provider: &'static [u8],
+	// Which of the provider's serve roots this is a client of. `SERVE` for nearly all of them, and
+	// the exceptions are the point: PermissionManager's `STORAGE_ADMIN` is a client of
+	// StorageService's ADMIN root, which grants differently over the same volume.
+	source: &'static [u8],
 	// False for a role whose tag is always sent and whose handle may legitimately be zero - an
 	// absent disk, an absent device. The TAG still arrives; only the capability is missing.
 	required: bool,
@@ -115,13 +119,130 @@ include!(concat!(env!("OUT_DIR"), "/driver_names.rs"));
 #[derive(Clone, Copy, PartialEq)]
 enum State {
 	// Not started yet (its dependencies are not all up).
-	Pending,
-	// Started and reported in.
-	Running,
+	Absent,
+	// The process exists and its bootstrap has been sent; its report has not arrived.
+	//
+	// STARTED IS NOT READY, and this state is the difference. Before it there was one `Running`
+	// meaning both, so a service that launched and never reported in was indistinguishable from
+	// one serving its clients - and the supervisor had nothing to name while it waited.
+	Starting,
+	// Started, reported in, and serving. The readiness condition for every managed service is that
+	// report: the service itself says when it is able to answer, because nothing outside it knows.
+	Ready,
+	// A stop was asked for and the process is not gone yet.
+	Stopping,
 	// Stopped on request after having run.
 	Stopped,
 	// Could not be started, or did not report in.
 	Failed,
+}
+
+// WHAT THE SUPERVISOR WANTS, kept apart from what it observes.
+//
+// Two values and no more. Without this a service the operator deliberately stopped is
+// indistinguishable from one that is missing, and anything comparing the running system against
+// the declared one reports the deliberate act as a fault.
+#[derive(Clone, Copy, PartialEq)]
+enum Desired {
+	Running,
+	Stopped,
+}
+
+// ONE LIFECYCLE TRANSITION, as the supervisor records it.
+//
+// The epoch is what makes a late event from a dead instance harmless: a restarted service is a new
+// process with a new KOID, and a report tagged with the old one can be recognised as belonging to
+// an instance that no longer exists rather than applied to its replacement. The sequence orders
+// transitions within a boot; the boot id says which boot they belong to, and it comes from the
+// kernel so it survives the first userspace process being replaced.
+#[derive(Clone, Copy)]
+struct Transition {
+	service: usize,
+	from: State,
+	to: State,
+	// The KOID of the process this is about, or 0 before one exists. Used AS the instance epoch:
+	// koids are handed out by a monotonic counter that never reuses a value, so an epoch needs no
+	// allocator of its own.
+	epoch: u64,
+	reason: Reason,
+	sequence: u64,
+}
+
+// Why a transition happened. A count of restarts says how often; this says what for.
+#[derive(Clone, Copy, PartialEq)]
+enum Reason {
+	// Its dependencies came up and the supervisor started it.
+	Started,
+	// It reported in.
+	ReportedReady,
+	// Its bootstrap could not be completed.
+	BootstrapRefused,
+	// It did not report in.
+	NoReport,
+	// The process faulted or exited.
+	Faulted,
+	// It missed its watchdog deadline.
+	Unresponsive,
+	// A stop was asked for.
+	StopRequested,
+	// It was restarted and this record is about the instance that was replaced.
+	Replaced,
+	// Its restart budget ran out.
+	BudgetSpent,
+}
+
+// THE LIFECYCLE RECORD. Bounded on purpose: a supervisor that grew a record per transition would
+// be a supervisor whose memory depends on how often the system misbehaves, which is exactly when it
+// must not run out. The oldest entries are dropped, because the newest are what a failure is
+// diagnosed from.
+const TRANSITIONS_KEPT: usize = 64;
+
+struct LifecycleLog {
+	boot: u64,
+	sequence: u64,
+	entries: [Option<Transition>; TRANSITIONS_KEPT],
+	next: usize,
+}
+
+impl LifecycleLog {
+	fn new(boot: u64) -> LifecycleLog {
+		LifecycleLog { boot, sequence: 0, entries: [None; TRANSITIONS_KEPT], next: 0 }
+	}
+
+	// Record one transition. A no-op when nothing changed, so a poll that finds a service where it
+	// left it does not fill the record with sameness.
+	fn record(&mut self, service: usize, from: State, to: State, epoch: u64, reason: Reason) {
+		if from == to {
+			return;
+		}
+		self.sequence += 1;
+		self.entries[self.next] = Some(Transition { service, from, to, epoch, reason, sequence: self.sequence });
+		self.next = (self.next + 1) % TRANSITIONS_KEPT;
+	}
+
+	// The most recent transition for one service, which is what "why is it like this" asks for.
+	fn latest(&self, service: usize) -> Option<Transition> {
+		let mut best: Option<Transition> = None;
+		for entry in self.entries.iter().flatten() {
+			if entry.service == service && best.map_or(true, |b| entry.sequence > b.sequence) {
+				best = Some(*entry);
+			}
+		}
+		best
+	}
+}
+
+// THE INSTANCE EPOCH IS THE PROCESS KOID. Koids come from a monotonic counter the kernel never
+// reuses, so an instance identity needs no allocator, no persistence and no wraparound rule - and
+// a report tagged with a koid that is not the current one is recognisably about an instance that
+// no longer exists.
+unsafe fn epoch_of(process: u64) -> u64 {
+	if process == 0 {
+		return 0;
+	}
+	let mut info = ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
+	let read: i64 = unsafe { syscall(SYS_OBJECT_INFO_GET, process, &mut info as *mut ObjectInfo as u64, core::mem::size_of::<ObjectInfo>() as u64, 0) } as i64;
+	if read < 0 { 0 } else { info.koid }
 }
 
 // The watchdog's heartbeat deadline: a healthy service answers a probe in one
@@ -248,7 +369,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     `!poweroff` / `!reboot` path work; a duplicate goes to DeviceManager for the
 	//     keyboard driver's Power key, which must keep working when this supervisor does not.
 	let power: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if len == 5 && &buf[..5] == b"POWER" && handle != 0 => handle,
+		// A CLIENT OF SYSTEMPOWER, NOT THE ROOT DOMAIN. This supervisor used to hold a capability
+		// that could kill the whole system, for no reason other than being on the path between the
+		// kernel and the keyboard driver. What it holds now can ask for a reboot and nothing else.
+		Received::Message { len, handle } if len == 8 && &buf[..8] == b"SYSPOWER" && handle != 0 => handle,
 		_ => exit(),
 	};
 
@@ -284,7 +408,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    progress (everything started, or what is left is blocked on a failed or
 	//    missing dependency). StorageService's service-channel client end is kept
 	//    alive in `storage_client` so the service stays standing after it reports in.
-	let mut state: [State; N] = [State::Pending; N];
+	let mut state: [State; N] = [State::Absent; N];
+	// WHAT THE SUPERVISOR WANTS, beside what it sees. Every managed service is wanted running until
+	// somebody says otherwise; `stop` is the only thing that says otherwise. Without this a service
+	// deliberately stopped and one that never came up are the same observation.
+	let mut desired: [Desired; N] = [Desired::Running; N];
+	// The lifecycle record: which boot, which instance, in what order, and why.
+	let mut lifecycle = LifecycleLog::new(unsafe { boot_id() });
+	// The client ends kept from every serve root, so a service the plan wires can be a client of a
+	// provider a hand-written branch still wires. One table for the whole bring-up, because a role
+	// resolves against what was kept BEFORE it, which is what the start order already guarantees.
+	let mut kept = Kept::new();
 	let mut channels: [u64; N] = [0u64; N];
 	// The spawned Process handle of each component, kept so SystemGraphService can be
 	// handed a read-only duplicate of every component it observes (the live data source
@@ -393,9 +527,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut progress: bool = false;
 		let mut i: usize = 0;
 		while i < N {
-			if state[i] == State::Pending && deps_satisfied(MANIFEST[i].deps, &state) {
+			if state[i] == State::Absent && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let started: State = unsafe { start_service(&package, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				let started: State = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
+				// bring-up waits for the report, but it is the honest name for the window between
+				// a process existing and a service answering, and it is what a later non-blocking
+				// bring-up would sit in.
+				lifecycle.record(i, state[i], State::Starting, unsafe { epoch_of(procs[i]) }, Reason::Started);
+				state[i] = State::Starting;
+				lifecycle.record(i, State::Starting, started, unsafe { epoch_of(procs[i]) }, if started == State::Ready { Reason::ReportedReady } else { Reason::NoReport });
 				state[i] = started;
 				procs[i] = proc_handle;
 				progress = true;
@@ -420,13 +561,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						}
 					}
 				}
-				if MANIFEST[i].name == b"process_service" && started == State::Running {
+				if MANIFEST[i].name == b"process_service" && started == State::Ready {
 					broker_process = unsafe { service_connect(process_client) }.unwrap_or(0);
 				}
-				if MANIFEST[i].name == b"storage_service" && started == State::Running {
+				if MANIFEST[i].name == b"storage_service" && started == State::Ready {
 					broker_storage_admin = storage_admin;
 				}
-				if MANIFEST[i].name == b"permission_manager" && started == State::Running && selftest {
+				if MANIFEST[i].name == b"permission_manager" && started == State::Ready && selftest {
 					drill_perm = unsafe { service_connect(perm_client) }.unwrap_or(0);
 				}
 				// The development agent launches through PermissionManager like anything else,
@@ -435,7 +576,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// is delivered here on DeviceManager's control channel, the same late hand-off
 				// LogService's journal uses below, and DeviceManager passes it on to the agent.
 				// Ignored entirely by a boot that has no agent.
-				if MANIFEST[i].name == b"permission_manager" && started == State::Running {
+				if MANIFEST[i].name == b"permission_manager" && started == State::Ready {
 					if let Some(dm) = index_of(b"device_manager") {
 						let launcher: u64 = unsafe { service_connect(perm_client) }.unwrap_or(0);
 						if launcher != 0 {
@@ -453,7 +594,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// 2 - it now loads the non-bootstrap drivers from the volume, which is only
 				// mountable now. This runs before the driver-consuming services (which depend
 				// on process_service, so come up later), so their driver channels are ready.
-				if MANIFEST[i].name == b"storage_service" && started == State::Running {
+				if MANIFEST[i].name == b"storage_service" && started == State::Ready {
 					if let Some(dm) = index_of(b"device_manager") {
 						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_client, &mut snd_client, &mut input_raw, &mut block5_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut buf) };
 					}
@@ -486,14 +627,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	{
 		let mut i: usize = 0;
 		while i < N {
-			if state[i] == State::Pending {
+			if state[i] == State::Absent {
 				unsafe {
 					print(b"ServiceManager: ");
 					print(MANIFEST[i].name);
 					print(b": never started - waiting for");
 					for dependency in MANIFEST[i].deps {
 						if let Some(idx) = index_of(dependency) {
-							if state[idx] != State::Running {
+							if state[idx] != State::Ready {
 								print(b" ");
 								print(dependency);
 							}
@@ -612,15 +753,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     system volume, which stopping DeviceManager makes unavailable. The broker
 	//     stands for the life of the system (the supervise loop serves resolves and
 	//     restarts config on a runtime crash the same way).
-	let mut broker: Broker = Broker { config: config_client, device: device_client, graph: graph_client, process: broker_process, storage_admin: broker_storage_admin };
+	let mut broker: Broker = Broker { config: config_client, device: device_client, graph: graph_client, process: broker_process, storage_admin: broker_storage_admin, lifecycle };
 	if selftest && canary_ctrl != 0 {
 		if let Some(cfg) = index_of(b"config_service") {
-			if state[cfg] == State::Running && procs[cfg] != 0 {
+			if state[cfg] == State::Ready && procs[cfg] != 0 {
 				unsafe {
+					// The epoch of the instance about to be killed, so the replacement can be
+					// shown to be a DIFFERENT instance rather than assumed to be one.
+					let before: u64 = epoch_of(procs[cfg]);
 					// A real crash: kill the live instance out from under its clients.
 					signal(procs[cfg], SIG_KILL);
 					if restart_service(&mut broker, cfg, &mut state, &mut channels, &mut procs, &mut sup, &mut stats_server, policy.restart_budget, park, &mut buf) {
 						send_blocking(bootstrap, b"ConfigService: restarted", 0);
+						// REPORTED ONLY IF IT IS TRUE. The epoch is the process koid and the kernel
+						// never reuses one, so a replacement that shared its predecessor's epoch
+						// would mean the restart had not produced a new process at all - and an
+						// endpoint held from before would be indistinguishable from a live one.
+						// This message is the assertion, not a description of it.
+						let after: u64 = epoch_of(procs[cfg]);
+						if before != 0 && after != 0 && before != after {
+							send_blocking(bootstrap, b"ConfigService: new epoch", 0);
+						}
 						emit_event(log_client, b"config_service", b"restarted");
 						// The client-survives proof: the canary resolves and queries the
 						// restarted instance, and its STORAGE resolve is denied.
@@ -675,7 +828,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     running.
 	if selftest {
 		if let Some(dev) = index_of(b"device_manager") {
-			if state[dev] == State::Running {
+			if state[dev] == State::Ready {
 				state[dev] = unsafe { stop_service(channels[dev], bootstrap, &mut buf) };
 				sup[dev].failure = Failure::Stopped;
 				channels[dev] = 0;
@@ -721,7 +874,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
 	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
 	unsafe {
-		supervise(power, &mut state, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, park, &mut buf);
+		supervise(power, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, park, &mut buf);
 	}
 	exit();
 }
@@ -732,7 +885,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 fn all_settled(state: &[State; N]) -> bool {
 	let mut i: usize = 0;
 	while i < N {
-		if state[i] != State::Running && state[i] != State::Stopped {
+		if state[i] != State::Ready && state[i] != State::Stopped {
 			return false;
 		}
 		i += 1;
@@ -744,7 +897,7 @@ fn all_settled(state: &[State; N]) -> bool {
 fn deps_satisfied(deps: &[&[u8]], state: &[State; N]) -> bool {
 	for &dep in deps {
 		match index_of(dep) {
-			Some(idx) if state[idx] == State::Running => {}
+			Some(idx) if state[idx] == State::Ready => {}
 			_ => return false,
 		}
 	}
@@ -878,6 +1031,9 @@ struct Broker {
 	graph: u64,
 	process: u64,
 	storage_admin: u64,
+	// The lifecycle record travels with the broker because the broker is what restarts a service,
+	// and a restart is the transition the record exists for.
+	lifecycle: LifecycleLog,
 }
 
 // The grant set of each resolving component: which capability names its resolves may
@@ -926,7 +1082,7 @@ unsafe fn serve_resolve(chan: u64, requester: &[u8], request: &[u8], broker: &Br
 			_ => 0,
 		};
 		let alive: bool = match service_of_cap(name).and_then(index_of) {
-			Some(idx) => state[idx] == State::Running,
+			Some(idx) => state[idx] == State::Ready,
 			None => false,
 		};
 		if root == 0 || !alive {
@@ -970,6 +1126,9 @@ fn is_goodbye(request: &[u8]) -> bool {
 unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], stats_server: &mut u64, budget: u32, park: u64, buf: &mut [u8]) -> bool {
 	unsafe {
 		sup[idx].failure = Failure::Crashed;
+		// THE INSTANCE BEING REPLACED IS RECORDED BEFORE IT IS GONE, with its own epoch, so a late
+		// report from it can be matched to the instance it belongs to rather than to its successor.
+		broker.lifecycle.record(idx, state[idx], State::Stopping, epoch_of(procs[idx]), Reason::Replaced);
 		state[idx] = State::Failed;
 		// Reap every endpoint of the dead instance: the control channel, our Process
 		// handle, and the broker's serve root (it died with the instance).
@@ -1087,7 +1246,11 @@ unsafe fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; 
 		}
 		channels[idx] = manager_side;
 		procs[idx] = proc as u64;
-		state[idx] = State::Running;
+		// The replacement is a NEW instance: a new process, and therefore a new koid, which is the
+		// epoch. Anything holding an endpoint from before is holding one to an instance that has
+		// ended, and the epoch is how that is told apart from the one now serving.
+		broker.lifecycle.record(idx, State::Starting, State::Ready, epoch_of(procs[idx]), Reason::ReportedReady);
+		state[idx] = State::Ready;
 		true
 	}
 }
@@ -1192,7 +1355,7 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // dropped from the wait set. The canary is restarted per policy; an admin message
 // drives a reverse-dependency stop; a stats request is answered over the `supervisor`
 // interface. Returns when nothing is left to watch.
-unsafe fn supervise(power: u64, state: &mut [State; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, buf: &mut [u8]) {
+unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
@@ -1205,7 +1368,7 @@ unsafe fn supervise(power: u64, state: &mut [State; N], channels: &mut [u64; N],
 			let mut count: usize = 0;
 			let mut i: usize = 0;
 			while i < N {
-				if state[i] == State::Running && channels[i] != 0 {
+				if state[i] == State::Ready && channels[i] != 0 {
 					handles[count] = channels[i];
 					kinds[count] = 0;
 					idxs[count] = i;
@@ -1267,6 +1430,8 @@ unsafe fn supervise(power: u64, state: &mut [State; N], channels: &mut [u64; N],
 							// clean stop and drop it from the wait set. ConsoleService reloads a
 							// fresh shell on the VT, so nothing here restarts it.
 							emit_event(log_client, MANIFEST[idx].name, b"exited");
+							broker.lifecycle.record(idx, state[idx], State::Stopped, epoch_of(procs[idx]), Reason::StopRequested);
+							desired[idx] = Desired::Stopped;
 							state[idx] = State::Stopped;
 							channels[idx] = 0;
 						}
@@ -1282,6 +1447,7 @@ unsafe fn supervise(power: u64, state: &mut [State; N], channels: &mut [u64; N],
 									console_report(MANIFEST[idx].name, b"escalated");
 								}
 							} else {
+								broker.lifecycle.record(idx, state[idx], State::Failed, epoch_of(procs[idx]), Reason::Faulted);
 								state[idx] = State::Failed;
 								sup[idx].failure = Failure::Crashed;
 								channels[idx] = 0;
@@ -1321,7 +1487,7 @@ unsafe fn supervise(power: u64, state: &mut [State; N], channels: &mut [u64; N],
 				}
 				3 => {
 					// SystemGraphService queried the supervisor state; answer one request.
-					if !serve_stats_once(stats, state, sup, reason, canary_sup, drivers, buf) {
+					if !serve_stats_once(stats, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, buf) {
 						stats = 0;
 					}
 				}
@@ -1335,7 +1501,7 @@ unsafe fn supervise(power: u64, state: &mut [State; N], channels: &mut [u64; N],
 				_ => {
 					// The sandboxed `lssvc` tool (granted the services capability) queried the
 					// supervisor state over its own status channel; answer one request.
-					if !serve_stats_once(stats2, state, sup, reason, canary_sup, drivers, buf) {
+					if !serve_stats_once(stats2, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, buf) {
 						stats2 = 0;
 					}
 				}
@@ -1402,7 +1568,7 @@ unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut 
 			return true;
 		}
 		match index_of(name) {
-			Some(target) if state[target] == State::Running => {
+			Some(target) if state[target] == State::Ready => {
 				let stopped: Vec<u8> = stop_subtree(target, state, channels, sup, procs, log_client, buf);
 				let mut reply: Vec<u8> = Vec::new();
 				reply.extend_from_slice(b"STOPPED\n");
@@ -1437,7 +1603,7 @@ unsafe fn stop_subtree(target: usize, state: &mut [State; N], channels: &mut [u6
 			let mut grew: bool = false;
 			let mut i: usize = 0;
 			while i < N {
-				if !scope[i] && state[i] == State::Running && depends_on_scoped(i, &scope) {
+				if !scope[i] && state[i] == State::Ready && depends_on_scoped(i, &scope) {
 					scope[i] = true;
 					grew = true;
 				}
@@ -1457,7 +1623,7 @@ unsafe fn stop_subtree(target: usize, state: &mut [State; N], channels: &mut [u6
 			let mut progress: bool = false;
 			let mut i: usize = 0;
 			while i < N {
-				if scope[i] && state[i] == State::Running && !has_running_dependent(i, &scope, state) {
+				if scope[i] && state[i] == State::Ready && !has_running_dependent(i, &scope, state) {
 					if procs[i] != 0 {
 						signal(procs[i], SIG_KILL);
 					}

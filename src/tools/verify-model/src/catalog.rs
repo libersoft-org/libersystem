@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 24] = [
+const GATES: [(&str, &str); 25] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -149,6 +149,10 @@ const GATES: [(&str, &str); 24] = [
 	// does: it reads source, costs milliseconds, and a pair that drifts apart is not something to
 	// find only when the change that broke it is far behind.
 	("forwarded-abi", "harness.tools"),
+	// P02M0141's migration gate: while the bootstrap ladder and the generated role plan both
+	// describe the wiring, they must agree. Its subject is the manifest and the supervisor, and it
+	// reads source rather than building anything.
+	("bootstrap-plan", "harness.tools"),
 	// P02M0137's gate: the dynamic-report checker's own exit contract, mode dispatch and refusal
 	// behaviour, against a disposable fixture. The subject is that checker, which is harness tooling.
 	("dynamic-report-regressions", "harness.tools"),

@@ -758,6 +758,27 @@ impl Cg {
 				self.line("");
 			}
 		}
+		// WHAT A FAILED CALL MEANS, IN THE PROTOCOL'S OWN WORDS.
+		//
+		// The transport distinguishes a request that never left from one that went out and got no
+		// answer; every client method used to flatten both to `None`, so a caller could not tell a
+		// write that never reached the medium from one that may have landed - and had no safe move
+		// either way. These are the two things it can say and they are already in `base.error`.
+		self.line("\tfn transport_outcome(error: TransportError) -> Error {");
+		self.line("\t\tmatch error {");
+		self.line("\t\t\t// The request never left this process, so nothing happened and trying");
+		self.line("\t\t\t// again is safe - which is what `again` says.");
+		self.line("\t\t\tTransportError::SendRefused | TransportError::NoRoute => Error::Again,");
+		self.line("\t\t\t// It went out and no answer came back. The server may have acted before");
+		self.line("\t\t\t// it died or before the deadline; nobody knows, and `commit-uncertain` is");
+		self.line("\t\t\t// the answer `base.error` grew so a caller is not forced to guess.");
+		self.line("\t\t\t// The reply could not be held, or arrived and broke the framing rules. In");
+		self.line("\t\t\t// both the server ANSWERED, so it acted; this end simply cannot read what");
+		self.line("\t\t\t// it said, which is the same position as never hearing back.");
+		self.line("\t\t\tTransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,");
+		self.line("\t\t}");
+		self.line("\t}");
+		self.line("");
 		self.line("\tpub struct Client<T: Transport> {");
 		self.line("\t\ttransport: T,");
 		self.line("\t\tcorr: u32,");
@@ -849,7 +870,29 @@ impl Cg {
 				self.line("\t\t\t// One call for both halves: the bytes cannot be taken without them.");
 				self.line("\t\t\tlet (request, request_handles) = writer.into_message();");
 				self.line("\t\t\tlet mut reply_handles = Handles::new();");
-				self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline).map_err(|e| { self.last_error = Some(e); e }).ok()?;");
+				// THE TRANSPORT ALREADY KNOWS WHETHER THE REQUEST LEFT; THIS IS WHERE IT USED TO BE THROWN AWAY.
+				// `SvcTransport` answers `SendRefused` when the request never went out and `PeerClosed`
+				// or `TimedOut` when it did and no reply came - which is exactly "nothing happened" as
+				// against "may already have been acted on". Collapsing both into `None` made a caller
+				// unable to tell a write that never reached the medium from one that may have landed,
+				// and left it with no safe move.
+				//
+				// Answered in the protocol's own words instead: `again` for a request that never left,
+				// so retrying is safe, and `commit-uncertain` for one whose outcome nobody knows, which
+				// is the answer `base.error` grew for exactly this and which a caller must not be
+				// forced to guess. NOTHING IS RETRIED HERE: replaying a request that may already have
+				// been acted on is how a transfer happens twice.
+				if matches!(&m.ret, Type::Result(_, _)) {
+					self.line("\t\t\tlet reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {");
+					self.line("\t\t\t\tOk(reply) => reply,");
+					self.line("\t\t\t\tErr(e) => {");
+					self.line("\t\t\t\t\tself.last_error = Some(e);");
+					self.line("\t\t\t\t\treturn Some(Err(transport_outcome(e)));");
+					self.line("\t\t\t\t}");
+					self.line("\t\t\t};");
+				} else {
+					self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline).map_err(|e| { self.last_error = Some(e); e }).ok()?;");
+				}
 				self.line("\t\t\tlet mut reader = Reader::new(&reply);");
 				self.line("\t\t\tlet r = &mut reader;");
 				// EXACTLY ONE, and the extras closed. This checked only that the list was NOT
@@ -922,7 +965,29 @@ impl Cg {
 			self.line("\t\t\t// One call for both halves: the bytes cannot be taken without them.");
 			self.line("\t\t\tlet (request, request_handles) = writer.into_message();");
 			self.line("\t\t\tlet mut reply_handles = Handles::new();");
-			self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline).map_err(|e| { self.last_error = Some(e); e }).ok()?;");
+			// THE TRANSPORT ALREADY KNOWS WHETHER THE REQUEST LEFT; THIS IS WHERE IT USED TO BE THROWN AWAY.
+			// `SvcTransport` answers `SendRefused` when the request never went out and `PeerClosed`
+			// or `TimedOut` when it did and no reply came - which is exactly "nothing happened" as
+			// against "may already have been acted on". Collapsing both into `None` made a caller
+			// unable to tell a write that never reached the medium from one that may have landed,
+			// and left it with no safe move.
+			//
+			// Answered in the protocol's own words instead: `again` for a request that never left,
+			// so retrying is safe, and `commit-uncertain` for one whose outcome nobody knows, which
+			// is the answer `base.error` grew for exactly this and which a caller must not be
+			// forced to guess. NOTHING IS RETRIED HERE: replaying a request that may already have
+			// been acted on is how a transfer happens twice.
+			if matches!(&m.ret, Type::Result(_, _)) {
+				self.line("\t\t\tlet reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {");
+				self.line("\t\t\t\tOk(reply) => reply,");
+				self.line("\t\t\t\tErr(e) => {");
+				self.line("\t\t\t\t\tself.last_error = Some(e);");
+				self.line("\t\t\t\t\treturn Some(Err(transport_outcome(e)));");
+				self.line("\t\t\t\t}");
+				self.line("\t\t\t};");
+			} else {
+				self.line("\t\t\tlet reply = self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline).map_err(|e| { self.last_error = Some(e); e }).ok()?;");
+			}
 			self.line("\t\t\tlet mut reader = Reader::with_handle_list(&reply, &reply_handles);");
 			let retexpr = self.read_value_bounded(&m.ret, m.ret_bound).map_err(|e| Error::new(m.span, e))?;
 			self.line("\t\t\tlet decoded = (|| {");

@@ -87,7 +87,20 @@ interface system-graph {
 /// System Graph folds into each node's counters and the `graph` command renders.
 record supervisor-stat {
 	name:           string,
+	/// What the supervisor OBSERVES: absent, starting, ready, stopping, stopped or failed. Six
+	/// words, and `starting` and `stopping` are the two that had no name - a process that had been
+	/// launched and had not reported in used to be called running, which is the one thing it
+	/// certainly was not.
 	state:          string,
+	/// What the supervisor WANTS: running or stopped. A separate field, because a service somebody
+	/// stopped on purpose and one that never came up are otherwise the same observation.
+	desired:        string,
+	/// This instance's epoch - the process koid, which the kernel hands out from a counter it
+	/// never reuses. A restarted service has a different one, so an endpoint or a report from
+	/// before the restart can be recognised as belonging to an instance that has ended.
+	epoch:          u64,
+	/// Why the last transition happened. A restart count says how often; this says what for.
+	last-reason:    string,
 	restarts:       u32,
 	watchdog-trips: u32,
 	last-failure:   string,
