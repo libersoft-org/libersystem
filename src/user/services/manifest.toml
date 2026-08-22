@@ -1768,7 +1768,9 @@ interface = "liber:network@1/network"
 
 [[services.roles]]
 tag = "DISPLAY"
-kind = "client"
+# An independent typed connection: ConsoleService only ever sees a surface, and the service owns
+# either the virtio-gpu backing or the boot framebuffer behind it.
+kind = "factory"
 provider = "display_service"
 presence = "optional"
 interface = "liber:display@1/display"
@@ -1848,12 +1850,16 @@ tag = "FOCUS"
 kind = "client"
 provider = "input_service"
 source = "FOCUS"
+# HANDED OVER, NOT COPIED. InputService made this pair for DisplayService alone; a copy kept here
+# would mean the input side never learns that the display it forwards focus to has gone.
+exclusive = true
 
 [[services.roles]]
 tag = "KILL"
 kind = "client"
 provider = "input_service"
 source = "KILL"
+exclusive = true
 
 [[services.roles]]
 tag = "ADMIN"
@@ -2222,7 +2228,9 @@ provider = "service_manager"
 
 [[services.roles]]
 tag = "STORAGE"
-kind = "client"
+# A CONNECTION OF ITS OWN, not a copy of the supervisor's. ProcessService serves every launch
+# through it, so a shared channel would put its replies in the same queue as everyone else's.
+kind = "factory"
 provider = "storage_service"
 interface = "liber:storage@1/volume"
 

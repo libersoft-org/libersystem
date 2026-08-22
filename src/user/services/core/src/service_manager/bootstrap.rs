@@ -298,15 +298,24 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 		// the branch's before the branch was deleted. That order is the whole discipline - a
 		// migration that switches and then checks has already lost the thing it would check
 		// against.
-		let migrated: Option<&mut u64> = match name {
-			b"log_service" => Some(log_client),
-			b"device_service" => Some(device_client),
-			b"session_service" => Some(session_client),
-			b"time_service" => Some(time_client),
-			b"shell" => Some(admin_server),
-			_ => None,
-		};
-		if let Some(client) = migrated {
+		// THE PLAN IS THE DEFAULT AND THE LADDER IS THE EXCEPTION, which is the whole of M6. An
+		// ordinary service of an existing shape needs a manifest row and an implementation; this
+		// list is what it does NOT need an edit to, because a name that is not on it is executed
+		// from the plan.
+		//
+		// TWO REMAIN, AND BOTH FOR A STATED REASON:
+		//
+		// PermissionManager holds authority to hand ON, so several of its clients need rights the
+		// plan's client role does not grant - `DUPLICATE`, so it can give a sandboxed component a
+		// narrowed copy. Expressing that would mean per-role rights in the manifest, which is model
+		// growth for one service, and M6 leaves a branch carrying real policy where it is.
+		//
+		// SystemGraphService is handed one message PER RUNNING COMPONENT, each carrying that
+		// component's name, its declared edges and a read-only duplicate of its Process. The plan
+		// has one `NODE` role and no way to say "as many as there are"; a role that expands into a
+		// variable number of messages is a model this milestone did not build.
+		let hand_wired: bool = matches!(name, b"permission_manager" | b"system_graph_service");
+		if !hand_wired {
 			let index: usize = match index_of(name) {
 				Some(index) => index,
 				None => return State::Failed,
@@ -322,24 +331,222 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			// serve roots it creates, and a closure holding a reference alongside would be two
 			// borrows of one table.
 			let session_root: u64 = kept.end_of(b"session_service", CAP_SERVE);
+			let (fat, iso, udf, usb): (u64, u64, u64, u64) = (*block2_client, *block3_client, *block4_client, *block5_client);
+			let (block, snd, frames, gpu): (u64, u64, u64, u64) = (*block_client, *snd_client, *net_frames, *gpu_client);
+			let (pointer, pointer2, keys): (u64, u64, u64) = (*input_raw, *usb_pointer, *raw_keys);
+			let (storage_root, storage_adm): (u64, u64) = (*storage_client, *storage_admin);
+			let pointer_forward: u64 = *pointer_console;
 			let mut external = |role: &Role| -> Option<(alloc::vec::Vec<u8>, u64)> {
-				if name != b"shell" || role.tag != CAP_SESSION {
-					return None;
+				// The shell's session is minted ONCE and reused for the life of the system, so its
+				// working directory survives a logout and a reload; a fresh connection per shell
+				// would lose it silently. The plan says the role is a factory of SessionService,
+				// which is true - what it cannot say is that this one is cached.
+				if name == b"shell" && role.tag == CAP_SESSION {
+					if *session1 == 0 {
+						*session1 = service_connect(session_root)?;
+					}
+					let copy: i64 = duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+					if copy < 0 {
+						return None;
+					}
+					return Some((role.tag.to_vec(), copy as u64));
 				}
-				if *session1 == 0 {
-					*session1 = service_connect(session_root)?;
+				// A MEMORY VOLUME IS ASKED FOR ITS SIZE, and a size is content rather than shape. A
+				// payload role says a message of bytes travels here; what those bytes are is the
+				// supervisor's, and putting the number in the manifest would be a policy declared
+				// in the one file that is meant to describe wiring.
+				if name == b"ram_storage" && role.tag == b"RAMVOL" {
+					return Some((memory_volume_request(b"RAMVOL", RAM_VOLUME_BYTES), 0));
 				}
-				let copy: i64 = duplicate(*session1, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
-				if copy < 0 {
-					return None;
+				if name == b"tmp_storage" && role.tag == b"TMPVOL" {
+					return Some((memory_volume_request(b"TMPVOL", TMP_VOLUME_BYTES), 0));
 				}
-				Some((role.tag.to_vec(), copy as u64))
+				// A BLOCK SERVICE COMES FROM A DRIVER, not from the service graph: DeviceManager
+				// routes it up and this supervisor is holding it. The plan can say a device role
+				// arrives under this tag and cannot say which local holds it.
+				if name == b"media_storage" && role.tag == b"FATBLOCK" {
+					return Some((role.tag.to_vec(), fat));
+				}
+				if name == b"iso_storage" && role.tag == b"ISOBLOCK" {
+					return Some((role.tag.to_vec(), iso));
+				}
+				if name == b"udf_storage" && role.tag == b"UDFBLOCK" {
+					return Some((role.tag.to_vec(), udf));
+				}
+				// USB IS THE ONE THAT NEEDS A STAND-IN RATHER THAN NOTHING. With no xhci driver the
+				// other three instances take a zero handle and mount lazily, but this one talks to
+				// its block service during bring-up: handed nothing it would wait, and handed a
+				// channel whose far end is already closed it gets the refusal it can act on. An
+				// absent device and a dead one are the same answer to a caller, which is the point.
+				if name == b"usb_storage" && role.tag == b"USBBLOCK" {
+					if usb != 0 {
+						return Some((role.tag.to_vec(), usb));
+					}
+					let (dead_server, dead_client): (u64, u64) = channel()?;
+					close(dead_server);
+					return Some((role.tag.to_vec(), dead_client));
+				}
+				// THE DISK OR THE IMAGE, IN THE SAME POSITION. A live system serves its volume from a
+				// filesystem image copied into memory and an installed one from the disk, and the
+				// two arrive under different tags in the one place the plan has for them. Sending
+				// an extra message instead would shift every read after it - the desyncs that cost
+				// this milestone the most all came from exactly that.
+				if name == b"storage_service" && role.tag == b"BLOCK" {
+					return if live_volume != 0 { Some((b"LIVEVOL".to_vec(), live_volume)) } else { Some((role.tag.to_vec(), block)) };
+				}
+				if name == b"audio_service" && role.tag == b"SND" {
+					return Some((role.tag.to_vec(), snd));
+				}
+				if name == b"network_service" && role.tag == b"FRAMES" {
+					return Some((role.tag.to_vec(), frames));
+				}
+				if name == b"display_service" && role.tag == b"GPU" {
+					return Some((role.tag.to_vec(), gpu));
+				}
+				// A PRIVILEGE IS THE KERNEL'S, HANDED ON. Duplicated rather than transferred,
+				// because this supervisor keeps its own copy for whoever needs one next.
+				//
+				// AND THE TAG TRAVELS EVEN WHEN THE PRIVILEGE DOES NOT. `send_privilege` sent
+				// NOTHING for a zero handle, while DisplayService reads this position with a
+				// blocking tagged receive - a machine without the privilege would have waited here
+				// for a message nobody was going to send. The plan's rule that the tag always
+				// travels is what removes that.
+				if name == b"display_service" && role.tag == b"DISPLAYCTL" {
+					if display_ctl == 0 {
+						return Some((role.tag.to_vec(), 0));
+					}
+					let copy: i64 = duplicate(display_ctl, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+					return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
+				}
+				// THE RAW EVENT CHANNELS COME FROM DRIVERS, routed up by DeviceManager. A zero handle
+				// is an absent pointer source, and InputService serves an empty stream rather than
+				// refusing to start.
+				if name == b"input_service" {
+					if role.tag == b"INPUT" {
+						return Some((role.tag.to_vec(), pointer));
+					}
+					if role.tag == b"INPUT2" {
+						return Some((role.tag.to_vec(), pointer2));
+					}
+					if role.tag == b"KEYS" {
+						return Some((role.tag.to_vec(), keys));
+					}
+				}
+				// CONFIGSERVICE GETS A CLIENT SCOPED TO ONE DIRECTORY, minted from StorageService's
+				// admin endpoint rather than duplicated from its public root. The plan can say the
+				// role is a factory of that endpoint; the directory is the part it cannot say, and
+				// this is the whole content of the branch it replaces.
+				if name == b"config_service" && role.tag == CAP_STORAGE {
+					if storage_root == 0 {
+						return Some((role.tag.to_vec(), 0));
+					}
+					let scoped: u64 = open_storage_directory(storage_adm, "vol://system/libexec/config_service");
+					return if scoped != 0 { Some((role.tag.to_vec(), scoped)) } else { None };
+				}
+				// THE INIT PACKAGE, under the rights a launcher needs: read it, map it, pass it on.
+				// The message carries its length behind the tag because a memory object does not
+				// say how much of itself is the archive.
+				if role.tag == b"PACKAGE" {
+					let dup: i64 = duplicate(pkg_handle, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER);
+					if dup < 0 {
+						return None;
+					}
+					let mut message: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+					message.extend_from_slice(b"PACKAGE");
+					message.extend_from_slice(&(pkg_len as u64).to_le_bytes());
+					return Some((message, dup as u64));
+				}
+				// DEVICEMANAGER CARRIES THE POWER PATH TO THE KEYBOARD DRIVERS, because the Power
+				// key must keep working when this supervisor does not - the whole reason it is a
+				// separate path from `!poweroff`. What travels is a SystemPower connection, not the
+				// root Domain that used to.
+				if name == b"device_manager" {
+					if role.tag == b"SYSPOWER" {
+						return Some((role.tag.to_vec(), service_connect(power)?));
+					}
+					if role.tag == b"CONSOLE" || role.tag == b"DEVPRIV" {
+						let privilege: u64 = if role.tag == b"CONSOLE" { console_input } else { device_manager };
+						if privilege == 0 {
+							return Some((role.tag.to_vec(), 0));
+						}
+						let copy: i64 = duplicate(privilege, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+						return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
+					}
+				}
+				// PROCESSSERVICE HOLDS AN END NOBODY IS ON YET. The development agent is started
+				// later, by DeviceManager, and takes the far end then; making the pair here is what
+				// keeps ProcessService from having to learn about a capability that arrives after
+				// it has begun serving.
+				if name == b"process_service" && role.tag == b"REGISTRY" {
+					let (far, near): (u64, u64) = channel()?;
+					*registry_far = far;
+					return Some((role.tag.to_vec(), near));
+				}
+				if name == b"console_service" {
+					if role.tag == b"CONSOLESINK" {
+						if console_sink == 0 {
+							return Some((role.tag.to_vec(), 0));
+						}
+						let copy: i64 = duplicate(console_sink, RIGHT_TRANSFER | RIGHT_DUPLICATE);
+						return if copy > 0 { Some((role.tag.to_vec(), copy as u64)) } else { None };
+					}
+					// The pointer-forward end InputService was given the other half of. It is a
+					// handle this supervisor is holding for a service that starts later, which the
+					// plan calls a device role because that is where it comes from.
+					if role.tag == CAP_POINTER {
+						return Some((role.tag.to_vec(), pointer_forward));
+					}
+				}
+				None
 			};
 			if !deliver_roles(manager_side, index, kept, &mut external) {
 				return State::Failed;
 			}
-			// The shell's own serve root is its ADMIN channel, which this supervisor answers on.
-			*client = kept.end_of(name, if name == b"shell" { b"ADMIN" } else { CAP_SERVE });
+			// THE ENDS THIS SUPERVISOR KEEPS, copied out of the plan's own table into the names the
+			// remaining hand-written branches still read. Every line here goes when the branch that
+			// reads it goes, so this block empties as the ladder does.
+			match name {
+				b"log_service" => *log_client = kept.end_of(name, CAP_SERVE),
+				b"device_service" => *device_client = kept.end_of(name, CAP_SERVE),
+				b"session_service" => *session_client = kept.end_of(name, CAP_SERVE),
+				b"time_service" => *time_client = kept.end_of(name, CAP_SERVE),
+				// The shell's own serve root is its ADMIN channel, which this supervisor answers on.
+				b"shell" => *admin_server = kept.end_of(name, b"ADMIN"),
+				b"ram_storage" => *ram_client = kept.end_of(name, CAP_SERVE),
+				b"tmp_storage" => *tmp_client = kept.end_of(name, CAP_SERVE),
+				b"media_storage" => *media_client = kept.end_of(name, CAP_SERVE),
+				b"iso_storage" => *iso_client = kept.end_of(name, CAP_SERVE),
+				b"udf_storage" => *udf_client = kept.end_of(name, CAP_SERVE),
+				b"usb_storage" => *usb_client = kept.end_of(name, CAP_SERVE),
+				b"storage_service" => {
+					*storage_client = kept.end_of(name, CAP_SERVE);
+					*storage_admin = kept.end_of(name, b"ADMIN");
+				}
+				b"audio_service" => {
+					*audio_client = kept.end_of(name, CAP_SERVE);
+					*audio_admin = kept.end_of(name, b"ADMIN");
+				}
+				b"network_service" => *net_client = kept.end_of(name, CAP_SERVE),
+				b"display_service" => {
+					*display_client = kept.end_of(name, CAP_SERVE);
+					*display_admin = kept.end_of(name, b"ADMIN");
+				}
+				b"input_service" => {
+					*input_client = kept.end_of(name, CAP_SERVE);
+					*input_admin = kept.end_of(name, b"ADMIN");
+					*input_focus = kept.end_of(name, b"FOCUS");
+					*input_kill = kept.end_of(name, b"KILL");
+					*pointer_console = kept.end_of(name, b"FORWARD");
+				}
+				b"config_service" => *config_client = kept.end_of(name, CAP_SERVE),
+				b"resource_manager" => *res_client = kept.end_of(name, CAP_SERVE),
+				b"process_service" => *process_client = kept.end_of(name, CAP_SERVE),
+				b"console_service" => {
+					*console_client = kept.end_of(name, CAP_CLIENT);
+					*console_control = kept.end_of(name, CAP_CONTROL);
+				}
+				_ => {}
+			}
 		}
 		// DeviceManager also carries the power capability, because it is what starts the
 		// keyboard drivers and the Power key must keep working when this supervisor does not -
@@ -347,58 +554,10 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 		// DEVPRIV is appended AFTER CONSOLE, and every launcher of device_manager owes it: the
 		// bootstrap is read positionally, so `recv_tagged` checks the tag of the next message rather
 		// than searching for one, and anything inserted in the middle shifts every read after it.
-		if name == b"device_manager" && !(bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_power(manager_side, power) && send_privilege(manager_side, b"CONSOLE", console_input) && send_privilege(manager_side, b"DEVPRIV", device_manager)) {
-			return State::Failed;
-		}
-		if name == b"storage_service" && !bootstrap_storage(manager_side, *block_client, live_volume, storage_client, storage_admin) {
-			return State::Failed;
-		}
-		if name == b"media_storage" && !bootstrap_media_storage(manager_side, *block2_client, media_client) {
-			return State::Failed;
-		}
-		if name == b"iso_storage" && !bootstrap_iso_storage(manager_side, *block3_client, iso_client) {
-			return State::Failed;
-		}
-		if name == b"udf_storage" && !bootstrap_udf_storage(manager_side, *block4_client, udf_client) {
-			return State::Failed;
-		}
-		if name == b"ram_storage" && !bootstrap_ram_storage(manager_side, ram_client) {
-			return State::Failed;
-		}
-		if name == b"tmp_storage" && !bootstrap_tmp_storage(manager_side, tmp_client) {
-			return State::Failed;
-		}
-		if name == b"usb_storage" && !bootstrap_usb_storage(manager_side, *block5_client, usb_client) {
-			return State::Failed;
-		}
-		if name == b"process_service" && !bootstrap_process_service(manager_side, pkg_handle, pkg_len, *storage_client, *registry_far, process_client, buf) {
-			return State::Failed;
-		}
-		if name == b"config_service" && !bootstrap_config_service(manager_side, *storage_client, *storage_admin, config_client) {
-			return State::Failed;
-		}
-		if name == b"network_service" && !bootstrap_network_service(manager_side, *net_frames, *config_client, net_client) {
-			return State::Failed;
-		}
-		if name == b"audio_service" && !bootstrap_audio_service(manager_side, *snd_client, audio_client, audio_admin) {
-			return State::Failed;
-		}
-		if name == b"input_service" && !bootstrap_input(manager_side, *input_raw, *usb_pointer, *raw_keys, input_client, input_admin, input_focus, input_kill, pointer_console) {
-			return State::Failed;
-		}
-		if name == b"display_service" && !(bootstrap_display_service(manager_side, *gpu_client, *input_focus, *input_kill, display_client, display_admin) && send_privilege(manager_side, b"DISPLAYCTL", display_ctl)) {
-			return State::Failed;
-		}
-		if name == b"console_service" && !(send_privilege(manager_side, b"CONSOLESINK", console_sink) && bootstrap_console_service(manager_side, *storage_client, *log_client, *device_client, *process_client, *config_client, *net_client, *display_client, *time_client, *audio_client, *session_client, *perm_client, *pointer_console, console_client, console_control)) {
-			return State::Failed;
-		}
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
 			return State::Failed;
 		}
 		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
-			return State::Failed;
-		}
-		if name == b"resource_manager" && !bootstrap_resource_manager(manager_side, res_client, *process_client, pkg_handle, pkg_len, buf) {
 			return State::Failed;
 		}
 		match recv_blocking(manager_side, buf) {
@@ -479,38 +638,6 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				// TEMPORARY BY CONSTRUCTION: each line goes with the branch that made it, and when
 				// the ladder is empty this block is empty too.
 				match name {
-					b"storage_service" => {
-						kept.register(name, CAP_SERVE, *storage_client);
-						kept.register(name, b"ADMIN", *storage_admin);
-					}
-					b"media_storage" => kept.register(name, CAP_SERVE, *media_client),
-					b"iso_storage" => kept.register(name, CAP_SERVE, *iso_client),
-					b"udf_storage" => kept.register(name, CAP_SERVE, *udf_client),
-					b"usb_storage" => kept.register(name, CAP_SERVE, *usb_client),
-					b"ram_storage" => kept.register(name, CAP_SERVE, *ram_client),
-					b"tmp_storage" => kept.register(name, CAP_SERVE, *tmp_client),
-					b"process_service" => kept.register(name, CAP_SERVE, *process_client),
-					b"config_service" => kept.register(name, CAP_SERVE, *config_client),
-					b"resource_manager" => kept.register(name, CAP_SERVE, *res_client),
-					b"network_service" => kept.register(name, CAP_SERVE, *net_client),
-					b"audio_service" => {
-						kept.register(name, CAP_SERVE, *audio_client);
-						kept.register(name, b"ADMIN", *audio_admin);
-					}
-					b"input_service" => {
-						kept.register(name, CAP_SERVE, *input_client);
-						kept.register(name, b"ADMIN", *input_admin);
-						kept.register(name, b"FOCUS", *input_focus);
-						kept.register(name, b"KILL", *input_kill);
-					}
-					b"display_service" => {
-						kept.register(name, CAP_SERVE, *display_client);
-						kept.register(name, b"ADMIN", *display_admin);
-					}
-					b"console_service" => {
-						kept.register(name, b"CLIENT", *console_client);
-						kept.register(name, b"CONTROL", *console_control);
-					}
 					b"system_graph_service" => kept.register(name, CAP_SERVE, *graph_client),
 					b"permission_manager" => kept.register(name, CAP_SERVE, *perm_client),
 					_ => {}
@@ -892,47 +1019,6 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_admin: u64, st
 // answers with values. The manager still governs its own component's Domain through the
 // kernel's resource syscalls, not by granting service connections.
 //
-// `resource_manager` depends on `process_service` in the service manifest, so the client is
-// live by the time this runs.
-unsafe fn bootstrap_resource_manager(manager_side: u64, res_client: &mut u64, process_client: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
-	unsafe {
-		// The init package, so the manager can spawn the component it governs.
-		if !bootstrap_package(manager_side, pkg_handle, pkg_len, buf) {
-			return false;
-		}
-		// The channel its clients reach it on; the client end kept for the shell.
-		if !bootstrap_serve(manager_side, res_client) {
-			return false;
-		}
-		// A ProcessService connection, so `usage` can report the per-launch Domains.
-		send_factory(manager_side, b"PROCESS", process_client)
-	}
-}
-
-// Hand a service a read-only view of the init package so it can spawn programs from
-// it (DeviceManager spawns drivers, ProcessService launches programs): duplicate
-// our package handle (read + map + transfer) and send "PACKAGE" + the byte length
-// with the duplicate. We keep our own handle and mapping; the kernel allows the
-// same object to be mapped in both address spaces.
-unsafe fn bootstrap_package(manager_side: u64, pkg_handle: u64, pkg_len: usize, buf: &mut [u8]) -> bool {
-	unsafe { bootstrap_package_rights(manager_side, pkg_handle, pkg_len, RIGHT_READ | RIGHT_MAP | RIGHT_TRANSFER, buf) }
-}
-
-// The general form: hand a service the package under an explicit rights set. The
-// launchers that still carry the package (DeviceManager, ProcessService as a bring-up
-// fallback, ResourceManager) get read + map + transfer - enough to map it and pass it on.
-unsafe fn bootstrap_package_rights(manager_side: u64, pkg_handle: u64, pkg_len: usize, rights: u32, buf: &mut [u8]) -> bool {
-	unsafe {
-		let dup: i64 = duplicate(pkg_handle, rights);
-		if dup < 0 {
-			return false;
-		}
-		buf[..7].copy_from_slice(b"PACKAGE");
-		buf[7..15].copy_from_slice(&(pkg_len as u64).to_le_bytes());
-		send_blocking(manager_side, &buf[..15], dup as u64)
-	}
-}
-
 // Hand a service the channel its clients reach it on: create a fresh service channel
 // and transfer one end with the "SERVE" tag, keeping the other end in `*client` for
 // the supervisor to later hand to the shell. The shared bootstrap for every SERVE-
@@ -972,131 +1058,6 @@ pub(super) unsafe fn serve_root(manager_side: u64, tag: &[u8], client: &mut u64)
 	}
 }
 
-// Hand ConfigService its directory-scoped persistence backing - a fresh
-// `libexec/config_service` client minted by the supervisor-held StorageService admin
-// endpoint - then the channel its clients reach it on. The tree then loads from and
-// write-through-persists to `vol://system/libexec/config_service/config.tree`, so a `config set`
-// survives a restart and a reboot.
-unsafe fn bootstrap_config_service(manager_side: u64, storage_client: u64, storage_admin: u64, config_client: &mut u64) -> bool {
-	unsafe {
-		if storage_client != 0 {
-			let storage: u64 = open_storage_directory(storage_admin, "vol://system/libexec/config_service");
-			if storage == 0 || !send_blocking(manager_side, b"STORAGE", storage) {
-				return false;
-			}
-		}
-		bootstrap_serve(manager_side, config_client)
-	}
-}
-
-// Hand InputService the channel its clients reach it on ("SERVE", the client end kept
-// in `*input_client` for the shell) and the raw pointer-event channels routed up from
-// the virtio_input pointer driver and the xhci driver via DeviceManager ("INPUT" and
-// "INPUT2"; a handle is 0 when that pointer source is absent, e.g. under test -
-// InputService still serves an empty stream), then "FORWARD" transferring the input
-// end of a fresh pointer-forward channel - InputService forwards every raw pointer
-// event over it to ConsoleService, whose end is kept in `*pointer_console` for
-// ConsoleService's own bootstrap (it starts later, since it declares input_service as
-// a dependency). "KEYS" carries the merged keyboard-driver consumer, while private
-// "FOCUS" and "KILL" pairs connect InputService to DisplayService; "ADMIN" lets only
-// PermissionManager mint key-only clients. The order matches InputService's receive
-// order: SERVE, INPUT, INPUT2, FORWARD, KEYS, FOCUS, KILL, ADMIN.
-unsafe fn bootstrap_input(manager_side: u64, input_raw: u64, usb_pointer: u64, raw_keys: u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64) -> bool {
-	unsafe {
-		if !bootstrap_serve(manager_side, input_client) {
-			return false;
-		}
-		if !send_blocking(manager_side, b"INPUT", input_raw) {
-			return false;
-		}
-		if !send_blocking(manager_side, b"INPUT2", usb_pointer) {
-			return false;
-		}
-		let (input_fwd, console_fwd): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"FORWARD", input_fwd) {
-			return false;
-		}
-		*pointer_console = console_fwd;
-		if !send_blocking(manager_side, b"KEYS", raw_keys) {
-			return false;
-		}
-		let (input_end, display_end): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"FOCUS", input_end) {
-			return false;
-		}
-		*input_focus = display_end;
-		let (input_end, display_end): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"KILL", input_end) {
-			return false;
-		}
-		*input_kill = display_end;
-		let (service_admin, manager_admin): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"ADMIN", service_admin) {
-			return false;
-		}
-		*input_admin = manager_admin;
-		true
-	}
-}
-
-// Hand ProcessService the StorageService client it loads the on-disk program binaries
-// through ("STORAGE", a fresh factory connection), a read-only view of the init package
-// (the bring-up fallback), and the channel its clients reach it on. The service-channel
-// client end is kept in `*process_client` and later transferred to the shell for
-// `ps`/`run`. The receive order matches ProcessService's: package, storage, serve.
-unsafe fn bootstrap_process_service(manager_side: u64, pkg_handle: u64, pkg_len: usize, storage_client: u64, registry: u64, process_client: &mut u64, buf: &mut [u8]) -> bool {
-	// The registry channel is handed over here even though nothing is on the other end yet:
-	// the development agent is started later, by DeviceManager, and gets the far end then.
-	// Making the pair up front is what keeps ProcessService from needing to learn about a
-	// capability arriving after it started serving - it simply holds an end that stays silent
-	// on a boot that never has an agent.
-	unsafe { bootstrap_package(manager_side, pkg_handle, pkg_len, buf) && send_factory(manager_side, b"STORAGE", storage_client) && send_blocking(manager_side, b"REGISTRY", registry) && bootstrap_serve(manager_side, process_client) }
-}
-
-// Hand StorageService its disk-backed volume, private directory-scope admin endpoint,
-// and a public service channel over `manager_side`: "BLOCK" transfers the block-read
-// service channel routed up from DeviceManager, "ADMIN" is retained only by this
-// supervisor, then "SERVE" transfers one end of a fresh public service channel.
-unsafe fn bootstrap_storage(manager_side: u64, block_client: u64, live_volume: u64, storage_client: &mut u64, storage_admin: &mut u64) -> bool {
-	unsafe {
-		// One message either way, in the same position: a live system serves its volume from a
-		// filesystem image copied into memory, an installed one from the disk. Sending an EXTRA
-		// message instead would shift everything after it, and this bootstrap carries its length
-		// implicitly at both ends - the desyncs that cost the most this milestone all came from
-		// exactly that.
-		let (tag, handle): (&[u8], u64) = if live_volume != 0 { (b"LIVEVOL", live_volume) } else { (b"BLOCK", block_client) };
-		if !send_blocking(manager_side, tag, handle) {
-			return false;
-		}
-		let (service_admin, manager_admin): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"ADMIN", service_admin) {
-			close(manager_admin);
-			return false;
-		}
-		if !bootstrap_serve(manager_side, storage_client) {
-			close(manager_admin);
-			return false;
-		}
-		*storage_admin = manager_admin;
-		true
-	}
-}
-
 // Mint a client confined to one declared system-volume directory. The caller keeps the
 // private admin endpoint; ordinary volume clients never receive it and can only mint
 // another client with their existing scope.
@@ -1110,60 +1071,21 @@ pub(super) unsafe fn open_storage_directory(storage_admin: u64, path: &str) -> u
 	}
 }
 
-// Bootstrap the media StorageService instance: hand it the second virtio-blk disk's
-// block service ("FATBLOCK"), which it mounts as the FAT vol://media volume,
-// then mint its service channel ("SERVE"); the client end is kept in `*media_client`
-// and later handed to the shell. The block handle is 0 when no second disk is present,
-// so the instance simply fails to mount and reports failed.
-unsafe fn bootstrap_media_storage(manager_side: u64, block2_client: u64, media_client: &mut u64) -> bool {
-	unsafe {
-		if !send_blocking(manager_side, b"FATBLOCK", block2_client) {
-			return false;
-		}
-		bootstrap_serve(manager_side, media_client)
-	}
-}
-
-// Bootstrap the ISO StorageService instance: hand it the third virtio-blk disk's block
-// service ("ISOBLOCK"), which it mounts as the read-only ISO9660 vol://iso volume, then
-// mint its service channel ("SERVE"); the client end is kept in `*iso_client` and later
-// handed to the shell. The block handle is 0 when no third disk is present, so the
-// instance simply fails to mount and reports failed.
-unsafe fn bootstrap_iso_storage(manager_side: u64, block3_client: u64, iso_client: &mut u64) -> bool {
-	unsafe {
-		if !send_blocking(manager_side, b"ISOBLOCK", block3_client) {
-			return false;
-		}
-		bootstrap_serve(manager_side, iso_client)
-	}
-}
-
-// Bootstrap the UDF StorageService instance: hand it the fourth virtio-blk disk's block
-// service ("UDFBLOCK"), which it mounts as the read-only UDF vol://udf volume, then mint
-// its service channel ("SERVE"); the client end is kept in `*udf_client` and later handed
-// to the shell. The block handle is 0 when no fourth disk is present, so the instance
-// simply fails to mount and reports failed.
-unsafe fn bootstrap_udf_storage(manager_side: u64, block4_client: u64, udf_client: &mut u64) -> bool {
-	unsafe {
-		if !send_blocking(manager_side, b"UDFBLOCK", block4_client) {
-			return false;
-		}
-		bootstrap_serve(manager_side, udf_client)
-	}
-}
-
-// Bootstrap the two memory StorageService instances. Unlike every other volume there is no
-// block service to hand over - the filesystem holds its files on the heap - so the tag carries
-// the capacity in bytes instead of a handle.
+// The two memory StorageService instances. Unlike every other volume there is no block service to
+// hand over - the filesystem holds its files on the heap - so the tag carries the capacity in bytes
+// instead of a handle.
 //
-// `vol://ram` is reserved: it takes its memory when it mounts, so a later write cannot fail
-// because something else took it. `vol://tmp` is capped: it holds only what is stored and
-// refuses the write that would cross the limit. One filesystem, two moments of charging.
-pub(super) const RAM_VOLUME_BYTES: usize = 4 * 1024 * 1024;
-pub(super) const TMP_VOLUME_BYTES: usize = 16 * 1024 * 1024;
+// `vol://ram` is reserved: it takes its memory when it mounts, so a later write cannot fail because
+// something else took it. `vol://tmp` is capped: it holds only what is stored and refuses the write
+// that would cross the limit. One filesystem, two moments of charging.
+const RAM_VOLUME_BYTES: usize = 4 * 1024 * 1024;
+const TMP_VOLUME_BYTES: usize = 16 * 1024 * 1024;
 
-unsafe fn bootstrap_memory_storage(manager_side: u64, tag: &[u8], bytes: usize, client: &mut u64) -> bool {
-	unsafe {
+// The bytes a memory volume is asked for: its tag followed by its size in decimal. A PAYLOAD role
+// carries content, and content is the one thing the plan cannot state - a number in the manifest
+// would be a policy nobody declared there.
+fn memory_volume_request(tag: &[u8], bytes: usize) -> Vec<u8> {
+	{
 		let mut request: Vec<u8> = Vec::new();
 		request.extend_from_slice(tag);
 		let mut digits = [0u8; 20];
@@ -1179,262 +1101,6 @@ unsafe fn bootstrap_memory_storage(manager_side: u64, tag: &[u8], bytes: usize, 
 			value /= 10;
 		}
 		request.extend_from_slice(&digits[at..]);
-		if !send_blocking(manager_side, &request, 0) {
-			return false;
-		}
-		bootstrap_serve(manager_side, client)
-	}
-}
-
-pub(super) unsafe fn bootstrap_ram_storage(manager_side: u64, client: &mut u64) -> bool {
-	unsafe { bootstrap_memory_storage(manager_side, b"RAMVOL", RAM_VOLUME_BYTES, client) }
-}
-
-pub(super) unsafe fn bootstrap_tmp_storage(manager_side: u64, client: &mut u64) -> bool {
-	unsafe { bootstrap_memory_storage(manager_side, b"TMPVOL", TMP_VOLUME_BYTES, client) }
-}
-
-// Bootstrap the USB StorageService instance: hand it the USB stick's block service
-// ("USBBLOCK", served by the xhci driver over the Bulk-Only Transport and routed up in
-// DeviceManager's phase 2), which it mounts as the writable FAT vol://usb volume, then
-// mint its service channel ("SERVE"); the client end is kept in `*usb_client` and later
-// handed to the shell. The block handle is 0 when the xhci driver never came up (no
-// controller, or the driver failed) - the instance must still come up, so a dead-peer
-// stand-in channel is handed over instead: the removable FAT backing mounts lazily and
-// every probe of the dead channel fails like absent media, so vol://usb simply shows
-// as unavailable rather than failing the boot chain (the shell depends on this
-// instance).
-unsafe fn bootstrap_usb_storage(manager_side: u64, block5_client: u64, usb_client: &mut u64) -> bool {
-	unsafe {
-		let block: u64 = if block5_client != 0 {
-			block5_client
-		} else {
-			let (dead_server, dead_client): (u64, u64) = match channel() {
-				Some(pair) => pair,
-				None => return false,
-			};
-			close(dead_server);
-			dead_client
-		};
-		if !send_blocking(manager_side, b"USBBLOCK", block) {
-			return false;
-		}
-		bootstrap_serve(manager_side, usb_client)
-	}
-}
-
-// Hand NetworkService the net driver's frame channel ("FRAMES", routed up from the
-// virtio-net driver via DeviceManager - it moves frames over it) and the channel
-// its clients reach it on ("SERVE"). The service-channel client end is kept in
-// `*net_client` and later transferred to the shell for the `ip`/`ping`/`nslookup`
-// commands.
-unsafe fn bootstrap_network_service(manager_side: u64, net_frames: u64, config_client: u64, net_client: &mut u64) -> bool {
-	unsafe {
-		if !send_blocking(manager_side, b"FRAMES", net_frames) {
-			return false;
-		}
-		// The config tree's client (the `net.arp-cache` policy), minted fresh - the
-		// service depends on config_service, so the tree serves by now. Handle 0
-		// tells the service to fall back to its compiled-in default.
-		let cfg: u64 = match service_connect(config_client) {
-			Some(c) => c,
-			None => 0,
-		};
-		if !send_blocking(manager_side, b"CONFIG", cfg) {
-			return false;
-		}
-		bootstrap_serve(manager_side, net_client)
-	}
-}
-
-// Hand AudioService the virtio-snd driver's control channel ("SND" - a 0 handle when
-// no sound device is present, routed up from the snd driver via DeviceManager), a private
-// ADMIN channel for playback-only grants, and the channel its clients reach on ("SERVE").
-// The service-channel client end is kept in
-// `*audio_client` and later handed to the shell (and to ConsoleService as a factory)
-// for the `beep` command. (AudioService depends on device_manager, so `snd_client` is
-// already set by the time this runs; it is 0 when there is no sound device, and
-// AudioService then answers `beep` with a not-found error.)
-unsafe fn bootstrap_audio_service(manager_side: u64, snd_client: u64, audio_client: &mut u64, audio_admin: &mut u64) -> bool {
-	unsafe {
-		if !send_blocking(manager_side, b"SND", snd_client) {
-			return false;
-		}
-		let (service_admin, manager_admin): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"ADMIN", service_admin) {
-			return false;
-		}
-		*audio_admin = manager_admin;
-		bootstrap_serve(manager_side, audio_client)
-	}
-}
-
-// Hand DisplayService the raw virtio-gpu channel, private focus/kill links to InputService,
-// and an ADMIN channel only PermissionManager can use to bind Process handles to fresh
-// display clients. Then create the ordinary display root. With no gpu, the service maps
-// the boot framebuffer instead.
-unsafe fn bootstrap_display_service(manager_side: u64, gpu_client: u64, input_focus: u64, input_kill: u64, display_client: &mut u64, display_admin: &mut u64) -> bool {
-	unsafe {
-		if !send_blocking(manager_side, b"GPU", gpu_client) {
-			return false;
-		}
-		if !send_blocking(manager_side, b"FOCUS", input_focus) {
-			return false;
-		}
-		if !send_blocking(manager_side, b"KILL", input_kill) {
-			return false;
-		}
-		let (service_admin, manager_admin): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, b"ADMIN", service_admin) {
-			return false;
-		}
-		*display_admin = manager_admin;
-		bootstrap_serve(manager_side, display_client)
-	}
-}
-
-// Hand ConsoleService the client end of a fresh console channel over "CLIENT" (VT 1's
-// terminal: the shell writes its output to it and reads its keystrokes from it), then
-// a *factory* connection to every multi-client service plus a read-only view of the
-// init package. ConsoleService is the session spawner: when it opens an additional
-// virtual terminal it mints a fresh per-VT client from each factory (`service_connect`
-// / `network.open`) and spawns that VT's shell with the full capability set, so every
-// VT runs a fully-capable shell over its own independent service connections. The
-// factories are independent connections (not the supervisor's own clients or VT 1's),
-// so minting from them never crosses the supervisor's lifecycle traffic. ConsoleService
-// maps the framebuffer itself (the kernel console then stops drawing) and attaches to
-// the kernel console input for keys.
-unsafe fn bootstrap_console_service(manager_side: u64, storage_client: u64, log_client: u64, device_client: u64, process_client: u64, config_client: u64, net_client: u64, display_client: u64, time_client: u64, audio_client: u64, session_client: u64, perm_client: u64, pointer_console: u64, console_client: &mut u64, console_control: &mut u64) -> bool {
-	unsafe {
-		let (service_end, client_end): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, CAP_CLIENT, service_end) {
-			return false;
-		}
-		*console_client = client_end;
-		// VT 1's control channel: the console end goes to ConsoleService now, the shell end
-		// is kept for the shell's own bootstrap (it starts later in the boot order).
-		let (control_console, control_shell): (u64, u64) = match channel() {
-			Some(pair) => pair,
-			None => return false,
-		};
-		if !send_blocking(manager_side, CAP_CONTROL, control_console) {
-			return false;
-		}
-		*console_control = control_shell;
-		// A factory connection per serve_multi service, minted with `service_connect`.
-		if !send_factory(manager_side, CAP_FSTORAGE, storage_client) {
-			return false;
-		}
-		if !send_factory(manager_side, CAP_FLOG, log_client) {
-			return false;
-		}
-		if !send_factory(manager_side, CAP_FDEVICE, device_client) {
-			return false;
-		}
-		if !send_factory(manager_side, CAP_FPROCESS, process_client) {
-			return false;
-		}
-		if !send_factory(manager_side, CAP_FCONFIG, config_client) {
-			return false;
-		}
-		if !send_factory(manager_side, CAP_FTIME, time_client) {
-			return false;
-		}
-		if !send_factory(manager_side, CAP_FAUDIO, audio_client) {
-			return false;
-		}
-		// The SessionService factory, so ConsoleService can mint a fresh per-VT session for
-		// each additional virtual terminal it spawns.
-		if !send_factory(manager_side, CAP_FSESSION, session_client) {
-			return false;
-		}
-		// The PermissionManager factory, so ConsoleService can mint a fresh per-VT launcher
-		// client for each shell it spawns.
-		if !send_factory(manager_side, CAP_FPERM, perm_client) {
-			return false;
-		}
-		// NetworkService is multi-client through its own typed `open`, not serve_multi.
-		let mut net = network::Client::new(ChannelTransport { chan: net_client });
-		let net_fac: u64 = match net.open() {
-			Some(Ok(h)) => h,
-			_ => return false,
-		};
-		if !send_blocking(manager_side, CAP_FNET, net_fac) {
-			return false;
-		}
-		// An independent typed DisplayService connection. The service owns either the
-		// virtio-gpu backing or the boot framebuffer; ConsoleService only sees a surface.
-		let display: u64 = match service_connect(display_client) {
-			Some(channel) => channel,
-			None => return false,
-		};
-		if !send_blocking(manager_side, CAP_DISPLAY, display) {
-			return false;
-		}
-		// The pointer-forward channel from InputService (0 when no pointer device this
-		// boot): ConsoleService reads raw pointer events off it to drive selection,
-		// scrollback, and SGR mouse reports.
-		if !send_blocking(manager_side, CAP_POINTER, pointer_console) {
-			return false;
-		}
-		send_ready(manager_side)
-	}
-}
-
-// Mint an independent factory connection to a serve_multi service and transfer it to
-// ConsoleService under `tag`. The factory is a fresh client connection, so the
-// session spawner can mint per-VT clients from it without racing other holders.
-// Delegate the power capability - a root-Domain handle carrying MANAGE - to a service that
-// must be able to stop the machine. A duplicate, not the handle itself: this supervisor keeps
-// its own for the graceful `!poweroff` path, and the only other holder is the keyboard driver
-// DeviceManager starts. RIGHT_MANAGE is what `SYS_SYSTEM_POWER` checks; TRANSFER lets
-// DeviceManager pass it on to the driver, DUPLICATE lets it serve more than one keyboard.
-pub(super) unsafe fn send_power(manager_side: u64, power: u64) -> bool {
-	unsafe {
-		// A CONNECTION, NOT A COPY OF THE AUTHORITY. This duplicated the root-Domain handle with
-		// `MANAGE`, so DeviceManager - and then two keyboard drivers - each held a capability the
-		// kernel's own comment describes as able to `sys_domain_kill` the whole system. What
-		// travels now is a fresh SystemPower connection: it can ask for a reboot and nothing else,
-		// and it is its own channel so two holders cannot take each other's replies.
-		match service_connect(power) {
-			Some(connection) => send_blocking(manager_side, b"SYSPOWER", connection),
-			None => false,
-		}
-	}
-}
-
-// Delegate one of the three console/display capabilities. A duplicate, not the handle itself:
-// this supervisor keeps what it was handed so a restarted service can be given one again, and
-// DeviceManager needs DUPLICATE of its own to serve more than one keyboard.
-//
-// A zero capability sends nothing and reports success. A boot that handed out none - an older
-// kernel, a hand-built chain - then brings its services up without them, and the syscalls they
-// gate refuse rather than the service failing to start. That is the same posture the power
-// capability takes, and it keeps this from being a new way for the boot to stop.
-pub(super) unsafe fn send_privilege(manager_side: u64, tag: &[u8], privilege: u64) -> bool {
-	unsafe {
-		if privilege == 0 {
-			return true;
-		}
-		let copy: i64 = duplicate(privilege, RIGHT_TRANSFER | RIGHT_DUPLICATE);
-		copy > 0 && send_blocking(manager_side, tag, copy as u64)
-	}
-}
-
-pub(super) unsafe fn send_factory(manager_side: u64, tag: &[u8], root: u64) -> bool {
-	unsafe {
-		match service_connect(root) {
-			Some(fac) => send_blocking(manager_side, tag, fac),
-			None => false,
-		}
+		request
 	}
 }
