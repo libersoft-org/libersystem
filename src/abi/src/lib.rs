@@ -346,6 +346,18 @@ pub const SYS_PROCESS_GROUP_SIGNAL: u64 = 66;
 // about a finished pipeline the processes may be gone, and the answer would depend on how quickly
 // the question was asked.
 pub const SYS_PROCESS_GROUP_STATS: u64 = 75;
+
+// THIS BOOT'S IDENTITY, so an event can say which boot it came from.
+//
+// It belongs to the KERNEL and not to the first userspace process, because the one event it has to
+// survive is that process being replaced: an id owned by SystemManager would be re-minted by its
+// successor, and every record from before the replacement would then claim to be from a boot that
+// no longer exists. The kernel boots once per id by construction.
+//
+// Not a secret and not a sequence. It is an arbitrary nonzero number drawn once from the insecure
+// source - which is the use that source's own comment names first - and its only property is that
+// two boots do not share one.
+pub const SYS_BOOT_ID: u64 = 76;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;

@@ -173,29 +173,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => exit(),
 		},
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None })),
-		// `mount_checked` here too, for the reason written against UDF below - which was written
-		// while this line went on calling `mount`. The reader gained `MountError` and this boundary
-		// went on collapsing it, so the distinction existed everywhere except where somebody would
-		// read it.
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"ISOBLOCK" => match Iso9660::mount_checked(IsoBlockDevice { chan: handle }) {
-			Ok(fs) => Volume::new(alloc::boxed::Box::new(IsoFs { fs })),
-			Err(why) => {
-				unsafe { print(alloc::format!("storage: the ISO volume was refused: {why:?}\n").as_bytes()) };
-				exit()
-			}
-		},
-		// `mount_checked`, so a refusal says WHICH refusal. `mount` collapses "this is not UDF",
-		// "this UDF is damaged", "this UDF uses something the reader does not implement" and "the
-		// device would not answer" into one `None`, and a probe that tries backends in turn cannot
-		// tell "try the next one" from "this IS the format and it is broken, do not pretend
-		// otherwise". The distinction existed in the reader and stopped at this line.
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"UDFBLOCK" => match Udf::mount_checked(UdfBlockDevice { chan: handle }) {
-			Ok(fs) => Volume::new(alloc::boxed::Box::new(UdfFs { fs })),
-			Err(why) => {
-				unsafe { print(alloc::format!("storage: the UDF volume was refused: {why:?}\n").as_bytes()) };
-				exit()
-			}
-		},
+		// NO MOUNT HERE, AND NO `handle != 0` EITHER - the same shape as USBBLOCK below.
+		//
+		// These two mounted the medium at bootstrap and `exit()`ed on any refusal, and the arms
+		// did not match at all when the machine had no such drive (handle 0), which fell through
+		// to `_ => exit()`. Either way the service died before reporting in, and because
+		// `iso_storage` and `udf_storage` are declared dependencies of `permission_manager` and
+		// the shell, the machine brought its whole userspace up and then halted at
+		// `no interactive shell attached` - a missing read-only fixture disc taking the login
+		// with it. A drive that is absent, empty or unreadable is a fact about the medium, and
+		// the place to learn it is a read of `vol://iso` or `vol://udf`.
+		Received::Message { len, handle } if len >= 8 && &buf[..8] == b"ISOBLOCK" => Volume::new(alloc::boxed::Box::new(IsoFs { chan: handle, fs: None })),
+		Received::Message { len, handle } if len >= 8 && &buf[..8] == b"UDFBLOCK" => Volume::new(alloc::boxed::Box::new(UdfFs { chan: handle, fs: None })),
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None })),
 		// The two memory volumes. They carry no handle - there is no block device to hand over,
 		// which is the whole point - and the capacity follows the tag as a decimal byte count.
@@ -3066,8 +3055,50 @@ fn mem_capacity(bytes: &[u8]) -> usize {
 	text.trim().parse::<usize>().unwrap_or_else(|_| unsafe { exit() })
 }
 
+// LAZY, like `FatBacking` above and for the same reason.
+//
+// This mounted at bootstrap and `exit()`ed when it could not, so an absent or unreadable disc did
+// not make `vol://iso` empty - it killed the service. `iso_storage` is a declared dependency of
+// `permission_manager` and the shell, so the machine then booted its whole userspace and halted at
+// `no interactive shell attached`: an optional read-only fixture medium taking the login down with
+// it. The medium is now what it always was - something you find out about when you read it.
 struct IsoFs {
-	fs: Iso9660<IsoBlockDevice>,
+	chan: u64,
+	fs: Option<Iso9660<IsoBlockDevice>>,
+}
+
+impl IsoFs {
+	// The mounted filesystem, mounting on first use and re-probing after an I/O failure - the
+	// disc was ejected. The mount reasons are kept apart exactly as `FatBacking` keeps them:
+	// a device that did not answer is worth retrying, a disc this build cannot read is not.
+	fn ensure_mounted(&mut self) -> Result<&mut Iso9660<IsoBlockDevice>, Error> {
+		if self.fs.is_none() {
+			// No block device was handed over at all (no disc drive on this machine): there is
+			// nothing to probe, and saying so is the honest answer to every request.
+			if self.chan == 0 {
+				return Err(Error::NotFound);
+			}
+			match Iso9660::mount_checked(IsoBlockDevice { chan: self.chan }) {
+				Ok(fs) => self.fs = Some(fs),
+				Err(iso9660::MountError::Io | iso9660::MountError::NoMemory) => return Err(Error::Again),
+				Err(iso9660::MountError::Unsupported | iso9660::MountError::Corrupt) => return Err(Error::Invalid),
+				Err(iso9660::MountError::NotIso) => return Err(Error::NotFound),
+			}
+		}
+		self.fs.as_mut().ok_or(Error::NotFound)
+	}
+
+	fn run<R>(&mut self, op: impl FnOnce(&mut Iso9660<IsoBlockDevice>) -> Result<R, FsError>) -> Result<R, Error> {
+		let fs: &mut Iso9660<IsoBlockDevice> = self.ensure_mounted()?;
+		match op(fs) {
+			Ok(r) => Ok(r),
+			Err(FsError::Io) => {
+				self.fs = None;
+				Err(Error::Again)
+			}
+			Err(e) => Err(map_fs_err(e)),
+		}
+	}
 }
 
 impl FileSystem for IsoFs {
@@ -3075,7 +3106,7 @@ impl FileSystem for IsoFs {
 		ISO_VOLUME
 	}
 	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
-		self.fs.read_file(name).map_err(map_fs_err)
+		self.run(|fs| fs.read_file(name))
 	}
 	// THE RANGED READ, CONNECTED. `Storage.Volume.read(path, offset, length)` is in the interface,
 	// `read_window` is the backend hook and `DiskFs` overrides it; this took the default, which
@@ -3087,25 +3118,60 @@ impl FileSystem for IsoFs {
 		let mut window: Vec<u8> = Vec::new();
 		window.try_reserve_exact(len).map_err(|_| Error::Again)?;
 		window.resize(len, 0);
-		let read = self.fs.read_file_into(name, offset, &mut window).map_err(map_fs_err)?;
+		let read = self.run(|fs| fs.read_file_into(name, offset, &mut window))?;
 		window.truncate(read);
 		Ok(window)
 	}
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
-		let entries = if dir.is_empty() { self.fs.list() } else { self.fs.list_dir(dir) }.map_err(map_fs_err)?;
+		let entries = self.run(|fs| if dir.is_empty() { fs.list() } else { fs.list_dir(dir) })?;
 		try_collect(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)))
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
-		unsafe { block_capacity(self.fs.device().chan) }
+		if self.chan == 0 {
+			return Err(Error::NotFound);
+		}
+		unsafe { block_capacity(self.chan) }
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
-		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.total_bytes(), free_bytes: 0, compression: false, read_only: true, filesystem: String::from("iso9660") })
+		let total: u64 = self.run(|fs| Ok(fs.total_bytes()))?;
+		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("iso9660") })
 	}
 }
 
-// The read-only UDF backend for optical media: read and list only, like ISO9660.
+// The read-only UDF backend for optical media: read and list only, like ISO9660 - and lazy for
+// the same reason, written out against `IsoFs` above.
 struct UdfFs {
-	fs: Udf<UdfBlockDevice>,
+	chan: u64,
+	fs: Option<Udf<UdfBlockDevice>>,
+}
+
+impl UdfFs {
+	fn ensure_mounted(&mut self) -> Result<&mut Udf<UdfBlockDevice>, Error> {
+		if self.fs.is_none() {
+			if self.chan == 0 {
+				return Err(Error::NotFound);
+			}
+			match Udf::mount_checked(UdfBlockDevice { chan: self.chan }) {
+				Ok(fs) => self.fs = Some(fs),
+				Err(udf::MountError::Io | udf::MountError::NoMemory) => return Err(Error::Again),
+				Err(udf::MountError::Unsupported | udf::MountError::Corrupt) => return Err(Error::Invalid),
+				Err(udf::MountError::NotUdf) => return Err(Error::NotFound),
+			}
+		}
+		self.fs.as_mut().ok_or(Error::NotFound)
+	}
+
+	fn run<R>(&mut self, op: impl FnOnce(&mut Udf<UdfBlockDevice>) -> Result<R, FsError>) -> Result<R, Error> {
+		let fs: &mut Udf<UdfBlockDevice> = self.ensure_mounted()?;
+		match op(fs) {
+			Ok(r) => Ok(r),
+			Err(FsError::Io) => {
+				self.fs = None;
+				Err(Error::Again)
+			}
+			Err(e) => Err(map_fs_err(e)),
+		}
+	}
 }
 
 impl FileSystem for UdfFs {
@@ -3113,17 +3179,21 @@ impl FileSystem for UdfFs {
 		UDF_VOLUME
 	}
 	fn read_file(&mut self, name: &[u8]) -> Result<Vec<u8>, Error> {
-		self.fs.read_file(name).map_err(map_fs_err)
+		self.run(|fs| fs.read_file(name))
 	}
 	fn list_entries(&mut self, dir: &[u8]) -> Result<Vec<FileInfo>, Error> {
-		let entries = if dir.is_empty() { self.fs.list() } else { self.fs.list_dir(dir) }.map_err(map_fs_err)?;
+		let entries = self.run(|fs| if dir.is_empty() { fs.list() } else { fs.list_dir(dir) })?;
 		try_collect(entries.into_iter().map(|e| file_info(e.name.as_bytes(), e.size, e.is_dir, 0, 0)))
 	}
 	fn capacity(&mut self) -> Result<u64, Error> {
-		unsafe { block_capacity(self.fs.device().chan) }
+		if self.chan == 0 {
+			return Err(Error::NotFound);
+		}
+		unsafe { block_capacity(self.chan) }
 	}
 	fn status(&mut self) -> Result<VolumeStatus, Error> {
-		Ok(VolumeStatus { label: String::new(), total_bytes: self.fs.total_bytes(), free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf") })
+		let total: u64 = self.run(|fs| Ok(fs.total_bytes()))?;
+		Ok(VolumeStatus { label: String::new(), total_bytes: total, free_bytes: 0, compression: false, read_only: true, filesystem: String::from("udf") })
 	}
 }
 

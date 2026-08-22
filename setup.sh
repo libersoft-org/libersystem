@@ -40,6 +40,7 @@ APT_PACKAGES=(
 	xorriso           # ISO creation (UEFI)
 	gdisk             # sgdisk: GPT partitioning for the disk image
 	mtools            # mformat/mcopy: populate the FAT boot partition without root
+	exfatprogs        # mkfs.exfat: the FAT fixture medium the aarch64 and riscv64 runners have no fallback for
 	udftools          # mkfs.udf: build the UDF fixture required by the storage test topology
 	netpbm            # pnmtopng/pnmtojpeg: convert QEMU framebuffer screendumps
 	imagemagick       # convert: framebuffer screenshots to png/jpg/webp/...
@@ -99,7 +100,7 @@ fi
 echo
 info "${BOLD}Done.${RESET}"
 echo "  - Rust nightly + rust-src + llvm-tools-preview"
-echo "  - QEMU (x86_64 + aarch64), gdb, lld, xorriso, gdisk, mtools, udftools, taplo"
+echo "  - QEMU (x86_64 + aarch64 + riscv64), gdb, lld, xorriso, gdisk, mtools, exfatprogs, udftools, taplo"
 echo
-echo "Next step: cd src/kernel && cargo build"
+echo "Next step: ./build.sh"
 echo "Note: the project selects nightly via rust-toolchain.toml, no global switch needed."

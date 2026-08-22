@@ -116,6 +116,7 @@ fn option32(value: Option<u32>) -> String {
 
 fn generate_services(manifest: &Manifest) {
 	let mut entries = String::new();
+	let mut plans = String::new();
 	for service in manifest.services.values() {
 		let program = manifest.programs.get(&service.program).expect("validated service program");
 		let restart = match service.restart {
@@ -123,10 +124,57 @@ fn generate_services(manifest: &Manifest) {
 			Restart::Escalate => "Restart::Escalate",
 		};
 		let dependencies = service.dependencies.iter().map(|dependency| format!("b\"{dependency}\" as &'static [u8]")).collect::<Vec<_>>().join(", ");
+		let roles = service
+			.roles
+			.iter()
+			.map(|role| {
+				let kind = match role.kind {
+					RoleKind::ServeRoot => "RoleKind::ServeRoot",
+					RoleKind::Client => "RoleKind::Client",
+					RoleKind::Factory => "RoleKind::Factory",
+					RoleKind::Privilege => "RoleKind::Privilege",
+					RoleKind::Power => "RoleKind::Power",
+					RoleKind::Package => "RoleKind::Package",
+					RoleKind::Device => "RoleKind::Device",
+					RoleKind::Payload => "RoleKind::Payload",
+				};
+				let required = role.presence == Presence::Required;
+				format!("Role {{ tag: b\"{}\", kind: {kind}, provider: b\"{}\", required: {required} }}", role.tag, role.provider)
+			})
+			.collect::<Vec<_>>()
+			.join(", ");
 		entries.push_str(&format!("\tService {{ name: b\"{}\", program: b\"{}\", pinned: {}, restart: {restart}, deps: &[{dependencies}] }},\n", service.name, service.program, program.stage == Stage::Pinned));
+		plans.push_str(&format!("\t&[{roles}],\n"));
 	}
-	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst N: usize = {};\nconst MANIFEST: [Service; N] = [\n{entries}];\n", manifest.services.len());
+	// THE PLAN IS INDEXED THE SAME WAY THE MANIFEST IS, deliberately: two arrays over one order
+	// cannot drift the way two tables keyed by name can, and the supervisor already walks services
+	// by index. `ROLES[i]` is what `MANIFEST[i]` must be handed, in the order it must arrive.
+	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst N: usize = {};\nconst MANIFEST: [Service; N] = [\n{entries}];\nconst ROLES: [&[Role]; N] = [\n{plans}];\n", manifest.services.len());
 	write_generated("manifest.rs", &generated);
+	generate_role_tags(manifest);
+}
+
+// THE ROLE TAGS, AS ONE SET OF CONSTANTS BOTH ENDS READ.
+//
+// A tag is written twice today: once where the supervisor sends it and once where the service
+// reads it, each spelled by hand. That is how three programs came to read their bootstrap in an
+// order the sender does not use - a blocking tagged read consumes the message that was actually
+// next and then waits for one nobody will send, and it took a bisect over 170 tests to find,
+// because the failure surfaced in an unrelated service. Two hand-written spellings of one name is
+// the shape of that defect; one generated constant is the shape that cannot have it.
+fn generate_role_tags(manifest: &Manifest) {
+	let mut tags: BTreeSet<&str> = BTreeSet::new();
+	for service in manifest.services.values() {
+		for role in &service.roles {
+			tags.insert(role.tag.as_str());
+		}
+	}
+	let mut out = String::from("// @generated from services/manifest.toml by build.rs - do not edit.\n");
+	for tag in &tags {
+		out.push_str(&format!("pub const ROLE_{tag}: &[u8] = b\"{tag}\";\n"));
+	}
+	out.push_str(&format!("pub const ROLE_TAGS: [&[u8]; {}] = [{}];\n", tags.len(), tags.iter().map(|tag| format!("ROLE_{tag}")).collect::<Vec<_>>().join(", ")));
+	write_generated("role_tags.rs", &out);
 }
 
 fn generate_library_paths(manifest: &Manifest) {

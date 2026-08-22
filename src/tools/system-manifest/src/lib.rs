@@ -160,6 +160,20 @@ struct RawService {
 	restart: Restart,
 	#[serde(default)]
 	dependencies: Vec<String>,
+	#[serde(default)]
+	roles: Vec<RawRole>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct RawRole {
+	tag: String,
+	kind: RoleKind,
+	provider: String,
+	#[serde(default)]
+	presence: Presence,
+	#[serde(default)]
+	interface: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -401,6 +415,75 @@ pub struct Service {
 	pub program: Name,
 	pub restart: Restart,
 	pub dependencies: Vec<Name>,
+	/// THE CAPABILITIES THIS SERVICE MUST BE HANDED BEFORE IT CAN RUN, in the order they are sent.
+	///
+	/// Order is part of the contract, not presentation: the bootstrap is read positionally - a
+	/// receiver checks the tag of the NEXT message rather than searching for one - so a role
+	/// inserted in the middle shifts every read after it. `bootstrap.rs` says exactly that beside
+	/// DeviceManager's branch, having learned it the hard way.
+	pub roles: Vec<Role>,
+}
+
+/// One capability a service is handed at bootstrap: what it is called, what shape it is, and who
+/// supplies it.
+///
+/// This is ONE relation and not three. A service requiring an interface, that interface having a
+/// provider, and the provider arriving under a tag are the same fact seen from three sides; written
+/// as three fields they can disagree, and the disagreement is silent.
+#[derive(Clone, Debug, Serialize)]
+pub struct Role {
+	pub tag: Name,
+	pub kind: RoleKind,
+	/// The service that supplies it, `self` for a channel the supervisor creates for this service
+	/// to serve on, or `kernel` for a capability the kernel handed the boot chain.
+	pub provider: Name,
+	pub presence: Presence,
+	/// The LSIDL interface a channel role speaks, empty for the kinds that carry no protocol. A
+	/// REFERENCE, never a copy: what the interface means is LSIDL's to say.
+	pub interface: String,
+}
+
+/// How a role is delivered - which is also what decides whether it can be delivered AGAIN, and
+/// therefore whether the service holding it can be restarted.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum RoleKind {
+	/// One end of a channel pair the supervisor made; the service serves its clients on it and the
+	/// supervisor keeps the other end. Re-creatable: the supervisor simply makes another pair.
+	ServeRoot,
+	/// A duplicate of another service's client end. Re-creatable while that service lives AND the
+	/// supervisor still holds the end it duplicates from - which is why it duplicates rather than
+	/// transferring, and says so at the call site.
+	Client,
+	/// A fresh connection minted from another service's serve root. Re-creatable while it lives.
+	Factory,
+	/// A privileged handle the kernel gave the boot chain, duplicated on. Re-creatable while the
+	/// supervisor holds its own copy.
+	Privilege,
+	/// The root-Domain handle. Whoever holds it can stop the machine and kill every process on it;
+	/// P02M0141's M11 removes every one of these in favour of a narrow SystemPower service, and
+	/// this kind exists so the ones that remain can be counted.
+	Power,
+	/// The init package as a read-only memory object.
+	Package,
+	/// A handle produced by a driver and passed through DeviceManager. NOT re-creatable on its
+	/// own: it exists only while its driver does.
+	Device,
+	/// A tagged message carrying bytes and no capability at all.
+	Payload,
+}
+
+/// Whether a role must arrive carrying a capability.
+///
+/// `Optional` is not "may be omitted": the TAG IS ALWAYS SENT, and it may carry a zero handle. A
+/// boot with no second disk still sends `FATBLOCK`, empty, because the read is positional and a
+/// missing message would shift every one after it.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Presence {
+	#[default]
+	Required,
+	Optional,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -647,8 +730,49 @@ impl Manifest {
 			let Some(name) = validate_name(&raw_service.name, &format!("{location}.name"), &mut errors) else { continue };
 			let Some(program) = validate_name(&raw_service.program, &format!("{location}.program"), &mut errors) else { continue };
 			let dependencies = validate_name_list(raw_service.dependencies, &format!("{location}.dependencies"), &mut errors);
-			if services.insert(name.clone(), Service { name, program, restart: raw_service.restart, dependencies }).is_some() {
+			let mut roles: Vec<Role> = Vec::new();
+			let mut seen_tags: BTreeSet<String> = BTreeSet::new();
+			for raw_role in raw_service.roles {
+				let where_role = format!("{location}.roles.{}", raw_role.tag);
+				let Some(tag) = validate_tag(&raw_role.tag, &format!("{where_role}.tag"), &mut errors) else { continue };
+				let Some(provider) = validate_name(&raw_role.provider, &format!("{where_role}.provider"), &mut errors) else { continue };
+				if !seen_tags.insert(tag.to_string()) {
+					push_error(&mut errors, format!("{where_role}.tag"), "duplicate role tag within one service");
+				}
+				// A `serve-root` is made by the supervisor FOR this service, so its provider is
+				// itself; anything else naming itself is a service that cannot be started.
+				if raw_role.kind == RoleKind::ServeRoot {
+					if provider.as_str() != "self" {
+						push_error(&mut errors, format!("{where_role}.provider"), "a serve-root role is created for the service itself, so its provider must be `self`");
+					}
+				} else if provider.as_str() == "self" {
+					push_error(&mut errors, format!("{where_role}.provider"), "only a serve-root role may name `self` as its provider");
+				}
+				// An interface is what a CHANNEL speaks. On a memory object, a Domain handle or a
+				// message of bytes there is nothing for it to describe, and a field that describes
+				// nothing is one that goes stale unnoticed.
+				if !raw_role.interface.is_empty() && matches!(raw_role.kind, RoleKind::Package | RoleKind::Payload | RoleKind::Power) {
+					push_error(&mut errors, format!("{where_role}.interface"), "this role carries no channel, so it speaks no interface");
+				}
+				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface });
+			}
+			if services.insert(name.clone(), Service { name, program, restart: raw_service.restart, dependencies, roles }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate service name");
+			}
+		}
+		// A provider has to exist and has to be something that can supply a capability: another
+		// declared service, or `kernel` for what the boot chain was handed, or `service_manager`
+		// for what the supervisor itself holds. Checked after the loop because a service may name
+		// a provider that appears later in the file - the manifest's order is not the boot order.
+		for service in services.values() {
+			for role in &service.roles {
+				let provider = role.provider.as_str();
+				if provider == "self" || provider == "kernel" || provider == "service_manager" {
+					continue;
+				}
+				if !services.contains_key(&role.provider) {
+					push_error(&mut errors, format!("services.{}.roles.{}.provider", service.name, role.tag), format!("unknown role provider {provider}"));
+				}
 			}
 		}
 
@@ -726,6 +850,19 @@ fn validate_name(value: &str, location: &str, errors: &mut Vec<ValidationError>)
 	let valid = !value.is_empty() && value.len() <= 64 && value.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'));
 	if !valid {
 		push_error(errors, location, format!("invalid logical name {value:?}"));
+		return None;
+	}
+	Some(Name(value.to_string()))
+}
+
+// A bootstrap role's tag, which travels on the wire as the first bytes of its message and is
+// generated into a constant both ends read. Upper case with underscores, because that is what the
+// twenty-three hand-written branches already use and because a tag that differs from its constant
+// only by case is a defect nobody would see in a diff.
+fn validate_tag(value: &str, location: &str, errors: &mut Vec<ValidationError>) -> Option<Name> {
+	let valid = !value.is_empty() && value.len() <= 32 && value.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_');
+	if !valid {
+		push_error(errors, location, format!("invalid role tag {value:?} - upper case, digits and underscores, at most 32 bytes"));
 		return None;
 	}
 	Some(Name(value.to_string()))

@@ -331,14 +331,13 @@ qemu_prepare_media_images() {
 			media_publish "$candidate" "$UDF_DISK" "$udf_key"
 		else
 			rm -f "$candidate"
-			# SAID OUT LOUD, because this one has never worked and nothing reported it.
+			# SAID OUT LOUD, because this one failed silently for a long time.
 			#
-			# Measured on this host: the kernel mounts a `mkfs.udf --media-type=hd` image READ-ONLY,
-			# so the copy has always failed - `cp: Read-only file system` - and the old code
-			# suppressed that and kept the empty filesystem it had just created. Every UDF fixture
-			# in this tree is therefore an EMPTY UDF volume, and has been since it was first built.
-			# Nothing is published now, so whatever was there stays and this line says why.
-			echo "qemu-run: the UDF fixture could not be populated (the host mounts this image read-only); ${UDF_DISK##*/} is unchanged and holds no fixture files" >&2
+			# The cause was this file's own mount options: the x86_64 caller passed `loop,ro=0`,
+			# and util-linux reads that as the `ro` flag and DISCARDS the `=0`, so the image was
+			# mounted read-only and every copy failed with `cp: Read-only file system`. It is
+			# `loop` now. Nothing is published on failure, so whatever was there stays.
+			echo "qemu-run: the UDF fixture could not be populated (mount or copy failed); ${UDF_DISK##*/} is unchanged and holds no fixture files" >&2
 		fi
 	fi
 }
@@ -772,7 +771,7 @@ qemu_run_x86_64() {
 	qemu_attach_virtio_blk qemu_args "$virtio_disk" vblk "disable-legacy=on"
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
-	qemu_prepare_media_images "$artifact_suffix" "$artifact_suffix" loop,ro=0 1
+	qemu_prepare_media_images "$artifact_suffix" "$artifact_suffix" loop 1
 
 	# An ad-hoc guest cannot run beside the persistent development instance, and the reason is
 	# not the port - it is the disks. Both attach the same raw images, QEMU takes a write lock

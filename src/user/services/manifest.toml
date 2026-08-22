@@ -1610,11 +1610,41 @@ program = "audio_service"
 restart = "escalate"
 dependencies = ["log_service", "device_manager", "process_service"]
 
+[[services.roles]]
+tag = "SND"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:audio@1/audio-admin"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:audio@1/audio"
+
 [[services]]
 name = "config_service"
 program = "config_service"
 restart = "transparent"
 dependencies = ["log_service", "process_service"]
+
+[[services.roles]]
+tag = "STORAGE"
+kind = "client"
+provider = "storage_service"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:config@1/config"
 
 [[services]]
 name = "console_service"
@@ -1631,11 +1661,124 @@ dependencies = [
 	"permission_manager",
 ]
 
+[[services.roles]]
+tag = "CONSOLESINK"
+kind = "privilege"
+provider = "kernel"
+presence = "optional"
+
+[[services.roles]]
+tag = "CLIENT"
+kind = "serve-root"
+provider = "self"
+
+[[services.roles]]
+tag = "CONTROL"
+kind = "serve-root"
+provider = "self"
+
+[[services.roles]]
+tag = "FSTORAGE"
+kind = "factory"
+provider = "storage_service"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "FLOG"
+kind = "factory"
+provider = "log_service"
+interface = "liber:log@1/log"
+
+[[services.roles]]
+tag = "FDEVICE"
+kind = "factory"
+provider = "device_service"
+interface = "liber:device@1/device"
+
+[[services.roles]]
+tag = "FPROCESS"
+kind = "factory"
+provider = "process_service"
+interface = "liber:process@1/process"
+
+[[services.roles]]
+tag = "FCONFIG"
+kind = "factory"
+provider = "config_service"
+interface = "liber:config@1/config"
+
+[[services.roles]]
+tag = "FTIME"
+kind = "factory"
+provider = "time_service"
+interface = "liber:time@1/time"
+
+[[services.roles]]
+tag = "FAUDIO"
+kind = "factory"
+provider = "audio_service"
+presence = "optional"
+interface = "liber:audio@1/audio"
+
+[[services.roles]]
+tag = "FSESSION"
+kind = "factory"
+provider = "session_service"
+interface = "liber:session@1/session"
+
+[[services.roles]]
+tag = "FPERM"
+kind = "factory"
+provider = "permission_manager"
+interface = "liber:security@1/permission"
+
+[[services.roles]]
+tag = "FNET"
+kind = "factory"
+provider = "network_service"
+presence = "optional"
+interface = "liber:network@1/network"
+
+[[services.roles]]
+tag = "DISPLAY"
+kind = "client"
+provider = "display_service"
+presence = "optional"
+interface = "liber:display@1/display"
+
+[[services.roles]]
+tag = "POINTER"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
 [[services]]
 name = "device_manager"
 program = "device_manager"
 restart = "escalate"
 dependencies = ["log_service"]
+
+[[services.roles]]
+tag = "PACKAGE"
+kind = "package"
+provider = "service_manager"
+
+[[services.roles]]
+tag = "POWER"
+kind = "power"
+provider = "kernel"
+
+[[services.roles]]
+tag = "CONSOLE"
+kind = "privilege"
+provider = "kernel"
+presence = "optional"
+
+[[services.roles]]
+tag = "DEVPRIV"
+kind = "privilege"
+provider = "kernel"
+presence = "optional"
 
 [[services]]
 name = "device_service"
@@ -1643,11 +1786,51 @@ program = "device_service"
 restart = "transparent"
 dependencies = ["log_service", "process_service"]
 
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:device@1/device"
+
 [[services]]
 name = "display_service"
 program = "display_service"
 restart = "escalate"
 dependencies = ["log_service", "device_manager", "process_service", "input_service"]
+
+[[services.roles]]
+tag = "GPU"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "FOCUS"
+kind = "client"
+provider = "input_service"
+
+[[services.roles]]
+tag = "KILL"
+kind = "client"
+provider = "input_service"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:display@1/display-admin"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:display@1/display"
+
+[[services.roles]]
+tag = "DISPLAYCTL"
+kind = "privilege"
+provider = "kernel"
+presence = "optional"
 
 [[services]]
 name = "input_service"
@@ -1655,11 +1838,68 @@ program = "input_service"
 restart = "escalate"
 dependencies = ["log_service", "device_manager", "process_service"]
 
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:input@1/input"
+
+[[services.roles]]
+tag = "INPUT"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "INPUT2"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "FORWARD"
+kind = "serve-root"
+provider = "self"
+
+[[services.roles]]
+tag = "KEYS"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "FOCUS"
+kind = "serve-root"
+provider = "self"
+
+[[services.roles]]
+tag = "KILL"
+kind = "serve-root"
+provider = "self"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:input@1/input-admin"
+
 [[services]]
 name = "iso_storage"
 program = "storage_service"
 restart = "escalate"
 dependencies = ["log_service", "device_manager"]
+
+[[services.roles]]
+tag = "ISOBLOCK"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume"
 
 [[services]]
 name = "log_service"
@@ -1667,17 +1907,53 @@ program = "log_service"
 restart = "escalate"
 dependencies = []
 
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:log@1/log"
+
 [[services]]
 name = "media_storage"
 program = "storage_service"
 restart = "escalate"
 dependencies = ["log_service", "device_manager"]
 
+[[services.roles]]
+tag = "FATBLOCK"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume"
+
 [[services]]
 name = "network_service"
 program = "network_service"
 restart = "escalate"
 dependencies = ["log_service", "device_manager", "process_service", "config_service"]
+
+[[services.roles]]
+tag = "FRAMES"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "CONFIG"
+kind = "client"
+provider = "config_service"
+interface = "liber:config@1/config"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:network@1/network"
 
 [[services]]
 name = "permission_manager"
@@ -1704,11 +1980,191 @@ dependencies = [
 	"session_service",
 ]
 
+[[services.roles]]
+tag = "STORAGE_ADMIN"
+kind = "client"
+provider = "storage_service"
+interface = "liber:storage@1/volume-admin"
+
+[[services.roles]]
+tag = "STORAGE"
+kind = "client"
+provider = "storage_service"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "LOG"
+kind = "client"
+provider = "log_service"
+interface = "liber:log@1/log"
+
+[[services.roles]]
+tag = "NETWORK"
+kind = "client"
+provider = "network_service"
+presence = "optional"
+interface = "liber:network@1/network"
+
+[[services.roles]]
+tag = "TIME"
+kind = "client"
+provider = "time_service"
+interface = "liber:time@1/time"
+
+[[services.roles]]
+tag = "SESSION"
+kind = "client"
+provider = "session_service"
+interface = "liber:session@1/session"
+
+[[services.roles]]
+tag = "CONFIG"
+kind = "client"
+provider = "config_service"
+interface = "liber:config@1/config"
+
+[[services.roles]]
+tag = "DEVICE"
+kind = "client"
+provider = "device_service"
+interface = "liber:device@1/device"
+
+[[services.roles]]
+tag = "AUDIO"
+kind = "client"
+provider = "audio_service"
+presence = "optional"
+interface = "liber:audio@1/audio"
+
+[[services.roles]]
+tag = "DISPLAY_ADMIN"
+kind = "client"
+provider = "display_service"
+presence = "optional"
+interface = "liber:display@1/display-admin"
+
+[[services.roles]]
+tag = "INPUT_ADMIN"
+kind = "client"
+provider = "input_service"
+presence = "optional"
+interface = "liber:input@1/input-admin"
+
+[[services.roles]]
+tag = "AUDIO_ADMIN"
+kind = "client"
+provider = "audio_service"
+presence = "optional"
+interface = "liber:audio@1/audio-admin"
+
+[[services.roles]]
+tag = "RESOURCE"
+kind = "client"
+provider = "resource_manager"
+interface = "liber:resources@1/resource"
+
+[[services.roles]]
+tag = "PROCESS_GRANT"
+kind = "client"
+provider = "process_service"
+interface = "liber:process@1/process"
+
+[[services.roles]]
+tag = "SUPERVISOR"
+kind = "serve-root"
+provider = "self"
+
+[[services.roles]]
+tag = "STORAGE_MEDIA"
+kind = "client"
+provider = "media_storage"
+presence = "optional"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "STORAGE_ISO"
+kind = "client"
+provider = "iso_storage"
+presence = "optional"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "STORAGE_UDF"
+kind = "client"
+provider = "udf_storage"
+presence = "optional"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "STORAGE_USB"
+kind = "client"
+provider = "usb_storage"
+presence = "optional"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "STORAGE_RAM"
+kind = "client"
+provider = "ram_storage"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "STORAGE_TMP"
+kind = "client"
+provider = "tmp_storage"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "SERVICES"
+kind = "payload"
+provider = "service_manager"
+
+[[services.roles]]
+tag = "USBBUS"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "PROCESS"
+kind = "client"
+provider = "process_service"
+interface = "liber:process@1/process"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:security@1/permission"
+
 [[services]]
 name = "process_service"
 program = "process_service"
 restart = "escalate"
 dependencies = ["log_service", "storage_service"]
+
+[[services.roles]]
+tag = "PACKAGE"
+kind = "package"
+provider = "service_manager"
+
+[[services.roles]]
+tag = "STORAGE"
+kind = "client"
+provider = "storage_service"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "REGISTRY"
+kind = "client"
+provider = "service_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:process@1/process"
 
 [[services]]
 name = "resource_manager"
@@ -1716,11 +2172,34 @@ program = "resource_manager"
 restart = "escalate"
 dependencies = ["log_service", "process_service"]
 
+[[services.roles]]
+tag = "PACKAGE"
+kind = "package"
+provider = "service_manager"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:resources@1/resource"
+
+[[services.roles]]
+tag = "PROCESS"
+kind = "client"
+provider = "process_service"
+interface = "liber:process@1/process"
+
 [[services]]
 name = "session_service"
 program = "session_service"
 restart = "escalate"
 dependencies = ["log_service", "process_service"]
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:session@1/session"
 
 [[services]]
 name = "shell"
@@ -1746,11 +2225,153 @@ dependencies = [
 	"session_service",
 ]
 
+[[services.roles]]
+tag = "STORAGE"
+kind = "client"
+provider = "storage_service"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "MEDIA"
+kind = "client"
+provider = "media_storage"
+presence = "optional"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "ISO"
+kind = "client"
+provider = "iso_storage"
+presence = "optional"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "UDF"
+kind = "client"
+provider = "udf_storage"
+presence = "optional"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "USB"
+kind = "client"
+provider = "usb_storage"
+presence = "optional"
+interface = "liber:storage@1/volume"
+
+[[services.roles]]
+tag = "LOG"
+kind = "client"
+provider = "log_service"
+interface = "liber:log@1/log"
+
+[[services.roles]]
+tag = "DEVICE"
+kind = "client"
+provider = "device_service"
+interface = "liber:device@1/device"
+
+[[services.roles]]
+tag = "PROCESS"
+kind = "client"
+provider = "process_service"
+interface = "liber:process@1/process"
+
+[[services.roles]]
+tag = "CONFIG"
+kind = "client"
+provider = "config_service"
+interface = "liber:config@1/config"
+
+[[services.roles]]
+tag = "NET"
+kind = "client"
+provider = "network_service"
+presence = "optional"
+interface = "liber:network@1/network"
+
+[[services.roles]]
+tag = "TIME"
+kind = "client"
+provider = "time_service"
+interface = "liber:time@1/time"
+
+[[services.roles]]
+tag = "AUDIO"
+kind = "client"
+provider = "audio_service"
+presence = "optional"
+interface = "liber:audio@1/audio"
+
+[[services.roles]]
+tag = "INPUT"
+kind = "client"
+provider = "input_service"
+presence = "optional"
+interface = "liber:input@1/input"
+
+[[services.roles]]
+tag = "GRAPH"
+kind = "client"
+provider = "system_graph_service"
+interface = "liber:observability@1/system-graph"
+
+[[services.roles]]
+tag = "PERM"
+kind = "client"
+provider = "permission_manager"
+interface = "liber:security@1/permission"
+
+[[services.roles]]
+tag = "RESOURCE"
+kind = "client"
+provider = "resource_manager"
+interface = "liber:resources@1/resource"
+
+[[services.roles]]
+tag = "SESSION"
+kind = "client"
+provider = "session_service"
+interface = "liber:session@1/session"
+
+[[services.roles]]
+tag = "CONSOLE"
+kind = "client"
+provider = "console_service"
+
+[[services.roles]]
+tag = "CONTROL"
+kind = "client"
+provider = "console_service"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:process@1/supervisor"
+
 [[services]]
 name = "storage_service"
 program = "storage_service"
 restart = "escalate"
 dependencies = ["log_service", "device_manager"]
+
+[[services.roles]]
+tag = "BLOCK"
+kind = "device"
+provider = "device_manager"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume-admin"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume"
 
 [[services]]
 name = "system_graph_service"
@@ -1772,17 +2393,64 @@ dependencies = [
 	"resource_manager",
 ]
 
+[[services.roles]]
+tag = "NODE"
+kind = "payload"
+provider = "service_manager"
+
+[[services.roles]]
+tag = "DEVICE"
+kind = "client"
+provider = "device_service"
+interface = "liber:device@1/device"
+
+[[services.roles]]
+tag = "SUPERVISOR"
+kind = "serve-root"
+provider = "self"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:observability@1/system-graph"
+
 [[services]]
 name = "time_service"
 program = "time_service"
 restart = "escalate"
 dependencies = ["log_service", "network_service", "process_service"]
 
+[[services.roles]]
+tag = "NET"
+kind = "client"
+provider = "network_service"
+presence = "optional"
+interface = "liber:network@1/network"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:time@1/time"
+
 [[services]]
 name = "udf_storage"
 program = "storage_service"
 restart = "escalate"
 dependencies = ["log_service", "device_manager"]
+
+[[services.roles]]
+tag = "UDFBLOCK"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume"
 
 # The two memory volumes. Same program as every other volume instance; what differs is the
 # bootstrap tag, which carries a capacity instead of a block service - there is no disk under
@@ -1793,17 +2461,51 @@ program = "storage_service"
 restart = "escalate"
 dependencies = ["log_service"]
 
+[[services.roles]]
+tag = "RAMVOL"
+kind = "payload"
+provider = "service_manager"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume"
+
 [[services]]
 name = "tmp_storage"
 program = "storage_service"
 restart = "escalate"
 dependencies = ["log_service"]
 
+[[services.roles]]
+tag = "TMPVOL"
+kind = "payload"
+provider = "service_manager"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume"
+
 [[services]]
 name = "usb_storage"
 program = "storage_service"
 restart = "escalate"
 dependencies = ["log_service", "storage_service"]
+
+[[services.roles]]
+tag = "USBBLOCK"
+kind = "device"
+provider = "device_manager"
+presence = "optional"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume"
 
 [[libraries]]
 name = "adpcm"

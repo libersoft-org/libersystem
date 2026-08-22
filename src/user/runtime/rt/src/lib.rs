@@ -1965,6 +1965,17 @@ pub unsafe fn random_insecure(bytes: &mut [u8]) -> usize {
 
 // Read the boot profile's name into `name`, returning the bytes written, or 0 when this boot
 // named none. A development-only facility asks this rather than inferring the profile from
+// THIS BOOT'S IDENTITY, for anything that has to say which boot an event came from.
+//
+// The kernel owns it, so it survives the first userspace process being replaced - which is the one
+// event it exists to outlast. Never zero: zero means "no boot id", which is what a caller on an
+// older kernel gets.
+#[inline(always)]
+pub unsafe fn boot_id() -> u64 {
+	let value: i64 = unsafe { syscall(SYS_BOOT_ID, 0, 0, 0, 0) } as i64;
+	if value < 0 { 0 } else { value as u64 }
+}
+
 // what happens to be attached.
 pub unsafe fn boot_profile(name: &mut [u8]) -> usize {
 	let written: i64 = unsafe { syscall(SYS_BOOT_PROFILE, name.as_mut_ptr() as u64, name.len() as u64, 0, 0) as i64 };

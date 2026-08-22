@@ -14,6 +14,21 @@ BUILD_DIR="$REPO_ROOT/.build"
 
 ARCHS_ALL=(x86_64 aarch64 riscv64)
 
+# CARGO ON THE PATH, FOUND RATHER THAN REQUIRED.
+#
+# `setup.sh` cannot put it there: `rustup` adds `~/.cargo/bin` through the shell PROFILE, and the
+# shell that runs `setup.sh` read its profile before rustup existed. So the documented first
+# session - `./setup.sh`, then `./build.sh` - died on `cargo: command not found`, and the fix was a
+# `source ~/.cargo/env` nothing told the reader about. A script that needs cargo finds it.
+#
+# Exported, because the work is not done here: `src/boot/mkimage.sh`, `src/boot/qemu-run.sh` and
+# `src/boot/lab.py` all call cargo as child processes of these scripts.
+if ! command -v cargo >/dev/null 2>&1; then
+	_cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+	[[ -x "$_cargo_bin/cargo" ]] && export PATH="$_cargo_bin:$PATH"
+	unset _cargo_bin
+fi
+
 die() {
 	echo "${SCRIPT_NAME:-$(basename "$0")}: $*" >&2
 	exit 1

@@ -20,6 +20,24 @@ fn syscall_roundtrip_stateless() {
 	}
 }
 
+crate::tagged_test!(the_boot_id_is_one_nonzero_value_for_the_life_of_the_kernel, [Syscall], id = "kernel.syscall.the_boot_id_is_one_nonzero_value_for_the_life_of_the_kernel", covers = ["kernel"]);
+fn the_boot_id_is_one_nonzero_value_for_the_life_of_the_kernel() {
+	// WHAT AN EVENT NEEDS FROM IT is that two reads inside one boot agree and that zero never
+	// means a boot. Uniqueness ACROSS boots cannot be tested from inside one, so it is bought by
+	// construction instead - the value is drawn from the insecure source, which the source's own
+	// comment names a boot identifier as its first use.
+	unsafe {
+		let first = arch::syscall::invoke(SYS_BOOT_ID, 0, 0, 0, 0);
+		assert!(!sys_is_err(first), "the boot id is not an error");
+		assert_ne!(first, 0, "zero is reserved for 'no boot id' and must never be handed out");
+		let second = arch::syscall::invoke(SYS_BOOT_ID, 0, 0, 0, 0);
+		assert_eq!(first, second, "the id is drawn once, not per call - an event recorded twice would name two boots");
+		// Positive as a signed value, because the syscall table returns errors as negatives and a
+		// caller cannot tell an id with the top bit set from a failure.
+		assert!((first as i64) > 0, "the id fits the positive half of the return value");
+	}
+}
+
 crate::tagged_test!(boot_profile_reports_nothing_when_the_boot_named_none, [Syscall], id = "kernel.syscall.boot_profile_reports_nothing_when_the_boot_named_none", covers = ["kernel"]);
 fn boot_profile_reports_nothing_when_the_boot_named_none() {
 	// The development-only artifact registry gates itself on this answer, so the answer for
