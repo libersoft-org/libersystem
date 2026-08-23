@@ -36,6 +36,7 @@ use proto::system::network;
 use proto::system::permission;
 use proto::system::process;
 use proto::system::supervisor;
+use proto::system::system_power;
 use proto::system::{Entry, Error, Field, Severity, SupervisorStat};
 use rt::*;
 
@@ -907,7 +908,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    (reverse-dependency teardown), or SystemGraphService querying the supervisor state.
 	//    No timer stands here, so the loop sleeps at ~0% CPU until an event arrives.
 	unsafe {
-		supervise(power, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, stats_server, stats_server2, &driver_state, log_client, park, &mut buf);
+		// AND THE ONE CONSOLESERVICE HANDS TO EVERY SHELL IT SPAWNS. Read from the plan's own table
+		// rather than threaded out through `start_service`: the end is recorded there when the role
+		// is delivered, and this is the only place that needs it.
+		let admin_server3: u64 = kept.end_of(b"console_service", b"ADMIN");
+		supervise(power, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, admin_server3, stats_server, stats_server2, &driver_state, log_client, park, &mut buf);
 	}
 	exit();
 }
@@ -1409,16 +1414,21 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // dropped from the wait set. The canary is restarted per policy; an admin message
 // drives a reverse-dependency stop; a stats request is answered over the `supervisor`
 // interface. Returns when nothing is left to watch.
-unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, buf: &mut [u8]) {
+unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, admin_server3: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
+		// The console's, which every shell it spawns holds a duplicate of. One request at a time
+		// like the other two, and answered by the same handler: a shell asking to stop the machine
+		// is the same request whichever channel it arrives on.
+		let mut admin3: u64 = admin_server3;
 		let mut stats: u64 = stats_server;
 		let mut stats2: u64 = stats_server2;
 		loop {
-			let mut handles: [u64; N + 5] = [0u64; N + 5];
-			let mut kinds: [u8; N + 5] = [0u8; N + 5];
-			let mut idxs: [usize; N + 5] = [0usize; N + 5];
+			// N services, the canary, and the four supervisor channels plus the console's.
+			let mut handles: [u64; N + 6] = [0u64; N + 6];
+			let mut kinds: [u8; N + 6] = [0u8; N + 6];
+			let mut idxs: [usize; N + 6] = [0usize; N + 6];
 			let mut count: usize = 0;
 			let mut i: usize = 0;
 			while i < N {
@@ -1453,6 +1463,11 @@ unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; 
 			if stats2 != 0 {
 				handles[count] = stats2;
 				kinds[count] = 5;
+				count += 1;
+			}
+			if admin3 != 0 {
+				handles[count] = admin3;
+				kinds[count] = 6;
 				count += 1;
 			}
 			if count == 0 {
@@ -1552,11 +1567,18 @@ unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; 
 						admin2 = 0;
 					}
 				}
-				_ => {
+				5 => {
 					// The sandboxed `lssvc` tool (granted the services capability) queried the
 					// supervisor state over its own status channel; answer one request.
 					if !serve_stats_once(stats2, state, desired, procs, &broker.lifecycle, sup, reason, canary_sup, drivers, buf) {
 						stats2 = 0;
+					}
+				}
+				_ => {
+					// A shell ConsoleService spawned - the replacement a logout puts on the primary
+					// VT - asking to stop a service or to stop the machine.
+					if !handle_admin(admin3, power, broker, state, desired, channels, sup, procs, &mut stats, log_client, buf) {
+						admin3 = 0;
 					}
 				}
 			}
@@ -1596,7 +1618,25 @@ unsafe fn handle_admin(admin: u64, power: u64, broker: &mut Broker, state: &mut 
 			// above already knew this ("system_power would stop QEMU mid-suite"); the knowledge
 			// just never reached the log.
 			debug_write(b"service_manager: power verb - shutting down\n");
-			system_power(power, action);
+			// THROUGH THE SERVICE THAT HOLDS THE AUTHORITY, not through the syscall.
+			//
+			// `power` is a CLIENT CHANNEL of the `system_power` service SystemManager serves - it
+			// stopped being a root-Domain handle when that authority became a service. The syscall
+			// this used to call looks its argument up as a Domain carrying MANAGE, so it answered
+			// with an error every time: every `shutdown` tore the whole service tree down and then
+			// LEFT THE MACHINE RUNNING, with the kernel printing `halting` and QEMU still alive.
+			// The keyboard driver's Power key has always gone through the client and has always
+			// worked, which is how one of the two holders of this authority stayed correct.
+			//
+			// The call RETURNS ONLY WHEN IT FAILED - a machine that stops does not come back - so
+			// what follows is the refusal path, and this process is the last thing running: if it
+			// does not say so, nothing will.
+			let stopped = if action == POWER_REBOOT { system_power::Client::new(ChannelTransport { chan: power }).reboot() } else { system_power::Client::new(ChannelTransport { chan: power }).power_off() };
+			match stopped {
+				Some(Ok(())) => debug_write(b"service_manager: the machine did not stop, and the power service reported no error\n"),
+				Some(Err(_)) => debug_write(b"service_manager: the power service refused to stop the machine\n"),
+				None => debug_write(b"service_manager: the power service did not answer; the machine is still running\n"),
+			};
 			return true;
 		}
 		// `+name` starts a service that was stopped, the inverse of the bare name below. The

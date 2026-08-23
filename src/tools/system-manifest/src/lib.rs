@@ -862,10 +862,18 @@ impl Manifest {
 				// is what happens. A serve root is made for this service alone, a factory mints a
 				// fresh connection per caller, and the rest carry no client end to hand over -
 				// marking any of them exclusive would be a word with nothing behind it.
-				// `handed_on` widens the CLIENT delivery, which is the one that is a narrowed
-				// duplicate. A serve root is a fresh endpoint and a factory connection is minted
-				// per launch, so neither is narrowed this way and neither can be widened this way.
-				if raw_role.handed_on && raw_role.kind != RoleKind::Client {
+				// `handed_on` widens a delivery that is a NARROWED DUPLICATE, and two kinds are:
+				// a client role, and a serve root - `serve_root` makes the pair and hands the
+				// service a duplicate narrowed to the same ceiling, which is why a service holding
+				// one cannot pass it on either. A factory connection is minted per caller by the
+				// provider, so there is nothing for this to widen.
+				//
+				// THE SERVE ROOT HAD TO BE ALLOWED BECAUSE ONE HOLDER'S JOB IS TO HAND IT ON:
+				// ConsoleService spawns every shell, including the replacement a logout puts on the
+				// primary VT, and that shell needs the supervisor channel the first one was given
+				// by the supervisor itself. Without the right to duplicate, a reloaded shell had no
+				// way to stop the machine at all.
+				if raw_role.handed_on && !matches!(raw_role.kind, RoleKind::Client | RoleKind::ServeRoot) {
 					push_error(&mut errors, format!("{where_role}.handed_on"), "only a role delivered as a duplicate can be given the right to duplicate");
 				}
 				if raw_role.exclusive && raw_role.kind != RoleKind::Client {

@@ -105,7 +105,7 @@ pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut K
 			let delivered: bool = match role.kind {
 				RoleKind::ServeRoot => {
 					let mut client: u64 = 0;
-					let ok = serve_root(manager_side, role.tag, &mut client);
+					let ok = serve_root(manager_side, role.tag, role.handed_on, &mut client);
 					if ok && slot < MAX_ROLES {
 						kept.ends[index][slot] = client;
 					}
@@ -1029,7 +1029,7 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, storage_admin: u64, st
 // the supervisor to later hand to the shell. The shared bootstrap for every SERVE-
 // only service (Log, Device, Config) and the tail of Storage and Process.
 pub(super) unsafe fn bootstrap_serve(manager_side: u64, client: &mut u64) -> bool {
-	unsafe { serve_root(manager_side, CAP_SERVE, client) }
+	unsafe { serve_root(manager_side, CAP_SERVE, false, client) }
 }
 
 // Hand over one end of a fresh channel pair as a serve root, NARROWED TO WHAT SERVING NEEDS.
@@ -1042,13 +1042,17 @@ pub(super) unsafe fn bootstrap_serve(manager_side: u64, client: &mut u64) -> boo
 // Send, receive and wait are what a serve loop does. TRANSFER is unavoidable: a capability that
 // cannot be transferred cannot be delivered, so it is in the grant by construction rather than by
 // choice.
-pub(super) unsafe fn serve_root(manager_side: u64, tag: &[u8], client: &mut u64) -> bool {
+pub(super) unsafe fn serve_root(manager_side: u64, tag: &[u8], handed_on: bool, client: &mut u64) -> bool {
 	unsafe {
 		let (service_server, service_client): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => return false,
 		};
-		let narrowed: i64 = duplicate(service_server, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		// AND THE RIGHT TO PASS IT ON WHERE THE ROLE SAYS SO, exactly as the client delivery does.
+		// A service whose job is to hand this channel to somebody else - ConsoleService, which
+		// spawns every shell there is - cannot do it from the ceiling below.
+		let rights: u32 = if handed_on { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER | RIGHT_DUPLICATE } else { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER };
+		let narrowed: i64 = duplicate(service_server, rights);
 		close(service_server);
 		if narrowed < 0 {
 			close(service_client);

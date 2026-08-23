@@ -344,6 +344,9 @@ struct Console {
 	// are not on the screen - so they are kept apart from `vts` to leave the display path
 	// (foreground, scrollback, switch, gpu-resize) untouched.
 	ptys: Vec<Vt>,
+	// The supervisor channel handed to the shell on the primary VT and to no other. A duplicate per
+	// spawn: the shell that has it closes it when it exits, and the next one gets a fresh copy.
+	admin: u64,
 	facs: Factories,
 	// The broker (bootstrap) channel the restartable factories (config, device) are
 	// re-resolved over when their service crashed and was restarted: ServiceManager
@@ -419,6 +422,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let net: u64 = required(caps.take(CAP_FNET));
 		let display_chan: u64 = caps.take(CAP_DISPLAY);
 		let pointer: u64 = caps.take(CAP_POINTER);
+		// The supervisor channel a shell needs to stop a service or the machine. Held here for one
+		// purpose: the shell this service puts back on the PRIMARY VT after a logout. The first
+		// shell gets its own from the supervisor, and that one dies with it - so without this a
+		// `shutdown` after `exit` had nothing to ask.
+		let admin: u64 = caps.take(CAP_ADMIN);
 		drop(caps);
 
 		// 2. Acquire one native-size logical surface for all display VTs. DisplayService
@@ -467,7 +475,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 		// 4. run the multiplexing terminal loop, starting with VT 1.
 		let facs: Factories = Factories { storage, log, device, process, config, net, time, audio, session, perm };
-		let mut console: Console = Console { addr, bell_until: 0, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::with_limit(SERIAL_PENDING_MAX), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
+		let mut console: Console = Console { addr, bell_until: 0, fb, surface, has_fb, display, display_events, display_focused: true, cur_w, cur_h, input: 0, serial: RawSink::with_limit(SERIAL_PENDING_MAX), vts: alloc::vec![Vt { term, client, control, fg_proc: None, ld: Box::new(Ld::new(vt_history)), master: 0, cwd: String::from("vol://system") }], fg: 0, ptys: Vec::new(), admin, facs, broker: bootstrap, config_client, pointer, clipboard: Vec::new(), ptr_buttons: 0, serial_gap: false, vocab: None };
 		run(&mut console);
 	}
 }
@@ -1697,11 +1705,23 @@ unsafe fn reload_vt(console: &mut Console, vi: usize) -> bool {
 			}
 		};
 		let broker: u64 = console.broker;
-		if !spawn_shell(&mut console.facs, broker, vt_client, control_shell) {
+		// THE PRIMARY VT KEEPS WHAT IT HAD. A logout is not a demotion: the console the machine
+		// boots on could stop the machine before `exit` and can after it. Any other VT gets zero,
+		// which is what it got before this existed.
+		let admin: u64 = if vi == 0 && console.admin != 0 {
+			let copy: i64 = duplicate(console.admin, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+			if copy > 0 { copy as u64 } else { 0 }
+		} else {
+			0
+		};
+		if !spawn_shell(&mut console.facs, broker, vt_client, control_shell, admin) {
 			close(vt_service);
 			close(vt_client);
 			close(control_console);
 			close(control_shell);
+			if admin != 0 {
+				close(admin);
+			}
 			return false;
 		}
 		console.vts[vi].client = vt_service;
@@ -1755,7 +1775,7 @@ fn repaint(console: &mut Console) {
 // handle would pin the shell's handle table (and that channel) alive, so the terminal
 // could never be reaped when the shell logs out or exits. Shared by spawn_vt (a display
 // VT) and open_pty (a program-hosted PTY).
-unsafe fn spawn_shell(facs: &mut Factories, broker: u64, shell_console: u64, shell_control: u64) -> bool {
+unsafe fn spawn_shell(facs: &mut Factories, broker: u64, shell_console: u64, shell_control: u64, admin: u64) -> bool {
 	unsafe {
 		let storage: u64 = match service_connect(facs.storage) {
 			Some(h) => h,
@@ -1842,6 +1862,13 @@ unsafe fn spawn_shell(facs: &mut Factories, broker: u64, shell_console: u64, she
 		send_blocking(boot_parent, CAP_SESSION, session);
 		send_blocking(boot_parent, CAP_CONSOLE, shell_console);
 		send_blocking(boot_parent, CAP_CONTROL, shell_control);
+		// THE SUPERVISOR CHANNEL, FOR THE PRIMARY VT ONLY. Zero everywhere else, and the shell
+		// reads it as "no supervisor connection" and says so rather than pretending - which is what
+		// a secondary VT and a PTY shell have always got, and is the policy this restores rather
+		// than widens.
+		if admin != 0 {
+			send_blocking(boot_parent, CAP_ADMIN, admin);
+		}
 		send_ready(boot_parent);
 		// wait for the shell to report in, then drop its bootstrap.
 		let mut rbuf: [u8; 32] = [0u8; 32];
@@ -1863,7 +1890,7 @@ unsafe fn spawn_vt(facs: &mut Factories, broker: u64, config_client: u64, addr: 
 	unsafe {
 		let (vt_service, vt_client): (u64, u64) = channel()?;
 		let (control_console, control_shell): (u64, u64) = channel()?;
-		if !spawn_shell(facs, broker, vt_client, control_shell) {
+		if !spawn_shell(facs, broker, vt_client, control_shell, 0) {
 			close(vt_service);
 			close(vt_client);
 			close(control_console);
@@ -1902,7 +1929,7 @@ unsafe fn open_pty(console: &mut Console, name: &[u8]) -> Option<u64> {
 		let (master_console, master_host): (u64, u64) = channel()?;
 		let is_shell: bool = name == b"shell";
 		let broker: u64 = console.broker;
-		let ok: bool = if is_shell { spawn_shell(&mut console.facs, broker, slave_client, control_slave) } else { spawn_pty_program(&console.facs, name, slave_client, control_slave) };
+		let ok: bool = if is_shell { spawn_shell(&mut console.facs, broker, slave_client, control_slave, 0) } else { spawn_pty_program(&console.facs, name, slave_client, control_slave) };
 		if !ok {
 			close(slave_service);
 			close(slave_client);

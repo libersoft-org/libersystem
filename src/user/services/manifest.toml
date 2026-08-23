@@ -1812,6 +1812,22 @@ provider = "device_manager"
 presence = "optional"
 
 [[services.roles]]
+tag = "ADMIN"
+# THE SUPERVISOR CHANNEL EVERY SHELL THIS SERVICE SPAWNS NEEDS, and the reason it is here rather
+# than only on the shell: the shell's own copy dies with the shell, and what puts a new shell on the
+# primary VT after a logout is THIS service. Without one, `exit` cost the console its ability to
+# stop the machine - the reloaded shell answered "no supervisor connection" to `shutdown`, and there
+# was nothing left to reconnect it.
+#
+# Handed on rather than used here: ConsoleService never sends anything on this channel. It
+# duplicates it for the shell it spawns on the PRIMARY VT and for no other, which is the policy that
+# was already written down - a secondary VT's shell has never had one and still does not.
+kind = "serve-root"
+provider = "self"
+interface = "liber:observability@1/supervisor"
+handed_on = true
+
+[[services.roles]]
 tag = "READY"
 kind = "payload"
 provider = "service_manager"
