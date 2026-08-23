@@ -92,6 +92,24 @@ GPT_SYSTEM_GUID="4C424653-0000-4000-8000-000000000002"
 # Stamp a staged file with the build epoch before it is copied into a filesystem that records
 # mtimes. mtools copies the source file's timestamp, so the recorded time is whatever the build
 # happened to write - which differs between two builds of identical content.
+# Make a directory on a FAT image, and DO NOT ASK WHEN IT IS ALREADY THERE.
+#
+# `mmd` on an existing name asks what to do about the collision - and it asks on `/dev/tty`, which
+# it opens itself. Neither redirecting stdin nor discarding stderr reaches that: the question is
+# invisible and the answer can only come from a person sitting at the terminal that started the
+# build. `./run.sh` on a fresh machine therefore stopped dead right after `kernel: stripped`,
+# printing nothing further and using no CPU, for as long as anyone let it. It reproduces ONLY with
+# a terminal on stdin, which is why every scripted run and every CI run of the same command passed:
+# with no controlling terminal the open fails and mtools gives up instead of waiting.
+#
+# Asking first is the fix, not silencing the answer. `::/etc` legitimately exists already whenever a
+# medium stages the bootstrap set before its manifest - two callers here do exactly that - so the
+# collision is expected and creating the directory is what is conditional.
+ensure_dir() {
+	local image="$1" dir="$2"
+	mdir -i "$image" "$dir" >/dev/null 2>&1 || mmd -i "$image" "$dir"
+}
+
 stamp_epoch() {
 	touch -d "@$SOURCE_DATE_EPOCH" "$@"
 }
@@ -216,7 +234,7 @@ stage_boot_manifest() {
 	fi
 	printf '%s  kernel\n' "$(sha256sum "$staged_kernel" | cut -d" " -f1)" >>"$out"
 	# `::/etc` already exists when a bootstrap set was staged into it.
-	mmd -i "$image" ::/etc 2>/dev/null || true
+	ensure_dir "$image" ::/etc
 	stamp_epoch "$out"
 	mcopy -i "$image" "$out" ::/etc/boot.manifest
 	rm -f "$out"
@@ -254,8 +272,9 @@ stage_volume_pairing() {
 		return 0
 	fi
 	assert_pairing_matches_volume "$uuid_file" "$BUILD/system-volume-${arch}.img"
-	# `::/etc` already exists when the bootstrap set was staged; the shipping ISO stages no set.
-	mmd -i "$image" ::/etc 2>/dev/null || true
+	# `::/etc` already exists when the bootstrap set was staged, and when the boot manifest was
+	# written before this - which is every medium, since P02M0143 gave them all one.
+	ensure_dir "$image" ::/etc
 	stamp_epoch "$uuid_file"
 	mcopy -i "$image" "$uuid_file" ::/etc/system-volume.uuid
 }
