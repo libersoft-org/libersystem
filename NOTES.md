@@ -1,8 +1,18 @@
 # Bugs / changes
 
+- lico.lsexe, licoview.lsexe and licoedit.lsexe should be in /bin/lico/, not directly in /bin/
+- audioconv.lsexe, audiorec.exe, beep.lsexe, play.lsexe should be in /bin/audio-tools/
+- imgconv.lsexe, imgview.lsexe should be in /bin/image-tools/
+- httpd.lsexe should be in /bin/web-server/
+- arp.lsexe, ip.lsexe, ping.lsexe, nslookup.lsexe, tcp.lsexe, traceroute.lsexe should be in /bin/net-tools/
+- everything else should be in /bin/base-tools
+- all of these directories should be in PATH, so we can call any of these utilities from anywhere ... also we need an utility for showing and adding / removing from / to this PATH.
+
+- some of the tools miss --json parameter
 - lico, licoedit and licoview look horrible
 - architecture audit (!!!)
-- for testing of one utility, it builds the whole system from scratch (./build.sh --arch x86_64) - we should not build everything from scratch, only parts that are are not built in its current version - this command took a long time: ./build.sh --arch x86_64 >/dev/null 2>&1; ./test.sh --arch x86_64 --tags kernel,memory,component,service --timeout 1500 2>&1 | tail -4
+- in terminal, when I have some text in clipboard, right mouse button click should paste it (if not selected something, in this case right mouse button click copies selected text)
+- split all image and audio codecs into 3 parts - encoder, decoder, common, for example: png-common.lsidl, png-enc.lsidl, png-dec.lsidl (both dec and enc use common), make play, audioconv, audiorec, imgview, imgconv use these newly splitted libraries
 - create SDK not just for WASM, but for Rust and other languages too
 - h.264 codec + mp4 container + make "play" play video too (not just audio)
 - check if we have only our own implementations of image and audio decoders and encoders
