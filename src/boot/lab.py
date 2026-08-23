@@ -2880,7 +2880,14 @@ def cmd_scenario_cold(args):
 		for complaint in stale:
 			print(f'lab: {complaint}', file=sys.stderr)
 		die(f'the {target} scenario fixtures do not match this tree')
-	guest_env = dict(env, DEV_PROFILE='1', COLD='1', SERIAL=f'file:{log}')
+	# A CORE COUNT THE KERNEL TRACKS. `qemu-run.sh`'s x86_64 default is `nproc`, and on a large host
+	# that is more cores than the kernel's shootdown tracking covers: measured on a 100-core host, the
+	# cold guest printed `100 cores are online and this tracks 64` and then a RETIRED-page warning per
+	# page for the whole run, drowning the console a scenario reads its answers out of and taking
+	# frames out of circulation for good. The device-tree targets already cap themselves at 8; this is
+	# the same decision for the one that does not. Four, like the test profile: a driven guest is for
+	# scenarios, and a core count is not what they measure. An explicit SMP still wins.
+	guest_env = dict(env, DEV_PROFILE='1', COLD='1', SERIAL=f'file:{log}', SMP=os.environ.get('SMP', '4'))
 	# UEFI ON THE DEVICE-TREE TARGETS, because a direct boot cannot carry what a driven guest needs.
 	#
 	# `-kernel` on `virt` has no module hand-off: the machine takes one blob, so a direct boot gets

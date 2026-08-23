@@ -146,8 +146,16 @@ verify_boot_artifacts() {
 	# `cargo run -- boot-artifacts` that failed and printed nothing left this loop with no
 	# iterations and `missing=0` - and the function then declared every required artifact present.
 	# That is the authoritative list of what an image must contain, verified by not being read.
+	#
+	# THROUGH THE SCRIPT THAT OWNS THAT TOOL, not through a second `cargo run` of its crate. This
+	# ran `cargo run --quiet` from the crate directory, which builds it AGAIN into the shared target
+	# directory - and `--quiet` means a first run on a fresh machine compiles `serde`, `serde_json`
+	# and `toml` while printing NOTHING AT ALL. Reported as a hang: `./run.sh` on a new VM stopped
+	# dead after `kernel: stripped` and sat there. `tools/system-manifest.sh` is the tree's one way
+	# to reach this tool - it keys the binary against the crate's sources, builds it once under a
+	# lock, and `exec`s it - so this costs nothing after `./build.sh` has run.
 	local rows
-	rows="$(cd "$REPO_ROOT/src/tools/system-manifest" && cargo run --quiet -- boot-artifacts)" ||
+	rows="$("$REPO_ROOT/src/tools/system-manifest.sh" boot-artifacts)" ||
 		die "the system manifest could not be exported, so nothing here knows what this image must contain"
 	[[ -n "$rows" ]] || die "the system manifest exported no boot artifacts, which is not a manifest this builder can act on"
 	# Published for the cache key: the artifact list and its destinations ARE part of what an image
