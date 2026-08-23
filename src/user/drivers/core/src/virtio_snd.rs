@@ -1,4 +1,4 @@
-// driver.virtio-snd - the userspace virtio-sound PCM playback driver.
+// driver.virtio-snd - the userspace virtio-sound PCM playback and capture driver.
 //
 // virtio-sound plays audio by configuring a PCM output stream over the control
 // queue (set-params -> prepare -> start) and then handing the device PCM periods on
@@ -8,6 +8,9 @@
 // single client (AudioService): each message it receives is one PCM period (signed
 // 16-bit, 2 channels, 48 kHz - the fixed format AudioService synthesizes), which it
 // plays on the transmit queue; an empty message ends the stream (stop + release).
+// Capture is the same shape with the direction reversed - the driver hands the
+// device SPACE on the receive queue and waits for it to be filled - and reaches
+// AudioService as the one-byte commands documented beside `CMD_CAPTURE`.
 //
 // Like driver.virtio-input it is interrupt-driven (MSI-X): DeviceManager hands it,
 // after the usual "DEVICE" message, a second "IRQ" message carrying an Interrupt
@@ -38,16 +41,32 @@ const S_OK: u32 = 0x8000;
 
 // PCM stream direction, format, and rate codes (the values AudioService produces).
 const D_OUTPUT: u8 = 0;
+const D_INPUT: u8 = 1;
 const FMT_S16: u8 = 5;
 const RATE_48000: u8 = 7;
 const CHANNELS: u8 = 2;
 
-// The virtqueues: control (0), event (1), and transmit (2). The event queue is set
-// up (the device expects it) but its notifications are ignored; the receive queue
-// (capture) is not used.
+// The virtqueues: control (0), event (1), transmit (2) and receive (3). The event queue is set
+// up (the device expects it) but its notifications are ignored.
 const CONTROLQ: u16 = 0;
 const EVENTQ: u16 = 1;
 const TXQ: u16 = 2;
+const RXQ: u16 = 3;
+
+// THE SERVICE PROTOCOL, IN FULL, because it is three message shapes on one channel and a reader
+// should not have to infer the third from the code:
+//
+//   - a message of PERIOD_BYTES is one PCM period to PLAY, received straight into the transmit DMA
+//     page. The reply is "OK";
+//   - an EMPTY message ends the playback stream (stop + release). The reply is "OK";
+//   - a ONE-BYTE message is a command. `CMD_CAPTURE` asks for one captured period and is answered
+//     with the period itself; `CMD_CAPTURE_STOP` ends the capture stream and is answered with "OK".
+//
+// One byte is unambiguous because AudioService pads every playback period to exactly PERIOD_BYTES -
+// the driver's own SET_PARAMS negotiated that size, so a period of any other length was never a
+// shape this protocol had.
+const CMD_CAPTURE: u8 = 1;
+const CMD_CAPTURE_STOP: u8 = 2;
 
 // One PCM period: 512 stereo signed-16-bit frames = 2048 bytes (~10.6 ms at 48 kHz).
 // AudioService always sends exactly this many bytes per period (padding the last
@@ -91,12 +110,17 @@ impl Ctl {
 		}
 	}
 
-	// PCM_INFO over `count` streams starting at 0: return the id of the first output
-	// stream, or 0 if the query fails (stream 0 is the output stream on QEMU).
-	unsafe fn find_output_stream(&self, count: u32) -> u32 {
+	// PCM_INFO over `count` streams starting at 0: return the id of the first stream in
+	// `direction`, or None when the query fails or the device has none.
+	//
+	// CAPTURE IS NOT ASSUMED TO EXIST. A device with no input stream is a machine with no
+	// microphone, which is an ordinary machine - the caller reports "not found" rather than the
+	// driver refusing to start. Playback keeps its historical fallback of stream 0 at the call site,
+	// because that is the one QEMU has always had and changing it is not this item.
+	unsafe fn find_stream(&self, count: u32, direction: u8) -> Option<u32> {
 		unsafe {
 			if count == 0 || count > 32 {
-				return 0;
+				return None;
 			}
 			// request: virtio_snd_query_info { code, start_id, count, size(=32) }.
 			core::ptr::write_bytes(self.cmd_virt as *mut u8, 0, 16);
@@ -107,15 +131,15 @@ impl Ctl {
 			// response: status(4) + count * virtio_snd_pcm_info(32); direction @ +24 of each.
 			let resp_len = 4 + count * 32;
 			if self.submit(16, resp_len) != Some(S_OK) {
-				return 0;
+				return None;
 			}
 			for i in 0..count {
 				let info = self.resp_virt + 4 + i as u64 * 32;
-				if ((info + 24) as *const u8).read_volatile() == D_OUTPUT {
-					return i;
+				if ((info + 24) as *const u8).read_volatile() == direction {
+					return Some(i);
 				}
 			}
-			0
+			None
 		}
 	}
 
@@ -176,6 +200,36 @@ impl Tx {
 	}
 }
 
+// The receive queue and its own DMA page, laid out exactly like the transmit one.
+//
+// THE DIRECTION IS THE WHOLE DIFFERENCE. Playback hands the device a period it may READ and waits
+// for it to be consumed; capture hands it SPACE it may WRITE and waits for it to be filled. The
+// descriptor chain says which: the PCM segment is device-writable here and device-readable there,
+// and the xfer header stays device-readable in both because it is the driver naming the stream.
+struct Rx {
+	q: Queue,
+	xfer_phys: u64,
+	period_virt: u64,
+	period_phys: u64,
+	status_phys: u64,
+}
+
+impl Rx {
+	// Capture one period into `period_virt`: submit [xfer][space][status], block on the device's
+	// MSI-X interrupt until it has filled the chain, reap the completion and re-arm.
+	unsafe fn capture(&mut self, irq: u64) -> bool {
+		unsafe {
+			if !self.q.submit_async(&[(self.xfer_phys, 4, false), (self.period_phys, PERIOD_BYTES, true), (self.status_phys, 8, true)]) {
+				return false;
+			}
+			wait(irq, 0);
+			self.q.take_used();
+			interrupt_ack(irq);
+			true
+		}
+	}
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
@@ -201,7 +255,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(q) => q,
 			None => exit(),
 		};
+		// The receive queue is set up whether or not this device has an input stream: the queue
+		// exists in the transport either way, and a device with no capture stream simply never has
+		// a chain submitted to it.
+		let rxq: Queue = match device.setup_queue(RXQ) {
+			Some(q) => q,
+			None => exit(),
+		};
 		txq.enable_interrupts();
+		rxq.enable_interrupts();
 		device.driver_ok();
 
 		// 4. allocate the control command/response buffers and the transmit DMA page.
@@ -212,13 +274,22 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let (_tx_h, tx_virt, tx_phys) = dma_buffer_for(device.capability, PAGE).unwrap_or_else(|| exit());
 		wr32(tx_virt, 0); // xfer header = stream id (filled below once known)
 		let mut tx = Tx { q: txq, xfer_phys: tx_phys, period_virt: tx_virt + 64, period_phys: tx_phys + 64, status_phys: tx_phys + 8 };
+		// The capture page is its own, not a second use of the transmit one: a captured period is
+		// device-written while a played one is device-read, and one page serving both would be a
+		// buffer the device may write while the driver is filling it for playback.
+		let (_rx_h, rx_virt, rx_phys) = dma_buffer_for(device.capability, PAGE).unwrap_or_else(|| exit());
+		let mut rx = Rx { q: rxq, xfer_phys: rx_phys, period_virt: rx_virt + 64, period_phys: rx_phys + 64, status_phys: rx_phys + 8 };
 
 		// 5. read the PCM stream count from the device config (virtio_snd_config: jacks
 		//    @0, streams @4, chmaps @8), find the output stream, and write its id into the
 		//    xfer header.
 		let streams: u32 = config_u32(&device, 4);
-		let stream: u32 = ctl.find_output_stream(streams);
+		let stream: u32 = ctl.find_stream(streams, D_OUTPUT).unwrap_or(0);
 		wr32(tx_virt, stream);
+		// The capture stream, when the device has one. `NO_STREAM` is the answer to "record" on a
+		// machine with no input stream, and AudioService turns it into a not-found for its client.
+		let capture: Option<u32> = ctl.find_stream(streams, D_INPUT);
+		wr32(rx_virt, capture.unwrap_or(0));
 
 		// 6. report in, transferring the client end of our service channel up the chain
 		//    (DeviceManager -> ServiceManager -> AudioService), then serve it. We stand on
@@ -226,7 +297,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    after boot does not tear us down.
 		let (service, far): (u64, u64) = channel().unwrap_or_else(|| exit());
 		send_blocking(bootstrap, b"driver.virtio-snd: online", far);
-		serve(&ctl, &mut tx, irq, stream, service)
+		serve(&ctl, &mut tx, &mut rx, irq, stream, capture, service)
 	}
 }
 
@@ -248,13 +319,14 @@ unsafe fn config_u32(device: &Virtio, offset: u64) -> u32 {
 	unsafe { device.config_read(offset) as u32 | (device.config_read(offset + 1) as u32) << 8 | (device.config_read(offset + 2) as u32) << 16 | (device.config_read(offset + 3) as u32) << 24 }
 }
 
-// Serve AudioService: each non-empty message is one PCM period (received straight
-// into the transmit DMA page) to play; the first period of a session lazily
-// configures and starts the stream; an empty message ends the session (stop +
-// release). Exits when the client closes.
-unsafe fn serve(ctl: &Ctl, tx: &mut Tx, irq: u64, stream: u32, service: u64) -> ! {
+// Serve AudioService. The protocol is the three shapes documented beside `CMD_CAPTURE`: a period
+// to play, an empty message that ends playback, or a one-byte command. A playback period is
+// received straight into the transmit DMA page; the first period of a session lazily configures and
+// starts the output stream. Exits when the client closes.
+unsafe fn serve(ctl: &Ctl, tx: &mut Tx, rx: &mut Rx, irq: u64, stream: u32, capture: Option<u32>, service: u64) -> ! {
 	unsafe {
 		let mut started: bool = false;
+		let mut capturing: bool = false;
 		loop {
 			// receive straight into the period region of the transmit DMA page.
 			let period: &mut [u8] = core::slice::from_raw_parts_mut(tx.period_virt as *mut u8, PERIOD_BYTES as usize);
@@ -268,6 +340,11 @@ unsafe fn serve(ctl: &Ctl, tx: &mut Tx, irq: u64, stream: u32, service: u64) -> 
 							started = false;
 						}
 						send_blocking(service, b"OK", 0);
+						continue;
+					}
+					if len == 1 {
+						let command: u8 = period[0];
+						serve_command(ctl, rx, irq, capture, service, command, &mut capturing);
 						continue;
 					}
 					// first period of a session: configure and start the stream.
@@ -284,8 +361,56 @@ unsafe fn serve(ctl: &Ctl, tx: &mut Tx, irq: u64, stream: u32, service: u64) -> 
 						ctl.stream_cmd(R_PCM_STOP, stream);
 						ctl.stream_cmd(R_PCM_RELEASE, stream);
 					}
+					if capturing {
+						ctl.stream_cmd(R_PCM_STOP, capture.unwrap_or(0));
+						ctl.stream_cmd(R_PCM_RELEASE, capture.unwrap_or(0));
+					}
 					exit();
 				}
+			}
+		}
+	}
+}
+
+// The one-byte commands. Split out because the capture side has its own lifecycle - prepare and
+// start on the first period, stop and release on request - and threading it through the playback
+// match arm would put two stream state machines in one block.
+//
+// A REFUSAL IS AN EMPTY REPLY, and an empty reply is never a period: a period is PERIOD_BYTES. That
+// is how "this machine has no input stream" and "the device would not start one" reach AudioService
+// without a second message shape for errors.
+unsafe fn serve_command(ctl: &Ctl, rx: &mut Rx, irq: u64, capture: Option<u32>, service: u64, command: u8, capturing: &mut bool) {
+	unsafe {
+		let Some(stream) = capture else {
+			// No input stream on this device. Answer every capture command the same way, including
+			// the stop, so a client that gives up does not block on a reply that never comes.
+			send_blocking(service, &[], 0);
+			return;
+		};
+		match command {
+			CMD_CAPTURE => {
+				if !*capturing {
+					*capturing = ctl.set_params(stream) && ctl.stream_cmd(R_PCM_PREPARE, stream) && ctl.stream_cmd(R_PCM_START, stream);
+				}
+				if !*capturing || !rx.capture(irq) {
+					send_blocking(service, &[], 0);
+					return;
+				}
+				let filled: &[u8] = core::slice::from_raw_parts(rx.period_virt as *const u8, PERIOD_BYTES as usize);
+				send_blocking(service, filled, 0);
+			}
+			CMD_CAPTURE_STOP => {
+				if *capturing {
+					ctl.stream_cmd(R_PCM_STOP, stream);
+					ctl.stream_cmd(R_PCM_RELEASE, stream);
+					*capturing = false;
+				}
+				send_blocking(service, b"OK", 0);
+			}
+			// A command this driver does not know. Answered rather than ignored, because the client
+			// is blocked on the reply either way.
+			_ => {
+				send_blocking(service, &[], 0);
 			}
 		}
 	}

@@ -227,17 +227,19 @@ impl Parser {
 	fn item(&mut self) -> Result<Item, Error> {
 		let doc = self.doc_comments();
 		let anns = self.annotations()?;
-		reject_anns_except(&anns, &["since", "deprecated"])?;
 		let evolution = parse_evolution(&anns)?;
 		let span = self.span();
 		let (kw, _) = self.ident()?;
+		// AFTER THE KEYWORD, because `@kernel` belongs to a resource and nowhere else. Checking
+		// before it would either forbid the annotation everywhere or allow it everywhere.
+		reject_anns_except(&anns, if kw == "resource" { &["kernel", "since", "deprecated"] } else { &["since", "deprecated"] })?;
 		match kw.as_str() {
 			"type" => Ok(Item::Alias(self.alias(doc, evolution)?)),
 			"record" => Ok(Item::Record(self.record(doc, evolution)?)),
 			"enum" => Ok(Item::Enum(self.enum_decl(doc, evolution)?)),
 			"variant" => Ok(Item::Variant(self.variant(doc, evolution)?)),
 			"flags" => Ok(Item::Flags(self.flags(doc, evolution)?)),
-			"resource" => Ok(Item::Resource(self.resource(doc, evolution)?)),
+			"resource" => Ok(Item::Resource(self.resource(doc, evolution, &anns)?)),
 			"interface" => Ok(Item::Interface(self.interface(doc, evolution)?)),
 			other => Err(Error::new(span, format!("expected a type or interface declaration, found `{other}`"))),
 		}
@@ -359,10 +361,21 @@ impl Parser {
 		Ok(Flags { name, flags, doc, evolution, span })
 	}
 
-	fn resource(&mut self, doc: Vec<Doc>, evolution: Evolution) -> Result<Resource, Error> {
+	fn resource(&mut self, doc: Vec<Doc>, evolution: Evolution, anns: &[Ann]) -> Result<Resource, Error> {
 		let (name, span) = self.ident()?;
 		self.eat(&Tok::Semi)?;
-		Ok(Resource { name, doc, evolution, span })
+		// `@kernel(process)` names the kernel object a handle of this resource must be. One word,
+		// and it has to be one the ABI has a type code for - a name nobody can resolve would be a
+		// declaration that reads as a check and is not one.
+		let kernel = match anns.iter().find(|a| a.name == "kernel") {
+			Some(a) => match a.args.as_slice() {
+				[Arg::Name(word)] if kernel_object_code(word).is_some() => Some(word.clone()),
+				[Arg::Name(word)] => return Err(Error::new(a.span, format!("@kernel names '{word}', which is not a kernel object type"))),
+				_ => return Err(Error::new(a.span, String::from("@kernel takes exactly one kernel object type"))),
+			},
+			None => None,
+		};
+		Ok(Resource { name, kernel, doc, evolution, span })
 	}
 
 	fn interface(&mut self, doc: Vec<Doc>, evolution: Evolution) -> Result<Interface, Error> {
@@ -573,4 +586,28 @@ fn collect_rights(anns: &[Ann]) -> Vec<String> {
 		}
 	}
 	rights
+}
+
+// The ABI object-type code a `@kernel(...)` word names, or None for a word the ABI has no code for.
+//
+// Written out here rather than imported: `lsidl-gen` is a host tool and `abi` is a no_std crate the
+// guest links, and a table of eleven numbers is a smaller thing to keep in step than a dependency
+// between the two halves of the build. A name that is not here is a parse error, so the two lists
+// disagreeing is a build failure rather than a check that silently does nothing.
+pub(crate) fn kernel_object_code(word: &str) -> Option<u64> {
+	Some(match word {
+		"domain" => 0,
+		"process" => 1,
+		"thread" => 2,
+		"address-space" => 3,
+		"memory-object" => 4,
+		"channel" => 5,
+		"event" => 6,
+		"timer" => 7,
+		"interrupt" => 8,
+		"device-memory" => 9,
+		"dma-buffer" => 10,
+		"process-group" => 11,
+		_ => return None,
+	})
 }

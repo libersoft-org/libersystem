@@ -113,7 +113,7 @@ for tool in echo uname uptime dmesg free lscpu lsmem lsirq lspci ptyecho readln 
 for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do TOOL_WAVES[$tool]=2; done
 for tool in date log config set lsdev lsusb lssvc usage ps run perm start stop beep; do TOOL_WAVES[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss traceroute; do TOOL_WAVES[$tool]=4; done
-for tool in imgview imgconv audioconv play graphics_probe lico licoedit licoview; do TOOL_WAVES[$tool]=5; done
+for tool in imgview imgconv audioconv audiorec play graphics_probe lico licoedit licoview; do TOOL_WAVES[$tool]=5; done
 # Wave 6: the P02M0101 command family. They are their own wave because they share a shape - the
 # bounded window read, the shared parsers, the volume bundle - so a regression in that shape shows
 # as a wave rather than as one tool, and because measuring them beside the image and audio tools

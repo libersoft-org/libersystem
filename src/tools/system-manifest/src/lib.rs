@@ -6,7 +6,22 @@ use std::path::{Component, Path, PathBuf};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const MAX_PROVIDER_DEPTH: usize = 16;
+
+// How many modules ONE PROGRAM may pull in. This is a real limit and not a sanity bound: the kernel
+// gives a dynamic process sixty-four 16 MiB module slots from `DYNAMIC_MODULE_BASE`, so a closure
+// larger than this is a program that cannot be loaded. Kept in step with
+// `bootproto::elf::MAX_DYNAMIC_MODULES` by name rather than by dependency - this is a host tool and
+// that is a bare-metal crate.
 pub const MAX_PROVIDER_MODULES: usize = 64;
+
+// How many shared libraries the SYSTEM may have, which is a different question and was answered
+// with the same number for as long as the two happened to agree.
+//
+// Nothing loads every library at once - that is what the per-program bound above is for - so this
+// is a bound on the manifest rather than on any process: a graph that grows past it is one nobody
+// decided to grow, and the check is here to make that a decision. Adding the sixty-fifth library
+// was a legitimate change that the shared constant reported as a program that could not be loaded.
+pub const MAX_LIBRARIES: usize = 256;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -182,6 +197,8 @@ struct RawRole {
 	source: String,
 	#[serde(default)]
 	exclusive: bool,
+	#[serde(default)]
+	handed_on: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -505,6 +522,20 @@ pub struct Role {
 	/// the shell exits and the console waits forever for a peer that is still open in the
 	/// supervisor's handle table.
 	pub exclusive: bool,
+	/// WHETHER THE HOLDER PASSES THIS CHANNEL ON, and therefore whether it may duplicate it.
+	///
+	/// A client role arrives narrowed to send, receive, wait and transfer - the ceiling a receiver
+	/// can check against, and enough for a service that talks to another service. It is NOT enough
+	/// for a holder whose job is to hand the same channel to somebody else, because that needs
+	/// `duplicate`, and `duplicate` needs the right by that name.
+	///
+	/// The shell's console is why this exists. A shell hands its terminal to the foreground job it
+	/// starts - that is what a foreground job IS - and with the ceiling alone every interactive
+	/// tool failed to launch: `duplicate` was refused, `run_tool_interactive` returned false, and
+	/// the shell printed nothing because a launch that never happened has nothing to report. Said
+	/// at the role, so the widening is a decision somebody made about one channel rather than a
+	/// right handed to every client in the system.
+	pub handed_on: bool,
 }
 
 /// How a role is delivered - which is also what decides whether it can be delivered AGAIN, and
@@ -831,10 +862,16 @@ impl Manifest {
 				// is what happens. A serve root is made for this service alone, a factory mints a
 				// fresh connection per caller, and the rest carry no client end to hand over -
 				// marking any of them exclusive would be a word with nothing behind it.
+				// `handed_on` widens the CLIENT delivery, which is the one that is a narrowed
+				// duplicate. A serve root is a fresh endpoint and a factory connection is minted
+				// per launch, so neither is narrowed this way and neither can be widened this way.
+				if raw_role.handed_on && raw_role.kind != RoleKind::Client {
+					push_error(&mut errors, format!("{where_role}.handed_on"), "only a role delivered as a duplicate can be given the right to duplicate");
+				}
 				if raw_role.exclusive && raw_role.kind != RoleKind::Client {
 					push_error(&mut errors, format!("{where_role}.exclusive"), "only a client role is delivered as a duplicate, so only a client role can be handed over instead");
 				}
-				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface, source, exclusive: raw_role.exclusive });
+				roles.push(Role { tag, kind: raw_role.kind, provider, presence: raw_role.presence, interface: raw_role.interface, source, exclusive: raw_role.exclusive, handed_on: raw_role.handed_on });
 			}
 			// A CLASS AND A PLACE MUST AGREE. Durable means written down, so it has to say where;
 			// anything else means not written down, so a path would be a claim about a file that
@@ -964,7 +1001,7 @@ impl Manifest {
 			}
 		}
 		validate_references(&libraries, &programs, &services, &mut errors);
-		validate_graph("libraries", &libraries, |library| &library.providers, MAX_PROVIDER_DEPTH, MAX_PROVIDER_MODULES, &mut errors);
+		validate_graph("libraries", &libraries, |library| &library.providers, MAX_PROVIDER_DEPTH, MAX_LIBRARIES, &mut errors);
 		validate_graph("services", &services, |service| &service.dependencies, usize::MAX, usize::MAX, &mut errors);
 		validate_program_closures(&programs, &libraries, &mut errors);
 		validate_user_source_coverage(workspace_root, &sources, &mut errors);

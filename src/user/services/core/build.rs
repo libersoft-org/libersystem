@@ -140,7 +140,7 @@ fn generate_services(manifest: &Manifest) {
 					RoleKind::Payload => "RoleKind::Payload",
 				};
 				let required = role.presence == Presence::Required;
-				format!("Role {{ tag: b\"{}\", kind: {kind}, provider: b\"{}\", source: b\"{}\", required: {required}, exclusive: {} }}", role.tag, role.provider, role.source, role.exclusive)
+				format!("Role {{ tag: b\"{}\", kind: {kind}, provider: b\"{}\", source: b\"{}\", required: {required}, exclusive: {}, handed_on: {} }}", role.tag, role.provider, role.source, role.exclusive, role.handed_on)
 			})
 			.collect::<Vec<_>>()
 			.join(", ");

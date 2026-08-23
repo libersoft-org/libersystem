@@ -74,6 +74,27 @@ pub struct BlkDevice {
 	req: u64, // header@+0 (16), data@+512 (512), status@+1024 (1)
 	avail_idx: u16,
 	used_seen: u16,
+	// Where the device sits, so it can be stopped again. This driver runs in the kernel, which
+	// makes it the one bus master that has no `DeviceMemory` handle to die with - so it turns the
+	// bit on for itself and its `Drop` is what turns it off.
+	cfg_base: u64,
+	bus: u8,
+	dev: u8,
+	func: u8,
+}
+
+impl Drop for BlkDevice {
+	// GIVE THE DEVICE BACK. Bus mastering follows ownership, and this borrow ends when the boot
+	// probe is done - long before userspace's virtio-blk driver acquires the same device. Leaving
+	// the bit set would mean a device with no driver, an enabled queue and permission to write to
+	// any physical address, for the rest of the machine's life.
+	//
+	// The status register goes to zero first: that is the device's own "stop", and it is what makes
+	// the queue frames below safe to leave behind.
+	fn drop(&mut self) {
+		unsafe { w8(self.cfg_base + CFG_DEVICE_STATUS, 0) };
+		crate::arch::pci::set_bus_master(self.bus, self.dev, self.func, false);
+	}
 }
 
 impl BlkDevice {
@@ -81,6 +102,10 @@ impl BlkDevice {
 	// failure or if memory is exhausted.
 	pub fn init(dev: &VirtioDevice) -> Option<BlkDevice> {
 		let cfg = phys_to_virt(dev.bar_phys + dev.common.offset as u64);
+		// TAKE THE DEVICE FIRST. Enumeration leaves every function unable to write to memory, so the
+		// queue rings below would be addresses the device is not allowed to touch: the ring would be
+		// programmed, the notify written, and nothing would ever complete.
+		crate::arch::pci::set_bus_master(dev.pci.bus, dev.pci.dev, dev.pci.func, true);
 		unsafe {
 			// Reset, acknowledge, claim.
 			w8(cfg + CFG_DEVICE_STATUS, 0);
@@ -123,7 +148,7 @@ impl BlkDevice {
 			w8(cfg + CFG_DEVICE_STATUS, S_ACK | S_DRIVER | S_FEATURES_OK | S_DRIVER_OK);
 
 			let notify = phys_to_virt(dev.bar_phys + dev.notify.offset as u64 + notify_off as u64 * dev.notify.notify_multiplier as u64);
-			Some(BlkDevice { notify, desc, avail, used, qsz, req, avail_idx: 0, used_seen: 0 })
+			Some(BlkDevice { notify, desc, avail, used, qsz, req, avail_idx: 0, used_seen: 0, cfg_base: cfg, bus: dev.pci.bus, dev: dev.pci.dev, func: dev.pci.func })
 		}
 	}
 

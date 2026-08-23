@@ -537,6 +537,20 @@ qemu_build_esp() {
 		mcopy -i "$ESP" "$bootstrap/etc/bootstrap.list" ::/etc/bootstrap.list
 		mcopy -i "$ESP" "$bootstrap"/libexec/* ::/libexec/
 	fi
+	# AND THE MANIFEST FOR THIS MEDIUM. The loader checks what it reads against the manifest of the
+	# source it read it from, so a medium with files and no manifest is one it refuses. The kernel
+	# row is computed over the STRIPPED copy staged above - a different sequence of bytes from the
+	# volume's kernel, so the volume's digest for it would be wrong here.
+	local manifest="$QEMU_BUILD_DIR/boot.manifest.$$"
+	if [[ -d "$bootstrap" ]]; then
+		cp "$bootstrap/etc/boot.manifest" "$manifest"
+	else
+		mmd -i "$ESP" ::/etc 2>/dev/null || true
+		printf 'liberboot-manifest 1\n' >"$manifest"
+	fi
+	printf '%s  kernel\n' "$(sha256sum "$STAGED_KERNEL" | cut -d" " -f1)" >>"$manifest"
+	mcopy -i "$ESP" "$manifest" ::/etc/boot.manifest
+	rm -f "$manifest"
 	# The factory archive still travels for the tests that read it as a fixture.
 	local volume_pkg="$QEMU_BUILD_DIR/volume-${arch}.pkg"
 	[[ -f "$volume_pkg" ]] && mcopy -i "$ESP" "$volume_pkg" ::/volume.pkg
@@ -878,6 +892,17 @@ qemu_run_x86_64() {
 			-device "pcie-pci-bridge,id=liberbr,bus=pcie.0,addr=0x1c"
 			-device "pci-testdev,bus=liberbr,addr=0x1"
 		)
+		# A SOUND DEVICE THE SUITE CAN RECORD FROM. The audio path used to be tested against no
+		# device at all - AudioService reporting not-found is a real case and it is the only one that
+		# ran - so playback was exercised nowhere and capture could not be exercised at all.
+		#
+		# The `none` audio backend is a SYNTHETIC SOURCE, not a disabled one: it fills a capture
+		# period with silence on the device's own clock, so the receive queue, the stream set-up and
+		# the whole inverted used-ring path run exactly as they would with a microphone. What it
+		# cannot prove is the sample values, which is why the recording test asserts that what it got
+		# IS silence - a path returning stale playback data or uninitialised memory fails that.
+		qemu_append_audio qemu_args
+		qemu_args+=(-device "virtio-sound-pci,audiodev=snd0")
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start
 		set +e
@@ -1005,6 +1030,13 @@ qemu_run_aarch64() {
 		# the same discoverable GPU path without enabling the interactive peripherals.
 		qemu_args+=(-device virtio-gpu-pci,disable-legacy=on)
 		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-aarch64-test.sock" "disable-legacy=on"
+		# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
+		# SOURCE rather than a disabled one: it fills a capture period with silence on the device's
+		# own clock, so the receive queue, the input-stream search and the whole inverted used-ring
+		# path run exactly as they would with a microphone. See the same block in the x86_64 test
+		# arm for what the recording test can and cannot prove with it.
+		qemu_append_audio qemu_args
+		qemu_args+=(-device "virtio-sound-pci,audiodev=snd0,disable-legacy=on")
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -aarch64 "disable-legacy=on"
@@ -1189,6 +1221,13 @@ qemu_run_riscv64() {
 		# requires DisplayService and its Console/Shell dependents.
 		qemu_args+=(-device virtio-gpu-pci)
 		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-riscv64-test.sock" ""
+		# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
+		# SOURCE rather than a disabled one: it fills a capture period with silence on the device's
+		# own clock, so the receive queue, the input-stream search and the whole inverted used-ring
+		# path run exactly as they would with a microphone. See the same block in the x86_64 test
+		# arm for what the recording test can and cannot prove with it.
+		qemu_append_audio qemu_args
+		qemu_args+=(-device "virtio-sound-pci,audiodev=snd0")
 	else
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -riscv64 ""

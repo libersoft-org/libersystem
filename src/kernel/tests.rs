@@ -2070,7 +2070,7 @@ extern "C" fn user_exception_thread_body(arg: u64) {
 // syscalls from kernel threads and there is no ring-0 exemption - a gate every test walks around is
 // a gate nobody has walked through - so a test that means to acquire a device holds the authority
 // like the one program that legitimately does.
-fn device_privilege() -> u64 {
+pub(crate) fn device_privilege() -> u64 {
 	use object::privilege::{Privilege, PrivilegeKind};
 	let thread = sched::current_thread().expect("a current thread");
 	let privilege = Privilege::create(PrivilegeKind::DeviceManager).expect("a test privilege");

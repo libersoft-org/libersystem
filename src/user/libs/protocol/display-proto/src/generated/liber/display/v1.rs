@@ -848,7 +848,7 @@ pub mod display_admin {
 				};
 				r.finish()?;
 				request_handles.clear();
-				let authorized = crate::codec::handle_carries(task, 1024, crate::codec::NO_REQUIRED_TYPE);
+				let authorized = crate::codec::handle_carries(task, 1024, 1);
 				let result = if authorized { service.bind(task) } else { Err(Error::Denied) };
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;

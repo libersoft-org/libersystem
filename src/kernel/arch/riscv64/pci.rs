@@ -128,12 +128,23 @@ pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 
 // The device's PCI Interrupt Pin (config byte 0x3D): 0 = none, 1..4 = INTA..INTD.
 
+// Turn bus mastering on or off for one function. The only caller is `device`, which knows whether a
+// driver owns the device - see `arch::common::pci::set_bus_master`.
+pub fn set_bus_master(bus: u8, dev: u8, func: u8, on: bool) {
+	common::set_bus_master::<Access>(bus, dev, func, on);
+}
+
+// One function's COMMAND register, read back - test-only, see `arch::common::pci::command`.
+#[cfg(test)]
+pub fn command(bus: u8, dev: u8, func: u8) -> u16 {
+	common::command::<Access>(bus, dev, func)
+}
+
 // With QEMU's `virt,aia=aplic-imsic` the PCIe host bridge delivers MSI-X to the AIA
 // IMSIC, so - like x86 and aarch64 - each device gets its own edge-triggered vector
-// (its IMSIC EID) with no INTx line sharing. Ensure memory decode + bus mastering (the
-// MSI-X DMA write to the IMSIC and virtio DMA both need them), then set the device's
-// MSI-X enable bit + clear its function mask.
+// (its IMSIC EID) with no INTx line sharing. Ensure memory decode, then set the device's
+// MSI-X enable bit + clear its function mask. Bus mastering follows ownership and is not set here.
 pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
-	common::enable_mem_and_master::<Access>(bus, dev, func);
+	common::enable_memory_space::<Access>(bus, dev, func);
 	common::msix_enable::<Access>(bus, dev, func, cap);
 }

@@ -90,6 +90,11 @@ pub struct ResolvedSymbol {
 	// about an IMPORTED enum too, and only the resolver has looked at that package.
 	pub contains_denied: bool,
 	pub wire_type: Option<Type>,
+	// The ABI object-type code an imported resource declares with `@kernel(...)`. Carried for the
+	// same reason as `contains_denied`: the emitter needs it about a resource declared in ANOTHER
+	// package - `handle<task>` in `display` is `liber:process@1`'s `task` - and only the resolver
+	// has read that package.
+	pub kernel_type: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -112,6 +117,7 @@ struct Export {
 	contains_again: bool,
 	contains_denied: bool,
 	wire_type: Option<Type>,
+	kernel_type: Option<u64>,
 }
 
 pub fn resolve(files: &[File]) -> Result<Vec<ResolvedPackage>, Vec<ResolveError>> {
@@ -167,7 +173,7 @@ pub fn resolve(files: &[File]) -> Result<Vec<ResolvedPackage>, Vec<ResolveError>
 					errors.push(ResolveError { file: index, error: Error::new(name.alias_span.unwrap_or(name.span), format!("imported name `{local}` is already defined")) });
 					continue;
 				}
-				imports.insert(local, ResolvedSymbol { package: ids[target].clone(), source_name: name.name.clone(), kind: export.kind, cardinality: export.cardinality, contains_again: export.contains_again, contains_denied: export.contains_denied, wire_type: export.wire_type.clone() });
+				imports.insert(local, ResolvedSymbol { package: ids[target].clone(), source_name: name.name.clone(), kind: export.kind, cardinality: export.cardinality, contains_again: export.contains_again, contains_denied: export.contains_denied, wire_type: export.wire_type.clone(), kernel_type: export.kernel_type });
 			}
 		}
 		if errors.is_empty() {
@@ -201,16 +207,16 @@ fn edit_distance(left: &str, right: &str) -> usize {
 fn base_exports(file: &File) -> HashMap<String, Export> {
 	let mut out = HashMap::new();
 	for item in &file.items {
-		let (name, kind, again, denied, wire_type) = match item {
-			Item::Alias(item) => (&item.name, SymbolKind::Value, false, false, Some(item.ty.clone())),
-			Item::Record(item) => (&item.name, SymbolKind::Value, false, false, None),
-			Item::Enum(item) => (&item.name, SymbolKind::Value, item.cases.iter().any(|case| case.name == "again"), item.cases.iter().any(|case| case.name == "denied"), None),
-			Item::Variant(item) => (&item.name, SymbolKind::Value, false, false, None),
-			Item::Flags(item) => (&item.name, SymbolKind::Value, false, false, None),
-			Item::Resource(item) => (&item.name, SymbolKind::Resource, false, false, None),
-			Item::Interface(item) => (&item.name, SymbolKind::Interface, false, false, None),
+		let (name, kind, again, denied, wire_type, kernel_type) = match item {
+			Item::Alias(item) => (&item.name, SymbolKind::Value, false, false, Some(item.ty.clone()), None),
+			Item::Record(item) => (&item.name, SymbolKind::Value, false, false, None, None),
+			Item::Enum(item) => (&item.name, SymbolKind::Value, item.cases.iter().any(|case| case.name == "again"), item.cases.iter().any(|case| case.name == "denied"), None, None),
+			Item::Variant(item) => (&item.name, SymbolKind::Value, false, false, None, None),
+			Item::Flags(item) => (&item.name, SymbolKind::Value, false, false, None, None),
+			Item::Resource(item) => (&item.name, SymbolKind::Resource, false, false, None, item.kernel.as_deref().and_then(crate::parser::kernel_object_code)),
+			Item::Interface(item) => (&item.name, SymbolKind::Interface, false, false, None, None),
 		};
-		out.entry(name.clone()).or_insert(Export { kind, cardinality: HandleCardinality::ZERO, contains_again: again, contains_denied: denied, wire_type });
+		out.entry(name.clone()).or_insert(Export { kind, cardinality: HandleCardinality::ZERO, contains_again: again, contains_denied: denied, wire_type, kernel_type });
 	}
 	out
 }

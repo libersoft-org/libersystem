@@ -500,8 +500,14 @@ pub fn assign_bars_ecam<A: ConfigAccess>(d: &PciDevice) {
 		crate::serial_println!("pci: {:02x}:{:02x}.{} left disabled - a BAR could not be placed", d.bus, d.dev, d.func);
 		return;
 	}
-	// Enable memory space (bit 1) + bus master (bit 2) for the device to respond + DMA.
-	A::update32(d.bus, d.dev, d.func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
+	// Memory space on, BUS MASTERING OFF - and off explicitly, whatever the firmware left set.
+	//
+	// A device may write to memory exactly while a driver owns it. Enumeration is not ownership: it
+	// is the kernel looking at the bus, and a device left mastering from here would be able to DMA
+	// into any physical address from boot until the machine stopped, on a machine with no IOMMU,
+	// with nobody driving it. `device::acquire_bus_master` turns it on when a driver takes the
+	// device and `device::release_bus_master` turns it off when the last one lets go.
+	A::update32(d.bus, d.dev, d.func, 0x04, |dword| (((dword as u16) | CMD_MEMORY_SPACE) & !CMD_BUS_MASTER) as u32);
 }
 
 // Walk a device's PCI capability list and resolve its MSI-X capability: the
@@ -675,13 +681,17 @@ pub fn set_intx_disabled<A: ConfigAccess>(bus: u8, dev: u8, func: u8, disabled: 
 	});
 }
 
-// Enable MSI-X on a device (set the MSI-X Enable bit, clear the Function Mask) and
-// make sure its memory space is decoded and it is a bus master, so the MSI-X table
-// BAR responds and the device may issue the DMA memory write MSI delivery is. Called
-// once the kernel has programmed the device's table entry. `cap` is the MSI-X
-// capability's config-space offset (from VirtioDevice::msix_cap).
+// Enable MSI-X on a device (set the MSI-X Enable bit, clear the Function Mask) and make sure its
+// memory space is decoded, so the MSI-X table BAR responds. Called once the kernel has programmed
+// the device's table entry. `cap` is the MSI-X capability's config-space offset.
+//
+// IT DOES NOT TOUCH BUS MASTERING ANY MORE. It used to set the bit as a side effect, with the
+// reasoning that MSI delivery is itself a DMA write - true, and still not this function's to decide:
+// the message is only sent when a driver has the device running, and a driver has the device only
+// after `sys_device_acquire`, which is where the bit is turned on now. Two places setting one bit is
+// how it came to be set for devices nobody owned.
 pub fn msix_enable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
-	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
+	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE) as u32);
 	// Message Control is the upper 16 bits of the dword at `cap` (cap_id/next are the
 	// low 16): enable MSI-X, clear the function mask.
 	A::update32(bus, dev, func, cap, |dword| {
@@ -690,15 +700,39 @@ pub fn msix_enable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
 	});
 }
 
-// Ensure a function decodes memory space and masters the bus without touching its
-// interrupt-delivery mode. The riscv INTx-over-PLIC path needs both (its driver reads
-// the device BARs and the device DMAs its virtqueues) but must NOT enable MSI-X: on
-// QEMU virt the PLIC receives only wired INTx, so a device switched to MSI-X would send
-// a message nothing receives. This keeps the device on its INTx pin.
-// only the riscv INTx-over-PLIC backend keeps devices off MSI-X
+// Ensure a function decodes memory space without touching its interrupt-delivery mode. The riscv
+// INTx-over-PLIC path needs the BARs to respond but must NOT enable MSI-X: on QEMU virt the PLIC
+// receives only wired INTx, so a device switched to MSI-X would send a message nothing receives.
+// This keeps the device on its INTx pin.
+//
+// BUS MASTERING IS NOT ITS BUSINESS EITHER - see `msix_enable`. The name lost its second half with
+// the behaviour.
 #[cfg(target_arch = "riscv64")]
-pub fn enable_mem_and_master<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
-	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE | CMD_BUS_MASTER) as u32);
+pub fn enable_memory_space<A: ConfigAccess>(bus: u8, dev: u8, func: u8) {
+	A::update32(bus, dev, func, 0x04, |dword| ((dword as u16) | CMD_MEMORY_SPACE) as u32);
+}
+
+// Turn bus mastering on or off for one function.
+//
+// THE ONE PLACE THE BIT IS WRITTEN, and the caller is `device`, which knows whether anybody owns the
+// device. Every other writer of this bit was removed: enumeration clears it, MSI-X setup leaves it
+// alone, and the riscv INTx path leaves it alone.
+pub fn set_bus_master<A: ConfigAccess>(bus: u8, dev: u8, func: u8, on: bool) {
+	A::update32(bus, dev, func, 0x04, |dword| {
+		let command = dword as u16;
+		(if on { command | CMD_BUS_MASTER } else { command & !CMD_BUS_MASTER }) as u32
+	});
+}
+
+// One function's COMMAND register, read back.
+//
+// TEST-ONLY. The kernel never reads this register for its own sake - every write above is a
+// read-modify-write that reads it inline - but a test that asserts what a device is allowed to do
+// has to be able to see it, and asserting on the value the kernel intended to write would assert
+// nothing about the bus.
+#[cfg(test)]
+pub fn command<A: ConfigAccess>(bus: u8, dev: u8, func: u8) -> u16 {
+	A::read16(bus, dev, func, 0x04)
 }
 
 #[cfg(test)]

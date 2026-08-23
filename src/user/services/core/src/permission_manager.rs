@@ -123,7 +123,7 @@ const DENY_REPLY: &[u8] = b"DENY";
 // So the fix is two changes and not one: the manager has to HOLD a session client to grant, and the
 // grant loop's failure path has to close the task it prepared. Until both, this list stays as it is
 // and `kill`'s hang is the lesser fault.
-const VOCABULARY: [Capability; 20] = [
+const VOCABULARY: [Capability; 21] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
@@ -143,6 +143,7 @@ const VOCABULARY: [Capability; 20] = [
 	Capability::Display,
 	Capability::InputKeys,
 	Capability::AudioStream,
+	Capability::AudioCapture,
 	Capability::AppAssets,
 ];
 
@@ -234,7 +235,16 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// vocabulary to be fixed.
 		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes, Capability::AppAssets, Capability::Permission])),
 		b"imgconv" => Some(granted("imgconv", alloc::vec![Capability::Volumes])),
+		// A CONVERSION IS NOT A PLAYBACK. `audioconv` holds the volume bundle and nothing else - no
+		// AudioService and no device authority - which is the distinction the bundle makes rather
+		// than the code: converting a file is not playing one. It had no row here at all, so the
+		// tool existed on the volume, was tested by the suite, and could not be launched on a real
+		// system by any means.
+		b"audioconv" => Some(granted("audioconv", alloc::vec![Capability::Volumes])),
 		b"play" => Some(granted("play", alloc::vec![Capability::Volumes, Capability::AudioStream])),
+		// A RECORDER HOLDS TWO THINGS: somewhere to write, and the authority to record. Not
+		// `audio-stream`, which it has no use for, and not `audio`, which is the whole service.
+		b"audiorec" => Some(granted("audiorec", alloc::vec![Capability::Volumes, Capability::AudioCapture])),
 		b"graphics_probe" => Some(granted("graphics_probe", alloc::vec![Capability::Display, Capability::InputKeys, Capability::AudioStream])),
 		b"usage" => Some(granted("usage", alloc::vec![Capability::Resource])),
 		b"ps" => Some(granted("ps", alloc::vec![Capability::Resource, Capability::Process])),
@@ -328,6 +338,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::Display => b"DISPLAY",
 		Capability::InputKeys => b"INPUT_KEYS",
 		Capability::AudioStream => b"AUDIO_STREAM",
+		Capability::AudioCapture => b"AUDIO_CAPTURE",
 		Capability::Session => b"SESSION",
 		Capability::AppAssets => b"APP_ASSETS",
 	}
@@ -403,7 +414,7 @@ impl Clients {
 			Capability::Supervisor => self.supervisor,
 			Capability::Services => self.services,
 			Capability::Usb => self.usb,
-			Capability::Display | Capability::InputKeys | Capability::AudioStream => 0,
+			Capability::Display | Capability::InputKeys | Capability::AudioStream | Capability::AudioCapture => 0,
 			// The `volumes` capability has no single representative client - it is granted as a
 			// bundle of five channels by `grant_volumes`, never through this single-channel path.
 			// The system volume stands in here for the (headless-denied) dynamic-request path.
@@ -451,6 +462,19 @@ unsafe fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, comp
 					return 0;
 				}
 				match audio_admin::Client::new(ChannelTransport { chan: clients.audio_admin }).open_streams() {
+					Some(Ok(audio)) => audio,
+					_ => 0,
+				}
+			}
+			// THE OTHER DIRECTION, FROM THE SAME ADMIN CHANNEL AND NOT THE SAME GRANT. The
+			// connection this mints refuses `open-stream` and refuses `beep`, so a recorder holding
+			// it cannot make a sound - which is what makes granting a microphone a decision the
+			// manifest states rather than one that comes along with playback.
+			Capability::AudioCapture => {
+				if clients.audio_admin == 0 {
+					return 0;
+				}
+				match audio_admin::Client::new(ChannelTransport { chan: clients.audio_admin }).open_captures() {
 					Some(Ok(audio)) => audio,
 					_ => 0,
 				}
@@ -826,6 +850,8 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		let started: StartResult = match if name == b"imgconv" { process_client.launch_bounded(name_str, &IMGCONV_MEMORY_LIMIT, &child_side) } else { process_client.launch_prepared(name_str, &child_side) } {
 			Some(Ok(s)) => s,
 			_ => {
+				debug_write(name);
+				debug_write(b"\n");
 				close(manager_side);
 				return None;
 			}

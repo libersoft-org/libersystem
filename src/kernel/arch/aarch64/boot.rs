@@ -243,7 +243,7 @@ fn loader_module_at(arg: u64, want: &[u8]) -> Option<&'static [u8]> {
 }
 
 // The boot argument, kept so a module can be looked up after the early boot has moved on.
-static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub(super) static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 fn loader_archive(arg: u64) -> Option<&'static [u8]> {
 	BOOT_ARG.store(arg, core::sync::atomic::Ordering::SeqCst);
@@ -780,40 +780,11 @@ fn run_system_manager() {
 
 	publish_embedded_boot_info();
 
-	match crate::spawn_system_manager() {
-		Ok((ep, manager)) => {
-			// The process itself, not just its id: `spawn_system_manager` hands it back so the
-			// recovery ladder can see an ENDING rather than only a fault, and this path names it
-			// the same way rather than keeping a second spelling of the same handover.
-			let koid: u64 = {
-				use crate::object::KernelObject;
-				manager.header().koid()
-			};
-			crate::serial_println!("aarch64: system - SystemManager spawned (koid {koid}), bringing up userspace");
-			// Drive the boot chain until the interactive shell attaches (the last
-			// component to come up), draining its reports as they arrive: run the
-			// scheduler to quiescence, then let the timer advance (idle_halt) so
-			// periodic / timed waiters wake and the next service starts. The cap is
-			// generous so the loop always returns even if a component never settles.
-			for _ in 0..400 {
-				crate::sched::run_until_idle();
-				while let Ok(msg) = ep.recv() {
-					crate::serial_println!("aarch64: userspace: {}", core::str::from_utf8(&msg.bytes).unwrap_or("<bad>"));
-				}
-				if crate::console_input::shell_listening() {
-					break;
-				}
-				super::idle_halt();
-			}
-			crate::serial_println!("aarch64: system - userspace boot chain settled");
-			// Hand control to the interactive shell over the serial console: the shell
-			// registered a console channel during bring-up, and this pumps polled PL011
-			// keystrokes to it (running the cooperative schedule after each) until the
-			// user types `exit`. The same portable driver the x86 kernel hands off to.
-			crate::console_shell_loop();
-		}
-		Err(reason) => {
-			crate::serial_println!("aarch64: system - SystemManager failed to start: {reason}");
-		}
-	}
+	// THE SHARED BOOT TAIL. This port used to hand-roll a settle loop and then call
+	// `console_shell_loop` directly, which meant no recovery ladder, no crash-notify channel and no
+	// idle hook - so a SystemManager that faulted while the chain came up left the machine sitting
+	// at a prompt that would never appear, and one lost afterwards left an ownerless control plane
+	// nothing watched. Four hundred rounds is the budget this machine needs; the rest is policy and
+	// lives in one place.
+	crate::boot_userspace("aarch64", 400);
 }

@@ -268,10 +268,18 @@ pub fn map_page(virt: u64, phys: u64, flags: u64) {
 	map_page_in(active_pml4_phys(), virt, phys, flags);
 }
 
+// The most page-table frames one 4 kB mapping can create here: PDPT, PD and PT below a populated PML4.
+//
+// The bound is what makes charging possible without a partial result: `AddressSpace::try_map`
+// reserves this many against the Domain's memory limit BEFORE it walks, and gives back what the
+// walk did not use. Charging afterwards would mean discovering the quota was exceeded with the
+// frames already attached.
+pub const MAX_NEW_TABLES: usize = 3;
+
 // Fallible counterpart of `map_page` for userspace-triggered mappings: returns Err
 // when an intermediate page table cannot be allocated (out of frames), so the
 // caller can propagate ERR_NO_MEMORY and roll back rather than panicking the kernel.
-pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
+pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<usize, ()> {
 	try_map_page_in(active_pml4_phys(), virt, phys, flags)
 }
 
@@ -341,7 +349,7 @@ pub fn map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) {
 // instead of panicking. Nothing is left mapped on failure - the walk stops at the
 // level that could not be extended, and the leaf is only written once every
 // intermediate exists.
-pub fn try_map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
+pub fn try_map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> Result<usize, ()> {
 	let _guard = PT_LOCK.lock();
 	// Without EFER.NXE the NX bit is a reserved bit; strip it so old CPUs still map.
 	let flags = if nx_enabled() { flags } else { flags & !NO_EXECUTE };
@@ -359,8 +367,8 @@ pub fn try_map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> Resu
 		// (the entry that points at it, the frame). BOTH are needed: freeing the frame without
 		// clearing the entry leaves a live page-table pointer to memory the allocator has given
 		// away, which is worse than the leak this replaces.
-		let mut created: [(*mut u64, u64); 3] = [(core::ptr::null_mut(), 0); 3];
 		let mut created_len = 0usize;
+		let mut created: [(*mut u64, u64); 3] = [(core::ptr::null_mut(), 0); 3];
 		let mut level = |table: *mut u64, index: usize| -> Result<*mut u64, ()> {
 			let (phys, fresh) = next_table_create_tracked(table, index, parent_flags).ok_or(())?;
 			if fresh {
@@ -420,8 +428,10 @@ pub fn try_map_page_in(pml4_phys: u64, virt: u64, phys: u64, flags: u64) -> Resu
 		}
 		entry.write_volatile((phys & ADDR_MASK) | flags | PRESENT);
 		invlpg(virt);
+		// The page-table frames this call created, so the caller can charge them to whoever asked
+		// for the mapping - see `AddressSpace::try_map`.
+		Ok(created_len)
 	}
-	Ok(())
 }
 
 // Unmap `virt` in the active address space, returning the frame it pointed at.

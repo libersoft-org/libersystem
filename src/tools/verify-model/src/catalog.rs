@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 27] = [
+const GATES: [(&str, &str); 28] = [
 	("development-gate", "harness.tools"),
 	("artifact-metadata", "harness.tools"),
 	("dynamic-report", "manifest"),
@@ -137,6 +137,10 @@ const GATES: [(&str, &str); 27] = [
 	// under `src/`, so it belongs to the harness and every change selects it - which is right, since
 	// the attribute it refuses can be added anywhere and costs milliseconds to look for.
 	("no-suppression", "harness.tools"),
+	// P02M0143's gate: every source the loader may boot from carries a manifest naming what will be
+	// read from it. Its subject is the staging - `mkpackages`, `mkimage.sh`, `qemu-run.sh` - and the
+	// media they write, so it belongs to the harness and every change selects it.
+	("boot-manifest", "harness.tools"),
 	// P02M0104's gate: the boot harness tested against fakes - the scenario oracles, the broker's
 	// reply framing, the instance identity records and the preflight producers. Its subject is the
 	// harness itself, so a harness change selects it, and it needs no guest and no QEMU.

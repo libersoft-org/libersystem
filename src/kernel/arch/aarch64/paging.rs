@@ -371,7 +371,7 @@ unsafe fn unwind_created(created: &[(*mut u64, u64); 3], len: usize) {
 	}
 }
 
-unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), ()> {
+unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<usize, ()> {
 	let _guard = PT_LOCK.lock();
 	let mut table = phys_to_virt(root) as *mut u64;
 	let mut created: [(*mut u64, u64); 3] = [(core::ptr::null_mut(), 0); 3];
@@ -421,7 +421,9 @@ unsafe fn map_page_root(root: u64, va: u64, pa: u64, flags: u64) -> Result<(), (
 			options(nostack, preserves_flags),
 		);
 	}
-	Ok(())
+	// The page-table frames this call created, so the caller can charge them to whoever asked for
+	// the mapping - see `AddressSpace::try_map`.
+	Ok(created_len)
 }
 
 // The active TTBR0 (low-half) root physical address.
@@ -458,25 +460,37 @@ pub unsafe fn copy_to_user_page(dst: u64, bytes: &[u8]) {
 pub fn map_page(virt: u64, phys: u64, flags: u64) {
 	// A top-bit-set virtual address translates through TTBR1 (higher half); a
 	// low address through the active TTBR0 tree.
-	unsafe { map_page_root(map_root_for(virt), virt, phys, flags).expect("aarch64 map_page: out of frames") }
+	unsafe {
+		map_page_root(map_root_for(virt), virt, phys, flags).expect("aarch64 map_page: out of frames");
+	}
 }
+
+// The most page-table frames one 4 kB mapping can create here: L1, L2 and L3 below a populated L0.
+//
+// The bound is what makes charging possible without a partial result: `AddressSpace::try_map`
+// reserves this many against the Domain's memory limit BEFORE it walks, and gives back what the
+// walk did not use. Charging afterwards would mean discovering the quota was exceeded with the
+// frames already attached.
+pub const MAX_NEW_TABLES: usize = 3;
 
 // Fallible counterpart of `map_page` for userspace-triggered mappings: returns Err
 // when an intermediate table cannot be allocated (out of frames), so the caller
 // degrades to ERR_NO_MEMORY rather than panicking the kernel.
-pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
+pub fn try_map_page(virt: u64, phys: u64, flags: u64) -> Result<usize, ()> {
 	unsafe { map_page_root(map_root_for(virt), virt, phys, flags) }
 }
 
 #[cfg(test)]
 pub fn map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) {
-	unsafe { map_page_root(root_in(ttbr, virt), virt, phys, flags).expect("aarch64 map_page: out of frames") }
+	unsafe {
+		map_page_root(root_in(ttbr, virt), virt, phys, flags).expect("aarch64 map_page: out of frames");
+	}
 }
 
 // Fallible counterpart of `map_page_in`: returns Err when an intermediate table
 // cannot be allocated, leaving nothing mapped so a userspace map can degrade to
 // ERR_NO_MEMORY.
-pub fn try_map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) -> Result<(), ()> {
+pub fn try_map_page_in(ttbr: u64, virt: u64, phys: u64, flags: u64) -> Result<usize, ()> {
 	unsafe { map_page_root(root_in(ttbr, virt), virt, phys, flags) }
 }
 

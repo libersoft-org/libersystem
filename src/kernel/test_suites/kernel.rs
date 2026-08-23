@@ -1224,6 +1224,69 @@ fn kernel_access_to_user_memory_is_refused_outside_the_window() {
 	unsafe { frame::deallocate(frame) };
 }
 
+// THE SAME PROPERTY ON riscv64, where the mechanism is SSTATUS.SUM rather than SMAP: outside
+// `user_access` a supervisor load of a U-mapped page faults, and a supervisor FETCH from one faults
+// whatever SUM says, because SUM covers data access only.
+//
+// NOT ON aarch64, and the reason belongs here rather than in a disabled test. The tested CPU is a
+// cortex-a72, which is ARMv8.0 and has no PAN: EL1 may read an EL0 page and there is nothing to
+// refuse it. `aarch64::paging::user_access` is a passthrough that says so at its own call site. Two
+// targets of three refuse a stray kernel read of user memory and one cannot, and that asymmetry is
+// the finding - a stub answering "refused" there would be a test asserting a protection the machine
+// does not have.
+tagged_test!(
+	#[cfg(target_arch = "riscv64")]
+	kernel_access_to_user_memory_is_refused_outside_the_window,
+	[Kernel, Memory, ArchRiscv64],
+	id = "kernel.kernel.kernel_access_to_user_memory_is_refused_outside_the_window",
+	covers = ["kernel"]
+);
+#[cfg(target_arch = "riscv64")]
+fn kernel_access_to_user_memory_is_refused_outside_the_window() {
+	use mem::frame;
+	// Clear of every other test's user pages, like the x86_64 probe address.
+	const SUM_PROBE_VA: u64 = 0x0000_0000_4100_0000;
+	// riscv64 scause codes for the two refusals.
+	const LOAD_PAGE_FAULT: u64 = 13;
+	const INSTRUCTION_PAGE_FAULT: u64 = 12;
+	let frame = frame::allocate().expect("probe frame");
+	// A marker written through the direct map, so an unrefused read would be visible rather than
+	// reading whatever the frame held.
+	unsafe { ((mem::hhdm_offset() + frame) as *mut u64).write_volatile(0x5341_4645) };
+	// USER and executable: the fetch probe below runs from it, and SUM must refuse the data read
+	// regardless of that.
+	arch::paging::map_page(SUM_PROBE_VA, frame, arch::paging::PRESENT | arch::paging::WRITABLE | arch::paging::USER);
+	// Probe 1: a plain supervisor read outside the window. Only Copy values live across the
+	// faulting access - the trap handler retires this thread mid-statement.
+	extern "C" fn sum_probe(_arg: u64) {
+		fault::arm_smap_probe(SUM_PROBE_VA);
+		let value = unsafe { (SUM_PROBE_VA as *const u64).read_volatile() };
+		panic!("SUM did not refuse a kernel read of user memory (read {:#x})", value);
+	}
+	sched::spawn(sum_probe, 0);
+	sched::run_until_idle();
+	let cause = fault::smap_probe_hit().expect("the kernel read of user memory faulted");
+	assert_eq!(cause & 0xff, LOAD_PAGE_FAULT, "the refusal is a load page fault, not a fetch");
+	// The sanctioned window still reads it - the copy paths keep working.
+	let through_window = arch::paging::user_access(|| unsafe { (SUM_PROBE_VA as *const u64).read_volatile() });
+	assert_eq!(through_window, 0x5341_4645, "the sanctioned user_access window reads the page");
+	// Probe 2: a supervisor jump into the user page. SUM does not cover instruction fetch, so this
+	// faults whether the window is open or not - which is the point: there is no window for it.
+	extern "C" fn fetch_probe(_arg: u64) {
+		fault::arm_smap_probe(SUM_PROBE_VA);
+		let target: extern "C" fn() = unsafe { core::mem::transmute::<u64, extern "C" fn()>(SUM_PROBE_VA) };
+		target();
+		panic!("a supervisor fetch from user memory was not refused");
+	}
+	sched::spawn(fetch_probe, 0);
+	sched::run_until_idle();
+	let cause = fault::smap_probe_hit().expect("the kernel fetch from user memory faulted");
+	assert_eq!(cause & 0xff, INSTRUCTION_PAGE_FAULT, "the refusal is an instruction page fault");
+	// The probe threads died mid-body: clean their mapping up here.
+	arch::paging::unmap_page(SUM_PROBE_VA);
+	unsafe { frame::deallocate(frame) };
+}
+
 tagged_test!(a_user_stack_grows_on_demand_past_its_initial_pages, [Kernel, Memory], id = "kernel.kernel.a_user_stack_grows_on_demand_past_its_initial_pages", covers = ["kernel"]);
 fn a_user_stack_grows_on_demand_past_its_initial_pages() {
 	use core::sync::atomic::Ordering;

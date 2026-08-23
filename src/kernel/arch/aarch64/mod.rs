@@ -94,12 +94,23 @@ pub fn idle_halt() {
 	}
 }
 
-// reboot / power off via PSCI (SYSTEM_RESET / SYSTEM_OFF) - stubbed to a halt.
+// Reboot via PSCI SYSTEM_RESET, over the conduit the platform named.
+//
+// THIS WAS A HALT, and the recovery ladder is why that mattered: when it runs out of attempts it
+// calls `reset()` to get a clean machine, and on this port the machine simply stopped instead - the
+// last rung of the ladder silently absent on one target of three. A platform with no usable conduit
+// still halts, but says why rather than pretending it rebooted.
 pub fn reset() -> ! {
+	if !psci::system_reset() {
+		crate::serial_println!("aarch64: no PSCI conduit below this kernel - cannot reboot, halting instead");
+	}
 	halt_loop()
 }
 
 pub fn poweroff() -> ! {
+	if !psci::system_off() {
+		crate::serial_println!("aarch64: no PSCI conduit below this kernel - cannot power off, halting instead");
+	}
 	halt_loop()
 }
 

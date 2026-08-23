@@ -94,6 +94,9 @@ pub extern "C" fn run() -> i32 {
 //
 // `Unknown(x)` passes the host's own number straight back: it is a status this SDK did not know how
 // to name, and inventing one here would lose what the host actually said.
+// The wasm entry point above is its only caller, so a host build of this example - which is how
+// its tests run - compiles it and nothing else does.
+#[cfg(target_arch = "wasm32")]
 fn status_of(error: liber_sdk::Error) -> i32 {
 	use liber_sdk::{Error, STATUS_DENIED, STATUS_FAULT, STATUS_IO, STATUS_UNSUPPORTED};
 	match error {

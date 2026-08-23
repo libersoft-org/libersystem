@@ -16,6 +16,11 @@ record process-info {
 /// capability (carrying MANAGE), so the caller can do job control on the program it
 /// started: signal it and wait on it. Named `task` to stay distinct from the `process`
 /// service interface; it is the same kernel Process the koid names.
+///
+/// `@kernel(process)` is what makes that last sentence checkable: a `@rights` guard on a
+/// `handle<task>` now refuses a handle of any other kernel object, rather than checking the rights
+/// on whatever it was handed.
+@kernel(process)
 resource task;
 
 /// A live ProcessGroup - every stage of a pipeline under one object, so signalling and waiting
@@ -25,7 +30,9 @@ resource task;
 /// used to name both, and every record that could carry either carried a boolean beside it saying
 /// which - so the two could disagree, and nothing on the wire could tell. Signalling and waiting
 /// take a different syscall for each, so a mismatched pair is a signal sent to the wrong kind of
-/// object, which is exactly the case a type is for.
+/// object, which is exactly the case a type is for. `@kernel(process-group)` is that distinction
+/// enforced at the boundary instead of described above it.
+@kernel(process-group)
 resource task-group;
 
 /// The result of launching a program: the live process as a capability (transferred

@@ -47,8 +47,7 @@ pub fn attach(channel: Arc<Channel>) {
 // Send one input byte to the attached shell. Returns false if no shell is attached
 // or its endpoint has closed (it exited).
 // Whether a shell is attached and still listening (its peer endpoint is alive). False once the
-// shell exits and drops its end. Asked by the boot tail's shell loop, which the test build has not.
-#[cfg(not(test))]
+// shell exits and drops its end. Asked by `supervise`, which is what decides a boot round is over.
 pub fn shell_listening() -> bool {
 	match &*CONSOLE.lock() {
 		Some(channel) => !channel.is_peer_closed(),

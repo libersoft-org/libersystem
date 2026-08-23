@@ -219,6 +219,14 @@ impl DmaBuffer {
 		self.orphaned.load(Ordering::Acquire)
 	}
 
+	// The device-table entry this buffer was created for, or None for one bound to nothing.
+	//
+	// Asked by `sys_dma_buffer_phys`: a physical address is what lets a device write into a page,
+	// so it is answerable only for a buffer some device was named for.
+	pub fn device(&self) -> Option<u32> {
+		self.device
+	}
+
 	pub fn frames(&self) -> &[u64] {
 		&self.frames
 	}

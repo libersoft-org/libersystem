@@ -14,6 +14,14 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // PSCI CPU_ON, SMC64 calling convention (function id 0xC400_0003).
 const PSCI_CPU_ON: u64 = 0xC400_0003;
+// PSCI SYSTEM_OFF and SYSTEM_RESET, SMC32 function ids. They take no arguments and do not return.
+const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
+const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+
+// The conduit, resolved once and kept. `bring_up_secondaries` reads it too, but it returns early on
+// a single-core machine - and a machine with one core still has to be able to reboot, which is what
+// the recovery ladder does when it runs out of attempts.
+static CONDUIT: AtomicU32 = AtomicU32::new(u32::MAX);
 
 // Matches the per-CPU pool size in `percpu`.
 const MAX_CPUS: usize = 8;
@@ -227,6 +235,48 @@ pub(crate) fn conduit(arg: u64) -> u32 {
 	}
 	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
 	unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).psci_conduit)) }
+}
+
+// The conduit for this machine, resolved from the boot argument the first time it is asked for.
+fn resolved_conduit() -> u32 {
+	let cached = CONDUIT.load(Ordering::Relaxed);
+	if cached != u32::MAX {
+		return cached;
+	}
+	let value = conduit(super::boot::BOOT_ARG.load(Ordering::SeqCst));
+	CONDUIT.store(value, Ordering::Relaxed);
+	value
+}
+
+// One PSCI call that takes no arguments and is not expected to return. False means there is no
+// conduit below this kernel, or the call came back - in which case the caller says so and halts,
+// which is what this port did unconditionally before.
+fn call_no_return(function: u64) -> bool {
+	let conduit = resolved_conduit();
+	match conduit {
+		bootproto::PSCI_HVC | bootproto::PSCI_SMC => {}
+		_ => return false,
+	}
+	unsafe {
+		if conduit == bootproto::PSCI_SMC {
+			core::arch::asm!("smc #0", in("x0") function, options(nostack));
+		} else {
+			core::arch::asm!("hvc #0", in("x0") function, options(nostack));
+		}
+	}
+	false
+}
+
+// Reboot the machine. Returns only if the platform has no PSCI conduit or refused the call.
+pub(crate) fn system_reset() -> bool {
+	call_no_return(PSCI_SYSTEM_RESET)
+}
+
+// Power the machine off. SAME CONDUIT, ONE MORE FUNCTION ID - which is the whole reason it is here:
+// leaving `poweroff` a halt while `reset` works would be an inconsistency made on purpose to save
+// four lines, on the one path an operator uses deliberately.
+pub(crate) fn system_off() -> bool {
+	call_no_return(PSCI_SYSTEM_OFF)
 }
 
 // Issue a PSCI CPU_ON on the conduit the loader said exists. Returns the PSCI status (0 = SUCCESS).

@@ -718,6 +718,23 @@ fn sys_dma_buffer_phys(handle: u64, offset: u64) -> i64 {
 		Ok(o) => o,
 		Err(e) => return e,
 	};
+	// A PHYSICAL ADDRESS IS FOR A DEVICE, so a buffer bound to none cannot have one.
+	//
+	// `sys_dma_buffer_create` accepts a zero device handle, and this did not look - so any process
+	// that could make a DMA buffer could learn the physical address of its own pages, on a machine
+	// with no IOMMU, for no device. Binding is what makes the address answerable.
+	//
+	// NOT "ONLY WHILE MAPPED", which is the narrowing that suggests itself and would break the
+	// display: virtio-gpu deliberately does not map its framebuffer backing - ConsoleService renders
+	// into it and a `DmaBuffer` maps only once - while the GPU still needs the addresses. Mapping is
+	// not what makes an address legitimate; being for a device is.
+	//
+	// WHAT THIS DOES NOT DO, said plainly: an address is an integer and nothing takes one back.
+	// Without an IOMMU a driver that has one keeps it after the buffer is gone. This closes who may
+	// ask, not how long an answer lives.
+	if dma.device().is_none() {
+		return ERR_INVALID;
+	}
 	let frames = dma.frames();
 	let page = (offset / PAGE_SIZE) as usize;
 	if page >= frames.len() {
@@ -1061,7 +1078,20 @@ fn sys_device_acquire(index: u64, privilege: u64) -> i64 {
 		Some(None) => return ERR_RESOURCE_EXHAUSTED,
 		None => return ERR_INVALID,
 	};
-	install_object(&thread, memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER)
+	// TAKING THE DEVICE IS WHAT LETS IT WRITE TO MEMORY. The count goes up here and comes down in
+	// `DeviceMemory::drop`; the 0 -> 1 transition is what turns bus mastering on. Ordered after the
+	// object exists so a heap refusal above cannot leave a device mastering for a driver that never
+	// got a capability to it.
+	if !device::acquire_bus_master(index as usize) {
+		return ERR_INVALID;
+	}
+	let handle = install_object(&thread, memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER);
+	if handle < 0 {
+		// The table refused the handle, so nothing owns this `DeviceMemory` and its `Drop` will not
+		// run for a capability the caller never received: give the count back by hand.
+		device::release_bus_master(index as usize);
+	}
+	handle
 }
 
 // "I have stopped this device": release the DMA frames held for it.

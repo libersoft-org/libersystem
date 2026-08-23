@@ -42,7 +42,27 @@ pub fn rust(file: &File, source: &str, imports: &HashMap<String, ResolvedSymbol>
 			aliases.insert(local.clone(), wire_type.clone());
 		}
 	}
-	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums, denied_enums, aliases };
+	let resource_types: HashMap<String, u64> = file
+		.items
+		.iter()
+		.filter_map(|item| match item {
+			Item::Resource(r) => r.kernel.as_ref().and_then(|word| crate::parser::kernel_object_code(word)).map(|code| (r.name.clone(), code)),
+			_ => None,
+		})
+		.collect();
+	// THE BUILT-INS, which no package declares because the language has them: `handle<channel>` is a
+	// kernel Channel and `handle<buffer>` a MemoryObject, everywhere and by definition.
+	let mut resource_types = resource_types;
+	resource_types.insert(String::from("channel"), 5);
+	resource_types.insert(String::from("buffer"), 4);
+	// AND THE IMPORTED ONES. `handle<task>` in `display` names `liber:process@1`'s resource, so a
+	// map built from this file alone would leave every cross-package guard unchecked.
+	for (local, symbol) in imports {
+		if let Some(code) = symbol.kernel_type {
+			resource_types.insert(local.clone(), code);
+		}
+	}
+	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums, denied_enums, aliases, resource_types };
 	cg.file(file, source);
 	cg.imports(imports);
 	for item in &file.items {
@@ -64,7 +84,7 @@ pub fn compat_rust(file: &File, imports: &HashMap<String, ResolvedSymbol>) -> St
 			aliases.insert(local.clone(), wire_type.clone());
 		}
 	}
-	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums: std::collections::HashSet::new(), denied_enums: std::collections::HashSet::new(), aliases };
+	let mut cg = Cg { out: String::new(), tmp: 0, package: file.package.path.join("_"), package_id: file.package.path.join(":"), package_version: file.package.version, again_enums: std::collections::HashSet::new(), denied_enums: std::collections::HashSet::new(), aliases, resource_types: HashMap::new() };
 	cg.compat_tests(file);
 	cg.out
 }
@@ -83,6 +103,10 @@ struct Cg {
 	again_enums: std::collections::HashSet<String>,
 	denied_enums: std::collections::HashSet<String>,
 	aliases: HashMap<String, Type>,
+	// The ABI object-type code each resource declares with `@kernel(...)`, for the resources that
+	// declare one. A `@rights` guard on a handle of such a resource checks the TYPE as well as the
+	// rights; one that does not keeps `NO_REQUIRED_TYPE`, so this is adopted a resource at a time.
+	resource_types: HashMap<String, u64>,
 }
 
 // Emit doc comments (/// doc) from the AST into the generated output.
@@ -558,7 +582,19 @@ impl Cg {
 							None => return Err(Error::new(p.span, format!("@rights names '{right}', which is not a kernel right"))),
 						}
 					}
-					guards.push(format!("crate::codec::handle_carries({}, {mask}, crate::codec::NO_REQUIRED_TYPE)", field_ident(&p.name)));
+					// AND THE OBJECT TYPE, when the resource says what it is. `@rights` keeps meaning
+					// exactly what it meant - the minimum the handle must carry - and the type comes
+					// from the resource's own `@kernel(...)`, so a handle of the right shape and the
+					// wrong kind is refused with the method's error rather than handed over.
+					let required_type = match &p.ty {
+						Type::Handle(resource) => self.resource_types.get(resource).copied(),
+						_ => None,
+					};
+					let required_type = match required_type {
+						Some(code) => format!("{code}"),
+						None => String::from("crate::codec::NO_REQUIRED_TYPE"),
+					};
+					guards.push(format!("crate::codec::handle_carries({}, {mask}, {required_type})", field_ident(&p.name)));
 				}
 				let denied: Option<String> = if guards.is_empty() {
 					None

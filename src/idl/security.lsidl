@@ -45,6 +45,14 @@ enum capability {
 	/// directory as its SCOPE rather than as a convention the holder is trusted to respect: a path
 	/// outside it is refused by the service, and the client cannot mint a broader one.
 	app-assets,
+	/// The authority to RECORD, minted per launch through `audio-admin.open-captures`.
+	///
+	/// Separate from `audio-stream` on purpose. Playback and capture are the same device and the
+	/// same service, and they are not the same authority: "may make a sound" is a nuisance if it is
+	/// wrong, "may record" is a microphone. A manifest that could only say `audio-stream` would be
+	/// a manifest that hands the microphone to anything that beeps, so the two are named apart and
+	/// the connection each mints refuses the other's operations.
+	audio-capture,
 }
 
 /// A component's permission manifest: its name, the capabilities it requests (the
@@ -121,7 +129,7 @@ record pipeline-result {
 interface permission {
 	@op(1) lookup: func(component: string) -> result<manifest, error>;
 	@op(2) audit:  func() -> stream<audit-entry>;
-	@op(3) run:    func(name: string, args: string, cwd: string, environment: list<env-var>, stdout: handle<channel>) -> result<process-start-result, error>;
+	@op(3) run:    func(name: string, args: string, cwd: string, environment: list<env-var>, @rights(send) stdout: handle<channel>) -> result<process-start-result, error>;
 	/// Start a whole pipeline as ONE transaction: every stage is authorized against its own
 	/// manifest and created behind the start gate, the edges are allocated by the broker, and
 	/// the stages are released together. A failure at any stage starts none of them, because
@@ -135,7 +143,7 @@ interface permission {
 	/// is not the same as it never having started. The group primitive validates every token before
 	/// queueing any thread, so a refusal comes back with nothing started - which is what makes this
 	/// sentence a guarantee rather than an intention.
-	@op(4) run-pipeline: func(@bound(8) stages: list<pipeline-stage>, cwd: string, environment: list<env-var>, stdout: handle<channel>) -> result<pipeline-result, error>;
+	@op(4) run-pipeline: func(@bound(8) stages: list<pipeline-stage>, cwd: string, environment: list<env-var>, @rights(send) stdout: handle<channel>) -> result<pipeline-result, error>;
 
 	/// Start a program over ONE SELECTED FILE, with an attenuated grant instead of a volume bundle.
 	///
@@ -151,5 +159,5 @@ interface permission {
 	///
 	/// The path is checked against the caller's own reach before anything is minted: this narrows
 	/// authority and never widens it.
-	@op(5) run-with-file: func(name: string, args: string, cwd: string, file: string, writable: bool, stdout: handle<channel>) -> result<process-start-result, error>;
+	@op(5) run-with-file: func(name: string, args: string, cwd: string, file: string, writable: bool, @rights(send) stdout: handle<channel>) -> result<process-start-result, error>;
 }

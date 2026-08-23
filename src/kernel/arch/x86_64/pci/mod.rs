@@ -111,6 +111,18 @@ pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 	common::set_intx_disabled::<Access>(bus, dev, func, disabled);
 }
 
+// Turn bus mastering on or off for one function. The only caller is `device`, which knows whether a
+// driver owns the device - see `arch::common::pci::set_bus_master`.
+pub fn set_bus_master(bus: u8, dev: u8, func: u8, on: bool) {
+	common::set_bus_master::<Access>(bus, dev, func, on);
+}
+
+// One function's COMMAND register, read back - test-only, see `arch::common::pci::command`.
+#[cfg(test)]
+pub fn command(bus: u8, dev: u8, func: u8) -> u16 {
+	common::command::<Access>(bus, dev, func)
+}
+
 // Enable MSI-X on a device and ensure its memory space is decoded. `cap` is the
 // MSI-X capability's config-space offset (from VirtioDevice::msix_cap).
 pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {

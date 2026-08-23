@@ -1212,15 +1212,6 @@ fn a_descriptor_whose_crc_stops_short_of_what_is_read_is_refused() {
 	// The forgery is MINIMAL - shorten the declared coverage and re-stamp the CRC and the tag
 	// checksum over what it now claims - because that is what a forger can do with no other change,
 	// and it is what a constant cannot notice.
-	// kept beside the FID case it was written for; the File Entry case inlines it
-	fn shrink_coverage(img: &mut [u8], at: usize, to: u16) {
-		img[at + 10..at + 12].copy_from_slice(&to.to_le_bytes());
-		let crc = crc_ccitt(&img[at + 16..at + 16 + to as usize]);
-		img[at + 8..at + 10].copy_from_slice(&crc.to_le_bytes());
-		img[at + 4] = 0;
-		let sum: u8 = img[at..at + 16].iter().fold(0u8, |a, b| a.wrapping_add(*b));
-		img[at + 4] = sum;
-	}
 
 	// The fixture as it stands reads, which is what makes the refusal below the coverage rule's.
 	let mut fs = Udf::mount(MemDisc { data: build_udf() }).expect("the fixture mounts");

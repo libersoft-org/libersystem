@@ -1,0 +1,107 @@
+# A recording, end to end, on a machine that has a sound device.
+#
+# The kernel suite covers the two halves separately - the driver against the real device (silence
+# from QEMU's `none` backend), and the whole conversion against known periods through a stand-in.
+# What only a booted system can show is the two joined by the launcher: PermissionManager granting
+# `audio-capture` and nothing else, AudioService reaching the driver DeviceManager started, and a
+# file arriving on the volume the shell can then read back.
+version = 1
+name = "audio capture"
+description = "audiorec records from the sound device through AudioService and publishes a WAV file."
+timeout = 180
+
+# EVERY PATH HERE IS RELATIVE, and that is not brevity. The console's line discipline has a
+# finite input buffer, and a command line past it is truncated where it stands - the shell then
+# runs whatever the first part happened to spell. The working directory is the system volume, so
+# `take.wav` names the same file `vol://system/take.wav` does in half the characters.
+[[step]]
+do = "prompt"
+timeout = 60
+
+# A second of 8 kHz mono. The report is the tool's own line, and it names the shape it wrote - a
+# string that appears nowhere in the command that produced it, so it cannot be the terminal echo.
+[[step]]
+do = "input"
+text = "audiorec -r 8000 -c 1 -s 1 -f take.wav"
+
+[[step]]
+do = "expect"
+contains = "8000Hz/1ch/16-bit 8000fr duration=1000ms"
+timeout = 90
+
+# AND THE FILE IS ON THE VOLUME, at the length the header claims: 8000 mono frames of two bytes
+# plus the 44-byte header. A recording that was reported and not published, or published with the
+# placeholder lengths still in its header, does not produce this number.
+[[step]]
+do = "input"
+text = "ls vol://system"
+
+[[step]]
+do = "expect"
+contains = "take.wav"
+timeout = 30
+
+[[step]]
+do = "input"
+text = "wc take.wav"
+
+[[step]]
+do = "expect"
+contains = "16044"
+timeout = 30
+
+# It is a WAV file this tree can read, which `play` proves by playing it rather than by parsing it:
+# the tool decodes the container and hands the samples to AudioService, so a file with a wrong
+# `fmt` chunk or a `data` length that outruns the file is refused here. What it prints is the shape
+# it found, which must be the shape that was recorded.
+[[step]]
+do = "input"
+text = "play take.wav"
+
+[[step]]
+do = "expect"
+contains = "play: WAV 8000 Hz, 1 channel, 8000 frames"
+timeout = 60
+
+# AND A CONVERSION OF WHAT WAS RECORDED, one lossless and one lossy, through the governed
+# `audioconv` - which holds the volume bundle and nothing else. This is the recording leaving the
+# capture path and entering the codec path on the same machine, which nothing else joins up: the
+# suite tests each half against fixtures it built itself.
+[[step]]
+do = "input"
+text = "audioconv take.wav take.flac"
+
+[[step]]
+do = "expect"
+contains = "WAV 8000Hz/1ch/8000fr -> FLAC 8000Hz/1ch/8000fr duration=1000ms"
+timeout = 60
+
+[[step]]
+do = "input"
+text = "audioconv take.wav take.ogg"
+
+[[step]]
+do = "expect"
+contains = "WAV 8000Hz/1ch/8000fr -> Ogg Vorbis 8000Hz/1ch/8000fr duration=1000ms"
+timeout = 90
+
+# And the lossless one plays, which decodes it through the same path a listener would.
+[[step]]
+do = "input"
+text = "play take.flac"
+
+[[step]]
+do = "expect"
+contains = "play: FLAC 8000 Hz, 1 channel, 8000 frames"
+timeout = 60
+
+# And the destination is not overwritten without being told to. The refusal happens before the
+# device is opened, so a mistyped path costs nothing.
+[[step]]
+do = "input"
+text = "audiorec -r 8000 -c 1 -s 1 take.wav"
+
+[[step]]
+do = "expect"
+contains = "destination exists"
+timeout = 30

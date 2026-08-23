@@ -1275,13 +1275,11 @@ unsafe fn write_volume_file(storage: u64, path: &str, body: &[u8]) -> bool {
 // Remove `path` from the volume. Only names this session wrote are ever passed here, so a
 // removal that fails means the file is still there and the caller is told so.
 unsafe fn remove_volume_file(storage: u64, path: &str) -> bool {
-	unsafe {
-		if storage == 0 {
-			return false;
-		}
-		let mut client = volume::Client::new(ChannelTransport { chan: storage });
-		matches!(client.remove(path), Some(Ok(())))
+	if storage == 0 {
+		return false;
 	}
+	let mut client = volume::Client::new(ChannelTransport { chan: storage });
+	matches!(client.remove(path), Some(Ok(())))
 }
 
 unsafe fn read_installed(storage: u64, path: &str) -> Option<Vec<u8>> {
@@ -1340,7 +1338,11 @@ impl Session {
 			Some(pair) => pair,
 			None => return sink.send(OP_ERROR, request, 0, ST_LAUNCH_REFUSED, &[]),
 		};
-		let started = security::permission::Client::new(ChannelTransport { chan: self.launcher }).run(name, args, cwd, &theirs);
+		// NO ENVIRONMENT. `permission.run` carries the launching session's variables, and a
+		// development launch has no session behind it - it is a scenario asking the launcher for a
+		// program directly. An empty list says that, where inheriting the agent's own would be
+		// inventing an environment the request never named.
+		let started = security::permission::Client::new(ChannelTransport { chan: self.launcher }).run(name, args, cwd, &Vec::new(), &theirs);
 		let (koid, task): (u64, u64) = match started {
 			Some(Ok(result)) => (result.info.koid, result.task),
 			_ => {

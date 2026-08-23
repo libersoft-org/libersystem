@@ -602,36 +602,8 @@ fn run_system_manager() {
 
 	publish_embedded_boot_info();
 
-	match crate::spawn_system_manager() {
-		Ok((ep, manager)) => {
-			// The process itself, not just its id: `spawn_system_manager` hands it back so the
-			// recovery ladder can see an ENDING rather than only a fault, and this path names it
-			// the same way rather than keeping a second spelling of the same handover.
-			let koid: u64 = {
-				use crate::object::KernelObject;
-				manager.header().koid()
-			};
-			crate::serial_println!("riscv64: system - SystemManager spawned (koid {koid}), bringing up userspace");
-			// Drive the boot chain until the interactive shell attaches (the last component
-			// to come up), draining its reports as they arrive. riscv under TCG settles the
-			// interrupt-driven chain more slowly and variably than x86/aarch64, so drive to
-			// the shell rather than a fixed budget; the cap is generous so the loop always
-			// returns even if a component never settles.
-			for _ in 0..4000 {
-				crate::sched::run_until_idle();
-				while let Ok(msg) = ep.recv() {
-					crate::serial_println!("riscv64: userspace: {}", core::str::from_utf8(&msg.bytes).unwrap_or("<bad>"));
-				}
-				if crate::console_input::shell_listening() {
-					break;
-				}
-				super::idle_halt();
-			}
-			crate::serial_println!("riscv64: system - userspace boot chain settled");
-			crate::console_shell_loop();
-		}
-		Err(reason) => {
-			crate::serial_println!("riscv64: system - SystemManager failed to start: {reason}");
-		}
-	}
+	// THE SHARED BOOT TAIL - see the note in the aarch64 port. Four thousand rounds because this
+	// machine settles an order of magnitude more slowly under TCG than the other two, which is a
+	// number this caller passes rather than a reason for a third copy of the policy.
+	crate::boot_userspace("riscv64", 4000);
 }

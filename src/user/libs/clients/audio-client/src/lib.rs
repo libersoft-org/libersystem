@@ -1,5 +1,8 @@
 #![no_std]
 
+extern crate alloc;
+
+use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::Error;
 use wire::Buffer;
 
@@ -8,12 +11,20 @@ unsafe extern "Rust" {
 	fn audio_beep(chan: u64, freq: &u16, millis: &u32) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_audio_audio_open_stream"]
 	fn audio_open_stream(chan: u64, rate: &u32, channels: &u8) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_audio_audio_open_capture"]
+	fn audio_open_capture(chan: u64, rate: &u32, channels: &u8) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_audio_pcm_capture_read"]
+	fn pcm_capture_read(chan: u64) -> Option<Result<Vec<u8>, Error>>;
+	#[link_name = "liber_channel_liber_audio_pcm_capture_close"]
+	fn pcm_capture_close(chan: u64) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_audio_pcm_stream_write"]
 	fn pcm_stream_write(chan: u64, data: &Buffer) -> Option<Result<u32, Error>>;
 	#[link_name = "liber_channel_liber_audio_pcm_stream_close"]
 	fn pcm_stream_close(chan: u64) -> Option<Result<(), Error>>;
 	#[link_name = "liber_channel_liber_audio_audio_admin_open_streams"]
 	fn audio_admin_open_streams(chan: u64) -> Option<Result<u64, Error>>;
+	#[link_name = "liber_channel_liber_audio_audio_admin_open_captures"]
+	fn audio_admin_open_captures(chan: u64) -> Option<Result<u64, Error>>;
 }
 
 #[derive(Clone, Copy)]
@@ -36,6 +47,34 @@ impl AudioClient {
 	#[inline(always)]
 	pub fn open_stream(&mut self, rate: &u32, channels: &u8) -> Option<Result<u64, Error>> {
 		unsafe { audio_open_stream(self.chan, rate, channels) }
+	}
+
+	#[inline(always)]
+	pub fn open_capture(&mut self, rate: &u32, channels: &u8) -> Option<Result<u64, Error>> {
+		unsafe { audio_open_capture(self.chan, rate, channels) }
+	}
+}
+
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct PcmCaptureClient {
+	chan: u64,
+}
+
+impl PcmCaptureClient {
+	#[inline(always)]
+	pub const fn new(chan: u64) -> Self {
+		Self { chan }
+	}
+
+	#[inline(always)]
+	pub fn read(&mut self) -> Option<Result<Vec<u8>, Error>> {
+		unsafe { pcm_capture_read(self.chan) }
+	}
+
+	#[inline(always)]
+	pub fn close(&mut self) -> Option<Result<(), Error>> {
+		unsafe { pcm_capture_close(self.chan) }
 	}
 }
 
@@ -77,5 +116,10 @@ impl AudioAdminClient {
 	#[inline(always)]
 	pub fn open_streams(&mut self) -> Option<Result<u64, Error>> {
 		unsafe { audio_admin_open_streams(self.chan) }
+	}
+
+	#[inline(always)]
+	pub fn open_captures(&mut self) -> Option<Result<u64, Error>> {
+		unsafe { audio_admin_open_captures(self.chan) }
 	}
 }

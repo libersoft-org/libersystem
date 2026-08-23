@@ -53,6 +53,9 @@ flac = { path = "../user/libs/audio/flac" }
 pcm = { path = "../user/libs/audio/pcm" }
 wav = { path = "../user/libs/audio/wav" }
 wavpack = { path = "../user/libs/audio/wavpack" }
+# The audioconv scenario reads back what the tool wrote, and the lossy destination is read by the
+# same decoder a player would use rather than by a parser written for the test.
+vorbis = { path = "../user/libs/audio/vorbis" }
 
 bmp = { path = "../user/libs/image/bmp" }
 gif = { path = "../user/libs/image/gif" }

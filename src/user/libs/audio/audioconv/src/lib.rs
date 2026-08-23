@@ -110,7 +110,12 @@ pub const PROFILES: &[Capabilities] = &[
 	// No `--compression`: the WavPack encoder has one mode and no effort to spend, and a table that
 	// offered a knob nothing reads would be the exact lie this table exists to prevent.
 	Capabilities { profile: Profile::WavPack, name: "WavPack", suffixes: &["wv"], lossless: true, bits: &[], quality: false, compression: false, implemented: true },
-	Capabilities { profile: Profile::Vorbis, name: "Ogg Vorbis", suffixes: &["ogg", "oga"], lossless: false, bits: &[], quality: true, compression: false, implemented: false },
+	// `--quality` does NOT apply, and that is a statement about this encoder rather than about the
+	// format. Vorbis has a quality dimension; this encoder has ONE configuration - a single block
+	// size, floor 1 with one class, residue 2 with one classification, no coupling - so there is
+	// nothing for a number to select. A row offering a knob nothing reads is the exact lie this
+	// table exists to prevent, which is why WavPack's `--compression` says the same.
+	Capabilities { profile: Profile::Vorbis, name: "Ogg Vorbis", suffixes: &["ogg", "oga"], lossless: false, bits: &[], quality: false, compression: false, implemented: true },
 	Capabilities { profile: Profile::Mp3, name: "MP3", suffixes: &["mp3"], lossless: false, bits: &[], quality: true, compression: false, implemented: false },
 ];
 
@@ -371,6 +376,78 @@ enum Destination {
 	Aiff(aiff::encode::Encoder<VecSink>),
 	Flac(flac::encode::Encoder<VecSink>),
 	WavPack(wavpack::encode::Encoder<VecSink>),
+	Vorbis(VorbisTrack),
+}
+
+// THE ONE DESTINATION THAT CANNOT STREAM, and the reason is in its own encoder rather than here.
+//
+// Vorbis scales its spectra into the reach of the floor, and that scale has to be ONE NUMBER FOR
+// THE WHOLE STREAM - a scale that changed between packets would be a gain nothing in the stream
+// records, which is audible as pumping. The peak of a spectrum is not a function of the peak of the
+// samples, so it has to be measured, which means the whole track has to exist before the first
+// packet can be written.
+//
+// So this one holds the decoded audio, which every other destination here deliberately does not.
+// That is stated rather than hidden, and it is BOUNDED: past the ceiling the conversion is refused
+// before it starts rather than discovered when the machine runs out. Teaching the encoder to make
+// its scale in one pass and its packets in another over a re-read source would remove this, and
+// would remove the ceiling with it.
+struct VorbisTrack {
+	channels: Vec<Vec<f32>>,
+	rate: u32,
+	frames: u64,
+}
+
+// Eight million samples of `f32`, which is thirty-two megabytes held - about ninety seconds of
+// 44.1 kHz stereo, or three minutes of mono. Chosen against what a governed tool is given rather
+// than against what the machine has: `audioconv` runs under an ordinary process memory limit, and a
+// ceiling that only fails on the machine with the least memory is a ceiling nobody tested.
+const VORBIS_MAX_SAMPLES: usize = 8 * 1024 * 1024;
+
+impl VorbisTrack {
+	fn new(format: Format) -> Result<VorbisTrack, Error> {
+		let mut channels: Vec<Vec<f32>> = Vec::new();
+		channels.try_reserve_exact(format.channels() as usize).map_err(|_| Error::TooLarge)?;
+		for _ in 0..format.channels() {
+			channels.push(Vec::new());
+		}
+		Ok(VorbisTrack { channels, rate: format.rate(), frames: 0 })
+	}
+
+	fn push(&mut self, frames: &[i16]) -> Result<(), Error> {
+		let count = self.channels.len();
+		if count == 0 || frames.len() % count != 0 {
+			return Err(Error::InvalidAudio);
+		}
+		let held = self.frames as usize * count;
+		if held.saturating_add(frames.len()) > VORBIS_MAX_SAMPLES {
+			return Err(Error::TooLarge);
+		}
+		for (index, channel) in self.channels.iter_mut().enumerate() {
+			channel.try_reserve(frames.len() / count).map_err(|_| Error::TooLarge)?;
+			for frame in frames.chunks_exact(count) {
+				// Signed 16-bit into the -1..1 the transform works in, by the negative full scale
+				// so that the range maps without clipping the one sample that reaches it.
+				channel.push(frame[index] as f32 / 32_768.0);
+			}
+		}
+		self.frames += (frames.len() / count) as u64;
+		Ok(())
+	}
+
+	fn finish(self) -> Result<(Vec<u8>, u64), Error> {
+		if self.frames == 0 {
+			return Err(Error::InvalidAudio);
+		}
+		// One block size, so no window switching and no mode selection - the configuration the
+		// encoder was written for. The stream serial is FIXED, because two conversions of the same
+		// input must produce the same bytes: a serial from a clock would make the output depend on
+		// when it was made, and this tree's image builds are reproducible by rule.
+		const BLOCKSIZE_LOG2: u8 = 11;
+		const SERIAL: u32 = 0x4c69_6265;
+		let bytes = vorbis::encode::encode(&self.channels, self.rate, BLOCKSIZE_LOG2, SERIAL).ok_or(Error::TooLarge)?;
+		Ok((bytes, self.frames))
+	}
 }
 
 impl Destination {
@@ -380,6 +457,7 @@ impl Destination {
 			Destination::Aiff(encoder) => encoder.push(frames).map_err(aiff_error),
 			Destination::Flac(encoder) => encoder.push(frames).map_err(flac_error),
 			Destination::WavPack(encoder) => encoder.push(frames).map_err(wavpack_error),
+			Destination::Vorbis(track) => track.push(frames),
 		}
 	}
 
@@ -389,6 +467,7 @@ impl Destination {
 			Destination::Aiff(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(aiff_error),
 			Destination::Flac(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(flac_error),
 			Destination::WavPack(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(wavpack_error),
+			Destination::Vorbis(track) => track.finish(),
 		}
 	}
 }
@@ -533,7 +612,13 @@ fn build(profile: Profile, sink: VecSink, format: Format, config: &Config) -> Re
 		// Joint stereo always: it costs nothing on material it does not suit and is most of the gain
 		// on material it does, which leaves nothing for a caller to decide.
 		Profile::WavPack => wavpack::encode::Encoder::new(sink, format, true).map(Destination::WavPack).map_err(wavpack_error),
-		Profile::Vorbis | Profile::Mp3 => Err(Error::NotImplemented),
+		// The sink is dropped: this destination builds its own bytes at the end rather than
+		// streaming into one, for the reason `VorbisTrack` states.
+		Profile::Vorbis => {
+			drop(sink);
+			VorbisTrack::new(format).map(Destination::Vorbis)
+		}
+		Profile::Mp3 => Err(Error::NotImplemented),
 	}
 }
 

@@ -99,6 +99,9 @@ struct Role {
 	// really sees its peer close when the receiver ends. ConsoleService reloading the shell on a
 	// logout depends on exactly that.
 	exclusive: bool,
+	// Whether the holder passes this channel on, and therefore whether it may duplicate it. See
+	// `system_manifest::Role::handed_on` for what it is for and what went wrong without it.
+	handed_on: bool,
 }
 
 // How a role is delivered, which is also what decides whether it can be delivered AGAIN.

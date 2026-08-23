@@ -273,18 +273,26 @@ impl<'a> BitpackCursor<'a> {
 	// u16 based
 
 	uk_reader!(read_u16, u16, 16, 2);
+	#[cfg(test)]
+	uk_reader!(read_u13, u16, 13, 1);
 
 	// TODO add here if needed
 	// TODO add here if needed
 
 	// u8 based
 	uk_reader!(read_u8, u8, 8, 1);
+	#[cfg(test)]
+	uk_reader!(read_u7, u8, 7, 0);
 	uk_reader!(read_u6, u8, 6, 0);
 	uk_reader!(read_u5, u8, 5, 0);
 	uk_reader!(read_u4, u8, 4, 0);
 	uk_reader!(read_u3, u8, 3, 0);
 	uk_reader!(read_u2, u8, 2, 0);
 	uk_reader!(read_u1, u8, 1, 0);
+	#[cfg(test)]
+	ik_reader!(read_i8, i8, 8, 8, 1);
+	#[cfg(test)]
+	uk_dynamic_reader!(read_dyn_u16, u16, 16);
 
 	// Returning bool:
 	#[inline]

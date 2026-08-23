@@ -212,6 +212,10 @@ name = "audioconv"
 path = "src/audioconv.rs"
 
 [[bin]]
+name = "audiorec"
+path = "src/audiorec.rs"
+
+[[bin]]
 name = "usage"
 path = "src/usage.rs"
 
@@ -409,6 +413,10 @@ keys = { path = "../../libs/input/keys" }
 lico = { path = "../../libs/terminal/lico" }
 imgconv = { path = "../../libs/image/imgconv" }
 audioconv = { path = "../../libs/audio/audioconv" }
+audiorec = { path = "../../libs/audio/audiorec" }
+# `audiorec` writes its own container, so it holds the encoder and the sink trait directly rather
+# than through a conversion library the way `audioconv` does.
+pcm = { path = "../../libs/audio/pcm" }
 pix = { path = "../../libs/image/pix" }
 png = { path = "../../libs/image/png" }
 surface = { path = "../../libs/display/surface" }

@@ -278,7 +278,16 @@ fn boot_main() {
 	// convert the ring-3 `\x1ePERF` cycle markers to wall-clock time.
 	serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());
 	serial_println!("boot OK - entering the userspace shell (type 'help', or 'exit' to halt)");
-	boot_userspace_with_recovery();
+	// Serial input goes interrupt-driven HERE, in this port's prologue, because it is the machine
+	// and not the policy: route the UART's legacy IRQ (COM1 = ISA IRQ 4) to the BSP and enable the
+	// receive interrupt, so a typed byte reaches the shell at once rather than on the next
+	// tick-quantized poll. The other two ports poll their UART and arrange nothing here.
+	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
+	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0));
+	arch::serial::enable_rx_irq();
+	// THREE HUNDRED ROUNDS, which is what `console_shell_loop` used to wait on this port before the
+	// wait moved inside the supervised attempt.
+	boot_userspace("x86_64", 300);
 	serial_println!("halting");
 }
 
@@ -322,23 +331,11 @@ fn serial_console_pump() {
 // shell exits (the user typed `exit`) or never attached.
 #[cfg(not(test))]
 pub(crate) fn console_shell_loop() {
-	// The shell attaches asynchronously: ConsoleService registers its console channel
-	// (SYS_CONSOLE_ATTACH) a few scheduler passes after it reports in, so the instant
-	// the boot chain settles it may not be attached yet on a slower arch (riscv under
-	// TCG emulation). Pump the schedule for a bounded window waiting for it before
-	// concluding none is present; on x86/aarch64 it has already attached, so this falls
-	// straight through with no wait.
-	let mut waited = 0u32;
-	while !console_input::shell_listening() {
-		if waited >= 300 {
-			serial_println!("shell: no interactive shell attached");
-			return;
-		}
-		waited += 1;
-		sched::run_until_idle();
-		arch::serial::drain_tx();
-		arch::idle_halt();
-	}
+	// NO WAIT HERE ANY MORE. This used to pump the schedule for three hundred rounds waiting for
+	// ConsoleService to register its channel - after the recovery ladder had already reported the
+	// boot a success, so a chain that never came up was a boot the kernel had called good and then
+	// printed "no interactive shell attached" over. The wait belongs to the attempt, and
+	// `supervise` does not return true until the shell is listening.
 	// Nudge the shell to print its first prompt, then pump both input sources until
 	// it exits. Each round forwards any waiting serial byte and runs the cooperative
 	// schedule, so threads a device interrupt woke also make progress: the
@@ -606,15 +603,25 @@ fn root_child_domains() -> usize {
 	}
 }
 
-// Supervise a critical process (SystemManager) through the recovery ladder: each
-// round, `spawn` it (returning its process, or None if it could not be spawned),
-// run the system to a quiescent point, and check that it neither faulted nor ended.
-// Returns true as soon as a round completes with the process still running (the
-// system is up), or false once every attempt - the original plus `max_restarts`
-// recovery restarts - has failed, at which point the caller escalates (reboot as
-// the last resort). This is the kernel's one minimal rescue mechanism, the single
-// exception to "the kernel is pure mechanism".
-fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: impl FnMut() -> Option<alloc::sync::Arc<object::process::Process>>) -> bool {
+// Supervise a critical process (SystemManager) through the recovery ladder: each round, `spawn` it
+// (returning its report endpoint and its process, or None if it could not be spawned), then drive
+// the system until the interactive shell is listening. Returns true as soon as a round gets that
+// far, or false once every attempt - the original plus `max_restarts` recovery restarts - has
+// failed, at which point the caller escalates (reboot as the last resort). This is the kernel's one
+// minimal rescue mechanism, the single exception to "the kernel is pure mechanism".
+//
+// A ROUND ENDS WHEN THE SHELL IS LISTENING, not when one pass of the scheduler left the manager
+// standing. All three ports used to wait for readiness AFTER the ladder had already returned
+// success - x86_64 inside `console_shell_loop`, the other two in a loop of their own - so a boot
+// whose chain never came up was a boot the ladder had called good, and the two hand-rolled tails
+// printed "settled" over it. Inside the attempt the three outcomes are distinct and each is honest:
+// the shell attaches and the round succeeded; the manager faults or ends while the wait runs and
+// the ladder retries; the budget runs out and the round FAILED, which is not a boot that settled.
+//
+// `settle_rounds` is a caller's number because the machines differ by an order of magnitude:
+// riscv64 under TCG needs thousands of passes where x86_64 needs hundreds. A number that differs by
+// target is a parameter, not a reason for three functions.
+fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, settle_rounds: u32, log: &'static str, mut spawn: impl FnMut() -> Option<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>)>) -> bool {
 	use object::KernelObject;
 	let branches_before: usize = root_child_domains();
 	for attempt in 0..=max_restarts {
@@ -630,7 +637,7 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: 
 		// recovery ladder has reported SUCCESS when nothing had been started - and the boot then
 		// carried on as though userspace were up. A failed spawn is a failed attempt: retry it like
 		// a crash, and let the ladder run out if it keeps failing.
-		let Some(process) = spawn() else {
+		let Some((reports, process)) = spawn() else {
 			serial_println!("recovery: SystemManager did not start (attempt {} of {})", attempt + 1, max_restarts + 1);
 			continue;
 		};
@@ -651,7 +658,37 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, mut spawn: 
 			serial_println!("recovery: SystemManager (koid {}) ended before the system was up (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
 			continue;
 		}
-		return true;
+		// DRIVE THE CHAIN UNTIL THE SHELL IS LISTENING. The reports are drained as they arrive,
+		// because the endpoint is bounded and a full one would block the manager that is writing to
+		// it - so this is the boot log and the backpressure relief in one loop.
+		let mut listening = false;
+		let mut gone = false;
+		for _ in 0..settle_rounds {
+			sched::run_until_idle();
+			while let Ok(message) = reports.recv() {
+				serial_println!("{}: userspace: {}", log, core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
+			}
+			if console_input::shell_listening() {
+				listening = true;
+				break;
+			}
+			// THE MANAGER IS CHECKED ACROSS THE WAIT, not only before it. Bringing the chain up is
+			// where it does its work, so it is also where it faults - and a fault noticed only at
+			// the end of the budget is a retry that waited for nothing.
+			if crash_seen(crash_rx, koid) || process.is_terminated() {
+				gone = true;
+				break;
+			}
+			arch::idle_halt();
+		}
+		if listening {
+			return true;
+		}
+		if gone {
+			serial_println!("recovery: SystemManager (koid {}) is gone while the chain was coming up (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
+		} else {
+			serial_println!("recovery: no interactive shell after {} rounds (attempt {} of {})", settle_rounds, attempt + 1, max_restarts + 1);
+		}
 	}
 	false
 }
@@ -668,50 +705,48 @@ fn serial_rx_interrupt(_vector: u32) {
 	}
 }
 
-// Bring up the userspace system under SystemManager-crash recovery, then hand
-// control to the interactive shell. The kernel registers a crash-notify channel
-// and supervises SystemManager: if it faults before the system is up, the kernel
-// starts a recovery SystemManager, up to a few times, and reboots as the last
-// resort. On a clean start it prints the boot-chain reports and runs the shell.
+// THE ONE BOOT TAIL, called by all three entries once their machine is up.
+//
+// Bring the userspace system up under SystemManager-crash recovery and hand control to the
+// interactive shell. The kernel registers a crash-notify channel and supervises SystemManager: if
+// it faults, ends, or never brings the chain as far as a listening shell, the kernel starts a
+// recovery SystemManager, up to a few times, and reboots as the last resort.
+//
+// WHAT EACH PORT KEEPS FOR ITSELF is the machine: firmware hand-off, memory, per-CPU, the interrupt
+// controller, the timer, device discovery, and its own console arrangement - interrupt-driven on
+// x86_64, polled on the other two. What is here is the part that carries POLICY, and it used to
+// exist three times: x86_64 called this, and aarch64 and riscv64 hand-rolled a settle loop and then
+// called `console_shell_loop` directly. Those two therefore had no recovery ladder, no crash-notify
+// channel, no ended-is-as-gone-as-faulted check, no rule that the ladder stops once a control-plane
+// branch exists, and no idle hook - so a SystemManager lost after boot left an ownerless control
+// plane on two targets of three and nothing noticed. None of that machinery needed porting: it
+// carries no `cfg` and compiled on every target already. Two entries simply did not call it.
+//
+// `log` is the prefix a port's boot lines carry; `settle_rounds` is how long the readiness wait may
+// take on this machine (see `supervise`).
 #[cfg(not(test))]
-fn boot_userspace_with_recovery() {
-	use alloc::sync::Arc;
+pub(crate) fn boot_userspace(log: &'static str, settle_rounds: u32) {
 	const MAX_RESTARTS: u32 = 3;
 	// Pump the serial console from the scheduler's idle spin: virtio-gpu polls its
 	// display size on a short repeating timer, so run_until_idle never returns and the
 	// BSP would never reach console_shell_loop to poll the UART. The idle hook keeps
-	// serial input live regardless (the keyboard is interrupt-driven and unaffected).
+	// serial input live regardless (the keyboard is interrupt-driven and unaffected),
+	// and it is what watches for a resident SystemManager going away later.
 	sched::set_idle_hook(serial_console_pump);
-	// Serial input goes interrupt-driven: route the UART's legacy IRQ (COM1 = ISA
-	// IRQ 4) to the BSP and enable the receive interrupt, so a typed byte reaches
-	// the shell at once rather than on the next tick-quantized poll.
-	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
-	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0));
-	arch::serial::enable_rx_irq();
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
-	let mut kernel_ep: Option<Arc<object::channel::Channel>> = None;
-	let up = supervise(&crash_rx, MAX_RESTARTS, || match spawn_system_manager() {
-		Ok((ep, process)) => {
-			kernel_ep = Some(ep);
-			Some(process)
-		}
+	let up = supervise(&crash_rx, MAX_RESTARTS, settle_rounds, log, || match spawn_system_manager() {
+		Ok((ep, process)) => Some((ep, process)),
 		Err(reason) => {
 			serial_println!("recovery: could not start SystemManager: {}", reason);
 			None
 		}
 	});
 	if up {
-		// From here a SystemManager that ends is a control plane with no owner, and the idle hook
-		// reboots rather than letting the machine run on as though somebody were still supervising.
+		// SET HERE AND NOT BEFORE. From this point a SystemManager that ends is a control plane
+		// with no owner, and the idle hook reboots rather than letting the machine run on as though
+		// somebody were still supervising. Before the shell is listening there is nothing to own.
 		SYSTEM_IS_UP.store(true, core::sync::atomic::Ordering::Relaxed);
-		// SystemManager came up without faulting: print the boot-chain reports and
-		// hand control to the interactive shell it started.
-		if let Some(ep) = &kernel_ep {
-			while let Ok(message) = ep.recv() {
-				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
-			}
-		}
 		console_shell_loop();
 		fault::clear_crash_notify();
 	} else {

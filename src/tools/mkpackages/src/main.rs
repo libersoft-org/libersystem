@@ -178,6 +178,17 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 		}
 	}
 	staged.push((String::from("etc/bootstrap.list"), bootstrap.clone().into_bytes()));
+	// THE DIGESTS OF THE BYTES THE LOADER READS, beside the list it already reads.
+	//
+	// It covers the kernel, `etc/bootstrap.list` and every program that list names - the final bytes
+	// after any staging, because those are what the loader actually gets. Once the loader has chosen
+	// a source, a manifest that is missing, malformed or disagreeing is fatal there.
+	//
+	// WHAT IT PROVES, and it is worth being exact: the content matches the manifest beside it. That
+	// catches corruption, a half-written image and artifacts from two different builds mixed
+	// together. It does NOT catch an OLD image - an old one carries its own old manifest and agrees
+	// with itself - and it is not a signature: whoever can rewrite one file can rewrite both.
+	staged.push((String::from("etc/boot.manifest"), boot_manifest(&staged)));
 
 	// The SAME files, written out for staging on the boot medium's own filesystem.
 	//
@@ -188,6 +199,8 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// shapes, and the programs on it can be replaced one at a time instead of rebuilt as a blob.
 	{
 		fallback.push((String::from("etc/bootstrap.list"), bootstrap.clone().into_bytes()));
+		// EACH SOURCE CARRIES ITS OWN, over what actually sits there.
+		fallback.push((String::from("etc/boot.manifest"), boot_manifest(&fallback)));
 		// Architecture-qualified, like `init-<arch>.pkg` beside it. An unqualified directory is the
 		// same trap that put x86_64 programs on a riscv64 ESP: every architecture's build writes
 		// it, so it holds whichever built last.
@@ -465,6 +478,20 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 
 fn valid_library_name(name: &str) -> bool {
 	!name.is_empty() && !name.starts_with("lib") && name.len() <= 58 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+// The boot manifest for one source: a version line, then one `sha256  path` row per file the loader
+// will read from it, sorted so two builds of the same bytes produce the same file.
+//
+// `etc/boot.manifest` never lists itself: it is the thing being compared against.
+fn boot_manifest(files: &[(String, Vec<u8>)]) -> Vec<u8> {
+	let mut rows: Vec<String> = files.iter().filter(|(name, _)| name != "etc/boot.manifest").map(|(name, bytes)| format!("{}  {name}\n", sha256_hex(bytes))).collect();
+	rows.sort();
+	let mut out = String::from("liberboot-manifest 1\n");
+	for row in rows {
+		out.push_str(&row);
+	}
+	out.into_bytes()
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

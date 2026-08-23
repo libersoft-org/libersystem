@@ -63,6 +63,10 @@ owner = "audioconv"
 path = "user/libs/audio/audioconv"
 
 [[sources]]
+owner = "audiorec"
+path = "user/libs/audio/audiorec"
+
+[[sources]]
 owner = "apng"
 path = "user/libs/image/apng"
 
@@ -887,6 +891,32 @@ destination = "bin/audioconv.lsexe"
 # What the BINARY imports, which is the library and the plumbing - the codecs are the library's
 # providers, not this one's. `play` lists them because `play` calls the decoders itself.
 providers = ["base-proto", "audioconv", "volume-client", "storage-proto", "lsrt"]
+
+[[programs]]
+name = "audiorec"
+owner = "tools"
+role = "tool"
+linkage = "dynamic"
+stage = "volume"
+destination = "bin/audiorec.lsexe"
+# The recorder writes the container itself - one WAV encoder over a storage transaction - so `wav`
+# and `pcm` are its own imports rather than a library's. `audio-client` is the capture stream and
+# `audiorec` is the option and ceiling arithmetic.
+# NO `wav`, which is not an omission. `wav::encode::Encoder<S>` is generic over the destination, so
+# instantiating it over this program's storage-transaction sink monomorphises the encoder INTO this
+# program - there is nothing left to import from the shared library. `pcm` and `adpcm` DO cross:
+# `Format::new` is an ordinary function, and the encoder is one type over every profile the leaf can
+# write, so a generic instantiated in the block codec's context comes with it either way.
+providers = [
+	"base-proto",
+	"audiorec",
+	"audio-client",
+	"pcm",
+	"adpcm",
+	"volume-client",
+	"storage-proto",
+	"lsrt",
+]
 
 [[programs]]
 name = "play"
@@ -2430,6 +2460,12 @@ source = "CLIENT"
 # closes - which is what makes `exit` return a fresh login prompt - and it can only see the
 # close if this supervisor kept no copy of the other end.
 exclusive = true
+# AND THE SHELL PASSES IT ON. Handing the terminal to the foreground job is what a foreground job
+# IS: `run_tool_interactive` and `send_stdout` both duplicate this channel for the child. Without
+# the right to duplicate, every interactive tool - `play`, `lico`, `licoview`, `licoedit`,
+# `imgview`, `watch`, `less`, `audiorec` - failed to launch, silently, because a launch that never
+# happened has nothing to report.
+handed_on = true
 
 [[services.roles]]
 tag = "CONTROL"
@@ -2649,6 +2685,13 @@ owner = "audioconv"
 destination = "lib/audio/audioconv.lslib"
 features = []
 providers = ["adpcm", "aiff", "flac", "mp3", "pcm", "vorbis", "wav", "wavpack", "lsrt"]
+
+[[libraries]]
+name = "audiorec"
+owner = "audiorec"
+destination = "lib/audio/audiorec.lslib"
+features = []
+providers = ["pcm", "lsrt"]
 
 [[libraries]]
 name = "apng"

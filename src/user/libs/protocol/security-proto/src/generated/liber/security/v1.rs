@@ -54,6 +54,14 @@ pub enum Capability {
 	/// directory as its SCOPE rather than as a convention the holder is trusted to respect: a path
 	/// outside it is refused by the service, and the client cannot mint a broader one.
 	AppAssets = 20,
+	/// The authority to RECORD, minted per launch through `audio-admin.open-captures`.
+	///
+	/// Separate from `audio-stream` on purpose. Playback and capture are the same device and the
+	/// same service, and they are not the same authority: "may make a sound" is a nuisance if it is
+	/// wrong, "may record" is a microphone. A manifest that could only say `audio-stream` would be
+	/// a manifest that hands the microphone to anything that beeps, so the two are named apart and
+	/// the connection each mints refuses the other's operations.
+	AudioCapture = 21,
 }
 
 impl Capability {
@@ -117,6 +125,7 @@ impl Capability {
 			18 => Some(Capability::AudioStream),
 			19 => Some(Capability::Session),
 			20 => Some(Capability::AppAssets),
+			21 => Some(Capability::AudioCapture),
 			_ => None,
 		}
 	}
@@ -548,7 +557,8 @@ pub mod permission {
 				};
 				r.finish()?;
 				request_handles.clear();
-				let result = service.run(name, args, cwd, environment, stdout);
+				let authorized = crate::codec::handle_carries(stdout, 16, 5);
+				let result = if authorized { service.run(name, args, cwd, environment, stdout) } else { Err(Error::Denied) };
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
@@ -608,7 +618,8 @@ pub mod permission {
 				};
 				r.finish()?;
 				request_handles.clear();
-				let result = service.run_pipeline(stages, cwd, environment, stdout);
+				let authorized = crate::codec::handle_carries(stdout, 16, 5);
+				let result = if authorized { service.run_pipeline(stages, cwd, environment, stdout) } else { Err(Error::Denied) };
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
@@ -653,7 +664,8 @@ pub mod permission {
 				};
 				r.finish()?;
 				request_handles.clear();
-				let result = service.run_with_file(name, args, cwd, file, writable, stdout);
+				let authorized = crate::codec::handle_carries(stdout, 16, 5);
+				let result = if authorized { service.run_with_file(name, args, cwd, file, writable, stdout) } else { Err(Error::Denied) };
 				let encoded: Option<()> = (|| {
 					let w = &mut writer;
 					w.u32(corr)?;
@@ -1079,6 +1091,7 @@ impl Capability {
 			Capability::AudioStream => out.push_str("\"audio-stream\""),
 			Capability::Session => out.push_str("\"session\""),
 			Capability::AppAssets => out.push_str("\"app-assets\""),
+			Capability::AudioCapture => out.push_str("\"audio-capture\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -1104,6 +1117,7 @@ impl Capability {
 			Capability::AudioStream => out.push_str("audio-stream"),
 			Capability::Session => out.push_str("session"),
 			Capability::AppAssets => out.push_str("app-assets"),
+			Capability::AudioCapture => out.push_str("audio-capture"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -1129,6 +1143,7 @@ impl Capability {
 			Capability::AudioStream => crate::codec::cbor::text(out, "audio-stream"),
 			Capability::Session => crate::codec::cbor::text(out, "session"),
 			Capability::AppAssets => crate::codec::cbor::text(out, "app-assets"),
+			Capability::AudioCapture => crate::codec::cbor::text(out, "audio-capture"),
 		}
 	}
 }

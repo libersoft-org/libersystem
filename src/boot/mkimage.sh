@@ -186,6 +186,34 @@ stage_bootstrap_files() {
 	mcopy -i "$image" "$root"/libexec/* ::/libexec/
 }
 
+# The `etc/boot.manifest` for a BOOT MEDIUM, which is not the system volume's.
+#
+# The loader checks every file it reads against the manifest of THE SOURCE IT READ IT FROM, so a
+# medium the loader may boot needs one of its own - and it cannot simply be the volume's copy,
+# because the kernel staged here is the STRIPPED build. That is a different sequence of bytes from
+# the volume's kernel, so the volume's digest for it would refuse every boot from this medium.
+#
+# The kernel row is therefore computed here, over the file that was actually copied in. The
+# bootstrap rows come from the set's own manifest when the medium carries the set; a medium that
+# carries only a kernel - the shipping ISO, whose programs live on the volume beside it - gets a
+# manifest with the kernel alone, which is still a source that can be checked rather than one the
+# loader has to take on trust.
+stage_boot_manifest() {
+	local image="$1" staged_kernel="$2" arch="${3:-}"
+	local out="$BUILD/boot.manifest.$$"
+	if [[ -n "$arch" ]]; then
+		cp "$BUILD/bootstrap-${arch}/etc/boot.manifest" "$out"
+	else
+		printf 'liberboot-manifest 1\n' >"$out"
+	fi
+	printf '%s  kernel\n' "$(sha256sum "$staged_kernel" | cut -d" " -f1)" >>"$out"
+	# `::/etc` already exists when a bootstrap set was staged into it.
+	mmd -i "$image" ::/etc 2>/dev/null || true
+	stamp_epoch "$out"
+	mcopy -i "$image" "$out" ::/etc/boot.manifest
+	rm -f "$out"
+}
+
 # WHICH volume this boot medium is paired with.
 #
 # The loader has read `etc/system-volume.uuid` since P02M0129 and nothing ever wrote it, so every
@@ -308,7 +336,9 @@ make_iso() {
 	# names its own programs, and a medium whose volume is unreadable has nothing else to boot.
 	if [[ "$test_medium" == "1" ]]; then
 		stage_bootstrap_files "$efi_img" x86_64
+		stage_boot_manifest "$efi_img" "$staged" x86_64
 	else
+		stage_boot_manifest "$efi_img" "$staged"
 		# THE SHIPPING MEDIUM ONLY. It carries the system volume as a file on this same filesystem,
 		# so naming that volume is true of it. The TEST medium carries the factory archive and no
 		# volume at all - a pairing file there would name a volume the medium does not have, which
@@ -399,6 +429,7 @@ make_img() {
 	# `libexec/`, assembled by the same loader code. `init.pkg` was the second mechanism for this
 	# one job, and the only one of the two whose programs could not be replaced individually.
 	stage_bootstrap_files "$esp" x86_64
+	stage_boot_manifest "$esp" "$staged" x86_64
 	stage_volume_pairing "$esp" x86_64
 	# No volume archive: the system volume is a filesystem in partition 2, and the archive exists
 	# only as the kernel test suite's fixture (P02M0108).

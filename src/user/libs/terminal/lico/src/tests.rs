@@ -504,7 +504,7 @@ fn a_modified_key_arrives_as_a_chord_and_a_bare_one_does_not() {
 	// shift+arrow was indistinguishable from a damaged sequence and an editor could not offer
 	// shift-movement at all.
 	let mut decoder = InputDecoder::new();
-	let mut feed = |decoder: &mut InputDecoder, bytes: &[u8]| {
+	let feed = |decoder: &mut InputDecoder, bytes: &[u8]| {
 		let mut last = None;
 		for &byte in bytes {
 			if let Some(event) = decoder.feed(byte) {

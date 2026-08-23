@@ -1,18 +1,22 @@
-//! LiberSystem audio package - audio playback service.
+//! LiberSystem audio package - audio playback and capture service.
 
 package liber:audio@1;
 
 use liber:base@1.{error};
 
-/// AudioService: headless PCM playback over the virtio-sound device. `beep` queues a
+/// AudioService: headless PCM playback and capture over the virtio-sound device. `beep` queues a
 /// tone of the given frequency (Hz) and duration (milliseconds) into the same mixer - the device is
 /// reached as a capability (the channel this interface is served on), never as
 /// ambient device access. `open-stream` returns a sub-channel served as `pcm-stream`;
 /// rates from 8 through 48 kHz and one or two channels are accepted, then converted
-/// to the hardware's fixed 48 kHz stereo periods.
+/// to the hardware's fixed 48 kHz stereo periods. `open-capture` is the same in reverse: a
+/// sub-channel served as `pcm-capture`, converted DOWN from the hardware's 48 kHz stereo to the
+/// rate and channel count asked for. It answers not-found on a machine whose sound device has no
+/// input stream, which is an ordinary machine rather than an error.
 interface audio {
-	@op(1) beep:        func(freq: u16, millis: u32) -> result<unit, error>;
-	@op(2) open-stream: func(rate: u32, channels: u8) -> result<handle<channel>, error>;
+	@op(1) beep:         func(freq: u16, millis: u32) -> result<unit, error>;
+	@op(2) open-stream:  func(rate: u32, channels: u8) -> result<handle<channel>, error>;
+	@op(3) open-capture: func(rate: u32, channels: u8) -> result<handle<channel>, error>;
 }
 
 /// A playback stream returned by `audio.open-stream`. Samples are signed 16-bit
@@ -25,8 +29,23 @@ interface pcm-stream {
 	@op(2) close: func() -> result<unit, error>;
 }
 
-/// Privileged launcher boundary that mints a factory restricted to `open-stream`.
-/// Connections produced from it cannot queue `beep` tones.
+/// A capture stream returned by `audio.open-capture`. Samples are signed 16-bit little-endian,
+/// interleaved by channel, and one `read` answers exactly one device period converted into the
+/// stream's format - a bounded amount, so a recorder that stops asking stops the flow rather than
+/// filling a queue nobody drains. A read blocks until the device has filled a period, which makes
+/// the device the capture clock the way playback backpressure is the playback clock. An empty
+/// answer means the stream is over; closing the channel is equivalent to `close`.
+interface pcm-capture {
+	@op(1) read:  func() -> result<list<u8>, error>;
+	@op(2) close: func() -> result<unit, error>;
+}
+
+/// Privileged launcher boundary that mints factories restricted to one direction.
+/// A connection from `open-streams` may only `open-stream`; one from `open-captures` may only
+/// `open-capture`. Neither can queue `beep` tones, and NEITHER CAN DO THE OTHER'S JOB: "may record"
+/// is not "may make a sound", and a launcher that cannot say which it is granting is a launcher that
+/// hands a microphone to anything that beeps.
 interface audio-admin {
-	@op(1) open-streams: func() -> result<handle<channel>, error>;
+	@op(1) open-streams:  func() -> result<handle<channel>, error>;
+	@op(2) open-captures: func() -> result<handle<channel>, error>;
 }

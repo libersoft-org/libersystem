@@ -1,15 +1,24 @@
 // Event-driven AudioService engine: typed PCM streams, bounded source queues,
 // nearest-neighbor rate conversion, saturating software mixing, and one-period
 // virtio-snd backpressure without blocking other clients on the driver ACK.
+//
+// CAPTURE RUNS THROUGH THE SAME ONE-OP-AT-A-TIME DRIVER. The driver is synchronous - it blocks on
+// the device's interrupt for the period it is playing or filling - so this engine may have exactly
+// one request outstanding to it, and `DriverPending` is what says which. A `read` that arrives with
+// no period ready is DEFERRED the way a `write` with no capacity is: the raw request is kept, the
+// period is asked for, and the request is re-dispatched when the answer lands. Nothing about
+// capture blocks an unrelated client's RPC.
 
 extern crate alloc;
 
 use alloc::vec::Vec;
+use pcm::encode::{Remix, Resample};
 use pcm::{Format, OUTPUT_RATE};
 use proto::codec::Buffer;
 use proto::system::Error;
 use proto::system::audio::{self, Service as AudioService};
 use proto::system::audio_admin::{self, Service as AdminService};
+use proto::system::pcm_capture::{self, Service as PcmCaptureService};
 use proto::system::pcm_stream::{self, Service as PcmService};
 use rt::*;
 
@@ -17,10 +26,21 @@ const PERIOD_FRAMES: usize = 512;
 const PERIOD_BYTES: usize = PERIOD_FRAMES * 4;
 const MAX_QUEUED_FRAMES: usize = 4_096;
 const MAX_STREAMS: usize = 16;
+// One recorder at a time, and it is a hardware limit rather than a policy: there is one input
+// stream on the device and its periods cannot be handed to two readers without deciding which of
+// them the audio belongs to.
+const MAX_CAPTURES: usize = 1;
+// The driver's one-byte commands. Declared here as well as there because the two ends of a protocol
+// with three message shapes should each state what they send - see the block beside `CMD_CAPTURE`
+// in driver.virtio-snd for the whole of it.
+const CMD_CAPTURE: u8 = 1;
+const CMD_CAPTURE_STOP: u8 = 2;
 const MAX_TONES: usize = 8;
 const AMP: i16 = 6_000;
 const REQUEST_MAX: usize = 128;
-const REPLY_MAX: usize = 128;
+// A capture `read` answers with a whole period inline, so the reply buffer holds one: 512 stereo
+// frames is PERIOD_BYTES, and everything else this service answers is a few bytes.
+const REPLY_MAX: usize = PERIOD_BYTES + 128;
 
 struct PendingWrite {
 	request: Vec<u8>,
@@ -114,21 +134,52 @@ enum DriverPending {
 	None,
 	Period,
 	Stop,
+	// A capture period was asked for on behalf of the recorder at this index.
+	Capture(usize),
+	// The capture stream was asked to stop. Nobody is waiting for the answer, but the driver owes
+	// one and it has to be read off the channel before the next request.
+	CaptureStop,
+}
+
+// One recorder: the channel it is served on, the conversion from the device's 48 kHz stereo down to
+// what it asked for, and the two halves of the deferral - the request that is waiting for a period
+// and the period that is waiting for a request.
+struct Capture {
+	chan: u64,
+	remix: Remix,
+	resample: Resample,
+	// The raw `read` request kept while the driver fills a period. Re-dispatched when it lands.
+	pending: Option<Vec<u8>>,
+	// The converted period an answered `read` takes.
+	ready: Option<Vec<u8>>,
+	// The device has no input stream, or refused to start one. The next `read` says so and every
+	// one after it - a recorder is not left waiting for periods that will never come.
+	unavailable: bool,
+	closing: bool,
 }
 
 struct Audio {
 	snd: u64,
 	streams: Vec<Stream>,
+	captures: Vec<Capture>,
 	tones: Vec<Tone>,
 	driver_pending: DriverPending,
 	driver_running: bool,
+	capture_running: bool,
 	period: Vec<u8>,
 }
 
+// What a connection may ask for. `Full` is the service channel ServiceManager holds; the other two
+// are what `audio-admin` mints for a launcher, one direction each.
+//
+// CAPTURE IS NOT A SUBSET OF PLAYBACK. A program granted `audio-stream` may make a sound and may
+// not record; a program granted `audio-capture` may record and may not make a sound. Two scopes
+// rather than one with a flag, because the launcher's manifest names one or the other.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
 	Full,
 	StreamOnly,
+	CaptureOnly,
 }
 
 struct Client {
@@ -138,7 +189,7 @@ struct Client {
 
 impl Audio {
 	fn new(snd: u64) -> Audio {
-		Audio { snd, streams: Vec::new(), tones: Vec::new(), driver_pending: DriverPending::None, driver_running: false, period: alloc::vec![0; PERIOD_BYTES] }
+		Audio { snd, streams: Vec::new(), captures: Vec::new(), tones: Vec::new(), driver_pending: DriverPending::None, driver_running: false, capture_running: false, period: alloc::vec![0; PERIOD_BYTES] }
 	}
 
 	fn has_audio(&self) -> bool {
@@ -171,6 +222,78 @@ impl Audio {
 			stream.compact();
 		}
 		self.tones.retain(|tone| tone.remaining != 0);
+	}
+
+	// Ask the driver for one capture period on behalf of the first recorder that is waiting for one.
+	// Returns whether a request went out, so `pump` knows the driver is busy.
+	//
+	// CAPTURE IS ASKED FOR BEFORE PLAYBACK IS PUMPED. The device fills a period on its own clock and
+	// a recorder that is late loses audio; a playback period that is late is a period the mixer
+	// simply sends on the next turn, because the device's own ring holds several.
+	fn pump_capture(&mut self) -> bool {
+		if self.snd == 0 || self.driver_pending != DriverPending::None {
+			return false;
+		}
+		let Some(index) = self.captures.iter().position(|capture| capture.pending.is_some() && capture.ready.is_none() && !capture.unavailable) else {
+			return false;
+		};
+		if unsafe { send_blocking(self.snd, &[CMD_CAPTURE], 0) } {
+			self.driver_pending = DriverPending::Capture(index);
+			self.capture_running = true;
+			true
+		} else {
+			self.driver_failed();
+			false
+		}
+	}
+
+	// One captured period from the driver, converted into the recorder's format. An EMPTY message is
+	// the driver saying this device cannot capture - see `serve_command` in driver.virtio-snd.
+	fn capture_ready(&mut self, index: usize, period: &[u8]) {
+		self.driver_pending = DriverPending::None;
+		let Some(capture) = self.captures.get_mut(index) else { return };
+		if period.is_empty() {
+			capture.unavailable = true;
+			return;
+		}
+		// The device's period is 48 kHz stereo signed-16-bit little-endian. Mixed down to the
+		// recorder's channel count first, then resampled: the resampler is built for that channel
+		// count, so remixing after it would interpolate across channels that are not there yet.
+		let mut stereo: Vec<i16> = Vec::with_capacity(period.len() / 2);
+		for frame in period.chunks_exact(2) {
+			stereo.push(i16::from_le_bytes([frame[0], frame[1]]));
+		}
+		let mut remixed: Vec<i16> = Vec::new();
+		if capture.remix.apply(&stereo, &mut remixed).is_none() {
+			capture.unavailable = true;
+			return;
+		}
+		let mut converted: Vec<i16> = Vec::new();
+		if capture.resample.push(&remixed, &mut converted).is_none() {
+			capture.unavailable = true;
+			return;
+		}
+		let mut bytes: Vec<u8> = Vec::with_capacity(converted.len() * 2);
+		for sample in converted {
+			bytes.extend_from_slice(&sample.to_le_bytes());
+		}
+		capture.ready = Some(bytes);
+	}
+
+	// Tell the driver the capture stream is over, when the last recorder has gone.
+	fn stop_capture(&mut self) {
+		if self.snd == 0 || self.driver_pending != DriverPending::None || !self.captures.is_empty() {
+			return;
+		}
+		if !self.capture_running {
+			return;
+		}
+		if unsafe { send_blocking(self.snd, &[CMD_CAPTURE_STOP], 0) } {
+			self.driver_pending = DriverPending::CaptureStop;
+			self.capture_running = false;
+		} else {
+			self.driver_failed();
+		}
 	}
 
 	fn pump(&mut self) {
@@ -211,7 +334,15 @@ impl Audio {
 		self.snd = 0;
 		self.driver_pending = DriverPending::None;
 		self.driver_running = false;
+		self.capture_running = false;
 		self.tones.clear();
+		// A recorder outlives the device only as a stream that says so: the channel stays open and
+		// every `read` on it answers not-found, so a recording in progress ends with an error rather
+		// than with a file that stops mid-sentence and looks complete.
+		for capture in &mut self.captures {
+			capture.unavailable = true;
+			capture.ready = None;
+		}
 		while let Some(mut stream) = self.streams.pop() {
 			if let Some(pending) = stream.pending.take() {
 				for &handle in pending.caps.as_slice() {
@@ -236,8 +367,94 @@ impl Audio {
 		}
 	}
 
+	fn remove_capture(&mut self, index: usize) {
+		let capture: Capture = self.captures.swap_remove(index);
+		if capture.chan != 0 {
+			unsafe { close(capture.chan) };
+		}
+	}
+
+	// Re-dispatch a deferred `read` once its period has landed - or once the stream is known to be
+	// unavailable, which is an answer too. Exactly the shape `service_pending_writes` has for the
+	// playback direction.
+	fn service_pending_reads(&mut self) {
+		let mut index: usize = 0;
+		while index < self.captures.len() {
+			if (self.captures[index].ready.is_some() || self.captures[index].unavailable)
+				&& let Some(request) = self.captures[index].pending.take()
+			{
+				self.dispatch_capture(index, &request);
+			}
+			index += 1;
+		}
+	}
+
+	fn dispatch_capture(&mut self, index: usize, request: &[u8]) {
+		let chan: u64 = self.captures[index].chan;
+		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
+		let mut reply_handle = proto::codec::Handles::new();
+		let mut request_handle = proto::codec::Handles::new();
+		let mut call = CaptureCall { capture: &mut self.captures[index] };
+		if let Some(len) = pcm_capture::dispatch(&mut call, request, &mut request_handle, &mut reply, &mut reply_handle) {
+			if !unsafe { send_caps_blocking(chan, &reply[..len], reply_handle.as_slice()) } {
+				for &leftover in reply_handle.as_slice() {
+					unsafe { close(leftover) };
+				}
+			}
+		} else {
+			for &leftover in reply_handle.as_slice() {
+				unsafe { close(leftover) };
+			}
+		}
+		for &unclaimed in request_handle.as_slice() {
+			unsafe { close(unclaimed) };
+		}
+	}
+
+	fn poll_captures(&mut self) {
+		let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
+		let mut index: usize = 0;
+		while index < self.captures.len() {
+			if self.captures[index].chan == 0 || self.captures[index].pending.is_some() {
+				index += 1;
+				continue;
+			}
+			let chan: u64 = self.captures[index].chan;
+			match unsafe { try_recv_caps(chan, &mut request) } {
+				PolledCaps::Message { len, handles } => {
+					for &unclaimed in handles.as_slice() {
+						unsafe { close(unclaimed) };
+					}
+					self.take_capture_request(index, &request[..len]);
+					index += 1;
+				}
+				PolledCaps::Empty => index += 1,
+				PolledCaps::Closed => self.remove_capture(index),
+			}
+		}
+	}
+
+	// A `read` with nothing ready is DEFERRED rather than refused: the request is kept, a period is
+	// asked for, and the reply goes out when it lands. Anything else is answered now.
+	fn take_capture_request(&mut self, index: usize, request: &[u8]) {
+		let op: u16 = if request.len() >= 2 { u16::from_le_bytes([request[0], request[1]]) } else { 0 };
+		if op == pcm_capture::OP_READ && self.captures[index].ready.is_none() && !self.captures[index].unavailable {
+			self.captures[index].pending = Some(request.to_vec());
+		} else {
+			self.dispatch_capture(index, request);
+		}
+	}
+
 	fn cleanup_drained(&mut self) {
 		let mut index: usize = 0;
+		while index < self.captures.len() {
+			if self.captures[index].closing && self.captures[index].pending.is_none() {
+				self.remove_capture(index);
+			} else {
+				index += 1;
+			}
+		}
+		index = 0;
 		while index < self.streams.len() {
 			if self.streams[index].closing && self.streams[index].queued_frames() == 0 && self.streams[index].pending.is_none() {
 				self.remove_stream(index);
@@ -323,6 +540,7 @@ struct RootCall<'a> {
 
 impl AudioService for RootCall<'_> {
 	fn beep(&mut self, freq: u16, millis: u32) -> Result<(), Error> {
+		// Neither restricted scope may beep - see `audio-admin` in the IDL.
 		if self.scope != Scope::Full {
 			return Err(Error::Denied);
 		}
@@ -340,6 +558,9 @@ impl AudioService for RootCall<'_> {
 	}
 
 	fn open_stream(&mut self, rate: u32, channels: u8) -> Result<u64, Error> {
+		if self.scope == Scope::CaptureOnly {
+			return Err(Error::Denied);
+		}
 		if self.audio.snd == 0 {
 			return Err(Error::NotFound);
 		}
@@ -349,6 +570,29 @@ impl AudioService for RootCall<'_> {
 		}
 		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
 		self.audio.streams.push(Stream { chan: server, format, samples: Vec::new(), read_frame: 0, phase: 0, closing: false, pending: None });
+		Ok(client)
+	}
+
+	// WHETHER THE DEVICE CAN CAPTURE IS NOT KNOWN HERE, and asking would mean a blocking round trip
+	// to the driver inside a dispatch - which is the one thing this engine does not do. A machine
+	// with a sound device but no input stream therefore opens the stream and answers not-found on
+	// the first `read`, which is where a recorder finds out either way: it has to read before it
+	// knows there is anything to record.
+	fn open_capture(&mut self, rate: u32, channels: u8) -> Result<u64, Error> {
+		if self.scope == Scope::StreamOnly {
+			return Err(Error::Denied);
+		}
+		if self.audio.snd == 0 {
+			return Err(Error::NotFound);
+		}
+		Format::new(rate, channels).ok_or(Error::Invalid)?;
+		let remix: Remix = Remix::new(2, channels).ok_or(Error::Invalid)?;
+		let resample: Resample = Resample::new(OUTPUT_RATE, rate, channels).ok_or(Error::Invalid)?;
+		if self.audio.captures.len() >= MAX_CAPTURES {
+			return Err(Error::Again);
+		}
+		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		self.audio.captures.push(Capture { chan: server, remix, resample, pending: None, ready: None, unavailable: false, closing: false });
 		Ok(client)
 	}
 }
@@ -361,6 +605,12 @@ impl AdminService for AdminCall<'_> {
 	fn open_streams(&mut self) -> Result<u64, Error> {
 		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
 		self.clients.push(Client { chan: server, scope: Scope::StreamOnly });
+		Ok(client)
+	}
+
+	fn open_captures(&mut self) -> Result<u64, Error> {
+		let (server, client): (u64, u64) = unsafe { channel() }.ok_or(Error::Again)?;
+		self.clients.push(Client { chan: server, scope: Scope::CaptureOnly });
 		Ok(client)
 	}
 }
@@ -376,6 +626,29 @@ impl PcmService for StreamCall<'_> {
 
 	fn close(&mut self) -> Result<(), Error> {
 		self.stream.closing = true;
+		Ok(())
+	}
+}
+
+struct CaptureCall<'a> {
+	capture: &'a mut Capture,
+}
+
+impl PcmCaptureService for CaptureCall<'_> {
+	// One period, or the reason there is not one. This only ever runs with an answer available:
+	// `take_capture_request` defers a `read` that has neither until the driver has answered.
+	fn read(&mut self) -> Result<Vec<u8>, Error> {
+		if let Some(period) = self.capture.ready.take() {
+			return Ok(period);
+		}
+		if self.capture.unavailable {
+			return Err(Error::NotFound);
+		}
+		Err(Error::Again)
+	}
+
+	fn close(&mut self) -> Result<(), Error> {
+		self.capture.closing = true;
 		Ok(())
 	}
 }
@@ -401,12 +674,20 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 		loop {
 			state.poll_streams();
+			state.poll_captures();
 			state.service_pending_writes();
+			state.service_pending_reads();
 			state.cleanup_drained();
-			state.pump();
+			// The capture side is asked for first and the stop is offered last: a period the device
+			// has already filled is audio that is lost if it is not collected, while a playback
+			// period is one the device's own ring can wait for.
+			if !state.pump_capture() {
+				state.pump();
+				state.stop_capture();
+			}
 
 			let driver_first: bool = state.snd != 0 && state.driver_pending != DriverPending::None;
-			let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len() + 1);
+			let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len() + state.captures.len() + 1);
 			if driver_first {
 				waits.push(state.snd);
 			}
@@ -417,15 +698,36 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 					waits.push(stream.chan);
 				}
 			}
+			for capture in &state.captures {
+				if capture.chan != 0 && capture.pending.is_none() {
+					waits.push(capture.chan);
+				}
+			}
 			let ready: i64 = wait_any(&waits, 0);
 			if ready < 0 {
 				continue;
 			}
 			let ready_chan: u64 = waits[ready as usize];
 			if driver_first && ready_chan == state.snd {
-				match recv_blocking(state.snd, &mut request) {
-					Received::Message { handle, .. } => state.driver_ready(handle),
-					Received::Closed => state.driver_failed(),
+				// A capture reply carries a whole period, so it is received into a buffer that can
+				// hold one rather than into the small request scratch.
+				match state.driver_pending {
+					DriverPending::Capture(index) => {
+						let mut period: Vec<u8> = alloc::vec![0; PERIOD_BYTES];
+						match recv_blocking(state.snd, &mut period) {
+							Received::Message { len, handle } => {
+								if handle != 0 {
+									close(handle);
+								}
+								state.capture_ready(index, &period[..len]);
+							}
+							Received::Closed => state.driver_failed(),
+						}
+					}
+					_ => match recv_blocking(state.snd, &mut request) {
+						Received::Message { handle, .. } => state.driver_ready(handle),
+						Received::Closed => state.driver_failed(),
+					},
 				}
 				continue;
 			}
@@ -499,6 +801,18 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 						close(ready_chan);
 						clients.swap_remove(index);
 					}
+				}
+				continue;
+			}
+			if let Some(index) = state.captures.iter().position(|capture| capture.chan == ready_chan) {
+				match recv_caps_blocking(ready_chan, &mut request) {
+					ReceivedCaps::Message { len, handles } => {
+						for &unclaimed in handles.as_slice() {
+							close(unclaimed);
+						}
+						state.take_capture_request(index, &request[..len]);
+					}
+					ReceivedCaps::Closed => state.remove_capture(index),
 				}
 				continue;
 			}

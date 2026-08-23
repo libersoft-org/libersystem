@@ -2,8 +2,13 @@ package liber:audio@1
 interface audio
 method audio.beep op=1 (freq:u16:rights=,millis:u32:rights=) -> result<unit, liber:base@1::error>
 method audio.open-stream op=2 (rate:u32:rights=,channels:u8:rights=) -> result<handle<channel>, liber:base@1::error>
+method audio.open-capture op=3 (rate:u32:rights=,channels:u8:rights=) -> result<handle<channel>, liber:base@1::error>
 interface pcm-stream
 method pcm-stream.write op=1 (data:buffer:rights=) -> result<u32, liber:base@1::error>
 method pcm-stream.close op=2 () -> result<unit, liber:base@1::error>
+interface pcm-capture
+method pcm-capture.read op=1 () -> result<list<u8>, liber:base@1::error>
+method pcm-capture.close op=2 () -> result<unit, liber:base@1::error>
 interface audio-admin
 method audio-admin.open-streams op=1 () -> result<handle<channel>, liber:base@1::error>
+method audio-admin.open-captures op=2 () -> result<handle<channel>, liber:base@1::error>

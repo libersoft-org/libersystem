@@ -111,7 +111,11 @@ fn options_are_judged_against_the_profile_they_are_given_with() {
 	// And each of these is the same option where it does mean something.
 	assert_eq!(parse_args(b"--compression 80 in.wav out.flac").unwrap().compression, Some(80));
 	assert_eq!(parse_args(b"--bits 24 in.wav out.wav").unwrap().bits, Some(24));
-	assert_eq!(parse_args(b"--quality 20 in.wav out.ogg").unwrap().quality, Some(20));
+	// `--quality` has no destination left that reads it: this tree's Vorbis encoder has one
+	// configuration and MP3 has no encoder at all. The option stays in the vocabulary because the
+	// table is what decides, and the table will say yes again the moment an encoder has something
+	// for it to select.
+	assert_eq!(parse_args(b"--quality 20 in.wav out.ogg").err(), Some(Error::UnsupportedOption));
 
 	assert_eq!(parse_args(b"--rate 96000 in.wav out.wav").err(), Some(Error::InvalidOptions));
 	assert_eq!(parse_args(b"--channels 3 in.wav out.wav").err(), Some(Error::InvalidOptions));
@@ -234,9 +238,7 @@ fn config_wav() -> Config {
 #[test]
 fn a_profile_with_no_encoder_yet_says_so_rather_than_writing_something_else() {
 	let source = wave(64, 1, 44_100);
-	for suffix in ["out.ogg", "out.mp3"] {
-		assert_eq!(convert(&source, &config(suffix)).err(), Some(Error::NotImplemented), "{suffix} should not be written yet");
-	}
+	assert_eq!(convert(&source, &config("out.mp3")).err(), Some(Error::NotImplemented), "out.mp3 should not be written yet");
 	// And an input nothing here reads is refused before a destination is opened.
 	assert_eq!(convert(b"not audio", &config("out.wav")).err(), Some(Error::UnsupportedFormat));
 	// A WAV header with nothing behind it is a damaged file, not an unknown format.
@@ -257,4 +259,38 @@ fn a_conversion_does_not_hold_the_decoded_track() {
 	assert_eq!(info.duration_ms, 2_083);
 	assert!(bytes.len() < source.len());
 	assert_eq!(vec![Container::Flac], vec![sniff(&bytes).unwrap()]);
+}
+
+#[test]
+fn ogg_vorbis_is_written_and_reads_back_as_the_track_that_went_in() {
+	// Lossy, so the samples are not compared - what is compared is that the stream is a Vorbis
+	// stream this tree's own decoder accepts, at the rate and channel count asked for, and long
+	// enough to be the track rather than a fragment of it. A container that parsed but decoded to
+	// nothing would pass a "does it parse" test and fail this one.
+	let source = wave(4_096, 1, 44_100);
+	let (bytes, info) = convert(&source, &config("out.ogg")).expect("the Vorbis conversion runs");
+	assert_eq!(info.destination, Profile::Vorbis);
+	assert_eq!(info.frames, 4_096);
+	let decoded = vorbis::Vorbis::parse(&bytes).expect("the stream this encoder wrote is one this decoder reads");
+	assert_eq!(decoded.metadata().rate, 44_100);
+	assert_eq!(decoded.metadata().channels, 1);
+	let mut out = Vec::new();
+	let read = decoded.decoder().read_i16_le(4_096, &mut out).expect("the stream decodes");
+	assert!(read > 3_000, "the stream decoded {read} frames of a four-thousand-frame track");
+
+	// AND IT IS DETERMINISTIC. Two conversions of one input are byte-identical, which is only true
+	// because the stream serial is fixed rather than taken from a clock - the same rule the image
+	// builds are held to.
+	let (again, _) = convert(&source, &config("out.ogg")).expect("the second conversion runs");
+	assert_eq!(bytes, again, "two conversions of one input differ");
+}
+
+#[test]
+fn a_vorbis_conversion_longer_than_the_ceiling_is_refused_rather_than_attempted() {
+	// The one destination that holds the decoded track says where it stops. Half a million mono
+	// frames is well inside it; the ceiling itself is eight million samples, and the arithmetic
+	// that decides is the thing under test rather than a conversion that would take a minute.
+	assert_eq!(VORBIS_MAX_SAMPLES, 8 * 1024 * 1024);
+	let source = wave(512, 1, 44_100);
+	assert!(convert(&source, &config("out.ogg")).is_ok(), "a short track is inside the ceiling");
 }

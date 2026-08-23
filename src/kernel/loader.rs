@@ -88,7 +88,9 @@ fn image_artifact_name(elf_image: &[u8]) -> Option<&str> {
 }
 
 pub fn spawn_elf_process(domain: Arc<Domain>, elf_image: &[u8], bootstrap: Arc<dyn KernelObject>, rights: Rights) -> Result<Arc<Process>, LoadError> {
-	let address_space = AddressSpace::create().ok_or(LoadError::OutOfMemory)?;
+	// CHARGED TO THE DOMAIN THAT ASKED FOR THE PROCESS, root table and every intermediate the
+	// load then builds - see `AddressSpace::create_in`.
+	let address_space = AddressSpace::create_in(&domain).ok_or(LoadError::OutOfMemory)?;
 	let mut frames: Vec<u64> = Vec::new();
 	let mut shared = Vec::new();
 

@@ -747,7 +747,7 @@ fn mounts_and_lists_exfat() {
 fn reads_a_file_off_each_family() {
 	for (label, kind) in [("fat12", Kind::Fat12), ("fat16", Kind::Fat16), ("fat32", Kind::Fat32)] {
 		let mut fs = FatFs::mount(MemDisk { data: build_fat(kind, ROOT) }).unwrap();
-		assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"Hello, FAT!");
+		assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"Hello, FAT!", "{label}");
 	}
 	let mut fs = FatFs::mount(MemDisk { data: build_exfat(ROOT) }).unwrap();
 	assert_eq!(fs.read_file(b"HELLO.TXT").unwrap(), b"Hello, FAT!");
@@ -3670,7 +3670,7 @@ fn an_exfat_bitmap_that_calls_a_system_chain_free_mounts_read_only() {
 		let bitmap = ex_cluster(2);
 		let bit = cluster - 2;
 		img[bitmap + bit / 8] &= !(1u8 << (bit % 8));
-		let mut fs = FatFs::mount(MemDisk { data: img }).unwrap_or_else(|| panic!("{label}: the volume still mounts"));
+		let fs = FatFs::mount(MemDisk { data: img }).unwrap_or_else(|| panic!("{label}: the volume still mounts"));
 		assert!(fs.is_degraded(), "{label} marked free is a volume whose next write overwrites its own metadata");
 	}
 }

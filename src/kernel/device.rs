@@ -59,6 +59,20 @@ pub fn init() {
 	let mut functions = PCI_FUNCTIONS.lock();
 	functions.clear();
 	for p in crate::arch::pci::scan() {
+		// NOBODY IS DRIVING ANYTHING YET, so nothing on this bus may write to memory.
+		//
+		// `assign_bars_ecam` clears the bit as it places the BARs, but only two of the three ports
+		// place their own: on x86 the firmware placed them AND enabled bus mastering, and that path
+		// never runs, so the bit arrived set and stayed set. This is the sweep that covers every
+		// port, over every function the scan found - including the ones no driver will ever bind,
+		// which are exactly the devices nobody would notice mastering the bus.
+		//
+		// BRIDGES ARE LEFT ALONE (header type 1): their bus-master bit forwards transactions from
+		// everything behind them rather than granting the bridge anything of its own, and clearing
+		// it here would silently cut off a device whose own driver had legitimately acquired it.
+		if p.header_type & 0x7F == 0 {
+			crate::arch::pci::set_bus_master(p.bus, p.dev, p.func, false);
+		}
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
 		functions.push(abi::PciInfo { vendor: p.vendor, device: p.device_id, class: p.class, subclass: p.subclass, prog_if: p.prog_if, bus: p.bus, dev: p.dev, func: p.func, _pad: 0 });
 	}
@@ -82,6 +96,12 @@ pub fn init() {
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
 		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if });
 	}
+	// One ownership count per device, all zero: nothing is driving anything yet, and enumeration
+	// left every device with bus mastering off.
+	let mut owners = OWNERS.lock();
+	owners.clear();
+	// ALLOC-OK: sized once at boot from the table just built.
+	owners.resize(table.len(), 0);
 }
 
 // The number of discovered devices.
@@ -104,4 +124,56 @@ pub fn pci_get(index: usize) -> Option<abi::PciInfo> {
 pub fn with<R>(index: usize, f: impl FnOnce(&DeviceEntry) -> R) -> Option<R> {
 	let table = DEVICES.lock();
 	table.get(index).map(f)
+}
+
+// HOW MANY DRIVERS HOLD EACH DEVICE, and therefore whether it may write to memory.
+//
+// `sys_device_acquire` mints a FRESH `DeviceMemory` per call, so two acquisitions of one device are
+// two independent objects with no refcount between them - which is why "nobody owns it" needed
+// defining before bus mastering could follow ownership at all. One count per device-table index is
+// enough, and the kernel already keys per-device bookkeeping this way in `dma_buffer::release_for`.
+//
+// Parallel to `DEVICES` and taken under the SAME lock as the config-space write below, so two
+// acquisitions racing cannot leave the PCI bit disagreeing with the count.
+static OWNERS: SpinLock<Vec<u32>> = SpinLock::new(Vec::new());
+
+// A driver has taken the device at `index`: count it, and on the 0 -> 1 transition let the device
+// master the bus. False when the index names no device, in which case NOTHING changed - a failed
+// acquisition must not leave a device able to write to memory.
+pub fn acquire_bus_master(index: usize) -> bool {
+	let table = DEVICES.lock();
+	let mut owners = OWNERS.lock();
+	let Some(entry) = table.get(index) else { return false };
+	let Some(count) = owners.get_mut(index) else { return false };
+	if *count == 0 {
+		crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, true);
+	}
+	*count += 1;
+	true
+}
+
+// How many drivers hold the device at `index`.
+//
+// TEST-ONLY. Nothing in the kernel needs to ask - the count exists to drive the two transitions
+// above - but a test that means to check the PCI bit against the kernel's own opinion of who is
+// driving what has to be able to read both.
+#[cfg(test)]
+pub fn bus_master_owners(index: usize) -> u32 {
+	OWNERS.lock().get(index).copied().unwrap_or(0)
+}
+
+// A driver has let the device at `index` go - the last `DeviceMemory` for it was dropped. On the
+// 1 -> 0 transition the device stops mastering the bus, so a driver that CRASHED disables its own
+// device without knowing the rule exists: its handle dies with its process.
+pub fn release_bus_master(index: usize) {
+	let table = DEVICES.lock();
+	let mut owners = OWNERS.lock();
+	let (Some(entry), Some(count)) = (table.get(index), owners.get_mut(index)) else { return };
+	if *count == 0 {
+		return;
+	}
+	*count -= 1;
+	if *count == 0 {
+		crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, false);
+	}
 }

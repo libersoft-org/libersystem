@@ -152,6 +152,10 @@ pub struct FlagCase {
 #[derive(Clone, Debug)]
 pub struct Resource {
 	pub name: String,
+	// THE KERNEL OBJECT THIS RESOURCE STANDS FOR, from `@kernel(...)`, or None for one that does not
+	// say. A resource that says nothing keeps `NO_REQUIRED_TYPE` in the generated guard, so the type
+	// check is adopted one resource at a time rather than in one edit.
+	pub kernel: Option<String>,
 	pub doc: Vec<Doc>,
 	pub evolution: Evolution,
 	pub span: Span,

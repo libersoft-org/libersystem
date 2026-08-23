@@ -67,6 +67,11 @@ declare -A GATES=(
 	# attributes had accumulated, hiding a hundred and twenty more warnings than the build printed -
 	# and hiding them UNEVENLY, so the same code was reported on one target and silent on another.
 	["no-suppression"]="tools/check-no-suppression.sh"
+	# P02M0143's M4 produced a manifest and a host-tested verifier, and the two defects it actually
+	# had were in neither: the x86_64 boot medium carried no manifest at all, and the kernel read
+	# from a boot medium was checked against nothing. A verifier that is right about files nobody
+	# reads is not integrity - this asks the loader's question of the media on disk.
+	["boot-manifest"]="tools/check-boot-manifest.sh"
 	# The `--artifact` fast path knows a library's DEPENDENCIES, or it reports an artifact as
 	# current after a crate it compiles against changed - which makes every test result taken on
 	# that artifact meaningless. Its own family's `quick` and `provider` modes are not gates because

@@ -122,3 +122,52 @@ fn a_processs_image_counts_against_its_domains_memory_limit() {
 	assert!(process.try_adopt_frame(frame), "one page fits");
 	assert_eq!(domain.account().memory().used(), before + PAGE_SIZE, "an adopted frame reached the account");
 }
+
+crate::tagged_test!(page_tables_are_charged_to_the_domain_that_caused_them, [Kernel, Memory], id = "kernel.object.domain.page_tables_are_charged_to_the_domain_that_caused_them", covers = ["kernel"]);
+fn page_tables_are_charged_to_the_domain_that_caused_them() {
+	// A process that maps pages makes the kernel allocate frames for its OWN page tables, and until
+	// this nothing charged them: a mapping loop was a way to consume kernel memory without meeting
+	// any limit.
+	//
+	// The property has three halves and all three are here: the root table is charged when the
+	// space is made; a mapping that would exceed the limit is refused WITHOUT leaving a partial
+	// result; and everything comes back when the space dies.
+	use crate::arch::paging;
+	use crate::mem::frame::{self, PAGE_SIZE};
+	use crate::memlayout::USER_MMAP_BASE;
+	use crate::object::address_space::AddressSpace;
+
+	let domain = Domain::new(64 * PAGE_SIZE, UNLIMITED, UNLIMITED);
+	let before = domain.account().memory().used();
+	let space = AddressSpace::create_in(&domain).expect("an address space in a bounded domain");
+	assert_eq!(domain.account().memory().used(), before + PAGE_SIZE, "the root page table is charged when the space is made");
+
+	// One mapping, which builds the levels below the root on a fresh space.
+	let data = frame::allocate().expect("a data frame");
+	let at = USER_MMAP_BASE;
+	space.try_map(at, data, paging::PRESENT | paging::WRITABLE | paging::USER | paging::NO_EXECUTE).expect("the first mapping fits");
+	let after_first = domain.account().memory().used();
+	assert!(after_first > before + PAGE_SIZE, "the intermediate tables the walk built are charged too");
+	assert!(after_first <= before + (1 + paging::MAX_NEW_TABLES as u64) * PAGE_SIZE, "and only what the walk actually built - the rest of the reservation goes back");
+
+	// A DOMAIN WITH NO ROOM LEFT CANNOT BE MADE TO BUILD ONE MORE TABLE. The limit is filled with
+	// an ordinary charge, then a mapping far enough away to need fresh levels is asked for.
+	let room = 64 * PAGE_SIZE - (after_first - before);
+	assert!(domain.try_charge_memory(room), "the rest of the limit is taken");
+	let at_limit = domain.account().memory().used();
+	let far = USER_MMAP_BASE + (1u64 << 30);
+	let second = frame::allocate().expect("a second data frame");
+	assert!(space.try_map(far, second, paging::PRESENT | paging::WRITABLE | paging::USER | paging::NO_EXECUTE).is_err(), "a mapping the limit has no room for is refused");
+	assert_eq!(domain.account().memory().used(), at_limit, "a refused mapping leaves the account exactly where it was");
+	// AND NOTHING WAS LEFT AT THE REFUSED ADDRESS. The walk refuses to replace a live mapping, so a
+	// second attempt succeeding is exactly the proof that the first left no leaf and no half-built
+	// path behind it.
+	domain.uncharge_memory(room);
+	space.try_map(far, second, paging::PRESENT | paging::WRITABLE | paging::USER | paging::NO_EXECUTE).expect("the same address maps once there is room, so the refusal left nothing behind");
+
+	// AND THE SPACE GIVES IT ALL BACK. Dropping it frees the tables and uncharges the same pages
+	// that were charged, from the count kept as they were taken.
+	drop(space);
+	assert_eq!(domain.account().memory().used(), before, "an address space that dies returns every page table it was charged for");
+	unsafe { frame::deallocate(data) };
+}

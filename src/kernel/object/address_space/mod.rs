@@ -9,9 +9,12 @@
 
 use alloc::sync::Arc;
 use core::any::Any;
+use core::sync::atomic::{AtomicU64, Ordering};
 
+use super::domain::Domain;
 use super::{KernelObject, ObjectHeader, ObjectType, impl_kernel_object};
 use crate::arch;
+use crate::mem::frame::PAGE_SIZE;
 use crate::mem::vapool::VaPool;
 use crate::memlayout::{USER_MMAP_BASE, USER_VA_END};
 use crate::sync::SpinLock;
@@ -33,21 +36,54 @@ pub struct AddressSpace {
 	// selected by address - and it is empty rather than absent because `kernel()`
 	// hands out a fresh wrapper each call, so there is nothing durable to key on.
 	vmap: SpinLock<VaPool>,
+	// WHO PAYS FOR THE PAGE TABLES. None for the kernel space, which wraps tables the bootloader
+	// built and owns nothing.
+	//
+	// A process that maps pages makes the kernel allocate frames for its OWN page tables, and until
+	// this nothing charged them: a mapping loop was a way to consume kernel memory without meeting
+	// any limit. The frames are charged against the memory limit that already exists, so a Domain
+	// that is out of memory cannot be made to build tables for one more page.
+	domain: Option<Arc<Domain>>,
+	// Page-table frames charged so far, in pages. Kept so `Drop` gives back exactly what was taken
+	// rather than recomputing it from tables that are being torn down.
+	table_pages: AtomicU64,
 }
 
 impl AddressSpace {
 	// Capture the active address space (the kernel tables the bootloader built).
 	pub fn kernel() -> Arc<Self> {
 		// ALLOC-OK: the kernel's own address space, captured once at boot before userspace exists.
-		Arc::new(Self { header: ObjectHeader::new(), cr3: arch::context::read_cr3(), owned: false, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)) })
+		Arc::new(Self { header: ObjectHeader::new(), cr3: arch::context::read_cr3(), owned: false, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)), domain: None, table_pages: AtomicU64::new(0) })
 	}
 
-	// Create a new process address space with its own page tables. The user half
-	// is empty; the kernel half is shared with the kernel space. Returns None if
-	// no frame is available for the top-level table.
+	// Create a new process address space with its own page tables, charged to `domain`. The user
+	// half is empty; the kernel half is shared with the kernel space. Returns None if the Domain's
+	// memory limit has no room for the root table, or if no frame is available for it.
+	pub fn create_in(domain: &Arc<Domain>) -> Option<Arc<Self>> {
+		// THE ROOT TABLE IS THE FIRST PAGE THIS SPACE COSTS, and it is charged before it is
+		// allocated: a Domain at its limit does not get one more frame because the frame happened
+		// to be free.
+		if !domain.try_charge_memory(PAGE_SIZE) {
+			return None;
+		}
+		let Some(cr3) = arch::paging::new_address_space() else {
+			domain.uncharge_memory(PAGE_SIZE);
+			return None;
+		};
+		let space = crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), cr3, owned: true, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)), domain: Some(domain.clone()), table_pages: AtomicU64::new(1) });
+		if space.is_none() {
+			arch::paging::free_address_space(cr3);
+			domain.uncharge_memory(PAGE_SIZE);
+		}
+		space
+	}
+
+	// The same, charged to nobody. TEST-ONLY: a space with no Domain behind it is one whose page
+	// tables no limit covers, which is the state this milestone exists to remove from production.
+	#[cfg(test)]
 	pub fn create() -> Option<Arc<Self>> {
 		let cr3 = arch::paging::new_address_space()?;
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), cr3, owned: true, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)) })
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), cr3, owned: true, vmap: SpinLock::new(VaPool::new(USER_MMAP_BASE, USER_VA_END)), domain: None, table_pages: AtomicU64::new(0) })
 	}
 
 	// Hand out a range of this space's user mmap window, or 0 when it is exhausted.
@@ -95,7 +131,28 @@ impl AddressSpace {
 		if flags & arch::paging::USER != 0 && !user_range_ok(virt) {
 			return Err(());
 		}
-		arch::paging::try_map_page_in(self.cr3, virt, phys, flags)
+		// THE PAGE TABLES THIS MAPPING MAY BUILD ARE CHARGED BEFORE THE WALK, and the walk gives
+		// back what it did not use. Reserving the worst case first is what makes the refusal clean:
+		// a Domain over its limit is told so with nothing mapped and no table attached, where
+		// charging afterwards would discover it with the frames already in the tree.
+		//
+		// The kernel space has no Domain and is not charged: it wraps tables the bootloader built.
+		let reserved = self.domain.as_ref().map(|domain| {
+			let bytes = arch::paging::MAX_NEW_TABLES as u64 * PAGE_SIZE;
+			if domain.try_charge_memory(bytes) { Some(bytes) } else { None }
+		});
+		if let Some(None) = reserved {
+			return Err(());
+		}
+		let created = arch::paging::try_map_page_in(self.cr3, virt, phys, flags);
+		if let (Some(domain), Some(Some(bytes))) = (self.domain.as_ref(), reserved) {
+			// What the walk actually built stays charged; the rest goes straight back. A failed
+			// walk built nothing - it unwinds its own levels - so the whole reservation returns.
+			let used = created.unwrap_or(0) as u64 * PAGE_SIZE;
+			self.table_pages.fetch_add(created.unwrap_or(0) as u64, Ordering::Relaxed);
+			domain.uncharge_memory(bytes - used);
+		}
+		created.map(|_| ())
 	}
 
 	// Unmap `virt` in this address space, returning the frame it pointed at.
@@ -115,6 +172,13 @@ impl Drop for AddressSpace {
 		// kernel half is shared and is never freed.
 		if self.owned {
 			arch::paging::free_address_space(self.cr3);
+		}
+		// AND THE DOMAIN GETS ITS MEMORY BACK - the root table plus every intermediate this space
+		// built, in one uncharge, from the count kept as they were charged rather than recomputed
+		// from tables that have just been torn down.
+		if let Some(domain) = self.domain.as_ref() {
+			let pages = self.table_pages.swap(0, Ordering::Relaxed);
+			domain.uncharge_memory(pages * PAGE_SIZE);
 		}
 	}
 }

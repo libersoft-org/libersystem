@@ -77,6 +77,18 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> Option<alloc::vec
 	// parts that need a test. What stays here is the reading.
 	let list = fs.read(b"etc/bootstrap.list")?;
 	let rows = abi::bootstrap::parse_list(&list)?;
+	// THE MANIFEST BESIDE THE LIST. It is read before anything is trusted, and from here on this
+	// source is the chosen one: a manifest that is absent, malformed or disagreeing stops the boot
+	// rather than falling through to another source. Choosing a source and failing a check on it are
+	// different things, and there is no path from the second to the first.
+	let manifest = fs.read(b"etc/boot.manifest");
+	let Some(manifest) = manifest else {
+		crate::arch::serial::write_str("loader: this source has no etc/boot.manifest - refusing to boot from it\n");
+		return None;
+	};
+	if !digests_ok(&manifest, b"etc/bootstrap.list", &list) {
+		return None;
+	}
 	let mut blobs: Vec<Vec<u8>> = Vec::new();
 	blobs.try_reserve_exact(rows.len()).ok()?;
 	for row in &rows {
@@ -84,8 +96,36 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> Option<alloc::vec
 		// set is exactly the programs the system needs before its volume is readable, so a
 		// missing one produces a machine that dies later and further away, with nothing to say
 		// which program it was.
-		blobs.push(fs.read(row.path)?);
+		let blob = fs.read(row.path)?;
+		if !digests_ok(&manifest, row.path, &blob) {
+			return None;
+		}
+		blobs.push(blob);
 	}
+	// SAY THAT IT CHECKED. A check that is silent when it passes cannot be told apart in a boot log
+	// from one that was never wired up, and this one's whole value is that it ran.
+	crate::arch::serial::write_str("loader: bootstrap set verified against etc/boot.manifest\n");
 	let entries: Vec<(&[u8], &[u8])> = rows.iter().zip(&blobs).map(|(row, blob)| (row.name, blob.as_slice())).collect();
 	abi::bootstrap::build_package(&entries)
+}
+
+// Whether `bytes` is what the manifest says the file at `path` should be, with the line that says
+// which way it failed. The checking itself is `bootproto::boot_manifest`, which is host-tested; what
+// is here is the reporting, because this is a UEFI binary and nothing in one can be tested.
+pub(crate) fn digests_ok(manifest: &[u8], path: &[u8], bytes: &[u8]) -> bool {
+	match bootproto::boot_manifest::verify(manifest, path, bytes) {
+		bootproto::boot_manifest::Verdict::Ok => true,
+		bootproto::boot_manifest::Verdict::NotAManifest => {
+			crate::arch::serial::write_str("loader: etc/boot.manifest is not a manifest this loader understands - refusing to boot\n");
+			false
+		}
+		bootproto::boot_manifest::Verdict::NotNamed => {
+			crate::arch::serial::write_str("loader: a boot file is not named in etc/boot.manifest - refusing to boot\n");
+			false
+		}
+		bootproto::boot_manifest::Verdict::Mismatch => {
+			crate::arch::serial::write_str("loader: a boot file does not match its digest in etc/boot.manifest - refusing to boot\n");
+			false
+		}
+	}
 }

@@ -119,6 +119,13 @@ impl_kernel_object!(DeviceMemory, DeviceMemory);
 
 impl Drop for DeviceMemory {
 	fn drop(&mut self) {
+		// A DRIVER HAS LET THE DEVICE GO. On the last one for this device the count reaches zero and
+		// bus mastering is turned off - so a driver that CRASHED disables its own device without
+		// knowing the rule exists, because its handle dies with its process. A capability naming no
+		// device-table entry (the tests mint bare MMIO windows) counts against nothing.
+		if let Some(index) = self.index {
+			crate::device::release_bus_master(index as usize);
+		}
 		// Tear down the mapping so the VA window is not left pointing at the device
 		// after the capability is gone, and return its address range to the window's
 		// pool. The physical range is hardware, not owned RAM, so nothing is freed.

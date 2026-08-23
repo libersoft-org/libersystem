@@ -191,7 +191,14 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let mut msg = alloc::vec::Vec::with_capacity(6 + core::mem::size_of::<abi::DeviceInfo>());
 	msg.extend_from_slice(b"DEVICE");
 	msg.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
-	send_cap(&kernel_ep, &msg, DeviceMemory::new(bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE handoff should send");
+	// THE CAPABILITY IS MINTED THE WAY `sys_device_acquire` MINTS IT - for the device index, not for
+	// a bare physical range - and the device is taken at the same moment. This harness is standing in
+	// for DeviceManager, and taking the device is what lets it write to memory: a controller handed
+	// only its BAR would bring its rings up, ring the doorbell, and wait forever for a completion the
+	// bus would not let it write. The count comes back down when the driver process dies and the
+	// transferred handle dies with it.
+	assert!(device::acquire_bus_master(index), "the xHCI controller is taken, as DeviceManager takes it");
+	send_cap(&kernel_ep, &msg, DeviceMemory::for_device(index as u32, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE handoff should send");
 	send_cap(&kernel_ep, b"IRQ", interrupt, Rights::ALL).expect("the IRQ handoff should send");
 	// The raw keyboard sink is the third handoff, and it is not optional here: the
 	// driver tolerates an absent sink (it stores handle 0 and carries on) but blocks
@@ -307,6 +314,46 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	assert_eq!(read_from_object(file, size), expected, "vol://usb should serve the seeded file's bytes");
 }
 
+// A PHYSICAL ADDRESS IS ANSWERABLE ONLY FOR A BUFFER SOME DEVICE WAS NAMED FOR, in both directions.
+//
+// `sys_dma_buffer_create` accepts a zero device handle, and `sys_dma_buffer_phys` did not look - so
+// any process that could make a DMA buffer could learn where its own pages are, on a machine with
+// no IOMMU, for no device at all.
+//
+// AND THE OTHER DIRECTION MATTERS AS MUCH: a device-bound buffer still answers WITHOUT BEING MAPPED.
+// virtio-gpu's framebuffer backing is exactly that - ConsoleService renders into it and a
+// `DmaBuffer` maps only once, while the GPU needs the addresses - so a narrowing to "only while
+// mapped" would have taken the display with it. That case is asserted here on purpose.
+tagged_test!(a_physical_address_is_answerable_only_for_a_device_bound_buffer, [Drivers, Memory], id = "kernel.hardware.a_physical_address_is_answerable_only_for_a_device_bound_buffer", covers = ["kernel"]);
+fn a_physical_address_is_answerable_only_for_a_device_bound_buffer() {
+	use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+	static BOUND_PHYS: AtomicI64 = AtomicI64::new(0);
+	static UNBOUND_PHYS: AtomicI64 = AtomicI64::new(0);
+	static DONE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let device = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, crate::tests::device_privilege(), 0, 0);
+			assert!(!syscall::sys_is_err(device), "the test acquires device 0");
+			// Bound, and deliberately NEVER MAPPED - the virtio-gpu framebuffer case.
+			let bound = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, device as u64, 0, 0);
+			assert!(!syscall::sys_is_err(bound), "a device-bound DMA buffer is created");
+			BOUND_PHYS.store(arch::syscall::invoke(syscall::SYS_DMA_BUFFER_PHYS, bound, 0, 0, 0) as i64, Ordering::SeqCst);
+			// Bound to nothing, which is what a zero device handle means.
+			let unbound = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 0, 0);
+			assert!(!syscall::sys_is_err(unbound), "an unbound DMA buffer is still creatable");
+			UNBOUND_PHYS.store(arch::syscall::invoke(syscall::SYS_DMA_BUFFER_PHYS, unbound, 0, 0, 0) as i64, Ordering::SeqCst);
+			DONE.store(true, Ordering::SeqCst);
+		}
+	}
+	DONE.store(false, Ordering::SeqCst);
+	sched::spawn(body, 0);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the probing thread ran to the end");
+	let bound = BOUND_PHYS.load(Ordering::SeqCst);
+	assert!(!syscall::sys_is_err(bound as u64) && bound != 0, "an unmapped device-bound buffer still reports its physical base");
+	assert_eq!(UNBOUND_PHYS.load(Ordering::SeqCst), syscall::ERR_INVALID, "a buffer bound to no device has no physical address to give");
+}
+
 tagged_test!(dma_buffer_maps_and_reports_phys, [Drivers, Memory], id = "kernel.hardware.dma_buffer_maps_and_reports_phys", covers = ["kernel"]);
 fn dma_buffer_maps_and_reports_phys() {
 	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -322,7 +369,11 @@ fn dma_buffer_maps_and_reports_phys() {
 	static DONE: AtomicBool = AtomicBool::new(false);
 	extern "C" fn body(_arg: u64) {
 		unsafe {
-			let handle = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, 0, 0, 0);
+			let device = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, crate::tests::device_privilege(), 0, 0);
+			if syscall::sys_is_err(device) {
+				return;
+			}
+			let handle = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, device as u64, 0, 0);
 			if syscall::sys_is_err(handle) {
 				return;
 			}
@@ -539,6 +590,154 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
 	sched::run_until_idle();
 	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
+}
+
+tagged_test!(a_device_masters_the_bus_only_while_a_driver_holds_it, [Pci, Drivers], id = "kernel.hardware.a_device_masters_the_bus_only_while_a_driver_holds_it", covers = ["kernel"]);
+fn a_device_masters_the_bus_only_while_a_driver_holds_it() {
+	// Bus mastering is permission to write anywhere in physical memory. On these machines there is
+	// no IOMMU, so the PCI command bit IS the whole of the check: a device with it set can put bytes
+	// at any address it likes, and nothing between the device and the DRAM will ask why.
+	//
+	// It used to be turned on at enumeration and never turned off - so from the moment the kernel
+	// walked the bus, every device on it could write to any physical address, with no driver
+	// running and nobody to notice. Now the bit follows OWNERSHIP: `sys_device_acquire` sets it and
+	// `DeviceMemory::drop` clears it, which also means a driver that crashes disables its own device
+	// without knowing the rule exists - its handle dies with its process.
+	//
+	// The config register is read back rather than the count, because the count is the kernel's
+	// opinion and the register is what the bus obeys.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static DONE: AtomicBool = AtomicBool::new(false);
+	const BUS_MASTER: u16 = 1 << 2;
+	extern "C" fn body(_arg: u64) {
+		// A DEVICE NOBODY IS DRIVING. By the time this runs the suite has started real services, and
+		// the ones holding a device are supposed to have their bit set - so picking index 0 would be
+		// asserting against a driver doing its job. The count is the kernel's record of who holds
+		// what; a device with a count of zero is the case this test is about.
+		let Some(index) = (0..device::count()).find(|&i| device::bus_master_owners(i) == 0) else {
+			// Every device on this machine is driven right now, which is the rule holding rather
+			// than a case to check. Nothing to say.
+			DONE.store(true, Ordering::SeqCst);
+			return;
+		};
+		let (bus, dev, func) = device::with(index, |d| (d.bus, d.dev, d.func)).expect("the device is in the table");
+		unsafe {
+			assert_eq!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "nothing is driving this device, so it may not write to memory");
+
+			let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, index as u64, device_privilege(), 0, 0) as i64;
+			assert!(handle > 0, "the device is acquired");
+			assert_eq!(device::bus_master_owners(index), 1, "and the kernel records who holds it");
+			assert_ne!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "a driver holds it now, so it may write to memory");
+
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle as u64, 0, 0, 0) as i64, 0, "the driver lets the device go");
+			assert_eq!(device::bus_master_owners(index), 0, "the count comes back down");
+			assert_eq!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "and the permission goes with it");
+		}
+		DONE.store(true, Ordering::SeqCst);
+	}
+	sched::spawn_with_object(body, object::event::Event::create().expect("a test event"), object::rights::Rights::ALL);
+	sched::run_until_idle();
+	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
+}
+
+tagged_test!(virtio_snd_driver_captures_a_period_from_the_device, [Drivers, Pci, Audio], id = "kernel.hardware.virtio_snd_driver_captures_a_period_from_the_device", covers = ["kernel"]);
+fn virtio_snd_driver_captures_a_period_from_the_device() {
+	// The REAL driver against the REAL device: the receive queue, the input-stream search, the
+	// capture stream's set-up and the inverted used-ring handling, all of which exist only for
+	// recording and none of which the playback path touches.
+	//
+	// WHAT A TEST MACHINE CANNOT SUPPLY IS SOUND. QEMU's `none` audio backend is a synthetic source:
+	// it fills a capture period with silence on the device's own clock, so every step above runs
+	// exactly as it would with a microphone and the samples come back zero. That is why this asserts
+	// the period IS silence rather than ignoring its contents - a driver that returned stale
+	// playback bytes, uninitialised DMA memory or a short buffer fails here, and a machine that
+	// starts producing real audio fails here too, which is the right way to find out.
+	//
+	// The sample VALUES on a real source are covered where they can be: the AudioService capture
+	// scenario feeds known periods through the whole conversion and into a file.
+	use object::device_memory::DeviceMemory;
+	use object::rights::Rights;
+	let (volume, _package) = scenario_packages().expect("boot modules should be present");
+	let elf = pkg::Package::parse(volume).and_then(|p| p.lookup(b"drivers/virtio_snd.lsexe")).expect("the virtio-snd driver should be staged on the volume under drivers/");
+
+	// Find the sound device. A machine without one is not a failure - it is a machine with no sound
+	// card, and this port runs on those - but the test configuration has one, so on the target it
+	// runs on, an absent device IS the failure.
+	let mut found: Option<(abi::DeviceInfo, u64, u64, usize)> = None;
+	for i in 0..device::count() {
+		let entry = device::with(i, |d| (d.device_type, d.bar_phys, d.bar_len)).unwrap();
+		if entry.0 as u32 == abi::VIRTIO_TYPE_SOUND {
+			let info = device::with(i, |d| abi::DeviceInfo { device_type: d.device_type as u32, bar_len: d.bar_len, common_offset: d.common_offset, notify_offset: d.notify_offset, notify_multiplier: d.notify_multiplier, isr_offset: d.isr_offset, device_offset: d.device_offset, device_len: d.device_len, bus: d.bus, dev: d.dev, func: d.func, class: d.class, subclass: d.subclass, prog_if: d.prog_if, _pad0: 0, _pad1: [0; 2] }).unwrap();
+			found = Some((info, entry.1, entry.2, i));
+			break;
+		}
+	}
+	let (info, bar_phys, bar_len, index) = found.expect("the device table should hold the virtio-sound device");
+
+	// Its MSI-X vector, minted the way `sys_device_msix_acquire` mints one.
+	let (msix_cap, table_phys, bus, dev, func) = device::with(index, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)).unwrap();
+	assert!(msix_cap != 0, "the virtio-sound device should expose MSI-X");
+	let dest = arch::percpu::this_cpu().lapic_id() as u8;
+	let vector = arch::interrupts::acquire_msi(table_phys, dest, index as u32).expect("an MSI vector should be free");
+	let interrupt = object::interrupt::Interrupt::new(vector).expect("a test interrupt");
+	assert!(arch::interrupts::bind_msi(vector, &interrupt), "the MSI vector should bind");
+	arch::pci::msix_enable(bus, dev, func, msix_cap);
+
+	let (kernel_ep, user_ep) = object::channel::Channel::create();
+	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the virtio-snd driver should load");
+	let mut message = alloc::vec::Vec::with_capacity(6 + core::mem::size_of::<abi::DeviceInfo>());
+	message.extend_from_slice(b"DEVICE");
+	message.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
+	// Taken as DeviceManager takes it, so the device may write to the capture buffer at all - see
+	// `a_device_masters_the_bus_only_while_a_driver_holds_it`.
+	assert!(device::acquire_bus_master(index), "the sound device is taken, as DeviceManager takes it");
+	send_cap(&kernel_ep, &message, DeviceMemory::for_device(index as u32, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE handoff should send");
+	send_cap(&kernel_ep, b"IRQ", interrupt, Rights::ALL).expect("the IRQ handoff should send");
+	sched::run_until_idle();
+
+	let report = kernel_ep.recv().expect("the virtio-snd driver should report in");
+	assert_eq!(&report.bytes[..], b"driver.virtio-snd: online", "unexpected driver report");
+	let service = report.caps.first().expect("the driver transfers its service channel").object().clone().into_any_arc().downcast::<object::channel::Channel>().expect("the service channel is a channel");
+
+	// One capture period. The reply is the period itself; an EMPTY reply is the driver saying this
+	// device has no input stream, which on the test configuration would mean the device or the
+	// stream search is wrong rather than that the machine has no microphone.
+	service.send(object::channel::Message::new(alloc::vec![1u8], alloc::vec::Vec::new())).expect("the capture command should send");
+	sched::run_until_idle();
+	let period = wait_for_message(&service, 2_000).expect("the driver should answer the capture command");
+	assert!(!period.is_empty(), "the device reported no input stream - the receive path never ran");
+	assert_eq!(period.len(), 2_048, "a capture period is 512 stereo signed-16-bit frames");
+	assert!(period.chunks_exact(2).all(|sample| i16::from_le_bytes([sample[0], sample[1]]) == 0), "the `none` audio backend produces silence, and this is not silence");
+
+	// A second period, so the used ring is proven to advance rather than to answer once.
+	service.send(object::channel::Message::new(alloc::vec![1u8], alloc::vec::Vec::new())).expect("the second capture command should send");
+	sched::run_until_idle();
+	assert_eq!(wait_for_message(&service, 2_000).expect("the driver should answer the second command").len(), 2_048, "the capture queue stopped after one period");
+
+	// And the stream stops on request, which releases it on the device.
+	service.send(object::channel::Message::new(alloc::vec![2u8], alloc::vec::Vec::new())).expect("the capture stop should send");
+	sched::run_until_idle();
+	assert_eq!(wait_for_message(&service, 2_000).expect("the driver should acknowledge the stop"), b"OK", "the stop was not acknowledged");
+}
+
+// Receive one message from a channel, pumping the scheduler until it arrives or a WALL-CLOCK
+// deadline passes.
+//
+// A count of iterations is the wrong bound here and it is worth saying why: between the command and
+// the answer the driver is blocked on its device interrupt, so nothing is runnable and
+// `run_until_idle` returns immediately - a thousand iterations pass in microseconds while the device
+// is still filling a ten-millisecond period. What this waits for is TIME, not scheduling.
+fn wait_for_message(channel: &object::channel::Channel, millis: u64) -> Option<alloc::vec::Vec<u8>> {
+	let deadline = arch::tsc::now();
+	loop {
+		if let Ok(message) = channel.recv() {
+			return Some(message.bytes);
+		}
+		sched::run_until_idle();
+		if arch::tsc::cycles_to_ns(arch::tsc::now().wrapping_sub(deadline)) / 1_000_000 >= millis {
+			return None;
+		}
+	}
 }
 
 tagged_test!(

@@ -83,6 +83,8 @@ pub const SYNOPSES: &[(&str, &str)] = &[
 	("perm", "perm [json] - print the permission audit trail"),
 	("usage", "usage [json] - print the per-domain resource budgets"),
 	("beep", "beep [FREQ [MS]] - play a tone"),
+	("audiorec", "audiorec [-r HZ][-c N][-s SECS][-f] PATH - record PCM audio to a WAV file"),
+	("audioconv", "audioconv [--format F][--rate HZ][--channels N][--bits N][-f] IN OUT - convert audio"),
 	("stop", "stop SERVICE - stop a service and its dependents"),
 	("run", "run NAME [args] - launch a governed tool by name"),
 	// network tools

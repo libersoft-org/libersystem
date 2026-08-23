@@ -133,7 +133,12 @@ pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut K
 						// refuse a raw end carrying everything the pair was made with. What
 						// exclusivity changes is only how many handles are left afterwards: one,
 						// held by the service, so its closing is the peer's to see.
-						let copy: i64 = duplicate(root, RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+						// AND THE RIGHT TO PASS IT ON, for the roles that say they do. The ceiling
+						// above is what a service needs to TALK to another service; a holder whose
+						// job is to hand the same channel to somebody else needs `duplicate` as
+						// well, and the role is where that is declared - see `handed_on`.
+						let rights: u32 = if role.handed_on { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER | RIGHT_DUPLICATE } else { RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER };
+						let copy: i64 = duplicate(root, rights);
 						// AFTER THE COPY EXISTS, NOT BEFORE. A failed duplicate leaves the
 						// supervisor holding what it held, rather than holding nothing and having
 						// nothing to hand over.

@@ -1772,18 +1772,6 @@ impl<D: BlockDevice> FatFs<D> {
 		let _ = self.write_fs_sectors(self.geo.fsinfo_sector as u64, 1, &buf);
 	}
 
-	// Read a directory's raw bytes: the fixed root region for FAT12/16, a contiguous
-	// NoFatChain run for an exFAT directory carrying one, else its cluster chain.
-	#[cfg(test)]
-	pub(crate) fn read_dir_bytes_for_test(&mut self, dir: &Dir) -> Result<Vec<u8>, FsError> {
-		self.read_dir_bytes(dir)
-	}
-
-	#[cfg(test)]
-	pub(crate) fn is_end_for_test(&self, cluster: u32) -> bool {
-		self.is_end(cluster)
-	}
-
 	fn read_dir_bytes(&mut self, dir: &Dir) -> Result<Vec<u8>, FsError> {
 		if dir.cluster == 0 {
 			return self.read_root_region();

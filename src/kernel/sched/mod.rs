@@ -432,10 +432,11 @@ pub fn spawn_in(domain: Arc<Domain>, entry: extern "C" fn(u64), arg: u64) -> Opt
 	Some(thread)
 }
 
-// Create a new process with its own address space, accounted to `domain`. Returns
-// None if no frame is available for the address space's top-level page table.
+// Create a new process with its own address space, accounted to `domain`. Returns None if the
+// Domain's memory limit has no room for the address space's page tables, or if no frame is
+// available for its top-level table.
 pub fn process_create(domain: Arc<Domain>) -> Option<Arc<Process>> {
-	let address_space = AddressSpace::create()?;
+	let address_space = AddressSpace::create_in(&domain)?;
 	Process::new(address_space, domain)
 }
 

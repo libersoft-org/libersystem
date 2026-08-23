@@ -24,10 +24,24 @@ fn scheduler_multiplexes_threads() {
 	assert_eq!(COUNTER.load(Ordering::SeqCst), threads * iterations);
 }
 
+// A CONTEXT SWITCH DOES NOT LOSE THE FLOATING-POINT STATE IT IS RESPONSIBLE FOR, on every target.
+//
+// One id, three bodies, because the three backends save DIFFERENT sets and a test that asked about
+// the wrong one would be asking about something the kernel never promised: x86_64 saves the whole
+// FPU/SSE state with `fxsave64`, aarch64 the callee-saved `d8..d15`, riscv64 the callee-saved
+// `fs0..fs11`. Neither of the latter two saves vector registers or the FP control word, so the id
+// lost the `xmm` it used to carry - what is asserted is that the saved set survives, and the saved
+// set is the backend's to name. Getting this wrong is silent data corruption, which is why it is
+// worth asserting on the two targets that had no equivalent at all.
+crate::tagged_test!(
+	#[cfg(target_arch = "x86_64")]
+	scheduler_preserves_saved_fp_state,
+	[Scheduler],
+	id = "kernel.sched.scheduler_preserves_saved_fp_state",
+	covers = ["kernel"]
+);
 #[cfg(target_arch = "x86_64")]
-crate::tagged_test!(scheduler_preserves_xmm_state, [Scheduler], id = "kernel.sched.scheduler_preserves_xmm_state", covers = ["kernel"]);
-#[cfg(target_arch = "x86_64")]
-fn scheduler_preserves_xmm_state() {
+fn scheduler_preserves_saved_fp_state() {
 	use core::arch::asm;
 	use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 	static FAILED: AtomicBool = AtomicBool::new(false);
@@ -51,6 +65,87 @@ fn scheduler_preserves_xmm_state() {
 	sched::run_until_idle();
 	assert_eq!(DONE.load(Ordering::SeqCst), 2);
 	assert!(!FAILED.load(Ordering::SeqCst), "one thread observed another thread's XMM state");
+}
+
+crate::tagged_test!(
+	#[cfg(target_arch = "aarch64")]
+	scheduler_preserves_saved_fp_state,
+	[Scheduler],
+	id = "kernel.sched.scheduler_preserves_saved_fp_state",
+	covers = ["kernel"]
+);
+#[cfg(target_arch = "aarch64")]
+fn scheduler_preserves_saved_fp_state() {
+	use core::arch::asm;
+	use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+	static FAILED: AtomicBool = AtomicBool::new(false);
+	static DONE: AtomicU32 = AtomicU32::new(0);
+	// `d8` and `d15` are the ends of the callee-saved range `switch_context` stores, so a switch
+	// that dropped the block or mis-sized the frame shows up on one of them.
+	extern "C" fn worker(value: u64) {
+		unsafe {
+			asm!("fmov d8, {}", "fmov d15, {}", in(reg) value, in(reg) !value, options(nostack, preserves_flags));
+		}
+		for _ in 0..64 {
+			sched::yield_now();
+			let low: u64;
+			let high: u64;
+			unsafe {
+				asm!("fmov {}, d8", "fmov {}, d15", out(reg) low, out(reg) high, options(nostack, preserves_flags));
+			}
+			if low != value || high != !value {
+				FAILED.store(true, Ordering::SeqCst);
+			}
+		}
+		DONE.fetch_add(1, Ordering::SeqCst);
+	}
+	FAILED.store(false, Ordering::SeqCst);
+	DONE.store(0, Ordering::SeqCst);
+	sched::spawn(worker, 0x1122_3344_5566_7788);
+	sched::spawn(worker, 0x8877_6655_4433_2211);
+	sched::run_until_idle();
+	assert_eq!(DONE.load(Ordering::SeqCst), 2);
+	assert!(!FAILED.load(Ordering::SeqCst), "one thread observed another thread's d8/d15 state");
+}
+
+crate::tagged_test!(
+	#[cfg(target_arch = "riscv64")]
+	scheduler_preserves_saved_fp_state,
+	[Scheduler],
+	id = "kernel.sched.scheduler_preserves_saved_fp_state",
+	covers = ["kernel"]
+);
+#[cfg(target_arch = "riscv64")]
+fn scheduler_preserves_saved_fp_state() {
+	use core::arch::asm;
+	use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+	static FAILED: AtomicBool = AtomicBool::new(false);
+	static DONE: AtomicU32 = AtomicU32::new(0);
+	// `fs0` and `fs11` are the ends of the callee-saved range `switch_context` stores.
+	extern "C" fn worker(value: u64) {
+		unsafe {
+			asm!("fmv.d.x fs0, {}", "fmv.d.x fs11, {}", in(reg) value, in(reg) !value, options(nostack, preserves_flags));
+		}
+		for _ in 0..64 {
+			sched::yield_now();
+			let low: u64;
+			let high: u64;
+			unsafe {
+				asm!("fmv.x.d {}, fs0", "fmv.x.d {}, fs11", out(reg) low, out(reg) high, options(nostack, preserves_flags));
+			}
+			if low != value || high != !value {
+				FAILED.store(true, Ordering::SeqCst);
+			}
+		}
+		DONE.fetch_add(1, Ordering::SeqCst);
+	}
+	FAILED.store(false, Ordering::SeqCst);
+	DONE.store(0, Ordering::SeqCst);
+	sched::spawn(worker, 0x1122_3344_5566_7788);
+	sched::spawn(worker, 0x8877_6655_4433_2211);
+	sched::run_until_idle();
+	assert_eq!(DONE.load(Ordering::SeqCst), 2);
+	assert!(!FAILED.load(Ordering::SeqCst), "one thread observed another thread's fs0/fs11 state");
 }
 
 crate::tagged_test!(preemption_preempts_a_cpu_bound_thread, [Scheduler], id = "kernel.sched.preemption_preempts_a_cpu_bound_thread", covers = ["kernel"]);

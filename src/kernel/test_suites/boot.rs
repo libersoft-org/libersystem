@@ -661,10 +661,18 @@ fn system_manager_recovery_escalates_after_repeated_crashes() {
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
 	let mut attempts: u32 = 0;
-	let up = supervise(&crash_rx, 3, || {
+	// A STAND-IN FOR THE SHELL, held for the length of the test. A round now ends when a console
+	// channel is registered and its peer is alive, which is what "the system came up" means; here
+	// every attempt faults long before that, and the stand-in is what keeps the wait from being the
+	// reason rather than the crash.
+	let (console_far, console_near) = object::channel::Channel::create();
+	console_input::attach(console_far);
+	let up = supervise(&crash_rx, 3, 8, "test", || {
 		attempts += 1;
-		Some(sched::spawn(user_fault_thread_body, 0).process().clone())
+		let (reports, _peer) = object::channel::Channel::create();
+		Some((reports, sched::spawn(user_fault_thread_body, 0).process().clone()))
 	});
+	drop(console_near);
 	fault::clear_crash_notify();
 	assert!(!up, "a SystemManager that faults on every attempt must exhaust recovery and escalate");
 	// EVERY ATTEMPT, and the count says so. The ladder stops early once a control-plane branch
@@ -701,10 +709,13 @@ fn system_manager_recovery_survives_a_clean_start() {
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
 	let mut resident: Option<alloc::sync::Arc<object::process::Process>> = None;
-	let up = supervise(&crash_rx, 3, || {
+	let (console_far, console_near) = object::channel::Channel::create();
+	console_input::attach(console_far);
+	let up = supervise(&crash_rx, 3, 8, "test", || {
 		let process = sched::spawn(resident_body, 0).process().clone();
 		resident = Some(process.clone());
-		Some(process)
+		let (reports, _peer) = object::channel::Channel::create();
+		Some((reports, process))
 	});
 	assert!(up, "a SystemManager that is still running should survive without recovery");
 	// AND IT LEAVES WITH THE TEST. A stand-in that stays alive by design has to be taken away by
@@ -716,10 +727,12 @@ fn system_manager_recovery_survives_a_clean_start() {
 	// AND THE SAME LADDER MUST REFUSE ONE THAT LEFT. Nothing faults here either; the difference is
 	// only that the process is gone, which is exactly the case the crash channel cannot report.
 	let mut attempts: u32 = 0;
-	let departed = supervise(&crash_rx, 3, || {
+	let departed = supervise(&crash_rx, 3, 8, "test", || {
 		attempts += 1;
-		Some(sched::spawn(departed_body, 0).process().clone())
+		let (reports, _peer) = object::channel::Channel::create();
+		Some((reports, sched::spawn(departed_body, 0).process().clone()))
 	});
+	drop(console_near);
 	fault::clear_crash_notify();
 	assert!(!departed, "a SystemManager that ended cleanly is as gone as one that faulted, and must not be reported up");
 	assert_eq!(attempts, 4, "an ending is a failed attempt, so the ladder runs out rather than stopping at the first");

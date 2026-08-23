@@ -399,15 +399,118 @@ pub fn forward_mdct(input: &[f32]) -> Option<Vec<f32>> {
 	let mut out: Vec<f32> = Vec::new();
 	out.try_reserve_exact(n).ok()?;
 	let scale = 2.0 / n as f32;
+
+	// FOLDED INTO A DCT-IV, THEN A DFT. This was the definition written out - `2n` terms for each of
+	// `n` outputs, with a `cosf` call inside the inner loop - which is the form that can be read
+	// against the formula and is what a first version should be. `audio-bench` then measured it:
+	// a tenth of real time on the host, and the encoder runs the transform TWICE per packet because
+	// it measures its peak in a first pass. A conversion nobody would wait for is not a ratio
+	// decision, so this is the same transform computed a different way.
+	//
+	// STEP ONE, THE FOLD. Substituting `m = i + n/2` turns the shifted phase into an index shift,
+	// and the cosine's own symmetries - `c(2n-1-m) = -c(m)` and `c(m+2n) = -c(m)` - collapse the
+	// `2n` inputs onto `n` values whose transform is the plain DCT-IV
+	// `X[k] = sum u[i] cos(pi/n (i+1/2)(k+1/2))`.
+	let mut u: Vec<f32> = Vec::new();
+	u.try_reserve_exact(n).ok()?;
+	u.resize(n, 0.0);
+	let half = n / 2;
+	for i in 0..half {
+		u[i + half] += input[i];
+	}
+	for i in half..(n + half) {
+		u[n + half - 1 - i] -= input[i];
+	}
+	for i in (n + half)..two_n {
+		u[i - n - half] -= input[i];
+	}
+
+	// STEP TWO, THE DFT. Expanding `(i+1/2)(k+1/2)` separates the phase into a factor that depends
+	// only on `i`, a factor that depends only on `k`, and `exp(-i*pi*i*k/n)` - which is the `2n`
+	// point DFT kernel. So the DCT-IV is one complex transform of the pre-twiddled `u`, zero-padded
+	// to `2n`, with a post-twiddle and the real part taken. The transform is exact arithmetic in the
+	// same sense the table it replaced was: no approximation, a different order of operations.
+	let mut re: Vec<f32> = Vec::new();
+	let mut im: Vec<f32> = Vec::new();
+	re.try_reserve_exact(two_n).ok()?;
+	im.try_reserve_exact(two_n).ok()?;
+	re.resize(two_n, 0.0);
+	im.resize(two_n, 0.0);
+	for (i, &value) in u.iter().enumerate() {
+		let angle = -core::f64::consts::PI * i as f64 / (2.0 * n as f64);
+		re[i] = value * libm::cos(angle) as f32;
+		im[i] = value * libm::sin(angle) as f32;
+	}
+	fft_in_place(&mut re, &mut im);
 	for k in 0..n {
-		let mut sum = 0.0f32;
-		for (i, &sample) in input.iter().enumerate() {
-			let angle = core::f32::consts::PI / n as f32 * (i as f32 + 0.5 + n as f32 / 2.0) * (k as f32 + 0.5);
-			sum += sample * libm::cosf(angle);
-		}
-		out.push(sum * scale);
+		let angle = -core::f64::consts::PI * (k as f64 + 0.5) / (2.0 * n as f64);
+		let (cos, sin) = (libm::cos(angle) as f32, libm::sin(angle) as f32);
+		out.push((re[k] * cos - im[k] * sin) * scale);
 	}
 	Some(out)
+}
+
+// An in-place radix-2 decimation-in-time complex FFT, forward (the `exp(-i*2*pi*k/N)` sign).
+//
+// Written out rather than taken from a crate: this tree has no floating-point transform library and
+// one function whose loop IS its own definition is easier to check than a dependency's API. The
+// check is not a reading either - `forward_mdct` round-trips against this tree's own INVERSE MDCT,
+// including the overlap-add of two consecutive blocks, so an error here shows up as a signal that
+// does not come back.
+fn fft_in_place(re: &mut [f32], im: &mut [f32]) {
+	let len = re.len();
+	if len < 2 || !len.is_power_of_two() || im.len() != len {
+		return;
+	}
+	// The bit-reversal permutation, by the counter trick: `j` is `i` with its bits reversed, carried
+	// from the top down.
+	let mut j = 0usize;
+	for i in 1..len {
+		let mut bit = len >> 1;
+		while j & bit != 0 {
+			j ^= bit;
+			bit >>= 1;
+		}
+		j |= bit;
+		if i < j {
+			re.swap(i, j);
+			im.swap(i, j);
+		}
+	}
+	// THE TWIDDLES ARE COMPUTED ONCE, and that is not micro-optimisation - it is the difference
+	// between `N/2` transcendental calls and `(N/2) log N` of them, because the innermost loop runs
+	// once per butterfly and every stage repeats the same angles for every block in it. On the host
+	// that showed as a constant factor; on riscv64 under emulation it showed as the guest suite's
+	// stall watchdog stopping a conversion that had not finished in fifteen minutes.
+	//
+	// `exp(-i*2*pi*j/N)` for j in `0..N/2`. A stage with span `s` reads it with a stride of `N/s`,
+	// which is what makes one table serve every stage.
+	let mut twiddle_re: Vec<f32> = Vec::with_capacity(len / 2);
+	let mut twiddle_im: Vec<f32> = Vec::with_capacity(len / 2);
+	for j in 0..len / 2 {
+		let angle = core::f64::consts::PI * -2.0 * j as f64 / len as f64;
+		twiddle_re.push(libm::cos(angle) as f32);
+		twiddle_im.push(libm::sin(angle) as f32);
+	}
+	let mut span = 2usize;
+	while span <= len {
+		let stride = len / span;
+		for start in (0..len).step_by(span) {
+			for offset in 0..span / 2 {
+				let index = offset * stride;
+				let (wr, wi) = (twiddle_re[index], twiddle_im[index]);
+				let a = start + offset;
+				let b = a + span / 2;
+				let tr = re[b] * wr - im[b] * wi;
+				let ti = re[b] * wi + im[b] * wr;
+				re[b] = re[a] - tr;
+				im[b] = im[a] - ti;
+				re[a] += tr;
+				im[a] += ti;
+			}
+		}
+		span <<= 1;
+	}
 }
 
 /// The window a Vorbis block is multiplied by, on the way in and on the way out.

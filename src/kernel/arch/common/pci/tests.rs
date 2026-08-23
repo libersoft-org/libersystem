@@ -163,7 +163,36 @@ fn a_bar_the_firmware_placed_is_not_handed_out_to_another() {
 	let placed = (bar(1) & 0xFFFF_FFF0) as u64;
 	assert_ne!(placed, WINDOW_BASE, "and the unprogrammed BAR did not land on top of it");
 	assert!(placed >= WINDOW_BASE + 0x1000 && placed < WINDOW_END, "it landed inside the window, past the retained span: {placed:#x}");
-	assert!(command() & 0x02 != 0 && command() & 0x04 != 0, "both BARs are placed, so the device is enabled");
+	assert!(command() & 0x02 != 0, "both BARs are placed, so the device decodes memory");
+	assert_eq!(command() & 0x04, 0, "and enumeration is not ownership, so it is not mastering the bus");
+}
+
+crate::tagged_test!(enumeration_takes_bus_mastering_away_from_a_device_that_arrived_with_it_on, [Kernel, Pci], id = "kernel.arch.common.pci.enumeration_takes_bus_mastering_away_from_a_device_that_arrived_with_it_on", covers = ["kernel"]);
+fn enumeration_takes_bus_mastering_away_from_a_device_that_arrived_with_it_on() {
+	// Enumeration used to OR the bit in and never clear it, so a device the firmware had already
+	// set mastering on stayed a bus master from boot until the machine stopped - with no driver, no
+	// IOMMU, and therefore write access to every physical address in the machine. Leaving the bit
+	// alone is not neutral: the kernel is the only thing that will ever look.
+	stand_up([0, 0, 0, 0, 0, 0], [mask32(0x1000), 0, 0, 0, 0, 0]);
+	SPACE.lock().command = 0x06; // memory space + bus master, as the firmware left it
+	assign_bars_ecam::<Fake>(&DEVICE);
+	assert!(command() & 0x02 != 0, "the device still decodes memory - its BAR is placed");
+	assert_eq!(command() & 0x04, 0, "but it does not master the bus, whatever it arrived with");
+}
+
+crate::tagged_test!(granting_bus_mastering_disturbs_no_other_command_bit, [Kernel, Pci], id = "kernel.arch.common.pci.granting_bus_mastering_disturbs_no_other_command_bit", covers = ["kernel"]);
+fn granting_bus_mastering_disturbs_no_other_command_bit() {
+	// The grant runs against a device that is already set up - BARs placed, memory decoding on,
+	// INTx pin disabled - so writing the command register wholesale would undo that setup at the
+	// moment a driver takes the device. It is one bit, read-modify-write, and nothing else.
+	stand_up([0, 0, 0, 0, 0, 0], [mask32(0x1000), 0, 0, 0, 0, 0]);
+	assign_bars_ecam::<Fake>(&DEVICE);
+	super::set_intx_disabled::<Fake>(DEVICE.bus, DEVICE.dev, DEVICE.func, true);
+	let before = command();
+	super::set_bus_master::<Fake>(DEVICE.bus, DEVICE.dev, DEVICE.func, true);
+	assert_eq!(command(), before | 0x04, "the grant sets exactly the one bit");
+	super::set_bus_master::<Fake>(DEVICE.bus, DEVICE.dev, DEVICE.func, false);
+	assert_eq!(command(), before, "and revoking it puts the register back where it was");
 }
 
 crate::tagged_test!(a_device_whose_bar_will_not_fit_is_left_switched_off, [Kernel, Pci], id = "kernel.arch.common.pci.a_device_whose_bar_will_not_fit_is_left_switched_off", covers = ["kernel"]);

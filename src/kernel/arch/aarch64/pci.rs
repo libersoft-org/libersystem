@@ -127,9 +127,24 @@ pub fn set_intx_disabled(bus: u8, dev: u8, func: u8, disabled: bool) {
 	common::set_intx_disabled::<Access>(bus, dev, func, disabled);
 }
 
-// Enable MSI-X on a device and ensure its memory space is decoded + bus mastering is
-// on (GICv2m MSI delivery is a DMA memory write). `cap` is the MSI-X capability's
-// config-space offset (from VirtioDevice::msix_cap).
+// Turn bus mastering on or off for one function. The only caller is `device`, which knows whether a
+// driver owns the device - see `arch::common::pci::set_bus_master`.
+pub fn set_bus_master(bus: u8, dev: u8, func: u8, on: bool) {
+	common::set_bus_master::<Access>(bus, dev, func, on);
+}
+
+// One function's COMMAND register, read back - test-only, see `arch::common::pci::command`.
+#[cfg(test)]
+pub fn command(bus: u8, dev: u8, func: u8) -> u16 {
+	common::command::<Access>(bus, dev, func)
+}
+
+// Enable MSI-X on a device and ensure its memory space is decoded, so the table BAR responds.
+// `cap` is the MSI-X capability's config-space offset (from VirtioDevice::msix_cap).
+//
+// It does NOT set bus mastering. It used to, on the reasoning that GICv2m MSI delivery is itself a
+// DMA memory write - true, and the message is only ever sent once a driver has the device running,
+// which is where the bit is turned on now.
 pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
 	common::msix_enable::<Access>(bus, dev, func, cap);
 }

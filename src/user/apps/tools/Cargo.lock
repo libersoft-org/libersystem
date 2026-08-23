@@ -103,6 +103,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "audiorec"
+version = "0.0.0"
+dependencies = [
+ "pcm",
+]
+
+[[package]]
 name = "base-proto"
 version = "0.0.0"
 dependencies = [
@@ -713,6 +720,7 @@ dependencies = [
  "audio-client",
  "audio-client-provider",
  "audioconv",
+ "audiorec",
  "bmp",
  "cli",
  "config-client",
@@ -731,6 +739,7 @@ dependencies = [
  "network-client-provider",
  "observability-client",
  "observability-client-provider",
+ "pcm",
  "pix",
  "png",
  "process-client",

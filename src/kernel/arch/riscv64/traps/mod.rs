@@ -380,6 +380,16 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 		return;
 	}
 
+	// AND ONE MORE IN A TEST BUILD: the armed SUM probe. The property under test is that a
+	// supervisor access to a U-mapped page outside `user_access` is refused, and the refusal IS a
+	// supervisor fault - which the branch below halts on, as it should. The probe records the cause
+	// and retires the probing thread so the suite can assert on it, the same hook the x86_64 IDT
+	// uses for SMAP/SMEP.
+	#[cfg(test)]
+	if crate::fault::smap_probe_trip(stval, scause) {
+		crate::sched::exit();
+	}
+
 	// Anything else reaching here is a kernel bug: report it and halt.
 	let cause = match code {
 		1 => "instruction access fault",

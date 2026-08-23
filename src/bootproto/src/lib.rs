@@ -21,6 +21,7 @@ extern crate std;
 // and the kernel (to load userspace programs).
 pub mod elf;
 
+pub mod boot_manifest;
 pub mod sha256;
 
 // The written rule for whether a candidate library may replace an installed provider in a

@@ -800,6 +800,10 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"lssvc", Shape::Rest),
 	(b"beep", Shape::Rest),
 	(b"play", Shape::InteractiveArgs),
+	// The recorder takes the INTERACTIVE shape because Ctrl+C is how a recording without `--seconds`
+	// ends: the signal reaches the foreground job, and the tool answers it by finishing the file
+	// rather than by dying half way through one.
+	(b"audiorec", Shape::InteractiveArgs),
 	(b"ls", Shape::Rest),
 	(b"du", Shape::Rest),
 	(b"start", Shape::Args),
@@ -812,6 +816,7 @@ const TOOLS: &[(&[u8], Shape)] = &[
 	(b"licoedit", Shape::InteractiveArgs),
 	(b"imgview", Shape::InteractiveArgs),
 	(b"imgconv", Shape::Args),
+	(b"audioconv", Shape::Args),
 	(b"write", Shape::Args),
 	(b"rm", Shape::Args),
 	(b"pwd", Shape::Json),

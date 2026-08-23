@@ -28,3 +28,7 @@ forward!("liber_channel_liber_audio_audio_open_stream", "liber_channel_impl_libe
 forward!("liber_channel_liber_audio_pcm_stream_write", "liber_channel_impl_liber_audio_pcm_stream_write");
 forward!("liber_channel_liber_audio_pcm_stream_close", "liber_channel_impl_liber_audio_pcm_stream_close");
 forward!("liber_channel_liber_audio_audio_admin_open_streams", "liber_channel_impl_liber_audio_audio_admin_open_streams");
+forward!("liber_channel_liber_audio_audio_open_capture", "liber_channel_impl_liber_audio_audio_open_capture");
+forward!("liber_channel_liber_audio_pcm_capture_read", "liber_channel_impl_liber_audio_pcm_capture_read");
+forward!("liber_channel_liber_audio_pcm_capture_close", "liber_channel_impl_liber_audio_pcm_capture_close");
+forward!("liber_channel_liber_audio_audio_admin_open_captures", "liber_channel_impl_liber_audio_audio_admin_open_captures");

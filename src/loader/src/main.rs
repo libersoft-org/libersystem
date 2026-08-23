@@ -136,9 +136,20 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// Prefer the system volume: a program that runs should have a file on the volume the user can
 	// see, which is the whole point of this milestone. The ESP copy is the fallback, so a machine
 	// whose system volume is missing or unreadable still boots far enough to say so.
+	// EACH SOURCE CARRIES ITS OWN MANIFEST, and the kernel is checked against the one belonging to
+	// the source it came from - not against whichever manifest happened to be readable. A boot made
+	// of two halves from two systems is the failure this code already refuses for the bootstrap set;
+	// the digests would be no use if they could be crossed the same way.
 	let kernel = match read_from_system_volume(bs, KERNEL_FILE.as_bytes()) {
 		VolumeRead::Read(bytes) => {
 			arch::serial::write_str("loader: kernel read from the system volume\n");
+			let VolumeRead::Read(manifest) = read_from_system_volume(bs, b"etc/boot.manifest") else {
+				panic!("loader: the system volume has a kernel and no etc/boot.manifest - refusing to boot from it");
+			};
+			if !blockio::digests_ok(&manifest, KERNEL_FILE.as_bytes(), &bytes) {
+				panic!("loader: the kernel does not match etc/boot.manifest on the system volume");
+			}
+			arch::serial::write_str("loader: kernel verified against the system volume's etc/boot.manifest\n");
 			bytes
 		}
 		// The two failures are reported apart on purpose. "No LiberFS volume" points at the
@@ -148,7 +159,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		// message matters more than usual here.
 		VolumeRead::NoVolume => {
 			arch::serial::write_str("loader: no LiberFS volume on any block device; using the boot volume\n");
-			read_boot_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel")
+			read_verified_kernel_from_boot_medium(bs, root)
 		}
 		VolumeRead::NotOnVolume => {
 			arch::serial::write_str("loader: system volume found but it has no kernel; using the boot volume\n");
@@ -163,7 +174,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 					BOOTSTRAP_SOURCE = "";
 				}
 			}
-			read_boot_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel")
+			read_verified_kernel_from_boot_medium(bs, root)
 		}
 	};
 	arch::serial::write_str("loader: kernel loaded\n");
@@ -463,13 +474,49 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 // Read a file from the boot medium: through the firmware when it mounted the volume, and through
 // the FAT backend over the block protocol when it did not.
 pub(crate) fn read_boot_file(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>, name: &str) -> Option<&'static [u8]> {
+	// ONE PATH SPELLING FOR TWO READERS. The FAT backend takes `/`-separated paths, as the bootstrap
+	// list writes them; the firmware's file protocol takes `\`. This took the caller's string
+	// verbatim for both, which worked for exactly as long as every name here was a single component
+	// - and then `etc/boot.manifest` reached the firmware reader as a name no volume has.
+	let mut separated = [0u8; 128];
+	let firmware_name = if name.len() < separated.len() {
+		for (i, &b) in name.as_bytes().iter().enumerate() {
+			separated[i] = if b == b'/' { b'\\' } else { b };
+		}
+		core::str::from_utf8(&separated[..name.len()]).ok()
+	} else {
+		None
+	};
 	if let Some(root) = root
-		&& let Some(bytes) = unsafe { read_file(bs, root, name) }
+		&& let Some(firmware_name) = firmware_name
+		&& let Some(bytes) = unsafe { read_file(bs, root, firmware_name) }
 	{
 		return Some(bytes);
 	}
 	arch::serial::write_str("loader: the firmware did not mount the boot volume; reading it as FAT\n");
 	read_from_fat(bs, name.as_bytes())
+}
+
+// The kernel from the BOOT MEDIUM, checked against the manifest that medium carries.
+//
+// The system-volume branch checks its kernel against the volume's manifest; this is the other
+// source, and it read its kernel unchecked - which is not a corner: it is the branch every machine
+// with no system volume takes, and the one the test media take on all three architectures. A
+// verified path nothing walks and an unverified one everything walks is worse than neither, because
+// the milestone can be read as done.
+//
+// The medium's manifest is not the volume's copy. The kernel staged on a boot medium is the
+// STRIPPED build, so its digest is computed where it is staged - see `stage_boot_manifest`.
+fn read_verified_kernel_from_boot_medium(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) -> &'static [u8] {
+	let bytes = read_boot_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel");
+	let Some(manifest) = read_boot_file(bs, root, "etc/boot.manifest") else {
+		panic!("loader: the boot medium has a kernel and no etc/boot.manifest - refusing to boot from it");
+	};
+	if !blockio::digests_ok(manifest, KERNEL_FILE.as_bytes(), bytes) {
+		panic!("loader: the kernel does not match etc/boot.manifest on the boot medium");
+	}
+	arch::serial::write_str("loader: kernel verified against the boot medium's etc/boot.manifest\n");
+	bytes
 }
 
 // The boot medium, chosen once.

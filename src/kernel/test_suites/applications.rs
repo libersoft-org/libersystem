@@ -362,6 +362,219 @@ fn imgconv_cross_volume_and_failed_overwrite_preserve_destination() {
 	assert_eq!(full_media.open(b"vol://media/KEEP.BMP", 0xfa11), Some(previous.to_vec()), "failed overwrite preserves the previous destination byte-for-byte");
 }
 
+tagged_test!(audioconv_writes_a_lossy_container_that_decodes_back, [Audio, Service, Storage, Process, Filesystem], id = "kernel.applications.audioconv_writes_a_lossy_container_that_decodes_back", covers = ["audioconv", "bin.audioconv", "ogg", "pcm", "vorbis"]);
+fn audioconv_writes_a_lossy_container_that_decodes_back() {
+	// The lossy row of the matrix, and a test OF ITS OWN rather than another conversion inside the
+	// lossless one. The reason is the watchdog: that test already cost 681 seconds on riscv64 under
+	// emulation, three quarters of the window in which a test must finish, and a fifth conversion
+	// pushed it past. Two tests that each finish say more than one that is stopped, and the split is
+	// along the line the milestone draws anyway - lossless round-trips sample-exactly, lossy does
+	// not and is judged differently.
+	//
+	// WHAT IS COMPARED IS NOT THE SAMPLES. A lossy stream is judged by being a stream this tree's
+	// own decoder accepts, at the shape that was asked for, long enough to be the track. A container
+	// that parsed and decoded to nothing would pass a "does it parse" check and fail this one.
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let audioconv_elf = program_elf(&package, volume, b"audioconv").expect("audioconv tool");
+
+	let samples = governed_audio_fixture(2_000);
+	let source_wav = {
+		let format = pcm::Format::new(8_000, 1).expect("the fixture rate is one `Format` names");
+		let mut encoder = wav::encode::Encoder::new(pcm::encode::VecSink::new(1 << 20), format, wav::encode::Output::Pcm { bits: 16 }).expect("the fixture encoder starts");
+		encoder.push(&samples).expect("the fixture encodes");
+		encoder.finish().expect("the fixture closes").0.into_bytes()
+	};
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let media_image = fat16_image(&[(*b"SOURCE  WAV", source_wav.as_slice())], false);
+	let mut media = StorageHarness::start(storage_elf, b"FATBLOCK", &media_image, media_image.len() as u64);
+
+	let line = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.OGG", &mut system, &mut media);
+	assert!(line.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> Ogg Vorbis 8000Hz/1ch/2000fr duration=250ms bytes="), "unexpected report: {}", alloc::string::String::from_utf8_lossy(&line));
+	let written = system.open(b"vol://system/CROSS.OGG", 0xaad12).expect("the cross-volume Ogg opens");
+	let stream = vorbis::Vorbis::parse(&written).expect("the Ogg this encoder wrote is one this decoder reads");
+	assert_eq!(stream.metadata().rate, 8_000);
+	assert_eq!(stream.metadata().channels, 1);
+	let mut decoded = alloc::vec::Vec::new();
+	let read = stream.decoder().read_i16_le(2_000, &mut decoded).expect("the Ogg decodes");
+	assert!(read > 1_500, "the Ogg decoded {read} frames of a two-thousand-frame track");
+}
+
+tagged_test!(audiorec_records_a_capture_stream_and_never_publishes_a_failed_one, [Audio, AudioService, Service, Storage, Process, Filesystem], id = "kernel.applications.audiorec_records_a_capture_stream_and_never_publishes_a_failed_one", covers = ["audiorec", "bin.audiorec", "pcm", "storage", "wav"]);
+fn audiorec_records_a_capture_stream_and_never_publishes_a_failed_one() {
+	// The real `audiorec.lsexe`, the real AudioService, and a harness standing in for the
+	// virtio-snd driver - so everything between the device and the file on the volume is the code
+	// that runs on a machine with a microphone. What the harness supplies is the one thing a test
+	// machine cannot: a period with KNOWN SAMPLES in it, which is what makes "the recording is the
+	// audio that arrived" an assertion rather than a hope.
+	//
+	// The signal is constant IN TIME AND DIFFERENT PER CHANNEL, which is what makes it able to catch
+	// something. Resampling a constant gives the constant back, so every sample in the finished file
+	// is one known value - and because the two channels differ, a mono recording distinguishes their
+	// AVERAGE from either of them. A downmix that quietly kept the left channel would pass against a
+	// signal that is the same on both, which is exactly the test that measures nothing.
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	const LEFT: i16 = 12_000;
+	const RIGHT: i16 = 4_000;
+	const MONO: i16 = 8_000;
+	// One device period: 512 stereo frames of signed-16-bit little-endian, which is what
+	// driver.virtio-snd hands back for a capture command.
+	const PERIOD_BYTES: usize = 2_048;
+
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let audio_elf = program_elf(&package, volume, b"audio_service").expect("audio_service");
+	let audiorec_elf = program_elf(&package, volume, b"audiorec").expect("audiorec tool");
+	let mut system = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+
+	// AudioService, with this test as its driver.
+	let (audio_boot_kernel, audio_boot_user) = Channel::create();
+	let (service_server, _service_client) = Channel::create();
+	let (snd_host, snd_service) = Channel::create();
+	let (audio_admin, admin) = Channel::create();
+	let _audio_service = spawn_dynamic_test_process(sched::root_domain(), audio_elf, audio_boot_user);
+	send_cap(&audio_boot_kernel, b"SND", snd_service, Rights::ALL).expect("the driver channel");
+	send_cap(&audio_boot_kernel, b"ADMIN", admin, Rights::ALL).expect("the admin channel");
+	send_cap(&audio_boot_kernel, b"SERVE", service_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the serve channel");
+	sched::run_until_idle();
+	assert_eq!(&audio_boot_kernel.recv().expect("AudioService online report").bytes[..], b"AudioService: online");
+
+	// THE CAPTURE GRANT, WHICH IS NOT THE PLAYBACK ONE. `open-captures` is op 2 on `audio-admin`;
+	// what it mints may record and may not make a sound, which the next block checks.
+	let capture_grant = |corr: u32| -> alloc::sync::Arc<Channel> {
+		let mut request = alloc::vec::Vec::new();
+		request.extend_from_slice(&2u16.to_le_bytes());
+		request.extend_from_slice(&corr.to_le_bytes());
+		audio_admin.send(Message::new(request, alloc::vec::Vec::new())).expect("open-captures request");
+		sched::run_until_idle();
+		let reply = audio_admin.recv().expect("open-captures reply");
+		assert_eq!(le_u32(&reply.bytes, 0), corr);
+		assert_eq!(reply.bytes[4], 1, "the launcher may mint a capture connection");
+		reply.caps.first().expect("the capture connection").object().into_any_arc().downcast::<Channel>().expect("the grant is a channel")
+	};
+
+	// A capture grant is not a playback grant. `beep` is op 1 and `open-stream` is op 2 on `audio`;
+	// both are refused on a connection minted for recording.
+	{
+		let scoped = capture_grant(60);
+		let mut denied_beep = alloc::vec::Vec::new();
+		denied_beep.extend_from_slice(&1u16.to_le_bytes());
+		denied_beep.extend_from_slice(&61u32.to_le_bytes());
+		denied_beep.extend_from_slice(&440u16.to_le_bytes());
+		denied_beep.extend_from_slice(&10u32.to_le_bytes());
+		scoped.send(Message::new(denied_beep, alloc::vec::Vec::new())).expect("scoped beep request");
+		let mut denied_stream = alloc::vec::Vec::new();
+		denied_stream.extend_from_slice(&2u16.to_le_bytes());
+		denied_stream.extend_from_slice(&62u32.to_le_bytes());
+		denied_stream.extend_from_slice(&48_000u32.to_le_bytes());
+		denied_stream.push(2);
+		scoped.send(Message::new(denied_stream, alloc::vec::Vec::new())).expect("scoped open-stream request");
+		sched::run_until_idle();
+		assert_eq!(scoped.recv().expect("scoped beep denial").bytes[4], 0, "a recorder may not make a sound");
+		assert_eq!(scoped.recv().expect("scoped open-stream denial").bytes[4], 0, "nor open a playback stream");
+	}
+
+	// Run `audiorec` to completion, answering every capture command the service sends the driver
+	// with one period of `TONE`. Returns what the tool printed.
+	let record = |arguments: &[u8], system: &mut StorageHarness| -> alloc::vec::Vec<u8> {
+		let grant = capture_grant(70);
+		let (bootstrap, child) = Channel::create();
+		let (stdout, child_stdout) = Channel::create();
+		let process = spawn_dynamic_test_process(sched::root_domain(), audiorec_elf, child);
+		send_cap(&bootstrap, b"STDOUT", child_stdout, Rights::ALL).expect("the tool's stdout");
+		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("endpoint run terminator");
+		bootstrap.send(Message::new(launch_context(arguments, b"vol://system"), alloc::vec::Vec::new())).expect("the tool's arguments");
+		send_cap(&bootstrap, b"SYSTEM", system.client.clone(), Rights::ALL).expect("the tool's system volume");
+		for tag in [b"MEDIA".as_slice(), b"ISO".as_slice(), b"UDF".as_slice(), b"USB".as_slice(), b"RAM".as_slice(), b"TMP".as_slice()] {
+			bootstrap.send(Message::new(tag.to_vec(), alloc::vec::Vec::new())).expect("an absent volume");
+		}
+		bootstrap.send(Message::new(b"READY".to_vec(), alloc::vec::Vec::new())).expect("volume bundle terminator");
+		send_cap(&bootstrap, b"AUDIO_CAPTURE", grant, Rights::ALL).expect("the tool's capture grant");
+
+		let mut line = None;
+		for _ in 0..200_000 {
+			system.pump();
+			// The driver's side of the protocol: a one-byte message is a command, `1` asks for a
+			// period and `2` ends the stream. Anything else here would be a playback period, which
+			// this test never produces.
+			if let Ok(command) = snd_host.recv() {
+				match command.bytes.as_slice() {
+					[1] => {
+						let mut period = alloc::vec::Vec::with_capacity(PERIOD_BYTES);
+						while period.len() < PERIOD_BYTES {
+							period.extend_from_slice(&LEFT.to_le_bytes());
+							period.extend_from_slice(&RIGHT.to_le_bytes());
+						}
+						snd_host.send(Message::new(period, alloc::vec::Vec::new())).expect("a captured period");
+					}
+					[2] => snd_host.send(Message::new(b"OK".to_vec(), alloc::vec::Vec::new())).expect("the capture stop ACK"),
+					other => panic!("the service sent the driver something that is not a capture command: {other:?}"),
+				}
+			}
+			if line.is_none()
+				&& let Ok(message) = stdout.recv()
+			{
+				line = Some(message.bytes);
+			}
+			if line.is_some() && process.is_terminated() {
+				break;
+			}
+			sched::run_until_idle();
+		}
+		assert!(process.is_terminated(), "the recorder exits");
+		line.expect("the recorder prints a result")
+	};
+
+	// A second of 8 kHz mono, which is the interesting shape: both a downmix and a downsample.
+	let report = record(b"-r 8000 -c 1 -s 1 vol://system/TAKE.WAV", &mut system);
+	// THE TWO NUMBERS THAT ARE NOT ROUND, ASSERTED RATHER THAN GLOSSED:
+	//
+	// `dropped=22` is the tail of the period that straddles the one-second mark. A device period is
+	// 512 frames at 48 kHz, which is about 85 frames at 8 kHz, and 8000 is not a multiple of 85 - so
+	// the last period carries 22 frames past the length that was asked for and they are not written.
+	// It is a real two-and-three-quarter milliseconds of captured audio that did not reach the file,
+	// which is why the tool says so instead of rounding it away.
+	//
+	// `peak=172` is the largest buffer the TOOL ever holds: one converted period, 86 mono frames of
+	// two bytes. Not 2048, which is the device period AudioService converts - the recorder never
+	// sees one. That is the whole claim behind "an hour of audio costs one period of memory".
+	assert_eq!(&report[..], b"audiorec: 8000Hz/1ch/16-bit 8000fr duration=1000ms bytes=16044 dropped=22 peak=172\n", "unexpected report: {}", alloc::string::String::from_utf8_lossy(&report));
+
+	let written = system.open(b"vol://system/TAKE.WAV", 0xaad20).expect("the recording is on the volume");
+	let parsed = wav::Wav::parse(&written).expect("the recording is a WAV file this tree can read");
+	assert_eq!(parsed.metadata().rate, 8_000);
+	assert_eq!(parsed.metadata().channels, 1);
+	assert_eq!(parsed.metadata().bits_per_sample, 16);
+	assert_eq!(parsed.metadata().frames, 8_000, "the RIFF and data lengths were patched to what was recorded");
+	let mut decoded = alloc::vec::Vec::new();
+	let frames = parsed.decoder().read_i16_le(8_000, &mut decoded).expect("the recording decodes");
+	assert_eq!(frames, 8_000);
+	assert!(decoded.chunks_exact(2).all(|sample| i16::from_le_bytes([sample[0], sample[1]]) == MONO), "a mono recording of a stereo source is the average of the two channels");
+
+	// AND THE OTHER SHAPE: 48 kHz stereo, where nothing is remixed and nothing is resampled, so the
+	// interleaving is what is under test. A file whose channels were swapped, doubled or collapsed
+	// decodes into something other than the pair that arrived.
+	let stereo_report = record(b"-r 48000 -c 2 -s 1 vol://system/STEREO.WAV", &mut system);
+	assert!(stereo_report.starts_with(b"audiorec: 48000Hz/2ch/16-bit 48000fr duration=1000ms bytes=192044 "), "unexpected report: {}", alloc::string::String::from_utf8_lossy(&stereo_report));
+	let stereo_written = system.open(b"vol://system/STEREO.WAV", 0xaad22).expect("the stereo recording is on the volume");
+	let stereo_parsed = wav::Wav::parse(&stereo_written).expect("the stereo recording parses");
+	assert_eq!(stereo_parsed.metadata().channels, 2);
+	assert_eq!(stereo_parsed.metadata().frames, 48_000);
+	let mut stereo_decoded = alloc::vec::Vec::new();
+	stereo_parsed.decoder().read_i16_le(48_000, &mut stereo_decoded).expect("the stereo recording decodes");
+	assert!(stereo_decoded.chunks_exact(4).all(|frame| i16::from_le_bytes([frame[0], frame[1]]) == LEFT && i16::from_le_bytes([frame[2], frame[3]]) == RIGHT), "the stereo recording is not the pair of channels that arrived");
+
+	// A DESTINATION THAT EXISTS IS NOT OVERWRITTEN, and the refusal happens before the microphone
+	// is ever opened - so a mistyped path costs nothing and destroys nothing.
+	let refused = record(b"-r 8000 -c 1 -s 1 vol://system/TAKE.WAV", &mut system);
+	assert_eq!(&refused[..], b"audiorec: destination exists (use --force)\n");
+	let again = system.open(b"vol://system/TAKE.WAV", 0xaad21).expect("the first recording is still there");
+	assert_eq!(again, written, "a refused run changed the file it refused to write");
+}
+
 tagged_test!(audioconv_converts_across_volumes_and_never_writes_a_failed_conversion, [Audio, Service, Storage, Process, Filesystem], id = "kernel.applications.audioconv_converts_across_volumes_and_never_writes_a_failed_conversion", covers = ["adpcm", "aiff", "audioconv", "bin.audioconv", "flac", "pcm", "storage", "wav", "wavpack"]);
 fn audioconv_converts_across_volumes_and_never_writes_a_failed_conversion() {
 	// The real `audioconv.lsexe`, launched with a volume bundle and nothing else - no AudioService,
@@ -419,9 +632,9 @@ fn audioconv_converts_across_volumes_and_never_writes_a_failed_conversion() {
 	assert_eq!(decode_wavpack_samples(&written), samples, "the WavPack conversion was not lossless");
 
 	// A format nothing writes yet says so in those words, and does not create the destination.
-	let unwritten = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.OGG", &mut system, &mut media);
+	let unwritten = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.MP3", &mut system, &mut media);
 	assert_eq!(unwritten, b"audioconv: writing that format is not implemented yet\n");
-	assert_eq!(system.open(b"vol://system/CROSS.OGG", 0xaad12), None, "a refused profile still created its destination");
+	assert_eq!(system.open(b"vol://system/CROSS.MP3", 0xaad13), None, "a refused profile still created its destination");
 
 	// Not audio at all, and a destination whose suffix names nothing.
 	let junk = run_volume_tool(audioconv_elf, b"vol://media/JUNK.BIN vol://system/JUNK.FLAC", &mut system, &mut media);
@@ -651,9 +864,9 @@ fn permission_manager_enforces_static_and_dynamic_probe_policy() {
 	let result = permission_scenario_result(PermissionCohort::Base).expect("the permission probe scenario should run");
 	assert!(!result.expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(result.probe_read, result.expected, "the sandboxed component read its one granted file through the storage grant");
-	assert_eq!(result.probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny app-assets=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
+	assert_eq!(result.probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
 	assert_eq!(result.request_read.as_slice(), b"storage denied", "request_probe's undeclared storage request was refused by the headless policy default");
-	assert_eq!(result.request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny app-assets=deny storage=deny(dynamic)", "request_probe's static grants and dynamic denial were recorded independently");
+	assert_eq!(result.request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny storage=deny(dynamic)", "request_probe's static grants and dynamic denial were recorded independently");
 }
 
 tagged_test!(permission_manager_runs_tools_with_minimal_grants, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_runs_tools_with_minimal_grants", covers = ["bin.permission_manager", "kernel", "services"]);
@@ -668,10 +881,10 @@ fn permission_manager_runs_tools_with_minimal_grants() {
 	assert_eq!(result.date_read[16], b':', "date separates the minute and second");
 	assert_eq!(result.date_read[19], b'Z', "date reports UTC");
 	assert_eq!(result.date_read[20], b'\n', "date ended its stdout line");
-	assert_eq!(result.date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny app-assets=deny", "date received only its time grant");
+	assert_eq!(result.date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "date received only its time grant");
 	assert_eq!(result.cat_read, result.expected, "cat printed its file through the storage grant");
 	assert_eq!(result.ip_read.as_slice(), b"net0: 10.0.2.15  mac 52:54:00:12:34:56  mtu 1500  gateway 10.0.2.2\n", "ip rendered state from its typed NetworkService grant");
-	assert_eq!(result.ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny app-assets=deny", "ip received only its network grant");
+	assert_eq!(result.ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "ip received only its network grant");
 }
 
 tagged_test!(permission_manager_mints_scoped_application_grants, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_mints_scoped_application_grants", covers = ["bin.permission_manager", "kernel", "services"]);

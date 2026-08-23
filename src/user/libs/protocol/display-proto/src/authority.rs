@@ -29,9 +29,12 @@ use std::cell::Cell;
 const RIGHT_MANAGE: u32 = 1 << 10;
 const RIGHT_READ: u32 = 1 << 0;
 
-// The stable object-type code for a task. The guard for this parameter passes `NO_REQUIRED_TYPE`,
-// so nothing checks it - it is here to make the packed word realistic rather than to be asserted.
-const TYPE_PROCESS: u64 = 3;
+// The stable object-type codes. `liber:process@1` declares `@kernel(process)` on its `task`
+// resource, so the generator now emits the Process code into this parameter's guard and a handle of
+// any other kind is refused before the service is reached. Written out rather than imported, like
+// the rights above and for the same reason.
+const TYPE_PROCESS: u64 = 1;
+const TYPE_CHANNEL: u64 = 5;
 
 thread_local! {
 	static AUTHORITY: Cell<u64> = const { Cell::new(u64::MAX) };
@@ -90,6 +93,10 @@ fn bind_with(authority: u64) -> (Recording, Result<u64, Error>) {
 	} else {
 		Err(Error::read(&mut reader).expect("an error variant"))
 	};
+	// NOTHING MAY BE LEFT OPEN BY A REFUSAL. The guard takes every capability the message carried
+	// out of the list before it answers, so a caller's handle is not still sitting in a list nobody
+	// will drain - which on a real system is a handle leaked once per refused request.
+	assert!(request_handles.as_slice().is_empty(), "the request's handles were taken, whatever the answer");
 	(service, outcome)
 }
 
@@ -123,5 +130,16 @@ fn every_right_except_manage_is_still_a_refusal() {
 fn an_unknown_handle_is_refused() {
 	let (service, outcome) = bind_with(u64::MAX);
 	assert_eq!(outcome, Err(Error::Denied));
+	assert_eq!(service.binds, 0, "the service was never reached");
+}
+
+#[test]
+fn a_handle_of_the_wrong_kernel_object_is_refused_however_wide_its_rights() {
+	// `bind` takes a `handle<task>`, and `task` declares `@kernel(process)`. A Channel carrying
+	// every right in the kernel is still not a process, and the guard says so before the service is
+	// reached - which is the half `@rights` alone could never check: rights are about what may be
+	// done to an object, not about which object it is.
+	let (service, outcome) = bind_with(packed(TYPE_CHANNEL, u32::MAX));
+	assert_eq!(outcome, Err(Error::Denied), "the schema's own error, not the service's");
 	assert_eq!(service.binds, 0, "the service was never reached");
 }

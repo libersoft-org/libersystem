@@ -10,6 +10,8 @@ mp3 = { path = "../../user/libs/audio/mp3" }
 vorbis = { path = "../../user/libs/audio/vorbis" }
 wav = { path = "../../user/libs/audio/wav" }
 wavpack = { path = "../../user/libs/audio/wavpack" }
+# The encoder rows need the shared sink and format vocabulary the encoders are written against.
+pcm = { path = "../../user/libs/audio/pcm" }
 
 # A WARNING IS AN ERROR HERE. P02M0144 took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to

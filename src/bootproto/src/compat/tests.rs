@@ -45,7 +45,7 @@ fn put(bytes: &mut [u8], at: usize, value: &[u8]) {
 fn library(record: &str, needed: &[&str], exports: &[Export]) -> Vec<u8> {
 	// The string table: a leading NUL, then every needed name and symbol name once.
 	let mut strings: Vec<u8> = vec![0];
-	let mut offset_of = |strings: &mut Vec<u8>, name: &str| -> u32 {
+	let offset_of = |strings: &mut Vec<u8>, name: &str| -> u32 {
 		let at = strings.len() as u32;
 		strings.extend_from_slice(name.as_bytes());
 		strings.push(0);
