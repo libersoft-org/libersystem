@@ -322,9 +322,9 @@ impl Catalog {
 		// through that agent, so it is exactly the check a regression in it would fail.
 		let development_only: Vec<String> = crates.iter().flat_map(|entry| entry.binaries.iter()).filter(|binary| binary.required_features.iter().any(|feature| feature == "development")).map(|binary| crate::graph::binary_component(&binary.name)).collect();
 		for (id, script, subject) in [
-			("dev.selftest", "boot/dev-selftest.py", "harness.boot"),
-			("dev.proto-test", "boot/proto-test.py", "proto"),
-			("dev.perf-gate", "boot/perf-gate.py", "harness.boot"),
+			("dev.selftest", "harness/dev-selftest.py", "harness.boot"),
+			("dev.proto-test", "harness/proto-test.py", "proto"),
+			("dev.perf-gate", "harness/perf-gate.py", "harness.boot"),
 		] {
 			let mut covers = vec![subject.to_string()];
 			if id == "dev.selftest" {
@@ -397,7 +397,7 @@ fn build_covers(part: &str, crates: &[Crate], staged: &BTreeSet<String>) -> Vec<
 		"libs" => "src/user/libs",
 		"user" => "src/user",
 		"kernel" => "src/kernel",
-		"loader" => "src/loader",
+		"loader" => "src/boot/loader",
 		// Packaging and volume assembly compile nothing; they ASSEMBLE, and their inputs are every
 		// artifact the manifest stages. Declaring only the manifest and the packager was the defect:
 		// `build.sh` deliberately does not chain `user` into `packages`, so a change that rebuilt

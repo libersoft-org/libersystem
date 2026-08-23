@@ -121,10 +121,10 @@ fi
 
 # A SHEBANG MEANS "RUN ME", and a file that says so has to be runnable.
 #
-# `perf-trace.py` carried `#!/usr/bin/env python3` and documented itself as `boot/perf-trace.py`
+# `perf-trace.py` carried `#!/usr/bin/env python3` and documented itself as `harness/perf-trace.py`
 # while its mode was 0644, so the documented entry point failed with `Permission denied` before
 # Python started - which reads as a missing interpreter rather than as a missing bit, and the
-# workaround people find (`python3 boot/perf-trace.py`) is not the documented interface.
+# workaround people find (`python3 harness/perf-trace.py`) is not the documented interface.
 #
 # The working tree is what this looks at, and that is also what Git records: a checkout takes its
 # modes from the index, so on the clean checkout this defect actually bites, the two are the same

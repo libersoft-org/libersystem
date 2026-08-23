@@ -169,7 +169,7 @@ is that their cost through the cold path is structural, not proportional, which 
 for the persistent instance rather than against the classes.
 
 A `loader` sample is not recorded, and the reason is worth more than the number would have been:
-the kernel test path never rebuilds the loader. `boot/test-kernel.sh` compiles the kernel and
+the kernel test path never rebuilds the loader. `harness/test-kernel.sh` compiles the kernel and
 runs it; `mkimage.sh` consumes an already-built `libersystem-loader.efi`; only `./build.sh`
 compiles one. So a loader edit is invisible to `./test.sh`, which boots whatever loader was last
 built, and a loader-only sample has to be taken through a path that assembles the image from a

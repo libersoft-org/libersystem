@@ -201,7 +201,7 @@ _start:
 // is handed to it, exactly as on x86_64 where its own loader passes the modules.
 static BOOT_MODULES: crate::sync::SpinLock<Option<&'static [u8]>> = crate::sync::SpinLock::new(None);
 
-// Where `boot/qemu-run.sh aarch64` loads the archive on a direct boot, and the one number the two
+// Where `harness/qemu-run.sh aarch64` loads the archive on a direct boot, and the one number the two
 // have to agree on (`MODULES_ADDR` there). It sits 16 MiB above the dumped DTB at 0x4A00_0000,
 // which is itself 1 MiB, and both are inside the 512 MiB the `virt` machine gets by default.
 //

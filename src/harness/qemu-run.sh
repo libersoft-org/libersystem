@@ -741,7 +741,7 @@ qemu_run_x86_64() {
 	timing_event image start
 	# Build the own UEFI loader (its EFI binary is staged into the boot image as
 	# BOOTX64.EFI); it lives in its own crate with its own UEFI target.
-	(cd "$HERE/../loader" && cargo build) >&2
+	(cd "$HERE/../boot/loader" && cargo build) >&2
 
 	# Build the bootable ISO (mkimage.sh prints its path on stdout).
 	#

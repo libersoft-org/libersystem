@@ -174,7 +174,7 @@ fn documentation_selects_nothing_and_says_so() {
 #[test]
 fn a_harness_change_boots_every_target() {
 	let model = model();
-	let plan = plan_for(&model, &["src/boot/qemu-run.sh"]);
+	let plan = plan_for(&model, &["src/harness/qemu-run.sh"]);
 	assert!(plan.full);
 	assert_eq!(plan.architectures_booted, vec!["aarch64", "riscv64", "x86_64"]);
 }
@@ -812,8 +812,8 @@ fn every_fail_open_trigger_selects_everything() {
 		("src/kernel/tests.rs", "the test framework: what `tagged_test!` expands to decides what every tag means"),
 		("src/user/services/manifest.toml", "component metadata: it declares every destination in the image"),
 		("src/tools/mkpackages/src/main.rs", "the packager: its output IS the system volume"),
-		("src/boot/mkimage.sh", "the image builder"),
-		("src/boot/qemu-run.sh", "the thing that boots and judges the guest"),
+		("src/harness/mkimage.sh", "the image builder"),
+		("src/harness/qemu-run.sh", "the thing that boots and judges the guest"),
 		("lib.sh", "the entry points"),
 		("src/abi/src/lib.rs", "the kernel/userspace contract"),
 	];
@@ -984,7 +984,7 @@ fn every_booted_architecture_gets_exactly_one_guest_step() {
 			*per_target.entry(architecture.clone()).or_default() += 1;
 		}
 	}
-	for paths in [vec!["src/user/libs/audio/flac/src/lib.rs"], vec!["src/kernel/arch/riscv64/traps/mod.rs"], vec!["src/boot/qemu-run.sh"]] {
+	for paths in [vec!["src/user/libs/audio/flac/src/lib.rs"], vec!["src/kernel/arch/riscv64/traps/mod.rs"], vec!["src/harness/qemu-run.sh"]] {
 		let plan = plan_for(&model, &paths);
 		let booted: BTreeSet<String> = plan.architectures_booted.iter().cloned().collect();
 		let steps = crate::commands::steps(&plan, &per_target, &model.registry);
@@ -1331,7 +1331,7 @@ fn every_check_kind_and_configuration_lowers_to_a_runnable_command() {
 	// it emitted contradicted the record.
 	//
 	// And it was not a wrong flag. A dev check's command is a shell pipeline, so the producer emitted
-	// `(cd src && boot/dev-selftest.py) --no-default-features --features development`, which bash
+	// `(cd src && harness/dev-selftest.py) --no-default-features --features development`, which bash
 	// refuses to parse. Every dev-guest shadow line failed before it started.
 	use crate::catalog::CheckKind;
 	let model = model();
@@ -1348,7 +1348,7 @@ fn every_check_kind_and_configuration_lowers_to_a_runnable_command() {
 	}
 
 	// EVERY OTHER KIND carries its own command and means it, in every configuration.
-	let pipeline = "(cd src && boot/dev-selftest.py)";
+	let pipeline = "(cd src && harness/dev-selftest.py)";
 	for kind in [CheckKind::Gate, CheckKind::Conformance, CheckKind::Build, CheckKind::DevCheck, CheckKind::KernelTest] {
 		for name in ["default", "shared-image", "test", "development"] {
 			let lowered = crate::commands::lower(kind.clone(), pipeline, &configuration(name));

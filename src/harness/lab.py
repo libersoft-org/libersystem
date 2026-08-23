@@ -12,26 +12,26 @@
 # along as subcommands.
 #
 # Usage:
-#   boot/lab.py boot [--fresh] [--vnc] [--spice] [--timeout N]
-#   boot/lab.py sh <command...>      run a shell command, print its output
-#   boot/lab.py int                  interrupt the foreground job (Ctrl+C)
-#   boot/lab.py wait [--timeout N]   wait for the shell prompt
-#   boot/lab.py log [-f | <pattern>] show / follow / grep the serial log
-#   boot/lab.py key <text>           type through the emulated keyboard (HID path)
-#   boot/lab.py monitor <command...> one QEMU monitor command, print the reply
-#   boot/lab.py usb-attach           hot-plug the USB mass-storage stick at runtime
-#   boot/lab.py usb-detach           hot-unplug the USB stick at runtime
-#   boot/lab.py pcap <on|off|dump>   capture guest network traffic and decode it
-#   boot/lab.py test                 run the kernel test suite, summarize
-#   boot/lab.py shot <path>          screenshot the framebuffer (screenshot.sh)
-#   boot/lab.py quit                 shut the instance down and clean up
+#   harness/lab.py boot [--fresh] [--vnc] [--spice] [--timeout N]
+#   harness/lab.py sh <command...>      run a shell command, print its output
+#   harness/lab.py int                  interrupt the foreground job (Ctrl+C)
+#   harness/lab.py wait [--timeout N]   wait for the shell prompt
+#   harness/lab.py log [-f | <pattern>] show / follow / grep the serial log
+#   harness/lab.py key <text>           type through the emulated keyboard (HID path)
+#   harness/lab.py monitor <command...> one QEMU monitor command, print the reply
+#   harness/lab.py usb-attach           hot-plug the USB mass-storage stick at runtime
+#   harness/lab.py usb-detach           hot-unplug the USB stick at runtime
+#   harness/lab.py pcap <on|off|dump>   capture guest network traffic and decode it
+#   harness/lab.py test                 run the kernel test suite, summarize
+#   harness/lab.py shot <path>          screenshot the framebuffer (screenshot.sh)
+#   harness/lab.py quit                 shut the instance down and clean up
 #
 # A second family keeps one guest alive across commands instead of booting per command:
-#   boot/lab.py dev-up [--fresh...]  boot once and keep the instance (takes the lock)
-#   boot/lab.py dev-status           report the instance state deterministically
-#   boot/lab.py dev-console [--read-only]  attach a detachable terminal (Ctrl-] leaves)
-#   boot/lab.py dev-log [-f|<pat>]   show / follow / grep its serial log
-#   boot/lab.py dev-down             stop it gracefully and release the lock
+#   harness/lab.py dev-up [--fresh...]  boot once and keep the instance (takes the lock)
+#   harness/lab.py dev-status           report the instance state deterministically
+#   harness/lab.py dev-console [--read-only]  attach a detachable terminal (Ctrl-] leaves)
+#   harness/lab.py dev-log [-f|<pat>]   show / follow / grep its serial log
+#   harness/lab.py dev-down             stop it gracefully and release the lock
 #
 # `sh` joins its arguments, so quoting is optional: `./lab.sh sh time ls`.
 
@@ -53,7 +53,7 @@ import time
 
 USAGE = """lab - drive a live LiberSystem instance for debugging.
 
-Usage (via `./lab.sh ...` from src/, or boot/lab.py directly):
+Usage (via `./lab.sh ...` from src/, or harness/lab.py directly):
   boot [--fresh] [--vnc] [--spice] [--timeout N]
   sh <command...>       run a shell command in the guest, print its output
   int                   interrupt the foreground job (Ctrl+C over serial)
@@ -704,12 +704,12 @@ def parse_reply(reply):
 # yet; files catch a build that has not been booted yet. Both are cold invalidations, and
 # naming the class is what keeps one from being mistaken for a hot-publishable change.
 INSTANCE_INPUTS = (
-	('protocol', ['src/bootproto'], []),
+	('protocol', ['src/boot/protocol'], []),
 	('kernel', ['src/kernel'], ['.build/cargo/kernel/x86_64-unknown-none/debug/kernel']),
-	('loader', ['src/loader'], ['.build/cargo/loader/x86_64-unknown-uefi/debug/libersystem-loader.efi']),
+	('loader', ['src/boot/loader'], ['.build/cargo/loader/x86_64-unknown-uefi/debug/libersystem-loader.efi']),
 	('packages', [], ['.build/boot/init-x86_64.pkg', '.build/boot/volume-x86_64.pkg']),
-	('image', [], ['.build/boot/libersystem.iso', 'src/boot/mkimage.sh']),
-	('topology', [], ['src/boot/qemu-run.sh']),
+	('image', [], ['.build/boot/libersystem.iso', 'src/harness/mkimage.sh']),
+	('topology', [], ['src/harness/qemu-run.sh']),
 	# THE CLASSES THAT WERE MISSING, and each of them can change what a guest is running while
 	# every fingerprint above stays equal.
 	#
@@ -2776,7 +2776,7 @@ def cmd_dev_test(args):
 	if stale:
 		for complaint in stale:
 			print(f'lab: {complaint}', file=sys.stderr)
-		die('the scenario fixtures do not match this tree; rebuild them with boot/scenarios/make-fixtures.py')
+		die('the scenario fixtures do not match this tree; rebuild them with harness/scenarios/make-fixtures.py')
 	failures = 0
 	# HELD ACROSS EVERY SCENARIO, not per scenario: teardown restores the instance for the run that
 	# comes next, and a second run starting between two of them inherits a half-restored guest.
@@ -2903,7 +2903,7 @@ def cmd_scenario_cold(args):
 	# is the process that says "loader EFI not found" or "init package not found", and discarding
 	# that left every startup failure looking like a guest that never answered.
 	runner_log = open(os.path.join(BUILD, f'cold-{target}-runner.log'), 'wb')
-	guest = subprocess.Popen(['bash', 'boot/qemu-run.sh', target, kernel], cwd=SRC, env=guest_env, stdout=runner_log, stderr=runner_log, start_new_session=True)
+	guest = subprocess.Popen(['bash', 'harness/qemu-run.sh', target, kernel], cwd=SRC, env=guest_env, stdout=runner_log, stderr=runner_log, start_new_session=True)
 	record_lab_guest(guest)
 	failures = 0
 	try:

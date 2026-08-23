@@ -49,7 +49,7 @@ import lab
 # published artifact rather than merely that the guest is alive.
 ARTIFACT = 'uname'
 SOURCE = 'user/apps/tools/src/uname.rs'
-SCENARIO = 'boot/scenarios/shell-basics.toml'
+SCENARIO = 'harness/scenarios/shell-basics.toml'
 TARGET = 'x86_64'
 
 # Budgets. The two totals are the roadmap's stated ambition, against the 101.67 second leaf

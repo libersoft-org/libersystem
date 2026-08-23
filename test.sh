@@ -194,7 +194,7 @@ require_built() {
 		local efi="$BUILD_DIR/cargo/loader/$(loader_triple "$arch")/debug/libersystem-loader.efi"
 		[[ -f "$efi" ]] || die "no loader for $arch - run: ./build.sh --arch $arch --part loader"
 		local loader_stamp="$BUILD_DIR/state/built-$arch-loader"
-		if [[ ! -f "$loader_stamp" || "$(cat "$loader_stamp")" != "$(source_digest loader)" ]]; then
+		if [[ ! -f "$loader_stamp" || "$(cat "$loader_stamp")" != "$(source_digest boot/loader)" ]]; then
 			die "the $arch loader does not match its sources
     Run:  ./build.sh --arch $arch --part loader"
 		fi
@@ -205,17 +205,17 @@ require_built() {
 preflight_full() {
 	local arch="$1"
 	require_built "$arch"
-	(cd "$SRC_DIR" && boot/check-test-tags.sh)
+	(cd "$SRC_DIR" && harness/check-test-tags.sh)
 	(cd "$SRC_DIR" && tools/check-staged-image.sh "$arch")
-	(cd "$SRC_DIR" && boot/test-preflight.sh write "$arch")
+	(cd "$SRC_DIR" && harness/test-preflight.sh write "$arch")
 }
 
 # The fast preflight: verify the recorded userspace still matches instead of rebuilding it.
 preflight_fast() {
 	local arch="$1"
 	require_built "$arch"
-	(cd "$SRC_DIR" && boot/check-test-tags.sh)
-	(cd "$SRC_DIR" && boot/test-preflight.sh check "$arch")
+	(cd "$SRC_DIR" && harness/check-test-tags.sh)
+	(cd "$SRC_DIR" && harness/test-preflight.sh check "$arch")
 }
 
 # --arch all runs the architectures CONCURRENTLY.
@@ -234,9 +234,9 @@ run_arch() {
 	# UEFI=1 on the device-tree architectures: they have no other way in since the packaged
 	# bootstrap archive and the magic scan that found it were retired.
 	if [[ "$arch" == x86_64 ]]; then
-		(cd "$SRC_DIR" && boot/test-kernel.sh "${args[@]}")
+		(cd "$SRC_DIR" && harness/test-kernel.sh "${args[@]}")
 	else
-		(cd "$SRC_DIR" && UEFI="${UEFI:-1}" boot/test-kernel.sh "${args[@]}")
+		(cd "$SRC_DIR" && UEFI="${UEFI:-1}" harness/test-kernel.sh "${args[@]}")
 	fi
 	# AND ONCE MORE AT EL2, on aarch64, over the smoke tag only.
 	#
@@ -252,7 +252,7 @@ run_arch() {
 	# a second boot, and the person who wants it says so.
 	if [[ "$arch" == aarch64 && "${EL2:-0}" == "1" ]]; then
 		echo "[test-$arch] and again at EL2 (virtualization=on), smoke tag only"
-		(cd "$SRC_DIR" && UEFI=1 EL2=1 boot/test-kernel.sh "$arch" boot)
+		(cd "$SRC_DIR" && UEFI=1 EL2=1 harness/test-kernel.sh "$arch" boot)
 	fi
 }
 

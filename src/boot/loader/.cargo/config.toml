@@ -1,6 +1,6 @@
 [build]
 target = "x86_64-unknown-uefi"
-target-dir = "../../.build/cargo/loader"
+target-dir = "../../../.build/cargo/loader"
 
 [unstable]
 # `alloc` is built because the loader now links the filesystem crates, and LiberFS is not

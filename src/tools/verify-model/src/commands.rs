@@ -35,8 +35,8 @@ pub struct Step {
 // `development` both declare `default_features = true` and no features at all - so both halves of
 // what it emitted contradicted the record.
 //
-// It was not a wrong flag. A dev check's command is `(cd src && boot/dev-selftest.py)`, so the
-// producer emitted `(cd src && boot/dev-selftest.py) --no-default-features --features development` -
+// It was not a wrong flag. A dev check's command is `(cd src && harness/dev-selftest.py)`, so the
+// producer emitted `(cd src && harness/dev-selftest.py) --no-default-features --features development` -
 // a bash SYNTAX ERROR, which every dev-guest shadow line then failed on before it started, making
 // clean `DevGuest` evidence unobtainable for `bin.dev_agent`, `bin.dev_channel`, `harness.boot` and
 // `proto`. The shared lowering removed a divergence on the host path and created one on the dev path.

@@ -533,7 +533,7 @@ fn the_crc32_is_the_one_uefi_specifies() {
 }
 
 // The non-zero bytes of a GPT that `sgdisk` actually wrote, recorded from an image built with
-// the exact commands `src/boot/mkimage.sh` uses for an installed system: a 256 MiB disk, a
+// the exact commands `src/harness/mkimage.sh` uses for an installed system: a 256 MiB disk, a
 // 32 MiB EFI System Partition, and the rest a LiberFS partition. Sparse, because the table is -
 // the whole of it is about three hundred non-zero bytes.
 //
@@ -683,7 +683,7 @@ fn sgdisk_image() -> Image {
 
 #[test]
 fn a_table_written_by_sgdisk_reads_as_the_partition_it_names() {
-	// The installed system's disk, as `src/boot/mkimage.sh` builds it. Nothing in this
+	// The installed system's disk, as `src/harness/mkimage.sh` builds it. Nothing in this
 	// system produced the table - if this build's idea of a GPT were wrong, this is where
 	// it would show.
 	let mut img = sgdisk_image();

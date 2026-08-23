@@ -6,7 +6,7 @@ basics are in [INSTALL.md](../INSTALL.md).
 
 ## The lab harness (`./lab.sh`)
 
-`boot/lab.py` drives a live instance end to end: it boots QEMU with the serial
+`harness/lab.py` drives a live instance end to end: it boots QEMU with the serial
 console on a unix socket, keeps a broker attached to it (so no output is ever
 lost), and turns the debug loop into single commands with real request/response
 semantics - no `sendkey` pacing, no sleep-and-grep of a log file.
@@ -57,7 +57,7 @@ provider; use `lab` for one-off poking and for anything the persistent profile d
 
 ```sh
 ./dev.sh up                                            # boot once and keep it
-./dev.sh loop uname boot/scenarios/shell-basics.toml   # build -> publish -> run
+./dev.sh loop uname harness/scenarios/shell-basics.toml   # build -> publish -> run
 ./dev.sh status                                        # what is running, and is it current
 ./dev.sh console                                       # attach a terminal (--read-only to watch)
 ./dev.sh down                                          # stop it
@@ -152,8 +152,8 @@ type at the terminal when you want to see a shadowed executable run.
 
 ### Scenarios
 
-Application scenarios are versioned TOML under `boot/scenarios/`, run by `./dev.sh test`. The
-interpreter is `boot/scenario.py` on the host, so nothing is staged in the guest and changing a
+Application scenarios are versioned TOML under `harness/scenarios/`, run by `./dev.sh test`. The
+interpreter is `harness/scenario.py` on the host, so nothing is staged in the guest and changing a
 scenario or the runner costs no build at all.
 
 A document is validated in full before its first step runs: the version, the step count, every
@@ -164,7 +164,7 @@ passed to whatever might understand it. The steps are `publish`, `input`, `key`,
 
 `input` reaches the console over the control channel; `key` and `pointer` go through the
 emulated devices instead, so they take the path a person's hand takes and are what to use when
-the input stack itself is the subject. Fixtures are built by `boot/scenarios/make-fixtures.py`
+the input stack itself is the subject. Fixtures are built by `harness/scenarios/make-fixtures.py`
 from real staged artifacts, because the guest verifies the image it is given.
 
 Every run tears its scope down whether it passed, failed or ran out of time, and then asks the
@@ -257,7 +257,7 @@ images: those are inputs to the next build, and `./clean.sh` is what discards th
 
 - The shell's `time <command>` prints the wall time of any command, measured in
   the guest: `time cat /bin/console_service`.
-- `boot/perf-trace.py` traces the console path on a fine-grained shared TSC
+- `harness/perf-trace.py` traces the console path on a fine-grained shared TSC
   timeline: the kernel and services emit `PERF` markers to the debug serial, and
   the tool prints a per-phase breakdown (shell produce, console render, gpu
   present) for one command. See its header for usage.
@@ -273,7 +273,7 @@ images: those are inputs to the next build, and `./clean.sh` is what discards th
 ```
 
 A wedged live instance can also be inspected without a restart: attach with
-`gdb -x boot/gdb-init` while the machine runs, `thread apply all bt` shows what
+`gdb -x harness/gdb-init` while the machine runs, `thread apply all bt` shows what
 every vCPU is executing - this is how a userspace spin was pinned down to a
 single syscall in the past (find the RIP, then `objdump` the user binaries to
 name it).

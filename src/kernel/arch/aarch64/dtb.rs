@@ -4,7 +4,7 @@
 // same on every device-tree-booted arch, and the loader reads the same trees this does).
 // This shim only supplies the two aarch64
 // specifics: where to find the blob on QEMU's `virt` machine (the `-kernel` path passes
-// x0 = 0, so `boot/qemu-run.sh aarch64` loads the dumped DTB at a fixed address,
+// x0 = 0, so `harness/qemu-run.sh aarch64` loads the dumped DTB at a fixed address,
 // and a low-DRAM scan is the fallback) and how to read physical memory (the higher-half
 // direct map, `paging::phys_to_virt`).
 

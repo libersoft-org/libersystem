@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Shared by every entry-point script in this directory.
 #
-# The scripts are the build INTERFACE; the work still lives where it lived - `src/boot/mkimage.sh`,
-# `src/boot/qemu-run.sh`, `src/boot/test-kernel.sh`, `src/boot/lab.py` and cargo. What these add is
+# The scripts are the build INTERFACE; the work still lives where it lived - `src/harness/mkimage.sh`,
+# `src/harness/qemu-run.sh`, `src/harness/test-kernel.sh`, `src/harness/lab.py` and cargo. What these add is
 # flags instead of names: the Justfile spelled every combination of architecture, mode and target
 # into its own recipe and reached 123 of them, which is a discovery surface nobody reads.
 
@@ -21,8 +21,8 @@ ARCHS_ALL=(x86_64 aarch64 riscv64)
 # session - `./setup.sh`, then `./build.sh` - died on `cargo: command not found`, and the fix was a
 # `source ~/.cargo/env` nothing told the reader about. A script that needs cargo finds it.
 #
-# Exported, because the work is not done here: `src/boot/mkimage.sh`, `src/boot/qemu-run.sh` and
-# `src/boot/lab.py` all call cargo as child processes of these scripts.
+# Exported, because the work is not done here: `src/harness/mkimage.sh`, `src/harness/qemu-run.sh` and
+# `src/harness/lab.py` all call cargo as child processes of these scripts.
 if ! command -v cargo >/dev/null 2>&1; then
 	_cargo_bin="${CARGO_HOME:-$HOME/.cargo}/bin"
 	[[ -x "$_cargo_bin/cargo" ]] && export PATH="$_cargo_bin:$PATH"
@@ -157,7 +157,7 @@ WAVE_TAGS[6]='service,process,storage,permission-service'
 # guest then booted the PREVIOUS userspace and passed. `src/volume` is worse in its simplicity: it is
 # the factory files the volume literally ships, and changing one of them changed nothing the check
 # could see.
-VOLUME_SOURCES=(abi bootproto fs idl proto sdk term tools user volume wasm wire)
+VOLUME_SOURCES=(abi boot fs idl proto sdk term tools user volume wasm wire)
 
 # A digest of every source file a build reads, so "has it changed" is answered by CONTENT.
 #

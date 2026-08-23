@@ -13,7 +13,7 @@ path = "main.rs"
 [dependencies]
 # The typed boot protocol the own UEFI loader hands the kernel (memory map, HHDM
 # offset, framebuffer, loaded packages, ACPI RSDP).
-bootproto = { path = "../bootproto" }
+bootproto = { path = "../boot/protocol" }
 # Shared kernel/userspace ABI constants (syscalls, errors, rights, package format).
 abi = { path = "../abi" }
 # The physical-frame buddy allocator. It is pure bitmap arithmetic, so it lives in a crate a host
@@ -41,7 +41,7 @@ term = { path = "../term" }
 # abi is also a build-dependency so build.rs packs with the same constants.
 [build-dependencies]
 abi = { path = "../abi" }
-bootproto = { path = "../bootproto" }
+bootproto = { path = "../boot/protocol" }
 system-manifest = { path = "../tools/system-manifest" }
 
 [dev-dependencies]

@@ -117,7 +117,7 @@ def stale_fixtures(target=None):
 		with open(manifest_path, encoding='utf-8') as handle:
 			record = json.load(handle)
 	except (OSError, ValueError):
-		return [f'no usable fixture manifest at {manifest_path} - run boot/scenarios/make-fixtures.py']
+		return [f'no usable fixture manifest at {manifest_path} - run harness/scenarios/make-fixtures.py']
 	if record.get('target') != target:
 		return [f'{manifest_path} was built for {record.get("target")!r}, not {target!r}']
 	complaints = []

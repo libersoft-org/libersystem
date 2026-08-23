@@ -284,9 +284,9 @@ fn run() -> Result<ExitCode, String> {
 						// the model reads one format and the comparison rebuilds nothing.
 						//
 						// THROUGH THE RECORD, not the configuration's name. This ran a dev check's
-						// command - `(cd src && boot/dev-selftest.py)` - through a lowering that
+						// command - `(cd src && harness/dev-selftest.py)` - through a lowering that
 						// appends cargo flags to anything not called `default`, and emitted
-						// `(cd src && boot/dev-selftest.py) --no-default-features --features
+						// `(cd src && harness/dev-selftest.py) --no-default-features --features
 						// development`: a bash syntax error, so every dev-guest shadow line failed
 						// before it started and clean `DevGuest` evidence was unobtainable.
 						let configuration = model.registry.configuration(&variant.configuration).ok_or_else(|| format!("the dev check '{}' names configuration '{}', which the registry does not define", check.id, variant.configuration))?;
@@ -635,7 +635,7 @@ fn run() -> Result<ExitCode, String> {
 				let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
 				let history = verify_model::history::History::load(&repo_root)?;
 				// The same execution sample, and the universe whose producer the mechanism would
-				// have caught: `(cd src && boot/dev-selftest.py) --no-default-features --features
+				// have caught: `(cd src && harness/dev-selftest.py) --no-default-features --features
 				// development` is a bash syntax error, so every dev shadow line failed before it
 				// started and no dry comparison could see it.
 				let dev_exec = match &dev_scoped_log {
@@ -1154,7 +1154,7 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 	// Comparing them here makes outgrowing the budget a fact the model states in a second, rather
 	// than one discovered forty-five minutes into a sweep.
 	{
-		let script = model.repo_root.join("src/boot/test-kernel.sh");
+		let script = model.repo_root.join("src/harness/test-kernel.sh");
 		match std::fs::read_to_string(&script) {
 			Ok(text) => {
 				let cost = verify_model::history::CostModel::default();

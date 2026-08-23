@@ -52,7 +52,7 @@ if [[ "$build_status" != 0 ]]; then
 fi
 
 set +e
-(cd "$root" && LIBER_TIMING_LOG="$events" boot/test-kernel.sh x86_64 "$tags") >"$test_log" 2>&1
+(cd "$root" && LIBER_TIMING_LOG="$events" harness/test-kernel.sh x86_64 "$tags") >"$test_log" 2>&1
 test_status=$?
 set -e
 run_ended_ns="$(date +%s%N)"

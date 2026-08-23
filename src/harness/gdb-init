@@ -1,5 +1,5 @@
 # gdb-init - attaches to the QEMU GDB stub and stops at kmain
-# Usage: gdb -x boot/gdb-init <kernel-elf>
+# Usage: gdb -x harness/gdb-init <kernel-elf>
 set confirm off
 set disassembly-flavor intel
 set architecture i386:x86-64

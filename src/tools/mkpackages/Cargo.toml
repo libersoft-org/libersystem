@@ -16,7 +16,7 @@ fscore = { path = "../../fs/core" }
 # The PKGARCH1 archive format constants, shared with the kernel and the storage runtime.
 abi = { path = "../../abi" }
 # ELF parsing for the identity records and the dynamic-linkage audit.
-bootproto = { path = "../../bootproto" }
+bootproto = { path = "../../boot/protocol" }
 # The component parser, so a staged `.wasm` is validated with the SAME code that will have to run
 # it - a toolchain that emits something this interpreter cannot represent fails the BUILD rather
 # than the boot.

@@ -9,7 +9,7 @@ passes the kernel. Everything here is a fixed, versioned layout; both the writer
 storage runtime, the loader) decode it through one shared implementation
 (`abi::Package`, `bootproto`), so the format and its parser never drift apart.
 
-The platform is UEFI-only and boots through its own loader (`src/loader`). On x86
+The platform is UEFI-only and boots through its own loader (`src/boot/loader`). On x86
 the loader is a native `x86_64-unknown-uefi` PE; on aarch64 / riscv64 it is an ELF
 static-PIE with a hand-written PE header (the Linux EFI-stub technique). All three
 read the same files off a FAT boot filesystem and hand the kernel the same
@@ -191,7 +191,7 @@ changes. Development QEMU runners deliberately recreate their system disk when t
 current `volume.pkg` is newer, so rebuilding a pre-release image receives a fresh seed
 without turning a normal on-disk mount into an implicit migration.
 
-Both are staged (by `boot/mkimage.sh`) onto the FAT boot filesystem next to the
+Both are staged (by `harness/mkimage.sh`) onto the FAT boot filesystem next to the
 loader, under their `product.conf` names (`INIT_PACKAGE` / `VOLUME_PACKAGE`), and
 the loader loads them as boot modules alongside the kernel.
 

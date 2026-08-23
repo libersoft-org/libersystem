@@ -17,10 +17,10 @@ fn imgview_interactions() {
 }
 
 // The licoview and licoedit harnesses that stood here are gone, and their coverage moved to
-// `boot/scenarios/terminal-lifecycle.toml`, which takes all three terminal applications
+// `harness/scenarios/terminal-lifecycle.toml`, which takes all three terminal applications
 // through the same life against a real terminal rather than a synthetic one. The scenario is
 // exercised on every target, not only the one a persistent instance runs on:
-// `./lab.sh scenario-cold aarch64 boot/scenarios/terminal-lifecycle.toml` passes, and the riscv64
+// `./lab.sh scenario-cold aarch64 harness/scenarios/terminal-lifecycle.toml` passes, and the riscv64
 // form with it, so nothing narrowed when they were removed.
 //
 // The `lico` harness below stays, deliberately. This item asks for one focused cold end-to-end

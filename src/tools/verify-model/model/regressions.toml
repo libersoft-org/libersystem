@@ -85,7 +85,7 @@ reason = "boots the target it belongs to and cross-builds the other two, because
 # is invisible from an x86_64 run.
 [[case]]
 name = "harness-qemu-runner"
-paths = ["src/boot/qemu-run.sh"]
+paths = ["src/harness/qemu-run.sh"]
 full = true
 must_boot = ["x86_64", "aarch64", "riscv64"]
 must_select = ["kernel.mem.frame.frame_alloc_distinct / riscv64 / test-guest / test"]

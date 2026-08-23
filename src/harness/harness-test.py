@@ -16,7 +16,7 @@
 # No guest, no QEMU, no privileged operation: everything here runs against fakes and temporary
 # files, so it is a gate rather than something that needs hardware or a live instance.
 #
-# Run: boot/harness-test.py            (or ./check.sh --gate boot-harness from the repository root)
+# Run: harness/harness-test.py            (or ./check.sh --gate boot-harness from the repository root)
 
 import contextlib
 import hashlib

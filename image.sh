@@ -79,10 +79,10 @@ kernel="$BUILD_DIR/cargo/kernel/x86_64-unknown-none/debug/kernel"
 
 for fmt in "${formats[@]}"; do
 	case "$fmt" in
-	iso) (cd "$SRC_DIR" && STRIP="$strip" boot/mkimage.sh iso "$kernel") ;;
-	img) (cd "$SRC_DIR" && STRIP="$strip" boot/mkimage.sh img "$kernel" "$size") ;;
+	iso) (cd "$SRC_DIR" && STRIP="$strip" harness/mkimage.sh iso "$kernel") ;;
+	img) (cd "$SRC_DIR" && STRIP="$strip" harness/mkimage.sh img "$kernel" "$size") ;;
 	qcow2)
-		(cd "$SRC_DIR" && STRIP="$strip" boot/mkimage.sh img "$kernel" "$size")
+		(cd "$SRC_DIR" && STRIP="$strip" harness/mkimage.sh img "$kernel" "$size")
 		slug="$(grep -m1 '^PRODUCT_NAME=' "$REPO_ROOT/product.conf" | cut -d'"' -f2 | tr '[:upper:]' '[:lower:]')"
 		raw="$BUILD_DIR/boot/$slug.img"
 		[[ -f "$raw" ]] || die "no raw image at $raw"

@@ -763,7 +763,7 @@ fn pci_enumeration_reaches_a_bus_behind_a_bridge() {
 	//
 	// THE TOPOLOGY IS THE TEST. q35's default puts everything on bus 0, which is why this could be
 	// written and never executed; the test configuration adds a `pcie-pci-bridge` with an inert
-	// `pci-testdev` behind it (`src/boot/qemu-run.sh`), so there is a second bus to reach and
+	// `pci-testdev` behind it (`src/harness/qemu-run.sh`), so there is a second bus to reach and
 	// nothing in this kernel binds what is on it.
 	let devices = arch::pci::scan();
 	assert!(!devices.is_empty(), "the scan found no PCI devices at all");

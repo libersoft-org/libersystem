@@ -7,7 +7,7 @@
 # `proto-test` are subcommands here and not gates: `./check.sh` with no arguments must be runnable
 # on a machine with nothing booted.
 #
-# Most subcommands are `boot/lab.py`'s own and are forwarded verbatim; three are scripts of their
+# Most subcommands are `harness/lab.py`'s own and are forwarded verbatim; three are scripts of their
 # own that this names beside them, because "drive the instance" is one concern and it had three
 # entry points.
 
@@ -51,11 +51,11 @@ examples:
   ./lab.sh sh time ls
   ./lab.sh screenshot shot.png
   ./lab.sh proto-test registry publication
-  ./lab.sh help                  # boot/lab.py's own help, with every option
+  ./lab.sh help                  # harness/lab.py's own help, with every option
 EOF
 }
 
-# The three that are not `boot/lab.py` subcommands. Kept in one list so the help above and the
+# The three that are not `harness/lab.py` subcommands. Kept in one list so the help above and the
 # dispatch below cannot disagree about which is which.
 OWN_SCRIPT=(screenshot proto-test perf-gate)
 
@@ -72,18 +72,18 @@ case "$1" in
 screenshot)
 	shift
 	[[ $# -eq 1 ]] || die "screenshot needs exactly one path (the format comes from its extension)"
-	exec bash -c 'cd "$1" && exec boot/screenshot.sh "$2"' _ "$SRC_DIR" "$1"
+	exec bash -c 'cd "$1" && exec harness/screenshot.sh "$2"' _ "$SRC_DIR" "$1"
 	;;
 proto-test)
 	shift
-	exec bash -c 'cd "$1" && shift && exec boot/proto-test.py "$@"' _ "$SRC_DIR" "$@"
+	exec bash -c 'cd "$1" && shift && exec harness/proto-test.py "$@"' _ "$SRC_DIR" "$@"
 	;;
 perf-gate)
 	[[ $# -eq 1 ]] || die "perf-gate takes no arguments"
-	exec bash -c 'cd "$1" && exec boot/perf-gate.py' _ "$SRC_DIR"
+	exec bash -c 'cd "$1" && exec harness/perf-gate.py' _ "$SRC_DIR"
 	;;
 dev-*)
-	# ONE WAY TO DRIVE THE PERSISTENT INSTANCE, and it is ./dev.sh. `boot/lab.py` answers
+	# ONE WAY TO DRIVE THE PERSISTENT INSTANCE, and it is ./dev.sh. `harness/lab.py` answers
 	# `dev-up` as well, so forwarding it from here would work - and would be a second spelling
 	# of a command that already has one, which is the thing this milestone is removing.
 	die "the persistent instance is ./dev.sh: try './dev.sh ${1#dev-}'"
@@ -92,6 +92,6 @@ dev-*)
 	die "unexpected option '$1' (try --help)"
 	;;
 *)
-	exec bash -c 'cd "$1" && shift && exec boot/lab.py "$@"' _ "$SRC_DIR" "$@"
+	exec bash -c 'cd "$1" && shift && exec harness/lab.py "$@"' _ "$SRC_DIR" "$@"
 	;;
 esac

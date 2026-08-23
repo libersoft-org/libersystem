@@ -640,7 +640,7 @@ warm_input_inventory() {
 		for variable in AR CARGO_BUILD_RUSTC CARGO_BUILD_RUSTFLAGS CARGO_ENCODED_RUSTFLAGS CC CFLAGS RUSTC RUSTC_BOOTSTRAP RUSTUP_TOOLCHAIN; do
 			printf 'env-%s=%s\n' "$variable" "${!variable-}"
 		done
-		find "$root/user" "$root/abi" "$root/bootproto" "$root/fs" "$root/proto" "$root/term" "$root/wasm" "$root/wire" "$root/tools/system-manifest" -type f -printf 'input\t%p\t%s\t%T@\n'
+		find "$root/user" "$root/abi" "$root/boot/protocol" "$root/fs" "$root/proto" "$root/term" "$root/wasm" "$root/wire" "$root/tools/system-manifest" -type f -printf 'input\t%p\t%s\t%T@\n'
 		for input in "$root/tools/build-shared.sh" "$root/tools/build-consumer-object.sh" "$root/tools/build-exe-start.sh" "$root/tools/exe-start.rs" "$root/tools/system-manifest.sh" "$root/../product.conf"; do
 			stat -c 'input\t%n\t%s\t%y' "$input"
 		done

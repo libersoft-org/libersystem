@@ -422,7 +422,7 @@ pub unsafe fn eprint(bytes: &[u8]) {
 
 // Lightweight cross-process perf tracing for latency hunting, off by default. `perf_mark`
 // emits a `\x1ePERF <label> <tsc>` line straight to the kernel debug serial (NOT the
-// console channel), so a marker reaches the host trace tool (boot/perf-trace.py) without
+// console channel), so a marker reaches the host trace tool (harness/perf-trace.py) without
 // touching the framebuffer or the console render path. The TSC is read in ring 3 (rdtsc is
 // unprivileged) and is a global cycle clock shared by every process and the kernel, so
 // markers from the shell, the console service, and the gpu driver sit on one timeline; the

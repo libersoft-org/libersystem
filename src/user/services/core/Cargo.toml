@@ -151,7 +151,7 @@ service-logic = { path = "../logic" }
 # serves them and the shell + ServiceManager speak them over the log channel.
 proto = { path = "../../../proto" }
 storage-proto = { path = "../../libs/protocol/storage-proto" }
-bootproto = { path = "../../../bootproto" }
+bootproto = { path = "../../../boot/protocol" }
 abi = { path = "../../../abi" }
 
 # The graphics-free terminal model (L2): the cell grid, escape parser, and text

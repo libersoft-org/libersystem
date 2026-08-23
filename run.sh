@@ -196,4 +196,4 @@ if [[ $debug -eq 1 ]]; then
 fi
 
 cd "$SRC_DIR"
-exec boot/qemu-run.sh "$arch" "$kernel"
+exec harness/qemu-run.sh "$arch" "$kernel"

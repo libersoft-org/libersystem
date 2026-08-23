@@ -22,7 +22,7 @@ abi = { path = "../../../abi" }
 # `ipc-client`.
 base-proto = { path = "../../libs/protocol/base-proto" }
 # The dynamic-loader bounds the module graph is checked against.
-bootproto = { path = "../../../bootproto" }
+bootproto = { path = "../../../boot/protocol" }
 # The component world's outcome types, so the classification answers in the vocabulary the guest is
 # actually told rather than in a private one both hosts would then have to translate.
 wasm = { path = "../../../wasm" }

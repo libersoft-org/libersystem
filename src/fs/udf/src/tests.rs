@@ -1043,7 +1043,7 @@ fn an_image_from_an_independent_formatter_mounts() {
 	// checked against media this crate produced - which is how a validator and its fixtures come to
 	// agree with each other and with nothing else. `mkfs.udf` has no stake in either.
 	//
-	// This is also the medium the GUEST is given: `boot/qemu-run.sh` formats the test UDF disk with
+	// This is also the medium the GUEST is given: `harness/qemu-run.sh` formats the test UDF disk with
 	// exactly this command, and a mount refused there takes `udf_storage` down with it.
 	//
 	// It earned its place the day it was extended: the CRC-coverage minimums added in 2026-08-12

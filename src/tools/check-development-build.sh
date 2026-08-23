@@ -3,7 +3,7 @@
 #
 # NOTHING IN THIS TREE BUILT IT, and it broke twice in one release for that one reason. The
 # development profile is a second configuration of the same source - `--features development` on the
-# services and drivers crates - and it is how every scenario in `boot/scenarios/` is run, so while
+# services and drivers crates - and it is how every scenario in `harness/scenarios/` is run, so while
 # it does not compile, no scenario can be replayed. It stopped compiling when `security.lsidl` grew
 # an argument that `dev_protocol.rs` was not passing, and nothing said so: the shipping build does
 # not read that file.

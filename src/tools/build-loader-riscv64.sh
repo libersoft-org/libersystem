@@ -12,7 +12,7 @@
 # in the build path that still needed `just` installed was this file's contents (P02M0140).
 set -euo pipefail
 
-cd "$(dirname "$0")/../loader"
+cd "$(dirname "$0")/../boot/loader"
 
 # Built from the loader's own directory so cargo reads ITS `.cargo/config.toml`. Run with
 # `--manifest-path` from elsewhere, cargo takes the configuration of the working directory
@@ -21,7 +21,7 @@ cd "$(dirname "$0")/../loader"
 RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-T$PWD/riscv64-pe.ld" \
 	cargo build --target riscv64gc-unknown-none-elf
 
-out="../../.build/cargo/loader/riscv64gc-unknown-none-elf/debug/libersystem-loader"
+out="../../../.build/cargo/loader/riscv64gc-unknown-none-elf/debug/libersystem-loader"
 
 # READ THE ELF, THEN LOOK AT IT - not `llvm-readelf | awk ... || true`.
 #

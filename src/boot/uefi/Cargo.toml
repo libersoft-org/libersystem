@@ -11,10 +11,10 @@ path = "src/lib.rs"
 [dependencies]
 # The memory map is translated into the boot protocol's region array, which is the one structure
 # that crosses from firmware into the kernel.
-bootproto = { path = "../bootproto" }
+bootproto = { path = "../protocol" }
 # The block-device trait the firmware's Block I/O protocol is presented as, so the filesystem crates
 # above it are the same code before and after `ExitBootServices`.
-fscore = { path = "../fs/core" }
+fscore = { path = "../../fs/core" }
 
 # A WARNING IS AN ERROR HERE. P02M0144 took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to

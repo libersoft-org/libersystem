@@ -14,14 +14,14 @@
 # -> gpu present). It pinpoints where a slow console command actually spends its time.
 #
 # Usage:
-#   boot/perf-trace.py [--sock /tmp/ls-ser.sock] [--cmd help] [--window 3.0]
+#   harness/perf-trace.py [--sock /tmp/ls-ser.sock] [--cmd help] [--window 3.0]
 #
 # Typical session (start a guest of your own; do NOT pattern-kill QEMU - this used to say
 # `pkill -9 qemu-system-x86`, which takes down every QEMU the user owns, including ones this has
 # nothing to do with):
 #   SERIAL="unix:/tmp/ls-ser.sock,server,nowait" DISPLAYS=vnc VNC_ADDR=127.0.0.1:9 \
-#     boot/qemu-run.sh x86_64 ../.build/cargo/kernel/x86_64-unknown-none/debug/kernel >/tmp/qemu.log 2>&1 &
-#   boot/perf-trace.py            # connects, waits for boot, runs `help`, prints the trace
+#     harness/qemu-run.sh x86_64 ../.build/cargo/kernel/x86_64-unknown-none/debug/kernel >/tmp/qemu.log 2>&1 &
+#   harness/perf-trace.py            # connects, waits for boot, runs `help`, prints the trace
 #
 # WHAT IT REFUSES TO MEASURE. A trace is only a measurement of the command if the guest was up
 # before the command was sent and the command's own markers bound the window. This used to print a

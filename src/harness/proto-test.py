@@ -20,8 +20,8 @@
 #
 # Cases are grouped so a failure names a subject, and any subset can be run by name:
 #
-#   boot/proto-test.py                     every group
-#   boot/proto-test.py registry publication  those two
+#   harness/proto-test.py                     every group
+#   harness/proto-test.py registry publication  those two
 #
 # Two groups deliberately wait out a guest deadline (the idle session, the abandoned
 # publication) and say so while they do it. They are what proves those deadlines exist.

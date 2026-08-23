@@ -23,11 +23,11 @@ declare -A GATES=(
 	# prove itself by re-invoking itself - a second full ELF sweep that accepted any nonzero status
 	# as proof. This tests its exit contract from outside, against a fixture, in seconds.
 	["dynamic-report-regressions"]="tools/check-dynamic-report-regressions.sh"
-	["test-tags"]="boot/check-test-tags.sh"
+	["test-tags"]="harness/check-test-tags.sh"
 	# The harness that decides whether every other test passed, tested against fakes. An audit found
 	# four of its oracles reporting success without measuring their subject; each looked correct on a
 	# reading, which is why this is a gate rather than a review note.
-	["boot-harness"]="boot/harness-test.py"
+	["boot-harness"]="harness/harness-test.py"
 	["host-tests"]="tools/check-host-tests.sh"
 	["verify-model"]="cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- check"
 	["verify-model-tests"]="cargo test --quiet --manifest-path tools/verify-model/Cargo.toml"

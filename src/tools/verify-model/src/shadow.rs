@@ -273,7 +273,7 @@ pub fn compare(selected: &[PlanItemKey], results: &GuestResults, architecture: &
 // made those universes permanently untrustable rather than honestly graded.
 //
 // It is also the exemption that hid a real defect for a round. The dev producer lowered
-// `(cd src && boot/dev-selftest.py)` through a rule that appends cargo flags to anything not called
+// `(cd src && harness/dev-selftest.py)` through a rule that appends cargo flags to anything not called
 // `default`, and emitted a bash syntax error - a selection computed correctly and impossible to
 // execute, which is precisely what an execution sample detects and exactly the class of defect this
 // mechanism exists for.

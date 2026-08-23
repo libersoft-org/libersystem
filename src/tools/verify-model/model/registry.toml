@@ -101,7 +101,7 @@ component = "idl"
 # alter what the system IS and how it is measured, so it is not a component that ships - it is a
 # component every guest run depends on. See the edges below.
 [[ownership]]
-path = "src/boot"
+path = "src/harness"
 component = "harness.boot"
 
 [[ownership]]
@@ -174,7 +174,7 @@ component = "product"
 # Not code
 #
 # A path here selects nothing at all, so each one needs a reason that survives being read a year
-# from now. "It is not source" is not a reason: `src/boot/mkimage.sh` is not source either and it
+# from now. "It is not source" is not a reason: `src/harness/mkimage.sh` is not source either and it
 # builds the image. The test is whether changing the file can change what an artifact DOES.
 
 [[non_code]]
@@ -243,7 +243,7 @@ reason = "file mode repair; changes no content"
 
 [[non_code]]
 path = "dev.sh"
-reason = "a thin launcher over src/boot; the harness it launches is harness.boot"
+reason = "a thin launcher over src/harness; the harness it launches is harness.boot"
 
 # ---------------------------------------------------------------------------------------------
 # Host suites that cannot run on the host
@@ -547,17 +547,17 @@ build = ["x86_64", "aarch64", "riscv64"]
 boot = ["riscv64"]
 
 [[architecture]]
-path = "src/loader/src/arch/x86_64"
+path = "src/boot/loader/src/arch/x86_64"
 build = ["x86_64", "aarch64", "riscv64"]
 boot = ["x86_64"]
 
 [[architecture]]
-path = "src/loader/src/arch/aarch64"
+path = "src/boot/loader/src/arch/aarch64"
 build = ["x86_64", "aarch64", "riscv64"]
 boot = ["aarch64"]
 
 [[architecture]]
-path = "src/loader/src/arch/riscv64"
+path = "src/boot/loader/src/arch/riscv64"
 build = ["x86_64", "aarch64", "riscv64"]
 boot = ["riscv64"]
 
@@ -604,7 +604,7 @@ build = ["x86_64", "aarch64", "riscv64"]
 boot = ["x86_64", "aarch64", "riscv64"]
 
 [[architecture]]
-path = "src/loader/src/arch/mod.rs"
+path = "src/boot/loader/src/arch/mod.rs"
 build = ["x86_64", "aarch64", "riscv64"]
 boot = ["x86_64", "aarch64", "riscv64"]
 
@@ -612,7 +612,7 @@ boot = ["x86_64", "aarch64", "riscv64"]
 # than one row: `main.rs` and `uefi.rs` are not per-target, and a fault in either shows on one
 # target and not the others.
 [[architecture]]
-path = "src/loader/src"
+path = "src/boot/loader/src"
 build = ["x86_64", "aarch64", "riscv64"]
 boot = ["x86_64", "aarch64", "riscv64"]
 
@@ -620,7 +620,7 @@ boot = ["x86_64", "aarch64", "riscv64"]
 # riscv64 branch is not visible from an x86_64 run, which is exactly the half of the false-green
 # defect that path ownership alone did not close.
 [[architecture]]
-path = "src/boot"
+path = "src/harness"
 build = ["x86_64", "aarch64", "riscv64"]
 boot = ["x86_64", "aarch64", "riscv64"]
 
@@ -637,7 +637,7 @@ build = ["x86_64", "aarch64", "riscv64"]
 boot = ["x86_64", "aarch64", "riscv64"]
 
 [[architecture]]
-path = "src/bootproto"
+path = "src/boot/protocol"
 build = ["x86_64", "aarch64", "riscv64"]
 boot = ["x86_64", "aarch64", "riscv64"]
 

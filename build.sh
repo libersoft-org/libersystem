@@ -118,8 +118,8 @@ step_loader() {
 	case "$arch" in
 	# The host triple's UEFI target, and cargo takes the configuration of the working directory -
 	# which is why both of these `cd` into the loader rather than passing `--manifest-path`.
-	x86_64) (cd "$SRC_DIR/loader" && cargo build) ;;
-	aarch64) (cd "$SRC_DIR/loader" && cargo build --target aarch64-unknown-uefi) ;;
+	x86_64) (cd "$SRC_DIR/boot/loader" && cargo build) ;;
+	aarch64) (cd "$SRC_DIR/boot/loader" && cargo build --target aarch64-unknown-uefi) ;;
 	# riscv64 has no UEFI rustc target at all: its EFI application is assembled by hand from a
 	# static PIE, a linker script and objcopy, which is a program and lives in one.
 	riscv64) (cd "$SRC_DIR" && tools/build-loader-riscv64.sh) ;;
@@ -285,7 +285,7 @@ for arch in "${archs[@]}"; do
 	# invalidate a userspace that no byte of it touched, and vice versa.
 	for part in "${parts[@]}"; do
 		case "$part" in
-		loader) printf '%s\n' "$(source_digest loader)" >"$BUILD_DIR/state/built-$arch-$part" ;;
+		loader) printf '%s\n' "$(source_digest boot/loader)" >"$BUILD_DIR/state/built-$arch-$part" ;;
 		*) printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$part" ;;
 		esac
 	done
