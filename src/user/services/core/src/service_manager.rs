@@ -354,11 +354,18 @@ impl Supervised {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
-	// The registry resolution channel, made before any service starts: ProcessService takes
-	// one end at its bootstrap and the development agent takes the other much later, so
-	// neither depends on the order the other comes up in. Both ends are zero when a channel
-	// cannot be made, which simply leaves resolution reading the volume.
-	let (mut registry_near, mut registry_far): (u64, u64) = unsafe { channel() }.unwrap_or((0, 0));
+	// The development agent's end of the registry resolution channel, held here until the agent
+	// exists. ProcessService takes the other end at its bootstrap and the agent takes this one much
+	// later, so neither depends on the order the other comes up in.
+	//
+	// FILLED IN BY THE BOOTSTRAP THAT HANDS PROCESSSERVICE ITS END, and not made here. This used to
+	// be a pair created before any service started - and the plan-based bootstrap made a SECOND pair
+	// for ProcessService's `REGISTRY` role, overwriting this variable with the new pair's far end
+	// while the agent was still being sent the old pair's near end. The agent then announced itself
+	// into a channel nobody held, ProcessService never armed, and EVERY LAUNCH SILENTLY SKIPPED THE
+	// REGISTRY: a published generation was accepted, listed, reported hot-publishable, and never
+	// loaded. Zero when ProcessService did not start, which leaves resolution reading the volume.
+	let mut registry_far: u64 = 0;
 
 	// 1. receive the init package shared buffer and map it. Keep the handle so we
 	//    can share the package with DeviceManager (which spawns drivers from it).
@@ -610,9 +617,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						}
 						// The other end of the pair ProcessService already holds. Sending it now
 						// connects the two without either having had to wait for the other.
-						if registry_near != 0 {
-							unsafe { send_blocking(channels[dm], b"DEVREG", registry_near) };
-							registry_near = 0;
+						if registry_far != 0 {
+							unsafe { send_blocking(channels[dm], b"DEVREG", registry_far) };
+							registry_far = 0;
 						}
 					}
 				}
