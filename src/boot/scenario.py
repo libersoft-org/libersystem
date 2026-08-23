@@ -153,12 +153,19 @@ TIME_SCALE = 1.0
 # what a terminal restores is named here because it is the scenario format's word for it.
 #
 # Each entry is the escape sequence that puts one thing back. A program that entered the
-# alternate screen, hid the cursor, took raw input or turned on mouse reporting has to undo
-# exactly these, and a scenario says which of them it expects to see.
+# alternate screen, hid the cursor or turned on mouse reporting has to undo exactly these, and a
+# scenario says which of them it expects to see.
+#
+# RAW INPUT IS NOT ONE OF THEM, AND HAS NOT BEEN FOR SOME TIME. `ESC[?9001h` / `ESC[?9002l` in the
+# output stream used to set the terminal's raw and echo modes - a program's data and its requests
+# being the same bytes, so `cat` on a file holding them reconfigured the terminal. That was replaced
+# by `tty_set_mode` over a control channel the shell hands an interactive foreground job, which is a
+# capability and leaves no trace in the output at all. The word stayed in this table and in three
+# scenarios, where it could never match again: an assertion that cannot be satisfied is not a strict
+# test, it is a test that always fails, and it did.
 RESTORED = {
 	'screen': b'\x1b[?1049l',
 	'cursor': b'\x1b[?25h',
-	'raw': b'\x1b[?9001l',
 	'mouse': (b'\x1b[?1000l', b'\x1b[?1002l', b'\x1b[?1003l'),
 	'paste': b'\x1b[?2004l',
 }
@@ -543,6 +550,19 @@ def teardown(lab, verbose=False, baseline=None, first_run=True):
 		for key in ('\x03', '\x1b', 'q'):
 			lab.type_text(key, False, 10)
 			if lab.wait_prompt(5):
+				# AND WHATEVER THE ESCALATION LEFT IN THE LINE EDITOR GOES WITH IT. A prompt is
+				# not an empty line: the `q` that quits a full-screen program lands in the line
+				# buffer when the program is already gone, and stays there - so the NEXT
+				# scenario's first command was typed onto the end of it and the guest answered
+				# `unknown command: qaudiorec`. Observed exactly that way, with a recording
+				# scenario failing on the teardown of the scenario before it.
+				#
+				# Ctrl+C at a prompt discards the line and draws a fresh one, so this costs one
+				# keystroke and is a no-op when the ladder stopped at Ctrl+C in the first place.
+				if key != '\x03':
+					lab.type_text('\x03', False, 10)
+					if not lab.wait_prompt(5):
+						left.append('the terminal is not at a prompt')
 				break
 		else:
 			left.append('the terminal is not at a prompt')

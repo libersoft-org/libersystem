@@ -2473,6 +2473,14 @@ kind = "client"
 provider = "console_service"
 source = "CONTROL"
 exclusive = true
+# AND THE SHELL PASSES THIS ON TOO, for the same reason the CONSOLE role above does - which is the
+# half that was missed when that one was fixed. `run_tool_interactive` duplicates this channel for
+# an interactive foreground job, and it is what lets a full-screen program ASK for raw mode instead
+# of printing an escape sequence into its own output. Without the right to duplicate, the duplicate
+# failed, the child was launched with no control channel, `tty_set_mode` answered false, and every
+# full-screen program ran COOKED: `licoview`, `licoedit` and `lico` rendered, and then every key
+# meant for them was echoed and buffered by the line editor instead, so nothing could quit them.
+handed_on = true
 
 [[services.roles]]
 tag = "ADMIN"

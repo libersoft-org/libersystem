@@ -12,6 +12,11 @@
 # looks like. Any file long enough to scroll will do; a staged library is one that is always
 # there and never edited.
 #
+# THE BANNER IS THE STATUS LINE licoview PRINTS ON EVERY REDRAW, quoted from what it actually
+# writes. This said `arrows/page scroll`, which appears NOWHERE IN THE TREE - the hint text was
+# rewritten and the scenario was not, so every run of this scenario failed at the same step on
+# every architecture, waiting for a string no program has ever printed.
+#
 # The last assertion is the one an interactive program is most likely to get wrong: `licoview`
 # takes the alternate screen, hides the cursor, puts the terminal in raw mode and turns on
 # mouse reporting, and all four have to be given back when it exits. That is escape sequences
@@ -49,7 +54,7 @@ text = "licoview vol://system/lib/protocol/time-proto.lslib"
 
 [[step]]
 do = "expect"
-contains = "arrows/page scroll"
+contains = "t/r/x mode  w wrap"
 timeout = 20
 
 # The wheel scrolls it, so a second banner is the pointer event having reached the program.
@@ -59,7 +64,7 @@ button = "wheel-down"
 
 [[step]]
 do = "expect"
-contains = "arrows/page scroll"
+contains = "t/r/x mode  w wrap"
 timeout = 20
 
 # Quit, and take the terminal back.
@@ -69,7 +74,7 @@ keys = ["q"]
 
 [[step]]
 do = "restored"
-expect = ["mouse", "raw", "cursor", "screen"]
+expect = ["mouse", "cursor", "screen"]
 timeout = 20
 
 [[step]]

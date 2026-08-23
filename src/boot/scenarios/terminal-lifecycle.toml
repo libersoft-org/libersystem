@@ -43,11 +43,12 @@ timeout = 20
 do = "key"
 keys = ["q"]
 
-# The order licoview writes: pointer reporting off, raw input off, cursor back, alternate
-# screen left.
+# The order licoview writes: pointer reporting off, cursor back, alternate screen left. Raw input
+# is not in the list because it is not an escape sequence - it is asked for over the tty control
+# channel, and a capability leaves no mark on the output stream.
 [[step]]
 do = "restored"
-expect = ["mouse", "raw", "cursor", "screen"]
+expect = ["mouse", "cursor", "screen"]
 timeout = 20
 
 [[step]]
@@ -71,7 +72,7 @@ keys = ["f10"]
 # No pointer reporting in the editor, so there is none to turn off.
 [[step]]
 do = "restored"
-expect = ["raw", "cursor", "screen"]
+expect = ["cursor", "screen"]
 timeout = 20
 
 [[step]]
@@ -106,7 +107,7 @@ keys = ["f10"]
 
 [[step]]
 do = "restored"
-expect = ["mouse", "raw", "cursor", "screen"]
+expect = ["mouse", "cursor", "screen"]
 timeout = 20
 
 [[step]]
