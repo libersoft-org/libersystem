@@ -19,8 +19,9 @@
 #   SMP=N     override core/hart count (default: nproc, with arch-specific caps)
 #   MEM=      override RAM (default varies by arch)
 #   DISPLAYS= space-separated list of vnc and/or spice (empty = headless)
-#   VNC_ADDR= VNC bind address (default 127.0.0.1:0 - loopback, see the note at -vnc below)
+#   VNC_ADDR= VNC bind address and display (default 0.0.0.0:0 - every interface, unauthenticated)
 #   SPICE_PORT= SPICE TCP port (default 5930)
+#   SPICE_ADDR= SPICE bind address (default 0.0.0.0 - every interface, unauthenticated; see below)
 #   SPICE_ADDR= SPICE bind address (default 127.0.0.1)
 #   AUDIO_WAV= capture virtio-sound output to this WAV file (overrides spice/none)
 #   QEMU_EXTRA= extra QEMU arguments
@@ -55,18 +56,33 @@ qemu_parse_displays() {
 
 	DISPLAY_ARGS=()
 	if [[ "$want_vnc" == "1" ]]; then
-		# LOOPBACK BY DEFAULT. This bound 0.0.0.0 with no password, so enabling VNC for a moment put
-		# an unauthenticated console of the whole machine on every interface the host has - a
-		# development convenience that is a remote console to anyone who can reach the port. Binding
-		# elsewhere is now an explicit act: set VNC_ADDR.
-		DISPLAY_ARGS+=(-vnc "${VNC_ADDR:-127.0.0.1:0}")
+		# EVERY INTERFACE, DELIBERATELY - the same decision as SPICE below, for the same reason: a
+		# console bound to loopback is reachable only from the host, which is the one place the
+		# person running this usually is not. `:0` is the DISPLAY number, so this is port 5900.
+		#
+		# AND WITH NOTHING GUARDING IT. No password is set here and VNC is plaintext, so anyone who
+		# can reach the port has this guest's screen and keyboard. `VNC_ADDR=127.0.0.1:0` puts it
+		# back on loopback, which with an SSH tunnel is the arrangement that needs no keys.
+		DISPLAY_ARGS+=(-vnc "${VNC_ADDR:-0.0.0.0:0}")
+		echo "qemu-run: VNC console on ${VNC_ADDR:-0.0.0.0:0} (port 5900 + display) - NO PASSWORD, NO TLS: anyone who can reach that port has this guest's console" >&2
 	else
 		DISPLAY_ARGS+=(-display none)
 	fi
 	if [[ "$want_spice" == "1" ]]; then
-		# Same rule as VNC above, and `disable-ticketing=on` means there is no password either, so
-		# the address is the only thing standing between the guest's console and the network.
-		DISPLAY_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=${SPICE_ADDR:-127.0.0.1},disable-ticketing=on")
+		# EVERY INTERFACE, DELIBERATELY, AND WITH NOTHING GUARDING IT.
+		#
+		# A SPICE console bound to loopback is unreachable from anywhere but the host itself, which
+		# is the one place a developer running this rarely is: the guest runs on a machine somewhere
+		# and the person is not sitting at it. So the default binds `0.0.0.0` and the runner SAYS SO
+		# on every start, rather than being quietly useless.
+		#
+		# WHAT THAT MEANS RIGHT NOW: `disable-ticketing=on` is no password, and this is plain TCP -
+		# so anyone who can reach the port has the guest's console, keyboard and pointer. That is
+		# acceptable only on a network where that is already true of the host. `SPICE_ADDR=127.0.0.1`
+		# puts it back on loopback, and a password and TLS are the two things that would make the
+		# open bind safe rather than merely convenient.
+		DISPLAY_ARGS+=(-spice "port=${SPICE_PORT:-5930},addr=${SPICE_ADDR:-0.0.0.0},disable-ticketing=on")
+		echo "qemu-run: SPICE console on ${SPICE_ADDR:-0.0.0.0}:${SPICE_PORT:-5930} - NO PASSWORD, NO TLS: anyone who can reach that port has this guest's console" >&2
 	fi
 }
 
