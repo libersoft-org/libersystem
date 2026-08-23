@@ -116,7 +116,11 @@ pub const PROFILES: &[Capabilities] = &[
 	// nothing for a number to select. A row offering a knob nothing reads is the exact lie this
 	// table exists to prevent, which is why WavPack's `--compression` says the same.
 	Capabilities { profile: Profile::Vorbis, name: "Ogg Vorbis", suffixes: &["ogg", "oga"], lossless: false, bits: &[], quality: false, compression: false, implemented: true },
-	Capabilities { profile: Profile::Mp3, name: "MP3", suffixes: &["mp3"], lossless: false, bits: &[], quality: true, compression: false, implemented: false },
+	// `--quality` does NOT apply, for the same reason it does not apply to Vorbis: this encoder has
+	// one configuration - long blocks, constant bitrate, no reservoir, no scalefactors - so there is
+	// nothing for a number to select. The bitrate is chosen from the channel count, which is the one
+	// knob that exists.
+	Capabilities { profile: Profile::Mp3, name: "MP3", suffixes: &["mp3"], lossless: false, bits: &[], quality: false, compression: false, implemented: true },
 ];
 
 pub fn capabilities(profile: Profile) -> &'static Capabilities {
@@ -377,6 +381,7 @@ enum Destination {
 	Flac(flac::encode::Encoder<VecSink>),
 	WavPack(wavpack::encode::Encoder<VecSink>),
 	Vorbis(VorbisTrack),
+	Mp3(mp3::encode::Encoder<VecSink>),
 }
 
 // THE ONE DESTINATION THAT CANNOT STREAM, and the reason is in its own encoder rather than here.
@@ -458,6 +463,7 @@ impl Destination {
 			Destination::Flac(encoder) => encoder.push(frames).map_err(flac_error),
 			Destination::WavPack(encoder) => encoder.push(frames).map_err(wavpack_error),
 			Destination::Vorbis(track) => track.push(frames),
+			Destination::Mp3(encoder) => encoder.push(frames).map_err(mp3_error),
 		}
 	}
 
@@ -468,7 +474,19 @@ impl Destination {
 			Destination::Flac(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(flac_error),
 			Destination::WavPack(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(wavpack_error),
 			Destination::Vorbis(track) => track.finish(),
+			// The frame count an MP3 encoder returns is FRAMES OF THE FORMAT, 1152 samples each,
+			// not sample frames - so it is converted here rather than reported as if it were the
+			// same number.
+			Destination::Mp3(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames * 1_152)).map_err(mp3_error),
 		}
+	}
+}
+
+fn mp3_error(error: mp3::encode::EncodeError) -> Error {
+	match error {
+		mp3::encode::EncodeError::Unsupported => Error::UnsupportedOption,
+		mp3::encode::EncodeError::TooLarge | mp3::encode::EncodeError::Destination(_) => Error::TooLarge,
+		mp3::encode::EncodeError::Invalid => Error::InvalidAudio,
 	}
 }
 
@@ -618,7 +636,12 @@ fn build(profile: Profile, sink: VecSink, format: Format, config: &Config) -> Re
 			drop(sink);
 			VorbisTrack::new(format).map(Destination::Vorbis)
 		}
-		Profile::Mp3 => Err(Error::NotImplemented),
+		// 128 kbit/s for stereo and 64 for mono, which is where this format's quality is
+		// conventionally judged. `--quality` does not reach it: see the table's row.
+		Profile::Mp3 => {
+			let bitrate = if format.channels() >= 2 { 128 } else { 64 };
+			mp3::encode::Encoder::new(sink, format, bitrate).map(Destination::Mp3).map_err(mp3_error)
+		}
 	}
 }
 

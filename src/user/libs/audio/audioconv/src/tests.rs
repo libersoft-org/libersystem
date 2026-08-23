@@ -116,6 +116,7 @@ fn options_are_judged_against_the_profile_they_are_given_with() {
 	// table is what decides, and the table will say yes again the moment an encoder has something
 	// for it to select.
 	assert_eq!(parse_args(b"--quality 20 in.wav out.ogg").err(), Some(Error::UnsupportedOption));
+	assert_eq!(parse_args(b"--quality 20 in.wav out.mp3").err(), Some(Error::UnsupportedOption));
 
 	assert_eq!(parse_args(b"--rate 96000 in.wav out.wav").err(), Some(Error::InvalidOptions));
 	assert_eq!(parse_args(b"--channels 3 in.wav out.wav").err(), Some(Error::InvalidOptions));
@@ -236,9 +237,14 @@ fn config_wav() -> Config {
 }
 
 #[test]
-fn a_profile_with_no_encoder_yet_says_so_rather_than_writing_something_else() {
+fn an_input_nothing_here_reads_is_refused_before_a_destination_is_opened() {
 	let source = wave(64, 1, 44_100);
-	assert_eq!(convert(&source, &config("out.mp3")).err(), Some(Error::NotImplemented), "out.mp3 should not be written yet");
+	// EVERY PROFILE IN THE TABLE HAS AN ENCODER NOW, which is what this test used to be about: it
+	// asserted that Ogg and MP3 answered `NotImplemented`, and both do not any more. What is left
+	// is the other half it always checked - that an input this tree cannot read is refused before
+	// anything is written.
+	assert!(PROFILES.iter().all(|profile| profile.implemented), "a profile in the table has no encoder");
+	let _ = source;
 	// And an input nothing here reads is refused before a destination is opened.
 	assert_eq!(convert(b"not audio", &config("out.wav")).err(), Some(Error::UnsupportedFormat));
 	// A WAV header with nothing behind it is a damaged file, not an unknown format.
@@ -293,4 +299,24 @@ fn a_vorbis_conversion_longer_than_the_ceiling_is_refused_rather_than_attempted(
 	assert_eq!(VORBIS_MAX_SAMPLES, 8 * 1024 * 1024);
 	let source = wave(512, 1, 44_100);
 	assert!(convert(&source, &config("out.ogg")).is_ok(), "a short track is inside the ceiling");
+}
+
+#[test]
+fn mp3_is_written_and_reads_back_as_the_track_that_went_in() {
+	// Lossy, so what is compared is that the stream is an MP3 this tree's own decoder accepts, at
+	// the rate and channel count asked for, and long enough to be the track rather than a fragment.
+	let source = wave(9_000, 1, 44_100);
+	let (bytes, info) = convert(&source, &config("out.mp3")).expect("the MP3 conversion runs");
+	assert_eq!(info.destination, Profile::Mp3);
+	let decoded = mp3::Mp3::parse(&bytes).expect("the stream this encoder wrote is one this decoder reads");
+	assert_eq!(decoded.metadata().rate, 44_100);
+	assert_eq!(decoded.metadata().channels, 1);
+	let mut out = Vec::new();
+	let read = decoded.decoder().read_i16_le(9_000, &mut out).expect("the stream decodes");
+	assert!(read > 6_000, "the stream decoded {read} frames of a nine-thousand-frame track");
+
+	// AND IT IS DETERMINISTIC. Two conversions of one input are byte-identical: the rate loop is a
+	// search over a fixed cost function, with nothing in it that depends on when it ran.
+	let (again, _) = convert(&source, &config("out.mp3")).expect("the second conversion runs");
+	assert_eq!(bytes, again, "two conversions of one input differ");
 }
