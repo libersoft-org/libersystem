@@ -1045,5 +1045,63 @@ class ScenarioValidationTest(unittest.TestCase):
 				scenario.validate({'version': scenario.SCENARIO_VERSION, 'name': 'x', 'step': [{'do': 'absent', 'contains': 'x', 'until': until}]}, 'test.toml')
 
 
+# Which guest a scenario's CHILD steps drive. `publish`, `reset` and `restart` re-invoke `lab.py` as
+# a subprocess, so the endpoint every other step reaches through a module global has to be handed
+# across the exec - and a module global does not cross one.
+class ChildEndpointTest(unittest.TestCase):
+	def setUp(self):
+		self.calls = []
+		previous = lab.run_child
+
+		def record(command, timeout, **kwargs):
+			self.calls.append((command, kwargs.get('env')))
+			return subprocess.CompletedProcess(command, 0)
+
+		lab.run_child = record
+		self.addCleanup(setattr, lab, 'run_child', previous)
+		for name in ('CHANNEL_OVERRIDE', 'SERIAL_OVERRIDE', 'MON_OVERRIDE', 'QMP_OVERRIDE'):
+			self.addCleanup(setattr, lab, name, getattr(lab, name))
+
+	# The break: `scenario_child` started its child with this process's environment and nothing else.
+	# On a cold run the parent drove the cold guest and the three child steps drove the persistent
+	# instance's sockets - which on a machine with no persistent instance do not exist, so a scenario
+	# passed and its teardown could not drop the state it had just made. Watched to fail with the
+	# `env=` argument removed: the child then carries no endpoint at all.
+	def test_a_child_step_is_told_which_guest_to_drive(self):
+		lab.CHANNEL_OVERRIDE = '/tmp/cold-channel.sock'
+		lab.SERIAL_OVERRIDE = '/tmp/cold-serial.log'
+		lab.MON_OVERRIDE = '/tmp/cold-monitor.sock'
+		lab.QMP_OVERRIDE = '/tmp/cold-qmp.sock'
+		self.assertTrue(lab.LabGuest(10).reset(10))
+		command, env = self.calls[0]
+		self.assertIn('dev-reset', command)
+		self.assertEqual(env.get('LAB_CHANNEL_OVERRIDE'), '/tmp/cold-channel.sock')
+		self.assertEqual(env.get('LAB_SERIAL_OVERRIDE'), '/tmp/cold-serial.log')
+		self.assertEqual(env.get('LAB_MON_OVERRIDE'), '/tmp/cold-monitor.sock')
+		self.assertEqual(env.get('LAB_QMP_OVERRIDE'), '/tmp/cold-qmp.sock')
+
+	# And the persistent instance keeps its defaults: with no override in force the child is told
+	# nothing, rather than being pointed at an empty string it would then treat as a path.
+	def test_a_child_step_with_no_override_inherits_the_default_endpoint(self):
+		lab.CHANNEL_OVERRIDE = None
+		lab.SERIAL_OVERRIDE = None
+		lab.MON_OVERRIDE = None
+		lab.QMP_OVERRIDE = None
+		self.assertTrue(lab.LabGuest(10).publish('artifact', '/tmp/artifact', 10))
+		_, env = self.calls[0]
+		self.assertIsNotNone(env, 'the child is given an environment to inherit')
+		for name in ('LAB_CHANNEL_OVERRIDE', 'LAB_SERIAL_OVERRIDE', 'LAB_MON_OVERRIDE', 'LAB_QMP_OVERRIDE'):
+			self.assertNotIn(name, env)
+
+	# The other half of the same contract: what `scenario_child` writes into the environment is what
+	# a fresh `lab.py` reads out of it. Read through a child process, because that is the only place
+	# the import-time read actually happens.
+	def test_a_fresh_process_reads_the_endpoint_out_of_its_environment(self):
+		script = 'import lab; print(lab.channel_path()); print(lab.serial_log_path()); print(lab.mon_sock()); print(lab.qmp_sock())'
+		env = dict(os.environ, LAB_CHANNEL_OVERRIDE='/tmp/cold-channel.sock', LAB_SERIAL_OVERRIDE='/tmp/cold-serial.log', LAB_MON_OVERRIDE='/tmp/cold-monitor.sock', LAB_QMP_OVERRIDE='/tmp/cold-qmp.sock')
+		out = subprocess.run([sys.executable, '-c', script], cwd=HERE, env=env, capture_output=True, text=True, check=True).stdout.split()
+		self.assertEqual(out, ['/tmp/cold-channel.sock', '/tmp/cold-serial.log', '/tmp/cold-monitor.sock', '/tmp/cold-qmp.sock'])
+
+
 if __name__ == '__main__':
 	unittest.main(verbosity=2)

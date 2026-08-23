@@ -44,6 +44,22 @@ const STATE_DRIVER_MISSING: u8 = 4;
 // before giving up on its device.
 const MAX_DRIVER_RESTARTS: u32 = 3;
 
+// How long the development agent has to report in before DeviceManager stops waiting for it, in
+// clock ticks (a hundred to the second, so this is two seconds).
+//
+// THE WAIT IS ON THE BOOT'S CRITICAL PATH, AND THAT PATH IS ALREADY BEING TIMED. ServiceManager is
+// blocked on DeviceManager's phase-2 answer, which is blocked on this; around all of it the
+// kernel's recovery ladder gives the chain a bounded number of settle rounds and REBOOTS THE
+// MACHINE when they run out. A deadline longer than that window can never fire - the guest is
+// already restarting - so this one has to be much shorter than it, not merely finite. Ten seconds
+// was tried and the reboot beat it every time.
+//
+// Two seconds is the other side of the same measurement: a working agent reports in before the
+// first service does, so this is orders of magnitude more time than a spawn and three receives
+// need, and it still leaves most of the settle window for the rest of the chain to come up in.
+#[cfg(feature = "development")]
+const DEV_AGENT_REPORT_TICKS: u64 = 200;
+
 // Everything this program holds on behalf of the development agent, so supervising it is one
 // value rather than five more out-parameters threaded through driver launching.
 //
@@ -74,6 +90,11 @@ struct DevAgent {
 	// nothing would deliver them a second time.
 	launcher: u64,
 	registry: u64,
+	// The console this program hands every keyboard driver, kept so a REPLACEMENT agent gets one
+	// too. Retained rather than re-derived: `restart` runs long after phase 2, where the value came
+	// from, and an agent that could not type would be a quietly reduced agent rather than a failed
+	// one - which is the harder kind of fault to notice.
+	console_input: u64,
 	// The value every handshake reports so a tool can tell which boot answered it. It is drawn
 	// here, once, and handed to each agent: it identifies the boot, and this program is what
 	// lives as long as the boot does. An agent drawing its own would announce a reboot that did
@@ -163,7 +184,7 @@ impl DevAgent {
 			// The agent is started before the driver is told, so a start that fails leaves the
 			// driver waiting for a channel that will be offered again rather than holding one
 			// whose other end never appears.
-			self.bootstrap = start_dev_agent(self.storage, agent_side, &self.nonce);
+			self.bootstrap = start_dev_agent(self.storage, agent_side, self.console_input, &self.nonce);
 			if self.bootstrap == 0 || !send_blocking(self.driver, b"BYTES", driver_side) {
 				close(driver_side);
 				print(b"DeviceManager: the development agent did not restart; the control channel is transport-only\n");
@@ -457,7 +478,8 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 						// every machine with no hardware random source - which is two of the three
 						// architectures - for a number that never needed to be unguessable.
 						random_insecure(&mut dev.nonce);
-						dev.bootstrap = start_dev_agent(dev.storage, handle, &dev.nonce);
+						dev.console_input = console_input;
+						dev.bootstrap = start_dev_agent(dev.storage, handle, console_input, &dev.nonce);
 						if dev.bootstrap == 0 {
 							print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
 						}
@@ -511,7 +533,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 // a failure to start is reported rather than retried - a development instance without its
 // agent is still a usable guest, just one whose control channel carries nothing.
 #[cfg(feature = "development")]
-unsafe fn start_dev_agent(storage: u64, bytes: u64, nonce: &[u8; 8]) -> u64 {
+unsafe fn start_dev_agent(storage: u64, bytes: u64, console_input: u64, nonce: &[u8; 8]) -> u64 {
 	unsafe {
 		let loaded: Option<(u64, u64, usize)> = read_driver(storage, b"dev_agent");
 		let (file, mapped, size): (u64, u64, usize) = match loaded {
@@ -553,20 +575,72 @@ unsafe fn start_dev_agent(storage: u64, bytes: u64, nonce: &[u8; 8]) -> u64 {
 		if !send_blocking(dm_side, b"STORAGE", connection) {
 			return 0;
 		}
+		// THE CONSOLE, WHICH THE AGENT WAITS FOR AND NOBODY WAS SENDING. `dev_agent` reads three
+		// things from its bootstrap - the wire, a volume client, and this - and `recv_tagged`
+		// BLOCKS. Sending two of the three left the agent waiting for a message nobody would send,
+		// which left this function waiting for a report the agent would never make, which left
+		// ServiceManager waiting for a phase-2 answer: one missing handoff stopped the whole boot,
+		// silently. It is the ordered-bootstrap hazard this tree has written down three times.
+		//
+		// SENT WHETHER OR NOT THERE IS ONE. A zero handle is how "there is none" is said, and the
+		// agent already reads it that way - it works without a console and cannot type into it.
+		// What must never vary is the NUMBER of messages, because their order is the protocol.
+		let feed: u64 = if console_input != 0 {
+			let copy: i64 = duplicate(console_input, RIGHT_TRANSFER);
+			if copy < 0 { 0 } else { copy as u64 }
+		} else {
+			0
+		};
+		if !send_blocking(dm_side, b"CONSOLE", feed) {
+			return 0;
+		}
 		// The agent reports in before it serves, so a start that loaded but never ran is not
 		// mistaken for a working one. The bootstrap stays open afterwards: dropping it is how
 		// the agent would learn to shut down.
+		//
+		// AND THE WAIT HAS AN END. It used to be `recv_blocking`, which is a wait with no end, on
+		// the boot's critical path, for the one program in this tree that nothing builds. When that
+		// program was missing a single bootstrap handoff, the machine did not boot and no service
+		// reported a failure - because none had failed, they were all waiting here. A start that
+		// does not finish now costs the agent and nothing else.
+		//
+		// Not a retry and not a watchdog: an agent that dies LATER is `DevAgent::restart`'s job and
+		// is unchanged. This is one bounded wait with a number on it.
 		let mut buf: [u8; 64] = [0u8; 64];
-		match recv_blocking(dm_side, &mut buf) {
-			Received::Message { len, .. } if len >= 5 && &buf[..5] == b"agent" => {
-				print(&buf[..len]);
-				print(b"\n");
-				// Kept, not dropped: this is how the launcher reaches the agent later, and how
-				// the agent would learn to shut down.
-				dm_side
+		let deadline: u64 = clock() + DEV_AGENT_REPORT_TICKS;
+		loop {
+			match try_recv(dm_side, &mut buf) {
+				Polled::Message { len, .. } if len >= 5 && &buf[..5] == b"agent" => {
+					print(&buf[..len]);
+					print(b"\n");
+					// Kept, not dropped: this is how the launcher reaches the agent later, and how
+					// the agent would learn to shut down.
+					return dm_side;
+				}
+				Polled::Empty if clock() < deadline => {
+					// PERIODIC deliberately. A plain timed wait counts as pending progress, and the
+					// kernel then halts until the deadline whenever the run queue empties - which
+					// would park the very process this is waiting for. This wait is a guard, not
+					// progress; the kernel still wakes it when due.
+					let waited: i64 = wait_periodic(dm_side, deadline);
+					// A wait that cannot be done at all must not become a spin until the deadline:
+					// burning a boot CPU until it expires is worse than the failure being survived.
+					if waited < 0 && waited != ERR_TIMED_OUT {
+						break;
+					}
+				}
+				// Out of time, or a first message that is not a report. Both say the agent did not
+				// start, and abandoning it means CLOSING its bootstrap: an agent whose bootstrap is
+				// gone stops, where one left holding a wire nobody reads would hold the port for as
+				// long as the boot lasts.
+				_ => break,
 			}
-			_ => 0,
 		}
+		// The caller says what the loss COSTS ("the control channel is transport-only") for every
+		// way this can fail; this line says which way it was.
+		print(b"DeviceManager: the development agent did not report in; it is abandoned\n");
+		close(dm_side);
+		0
 	}
 }
 

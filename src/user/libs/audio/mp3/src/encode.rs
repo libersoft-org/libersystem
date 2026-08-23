@@ -64,6 +64,25 @@ const BITRATES: [u32; 15] = [0, 32, 40, 48, 56, 64, 80, 96, 112, 128, 160, 192, 
 // A Layer III frame is two granules of 576 samples.
 const FRAME_SAMPLES: usize = 1_152;
 
+// SILENCE AHEAD OF THE TRACK, and the delay the gapless tag then declares.
+//
+// The transform's own delay is 481 samples, measured - the number the analysis window was fitted at.
+// The trouble is that a decoder reading a Xing/Info tag computes its skip as
+// `one frame + declared delay + 529`, so the smallest total it can express is 1681 samples; an
+// encoder whose real delay is under that cannot say so, and declaring zero would leave the decoder
+// cutting into the audio.
+//
+// So the track is PRIMED with silence, which is what every encoder that writes this tag does. 576
+// samples of it puts the total where the tag can name it, and the declared delay is then
+// `481 + 576 - 529`.
+const PRIMER_SAMPLES: usize = 576;
+const ENCODER_DELAY: u32 = 528;
+
+// The four bytes that name the encoder in a Xing/Info tag. Decoders read the delay and padding only
+// from a tag they recognise; this tree's own decoder knows this one, and one that does not simply
+// declines to trim - which is what every decoder does with an encoder it has not heard of.
+const ENCODER_TAG: &[u8; 4] = b"LiBr";
+
 // The largest quantised magnitude the escape tables can carry: fifteen plus a thirteen-bit tail.
 const MAX_QUANT: i32 = 15 + 8_191;
 
@@ -270,6 +289,62 @@ fn write_quad(out: &mut BitWriter, values: &[i32], table_b: bool) -> Result<(), 
 	Ok(())
 }
 
+// The smallest table that can carry a magnitude, by rule rather than by measurement.
+//
+// This is the RATE LOOP's estimate, not the encoder's choice. The loop asks "does this gain fit"
+// twenty-odd times per granule, and pricing every pair against all thirty tables each time costs
+// thirty times what the answer is worth - the loop only needs a number that moves the same way. The
+// real choice is measured once, at the gain the loop settles on.
+fn smallest_table(max_magnitude: i32) -> u8 {
+	match max_magnitude {
+		0..=1 => 1,
+		2 => 2,
+		3 => 5,
+		4..=5 => 7,
+		6..=7 => 10,
+		8..=15 => 13,
+		_ => {
+			// An escape table, at the narrowest tail that reaches: 1, 2, 3, 4, 6, 8, 10, 13 bits.
+			for candidate in 16..24u8 {
+				if representable(&[max_magnitude], candidate) {
+					return candidate;
+				}
+			}
+			23
+		}
+	}
+}
+
+// What a granule costs at a gain, estimated: one table for the whole big-values area, plus the
+// count1 tail. Monotone in the gain the same way the exact cost is, which is all the search needs.
+fn estimate_bits(values: &[i32]) -> u32 {
+	let mut end = 0usize;
+	let mut peak = 0i32;
+	for (index, value) in values.iter().enumerate() {
+		if *value != 0 {
+			end = index + 1;
+		}
+		peak = peak.max(value.abs());
+	}
+	if end % 2 != 0 {
+		end += 1;
+	}
+	let mut count1_start = end;
+	while count1_start >= 4 && values[count1_start - 4..count1_start].iter().all(|v| v.abs() <= 1) {
+		count1_start -= 4;
+	}
+	let big_end = (count1_start / 2).min(288) * 2;
+	let table = smallest_table(values[..big_end].iter().map(|v| v.abs()).max().unwrap_or(0));
+	let mut total = 0u32;
+	for pair in values[..big_end].chunks(2) {
+		total += pair_bits(pair[0], pair[1], table).unwrap_or(u32::MAX / 4);
+	}
+	for quad in values[big_end..end].chunks(4) {
+		total += quad_bits(quad, false).min(quad_bits(quad, true));
+	}
+	total
+}
+
 // Split a granule and choose its tables, by measuring rather than by rule of thumb.
 fn partition(values: &[i32], rate_index: usize) -> Partition {
 	let mut end = 0usize;
@@ -410,8 +485,7 @@ fn fit_granule(lines: &[f32], budget: u32, rate_index: usize, scratch: &mut [i32
 		if quantise(lines, gain, scratch) {
 			return u32::MAX;
 		}
-		let part = partition(scratch, rate_index);
-		granule_bits(scratch, &part, rate_index)
+		estimate_bits(scratch)
 	};
 	// The coarsest gain must fit - at 255 the step is enormous and everything quantises to zero.
 	if cost_at(255, scratch) > budget {
@@ -422,12 +496,25 @@ fn fit_granule(lines: &[f32], budget: u32, rate_index: usize, scratch: &mut [i32
 		let mid = (low + high) / 2;
 		if cost_at(mid, scratch) <= budget { high = mid } else { low = mid + 1 }
 	}
-	quantise(lines, low, scratch);
-	let part = partition(scratch, rate_index);
-	let bits = granule_bits(scratch, &part, rate_index);
-	if bits > budget {
-		return None;
-	}
+	// THE MEASURED CHOICE, at the gain the estimate settled on. The estimate prices one table over
+	// the whole granule, so the measured cost with a table per region is never larger - but the
+	// gain is stepped up until it fits rather than trusted to, because "never larger" is an
+	// argument and this is a frame that has to fit.
+	let mut gain = low;
+	let (mut part, mut bits) = loop {
+		quantise(lines, gain, scratch);
+		let part = partition(scratch, rate_index);
+		let bits = granule_bits(scratch, &part, rate_index);
+		if bits <= budget {
+			break (part, bits);
+		}
+		gain += 1;
+		if gain > 255 {
+			return None;
+		}
+	};
+	let low = gain;
+	let _ = (&mut part, &mut bits);
 	let info = GranuleInfo { part2_3_length: bits, big_values: part.big_values as u32, global_gain: low as u32, tables: [part.tables[0] as u32, part.tables[1] as u32, part.tables[2] as u32], region0_count: part.region0_count, region1_count: part.region1_count, count1table_select: u32::from(part.count1_b) };
 	Some((info, part))
 }
@@ -499,13 +586,51 @@ pub struct Encoder<S: Sink> {
 	frames: u64,
 	samples: u64,
 	padding_accumulator: u32,
+	info_len: usize,
 }
 
 impl<S: Sink> Encoder<S> {
 	pub fn new(sink: S, format: Format, bitrate: u32) -> Result<Encoder<S>, EncodeError> {
 		let config = Config::with_bitrate(format.rate(), format.channels(), bitrate).ok_or(EncodeError::Unsupported)?;
 		let channels = config.channels as usize;
-		Ok(Encoder { sink, config, banks: (0..channels).map(|_| Filterbank::new()).collect(), pending: (0..channels).map(|_| Vec::new()).collect(), blocks: (0..channels).map(|_| Vec::new()).collect(), frames: 0, samples: 0, padding_accumulator: 0 })
+		let mut encoder = Encoder { sink, config, banks: (0..channels).map(|_| Filterbank::new()).collect(), pending: (0..channels).map(|_| Vec::new()).collect(), blocks: (0..channels).map(|_| Vec::new()).collect(), frames: 0, samples: 0, padding_accumulator: 0, info_len: 0 };
+		encoder.write_info_frame()?;
+		// The primer goes in before anything the caller pushes, and is not counted as audio: it is
+		// there to be dropped, and the tag is what says so.
+		for _ in 0..PRIMER_SAMPLES {
+			for channel in 0..channels {
+				encoder.pending[channel].push(0.0);
+			}
+			encoder.take_blocks()?;
+		}
+		Ok(encoder)
+	}
+
+	// THE GAPLESS TAG, WRITTEN FIRST AND CORRECTED LAST. A Layer III frame is 1152 samples, so a
+	// track whose length is not a multiple of that comes back longer than it went in - by up to a
+	// frame at the end, and by the encoder's own delay at the start. The Xing/Info tag is where the
+	// format records both, and it lives in the main-data area of a leading frame that decodes to
+	// silence.
+	//
+	// It cannot be written correctly here, because the frame count is not known until the end - so
+	// a placeholder goes out and `finish` patches it, which is what `Sink::patch` exists for and why
+	// this encoder refuses a destination that only goes forward.
+	fn write_info_frame(&mut self) -> Result<(), EncodeError> {
+		let (frame_bytes, padded) = self.config.frame_bytes(&mut self.padding_accumulator);
+		let mut out = BitWriter::new();
+		write_header(&mut out, &self.config, padded)?;
+		let empty = [[GranuleInfo::default(); 2]; 2];
+		write_side_info(&mut out, &self.config, &empty)?;
+		let mut bytes = out.into_bytes()?;
+		bytes.resize(frame_bytes, 0);
+		// `Info` rather than `Xing`: the two differ only in what they claim about the bitrate, and
+		// this stream is constant.
+		let tag = 4 + self.config.side_info_bytes();
+		bytes[tag..tag + 4].copy_from_slice(b"Info");
+		bytes[tag + 4..tag + 8].copy_from_slice(&1u32.to_be_bytes()); // flags: frame count present
+		self.info_len = frame_bytes;
+		self.sink.write(&bytes)?;
+		Ok(())
 	}
 
 	// Interleaved signed-16-bit frames, whole frames only.
@@ -520,9 +645,44 @@ impl<S: Sink> Encoder<S> {
 				// sample that reaches it does not clip.
 				self.pending[channel].push(*sample as f32 / 32_768.0);
 			}
+			self.take_blocks()?;
+			// AND FRAMES AS SOON AS THERE ARE BLOCKS FOR ONE. Without this the block buffer grows
+			// for the whole of a push - a caller handing over a minute of audio held ten megabytes
+			// of subband samples per channel, which is exactly the "nothing is held" claim at the
+			// top of this file being false. `audio-bench`'s peak-heap row is what found it.
+			if self.blocks[0].len() >= 3 * BLOCKS_PER_GRANULE {
+				self.drain()?;
+			}
 		}
 		self.samples += (interleaved.len() / channels) as u64;
 		self.drain()
+	}
+
+	// Turn every channel's part-filled block into a subband block once all of them are full.
+	//
+	// A BLOCK AT A TIME, NEVER A DRAIN FROM THE FRONT. This used to buffer the whole push and then
+	// `drain(..32)` in a loop, which is quadratic in the size of the push: a caller handing over a
+	// minute of audio in one call moved two hundred billion samples. The pending buffer now never
+	// holds more than one block.
+	fn take_blocks(&mut self) -> Result<(), EncodeError> {
+		let channels = self.config.channels as usize;
+		if self.pending[0].len() < BLOCK {
+			return Ok(());
+		}
+		for channel in 0..channels {
+			if self.pending[channel].len() < BLOCK {
+				return Ok(());
+			}
+		}
+		for channel in 0..channels {
+			let mut input = [0.0f32; BLOCK];
+			input.copy_from_slice(&self.pending[channel][..BLOCK]);
+			self.pending[channel].clear();
+			let mut out = [0.0f32; 32];
+			self.banks[channel].push(&input, &mut out);
+			self.blocks[channel].push(out);
+		}
+		Ok(())
 	}
 
 	// Turn whatever complete blocks are pending into frames. A frame is two granules, and the
@@ -531,16 +691,7 @@ impl<S: Sink> Encoder<S> {
 	fn drain(&mut self) -> Result<(), EncodeError> {
 		let channels = self.config.channels as usize;
 		loop {
-			for channel in 0..channels {
-				while self.pending[channel].len() >= BLOCK {
-					let mut input = [0.0f32; BLOCK];
-					input.copy_from_slice(&self.pending[channel][..BLOCK]);
-					self.pending[channel].drain(..BLOCK);
-					let mut out = [0.0f32; 32];
-					self.banks[channel].push(&input, &mut out);
-					self.blocks[channel].push(out);
-				}
-			}
+			self.take_blocks()?;
 			if self.blocks.iter().map(|b| b.len()).min().unwrap_or(0) < 3 * BLOCKS_PER_GRANULE {
 				return Ok(());
 			}
@@ -604,7 +755,9 @@ impl<S: Sink> Encoder<S> {
 		Ok(())
 	}
 
-	// Flush the tail and return the sink with the frame count.
+	// Flush the tail and return the sink with the number of SAMPLE FRAMES encoded - the track's own
+	// length, which is what every other encoder in this tree returns and what a caller reports.
+	// The count of format frames is the tag's business and stays here.
 	//
 	// THE TAIL NEEDS SILENCE PUSHED THROUGH IT, and a bounded amount: the filterbank holds 512
 	// samples of history and the MDCT reaches a granule ahead, so the last real sample leaves the
@@ -613,11 +766,37 @@ impl<S: Sink> Encoder<S> {
 	pub fn finish(mut self) -> Result<(S, u64), EncodeError> {
 		let channels = self.config.channels as usize;
 		let tail = 512 + FRAME_SAMPLES * 2;
-		for channel in 0..channels {
-			self.pending[channel].extend(core::iter::repeat_n(0.0, tail));
+		for _ in 0..tail {
+			for channel in 0..channels {
+				self.pending[channel].push(0.0);
+			}
+			self.take_blocks()?;
 		}
 		self.drain()?;
-		Ok((self.sink, self.frames))
+
+		// The tag, now that the count is known. `frames` counts audio frames; the leading tag frame
+		// is not one of them, and neither the count nor the padding may include it.
+		let encoded = self.frames.saturating_mul(FRAME_SAMPLES as u64);
+		let trimmed = self.samples.saturating_add(ENCODER_DELAY as u64);
+		// What the last frame carries past the end of the track, plus the delay at its start. A
+		// padding this cannot express is clamped rather than wrapped: the file is then a fraction of
+		// a frame longer than it claims, which is the smaller of the two lies available.
+		let padding = encoded.saturating_sub(trimmed).min(4_095) as u32;
+		let tag = 4 + self.config.side_info_bytes();
+		let mut patch = Vec::new();
+		patch.extend_from_slice(&(self.frames as u32).to_be_bytes());
+		patch.extend_from_slice(ENCODER_TAG);
+		// The delay and padding sit twenty-one bytes past the encoder tag, packed as two twelve-bit
+		// fields across three bytes - which is where every decoder that reads them looks.
+		patch.extend_from_slice(&[0u8; 17]);
+		patch.push((ENCODER_DELAY >> 4) as u8);
+		patch.push((((ENCODER_DELAY & 0x0f) << 4) | (padding >> 8)) as u8);
+		patch.push((padding & 0xff) as u8);
+		if tag + 8 + patch.len() <= self.info_len {
+			self.sink.patch((tag + 8) as u64, &patch)?;
+		}
+		let samples = self.samples;
+		Ok((self.sink, samples))
 	}
 }
 

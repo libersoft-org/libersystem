@@ -166,7 +166,10 @@ fn gapless_info(bytes: &[u8], frame_start: usize, header: FrameHeader) -> Option
 	if flags & 8 != 0 {
 		cursor = cursor.checked_add(4)?;
 	}
-	if !matches!(bytes.get(cursor..cursor.checked_add(4)?), Some(b"LAME") | Some(b"Lavf") | Some(b"Lavc") | Some(b"GOGO")) {
+	// The encoders whose delay and padding fields this reader trusts, and `LiBr` is this tree's own
+	// - see `encode::ENCODER_TAG`. A tag that is not on this list is not a broken file: it is an
+	// encoder whose gapless fields nobody has verified, and declining to trim is the safe answer.
+	if !matches!(bytes.get(cursor..cursor.checked_add(4)?), Some(b"LAME") | Some(b"Lavf") | Some(b"Lavc") | Some(b"GOGO") | Some(b"LiBr")) {
 		return None;
 	}
 	let delay_start = cursor.checked_add(21)?;

@@ -65,6 +65,32 @@ def substitute(image, old, new, what, occurrences=1):
 	return bytearray(bytes(image).replace(old, new))
 
 
+# The same, for a string whose NUMBER of copies is the compiler's business rather than the image's.
+#
+# A count is the right assertion for a string the program carries as data - it is the same on every
+# target, and a change in it is a fixture that has stopped patching what it names. It is the wrong
+# assertion for a compiled literal: `koid` in `process-proto` occurs twice on x86_64 (the packed
+# string table plus one immediate the text renderer stores), THREE times on aarch64 (the table plus
+# `"koid":` and `koid=` as separate literals) and ONCE on riscv64 (the table alone), so a recipe
+# demanding exactly two refused two of the three targets outright, and refused them for a fact about
+# a code generator.
+#
+# What the fixture needs is that EVERY copy is patched, so no rendering of a process record
+# disagrees with another about the field name. That is target-independent, and it still catches both
+# ways this can go wrong: a recipe that patches nothing finds zero occurrences, and one that patched
+# some of them leaves the rest behind - which the post-condition below is what says.
+def substitute_every(image, old, new, what):
+	if len(old) != len(new):
+		raise SystemExit(f'{what}: {old!r} and {new!r} differ in length')
+	found = image.count(old)
+	if found < 1:
+		raise SystemExit(f'{what}: {old!r} does not occur; this fixture would patch nothing')
+	patched = bytearray(bytes(image).replace(old, new))
+	if patched.count(old):
+		raise SystemExit(f'{what}: {old!r} still occurs {patched.count(old)} times after patching')
+	return patched
+
+
 # Give the identity record a different content digest. The compatibility rule allows exactly
 # this one field to differ, and a fixture that left it alone would prove less than it looks
 # like it proves: the loader compares provider digests, and two images with identical records
@@ -99,11 +125,12 @@ def generation_uname(index):
 # which is what makes it visible that the provider, and only the provider, was replaced.
 # Nothing else about the image moves, so the rule calls it hot-publishable.
 #
-# The name appears twice: once in the packed string the JSON and CBOR renderers index into,
-# and once as an immediate the text renderer stores directly. Both are patched, so every
-# rendering of a process record agrees about which build produced it.
+# Every copy of the name is patched - the packed string the JSON and CBOR renderers index into, and
+# whatever separate literals the compiler chose to emit beside it - so every rendering of a process
+# record agrees about which build produced it. How MANY copies there are differs per target, which
+# is why this one substitution counts differently from the others; see `substitute_every`.
 def shadowed_process_proto():
-	image = substitute(staged('lib/protocol/process-proto.lslib'), b'koid', b'PKID', 'process-proto', occurrences=2)
+	image = substitute_every(staged('lib/protocol/process-proto.lslib'), b'koid', b'PKID', 'process-proto')
 	return alter_source_digest(image, 'process-proto')
 
 

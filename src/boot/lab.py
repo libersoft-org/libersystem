@@ -220,8 +220,13 @@ QMP_SOCK = os.path.join(BUILD, 'qemu-qmp.sock')
 # The monitor and QMP endpoints in use. The persistent instance's by default; a cold run points
 # them at the guest it started, alongside the control channel and the console log. All four move
 # together or a scenario drives one guest and reads another.
-MON_OVERRIDE = None
-QMP_OVERRIDE = None
+# INHERITED BY A CHILD, because three scenario steps ARE a child. `publish`, `reset` and `restart`
+# re-invoke this file as a subprocess, and a module global does not cross a fork+exec - so on a cold
+# run those three talked to the persistent instance's sockets while every other step drove the cold
+# guest. The scenarios passed and their teardown could not drop the state it had just created.
+# `scenario_child` puts these four in the child's environment; this is where the child reads them.
+MON_OVERRIDE = os.environ.get('LAB_MON_OVERRIDE') or None
+QMP_OVERRIDE = os.environ.get('LAB_QMP_OVERRIDE') or None
 
 
 def mon_sock():
@@ -304,7 +309,7 @@ def broker_reply(conn, outcome, data):
 # cold run points it at that guest's own log, the same way it points the control channel at that
 # guest's own socket. Both have to move together, or a scenario types into one guest and reads
 # another's screen.
-SERIAL_OVERRIDE = None
+SERIAL_OVERRIDE = os.environ.get('LAB_SERIAL_OVERRIDE') or None
 
 
 def serial_log_path():
@@ -1743,7 +1748,7 @@ def proto_await(sock, buffer, request, deadline):
 # The control channel a session talks over. Normally the persistent instance's; a cold run on
 # another target points this at that target's own socket for the length of the run, because the
 # protocol and everything above it are identical either way - only the endpoint differs.
-CHANNEL_OVERRIDE = None
+CHANNEL_OVERRIDE = os.environ.get('LAB_CHANNEL_OVERRIDE') or None
 
 
 def channel_path():
@@ -2720,8 +2725,15 @@ class LabGuest:
 	# bound is the same number plus a small allowance, so the child's own timeout still reports the
 	# failure when it can and the host stops it when it cannot.
 	def scenario_child(self, arguments, timeout):
+		# WHICH GUEST, carried across the exec. Everything else in this class reaches the guest
+		# through this process's own overrides; a child starts with none of them and defaults to the
+		# persistent instance, which on a cold run is a different guest or no guest at all.
+		env = dict(os.environ)
+		for name, value in (('LAB_CHANNEL_OVERRIDE', CHANNEL_OVERRIDE), ('LAB_SERIAL_OVERRIDE', SERIAL_OVERRIDE), ('LAB_MON_OVERRIDE', MON_OVERRIDE), ('LAB_QMP_OVERRIDE', QMP_OVERRIDE)):
+			if value:
+				env[name] = value
 		try:
-			return run_child([os.path.join(HERE, 'lab.py'), *arguments], timeout + CHILD_GRACE, cwd=SRC, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+			return run_child([os.path.join(HERE, 'lab.py'), *arguments], timeout + CHILD_GRACE, cwd=SRC, env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
 		except ChildTimeout:
 			return False
 
@@ -2852,7 +2864,14 @@ def cmd_scenario_cold(args):
 	scenario.TARGET = target
 	fixture_env = dict(env, FIXTURE_TARGET=target)
 	try:
-		if run_child([os.path.join(HERE, 'scenarios', 'make-fixtures.py')], 600, cwd=SRC, env=fixture_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE).returncode != 0:
+		built = run_child([os.path.join(HERE, 'scenarios', 'make-fixtures.py')], 600, cwd=SRC, env=fixture_env, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+		if built.returncode != 0:
+			# WHAT THE RECIPE SAID, for the reason the runner log below is kept: this captured the
+			# builder's stderr into a pipe and then threw the pipe away, so a refusal arrived as a
+			# sentence naming no cause and had to be re-run by hand to be read. It cost a nine-minute
+			# build to find out that a byte string occurred three times where the recipe expected two.
+			for line in (built.stderr or b'').decode(errors='replace').splitlines():
+				print(f'lab: {line}', file=sys.stderr)
 			die(f'the {target} scenario fixtures could not be built')
 	except ChildTimeout as expired:
 		die(f'building the {target} scenario fixtures did not finish ({expired})')

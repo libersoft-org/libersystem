@@ -167,7 +167,11 @@ unsafe fn exists(storage: u64, uri: &str) -> bool {
 fn fail(error: Error) -> ! {
 	let message = match error {
 		Error::InvalidOptions => b"audioconv: invalid options\n".as_slice(),
-		Error::UnsupportedOption => b"audioconv: option not supported by output format\n".as_slice(),
+		// Two cases behind one answer, and the message says both: an option this destination has no
+		// use for (`--quality` on a lossless format), and a RATE it cannot carry - MPEG-1 Layer III
+		// names 32, 44.1 and 48 kHz and nothing else, so an 8 kHz source needs `--rate` to become
+		// an MP3 at all.
+		Error::UnsupportedOption => b"audioconv: the output format does not support that option or sample rate\n".as_slice(),
 		Error::UnsupportedFormat => b"audioconv: unsupported audio format\n".as_slice(),
 		Error::InvalidAudio => b"audioconv: invalid or corrupt audio\n".as_slice(),
 		// Distinct from Unsupported on purpose: the format is real and this tool will write it one

@@ -13,6 +13,10 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # argument, which is exactly the shape that became six recipe names.
 declare -A GATES=(
 	["development-gate"]="tools/check-development-gate.sh"
+	# The other configuration of the same source, compiled. `development-gate` above checks which
+	# artifacts a configuration STAGES; it never builds the one it is guarding, and the profile it
+	# guards stopped compiling twice in one release without anything noticing.
+	["development-build"]="tools/check-development-build.sh"
 	["artifact-metadata"]="tools/check-artifact-metadata.sh"
 	["dynamic-report"]="tools/check-dynamic-report.sh --check"
 	# The checker above decides whether the tracked reports still describe the tree, and it used to

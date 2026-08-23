@@ -320,3 +320,31 @@ fn mp3_is_written_and_reads_back_as_the_track_that_went_in() {
 	let (again, _) = convert(&source, &config("out.mp3")).expect("the second conversion runs");
 	assert_eq!(bytes, again, "two conversions of one input differ");
 }
+
+#[test]
+fn a_destination_that_runs_out_is_refused_by_every_profile() {
+	// THE HOSTILE CASE EVERY ENCODER SHARES: the place it is writing to says no, part way through.
+	// What must not happen is a partial file reported as a whole one - and it is worth testing for
+	// all six, because each of them handles the sink differently: three stream into it, one patches
+	// it at the end, one builds its bytes itself, and one writes a frame at a time.
+	//
+	// The ceiling is one byte, so every profile hits it on its own header.
+	let source = wave(4_096, 1, 44_100);
+	for profile in PROFILES {
+		let config = Config { mode: Mode::Convert, input: String::new(), output: String::new(), profile: Some(profile.profile), force: false, rate: None, channels: None, bits: None, quality: None, compression: None };
+		let result = convert_with_ceiling(&source, &config, 1);
+		assert!(result.is_err(), "{} wrote a whole file into one byte", profile.name);
+		assert_eq!(result.err(), Some(Error::TooLarge), "{} reported the wrong reason", profile.name);
+	}
+}
+
+#[test]
+fn a_conversion_that_fails_returns_no_bytes_at_all() {
+	// The other half: a failed conversion hands back nothing, so a caller cannot write a prefix of
+	// it by mistake. `audioconv.lsexe` relies on this - it opens the destination only once the
+	// conversion has succeeded.
+	let source = wave(4_096, 1, 44_100);
+	let config = config("out.flac");
+	assert!(convert_with_ceiling(&source, &config, 1).is_err());
+	assert!(convert(&source, &config).is_ok(), "the same conversion succeeds with room");
+}

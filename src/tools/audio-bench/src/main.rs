@@ -1,4 +1,46 @@
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
+
+// PEAK HEAP, MEASURED RATHER THAN ESTIMATED. The milestone asks for it beside the throughput, and
+// the number that matters is what an encoder HOLDS while it runs - which is the claim each of them
+// makes about bounded memory. A counting allocator is the only way to see it from outside.
+//
+// Live bytes and the high-water mark since it was last reset. Single-threaded here, so `Relaxed` is
+// enough: nothing orders anything against these.
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+struct Counting;
+
+unsafe impl GlobalAlloc for Counting {
+	unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+		let pointer = unsafe { System.alloc(layout) };
+		if !pointer.is_null() {
+			let live = LIVE.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+			PEAK.fetch_max(live, Ordering::Relaxed);
+		}
+		pointer
+	}
+
+	unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
+		LIVE.fetch_sub(layout.size(), Ordering::Relaxed);
+		unsafe { System.dealloc(pointer, layout) };
+	}
+
+	unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+		let grown = unsafe { System.realloc(pointer, layout, new_size) };
+		if !grown.is_null() {
+			let live = LIVE.load(Ordering::Relaxed) + new_size - layout.size();
+			LIVE.store(live, Ordering::Relaxed);
+			PEAK.fetch_max(live, Ordering::Relaxed);
+		}
+		grown
+	}
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
 
 const LOGICAL_SECONDS: u64 = 60;
 const CHUNK_FRAMES: usize = 1_024;
@@ -85,14 +127,19 @@ fn fixture(frames: usize, channels: u8, rate: u32) -> Vec<i16> {
 // caller actually chooses a profile by, and it is not derivable from the throughput.
 fn bench_encode(name: &str, rate: u32, channels: u8, frames: usize, mut encode: impl FnMut(&[i16]) -> usize) -> f64 {
 	let samples = fixture(frames, channels, rate);
+	// The fixture is held by the caller, so the mark starts from what is live now: what the encoder
+	// adds is what the row reports.
+	let base = LIVE.load(Ordering::Relaxed);
+	PEAK.store(base, Ordering::Relaxed);
 	let start = Instant::now();
 	let bytes = encode(&samples);
 	let elapsed = start.elapsed();
+	let peak = PEAK.load(Ordering::Relaxed).saturating_sub(base);
 	std::hint::black_box(bytes);
 	let logical_seconds = frames as f64 / rate as f64;
 	let realtime = logical_seconds / elapsed.as_secs_f64();
 	let kbps = (bytes as f64 * 8.0 / 1_000.0) / logical_seconds;
-	println!("| {name} | {rate} | {channels} | {frames} | {:.3} | {realtime:.1}x | {bytes} | {kbps:.0} |", elapsed.as_secs_f64());
+	println!("| {name} | {rate} | {channels} | {frames} | {:.3} | {realtime:.1}x | {bytes} | {kbps:.0} | {} |", elapsed.as_secs_f64(), peak);
 	assert!(realtime > 1.0, "{name} encoder is slower than real time: {realtime:.2}x");
 	realtime
 }
@@ -115,8 +162,8 @@ fn main() {
 	const CHANNELS: u8 = 2;
 	let frames = (LOGICAL_SECONDS * RATE as u64) as usize;
 	println!();
-	println!("| encoder | rate (Hz) | channels | frames | wall (s) | realtime | bytes | kbit/s |");
-	println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
+	println!("| encoder | rate (Hz) | channels | frames | wall (s) | realtime | bytes | kbit/s | peak heap |");
+	println!("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |");
 	let format = pcm::Format::new(RATE, CHANNELS).expect("the bench format is one `Format` names");
 	let ceiling: u64 = 1 << 30;
 	let encoded = [
@@ -146,6 +193,11 @@ fn main() {
 			encoder.finish().expect("WavPack finish").0.into_bytes().len()
 		}),
 	];
+	let mp3_rate = bench_encode("MP3", RATE, CHANNELS, frames, |samples| {
+		let mut encoder = mp3::encode::Encoder::new(pcm::encode::VecSink::new(ceiling), format, 128).expect("MP3 encoder");
+		encoder.push(samples).expect("MP3 push");
+		encoder.finish().expect("MP3 finish").0.into_bytes().len()
+	});
 	// Ten seconds rather than sixty, for the reason above.
 	let vorbis_frames = (10 * RATE) as usize;
 	let vorbis = bench_encode("Ogg Vorbis (10 s)", RATE, CHANNELS, vorbis_frames, |samples| {
@@ -157,6 +209,6 @@ fn main() {
 		}
 		vorbis::encode::encode(&channels, RATE, 11, 0x4c69_6265).expect("Vorbis encode").len()
 	});
-	let slowest = encoded.into_iter().chain(core::iter::once(vorbis)).fold(f64::INFINITY, f64::min);
+	let slowest = encoded.into_iter().chain([mp3_rate, vorbis]).fold(f64::INFINITY, f64::min);
 	println!("slowest encoder: {slowest:.1}x realtime");
 }

@@ -401,6 +401,10 @@ struct VorbisTrack {
 	channels: Vec<Vec<f32>>,
 	rate: u32,
 	frames: u64,
+	// THE DESTINATION'S OWN CEILING, carried rather than inherited. Every other profile streams into
+	// a `VecSink` that enforces it; this one builds its bytes at the end, so it has to check what it
+	// built - otherwise it is the one destination a caller's bound does not reach.
+	ceiling: u64,
 }
 
 // Eight million samples of `f32`, which is thirty-two megabytes held - about ninety seconds of
@@ -410,13 +414,13 @@ struct VorbisTrack {
 const VORBIS_MAX_SAMPLES: usize = 8 * 1024 * 1024;
 
 impl VorbisTrack {
-	fn new(format: Format) -> Result<VorbisTrack, Error> {
+	fn new(format: Format, ceiling: u64) -> Result<VorbisTrack, Error> {
 		let mut channels: Vec<Vec<f32>> = Vec::new();
 		channels.try_reserve_exact(format.channels() as usize).map_err(|_| Error::TooLarge)?;
 		for _ in 0..format.channels() {
 			channels.push(Vec::new());
 		}
-		Ok(VorbisTrack { channels, rate: format.rate(), frames: 0 })
+		Ok(VorbisTrack { channels, rate: format.rate(), frames: 0, ceiling })
 	}
 
 	fn push(&mut self, frames: &[i16]) -> Result<(), Error> {
@@ -451,6 +455,9 @@ impl VorbisTrack {
 		const BLOCKSIZE_LOG2: u8 = 11;
 		const SERIAL: u32 = 0x4c69_6265;
 		let bytes = vorbis::encode::encode(&self.channels, self.rate, BLOCKSIZE_LOG2, SERIAL).ok_or(Error::TooLarge)?;
+		if bytes.len() as u64 > self.ceiling {
+			return Err(Error::TooLarge);
+		}
 		Ok((bytes, self.frames))
 	}
 }
@@ -474,10 +481,7 @@ impl Destination {
 			Destination::Flac(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(flac_error),
 			Destination::WavPack(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(wavpack_error),
 			Destination::Vorbis(track) => track.finish(),
-			// The frame count an MP3 encoder returns is FRAMES OF THE FORMAT, 1152 samples each,
-			// not sample frames - so it is converted here rather than reported as if it were the
-			// same number.
-			Destination::Mp3(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames * 1_152)).map_err(mp3_error),
+			Destination::Mp3(encoder) => encoder.finish().map(|(sink, frames)| (sink.into_bytes(), frames)).map_err(mp3_error),
 		}
 	}
 }
@@ -525,6 +529,17 @@ fn wavpack_error(error: wavpack::encode::EncodeError) -> Error {
 // Read one file, write another. Nothing here touches a volume: the caller supplies the bytes and
 // takes the bytes back, which is what makes the whole of this testable without booting.
 pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), Error> {
+	convert_bounded(input, config, None)
+}
+
+// The same, with the destination's ceiling forced - which is how the hostile tests make every
+// encoder meet a destination that runs out part way through.
+#[cfg(test)]
+pub(crate) fn convert_with_ceiling(input: &[u8], config: &Config, ceiling: u64) -> Result<(Vec<u8>, ResultInfo), Error> {
+	convert_bounded(input, config, Some(ceiling)).map(|(bytes, info)| (bytes, info))
+}
+
+fn convert_bounded(input: &[u8], config: &Config, forced_ceiling: Option<u64>) -> Result<(Vec<u8>, ResultInfo), Error> {
 	let container = sniff(input).ok_or(Error::UnsupportedFormat)?;
 	let profile = config.resolved_profile().ok_or(Error::UnsupportedFormat)?;
 	let entry = capabilities(profile);
@@ -536,38 +551,38 @@ pub fn convert(input: &[u8], config: &Config) -> Result<(Vec<u8>, ResultInfo), E
 		Container::Wav => {
 			let file = wav::Wav::parse(input).map_err(|_| Error::InvalidAudio)?;
 			let metadata = file.metadata();
-			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config)
+			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config, forced_ceiling)
 		}
 		Container::Aiff | Container::Aifc => {
 			let file = aiff::Aiff::parse(input).map_err(|_| Error::InvalidAudio)?;
 			let metadata = file.metadata();
-			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config)
+			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config, forced_ceiling)
 		}
 		Container::Flac => {
 			let file = flac::Flac::parse(input).map_err(|_| Error::InvalidAudio)?;
 			let metadata = file.metadata();
-			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config)
+			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config, forced_ceiling)
 		}
 		Container::WavPack => {
 			let file = wavpack::WavPack::parse(input).map_err(|_| Error::InvalidAudio)?;
 			let metadata = file.metadata();
-			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config)
+			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config, forced_ceiling)
 		}
 		Container::Vorbis => {
 			let file = vorbis::Vorbis::parse(input).map_err(|_| Error::InvalidAudio)?;
 			let metadata = file.metadata();
-			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config)
+			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config, forced_ceiling)
 		}
 		Container::Mp3 => {
 			let file = mp3::Mp3::parse(input).map_err(|_| Error::InvalidAudio)?;
 			let metadata = file.metadata();
-			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config)
+			pump(file.decoder(), container, metadata.rate, metadata.channels, metadata.frames, profile, config, forced_ceiling)
 		}
 	}
 }
 
 #[allow(clippy::too_many_arguments)]
-fn pump(mut source: impl Frames, container: Container, source_rate: u32, source_channels: u8, source_frames: u64, profile: Profile, config: &Config) -> Result<(Vec<u8>, ResultInfo), Error> {
+fn pump(mut source: impl Frames, container: Container, source_rate: u32, source_channels: u8, source_frames: u64, profile: Profile, config: &Config, forced_ceiling: Option<u64>) -> Result<(Vec<u8>, ResultInfo), Error> {
 	let rate = config.rate.unwrap_or(source_rate);
 	let channels = config.channels.unwrap_or(source_channels);
 	let format = Format::new(rate, channels).ok_or(Error::InvalidOptions)?;
@@ -580,9 +595,12 @@ fn pump(mut source: impl Frames, container: Container, source_rate: u32, source_
 	// Room for the worst case any of these encoders can produce - four bytes per sample is the
 	// widest PCM profile, and everything else is smaller - plus a header's worth. A ceiling rather
 	// than an open-ended buffer, so a damaged input that claims a billion frames hits a bound.
-	let ceiling = expected_frames.checked_mul(channels as u64).and_then(|samples| samples.checked_mul(4)).and_then(|bytes| bytes.checked_add(1 << 16)).ok_or(Error::TooLarge)?;
+	let ceiling = match forced_ceiling {
+		Some(forced) => forced,
+		None => expected_frames.checked_mul(channels as u64).and_then(|samples| samples.checked_mul(4)).and_then(|bytes| bytes.checked_add(1 << 16)).ok_or(Error::TooLarge)?,
+	};
 
-	let mut destination = build(profile, VecSink::new(ceiling), format, config)?;
+	let mut destination = build(profile, VecSink::new(ceiling), format, config, ceiling)?;
 	let mut raw = Vec::new();
 	let mut decoded: Vec<i16> = Vec::new();
 	let mut remixed: Vec<i16> = Vec::new();
@@ -615,7 +633,7 @@ fn pump(mut source: impl Frames, container: Container, source_rate: u32, source_
 	Ok((bytes, info))
 }
 
-fn build(profile: Profile, sink: VecSink, format: Format, config: &Config) -> Result<Destination, Error> {
+fn build(profile: Profile, sink: VecSink, format: Format, config: &Config, ceiling: u64) -> Result<Destination, Error> {
 	// The defaults each profile falls back to when the option that would choose was not given.
 	let bits = config.bits.unwrap_or(16);
 	let effort = flac::encode::Effort::from_percent(config.compression.unwrap_or(50));
@@ -634,7 +652,7 @@ fn build(profile: Profile, sink: VecSink, format: Format, config: &Config) -> Re
 		// streaming into one, for the reason `VorbisTrack` states.
 		Profile::Vorbis => {
 			drop(sink);
-			VorbisTrack::new(format).map(Destination::Vorbis)
+			VorbisTrack::new(format, ceiling).map(Destination::Vorbis)
 		}
 		// 128 kbit/s for stereo and 64 for mono, which is where this format's quality is
 		// conventionally judged. `--quality` does not reach it: see the table's row.

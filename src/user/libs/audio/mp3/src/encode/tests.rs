@@ -36,25 +36,36 @@ fn encode(samples: &[i16], rate: u32, channels: u8, bitrate: u32) -> Vec<u8> {
 // its output by the filterbank's delay, so comparing sample for sample from zero would measure the
 // delay rather than the audio.
 fn best_match(original: &[i16], decoded: &[i16], channels: usize) -> f64 {
-	let take = 4_096.min(original.len() / channels - 1);
-	let mut best = 0.0f64;
+	best_match_at(original, decoded, channels).0
+}
+
+// The correlation and the alignment it was found at.
+//
+// SKIPPING THE FIRST 1024 FRAMES IS NOT SLACK. A filterbank's first output is computed over a
+// history that is still mostly zeros, so the opening of any encode is a ramp - measuring it would be
+// measuring the start-up rather than the codec. What the alignment says is separate and is asserted
+// on its own: a gapless tag that records the right delay puts the audio at sample zero.
+fn best_match_at(original: &[i16], decoded: &[i16], channels: usize) -> (f64, usize) {
+	const SKIP: usize = 1_024;
+	let take = 4_096.min(original.len() / channels - SKIP - 1);
+	let mut best = (0.0f64, 0usize);
 	for shift in 0..2_000 {
-		let start = shift * channels;
+		let start = (shift + SKIP) * channels;
 		if start + take * channels > decoded.len() {
 			break;
 		}
 		let (mut dot, mut a2, mut b2) = (0.0f64, 0.0f64, 0.0f64);
 		for i in 0..take {
 			let a = decoded[start + i * channels] as f64;
-			let b = original[i * channels] as f64;
+			let b = original[(SKIP + i) * channels] as f64;
 			dot += a * b;
 			a2 += a * a;
 			b2 += b * b;
 		}
 		if a2 > 0.0 && b2 > 0.0 {
 			let correlation = dot / (a2.sqrt() * b2.sqrt());
-			if correlation > best {
-				best = correlation;
+			if correlation > best.0 {
+				best = (correlation, shift);
 			}
 		}
 	}
@@ -87,7 +98,10 @@ fn a_mono_stream_decodes_back_as_the_signal_that_went_in() {
 	assert_eq!((rate, channels), (44_100, 1));
 	assert!(decoded.len() > 7_000, "the stream decoded {} samples of a nine-thousand-sample track", decoded.len());
 	let correlation = best_match(&original, &decoded, 1);
-	assert!(correlation > 0.95, "the decoded audio correlates {correlation:.4} with what was encoded");
+	// 0.999 rather than "close enough": at 128 kbit/s this format is transparent on a signal this
+	// simple, and a threshold that a broken alias butterfly or a mistranscribed codeword could still
+	// pass is a threshold that measures nothing.
+	assert!(correlation > 0.999, "the decoded audio correlates {correlation:.4} with what was encoded");
 }
 
 #[test]
@@ -103,7 +117,7 @@ fn a_stereo_stream_keeps_its_two_channels_apart() {
 	let energy = |v: &[i16]| v.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>().sqrt();
 	let ratio = energy(&right) / energy(&left).max(1.0);
 	assert!((0.6..0.9).contains(&ratio), "the channels came back at a level ratio of {ratio:.3}");
-	assert!(best_match(&original, &decoded, 2) > 0.9, "the stereo stream does not match what was encoded");
+	assert!(best_match(&original, &decoded, 2) > 0.999, "the stereo stream does not match what was encoded");
 }
 
 #[test]
@@ -112,7 +126,7 @@ fn every_rate_this_encoder_names_round_trips_and_every_other_is_refused() {
 		let original = signal(5_000, rate, 1);
 		let (decoded, decoded_rate, _) = decode(&encode(&original, rate, 1, 128));
 		assert_eq!(decoded_rate, rate);
-		assert!(best_match(&original, &decoded, 1) > 0.9, "{rate} Hz does not round trip");
+		assert!(best_match(&original, &decoded, 1) > 0.999, "{rate} Hz does not round trip");
 	}
 	// MPEG-2 halves these rates and changes the side info; refused by name rather than mislabelled.
 	assert!(Config::new(22_050, 1).is_none());
@@ -148,4 +162,23 @@ fn a_higher_bitrate_is_a_closer_reconstruction() {
 	let low = best_match(&original, &decode(&encode(&original, 44_100, 1, 32)).0, 1);
 	let high = best_match(&original, &decode(&encode(&original, 44_100, 1, 320)).0, 1);
 	assert!(high > low + 0.05, "320 kbit/s ({high:.4}) is no closer than 32 ({low:.4})");
+}
+
+#[test]
+fn the_gapless_tag_records_the_length_and_the_delay() {
+	// WHAT THE TAG IS FOR. A Layer III frame is 1152 samples, so a track that is not a multiple of
+	// that comes back longer than it went in - and the encoder's own filterbank delays it as well.
+	// The Xing/Info tag records both, and a decoder that reads it hands back exactly the track.
+	//
+	// Without it the round trip grows: convert a file twice and it is longer both times.
+	let original = signal(9_000, 44_100, 1);
+	let bytes = encode(&original, 44_100, 1, 128);
+	let mp3 = Mp3::parse(&bytes).expect("the stream parses");
+	assert_eq!(mp3.metadata().frames, 9_000, "the tag does not name the track's own length");
+	assert_eq!(mp3.metadata().rate, 44_100);
+
+	let (decoded, _, _) = decode(&bytes);
+	let (correlation, shift) = best_match_at(&original, &decoded, 1);
+	assert!(shift <= 2, "the decoded audio starts {shift} samples late - the recorded delay is wrong");
+	assert!(correlation > 0.999, "the aligned audio correlates {correlation:.4}");
 }

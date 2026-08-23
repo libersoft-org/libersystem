@@ -1055,8 +1055,18 @@ qemu_run_aarch64() {
 			# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
 			# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
 			# or collide with it. Without these a `key` step reaches nothing and quietly does nothing.
+			#
+			# AND A COLD RUN TAKES THE COLD NAMES, which is what `scenario-cold` connects to. The x86
+			# block below has taken them since the run that destroyed a persistent instance's sockets;
+			# these two never did, so on these targets the guest listened on one path while the runner
+			# dialled another - and `key` steps failed with "no QEMU QMP socket" against a guest that
+			# was up and answering everything else.
 			local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
 			local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+			if [[ "${COLD:-0}" == "1" ]]; then
+				dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
+				dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
+			fi
 			rm -f "$dev_monitor" "$dev_qmp"
 			qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
 			qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")
@@ -1243,8 +1253,18 @@ qemu_run_riscv64() {
 			# QMP, which is how a scenario reaches the emulated keyboard and tablet rather than the
 			# console. Per target, so a one-shot run cannot be mistaken for the persistent instance's
 			# or collide with it. Without these a `key` step reaches nothing and quietly does nothing.
+			#
+			# AND A COLD RUN TAKES THE COLD NAMES, which is what `scenario-cold` connects to. The x86
+			# block below has taken them since the run that destroyed a persistent instance's sockets;
+			# these two never did, so on these targets the guest listened on one path while the runner
+			# dialled another - and `key` steps failed with "no QEMU QMP socket" against a guest that
+			# was up and answering everything else.
 			local dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-$TARGET_ARCH.sock"
 			local dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-$TARGET_ARCH.sock"
+			if [[ "${COLD:-0}" == "1" ]]; then
+				dev_monitor="$QEMU_BUILD_DIR/qemu-monitor-cold-$TARGET_ARCH.sock"
+				dev_qmp="$QEMU_BUILD_DIR/qemu-qmp-cold-$TARGET_ARCH.sock"
+			fi
 			rm -f "$dev_monitor" "$dev_qmp"
 			qemu_args+=(-monitor "unix:$dev_monitor,server,nowait")
 			qemu_args+=(-qmp "unix:$dev_qmp,server,nowait")

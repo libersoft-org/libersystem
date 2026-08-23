@@ -399,6 +399,25 @@ fn audioconv_writes_a_lossy_container_that_decodes_back() {
 	let mut decoded = alloc::vec::Vec::new();
 	let read = stream.decoder().read_i16_le(2_000, &mut decoded).expect("the Ogg decodes");
 	assert!(read > 1_500, "the Ogg decoded {read} frames of a two-thousand-frame track");
+
+	// AND THE OTHER LOSSY CONTAINER. MPEG-1 Layer III names 32, 44.1 and 48 kHz and nothing else,
+	// so the 8 kHz fixture has to be resampled on the way - which is the tool's own `--rate` rather
+	// than something the encoder does quietly.
+	let line = run_volume_tool(audioconv_elf, b"--rate 44100 vol://media/SOURCE.WAV vol://system/CROSS.MP3", &mut system, &mut media);
+	assert!(line.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> MP3 44100Hz/1ch/11025fr duration=250ms bytes="), "unexpected report: {}", alloc::string::String::from_utf8_lossy(&line));
+	let written = system.open(b"vol://system/CROSS.MP3", 0xaad14).expect("the cross-volume MP3 opens");
+	let stream = mp3::Mp3::parse(&written).expect("the MP3 this encoder wrote is one this decoder reads");
+	assert_eq!(stream.metadata().rate, 44_100);
+	assert_eq!(stream.metadata().channels, 1);
+	let mut decoded = alloc::vec::Vec::new();
+	let read = stream.decoder().read_i16_le(11_025, &mut decoded).expect("the MP3 decodes");
+	assert!(read > 8_000, "the MP3 decoded {read} frames of an eleven-thousand-frame track");
+
+	// A RATE THE FORMAT CANNOT CARRY IS REFUSED, and nothing is written. Resampling to whatever the
+	// encoder could manage would be changing the audio without being asked.
+	let refused = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/RATE.MP3", &mut system, &mut media);
+	assert_eq!(refused, b"audioconv: the output format does not support that option or sample rate\n");
+	assert_eq!(system.open(b"vol://system/RATE.MP3", 0xaad15), None, "a refused rate still created its destination");
 }
 
 tagged_test!(audiorec_records_a_capture_stream_and_never_publishes_a_failed_one, [Audio, AudioService, Service, Storage, Process, Filesystem], id = "kernel.applications.audiorec_records_a_capture_stream_and_never_publishes_a_failed_one", covers = ["audiorec", "bin.audiorec", "pcm", "storage", "wav"]);
@@ -630,11 +649,6 @@ fn audioconv_converts_across_volumes_and_never_writes_a_failed_conversion() {
 	assert!(line.starts_with(b"audioconv: WAV 8000Hz/1ch/2000fr -> WavPack 8000Hz/1ch/2000fr duration=250ms bytes="), "unexpected report: {}", alloc::string::String::from_utf8_lossy(&line));
 	let written = system.open(b"vol://system/CROSS.WV", 0xaad16).expect("the cross-volume WavPack opens");
 	assert_eq!(decode_wavpack_samples(&written), samples, "the WavPack conversion was not lossless");
-
-	// A format nothing writes yet says so in those words, and does not create the destination.
-	let unwritten = run_volume_tool(audioconv_elf, b"vol://media/SOURCE.WAV vol://system/CROSS.MP3", &mut system, &mut media);
-	assert_eq!(unwritten, b"audioconv: writing that format is not implemented yet\n");
-	assert_eq!(system.open(b"vol://system/CROSS.MP3", 0xaad13), None, "a refused profile still created its destination");
 
 	// Not audio at all, and a destination whose suffix names nothing.
 	let junk = run_volume_tool(audioconv_elf, b"vol://media/JUNK.BIN vol://system/JUNK.FLAC", &mut system, &mut media);
