@@ -655,8 +655,3 @@ pub unsafe fn copy_to_user_page(dst: u64, bytes: &[u8]) {
 		asm!("fence.i", options(nostack, preserves_flags));
 	});
 }
-
-// The boot identity map (root[2]) is only used during the hand-off; the kernel runs
-// from the high half, so it can be dropped once the port matures. No-op for now (it
-// does not collide with any user or kernel VA the kernel later touches).
-pub fn remove_bootstrap_identity() {}

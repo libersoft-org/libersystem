@@ -10,12 +10,12 @@
 // entry and drives the whole bring-up itself (memory, paging, per-CPU, SMP, scheduler,
 // then the userspace boot chain to the shell).
 //
-// Because of that self-driven entry, the portable `arch::*` init contract below
-// (`init`, `init_interrupts`, `init_syscalls`, `init_tsc`, `init_bsp_percpu`,
-// `init_ap`) - the hooks the bootloader-handoff `kmain` calls on x86_64 - is never
-// reached on this arch. Those functions remain `todo!()` on purpose: they exist only so
-// the shared crate root type-checks for `riscv64gc-unknown-none-elf`; the equivalent
-// work happens inline in `boot::riscv64_main`.
+// Because of that self-driven entry, the x86 bootloader hand-off (`init`, `init_interrupts`,
+// `init_syscalls`, `init_tsc`, `init_bsp_percpu`, `init_ap` and the shims around them) is not part
+// of this backend at all: it compiles for x86_64 alone, and the equivalent work happens inline in
+// `boot::riscv64_main`. Those symbols used to be defined here as `todo!()` bodies so the shared
+// crate root would type-check - unreachable, and indistinguishable from an unfinished port to
+// anything that reads source rather than call graphs.
 
 pub mod boot;
 pub mod dtb;
@@ -30,31 +30,6 @@ pub fn halt_loop() -> ! {
 			core::arch::asm!("wfi", options(nomem, nostack, preserves_flags));
 		}
 	}
-}
-
-// install the trap vector and enable memory-protection features
-pub fn init() {
-	todo!("riscv64: STVEC + page-protection bits")
-}
-
-pub fn init_interrupts() {
-	todo!("riscv64: PLIC + CLINT / SBI timer")
-}
-
-pub fn init_syscalls() {
-	todo!("riscv64: ECALL vector wiring")
-}
-
-pub fn init_tsc() {
-	todo!("riscv64: timebase-frequency")
-}
-
-pub fn init_bsp_percpu(_hartid: u32) {
-	todo!("riscv64: tp register for the boot hart")
-}
-
-pub fn init_ap(_cpu_id: usize, _hartid: u32) {
-	todo!("riscv64: secondary-hart bring-up")
 }
 
 // enable maskable interrupts on the current hart (set SSTATUS.SIE, bit 1)
@@ -260,10 +235,6 @@ pub mod apic {
 		sbi_set_timer(super::tsc::now() + interval);
 	}
 
-	pub fn local_id() -> u32 {
-		BOOT_HART.load(Ordering::Relaxed) as u32
-	}
-
 	pub fn send_wake_ipi(dest: u32) {
 		// SBI IPI extension (EID 0x735049 "sPI", FID 0): raise a supervisor software
 		// interrupt on the target hart so it leaves wfi and re-checks the run queue.
@@ -279,8 +250,6 @@ pub mod apic {
 			);
 		}
 	}
-	pub fn send_init(_dest: u32) {}
-	pub fn send_startup(_dest: u32, _vector: u8) {}
 
 	// See the x86_64 note: a test build adds a harness-controlled skew so a deadline is reachable.
 	pub fn ticks() -> u64 {
@@ -364,14 +333,6 @@ pub mod tsc {
 	}
 }
 
-// ------------------------------------------------------------------ ioapic
-pub mod ioapic {
-	#[cfg(not(test))]
-	pub fn route(_gsi: u32, _vector: u8, _dest: u32) {
-		todo!("riscv64 PLIC routing")
-	}
-}
-
 // --------------------------------------------------------------------- rtc
 pub mod rtc {
 	// QEMU virt exposes a Goldfish RTC (device tree "rtc@101000"): TIME_LOW then
@@ -425,20 +386,7 @@ pub mod random {
 // (riscv64 wakes secondary harts via the SBI HSM `hart_start` call, not a
 // real-mode trampoline; these keep the portable names so smp.rs links until
 // the real wake path replaces them.)
-pub mod apboot {
-	// No 32-bit CR3 load on this port, so no root is out of reach; the portable name exists
-	// because the SMP path asks before it installs anything (KERN-ARCH-010).
-	pub fn cr3_is_reachable(_root: u64) -> bool {
-		true
-	}
-	#[must_use]
-	pub unsafe fn install(_dst: *mut u8, _satp: u64, _entry: u64) -> bool {
-		todo!("riscv64 SBI HSM wake")
-	}
-	pub unsafe fn set_stack(_dst: *mut u8, _stack_top: u64) {
-		todo!("riscv64 SBI HSM wake")
-	}
-}
+pub mod apboot {}
 
 // ----------------------------------------------------------------- syscall
 pub mod syscall {

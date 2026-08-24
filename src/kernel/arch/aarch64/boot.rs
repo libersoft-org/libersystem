@@ -477,6 +477,13 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	crate::mem::frame::init(&regions[..region_count]);
 	crate::serial_println!("aarch64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
 	crate::mem::heap::init();
+	// THE SAME PORTABLE STEP riscv64 TAKES, and aarch64 was the one port that skipped it. The body
+	// it reaches is empty here - the kernel runs from the low half on the boot identity map, so the
+	// top-level entry a kernel window needs is already present - but the step belongs to the layout
+	// rather than to the architecture, and a port that does not take it is a port whose absence of a
+	// call is doing the work of a comment.
+	crate::mem::heap::reserve_window();
+	crate::syscall::reserve_kernel_vmap();
 	crate::mem::frame::upgrade_to_heap();
 	// Retain the boot memory map now the heap is up, so SYS_MEMMAP_GET (lsmem) can
 	// report the physical layout - the x86 loader path retains it inside mem::init.
@@ -614,6 +621,10 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// use - the aarch64 arch backend (context switch, per-CPU, read/write_cr3, timer)
 	// satisfies its whole contract.
 	crate::smp::set_cpu_count(cpu_count as usize);
+	// Said out loud here, from the portable counter every port increments as a core reports in.
+	// x86_64 prints the same line from its own prologue; a port that wakes cores and never says how
+	// many answered is one whose secondary bring-up can regress in silence.
+	crate::serial_println!("aarch64: {} of {} cores online", crate::smp::online_count(), crate::smp::cpu_count());
 	crate::sched::allocate(cpu_count as usize);
 
 	// Under `cargo test`, give the kernel address space a fresh, empty low (TTBR0) half
@@ -786,5 +797,5 @@ fn run_system_manager() {
 	// at a prompt that would never appear, and one lost afterwards left an ownerless control plane
 	// nothing watched. Four hundred rounds is the budget this machine needs; the rest is policy and
 	// lives in one place.
-	crate::boot_userspace("aarch64", 400);
+	crate::boot_userspace(crate::arch::NAME, 400);
 }

@@ -13,6 +13,11 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # argument, which is exactly the shape that became six recipe names.
 declare -A GATES=(
 	["development-gate"]="tools/check-development-gate.sh"
+	# P02M0151's gate: every symbol in an architecture's compiled contract is a path that
+	# architecture can execute. Twenty `todo!()` bodies used to answer the x86 loader hand-off on the
+	# two ports that never arrive through it, and nothing but a paragraph of prose separated "dormant
+	# by construction" from "unfinished".
+	["arch-surface"]="tools/check-arch-surface.sh"
 	# The other configuration of the same source, compiled. `development-gate` above checks which
 	# artifacts a configuration STAGES; it never builds the one it is guarding, and the profile it
 	# guards stopped compiling twice in one release without anything noticing.

@@ -25,12 +25,6 @@ use crate::object::interrupt::Interrupt;
 
 // The device-IRQ vector window base (mirrors the contract; only the MSI window is
 // live on aarch64).
-#[cfg(not(test))]
-pub const IRQ_BASE: u8 = 32;
-
-#[cfg(not(test))]
-pub type HandlerFn = fn(u32);
-
 // The GICv2m frame on QEMU's `virt` machine (gic-version=2), fixed just above the GIC
 // CPU interface at 0x0801_0000. Its MSI_TYPER reports the SPI range the frame owns; a
 // device writes an SPI number to MSI_SETSPI_NS to raise it.
@@ -211,10 +205,6 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 pub fn irq_info_len() -> usize {
 	1 + MSI_LEN.load(Ordering::Relaxed)
 }
-
-// No kernel-side INTx handlers on aarch64 (the timer is handled in gic::handle_irq).
-#[cfg(not(test))]
-pub fn register(_vector: u32, _handler: HandlerFn) {}
 
 // Read the GICv2m frame's MSI SPI range (base SPI + count) so acquire_msi/dispatch can
 // map slots to SPI INTIDs. Called once, after the GIC is up.

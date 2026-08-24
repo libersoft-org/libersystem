@@ -53,9 +53,6 @@ pub fn read_byte() -> Option<u8> {
 
 // The interrupt / async-TX surface (used by the portable console path); these
 // become real once the GIC is up. Polled transmit needs none of them.
-#[cfg(not(test))]
-pub fn enable_rx_irq() {}
-
 pub fn enable_async() {}
 
 pub fn drain_tx() {}

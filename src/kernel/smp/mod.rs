@@ -11,12 +11,19 @@
 
 use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 
+#[cfg(target_arch = "x86_64")]
 use alloc::boxed::Box;
+#[cfg(target_arch = "x86_64")]
 use alloc::vec;
 use alloc::vec::Vec;
+// The MADT walk that reads it is x86_64's, so the type is too.
+#[cfg(target_arch = "x86_64")]
 use bootproto::BootInfo;
 
+#[cfg(target_arch = "x86_64")]
 use crate::arch;
+// The ACPI table walk that reads through it is x86_64's.
+#[cfg(target_arch = "x86_64")]
 use crate::mem;
 
 // Total cores we manage (BSP + woken APs).
@@ -47,15 +54,22 @@ static LAPIC_IDS: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
 // invitation it is answering: a core whose invitation has been superseded loses the CAS
 // and parks instead of joining, which is the outcome that costs a core rather than the
 // machine.
+// The published identity belongs to the x86 trampoline wake: a core started by PSCI or SBI HSM is
+// given its id by the call that started it, so it has nothing to claim.
+#[cfg(target_arch = "x86_64")]
 static AP_CPU_ID: AtomicUsize = AtomicUsize::new(0);
+#[cfg(target_arch = "x86_64")]
 static AP_LAPIC_ID: AtomicU32 = AtomicU32::new(0);
 // Even and stable, odd while the two slots above are being rewritten.
+#[cfg(target_arch = "x86_64")]
 static AP_SEQ: AtomicUsize = AtomicUsize::new(0);
 // The generation an arriving AP may claim, or 0 for "nothing is open".
+#[cfg(target_arch = "x86_64")]
 static AP_INVITE: AtomicUsize = AtomicUsize::new(0);
 
 // Each application processor's kernel stack in 16-byte words (64 KiB), 16-aligned
 // (a Box<[u128]>) so the trampoline's `call` into Rust lands ABI-aligned.
+#[cfg(target_arch = "x86_64")]
 const AP_STACK_WORDS: usize = 4096;
 
 // Number of cores brought under kernel management.
@@ -123,6 +137,15 @@ pub fn set_lapic_id(cpu: usize, id: u32) {
 
 // Wake every application processor and wait for all cores to report in. Runs on
 // the BSP after memory and interrupts are up.
+//
+// THE x86 WAKE SEQUENCE, and only that. It reads the ACPI MADT for local APIC ids and drives
+// INIT-SIPI-SIPI through the real-mode trampoline the loader reserved a page for. The other two
+// ports do not have any of those things: aarch64 asks PSCI to start a core at an address and
+// riscv64 asks SBI HSM, both from their own prologue, and both then call the portable bookkeeping
+// below - `set_cpu_count`, `report`, `mark_online`. Compiling this function for them made
+// `send_init`, `send_startup` and the trampoline into symbols they had to define and could never
+// run.
+#[cfg(target_arch = "x86_64")]
 pub fn init(boot_info: &BootInfo) {
 	let bsp_lapic_id = arch::apic::local_id();
 
@@ -227,6 +250,10 @@ pub fn init(boot_info: &BootInfo) {
 // directly: a discovered total of one is nothing to do, a trampoline of zero is the loader
 // reporting it reserved no low page, and a root above 4 GB is one the 32-bit CR3 load in the
 // trampoline would truncate (KERN-ARCH-009, KERN-ARCH-010).
+// The reasons the x86 trampoline wake will not be attempted. It reads a low real-mode page and a
+// 32-bit-reachable CR3, neither of which exists on a port whose firmware starts a core at an
+// address for it.
+#[cfg(target_arch = "x86_64")]
 fn ap_boot_refusal(total: usize, trampoline: u64, cr3: u64) -> Option<&'static str> {
 	if total <= 1 {
 		return Some("the firmware reports a single core");
@@ -244,6 +271,11 @@ fn ap_boot_refusal(total: usize, trampoline: u64, cr3: u64) -> Option<&'static s
 // mode on the shared page tables and its own stack. It reads the id the BSP
 // published, runs its per-CPU init, reports in, then parks in the scheduler idle
 // loop so threads can be scheduled onto it.
+//
+// THE TRAMPOLINE IS x86's, so this is too. A core woken by PSCI or SBI HSM starts at an address its
+// own prologue chose, in that port's own entry, and reaches the portable bookkeeping - `report`,
+// `mark_online` - from there.
+#[cfg(target_arch = "x86_64")]
 extern "C" fn ap_entry() -> ! {
 	// Read the identity and the generation it belongs to together, then claim that exact
 	// generation. Losing the claim means this core's invitation was withdrawn or taken -
@@ -267,6 +299,8 @@ extern "C" fn ap_entry() -> ! {
 // mid-write, and a sequence that changed across the read means the snapshot is torn. The
 // claim then ties that snapshot to the invitation - if the BSP has moved on, `AP_INVITE`
 // no longer names this generation and the exchange fails.
+// Reading the seqlock the x86 wake publishes, and claiming the invitation it belongs to.
+#[cfg(target_arch = "x86_64")]
 fn claim_identity() -> Option<(usize, u32)> {
 	for _ in 0..1_000_000 {
 		let before = AP_SEQ.load(Ordering::SeqCst);
@@ -286,6 +320,7 @@ fn claim_identity() -> Option<(usize, u32)> {
 
 // Spin until at least `target` cores are online or `spin_us` microseconds elapse.
 // Returns whether the target was reached.
+#[cfg(target_arch = "x86_64")]
 fn wait_online(target: usize, spin_us: u64) -> bool {
 	let hz = arch::tsc::hz();
 	let deadline = arch::tsc::now().wrapping_add(hz / 1_000_000 * spin_us);
@@ -299,6 +334,7 @@ fn wait_online(target: usize, spin_us: u64) -> bool {
 }
 
 // Busy-wait `us` microseconds against the calibrated TSC (up before SMP bring-up).
+#[cfg(target_arch = "x86_64")]
 fn udelay(us: u64) {
 	let hz = arch::tsc::hz();
 	let cycles = hz / 1_000_000 * us;
@@ -310,6 +346,7 @@ fn udelay(us: u64) {
 
 // Allocate one application processor's kernel stack (16-aligned, leaked for the
 // lifetime of the system) and return its top.
+#[cfg(target_arch = "x86_64")]
 fn alloc_ap_stack() -> u64 {
 	// ALLOC-OK: boot, an AP's stack, allocated before that core starts
 	let stack: Box<[u128]> = vec![0u128; AP_STACK_WORDS].into_boxed_slice();
@@ -320,6 +357,9 @@ fn alloc_ap_stack() -> u64 {
 // Enumerate the enabled processors' LAPIC ids from the ACPI MADT, reachable via
 // the RSDP the loader passed (0 if the firmware exposed none). All ACPI tables are
 // read through the HHDM. Returns an empty vec if there is no RSDP or no MADT.
+// The ACPI MADT walk, which is how x86_64 learns its local APIC ids. The device-tree ports read
+// their CPU nodes in their own prologue.
+#[cfg(target_arch = "x86_64")]
 fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 	let mut out = Vec::new();
 	if rsdp_phys == 0 {
@@ -389,6 +429,7 @@ fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 //
 // This does not make firmware trustworthy; it makes a corrupt table fail as a corrupt
 // table rather than as a wild read.
+#[cfg(target_arch = "x86_64")]
 fn table_ok(hhdm: u64, phys: u64) -> bool {
 	let Some(len) = table_length(hhdm, phys) else {
 		return false;
@@ -421,6 +462,7 @@ fn table_ok(hhdm: u64, phys: u64) -> bool {
 // checksum that was meant to be the gate came second and the wild read came first. `table_ok`
 // existed because this code had already decided not to take the firmware's word; the gap was an
 // inconsistency rather than a policy.
+#[cfg(target_arch = "x86_64")]
 fn table_signature(hhdm: u64, phys: u64) -> Option<[u8; 4]> {
 	if !mem::within_direct_map(phys, 36) {
 		return None;
@@ -430,6 +472,7 @@ fn table_signature(hhdm: u64, phys: u64) -> Option<[u8; 4]> {
 }
 
 // The `length` field (offset 4) of the ACPI table header at physical `phys`.
+#[cfg(target_arch = "x86_64")]
 fn table_length(hhdm: u64, phys: u64) -> Option<u32> {
 	if !mem::within_direct_map(phys, 36) {
 		return None;
@@ -439,6 +482,7 @@ fn table_length(hhdm: u64, phys: u64) -> Option<u32> {
 
 // Scan an RSDT/XSDT (entry pointers are `ptr_size` bytes each, after the 36-byte
 // header) for the MADT (signature "APIC"), returning its physical address.
+#[cfg(target_arch = "x86_64")]
 fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize) -> Option<u64> {
 	if sdt_phys == 0 {
 		return None;
@@ -467,6 +511,7 @@ fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize) -> Option<u64> {
 // Walk the MADT's interrupt-controller structures, collecting the LAPIC id of each
 // enabled Processor Local APIC (type 0, flags bit 0). Entries start at offset 44
 // (36-byte header + 4-byte local APIC address + 4-byte flags).
+#[cfg(target_arch = "x86_64")]
 fn parse_madt(hhdm: u64, madt_phys: u64, out: &mut Vec<u32>) {
 	// `table_ok` has passed for this table, so the length is readable and the table is inside the
 	// direct map for the whole of it.
@@ -501,6 +546,9 @@ fn parse_madt(hhdm: u64, madt_phys: u64, out: &mut Vec<u32>) {
 	}
 }
 
+// The x86 topology publication: an AP records the id it was woken with. The device-tree ports
+// publish their own per-CPU identity in their prologue and only count themselves online here.
+#[cfg(target_arch = "x86_64")]
 fn report(cpu_id: usize, lapic_id: u32) {
 	let base = LAPIC_IDS.load(Ordering::Acquire);
 	unsafe { (*base.add(cpu_id)).store(lapic_id, Ordering::Relaxed) };

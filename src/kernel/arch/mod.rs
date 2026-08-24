@@ -33,16 +33,21 @@
 //       syscall:    invoke (cfg(test))            usermode: enter, exit_to_kernel
 //       rtc:        read_unix                     random:   fill
 //
-// (2) WHAT ONLY THE x86_64 BOOTLOADER HAND-OFF CALLS, answered by `todo!()` on the other two.
+// (2) WHAT ONLY THE x86_64 BOOTLOADER HAND-OFF CALLS, AND ONLY x86_64 COMPILES.
 //     `main::kmain` is the UEFI-loader entry and only x86_64 arrives through it; aarch64 enters at
 //     `aarch64::boot::aarch64_main` and riscv64 at `riscv64::boot::riscv64_main`, and each brings up
 //     its console, page tables, per-CPU register, interrupt controller, timer, syscall vector and
 //     secondary cores INLINE. A fourth architecture writes its own `boot.rs` and owes NONE of these:
 //       top-level:  init, init_interrupts, init_syscalls, init_tsc, init_bsp_percpu, init_ap
-//       apic:       send_init, send_startup       apboot: trampoline_len, install, set_stack
+//       apic:       send_init, send_startup       apboot: cr3_is_reachable, install, set_stack
 //       ioapic:     route, init, mask             syscall: init
-//     `ioapic` is the x86 I/O APIC by name and by concept; the other two route interrupts through
-//     their own controllers and their shims exist for the same reason the six `init_*` do.
+//       interrupts: IRQ_BASE, HandlerFn, register (the x86 INTx registry; the other two are MSI)
+//     THESE ARE NOT ENTRIES ON THE OTHER TWO BACKENDS AT ALL. They used to be, answered by twenty
+//     `todo!()` bodies nothing could reach - and a body like that is indistinguishable, to a reader
+//     and to a static scan, from an unfinished port. P02M0151 removed the requirement rather than the
+//     symptom: `kmain`, the ACPI MADT walk, the INIT-SIPI-SIPI wake, the real-mode trampoline and
+//     everything reached only from them are `#[cfg(target_arch = "x86_64")]`, so a port that does not
+//     arrive that way defines none of it. `tools/check-arch-surface.sh` keeps it that way.
 //
 // (3) WHAT ONLY x86_64 HAS AT ALL, because the protection exists there and not elsewhere:
 //       paging:     enable_nx, enable_smap_smep, nx_enabled, smap_enabled, smep_enabled

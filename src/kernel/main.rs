@@ -160,6 +160,15 @@ pub fn _print_byte(byte: u8) {
 }
 
 // kernel entry point (ELF entry, see ENTRY(kmain) in the linker script)
+//
+// x86_64 ONLY, AND SAID SO IN THE TYPE-CHECKED TREE. This is the UEFI loader hand-off: the loader
+// builds page tables and a `BootInfo` and jumps here. The other two ports enter their own prologue -
+// `aarch64::boot::aarch64_main`, `riscv64::boot::riscv64_main` - and bring up their console, page
+// tables, per-CPU register, interrupt controller, timer, syscall vector and secondary cores there.
+// While this function compiled everywhere, every step it calls was a symbol the other backends had
+// to define, and they defined them as `todo!()` bodies nothing could reach. A reader - and a static
+// scan - could only read that as an unfinished port.
+#[cfg(target_arch = "x86_64")]
 #[unsafe(no_mangle)]
 unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	arch::serial::init();
@@ -204,6 +213,9 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 
 // Bring up physical frames, paging and the kernel heap from the loader's boot
 // info. Runs before the test/boot split so `alloc` is available in tests.
+// Reached from `kmain` alone: the other two prologues carve their own memory from the device tree
+// before they have a `BootInfo` to read.
+#[cfg(target_arch = "x86_64")]
 fn init_memory() {
 	let bi = boot_info();
 	let regions = unsafe { core::slice::from_raw_parts(bi.memmap as *const bootproto::MemRegion, bi.memmap_len as usize) };
@@ -215,6 +227,7 @@ fn init_memory() {
 // the bootloader provided no framebuffer. Runs before the test/boot split so the
 // console is up for both paths; it allocates its grid model (the shared `term`
 // stack), so it must run after init_memory brings up the heap.
+#[cfg(target_arch = "x86_64")]
 fn init_framebuffer() {
 	let bi = boot_info();
 	if bi.fb_present == 0 {
@@ -239,13 +252,20 @@ pub fn framebuffer_geometry() -> Option<(u64, abi::Framebuffer)> {
 
 // Wake the application processors and wait for every core to report in. Runs
 // before the test/boot split so SMP is up for both paths.
+//
+// The x86 wake sequence, so x86_64 only: it enumerates local APICs from the ACPI MADT and drives
+// INIT-SIPI-SIPI through a real-mode trampoline. aarch64 wakes its secondaries with PSCI `CPU_ON`
+// and riscv64 with SBI HSM `hart_start`, each from its own prologue.
+#[cfg(target_arch = "x86_64")]
 fn init_smp() {
 	smp::init(boot_info());
 	#[cfg(all(test, target_arch = "x86_64"))]
 	serial_println!("smp: {} of {} cores online", smp::online_count(), smp::cpu_count());
 }
 
-#[cfg(not(test))]
+// x86_64's own boot tail: it calls the portable `boot_userspace` that the other two prologues call
+// directly. See `arch/mod.rs` for which half of the boot is shared and which is each port's own.
+#[cfg(all(not(test), target_arch = "x86_64"))]
 fn boot_main() {
 	serial_println!("arch: {}", arch::NAME);
 	// Said at BOOT, once, where an operator will see it - not left for whoever eventually derives a
@@ -699,6 +719,7 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, settle_roun
 // prompt nudge). Runs on the BSP (the UART's legacy IRQ is routed there); the
 // channel send inside feed() wakes the shell's waiter on this same core.
 #[cfg(not(test))]
+#[cfg(target_arch = "x86_64")]
 fn serial_rx_interrupt(_vector: u32) {
 	while let Some(byte) = arch::serial::read_byte() {
 		console_input::feed_serial(byte);

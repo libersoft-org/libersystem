@@ -162,6 +162,10 @@ fn boot_archive() -> &'static [u8] {
 #[unsafe(no_mangle)]
 extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	super::serial::init();
+	// The same first line every port prints, from the same constant: which product this kernel is.
+	// x86_64 prints it from `kmain`, aarch64 from its own prologue, and riscv64 was the one that
+	// did not - so the product name was a string only two of the three boots ever showed.
+	crate::serial_println!("{} kernel is starting ...", crate::product::NAME);
 	crate::serial_println!("riscv64: hello from the kernel (higher half)");
 	// The entry argument is either a raw DTB pointer (OpenSBI `-kernel`) or a
 	// `bootproto::BootInfo` pointer (the UEFI loader); tell them apart by the BootInfo
@@ -442,6 +446,10 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// hart can record itself in it; this one is what the scheduler, the IPI paths and the shootdown
 	// read from here on, and it counts only harts that reported in.
 	let cpu_count = super::smp::bring_up_secondaries(&cpu_ids[..cpu_count as usize], hartid) as u32;
+	// From the portable counter every port increments as a hart reports in - the same line x86_64
+	// and aarch64 print. A port that wakes cores and never says how many answered is one whose
+	// secondary bring-up can regress in silence.
+	crate::serial_println!("riscv64: {} of {} harts online", crate::smp::online_count(), cpu_count);
 	crate::smp::set_cpu_count(cpu_count as usize);
 
 	// W^X ACROSS THE DIRECT MAP, once every hart that needs the identity window has used it
@@ -605,5 +613,5 @@ fn run_system_manager() {
 	// THE SHARED BOOT TAIL - see the note in the aarch64 port. Four thousand rounds because this
 	// machine settles an order of magnitude more slowly under TCG than the other two, which is a
 	// number this caller passes rather than a reason for a third copy of the policy.
-	crate::boot_userspace("riscv64", 4000);
+	crate::boot_userspace(crate::arch::NAME, 4000);
 }

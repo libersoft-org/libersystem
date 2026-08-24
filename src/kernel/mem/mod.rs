@@ -46,6 +46,10 @@ static DIRECT_MAP_MAPPED: AtomicU64 = AtomicU64::new(0);
 // an address ACPI or a device tree handed over, and those were dereferenced on the strength of a
 // signature match. A pointer past the end of the HHDM is a wild read in early boot, before there is
 // a fault handler worth the name - and refusing it costs one comparison.
+// Asked by the x86 SMP path of a firmware table pointer before it reads one, and by its own tests.
+// The device-tree ports validate their controller ranges in their prologue, against the ceiling the
+// prologue itself published - see the note in `arch/mod.rs` about which half of the boot is shared.
+#[cfg(any(target_arch = "x86_64", test))]
 pub fn within_direct_map(phys: u64, len: u64) -> bool {
 	let limit = DIRECT_MAP_LIMIT.load(Ordering::Relaxed);
 	if phys == 0 || limit == 0 {
@@ -136,6 +140,9 @@ pub fn memmap_get(index: usize) -> Option<abi::MemmapRegion> {
 // The loader already hands the kernel these stable codes (bootproto MEM_* mirror
 // abi MEMMAP_*), so the memory map is retained verbatim - no translation here.
 
+// THE LOADER'S HAND-OFF, so x86_64's. aarch64 and riscv64 build their region list from the device
+// tree in their own prologue and call `frame::init` with it directly.
+#[cfg(target_arch = "x86_64")]
 pub fn init(regions: &[MemRegion], hhdm: u64) {
 	HHDM_OFFSET.store(hhdm, Ordering::Relaxed);
 	frame::init(regions);

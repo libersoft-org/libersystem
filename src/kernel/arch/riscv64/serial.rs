@@ -39,9 +39,6 @@ fn reg(off: u64) -> *mut u8 {
 // firmware. Divisor and line-control setup belongs with a machine that boots the kernel cold.
 pub fn init() {}
 
-#[cfg(not(test))]
-pub fn enable_rx_irq() {}
-
 pub fn enable_async() {}
 
 pub fn drain_tx() {}

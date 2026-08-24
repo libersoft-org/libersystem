@@ -888,6 +888,8 @@ pub fn free_count() -> usize {
 // So: counted always, not only under test, because a number nobody can read in production is not a
 // measurement. This is the cheap half of P02M0120 and the thing that says whether the buddy allocator
 // below it actually fixed anything - measure first, and be willing to record that it did not pay.
+// Printed by x86_64's halt path, which is the one boot tail that reaches an end and reports.
+#[cfg(any(target_arch = "x86_64", test))]
 pub fn refused_frees() -> u64 {
 	REFUSED_FREES.load(core::sync::atomic::Ordering::Acquire)
 }

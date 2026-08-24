@@ -8,16 +8,15 @@
 // in `gic`/`apic`/`interrupts`, PSCI SMP wake in `psci`/`smp`, the SVC syscall path in `syscall`,
 // TPIDR_EL1 per-CPU in `percpu`, the PL011 UART in `serial`, and device-tree parsing in `dtb`.
 //
-// What IS still `todo!()` is the portable init contract listed in `arch/mod.rs`: `init`,
-// `init_interrupts`, `init_syscalls`, `init_tsc`, `init_bsp_percpu` and `init_ap`, plus the shims
-// the x86 bring-up reaches them through. Seventeen stubs, and none of them is on a path this target
-// takes. aarch64 boots from firmware straight into `boot::aarch64_main`, which is the EL1 entry and
-// drives the whole bring-up itself - console, memory, paging, per-CPU, GIC, timer, SMP, scheduler,
-// then the userspace boot chain - so it never enters the bootloader-handoff `main::kmain` that
-// calls those hooks. They exist so the shared crate root type-checks for `aarch64-unknown-none`.
+// WHAT THIS BACKEND DOES NOT DEFINE, and no longer has to. `init`, `init_interrupts`,
+// `init_syscalls`, `init_tsc`, `init_bsp_percpu`, `init_ap` and the shims around them are the x86
+// bootloader hand-off, and they are compiled for x86_64 alone. aarch64 boots from firmware straight
+// into `boot::aarch64_main`, the EL1 entry, which drives the whole bring-up itself - console,
+// memory, paging, per-CPU, GIC, timer, SMP, scheduler, then the userspace boot chain.
 //
-// The consequence, which `arch/mod.rs` states once for both device-tree targets: the HAL contract
-// is satisfied for everything after boot and bypassed for boot itself.
+// They used to be defined here as `todo!()` bodies so the shared crate root would type-check.
+// Seventeen of them, none reachable - and a reader, or a static scan, could only read that as an
+// unfinished interrupt and timer port. `tools/check-arch-surface.sh` now refuses their return.
 
 mod boot;
 mod dtb;
@@ -35,22 +34,6 @@ pub fn halt_loop() -> ! {
 			core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
 		}
 	}
-}
-
-pub fn init_interrupts() {
-	todo!("aarch64: GIC + generic timer")
-}
-
-pub fn init_syscalls() {
-	todo!("aarch64: SVC vector wiring")
-}
-
-pub fn init_tsc() {
-	todo!("aarch64: generic-timer frequency")
-}
-
-pub fn init_bsp_percpu(_mpidr: u32) {
-	todo!("aarch64: TPIDR_EL1 for the boot core")
 }
 
 // enable maskable interrupts on the current core (clear DAIF.I)
@@ -191,38 +174,15 @@ pub mod percpu;
 // -------------------------------------------------------------- interrupts
 pub mod interrupts;
 
-// install the CPU exception vectors and enable memory-protection features
-pub fn init() {
-	todo!("aarch64: VBAR_EL1 + MMU protection bits")
-}
-
-pub fn init_ap(_cpu_id: usize, _mpidr: u32) {
-	todo!("aarch64: secondary-core bring-up")
-}
-
 // -------------------------------------------------------------------- apic
 // (the aarch64 interrupt controller is the GIC; the module keeps the portable
 // `apic` name for the contract until the ports rename it.)
 pub mod apic {
-	pub fn local_id() -> u32 {
-		// The running core's MPIDR affinity (Aff0 identifies the core on virt).
-		let mpidr: u64;
-		unsafe {
-			core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
-		}
-		(mpidr & 0xff_ffff) as u32
-	}
 	pub fn send_wake_ipi(dest: u32) {
 		// Bounce a halted core out of WFI so its idle loop re-checks its run queue: send
 		// it SGI 0 (the wake IPI). The delivery is the whole message; gic::handle_irq EOIs
 		// it and the core's idle loop picks up the enqueued work.
 		super::gic::send_sgi(dest, 0);
-	}
-	pub fn send_init(_dest: u32) {
-		todo!("aarch64 PSCI wake")
-	}
-	pub fn send_startup(_dest: u32, _vector: u8) {
-		todo!("aarch64 PSCI wake")
 	}
 	// See the x86_64 note: a test build adds a harness-controlled skew so a deadline is reachable.
 	pub fn ticks() -> u64 {
@@ -261,14 +221,6 @@ pub mod tsc {
 	}
 	pub fn cycles_to_ns(cycles: u64) -> u64 {
 		crate::arch::common::time::cycles_to_ns(cycles, hz())
-	}
-}
-
-// ------------------------------------------------------------------ ioapic
-pub mod ioapic {
-	#[cfg(not(test))]
-	pub fn route(_gsi: u32, _vector: u8, _dest: u32) {
-		todo!("aarch64 GIC routing")
 	}
 }
 
@@ -323,20 +275,7 @@ pub mod random {
 // ------------------------------------------------------------------ apboot
 // (aarch64 wakes secondaries via PSCI CPU_ON, not a real-mode trampoline; these
 // keep the portable names so smp.rs links until the real wake path replaces them.)
-pub mod apboot {
-	// No 32-bit CR3 load on this port, so no root is out of reach; the portable name exists
-	// because the SMP path asks before it installs anything (KERN-ARCH-010).
-	pub fn cr3_is_reachable(_root: u64) -> bool {
-		true
-	}
-	#[must_use]
-	pub unsafe fn install(_dst: *mut u8, _ttbr: u64, _entry: u64) -> bool {
-		todo!("aarch64 PSCI wake")
-	}
-	pub unsafe fn set_stack(_dst: *mut u8, _stack_top: u64) {
-		todo!("aarch64 PSCI wake")
-	}
-}
+pub mod apboot {}
 
 // ----------------------------------------------------------------- syscall
 pub mod syscall {

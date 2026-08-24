@@ -585,6 +585,11 @@ pub fn kernel_half_divergence(_root: u64, _reference: u64) -> Option<(usize, u64
 // after a process exists is already visible to it. The callers reserve unconditionally - a
 // window that must exist everywhere is a property of the layout, not of the architecture that
 // happens to need help enforcing it.
+// EMPTY BECAUSE THERE IS NOTHING TO RESERVE HERE, which is not the same as unimplemented. This is
+// part of the PORTABLE surface - `mem::heap` and the syscall mmap window both call it, on every
+// target - and on aarch64 the kernel runs from the low half on the boot identity map, so a
+// top-level entry for a kernel window is already present for the whole address space. The x86_64
+// body pre-populates a PML4 slot so a window created after a process exists is visible to it.
 pub fn reserve_kernel_top_level(_base: u64, _len: u64) {}
 
 pub fn new_address_space() -> Option<u64> {
@@ -638,8 +643,3 @@ unsafe fn free_table_level(phys: u64, level: u32) {
 		dealloc_frame(phys);
 	}
 }
-
-// No bootstrap identity to remove on aarch64: the boot identity map IS the kernel
-// address space (the kernel runs from the low half). This no-op keeps the portable
-// contract until the kernel moves to the high half.
-pub fn remove_bootstrap_identity() {}
