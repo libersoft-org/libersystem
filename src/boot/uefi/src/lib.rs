@@ -30,6 +30,9 @@ pub mod disk;
 pub mod file;
 pub mod gop;
 pub mod memory;
+// The two UEFI variables that say whether firmware Secure Boot is enforcing, and the single
+// Runtime Services entry needed to read them.
+pub mod variables;
 
 #[cfg(test)]
 mod mock;

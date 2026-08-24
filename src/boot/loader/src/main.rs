@@ -114,6 +114,17 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// by a key whose private half is published, and does not say so, is exactly the thing a trust
 	// chain is supposed to make impossible to do by accident.
 	trust::announce();
+	// AND WHAT THE FIRMWARE SAYS ABOUT ITSELF, in the same breath. A loader that verifies a manifest
+	// under firmware that verified nothing is one link of a chain reported as the whole of it - so
+	// the state is printed whether or not it is enforcing, and the gate reads this line.
+	{
+		let state = unsafe { uefi::variables::secure_boot_state(system_table) };
+		arch::serial::write_str("loader: firmware SecureBoot=");
+		write_variable(state.secure_boot);
+		arch::serial::write_str(" SetupMode=");
+		write_variable(state.setup_mode);
+		arch::serial::write_str(if state.enforcing() { " (enforcing)\n" } else { " (NOT enforcing)\n" });
+	}
 	arch::serial::write_str("\nLiberSystem UEFI loader\n");
 	// AFTER the banner, because it is a line about this loader rather than a line from the
 	// firmware, and a diagnostic printed before the program names itself reads as stray output.
@@ -260,7 +271,22 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	}
 
 	impl blockio::ReadsFiles for FirmwareVolume {
-		fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+		// WHAT THIS BACKEND CANNOT TELL YOU, said rather than glossed. `read_file` answers with an
+		// option: the firmware's own status is not carried back, so "not there" and "there and
+		// unreadable" arrive here as the same `None`. Every answer is therefore `Absent`, and the
+		// downgrade `FileRead::Unreadable` exists to catch is one this path cannot catch - which is
+		// a fact about the Simple File System reader rather than a decision taken here, and the one
+		// place a caller might otherwise assume all three backends are equally sharp.
+		fn read_file(&mut self, path: &[u8]) -> blockio::FileRead {
+			match self.read_bytes(path) {
+				Some(bytes) => blockio::FileRead::Bytes(bytes),
+				None => blockio::FileRead::Absent,
+			}
+		}
+	}
+
+	impl FirmwareVolume {
+		fn read_bytes(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 			let mut name = [0u8; 128];
 			if path.len() >= name.len() {
 				return None;
@@ -616,6 +642,16 @@ fn write_hex32(value: u32) {
 // ONE PLACE, because two call sites read it: the kernel, and the system volume image the medium
 // hands the kernel as a module. Reading it twice would be two chances to check different things
 // against different manifests.
+// A variable firmware defines, or the fact that it does not. `absent` is not a zero: firmware
+// without these variables has no Secure Boot at all, which is a different machine from one that has
+// it switched off.
+fn write_variable(value: Option<u8>) {
+	match value {
+		Some(byte) => arch::serial::write_byte(b'0' + (byte % 10)),
+		None => arch::serial::write_str("absent"),
+	}
+}
+
 fn boot_medium_manifest(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) -> Option<bootproto::manifest::Manifest<'static>> {
 	let signed = read_boot_file(bs, root, "etc/boot.manifest2")?;
 	let mut scratch = alloc::vec::Vec::new();

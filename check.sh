@@ -28,6 +28,9 @@ declare -A GATES=(
 	# P02M0150's other gate: the boot that must NOT happen. One successful signed boot proves the
 	# pieces fit; only a refused one proves the check is load-bearing.
 	["signed-boot"]="tools/check-signed-boot.sh"
+	# P02M0150 M5: the firmware verifies the LOADER, or the loader does not run. Preflights its four
+	# host tools by name and skips nothing when one is missing.
+	["secure-boot"]="tools/check-secure-boot.sh"
 	# The other configuration of the same source, compiled. `development-gate` above checks which
 	# artifacts a configuration STAGES; it never builds the one it is guarding, and the profile it
 	# guards stopped compiling twice in one release without anything noticing.

@@ -17,8 +17,8 @@ VARIABLES
     closed,       \* [Procs -> BOOLEAN] - close_all has run
     charge,       \* [Procs -> Nat] - the Domain handle ledger
     booked,       \* [Procs -> Seq(1..Slots)] - concrete slots taken out of circulation
-    xfer,         \* [Procs -> Caps] - the transfer-local capability
-    xferSlot,     \* [Procs -> Nat] - the slot it came from, 0 for none
+    xfer,         \* [Procs -> Seq(Caps)] - the transfer-local batch, in the order it was taken
+    xferSlot,     \* [Procs -> Seq(1..Slots)] - the slots it came from, in the same order
     queue,        \* Seq of messages on the receiving endpoint
     inflight,     \* messages taken and not yet committed - they still hold their queue slot
     held,         \* the receiver's delivery-local message
@@ -43,8 +43,6 @@ TypeOK ==
     /\ table \in [Procs -> [1..Slots -> [state: SlotStates, cap: Caps, gen: 1..MaxGen]]]
     /\ closed \in [Procs -> BOOLEAN]
     /\ charge \in [Procs -> 0..(2 * Slots)]
-    /\ xfer \in [Procs -> Caps]
-    /\ xferSlot \in [Procs -> 0..Slots]
     /\ inflight \in 0..QueueLimit
     /\ committed \in BOOLEAN
     /\ bytes \in 0..QueueLimit
@@ -70,8 +68,8 @@ Init ==
     /\ closed = [p \in Procs |-> FALSE]
     /\ charge = [p \in Procs |-> IF p = Sender THEN 1 ELSE 0]
     /\ booked = [p \in Procs |-> <<>>]
-    /\ xfer = [p \in Procs |-> NoCap]
-    /\ xferSlot = [p \in Procs |-> 0]
+    /\ xfer = [p \in Procs |-> <<>>]
+    /\ xferSlot = [p \in Procs |-> <<>>]
     /\ queue = <<>>
     /\ inflight = 0
     /\ held = NoMsg
@@ -92,11 +90,23 @@ Init ==
 \* The charge does NOT move - the slot is still spoken for.
 Take(p, i) ==
     /\ ~closed[p]
-    /\ xfer[p] = NoCap
+    \* BOUNDED BY THE RESERVATIONS, NOT BY WHAT IS IN HAND. After the message is queued the
+    \* capabilities have left but their slots are still reserved, and a take that started a second
+    \* batch there would leave the two out of step - a capability whose slot nobody is holding. The
+    \* syscall commits before it sends again, and this is that.
+    /\ Len(xferSlot[p]) < BatchMax
+    \* AND ONLY WHILE THE BATCH IS STILL IN HAND. The syscall takes every capability it is going to
+    \* send and then sends them; it never takes another after the message is queued. Allowing that
+    \* would leave a capability in hand whose slot nobody reserved.
+    /\ Len(xfer[p]) = Len(xferSlot[p])
+    \* NOT THE SAME HANDLE TWICE. A caller naming one handle twice in a batch would have this take
+    \* it once and find nothing the second time - which is what `take_for_transfer` emptying the slot
+    \* already guarantees, and this is that guarantee written where the model can check it.
+    /\ \A k \in 1..Len(xferSlot[p]) : xferSlot[p][k] # i
     /\ table[p][i].state = "Live"
     /\ "TRANSFER" \in table[p][i].cap.rights
-    /\ xfer' = [xfer EXCEPT ![p] = table[p][i].cap]
-    /\ xferSlot' = [xferSlot EXCEPT ![p] = i]
+    /\ xfer' = [xfer EXCEPT ![p] = Append(xfer[p], table[p][i].cap)]
+    /\ xferSlot' = [xferSlot EXCEPT ![p] = Append(xferSlot[p], i)]
     /\ table' = [table EXCEPT ![p][i] = [state |-> "Reserved", cap |-> NoCap, gen |-> table[p][i].gen]]
     /\ UNCHANGED <<closed, charge, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
 
@@ -106,55 +116,63 @@ Recycle(p, i) ==
     THEN [state |-> "Retired", cap |-> NoCap, gen |-> MaxGen]
     ELSE [state |-> "Free", cap |-> NoCap, gen |-> table[p][i].gen + 1]
 
-\* `commit_taken`: the handle value dies and the quota is refunded. Only after the message is queued.
+\* `commit_taken`, FOR EVERY SLOT THE BATCH CAME FROM. The handle values die and their quota is
+\* refunded. Only after the message is queued.
 CommitTake(p) ==
-    /\ xferSlot[p] # 0
-    /\ xfer[p] = NoCap          \* the capability has already gone into the queue
-    /\ table' = [table EXCEPT ![p][xferSlot[p]] = Recycle(p, xferSlot[p])]
-    /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
-    /\ xferSlot' = [xferSlot EXCEPT ![p] = 0]
+    /\ Len(xferSlot[p]) > 0
+    /\ Len(xfer[p]) = 0          \* the capabilities have already gone into the queue
+    /\ table' = [table EXCEPT ![p] = [i \in 1..Slots |->
+                   IF \E k \in 1..Len(xferSlot[p]) : xferSlot[p][k] = i THEN Recycle(p, i) ELSE table[p][i]]]
+    /\ charge' = [charge EXCEPT ![p] = charge[p] - Len(xferSlot[p])]
+    /\ xferSlot' = [xferSlot EXCEPT ![p] = <<>>]
     /\ UNCHANGED <<closed, booked, xfer, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
 
-\* `restore_taken`: the send was refused, and the capability goes back to the SAME handle - unless
-\* the table has been closed, in which case there is nobody to give it back to and the charge is
-\* refunded here instead.
+\* `restore_taken`, FOR EVERY CAPABILITY THE SEND WAS CARRYING. All or nothing: a refused send costs
+\* the caller nothing, not even the handles it named - so a batch comes back whole, to the same
+\* slots, still live. Unless the table has been closed, in which case there is nobody to give any of
+\* them back to and each one's charge is refunded here instead.
 RestoreTake(p) ==
-    /\ IsCap(xfer[p])
-    /\ xferSlot[p] # 0
+    /\ Len(xfer[p]) > 0
     /\ IF closed[p]
-       THEN /\ table' = [table EXCEPT ![p][xferSlot[p]] = Recycle(p, xferSlot[p])]
-            /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
-       ELSE /\ table' = [table EXCEPT ![p][xferSlot[p]] =
-                          [state |-> "Live", cap |-> xfer[p], gen |-> table[p][xferSlot[p]].gen]]
+       THEN /\ table' = [table EXCEPT ![p] = [i \in 1..Slots |->
+                           IF \E k \in 1..Len(xferSlot[p]) : xferSlot[p][k] = i THEN Recycle(p, i) ELSE table[p][i]]]
+            /\ charge' = [charge EXCEPT ![p] = charge[p] - Len(xferSlot[p])]
+       ELSE /\ table' = [table EXCEPT ![p] = [i \in 1..Slots |->
+                           IF \E k \in 1..Len(xferSlot[p]) : xferSlot[p][k] = i
+                           THEN [state |-> "Live",
+                                 cap |-> xfer[p][CHOOSE k \in 1..Len(xferSlot[p]) : xferSlot[p][k] = i],
+                                 gen |-> table[p][i].gen]
+                           ELSE table[p][i]]]
             /\ UNCHANGED charge
-    /\ xfer' = [xfer EXCEPT ![p] = NoCap]
-    /\ xferSlot' = [xferSlot EXCEPT ![p] = 0]
+    /\ xfer' = [xfer EXCEPT ![p] = <<>>]
+    /\ xferSlot' = [xferSlot EXCEPT ![p] = <<>>]
     /\ UNCHANGED <<closed, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
 
-\* `abandon_taken`: the transfer can no longer be resolved either way. The capability is GONE and
-\* the slot must not hold its place forever.
+\* `abandon_taken`: the transfer can no longer be resolved either way. The capabilities are GONE and
+\* the slots that were holding their places must not hold them forever.
 AbandonTake(p) ==
-    /\ xferSlot[p] # 0
-    /\ IsCap(xfer[p])
-    /\ table' = [table EXCEPT ![p][xferSlot[p]] = Recycle(p, xferSlot[p])]
-    /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
-    /\ xfer' = [xfer EXCEPT ![p] = NoCap]
-    /\ xferSlot' = [xferSlot EXCEPT ![p] = 0]
+    /\ Len(xferSlot[p]) > 0
+    /\ Len(xfer[p]) > 0
+    /\ table' = [table EXCEPT ![p] = [i \in 1..Slots |->
+                   IF \E k \in 1..Len(xferSlot[p]) : xferSlot[p][k] = i THEN Recycle(p, i) ELSE table[p][i]]]
+    /\ charge' = [charge EXCEPT ![p] = charge[p] - Len(xferSlot[p])]
+    /\ xfer' = [xfer EXCEPT ![p] = <<>>]
+    /\ xferSlot' = [xferSlot EXCEPT ![p] = <<>>]
     /\ UNCHANGED <<closed, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
 
 \* `send_inner`: room in the ring, then the charge, then the message. A refused send charges nothing.
 Enqueue(p) ==
-    /\ IsCap(xfer[p])
+    /\ Len(xfer[p]) > 0
     /\ Depth < QueueLimit
     \* AN EXPLICIT MODEL BOUND, not a property of the kernel: `Message::new` mints identities from a
     \* monotonic counter, which is unbounded and would make the state space infinite. Two is enough
     \* for the property identities exist for - one receiver looking at a message and another taking
     \* it - and the bound is stated here rather than hidden in a type.
     /\ nextId =< MaxId
-    /\ queue' = Append(queue, [id |-> nextId, caps |-> <<xfer[p]>>, slotHeld |-> FALSE])
+    /\ queue' = Append(queue, [id |-> nextId, caps |-> xfer[p], slotHeld |-> FALSE])
     /\ nextId' = nextId + 1
     /\ bytes' = bytes + 1
-    /\ xfer' = [xfer EXCEPT ![p] = NoCap]
+    /\ xfer' = [xfer EXCEPT ![p] = <<>>]
     /\ UNCHANGED <<table, closed, charge, booked, xferSlot, inflight, held, holder, installed, committed, peeked, lastUse, objgen>>
 
 (***************************************************************************)
@@ -400,7 +418,7 @@ Terminate(p) ==
 \* would also stop it reporting a state that IS stuck.
 Done ==
     /\ \A p \in Procs : closed[p]
-    /\ \A p \in Procs : ~IsCap(xfer[p])
+    /\ \A p \in Procs : Len(xfer[p]) = 0
     /\ ~IsMsg(held)
     /\ Len(queue) = 0
     /\ UNCHANGED vars
@@ -425,7 +443,7 @@ Spec == Init /\ [][Next]_vars
 
 \* Every place a capability may be, counted. ONE AUTHORITY, ONE PLACE.
 CopiesInSlots == Cardinality({<<p, i>> \in Procs \X (1..Slots) : HoldsCap(table[p][i])})
-CopiesInXfer == Cardinality({p \in Procs : IsCap(xfer[p])})
+CopiesInXfer == Cardinality({<<p, k>> \in Procs \X (1..BatchMax) : k =< Len(xfer[p])})
 CopiesInQueue == IF Len(queue) = 0 THEN 0 ELSE Len(queue[1].caps)
 CopiesInHeld == IF IsMsg(held) THEN Len(held.caps) ELSE 0
 
@@ -444,7 +462,7 @@ TransferIsLinear == CopiesInSlots + CopiesInXfer + CopiesInQueue + CopiesInHeld 
 AuthorityNeverWidens ==
     /\ \A p \in Procs, i \in 1..Slots :
          HoldsCap(table[p][i]) => table[p][i].cap.rights \subseteq TheCap.rights
-    /\ \A p \in Procs : IsCap(xfer[p]) => xfer[p].rights \subseteq TheCap.rights
+    /\ \A p \in Procs : \A k \in 1..Len(xfer[p]) : xfer[p][k].rights \subseteq TheCap.rights
     /\ (Len(queue) > 0 /\ Len(queue[1].caps) > 0) => queue[1].caps[1].rights \subseteq TheCap.rights
 
 \* NO FORGERY: every capability that exists names the object that was minted, at the generation it
@@ -452,7 +470,7 @@ AuthorityNeverWidens ==
 NoForgery ==
     /\ \A p \in Procs, i \in 1..Slots :
          HoldsCap(table[p][i]) => table[p][i].cap.obj = TheObject /\ table[p][i].cap.objgen = TheCap.objgen
-    /\ \A p \in Procs : IsCap(xfer[p]) => xfer[p].obj = TheObject
+    /\ \A p \in Procs : \A k \in 1..Len(xfer[p]) : xfer[p][k].obj = TheObject
 
 \* QUOTA CONSERVED: the handle ledger equals the slots it represents, at every point of every
 \* transfer - including the ones inside a two-lock operation.
@@ -474,6 +492,21 @@ SlotOwnershipUnique ==
 PostCommitCopyoutIsTerminal ==
     /\ (holder = "none") => (Len(installed) = 0 /\ ~committed)
     /\ committed => IsMsg(held) \/ Len(installed) > 0
+
+\* A FAILED SEND RESTORES THE WHOLE BATCH, OR REACHES A DOCUMENTED TERMINAL OWNER. Stated as the
+\* contract `take_for_transfer` promises: a slot is `Reserved` only while its process is holding the
+\* capability that came out of it. No outstanding batch means no reservation left behind - which is
+\* what "exactly one of commit, restore or abandon follows" means, seen as a state rather than as a
+\* sequence.
+FailedSendRestores ==
+    \A p \in Procs :
+      \* The capabilities may have gone into the queue while their slots are still reserved - that
+      \* is the window between `send` and `commit_taken`, and it is exactly where a termination can
+      \* arrive. What may never happen is the other way round: a capability in hand whose slot is
+      \* not held for it.
+      /\ Len(xfer[p]) =< Len(xferSlot[p])
+      /\ (Len(xferSlot[p]) = 0) => \A i \in 1..Slots : table[p][i].state # "Reserved"
+      /\ \A k \in 1..Len(xferSlot[p]) : table[p][xferSlot[p][k]].state = "Reserved"
 
 \* A CLOSED PROCESS CANNOT RESURRECT: close is a barrier. A rollback into a closed table creates no
 \* live handle, and no booking survives it.

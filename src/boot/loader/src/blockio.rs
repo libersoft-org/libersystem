@@ -58,19 +58,51 @@ impl BlockDevice for ImageDisk {
 // archive writer, where a host can drive it. This crate keeps its own trait because the two
 // filesystems are types it does not own, and the orphan rule does not let it implement somebody
 // else's trait for them.
+// THREE ANSWERS, NOT TWO, AND THE THIRD ONE IS THE POINT. "The file is not here" and "the file is
+// here and I could not read it" are different facts about a medium, and collapsing them is the same
+// defect `Selection` was introduced for one level up: a signed manifest that has been DAMAGED reads
+// as absent, the loader falls back to the text manifest, and an attacker has performed a downgrade
+// by corrupting one file rather than forging anything.
+pub(crate) enum FileRead {
+	Bytes(alloc::vec::Vec<u8>),
+	// The path names nothing on this source.
+	Absent,
+	// Something is there and this loader could not read it.
+	Unreadable,
+}
+
 pub(crate) trait ReadsFiles {
-	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>>;
+	fn read_file(&mut self, path: &[u8]) -> FileRead;
+
+	// For the walk, which treats both failures alike: a program that is missing and one that cannot
+	// be read are both a source that cannot supply its bootstrap set.
+	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+		match self.read_file(path) {
+			FileRead::Bytes(bytes) => Some(bytes),
+			_ => None,
+		}
+	}
 }
 
 impl<D: BlockDevice> ReadsFiles for liberfs::LiberFs<D> {
-	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
-		self.read_file(path).ok()
+	fn read_file(&mut self, path: &[u8]) -> FileRead {
+		match liberfs::LiberFs::read_file(self, path) {
+			Ok(bytes) => FileRead::Bytes(bytes),
+			// `NotFound` is the filesystem saying the path names nothing. Every other error is it
+			// saying something is wrong with what is there.
+			Err(fscore::FsError::NotFound) => FileRead::Absent,
+			Err(_) => FileRead::Unreadable,
+		}
 	}
 }
 
 impl<D: BlockDevice> ReadsFiles for fat::FatFs<D> {
-	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
-		self.read_file(path).ok()
+	fn read_file(&mut self, path: &[u8]) -> FileRead {
+		match fat::FatFs::read_file(self, path) {
+			Ok(bytes) => FileRead::Bytes(bytes),
+			Err(fscore::FsError::NotFound) => FileRead::Absent,
+			Err(_) => FileRead::Unreadable,
+		}
 	}
 }
 
@@ -90,7 +122,18 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> abi::bootstrap::S
 	// is one that was signed, and reading the text manifest beside it instead would be choosing the
 	// weaker of two answers about the same bytes. A source with only the text one is a medium made
 	// before signing; it still proves integrity, and it still proves nothing about origin.
-	if let Some(signed) = fs.read(b"etc/boot.manifest2") {
+	let signed = match fs.read_file(b"etc/boot.manifest2") {
+		FileRead::Bytes(bytes) => Some(bytes),
+		// PRESENT AND UNREADABLE IS BETRAYAL, NOT ABSENCE. Falling back to the text manifest here
+		// would let anybody who can damage one file drop this source from "signed" to "checksummed",
+		// which is a downgrade performed without forging anything.
+		FileRead::Unreadable => {
+			crate::arch::serial::write_str("loader: this source has a signed manifest that cannot be read - refusing to boot from it rather than falling back\n");
+			return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::NoManifest);
+		}
+		FileRead::Absent => None,
+	};
+	if let Some(signed) = signed {
 		let mut scratch = alloc::vec::Vec::new();
 		if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + signed.len()).is_err() {
 			return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::OutOfMemory);

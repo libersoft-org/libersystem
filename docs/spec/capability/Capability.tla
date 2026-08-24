@@ -22,6 +22,9 @@ CONSTANTS
     RevocationModeled, \* whether `ObjectHeader::revoke` exists in this configuration. It is TEST-ONLY
                        \* in the tree, so the production result may not be cited from a run with it
                        \* enabled - which is why it is a constant and not an always-available action.
+    BatchMax,       \* how many capabilities one send may carry. `sys_channel_send_caps` takes a
+                    \* batch and returns ALL of them when it is refused, so one is not enough to see
+                    \* the rule that matters: two is.
     DerivedRights   \* the right sets a duplicate may be asked for. A SET OF SETS, and small on
                     \* purpose: quantifying a duplicate over every subset of the minted rights is
                     \* the Cartesian widening M3 refuses, and it buys nothing the two interesting
