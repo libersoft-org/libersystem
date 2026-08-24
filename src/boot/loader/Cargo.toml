@@ -11,6 +11,9 @@ path = "src/main.rs"
 
 [dependencies]
 bootproto = { path = "../protocol" }
+# Ed25519 verification for the signed boot manifest, in its own crate so `bootproto` - which the
+# KERNEL also links - stays dependency-free and never compiles any of it.
+bootsig = { path = "../signature" }
 # The UEFI bindings and the firmware-facing algorithms, in a crate that can be host-tested against a
 # mock firmware. Nothing inside a UEFI binary can be, which is why they are not here.
 uefi = { path = "../uefi" }

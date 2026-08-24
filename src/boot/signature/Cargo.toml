@@ -1,0 +1,25 @@
+[package]
+name = "bootsig"
+# The product version lives only in /product.conf; Cargo's optional package version is unused here
+# and omitted.
+edition = "2024"
+description = "Ed25519 verification for the signed boot manifest, isolated so nothing else carries it"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# THE FIRST EXTERNAL DEPENDENCY IN THE BOOT CHAIN, and it is here rather than in `bootproto`
+# deliberately: the format crate stays dependency-free and the kernel, which shares it, never
+# compiles any of this. P02M0150 M1 says what this is - "use an established `no_std` verifier and do
+# not implement curve or signature arithmetic in this tree" - and signature arithmetic written from
+# scratch is the one kind of code where being wrong is invisible until it matters.
+ed25519-dalek = { version = "2", default-features = false }
+# NAMED DIRECTLY SO ITS FEATURE APPLIES. `ed25519-dalek` pulls this in either way; what a direct
+# dependency buys is `force-soft`, and without it the target that has no SIMD to speak of stops the
+# compiler dead: "rustc-LLVM ERROR: Do not know how to split the result of this operator!" on a
+# bare-metal build. Software SHA-2 is fast enough for a handful of digests at boot.
+sha2 = { version = "0.10", default-features = false, features = ["force-soft"] }
+
+[lints.rust]
+warnings = "deny"

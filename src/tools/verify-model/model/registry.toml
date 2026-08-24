@@ -129,6 +129,16 @@ component = "harness.scripts"
 path = "verify.sh"
 component = "harness.scripts"
 
+# P02M0154's one bootstrap command and the pin it reads. The gates never fetch: they read the cache
+# and name this when the artifact is absent.
+[[ownership]]
+path = "bootstrap.sh"
+component = "harness.scripts"
+
+[[ownership]]
+path = "toolchain.lock"
+component = "harness.scripts"
+
 [[ownership]]
 path = "image.sh"
 component = "harness.scripts"

@@ -96,6 +96,15 @@ pub struct Row<'a> {
 // A manifest that has been READ but not yet VERIFIED. Holding those apart is the point: `decode`
 // answers whether the bytes are a well-formed manifest, and `payload` is exactly what a signature
 // has to cover for it to be this manifest's.
+// `Debug` so a test can say which refusal it got instead of which it expected. It prints what the
+// manifest CLAIMS, never its bytes: a record that failed to parse is not one whose contents mean
+// anything.
+impl core::fmt::Debug for Manifest<'_> {
+	fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+		write!(f, "Manifest {{ key_id: {}, arch: {}, source: {}, rows: {} }}", self.key_id, self.arch, self.source_kind, self.row_count)
+	}
+}
+
 pub struct Manifest<'a> {
 	// The whole record, kept so the row walk can index it without a second copy.
 	bytes: &'a [u8],
@@ -255,19 +264,7 @@ impl<'a> Manifest<'a> {
 			return Err(Refusal::TrailingBytes);
 		}
 
-		Ok(Manifest {
-			bytes,
-			payload_len,
-			alg,
-			key_id,
-			product,
-			arch: arch[0],
-			source_kind: source[0],
-			release,
-			volume_uuid,
-			rows_at,
-			row_count: row_count as usize,
-		})
+		Ok(Manifest { bytes, payload_len, alg, key_id, product, arch: arch[0], source_kind: source[0], release, volume_uuid, rows_at, row_count: row_count as usize })
 	}
 
 	// EXACTLY WHAT A SIGNATURE MUST COVER, domain string included. A caller cannot ask about

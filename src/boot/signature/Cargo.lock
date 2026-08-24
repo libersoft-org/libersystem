@@ -3,10 +3,6 @@
 version = 4
 
 [[package]]
-name = "abi"
-version = "0.0.0"
-
-[[package]]
 name = "block-buffer"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -14,10 +10,6 @@ checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
 dependencies = [
  "generic-array",
 ]
-
-[[package]]
-name = "bootproto"
-version = "0.0.0"
 
 [[package]]
 name = "bootsig"
@@ -110,25 +102,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "fat"
-version = "0.0.0"
-dependencies = [
- "fscore",
-]
-
-[[package]]
-name = "fdt"
-version = "0.0.0"
-
-[[package]]
 name = "fiat-crypto"
 version = "0.2.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "28dea519a9695b9977216879a3ebfddf92f1c08c05d984f8996aecd6ecdc811d"
-
-[[package]]
-name = "fscore"
-version = "0.0.0"
 
 [[package]]
 name = "generic-array"
@@ -145,27 +122,6 @@ name = "libc"
 version = "0.2.189"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
-
-[[package]]
-name = "liberfs"
-version = "0.0.0"
-dependencies = [
- "fscore",
-]
-
-[[package]]
-name = "loader"
-version = "0.0.0"
-dependencies = [
- "abi",
- "bootproto",
- "bootsig",
- "fat",
- "fdt",
- "fscore",
- "liberfs",
- "uefi",
-]
 
 [[package]]
 name = "proc-macro2"
@@ -239,14 +195,6 @@ name = "typenum"
 version = "1.20.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6f5e870be6c3b371b77fe0ee0bafb859fa4964b4404c27de1d380043c4dda20"
-
-[[package]]
-name = "uefi"
-version = "0.0.0"
-dependencies = [
- "bootproto",
- "fscore",
-]
 
 [[package]]
 name = "unicode-ident"
