@@ -35,20 +35,17 @@ fn a_firmware_pointer_outside_the_direct_map_is_refused_before_it_is_dereference
 	}
 
 	// A table whose DECLARED length runs off the end of the map is refused too - the ceiling bounds
-	// how far a bad length walks, not whether the walk stays somewhere readable. Built at the very
-	// top of the map so its header is inside and its body is not.
-	let limit = {
-		let mut top = 0u64;
-		for index in 0..mem::memmap_len() {
-			if let Some(region) = mem::memmap_get(index) {
-				top = top.max(region.base + region.length);
-			}
-		}
-		top.next_multiple_of(2 * 1024 * 1024)
-	};
-	assert!(limit > 0, "the boot memory map was retained, so the direct map has a known extent");
-	assert!(mem::within_direct_map(limit - 4096, 36), "the last page of the map is inside it");
-	assert!(!mem::within_direct_map(limit - 4096, 8192), "a table that starts inside and ends outside is not");
+	// how far a bad length walks, not whether the walk stays somewhere readable.
+	//
+	// ASKED OF THE MAP RATHER THAN DERIVED FROM THE MEMORY MAP. This used to sum the memory map's
+	// regions and round up, which is the same number only on the port whose direct map is sized from
+	// that map: a device-tree port's boot stub maps a FIXED window past the top of RAM, so an
+	// address one page below the last byte of memory is comfortably inside what `phys_to_virt`
+	// translates - and the assertion below was false there, for a correct reason.
+	let ceiling = mem::direct_map_ceiling_for_test();
+	assert!(ceiling > 0, "the direct map has a published ceiling by the time tests run");
+	assert!(mem::within_direct_map(ceiling - 4096, 4096), "the last page of the map is inside it");
+	assert!(!mem::within_direct_map(ceiling - 4096, 8192), "a table that starts inside and ends outside is not");
 }
 
 crate::tagged_test!(the_global_clock_advances_once_per_period_however_many_cores_tick, [Smp, Kernel], id = "kernel.smp.the_global_clock_advances_once_per_period_however_many_cores_tick", covers = ["kernel"]);

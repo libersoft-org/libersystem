@@ -49,3 +49,8 @@ desktop.ini
 
 # Python bytecode cache, created when lab.py imports the scenario runner beside it
 __pycache__/
+
+# TLC (the TLA+ model checker) writes its state queue beside the specification unless it is told
+# otherwise. Gigabytes of scratch, one file per queue segment - the gate passes `-metadir` so it
+# lands in .build/, and this catches a bare `tlc2.TLC` run that does not.
+states/

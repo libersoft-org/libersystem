@@ -1,0 +1,24 @@
+# Pinned external verification artifacts.
+#
+# WHAT THIS FILE IS FOR: a tool that a gate depends on and that this repository does not build must
+# be pinned by CONTENT, not by name. A version number names what a mirror is supposed to serve; a
+# SHA-256 names what it actually served, and a gate that verifies the second cannot be moved by
+# anybody who can move the first.
+#
+# The verification gates themselves are NETWORK-DISABLED. They read the cache and, when the artifact
+# is absent, print the one bootstrap command that fetches it - so a clean checkout is honest about
+# needing one step rather than pretending to be self-contained.
+#
+# Format: one artifact per block. `sha256` is over the file exactly as fetched.
+
+[tla2tools]
+purpose = "TLC, the TLA+ model checker: the capability transfer model's gate (P02M0154)"
+version = "1.7.4"
+url = "https://github.com/tlaplus/tlaplus/releases/download/v1.7.4/tla2tools.jar"
+sha256 = "936a262061c914694dfd669a543be24573c45d5aa0ff20a8b96b23d01e050e88"
+cache = ".build/tools/tla2tools.jar"
+# The JAR is bytecode: the Java that runs it is the other half of the pin. Measured on the machine
+# this was developed on; TLC 1.7.4 requires 11 or later, and a newer major is accepted rather than
+# demanded because a model checker's answer does not depend on which one ran it.
+java_min_major = 11
+java_measured = "25.0.4.1"

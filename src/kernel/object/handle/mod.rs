@@ -367,6 +367,20 @@ impl HandleTable {
 	// again here would bill twice for one handle. Cannot fail, and `reserve` is what makes
 	// that true of the memory as well as of the quota.
 	pub fn insert_reserved(&mut self, cap: Capability) -> Handle {
+		// THE SAME BARRIER `restore_taken` STANDS BEHIND. `close_all` has run, so there is nobody to
+		// install for: the capability is dropped here and the quota `reserve` charged for the
+		// booking is refunded, which is what `close_all` would have done to this handle had it
+		// existed at the time. Returning a handle into a dead process's table would leave a live
+		// capability in a process that has finished tearing down.
+		if self.closed {
+			drop(cap);
+			if self.booked.pop().is_some()
+				&& let Some(domain) = &self.domain
+			{
+				domain.uncharge_handles(1);
+			}
+			return Handle::from_raw(0);
+		}
 		// INTO THE SLOT THIS RESERVATION OWNS. `place` searched the free list, which another thread
 		// may have emptied since the booking - and answered with the zero handle when it had, after
 		// the hardware was programmed or the message committed.
@@ -699,6 +713,13 @@ impl HandleTable {
 		self.slots.len()
 	}
 
+	// The slots a reservation is holding, for the test that asks what a termination does to them.
+	#[cfg(test)]
+	pub fn booked_indices_for_test(&self) -> alloc::vec::Vec<u32> {
+		// ALLOC-OK: `#[cfg(test)]`, as below.
+		self.booked.clone()
+	}
+
 	#[cfg(test)]
 	pub fn free_indices_for_test(&self) -> alloc::vec::Vec<u32> {
 		// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed. The gate
@@ -725,11 +746,26 @@ impl HandleTable {
 		let mut closed: u64 = 0;
 		self.free.clear();
 		for index in 0..self.slots.len() {
+			// Asked BEFORE the slot is borrowed mutably, which is the only reason it is a line of
+			// its own: `booked` and `slots` are two fields of the same table.
+			let booked = self.booked.contains(&(index as u32));
 			let slot = &mut self.slots[index];
 			// A slot with a transfer in flight is not this function's to reclaim. Its capability is
 			// somewhere else and exactly one of `commit_taken`/`restore_taken` is still to come; put
 			// it on the free list and that call writes into a slot something else may already own.
-			if slot.reserved {
+			//
+			// A BOOKED SLOT IS NOT THIS FUNCTION'S TO RECLAIM EITHER, and it used to be. `reserve`
+			// takes a CONCRETE slot out of circulation and charges the quota for it, and an
+			// `insert_reserved` may still be on its way to that index - a receive between its peek
+			// and its install, an MSI acquire between its booking and its handle. Rebuilding the
+			// free list over it put the index in two places at once, on `free` and on `booked`, so
+			// the install and the next `insert` could be handed the same slot; and the charge was
+			// refunded by nobody, because this function refunds the slots that HELD a capability
+			// and `Drop` refunds the LIVE ones, and a booking is neither.
+			//
+			// Found by the model in `docs/spec/capability` rather than by a machine: three states -
+			// Init, Book, Terminate - violating `QuotaConserved`.
+			if slot.reserved || booked {
 				continue;
 			}
 			let had = slot.cap.take().is_some();

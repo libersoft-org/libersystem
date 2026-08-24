@@ -13,9 +13,19 @@ EXTENDS Naturals, Sequences, FiniteSets
 CONSTANTS
     Procs,          \* the processes with handle tables
     Objects,        \* the kernel objects a capability can name
+    Types,          \* the object types, distinct atoms so type sealing is checked rather than assumed
     Slots,          \* how many slots one table has
     QueueLimit,     \* the endpoint's queue bound
-    MaxGen          \* the abstract generation ceiling; retirement is reachable at it
+    MaxGen,         \* the abstract generation ceiling; retirement is reachable at it
+    MaxId,          \* how many message identities one behaviour may mint - see `Transfer`'s Enqueue
+    MintedRights,   \* the rights the one minted capability carries; a configuration's lever
+    RevocationModeled, \* whether `ObjectHeader::revoke` exists in this configuration. It is TEST-ONLY
+                       \* in the tree, so the production result may not be cited from a run with it
+                       \* enabled - which is why it is a constant and not an always-available action.
+    DerivedRights   \* the right sets a duplicate may be asked for. A SET OF SETS, and small on
+                    \* purpose: quantifying a duplicate over every subset of the minted rights is
+                    \* the Cartesian widening M3 refuses, and it buys nothing the two interesting
+                    \* cases - keep everything, narrow to one - do not already say.
 
 (*************************************************************************)
 (* Rights. A finite set: USE abstracts a type-correct operation on the     *)
@@ -29,8 +39,12 @@ RightSets == SUBSET Rights
 (* object generation it was made against - which is what makes a handle to *)
 (* a destroyed object detectable rather than merely wrong.                 *)
 (*************************************************************************)
-NoCap == [obj |-> "none", rights |-> {}, objgen |-> 0]
-Caps == [obj: Objects, rights: RightSets, objgen: 1..MaxGen] \cup {NoCap}
+\* THE TYPE TRAVELS WITH THE CAPABILITY, because a lookup checks it: `lookup_typed` refuses a handle
+\* whose object is not the type the caller asked for, and that refusal is authority rather than
+\* convenience - a channel handle used as a memory object would be a type confusion inside the
+\* kernel, reachable from ring 3.
+NoCap == [obj |-> "none", type |-> "none", rights |-> {}, objgen |-> 0]
+Caps == [obj: Objects, type: Types, rights: RightSets, objgen: 1..MaxGen] \cup {NoCap}
 IsCap(c) == c # NoCap
 
 (*************************************************************************)
@@ -61,9 +75,4 @@ ChargedSlots(table) == Cardinality({i \in DOMAIN table : table[i].state \in {"Li
 NoMsg == [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
 IsMsg(m) == m.id # 0
 
-(*************************************************************************)
-(* Where a capability may be. THERE IS NO "IN THE KERNEL SOMEWHERE": the   *)
-(* linear-transfer invariant is stated over exactly these places.          *)
-(*************************************************************************)
-Places == {"slot", "xferlocal", "queued", "delivery", "installed"}
 =============================================================================

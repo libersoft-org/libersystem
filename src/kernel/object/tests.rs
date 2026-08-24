@@ -656,6 +656,35 @@ fn a_transfer_that_can_no_longer_be_resolved_gives_the_slot_back() {
 	assert_ne!(reused.raw(), moving.raw(), "under a new generation, so the old value stays dead");
 }
 
+crate::tagged_test!(a_booking_does_not_outlive_the_table_it_was_taken_in, [Handle, Object, Kernel], id = "kernel.object.a_booking_does_not_outlive_the_table_it_was_taken_in", covers = ["kernel"]);
+fn a_booking_does_not_outlive_the_table_it_was_taken_in() {
+	// A TERMINATION RACING A RESERVATION - the shape `close_all` already respected for a transfer
+	// and did not for a booking. Reachable the same way the transfer race is: another thread of the
+	// process is between `reserve` and `insert_reserved` - a channel receive between its peek and
+	// its install, an MSI acquire between its booking and its handle - when the process ends.
+	//
+	// FOUND BY THE MODEL RATHER THAN BY A MACHINE. `docs/spec/capability` produced it in three
+	// states - Init, Book, Terminate - violating `QuotaConserved`: `close_all` rebuilt the free list
+	// from every slot that was not `reserved`, and a booked one is not, so the index was on `free`
+	// and on `booked` at once and the quota `reserve` charged came back to nobody.
+	let domain = crate::object::domain::Domain::root();
+	let mut table = HandleTable::new();
+	table.set_domain(domain.clone());
+	let before = domain.account().handles().used();
+	assert!(table.reserve(1), "the booking is taken");
+	assert_eq!(domain.account().handles().used(), before + 1, "and charged for");
+	let booked = *table.booked_indices_for_test().first().expect("one slot is booked");
+
+	table.close_all();
+	assert!(!table.free_indices_for_test().contains(&booked), "a booked slot does not go back on the free list");
+
+	// And the install that was on its way finds a table with nobody to install for: the capability
+	// is dropped and the charge refunded, exactly as `restore_taken` does.
+	let handle = table.insert_reserved(super::handle::Capability::new(TestObject::new(1) as Arc<dyn KernelObject>, Rights::ALL));
+	assert_eq!(handle.raw(), 0, "a closed table installs nothing");
+	assert_eq!(domain.account().handles().used(), before, "the booking's charge comes back exactly once");
+}
+
 crate::tagged_test!(one_device_holds_one_msi_slot, [Object, Kernel], id = "kernel.object.one_device_holds_one_msi_slot", covers = ["kernel"]);
 fn one_device_holds_one_msi_slot() {
 	use crate::arch::common::msi::MsiRegistry;

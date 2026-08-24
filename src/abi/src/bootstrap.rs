@@ -185,3 +185,93 @@ pub fn build_package(entries: &[(&[u8], &[u8])]) -> Option<Vec<u8>> {
 	}
 	Some(out)
 }
+
+// WHY A SOURCE WAS REFUSED. Each one is a different fact about the medium, and the loader prints
+// which: they are the difference between "this disk is not a LiberSystem disk" and "this disk is
+// one and it has been tampered with or half-written".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refusal {
+	// A list, and no manifest beside it. A source that names programs and does not say what they
+	// should be cannot be checked at all.
+	NoManifest,
+	// The list itself is not what the manifest says.
+	ListMismatch,
+	// The list is not a list this loader understands.
+	MalformedList,
+	// A program the list names is not on the source.
+	MissingProgram,
+	// A program is not what the manifest says.
+	ProgramMismatch,
+	// The set is verified and could not be packed - an allocation failure, not a trust failure,
+	// and still not a source to boot from.
+	OutOfMemory,
+}
+
+// WHAT A SOURCE IS, once it has been looked at.
+//
+// THE THREE USED TO BE ONE `Option`, and that is the defect: `None` meant both "there is no
+// bootstrap list here, try the next disk" and "this source was selected and its manifest refused
+// it". A caller cannot tell those apart, so every caller did the same thing with both - it went on
+// to the next source. That turns a detected tampering into a silent fallback, which is the opposite
+// of what the check is for.
+pub enum Selection {
+	// No bootstrap list on this source. It is not a LiberSystem boot source; policy may consider
+	// another.
+	Unavailable,
+	// One source owns the whole set and every byte of it matched the manifest beside it.
+	Verified(Vec<u8>),
+	// This source was selected and failed. THE BOOT STOPS HERE - there is no path from this back to
+	// trying another source.
+	Invalid(Refusal),
+}
+
+// Where the bytes come from. The loader's implementations read UEFI filesystems; a test's reads a
+// table it was handed, which is the whole reason this lives here rather than in the loader.
+pub trait Files {
+	fn read(&mut self, path: &[u8]) -> Option<Vec<u8>>;
+}
+
+// Read a source's bootstrap set and say what the source is.
+//
+// `verify` answers one question - is this the content the manifest records for this path - and it
+// is a parameter rather than a call so this crate stays dependency-free: the manifest format lives
+// in `bootproto`, the policy lives here, and neither has to know the other's crate.
+pub fn assemble<F: Files>(fs: &mut F, verify: impl Fn(&[u8], &[u8], &[u8]) -> bool) -> Selection {
+	let Some(list) = fs.read(b"etc/bootstrap.list") else {
+		return Selection::Unavailable;
+	};
+	let Some(rows) = parse_list(&list) else {
+		return Selection::Invalid(Refusal::MalformedList);
+	};
+	// THE MANIFEST BESIDE THE LIST. From here on this source is the chosen one: a manifest that is
+	// absent, malformed or disagreeing stops the boot rather than falling through to another
+	// source. Choosing a source and failing a check on it are different things.
+	let Some(manifest) = fs.read(b"etc/boot.manifest") else {
+		return Selection::Invalid(Refusal::NoManifest);
+	};
+	if !verify(&manifest, b"etc/bootstrap.list", &list) {
+		return Selection::Invalid(Refusal::ListMismatch);
+	}
+	let mut blobs: Vec<Vec<u8>> = Vec::new();
+	if blobs.try_reserve_exact(rows.len()).is_err() {
+		return Selection::Invalid(Refusal::OutOfMemory);
+	}
+	for row in &rows {
+		// A named program that is not on the volume is fatal rather than skipped. The bootstrap set
+		// is exactly the programs the system needs before its volume is readable, so a missing one
+		// produces a machine that dies later and further away, with nothing to say which program it
+		// was.
+		let Some(blob) = fs.read(row.path) else {
+			return Selection::Invalid(Refusal::MissingProgram);
+		};
+		if !verify(&manifest, row.path, &blob) {
+			return Selection::Invalid(Refusal::ProgramMismatch);
+		}
+		blobs.push(blob);
+	}
+	let entries: Vec<(&[u8], &[u8])> = rows.iter().zip(&blobs).map(|(row, blob)| (row.name, blob.as_slice())).collect();
+	match build_package(&entries) {
+		Some(archive) => Selection::Verified(archive),
+		None => Selection::Invalid(Refusal::OutOfMemory),
+	}
+}

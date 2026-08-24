@@ -49,6 +49,23 @@ static DIRECT_MAP_MAPPED: AtomicU64 = AtomicU64::new(0);
 // Asked by the x86 SMP path of a firmware table pointer before it reads one, and by the
 // device-tree ports of every controller range the machine description names - both before the first
 // access through it, and both against the ceiling the boot prologue published.
+// How far `phys_to_virt` translates, which is the larger of the two ceilings - see
+// `within_direct_map`, whose whole answer is this number.
+//
+// IT IS NOT THE TOP OF RAM, and a caller that derives it from the memory map is right only on the
+// port whose direct map is sized from that map. A device-tree port's boot stub maps a FIXED window -
+// 4 GiB on aarch64, 8 GiB on riscv64 - which reaches past the last byte of memory the machine has,
+// and every address inside that window is one `phys_to_virt` translates whether or not it is RAM.
+fn direct_map_ceiling() -> u64 {
+	DIRECT_MAP_LIMIT.load(Ordering::Relaxed).max(DIRECT_MAP_MAPPED.load(Ordering::Relaxed))
+}
+
+// The same, for the test that asserts on the ceiling itself.
+#[cfg(test)]
+pub fn direct_map_ceiling_for_test() -> u64 {
+	direct_map_ceiling()
+}
+
 pub fn within_direct_map(phys: u64, len: u64) -> bool {
 	// THE CEILING THE STUB PUBLISHED COUNTS ON ITS OWN, before any memory map has been retained.
 	//
@@ -60,7 +77,7 @@ pub fn within_direct_map(phys: u64, len: u64) -> bool {
 	// Both numbers answer the same question - how far `phys_to_virt` translates - and the larger of
 	// the two is the honest answer at any moment: the stub's span is a fact from the instant the MMU
 	// is on, and the map-derived one only ever raises it.
-	let limit = DIRECT_MAP_LIMIT.load(Ordering::Relaxed).max(DIRECT_MAP_MAPPED.load(Ordering::Relaxed));
+	let limit = direct_map_ceiling();
 	if phys == 0 || limit == 0 {
 		return false;
 	}

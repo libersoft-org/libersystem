@@ -18,6 +18,10 @@ declare -A GATES=(
 	# two ports that never arrive through it, and nothing but a paragraph of prose separated "dormant
 	# by construction" from "unfinished".
 	["arch-surface"]="tools/check-arch-surface.sh"
+	# P02M0154's gate: the capability transfer model, explored exhaustively under each published
+	# configuration. It runs TLC from the JAR pinned in `toolchain.lock` with NO NETWORK, and names
+	# `./bootstrap.sh tla2tools` when the artifact is absent rather than fetching one.
+	["capability-model"]="tools/check-capability-model.sh"
 	# The other configuration of the same source, compiled. `development-gate` above checks which
 	# artifacts a configuration STAGES; it never builds the one it is guarding, and the profile it
 	# guards stopped compiling twice in one release without anything noticing.

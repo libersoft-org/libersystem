@@ -15,6 +15,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::mem::frame;
+use crate::sync::SpinLock;
 
 // The control frame.
 const GITS_CTLR: u64 = 0x0000; // bit 0 Enabled, bit 31 Quiescent
@@ -75,6 +76,8 @@ static LPI_CONFIG: AtomicU64 = AtomicU64::new(0); // physical
 // and both bounds this kernel refuses past rather than truncates into.
 static EVENT_BITS: AtomicU32 = AtomicU32::new(0);
 static DEVICE_LIMIT: AtomicU32 = AtomicU32::new(0);
+// How many bytes one entry of a device's interrupt translation table takes, from GITS_TYPER.
+static ITT_ENTRY: AtomicU32 = AtomicU32::new(0);
 // The value this controller wants in a command's RDbase field, already shifted into place.
 //
 // TWO WAYS TO NAME A CORE, AND GITS_TYPER.PTA SAYS WHICH. With PTA set a collection targets a
@@ -82,6 +85,16 @@ static DEVICE_LIMIT: AtomicU32 = AtomicU32::new(0);
 // NUMBER - a third numbering, neither the logical cpu id nor the affinity. QEMU's ITS reports PTA
 // clear, so the address form was the one that could not be tested by running it.
 static TARGET: AtomicU64 = AtomicU64::new(0);
+
+// THE COMMAND QUEUE IS A RING, AND TWO CORES CAN REACH IT AT ONCE. Posting a command is read the
+// write offset, write thirty-two bytes there, ring the doorbell, wait for the read pointer - four
+// steps, each atomic on its own and the sequence not. An MSI acquire and a teardown are both
+// userspace syscalls, so two cores can be inside this at the same time, write the same slot, and
+// leave one command never issued while its caller waits for it.
+//
+// The v2m backend never needed this because it has no queue: it writes distributor registers, and
+// each of those is its own operation.
+static QUEUE: SpinLock<()> = SpinLock::new(());
 
 fn reg(off: u64) -> *mut u64 {
 	super::paging::phys_to_virt(ITS_BASE.load(Ordering::Relaxed) + off) as *mut u64
@@ -153,6 +166,10 @@ fn program_baser(index: u64, kind: u64, entry_size: u64, pages: u64, phys: u64) 
 // caller here is a device setup or teardown, none of them is on a hot path, and the alternative is
 // a queue whose errors are discovered by an interrupt that never arrives.
 fn command(dw0: u64, dw1: u64, dw2: u64, dw3: u64) -> bool {
+	// HELD ACROSS THE POST AND THE WAIT, because the wait reads `GITS_CREADR` against the offset
+	// this caller wrote: another core advancing the ring underneath it would make it wait for a
+	// pointer that has already gone past.
+	let _posting = QUEUE.lock();
 	let base = CMD_BASE.load(Ordering::Relaxed);
 	let offset = CMD_WRITE.load(Ordering::Relaxed);
 	let slot = super::paging::phys_to_virt(base + offset) as *mut u64;
@@ -197,8 +214,12 @@ pub fn init(base: u64, size: u64, redistributor: u64) -> bool {
 	}
 	let target = if typer >> 19 & 1 != 0 { redistributor & 0x0007_ffff_ffff_0000 } else { u64::from(super::gic::processor_number(redistributor)) << 16 };
 	TARGET.store(target, Ordering::Relaxed);
+	// How big one entry of a device's interrupt translation table is. This port gives a device ONE
+	// PAGE for its table, so this is the number that decides whether the event window it maps fits -
+	// and it was being read and thrown away.
 	let itt_entry = (typer >> 4 & 0xf) + 1;
 	EVENT_BITS.store((typer >> 8 & 0x1f) as u32 + 1, Ordering::Relaxed);
+	ITT_ENTRY.store(itt_entry as u32, Ordering::Relaxed);
 
 	// The tables. Their types are reported per register, so each is programmed where the controller
 	// put it rather than at a fixed index.
@@ -263,7 +284,6 @@ pub fn init(base: u64, size: u64, redistributor: u64) -> bool {
 		return false;
 	}
 	crate::serial_println!("its: up - {} event id bits, {} device ids, {} LPIs from INTID {}", EVENT_BITS.load(Ordering::Relaxed), DEVICE_LIMIT.load(Ordering::Relaxed), LPI_COUNT, LPI_BASE);
-	let _ = itt_entry;
 	true
 }
 
@@ -283,6 +303,13 @@ pub fn map_device(devid: u32, events: u32, itt: u64) -> bool {
 	}
 	let bits = events.max(2).next_power_of_two().trailing_zeros() as u64;
 	if bits > EVENT_BITS.load(Ordering::Relaxed) as u64 {
+		return false;
+	}
+	// THE TABLE IS ONE PAGE, AND THE CONTROLLER SAYS HOW WIDE AN ENTRY IS. A window that does not
+	// fit would have the ITS writing an event's entry past the end of the page this kernel
+	// allocated - into whatever is next - so it is refused here by name.
+	if (1u64 << bits) * u64::from(ITT_ENTRY.load(Ordering::Relaxed)) > 4096 {
+		crate::serial_println!("its: {} events at {} bytes each do not fit the one page this port gives a device", 1u64 << bits, ITT_ENTRY.load(Ordering::Relaxed));
 		return false;
 	}
 	// ITT address from bit 8 up, size in bits minus one, Valid.
