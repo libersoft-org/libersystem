@@ -132,7 +132,50 @@ absent from the model, both of them about when a take may happen:
 - A take is bounded by the RESERVATIONS outstanding, not by what is in hand. The syscall takes every
   capability it is going to send and then sends them; it never takes another after the send.
 
-## Configurations not yet committed
+## `transactions-single.cfg`
 
-`propagation.cfg` and `transactions-single.cfg` are the rest of P02M0154 M3, and each is one measured change from one of these rather than a
-speculative widening in every dimension at once.
+The single-capability fault phases, with room in the queue for the reservation to be visible. The
+spike's queue holds ONE message, which makes "the message is off the queue and still holding its
+slot" and "the queue is full" the same state; two makes them different, and the depth a receive can
+be interrupted at is what this configuration is for.
+
+| | |
+| --- | --- |
+| Result | model checking completed, no error |
+| Distinct states | 35592 |
+| Search depth | 34 |
+| Wall clock | 4.2 s, one worker |
+| Peak resident | 1.2 GiB |
+| `transactions-single.cfg` | `4a7b947d0f58f9c7…` |
+
+## `propagation.cfg`
+
+Three processes, so a capability can be passed ALONG rather than just across - a chain is what makes
+attenuation a property rather than a rule about one step. Duplication is enabled with exactly one
+derivation offered, narrowing to `USE`: attenuation without a way to narrow is a sentence with no
+verb. `TransferIsLinear` is not checked here for the same reason as in `handles.cfg`.
+
+| | |
+| --- | --- |
+| Result | model checking completed, no error |
+| Distinct states | 2998061 |
+| Search depth | 35 |
+| Wall clock | 303 s at one worker, 76 s at four |
+| Peak resident | 2.4 GiB |
+| `propagation.cfg` | `992983e156ee2971…` |
+
+THE MOST EXPENSIVE CONFIGURATION BY AN ORDER OF MAGNITUDE, and it is the third process that costs
+it: every action is quantified over the process set, so a third actor multiplies the interleavings
+rather than adding to them. It is kept because a two-process model cannot express a chain at all,
+and the rights algebra it needs is one derivation rather than every subset - which is where the cost
+would have become unaffordable.
+
+## The gate budget
+
+`check.sh --gate capability-model` runs all six with four workers. Measured end to end: about two
+and a half minutes, of which `propagation` is half and `handles` most of the rest. Peak resident is
+`propagation`'s 2.4 GiB.
+
+A configuration that no longer fits this is a configuration to SPLIT rather than to shrink quietly:
+a reduced bound is a different result, and the counts above are what a later run is compared
+against.

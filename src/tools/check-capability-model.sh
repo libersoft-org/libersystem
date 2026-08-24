@@ -45,7 +45,7 @@ for cfg in "$SPEC_DIR"/*.cfg; do
 	# of any size, in a directory git reports as untracked and an editor's file watcher tries to
 	# diff. `-cleanup` removes it afterwards; `-metadir` is what keeps it from being in the tree at
 	# all while the run is going.
-	if java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -metadir "$meta" -cleanup -workers 1 -config "$cfg" "$SPEC_DIR/Transfer.tla" >"$out" 2>&1; then
+	if java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -metadir "$meta" -cleanup -workers 4 -config "$cfg" "$SPEC_DIR/Transfer.tla" >"$out" 2>&1; then
 		# THE LAST ONE, NOT THE FIRST. TLC prints a progress line a minute into a long run and the
 		# summary at the end, and both say "distinct states found" - so taking the first reported
 		# the point the run had reached rather than where it finished, which looked like a
