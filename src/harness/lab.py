@@ -2729,7 +2729,7 @@ class LabGuest:
 		# through this process's own overrides; a child starts with none of them and defaults to the
 		# persistent instance, which on a cold run is a different guest or no guest at all.
 		env = dict(os.environ)
-		for name, value in (('LAB_CHANNEL_OVERRIDE', CHANNEL_OVERRIDE), ('LAB_SERIAL_OVERRIDE', SERIAL_OVERRIDE), ('LAB_MON_OVERRIDE', MON_OVERRIDE), ('LAB_QMP_OVERRIDE', QMP_OVERRIDE)):
+		for name, value in (('LAB_CHANNEL_OVERRIDE', CHANNEL_OVERRIDE), ('LAB_SERIAL_OVERRIDE', SERIAL_OVERRIDE), ('LAB_MON_OVERRIDE', MON_OVERRIDE), ('LAB_QMP_OVERRIDE', QMP_OVERRIDE), ('LAB_KEY_PACING', str(KEY_PACING))):
 			if value:
 				env[name] = value
 		try:
@@ -2805,7 +2805,7 @@ def cmd_dev_test(args):
 def cmd_scenario_cold(args):
 	import scenario
 
-	global CHANNEL_OVERRIDE, SERIAL_OVERRIDE, MON_OVERRIDE, QMP_OVERRIDE
+	global CHANNEL_OVERRIDE, SERIAL_OVERRIDE, MON_OVERRIDE, QMP_OVERRIDE, KEY_PACING
 	verbose = '--verbose' in args
 	rest = [a for a in args if not a.startswith('--')]
 	if len(rest) < 2 or rest[0] not in ('x86_64', 'aarch64', 'riscv64'):
@@ -2912,6 +2912,8 @@ def cmd_scenario_cold(args):
 		# An emulated guest is slower than the native one every scenario deadline was written
 		# against, by roughly an order of magnitude on the interactive steps.
 		scenario.TIME_SCALE = 1.0 if target == 'x86_64' else 10.0
+		# AND THE RATE THIS TYPES AT, by the same factor and for the same reason.
+		KEY_PACING = 0.05 * scenario.TIME_SCALE
 		MON_OVERRIDE = os.path.join(BUILD, f'qemu-monitor-cold-{target}.sock')
 		QMP_OVERRIDE = os.path.join(BUILD, f'qemu-qmp-cold-{target}.sock')
 		# The guest is answering when it answers, not when a timer says so: poll the handshake
@@ -3252,6 +3254,17 @@ def qmp_command(execute, arguments=None, timeout=5):
 # A batch is up to 64 keys and each key was its own five-second monitor operation plus a pause, so a
 # step declaring five seconds could spend several minutes inside this and the scenario's own total
 # deadline meant nothing while it did. The budget is the caller's and it is spent, not multiplied.
+# HOW LONG TO LEAVE BETWEEN TWO KEYS, in seconds.
+#
+# SCALED FOR AN EMULATED GUEST, like the scenario deadlines beside it. Fifty milliseconds is right
+# for a native x86_64 guest and far too fast for aarch64 or riscv64 under emulation: measured there,
+# a prompt landed in the MIDDLE of a typed command - `licoview ...` reached the shell as `li` and
+# then `coview vol://system/hello.txt`, two commands, neither of them the one the scenario typed.
+# The runner already multiplies every step deadline by ten on those targets; the rate it types at is
+# the same kind of quantity and was the one thing left at the native number.
+KEY_PACING = float(os.environ.get('LAB_KEY_PACING') or 0.05)
+
+
 def send_keys(keys, deadline=None):
 	for name in keys:
 		sequence = key_sequence(name)
@@ -3261,9 +3274,10 @@ def send_keys(keys, deadline=None):
 			die(f'the key batch ran out of time with {len(keys)} key(s) requested')
 		remaining = 5 if deadline is None else max(0.5, deadline - time.monotonic())
 		monitor_command(f'sendkey {sequence}', timeout=remaining)
-		# The guest's line discipline is a real one: keys arriving faster than it drains lose
-		# nothing, but pacing them keeps a burst from being one indistinguishable event.
-		time.sleep(0.05)
+		# The guest's line discipline is a real one, and on an emulated target it drains slowly:
+		# keys arriving faster than that interleave with what the shell is printing, which is how a
+		# single command became two.
+		time.sleep(KEY_PACING)
 	return True
 
 
