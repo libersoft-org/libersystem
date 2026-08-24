@@ -30,6 +30,9 @@ mod blockio;
 mod console;
 mod elf;
 mod heap;
+// The public keys this loader accepts a signed boot manifest from, and the profile it was built
+// for. Public halves only - see the module.
+mod trust;
 
 use core::ffi::c_void;
 
@@ -107,6 +110,10 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	#[cfg(not(target_arch = "x86_64"))]
 	console::discover(system_table);
 	arch::serial::init();
+	// WHICH KEYS THIS BUILD TRUSTS, BEFORE IT LOADS ANYTHING. A boot that accepts a manifest signed
+	// by a key whose private half is published, and does not say so, is exactly the thing a trust
+	// chain is supposed to make impossible to do by accident.
+	trust::announce();
 	arch::serial::write_str("\nLiberSystem UEFI loader\n");
 	// AFTER the banner, because it is a line about this loader rather than a line from the
 	// firmware, and a diagnostic printed before the program names itself reads as stray output.
@@ -121,6 +128,40 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// File System driver declines - the FAT backend below reads it through the block protocol
 	// instead, which is the whole reason that crate is linked.
 	let root = open_boot_volume(bs, image_handle);
+
+	// WHAT WAS VERIFIED, SAID OUT LOUD AND NOT PUT IN `BootInfo`.
+	//
+	// The kernel does not need trust metadata: this is a loader-owned decision, taken before the
+	// kernel exists, and a field it could read would be a field something could later be tempted to
+	// re-derive a decision from. What the harness asserts is this line - the release the manifest
+	// names, the key that signed it, and the digest of the record itself, which is what makes two
+	// boots comparable.
+	fn announce_release(manifest: &bootproto::manifest::Manifest<'_>) {
+		arch::serial::write_str("loader: signed manifest verified - release ");
+		for byte in manifest.release {
+			arch::serial::write_byte(*byte);
+		}
+		arch::serial::write_str(", key ");
+		write_hex32(manifest.key_id);
+		arch::serial::write_str(", manifest ");
+		let digest = bootproto::sha256::digest(manifest.payload());
+		for byte in &digest[..8] {
+			write_hex8(*byte);
+		}
+		arch::serial::write_str("\n");
+	}
+
+	fn write_hex8(byte: u8) {
+		const HEX: &[u8; 16] = b"0123456789abcdef";
+		arch::serial::write_byte(HEX[(byte >> 4) as usize]);
+		arch::serial::write_byte(HEX[(byte & 0xf) as usize]);
+	}
+
+	fn write_hex32(value: u32) {
+		for shift in [24, 16, 8, 0] {
+			write_hex8((value >> shift) as u8);
+		}
+	}
 
 	// WHICH LiberFS volume is this installation's. A superblock identifies LiberFS; it does not
 	// identify the system that owns it, so two LiberSystem disks in one machine used to let the
@@ -143,13 +184,35 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	let kernel = match read_from_system_volume(bs, KERNEL_FILE.as_bytes()) {
 		VolumeRead::Read(bytes) => {
 			arch::serial::write_str("loader: kernel read from the system volume\n");
-			let VolumeRead::Read(manifest) = read_from_system_volume(bs, b"etc/boot.manifest") else {
-				panic!("loader: the system volume has a kernel and no etc/boot.manifest - refusing to boot from it");
-			};
-			if !blockio::digests_ok(&manifest, KERNEL_FILE.as_bytes(), &bytes) {
-				panic!("loader: the kernel does not match etc/boot.manifest on the system volume");
+			// THE SIGNED MANIFEST WHEREVER THE SOURCE HAS ONE, and the text one otherwise. Both are
+			// checked BEFORE these bytes are parsed as an ELF, before a destination is derived from
+			// them and before anything is copied anywhere: a header read out of an unverified image
+			// is a decision made on an attacker's numbers.
+			match read_from_system_volume(bs, b"etc/boot.manifest2") {
+				VolumeRead::Read(signed) => {
+					let mut scratch = alloc::vec::Vec::new();
+					if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + signed.len()).is_err() {
+						panic!("loader: no room to verify the system volume's signed manifest");
+					}
+					scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
+					let Some(manifest) = trust::verify(signed, &mut scratch) else {
+						panic!("loader: the system volume's signed manifest was refused - see the line above");
+					};
+					if !blockio::covered_by(&manifest, bootproto::manifest::KIND_KERNEL, KERNEL_FILE.as_bytes(), &bytes) {
+						panic!("loader: the kernel is not what the system volume's SIGNED manifest records");
+					}
+					announce_release(&manifest);
+				}
+				_ => {
+					let VolumeRead::Read(manifest) = read_from_system_volume(bs, b"etc/boot.manifest") else {
+						panic!("loader: the system volume has a kernel and no manifest of either kind - refusing to boot from it");
+					};
+					if !blockio::digests_ok(&manifest, KERNEL_FILE.as_bytes(), &bytes) {
+						panic!("loader: the kernel does not match etc/boot.manifest on the system volume");
+					}
+					arch::serial::write_str("loader: kernel verified against the system volume's etc/boot.manifest\n");
+				}
 			}
-			arch::serial::write_str("loader: kernel verified against the system volume's etc/boot.manifest\n");
 			bytes
 		}
 		// The two failures are reported apart on purpose. "No LiberFS volume" points at the

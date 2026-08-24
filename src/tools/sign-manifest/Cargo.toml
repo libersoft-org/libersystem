@@ -1,0 +1,24 @@
+[package]
+name = "sign-manifest"
+# The product version lives only in /product.conf; Cargo's optional package version is unused here
+# and omitted.
+edition = "2024"
+description = "Sign a boot manifest over the final staged bytes, and verify what it wrote"
+
+default-run = "sign-manifest"
+
+[[bin]]
+name = "sign-manifest"
+path = "src/main.rs"
+
+[dependencies]
+# THE SHARED FORMAT, not a second reading of it. This tool writes with the same module the loader
+# parses with, which is what keeps a signed thing and a verified thing the same thing.
+bootproto = { path = "../../boot/protocol" }
+# The same verifier the loader carries, used here to check what this tool just produced. A signing
+# tool that cannot verify its own output is one whose failures are discovered at boot.
+bootsig = { path = "../../boot/signature" }
+ed25519-dalek = { version = "2", default-features = false }
+
+[lints.rust]
+warnings = "deny"

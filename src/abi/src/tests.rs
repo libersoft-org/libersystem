@@ -1017,61 +1017,70 @@ impl FakeSource {
 	}
 }
 
-// The manifest this fake carries is the list of paths it vouches for; a path not in it is a
-// mismatch. The real one is `bootproto::boot_manifest`, which is tested where it lives.
-fn vouches(manifest: &[u8], path: &[u8], _bytes: &[u8]) -> bool {
-	manifest.split(|b| *b == b'\n').any(|line| line == path)
+// The manifest this fake stands for is a list of paths it vouches for; a path not in it is a
+// mismatch. The real ones are `bootproto::boot_manifest` and `bootproto::manifest`, tested where
+// they live - what is tested here is the WALK, which is the same whichever answers.
+fn vouching(manifest: &'static [u8]) -> impl Fn(&[u8], &[u8]) -> bool {
+	move |path, _bytes| manifest.split(|b| *b == b'\n').any(|line| line == path)
+}
+
+// A source that vouches for nothing, for the case where there is no manifest at all.
+fn vouches_nothing(_path: &[u8], _bytes: &[u8]) -> bool {
+	false
 }
 
 // Paths are RELATIVE: `valid_bootstrap_path` refuses an empty segment, and a leading slash is one.
 const LIST: &[u8] = b"init bin/init\nsvc bin/svc\n";
+// What a manifest vouching for the whole set looks like to the fake above.
+const MANIFEST: &[u8] = b"etc/bootstrap.list\nbin/init\nbin/svc";
+// One that does not name the list itself.
+const MANIFEST_WITHOUT_LIST: &[u8] = b"bin/init\nbin/svc";
+// One that names the list and only the first program.
+const MANIFEST_PARTIAL: &[u8] = b"etc/bootstrap.list\nbin/init";
 
 #[test]
 fn a_source_with_no_bootstrap_list_is_not_a_source() {
 	use crate::bootstrap::{Selection, assemble};
 	let mut fs = FakeSource::new(&[(b"etc/other", b"x")]);
-	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Unavailable));
+	assert!(matches!(assemble(|path| fs.read(path), vouching(MANIFEST)), Selection::Unavailable));
 }
 
 #[test]
-fn a_source_with_a_list_and_no_manifest_is_refused_rather_than_skipped() {
+fn a_source_with_a_list_and_nothing_vouching_is_refused_rather_than_skipped() {
 	// THE DEFECT THIS ANSWERS. Both of these used to be `None`, so a source that names programs and
 	// cannot be checked was indistinguishable from a disk that is not a boot source at all - and
 	// every caller went on to the next one either way.
 	use crate::bootstrap::{Refusal, Selection, assemble};
 	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST)]);
-	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Invalid(Refusal::NoManifest)));
+	assert!(matches!(assemble(|path| fs.read(path), vouches_nothing), Selection::Invalid(Refusal::ListMismatch)));
 }
 
 #[test]
 fn a_list_the_manifest_does_not_vouch_for_is_refused() {
 	use crate::bootstrap::{Refusal, Selection, assemble};
-	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"etc/boot.manifest", b"bin/init\nbin/svc")]);
-	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Invalid(Refusal::ListMismatch)));
+	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST)]);
+	assert!(matches!(assemble(|path| fs.read(path), vouching(MANIFEST_WITHOUT_LIST)), Selection::Invalid(Refusal::ListMismatch)));
 }
 
 #[test]
 fn a_program_the_list_names_and_the_source_lacks_is_refused() {
 	use crate::bootstrap::{Refusal, Selection, assemble};
-	let manifest: &[u8] = b"etc/bootstrap.list\nbin/init\nbin/svc";
-	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"etc/boot.manifest", manifest), (b"bin/init", b"i")]);
-	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Invalid(Refusal::MissingProgram)));
+	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"bin/init", b"i")]);
+	assert!(matches!(assemble(|path| fs.read(path), vouching(MANIFEST)), Selection::Invalid(Refusal::MissingProgram)));
 }
 
 #[test]
 fn a_program_the_manifest_does_not_vouch_for_is_refused() {
 	use crate::bootstrap::{Refusal, Selection, assemble};
-	let manifest: &[u8] = b"etc/bootstrap.list\nbin/init";
-	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"etc/boot.manifest", manifest), (b"bin/init", b"i"), (b"bin/svc", b"s")]);
-	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Invalid(Refusal::ProgramMismatch)));
+	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"bin/init", b"i"), (b"bin/svc", b"s")]);
+	assert!(matches!(assemble(|path| fs.read(path), vouching(MANIFEST_PARTIAL)), Selection::Invalid(Refusal::ProgramMismatch)));
 }
 
 #[test]
 fn a_source_that_vouches_for_everything_it_names_is_verified() {
 	use crate::bootstrap::{Selection, assemble};
-	let manifest: &[u8] = b"etc/bootstrap.list\nbin/init\nbin/svc";
-	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"etc/boot.manifest", manifest), (b"bin/init", b"i"), (b"bin/svc", b"s")]);
-	let Selection::Verified(archive) = assemble(|path| fs.read(path), vouches) else { panic!("the source verifies") };
+	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"bin/init", b"i"), (b"bin/svc", b"s")]);
+	let Selection::Verified(archive) = assemble(|path| fs.read(path), vouching(MANIFEST)) else { panic!("the source verifies") };
 	// And what it produced is the archive the kernel unpacks, with both programs under the names
 	// the list gave them rather than the paths they were read from.
 	let package = crate::Package::parse(&archive).expect("the archive parses");
@@ -1087,16 +1096,16 @@ fn an_invalid_source_is_invalid_whichever_order_the_sources_are_tried_in() {
 	// merely absent never is. Two disks in either handle order is the same two verdicts in either
 	// order.
 	use crate::bootstrap::{Refusal, Selection, assemble};
-	let manifest: &[u8] = b"etc/bootstrap.list\nbin/init\nbin/svc";
-	let good: &[(&'static [u8], &[u8])] = &[(b"etc/bootstrap.list", LIST), (b"etc/boot.manifest", manifest), (b"bin/init", b"i"), (b"bin/svc", b"s")];
-	let bad: &[(&'static [u8], &[u8])] = &[(b"etc/bootstrap.list", LIST)];
+	let good: &[(&'static [u8], &[u8])] = &[(b"etc/bootstrap.list", LIST), (b"bin/init", b"i"), (b"bin/svc", b"s")];
+	// The bad source names its programs and does not have them - selected, and it fails.
+	let bad: &[(&'static [u8], &[u8])] = &[(b"etc/bootstrap.list", LIST), (b"bin/init", b"i")];
 	for order in [[good, bad], [bad, good]] {
 		let mut verdicts = alloc::vec::Vec::new();
 		for source in order {
 			let mut fs = FakeSource::new(source);
-			verdicts.push(assemble(|path| fs.read(path), vouches));
+			verdicts.push(assemble(|path| fs.read(path), vouching(MANIFEST)));
 		}
-		assert!(verdicts.iter().any(|v| matches!(v, Selection::Invalid(Refusal::NoManifest))), "the bad source refuses either way");
+		assert!(verdicts.iter().any(|v| matches!(v, Selection::Invalid(Refusal::MissingProgram))), "the bad source refuses either way");
 		assert!(verdicts.iter().any(|v| matches!(v, Selection::Verified(_))), "and the good one verifies either way");
 	}
 }

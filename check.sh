@@ -22,6 +22,9 @@ declare -A GATES=(
 	# configuration. It runs TLC from the JAR pinned in `toolchain.lock` with NO NETWORK, and names
 	# `./bootstrap.sh tla2tools` when the artifact is absent rather than fetching one.
 	["capability-model"]="tools/check-capability-model.sh"
+	# P02M0150's gate: the two trust profiles differ in the BINARY. The test key's private half is
+	# published on purpose, which is exactly why a release loader must contain none of it.
+	["trust-profile"]="tools/check-trust-profile.sh"
 	# The other configuration of the same source, compiled. `development-gate` above checks which
 	# artifacts a configuration STAGES; it never builds the one it is guarding, and the profile it
 	# guards stopped compiling twice in one release without anything noticing.

@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 31] = [
+const GATES: [(&str, &str); 32] = [
 	("development-gate", "harness.tools"),
 	// P02M0151's gate: no unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -109,6 +109,9 @@ const GATES: [(&str, &str); 31] = [
 	// machines, so a kernel change selects it - the specification is a model OF that code, and a
 	// change to it that the model no longer describes is exactly what this is for.
 	("capability-model", "kernel"),
+	// P02M0150's gate: which keys a loader carries. Its subject is the loader, so a boot change
+	// selects it - and the two profiles differing only in a comment is the failure it exists for.
+	("trust-profile", "boot.loader"),
 	// P02M0145's gate: the development configuration COMPILES. Its subject is every services and
 	// drivers crate at once, which is a set no single component names - so it takes the
 	// always-selected label for the reason the entry above it does, and for a second one: the fault

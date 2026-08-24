@@ -233,20 +233,19 @@ pub enum Selection {
 // `bootproto`, the policy lives here, and neither has to know the other's crate. They are closures
 // rather than traits because the loader's filesystems are types it does not own, and the orphan
 // rule does not let it implement somebody else's trait for them.
-pub fn assemble(mut read: impl FnMut(&[u8]) -> Option<Vec<u8>>, verify: impl Fn(&[u8], &[u8], &[u8]) -> bool) -> Selection {
+pub fn assemble(mut read: impl FnMut(&[u8]) -> Option<Vec<u8>>, verify: impl Fn(&[u8], &[u8]) -> bool) -> Selection {
 	let Some(list) = read(b"etc/bootstrap.list") else {
 		return Selection::Unavailable;
 	};
 	let Some(rows) = parse_list(&list) else {
 		return Selection::Invalid(Refusal::MalformedList);
 	};
-	// THE MANIFEST BESIDE THE LIST. From here on this source is the chosen one: a manifest that is
-	// absent, malformed or disagreeing stops the boot rather than falling through to another
-	// source. Choosing a source and failing a check on it are different things.
-	let Some(manifest) = read(b"etc/boot.manifest") else {
-		return Selection::Invalid(Refusal::NoManifest);
-	};
-	if !verify(&manifest, b"etc/bootstrap.list", &list) {
+	// WHICH MANIFEST IS THE CALLER'S QUESTION, and `verify` is the answer it already made. A signed
+	// v2 manifest and the text one are different formats with different guarantees, and the choice
+	// between them is a policy - which source, which profile, which key - that belongs where the
+	// policy lives rather than inside the walk. From here on this source is the CHOSEN one: a check
+	// that fails stops the boot rather than falling through to another source.
+	if !verify(b"etc/bootstrap.list", &list) {
 		return Selection::Invalid(Refusal::ListMismatch);
 	}
 	let mut blobs: Vec<Vec<u8>> = Vec::new();
@@ -261,7 +260,7 @@ pub fn assemble(mut read: impl FnMut(&[u8]) -> Option<Vec<u8>>, verify: impl Fn(
 		let Some(blob) = read(row.path) else {
 			return Selection::Invalid(Refusal::MissingProgram);
 		};
-		if !verify(&manifest, row.path, &blob) {
+		if !verify(row.path, &blob) {
 			return Selection::Invalid(Refusal::ProgramMismatch);
 		}
 		blobs.push(blob);

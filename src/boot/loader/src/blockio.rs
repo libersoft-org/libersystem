@@ -86,13 +86,61 @@ impl<D: BlockDevice> ReadsFiles for fat::FatFs<D> {
 // writer it ends with, because this is a UEFI binary and nothing inside one can be tested. What
 // stays here is the reading and the reporting.
 pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> abi::bootstrap::Selection {
-	let verdict = abi::bootstrap::assemble(|path| fs.read(path), digests_ok);
+	// WHICH MANIFEST, AND THE SIGNED ONE WINS WHEREVER IT EXISTS. A source carrying `boot.manifest2`
+	// is one that was signed, and reading the text manifest beside it instead would be choosing the
+	// weaker of two answers about the same bytes. A source with only the text one is a medium made
+	// before signing; it still proves integrity, and it still proves nothing about origin.
+	if let Some(signed) = fs.read(b"etc/boot.manifest2") {
+		let mut scratch = alloc::vec::Vec::new();
+		if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + signed.len()).is_err() {
+			return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::OutOfMemory);
+		}
+		scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
+		let Some(manifest) = crate::trust::verify(&signed, &mut scratch) else {
+			return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::NoManifest);
+		};
+		let verdict = abi::bootstrap::assemble(
+			|path| fs.read(path),
+			|path, bytes| {
+				// THE KIND COMES FROM THE PATH because the walk knows only two: the list itself, and the
+				// programs it names. A row of the wrong kind under the right path is not this file.
+				let kind = if path == b"etc/bootstrap.list" { bootproto::manifest::KIND_BOOTSTRAP_LIST } else { bootproto::manifest::KIND_PROGRAM };
+				covered_by(&manifest, kind, path, bytes)
+			},
+		);
+		if matches!(verdict, abi::bootstrap::Selection::Verified(_)) {
+			crate::arch::serial::write_str("loader: bootstrap set verified against a SIGNED etc/boot.manifest2\n");
+		}
+		return verdict;
+	}
+	let Some(manifest) = fs.read(b"etc/boot.manifest") else {
+		crate::arch::serial::write_str("loader: this source has no manifest of either kind - refusing to boot from it\n");
+		return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::NoManifest);
+	};
+	let verdict = abi::bootstrap::assemble(|path| fs.read(path), |path, bytes| digests_ok(&manifest, path, bytes));
 	if matches!(verdict, abi::bootstrap::Selection::Verified(_)) {
 		// SAY THAT IT CHECKED. A check that is silent when it passes cannot be told apart in a boot
 		// log from one that was never wired up, and this one's whole value is that it ran.
 		crate::arch::serial::write_str("loader: bootstrap set verified against etc/boot.manifest\n");
 	}
 	verdict
+}
+
+// Whether the SIGNED manifest covers this file, with the length and digest it records.
+//
+// THE KIND COMES FROM THE PATH because the walk only knows two: the list itself, and the programs it
+// names. A row of the wrong kind under the right path is not this file - which is what makes the
+// kind part of the name rather than decoration.
+pub(crate) fn covered_by(manifest: &bootproto::manifest::Manifest<'_>, kind: u8, path: &[u8], bytes: &[u8]) -> bool {
+	let Some(row) = manifest.find(kind, path) else {
+		crate::arch::serial::write_str("loader: a boot file is not named in the signed manifest - refusing to boot\n");
+		return false;
+	};
+	if row.length != bytes.len() as u64 || row.digest != bootproto::sha256::digest(bytes) {
+		crate::arch::serial::write_str("loader: a boot file does not match the signed manifest - refusing to boot\n");
+		return false;
+	}
+	true
 }
 
 // Whether `bytes` is what the manifest says the file at `path` should be, with the line that says
