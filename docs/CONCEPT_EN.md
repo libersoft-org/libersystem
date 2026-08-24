@@ -151,7 +151,7 @@ At present the system is **aimed at developers, early adopters, and edge/securit
 - The early target group are those who are drawn to the capability model, WASI, and a clean architecture, and who will start building an ecosystem of applications, tools, and drivers.
 - The driving force of the direction is not "modernity and the absence of legacy" in itself, but **capability security, the WASI application model, and memory safety**.
 
-The system's further direction (server -> real hardware -> desktop -> AI platform) and the moment of opening to a wider audience are described in the *Roadmap*.
+The system's further direction (server -> desktop -> real hardware and foreign-software compatibility -> AI platform) and the moment of opening to a wider audience are described in the *Roadmap*.
 
 #### Deployment targets: appliance/edge -> server -> desktop
 
@@ -160,12 +160,12 @@ Besides layering *in time* (who), the project also has a clear order of *deploym
 | Target | Order | Who controls the hardware | Who writes the running software | Required external ecosystem |
 |---|---|---|---|---|
 | **Appliance / edge / embedded** | **1st (current)** | the project (a single board / VM profile) | the project (native / WASI) | minimal |
-| **Server** | 2nd | partly the project | partly external (services, DB) | medium (POSIX compat.) |
-| **Desktop** | 3rd | anyone (unbounded HW) | the whole world (GUI apps) | extensive (where most OSes fail) |
+| **Server** | 2nd | partly the project | partly external (native / WASI services, DB) | medium (native / WASI ecosystem) |
+| **Desktop** | 3rd | initially a VM/reference profile; later anyone | the whole world (native apps first) | extensive (foreign compatibility follows later) |
 
 Key rules of this ordering:
 
-- **Each target is a superset of the previous one.** From embedded to server you mainly add networking (and, later, POSIX compatibility for foreign software); from server to desktop you add the GUI/compositor, the full input and audio stacks (basic console input and a headless audio service already arrive earlier), and a wider range of drivers. These are not three independent from-scratch starts, but building in layers (see *Layering principle*).
+- **Each target is a superset of the previous one.** From embedded to server you mainly add networking and server services; from server to desktop you add the GUI/compositor and the full input and audio stacks (basic console input and a headless audio service already arrive earlier). The desktop is first completed on a VM/reference hardware profile. Broader real-hardware support and POSIX/Linux compatibility for foreign software are deliberately deferred until the native server and desktop stacks exist. These are not independent from-scratch starts, but building in layers (see *Layering principle*).
 - **Each target is valuable on its own, not merely a stepping stone.** Even the appliance/edge target is a full product in its own right (a secure edge node), so the system delivers real value from the very first phase - not only at the end of the journey. Server and desktop build on this foundation as full-fledged extensions the system is heading toward.
 
 ### Language policy
@@ -999,7 +999,7 @@ their portability and appliance/edge value justify the bounded implementation co
 
 #### Device-specific drivers (later)
 
-Phase 4 brings up selected real machines. Its new drivers are therefore specific to
+Phase 5 brings up selected real machines. Its new drivers are therefore specific to
 the concrete deployment: a particular NIC, GPU, Wi-Fi/audio chip, storage controller,
 SoC peripheral block or board. DeviceManager still binds them behind the same typed
 service contracts, while the universal drivers created earlier remain shared building
@@ -1523,12 +1523,12 @@ POSIX-like compatibility is an **optional userspace layer**, not part of the ker
                               (the Redox relibc model) for porting programs.
 3. Linux-syscall emulation:   running unmodified Linux binaries
                               (the Fuchsia Starnix / WSL1 model) - the most demanding,
-                              the latest phase.
+                              implemented last within the compatibility work.
 ```
 
 #### Order: WASI first, POSIX-like later
 
-First we properly build the native and WASI path. The compatibility layer comes once there is something and a reason to port - as a convenience for developers, not as a crutch that dilutes the native model.
+First we properly build the native and WASI path, including the server and desktop platforms. The compatibility layer comes only afterward, once there is something and a reason to port - as a convenience for developers, not as a crutch that dilutes the native model.
 
 > Note on wording: yes, it is "our own compatibility layer" - specifically a **userspace translation layer** that converts the POSIX/Linux interface onto our services. The point is not to turn the OS into Linux, but to be able to *run* existing software on it when that makes sense.
 
@@ -1595,11 +1595,11 @@ The roadmap is milestone-based, not time-based (deliberately without dates):
 
 - We manage scope through phases, and each phase should be a *usable* intermediate state.
 - The order of the phases follows the deployment targets appliance/edge -> server -> desktop (see *Why this OS instead of Linux*).
-- Deployment on real hardware comes after the server phase; the AI platform as the final evolution on top of the desktop.
+- The desktop is first completed on the VM/reference profile; deployment on selected real hardware and foreign-software compatibility follow it. The AI platform is the final evolution on top of the desktop.
 
 **How to read the phase horizon.** Phases 0-2 target appliance/edge and represent a **real, near-term goal** for one person or a small team (a bootable capability microkernel + the first WASI component + virtio + a bounded universal-driver set + networking). They should be understood as a *complete* project, not as a stepping stone to something bigger - even the appliance/edge platform alone is a finished, meaningful product.
 
-**Phases 3-6 are not a plan but a vision - and they hold only on the assumption that a community forms around the project.** Phase 3 (server), Phase 4 (real hardware), Phase 5 (a full-fledged desktop), and Phase 6 (the AI platform) represent hundreds of person-years. They are therefore deliberately phrased as a *direction* in which the system **can** grow thanks to its architecture as more contributors arrive.
+**Phases 3-6 are not a plan but a vision - and they hold only on the assumption that a community forms around the project.** Phase 3 (server), Phase 4 (a full-fledged desktop), Phase 5 (real hardware and foreign-software compatibility), and Phase 6 (the AI platform) represent hundreds of person-years. They are therefore deliberately phrased as a *direction* in which the system **can** grow thanks to its architecture as more contributors arrive.
 
 **What will attract a community and what will not**:
 - NO - modernity and the absence of legacy
@@ -1608,107 +1608,110 @@ The roadmap is milestone-based, not time-based (deliberately without dates):
 #### Phase 0 - Bring-up (kernel MVP)
 
 ```text
-boot in QEMU, serial log, framebuffer text
-physical/virtual memory, heap, address spaces
-thread, scheduler (SMP-aware design, running on a single core for now), Channel IPC, handle table, capabilities, Domain
-start SystemManager, the first IPC message
-catching a page fault, cleanup of a crashed process
-ramdisk/init package, StorageService over a ramdisk, vol:// access
-a simple CLI, a basic System Graph
+- boot in QEMU, serial log, framebuffer text
+- physical/virtual memory, heap, address spaces
+- thread, scheduler (SMP-aware design, running on a single core for now), Channel IPC, handle table, capabilities, Domain
+- start SystemManager, the first IPC message
+- catching a page fault, cleanup of a crashed process
+- ramdisk/init package, StorageService over a ramdisk, vol:// access
+- a simple CLI, a basic System Graph
 ```
 
 #### Phase 1 - First usable userspace
 
 ```text
-IDL/WIT toolchain and generators
-core services: Process, Storage, Log, Device, Config
-virtio drivers (headless): blk, net, console
-minimal WASI host: running the first Wasm component
-a prototype file picker (powerbox)
+- IDL/WIT toolchain and generators
+- core services: Process, Storage, Log, Device, Config
+- virtio drivers (headless): blk, net, console
+- minimal WASI host: running the first Wasm component
+- a prototype file picker (powerbox)
 ```
 
 #### Phase 2 - Appliance/edge platform
 
 ```text
-a network stack over virtio-net (a priority - on the edge, networking is the core)
-standards-based universal drivers with broad reuse, starting with xHCI USB plus HID and mass-storage classes; no vendor-device support matrix
-an interactive console: keyboard input + a userspace line editor (command history, cursor movement, in-line editing, ANSI key sequences for arrows) - the kernel console stays a dumb byte sink, the line editor lives in the shell
-simple pointer/mouse plumbing over virtio-input (text-cell pointer + button events for TUI apps such as a file manager); no mouse stack or touch yet (those are the desktop phase)
-observability: full System Graph, JSON/CBOR/CLI representations, tracing, counters (the JSON/CBOR forms are network-friendly; exposing and administering it over the network is phase 3)
-security hardening: app sandbox, permission manifests, threat model
-ServiceManager with restart policy and watchdog
-full Component Model + WASI preview 2, an SDK for Rust/C/Go
-a simple persistent native filesystem
-the kernel and the own UEFI loader ported to ARM64 (aarch64) and RISC-V (riscv64), tested under QEMU emulation (qemu-system-aarch64 / qemu-system-riscv64) - one arch-abstracted kernel over three architectures; real boards stay phase 4
+- a network stack over virtio-net (a priority - on the edge, networking is the core)
+- standards-based universal drivers with broad reuse, starting with xHCI USB plus HID and mass-storage classes; no vendor-device support matrix
+- an interactive console: keyboard input + a userspace line editor (command history, cursor movement, in-line editing, ANSI key sequences for arrows) - the kernel console stays a dumb byte sink, the line editor lives in the shell
+- simple pointer/mouse plumbing over virtio-input (text-cell pointer + button events for TUI apps such as a file manager); no mouse stack or touch yet (those are the desktop phase)
+- user accounts / identities (local and multi-user management; the identity foundation for later remote access) - userspace identity over capabilities, not kernel uid/gid
+- localization (locale, language, time zone, formatting) - already relevant in the CLI and logs
+- observability: full System Graph, JSON/CBOR/CLI representations, tracing, counters (the JSON/CBOR forms are network-friendly; exposing and administering it over the network is phase 3)
+- security hardening: app sandbox, permission manifests, threat model
+- ServiceManager with restart policy and watchdog
+- full Component Model + WASI preview 2, a WASI SDK for Rust/C/Go
+- a general-purpose native application SDK and cross-compilation toolchain for building LiberSystem `.lsexe` executables and `.lslib` libraries from other host operating systems (compiler targets, sysroot, ABI/IDL bindings, and linker support); separate from the WASM/WASI SDK
+- a modern persistent native filesystem designed for LiberSystem (CoW, checksums, snapshots, compression)
+- the kernel and the own UEFI loader ported to ARM64 (aarch64) and RISC-V (riscv64), tested under QEMU emulation (qemu-system-aarch64 / qemu-system-riscv64) - one arch-abstracted kernel over three architectures; real boards stay phase 5
 ```
 
 #### Phase 3 - Server platform
 
 ```text
-user accounts / identities (multi-user management, remote access) - userspace identity over capabilities, not kernel uid/gid
-remote admin: the System Graph / logs / counters exposed and administered over the network, authenticated against the identity model (phase 2 keeps observability local + network-friendly representations)
-localization (locale, language, time zone, formatting) - relevant already in the CLI and in logs
-a wider network stack and server-class workloads
-immutable signed system, A/B updates, rollback, verified boot
-encrypted user volumes
-a native modern FS (CoW, checksums, snapshots, compression)
-first first-party services: a simple static-file web server and similar small services - dogfooding the network stack + storage + service model on our own / WASI layer (no POSIX needed)
-a minimal headless AudioService over virtio-sound (playback, optionally capture) - so audio works from the console too (e.g. for a headless voice assistant); the full desktop audio stack stays Phase 5
-package/app format, installation, AOT compilation
-a CLI package manager (search / install / update / remove of first-party packages, built on the package/app format from this phase) - the end-user app store stays Phase 5
+- remote admin: the System Graph / logs / counters exposed and administered over the network, authenticated against the phase-2 identity model (phase 2 keeps observability local + network-friendly representations)
+- a wider network stack and server-class workloads
+- a native cryptography library and secure-random API shared by system services
+- a TLS/SSL library built on the native cryptography library
+- an SSH server with SFTP support, authenticated against the native identity model
+- a basic HTTPS server (including static-file serving) as a first-party service - dogfooding the network stack + storage + service model on our own / WASI layer (no POSIX needed)
+- immutable signed system, A/B updates, rollback, verified boot
+- encrypted user volumes
+- a minimal headless AudioService over virtio-sound (playback, optionally capture) - so audio works from the console too (e.g. for a headless voice assistant); the full desktop audio stack stays Phase 4
+- package/app format, installation, AOT compilation
+- a CLI package manager (search / install / update / remove of first-party packages, built on the package/app format from this phase) - the end-user app store stays Phase 4
 ```
 
-#### Phase 4 - Real hardware and foreign-software compatibility
+#### Phase 4 - Desktop platform
 
 ```text
-a POSIX-like compatibility layer (relibc-style) - for foreign server software
-the driver binding model in practice: DeviceManager pairs real devices -> drivers
-device- and board-specific drivers selected per deployment (concrete NIC/GPU/Wi-Fi/audio/storage controllers and SoC peripheral blocks)
-support for specific servers and SBCs (single-board computers)
-ARM64 / RISC-V real boards alongside x86-64 (the phase-2 QEMU ports brought to bare metal)
-power management per deployment (ACPI, idle/suspend)
-the transition from virtio/VM to bare metal
-```
-
-#### Phase 5 - Desktop platform
-
-```text
-GUI/compositor (virtio-gpu and real GPUs), input: keyboard/mouse/touch
-a window manager, a desktop shell, and a complete user environment
-the full audio stack (mixing, per-app routing, recording, real-HW drivers) - building on the headless Phase 3 AudioService
-portals: mic/cam/screenshot, screen sharing, file selection
-a package manager / app store for end users (GUI) - on top of the Phase 3 CLI package manager
-user profiles and desktop settings, accessibility (screen readers, etc.)
-notifications, clipboard, drag-and-drop, multi-monitor support
-accelerated graphics and multimedia
-optional Linux binary emulation (Starnix-style) - running existing applications
-Flow Graph metrics
+- GUI/compositor over virtio-gpu; real GPUs follow in Phase 5, input: keyboard/mouse/touch
+- a window manager, a desktop shell, and a complete user environment
+- the full audio stack (mixing, per-app routing, recording) over virtio-sound - building on the headless Phase 3 AudioService; real-hardware audio drivers follow in Phase 5
+- portals: mic/cam/screenshot, screen sharing, file selection
+- a package manager / app store for end users (GUI) - on top of the Phase 3 CLI package manager
+- user profiles and desktop settings, accessibility (screen readers, etc.)
+- notifications, clipboard, drag-and-drop, multi-monitor support
+- accelerated graphics and multimedia on the reference/virtual hardware profile
+- Flow Graph metrics
 ```
 
 **Only in this phase does "friendliness for ordinary users" become a real goal.** It is the culmination of the developer-first -> ecosystem -> broad friendliness trajectory (see *Why this OS instead of Linux*): the ordinary user arrives *only* at a mature desktop with an ecosystem and applications, not at a bare kernel. Until then, the ordinary user is not the target group by which early design decisions are made.
+
+#### Phase 5 - Real hardware and foreign-software compatibility
+
+```text
+- the driver binding model in practice: DeviceManager pairs real devices -> drivers
+- device- and board-specific drivers selected per deployment (concrete NIC/GPU/Wi-Fi/audio/storage controllers and SoC peripheral blocks)
+- support for specific servers, desktop machines, and SBCs (single-board computers)
+- ARM64 / RISC-V real boards alongside x86-64 (the phase-2 QEMU ports brought to bare metal)
+- power management per deployment (ACPI, idle/suspend)
+- the transition from virtio/VM to bare metal, including the desktop stack from Phase 4
+- a POSIX-like compatibility layer (relibc-style) - for foreign server and desktop software
+- optional Linux binary emulation (Starnix-style) - running existing applications
+```
 
 #### Phase 6 - AI platform
 
 An alternative to the classic desktop:
 
 - the primary interface is not direct control of applications, but an AI that carries out the user's intents on their behalf.
-- it builds on the desktop (Phase 5), because it is a **virtual agent (a 3D avatar)** - a visual and voice agent that displays alongside itself content relevant to the conversation (text, video, audio, images).
+- it builds on the desktop (Phase 4), because it is a **virtual agent (a 3D avatar)** - a visual and voice agent that displays alongside itself content relevant to the conversation (text, video, audio, images).
 - it needs the complete graphics, audio, and multimedia foundation from the desktop phase
 - the capability model and the typed API (*the object is canonical*) make the system a safe, machine-controllable substrate for such an agent
 - beyond the local system, the agent also connects to external tools and services via a standard protocol (**MCP - Model Context Protocol**), but each such connector is just another capability-restricted component, so connecting to the outside does not extend its permissions beyond what the user granted.
 
 ```text
-an embodied virtual agent (a 3D avatar) + voice and text input/output as the primary interface
-presentation of found content alongside the agent: text, video, audio, images (multimedia from Phase 5)
-the AI interface as the primary mode of interaction - the user formulates an intent, does not control applications directly
-the AI agent carries out the user's requests through the typed system API and applications
-a capability-restricted agent: it acts only within the granted permissions (auditably, revocably)
-orchestration of applications and services by the AI layer over the typed object API
-connection to external tools, data, and services via MCP (Model Context Protocol) - a unified protocol through which the agent calls remote tools and APIs
-each MCP connector runs as a separate capability-restricted component (sandbox, auditably, revocably)
-portals and confirmation of sensitive actions - the AI must not exceed the granted capabilities
-auditing of the AI's actions via the System Graph and the capability model
-the classic desktop remains available as an alternative interface
+- an embodied virtual agent (a 3D avatar) + voice and text input/output as the primary interface
+- presentation of found content alongside the agent: text, video, audio, images (multimedia from Phase 4)
+- the AI interface as the primary mode of interaction - the user formulates an intent, does not control applications directly
+- the AI agent carries out the user's requests through the typed system API and applications
+- a capability-restricted agent: it acts only within the granted permissions (auditably, revocably)
+- orchestration of applications and services by the AI layer over the typed object API
+- connection to external tools, data, and services via MCP (Model Context Protocol) - a unified protocol through which the agent calls remote tools and APIs
+- each MCP connector runs as a separate capability-restricted component (sandbox, auditably, revocably)
+- portals and confirmation of sensitive actions - the AI must not exceed the granted capabilities
+- auditing of the AI's actions via the System Graph and the capability model
+- the classic desktop remains available as an alternative interface
 ```
 
 ---
@@ -1781,4 +1784,4 @@ Phases 0 and 1 are complete (the kernel MVP and the first usable userspace - see
   first Wasm component; a powerbox file picker handing out a single file capability.
 ```
 
-The recommended next step is therefore **Phase 2 (the appliance/edge platform)**. Its priority is a network stack over virtio-net - on the edge, networking is the core - followed by the rest of the phase (full System Graph + observability, security hardening + PermissionManager, the ResourceManager policy, ServiceManager restart/watchdog, the full Component Model + WASI preview 2 + an SDK, a simple persistent native filesystem, and the kernel + own UEFI loader ported to ARM64/RISC-V and tested under QEMU); see the *Roadmap*.
+The recommended next step is therefore **Phase 2 (the appliance/edge platform)**. Its priority is a network stack over virtio-net - on the edge, networking is the core - followed by the rest of the phase (user accounts / identities and localization, full System Graph + observability, security hardening + PermissionManager, the ResourceManager policy, ServiceManager restart/watchdog, the full Component Model + WASI preview 2 + its WASI SDK, a native `.lsexe` / `.lslib` cross-compilation SDK, a modern persistent native filesystem, and the kernel + own UEFI loader ported to ARM64/RISC-V and tested under QEMU); see the *Roadmap*.

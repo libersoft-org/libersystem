@@ -151,7 +151,7 @@ V současnosti je systém **určen vývojářům, early-adopterům a nasazení v
 - Ranou cílovou skupinou jsou ti, které zaujme capability model, WASI a čistá architektura a kteří začnou budovat ekosystém aplikací, nástrojů a ovladačů.
 - Hnacím prvkem směřování není „modernost a absence legacy" sama o sobě, ale **capability bezpečnost, aplikační model WASI a paměťová bezpečnost**.
 
-Další směřování systému (server → reálný hardware → desktop → AI platforma) i okamžik otevření širšímu publiku popisuje *Roadmapa*.
+Další směřování systému (server → desktop → reálný hardware a kompatibilita cizího softwaru → AI platforma) i okamžik otevření širšímu publiku popisuje *Roadmapa*.
 
 #### Nasazovací cíle: appliance/edge → server → desktop
 
@@ -160,12 +160,12 @@ Kromě vrstvení *v čase* (kdo) má projekt i jasné pořadí *nasazovacích c�
 | Cíl | Pořadí | Kdo řídí hardware | Kdo píše běžící software | Potřebný externí ekosystém |
 |---|---|---|---|---|
 | **Appliance / edge / embedded** | **1. (současná)** | projekt (jeden board / VM profil) | projekt (nativní / WASI) | minimální |
-| **Server** | 2. | částečně projekt | částečně externí (služby, DB) | střední (POSIX kompat.) |
-| **Desktop** | 3. | kdokoli (neomezené HW) | celý svět (GUI aplikace) | rozsáhlý (zde selhává většina OS) |
+| **Server** | 2. | částečně projekt | částečně externí (nativní / WASI služby, DB) | střední (nativní / WASI ekosystém) |
+| **Desktop** | 3. | nejprve VM/referenční profil, později kdokoli | celý svět (nejprve nativní aplikace) | rozsáhlý (kompatibilita s cizím softwarem přijde později) |
 
 Klíčová pravidla tohoto pořadí:
 
-- **Každý cíl je nadmnožinou předchozího.** Z embedded na server přibývá především síť (a později POSIX kompatibilita kvůli cizímu softwaru), ze serveru na desktop pak GUI/compositor, plný vstupní a audio stack (základní vstup z konzole a headless audio služba přicházejí už dříve) a širší škála ovladačů. Nejde o tři nezávislé starty od nuly, ale o budování ve vrstvách (viz *Princip vrstvení*).
+- **Každý cíl je nadmnožinou předchozího.** Z embedded na server přibývá především síť a serverové služby, ze serveru na desktop pak GUI/compositor a plný vstupní a audio stack (základní vstup z konzole a headless audio služba přicházejí už dříve). Desktop se nejprve dokončí nad VM/referenčním hardwarovým profilem. Širší podpora reálného hardwaru a POSIX/Linux kompatibilita pro cizí software jsou záměrně odloženy, dokud neexistují nativní serverový i desktopový stack. Nejde o nezávislé starty od nuly, ale o budování ve vrstvách (viz *Princip vrstvení*).
 - **Každý cíl je samostatně hodnotný, nikoli pouze odrazový můstek.** Již appliance/edge představuje plnohodnotný produkt sám o sobě (bezpečný edge uzel), takže systém dodává reálnou hodnotu od první fáze - nikoli až na konci cesty. Server i desktop na tomto základu staví jako plnohodnotná rozšíření, k nimž systém směřuje.
 
 ### Jazyková politika
@@ -999,7 +999,7 @@ přenositelnost a hodnota pro appliance/edge ospravedlní omezené implementačn
 
 #### Ovladače konkrétních zařízení (později)
 
-Fáze 4 uvádí do provozu vybrané reálné stroje. Její nové ovladače jsou proto specifické
+Fáze 5 uvádí do provozu vybrané reálné stroje. Její nové ovladače jsou proto specifické
 pro konkrétní nasazení: určitý NIC, GPU, Wi-Fi/audio čip, storage řadič, periferní blok
 SoC nebo desku. DeviceManager je nadále váže za stejnými typovanými kontrakty služeb,
 zatímco dříve vytvořené univerzální ovladače zůstávají sdílenými stavebními bloky.
@@ -1523,12 +1523,12 @@ POSIX-like kompatibilita je **volitelná userspace vrstva**, ne součást kernel
                               (model Redox relibc) pro porty programů.
 3. Linux-syscall emulace:     spouštění nemodifikovaných Linux binárek
                               (model Fuchsia Starnix / WSL1) - nejnáročnější,
-                              nejpozdější fáze.
+                              implementovaná jako poslední v rámci kompatibility.
 ```
 
 #### Pořadí: WASI first, POSIX-like later
 
-Nejdřív pořádně postavíme nativní a WASI cestu. Kompatibilní vrstva přijde, až bude co a proč portovat - jako pohodlí pro vývojáře, ne jako berlička, která rozmělní nativní model.
+Nejdřív pořádně postavíme nativní a WASI cestu včetně serverové a desktopové platformy. Kompatibilní vrstva přijde až potom, až bude co a proč portovat - jako pohodlí pro vývojáře, ne jako berlička, která rozmělní nativní model.
 
 > Pozn. k formulaci: ano, je to „vlastní vrstva kompatibility" - konkrétně **userspace překladová vrstva**, která POSIX/Linux rozhraní převádí na naše služby. Nejde o to dělat z OS Linux, ale umět na něm *spustit* existující software, když to dává smysl.
 
@@ -1595,11 +1595,11 @@ Roadmapa je milníková, ne časová (záměrně bez termínů):
 
 - Rozsah řídíme přes fáze a každá fáze má být *použitelný* mezistav.
 - Pořadí fází sleduje nasazovací cíle appliance/edge → server → desktop (viz *Proč tento OS místo Linuxu*).
-- Nasazení na reálný hardware přichází po serverové fázi, AI platforma jako závěrečná evoluce nad desktopem.
+- Desktop se nejprve dokončí nad VM/referenčním profilem; nasazení na vybraný reálný hardware a kompatibilita cizího softwaru přijdou až po něm. AI platforma je závěrečnou evolucí nad desktopem.
 
 **Jak číst horizont fází.** Fáze 0-2 cílí na appliance/edge a představují **reálný, blízký cíl** jednoho člověka nebo malého týmu (bootovatelný capability microkernel + první WASI komponenta + virtio + omezená sada univerzálních ovladačů + síť). Je třeba je chápat jako *úplný* projekt, nikoli jako odrazový můstek k něčemu většímu - i samotná appliance/edge platforma je dokončený, smysluplný produkt.
 
-**Fáze 3-6 nejsou plánem, ale vizí - a platí pouze za předpokladu, že kolem projektu vznikne komunita.** Fáze 3 (server), Fáze 4 (reálný hardware), Fáze 5 (plnohodnotný desktop) a Fáze 6 (AI platforma) představují stovky člověko-roků. Jsou proto vědomě formulovány jako *směr*, kam systém **může** růst díky své architektuře s příchodem dalších přispěvatelů.
+**Fáze 3-6 nejsou plánem, ale vizí - a platí pouze za předpokladu, že kolem projektu vznikne komunita.** Fáze 3 (server), Fáze 4 (plnohodnotný desktop), Fáze 5 (reálný hardware a kompatibilita cizího softwaru) a Fáze 6 (AI platforma) představují stovky člověko-roků. Jsou proto vědomě formulovány jako *směr*, kam systém **může** růst díky své architektuře s příchodem dalších přispěvatelů.
 
 **Co komunitu přitáhne a co nikoliv**:
 - NE - modernost a absence legacy
@@ -1608,107 +1608,110 @@ Roadmapa je milníková, ne časová (záměrně bez termínů):
 #### Fáze 0 - Bring-up (MVP jádra)
 
 ```text
-boot v QEMU, serial log, framebuffer text
-physical/virtual memory, heap, address spaces
-thread, scheduler (SMP-aware návrh, běh zatím na jednom jádře), Channel IPC, handle table, capabilities, Domain
-start SystemManager, první IPC zpráva
-zachycení page faultu, úklid spadlého procesu
-ramdisk/init package, StorageService nad ramdiskem, vol:// přístup
-jednoduché CLI, základní System Graph
+- boot v QEMU, serial log, framebuffer text
+- physical/virtual memory, heap, address spaces
+- thread, scheduler (SMP-aware návrh, běh zatím na jednom jádře), Channel IPC, handle table, capabilities, Domain
+- start SystemManager, první IPC zpráva
+- zachycení page faultu, úklid spadlého procesu
+- ramdisk/init package, StorageService nad ramdiskem, vol:// přístup
+- jednoduché CLI, základní System Graph
 ```
 
 #### Fáze 1 - První použitelný userspace
 
 ```text
-IDL/WIT toolchain a generátory
-core služby: Process, Storage, Log, Device, Config
-virtio drivery (headless): blk, net, console
-minimální WASI host: spuštění první Wasm komponenty
-prototyp file pickeru (powerbox)
+- IDL/WIT toolchain a generátory
+- core služby: Process, Storage, Log, Device, Config
+- virtio drivery (headless): blk, net, console
+- minimální WASI host: spuštění první Wasm komponenty
+- prototyp file pickeru (powerbox)
 ```
 
 #### Fáze 2 - Appliance/edge platforma
 
 ```text
-síťový stack nad virtio-net (priorita - na edge je síť jádro)
-standardizované univerzální ovladače s širokým využitím, počínaje xHCI USB plus třídami HID a mass storage; žádná matice podpory vendor zařízení
-interaktivní konzole: vstup z klávesnice + userspace řádkový editor (historie příkazů, pohyb kurzoru, editace uvnitř řádku, ANSI sekvence pro šipky) - kernel konzole zůstává hloupým bajtovým kanálem, řádkový editor žije v shellu
-jednoduché pointer/myš plumbing nad virtio-input (pointer v textových buňkách + události tlačítek pro TUI aplikace typu správce souborů); zatím žádný myší stack ani touch (ty jsou až desktopová fáze)
-observabilita: plný System Graph, JSON/CBOR/CLI reprezentace, tracing, counters (JSON/CBOR formy jsou network-friendly; vystavení a správa po síti je fáze 3)
-bezpečnostní hardening: app sandbox, permission manifesty, threat model
-ServiceManager s restart policy a watchdog
-plný Component Model + WASI preview 2, SDK pro Rust/C/Go
-jednoduchý perzistentní nativní filesystem
-kernel a vlastní UEFI loader portované na ARM64 (aarch64) a RISC-V (riscv64), testované pod emulací v QEMU (qemu-system-aarch64 / qemu-system-riscv64) - jedno arch-abstrahované jádro nad třemi architekturami; reálné desky zůstávají fáze 4
+- síťový stack nad virtio-net (priorita - na edge je síť jádro)
+- standardizované univerzální ovladače s širokým využitím, počínaje xHCI USB plus třídami HID a mass storage; žádná matice podpory vendor zařízení
+- interaktivní konzole: vstup z klávesnice + userspace řádkový editor (historie příkazů, pohyb kurzoru, editace uvnitř řádku, ANSI sekvence pro šipky) - kernel konzole zůstává hloupým bajtovým kanálem, řádkový editor žije v shellu
+- jednoduché pointer/myš plumbing nad virtio-input (pointer v textových buňkách + události tlačítek pro TUI aplikace typu správce souborů); zatím žádný myší stack ani touch (ty jsou až desktopová fáze)
+- uživatelské účty / identity (lokální a víceuživatelská správa; identitní základ pro pozdější vzdálený přístup) - userspace identita nad capabilitami, ne kernel uid/gid
+- lokalizace (locale, jazyk, časová zóna, formátování) - relevantní už v CLI a v logách
+- observabilita: plný System Graph, JSON/CBOR/CLI reprezentace, tracing, counters (JSON/CBOR formy jsou network-friendly; vystavení a správa po síti je fáze 3)
+- bezpečnostní hardening: app sandbox, permission manifesty, threat model
+- ServiceManager s restart policy a watchdog
+- plný Component Model + WASI preview 2, WASI SDK pro Rust/C/Go
+- obecné SDK pro nativní aplikace a cross-compilační toolchain pro sestavování spustitelných souborů LiberSystemu `.lsexe` a knihoven `.lslib` na jiných hostitelských operačních systémech (compiler targety, sysroot, ABI/IDL bindingy a podpora linkeru); oddělené od WASM/WASI SDK
+- vlastní moderní perzistentní nativní filesystem (CoW, checksums, snapshots, komprese)
+- kernel a vlastní UEFI loader portované na ARM64 (aarch64) a RISC-V (riscv64), testované pod emulací v QEMU (qemu-system-aarch64 / qemu-system-riscv64) - jedno arch-abstrahované jádro nad třemi architekturami; reálné desky zůstávají fáze 5
 ```
 
 #### Fáze 3 - Serverová platforma
 
 ```text
-uživatelské účty / identity (víceuživatelská správa, vzdálený přístup) - userspace identita nad capabilitami, ne kernel uid/gid
-remote admin: System Graph / logy / countery vystavené a spravované po síti, autentizované vůči identitnímu modelu (fáze 2 drží observabilitu lokální + network-friendly reprezentace)
-lokalizace (locale, jazyk, časová zóna, formátování) - relevantní už v CLI a v logách
-širší síťový stack a server-class workloady
-immutable signed systém, A/B updates, rollback, verified boot
-šifrované user volumes
-nativní moderní FS (CoW, checksums, snapshots, komprese)
-první vlastní služby: jednoduchý web server pro statické soubory a podobné malé služby - dogfooding síťového stacku + storage + service modelu na naší vlastní / WASI vrstvě (bez POSIXu)
-minimální headless AudioService nad virtio-sound (přehrávání, volitelně záznam) - aby zvuk fungoval i z konzole (např. pro headless hlasového asistenta); plný desktopový audio stack zůstává fáze 5
-package/app formát, instalace, AOT kompilace
-CLI package manager (hledání / instalace / aktualizace / odebrání vlastních balíčků, postavený na package/app formátu z této fáze) - end-user app store zůstává fáze 5
+- remote admin: System Graph / logy / countery vystavené a spravované po síti, autentizované vůči identitnímu modelu z fáze 2 (fáze 2 drží observabilitu lokální + network-friendly reprezentace)
+- širší síťový stack a server-class workloady
+- nativní kryptografická knihovna a API pro bezpečný generátor náhodných čísel sdílené systémovými službami
+- TLS/SSL knihovna postavená nad nativní kryptografickou knihovnou
+- SSH server s podporou SFTP, autentizovaný vůči nativnímu identitnímu modelu
+- základní HTTPS server (včetně obsluhy statických souborů) jako první vlastní služba - dogfooding síťového stacku + storage + service modelu na naší vlastní / WASI vrstvě (bez POSIXu)
+- immutable signed systém, A/B updates, rollback, verified boot
+- šifrované user volumes
+- minimální headless AudioService nad virtio-sound (přehrávání, volitelně záznam) - aby zvuk fungoval i z konzole (např. pro headless hlasového asistenta); plný desktopový audio stack zůstává fáze 4
+- package/app formát, instalace, AOT kompilace
+- CLI package manager (hledání / instalace / aktualizace / odebrání vlastních balíčků, postavený na package/app formátu z této fáze) - end-user app store zůstává fáze 4
 ```
 
-#### Fáze 4 - Reálný hardware a kompatibilita cizího softwaru
+#### Fáze 4 - Desktopová platforma
 
 ```text
-POSIX-like kompatibilní vrstva (relibc-style) - pro cizí serverový software
-driver binding model v praxi: DeviceManager páruje reálná zařízení → drivery
-ovladače konkrétních zařízení a desek vybrané podle nasazení (konkrétní NIC/GPU/Wi-Fi/audio/storage řadiče a periferní bloky SoC)
-podpora konkrétních serverů a SBC (single-board computers)
-ARM64 / RISC-V reálné desky vedle x86-64 (portace z fáze 2 přenesená z QEMU na bare metal)
-power management dle nasazení (ACPI, idle/suspend)
-přechod z virtio/VM na bare metal
-```
-
-#### Fáze 5 - Desktopová platforma
-
-```text
-GUI/compositor (virtio-gpu i reálné GPU), vstup: klávesnice/myš/touch
-správce oken (window manager), desktop shell a kompletní uživatelské prostředí
-plný audio stack (mixování, per-app routing, záznam, ovladače reálného HW) - staví na headless AudioService z fáze 3
-portály: mic/cam/screenshot, sdílení obrazovky, výběr souborů
-package manager / app store pro koncové uživatele (GUI) - nad CLI package managerem z fáze 3
-uživatelské profily a nastavení desktopu, přístupnost (čtečky obrazovky apod.)
-notifikace, schránka, drag-and-drop, podpora více monitorů
-akcelerovaná grafika a multimédia
-volitelná emulace Linux binárek (Starnix-style) - běh existujících aplikací
-Flow Graph metriky
+- GUI/compositor nad virtio-gpu; reálné GPU přijdou ve fázi 5, vstup: klávesnice/myš/touch
+- správce oken (window manager), desktop shell a kompletní uživatelské prostředí
+- plný audio stack (mixování, per-app routing, záznam) nad virtio-sound - staví na headless AudioService z fáze 3; audio ovladače reálného HW přijdou ve fázi 5
+- portály: mic/cam/screenshot, sdílení obrazovky, výběr souborů
+- package manager / app store pro koncové uživatele (GUI) - nad CLI package managerem z fáze 3
+- uživatelské profily a nastavení desktopu, přístupnost (čtečky obrazovky apod.)
+- notifikace, schránka, drag-and-drop, podpora více monitorů
+- akcelerovaná grafika a multimédia na referenčním/virtuálním hardwarovém profilu
+- Flow Graph metriky
 ```
 
 **Teprve v této fázi se „přívětivost pro běžné uživatele" stává reálným cílem.** Jde o vyvrcholení trajektorie developer-first → ekosystém → široká přívětivost (viz *Proč tento OS místo Linuxu*): běžný uživatel přichází *až* ke zralému desktopu s ekosystémem a aplikacemi, nikoli k holému jádru. Do té doby běžný uživatel není cílovou skupinou, podle níž se činí raná návrhová rozhodnutí.
+
+#### Fáze 5 - Reálný hardware a kompatibilita cizího softwaru
+
+```text
+- driver binding model v praxi: DeviceManager páruje reálná zařízení → drivery
+- ovladače konkrétních zařízení a desek vybrané podle nasazení (konkrétní NIC/GPU/Wi-Fi/audio/storage řadiče a periferní bloky SoC)
+- podpora konkrétních serverů, desktopových strojů a SBC (single-board computers)
+- ARM64 / RISC-V reálné desky vedle x86-64 (portace z fáze 2 přenesená z QEMU na bare metal)
+- power management dle nasazení (ACPI, idle/suspend)
+- přechod z virtio/VM na bare metal včetně desktopového stacku z fáze 4
+- POSIX-like kompatibilní vrstva (relibc-style) - pro cizí serverový i desktopový software
+- volitelná emulace Linux binárek (Starnix-style) - běh existujících aplikací
+```
 
 #### Fáze 6 - AI platforma
 
 Alternativa ke klasickému desktopu:
 
 - primárním rozhraním není přímé ovládání aplikací, ale AI, která za uživatele vykonává jeho záměry.
-- staví až na desktopu (Fáze 5), protože jde o **virtuálního agenta (3D avatar)** - vizuálního a hlasového agenta, který vedle sebe uživateli zobrazuje obsah relevantní ke konverzaci (text, video, zvuk, obrázky).
+- staví až na desktopu (Fáze 4), protože jde o **virtuálního agenta (3D avatar)** - vizuálního a hlasového agenta, který vedle sebe uživateli zobrazuje obsah relevantní ke konverzaci (text, video, zvuk, obrázky).
 - potřebuje kompletní grafický, audio a multimediální základ z desktopové fáze
 - capability model a typované API (*objekt je kanon*) k tomu dělají ze systému bezpečný a strojově ovladatelný substrát pro takového agenta
 - mimo lokální systém se agent napojuje i na externí nástroje a služby standardním protokolem (**MCP - Model Context Protocol**), každý takový konektor je ale jen další capability-omezená komponenta, takže propojení s vnějškem nerozšiřuje jeho oprávnění za hranice udělené uživatelem.
 
 ```text
-ztělesněný virtuální agent (3D avatar) + hlasový a textový vstup/výstup jako primární rozhraní
-prezentace nalezeného obsahu vedle agenta: text, video, zvuk, obrázky (multimédia z Fáze 5)
-AI rozhraní jako primární způsob interakce - uživatel formuluje záměr, neovládá aplikace přímo
-AI agent vykonává požadavky za uživatele přes typované systémové API a aplikace
-capability-omezený agent: jedná jen v rámci udělených oprávnění (auditovatelně, odvolatelně)
-orchestrace aplikací a služeb AI vrstvou nad typovaným objektovým API
-propojení s externími nástroji, daty a službami přes MCP (Model Context Protocol) - jednotný protokol, kterým agent volá vzdálené nástroje a API
-každý MCP konektor běží jako samostatná capability-omezená komponenta (sandbox, auditovatelně, odvolatelně)
-portály a potvrzování citlivých akcí - AI nesmí překročit udělené capabilities
-audit akcí AI přes System Graph a capability model
-klasický desktop zůstává dostupný jako alternativní rozhraní
+- ztělesněný virtuální agent (3D avatar) + hlasový a textový vstup/výstup jako primární rozhraní
+- prezentace nalezeného obsahu vedle agenta: text, video, zvuk, obrázky (multimédia z Fáze 4)
+- AI rozhraní jako primární způsob interakce - uživatel formuluje záměr, neovládá aplikace přímo
+- AI agent vykonává požadavky za uživatele přes typované systémové API a aplikace
+- capability-omezený agent: jedná jen v rámci udělených oprávnění (auditovatelně, odvolatelně)
+- orchestrace aplikací a služeb AI vrstvou nad typovaným objektovým API
+- propojení s externími nástroji, daty a službami přes MCP (Model Context Protocol) - jednotný protokol, kterým agent volá vzdálené nástroje a API
+- každý MCP konektor běží jako samostatná capability-omezená komponenta (sandbox, auditovatelně, odvolatelně)
+- portály a potvrzování citlivých akcí - AI nesmí překročit udělené capabilities
+- audit akcí AI přes System Graph a capability model
+- klasický desktop zůstává dostupný jako alternativní rozhraní
 ```
 
 ---
@@ -1781,4 +1784,4 @@ Fáze 0 a 1 jsou hotové (kernel MVP a první použitelný userspace - viz *Road
   první Wasm komponentu; powerbox file picker předávající jednu file capability.
 ```
 
-Doporučený další krok je tedy **Fáze 2 (appliance/edge platforma)**. Její prioritou je síťový stack nad virtio-net - na edge je síť jádrem - následovaný zbytkem fáze (plný System Graph + observabilita, security hardening + PermissionManager, ResourceManager policy, ServiceManager restart/watchdog, plný Component Model + WASI preview 2 + SDK, jednoduchý perzistentní nativní filesystem a portace kernelu + vlastního UEFI loaderu na ARM64/RISC-V testovaná v QEMU); viz *Roadmapa*.
+Doporučený další krok je tedy **Fáze 2 (appliance/edge platforma)**. Její prioritou je síťový stack nad virtio-net - na edge je síť jádrem - následovaný zbytkem fáze (uživatelské účty / identity a lokalizace, plný System Graph + observabilita, security hardening + PermissionManager, ResourceManager policy, ServiceManager restart/watchdog, plný Component Model + WASI preview 2 + jeho WASI SDK, nativní cross-compilační SDK pro `.lsexe` / `.lslib`, moderní perzistentní nativní filesystem a portace kernelu + vlastního UEFI loaderu na ARM64/RISC-V testovaná v QEMU); viz *Roadmapa*.
