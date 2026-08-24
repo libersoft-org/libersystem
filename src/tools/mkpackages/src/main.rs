@@ -694,7 +694,32 @@ fn audit_identity(row: &ManifestRow, artifact: &Path, libraries: &[ManifestRow],
 		})
 		.collect();
 	expected_providers.sort();
-	assert_eq!(&lines[10..], expected_providers.as_slice(), "{} identity provider chain", row.name);
+	// THE MISMATCH IS NAMED, NOT PRINTED AS TWO LISTS OF DIGESTS.
+	//
+	// This was `assert_eq!` over the two vectors, and what it produced was a Rust panic carrying
+	// sixty-four-character hashes twice over: it did not say WHICH provider disagreed, that the
+	// staged tree was inconsistent rather than the library wrong, or what to do about it. Working
+	// that out took reading file dates in the staged directory. The check is unchanged - a
+	// consumer's recorded chain must equal the providers staged beside it - and only the refusal is
+	// legible now.
+	if lines[10..] != *expected_providers.as_slice() {
+		let recorded: &[&str] = &lines[10..];
+		eprintln!("mkpackages: {} was built against providers that are not the ones staged beside it", row.name);
+		for provider in &row.providers {
+			let prefix = format!("provider={provider}:");
+			let was = recorded.iter().find(|line| line.starts_with(&prefix)).map(|line| &line[prefix.len()..]).unwrap_or("(not recorded)");
+			let now = expected_providers.iter().find(|line| line.starts_with(&prefix)).map(|line| &line[prefix.len()..]).unwrap_or("(not staged)");
+			if was != now {
+				eprintln!("mkpackages:   {provider}: built against {was}, staged is {now}");
+			}
+		}
+		// A LIBRARY WHOSE OWN BYTES ARE FINE. Nothing here says the artifact is wrong: it says the
+		// staged directory holds a provider that was replaced after this consumer was built, which
+		// is a staleness in the build tree and not a fault in either file.
+		eprintln!("mkpackages: the staged tree for {} is inconsistent - a provider was replaced and this consumer was not rebuilt", user_target());
+		eprintln!("mkpackages: clear it and build again:  rm -rf .build/image/{} && ./build.sh --arch {}", user_target(), env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_else(|_| String::from("x86_64")));
+		panic!("{} identity provider chain", row.name);
+	}
 	bytes
 }
 

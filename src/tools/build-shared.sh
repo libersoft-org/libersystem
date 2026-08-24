@@ -2134,6 +2134,47 @@ for spec in "$@"; do
 	artifacts+=("$artifact")
 	artifact_available[$artifact]=1
 done
+# EVERY STAGED LIBRARY WAS BUILT AGAINST THE PROVIDERS STAGED BESIDE IT.
+#
+# The packager asks this at the end of `./build.sh` and it is the only thing that ever noticed a
+# staged tree going inconsistent - a provider replaced while a library recording its digest was
+# left as it was, which took a full architecture rebuild to clear. By then the build has compiled a
+# kernel and assembled a volume; here the answer costs one section dump per artifact.
+#
+# READ OFF THE STAGED FILES, not from what this run computed. A digest this phase is holding says
+# what it MEANT to write; the note inside the ELF on disk says what is actually there, and those two
+# disagreeing is precisely the condition being looked for.
+verify_staged_provider_chains() {
+	local artifact out note provider recorded expected inconsistent=0
+	note="$(mktemp "$build_scratch/staged-identity.XXXXXX")"
+	for artifact in "${artifacts[@]}"; do
+		out="$(library_file "$artifact")" || continue
+		[[ -f "$out" ]] || continue
+		llvm-objcopy --dump-section .note.liber.identity="$note" "$out" /dev/null 2>/dev/null || continue
+		# The provider lines are pulled straight out of the note payload rather than by parsing the
+		# ELF note header around them: the shape being checked is `provider=<name>:<64 hex>`, and a
+		# reader that can find those needs to know nothing else about the layout.
+		while IFS= read -r recorded; do
+			[[ -n "$recorded" ]] || continue
+			provider="${recorded#provider=}"
+			provider="${provider%%:*}"
+			expected="${provider_identity_digests[$provider]:-}"
+			[[ -n "$expected" ]] || continue
+			if [[ "$recorded" != "provider=$provider:$expected" ]]; then
+				echo "build-shared: $artifact was built against $provider:${recorded#provider=$provider:}, and the staged $provider is $expected" >&2
+				inconsistent=1
+			fi
+		done < <(grep -a -o 'provider=[a-z0-9_-]*:[0-9a-f]\{64\}' "$note" || true)
+	done
+	rm -f "$note"
+	if ((inconsistent)); then
+		echo "build-shared: the staged tree for $target is inconsistent - a provider was replaced and a library that records it was not rebuilt" >&2
+		echo "build-shared: clear it and build again:  rm -rf .build/image/$target && ./build.sh --arch ${target%%-*}" >&2
+		return 1
+	fi
+}
+verify_staged_provider_chains || exit 1
+
 # The export index and the ownership audit read only the staged provider ELFs. When every
 # provider proved its bytes unchanged, the previous run already audited these exact files.
 if ((artifact_state_misses > 0)); then
