@@ -16,14 +16,13 @@ takes.
 | TLC | 2.19 of 08 August 2024 (rev 5a47802), from the JAR pinned in `toolchain.lock` |
 | Java | OpenJDK 25.0.4.1 (the pin's floor is 11) |
 | Result | model checking completed, no error |
-| States generated | 76257 |
-| Distinct states | 15242 |
+| Distinct states | 12660 |
 | Search depth | 25 |
-| Wall clock | 2.4 s, one worker |
+| Wall clock | 2.5 s, one worker |
 | Peak resident | 650 MiB (the JVM's default heap on this machine, not a measured requirement) |
-| `Transfer.tla` | `d1e1f72850da9b4e…` |
-| `Capability.tla` | `06a14e7a3b280bce…` |
-| `spike.cfg` | `443609df3eb2556d…` |
+| `Transfer.tla` | `fa9b382edc90d029…` |
+| `Capability.tla` | `2ba66b6734ec973e…` |
+| `spike.cfg` | `e7ec796cb7a9b596…` |
 
 Checked: `TypeOK`, `TransferIsLinear`, `AuthorityNeverWidens`, `NoForgery`, `QuotaConserved`,
 `QueueBounded`, `SlotOwnershipUnique`, `PostCommitCopyoutIsTerminal`, `ClosedProcessCannotResurrect`,
@@ -60,12 +59,11 @@ one type to ask for.
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| States generated | 7626643 |
-| Distinct states | 1039839 |
-| Search depth | 31 |
-| Wall clock | 83 s, one worker |
+| Distinct states | 607859 |
+| Search depth | 30 |
+| Wall clock | 54 s, one worker |
 | Peak resident | 2.1 GiB |
-| `handles.cfg` | `46077bce3d4d661f…` |
+| `handles.cfg` | `dc4a6a3cc5c6dd1c…` |
 
 `TransferIsLinear` is NOT checked here, and that is the point of the split: it counts one authority
 in one place, which is exact only while nothing duplicates. Two capabilities for one object are two
@@ -93,12 +91,11 @@ the spike's state count is identical with and without the constant, which is how
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| States generated | 165843 |
-| Distinct states | 30484 |
+| Distinct states | 25320 |
 | Search depth | 26 |
-| Wall clock | 3.7 s, one worker |
+| Wall clock | 3.4 s, one worker |
 | Peak resident | 1.0 GiB |
-| `revoke-test-only.cfg` | `16f196f7abbeff91…` |
+| `revoke-test-only.cfg` | `c258c64577626888…` |
 
 ### Watched to fail
 
@@ -108,8 +105,34 @@ it instead of passing quietly. Removing `cap.objgen = objgen` from `Usable` make
 violation in two states: `Init`, `Revoke`. Restored, the configuration passes. An invariant that has
 not been seen to fail is a sentence, not a check.
 
+## `transactions-batch.cfg`
+
+The spike with ONE lever moved: `BatchMax = 2`. It is the smallest configuration in which "a refused
+send returns ALL of them" is a different sentence from "a refused send returns it" - one capability
+cannot show an all-or-nothing rule - and it is what `FailedSendRestores` is checked against.
+
+| | |
+| --- | --- |
+| Result | model checking completed, no error |
+| Distinct states | 51216 |
+| Search depth | 25 |
+| Wall clock | 6.1 s, one worker |
+| Peak resident | 1.6 GiB |
+| `transactions-batch.cfg` | `7b9ffe65d576aca4…` |
+
+### What the batch cost to model, and what that cost bought
+
+Turning one transfer-local capability into a SEQUENCE found two rules that were true of the code and
+absent from the model, both of them about when a take may happen:
+
+- A take may not start a second batch after the message is queued. The capabilities have left but
+  their slots are still reserved, so appending there produced a capability in hand whose slot nobody
+  was holding - and TLC found it by indexing past the end of a sequence rather than by an invariant,
+  which is the model being wrong rather than the kernel.
+- A take is bounded by the RESERVATIONS outstanding, not by what is in hand. The syscall takes every
+  capability it is going to send and then sends them; it never takes another after the send.
+
 ## Configurations not yet committed
 
-`propagation.cfg`, `transactions-single.cfg` and `transactions-batch.cfg` are the rest of
-P02M0154 M3, and each is one measured change from one of these rather than a
+`propagation.cfg` and `transactions-single.cfg` are the rest of P02M0154 M3, and each is one measured change from one of these rather than a
 speculative widening in every dimension at once.

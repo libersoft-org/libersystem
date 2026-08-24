@@ -13,6 +13,7 @@
 - arp.lsexe, ip.lsexe, ping.lsexe, nslookup.lsexe, tcp.lsexe, traceroute.lsexe should be in /bin/net-tools/
 - everything else should be in /bin/base-tools
 - all of these directories should be in PATH, so we can call any of these utilities from anywhere ... also we need an utility for showing and adding / removing from / to this PATH.
+- rename /bin/ to /apps/ (because some apps can contain other files than binaries)... /libs/ stays as it is, because these are standard system libraries, don't move it to /apps/.
 
 - some of the tools miss --json parameter
 - lico, licoedit and licoview look horrible
