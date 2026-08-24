@@ -7,6 +7,10 @@ description = "Sign a boot manifest over the final staged bytes, and verify what
 
 default-run = "sign-manifest"
 
+[lib]
+name = "sign_manifest"
+path = "src/lib.rs"
+
 [[bin]]
 name = "sign-manifest"
 path = "src/main.rs"

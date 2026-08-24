@@ -111,7 +111,7 @@ def timing_event(phase, event):
 REPO = os.path.dirname(SRC)
 BUILD_ROOT = os.path.join(REPO, '.build')
 
-# The two entry points this file drives, BY PATH.
+# The three entry points this file drives, BY PATH.
 #
 # It used to name Justfile recipes - `just run`, `just user kernel-build`, `just user-aarch64` -
 # and none of the three exists any more: building moved to `build.sh` and booting to `run.sh` at the
@@ -124,11 +124,12 @@ BUILD_ROOT = os.path.join(REPO, '.build')
 # file can check for and say plainly.
 RUN_SH = os.path.join(REPO, 'run.sh')
 BUILD_SH = os.path.join(REPO, 'build.sh')
+IMAGE_SH = os.path.join(REPO, 'image.sh')
 
 
-# The QEMU command a lab guest is started with. `run.sh` builds first and then execs the runner, so
-# the process this returns is the one that becomes QEMU - which is what `dev_guest_qemu` waits for
-# and what `record_lab_guest` takes the process group from.
+# The QEMU command a lab guest is started with. `run.sh` only boots an existing image and then execs
+# the runner, so the process this returns is the one that becomes QEMU - which is what
+# `dev_guest_qemu` waits for and what `record_lab_guest` takes the process group from.
 # EVERY CHILD THIS FILE STARTS HAS A DEADLINE, and a child that ignores TERM is killed.
 #
 # `dev-loop`, the scenario wrappers, the cold build and the artifact build all ran children with no
@@ -209,6 +210,17 @@ def build_command(target):
 	if not os.path.exists(BUILD_SH):
 		die(f'{BUILD_SH} is missing - the lab builds the system through it')
 	return [BUILD_SH, '--arch', target]
+
+
+def image_command():
+	if not os.path.exists(IMAGE_SH):
+		die(f'{IMAGE_SH} is missing - the lab assembles the boot image through it')
+	# The persistent and interactive lab guests boot only the ISO. image.sh performs the required
+	# x86_64 build first, so this is the complete pre-boot production step without also creating the
+	# raw and QCOW2 outputs that an interactive run does not use.
+	return [IMAGE_SH, '--format', 'iso']
+
+
 BUILD = os.path.join(BUILD_ROOT, 'boot')
 SERIAL_SOCK = os.path.join(BUILD, 'lab-serial.sock')
 CTL_SOCK = os.path.join(BUILD, 'lab-ctl.sock')
@@ -1117,7 +1129,7 @@ def cmd_dev_up(args):
 	# trace of them.
 	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1')
 	qemu_log = open(DEV_QEMU_LOG, 'wb')
-	# THE BUILD IS A STEP OF ITS OWN, because the runner no longer performs one.
+	# THE IMAGE BUILD IS A STEP OF ITS OWN, because the runner no longer performs one.
 	#
 	# The build and the boot are different waits and want different budgets: a tree needing a full
 	# rebuild - anything that touched the build tooling invalidates every artifact's cache key - can
@@ -1132,13 +1144,13 @@ def cmd_dev_up(args):
 	# fingerprints `init-x86_64.pkg`, and `scenario-cold` exists precisely because the other two
 	# have no persistent instance to be.
 	try:
-		build = subprocess.run(build_command('x86_64'), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, timeout=build_timeout)
+		build = subprocess.run(image_command(), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, timeout=build_timeout)
 	except subprocess.TimeoutExpired:
 		os.close(lock_fd)
-		die(f'the development build did not finish within {build_timeout} s (see {DEV_QEMU_LOG})')
+		die(f'the development image build did not finish within {build_timeout} s (see {DEV_QEMU_LOG})')
 	if build.returncode != 0:
 		os.close(lock_fd)
-		die(f'the development build failed (see {DEV_QEMU_LOG})')
+		die(f'the development image build failed (see {DEV_QEMU_LOG})')
 	guest = subprocess.Popen(run_command(displays), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True)
 	record_lab_guest(guest)
 	qemu_deadline = time.time() + 60
@@ -3065,11 +3077,10 @@ def cmd_boot(args):
 	# boot output is ever lost between startup and the connect below.
 	env = dict(os.environ, SERIAL=f'unix:{SERIAL_SOCK},server')
 	qemu_log = open(QEMU_LOG, 'wb')
-	# BUILD, then boot. The runner builds nothing, so without this `lab boot` boots whatever
-	# artifacts were last left in `.build` - or refuses with "no kernel for x86_64" on a clean tree,
-	# which reads as a broken lab rather than as a step nobody performed.
-	if subprocess.run(build_command('x86_64'), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log).returncode != 0:
-		die(f'the build failed (see {QEMU_LOG})')
+	# BUILD THE ISO, then boot it. image.sh owns the prerequisite system build as well as assembly, so
+	# the runner can consume one inspected artifact without silently refreshing it.
+	if subprocess.run(image_command(), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log).returncode != 0:
+		die(f'the image build failed (see {QEMU_LOG})')
 	record_lab_guest(subprocess.Popen(run_command(displays), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, start_new_session=True))
 	started = time.time()
 	serial = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

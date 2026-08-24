@@ -14,9 +14,9 @@ help() {
 	usage_and_exit <<EOF
 usage: image.sh [--format FMT[,FMT...]] [--size SIZE] [--strip debug|all]
 
-Builds bootable images into .build/boot/. With no arguments: the ISO.
+Builds bootable images into .build/boot/. With no --format: all three formats.
 
-  --format FMT   iso | img | qcow2 | all      (default: iso)
+  --format FMT   iso | img | qcow2 | all      (default: all)
   --size SIZE    disk size for img/qcow2, truncate-style: 128M, 1G   (default: 128M)
   --strip LEVEL  debug (drop DWARF, keep symbols) or all (smallest)  (default: debug)
   -h, --help     this text
@@ -29,9 +29,9 @@ formats:
   qcow2  the same disk, stored sparsely - a fraction of the raw size to keep or copy
 
 examples:
-  ./image.sh
+  ./image.sh                              # ISO, IMG and QCOW2
   ./image.sh --format img --size 1G
-  ./image.sh --format all --strip all
+  ./image.sh --format iso --strip all
 
 Note the size suffix is truncate's: 1G, not 1GB.
 EOF
@@ -67,7 +67,7 @@ while [[ $# -gt 0 ]]; do
 	esac
 done
 
-[[ ${#formats[@]} -eq 0 ]] && formats=(iso)
+[[ ${#formats[@]} -eq 0 ]] && formats=(iso img qcow2)
 
 # Every image needs the whole system built first, and the volume needs the kernel on it.
 # --kernel-on-volume: a shipping medium's loader reads the kernel off the system volume, which is

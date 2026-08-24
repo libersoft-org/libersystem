@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build and boot the system in QEMU.
+# Boot the system in QEMU.
 #
 # One command instead of five (`run`, `run-x86_64`, `run-aarch64`, `run-riscv64`, and the two
 # `-uefi` variants that are gone): the architecture and the displays are what vary, so they are
@@ -14,10 +14,11 @@ help() {
 	usage_and_exit <<EOF
 usage: run.sh [--arch ARCH] [--image PATH] [--attach PATH[,PATH...]] [--display D[,D...]] [--debug]
 
-Boots the system in QEMU, headless, with the serial console on your terminal.
+Boots the system in QEMU, headless, with the serial console on your terminal. On x86_64, omitting
+--image boots .build/boot/libersystem.iso.
 
   --arch ARCH     x86_64 | aarch64 | riscv64   (default: the host's architecture)
-  --image PATH    boot THIS medium and build nothing (from ./image.sh)
+  --image PATH    x86_64: boot this existing ISO instead of .build/boot/libersystem.iso
   --attach PATH   attach an extra disk or CD image, repeatable or comma-separated
   --display D     vnc | spice | all - attach a live display server (they combine)
   --smp N         cores given to the guest (default: the host's, capped at 8 on aarch64/riscv64)
@@ -33,23 +34,22 @@ Boots the system in QEMU, headless, with the serial console on your terminal.
                   and it boots nothing itself
   -h, --help      this text
 
-three steps, not one:
-
-  Without --image this builds the system, assembles a medium and boots it, which is convenient and
-  is also how a disk image came to carry the wrong kernel: nothing sits between assembling and
-  booting to look at what went on. The steps are separable, and for anything you intend to keep or
-  inspect they should be separate:
+build, image and run are separate steps:
 
     ./build.sh                          # 1. compile
-    ./image.sh --format iso             # 2. assemble a medium
-    ./run.sh --image .build/boot/libersystem.iso   # 3. boot exactly that
+    ./image.sh                          # 2. assemble ISO, IMG and QCOW2
+    ./run.sh                            # 3. boot .build/boot/libersystem.iso
+
+run.sh never compiles the system or assembles a distributable boot image. Use --image to boot a
+different existing x86_64 ISO. Explicit aarch64 and riscv64 runs continue to boot their built
+architecture artifacts through a private per-run ESP.
 
 All three architectures boot the same way a real machine does: firmware runs the system's own
 loader, which reads the kernel and the bootstrap programs off the system volume. aarch64 and
 riscv64 are emulated on an x86_64 host, so they are slower than the native run.
 
 examples:
-  ./run.sh
+  ./run.sh                              # boot .build/boot/libersystem.iso
   ./run.sh --arch riscv64
   ./run.sh --display vnc,spice
 EOF
@@ -82,10 +82,7 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--image)
 		[[ $# -ge 2 ]] || die "--image needs a path"
-		[[ -f "$2" ]] || die "no image at '$2'"
-		# Absolute: qemu-run.sh runs from src/, so a path relative to where you typed it would
-		# resolve somewhere else entirely - and the failure would read as a missing file.
-		image="$(realpath "$2")"
+		image="$2"
 		shift 2
 		;;
 	--attach)
@@ -155,23 +152,41 @@ if [[ -z "$arch" ]]; then
 	esac
 fi
 
-# THIS SCRIPT BUILDS NOTHING. `./build.sh` builds; this boots what is there.
+# THIS SCRIPT BUILDS NOTHING. `./build.sh` builds, `./image.sh` assembles distributable media, and
+# this boots what is already there.
 #
 # It used to build, assemble a medium and boot in one step, and that is how a disk image came to
 # carry the wrong kernel: with the three joined, nothing sits between them to look at what went on.
-[[ -n "$image" ]] && export BOOT_IMAGE="$image"
-
 kernel="$BUILD_DIR/cargo/kernel/$(target_triple "$arch")/debug/kernel"
-[[ -f "$kernel" ]] || die "no kernel for $arch - run: ./build.sh --arch $arch"
 
 # THE OTHER HALF OF --debug, and it boots nothing.
 #
 # `--debug` starts QEMU stopped on :1234; this attaches to it with the kernel's symbols, from a
-# second panel. Placed after the kernel-exists check and before everything that assembles or boots,
-# because attaching needs the ELF and nothing else.
+# second panel. This is the one image-backed x86_64 path that still requires the host-side ELF, so
+# it checks for that before the ordinary boot path deliberately stops caring whether it is present.
 if ((attach_gdb)); then
 	[[ $debug -eq 0 ]] || die "--gdb attaches to a waiting guest; --debug starts one. Use them in two panels, not in one command"
+	[[ -f "$kernel" ]] || die "no kernel for $arch - run: ./build.sh --arch $arch"
 	exec gdb -x "$SRC_DIR/boot/gdb-init" "$kernel"
+fi
+
+# x86_64 boots an image assembled explicitly by image.sh. The default is assigned here rather than
+# in qemu-run.sh so every invocation through this public entry point takes the no-build path. The
+# device-tree targets do not have distributable media yet; their explicit --arch workflows retain
+# the per-run ESP assembled from already-built architecture artifacts.
+if [[ "$arch" == x86_64 ]]; then
+	[[ -z "$image" ]] && image="$BUILD_DIR/boot/libersystem.iso"
+	[[ -f "$image" ]] || die "no boot image at '$image' - run: ./image.sh"
+	# Absolute: qemu-run.sh runs from src/, so a path relative to where you typed it would otherwise
+	# resolve somewhere else entirely.
+	image="$(realpath "$image")"
+	export BOOT_IMAGE="$image"
+elif [[ -n "$image" ]]; then
+	die "--image is currently supported only for x86_64; use ./run.sh --arch $arch after ./build.sh --arch $arch"
+fi
+
+if [[ "$arch" != x86_64 ]]; then
+	[[ -f "$kernel" ]] || die "no kernel for $arch - run: ./build.sh --arch $arch"
 fi
 if [[ -z "$image" && ! -f "$BUILD_DIR/boot/system-volume-$arch.img" ]]; then
 	die "no system volume for $arch - run: ./build.sh --arch $arch (or boot a medium with --image)"

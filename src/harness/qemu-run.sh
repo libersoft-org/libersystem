@@ -571,9 +571,45 @@ qemu_build_esp() {
 	printf '%s  kernel\n' "$(sha256sum "$STAGED_KERNEL" | cut -d" " -f1)" >>"$manifest"
 	mcopy -i "$ESP" "$manifest" ::/etc/boot.manifest
 	rm -f "$manifest"
+	stage_signed_boot_manifest "$ESP" "$bootstrap" "$arch"
 	# The factory archive still travels for the tests that read it as a fixture.
 	local volume_pkg="$QEMU_BUILD_DIR/volume-${arch}.pkg"
 	[[ -f "$volume_pkg" ]] && mcopy -i "$ESP" "$volume_pkg" ::/volume.pkg
+}
+
+# The SIGNED manifest for the boot medium, beside the text one.
+#
+# THE KERNEL HERE IS THE STRIPPED BUILD, which is a different sequence of bytes from the volume's -
+# so this medium needs a manifest over what actually sits on it, exactly as the text one does. What
+# the signature adds is who said so.
+#
+# Signed with the published test key, through the tool that owns it. A build that cannot sign is a
+# build that stops here rather than staging a medium whose signed manifest is missing or stale.
+stage_signed_boot_manifest() {
+	local esp="$1" bootstrap="$2" arch="$3"
+	local out="$QEMU_BUILD_DIR/boot.manifest2.$$"
+	# The release the manifest names, out of the one file that holds it.
+	local PRODUCT_VERSION_FOR_MANIFEST
+	PRODUCT_VERSION_FOR_MANIFEST="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p' "$HERE/../../product.conf" | head -1)"
+	local -a rows=(--row "kernel:kernel=$STAGED_KERNEL")
+	if [[ -d "$bootstrap" ]]; then
+		rows+=(--row "bootstrap-list:etc/bootstrap.list=$bootstrap/etc/bootstrap.list")
+		local program
+		for program in "$bootstrap"/libexec/*; do
+			[[ -f "$program" ]] || continue
+			rows+=(--row "program:libexec/$(basename "$program")=$program")
+		done
+	fi
+	(cd "$HERE/../tools/sign-manifest" && cargo run --quiet -- \
+		--profile test-trust --product LiberSystem --arch "$arch" --source boot-medium \
+		--release "$PRODUCT_VERSION_FOR_MANIFEST" \
+		--volume-uuid 00000000000000000000000000000000 \
+		"${rows[@]}" --out "$out") >&2 || {
+		echo "qemu-run: the boot medium's manifest could not be signed" >&2
+		exit 1
+	}
+	mcopy -i "$esp" "$out" ::/etc/boot.manifest2
+	rm -f "$out"
 }
 
 normalize_arch() {
@@ -715,7 +751,15 @@ watch_test_timing() {
 	done
 }
 
-if [[ -z "$KERNEL_ELF" ]]; then
+needs_kernel=1
+if [[ "$TARGET_ARCH" == x86_64 && -n "${BOOT_IMAGE:-}" ]]; then
+	# A shipping ISO contains its own kernel. Keeping a host-side ELF mandatory made `--image` unable
+	# to boot an artifact copied into a clean tree, even though the runner never reads that ELF on this
+	# path. `run.sh --gdb` checks for symbols separately because that command really does need them.
+	needs_kernel=0
+fi
+
+if [[ -z "$KERNEL_ELF" && "$needs_kernel" == 1 ]]; then
 	case "$TARGET_ARCH" in
 	x86_64) KERNEL_ELF="$REPO_ROOT/.build/cargo/kernel/x86_64-unknown-none/debug/kernel" ;;
 	aarch64) KERNEL_ELF="$REPO_ROOT/.build/cargo/kernel/aarch64-unknown-none/debug/kernel" ;;
@@ -723,7 +767,7 @@ if [[ -z "$KERNEL_ELF" ]]; then
 	esac
 fi
 
-[[ -f "$KERNEL_ELF" ]] || {
+[[ "$needs_kernel" == 0 || -f "$KERNEL_ELF" ]] || {
 	echo "qemu-run: kernel ELF not found: $KERNEL_ELF" >&2
 	exit 1
 }
@@ -743,11 +787,9 @@ qemu_run_x86_64() {
 	[[ "${COLD:-0}" == "1" ]] && artifact_suffix="-cold-$TARGET_ARCH"
 	timing_event runner start
 	timing_event image start
-	# Build the own UEFI loader (its EFI binary is staged into the boot image as
-	# BOOTX64.EFI); it lives in its own crate with its own UEFI target.
-	(cd "$HERE/../boot/loader" && cargo build) >&2
-
-	# Build the bootable ISO (mkimage.sh prints its path on stdout).
+	# Select an already-assembled ISO, or build the internal test/development medium for callers that
+	# invoke this harness directly. The public run.sh always supplies BOOT_IMAGE and therefore never
+	# enters the assembly path.
 	#
 	# The suite boots the TEST medium: it reads `volume.pkg` off it as its fixture source and as
 	# the table of expected file contents, which the shipping ISO deliberately no longer carries.
@@ -757,7 +799,7 @@ qemu_run_x86_64() {
 	# expressible: the build, the imaging and the run were one step, and what ended up on the medium
 	# could not be inspected between them. That is how a disk image came to carry the TEST kernel -
 	# nothing sat between assembling it and booting it.
-	local iso iso_mode="iso"
+	local iso
 	if [[ -n "${BOOT_IMAGE:-}" ]]; then
 		[[ -f "$BOOT_IMAGE" ]] || {
 			echo "qemu-run: no image at $BOOT_IMAGE" >&2
@@ -766,6 +808,10 @@ qemu_run_x86_64() {
 		iso="$BOOT_IMAGE"
 		echo "qemu-run: booting $iso (built elsewhere; nothing was rebuilt)" >&2
 	else
+		# Direct harness callers, notably the x86_64 kernel suite, still own their test medium. Build the
+		# loader only here because an already-assembled BOOT_IMAGE has no use for a fresh loader binary.
+		(cd "$HERE/../boot/loader" && cargo build) >&2
+		local iso_mode="iso"
 		[[ "${TEST:-0}" == "1" ]] && iso_mode="testiso"
 		iso="$("$HERE/mkimage.sh" "$iso_mode" "$kernel")"
 	fi
@@ -801,8 +847,9 @@ qemu_run_x86_64() {
 	# System volume disk: carries the LiberFS volume itself.
 	local volume_image="$QEMU_BUILD_DIR/system-volume-x86_64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${artifact_suffix}.img"
-	qemu_prepare_system_disk "$volume_image" "$virtio_disk" || true
-	qemu_attach_virtio_blk qemu_args "$virtio_disk" vblk "disable-legacy=on"
+	if qemu_prepare_system_disk "$volume_image" "$virtio_disk"; then
+		qemu_attach_virtio_blk qemu_args "$virtio_disk" vblk "disable-legacy=on"
+	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
 	qemu_prepare_media_images "$artifact_suffix" "$artifact_suffix" loop 1

@@ -238,6 +238,40 @@ stage_boot_manifest() {
 	stamp_epoch "$out"
 	mcopy -i "$image" "$out" ::/etc/boot.manifest
 	rm -f "$out"
+	stage_signed_boot_manifest "$image" "$staged_kernel" "$arch"
+}
+
+# The SIGNED manifest for this medium, beside the text one.
+#
+# THE SAME FILES, AND WHO SAYS SO. The text manifest proves the content matches what is next to it;
+# this proves it came from a build holding the key. Signed through the tool that owns the key, over
+# the kernel that was actually copied in - which is the stripped one, and a different sequence of
+# bytes from the volume's.
+#
+# A medium without a bootstrap set gets a manifest with the kernel alone: still a source that can be
+# checked rather than one the loader has to take on trust.
+stage_signed_boot_manifest() {
+	local image="$1" staged_kernel="$2" arch="$3"
+	local out="$BUILD/boot.manifest2.$$"
+	local release
+	release="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p' "$REPO_ROOT/product.conf" | head -1)"
+	local -a rows=(--row "kernel:kernel=$staged_kernel")
+	if [[ -n "$arch" && -d "$BUILD/bootstrap-${arch}" ]]; then
+		rows+=(--row "bootstrap-list:etc/bootstrap.list=$BUILD/bootstrap-${arch}/etc/bootstrap.list")
+		local program
+		for program in "$BUILD/bootstrap-${arch}"/libexec/*; do
+			[[ -f "$program" ]] || continue
+			rows+=(--row "program:libexec/$(basename "$program")=$program")
+		done
+	fi
+	(cd "$REPO_ROOT/src/tools/sign-manifest" && cargo run --quiet -- \
+		--profile test-trust --product LiberSystem --arch "${arch:-x86_64}" --source boot-medium \
+		--release "$release" --volume-uuid 00000000000000000000000000000000 \
+		"${rows[@]}" --out "$out") >&2 || die "the boot medium's manifest could not be signed"
+	ensure_dir "$image" ::/etc
+	stamp_epoch "$out"
+	mcopy -i "$image" "$out" ::/etc/boot.manifest2
+	rm -f "$out"
 }
 
 # WHICH volume this boot medium is paired with.

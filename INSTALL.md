@@ -40,18 +40,32 @@ Parts: `sdk`, `libs`, `user`, `kernel`, `loader`, `packages`, `volume`, `all`.
 
 **The kernel does not contain the userspace.** The programs that run before a disk is readable are files on the system volume, listed in `etc/bootstrap.list`; the loader reads them and hands them over. One kernel binary, whatever userspace it is given.
 
-Building produces no image. `./image.sh` assembles one, `./run.sh` boots one.
+`build.sh` produces build artifacts, not bootable media. Building an image and booting it are
+separate, explicit steps:
+
+```sh
+./build.sh    # 1. compile the system
+./image.sh    # 2. assemble ISO, IMG and QCOW2
+./run.sh      # 3. boot .build/boot/libersystem.iso
+```
+
+`image.sh` also runs the required x86_64 build itself, so the first command can be omitted when all
+you need is fresh bootable media.
 
 ## Run
 
 ```sh
-./run.sh                                        # the host's architecture
+./run.sh                                        # boot .build/boot/libersystem.iso on x86_64
 ./run.sh --arch aarch64                         # a specific one (emulated if not the host's)
-./run.sh --image .build/boot/libersystem.iso    # boot a medium you already built
+./run.sh --image path/to/another.iso            # boot a different existing x86_64 ISO
 ./run.sh --attach data.img                      # attach an extra disk or CD
 ```
 
-`run.sh` builds nothing - `build.sh` does that. QEMU runs headless with the serial console on your terminal, ending at a `vol://system>` prompt; `--serial file:boot.log` redirects it. Guest size is `--smp N` and `--mem 4G`.
+`run.sh` compiles and assembles nothing. On x86_64, omitting `--image` boots
+`.build/boot/libersystem.iso`; create it first with `./image.sh`. Explicit aarch64 and riscv64 runs
+boot their architecture-specific build artifacts through a private per-run ESP. QEMU runs headless
+with the serial console on your terminal, ending at a `vol://system>` prompt; `--serial file:boot.log`
+redirects it. Guest size is `--smp N` and `--mem 4G`.
 
 **Cores.** The guest gets the host's core count, capped at 8 on aarch64 and riscv64. aarch64 because QEMU's `virt` GICv2 addresses at most 8 CPU interfaces; riscv64 because U-Boot stops booting above roughly 50 harts - on a bigger host the guest produces no output at all while OpenSBI logs normally, which reads as a broken loader rather than as too many CPUs. Override with `--smp N`.
 
@@ -85,13 +99,14 @@ Attaches to a live run and snaps the current frame; otherwise boots a throwaway 
 ## Bootable images
 
 ```sh
+./image.sh                               # ISO, IMG and QCOW2
 ./image.sh --format iso                  # Live CD
 ./image.sh --format img --size 1G        # installed system (default 128M)
 ./image.sh --format qcow2                # the same disk, stored sparsely
 ./image.sh --format iso --strip all      # smaller: drop the symbol table too
 ```
 
-Written to `.build/boot/`, bootable on any UEFI machine.
+Written to `.build/boot/` as `libersystem.iso`, `libersystem.img` and `libersystem.qcow2`.
 
 **ISO is a Live CD.** The medium carries a LiberFS system volume that the running system copies into memory at boot. Nothing is written back: no disk needed, and changes are gone when the session ends.
 
@@ -152,8 +167,8 @@ See [docs/DEBUG.md](./docs/DEBUG.md) for the full toolbox. For a longer-lived in
 For kernel-level debugging, boot with a GDB stub on `:1234` and attach from a second terminal:
 
 ```sh
-cd src && ./run.sh --debug
-cd src && ./run.sh --gdb
+./run.sh --debug
+./run.sh --gdb
 ```
 
 ## Command reference
@@ -163,10 +178,10 @@ Every script is at the repository root and answers `--help`.
 | Command | Description |
 | --- | --- |
 | `./build.sh [--arch A] [--part P]` | Build the system or the parts you name. Anything after `--` goes to cargo. |
-| `./run.sh [--arch A] [--image PATH] [--attach PATH] [--display D] [--smp N] [--mem S] [--serial SPEC] [--debug]` | Boot in QEMU. Builds nothing. |
+| `./run.sh [--arch A] [--image PATH] [--attach PATH] [--display D] [--smp N] [--mem S] [--serial SPEC] [--debug]` | Boot an existing ISO in QEMU on x86_64 (default `.build/boot/libersystem.iso`); builds nothing. |
 | `./verify.sh [--for PATH] [--for-range A..B] [--plan] [--explain] [--sweep] [--release]` | Work out what a change needs verified, and run it. |
 | `./test.sh [--arch A] [--tags T] [--fast] [--build-only] [--smp N] [--timeout S]` | Run the in-kernel test suites. |
-| `./image.sh [--format F] [--size S] [--strip L]` | Build bootable images (`iso`, `img`, `qcow2`). |
+| `./image.sh [--format F] [--size S] [--strip L]` | Build bootable images (`iso`, `img`, `qcow2`); omitting `--format` builds all three. |
 | `./check.sh [--gate N] [--conformance F] [--refresh N] [--staged-image T] [--cache-check M] [--fast-path T]` | Build gates and image conformance suites; no arguments means all. `--refresh` regenerates what a gate checks instead of checking it. |
 | `./clean.sh [--part P] [--dry-run]` | Remove build output (`cargo`, `boot`, `logs`). |
 | `./dev.sh <verb> [args]` | Drive the persistent development guest. |

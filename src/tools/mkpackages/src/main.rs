@@ -189,6 +189,10 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// together. It does NOT catch an OLD image - an old one carries its own old manifest and agrees
 	// with itself - and it is not a signature: whoever can rewrite one file can rewrite both.
 	staged.push((String::from("etc/boot.manifest"), boot_manifest(&staged)));
+	// AND THE SIGNED ONE BESIDE IT. The text manifest proves the content matches what is next to it;
+	// this one proves who said so. Both are staged so a loader built before signing existed still
+	// boots this volume - the loader prefers the signed one wherever it finds it.
+	staged.push((String::from("etc/boot.manifest2"), signed_manifest(&staged, arch_of_build())));
 
 	// The SAME files, written out for staging on the boot medium's own filesystem.
 	//
@@ -201,6 +205,7 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 		fallback.push((String::from("etc/bootstrap.list"), bootstrap.clone().into_bytes()));
 		// EACH SOURCE CARRIES ITS OWN, over what actually sits there.
 		fallback.push((String::from("etc/boot.manifest"), boot_manifest(&fallback)));
+		fallback.push((String::from("etc/boot.manifest2"), signed_manifest(&fallback, arch_of_build())));
 		// Architecture-qualified, like `init-<arch>.pkg` beside it. An unqualified directory is the
 		// same trap that put x86_64 programs on a riscv64 ESP: every architecture's build writes
 		// it, so it holds whichever built last.
@@ -478,6 +483,47 @@ fn read_manifest(manifest: &Path) -> Vec<ManifestRow> {
 
 fn valid_library_name(name: &str) -> bool {
 	!name.is_empty() && !name.starts_with("lib") && name.len() <= 58 && name.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+// Which architecture this build is for, as the manifest names it. The first argument, the same one
+// the fallback directory is qualified by.
+fn arch_of_build() -> u8 {
+	match env::args().nth(1).unwrap_or_default().as_str() {
+		"aarch64" => bootproto::manifest::ARCH_AARCH64,
+		"riscv64" => bootproto::manifest::ARCH_RISCV64,
+		_ => bootproto::manifest::ARCH_X86_64,
+	}
+}
+
+// The SIGNED manifest for one source, over the same files the text one covers.
+//
+// SIGNED HERE BECAUSE THIS IS WHERE THE STAGED BYTES ARE. A manifest made anywhere else describes
+// files that have been copied, stripped or re-linked since - which is to say, other files.
+//
+// Neither manifest lists itself, and neither lists the other: they are the things being compared
+// against. A failure here stops the build, because a volume staged with a manifest that does not
+// verify is a volume whose next boot refuses it.
+fn signed_manifest(files: &[(String, Vec<u8>)], arch: u8) -> Vec<u8> {
+	let covered: Vec<&(String, Vec<u8>)> = files.iter().filter(|(name, _)| name != "etc/boot.manifest" && name != "etc/boot.manifest2").collect();
+	let mut rows: Vec<bootproto::manifest::Row<'_>> = covered
+		.iter()
+		.map(|(name, bytes)| bootproto::manifest::Row {
+			// THE KIND IS PART OF THE NAME, and the loader looks each artifact up by both. Three
+			// kinds reach a source: the kernel, the list, and the programs the list names - and a
+			// kernel filed as a program is a kernel the loader cannot find, which is what the first
+			// boot with this manifest said in as many words.
+			kind: match name.as_str() {
+				"kernel" => bootproto::manifest::KIND_KERNEL,
+				"etc/bootstrap.list" => bootproto::manifest::KIND_BOOTSTRAP_LIST,
+				_ => bootproto::manifest::KIND_PROGRAM,
+			},
+			path: name.as_bytes(),
+			length: bytes.len() as u64,
+			digest: bootproto::sha256::digest(bytes),
+		})
+		.collect();
+	let header = bootproto::manifest::Header { key_id: sign_manifest::TEST_KEY_ID, product: b"LiberSystem", arch, source_kind: bootproto::manifest::SOURCE_SYSTEM_VOLUME, release: env!("CARGO_PKG_VERSION").as_bytes(), volume_uuid: [0; 16] };
+	sign_manifest::sign_with_test_key(&header, &mut rows).unwrap_or_else(|e| panic!("mkpackages: the signed manifest could not be made: {e}"))
 }
 
 // The boot manifest for one source: a version line, then one `sha256  path` row per file the loader

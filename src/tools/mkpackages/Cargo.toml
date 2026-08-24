@@ -17,6 +17,9 @@ fscore = { path = "../../fs/core" }
 abi = { path = "../../abi" }
 # ELF parsing for the identity records and the dynamic-linkage audit.
 bootproto = { path = "../../boot/protocol" }
+# Signing the staged set's manifest with the published test key. The verifier is a different crate,
+# linked into the loader; this is the half that makes a manifest and never verifies one.
+sign-manifest = { path = "../sign-manifest" }
 # The component parser, so a staged `.wasm` is validated with the SAME code that will have to run
 # it - a toolchain that emits something this interpreter cannot represent fails the BUILD rather
 # than the boot.

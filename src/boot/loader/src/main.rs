@@ -129,40 +129,6 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// instead, which is the whole reason that crate is linked.
 	let root = open_boot_volume(bs, image_handle);
 
-	// WHAT WAS VERIFIED, SAID OUT LOUD AND NOT PUT IN `BootInfo`.
-	//
-	// The kernel does not need trust metadata: this is a loader-owned decision, taken before the
-	// kernel exists, and a field it could read would be a field something could later be tempted to
-	// re-derive a decision from. What the harness asserts is this line - the release the manifest
-	// names, the key that signed it, and the digest of the record itself, which is what makes two
-	// boots comparable.
-	fn announce_release(manifest: &bootproto::manifest::Manifest<'_>) {
-		arch::serial::write_str("loader: signed manifest verified - release ");
-		for byte in manifest.release {
-			arch::serial::write_byte(*byte);
-		}
-		arch::serial::write_str(", key ");
-		write_hex32(manifest.key_id);
-		arch::serial::write_str(", manifest ");
-		let digest = bootproto::sha256::digest(manifest.payload());
-		for byte in &digest[..8] {
-			write_hex8(*byte);
-		}
-		arch::serial::write_str("\n");
-	}
-
-	fn write_hex8(byte: u8) {
-		const HEX: &[u8; 16] = b"0123456789abcdef";
-		arch::serial::write_byte(HEX[(byte >> 4) as usize]);
-		arch::serial::write_byte(HEX[(byte & 0xf) as usize]);
-	}
-
-	fn write_hex32(value: u32) {
-		for shift in [24, 16, 8, 0] {
-			write_hex8((value >> shift) as u8);
-		}
-	}
-
 	// WHICH LiberFS volume is this installation's. A superblock identifies LiberFS; it does not
 	// identify the system that owns it, so two LiberSystem disks in one machine used to let the
 	// firmware's block-handle order decide which one booted. The boot medium names its volume by
@@ -602,10 +568,61 @@ pub(crate) fn read_boot_file(bs: *mut BootServices, root: Option<*mut uefi::File
 //
 // The medium's manifest is not the volume's copy. The kernel staged on a boot medium is the
 // STRIPPED build, so its digest is computed where it is staged - see `stage_boot_manifest`.
+// WHAT WAS VERIFIED, SAID OUT LOUD AND NOT PUT IN `BootInfo`.
+//
+// The kernel does not need trust metadata: this is a loader-owned decision, taken before the
+// kernel exists, and a field it could read would be a field something could later be tempted to
+// re-derive a decision from. What the harness asserts is this line - the release the manifest
+// names, the key that signed it, and the digest of the record itself, which is what makes two
+// boots comparable.
+fn announce_release(manifest: &bootproto::manifest::Manifest<'_>) {
+	arch::serial::write_str("loader: signed manifest verified - release ");
+	for byte in manifest.release {
+		arch::serial::write_byte(*byte);
+	}
+	arch::serial::write_str(", key ");
+	write_hex32(manifest.key_id);
+	arch::serial::write_str(", manifest ");
+	let digest = bootproto::sha256::digest(manifest.payload());
+	for byte in &digest[..8] {
+		write_hex8(*byte);
+	}
+	arch::serial::write_str("\n");
+}
+
+fn write_hex8(byte: u8) {
+	const HEX: &[u8; 16] = b"0123456789abcdef";
+	arch::serial::write_byte(HEX[(byte >> 4) as usize]);
+	arch::serial::write_byte(HEX[(byte & 0xf) as usize]);
+}
+
+fn write_hex32(value: u32) {
+	for shift in [24, 16, 8, 0] {
+		write_hex8((value >> shift) as u8);
+	}
+}
+
 fn read_verified_kernel_from_boot_medium(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) -> &'static [u8] {
 	let bytes = read_boot_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel");
+	// THE SIGNED MANIFEST WHEREVER THE MEDIUM HAS ONE, as on the system volume, and for the same
+	// reason: the check happens before these bytes are parsed as an ELF or copied anywhere.
+	if let Some(signed) = read_boot_file(bs, root, "etc/boot.manifest2") {
+		let mut scratch = alloc::vec::Vec::new();
+		if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + signed.len()).is_err() {
+			panic!("loader: no room to verify the boot medium's signed manifest");
+		}
+		scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
+		let Some(manifest) = trust::verify(signed, &mut scratch) else {
+			panic!("loader: the boot medium's signed manifest was refused - see the line above");
+		};
+		if !blockio::covered_by(&manifest, bootproto::manifest::KIND_KERNEL, KERNEL_FILE.as_bytes(), bytes) {
+			panic!("loader: the kernel is not what the boot medium's SIGNED manifest records");
+		}
+		announce_release(&manifest);
+		return bytes;
+	}
 	let Some(manifest) = read_boot_file(bs, root, "etc/boot.manifest") else {
-		panic!("loader: the boot medium has a kernel and no etc/boot.manifest - refusing to boot from it");
+		panic!("loader: the boot medium has a kernel and no manifest of either kind - refusing to boot from it");
 	};
 	if !blockio::digests_ok(manifest, KERNEL_FILE.as_bytes(), bytes) {
 		panic!("loader: the kernel does not match etc/boot.manifest on the boot medium");
