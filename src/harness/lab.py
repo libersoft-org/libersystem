@@ -2531,16 +2531,37 @@ class LabGuest:
 		# broker path stays for the persistent instance, where it is cheaper than polling a file
 		# and is what every existing scenario already runs through.
 		if SERIAL_OVERRIDE is not None:
+			# AND IT HAS TO SETTLE HERE TOO, for the reason the broker path gives above and for a
+			# second one this path alone has: a scenario reaches this straight after typing, and the
+			# guest may not have acted on what was typed yet. The prompt already in the log is then
+			# the one from BEFORE, so this returned at once and the next step typed into a terminal
+			# that was still processing the last thing - measured on an emulated aarch64 guest, where
+			# a Ctrl+C sent over the control channel landed between the first and second letters of
+			# the command the following step typed on the keyboard, discarding the line and running
+			# the rest as a command of its own.
+			#
+			# A prompt that is still being written past is not a prompt to type at: a match has to
+			# survive PROMPT_SETTLE seconds with the file not growing.
 			deadline = time.time() + timeout
+			settled_at = None
+			size = -1
 			while time.time() < deadline:
 				try:
 					with open(SERIAL_OVERRIDE, 'rb') as handle:
-						tail = handle.read()[-256:]
+						raw = handle.read()
 				except OSError:
-					tail = b''
-				if has_prompt(tail):
-					return True
-				time.sleep(0.5)
+					raw = b''
+				if len(raw) != size:
+					size = len(raw)
+					settled_at = None
+				if has_prompt(raw[-256:]):
+					if settled_at is None:
+						settled_at = time.time()
+					elif time.time() - settled_at >= PROMPT_SETTLE:
+						return True
+				else:
+					settled_at = None
+				time.sleep(0.2)
 			return False
 		try:
 			return ctl_request(f'WAIT {timeout}', timeout, DEV_CTL_SOCK).prompted
