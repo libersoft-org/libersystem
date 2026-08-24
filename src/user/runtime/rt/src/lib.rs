@@ -2199,8 +2199,8 @@ pub unsafe fn boot_profile(name: &mut [u8]) -> usize {
 
 // Read the online CPU set: fills `ids` with one LAPIC id per core (as many as fit)
 // and returns the core count. A free syscall feeding the `lscpu` inventory command.
-pub unsafe fn cpu_info(ids: &mut [u32]) -> i64 {
-	unsafe { syscall(SYS_CPU_INFO, ids.as_mut_ptr() as u64, ids.len() as u64 * 4, 0, 0) as i64 }
+pub unsafe fn cpu_info(ids: &mut [u64]) -> i64 {
+	unsafe { syscall(SYS_CPU_INFO, ids.as_mut_ptr() as u64, ids.len() as u64 * 8, 0, 0) as i64 }
 }
 
 // Read the CPU model / brand string into `buf`, returning the byte length written

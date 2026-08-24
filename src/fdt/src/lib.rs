@@ -61,6 +61,71 @@ pub struct BootInfo {
 	pub pcie_ecam: u64,
 	// PLIC (RISC-V platform interrupt controller) base (0 if none / not RISC-V).
 	pub plic_base: u64,
+	// THE ARM INTERRUPT CONTROLLER, AS THE MACHINE DESCRIBES IT, not as one machine happened to map
+	// it. The GIC's `reg` carries two ranges: the distributor first, then the CPU interface on a
+	// GICv2 or the redistributor region on a GICv3. Both are needed before the first controller
+	// access, which is why they are read here rather than compiled in - a fixed address is a claim
+	// about one QEMU machine and says nothing about the tree in front of it.
+	//
+	// Zero means the tree named no controller this reader knows. A caller that finds zero here has
+	// no GIC and cannot claim a timer interrupt, which is a refusal rather than a default.
+	pub gic_dist: u64,
+	pub gic_dist_size: u64,
+	pub gic_cpu: u64,
+	pub gic_cpu_size: u64,
+	// 2 for a GICv2 (`arm,cortex-a15-gic` / `arm,gic-400`), 3 for a GICv3, 0 for neither. The
+	// version decides which core profile drives it, and it comes from `compatible` rather than from
+	// the shape of `reg`, because two versions can describe two ranges.
+	pub gic_version: u8,
+	// The GICv2m frame, if the tree declares one as a child of the controller: a device writes an
+	// SPI number into it to signal an MSI. Zero when the tree names none, which is a machine
+	// without message-signalled interrupts rather than an error.
+	pub gic_msi: u64,
+	pub gic_msi_size: u64,
+	// THE GICv3 ITS, if the tree declares one as a child of the controller. It is the OTHER kind of
+	// MSI controller ARM defines and nothing like a v2m frame: a device writes an EVENT id to one
+	// translation register, and the ITS turns the pair (device, event) into an LPI aimed at a core -
+	// through tables in memory this kernel owns. Zero when the machine has none.
+	pub gic_its: u64,
+	pub gic_its_size: u64,
+	// HOW A PCI DEVICE'S REQUESTER ID BECOMES AN ITS DEVICE ID, from the host bridge's `msi-map`:
+	// a device whose RID is in `[rid_base, rid_base + length)` has ITS DeviceID `devid_base + RID -
+	// rid_base`. A machine that states no mapping leaves `length` zero, and this kernel then has no
+	// way to name its devices to the ITS - which is a refusal rather than an assumed identity.
+	pub pci_msi_rid_base: u32,
+	pub pci_msi_devid_base: u32,
+	pub pci_msi_length: u32,
+	// THE RISC-V S-MODE IMSIC, as the machine describes it. With `aia=aplic-imsic` a device's MSI
+	// write lands in a per-hart 4 KiB interrupt file, and the base of that array was a constant
+	// naming one QEMU machine even though the tree describes the controller.
+	//
+	// THE S-MODE ONE, NOT THE FIRST ONE FOUND. An AIA machine describes two IMSICs - M-mode and
+	// S-mode - and they are told apart by which CPU interrupt each one is wired to:
+	// `interrupts-extended` names IRQ 9 (supervisor external) for the file this kernel owns and 11
+	// (machine external) for the one the firmware owns. Taking the first node would take the
+	// firmware's controller on every machine that lists it first, which QEMU does.
+	pub imsic_base: u64,
+	pub imsic_size: u64,
+	// HOW THE FILES ARE ADDRESSED, which decides whether this kernel can address them at all. The
+	// AIA binding lets a machine index its files by guest and by group as well as by hart, and the
+	// address of hart H's file is then `base | group << shift | H << (12 + guest_bits)` rather than
+	// `base + H * 4096`. Zero for both - which is what QEMU's `virt` emits - is the flat layout this
+	// kernel computes; anything else is a machine it must refuse rather than compute a wrong
+	// address for. Absent properties default to zero, which the binding also says.
+	pub imsic_guest_index_bits: u32,
+	pub imsic_group_index_bits: u32,
+	// How many interrupt identities the controller carries (`riscv,num-ids`), 0 when it says
+	// nothing. A window of EIDs larger than this arms identities the hardware will not deliver.
+	pub imsic_num_ids: u32,
+	// THE HART EACH INTERRUPT FILE BELONGS TO, IN FILE ORDER, and `u64::MAX` for a file whose
+	// `interrupts-extended` entry names no cpu node in this tree.
+	//
+	// A file's address comes from its INDEX in this list, not from the hart id - the two coincide
+	// only when the machine's harts are dense and listed in order, which is what QEMU emits and
+	// what a kernel computing `base + hart * stride` silently assumes. Recording the association is
+	// what lets that assumption be checked instead of relied on.
+	pub imsic_harts: [u64; MAX_CPUS],
+	pub imsic_hart_count: u32,
 	// QEMU fw-cfg MMIO base (0 if the tree has no fw-cfg node). Drives the ramfb
 	// early framebuffer.
 	pub fwcfg_base: u64,
@@ -316,6 +381,37 @@ impl Fdt {
 		Some(unsafe { self.read_cells(&mut p, cells) })
 	}
 
+	// The `index`-th (address, size) pair of a `reg` property, with every check the single-range
+	// reader has plus the ones a list needs.
+	//
+	// A GIC's `reg` is two ranges - distributor then CPU interface or redistributor - and a reader
+	// that takes only the first cannot describe the controller. Each pair is `addr_cells +
+	// size_cells` cells wide, so the property must be at least that many cells long for the pair
+	// being asked for; a short one is a tree that does not say what the caller thinks it says, and
+	// reading past it would take the padding after the property or the next token as an address.
+	//
+	// A ZERO SIZE IS REFUSED, because a range of no bytes is not a region that can be mapped, and a
+	// caller that accepted one would compute an end equal to its start and check nothing.
+	unsafe fn read_reg_range(&self, value: u64, len: u32, addr_cells: u32, size_cells: u32, index: u32) -> Option<(u64, u64)> {
+		if addr_cells == 0 || addr_cells > MAX_CELLS || size_cells == 0 || size_cells > MAX_CELLS {
+			return None;
+		}
+		let pair_cells = addr_cells.checked_add(size_cells)?;
+		let pair_bytes = pair_cells.checked_mul(4)?;
+		let skip = pair_bytes.checked_mul(index)?;
+		let want = skip.checked_add(pair_bytes)?;
+		if len < want {
+			return None;
+		}
+		let mut p = value.checked_add(skip as u64)?;
+		let address = unsafe { self.read_cells(&mut p, addr_cells) };
+		let size = unsafe { self.read_cells(&mut p, size_cells) };
+		if size == 0 || address.checked_add(size).is_none() {
+			return None;
+		}
+		Some((address, size))
+	}
+
 	unsafe fn read_cells(&self, p: &mut u64, cells: u32) -> u64 {
 		let mut v = 0u64;
 		for _ in 0..cells {
@@ -517,6 +613,20 @@ impl Fdt {
 			// (depth 2) on riscv64 virt, so each is tracked by the depth at which we entered.
 			let mut pcie = Device::new();
 			let mut plic = Device::new();
+			// The ARM interrupt controller and, inside it, the GICv2m frame. The frame is a CHILD of
+			// the controller node on QEMU's virt machine, so it is tracked separately and only
+			// accepted while the controller node is open.
+			let mut gic = Device::new();
+			let mut v2m = Device::new();
+			let mut its = Device::new();
+			let mut gic_its: u64 = 0;
+			let mut gic_its_size: u64 = 0;
+			let mut pci_msi_rid_base: u32 = 0;
+			let mut pci_msi_devid_base: u32 = 0;
+			let mut pci_msi_length: u32 = 0;
+			// The RISC-V IMSIC, plus the one property that says whether it is the supervisor's.
+			let mut imsic = Device::new();
+			let mut imsic_supervisor = false;
 			let mut fwcfg = Device::new();
 			// What each depth declares for its children, and its `ranges` - so a device's `reg` is
 			// read in its PARENT's cells and translated up the buses it sits behind (FDT-003). The
@@ -543,6 +653,32 @@ impl Fdt {
 			let mut cpu_reg: Option<(u64, u32)> = None;
 			let mut pcie_ecam: u64 = 0;
 			let mut plic_base: u64 = 0;
+			let mut gic_dist: u64 = 0;
+			let mut gic_dist_size: u64 = 0;
+			let mut gic_cpu: u64 = 0;
+			let mut gic_cpu_size: u64 = 0;
+			let mut gic_version: u8 = 0;
+			let mut gic_msi: u64 = 0;
+			let mut gic_msi_size: u64 = 0;
+			let mut imsic_base: u64 = 0;
+			let mut imsic_size: u64 = 0;
+			// Read on whichever IMSIC node is being walked, committed only for the supervisor one.
+			let mut imsic_guest_bits_seen: u32 = 0;
+			let mut imsic_group_bits_seen: u32 = 0;
+			let mut imsic_num_ids_seen: u32 = 0;
+			let mut imsic_ext_seen: Option<(u64, u32)> = None;
+			let mut imsic_guest_index_bits: u32 = 0;
+			let mut imsic_group_index_bits: u32 = 0;
+			let mut imsic_num_ids: u32 = 0;
+			// The supervisor IMSIC's `interrupts-extended`, resolved after the walk: the cpu nodes
+			// it names may be walked before or after it, so the table it is resolved against is only
+			// complete at the end.
+			let mut imsic_ext: Option<(u64, u32)> = None;
+			// Each recorded cpu's interrupt-controller phandle, parallel to `cpu_ids`. Zero for a
+			// cpu node with no such child, which is a cpu nothing can be wired to.
+			let mut cpu_phandles = [0u32; MAX_CPUS];
+			let mut cpu_phandle: u32 = 0;
+			let mut in_cpu_intc = false;
 			let mut fwcfg_base: u64 = 0;
 			let mut modules_start: u64 = 0;
 			let mut modules_end: u64 = 0;
@@ -593,11 +729,46 @@ impl Fdt {
 						if plic.depth < 0 && self.str_starts(name, "plic") {
 							plic.enter(depth);
 						}
+						// `intc` is what QEMU's virt machine calls it; `interrupt-controller` is the
+						// generic name a hand-written tree uses. Either way `compatible` decides
+						// whether this reader knows the controller, and the name only decides where
+						// to look.
+						if gic.depth < 0 && (self.str_starts(name, "intc") || self.str_starts(name, "interrupt-controller")) {
+							gic.enter(depth);
+						}
+						if gic.depth >= 0 && v2m.depth < 0 && self.str_starts(name, "v2m") {
+							v2m.enter(depth);
+						}
+						// The ITS, also a child of the controller. QEMU names the node
+						// `its@...` and Linux's own trees name it `msi-controller@...`, so the
+						// `compatible` below is what decides - the name only narrows the search.
+						if gic.depth >= 0 && its.depth < 0 && (self.str_starts(name, "its") || self.str_starts(name, "msi-controller")) {
+							its.enter(depth);
+						}
+						// The same node names as the GIC above - an AIA machine calls its controllers
+						// `interrupt-controller@...` too - and `compatible` is again what decides
+						// which reader this node belongs to.
+						if imsic.depth < 0 && (self.str_starts(name, "imsic") || self.str_starts(name, "interrupt-controller")) {
+							imsic.enter(depth);
+							imsic_supervisor = false;
+							imsic_guest_bits_seen = 0;
+							imsic_group_bits_seen = 0;
+							imsic_num_ids_seen = 0;
+							imsic_ext_seen = None;
+						}
+						// A cpu's own interrupt controller, which is what an IMSIC's
+						// `interrupts-extended` names. Its phandle is how a file is tied to a hart.
+						if in_cpu && depth == 3 && self.str_starts(name, "interrupt-controller") {
+							in_cpu_intc = true;
+						}
 						if fwcfg.depth < 0 && self.str_starts(name, "fw-cfg") {
 							fwcfg.enter(depth);
 						}
 					}
 					FDT_END_NODE => {
+						if depth == 3 && in_cpu_intc {
+							in_cpu_intc = false;
+						}
 						if depth == 2 && in_cpu {
 							// THIS HART'S VERDICT, NOW THAT THE WHOLE NODE HAS BEEN SEEN. A node
 							// without a readable `reg` names no core - the specification requires
@@ -609,12 +780,14 @@ impl Fdt {
 							{
 								if (cpu_count as usize) < MAX_CPUS {
 									cpu_ids[cpu_count as usize] = id;
+									cpu_phandles[cpu_count as usize] = cpu_phandle;
 									cpu_count += 1;
 								}
 							}
 							in_cpu = false;
 							cpu_ok = true;
 							cpu_reg = None;
+							cpu_phandle = 0;
 						}
 						if depth == 1 {
 							// THE MEMORY NODE'S BANKS, COMMITTED NOW THAT IT IS FINISHED.
@@ -670,6 +843,75 @@ impl Fdt {
 								pcie_ecam = physical;
 							}
 							pcie.leave();
+						}
+						// THE CONTROLLER'S TWO RANGES, COMMITTED WHEN ITS NODE IS FINISHED, for the
+						// reason every other device here is: `reg`, `compatible` and `status` may
+						// come in any order and all three decide whether these addresses may be
+						// used. Both ranges must read and both must translate to the root bus; a
+						// controller whose second range is missing is a controller this reader
+						// cannot drive, and taking the first alone would leave the CPU interface at
+						// whatever a compiled-in constant said.
+						if depth == v2m.depth {
+							if gic_msi == 0
+								&& v2m.usable() && let Some((val, len)) = v2m.reg
+								&& let (parent_addr, parent_size) = cells_at[depth as usize - 1]
+								&& let Some((child, size)) = self.read_reg_range(val, len, parent_addr, parent_size, 0)
+								&& let Some(physical) = self.translate_to_root(&buses, depth as usize - 1, child)
+							{
+								gic_msi = physical;
+								gic_msi_size = size;
+							}
+							v2m.leave();
+						}
+						if depth == its.depth {
+							if gic_its == 0
+								&& its.usable() && let Some((val, len)) = its.reg
+								&& let (parent_addr, parent_size) = cells_at[depth as usize - 1]
+								&& let Some((child, size)) = self.read_reg_range(val, len, parent_addr, parent_size, 0)
+								&& let Some(physical) = self.translate_to_root(&buses, depth as usize - 1, child)
+							{
+								gic_its = physical;
+								gic_its_size = size;
+							}
+							its.leave();
+						}
+						if depth == gic.depth {
+							if gic_dist == 0
+								&& gic.usable() && let Some((val, len)) = gic.reg
+								&& let (parent_addr, parent_size) = cells_at[depth as usize - 1]
+								&& let Some((dist, dist_size)) = self.read_reg_range(val, len, parent_addr, parent_size, 0)
+								&& let Some((cpu, cpu_size)) = self.read_reg_range(val, len, parent_addr, parent_size, 1)
+								&& let Some(dist_phys) = self.translate_to_root(&buses, depth as usize - 1, dist)
+								&& let Some(cpu_phys) = self.translate_to_root(&buses, depth as usize - 1, cpu)
+								// TWO REGIONS THAT DO NOT OVERLAP. A tree that describes the same
+								// bytes twice describes a controller nobody can drive: writing the
+								// distributor would write the CPU interface. Checked here, where
+								// both are known, rather than at the first MMIO write.
+								&& !ranges_overlap(dist_phys, dist_size, cpu_phys, cpu_size)
+							{
+								gic_dist = dist_phys;
+								gic_dist_size = dist_size;
+								gic_cpu = cpu_phys;
+								gic_cpu_size = cpu_size;
+							}
+							gic.leave();
+						}
+						if depth == imsic.depth {
+							if imsic_base == 0
+								&& imsic_supervisor && imsic.usable()
+								&& let Some((val, len)) = imsic.reg
+								&& let (parent_addr, parent_size) = cells_at[depth as usize - 1]
+								&& let Some((base, size)) = self.read_reg_range(val, len, parent_addr, parent_size, 0)
+								&& let Some(physical) = self.translate_to_root(&buses, depth as usize - 1, base)
+							{
+								imsic_base = physical;
+								imsic_size = size;
+								imsic_guest_index_bits = imsic_guest_bits_seen;
+								imsic_group_index_bits = imsic_group_bits_seen;
+								imsic_num_ids = imsic_num_ids_seen;
+								imsic_ext = imsic_ext_seen;
+							}
+							imsic.leave();
 						}
 						if depth == plic.depth {
 							if plic_base == 0
@@ -775,6 +1017,48 @@ impl Fdt {
 							d1_memory_ok = (len >= 5 && self.str_eq(val, "okay")) || (len >= 3 && self.str_eq(val, "ok"));
 						} else if pcie.depth == depth && self.record_device(&mut pcie, pname, val, len, &["pci-host-ecam-generic"]) {
 						} else if plic.depth == depth && self.record_device(&mut plic, pname, val, len, &["sifive,plic-1.0.0", "riscv,plic0"]) {
+						} else if imsic.depth == depth && self.str_eq(pname, "interrupts-extended") {
+							// WHICH PRIVILEGE LEVEL'S FILE THIS IS. Each entry is a phandle and an
+							// interrupt number; 9 is the supervisor external interrupt and 11 the
+							// machine one. One entry is enough to tell the two controllers apart,
+							// and a property too short to hold one says nothing - which leaves this
+							// node unclaimed rather than guessed at.
+							if len >= 8 {
+								imsic_supervisor = self.be32(val + 4) == 9;
+							}
+							// AND WHICH HART EACH FILE IS, kept raw: every pair names one hart's
+							// interrupt controller, in the order the files are laid out.
+							imsic_ext_seen = Some((val, len));
+						} else if imsic.depth == depth && len == 4 && self.str_eq(pname, "riscv,guest-index-bits") {
+							imsic_guest_bits_seen = self.be32(val);
+						} else if imsic.depth == depth && len == 4 && self.str_eq(pname, "riscv,group-index-bits") {
+							imsic_group_bits_seen = self.be32(val);
+						} else if imsic.depth == depth && len == 4 && self.str_eq(pname, "riscv,num-ids") {
+							imsic_num_ids_seen = self.be32(val);
+						} else if in_cpu_intc && depth == 3 && len == 4 && self.str_eq(pname, "phandle") {
+							cpu_phandle = self.be32(val);
+						} else if its.depth == depth && self.record_device(&mut its, pname, val, len, &["arm,gic-v3-its"]) {
+						} else if pcie.depth == depth && len >= 16 && self.str_eq(pname, "msi-map") {
+							// One entry: rid-base, the controller's phandle, its devid-base, length.
+							// A tree may hold several; this reader takes the FIRST, and a machine
+							// that splits its bus across two MSI controllers is one it does not
+							// claim - the second entry is visible in the length it does not cover.
+							pci_msi_rid_base = self.be32(val);
+							pci_msi_devid_base = self.be32(val + 8);
+							pci_msi_length = self.be32(val + 12);
+						} else if v2m.depth == depth && self.record_device(&mut v2m, pname, val, len, &["arm,gic-v2m-frame"]) {
+						} else if imsic.depth == depth && self.record_device(&mut imsic, pname, val, len, &["riscv,imsics"]) {
+						} else if gic.depth == depth && self.record_device(&mut gic, pname, val, len, &["arm,cortex-a15-gic", "arm,gic-400", "arm,arm11mp-gic", "arm,gic-v3"]) {
+							// The version, from the same `compatible` the reader just matched. A
+							// GICv3 describes a distributor and a REDISTRIBUTOR region where a
+							// GICv2 describes a distributor and a CPU interface, and the two are
+							// driven differently - so which one this is has to come from the
+							// machine rather than from the shape of `reg`.
+							if self.str_eq(pname, "compatible") && self.stringlist_contains(val, len, b"arm,gic-v3") {
+								gic_version = 3;
+							} else if self.str_eq(pname, "compatible") && gic.known {
+								gic_version = 2;
+							}
 						} else if depth == 1 && d1_chosen && (self.str_eq(pname, "linux,initrd-start") || self.str_eq(pname, "linux,initrd-end")) {
 							// QEMU writes these as one or two cells depending on the machine, so
 							// the width is taken from the property length rather than assumed -
@@ -868,7 +1152,26 @@ impl Fdt {
 			if ram_size == 0 {
 				return None;
 			}
-			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, cpu_count: cpu_count.max(1), cpu_ids, cpu_nodes, pcie_ecam, plic_base, fwcfg_base, modules_start, modules_end })
+			// THE FILES' HARTS, RESOLVED AGAINST THE WHOLE TREE. Deferred to here because a tree may
+			// put its interrupt controller before or after the cpu nodes it names, and only one of
+			// those orders lets the table be read as it is built. `u64::MAX` marks a file whose
+			// entry names no cpu node in this tree - which is not a hart this kernel can find.
+			let mut imsic_harts = [u64::MAX; MAX_CPUS];
+			let mut imsic_hart_count: u32 = 0;
+			if let Some((val, len)) = imsic_ext {
+				let mut off: u32 = 0;
+				while off + 8 <= len && (imsic_hart_count as usize) < MAX_CPUS {
+					let phandle = self.be32(val + off as u64);
+					if phandle != 0
+						&& let Some(index) = cpu_phandles[..cpu_count as usize].iter().position(|&p| p == phandle)
+					{
+						imsic_harts[imsic_hart_count as usize] = cpu_ids[index];
+					}
+					imsic_hart_count += 1;
+					off += 8;
+				}
+			}
+			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, cpu_count: cpu_count.max(1), cpu_ids, cpu_nodes, pcie_ecam, plic_base, gic_dist, gic_dist_size, gic_cpu, gic_cpu_size, gic_version, gic_msi, gic_msi_size, gic_its, gic_its_size, pci_msi_rid_base, pci_msi_devid_base, pci_msi_length, imsic_base, imsic_size, imsic_guest_index_bits, imsic_group_index_bits, imsic_num_ids, imsic_harts, imsic_hart_count, fwcfg_base, modules_start, modules_end })
 		}
 	}
 }
@@ -951,6 +1254,19 @@ struct Bus {
 // the firmware had marked `disabled`, could overwrite a real one; a node under a bus with different
 // cell counts was read at the wrong width; and no address was ever translated through the bus it
 // sits behind. The verdict is taken at the node's end now, with everything about it in hand.
+// Do two physical ranges share a byte? Written as one function because two callers - the
+// controller's own pair, and a caller checking a frame against them - must answer it the same way,
+// and because an end computed with `+` wraps where this cannot.
+fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
+	let (a_end, b_end) = match (a.checked_add(a_len), b.checked_add(b_len)) {
+		(Some(x), Some(y)) => (x, y),
+		// An end that overflows is not a range this reader can compare, and calling that
+		// "no overlap" would let it through.
+		_ => return true,
+	};
+	a < b_end && b < a_end
+}
+
 #[derive(Clone, Copy)]
 struct Device {
 	// The depth the node was entered at, or -1 when not inside one.

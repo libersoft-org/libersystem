@@ -32,6 +32,9 @@ fn at(blob: &'static [u8]) -> Fdt {
 
 const AARCH64: &[u8] = include_bytes!("../tests/qemu-virt-aarch64.dtb");
 const RISCV64: &[u8] = include_bytes!("../tests/qemu-virt-riscv64.dtb");
+// The machine the riscv64 harness actually runs: `virt,aia=aplic-imsic`, whose tree describes two
+// IMSICs - the firmware's and this kernel's.
+const RISCV64_AIA: &[u8] = include_bytes!("../tests/qemu-virt-riscv64-aia.dtb");
 
 // ---------------------------------------------------------------------------------------------
 // A tree builder, so the awkward cases can be written rather than found.
@@ -1318,4 +1321,368 @@ fn a_reservation_list_that_does_not_terminate_reserves_nothing() {
 	let (seen, complete) = reservations_of(machine_reserving(&over));
 	assert!(!complete, "one more than this reader carries is a list it cannot carry");
 	assert!(seen.is_empty(), "and it commits none of it");
+}
+
+// ---------------------------------------------------------------------------------------------
+// The ARM interrupt controller, read from the machine rather than from a constant (P02M0151 M2).
+// ---------------------------------------------------------------------------------------------
+
+// A GICv2 node the way QEMU's virt machine writes it: two ranges in one `reg`, distributor first.
+fn gic_reg(dist: u64, dist_size: u64, cpu: u64, cpu_size: u64) -> Vec<u8> {
+	let mut reg = dist.to_be_bytes().to_vec();
+	reg.extend_from_slice(&dist_size.to_be_bytes());
+	reg.extend_from_slice(&cpu.to_be_bytes());
+	reg.extend_from_slice(&cpu_size.to_be_bytes());
+	reg
+}
+
+fn with_gic(reg: &[u8], compatible: &str) -> &'static [u8] {
+	let reg = reg.to_vec();
+	let compatible = compatible.to_string();
+	machine(move |builder| {
+		builder.begin("intc@8000000").prop_str("compatible", &compatible).prop("reg", &reg).end();
+	})
+}
+
+#[test]
+fn the_controller_addresses_come_from_the_tree() {
+	// THE POINT OF THE ITEM. Both addresses used to be constants naming one QEMU machine, so passing
+	// on that machine was not evidence that anything had been discovered. A tree that says something
+	// else must move them.
+	let blob = with_gic(&gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000), "arm,cortex-a15-gic");
+	let info = at(blob).parse().expect("the tree parses");
+	assert_eq!(info.gic_dist, 0x0800_0000, "the distributor is the first range");
+	assert_eq!(info.gic_cpu, 0x0801_0000, "the CPU interface is the second");
+	assert_eq!(info.gic_version, 2, "`arm,cortex-a15-gic` is a GICv2");
+
+	let moved = with_gic(&gic_reg(0x1_0000_0000, 0x1_0000, 0x1_0001_0000, 0x2_0000), "arm,gic-400");
+	let info = at(moved).parse().expect("the tree parses");
+	assert_eq!(info.gic_dist, 0x1_0000_0000, "a machine that maps it elsewhere is followed");
+	assert_eq!(info.gic_cpu, 0x1_0001_0000);
+	assert_eq!(info.gic_cpu_size, 0x2_0000, "the size is the tree's, not a fixed window");
+}
+
+#[test]
+fn a_gicv3_says_it_is_one() {
+	// The two versions describe two ranges each and are driven differently, so the version cannot be
+	// inferred from the shape of `reg` - it comes from `compatible`.
+	let blob = with_gic(&gic_reg(0x0800_0000, 0x1_0000, 0x080a_0000, 0xf6_0000), "arm,gic-v3");
+	let info = at(blob).parse().expect("the tree parses");
+	assert_eq!(info.gic_version, 3);
+	assert_eq!(info.gic_cpu, 0x080a_0000, "a GICv3's second range is the redistributor region");
+}
+
+#[test]
+fn a_controller_this_reader_does_not_know_is_not_used() {
+	// `compatible` is the whole of the decision. A node named `intc` that says it is something else
+	// leaves the addresses at zero, which the caller reads as "no controller" and refuses on.
+	let blob = with_gic(&gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000), "acme,not-a-gic");
+	let info = at(blob).parse().expect("the tree parses");
+	assert_eq!(info.gic_dist, 0, "an unknown controller is not an address to write to");
+	assert_eq!(info.gic_version, 0);
+}
+
+#[test]
+fn a_disabled_controller_is_not_used() {
+	let blob = machine(|builder| {
+		builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop("status", b"disabled\0").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000)).end();
+	});
+	assert_eq!(at(blob).parse().expect("parses").gic_dist, 0);
+}
+
+#[test]
+fn a_reg_too_short_for_two_ranges_is_refused() {
+	// A CONTROLLER IS BOTH REGIONS OR IT IS NOTHING. Taking the first range alone would leave the
+	// CPU interface at whatever the previous constant said, which is the failure this item exists to
+	// remove - and reading past the property takes the padding after it as an address.
+	let mut short = 0x0800_0000u64.to_be_bytes().to_vec();
+	short.extend_from_slice(&0x1_0000u64.to_be_bytes());
+	let blob = with_gic(&short, "arm,cortex-a15-gic");
+	let info = at(blob).parse().expect("the tree parses");
+	assert_eq!(info.gic_dist, 0, "one range is not a controller");
+	assert_eq!(info.gic_cpu, 0);
+}
+
+#[test]
+fn a_zero_sized_or_overflowing_range_is_refused() {
+	let zero = with_gic(&gic_reg(0x0800_0000, 0, 0x0801_0000, 0x1_0000), "arm,cortex-a15-gic");
+	assert_eq!(at(zero).parse().expect("parses").gic_dist, 0, "a region of no bytes cannot be mapped");
+
+	let overflow = with_gic(&gic_reg(0x0800_0000, 0x1_0000, u64::MAX - 8, 0x1_0000), "arm,cortex-a15-gic");
+	assert_eq!(at(overflow).parse().expect("parses").gic_dist, 0, "an end past the address space is refused, not wrapped");
+}
+
+#[test]
+fn two_ranges_that_share_a_byte_are_refused() {
+	// Writing the distributor would write the CPU interface. The check is here, where both are
+	// known, rather than at the first MMIO access - which is after `ExitBootServices`.
+	let blob = with_gic(&gic_reg(0x0800_0000, 0x2_0000, 0x0801_0000, 0x1_0000), "arm,cortex-a15-gic");
+	assert_eq!(at(blob).parse().expect("parses").gic_dist, 0);
+}
+
+#[test]
+fn the_first_usable_controller_wins() {
+	// The same rule the other platform devices follow: a later node cannot overwrite an address
+	// already taken from a usable one.
+	let blob = machine(|builder| {
+		builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000)).end();
+		builder.begin("intc@9000000").prop_str("compatible", "arm,cortex-a15-gic").prop("reg", &gic_reg(0x0900_0000, 0x1_0000, 0x0901_0000, 0x1_0000)).end();
+	});
+	assert_eq!(at(blob).parse().expect("parses").gic_dist, 0x0800_0000);
+}
+
+#[test]
+fn the_msi_frame_is_read_from_the_controller_s_child() {
+	// The GICv2m frame is a child of the controller node, and a machine without one is a machine
+	// without message-signalled interrupts rather than a broken tree.
+	let mut with_frame = Builder::new();
+	with_frame.begin("");
+	with_frame.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	with_frame.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	with_frame.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	// The cell widths for the frame BELOW it, which is what a controller with a child declares -
+	// QEMU's virt machine writes exactly this. A child's `reg` is read with its parent's widths, so
+	// a node that has children and declares none describes nothing about them.
+	with_frame
+		.begin("intc@8000000")
+		.prop_str("compatible", "arm,cortex-a15-gic")
+		.prop_u32("#address-cells", 2)
+		.prop_u32("#size-cells", 2)
+		// AND AN EMPTY `ranges`, which is what QEMU writes and what the specification requires of a
+		// node whose children have addresses: no entries means the identity mapping. Without it the
+		// frame's address is not translatable to the root bus at all, and the reader refuses it -
+		// which is the right answer for a tree that declares a child address under a bus that maps
+		// nothing.
+		.prop("ranges", b"")
+		.prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000));
+	with_frame.begin("v2m@8020000").prop_str("compatible", "arm,gic-v2m-frame").prop_reg64(0x0802_0000, 0x1000).end();
+	with_frame.end().end();
+	let blob = with_frame.finish();
+	let info = at(blob).parse().expect("the tree parses");
+	assert_eq!(info.gic_msi, 0x0802_0000);
+	assert_eq!(info.gic_msi_size, 0x1000);
+
+	let without = with_gic(&gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000), "arm,cortex-a15-gic");
+	assert_eq!(at(without).parse().expect("parses").gic_msi, 0, "no frame is no MSI, not a refusal");
+}
+
+#[test]
+fn the_real_qemu_tree_describes_its_own_controller() {
+	// The fixture is the machine this port actually boots on, so the addresses the constants used to
+	// carry must be the ones the tree names.
+	let info = at(AARCH64).parse().expect("the QEMU tree parses");
+	assert_eq!(info.gic_dist, 0x0800_0000, "QEMU virt maps the distributor here");
+	assert_eq!(info.gic_cpu, 0x0801_0000, "and the CPU interface here");
+	assert_eq!(info.gic_version, 2, "the harness runs `virt,gic-version=2`");
+	assert_eq!(info.gic_msi, 0x0802_0000, "and the v2m frame just above them");
+}
+
+#[test]
+fn a_frame_under_a_controller_that_maps_nothing_is_refused() {
+	// A child address is only meaningful through its parent's `ranges`. A controller that declares
+	// none maps nothing, so the frame address below it names nothing at the root - and taking it
+	// anyway would write MSI configuration at an address the machine never described.
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000));
+	builder.begin("v2m@8020000").prop_str("compatible", "arm,gic-v2m-frame").prop_reg64(0x0802_0000, 0x1000).end();
+	builder.end().end();
+	let info = at(builder.finish()).parse().expect("the tree parses");
+	assert_eq!(info.gic_msi, 0, "an untranslatable frame address is not an address");
+	assert_eq!(info.gic_dist, 0x0800_0000, "the controller itself is at the root and still readable");
+}
+
+#[test]
+fn the_supervisor_imsic_is_the_one_taken() {
+	// TWO CONTROLLERS, AND THE FIRST IS THE FIRMWARE'S. QEMU lists the M-mode IMSIC at 0x2400_0000
+	// before the S-mode one at 0x2800_0000, so a reader that took the first node would point every
+	// device MSI at the interrupt files OpenSBI owns - which this kernel cannot read and would never
+	// see fire. `interrupts-extended` names IRQ 9 for the supervisor file and 11 for the machine one.
+	let info = at(RISCV64_AIA).parse().expect("the AIA tree parses");
+	assert_eq!(info.imsic_base, 0x2800_0000, "the S-mode interrupt files");
+	assert_ne!(info.imsic_size, 0, "and the extent the tree gives them");
+}
+
+#[test]
+fn a_machine_without_imsics_reports_none() {
+	// The plain `virt` machine routes through a PLIC and has no IMSIC at all. Zero is the answer,
+	// and the port reads it as "this machine does not deliver MSI that way" rather than as a
+	// controller at address zero.
+	let info = at(RISCV64).parse().expect("the PLIC tree parses");
+	assert_eq!(info.imsic_base, 0);
+	assert_ne!(info.plic_base, 0, "that machine's controller is still found");
+}
+
+#[test]
+fn an_imsic_wired_to_the_machine_interrupt_is_not_taken() {
+	// The rule, written as its own case: the same node, the same `compatible`, one cell different.
+	let mut m_mode = 0u32.to_be_bytes().to_vec();
+	m_mode.extend_from_slice(&11u32.to_be_bytes());
+	let blob = machine(move |builder| {
+		builder.begin("interrupt-controller@28000000").prop_str("compatible", "riscv,imsics").prop("interrupts-extended", &m_mode).prop_reg64(0x2800_0000, 0x4000).end();
+	});
+	assert_eq!(at(blob).parse().expect("parses").imsic_base, 0, "the machine-mode file belongs to the firmware");
+}
+
+// A RISC-V AIA machine, built so the interrupt files' association with harts can be varied.
+// `harts` gives each cpu node's `reg` and the phandle of its interrupt-controller child; `files`
+// gives the phandles the S-mode IMSIC names, IN FILE ORDER.
+fn aia(addr_cells: u32, harts: &[(u64, u32)], files: &[u32], imsic_base: u64, props: impl FnOnce(&mut Builder)) -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", addr_cells).prop_u32("#size-cells", 0);
+	for &(reg, phandle) in harts {
+		builder.begin("cpu@x").prop("device_type", b"cpu\0");
+		if addr_cells == 2 {
+			let mut cells = ((reg >> 32) as u32).to_be_bytes().to_vec();
+			cells.extend_from_slice(&(reg as u32).to_be_bytes());
+			builder.prop("reg", &cells);
+		} else {
+			builder.prop_u32("reg", reg as u32);
+		}
+		builder.begin("interrupt-controller").prop_str("compatible", "riscv,cpu-intc").prop_u32("phandle", phandle).end();
+		builder.end();
+	}
+	builder.end();
+	let mut ext = Vec::new();
+	for &phandle in files {
+		ext.extend_from_slice(&phandle.to_be_bytes());
+		ext.extend_from_slice(&9u32.to_be_bytes()); // the supervisor external interrupt
+	}
+	builder.begin("imsics@x").prop_str("compatible", "riscv,imsics").prop("interrupts-extended", &ext).prop_reg64(imsic_base, 0x1000 * files.len() as u64);
+	props(&mut builder);
+	builder.end();
+	builder.end();
+	builder.finish()
+}
+
+#[test]
+fn the_real_aia_machine_ties_every_file_to_its_hart() {
+	// The identity the kernel's `base + hart * stride` addressing assumes, read rather than assumed:
+	// on this machine file N does belong to hart N, and now that is a fact the tree stated.
+	let info = at(RISCV64_AIA).parse().expect("the AIA machine parses");
+	assert_eq!(info.imsic_hart_count, 8, "one interrupt file per hart");
+	for (index, &hart) in info.imsic_harts[..8].iter().enumerate() {
+		assert_eq!(hart, index as u64, "file {index} belongs to hart {index}");
+	}
+	assert_eq!(info.imsic_guest_index_bits, 0, "no guest indexing");
+	assert_eq!(info.imsic_group_index_bits, 0, "no group indexing");
+	assert!(info.imsic_num_ids >= 63, "the controller carries at least the identities this kernel uses");
+}
+
+#[test]
+fn a_file_is_matched_to_its_hart_by_phandle_rather_than_by_position() {
+	// THE ORDER OF THE CPU NODES IS NOT THE ORDER OF THE FILES, and nothing says it must be. Here
+	// the tree lists its harts backwards while the IMSIC lists its files forwards; a reader that
+	// paired them off by position would have every file pointing at the wrong hart.
+	let harts = [(3u64, 0x30u32), (2, 0x20), (1, 0x10), (0, 0x100)];
+	let info = at(aia(1, &harts, &[0x100, 0x10, 0x20, 0x30], 0x2800_0000, |_| {})).parse().expect("parses");
+	assert_eq!(&info.cpu_ids[..4], &[3, 2, 1, 0], "the cpu ids are in tree order");
+	assert_eq!(&info.imsic_harts[..4], &[0, 1, 2, 3], "the files are in their own order, resolved by phandle");
+}
+
+#[test]
+fn a_file_whose_entry_names_no_cpu_belongs_to_no_hart() {
+	// A dangling phandle is not a hart to address. It is reported as unknown rather than silently
+	// becoming file index 0's hart.
+	let info = at(aia(1, &[(0, 0x10)], &[0x10, 0xdead], 0x2800_0000, |_| {})).parse().expect("parses");
+	assert_eq!(info.imsic_hart_count, 2, "the tree declares two files");
+	assert_eq!(info.imsic_harts[0], 0);
+	assert_eq!(info.imsic_harts[1], u64::MAX, "the second names nothing this tree describes");
+}
+
+#[test]
+fn a_hart_id_wider_than_thirty_two_bits_is_read_whole() {
+	// KERN-ARCH-008 again, at the other end: `#address-cells = 2` under `/cpus` is a 64-bit hart id,
+	// which the SBI ABI carries as an `unsigned long`. Truncating it to 32 bits gives two harts one
+	// id - and the id is what `hart_start` and every IPI target.
+	let harts = [(0x1_0000_0000u64, 0x10u32), (0x1_0000_0001, 0x20)];
+	let info = at(aia(2, &harts, &[0x10, 0x20], 0x2800_0000, |_| {})).parse().expect("parses");
+	assert_eq!(&info.cpu_ids[..2], &[0x1_0000_0000, 0x1_0000_0001], "both halves of the id survive");
+	assert_eq!(&info.imsic_harts[..2], &[0x1_0000_0000, 0x1_0000_0001], "and the files name them whole");
+}
+
+#[test]
+fn the_interrupt_files_are_wherever_the_tree_puts_them() {
+	// The address is read, not defaulted: a machine that relocates its files is followed.
+	let info = at(aia(1, &[(0, 0x10)], &[0x10], 0x9_8765_0000, |_| {})).parse().expect("parses");
+	assert_eq!(info.imsic_base, 0x9_8765_0000);
+	assert_eq!(info.imsic_size, 0x1000, "one file, one page");
+}
+
+#[test]
+fn a_guest_or_group_indexed_layout_is_reported_rather_than_flattened() {
+	// The AIA binding lets a machine index its files by guest and by group, which puts a hart's file
+	// somewhere `base + hart * 4096` does not. The parser states what the machine said; refusing it
+	// is the kernel's call, and it cannot make it from an address alone.
+	let guest = at(aia(1, &[(0, 0x10)], &[0x10], 0x2800_0000, |b| {
+		b.prop_u32("riscv,guest-index-bits", 3);
+	}))
+	.parse()
+	.expect("parses");
+	assert_eq!(guest.imsic_guest_index_bits, 3);
+	let group = at(aia(1, &[(0, 0x10)], &[0x10], 0x2800_0000, |b| {
+		b.prop_u32("riscv,group-index-bits", 2).prop_u32("riscv,group-index-shift", 24);
+	}))
+	.parse()
+	.expect("parses");
+	assert_eq!(group.imsic_group_index_bits, 2);
+	// And a controller that says how many identities it carries is taken at its word.
+	let ids = at(aia(1, &[(0, 0x10)], &[0x10], 0x2800_0000, |b| {
+		b.prop_u32("riscv,num-ids", 31);
+	}))
+	.parse()
+	.expect("parses");
+	assert_eq!(ids.imsic_num_ids, 31);
+}
+
+const AARCH64_GICV3: &[u8] = include_bytes!("../tests/qemu-virt-aarch64-gicv3.dtb");
+
+#[test]
+fn a_gicv3_machine_describes_a_distributor_and_a_redistributor_region() {
+	// THE SAME TWO RANGES MEAN DIFFERENT THINGS. A GICv2's second `reg` range is the memory-mapped
+	// CPU interface; a GICv3 has no such thing - its CPU interface is system registers - and the
+	// second range is the REDISTRIBUTOR region, one frame pair per core. A driver that read the
+	// version out of the shape of `reg` would drive one controller's registers on the other.
+	let info = at(AARCH64_GICV3).parse().expect("the GICv3 machine parses");
+	assert_eq!(info.gic_version, 3, "the version comes from `compatible`");
+	assert_eq!(info.gic_dist, 0x0800_0000, "the distributor");
+	assert_eq!(info.gic_dist_size, 0x1_0000);
+	assert_eq!(info.gic_cpu, 0x080a_0000, "the redistributor region");
+	// One 128 KiB frame pair per core, and QEMU sizes the region for the machine's maximum.
+	assert!(info.gic_cpu_size >= 0x2_0000 * 8, "the region holds a frame pair for every core");
+	assert_eq!(info.gic_msi, 0, "this machine signals MSIs through an ITS, which is not a v2m frame");
+	assert_eq!(info.cpu_count, 8, "and the same tree still describes the cores");
+}
+
+const AARCH64_GICV3_ITS: &[u8] = include_bytes!("../tests/qemu-virt-aarch64-gicv3-its.dtb");
+
+#[test]
+fn a_gicv3_its_machine_names_its_translator_and_how_a_device_is_identified_to_it() {
+	// An ITS is the OTHER kind of ARM MSI controller and nothing like a v2m frame: a device writes
+	// an EVENT id to one register, and the ITS turns (device, event) into an LPI aimed at a core.
+	// Which device it thinks wrote is the RequesterID mapped through the host bridge's `msi-map`, so
+	// a kernel that cannot read that mapping cannot name its own devices to the controller.
+	let info = at(AARCH64_GICV3_ITS).parse().expect("the GICv3/ITS machine parses");
+	assert_eq!(info.gic_version, 3);
+	assert_ne!(info.gic_its, 0, "the ITS is a child of the controller and is found there");
+	assert!(info.gic_its_size >= 0x2_0000, "its two 64 KiB frames - the control page and the translator");
+	assert_eq!(info.pci_msi_length, 0x10000, "the mapping covers the whole bus");
+	assert_eq!(info.pci_msi_rid_base, 0, "and it is the identity on this machine");
+	assert_eq!(info.pci_msi_devid_base, 0);
+}
+
+#[test]
+fn a_gicv3_without_an_its_declares_none() {
+	// The same controller, one child node fewer. `its=off` is a machine with no MSI controller at
+	// all, which is a boot that schedules and has no device interrupts - not one to guess an
+	// address for.
+	let info = at(AARCH64_GICV3).parse().expect("parses");
+	assert_eq!(info.gic_its, 0);
+	assert_eq!(info.gic_msi, 0, "and no v2m frame either");
 }

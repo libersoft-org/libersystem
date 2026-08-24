@@ -22,6 +22,8 @@ mod boot;
 mod dtb;
 mod exceptions;
 mod gic;
+// The GICv3 ITS: the MSI controller a GICv3 machine has instead of a v2m frame.
+mod its;
 pub mod psci;
 pub mod serial;
 pub mod usercopy;
@@ -178,7 +180,7 @@ pub mod interrupts;
 // (the aarch64 interrupt controller is the GIC; the module keeps the portable
 // `apic` name for the contract until the ports rename it.)
 pub mod apic {
-	pub fn send_wake_ipi(dest: u32) {
+	pub fn send_wake_ipi(dest: u64) {
 		// Bounce a halted core out of WFI so its idle loop re-checks its run queue: send
 		// it SGI 0 (the wake IPI). The delivery is the whole message; gic::handle_irq EOIs
 		// it and the core's idle loop picks up the enqueued work.

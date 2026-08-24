@@ -18,6 +18,11 @@ const SEC_STACK_SIZE: usize = 16384;
 // Count of secondaries that have come online.
 static SMP_ONLINE: AtomicU32 = AtomicU32::new(0);
 
+// WHO OWNS EACH LOGICAL ID, FOR AS LONG AS IT MIGHT STILL BE CLAIMED. The rule and its failure
+// cases live in `smpboot`, which a host can drive them through; this is the storage the boot hart
+// and the arriving harts share.
+static SEC_SLOT: [AtomicU32; fdt::MAX_CPUS] = [const { AtomicU32::new(smpboot::SLOT_FREE) }; fdt::MAX_CPUS];
+
 global_asm!(
 	r#"
 .section .data.boot, "a"
@@ -89,13 +94,19 @@ static mut riscv64_sec_stacks_ptr: u64 = 0;
 // per-CPU block, trap vector, and local timer, records itself online, then idles.
 #[unsafe(no_mangle)]
 extern "C" fn riscv64_secondary_main(cpu_id: u64, hartid: u64) -> ! {
+	// The invitation, claimed before anything shared is touched: a hart whose attempt timed out
+	// finds its slot abandoned and stops, rather than initializing a per-CPU block another hart now
+	// owns. See `SEC_SLOT`.
+	if !smpboot::Bringup::new(&SEC_SLOT).claim(cpu_id) {
+		super::halt_loop();
+	}
 	// Enable the FPU (FS = Initial) on this hart, matching the boot hart's setup before any context
 	// switch. SUM stays CLEAR here too - see `boot.rs` and `paging::user_access`.
 	unsafe { core::arch::asm!("csrs sstatus, {}", in(reg) 1u64 << 13, options(nostack, preserves_flags)) };
 	unsafe { core::arch::asm!("csrw scounteren, {}", in(reg) 0x7u64, options(nostack, preserves_flags)) };
 	super::traps::init();
-	super::percpu::init(cpu_id as usize, hartid as u32);
-	crate::smp::set_lapic_id(cpu_id as usize, hartid as u32);
+	super::percpu::init(cpu_id as usize, hartid);
+	crate::smp::set_lapic_id(cpu_id as usize, hartid);
 	super::imsic::init_hart();
 	super::apic::init_ap();
 	SMP_ONLINE.fetch_add(1, Ordering::Release);
@@ -128,23 +139,65 @@ fn sbi_hart_start(hartid: u64, start_addr: u64, opaque: u64) -> i64 {
 	err
 }
 
-// Wake every secondary hart the device tree names, via SBI HSM hart_start, and wait for each to
-// report in before starting the next. The OpenSBI boot hart is not necessarily hart 0 (QEMU virt
-// often boots on hart 1), so the boot hart id is skipped and the harts that answer get contiguous
-// cpu ids 1.. (the boot hart is cpu id 0). Returns how many cores are online, the boot hart
-// included - which is the number the rest of the kernel may use.
-pub fn bring_up_secondaries(hart_ids: &[u64], boot_hartid: u64) -> usize {
-	if hart_ids.len() <= 1 {
-		return 1;
+// The SBI side of a start attempt: the HSM call, the bounded wait, and what to say about either.
+// Everything about WHICH id a hart gets and for how long it keeps it is `smpboot`'s.
+struct Hsm {
+	entry: u64,
+}
+
+impl smpboot::Firmware for Hsm {
+	fn start(&mut self, target: u64, logical_id: u64) -> i64 {
+		sbi_hart_start(target, self.entry, logical_id)
+	}
+
+	fn await_report(&mut self, reported: u32) -> bool {
+		// A BOUND, NOT A MEASUREMENT: long enough that a working hart always arrives first, short
+		// enough that one which never will does not hold the boot.
+		let mut spins: u64 = 0;
+		while SMP_ONLINE.load(Ordering::Acquire) < reported && spins < 500_000_000 {
+			core::hint::spin_loop();
+			spins += 1;
+		}
+		SMP_ONLINE.load(Ordering::Acquire) >= reported
+	}
+
+	fn note(&mut self, event: smpboot::Event) {
+		match event {
+			smpboot::Event::Refused { target, status, .. } => {
+				crate::serial_println!("riscv64: hart_start hart {target} failed (SBI {status})")
+			}
+			smpboot::Event::Abandoned { target, logical_id } => crate::serial_println!("riscv64: hart {target} took hart_start and never reported in; logical id {logical_id} is abandoned rather than reused"),
+			smpboot::Event::Online { target, logical_id } => {
+				crate::serial_println!("riscv64:   cpu {logical_id} up (hart {target})")
+			}
+			smpboot::Event::PoolExhausted { target } => crate::serial_println!("riscv64: hart {target} has no logical id left in the per-CPU pool ({}); it stays parked", fdt::MAX_CPUS),
+		}
+	}
+}
+
+// Wake each secondary hart the resolved topology names, via SBI HSM `hart_start`, and wait for it
+// to report in before offering the next id.
+//
+// `secondaries` is what `smpboot::Topology` left after taking out the hart running this code - the
+// OpenSBI boot hart is not necessarily hart 0 - along with ids named twice and the remainder the
+// per-CPU pool has no room for. `slots` is how many logical ids this boot can hand out, the boot
+// hart's included, which is what the stack block is sized from.
+pub fn bring_up_secondaries(secondaries: &[u64], slots: usize) -> smpboot::Outcome {
+	// Nothing to wake, and one id in use: the boot hart's.
+	if secondaries.is_empty() {
+		return smpboot::Outcome { ids_used: 1, ..Default::default() };
 	}
 
 	// Allocate the secondary stacks as a single zeroed, 16-byte-aligned heap block: u128
 	// elements give the alignment (the RISC-V ABI needs a 16-aligned sp) and let the
 	// allocator zero the block directly - building a `[u8; 16384]` on the boot stack
 	// would blow it. Index 0 (the boot hart) is left unused; the stacks scale with the
-	// hart count, no compile-time cap. Publish the higher-half base to the boot stub
-	// through the shared data word before any secondary reads it.
-	let words = hart_ids.len() * (SEC_STACK_SIZE / 16);
+	// number of ids this boot can hand out, no compile-time cap. Publish the higher-half
+	// base to the boot stub through the shared data word before any secondary reads it.
+	//
+	// SIZED FROM THE IDS, NOT FROM THE DECLARED HARTS. A tree that omits the running hart declares
+	// N harts and produces N+1 ids, and this block is indexed by the id.
+	let words = slots * (SEC_STACK_SIZE / 16);
 	// ALLOC-OK: boot, the AP stacks, allocated once before the APs start
 	let stacks: Vec<u128> = alloc::vec![0u128; words];
 	let base = Vec::leak(stacks).as_mut_ptr() as u64;
@@ -158,43 +211,7 @@ pub fn bring_up_secondaries(hart_ids: &[u64], boot_hartid: u64) -> usize {
 	// tables. High kernel code cannot address the low symbol directly, so its address
 	// is read from a linker-filled data word.
 	let entry = unsafe { riscv64_secondary_entry };
-
-	// THE IDS THE TREE GAVE, AND ONE LOGICAL ID PER HART THAT ANSWERS (KERN-ARCH-008).
-	//
-	// This used to start harts `0..cpu_count` - dense, zero-based and in tree order, none of which
-	// a device tree promises - and hand out a logical id per attempt whether or not the hart behind
-	// it existed. A board whose harts are 0, 1, 4, 5, or whose middle hart is `disabled`, had ids
-	// pointing at harts that never started, and the count published afterwards described neither.
-	//
-	// The logical id - the index into the per-CPU table, the scheduler's run queues and the stack
-	// block - is now handed out only to a hart that has REPORTED IN, so a failure consumes no id
-	// and leaves no gap behind it.
-	let mut online = 1usize;
-	for &hartid in hart_ids {
-		if hartid == boot_hartid {
-			continue; // the hart this code is running on
-		}
-		let cpu_id = online as u64;
-		let status = sbi_hart_start(hartid, entry, cpu_id);
-		if status != 0 {
-			crate::serial_println!("riscv64: hart_start hart {hartid} failed (SBI {status})");
-			continue;
-		}
-		// A BOUND, NOT A MEASUREMENT: long enough that a working hart always arrives first, short
-		// enough that one which never will does not hold the boot. Waiting for THIS hart before
-		// starting the next is what keeps the logical ids contiguous.
-		let mut spins: u64 = 0;
-		while SMP_ONLINE.load(Ordering::Acquire) < online as u32 && spins < 500_000_000 {
-			core::hint::spin_loop();
-			spins += 1;
-		}
-		if SMP_ONLINE.load(Ordering::Acquire) < online as u32 {
-			crate::serial_println!("riscv64: hart {hartid} took hart_start and never reported in");
-			continue;
-		}
-		crate::serial_println!("riscv64:   cpu {cpu_id} up (hart {hartid})");
-		online += 1;
-	}
-	crate::serial_println!("riscv64: SMP - {} of {} declared harts online", online, hart_ids.len());
-	online
+	let outcome = smpboot::Bringup::new(&SEC_SLOT).run(secondaries, &mut Hsm { entry });
+	crate::serial_println!("riscv64: SMP - {} of {} declared harts online", outcome.online + 1, secondaries.len() + 1);
+	outcome
 }

@@ -265,6 +265,69 @@ unsafe extern "C" {
 	static __boot_stack_top: u8;
 }
 
+// What the boot stub maps, and therefore how far the direct map reaches. The assembly maps 1 GiB
+// blocks over 0..4 GiB before any memory map is read, so this is the extent - not the top of
+// whatever the device tree reports. Without it `within_direct_map` answers true for addresses
+// `phys_to_virt` does not translate.
+const BOOT_DIRECT_MAP_EXTENT: u64 = 4 * 1024 * 1024 * 1024;
+
+// The interrupt controller this boot will drive, and where it came from.
+//
+// `name` is in the boot log so the two cases can never be confused by a reader: a topology READ
+// from the machine, or the one fixed descriptor a no-DT boot falls back to.
+#[derive(Clone, Copy)]
+struct GicProfile {
+	name: &'static str,
+	version: u8,
+	dist: u64,
+	dist_size: u64,
+	cpu: u64,
+	cpu_size: u64,
+	msi: u64,
+	// The GICv3 ITS and how this machine's PCI requester ids become its device ids. Zero and a zero
+	// length on a machine that has neither, which is a machine with no MSI controller.
+	its: u64,
+	its_size: u64,
+	msi_map: (u32, u32, u32),
+}
+
+impl GicProfile {
+	const MISSING: Self = Self { name: "none", version: 0, dist: 0, dist_size: 0, cpu: 0, cpu_size: 0, msi: 0, its: 0, its_size: 0, msi_map: (0, 0, 0) };
+
+	// The controller the tree describes, checked against the map this kernel can actually reach.
+	//
+	// THE RANGES ARE VALIDATED BEFORE THE FIRST MMIO ACCESS, not at it. A `reg` naming an address
+	// outside the direct map is an address `phys_to_virt` does not translate, so writing it would be
+	// a store into whatever the arithmetic produced - after `ExitBootServices`, with no fault
+	// anybody can attribute. The tree reader has already refused overlapping, zero-sized and
+	// overflowing ranges; this is the part only the kernel knows.
+	fn from_tree(tree: &fdt::BootInfo) -> Self {
+		let usable = tree.gic_version != 0 && crate::mem::within_direct_map(tree.gic_dist, tree.gic_dist_size) && crate::mem::within_direct_map(tree.gic_cpu, tree.gic_cpu_size);
+		if !usable {
+			return Self::MISSING;
+		}
+		// A frame outside the map is no frame: the machine keeps its controller and loses only
+		// message-signalled interrupts, which is what a GIC with no usable MSI controller means.
+		let msi = if tree.gic_msi != 0 && crate::mem::within_direct_map(tree.gic_msi, tree.gic_msi_size) { tree.gic_msi } else { 0 };
+		// The ITS, on the same terms as the frame: a controller outside the direct map is one this
+		// kernel cannot reach, and the machine then keeps its GIC and loses device interrupts.
+		let its = if tree.gic_its != 0 && crate::mem::within_direct_map(tree.gic_its, tree.gic_its_size) { tree.gic_its } else { 0 };
+		Self { name: "the device tree", version: tree.gic_version, dist: tree.gic_dist, dist_size: tree.gic_dist_size, cpu: tree.gic_cpu, cpu_size: tree.gic_cpu_size, msi, its, its_size: tree.gic_its_size, msi_map: (tree.pci_msi_rid_base, tree.pci_msi_devid_base, tree.pci_msi_length) }
+	}
+
+	fn usable(&self) -> bool {
+		self.version != 0 && self.dist != 0 && self.cpu != 0
+	}
+}
+
+// THE ONE FIXED DESCRIPTOR, for the boot that has no machine description to read.
+//
+// The AAVMF/U-Boot UEFI path hands the kernel no device tree, and this port has always worked there
+// because these addresses are QEMU's `virt` machine with `gic-version=2`. That regression profile is
+// worth keeping; pretending it is discovery is not. It is selected ONLY when there is no tree at
+// all - never beside one, never as a default - and the boot log says which of the two happened.
+const QEMU_VIRT_GICV2: GicProfile = GicProfile { name: "qemu-virt-gicv2 (no device tree)", version: 2, dist: 0x0800_0000, dist_size: 0x1_0000, cpu: 0x0801_0000, cpu_size: 0x1_0000, msi: 0x0802_0000, its: 0, its_size: 0, msi_map: (0, 0, 0) };
+
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_main(arg: u64) -> ! {
 	super::serial::init();
@@ -325,14 +388,47 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	super::exceptions::init_vectors();
 	crate::serial_println!("aarch64: VBAR_EL1 exception vectors installed");
 
+	// THE MACHINE DESCRIPTION FIRST, BECAUSE THE CONTROLLER IS IN IT. The distributor and CPU
+	// interface used to be constants naming QEMU's `virt` machine, so this port could only run on a
+	// machine that mapped them there - and passing on that one machine was not evidence that
+	// anything had been discovered. The tree is parsed here, before the first controller access,
+	// and what it says is what gets written to.
+	//
+	// AND THE DIRECT MAP'S CEILING BEFORE THE VALIDATOR ASKS. `within_direct_map` answers against
+	// the extent published here; asking it before publication would have it answering about a map
+	// whose size it does not know yet, which is the same as not asking.
+	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
+	crate::mem::set_direct_map_extent(BOOT_DIRECT_MAP_EXTENT);
+	let tree = unsafe { super::dtb::parse(dtb) };
+	let controller = tree.as_ref().map_or(GicProfile::MISSING, GicProfile::from_tree);
+	// A NO-DT BOOT GETS ONE NAMED DESCRIPTOR AND MAKES NO DISCOVERY CLAIM. The AAVMF/U-Boot path
+	// hands the kernel no device tree, and it works only because these addresses are QEMU's. It is
+	// kept as an explicitly named single-node regression profile rather than as a default: it is
+	// selected only when there is NO tree, never beside one, and it says so in the boot log.
+	let controller = if controller.usable() {
+		controller
+	} else if tree.is_none() {
+		crate::serial_println!("aarch64: no device tree - falling back to the {} descriptor; this boot makes no controller-topology claim", QEMU_VIRT_GICV2.name);
+		QEMU_VIRT_GICV2
+	} else {
+		// A TREE THAT DESCRIBES NO CONTROLLER THIS KERNEL CAN DRIVE IS FATAL, and it is fatal here
+		// rather than at the first MMIO write. Without a GIC there is no timer interrupt, and a
+		// kernel without one cannot claim a working scheduler even on a single core - so guessing an
+		// address would be claiming a machine rather than reading one.
+		panic!("aarch64: the device tree describes no usable interrupt controller (distributor {:#x}, cpu interface {:#x}, version {})", controller.dist, controller.cpu, controller.version);
+	};
+	crate::serial_println!("aarch64: GICv{} from {} - distributor {:#x}+{:#x}, {} {:#x}+{:#x}", controller.version, controller.name, controller.dist, controller.dist_size, if controller.version >= 3 { "redistributors" } else { "cpu interface" }, controller.cpu, controller.cpu_size);
+
 	// Bring up the GIC + the generic timer, enable interrupts, and confirm the
 	// timer IRQ fires by watching the tick counter advance (each tick arrives
 	// through the IRQ vector -> gic::handle_irq -> eret).
-	super::gic::init();
+	super::gic::init(controller.version, controller.dist, controller.cpu, controller.cpu_size);
 	crate::serial_println!("aarch64: GIC + generic timer up ({} Hz counter)", super::gic::timer_hz());
-	// Read the GICv2m frame's MSI SPI range so userspace drivers can acquire per-device
-	// MSI-X vectors (the delivery path for virtio-net/input/snd, xhci, virtio-gpu).
-	super::interrupts::init();
+	// The MSI controller is brought up after the frame allocator, further down: a v2m frame is one
+	// register read, but an ITS is TABLES IN MEMORY THIS KERNEL OWNS - a command queue, a device
+	// table, a collection table and the LPI configuration - and none of them can be allocated
+	// before there is an allocator. Doing it here worked for as long as a v2m frame was the only
+	// MSI controller this port knew.
 	super::enable_interrupts();
 	let start = super::gic::ticks();
 	let mut spins: u64 = 0;
@@ -342,10 +438,9 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	}
 	crate::serial_println!("aarch64: timer IRQs delivered - {} ticks", super::gic::ticks() - start);
 
-	// Parse the device tree (QEMU leaves it in low RAM; x0 arrives as 0 for a bare
-	// ELF, so the parser scans for it) to learn the real RAM size and CPU count
-	// instead of hard-coding them.
-	let boot_info = unsafe { super::dtb::parse(dtb) };
+	// The tree read above, reused: the RAM size and CPU count come from the same parse that named
+	// the interrupt controller, because two parses of one blob are two chances to disagree.
+	let boot_info = tree;
 	let mut ram_banks = boot_info.map(|bi| (bi.ram_regions, bi.ram_region_count));
 	let (ram_top, cpu_count, fwcfg_base) = match boot_info {
 		Some(bi) => {
@@ -389,14 +484,9 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// Seed the portable frame allocator from the device-tree memory map, then bring
 	// up the kernel heap in the higher half (the TTBR1 root is already live from the
 	// boot stub). After this, `alloc` collections (Box, Vec, ...) are usable.
-	// Publish the direct-map offset so the portable subsystems (heap, ELF loader,
-	// ...) reach physical frames the same way this backend does (phys | KOFF).
-	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
-	// AND WHAT THE STUB ACTUALLY MAPPED. The boot assembly maps 1 GB blocks over 0..4 GiB before any memory
-	// map is read, so the direct map's extent is that number and not the top of whatever the device
-	// tree reports. Without this a machine with more RAM than the stub maps has `within_direct_map`
-	// answering true for addresses `phys_to_virt` does not translate.
-	crate::mem::set_direct_map_extent(4 * 1024 * 1024 * 1024);
+	// The direct-map offset and extent were published before the controller was validated - see the
+	// note there. Both are constants of the boot stub's own mapping, so they are known from the
+	// moment the MMU is on.
 	// The pool runs to the top of RAM, MINUS what the loader left in it.
 	//
 	// It used to be one region and nothing else, on the reasoning that a clamp without the thing
@@ -485,6 +575,13 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	crate::mem::heap::reserve_window();
 	crate::syscall::reserve_kernel_vmap();
 	crate::mem::frame::upgrade_to_heap();
+
+	// The MSI controller, now that its tables can be allocated: a GICv2m frame's SPI range, or a
+	// GICv3 ITS's queue and tables. Userspace drivers acquire per-device MSI-X vectors from it (the
+	// delivery path for virtio-net/input/snd, xhci, virtio-gpu).
+	if !super::interrupts::init(controller.msi, controller.its, controller.its_size, controller.msi_map) {
+		crate::serial_println!("aarch64: no usable MSI controller - this machine boots and schedules, and device interrupts are unavailable");
+	}
 	// Retain the boot memory map now the heap is up, so SYS_MEMMAP_GET (lsmem) can
 	// report the physical layout - the x86 loader path retains it inside mem::init.
 	crate::mem::retain_memmap(&regions);
@@ -569,8 +666,40 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	unsafe {
 		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
 	}
-	super::percpu::allocate(cpu_count as usize);
-	super::percpu::init(0, mpidr as u32);
+	// WHAT THE PER-CPU TABLE IS SIZED FROM, and it is not the declared count.
+	//
+	// A firmware topology is not a promise: it can name the core reading it, leave it out, name a
+	// core twice, or declare more than this kernel holds. Each of those turns "N declared cores"
+	// into a different number of LOGICAL IDS - and the id is the index into this table, the run
+	// queues and the stack array. `smpboot::Topology` reduces the list to the cores that may be
+	// started and answers how many ids that can produce; the failure cases are host tests rather
+	// than a comment (P02M0151 M5).
+	let (declared, cpu_nodes) = match boot_info {
+		Some(bi) => (bi.cpu_ids, bi.cpu_nodes),
+		None => ([0u64; fdt::MAX_CPUS], 0),
+	};
+	// The tree's `cpu@reg` and a PSCI `target_cpu` are both MPIDR AFFINITY values, so the running
+	// core is recognized in the list by the same bits it would be started with.
+	let mut affinity = [0u64; fdt::MAX_CPUS];
+	for (slot, &id) in affinity.iter_mut().zip(declared[..cpu_count as usize].iter()) {
+		*slot = id & super::psci::MPIDR_AFFINITY;
+	}
+	let mut secondaries = [0u64; fdt::MAX_CPUS];
+	let topology = smpboot::Topology::resolve(&affinity[..cpu_count as usize], super::psci::boot_mpidr(), &mut secondaries);
+	if cpu_nodes > cpu_count {
+		crate::serial_println!("aarch64: SMP - the tree declares {cpu_nodes} cpu node(s), {cpu_count} of them usable (disabled, without a reg, or past the {} this kernel holds)", fdt::MAX_CPUS);
+	}
+	if !topology.boot_declared() {
+		crate::serial_println!("aarch64: SMP - the tree names {} core(s) and none of them is this one (mpidr {:#x}); it holds logical id 0 either way", topology.declared(), super::psci::boot_mpidr());
+	}
+	if topology.duplicates() > 0 {
+		crate::serial_println!("aarch64: SMP - {} declared core(s) repeat an id already in the list; each core is started once", topology.duplicates());
+	}
+	if topology.parked() > 0 {
+		crate::serial_println!("aarch64: SMP - {} declared core(s) past the {} this kernel holds stay parked", topology.parked(), fdt::MAX_CPUS);
+	}
+	super::percpu::allocate(topology.slots());
+	super::percpu::init(0, mpidr & super::psci::MPIDR_AFFINITY);
 	// THE BOOT STACK HAS NO GUARD PAGE EITHER, and the linker script already records what that
 	// costs: it was 64 KiB until the in-kernel LiberFS format walked a B-tree and a transaction log
 	// off the bottom of it and into `.bss`, and the symptom was "memory corruption rather than a
@@ -590,17 +719,11 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 
 	// Wake the secondary cores via PSCI CPU_ON (each brings up its own per-CPU
 	// block + local GIC/timer, then idles).
-	// THE TREE'S OWN IDS, not a range (KERN-ARCH-008). `cpu_count` is how many entries of
-	// `cpu_ids` are usable cores; `cpu_nodes` is every `cpu@` node the tree declared, so the two
-	// differing is a fact worth saying out loud rather than a silent narrowing.
-	let (cpu_ids, cpu_nodes) = match boot_info {
-		Some(bi) => (bi.cpu_ids, bi.cpu_nodes),
-		None => ([0u64; fdt::MAX_CPUS], 0),
-	};
-	if cpu_nodes > cpu_count {
-		crate::serial_println!("aarch64: SMP - the tree declares {cpu_nodes} cpu node(s), {cpu_count} of them usable (disabled, without a reg, or past the {} this kernel holds)", fdt::MAX_CPUS);
-	}
-	let cpu_count = super::psci::bring_up_secondaries(&cpu_ids[..cpu_count as usize], arg) as u32;
+	let outcome = super::psci::bring_up_secondaries(topology.secondaries(), arg);
+	// THE IDS IN USE, NOT THE CORES ONLINE. An attempt that timed out keeps its id for the life of
+	// the boot, so a core that came up after one holds an id above the online count - and this is
+	// what the run queues and the controller-id map are indexed by.
+	let cpu_count = outcome.ids_used as u32;
 
 	// W^X ACROSS THE DIRECT MAP, once every core that needs the boot stub has used it
 	// (KERN-ARCH-006). The stub maps 1-4 GiB with 1 GiB blocks that are writable AND executable,

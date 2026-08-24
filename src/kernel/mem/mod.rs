@@ -46,12 +46,21 @@ static DIRECT_MAP_MAPPED: AtomicU64 = AtomicU64::new(0);
 // an address ACPI or a device tree handed over, and those were dereferenced on the strength of a
 // signature match. A pointer past the end of the HHDM is a wild read in early boot, before there is
 // a fault handler worth the name - and refusing it costs one comparison.
-// Asked by the x86 SMP path of a firmware table pointer before it reads one, and by its own tests.
-// The device-tree ports validate their controller ranges in their prologue, against the ceiling the
-// prologue itself published - see the note in `arch/mod.rs` about which half of the boot is shared.
-#[cfg(any(target_arch = "x86_64", test))]
+// Asked by the x86 SMP path of a firmware table pointer before it reads one, and by the
+// device-tree ports of every controller range the machine description names - both before the first
+// access through it, and both against the ceiling the boot prologue published.
 pub fn within_direct_map(phys: u64, len: u64) -> bool {
-	let limit = DIRECT_MAP_LIMIT.load(Ordering::Relaxed);
+	// THE CEILING THE STUB PUBLISHED COUNTS ON ITS OWN, before any memory map has been retained.
+	//
+	// This read only the map-derived limit, which is published when the frame allocator is seeded -
+	// so a device-tree port asking about its interrupt controller BEFORE that point got `false` for
+	// every address, including the one the machine had just named. The controller then looked
+	// unreachable and the boot refused a machine that was describing itself correctly.
+	//
+	// Both numbers answer the same question - how far `phys_to_virt` translates - and the larger of
+	// the two is the honest answer at any moment: the stub's span is a fact from the instant the MMU
+	// is on, and the map-derived one only ever raises it.
+	let limit = DIRECT_MAP_LIMIT.load(Ordering::Relaxed).max(DIRECT_MAP_MAPPED.load(Ordering::Relaxed));
 	if phys == 0 || limit == 0 {
 		return false;
 	}

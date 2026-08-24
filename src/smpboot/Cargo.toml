@@ -1,0 +1,14 @@
+[package]
+name = "smpboot"
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+edition = "2024"
+description = "Secondary-CPU start attempts and firmware topology, in a crate a host can drive the failure cases through"
+
+[lib]
+path = "src/lib.rs"
+
+# A WARNING IS AN ERROR HERE, for the same reason it is in `buddy`: this crate is the one place the
+# secondary-start rules are written, and a rule nobody is told about is not enforced.
+[lints.rust]
+warnings = "deny"

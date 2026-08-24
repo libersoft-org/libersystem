@@ -15,8 +15,9 @@ const MAX_CPUS: usize = 8;
 #[repr(C)]
 pub struct PerCpu {
 	cpu_id: u32,
-	// The core's MPIDR affinity (kept named `lapic_id` for the portable contract).
-	lapic_id: u32,
+	// The core's MPIDR affinity (kept named `lapic_id` for the portable contract). A `u64` because
+	// an affinity is 40 bits - Aff3 sits at 39:32 - and a `u32` silently dropped it.
+	lapic_id: u64,
 	// Kernel stack pointer to resume on when an EL0 thread enters the kernel (set
 	// by the scheduler / usermode entry once EL0 preemption lands).
 	kernel_sp: u64,
@@ -107,7 +108,7 @@ impl PerCpu {
 		self.cpu_id
 	}
 
-	pub fn lapic_id(&self) -> u32 {
+	pub fn lapic_id(&self) -> u64 {
 		self.lapic_id
 	}
 }
@@ -129,7 +130,7 @@ pub fn allocate(count: usize) {
 // Initialize the running core's per-CPU block and point TPIDR_EL1 at it. Each
 // core touches only its own slot, so concurrent calls on different cores do not
 // race.
-pub fn init(cpu_id: usize, mpidr: u32) {
+pub fn init(cpu_id: usize, mpidr: u64) {
 	assert!(cpu_id < CPU_COUNT.load(Ordering::Acquire), "per-CPU slot out of range");
 	let slot = POOL.0[cpu_id].get();
 	unsafe {

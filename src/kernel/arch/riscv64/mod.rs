@@ -235,7 +235,7 @@ pub mod apic {
 		sbi_set_timer(super::tsc::now() + interval);
 	}
 
-	pub fn send_wake_ipi(dest: u32) {
+	pub fn send_wake_ipi(dest: u64) {
 		// SBI IPI extension (EID 0x735049 "sPI", FID 0): raise a supervisor software
 		// interrupt on the target hart so it leaves wfi and re-checks the run queue.
 		unsafe {
@@ -244,7 +244,7 @@ pub mod apic {
 				in("a7") 0x735049usize,
 				in("a6") 0usize,
 				in("a0") 1usize,          // hart_mask = 1 bit, based at `dest`
-				in("a1") dest as usize,   // hart_mask_base
+				in("a1") dest as usize,   // hart_mask_base (SBI carries a hart id as an unsigned long)
 				lateout("a0") _,
 				options(nostack),
 			);

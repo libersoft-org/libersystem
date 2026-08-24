@@ -17,13 +17,6 @@
 The kernel is a small, safe arbiter; system services and drivers run as isolated, restartable components that talk to each other over stable, typed contracts. Security is capability-based and least-privilege by construction, the system is SMP-aware from the ground up, and memory safety comes from the Rust language itself rather than from discipline. One portable kernel runs on multiple architectures - **`x86_64`**, **`aarch64` (ARM64)** and
 **`riscv64`** - each booting through the system's own UEFI loader.
 
-They are not at the same stage, and the difference is worth stating rather than leaving to be
-discovered. `x86_64` is the primary target: it carries no unimplemented arch hook and its full test
-suite runs in minutes. `riscv64` and `aarch64` boot and run the same suite under emulation, and both
-still carry unimplemented hooks in their interrupt and timer glue - twelve and seventeen of them -
-so a machine that needs one of those paths meets it as a panic rather than as a missing feature.
-None of the three has been run on physical hardware.
-
 This is an early-stage project under active development. It is not yet a general-purpose OS release.
 
 ## Documentation

@@ -16,8 +16,9 @@ use alloc::vec::Vec;
 #[repr(C)]
 pub struct PerCpu {
 	cpu_id: u32,
-	// The hart id (kept named `lapic_id` for the portable contract).
-	lapic_id: u32,
+	// The hart id (kept named `lapic_id` for the portable contract). A `u64` because that is what
+	// the SBI ABI carries: an `unsigned long`, which on rv64 is 64 bits.
+	lapic_id: u64,
 	// Kernel stack pointer to resume on when a U-mode thread enters the kernel.
 	kernel_sp: u64,
 	// Address of the slot holding this hart's U-mode-entry kernel stack (the riscv
@@ -36,7 +37,7 @@ impl PerCpu {
 		self.cpu_id
 	}
 
-	pub fn lapic_id(&self) -> u32 {
+	pub fn lapic_id(&self) -> u64 {
 		self.lapic_id
 	}
 }
@@ -59,7 +60,7 @@ pub fn allocate(count: usize) {
 
 // Initialize the running hart's per-CPU block and point `tp` at it. Each hart touches
 // only its own slot, so concurrent calls on different harts do not race.
-pub fn init(cpu_id: usize, hartid: u32) {
+pub fn init(cpu_id: usize, hartid: u64) {
 	assert!(cpu_id < CPU_COUNT.load(Ordering::Acquire), "per-CPU slot out of range");
 	let base = PER_CPU.load(Ordering::Acquire);
 	assert!(!base.is_null(), "per-CPU blocks not allocated");

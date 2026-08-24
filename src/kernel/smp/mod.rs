@@ -9,7 +9,7 @@
 // table is sized from the core count before any core initializes its slot, and
 // indexed by our contiguous CPU id (the bootstrap processor is 0).
 
-use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 #[cfg(target_arch = "x86_64")]
 use alloc::boxed::Box;
@@ -35,7 +35,7 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 // Each core's LAPIC id by CPU id, retained at report-in so the CPU topology stays
 // inspectable at runtime - SYS_CPU_INFO reads it for `lscpu`. Allocated by init,
 // sized by the machine's real core count.
-static LAPIC_IDS: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
+static LAPIC_IDS: AtomicPtr<AtomicU64> = AtomicPtr::new(core::ptr::null_mut());
 
 // The CPU id and LAPIC id the next application processor reads on entry.
 //
@@ -59,7 +59,7 @@ static LAPIC_IDS: AtomicPtr<AtomicU32> = AtomicPtr::new(core::ptr::null_mut());
 #[cfg(target_arch = "x86_64")]
 static AP_CPU_ID: AtomicUsize = AtomicUsize::new(0);
 #[cfg(target_arch = "x86_64")]
-static AP_LAPIC_ID: AtomicU32 = AtomicU32::new(0);
+static AP_LAPIC_ID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 // Even and stable, odd while the two slots above are being rewritten.
 #[cfg(target_arch = "x86_64")]
 static AP_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -89,10 +89,10 @@ pub fn set_cpu_count(count: usize) {
 	// target list addresses CPU interface N for core N, so the id is the index.
 	if LAPIC_IDS.load(Ordering::Acquire).is_null() && count > 0 {
 		// ALLOC-OK: boot, the core id table, built during SMP bring-up
-		let mut ids: Vec<AtomicU32> = Vec::with_capacity(count);
+		let mut ids: Vec<AtomicU64> = Vec::with_capacity(count);
 		for i in 0..count {
 			// ALLOC-OK: CPU bring-up at boot; bounded by MAX_CPUS.
-			ids.push(AtomicU32::new(i as u32));
+			ids.push(AtomicU64::new(i as u64));
 		}
 		LAPIC_IDS.store(Vec::leak(ids).as_mut_ptr(), Ordering::Release);
 	}
@@ -111,8 +111,14 @@ pub fn mark_online() {
 	ONLINE.fetch_add(1, Ordering::Release);
 }
 
-// The LAPIC id of the core with CPU id `cpu` (0 for a core that never reported in).
-pub fn lapic_id(cpu: usize) -> u32 {
+// The interrupt-controller id of the core with CPU id `cpu` (0 for a core that never reported in).
+//
+// WIDE ENOUGH FOR THE FIRMWARE THAT NAMES IT. An x86 APIC id is 32 bits, but an SBI hart id is an
+// `unsigned long` and an MPIDR affinity is 40 bits (Aff3 sits at 39:32), and both used to reach this
+// table through a `u32` - so a machine whose harts are numbered above 2^32, or whose cores carry a
+// non-zero Aff3, had two cores answering to one id here. The narrow fields are real, but they are
+// the CONTROLLER's rather than this table's: each `send_wake_ipi` validates at its own boundary.
+pub fn lapic_id(cpu: usize) -> u64 {
 	if cpu >= cpu_count() {
 		return 0;
 	}
@@ -128,7 +134,7 @@ pub fn lapic_id(cpu: usize) -> u32 {
 // map is not the identity `set_cpu_count` assumes; each hart records its own on entry so
 // the cross-hart wake IPI targets the right hart.
 #[cfg(target_arch = "riscv64")]
-pub fn set_lapic_id(cpu: usize, id: u32) {
+pub fn set_lapic_id(cpu: usize, id: u64) {
 	let base = LAPIC_IDS.load(Ordering::Acquire);
 	if !base.is_null() && cpu < cpu_count() {
 		unsafe { (*base.add(cpu)).store(id, Ordering::Relaxed) };
@@ -162,8 +168,8 @@ pub fn init(boot_info: &BootInfo) {
 	// come online stay unused; ids are handed out contiguously as APs report in.
 	let total = lapics.len();
 	// ALLOC-OK: boot, as above
-	let mut ids: Vec<AtomicU32> = Vec::with_capacity(total);
-	ids.resize_with(total, || AtomicU32::new(0));
+	let mut ids: Vec<AtomicU64> = Vec::with_capacity(total);
+	ids.resize_with(total, || AtomicU64::new(0));
 	LAPIC_IDS.store(Vec::leak(ids).as_mut_ptr(), Ordering::Release);
 	arch::percpu::allocate(total);
 	crate::sched::allocate(total);
@@ -180,8 +186,9 @@ pub fn init(boot_info: &BootInfo) {
 		crate::serial_println!("smp: WARNING: LAPIC ids beyond 255 present; MSI delivery (8-bit xAPIC destination) cannot target those cores - x2APIC addressing is not implemented yet");
 	}
 
-	arch::init_bsp_percpu(bsp_lapic_id);
-	report(0, bsp_lapic_id);
+	// WIDENED HERE, where a 32-bit APIC id enters the portable path.
+	arch::init_bsp_percpu(bsp_lapic_id as u64);
+	report(0, bsp_lapic_id as u64);
 
 	// Wake the application processors, one at a time, via the real-mode trampoline
 	// the loader reserved a low page for. Nothing to do (and nowhere to land the
@@ -284,10 +291,10 @@ extern "C" fn ap_entry() -> ! {
 	let Some((cpu_id, lapic_id)) = claim_identity() else {
 		arch::halt_loop();
 	};
-	arch::init_ap(cpu_id, lapic_id);
+	arch::init_ap(cpu_id, lapic_id as u64);
 	// Publish the topology entry before counting the core online, so the BSP cannot
 	// observe a completed bring-up while the entry is still stale.
-	report(cpu_id, lapic_id);
+	report(cpu_id, lapic_id as u64);
 	ONLINE.fetch_add(1, Ordering::Release);
 	crate::sched::cpu_idle_loop()
 }
@@ -549,7 +556,7 @@ fn parse_madt(hhdm: u64, madt_phys: u64, out: &mut Vec<u32>) {
 // The x86 topology publication: an AP records the id it was woken with. The device-tree ports
 // publish their own per-CPU identity in their prologue and only count themselves online here.
 #[cfg(target_arch = "x86_64")]
-fn report(cpu_id: usize, lapic_id: u32) {
+fn report(cpu_id: usize, lapic_id: u64) {
 	let base = LAPIC_IDS.load(Ordering::Acquire);
 	unsafe { (*base.add(cpu_id)).store(lapic_id, Ordering::Relaxed) };
 }

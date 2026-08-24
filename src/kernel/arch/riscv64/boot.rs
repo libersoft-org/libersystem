@@ -415,16 +415,61 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	super::apic::set_boot_hart(hartid);
 	crate::serial_println!("riscv64: clock - timebase {} MHz, uptime {} ms", super::tsc::hz() / 1_000_000, super::tsc::cycles_to_ns(super::tsc::now()) / 1_000_000);
 
+	// WHAT THE PER-CPU TABLE IS SIZED FROM, and it is not the declared count.
+	//
+	// A firmware topology is not a promise: it can name the hart reading it, leave it out, name a
+	// hart twice, or declare more than this kernel holds. Each of those turns "N declared harts"
+	// into a different number of LOGICAL IDS - and the id is the index into this table, the run
+	// queues, the hart-id map and the stack block. `smpboot::Topology` reduces the list to the harts
+	// that may be started and answers how many ids that can produce; the failure cases are host
+	// tests rather than a comment (P02M0151 M5).
+	let (declared, cpu_nodes) = match boot_info {
+		Some(bi) => (bi.cpu_ids, bi.cpu_nodes),
+		None => ([0u64; fdt::MAX_CPUS], 0),
+	};
+	let mut secondaries = [0u64; fdt::MAX_CPUS];
+	let topology = smpboot::Topology::resolve(&declared[..cpu_count as usize], hartid, &mut secondaries);
+	if cpu_nodes > cpu_count {
+		crate::serial_println!("riscv64: SMP - the tree declares {cpu_nodes} cpu node(s), {cpu_count} of them usable (disabled, without a reg, or past the {} this kernel holds)", fdt::MAX_CPUS);
+	}
+	if !topology.boot_declared() {
+		crate::serial_println!("riscv64: SMP - the tree names {} hart(s) and none of them is this one (hart {hartid}); it holds logical id 0 either way", topology.declared());
+	}
+	if topology.duplicates() > 0 {
+		crate::serial_println!("riscv64: SMP - {} declared hart(s) repeat an id already in the list; each hart is started once", topology.duplicates());
+	}
+	if topology.parked() > 0 {
+		crate::serial_println!("riscv64: SMP - {} declared hart(s) past the {} this kernel holds stay parked", topology.parked(), fdt::MAX_CPUS);
+	}
+
 	// Per-CPU block for the boot hart, reachable through `tp`.
-	super::percpu::allocate(cpu_count as usize);
-	super::percpu::init(0, hartid as u32);
+	super::percpu::allocate(topology.slots());
+	super::percpu::init(0, hartid);
 	// Bring up the AIA IMSIC on the boot hart (enable MSI delivery, accept any priority)
 	// so per-device MSI EIDs can be enabled and delivered here.
+	// WHERE THE INTERRUPT FILES ARE, FROM THE TREE, before the first access to them. An AIA machine
+	// describes two IMSICs and this port takes the SUPERVISOR one; a machine that describes none -
+	// plain `virt`, which routes through a PLIC - leaves the address alone, and so does one whose
+	// address this kernel's direct map does not reach.
+	match boot_info.as_ref().map(|bi| (bi, super::imsic::configure(bi))) {
+		Some((bi, Ok(()))) => {
+			crate::serial_println!("riscv64: IMSIC S-mode files from the device tree at {:#x}+{:#x}, {} hart(s)", bi.imsic_base, bi.imsic_size, bi.imsic_hart_count);
+		}
+		// NAMED, NOT SILENTLY DEFAULTED. The descriptor still stands so the no-DT regression profile
+		// boots unchanged, but a tree that was read and refused says which fact refused it.
+		Some((_, Err(reason))) => {
+			crate::serial_println!("riscv64: the device tree's IMSIC is not one this kernel addresses - {reason}; using the qemu-virt-aia descriptor, which makes no discovery claim")
+		}
+		None => crate::serial_println!("riscv64: no device tree to read the IMSIC from - using the qemu-virt-aia descriptor, which makes no discovery claim"),
+	}
 	super::imsic::init_hart();
 	// Size the per-CPU id tables and record the boot hart's real id (the SBI boot hart
 	// is not necessarily hart 0), so the cross-hart wake IPI targets the right hart.
-	crate::smp::set_cpu_count(cpu_count as usize);
-	crate::smp::set_lapic_id(0, hartid as u32);
+	// Sized for every id this boot can hand out, because a hart records its own id in this table
+	// while the boot hart is still inside `bring_up_secondaries` - so the table has to be big
+	// enough before the count is narrowed to what answered.
+	crate::smp::set_cpu_count(topology.slots());
+	crate::smp::set_lapic_id(0, hartid);
 	{
 		let cpu = super::percpu::this_cpu();
 		crate::serial_println!("riscv64: per-CPU up (tp) - cpu_id={} hart={} of {} CPU(s)", cpu.cpu_id(), cpu.lapic_id(), cpu_count);
@@ -432,20 +477,13 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 
 	// Wake the secondary harts via SBI HSM hart_start (each brings up its own per-CPU
 	// block, trap vector, and local timer, then idles until the scheduler is ready).
-	// THE TREE'S OWN HART IDS, not a range (KERN-ARCH-008). `cpu_count` is how many entries of
-	// `cpu_ids` are usable harts; `cpu_nodes` is every `cpu@` node the tree declared, so the two
-	// differing is a fact worth saying out loud rather than a silent narrowing.
-	let (cpu_ids, cpu_nodes) = match boot_info {
-		Some(bi) => (bi.cpu_ids, bi.cpu_nodes),
-		None => ([0u64; fdt::MAX_CPUS], 0),
-	};
-	if cpu_nodes > cpu_count {
-		crate::serial_println!("riscv64: SMP - the tree declares {cpu_nodes} cpu node(s), {cpu_count} of them usable (disabled, without a reg, or past the {} this kernel holds)", fdt::MAX_CPUS);
-	}
-	// NARROWED TO WHAT CAME ONLINE. The count published above sizes the per-CPU id table before any
+	let outcome = super::smp::bring_up_secondaries(topology.secondaries(), topology.slots());
+	// NARROWED TO THE IDS IN USE. The count published above sizes the per-CPU id table before any
 	// hart can record itself in it; this one is what the scheduler, the IPI paths and the shootdown
-	// read from here on, and it counts only harts that reported in.
-	let cpu_count = super::smp::bring_up_secondaries(&cpu_ids[..cpu_count as usize], hartid) as u32;
+	// read from here on. It is the ids handed out rather than the harts online, because an attempt
+	// that timed out keeps its id for the life of the boot and a hart that came up after one holds
+	// an id above the online count.
+	let cpu_count = outcome.ids_used as u32;
 	// From the portable counter every port increments as a hart reports in - the same line x86_64
 	// and aarch64 print. A port that wakes cores and never says how many answered is one whose
 	// secondary bring-up can regress in silence.

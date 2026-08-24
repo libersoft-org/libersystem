@@ -171,6 +171,7 @@ dependencies = [
  "pcm",
  "pix",
  "png",
+ "smpboot",
  "system-manifest",
  "term",
  "tga",
@@ -333,6 +334,10 @@ checksum = "6662b5879511e06e8999a8a235d848113e942c9124f211511b16466ee2995f26"
 dependencies = [
  "serde_core",
 ]
+
+[[package]]
+name = "smpboot"
+version = "0.0.0"
 
 [[package]]
 name = "syn"

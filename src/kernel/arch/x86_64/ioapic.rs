@@ -65,8 +65,17 @@ pub fn init() {
 // physical destination, edge-triggered, active-high (the ISA defaults - the serial UART's legacy
 // IRQ is the one line the kernel routes). The boot tail routes it, so a test build never asks.
 #[cfg(not(test))]
-pub fn route(gsi: u32, vector: u8, dest_lapic: u32) {
-	write(REG_REDTBL + 2 * gsi + 1, dest_lapic << 24);
+// Route `gsi` to `vector` on one core, addressed by the redirection entry's PHYSICAL DESTINATION -
+// eight bits at 63:56, which is an xAPIC id and nothing wider. A machine with more than 256 cores
+// needs the interrupt-remapping path to address the rest; until then the honest answer for an
+// unaddressable core is to say so rather than to write `id & 0xff` and route the IRQ to whichever
+// core that happens to name.
+pub fn route(gsi: u32, vector: u8, dest_lapic: u64) {
+	let Ok(dest_lapic) = u8::try_from(dest_lapic) else {
+		crate::serial_println!("ioapic: GSI {gsi} cannot be routed to controller id {dest_lapic:#x} - the redirection entry addresses 8 bits");
+		return;
+	};
+	write(REG_REDTBL + 2 * gsi + 1, (dest_lapic as u32) << 24);
 	write(REG_REDTBL + 2 * gsi, vector as u32);
 }
 

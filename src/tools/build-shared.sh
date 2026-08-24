@@ -228,7 +228,11 @@ staged_identity_digest() {
 	llvm-objcopy --dump-section .note.liber.identity="$note" "$elf" /dev/null 2>/dev/null || return 1
 	len="$(od -An -tu4 -j4 -N4 "$note" | tr -d ' ')"
 	[[ -n "$len" && "$len" -gt 0 ]] || return 1
-	tail -c +21 "$note" | head -c "$len" | sha256sum | awk '{print $1}'
+	# HEAD READS THE FILE, TAIL READS THE PIPE. `tail ... | head -c` is the same bytes and a
+	# pipeline that can fail for no reason: under `pipefail` the reader stops at its byte count, the
+	# writer takes SIGPIPE, and the whole pipeline reports failure on a digest that was computed
+	# correctly. Nothing downstream of a pipe here stops early.
+	head -c "$((20 + len))" "$note" | tail -c "$len" | sha256sum | awk '{print $1}'
 }
 
 verify_staged_provider_chains() {

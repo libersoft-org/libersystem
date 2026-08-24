@@ -105,7 +105,16 @@ pub fn eoi() {
 // xAPIC ICR: wait out any in-flight send (delivery-status bit 12), write the
 // destination to the high dword, then the low dword (vector + fixed delivery +
 // physical destination) - the low write sends.
-pub fn send_wake_ipi(dest_lapic: u32) {
+pub fn send_wake_ipi(dest_lapic: u64) {
+	// THE PORTABLE TABLE IS WIDER THAN THIS FIELD, and this is where that is checked. An APIC id
+	// is 32 bits and the xAPIC ICR destination is the top byte of one; the ids here come from the
+	// MADT, which cannot express more, so a wider value means the table was written by something
+	// that is not the MADT walk. Dropping the IPI wakes the target one timer tick later; sending it
+	// to `dest & 0xff` wakes the WRONG CORE, which is a silent scheduling fault.
+	let Ok(dest_lapic) = u32::try_from(dest_lapic) else {
+		crate::serial_println!("apic: wake IPI to controller id {dest_lapic:#x}, which is wider than an APIC id - not sent");
+		return;
+	};
 	while read(REG_ICR_LOW) & (1 << 12) != 0 {
 		core::hint::spin_loop();
 	}

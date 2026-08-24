@@ -28,6 +28,11 @@ pub const TSS_RSP0_OFFSET: usize = 48;
 #[repr(C)]
 pub struct PerCpu {
 	cpu_id: u32,
+	// The local APIC id. STAYS 32 BITS, and this is one of the two fields the milestone's rule
+	// means by "a narrower hardware field that genuinely exists": an APIC id is 32 bits, the MADT
+	// cannot express more, and the offsets below are read by the syscall entry assembly - widening
+	// it moves `kernel_rsp` under `swapgs`. The portable table is wider because an SBI hart id and
+	// an MPIDR affinity are; the narrowing is checked at the boundary, in `init`.
 	lapic_id: u32,
 	// Kernel stack pointer to resume on when a ring-3 thread enters the kernel
 	// (set by usermode::enter before dropping to ring 3).
@@ -55,8 +60,8 @@ impl PerCpu {
 		self.cpu_id
 	}
 
-	pub fn lapic_id(&self) -> u32 {
-		self.lapic_id
+	pub fn lapic_id(&self) -> u64 {
+		self.lapic_id as u64
 	}
 }
 
@@ -82,7 +87,15 @@ pub fn allocate(count: usize) {
 
 // Initialize the running core's per-CPU block and point GS base at it. Each core
 // touches only its own slot, so concurrent calls on different cores do not race.
-pub fn init(cpu_id: usize, lapic_id: u32) {
+pub fn init(cpu_id: usize, lapic_id: u64) {
+	// THE BOUNDARY OF THE NARROW FIELD, NAMED. Nothing on this architecture can produce an id this
+	// wide - the MADT carries 8 or 32 bits - so a value that does not fit means the portable table
+	// was filled by something other than the MADT walk, and recording `id as u32` would give two
+	// cores one identity in the one place the IPI paths read.
+	let lapic_id = match u32::try_from(lapic_id) {
+		Ok(id) => id,
+		Err(_) => panic!("cpu {cpu_id} was given controller id {lapic_id:#x}, which is wider than an APIC id"),
+	};
 	let base = PER_CPU.load(Ordering::Acquire);
 	assert!(!base.is_null(), "per-CPU blocks not allocated");
 	unsafe {

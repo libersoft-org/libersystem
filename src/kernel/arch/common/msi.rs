@@ -40,6 +40,16 @@ pub struct MsiRegistry<const N: usize> {
 	// only the device says it stopped. A pending slot is `used` (so nothing acquires it) with its
 	// owner retained (so `release_for_device` can find it when the device is quiesced).
 	pending: [AtomicBool; N],
+	// Set when a slot's hardware identity COULD NOT BE DISABLED and the slot may therefore never be
+	// handed out again.
+	//
+	// Different from `pending`, and the difference is who can end it: a pending slot is waiting for
+	// its device to say it stopped, and `release_for_device` frees it when that happens. A
+	// quarantined slot is one whose interrupt controller still has the identity ARMED - the owning
+	// hart never answered the disable - so nothing the device says can make it safe. It leaks one
+	// vector, visibly, which is the trade the riscv64 backend's cross-hart teardown names: a leaked
+	// vector costs a vector, and a reused one hands a live identity to another driver.
+	quarantined: [AtomicBool; N],
 	// The discovered-device index each slot was acquired for (u32::MAX = none),
 	// retained for the `lsirq` inventory.
 	owner: [AtomicU32; N],
@@ -56,7 +66,7 @@ impl<const N: usize> Default for MsiRegistry<N> {
 
 impl<const N: usize> MsiRegistry<N> {
 	pub const fn new() -> Self {
-		Self { bound: [const { SpinLock::new(None) }; N], used: [const { AtomicBool::new(false) }; N], pending: [const { AtomicBool::new(false) }; N], owner: [const { AtomicU32::new(u32::MAX) }; N], claim: SpinLock::new(()) }
+		Self { bound: [const { SpinLock::new(None) }; N], used: [const { AtomicBool::new(false) }; N], pending: [const { AtomicBool::new(false) }; N], quarantined: [const { AtomicBool::new(false) }; N], owner: [const { AtomicU32::new(u32::MAX) }; N], claim: SpinLock::new(()) }
 	}
 
 	// Reserve a free slot for device `owner`, searching the first `limit` slots
@@ -203,6 +213,34 @@ impl<const N: usize> MsiRegistry<N> {
 		self.pending[slot].store(true, Ordering::Release);
 	}
 
+	// Drop `slot`'s binding and take it out of circulation for the life of the boot.
+	//
+	// For the one case that is neither "done with it" nor "waiting for the device": the identity
+	// could not be disabled in the hardware that holds it. The slot stays `used` and NOT `pending`,
+	// so nothing acquires it and no device quiesce can release it.
+	//
+	// RISC-V ONLY, BECAUSE IT IS THE ONLY BACKEND WHOSE DISABLE CAN FAIL. An x86 MSI is torn down by
+	// masking the device's own MSI-X entry, and a GICv2m SPI by clearing an enable bit in the
+	// distributor - one is the device's register and the other is global, so any core can write
+	// either. An IMSIC enable bit lives in ONE hart's interrupt file and is reachable only from that
+	// hart, so the request can go unanswered; a state for "still armed" exists where that is
+	// possible and nowhere else.
+	#[cfg(target_arch = "riscv64")]
+	pub fn quarantine(&self, slot: usize) {
+		// Under the slot's own lock, for the reason spelled out on `retire`.
+		let mut bound = self.bound[slot].lock();
+		*bound = None;
+		self.pending[slot].store(false, Ordering::Release);
+		self.quarantined[slot].store(true, Ordering::Release);
+		self.used[slot].store(true, Ordering::Release);
+	}
+
+	// Whether `slot` is out of circulation for the life of the boot.
+	#[cfg(all(target_arch = "riscv64", test))]
+	pub fn is_quarantined(&self, slot: usize) -> bool {
+		self.quarantined[slot].load(Ordering::Acquire)
+	}
+
 	// Free every slot pending for `device`, and answer how many. Reached from
 	// `SYS_DEVICE_QUIESCED`, which is the holder of the device's own DeviceMemory saying the
 	// hardware is stopped - the same claim, from the same capability, that releases its DMA frames.
@@ -213,6 +251,9 @@ impl<const N: usize> MsiRegistry<N> {
 			// retirement began or after it completed - never in between, which is the window that
 			// stranded a vector permanently.
 			let _bound = self.bound[slot].lock();
+			if self.quarantined[slot].load(Ordering::Acquire) {
+				continue;
+			}
 			if self.pending[slot].load(Ordering::Acquire) && self.owner[slot].load(Ordering::Acquire) == device {
 				self.pending[slot].store(false, Ordering::Release);
 				self.owner[slot].store(u32::MAX, Ordering::Release);

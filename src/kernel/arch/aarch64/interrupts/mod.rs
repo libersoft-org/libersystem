@@ -1,4 +1,5 @@
-// aarch64 device-interrupt binding + MSI-X delivery via GICv2m.
+// aarch64 device-interrupt binding + MSI-X delivery, through whichever MSI controller the machine
+// has: a GICv2m frame or a GICv3 ITS.
 //
 // The GIC has no per-vector "IDT" like x86: a device interrupt arrives at the core
 // as a GIC INTID read from GICC_IAR in gic::handle_irq. MSI-X on a GICv2 is done with
@@ -9,6 +10,11 @@
 // in the distributor (edge-triggered, routed to the boot core), and gic::handle_irq
 // wakes the bound Interrupt when that INTID fires.
 //
+// A GICv3 has no v2m frame. Its MSI controller is the ITS (`its.rs`), where a device writes an
+// EVENT ID to one translation register and the controller decides - from tables this kernel owns -
+// which LPI to raise and where. So a vector here is an SPI INTID on one machine and an LPI INTID on
+// the other, and the slot bookkeeping below is the same either way.
+//
 // This mirrors x86 interrupts.rs, minus the legacy-INTx window: every aarch64 driver
 // that needs an interrupt (virtio-net/input/snd, xhci, virtio-gpu) uses MSI-X, and
 // the polled drivers (virtio-blk/console) need none - so is_bindable is always false
@@ -16,7 +22,7 @@
 // through the higher-half physical direct map (phys_to_virt), so - unlike x86 - no
 // separate uncacheable mapping is set up here.
 
-use core::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::sync::Arc;
 
@@ -28,13 +34,36 @@ use crate::object::interrupt::Interrupt;
 // The GICv2m frame on QEMU's `virt` machine (gic-version=2), fixed just above the GIC
 // CPU interface at 0x0801_0000. Its MSI_TYPER reports the SPI range the frame owns; a
 // device writes an SPI number to MSI_SETSPI_NS to raise it.
-const GICV2M_FRAME_BASE: u64 = 0x0802_0000;
+// WHERE THE FRAME IS, FROM THE MACHINE DESCRIPTION. This was a constant naming QEMU's `virt`
+// machine; the tree describes the frame as a child of the interrupt controller and the prologue
+// passes what it read. Zero means the machine has no frame this kernel can drive - which is a
+// machine without message-signalled interrupts, not an error, and `init` says so.
+static FRAME_BASE: AtomicU64 = AtomicU64::new(0);
 const MSI_TYPER: u64 = 0x008; // [25:16] base SPI, [9:0] number of SPIs
 const MSI_SETSPI_NS: u64 = 0x040; // a device writes its SPI number here to signal
 
 // The MSI SPI range the GICv2m frame owns, read from MSI_TYPER at init: slot index
 // 0..MSI_LEN maps to SPI INTID BASE_SPI + slot, and the SPI is the vector handed out.
 static BASE_SPI: AtomicU32 = AtomicU32::new(0);
+// WHICH MSI CONTROLLER THIS MACHINE HAS, and they are not variations of one thing. A v2m frame
+// turns a device's write of an SPI NUMBER into that SPI; an ITS turns a device's write of an EVENT
+// id into an LPI it was mapped to. So the vector a slot names is an SPI on one and an LPI on the
+// other, and every path that converts between the two has to ask which.
+static USING_ITS: AtomicBool = AtomicBool::new(false);
+// The ITS DeviceID each live slot was mapped under, so a teardown can name the same device the
+// setup did. `u32::MAX` for a slot that holds none.
+static SLOT_DEVID: [AtomicU32; MAX_MSI] = [const { AtomicU32::new(u32::MAX) }; MAX_MSI];
+// Each mapped device's interrupt translation table, kept for the life of the boot: an ITT belongs
+// to the DeviceID it was mapped with, and a device that acquires a second vector must not be given
+// a second table under the same id.
+static ITT_DEVID: [AtomicU32; MAX_MSI] = [const { AtomicU32::new(u32::MAX) }; MAX_MSI];
+static ITT_FRAME: [AtomicU64; MAX_MSI] = [const { AtomicU64::new(0) }; MAX_MSI];
+// The host bridge's `msi-map`: how a PCI RequesterID becomes an ITS DeviceID.
+static MSI_MAP: [AtomicU32; 3] = [const { AtomicU32::new(0) }; 3];
+// Set when an ITS command was not consumed. The queue is the only way to map or unmap anything, so
+// a stall is not one lost vector - it is the end of this controller's usefulness, and continuing to
+// hand out vectors it cannot map or release is what would put a live identity on a second device.
+static ITS_STALLED: AtomicBool = AtomicBool::new(false);
 static MSI_LEN: AtomicUsize = AtomicUsize::new(0);
 
 // Upper bound on the GICv2m SPIs tracked (QEMU virt exposes 64). Fixed-size tables
@@ -46,14 +75,65 @@ const MAX_MSI: usize = 64;
 // BASE_SPI + i; only the first MSI_LEN slots (the frame's real SPI range) are used.
 static REGISTRY: MsiRegistry<MAX_MSI> = MsiRegistry::new();
 
-// The slot index of an SPI INTID, or None if it is outside the frame's MSI range.
+// The ITS DeviceID for a discovered device, through the host bridge's mapping.
+//
+// A DEVICE CANNOT BE NAMED TO THE CONTROLLER WITHOUT IT. The RequesterID is what the hardware puts
+// on the bus; `msi-map` says which DeviceIDs that bridge's RIDs become, and a machine that states no
+// mapping is one where this kernel has no name to give - so it refuses rather than sending the RID
+// and hoping the identity holds.
+fn its_devid(owner: u32) -> Option<u32> {
+	let (bus, dev, func) = crate::device::with(owner as usize, |d| (d.bus, d.dev, d.func))?;
+	let rid = (u32::from(bus) << 8) | (u32::from(dev) << 3) | u32::from(func);
+	let rid_base = MSI_MAP[0].load(Ordering::Relaxed);
+	let devid_base = MSI_MAP[1].load(Ordering::Relaxed);
+	let length = MSI_MAP[2].load(Ordering::Relaxed);
+	if length == 0 || rid < rid_base || rid - rid_base >= length {
+		crate::serial_println!("interrupts: {bus:02x}:{dev:02x}.{func} has requester id {rid:#x}, which this machine's msi-map does not cover");
+		return None;
+	}
+	Some(devid_base + (rid - rid_base))
+}
+
+// The interrupt translation table for `devid`, allocated on the device's first vector and kept for
+// the life of the boot: an ITT belongs to the DeviceID it was mapped with, and a device that
+// acquires a second vector must not be given a second table under the same id.
+fn device_itt(devid: u32) -> Option<u64> {
+	for (slot, held) in ITT_DEVID.iter().enumerate() {
+		if held.load(Ordering::Acquire) == devid {
+			return Some(ITT_FRAME[slot].load(Ordering::Acquire));
+		}
+	}
+	for (slot, held) in ITT_DEVID.iter().enumerate() {
+		if held.compare_exchange(u32::MAX, devid, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+			// ALLOC-OK: one page per device that ever takes an MSI, bounded by the vector count.
+			let Some(frame) = crate::mem::frame::allocate() else {
+				held.store(u32::MAX, Ordering::Release);
+				return None;
+			};
+			unsafe { core::ptr::write_bytes(super::paging::phys_to_virt(frame) as *mut u8, 0, 4096) };
+			ITT_FRAME[slot].store(frame, Ordering::Release);
+			if !super::its::map_device(devid, MAX_MSI as u32, frame) {
+				return None;
+			}
+			return Some(frame);
+		}
+	}
+	None
+}
+
+// The slot index of a vector INTID, or None if it is outside this controller's MSI window.
 fn spi_slot(intid: u32) -> Option<usize> {
-	let base = BASE_SPI.load(Ordering::Relaxed);
+	let base = if USING_ITS.load(Ordering::Relaxed) { super::its::LPI_BASE } else { BASE_SPI.load(Ordering::Relaxed) };
 	let len = MSI_LEN.load(Ordering::Relaxed);
 	if intid >= base && ((intid - base) as usize) < len { Some((intid - base) as usize) } else { None }
 }
 
-// Whether `vector` (an SPI INTID) is a kernel MSI vector. Only the bring-up test asks.
+// The vector INTID a slot names, which is an SPI on a v2m machine and an LPI on an ITS one.
+fn slot_vector(slot: usize) -> u32 {
+	let base = if USING_ITS.load(Ordering::Relaxed) { super::its::LPI_BASE } else { BASE_SPI.load(Ordering::Relaxed) };
+	base + slot as u32
+}
+
 #[cfg(test)]
 fn is_msi(vector: u32) -> bool {
 	spi_slot(vector).is_some()
@@ -76,6 +156,7 @@ pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
 // on its way will not land. The SPI waits for `SYS_DEVICE_QUIESCED`.
 pub fn unbind(vector: u32) {
 	if let Some(slot) = spi_slot(vector) {
+		release_translation(slot, vector);
 		REGISTRY.retire(slot);
 	}
 }
@@ -93,7 +174,32 @@ pub fn unbind(vector: u32) {
 // for why this is a free rather than a retire.
 pub fn release_unused_msi(vector: u32) {
 	if let Some(slot) = spi_slot(vector) {
+		release_translation(slot, vector);
 		REGISTRY.free(slot);
+	}
+}
+
+// Take an ITS translation back: the LPI is disabled in the configuration table, the mapping is
+// discarded, and the DeviceID this slot was mapped under is forgotten.
+//
+// A v2m vector has nothing to release here - its SPI stays enabled in the distributor and the
+// registry's own pending rule is what keeps a message already in flight from waking somebody else.
+// An ITS mapping is different: it is state in a table, and leaving it in place means the device can
+// still raise the identity after the slot is gone.
+fn release_translation(slot: usize, vector: u32) {
+	if !USING_ITS.load(Ordering::Relaxed) {
+		return;
+	}
+	let devid = SLOT_DEVID[slot].swap(u32::MAX, Ordering::AcqRel);
+	if devid == u32::MAX {
+		return;
+	}
+	if !super::its::discard_event(devid, slot as u32, vector) {
+		// The queue did not consume it, so the mapping may still stand. Nothing further can be
+		// mapped either - every acquire needs the same queue - so the window closes rather than
+		// handing out vectors this kernel can no longer take back.
+		ITS_STALLED.store(true, Ordering::Release);
+		crate::serial_println!("interrupts: the ITS did not take back device {devid}'s event {slot} - no further MSI vectors are handed out");
 	}
 }
 
@@ -103,18 +209,41 @@ pub fn release_unused_msi(vector: u32) {
 #[cfg(test)]
 pub fn acquire_msi(table_phys: u64, _dest: u8, owner: u32) -> Option<u32> {
 	let len = MSI_LEN.load(Ordering::Relaxed);
-	program_acquired(REGISTRY.acquire(owner, len)?, table_phys)
+	program_acquired(REGISTRY.acquire(owner, len)?, table_phys, owner)
 }
 
 // The same, and ONLY IF the device holds no live vector already - see
 // `MsiRegistry::acquire_unique_live`. This is what `sys_device_msix_acquire` calls; the form above
 // stays for the kernel's own bring-up test.
 pub fn acquire_msi_unique(table_phys: u64, _dest: u8, owner: u32) -> Option<u32> {
+	if ITS_STALLED.load(Ordering::Acquire) {
+		return None;
+	}
 	let len = MSI_LEN.load(Ordering::Relaxed);
-	program_acquired(REGISTRY.acquire_unique_live(owner, len)?, table_phys)
+	program_acquired(REGISTRY.acquire_unique_live(owner, len)?, table_phys, owner)
 }
 
-fn program_acquired(slot: usize, table_phys: u64) -> Option<u32> {
+fn program_acquired(slot: usize, table_phys: u64, owner: u32) -> Option<u32> {
+	if USING_ITS.load(Ordering::Relaxed) {
+		// THE DEVICE IS NAMED TO THE CONTROLLER BEFORE THE DEVICE IS TOLD ANYTHING. A mapping that
+		// does not exist yet turns an early message into an ITS error rather than an interrupt, so
+		// the order is: give the device an ITT, map its event to this LPI, and only then write the
+		// MSI-X entry that lets it write at all.
+		let lpi = super::its::LPI_BASE + slot as u32;
+		let devid = its_devid(owner)?;
+		let itt = device_itt(devid)?;
+		let _ = itt;
+		if !super::its::map_event(devid, slot as u32, lpi) {
+			ITS_STALLED.store(true, Ordering::Release);
+			REGISTRY.free(slot);
+			return None;
+		}
+		SLOT_DEVID[slot].store(devid, Ordering::Release);
+		// The message address is the ONE translation register, and the data is the event id - the
+		// device says which of ITS events happened and the controller decides what that means.
+		program_msix_entry_at(table_phys, super::its::translater(), slot as u32);
+		return Some(lpi);
+	}
 	let spi = BASE_SPI.load(Ordering::Relaxed) + slot as u32;
 	program_msix_entry(table_phys, spi);
 	super::gic::enable_msi_spi(spi);
@@ -130,12 +259,17 @@ fn program_acquired(slot: usize, table_phys: u64) -> Option<u32> {
 // control = 0 (unmasked). A driver must never write its own MSI-X table; only the
 // kernel programs it here.
 fn program_msix_entry(table_phys: u64, spi: u32) {
+	program_msix_entry_at(table_phys, FRAME_BASE.load(Ordering::Relaxed) + MSI_SETSPI_NS, spi);
+}
+
+// The same write, with the address and data the caller's controller wants.
+fn program_msix_entry_at(table_phys: u64, msg_addr: u64, data: u32) {
 	let entry = super::paging::phys_to_virt(table_phys) as *mut u32;
-	let msg_addr = GICV2M_FRAME_BASE + MSI_SETSPI_NS;
 	unsafe {
 		entry.add(0).write_volatile(msg_addr as u32); // message address low
 		entry.add(1).write_volatile((msg_addr >> 32) as u32); // message address high
-		entry.add(2).write_volatile(spi); // message data = the SPI number
+		// The message data: an SPI number to a v2m frame, an event id to an ITS.
+		entry.add(2).write_volatile(data);
 		entry.add(3).write_volatile(0); // vector control (unmasked)
 	}
 }
@@ -197,7 +331,7 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 	if slot >= len {
 		return None;
 	}
-	let vector = BASE_SPI.load(Ordering::Relaxed) + slot as u32;
+	let vector = slot_vector(slot);
 	Some(abi::IrqInfo { vector, kind: abi::IRQ_KIND_MSI, bound: is_bound(vector) as u32, device: REGISTRY.owner(slot) })
 }
 
@@ -208,12 +342,45 @@ pub fn irq_info_len() -> usize {
 
 // Read the GICv2m frame's MSI SPI range (base SPI + count) so acquire_msi/dispatch can
 // map slots to SPI INTIDs. Called once, after the GIC is up.
-pub fn init() {
-	let typer = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(GICV2M_FRAME_BASE + MSI_TYPER) as *const u32) };
-	let base = (typer >> 16) & 0x3ff;
-	let count = (typer & 0x3ff) as usize;
-	BASE_SPI.store(base, Ordering::Relaxed);
-	MSI_LEN.store(count.min(MAX_MSI), Ordering::Relaxed);
+// Read the frame's SPI range, or record that this machine has none.
+//
+// A GIC WITHOUT AN MSI CONTROLLER IS STILL A GIC. The timer PPI arrives through the distributor
+// either way, so the machine boots and schedules; what it loses is device interrupts, and saying
+// that once here is better than a driver discovering it as a vector that never fires.
+pub fn init(frame: u64, its: u64, its_size: u64, msi_map: (u32, u32, u32)) -> bool {
+	MSI_MAP[0].store(msi_map.0, Ordering::Relaxed);
+	MSI_MAP[1].store(msi_map.1, Ordering::Relaxed);
+	MSI_MAP[2].store(msi_map.2, Ordering::Relaxed);
+	if frame != 0 {
+		FRAME_BASE.store(frame, Ordering::Relaxed);
+		let typer = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(frame + MSI_TYPER) as *const u32) };
+		let base = (typer >> 16) & 0x3ff;
+		let count = (typer & 0x3ff) as usize;
+		BASE_SPI.store(base, Ordering::Relaxed);
+		MSI_LEN.store(count.min(MAX_MSI), Ordering::Relaxed);
+		return true;
+	}
+	// No frame: a GICv3 machine's MSI controller is the ITS, and it needs a redistributor to aim
+	// its one collection at - this core's, which is the same core the v2m path routes SPIs to.
+	if its != 0 {
+		let Some(redistributor) = super::gic::redistributor() else {
+			crate::serial_println!("interrupts: an ITS with no redistributor to aim it at - no MSI");
+			MSI_LEN.store(0, Ordering::Relaxed);
+			return false;
+		};
+		if msi_map.2 == 0 {
+			crate::serial_println!("interrupts: the machine describes an ITS but no msi-map, so a device cannot be named to it - no MSI");
+			MSI_LEN.store(0, Ordering::Relaxed);
+			return false;
+		}
+		if super::its::init(its, its_size, redistributor) {
+			USING_ITS.store(true, Ordering::Relaxed);
+			MSI_LEN.store(MAX_MSI, Ordering::Relaxed);
+			return true;
+		}
+	}
+	MSI_LEN.store(0, Ordering::Relaxed);
+	false
 }
 
 #[cfg(test)]

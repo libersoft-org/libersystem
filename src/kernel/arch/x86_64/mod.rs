@@ -60,7 +60,7 @@ pub fn init_tsc() {
 // Initialize per-CPU data for the bootstrap processor (CPU id 0). The BSP's
 // GDT/TSS and IDT are already loaded by init(); this only sets up its GS base
 // and records where its TSS.RSP0 slot lives for per-thread ring-3 stacks.
-pub fn init_bsp_percpu(lapic_id: u32) {
+pub fn init_bsp_percpu(lapic_id: u64) {
 	percpu::init(0, lapic_id);
 	percpu::set_tss_rsp0_slot(gdt::rsp0_slot_addr());
 }
@@ -69,7 +69,7 @@ pub fn init_bsp_percpu(lapic_id: u32) {
 // no-execute and SMAP/SMEP first (the shared page tables already carry NX-flagged
 // and USER-flagged leaves), load the shared descriptor tables, set up per-CPU
 // data, and enable its LAPIC.
-pub fn init_ap(cpu_id: usize, lapic_id: u32) {
+pub fn init_ap(cpu_id: usize, lapic_id: u64) {
 	context::enable_fpu();
 	paging::enable_nx();
 	paging::enable_smap_smep();

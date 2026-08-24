@@ -1,4 +1,4 @@
-use super::{acquire_msi, bind_msi, dispatch_msi, irq_info, irq_info_len, is_bound, unbind};
+use super::{acquire_msi, bind_msi, dispatch_msi, irq_info, irq_info_len, is_bound, is_quarantined, quarantine_for_test, release_msi_for_device, unbind};
 use crate::mem::frame;
 use crate::object::interrupt::Interrupt;
 
@@ -57,5 +57,39 @@ fn imsic_msi_inventory_reports_the_timer_and_msi_vectors() {
 	}
 	assert!(seen, "the acquired MSI vector appears in the inventory");
 	unbind(vector);
+	unsafe { frame::deallocate(table) };
+}
+
+crate::tagged_test!(an_eid_is_disabled_in_the_file_that_owns_it, [Interrupt, Drivers, ArchRiscv64], id = "kernel.arch.riscv64.interrupts.an_eid_is_disabled_in_the_file_that_owns_it", covers = ["kernel"]);
+fn an_eid_is_disabled_in_the_file_that_owns_it() {
+	// An IMSIC enable bit lives in ONE hart's interrupt file and can only be written by that hart.
+	// `acquire_msi` enables the EID here and programs the device to target here, so this hart is the
+	// owner and the disable is local.
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	let vector = acquire_msi(table, 0, 11).expect("acquire_msi hands out a free EID");
+	assert!(crate::arch::imsic::disable_eid_on_owner(vector), "the acquiring hart owns the EID, so it disables it itself");
+	// And an EID nobody owns is already in the state the caller asked for, rather than a refusal.
+	assert!(crate::arch::imsic::disable_eid_on_owner(vector), "an EID with no owner needs no cross-hart request");
+	unbind(vector);
+	unsafe { frame::deallocate(table) };
+}
+
+crate::tagged_test!(a_vector_whose_identity_stayed_armed_is_never_handed_out_again, [Interrupt, Drivers, ArchRiscv64], id = "kernel.arch.riscv64.interrupts.a_vector_whose_identity_stayed_armed_is_never_handed_out_again", covers = ["kernel"]);
+fn a_vector_whose_identity_stayed_armed_is_never_handed_out_again() {
+	// WHAT A TIMED-OUT CROSS-HART DISABLE COSTS, and what it must not cost. The owning hart never
+	// answered, so the EID is still enabled in its file and a device may still be delivering to it.
+	// Handing that identity to another driver would wake it from hardware it does not own; leaking
+	// one vector is the smaller price, and it is visible.
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	let stranded = acquire_msi(table, 0, 12).expect("acquire_msi hands out a free EID");
+	quarantine_for_test(stranded);
+	assert!(is_quarantined(stranded), "the vector reads as out of circulation");
+	assert!(!is_bound(stranded), "quarantine drops the binding");
+	// NOT EVEN THE DEVICE CAN RELEASE IT. A quiesce is the device saying it stopped, which answers
+	// the `retire` case; it says nothing about an enable bit this kernel could not clear.
+	assert_eq!(release_msi_for_device(12), 0, "a device quiesce does not release a quarantined vector");
+	let next = acquire_msi(table, 0, 13).expect("another EID is available");
+	assert_ne!(next, stranded, "the quarantined EID is not handed out again");
+	unbind(next);
 	unsafe { frame::deallocate(table) };
 }

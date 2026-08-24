@@ -24,6 +24,10 @@ buddy = { path = "../buddy" }
 # out is what let a real QEMU device tree be handed to it on a host, which immediately found that
 # `timebase_frequency` had never once returned a value.
 fdt = { path = "../fdt" }
+# The secondary-CPU start rules: which logical id a core is offered, and for how long it keeps it.
+# In a crate for the same reason `buddy` is - the cases that matter are a refused firmware call, a
+# core released late, a tree that forgot the core reading it, and QEMU has a switch for none of them.
+smpboot = { path = "../smpboot" }
 # LiberFS, for the test suite only: the storage scenarios hand StorageService a disk, and since
 # the factory archive was retired (P02M0108) that disk has to carry a real filesystem rather than a
 # package to make one from. Building the fixture with the same crate the service mounts means the

@@ -18,15 +18,21 @@ fn a_firmware_pointer_outside_the_direct_map_is_refused_before_it_is_dereference
 	// Asserted on the BOUND rather than by handing the walker a bad pointer, because the failure
 	// this closes is a triple fault: a test that reproduces it does not report anything.
 	use crate::mem;
-	let hhdm = mem::hhdm_offset();
 	assert!(mem::within_direct_map(0x1000, 36), "an ordinary low physical address is inside the map");
 	assert!(!mem::within_direct_map(0, 36), "a null firmware pointer is not a table");
 	assert!(!mem::within_direct_map(u64::MAX - 8, 36), "an address whose end overflows is refused rather than wrapped");
 	assert!(!mem::within_direct_map(0x1_0000_0000_0000, 36), "an address far past any machine's RAM is outside the map");
-	// And the readers refuse it rather than dereferencing it.
-	assert_eq!(super::table_signature(hhdm, 0x1_0000_0000_0000), None, "the signature read is bounded");
-	assert_eq!(super::table_length(hhdm, 0x1_0000_0000_0000), None, "so is the length read");
-	assert!(!super::table_ok(hhdm, 0x1_0000_0000_0000), "and a table nothing can read does not pass its checksum");
+	// And the readers refuse it rather than dereferencing it. THE READERS ARE THE ACPI WALK'S, so
+	// they exist only where ACPI does: the device-tree ports reach their firmware description
+	// through `fdt`, which is a host-tested parser rather than a pointer walked in early boot. The
+	// bound above is portable and is asserted on all three.
+	#[cfg(target_arch = "x86_64")]
+	{
+		let hhdm = mem::hhdm_offset();
+		assert_eq!(super::table_signature(hhdm, 0x1_0000_0000_0000), None, "the signature read is bounded");
+		assert_eq!(super::table_length(hhdm, 0x1_0000_0000_0000), None, "so is the length read");
+		assert!(!super::table_ok(hhdm, 0x1_0000_0000_0000), "and a table nothing can read does not pass its checksum");
+	}
 
 	// A table whose DECLARED length runs off the end of the map is refused too - the ceiling bounds
 	// how far a bad length walks, not whether the walk stays somewhere readable. Built at the very

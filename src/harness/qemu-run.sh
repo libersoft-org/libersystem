@@ -27,6 +27,10 @@
 #   QEMU_EXTRA= extra QEMU arguments
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
 #   UEFI=1    boot through own UEFI loader (aarch64/riscv64 only)
+#   GIC=      aarch64: which interrupt controller the machine has - 2 (default: GICv2 with a
+#             GICv2m MSI frame), 3 (GICv3, ITS off: the timer/IPI core profile) or 3its (GICv3
+#             with the ITS enabled). A NAMED PROFILE RATHER THAN A QEMU_EXTRA RECIPE, because
+#             which controller a boot exercised is the whole claim a discovery result makes.
 #   EL2=1     aarch64: start the guest at EL2 (`virtualization=on`), which is where the UEFI
 #             specification puts AArch64 firmware on most server-class parts - and which the
 #             loader's EL2 branch had never once executed under, because QEMU's `virt` starts at
@@ -999,7 +1003,19 @@ qemu_run_aarch64() {
 
 	qemu_parse_displays qemu-run
 
-	local machine="virt,gic-version=2"
+	# The interrupt-controller profile. `its=off` is written out for the GICv3 core profile rather
+	# than left to the default, because QEMU turns the ITS ON by default there - and a core profile
+	# that quietly had an ITS would not be the profile it says it is.
+	local machine
+	case "${GIC:-2}" in
+	2) machine="virt,gic-version=2" ;;
+	3) machine="virt,gic-version=3,its=off" ;;
+	3its) machine="virt,gic-version=3,its=on" ;;
+	*)
+		echo "qemu-run: GIC must be 2, 3 or 3its (got '${GIC}')" >&2
+		exit 1
+		;;
+	esac
 	# EL2, the level the specification says AArch64 firmware runs at. The loader reads `CurrentEL`
 	# and drops to EL1 before entering the kernel; that path is written from the architecture manual
 	# and, until this switch existed, had never been executed on any machine this project has run on.

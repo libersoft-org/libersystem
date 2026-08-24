@@ -31,7 +31,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let argument: &[u8] = context.arguments.as_bytes();
 		let mode: Option<JsonMode> = JsonMode::parse(argument);
 		// 3. read the online CPU set and the CPU model, and render them.
-		let mut ids: [u32; 64] = [0u32; 64];
+		let mut ids: [u64; 64] = [0u64; 64];
 		let count: i64 = cpu_info(&mut ids);
 		if count <= 0 {
 			eprint(b"lscpu: query error\n");
@@ -56,7 +56,7 @@ const ARCH: &str = "riscv64";
 
 // Render the CPU set as text (the default) or as a JSON object. `model` is the CPU
 // brand string (empty when the platform exposes none), rendered as the `name` field.
-fn render(ids: &[u32], count: u64, model: &str, mode: Option<JsonMode>) -> String {
+fn render(ids: &[u64], count: u64, model: &str, mode: Option<JsonMode>) -> String {
 	let mut out = String::new();
 	if let Some(mode) = mode {
 		out.push_str("{\"arch\":\"");

@@ -45,14 +45,20 @@ pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
 }
 
 // Remove any binding for `vector` (an EID; called from an Interrupt's Drop). The EID's IMSIC enable
-// bit is cleared best-effort, so a later stray MSI to it pends and dispatches to no one - WHILE IT
-// STAYS UNOWNED. Reallocate the EID and that same stray message wakes its next owner, which is the
-// defect the x86 backend spells out; so the slot is retired rather than freed and waits for
-// `SYS_DEVICE_QUIESCED`.
+// bit is cleared IN THE FILE THAT HOLDS IT - which is not necessarily this hart's - so a later stray
+// MSI to it pends and dispatches to no one WHILE IT STAYS UNOWNED. Reallocate the EID and that same
+// stray message wakes its next owner, which is the defect the x86 backend spells out; so the slot is
+// retired rather than freed and waits for `SYS_DEVICE_QUIESCED`.
+//
+// AND IF THE OWNING HART DOES NOT ANSWER, the identity is still armed somewhere, so the slot is
+// quarantined instead: it leaks a vector rather than handing a live one to the next driver.
 pub fn unbind(vector: u32) {
 	if let Some(slot) = eid_slot(vector) {
-		super::imsic::disable_eid(vector as u32);
-		REGISTRY.retire(slot);
+		if super::imsic::disable_eid_on_owner(vector) {
+			REGISTRY.retire(slot);
+		} else {
+			REGISTRY.quarantine(slot);
+		}
 	}
 }
 
@@ -68,8 +74,13 @@ pub fn unbind(vector: u32) {
 // for why this is a free rather than a retire.
 pub fn release_unused_msi(vector: u32) {
 	if let Some(slot) = eid_slot(vector) {
-		super::imsic::disable_eid(vector as u32);
-		REGISTRY.free(slot);
+		// Same rule as `unbind`: an identity that could not be disabled is not one to hand back,
+		// even though this vector never reached a driver.
+		if super::imsic::disable_eid_on_owner(vector) {
+			REGISTRY.free(slot);
+		} else {
+			REGISTRY.quarantine(slot);
+		}
 	}
 }
 
@@ -90,7 +101,13 @@ pub fn acquire_msi_unique(table_phys: u64, _dest: u8, owner: u32) -> Option<u32>
 
 fn program_acquired(slot: usize, table_phys: u64) -> Option<u32> {
 	let eid = EID_BASE + slot as u32;
-	let hart = super::percpu::this_cpu().lapic_id() as u64;
+	let hart = super::percpu::this_cpu().lapic_id();
+	// A HART WITH NO INTERRUPT FILE IS NOT AN MSI TARGET. `msi_address` is `base + hart * stride`,
+	// so a hart past the array the controller declares names an address inside something else.
+	if !super::imsic::has_file(hart) {
+		REGISTRY.free(slot);
+		return None;
+	}
 	program_msix_entry(table_phys, super::imsic::msi_address(hart), eid);
 	super::imsic::enable_eid(eid);
 	// The whole EID (KERN-ARCH-017): IMSIC identifiers are eleven bits, so narrowing one here
@@ -167,6 +184,21 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 	}
 	let eid = EID_BASE + slot as u32;
 	Some(abi::IrqInfo { vector: eid, kind: abi::IRQ_KIND_MSI, bound: is_bound(eid) as u32, device: REGISTRY.owner(slot) })
+}
+
+// Take a vector out of circulation the way an unanswered cross-hart disable does, so the rule can
+// be tested without wedging a hart with interrupts off.
+#[cfg(test)]
+pub fn quarantine_for_test(vector: u32) {
+	if let Some(slot) = eid_slot(vector) {
+		REGISTRY.quarantine(slot);
+	}
+}
+
+// Whether `vector` is out of circulation for the life of the boot.
+#[cfg(test)]
+pub fn is_quarantined(vector: u32) -> bool {
+	eid_slot(vector).is_some_and(|slot| REGISTRY.is_quarantined(slot))
 }
 
 // The number of vectors irq_info reports over (the timer entry plus the MSI window).

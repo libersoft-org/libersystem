@@ -1,5 +1,11 @@
 # Bugs / changes
 
+- rename uname to sysver
+- make boot faster (multicore + other optimizations)
+- move creating ISO and IMG from run.sh to build.sh + its command line parameters
+- consider change of CONCEPT - destkop before server, own sdk first, posix compatibility at the end
+- make build script compile parallelly (multicore)
+
 - lico.lsexe, licoview.lsexe and licoedit.lsexe should be in /bin/lico/, not directly in /bin/
 - audioconv.lsexe, audiorec.exe, beep.lsexe, play.lsexe should be in /bin/audio-tools/
 - imgconv.lsexe, imgview.lsexe should be in /bin/image-tools/
@@ -13,24 +19,16 @@
 - architecture audit (!!!)
 - in terminal, when I have some text in clipboard, right mouse button click should paste it (if not selected something, in this case right mouse button click copies selected text)
 - split all image and audio codecs into 3 parts - encoder, decoder, common, for example: png-common.lslib, png-enc.lslib, png-dec.lslib (both dec and enc use common), make play, audioconv, audiorec, imgview, imgconv use these newly splitted libraries
-- create SDK not just for WASM, but for Rust and other languages too
-- h.264 codec + mp4 container + make "play" play video too (not just audio)
 - check if we have only our own implementations of image and audio decoders and encoders
 - remove manual word wrapping in all documents - mainly milestone documents
 - find out how shared libraries work... if they are loaded in RAM just once for multiple apps using it or each app has its own instance
 - .build is a big mess, make it clean in well organized subdirectories - almost done, review
-- rename uname to sysver
 - some services in src/users/services/core/src/ have it's own folder (like graph_limits), but there is only tests.rs file while graph_limits.rs resides outside of this directory - fix it... move it to the proper directory
 - testing CD image should be different from release CD image (release should not have testing volumes like UDF, ISO etc.)
-- cd bin -> lico.lsexe - says command not found, but this lsexe is present in this directory
 - static builds are completely forbidden? - if so, allow it, just don't use it for system tools
 - Build workflow change - minimal system + drivers + basic services + system libraries, other libraries and tools -> will be added into minimal system if necessary
-- why /bin/lico / licoview / licoedit claims it is not a command?
 - implement the measured persistent incremental build, publish and QEMU application-test loop before continuing feature work
 - init.pkg is not in vol://system/ ... find out why?
-- tests are taking too long after every small task - optimization needed
-- make boot faster (multicore + other optimizations)
-- "exit" command gracefully stops everything and then halts, but poweroff doesn't... do the same gracefullness for poweroff
 - "ps -i" - escape doesn't work (both terminal console and directly using keyboard, "q" works well on both)
 - "ps -i" - it doesn't show up CPU cores usage
 - "ps -i" - it shows JSON instead of table
@@ -38,10 +36,9 @@
 - when I press and hold enter in shell, sometimes it writes "vol://system> vol://system>" on the same row (not just "vol://system>" on next row)
 - qemu - be on the same network like host
 - vorbis - LICENSE file
-- check if we have our implementations only (not licensed !!!)
+- check if we have our implementations only everywhere (not licensed !!!)
 - add "ls" parameters (filters like *.txt etc.)
 - kernel/tests.rs - too big - atomize
-- Native compilers - wasm
 - why there is a "help" command again when it was deleted already?
 - commands.rs shows up the list of builtin shell commands - some of them should be separated binaries
 - mountpoints as mount://
@@ -55,7 +52,6 @@
 - lsdev, lssvc - without --json parameter it still shows json, not a CLI text output
 - lsirq - show as table with columns (same like lsvol)
 - ls* - find out what should it show
-- Apps in vol://storage/bin/ are huge (hundreds of kB) - find out why
 - Some commands are missing --help parameter
 - How does the format of our binary files look like? describe it somewhere
 - Every command (even simple ones as ls or lsvol) has the delay at the beginning for no reason ... something that linux shows instantly - find out why and fix.
@@ -74,6 +70,8 @@
 
 # New features
 
+- create SDK not just for WASM, but for Rust and other languages too
+- h.264 codec + mp4 container + make "play" play video too (not just audio)
 - Add video player and video codecs
 - locale settings (keyboard layout, timezone etc.)
 - Live CD with options - live boot + hard drive installer 
@@ -88,7 +86,8 @@
 - audioconv - audio format conversion tool
 - web camera viewer / recorder
 - shell scripts
-- Rust Doom?
+- Rust Doom
+- Native compilers - wasm, c, rust,...
 - M0042 (old numbering) - app package format
 - P02M0006k - console login and lock
 - P02M0006f - non-US keyboard layout

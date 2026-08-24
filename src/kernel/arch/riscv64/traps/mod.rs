@@ -293,6 +293,10 @@ extern "C" fn riscv64_trap(scause: u64, stval: u64, frame: *mut u64) {
 			// S-mode software interrupt: a cross-hart wake IPI. Clear the pending bit
 			// (SIP.SSIP); the hart is now awake and will re-check the run queue.
 			unsafe { core::arch::asm!("csrci sip, 2", options(nostack, preserves_flags)) };
+			// And run any IMSIC disable this hart was asked for. An interrupt file can only be
+			// written by the hart that owns it, so a teardown running elsewhere asks through this
+			// mailbox - and the requester is waiting on a bound for the answer.
+			super::imsic::service_pending_disables();
 			// And service a TLB shootdown if one is what the IPI was for. The x86_64 and
 			// aarch64 handlers have always done this; this one did not, so a shootdown was
 			// only ever acted on when a hart happened to reach the idle loop - and a hart busy

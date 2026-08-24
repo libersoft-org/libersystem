@@ -886,14 +886,17 @@ fn sys_boot_profile(buf_ptr: u64, buf_len: u64) -> i64 {
 // report-in; a free syscall - the CPU inventory is public identity, not a capability.
 fn sys_cpu_info(buf_ptr: u64, buf_len: u64) -> i64 {
 	let count = crate::smp::cpu_count();
-	let n = count.min((buf_len / 4) as usize);
-	if n > 0 && !user_buf_ok(buf_ptr, n as u64 * 4) {
+	// EIGHT BYTES PER CORE, because that is the width of the id being reported: an SBI hart id is
+	// an `unsigned long` and an MPIDR affinity is 40 bits. A four-byte element would truncate the
+	// two architectures whose ids do not fit and hand the caller two cores with one id.
+	let n = count.min((buf_len / 8) as usize);
+	if n > 0 && !user_buf_ok(buf_ptr, n as u64 * 8) {
 		return ERR_INVALID;
 	}
 	for cpu in 0..n {
 		// A buffer that went away partway leaves the caller a list it cannot tell is short, so the
 		// loop stops and says so rather than reporting the full core count over a half-written array.
-		if let Err(e) = write_user((buf_ptr as *mut u32).wrapping_add(cpu) as u64, crate::smp::lapic_id(cpu)) {
+		if let Err(e) = write_user((buf_ptr as *mut u64).wrapping_add(cpu) as u64, crate::smp::lapic_id(cpu)) {
 			return e;
 		}
 	}
@@ -1234,10 +1237,10 @@ fn sys_device_msix_acquire(index: u64, privilege: u64) -> i64 {
 	// first core with an addressable id instead of truncating silently; x2APIC
 	// delivery, which would lift the limit, is not implemented yet.
 	let lapic = arch::percpu::this_cpu().lapic_id();
-	let dest = if lapic <= u8::MAX as u32 {
+	let dest = if lapic <= u8::MAX as u64 {
 		lapic as u8
 	} else {
-		match (0..crate::smp::cpu_count()).map(crate::smp::lapic_id).find(|&id| id <= u8::MAX as u32) {
+		match (0..crate::smp::cpu_count()).map(crate::smp::lapic_id).find(|&id| id <= u8::MAX as u64) {
 			Some(id) => id as u8,
 			None => return ERR_RESOURCE_EXHAUSTED,
 		}

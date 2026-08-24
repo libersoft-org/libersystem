@@ -73,6 +73,11 @@ static mut SEC_STACKS: [SecStack; MAX_CPUS] = [const { SecStack([0; SEC_STACK_SI
 static SMP_ONLINE: AtomicU32 = AtomicU32::new(0);
 static SEC_MPIDR: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
 
+// WHO OWNS EACH LOGICAL ID, FOR AS LONG AS IT MIGHT STILL BE CLAIMED. The rule and its failure
+// cases live in `smpboot`, which a host can drive them through; this is the storage the BSP and the
+// arriving cores share.
+static SEC_SLOT: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(smpboot::SLOT_FREE) }; MAX_CPUS];
+
 global_asm!(
 	r#"
 .section .data.boot, "a"
@@ -321,6 +326,14 @@ fn cpu_on(conduit: u32, target_mpidr: u64, entry: u64, context_id: u64) -> i64 {
 // up its per-CPU block and local GIC/timer, records itself online, then idles.
 #[unsafe(no_mangle)]
 extern "C" fn aarch64_secondary_main(cpu_id: u64) -> ! {
+	// THE INVITATION, CLAIMED BEFORE ANYTHING SHARED IS TOUCHED. A core that arrives after its
+	// attempt timed out finds its slot ABANDONED - the id and the stack are no longer its own - and
+	// the only safe thing it can do is stop. Initializing a per-CPU block or standing on the stack
+	// first would be writing over whoever owns them now. Halting costs one core; joining costs the
+	// machine.
+	if !smpboot::Bringup::new(&SEC_SLOT).claim(cpu_id) {
+		super::halt_loop();
+	}
 	// Install the shared EL1 exception vectors on this core (VBAR_EL1 resets to 0).
 	super::exceptions::init_vectors();
 	// Enable FP/SIMD on this core (CPACR_EL1 resets with FP trapped).
@@ -329,7 +342,7 @@ extern "C" fn aarch64_secondary_main(cpu_id: u64) -> ! {
 	unsafe {
 		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
 	}
-	super::percpu::init(cpu_id as usize, mpidr as u32);
+	super::percpu::init(cpu_id as usize, mpidr & MPIDR_AFFINITY);
 	// OFF THE BRING-UP SLICE AND ONTO A GUARDED STACK, before anything deep runs on it.
 	//
 	// `SEC_STACKS` is a static array with NO GUARD PAGES between its slices, so a core that runs off
@@ -385,11 +398,54 @@ extern "C" fn secondary_idle(cpu_id: u64) -> ! {
 	crate::sched::cpu_idle_loop()
 }
 
-// Wake every secondary core named by the device tree via PSCI CPU_ON and wait for
-// them to report in. On QEMU virt the MPIDR affinity of cpu N is simply N.
-pub fn bring_up_secondaries(cpu_ids: &[u64], boot_arg: u64) -> usize {
-	if cpu_ids.len() <= 1 {
-		return 1;
+// The PSCI side of a start attempt: the call, the bounded wait, and what to say about either.
+// Everything about WHICH id a core gets and for how long it keeps it is `smpboot`'s.
+struct Psci {
+	conduit: u32,
+	entry: u64,
+}
+
+impl smpboot::Firmware for Psci {
+	fn start(&mut self, target: u64, logical_id: u64) -> i64 {
+		cpu_on(self.conduit, target, self.entry, logical_id)
+	}
+
+	fn await_report(&mut self, reported: u32) -> bool {
+		// A BOUND, NOT A MEASUREMENT: long enough that a working core always arrives first, short
+		// enough that a core which never will does not hold the boot.
+		let mut spins: u64 = 0;
+		while SMP_ONLINE.load(Ordering::Acquire) < reported && spins < 500_000_000 {
+			core::hint::spin_loop();
+			spins += 1;
+		}
+		SMP_ONLINE.load(Ordering::Acquire) >= reported
+	}
+
+	fn note(&mut self, event: smpboot::Event) {
+		match event {
+			smpboot::Event::Refused { target, status, .. } => {
+				crate::serial_println!("aarch64: CPU_ON mpidr {target:#x} failed (PSCI {status})")
+			}
+			smpboot::Event::Abandoned { target, logical_id } => crate::serial_println!("aarch64: core mpidr {target:#x} took CPU_ON and never reported in; logical id {logical_id} is abandoned rather than reused"),
+			smpboot::Event::Online { target: _, logical_id } => crate::serial_println!("aarch64:   cpu {} up (mpidr={:#x})", logical_id, SEC_MPIDR[logical_id as usize].load(Ordering::Relaxed) & 0xff_ffff),
+			smpboot::Event::PoolExhausted { target } => {
+				crate::serial_println!("aarch64: core mpidr {target:#x} has no logical id left in the per-CPU pool ({MAX_CPUS}); it stays parked")
+			}
+		}
+	}
+}
+
+// Wake each secondary core the resolved topology names, via PSCI CPU_ON, and wait for it to report
+// in before offering the next id.
+//
+// `secondaries` is what `smpboot::Topology` left after taking out the core running this code, the
+// ids named twice and the remainder the per-CPU pool has no room for - so every entry here is a
+// core that may be started, named once (KERN-ARCH-008).
+pub fn bring_up_secondaries(secondaries: &[u64], boot_arg: u64) -> smpboot::Outcome {
+	// Nothing to wake, and one id in use: the boot core's.
+	let alone = smpboot::Outcome { ids_used: 1, ..Default::default() };
+	if secondaries.is_empty() {
+		return alone;
 	}
 	// NO CONDUIT, NO SECONDARIES - and a line saying so, rather than a fault into somebody else's
 	// exception vectors. A single-core boot is a working system; a machine that dies bringing up its
@@ -400,7 +456,7 @@ pub fn bring_up_secondaries(cpu_ids: &[u64], boot_arg: u64) -> usize {
 		bootproto::PSCI_HVC | bootproto::PSCI_SMC => {}
 		_ => {
 			crate::serial_println!("aarch64: SMP - no PSCI conduit below this kernel; running on one core");
-			return 1;
+			return alone;
 		}
 	}
 
@@ -409,61 +465,18 @@ pub fn bring_up_secondaries(cpu_ids: &[u64], boot_arg: u64) -> usize {
 	// page tables the primary already built. High kernel code cannot `adrp` the
 	// low symbol directly, so its address is read from a linker-filled data word.
 	let entry = unsafe { aarch64_secondary_entry };
-
-	// THE IDS THE TREE GAVE, AND ONE LOGICAL ID PER CORE THAT ANSWERS (KERN-ARCH-008).
-	//
-	// This used to call `CPU_ON` on targets `1..cpu_count` - the dense, zero-based, tree-ordered
-	// assumption - and then wait for all of them at once, handing every id out whether or not the
-	// core behind it existed. A machine whose cores are 0x0, 0x1, 0x100, 0x101 had two targets that
-	// are not cores and two cores never started, and the count published afterwards described
-	// neither.
-	//
-	// So: the target is the MPIDR affinity value out of the device tree, and the logical id - the
-	// index into the per-CPU pool, the scheduler's run queues and the stack array - is handed out
-	// only to a core that has REPORTED IN. A core that fails `CPU_ON`, or that takes it and never
-	// arrives, consumes no id and leaves no gap behind it.
-	let boot = boot_mpidr();
-	let mut online = 1usize;
-	for &target in cpu_ids {
-		if target & MPIDR_AFFINITY == boot {
-			continue; // the core this code is running on
-		}
-		if online >= MAX_CPUS {
-			crate::serial_println!("aarch64: SMP - the tree declares more cores than the per-CPU pool holds ({MAX_CPUS}); the rest stay parked");
-			break;
-		}
-		let cpu_id = online as u64;
-		let status = cpu_on(conduit, target, entry, cpu_id);
-		if status != 0 {
-			crate::serial_println!("aarch64: CPU_ON mpidr {target:#x} failed (PSCI {status})");
-			continue;
-		}
-		// A BOUND, NOT A MEASUREMENT: long enough that a working core always arrives first, short
-		// enough that a core which never will does not hold the boot. Waiting for THIS core before
-		// starting the next is what keeps the logical ids contiguous.
-		let mut spins: u64 = 0;
-		while SMP_ONLINE.load(Ordering::Acquire) < online as u32 && spins < 500_000_000 {
-			core::hint::spin_loop();
-			spins += 1;
-		}
-		if SMP_ONLINE.load(Ordering::Acquire) < online as u32 {
-			crate::serial_println!("aarch64: core mpidr {target:#x} took CPU_ON and never reported in");
-			continue;
-		}
-		crate::serial_println!("aarch64:   cpu {} up (mpidr={:#x})", cpu_id, SEC_MPIDR[cpu_id as usize].load(Ordering::Relaxed) & 0xff_ffff);
-		online += 1;
-	}
-	crate::serial_println!("aarch64: SMP - {} of {} declared cores online", online, cpu_ids.len());
-	online
+	let outcome = smpboot::Bringup::new(&SEC_SLOT).run(secondaries, &mut Psci { conduit, entry });
+	crate::serial_println!("aarch64: SMP - {} of {} declared cores online", outcome.online + 1, secondaries.len() + 1);
+	outcome
 }
 
 // The affinity bits of MPIDR_EL1, which is what a PSCI `target_cpu` and a device tree's `cpu@reg`
 // both are: Aff0..Aff2 in the low three bytes and Aff3 at bits 39:32. The other bits (U, MT, and
 // the RES1 at 31) describe the core rather than name it, and comparing them would make a core fail
 // to match itself.
-const MPIDR_AFFINITY: u64 = 0x0000_00ff_00ff_ffff;
+pub const MPIDR_AFFINITY: u64 = 0x0000_00ff_00ff_ffff;
 
-fn boot_mpidr() -> u64 {
+pub fn boot_mpidr() -> u64 {
 	let mpidr: u64;
 	unsafe {
 		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
