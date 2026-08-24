@@ -66,6 +66,15 @@ APT_PACKAGES=(
 	llvm              # llvm-objcopy and friends
 	clang
 	libssl-dev # OpenSSL headers required to build Taplo schema support
+
+	# THESE THREE ARE NOT BUILD DEPENDENCIES. Nothing in `./build.sh` touches them: they belong to
+	# ONE gate - the Secure Boot profile in P02M0150 M5, which signs the EFI loader with a test
+	# certificate and enrols a PK/KEK/db into a private OVMF variable store. They are installed here
+	# so a developer's machine can run the whole check suite, and the gate still PREFLIGHTS each one
+	# by name rather than assuming setup ran: a verification that skips itself when a tool is missing
+	# is the failure that milestone exists to prevent.
+	sbsigntool            # sbsign/sbverify: Authenticode-sign the loader and check the signature back
+	python3-virt-firmware # virt-fw-vars: enrol the test PK/KEK/db into a per-run OVMF VARS copy
 )
 
 info "Updating apt and installing packages..."

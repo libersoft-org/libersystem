@@ -534,6 +534,9 @@ qemu_build_esp() {
 	local boot_name="$4"
 	local strip="${STRIP:-all}"
 	scratch_sweep "$QEMU_BUILD_DIR/esp-${arch}" .img
+	# Left by runners from before the neutral `.staged` name; the pid-aware sweep never removes a
+	# file still owned by a live older run.
+	scratch_sweep "$QEMU_BUILD_DIR/kernel-${arch}" .stripped
 	scratch_sweep "$QEMU_BUILD_DIR/kernel-${arch}" .staged
 	ESP="$QEMU_BUILD_DIR/esp-${arch}.$$.img"
 	STAGED_KERNEL="$QEMU_BUILD_DIR/kernel-${arch}.$$.staged"

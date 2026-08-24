@@ -143,9 +143,10 @@ step_packages() {
 # carried the TEST kernel and booted into the suite. Naming the file removes the slot from the path.
 step_volume() {
 	local arch="$1" with_kernel="${2:-0}" kernel_strip="${3:-none}" args=("$arch" system-volume)
+	local staged_kernel=""
 	if [[ "$with_kernel" == "1" ]]; then
 		local source_kernel="$BUILD_DIR/cargo/kernel/$(target_triple "$arch")/debug/kernel"
-		local staged_kernel="$BUILD_DIR/boot/kernel-volume-$arch-$kernel_strip"
+		staged_kernel="$BUILD_DIR/boot/kernel-volume-$arch-$kernel_strip.$$"
 		local strip_tool="objcopy"
 		[[ "$arch" == "x86_64" ]] || strip_tool="llvm-strip"
 		KERNEL_STRIP_TOOL="$strip_tool" "$SRC_DIR/tools/stage-kernel.sh" \
@@ -153,7 +154,10 @@ step_volume() {
 		args+=("--with-kernel=$staged_kernel")
 	fi
 	note "volume ($arch)"
-	(cd "$SRC_DIR/tools/mkpackages" && cargo run --quiet -- "${args[@]}")
+	local status=0
+	(cd "$SRC_DIR/tools/mkpackages" && cargo run --quiet -- "${args[@]}") || status=$?
+	[[ -z "$staged_kernel" ]] || rm -f -- "$staged_kernel"
+	return "$status"
 }
 
 PARTS_ALL="sdk libs user kernel loader packages volume"

@@ -25,6 +25,12 @@ cd libersystem && ./setup.sh
 
 If you only build for x86_64, the foreign-architecture QEMU packages can be omitted.
 
+`sbsigntool` and `python3-virt-firmware` are not build dependencies - nothing in `build.sh` uses
+them. They belong to one verification gate, the Secure Boot profile, which signs the EFI loader with
+a test certificate and enrols a test PK/KEK/db into a private OVMF variable store. Leaving them out
+builds and boots the system exactly as before; the gate then reports which command it is missing
+rather than skipping itself.
+
 ## Build
 
 From the repository root:

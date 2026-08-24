@@ -75,6 +75,17 @@ class FakeLab:
 		return lab.serial_raw_since(at)
 
 
+class ImageCommandTest(unittest.TestCase):
+	def test_ordinary_images_use_the_production_strip_default(self):
+		self.assertEqual(lab.image_command(), [lab.IMAGE_SH, '--format', 'iso'])
+
+	def test_development_images_request_the_complete_kernel(self):
+		self.assertEqual(
+			lab.image_command('none'),
+			[lab.IMAGE_SH, '--format', 'iso', '--strip', 'none'],
+		)
+
+
 class SerialCursorTest(unittest.TestCase):
 	def setUp(self):
 		self.directory = tempfile.TemporaryDirectory()
