@@ -53,6 +53,11 @@ impl BlockDevice for ImageDisk {
 // places - which is the point. The recovery path used to be a packaged archive instead, so the
 // same job was done twice by two different means, and only one of them put the programs somewhere
 // a user could replace them.
+// THE READING IS THE ONLY PART THAT NEEDS FIRMWARE. The policy above it - what a source that names
+// programs and cannot be checked MEANS - lives in `abi::bootstrap`, beside the list parser and the
+// archive writer, where a host can drive it. This crate keeps its own trait because the two
+// filesystems are types it does not own, and the orphan rule does not let it implement somebody
+// else's trait for them.
 pub(crate) trait ReadsFiles {
 	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>>;
 }
@@ -69,44 +74,25 @@ impl<D: BlockDevice> ReadsFiles for fat::FatFs<D> {
 	}
 }
 
-pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> Option<alloc::vec::Vec<u8>> {
-	use alloc::vec::Vec;
-
-	// The list parser and the archive builder live in `abi`, beside the format's reader: the loader
-	// is a UEFI binary, so nothing here can be tested on the host, and these two are exactly the
-	// parts that need a test. What stays here is the reading.
-	let list = fs.read(b"etc/bootstrap.list")?;
-	let rows = abi::bootstrap::parse_list(&list)?;
-	// THE MANIFEST BESIDE THE LIST. It is read before anything is trusted, and from here on this
-	// source is the chosen one: a manifest that is absent, malformed or disagreeing stops the boot
-	// rather than falling through to another source. Choosing a source and failing a check on it are
-	// different things, and there is no path from the second to the first.
-	let manifest = fs.read(b"etc/boot.manifest");
-	let Some(manifest) = manifest else {
-		crate::arch::serial::write_str("loader: this source has no etc/boot.manifest - refusing to boot from it\n");
-		return None;
-	};
-	if !digests_ok(&manifest, b"etc/bootstrap.list", &list) {
-		return None;
+// Read a source's bootstrap set and say WHAT THE SOURCE IS.
+//
+// This used to answer `Option<Vec<u8>>`, and `None` meant two different things: "there is no
+// bootstrap list here, try the next disk" and "this source was selected and its manifest refused
+// it". A caller cannot tell those apart, so every caller did the same thing with both - it went on
+// to the next source. That turns a detected tampering into a silent fallback, which is the opposite
+// of what the check is for.
+//
+// The state machine is `abi::bootstrap::assemble`, beside the list parser it uses and the archive
+// writer it ends with, because this is a UEFI binary and nothing inside one can be tested. What
+// stays here is the reading and the reporting.
+pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> abi::bootstrap::Selection {
+	let verdict = abi::bootstrap::assemble(|path| fs.read(path), digests_ok);
+	if matches!(verdict, abi::bootstrap::Selection::Verified(_)) {
+		// SAY THAT IT CHECKED. A check that is silent when it passes cannot be told apart in a boot
+		// log from one that was never wired up, and this one's whole value is that it ran.
+		crate::arch::serial::write_str("loader: bootstrap set verified against etc/boot.manifest\n");
 	}
-	let mut blobs: Vec<Vec<u8>> = Vec::new();
-	blobs.try_reserve_exact(rows.len()).ok()?;
-	for row in &rows {
-		// A named program that is not on the volume is fatal rather than skipped. The bootstrap
-		// set is exactly the programs the system needs before its volume is readable, so a
-		// missing one produces a machine that dies later and further away, with nothing to say
-		// which program it was.
-		let blob = fs.read(row.path)?;
-		if !digests_ok(&manifest, row.path, &blob) {
-			return None;
-		}
-		blobs.push(blob);
-	}
-	// SAY THAT IT CHECKED. A check that is silent when it passes cannot be told apart in a boot log
-	// from one that was never wired up, and this one's whole value is that it ran.
-	crate::arch::serial::write_str("loader: bootstrap set verified against etc/boot.manifest\n");
-	let entries: Vec<(&[u8], &[u8])> = rows.iter().zip(&blobs).map(|(row, blob)| (row.name, blob.as_slice())).collect();
-	abi::bootstrap::build_package(&entries)
+	verdict
 }
 
 // Whether `bytes` is what the manifest says the file at `path` should be, with the line that says

@@ -225,19 +225,16 @@ pub enum Selection {
 	Invalid(Refusal),
 }
 
-// Where the bytes come from. The loader's implementations read UEFI filesystems; a test's reads a
-// table it was handed, which is the whole reason this lives here rather than in the loader.
-pub trait Files {
-	fn read(&mut self, path: &[u8]) -> Option<Vec<u8>>;
-}
-
 // Read a source's bootstrap set and say what the source is.
 //
-// `verify` answers one question - is this the content the manifest records for this path - and it
-// is a parameter rather than a call so this crate stays dependency-free: the manifest format lives
-// in `bootproto`, the policy lives here, and neither has to know the other's crate.
-pub fn assemble<F: Files>(fs: &mut F, verify: impl Fn(&[u8], &[u8], &[u8]) -> bool) -> Selection {
-	let Some(list) = fs.read(b"etc/bootstrap.list") else {
+// TWO CLOSURES RATHER THAN TWO TRAITS. `read` is the source - a UEFI filesystem in the loader, a
+// table in a test - and `verify` answers one question: is this the content the manifest records for
+// this path. Both are parameters so this crate stays dependency-free: the manifest format lives in
+// `bootproto`, the policy lives here, and neither has to know the other's crate. They are closures
+// rather than traits because the loader's filesystems are types it does not own, and the orphan
+// rule does not let it implement somebody else's trait for them.
+pub fn assemble(mut read: impl FnMut(&[u8]) -> Option<Vec<u8>>, verify: impl Fn(&[u8], &[u8], &[u8]) -> bool) -> Selection {
+	let Some(list) = read(b"etc/bootstrap.list") else {
 		return Selection::Unavailable;
 	};
 	let Some(rows) = parse_list(&list) else {
@@ -246,7 +243,7 @@ pub fn assemble<F: Files>(fs: &mut F, verify: impl Fn(&[u8], &[u8], &[u8]) -> bo
 	// THE MANIFEST BESIDE THE LIST. From here on this source is the chosen one: a manifest that is
 	// absent, malformed or disagreeing stops the boot rather than falling through to another
 	// source. Choosing a source and failing a check on it are different things.
-	let Some(manifest) = fs.read(b"etc/boot.manifest") else {
+	let Some(manifest) = read(b"etc/boot.manifest") else {
 		return Selection::Invalid(Refusal::NoManifest);
 	};
 	if !verify(&manifest, b"etc/bootstrap.list", &list) {
@@ -261,7 +258,7 @@ pub fn assemble<F: Files>(fs: &mut F, verify: impl Fn(&[u8], &[u8], &[u8]) -> bo
 		// is exactly the programs the system needs before its volume is readable, so a missing one
 		// produces a machine that dies later and further away, with nothing to say which program it
 		// was.
-		let Some(blob) = fs.read(row.path) else {
+		let Some(blob) = read(row.path) else {
 			return Selection::Invalid(Refusal::MissingProgram);
 		};
 		if !verify(&manifest, row.path, &blob) {

@@ -1011,7 +1011,7 @@ impl FakeSource {
 	}
 }
 
-impl crate::bootstrap::Files for FakeSource {
+impl FakeSource {
 	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 		self.files.iter().find(|(p, _)| *p == path).map(|(_, bytes)| bytes.clone())
 	}
@@ -1030,7 +1030,7 @@ const LIST: &[u8] = b"init bin/init\nsvc bin/svc\n";
 fn a_source_with_no_bootstrap_list_is_not_a_source() {
 	use crate::bootstrap::{Selection, assemble};
 	let mut fs = FakeSource::new(&[(b"etc/other", b"x")]);
-	assert!(matches!(assemble(&mut fs, vouches), Selection::Unavailable));
+	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Unavailable));
 }
 
 #[test]
@@ -1040,14 +1040,14 @@ fn a_source_with_a_list_and_no_manifest_is_refused_rather_than_skipped() {
 	// every caller went on to the next one either way.
 	use crate::bootstrap::{Refusal, Selection, assemble};
 	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST)]);
-	assert!(matches!(assemble(&mut fs, vouches), Selection::Invalid(Refusal::NoManifest)));
+	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Invalid(Refusal::NoManifest)));
 }
 
 #[test]
 fn a_list_the_manifest_does_not_vouch_for_is_refused() {
 	use crate::bootstrap::{Refusal, Selection, assemble};
 	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"etc/boot.manifest", b"bin/init\nbin/svc")]);
-	assert!(matches!(assemble(&mut fs, vouches), Selection::Invalid(Refusal::ListMismatch)));
+	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Invalid(Refusal::ListMismatch)));
 }
 
 #[test]
@@ -1055,7 +1055,7 @@ fn a_program_the_list_names_and_the_source_lacks_is_refused() {
 	use crate::bootstrap::{Refusal, Selection, assemble};
 	let manifest: &[u8] = b"etc/bootstrap.list\nbin/init\nbin/svc";
 	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"etc/boot.manifest", manifest), (b"bin/init", b"i")]);
-	assert!(matches!(assemble(&mut fs, vouches), Selection::Invalid(Refusal::MissingProgram)));
+	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Invalid(Refusal::MissingProgram)));
 }
 
 #[test]
@@ -1063,7 +1063,7 @@ fn a_program_the_manifest_does_not_vouch_for_is_refused() {
 	use crate::bootstrap::{Refusal, Selection, assemble};
 	let manifest: &[u8] = b"etc/bootstrap.list\nbin/init";
 	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"etc/boot.manifest", manifest), (b"bin/init", b"i"), (b"bin/svc", b"s")]);
-	assert!(matches!(assemble(&mut fs, vouches), Selection::Invalid(Refusal::ProgramMismatch)));
+	assert!(matches!(assemble(|path| fs.read(path), vouches), Selection::Invalid(Refusal::ProgramMismatch)));
 }
 
 #[test]
@@ -1071,7 +1071,7 @@ fn a_source_that_vouches_for_everything_it_names_is_verified() {
 	use crate::bootstrap::{Selection, assemble};
 	let manifest: &[u8] = b"etc/bootstrap.list\nbin/init\nbin/svc";
 	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"etc/boot.manifest", manifest), (b"bin/init", b"i"), (b"bin/svc", b"s")]);
-	let Selection::Verified(archive) = assemble(&mut fs, vouches) else { panic!("the source verifies") };
+	let Selection::Verified(archive) = assemble(|path| fs.read(path), vouches) else { panic!("the source verifies") };
 	// And what it produced is the archive the kernel unpacks, with both programs under the names
 	// the list gave them rather than the paths they were read from.
 	let package = crate::Package::parse(&archive).expect("the archive parses");
@@ -1094,7 +1094,7 @@ fn an_invalid_source_is_invalid_whichever_order_the_sources_are_tried_in() {
 		let mut verdicts = alloc::vec::Vec::new();
 		for source in order {
 			let mut fs = FakeSource::new(source);
-			verdicts.push(assemble(&mut fs, vouches));
+			verdicts.push(assemble(|path| fs.read(path), vouches));
 		}
 		assert!(verdicts.iter().any(|v| matches!(v, Selection::Invalid(Refusal::NoManifest))), "the bad source refuses either way");
 		assert!(verdicts.iter().any(|v| matches!(v, Selection::Verified(_))), "and the good one verifies either way");

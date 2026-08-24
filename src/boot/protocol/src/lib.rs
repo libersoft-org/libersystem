@@ -22,6 +22,8 @@ extern crate std;
 pub mod elf;
 
 pub mod boot_manifest;
+// The signed boot manifest, version 2: the same question the text one answers, plus who says so.
+pub mod manifest;
 pub mod sha256;
 
 // The written rule for whether a candidate library may replace an installed provider in a

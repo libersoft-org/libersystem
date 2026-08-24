@@ -270,27 +270,36 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	}
 
 	fn bootstrap_from_boot_medium(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) {
-		if unsafe { BOOTSTRAP }.is_some() {
+		if unsafe { BOOTSTRAP }.is_some() || unsafe { BOOTSTRAP_REFUSED }.is_some() {
 			return;
 		}
 		if let Some(root) = root {
 			let mut volume = FirmwareVolume { bs, root };
-			if let Some(archive) = blockio::assemble_bootstrap(&mut volume)
+			match blockio::assemble_bootstrap(&mut volume) {
 				// RETURN ONLY WHEN THE RETAIN SUCCEEDED. This returned either way, so an
 				// allocation failure here skipped the FAT scan that would have answered.
-				&& let Some(retained) = retain(bs, &archive)
-			{
-				unsafe {
-					BOOTSTRAP = Some(retained);
-					BOOTSTRAP_SOURCE = SOURCE_BOOT_MEDIUM;
+				abi::bootstrap::Selection::Verified(archive) => {
+					if let Some(retained) = retain(bs, &archive) {
+						unsafe {
+							BOOTSTRAP = Some(retained);
+							BOOTSTRAP_SOURCE = SOURCE_BOOT_MEDIUM;
+						}
+						return;
+					}
 				}
-				return;
+				// SELECTED AND FAILED. There is no path from here to another source.
+				abi::bootstrap::Selection::Invalid(reason) => {
+					unsafe { BOOTSTRAP_REFUSED = Some(reason) };
+					return;
+				}
+				// Not a boot source at all; the scan below may find one.
+				abi::bootstrap::Selection::Unavailable => {}
 			}
 		}
 		with_boot_medium(bs, |disk| {
 			let Some(mut fs) = fat::FatFs::mount(disk) else { return false };
 			match blockio::assemble_bootstrap(&mut fs) {
-				Some(archive) => unsafe {
+				abi::bootstrap::Selection::Verified(archive) => unsafe {
 					// A retain that fails is not an answer, so the scan goes on rather than
 					// stopping on a medium that gave nothing.
 					match retain(bs, &archive) {
@@ -302,8 +311,14 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 						None => false,
 					}
 				},
+				// SELECTED AND FAILED. The scan stops: a medium that names programs and cannot be
+				// checked is not one to look past.
+				abi::bootstrap::Selection::Invalid(reason) => {
+					unsafe { BOOTSTRAP_REFUSED = Some(reason) };
+					true
+				}
 				// A FAT volume without a bootstrap list is not the boot medium; the next might be.
-				None => false,
+				abi::bootstrap::Selection::Unavailable => false,
 			}
 		});
 	}
@@ -330,6 +345,13 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		// Every source has been tried, so this names a machine that cannot boot rather than one
 		// taking a slower path. The kernel is loaded and will say the same thing again.
 		None => arch::serial::write_str("loader: NO bootstrap list on the system volume, the live image or the boot medium\n"),
+	}
+	// A SELECTED SOURCE THAT FAILED ENDS THE BOOT, and it ends it HERE rather than by handing a
+	// kernel a set nobody checked. The same shape as the kernel's own manifest failure two hundred
+	// lines up: the panic handler writes to serial and hangs, which is what fail-closed looks like
+	// on a machine with no operator.
+	if let Some(reason) = unsafe { BOOTSTRAP_REFUSED } {
+		panic!("loader: a boot source was selected and failed its manifest ({reason:?}) - refusing to hand off");
 	}
 	#[cfg(target_arch = "x86_64")]
 	arch::hand_off(bs, image_handle, system_table, root, kernel);
@@ -362,6 +384,12 @@ pub(crate) static mut BOOTSTRAP: Option<&'static [u8]> = None;
 // last one looks identical to a boot that used the first unless it says so - which is the same
 // reason the kernel read is reported.
 static mut BOOTSTRAP_SOURCE: &str = "";
+// A SOURCE THAT REFUSED, WHICH IS NOT A SOURCE THAT WAS ABSENT.
+//
+// Once one is seen the search stops and the boot does not continue: there is no path from "this
+// medium named programs and its manifest refused them" to "try the next one". A fallback is another
+// source a signed policy permits, and "try everything until something boots" is not a policy.
+static mut BOOTSTRAP_REFUSED: Option<abi::bootstrap::Refusal> = None;
 pub(crate) const SOURCE_SYSTEM_VOLUME: &str = "the system volume";
 const SOURCE_LIVE_IMAGE: &str = "the live medium's volume image";
 const SOURCE_BOOT_MEDIUM: &str = "the boot medium (the system volume did not answer)";
@@ -423,11 +451,13 @@ pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) 
 		return;
 	}
 	let Ok(mut fs) = liberfs::LiberFs::mount(blockio::ImageDisk { bytes }) else { return };
-	if let Some(archive) = blockio::assemble_bootstrap(&mut fs) {
-		unsafe {
+	match blockio::assemble_bootstrap(&mut fs) {
+		abi::bootstrap::Selection::Verified(archive) => unsafe {
 			BOOTSTRAP = retain(bs, &archive);
 			BOOTSTRAP_SOURCE = SOURCE_LIVE_IMAGE;
-		}
+		},
+		abi::bootstrap::Selection::Invalid(reason) => unsafe { BOOTSTRAP_REFUSED = Some(reason) },
+		abi::bootstrap::Selection::Unavailable => {}
 	}
 }
 
@@ -453,11 +483,13 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 	// The bootstrap set, packed into the archive format the kernel already unpacks. This is
 	// what retires `init.pkg` as an artifact: the same bytes reach the kernel, assembled from
 	// files that exist on the volume rather than from a package built beside it.
-	if let Some(archive) = blockio::assemble_bootstrap(&mut fs) {
-		unsafe {
+	match blockio::assemble_bootstrap(&mut fs) {
+		abi::bootstrap::Selection::Verified(archive) => unsafe {
 			BOOTSTRAP = retain(bs, &archive);
 			BOOTSTRAP_SOURCE = SOURCE_SYSTEM_VOLUME;
-		}
+		},
+		abi::bootstrap::Selection::Invalid(reason) => unsafe { BOOTSTRAP_REFUSED = Some(reason) },
+		abi::bootstrap::Selection::Unavailable => {}
 	}
 	// A LiberFS volume without this file is still the system volume; a second one is not going to
 	// be more right. Stop rather than read the same name off another disk, which is how a machine
