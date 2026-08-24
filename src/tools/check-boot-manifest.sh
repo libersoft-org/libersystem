@@ -88,9 +88,8 @@ check_staging_dir() {
 	done < <(list_paths "$list")
 }
 
-# A FAT boot medium. Its manifest must cover the kernel as well: what is staged there is the
-# STRIPPED build, a different sequence of bytes from the volume's kernel, and the loader reads it
-# from here.
+# A FAT boot medium. Its manifest must cover the kernel as well: this is an independently staged
+# copy, and the loader reads it from here rather than through the volume's manifest.
 check_fat_medium() {
 	local image="$1"
 	local what="boot medium $(basename "$image")"

@@ -18,6 +18,7 @@
 #   SERIAL=   QEMU serial backend (default mon:stdio; e.g. file:boot.log or stdio)
 #   SMP=N     override core/hart count (default: nproc, with arch-specific caps)
 #   MEM=      override RAM (default varies by arch)
+#   STRIP=    none | debug | all for a harness-created boot medium (default: all)
 #   DISPLAYS= space-separated list of vnc and/or spice (empty = headless)
 #   VNC_ADDR= VNC bind address and display (default 0.0.0.0:0 - every interface, unauthenticated)
 #   SPICE_PORT= SPICE TCP port (default 5930)
@@ -531,11 +532,13 @@ qemu_build_esp() {
 	local kernel="$2"
 	local loader_efi="$3"
 	local boot_name="$4"
+	local strip="${STRIP:-all}"
 	scratch_sweep "$QEMU_BUILD_DIR/esp-${arch}" .img
-	scratch_sweep "$QEMU_BUILD_DIR/kernel-${arch}" .stripped
+	scratch_sweep "$QEMU_BUILD_DIR/kernel-${arch}" .staged
 	ESP="$QEMU_BUILD_DIR/esp-${arch}.$$.img"
-	STAGED_KERNEL="$QEMU_BUILD_DIR/kernel-${arch}.$$.stripped"
-	llvm-strip --strip-debug -o "$STAGED_KERNEL" "$kernel" 2>/dev/null || cp "$kernel" "$STAGED_KERNEL"
+	STAGED_KERNEL="$QEMU_BUILD_DIR/kernel-${arch}.$$.staged"
+	KERNEL_STRIP_TOOL=llvm-strip "$REPO_ROOT/src/tools/stage-kernel.sh" \
+		"$strip" "$kernel" "$STAGED_KERNEL"
 	local esp_mb=$((($(stat -c%s "$STAGED_KERNEL") + $(stat -c%s "$loader_efi")) / 1048576 + 16))
 	rm -f "$ESP"
 	truncate -s "${esp_mb}M" "$ESP"
@@ -559,8 +562,8 @@ qemu_build_esp() {
 	fi
 	# AND THE MANIFEST FOR THIS MEDIUM. The loader checks what it reads against the manifest of the
 	# source it read it from, so a medium with files and no manifest is one it refuses. The kernel
-	# row is computed over the STRIPPED copy staged above - a different sequence of bytes from the
-	# volume's kernel, so the volume's digest for it would be wrong here.
+	# row is computed over the independently staged copy above. The volume's digest does not cover
+	# this source, even when the selected staging policy happens to produce the same bytes.
 	local manifest="$QEMU_BUILD_DIR/boot.manifest.$$"
 	if [[ -d "$bootstrap" ]]; then
 		cp "$bootstrap/etc/boot.manifest" "$manifest"
@@ -579,9 +582,8 @@ qemu_build_esp() {
 
 # The SIGNED manifest for the boot medium, beside the text one.
 #
-# THE KERNEL HERE IS THE STRIPPED BUILD, which is a different sequence of bytes from the volume's -
-# so this medium needs a manifest over what actually sits on it, exactly as the text one does. What
-# the signature adds is who said so.
+# THE KERNEL HERE IS THIS MEDIUM'S STAGED COPY, so this medium needs a manifest over what actually
+# sits on it, exactly as the text one does. What the signature adds is who said so.
 #
 # Signed with the published test key, through the tool that owns it. A build that cannot sign is a
 # build that stops here rather than staging a medium whose signed manifest is missing or stale.

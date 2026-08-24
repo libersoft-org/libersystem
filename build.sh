@@ -142,9 +142,15 @@ step_packages() {
 # volume took whatever the previous recipe had left there - and a disk image built after a test run
 # carried the TEST kernel and booted into the suite. Naming the file removes the slot from the path.
 step_volume() {
-	local arch="$1" with_kernel="${2:-0}" args=("$arch" system-volume)
+	local arch="$1" with_kernel="${2:-0}" kernel_strip="${3:-none}" args=("$arch" system-volume)
 	if [[ "$with_kernel" == "1" ]]; then
-		args+=("--with-kernel=$BUILD_DIR/cargo/kernel/$(target_triple "$arch")/debug/kernel")
+		local source_kernel="$BUILD_DIR/cargo/kernel/$(target_triple "$arch")/debug/kernel"
+		local staged_kernel="$BUILD_DIR/boot/kernel-volume-$arch-$kernel_strip"
+		local strip_tool="objcopy"
+		[[ "$arch" == "x86_64" ]] || strip_tool="llvm-strip"
+		KERNEL_STRIP_TOOL="$strip_tool" "$SRC_DIR/tools/stage-kernel.sh" \
+			"$kernel_strip" "$source_kernel" "$staged_kernel"
+		args+=("--with-kernel=$staged_kernel")
 	fi
 	note "volume ($arch)"
 	(cd "$SRC_DIR/tools/mkpackages" && cargo run --quiet -- "${args[@]}")
@@ -267,7 +273,7 @@ for arch in "${archs[@]}"; do
 	# wants it absent, because the suite boots a different kernel staged on the ESP and the loader
 	# prefers the volume's. Putting it there during an ordinary build made `./test.sh` boot the
 	# SHIPPING kernel into an interactive shell and time out after fifteen minutes.
-	wants volume && ensure step_volume "$arch" "$kernel_on_volume"
+	wants volume && ensure step_volume "$arch" "$kernel_on_volume" "${LIBER_KERNEL_STRIP:-none}"
 	# Record that a build ran over the sources as they stand now.
 	#
 	# `./test.sh` refuses a build older than its sources, which is right - it caught two stale

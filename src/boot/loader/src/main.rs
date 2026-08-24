@@ -575,8 +575,8 @@ pub(crate) fn read_boot_file(bs: *mut BootServices, root: Option<*mut uefi::File
 // verified path nothing walks and an unverified one everything walks is worse than neither, because
 // the milestone can be read as done.
 //
-// The medium's manifest is not the volume's copy. The kernel staged on a boot medium is the
-// STRIPPED build, so its digest is computed where it is staged - see `stage_boot_manifest`.
+// The medium's manifest is not the volume's copy. Its kernel is staged independently, so its digest
+// is computed where it is staged - see `stage_boot_manifest`.
 // WHAT WAS VERIFIED, SAID OUT LOUD AND NOT PUT IN `BootInfo`.
 //
 // The kernel does not need trust metadata: this is a loader-owned decision, taken before the

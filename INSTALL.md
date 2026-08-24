@@ -103,7 +103,7 @@ Attaches to a live run and snaps the current frame; otherwise boots a throwaway 
 ./image.sh --format iso                  # Live CD
 ./image.sh --format img --size 1G        # installed system (default 128M)
 ./image.sh --format qcow2                # the same disk, stored sparsely
-./image.sh --format iso --strip all      # smaller: drop the symbol table too
+./image.sh --format iso --strip none     # development ISO with full kernel debug data
 ```
 
 Written to `.build/boot/` as `libersystem.iso`, `libersystem.img` and `libersystem.qcow2`.
@@ -112,7 +112,11 @@ Written to `.build/boot/` as `libersystem.iso`, `libersystem.img` and `libersyst
 
 **IMG is an installed system.** Two partitions - an ESP with the loader and a recovery copy of the bootstrap programs, and a LiberFS system volume with the kernel and everything else. The loader finds the volume by its superblock rather than by device order, so it boots whatever else is attached.
 
-Size suffixes are truncate's: `1G`, not `1GB`. Stripping never affects booting, only image size.
+Size suffixes are truncate's: `1G`, not `1GB`. Images use `--strip all` by default: DWARF and the
+kernel symbol table are omitted from the medium, while the unstripped build artifact remains under
+`.build/cargo/kernel/`. Use `--strip none` for a development image that should carry the complete
+kernel, or `--strip debug` to drop DWARF but retain the symbol table. Stripping never affects booting,
+only the diagnostics retained on the medium and its physical size.
 
 ```sh
 sudo dd if=.build/boot/libersystem.img of=/dev/sdX bs=4M conv=fsync status=progress

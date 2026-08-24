@@ -12,13 +12,14 @@ FORMATS_ALL="iso img qcow2"
 
 help() {
 	usage_and_exit <<EOF
-usage: image.sh [--format FMT[,FMT...]] [--size SIZE] [--strip debug|all]
+usage: image.sh [--format FMT[,FMT...]] [--size SIZE] [--strip none|debug|all]
 
 Builds bootable images into .build/boot/. With no --format: all three formats.
 
   --format FMT   iso | img | qcow2 | all      (default: all)
   --size SIZE    disk size for img/qcow2, truncate-style: 128M, 1G   (default: 128M)
-  --strip LEVEL  debug (drop DWARF, keep symbols) or all (smallest)  (default: debug)
+  --strip LEVEL  none (keep full debug kernel), debug (drop DWARF, keep symbols), or all (smallest)
+                                                                  (default: all)
   -h, --help     this text
 
 formats:
@@ -31,7 +32,7 @@ formats:
 examples:
   ./image.sh                              # ISO, IMG and QCOW2
   ./image.sh --format img --size 1G
-  ./image.sh --format iso --strip all
+  ./image.sh --format iso --strip none    # development image with full kernel debug data
 
 Note the size suffix is truncate's: 1G, not 1GB.
 EOF
@@ -39,7 +40,7 @@ EOF
 
 formats=()
 size="128M"
-strip="debug"
+strip="all"
 
 while [[ $# -gt 0 ]]; do
 	case "$1" in
@@ -59,7 +60,7 @@ while [[ $# -gt 0 ]]; do
 		;;
 	--strip)
 		[[ $# -ge 2 ]] || die "--strip needs a value"
-		[[ "$2" == debug || "$2" == all ]] || die "strip level must be 'debug' or 'all'"
+		[[ "$2" == none || "$2" == debug || "$2" == all ]] || die "strip level must be 'none', 'debug' or 'all'"
 		strip="$2"
 		shift 2
 		;;
@@ -72,7 +73,7 @@ done
 # Every image needs the whole system built first, and the volume needs the kernel on it.
 # --kernel-on-volume: a shipping medium's loader reads the kernel off the system volume, which is
 # what P02M0108 set out to do. Builds leave it off so a test run's ESP kernel is the one that boots.
-"$REPO_ROOT/build.sh" --arch x86_64 --kernel-on-volume >&2
+LIBER_KERNEL_STRIP="$strip" "$REPO_ROOT/build.sh" --arch x86_64 --kernel-on-volume >&2
 
 kernel="$BUILD_DIR/cargo/kernel/x86_64-unknown-none/debug/kernel"
 [[ -f "$kernel" ]] || die "no kernel at $kernel"

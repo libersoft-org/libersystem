@@ -212,13 +212,16 @@ def build_command(target):
 	return [BUILD_SH, '--arch', target]
 
 
-def image_command():
+def image_command(strip=None):
 	if not os.path.exists(IMAGE_SH):
 		die(f'{IMAGE_SH} is missing - the lab assembles the boot image through it')
 	# The persistent and interactive lab guests boot only the ISO. image.sh performs the required
 	# x86_64 build first, so this is the complete pre-boot production step without also creating the
 	# raw and QCOW2 outputs that an interactive run does not use.
-	return [IMAGE_SH, '--format', 'iso']
+	command = [IMAGE_SH, '--format', 'iso']
+	if strip is not None:
+		command += ['--strip', strip]
+	return command
 
 
 BUILD = os.path.join(BUILD_ROOT, 'boot')
@@ -1144,7 +1147,7 @@ def cmd_dev_up(args):
 	# fingerprints `init-x86_64.pkg`, and `scenario-cold` exists precisely because the other two
 	# have no persistent instance to be.
 	try:
-		build = subprocess.run(image_command(), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, timeout=build_timeout)
+		build = subprocess.run(image_command('none'), cwd=SRC, env=env, stdout=qemu_log, stderr=qemu_log, timeout=build_timeout)
 	except subprocess.TimeoutExpired:
 		os.close(lock_fd)
 		die(f'the development image build did not finish within {build_timeout} s (see {DEV_QEMU_LOG})')
@@ -2851,7 +2854,7 @@ def cmd_scenario_cold(args):
 		except scenario.ScenarioError as error:
 			die(str(error))
 
-	env = dict(os.environ, LIBER_DEVELOPMENT='1')
+	env = dict(os.environ, LIBER_DEVELOPMENT='1', STRIP='none')
 	build_timeout = arg_value(args, '--build-timeout', 3600)
 	print(f'lab: building {target} with the development profile')
 	# Bounded, and its whole group is stopped on expiry. A cross build for an emulated target is the

@@ -19,9 +19,10 @@
 # `size` (img only) accepts truncate-style suffixes (e.g. 64M, 1G); default 64M.
 #
 # STRIP env var selects how much is stripped from the staged kernel:
-#   STRIP=debug  (default) drop only the DWARF debug info (keeps the symbol table)
-#   STRIP=all              also drop the symbol table for the smallest image
-# Both only remove non-loadable sections, so booting is unaffected either way.
+#   STRIP=none             keep the complete kernel, including DWARF and the symbol table
+#   STRIP=debug            drop only the DWARF debug info (keeps the symbol table)
+#   STRIP=all    (default) drop DWARF and the symbol table for the smallest image
+# Stripping removes only non-loadable sections, so all three modes boot the same PT_LOAD segments.
 #
 # The artifact is written to .build/boot/<product-slug>.{iso,img}; its path is
 # printed to stdout (progress goes to stderr) so callers can capture it.
@@ -131,22 +132,21 @@ die() {
 	exit 1
 }
 
-# resolve the strip level (STRIP=debug|all) to an objcopy flag, once and up front
-STRIP="${STRIP:-debug}"
+# Resolve the strip level once and up front. `none` deliberately copies the ELF byte-for-byte rather
+# than running it through objcopy: a development image should carry exactly the kernel Cargo linked.
+STRIP="${STRIP:-all}"
 case "$STRIP" in
-debug) STRIP_FLAG="--strip-debug" ;;
-all) STRIP_FLAG="--strip-all" ;;
-*) die "invalid STRIP='$STRIP' (expected 'debug' or 'all')" ;;
+none | debug | all) ;;
+*) die "invalid STRIP='$STRIP' (expected 'none', 'debug' or 'all')" ;;
 esac
 
-# stage the kernel for an image: strip it per STRIP_FLAG. The loader loads only
-# the PT_LOAD segments and GDB reads symbols from the on-disk build, so the
-# stripped sections are dead weight in a bootable image. Prints the staged path on stdout.
+# Stage the kernel for an image. The loader reads only PT_LOAD segments; the optional DWARF and
+# symbol-table sections are retained solely when a development image asks for them. Prints the
+# staged path on stdout.
 stage_kernel() {
 	local src="$1" out="$BUILD/kernel"
-	mkdir -p "$BUILD"
-	objcopy "$STRIP_FLAG" "$src" "$out"
-	info "kernel: stripped ($STRIP) $(stat -c %s "$src") -> $(stat -c %s "$out") bytes"
+	"$REPO_ROOT/src/tools/stage-kernel.sh" "$STRIP" "$src" "$out"
+	info "kernel: staged ($STRIP) $(stat -c %s "$src") -> $(stat -c %s "$out") bytes"
 	echo "$out"
 }
 
@@ -216,8 +216,8 @@ stage_bootstrap_files() {
 #
 # The loader checks every file it reads against the manifest of THE SOURCE IT READ IT FROM, so a
 # medium the loader may boot needs one of its own - and it cannot simply be the volume's copy,
-# because the kernel staged here is the STRIPPED build. That is a different sequence of bytes from
-# the volume's kernel, so the volume's digest for it would refuse every boot from this medium.
+# because the kernel staged here belongs to this medium. It may have been transformed independently
+# from the volume's copy, so the volume's digest is not evidence for the bytes on this source.
 #
 # The kernel row is therefore computed here, over the file that was actually copied in. The
 # bootstrap rows come from the set's own manifest when the medium carries the set; a medium that
@@ -245,8 +245,7 @@ stage_boot_manifest() {
 #
 # THE SAME FILES, AND WHO SAYS SO. The text manifest proves the content matches what is next to it;
 # this proves it came from a build holding the key. Signed through the tool that owns the key, over
-# the kernel that was actually copied in - which is the stripped one, and a different sequence of
-# bytes from the volume's.
+# the kernel that was actually copied into this medium, after its selected staging policy.
 #
 # A medium without a bootstrap set gets a manifest with the kernel alone: still a source that can be
 # checked rather than one the loader has to take on trust.
@@ -600,7 +599,7 @@ image_input_key() {
 	# BOTH payloads are hashed, whichever medium is being built: the shipping ISO carries the
 	# system volume and the test ISO the archive, and keying on only one would serve a stale image
 	# whenever the other changed. `mode=` above already separates the two outputs.
-	sha256sum "$0" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg" "$BUILD/volume-x86_64.pkg" "$BUILD/system-volume-x86_64.img"
+	sha256sum "$0" "$REPO_ROOT/src/tools/stage-kernel.sh" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg" "$BUILD/volume-x86_64.pkg" "$BUILD/system-volume-x86_64.img"
 }
 
 key="$(image_input_key | sha256sum | awk '{print $1}')"
