@@ -357,6 +357,15 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// installed system's partition does.
 	unsafe { LIVE_VOLUME = read_boot_file(bs, root, LIVE_VOLUME_FILE) };
 	if let Some(image) = unsafe { LIVE_VOLUME } {
+		// COVERED BEFORE IT IS MOUNTED OR PUBLISHED. This image is handed to the kernel as a module
+		// and read as a filesystem here; both are decisions taken on its contents, so the medium's
+		// manifest has to have vouched for the whole of it first. A medium with only the text
+		// manifest keeps what it had - integrity, and nothing about origin.
+		if let Some(manifest) = boot_medium_manifest(bs, root)
+			&& !blockio::covered_by(&manifest, bootproto::manifest::KIND_SYSTEM_VOLUME, LIVE_VOLUME_FILE.as_bytes(), image)
+		{
+			panic!("loader: the live system volume is not what the boot medium's signed manifest records");
+		}
 		bootstrap_from_image(bs, image);
 	}
 
@@ -602,19 +611,29 @@ fn write_hex32(value: u32) {
 	}
 }
 
+// The boot medium's SIGNED manifest, verified, or None when it carries none.
+//
+// ONE PLACE, because two call sites read it: the kernel, and the system volume image the medium
+// hands the kernel as a module. Reading it twice would be two chances to check different things
+// against different manifests.
+fn boot_medium_manifest(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) -> Option<bootproto::manifest::Manifest<'static>> {
+	let signed = read_boot_file(bs, root, "etc/boot.manifest2")?;
+	let mut scratch = alloc::vec::Vec::new();
+	if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + signed.len()).is_err() {
+		panic!("loader: no room to verify the boot medium's signed manifest");
+	}
+	scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
+	let Some(manifest) = trust::verify(signed, &mut scratch) else {
+		panic!("loader: the boot medium's signed manifest was refused - see the line above");
+	};
+	Some(manifest)
+}
+
 fn read_verified_kernel_from_boot_medium(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) -> &'static [u8] {
 	let bytes = read_boot_file(bs, root, KERNEL_FILE).expect("loader: cannot read kernel");
 	// THE SIGNED MANIFEST WHEREVER THE MEDIUM HAS ONE, as on the system volume, and for the same
 	// reason: the check happens before these bytes are parsed as an ELF or copied anywhere.
-	if let Some(signed) = read_boot_file(bs, root, "etc/boot.manifest2") {
-		let mut scratch = alloc::vec::Vec::new();
-		if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + signed.len()).is_err() {
-			panic!("loader: no room to verify the boot medium's signed manifest");
-		}
-		scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
-		let Some(manifest) = trust::verify(signed, &mut scratch) else {
-			panic!("loader: the boot medium's signed manifest was refused - see the line above");
-		};
+	if let Some(manifest) = boot_medium_manifest(bs, root) {
 		if !blockio::covered_by(&manifest, bootproto::manifest::KIND_KERNEL, KERNEL_FILE.as_bytes(), bytes) {
 			panic!("loader: the kernel is not what the boot medium's SIGNED manifest records");
 		}

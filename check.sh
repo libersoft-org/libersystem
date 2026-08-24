@@ -25,6 +25,9 @@ declare -A GATES=(
 	# P02M0150's gate: the two trust profiles differ in the BINARY. The test key's private half is
 	# published on purpose, which is exactly why a release loader must contain none of it.
 	["trust-profile"]="tools/check-trust-profile.sh"
+	# P02M0150's other gate: the boot that must NOT happen. One successful signed boot proves the
+	# pieces fit; only a refused one proves the check is load-bearing.
+	["signed-boot"]="tools/check-signed-boot.sh"
 	# The other configuration of the same source, compiled. `development-gate` above checks which
 	# artifacts a configuration STAGES; it never builds the one it is guarding, and the profile it
 	# guards stopped compiling twice in one release without anything noticing.

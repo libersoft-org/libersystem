@@ -46,6 +46,23 @@ fn verify_artifacts() {
 	}
 }
 
+// The release this build is, out of the one file that holds it.
+//
+// NOT `CARGO_PKG_VERSION`. This crate has no version - the tree's rule is that the product version
+// lives only in `product.conf` - so that macro answers "0.0.0", and a volume whose signed manifest
+// named 0.0.0 beside a boot medium naming 0.0.1 is a boot made of two release identities. Which is
+// exactly what the milestone's "the selected kernel and bootstrap must come from the same signed
+// release" forbids, discovered by reading the two lines a boot printed.
+fn product_version() -> String {
+	let conf = fs::read_to_string(repo_root().join("product.conf")).expect("product.conf");
+	for line in conf.lines() {
+		if let Some(value) = line.strip_prefix("PRODUCT_VERSION=") {
+			return value.trim().trim_matches('"').to_string();
+		}
+	}
+	panic!("product.conf names no PRODUCT_VERSION")
+}
+
 // The repository root, found by walking up for `product.conf` rather than by counting `..`
 // segments from wherever this binary happens to live.
 fn repo_root() -> PathBuf {
@@ -504,6 +521,7 @@ fn arch_of_build() -> u8 {
 // against. A failure here stops the build, because a volume staged with a manifest that does not
 // verify is a volume whose next boot refuses it.
 fn signed_manifest(files: &[(String, Vec<u8>)], arch: u8) -> Vec<u8> {
+	let release = product_version();
 	let covered: Vec<&(String, Vec<u8>)> = files.iter().filter(|(name, _)| name != "etc/boot.manifest" && name != "etc/boot.manifest2").collect();
 	let mut rows: Vec<bootproto::manifest::Row<'_>> = covered
 		.iter()
@@ -522,7 +540,7 @@ fn signed_manifest(files: &[(String, Vec<u8>)], arch: u8) -> Vec<u8> {
 			digest: bootproto::sha256::digest(bytes),
 		})
 		.collect();
-	let header = bootproto::manifest::Header { key_id: sign_manifest::TEST_KEY_ID, product: b"LiberSystem", arch, source_kind: bootproto::manifest::SOURCE_SYSTEM_VOLUME, release: env!("CARGO_PKG_VERSION").as_bytes(), volume_uuid: [0; 16] };
+	let header = bootproto::manifest::Header { key_id: sign_manifest::TEST_KEY_ID, product: b"LiberSystem", arch, source_kind: bootproto::manifest::SOURCE_SYSTEM_VOLUME, release: release.as_bytes(), volume_uuid: [0; 16] };
 	sign_manifest::sign_with_test_key(&header, &mut rows).unwrap_or_else(|e| panic!("mkpackages: the signed manifest could not be made: {e}"))
 }
 

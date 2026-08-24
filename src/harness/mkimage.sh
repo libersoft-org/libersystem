@@ -225,7 +225,7 @@ stage_bootstrap_files() {
 # manifest with the kernel alone, which is still a source that can be checked rather than one the
 # loader has to take on trust.
 stage_boot_manifest() {
-	local image="$1" staged_kernel="$2" arch="${3:-}"
+	local image="$1" staged_kernel="$2" arch="${3:-}" payload="${4:-}" payload_name="${5:-}"
 	local out="$BUILD/boot.manifest.$$"
 	if [[ -n "$arch" ]]; then
 		cp "$BUILD/bootstrap-${arch}/etc/boot.manifest" "$out"
@@ -238,7 +238,7 @@ stage_boot_manifest() {
 	stamp_epoch "$out"
 	mcopy -i "$image" "$out" ::/etc/boot.manifest
 	rm -f "$out"
-	stage_signed_boot_manifest "$image" "$staged_kernel" "$arch"
+	stage_signed_boot_manifest "$image" "$staged_kernel" "$arch" "$payload" "$payload_name"
 }
 
 # The SIGNED manifest for this medium, beside the text one.
@@ -251,11 +251,20 @@ stage_boot_manifest() {
 # A medium without a bootstrap set gets a manifest with the kernel alone: still a source that can be
 # checked rather than one the loader has to take on trust.
 stage_signed_boot_manifest() {
-	local image="$1" staged_kernel="$2" arch="$3"
+	local image="$1" staged_kernel="$2" arch="$3" payload="${4:-}" payload_name="${5:-}"
 	local out="$BUILD/boot.manifest2.$$"
 	local release
 	release="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p' "$REPO_ROOT/product.conf" | head -1)"
 	local -a rows=(--row "kernel:kernel=$staged_kernel")
+	# THE PAYLOAD THIS MEDIUM CARRIES, whichever of the two it is. A boot medium that hands the
+	# kernel a system volume as a module is a medium whose manifest has to cover that whole image -
+	# otherwise the one artifact the loader publishes untouched is the one nothing vouched for.
+	if [[ -n "$payload" && -f "$payload" ]]; then
+		case "$payload_name" in
+		system-volume.img) rows+=(--row "system-volume:$payload_name=$payload") ;;
+		*) rows+=(--row "package:$payload_name=$payload") ;;
+		esac
+	fi
 	if [[ -n "$arch" && -d "$BUILD/bootstrap-${arch}" ]]; then
 		rows+=(--row "bootstrap-list:etc/bootstrap.list=$BUILD/bootstrap-${arch}/etc/bootstrap.list")
 		local program
@@ -397,9 +406,9 @@ make_iso() {
 	# names its own programs, and a medium whose volume is unreadable has nothing else to boot.
 	if [[ "$test_medium" == "1" ]]; then
 		stage_bootstrap_files "$efi_img" x86_64
-		stage_boot_manifest "$efi_img" "$staged" x86_64
+		stage_boot_manifest "$efi_img" "$staged" x86_64 "$payload" "$payload_name"
 	else
-		stage_boot_manifest "$efi_img" "$staged"
+		stage_boot_manifest "$efi_img" "$staged" "" "$payload" "$payload_name"
 		# THE SHIPPING MEDIUM ONLY. It carries the system volume as a file on this same filesystem,
 		# so naming that volume is true of it. The TEST medium carries the factory archive and no
 		# volume at all - a pairing file there would name a volume the medium does not have, which
