@@ -12,14 +12,13 @@
 - lico, licoedit and licoview look horrible
 - architecture audit (!!!)
 - in terminal, when I have some text in clipboard, right mouse button click should paste it (if not selected something, in this case right mouse button click copies selected text)
-- split all image and audio codecs into 3 parts - encoder, decoder, common, for example: png-common.lsidl, png-enc.lsidl, png-dec.lsidl (both dec and enc use common), make play, audioconv, audiorec, imgview, imgconv use these newly splitted libraries
+- split all image and audio codecs into 3 parts - encoder, decoder, common, for example: png-common.lslib, png-enc.lslib, png-dec.lslib (both dec and enc use common), make play, audioconv, audiorec, imgview, imgconv use these newly splitted libraries
 - create SDK not just for WASM, but for Rust and other languages too
 - h.264 codec + mp4 container + make "play" play video too (not just audio)
 - check if we have only our own implementations of image and audio decoders and encoders
-- check if image and audio decoders are separate libraries + common code
 - remove manual word wrapping in all documents - mainly milestone documents
 - find out how shared libraries work... if they are loaded in RAM just once for multiple apps using it or each app has its own instance
-- .build is a big mess, make it clean in well organized subdirectories
+- .build is a big mess, make it clean in well organized subdirectories - almost done, review
 - rename uname to sysver
 - some services in src/users/services/core/src/ have it's own folder (like graph_limits), but there is only tests.rs file while graph_limits.rs resides outside of this directory - fix it... move it to the proper directory
 - testing CD image should be different from release CD image (release should not have testing volumes like UDF, ISO etc.)

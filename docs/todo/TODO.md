@@ -223,6 +223,11 @@ or preventing further development of `v1`.
 - [ ] [P02M0147 - A full-screen program is launched without the terminal it is about to take over](P02M0147.md)
 - [x] [P02M0148 - `shutdown` tears the system down and then does not stop the machine](P02M0148.md)
 - [ ] [P02M0149 - A provider was rebuilt, its consumer was not, and only the packager noticed](P02M0149.md)
+- [ ] [P02M0150 - A digest beside a payload is not a boot trust chain](P02M0150.md)
+- [ ] [P02M0151 - The architecture boundary contains no panic-shaped compatibility contract](P02M0151.md)
+- [ ] [P02M0152 - Memory has a topology, not one global distance](P02M0152.md)
+- [ ] [P02M0153 - A DMA capability stops at the pages it names](P02M0153.md)
+- [ ] [P02M0154 - The capability transfer rules have a machine-checked bounded model](P02M0154.md)
 
 ### Definition of done (phase 2)
 

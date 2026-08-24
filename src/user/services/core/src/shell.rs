@@ -1809,8 +1809,30 @@ unsafe fn run_tool_interactive(jobs: &mut Jobs, permsvc: u64, name: &[u8], args:
 		if dup < 0 {
 			return false;
 		}
+		// AND THE TERMINAL GOES WITH THE JOB. `send_stdout` on the direct-spawn path has always
+		// duplicated this channel for an interactive child; the GOVERNED launch had no way to carry
+		// it, so every full-screen program started from this shell - `licoview`, `licoedit`, `lico`,
+		// `imgview`, `less`, `watch`, `ps -i` - ran with `tty_set_mode` answering false. They
+		// rendered, and then every key meant for them was echoed and kept by the line editor, so
+		// nothing could quit them but Ctrl+C.
+		//
+		// Send, receive, wait AND TRANSFER - the same set the stdout duplicate above carries, and
+		// transfer is not optional however narrow the intent: a handle is only SENDABLE if it
+		// carries it, and this one crosses two channels to get where it is going (this shell to the
+		// launcher, the launcher to the child). Left out, the send is refused before the request
+		// leaves this process, which the client reports as `again` - a launch that never happened
+		// and says nothing about why.
+		//
+		// Send and receive because the child asks the terminal for a mode and reads back how big it
+		// is. It cannot listen in on what this shell and the console say to each other: this is a
+		// duplicate of the shell's own control channel, not the console's end of it.
+		let control: i64 = duplicate(tty_control(), RIGHT_SEND | RIGHT_RECEIVE | RIGHT_WAIT | RIGHT_TRANSFER);
+		if control < 0 {
+			close(dup as u64);
+			return false;
+		}
 		let mut client = permission::Client::new(ChannelTransport { chan: permsvc });
-		let task: u64 = match client.run(name_str, args_str, cwd_str, &environment_snapshot(vars), &(dup as u64)) {
+		let task: u64 = match client.run_interactive(name_str, args_str, cwd_str, &environment_snapshot(vars), &(dup as u64), &(control as u64)) {
 			Some(Ok(started)) => started.task,
 			Some(Err(_)) | None => return false,
 		};

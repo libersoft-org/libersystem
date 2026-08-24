@@ -445,6 +445,7 @@ pub mod permission {
 	pub const OP_RUN: u16 = 3;
 	pub const OP_RUN_PIPELINE: u16 = 4;
 	pub const OP_RUN_WITH_FILE: u16 = 5;
+	pub const OP_RUN_INTERACTIVE: u16 = 6;
 
 	pub trait Service {
 		fn lookup(&mut self, component: String) -> Result<Manifest, Error>;
@@ -479,6 +480,32 @@ pub mod permission {
 		/// The path is checked against the caller's own reach before anything is minted: this narrows
 		/// authority and never widens it.
 		fn run_with_file(&mut self, name: String, args: String, cwd: String, file: String, writable: bool, stdout: u64) -> Result<ProcessStartResult, Error>;
+		/// Start a program AS THE FOREGROUND JOB OF A TERMINAL: the same launch as `run`, and the
+		/// caller's terminal control channel with it.
+		///
+		/// That channel is what lets a full-screen program ASK for raw input and no echo instead of
+		/// printing an escape sequence into its own output - where a program's data and its requests
+		/// were the same bytes, so `cat` on a file containing them reconfigured the terminal. Without
+		/// it `tty_set_mode` answers false and the program runs cooked: it renders, and then every key
+		/// meant for it is echoed and swallowed by the line editor. `licoview`, `licoedit`, `lico`,
+		/// `imgview`, `less`, `watch` and `ps -i` are all launched this way and none of them could be
+		/// typed at.
+		///
+		/// A SEPARATE OP RATHER THAN AN OPTIONAL HANDLE ON `run`, for two reasons. The op is where this
+		/// tree says which KIND of launch is being asked for - `run-pipeline` and `run-with-file` are
+		/// the same shape - and a caller with no terminal keeps calling `run`, unchanged. And the
+		/// generator emits the `@rights` guard only for a bare `handle<...>` parameter: expressed as
+		/// `option<handle<channel>>` the check on this capability would be silently skipped, which is
+		/// the one thing a capability boundary must not do quietly.
+		///
+		/// NOT FOR A PIPELINE STAGE OR A BACKGROUND JOB. The terminal belongs to whoever is in the
+		/// foreground, which is the caller's own bookkeeping - the shell sets it with SET_FG - and a
+		/// stage nobody is looking at must not be able to put the terminal in raw mode.
+		///
+		/// `receive` as well as `send`: the child asks the terminal how big it is and reads the answer
+		/// back on the same channel. It cannot listen to what the shell and the console say to each
+		/// other - this is a channel of the caller's own, not the console's.
+		fn run_interactive(&mut self, name: String, args: String, cwd: String, environment: Vec<EnvVar>, stdout: u64, control: u64) -> Result<ProcessStartResult, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -698,6 +725,63 @@ pub mod permission {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_RUN_INTERACTIVE => {
+				let name = r.string_lp()?;
+				let args = r.string_lp()?;
+				let cwd = r.string_lp()?;
+				let environment = {
+					let v20 = r.u16()? as usize;
+					let mut v21 = Vec::new();
+					v21.try_reserve_exact(v20).ok()?;
+					for _ in 0..v20 {
+						v21.push(EnvVar::read(r)?);
+					}
+					v21
+				};
+				let stdout = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				let control = {
+					let _ = r.u32()?;
+					r.take_handle()?
+				};
+				r.finish()?;
+				request_handles.clear();
+				let authorized = crate::codec::handle_carries(stdout, 16, 5) && crate::codec::handle_carries(control, 48, 5);
+				let result = if authorized { service.run_interactive(name, args, cwd, environment, stdout, control) } else { Err(Error::Denied) };
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v22) => {
+							w.u8(1)?;
+							v22.write(w)?;
+						}
+						Err(v23) => {
+							w.u8(0)?;
+							v23.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -890,8 +974,8 @@ pub mod permission {
 				return None;
 			}
 			w.u16(environment.len() as u16)?;
-			for v20 in environment.iter() {
-				v20.write(w)?;
+			for v24 in environment.iter() {
+				v24.write(w)?;
 			}
 			w.set_handle(*stdout)?;
 			w.u32(0)?;
@@ -931,16 +1015,16 @@ pub mod permission {
 				return None;
 			}
 			w.u16(stages.len() as u16)?;
-			for v21 in stages.iter() {
-				v21.write(w)?;
+			for v25 in stages.iter() {
+				v25.write(w)?;
 			}
 			w.bytes_lp(cwd.as_bytes())?;
 			if environment.len() > u16::MAX as usize {
 				return None;
 			}
 			w.u16(environment.len() as u16)?;
-			for v22 in environment.iter() {
-				v22.write(w)?;
+			for v26 in environment.iter() {
+				v26.write(w)?;
 			}
 			w.set_handle(*stdout)?;
 			w.u32(0)?;
@@ -1009,6 +1093,52 @@ pub mod permission {
 			}
 			decoded
 		}
+		pub fn run_interactive(&mut self, name: &str, args: &str, cwd: &str, environment: &[EnvVar], stdout: &u64, control: &u64) -> Option<Result<ProcessStartResult, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_RUN_INTERACTIVE)?;
+			w.u32(corr)?;
+			w.bytes_lp(name.as_bytes())?;
+			w.bytes_lp(args.as_bytes())?;
+			w.bytes_lp(cwd.as_bytes())?;
+			if environment.len() > u16::MAX as usize {
+				return None;
+			}
+			w.u16(environment.len() as u16)?;
+			for v27 in environment.iter() {
+				v27.write(w)?;
+			}
+			w.set_handle(*stdout)?;
+			w.u32(0)?;
+			w.set_handle(*control)?;
+			w.u32(0)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(ProcessStartResult::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1049,6 +1179,14 @@ pub mod permission {
 	fn channel_invoke_run_with_file(chan: u64, name: &str, args: &str, cwd: &str, file: &str, writable: &bool, stdout: &u64) -> Option<Result<ProcessStartResult, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.run_with_file(name, args, cwd, file, writable, stdout)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_security_permission_run_interactive")]
+	fn channel_invoke_run_interactive(chan: u64, name: &str, args: &str, cwd: &str, environment: &[EnvVar], stdout: &u64, control: &u64) -> Option<Result<ProcessStartResult, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.run_interactive(name, args, cwd, environment, stdout, control)
 	}
 }
 
@@ -1171,25 +1309,25 @@ impl Manifest {
 		out.push(',');
 		out.push_str("\"requested\":");
 		out.push('[');
-		let mut v24 = true;
-		for v23 in self.requested.iter() {
-			if !v24 {
+		let mut v29 = true;
+		for v28 in self.requested.iter() {
+			if !v29 {
 				out.push(',');
 			}
-			v24 = false;
-			v23.to_json_into(out);
+			v29 = false;
+			v28.to_json_into(out);
 		}
 		out.push(']');
 		out.push(',');
 		out.push_str("\"grants\":");
 		out.push('[');
-		let mut v26 = true;
-		for v25 in self.grants.iter() {
-			if !v26 {
+		let mut v31 = true;
+		for v30 in self.grants.iter() {
+			if !v31 {
 				out.push(',');
 			}
-			v26 = false;
-			v25.to_json_into(out);
+			v31 = false;
+			v30.to_json_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1201,25 +1339,25 @@ impl Manifest {
 		out.push_str(", ");
 		out.push_str("requested=");
 		out.push('[');
-		let mut v28 = true;
-		for v27 in self.requested.iter() {
-			if !v28 {
+		let mut v33 = true;
+		for v32 in self.requested.iter() {
+			if !v33 {
 				out.push_str(", ");
 			}
-			v28 = false;
-			v27.to_text_into(out);
+			v33 = false;
+			v32.to_text_into(out);
 		}
 		out.push(']');
 		out.push_str(", ");
 		out.push_str("grants=");
 		out.push('[');
-		let mut v30 = true;
-		for v29 in self.grants.iter() {
-			if !v30 {
+		let mut v35 = true;
+		for v34 in self.grants.iter() {
+			if !v35 {
 				out.push_str(", ");
 			}
-			v30 = false;
-			v29.to_text_into(out);
+			v35 = false;
+			v34.to_text_into(out);
 		}
 		out.push(']');
 		out.push('}');
@@ -1230,13 +1368,13 @@ impl Manifest {
 		crate::codec::cbor::text(out, &self.component);
 		crate::codec::cbor::text(out, "requested");
 		crate::codec::cbor::array(out, self.requested.len());
-		for v31 in self.requested.iter() {
-			v31.to_cbor_into(out);
+		for v36 in self.requested.iter() {
+			v36.to_cbor_into(out);
 		}
 		crate::codec::cbor::text(out, "grants");
 		crate::codec::cbor::array(out, self.grants.len());
-		for v32 in self.grants.iter() {
-			v32.to_cbor_into(out);
+		for v37 in self.grants.iter() {
+			v37.to_cbor_into(out);
 		}
 	}
 }

@@ -83,13 +83,16 @@ do = "prompt"
 #
 # The directory is named rather than left to default, because the shell routes an interactive
 # tool only when the line carries an argument: a bare `lico` is not a command it recognises.
+# THE HEADER lico DRAWS ON EVERY FULL REPAINT, quoted from what it writes. This said
+# `Tab/pointer panel`, which appears NOWHERE IN THE TREE - the same rot `input-events` carried, and
+# it could not have passed on any architecture since whenever that text was rewritten.
 [[step]]
 do = "key"
 text = "lico vol://system"
 
 [[step]]
 do = "expect"
-contains = "Tab/pointer panel"
+contains = "two-panel file manager"
 timeout = 20
 
 [[step]]
@@ -98,7 +101,7 @@ keys = ["tab"]
 
 [[step]]
 do = "expect"
-contains = "Tab/pointer panel"
+contains = "two-panel file manager"
 timeout = 20
 
 [[step]]

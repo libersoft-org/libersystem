@@ -590,7 +590,30 @@ impl Service for Manager {
 			unsafe { close(stdout) };
 			return Err(Error::Invalid);
 		}
-		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, &mut self.clients, &mut self.audit) } {
+		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, 0, &mut self.clients, &mut self.audit) } {
+			Some(started) => Ok(started),
+			None => Err(Error::NotFound),
+		}
+	}
+
+	// The same launch, and the caller's terminal with it. See the op's own comment in
+	// `security.lsidl` for why the terminal travels as a capability rather than as an escape
+	// sequence, and why this is an op of its own rather than an optional handle on `run`.
+	//
+	// THE TERMINAL IS OWNED EXACTLY THE WAY `stdout` IS, and that is deliberate. Both arrive as
+	// transfers, both are handed to `run_tool_under_manifest`, and past the point it forwards them
+	// to the child they belong to the child - so a caller that closed one on a late failure would be
+	// closing a number the kernel may already have reused. The refusal above happens BEFORE that
+	// point, which is why it is the one place both are closed here.
+	fn run_interactive(&mut self, name: String, args: String, cwd: String, environment: Vec<EnvVar>, stdout: u64, control: u64) -> Result<StartResult, Error> {
+		if !environment_is_acceptable(&environment) {
+			unsafe {
+				close(stdout);
+				close(control);
+			}
+			return Err(Error::Invalid);
+		}
+		match unsafe { run_tool_under_manifest(self.procsvc, name.as_bytes(), args.as_bytes(), cwd.as_bytes(), &environment, stdout, control, &mut self.clients, &mut self.audit) } {
 			Some(started) => Ok(started),
 			None => Err(Error::NotFound),
 		}
@@ -839,7 +862,7 @@ unsafe fn grant_dynamic(component: &[u8], cap: Capability, clients: &mut Clients
 // manifest's capabilities in vocabulary order (auditing each decision). Returns the live
 // process handle (for the caller's job control) and the per-capability decisions, or None if
 // the tool has no manifest, the argument is not a known program name, or the launch fails.
-unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], environment: &[EnvVar], stdout: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
+unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &[u8], environment: &[EnvVar], stdout: u64, control: u64, clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<StartResult> {
 	unsafe {
 		let name_str: &str = core::str::from_utf8(name).ok()?;
 		let (manager_side, child_side): (u64, u64) = channel()?;
@@ -878,6 +901,18 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		// The launch endpoints, named and ended by READY. A governed tool gets the caller's
 		// console, which is full duplex, so it reads and writes the same channel.
 		send_blocking(manager_side, CAP_STDOUT, stdout);
+		// AND THE TERMINAL, when this launch is a foreground job on one. `run` passes zero and nothing
+		// is sent; `run-interactive` passes the caller's control channel and the child finds it under
+		// `CONTROL`, which is what makes `tty_set_mode` answer true instead of false - and a
+		// full-screen program that cannot ask runs cooked, with every key meant for it swallowed by
+		// the line editor.
+		//
+		// A NAMED CAPABILITY, so its absence is not a hole in a sequence: the child takes each one by
+		// name out of the set this ends with READY, and reads zero for a name that never arrived. That
+		// is how a pipeline stage and a background job go on getting no terminal at all.
+		if control != 0 {
+			send_blocking(manager_side, CAP_CONTROL, control);
+		}
 		send_ready(manager_side);
 		if !send_launch_context(manager_side, args, cwd, environment) {
 			close(manager_side);
@@ -1342,7 +1377,7 @@ unsafe fn demonstrate_tool(procsvc: u64, name: &[u8], args: &[u8], clients: &mut
 			Some(pair) => pair,
 			None => return Vec::new(),
 		};
-		let started: StartResult = match run_tool_under_manifest(procsvc, name, args, b"", &[], console, clients, audit) {
+		let started: StartResult = match run_tool_under_manifest(procsvc, name, args, b"", &[], console, 0, clients, audit) {
 			Some(s) => s,
 			None => {
 				close(output);
