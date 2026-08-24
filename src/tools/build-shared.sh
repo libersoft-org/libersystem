@@ -24,6 +24,21 @@ if [[ "${1:-}" == "--explain" ]]; then
 fi
 selected_artifact=""
 selected_kind=""
+# `--verify-staged <target>`: answer the staged-tree question and nothing else.
+#
+# The check below runs at the end of every library phase, where it belongs. It is reachable on its
+# own too because the state it looks for is one a person meets after an interrupted or partial build
+# - the moment when running a full build is the very thing they are trying to avoid - and because a
+# check nobody can run against a tree by hand is one nobody can show working.
+if [[ "${1:-}" == "--verify-staged" ]]; then
+	verify_staged_only="${2:-}"
+	if [[ -z "$verify_staged_only" ]]; then
+		echo "usage: $0 --verify-staged <target>" >&2
+		exit 2
+	fi
+	shift 2
+	set -- "$verify_staged_only"
+fi
 if [[ "${1:-}" == "--artifact" ]]; then
 	selected_artifact="${2:-}"
 	if [[ -z "$selected_artifact" ]]; then
@@ -42,7 +57,9 @@ if [[ "${1:-}" == "--artifact" ]]; then
 		;;
 	esac
 fi
-if [[ -z "$selected_artifact" && $# -lt 2 ]] || [[ -n "$selected_artifact" && $# -lt 1 ]]; then
+# `--verify-staged` names a target and no crates: it compiles nothing, so a crate list would be a
+# list of things it does not read.
+if [[ -z "${verify_staged_only:-}" ]] && { [[ -z "$selected_artifact" && $# -lt 2 ]] || [[ -n "$selected_artifact" && $# -lt 1 ]]; }; then
 	echo "usage: $0 [--verbose] [--explain] [--rebuild] [--artifact <artifact>] <target> <crate>..." >&2
 	exit 2
 fi
@@ -202,6 +219,55 @@ artifact_cache_dir="$build_root/cache/$target"
 # a directory that should have been empty rather than as litter among the artifacts, and so a
 # sweep can be written without keeping a list of patterns true.
 build_scratch="$build_root/tmp"
+
+# The sha256 of the identity record inside a staged ELF - the same number a consumer records for it.
+# The note is a 20-byte ELF note header (namesz, descsz, type, "LIBER\0\0\0") followed by the record
+# and its padding, so the record is `descsz` bytes at offset 20.
+staged_identity_digest() {
+	local elf="$1" note="$2" len
+	llvm-objcopy --dump-section .note.liber.identity="$note" "$elf" /dev/null 2>/dev/null || return 1
+	len="$(od -An -tu4 -j4 -N4 "$note" | tr -d ' ')"
+	[[ -n "$len" && "$len" -gt 0 ]] || return 1
+	tail -c +21 "$note" | head -c "$len" | sha256sum | awk '{print $1}'
+}
+
+verify_staged_provider_chains() {
+	local note file artifact provider recorded expected inconsistent=0
+	local -A staged_digests=()
+	note="$(mktemp "$build_scratch/staged-identity.XXXXXX")"
+	while IFS= read -r file; do
+		artifact="$(basename "$file" .lslib)"
+		staged_digests[$artifact]="$(staged_identity_digest "$file" "$note" || true)"
+	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f 2>/dev/null | sort)
+	while IFS= read -r file; do
+		artifact="$(basename "$file" .lslib)"
+		llvm-objcopy --dump-section .note.liber.identity="$note" "$file" /dev/null 2>/dev/null || continue
+		while IFS= read -r recorded; do
+			[[ -n "$recorded" ]] || continue
+			provider="${recorded#provider=}"
+			provider="${provider%%:*}"
+			expected="${staged_digests[$provider]:-}"
+			[[ -n "$expected" ]] || continue
+			if [[ "$recorded" != "provider=$provider:$expected" ]]; then
+				echo "build-shared: $artifact was built against $provider ${recorded#provider=$provider:}, and the staged $provider is $expected" >&2
+				inconsistent=1
+			fi
+		done < <(grep -a -o 'provider=[a-z0-9_-]*:[0-9a-f]\{64\}' "$note" || true)
+	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f 2>/dev/null | sort)
+	rm -f "$note"
+	if ((inconsistent)); then
+		echo "build-shared: the staged tree for $target is inconsistent - a provider was replaced and a library that records it was not rebuilt" >&2
+		echo "build-shared: clear it and build again:  rm -rf .build/image/$target && ./build.sh --arch ${target%%-*}" >&2
+		return 1
+	fi
+}
+if [[ -n "${verify_staged_only:-}" ]]; then
+	mkdir -p "$build_scratch"
+	verify_staged_provider_chains || exit 1
+	echo "build-shared: every staged library in $target names the providers staged beside it"
+	exit 0
+fi
+
 mkdir -p "$build_scratch"
 provider_cargo_target="$build_root/cargo/provider-$target"
 cargo_target="$target"
@@ -2137,42 +2203,19 @@ done
 # EVERY STAGED LIBRARY WAS BUILT AGAINST THE PROVIDERS STAGED BESIDE IT.
 #
 # The packager asks this at the end of `./build.sh` and it is the only thing that ever noticed a
-# staged tree going inconsistent - a provider replaced while a library recording its digest was
-# left as it was, which took a full architecture rebuild to clear. By then the build has compiled a
-# kernel and assembled a volume; here the answer costs one section dump per artifact.
+# staged tree going inconsistent - a provider replaced while a library recording its digest was left
+# as it was, which took a full architecture rebuild of that target to clear. By then the build has
+# compiled a kernel and assembled a volume; here the answer costs one section dump per file.
 #
-# READ OFF THE STAGED FILES, not from what this run computed. A digest this phase is holding says
-# what it MEANT to write; the note inside the ELF on disk says what is actually there, and those two
-# disagreeing is precisely the condition being looked for.
-verify_staged_provider_chains() {
-	local artifact out note provider recorded expected inconsistent=0
-	note="$(mktemp "$build_scratch/staged-identity.XXXXXX")"
-	for artifact in "${artifacts[@]}"; do
-		out="$(library_file "$artifact")" || continue
-		[[ -f "$out" ]] || continue
-		llvm-objcopy --dump-section .note.liber.identity="$note" "$out" /dev/null 2>/dev/null || continue
-		# The provider lines are pulled straight out of the note payload rather than by parsing the
-		# ELF note header around them: the shape being checked is `provider=<name>:<64 hex>`, and a
-		# reader that can find those needs to know nothing else about the layout.
-		while IFS= read -r recorded; do
-			[[ -n "$recorded" ]] || continue
-			provider="${recorded#provider=}"
-			provider="${provider%%:*}"
-			expected="${provider_identity_digests[$provider]:-}"
-			[[ -n "$expected" ]] || continue
-			if [[ "$recorded" != "provider=$provider:$expected" ]]; then
-				echo "build-shared: $artifact was built against $provider:${recorded#provider=$provider:}, and the staged $provider is $expected" >&2
-				inconsistent=1
-			fi
-		done < <(grep -a -o 'provider=[a-z0-9_-]*:[0-9a-f]\{64\}' "$note" || true)
-	done
-	rm -f "$note"
-	if ((inconsistent)); then
-		echo "build-shared: the staged tree for $target is inconsistent - a provider was replaced and a library that records it was not rebuilt" >&2
-		echo "build-shared: clear it and build again:  rm -rf .build/image/$target && ./build.sh --arch ${target%%-*}" >&2
-		return 1
-	fi
-}
+# THE WHOLE STAGED TREE, not the artifacts this run touched. A run that rebuilds ONE provider - the
+# `--artifact` fast path `dev-build.sh` takes - leaves every consumer of it behind, and a check
+# scoped to what the run visited is blind to exactly that. Reading the directory answers for the
+# tree that will be packaged rather than for the subset that was compiled.
+#
+# READ OFF THE FILES, not from what this run computed: a digest held in memory says what the build
+# MEANT to write, and the note inside the ELF says what is there. Those two disagreeing is the
+# condition being looked for.
+
 verify_staged_provider_chains || exit 1
 
 # The export index and the ownership audit read only the staged provider ELFs. When every
