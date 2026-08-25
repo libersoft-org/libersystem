@@ -15,11 +15,13 @@ mod arch;
 mod console;
 mod console_input;
 mod device;
+mod dma_policy;
 mod elf;
 mod extable;
 mod fault;
 #[cfg(test)]
 mod graph;
+mod iommu;
 mod loader;
 mod mem;
 mod memlayout;
@@ -201,6 +203,10 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	arch::paging::remove_bootstrap_identity();
 	sched::init();
 	device::init();
+	// AFTER `device::init` RETURNS, not inside it. The bring-up reads the device table, and
+	// `device::init` is holding that table's lock while it fills it - a spin lock taken twice on one
+	// core is a boot that stops with no message at all, which is exactly what this did.
+	dma_policy::init();
 
 	#[cfg(test)]
 	test_main();
@@ -745,8 +751,27 @@ fn serial_rx_interrupt(_vector: u32) {
 //
 // `log` is the prefix a port's boot lines carry; `settle_rounds` is how long the readiness wait may
 // take on this machine (see `supervise`).
+// WHAT THIS MACHINE IS, printed once by every port rather than by one of them.
+//
+// Both lines are baselines: "every bus-mastering device is untranslated" and "one node, no locality"
+// are facts about the machine rather than absences of news, and a report that is always there is
+// what makes a later change worth reading. Placed in the shared tail because a report only x86
+// printed would be a report that says nothing about the ports most likely to differ.
+#[cfg(not(test))]
+fn report_machine() {
+	// The cores are bound to their nodes only now, after bring-up has established which of them
+	// answered. Firmware describes processors it believes exist; this binds the ones that are here.
+	let bound = smp::numa::bind_online();
+	if bound > 0 {
+		serial_println!("numa: {bound} of {} core(s) bound to a node", smp::cpu_count());
+	}
+	mem::numa::report();
+	dma_policy::report();
+}
+
 #[cfg(not(test))]
 pub(crate) fn boot_userspace(log: &'static str, settle_rounds: u32) {
+	report_machine();
 	const MAX_RESTARTS: u32 = 3;
 	// Pump the serial console from the scheduler's idle spin: virtio-gpu polls its
 	// display size on a short repeating timer, so run_until_idle never returns and the

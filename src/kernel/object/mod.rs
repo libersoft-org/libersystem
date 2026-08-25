@@ -15,13 +15,19 @@ pub mod handle;
 pub mod interrupt;
 pub mod memory_object;
 pub mod privilege;
+// What the implementation DID, in the vocabulary the model speaks. The sink is the conformance
+// fixture P02M0154 replays against `docs/spec/capability`; in a production build every record is an
+// empty function and the storage does not exist.
 pub mod process;
 pub mod process_group;
 pub mod rights;
 pub mod thread;
 pub mod timer;
+pub mod trace;
 pub mod wait_set;
 
+#[cfg(test)]
+pub(crate) mod capability_tcb;
 #[cfg(test)]
 pub(crate) mod tests;
 

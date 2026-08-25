@@ -73,6 +73,8 @@ static AP_INVITE: AtomicUsize = AtomicUsize::new(0);
 const AP_STACK_WORDS: usize = 4096;
 
 // Number of cores brought under kernel management.
+pub mod numa;
+
 pub fn cpu_count() -> usize {
 	CPU_COUNT.load(Ordering::Relaxed)
 }
@@ -415,16 +417,59 @@ fn madt_local_apics(rsdp_phys: u64) -> Vec<u32> {
 	};
 	let madt = if revision >= 2 && extended_ok {
 		let xsdt = unsafe { core::ptr::read_unaligned(rsdp.add(24) as *const u64) };
-		find_table(hhdm, xsdt, 8)
+		find_table(hhdm, xsdt, 8, b"APIC")
 	} else {
 		let rsdt = unsafe { core::ptr::read_unaligned(rsdp.add(16) as *const u32) } as u64;
-		find_table(hhdm, rsdt, 4)
+		find_table(hhdm, rsdt, 4, b"APIC")
 	};
 	let Some(madt) = madt else {
 		return out;
 	};
 	parse_madt(hhdm, madt, &mut out);
 	out
+}
+
+// ANY ACPI TABLE, BY SIGNATURE, as bytes this kernel may read.
+//
+// The RSDP walk is the same one SMP does for the MADT, and it is shared rather than copied: the
+// checksum rules, the revision-2 fallback and the direct-map bound are all decisions that must not
+// exist twice and drift. What differs is only which signature is wanted, and what comes back is a
+// SLICE - so the parsers above this take bytes and can be driven by a host with a table nobody's
+// firmware would produce.
+#[cfg(target_arch = "x86_64")]
+pub fn acpi_table(rsdp_phys: u64, want: &[u8; 4]) -> Option<&'static [u8]> {
+	if rsdp_phys == 0 || !mem::within_direct_map(rsdp_phys, 36) {
+		return None;
+	}
+	let hhdm = mem::hhdm_offset();
+	let rsdp = (hhdm + rsdp_phys) as *const u8;
+	let mut sum: u8 = 0;
+	for i in 0..20 {
+		sum = sum.wrapping_add(unsafe { *rsdp.add(i) });
+	}
+	if sum != 0 {
+		return None;
+	}
+	let revision = unsafe { *rsdp.add(15) };
+	let extended_ok = revision < 2 || {
+		let mut sum: u8 = 0;
+		for i in 0..36 {
+			sum = sum.wrapping_add(unsafe { *rsdp.add(i) });
+		}
+		sum == 0
+	};
+	let found = if revision >= 2 && extended_ok {
+		let xsdt = unsafe { core::ptr::read_unaligned(rsdp.add(24) as *const u64) };
+		find_table(hhdm, xsdt, 8, want)
+	} else {
+		let rsdt = unsafe { core::ptr::read_unaligned(rsdp.add(16) as *const u32) } as u64;
+		find_table(hhdm, rsdt, 4, want)
+	}?;
+	// `find_table` accepted it, so the length is sane and the whole table is inside the direct map.
+	let len = table_length(hhdm, found)? as usize;
+	// SAFETY: `table_ok` established that `len` bytes from `found` are inside the direct map, and
+	// the direct map is a permanent mapping of physical memory.
+	Some(unsafe { core::slice::from_raw_parts((hhdm + found) as *const u8, len) })
 }
 
 // Does the ACPI table at `phys` pass its own checksum, and is its length sane?
@@ -490,7 +535,7 @@ fn table_length(hhdm: u64, phys: u64) -> Option<u32> {
 // Scan an RSDT/XSDT (entry pointers are `ptr_size` bytes each, after the 36-byte
 // header) for the MADT (signature "APIC"), returning its physical address.
 #[cfg(target_arch = "x86_64")]
-fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize) -> Option<u64> {
+fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize, want: &[u8; 4]) -> Option<u64> {
 	if sdt_phys == 0 {
 		return None;
 	}
@@ -508,7 +553,7 @@ fn find_table(hhdm: u64, sdt_phys: u64, ptr_size: usize) -> Option<u64> {
 		// The bound says the pointer is somewhere readable, the signature says what it claims to
 		// be, and the checksum says whether to believe it - in that order, because the first two
 		// are reads of the thing the third is about.
-		if table_signature(hhdm, phys) == Some(*b"APIC") && table_ok(hhdm, phys) {
+		if table_signature(hhdm, phys) == Some(*want) && table_ok(hhdm, phys) {
 			return Some(phys);
 		}
 	}

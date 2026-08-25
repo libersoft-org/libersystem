@@ -833,3 +833,385 @@ fn an_unmap_cannot_steal_a_mapping_that_is_still_being_made() {
 	// And now that it IS committed, an unmap finds it.
 	assert_eq!(object.take_committed_mapping(CR3), Some(0x4000), "a committed mapping is removable");
 }
+
+// The conformance fixture: the real handle and channel code, driven through every fault class the
+// model has, with the trace printed for a host checker to replay.
+//
+// WHAT THIS IS AND IS NOT. It is the implementation SIDE of P02M0154's trace relation: the actions
+// this kernel actually took, in the model's vocabulary, so a checker can ask whether each one was an
+// enabled model step. It is not a proof that every model trace is a Rust execution - it is a sample,
+// and the milestone says so in as many words.
+//
+// EVERY FAULT CLASS ON PURPOSE RATHER THAN AT RANDOM. A seeded walk finds interleavings; it does not
+// promise to reach the rollback that happens once in a thousand schedules. So the classes are driven
+// one at a time - a refused send, a take abandoned, a receive that fails before its commit and one
+// that fails after, a close racing a transfer - and the cover counters on the host require each one
+// to be present.
+crate::tagged_test!(capability_tcb_conformance_trace, [Handle, Channel, Object, Kernel], id = "kernel.object.capability_tcb_conformance_trace", covers = ["kernel"]);
+fn capability_tcb_conformance_trace() {
+	use super::channel::{Channel, Message};
+	use super::handle::Capability;
+	use super::trace;
+
+	let domain = crate::object::domain::Domain::root();
+
+	// A TABLE PER SCENARIO, and the reason is the model rather than tidiness. `Transfer.tla` starts
+	// from `Init` - one live capability, nothing booked, nothing reserved - and describes what
+	// follows. A table carried from one scenario into the next is a second run starting from a state
+	// the specification never describes, and the host checker says so: a capability appearing
+	// out-of-band in a table that has already stepped is refused. So each scenario gets its own
+	// tables, and each is one model run.
+	let table = |id: u16| {
+		let mut table = HandleTable::new();
+		table.set_domain(domain.clone());
+		table.set_trace_id(id);
+		table
+	};
+
+	trace::start();
+
+	// 1. A TRANSFER THAT COMPLETES. Take, send, commit; then the receiver books, installs and the
+	//    delivery commits - the whole of the path everything else is a failure of.
+	{
+		let (mut sender, mut receiver) = (table(1), table(2));
+		let (a, b) = Channel::create();
+		let object = TestObject::new(1) as Arc<dyn KernelObject>;
+		let koid = object.header().koid();
+		let handle = sender.insert_object(object, Rights::ALL);
+		let cap = sender.take_for_transfer(handle, Rights::TRANSFER).expect("taken");
+		assert!(a.send_charged_or_return(Message::new(alloc::vec![1, 2, 3], alloc::vec![cap]), &domain).is_ok(), "sent");
+		sender.commit_taken(handle);
+		let (id, _bytes, caps) = b.peek_identified().expect("a message is queued");
+		assert!(receiver.reserve(caps), "the destination books what it will install");
+		let Ok(mut message) = b.recv_identified(id, 16, caps) else { panic!("taken by identity") };
+		b.commit_delivery(&mut message);
+		for cap in message.caps.drain(..) {
+			let _ = receiver.insert_reserved(cap);
+		}
+
+		// ONE CAPABILITY, IN ONE TABLE. This is `TransferIsLinear` asked of the implementation: a
+		// transfer MOVES, and the way it stops moving is by leaving a copy behind at the source.
+		// Counting across both tables is what makes the question meaningful - "the receiver has it"
+		// is equally true of a clone.
+		let held = sender.entries().iter().filter(|e| e.koid == koid).count() + receiver.entries().iter().filter(|e| e.koid == koid).count();
+		assert_eq!(held, 1, "a completed transfer leaves exactly one capability, and it is the receiver's");
+		assert!(sender.lookup(handle, Rights::READ).is_err(), "the sender's handle died with the transfer");
+	}
+
+	// 2. A SEND THAT IS REFUSED, and the batch coming back to the handles it was named by.
+	{
+		let mut sender = table(3);
+		let (a, b) = Channel::try_create_with_depth(1).expect("a one-deep pair");
+		let filler = Message::new(alloc::vec![0], alloc::vec![]);
+		assert!(a.send_charged_or_return(filler, &domain).is_ok(), "the first fills it");
+		let handle = sender.insert_object(TestObject::new(2) as Arc<dyn KernelObject>, Rights::ALL);
+		let cap = sender.take_for_transfer(handle, Rights::TRANSFER).expect("taken");
+		let refused = a.send_charged_or_return(Message::new(alloc::vec![9], alloc::vec![cap]), &domain);
+		let Err((_, returned)) = refused else { panic!("a full endpoint refuses") };
+		for cap in returned {
+			sender.restore_taken(handle, cap);
+		}
+		assert!(sender.lookup(handle, Rights::READ).is_ok(), "a refused send costs the caller nothing");
+		let _ = b;
+	}
+
+	// 3. A TAKE THAT CAN NO LONGER BE RESOLVED. The capability is gone and the slot must not hold
+	//    its place for the life of the boot.
+	{
+		let mut sender = table(4);
+		let handle = sender.insert_object(TestObject::new(3) as Arc<dyn KernelObject>, Rights::ALL);
+		let cap = sender.take_for_transfer(handle, Rights::TRANSFER).expect("taken");
+		drop(cap);
+		sender.abandon_taken(handle);
+	}
+
+	// 4. A RECEIVE THAT FAILS BEFORE ITS COMMIT: the message goes back to the head, still charged,
+	//    and the booking is given back.
+	{
+		let mut receiver = table(5);
+		let (a, b) = Channel::create();
+		assert!(a.send_charged_or_return(Message::new(alloc::vec![7], alloc::vec![]), &domain).is_ok(), "sent");
+		let (id, _bytes, caps) = b.peek_identified().expect("queued");
+		assert!(receiver.reserve(caps.max(1)), "booked");
+		let Ok(message) = b.recv_identified(id, 16, caps) else { panic!("taken") };
+		receiver.release_reservation(caps.max(1));
+		b.return_to_head(message);
+		assert!(b.peek_identified().is_ok(), "the message is back at the head");
+	}
+
+	// 5. A CLOSE RACING A TRANSFER, which is the interleaving the whole model was written for: the
+	//    slot is reserved, the table is closed, and the restore has nobody to give the capability
+	//    back to.
+	{
+		let mut dying = table(6);
+		let handle = dying.insert_object(TestObject::new(4) as Arc<dyn KernelObject>, Rights::ALL);
+		let cap = dying.take_for_transfer(handle, Rights::TRANSFER).expect("taken");
+		dying.close_all();
+		dying.restore_taken(handle, cap);
+		// `ClosedProcessCannotResurrect`: the capability had nowhere to go back to, so it is gone.
+		// A table that has closed does not acquire handles.
+		assert!(dying.entries().is_empty(), "a closed table holds nothing, and a restore does not reopen it");
+		assert!(dying.lookup(handle, Rights::READ).is_err(), "the handle a closed table restored into is dead");
+	}
+
+	// 6. AN INSTALL INTO A TABLE THAT CLOSED UNDER IT, which is the booking's half of the same race.
+	{
+		let mut dying = table(7);
+		assert!(dying.reserve(1), "booked");
+		dying.close_all();
+		let handle = dying.insert_reserved(Capability::new(TestObject::new(5) as Arc<dyn KernelObject>, Rights::ALL));
+		assert_eq!(handle.raw(), 0, "a closed table installs nothing");
+	}
+
+	// 7. A DUPLICATE THAT WOULD WIDEN. `AuthorityNeverWidens` is the model's; here it is the check
+	//    that refuses to derive a handle carrying more than the one it came from.
+	{
+		let mut holder = table(8);
+		let handle = holder.insert_object(TestObject::new(6) as Arc<dyn KernelObject>, Rights::READ | Rights::DUPLICATE);
+		let widened = holder.duplicate(handle, Rights::ALL);
+		assert!(widened.is_err(), "a duplicate may not carry rights its source does not");
+		let narrowed = holder.duplicate(handle, Rights::READ).expect("a subset is allowed");
+		let rights = holder.rights_of(narrowed).expect("the duplicate is live");
+		assert_eq!(rights, Rights::READ, "a duplicate carries exactly what was asked for");
+	}
+
+	// 8. A HANDLE THAT OUTLIVED ITS SLOT. `StaleHandlesStayDead`: the generation is what makes a
+	//    closed handle stay closed, and a slot reused under a new one does not answer to the old.
+	{
+		let mut holder = table(9);
+		let first = holder.insert_object(TestObject::new(7) as Arc<dyn KernelObject>, Rights::ALL);
+		holder.close(first).expect("closed");
+		assert!(holder.lookup(first, Rights::READ).is_err(), "a closed handle names nothing");
+		let second = holder.insert_object(TestObject::new(8) as Arc<dyn KernelObject>, Rights::ALL);
+		assert_ne!(first.raw(), second.raw(), "the recycled slot answers to a new handle value");
+		assert!(holder.lookup(first, Rights::READ).is_err(), "and still not to the old one");
+		assert!(holder.lookup(second, Rights::READ).is_ok(), "while the new one works");
+	}
+
+	// 9. A RECEIVE THAT NAMES WHAT IS NOT THERE. `MessageIdentityStable`: a receiver sizes its
+	//    buffers from the message it peeked, so a receive must act on THAT message or on none. The
+	//    queue moving under it between the peek and the receive is the ordinary case, not the rare
+	//    one.
+	{
+		let mut receiver = table(10);
+		let (a, b) = Channel::create();
+		assert!(a.send_charged_or_return(Message::new(alloc::vec![1], alloc::vec![]), &domain).is_ok(), "the first is queued");
+		let (first, _bytes, caps) = b.peek_identified().expect("queued");
+		assert!(a.send_charged_or_return(Message::new(alloc::vec![2, 2], alloc::vec![]), &domain).is_ok(), "the second is queued");
+		assert!(receiver.reserve(caps.max(1)), "booked");
+		let Ok(mut message) = b.recv_identified(first, 16, caps) else { panic!("the head is what was named") };
+		b.commit_delivery(&mut message);
+		receiver.release_reservation(caps.max(1));
+		// The first is delivered and the second is now at the head. A receive still naming the first
+		// must be refused rather than handed whatever took its place.
+		let superseded = b.recv_identified(first, 16, 0);
+		assert!(matches!(superseded, Err(super::channel::RecvRefusal::Superseded)), "a receive naming a message that is not at the head takes nothing");
+		let (second, bytes, _caps) = b.peek_identified().expect("the second is still there");
+		assert_ne!(second, first, "and it is a different message");
+		assert_eq!(bytes, 2, "the one that was behind it, untouched");
+	}
+
+	trace::stop();
+
+	// THE TRACE, PRINTED FOR THE HOST CHECKER. One line per action, integers only: the checker reads
+	// these and asks whether each was an enabled model step.
+	assert!(!trace::overflowed(), "the trace ring overflowed - the checker would have seen a truncated run");
+	crate::serial_println!("captrace: begin {}", trace::len());
+	for index in 0..trace::len() {
+		let event = trace::get(index).expect("within the recorded length");
+		crate::serial_println!("captrace: {} {} {} {} {} {} {}", event.action, event.outcome, event.party, event.slot, event.generation, event.rights, event.message);
+	}
+	crate::serial_println!("captrace: end");
+}
+
+// SEEDED SCHEDULES, because the scenarios above are the ones somebody thought of.
+//
+// The fixture before this drives each fault class deliberately: it is what makes the cover counters
+// meetable at all, and it is exactly as good as the imagination that wrote it. This drives the same
+// operations in an order a stream decides, so the interleavings nobody chose - a close arriving
+// between a take and its send, a receive returning a message the next send then finds room behind -
+// get their turn. Every run is its own model behaviour and the host checker replays it as one.
+//
+// DETERMINISTIC, and it has to be: the trace is compared against a committed reference, so a
+// schedule that differed between runs would make that comparison meaningless. The stream is
+// splitmix64 from a fixed seed and every operation is a function of it.
+crate::tagged_test!(capability_tcb_seeded_schedules, [Handle, Channel, Object, Kernel], id = "kernel.object.capability_tcb_seeded_schedules", covers = ["kernel"]);
+fn capability_tcb_seeded_schedules() {
+	use super::channel::{Channel, Message};
+	use super::handle::Capability;
+	use super::trace;
+
+	const SEEDS: u64 = 8;
+	const STEPS: usize = 48;
+
+	let domain = crate::object::domain::Domain::root();
+	for seed in 1..=SEEDS {
+		let mut stream = seed.wrapping_mul(0x1234_5678_9ABC_DEF1);
+		let mut roll = || crate::arch::common::rng::splitmix64(&mut stream);
+
+		// A NUMBER PER TABLE INSTANCE, not per role. The short-lived table below is created afresh
+		// every time the schedule reaches it, and a number that named the role instead would tell
+		// the checker one table had been closed and then had capabilities appear in it again.
+		let mut next_table = seed as u16 * 64;
+		let mut table_of = || {
+			next_table += 1;
+			let mut table = HandleTable::new();
+			table.set_domain(domain.clone());
+			table.set_trace_id(next_table);
+			table
+		};
+		let mut sender = table_of();
+		let mut receiver = table_of();
+		let (a, b) = Channel::try_create_with_depth(2).expect("a two-deep pair");
+
+		// What the schedule is holding between steps. Each is the half-finished state of one of the
+		// protocol's two-phase operations, which is where every interesting interleaving lives.
+		let mut live: alloc::vec::Vec<super::handle::Handle> = alloc::vec::Vec::new();
+		let mut taken: Option<(super::handle::Handle, Capability)> = None;
+		let mut peeked: Option<(u64, usize)> = None;
+		let mut in_hand: Option<Message> = None;
+		let mut booked = 0usize;
+		let mut next_value = seed * 1000;
+
+		trace::start();
+		for _ in 0..STEPS {
+			match roll() % 10 {
+				// Create an object and take a handle to it.
+				0 => {
+					next_value += 1;
+					live.push(sender.insert_object(TestObject::new(next_value) as Arc<dyn KernelObject>, Rights::ALL));
+				}
+				// Begin a transfer out of a handle the schedule holds.
+				1 => {
+					if taken.is_none() && !live.is_empty() {
+						let at = (roll() as usize) % live.len();
+						let handle = live[at];
+						if let Ok(cap) = sender.take_for_transfer(handle, Rights::TRANSFER) {
+							live.remove(at);
+							taken = Some((handle, cap));
+						}
+					}
+				}
+				// Send it - and put it back where it came from if the endpoint refuses.
+				2 => {
+					if let Some((handle, cap)) = taken.take() {
+						next_value += 1;
+						let message = Message::new(alloc::vec![next_value as u8], alloc::vec![cap]);
+						match a.send_charged_or_return(message, &domain) {
+							Ok(()) => sender.commit_taken(handle),
+							Err((_, mut returned)) => {
+								for cap in returned.drain(..) {
+									sender.restore_taken(handle, cap);
+								}
+								live.push(handle);
+							}
+						}
+					}
+				}
+				// Abandon it: the capability is gone and the slot must not hold its place.
+				3 => {
+					if let Some((handle, cap)) = taken.take() {
+						drop(cap);
+						sender.abandon_taken(handle);
+					}
+				}
+				// Look at what is queued.
+				4 => {
+					if in_hand.is_none() {
+						if let Ok((id, _bytes, caps)) = b.peek_identified() {
+							peeked = Some((id, caps));
+						}
+					}
+				}
+				// Take it, having booked the room for what it carries.
+				5 => {
+					if let Some((id, caps)) = peeked.take() {
+						if in_hand.is_none() && receiver.reserve(caps.max(1)) {
+							booked = caps.max(1);
+							match b.recv_identified(id, 64, caps) {
+								Ok(message) => in_hand = Some(message),
+								Err(_) => {
+									receiver.release_reservation(booked);
+									booked = 0;
+								}
+							}
+						}
+					}
+				}
+				// Finish the delivery, installing what it carried.
+				6 => {
+					if let Some(mut message) = in_hand.take() {
+						b.commit_delivery(&mut message);
+						for cap in message.caps.drain(..) {
+							let handle = receiver.insert_reserved(cap);
+							if handle.raw() != 0 {
+								booked = booked.saturating_sub(1);
+							}
+						}
+						receiver.release_reservation(booked);
+						booked = 0;
+					}
+				}
+				// Or fail before the commit, which puts the message back at the head still charged.
+				7 => {
+					if let Some(message) = in_hand.take() {
+						receiver.release_reservation(booked);
+						booked = 0;
+						b.return_to_head(message);
+					}
+				}
+				// Close one of the handles the schedule holds.
+				8 => {
+					if !live.is_empty() {
+						let at = (roll() as usize) % live.len();
+						let handle = live.remove(at);
+						let _ = sender.close(handle);
+					}
+				}
+				// A table closing under a transfer that is still outstanding - the race the whole
+				// model was written for, driven here against a table of its own so the schedule's
+				// own sender survives it.
+				_ => {
+					let mut dying = table_of();
+					next_value += 1;
+					let handle = dying.insert_object(TestObject::new(next_value) as Arc<dyn KernelObject>, Rights::ALL);
+					if let Ok(cap) = dying.take_for_transfer(handle, Rights::TRANSFER) {
+						if roll() % 2 == 0 {
+							// The booking's half of the same race.
+							assert!(dying.reserve(1), "booked");
+							dying.close_all();
+							let installed = dying.insert_reserved(Capability::new(TestObject::new(next_value) as Arc<dyn KernelObject>, Rights::ALL));
+							assert_eq!(installed.raw(), 0, "a closed table installs nothing");
+						} else {
+							dying.close_all();
+						}
+						dying.restore_taken(handle, cap);
+					}
+				}
+			}
+		}
+
+		// WHATEVER THE SCHEDULE LEFT HALF-DONE IS FINISHED HERE, and finished honestly: an
+		// outstanding take that simply went out of scope would leave the trace describing a
+		// transfer that never ended, which is not what the implementation does.
+		if let Some((handle, cap)) = taken.take() {
+			sender.restore_taken(handle, cap);
+		}
+		if let Some(mut message) = in_hand.take() {
+			b.commit_delivery(&mut message);
+			message.caps.clear();
+		}
+		if booked > 0 {
+			receiver.release_reservation(booked);
+		}
+		trace::stop();
+
+		assert!(!trace::overflowed(), "the trace ring overflowed - the checker would have seen a truncated run");
+		crate::serial_println!("captrace: begin {}", trace::len());
+		for index in 0..trace::len() {
+			let event = trace::get(index).expect("within the recorded length");
+			crate::serial_println!("captrace: {} {} {} {} {} {} {}", event.action, event.outcome, event.party, event.slot, event.generation, event.rights, event.message);
+		}
+		crate::serial_println!("captrace: end");
+	}
+}

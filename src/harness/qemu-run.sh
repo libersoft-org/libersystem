@@ -595,7 +595,7 @@ stage_signed_boot_manifest() {
 	local out="$QEMU_BUILD_DIR/boot.manifest2.$$"
 	# The release the manifest names, out of the one file that holds it.
 	local PRODUCT_VERSION_FOR_MANIFEST
-	PRODUCT_VERSION_FOR_MANIFEST="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p' "$HERE/../../product.conf" | head -1)"
+	PRODUCT_VERSION_FOR_MANIFEST="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p;/^PRODUCT_VERSION=/q' "$HERE/../../product.conf")"
 	local -a rows=(--row "kernel:kernel=$STAGED_KERNEL")
 	if [[ -d "$bootstrap" ]]; then
 		rows+=(--row "bootstrap-list:etc/bootstrap.list=$bootstrap/etc/bootstrap.list")
@@ -1231,12 +1231,16 @@ qemu_run_aarch64() {
 	local dtb_file
 	dtb_file="$(mktemp /tmp/qemu-virt-XXXXXX.dtb)"
 	trap 'rm -f "$dtb_file"' EXIT
+	# THE DUMPED TREE MUST DESCRIBE THE MACHINE THE GUEST ACTUALLY RUNS ON, so the dump carries the
+	# same extra arguments the run below does. Without that, a machine given `-numa` boots with a
+	# device tree dumped from a machine that was not - and the guest reads one memory node where its
+	# hardware has two, with no way to tell that the tree and the machine disagree.
 	qemu-system-aarch64 \
 		-machine "$machine,dumpdtb=$dtb_file" \
 		"${cpu_args[@]}" \
 		-smp "$smp" \
 		-m "$mem" \
-		-display none >/dev/null 2>&1
+		-display none ${QEMU_EXTRA:-} >/dev/null 2>&1
 
 	# NOT `exec`, and the difference is the trap above. Bash does not run an EXIT trap when the
 	# shell successfully replaces itself, so every direct aarch64 start since this path existed

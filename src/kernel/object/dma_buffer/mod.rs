@@ -38,6 +38,14 @@ pub struct DmaBuffer {
 	// stop being the device's business when the DEVICE stops - which no shootdown, no quota and no
 	// handle count can observe.
 	device: Option<u32>,
+	// THE TRANSLATION, WHERE THERE IS ONE. Present exactly when the device this buffer was created
+	// for is behind an enforcing IOMMU: the address handed to the driver is then the IOVA rather
+	// than the physical address, and the frames are not reusable until the unmap and the
+	// invalidation have both completed.
+	//
+	// `None` is the untranslated case, which is every device in this tree today - and the comment
+	// above `device` says what that costs.
+	translation: SpinLock<Option<(dma::MappingId, dma::DmaAddress)>>,
 	// Set when the owning process was TERMINATED rather than when it closed this buffer.
 	//
 	// The difference is the whole rule. A driver that closes its buffer is saying the device is
@@ -200,7 +208,36 @@ impl DmaBuffer {
 			return Err(MemoryError::OutOfMemory);
 		}
 		frames.extend((0..pages as u64).map(|i| base + i * PAGE_SIZE));
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: domain.clone(), device, orphaned: AtomicBool::new(false) }).ok_or(MemoryError::OutOfMemory)
+
+		// THE TRANSLATION IS INSTALLED AND CONFIRMED BEFORE THE HANDLE EXISTS, which is the ordering
+		// the whole milestone turns on: a driver that has a handle has an address, and an address
+		// that is not yet translated is one the device would put on the bus untranslated. A map that
+		// does not confirm is a refusal here, with the frames and the quota given back - not a
+		// buffer that works for a while.
+		//
+		// BIDIRECTIONAL, because a `DmaBuffer` is a region a driver may use either way and this
+		// interface does not yet carry the direction of the intended use. That is a WEAKER claim
+		// than the contract can express - `Direction` is there and the model checks it - and it is
+		// stated rather than dressed up: narrowing it needs the create syscall to say which way the
+		// buffer is used, which is P02M0153's M4 for the two endpoints it migrates.
+		let translation = match device.filter(|_| crate::iommu::present()) {
+			Some(index) => match crate::iommu::map_device_buffer(index, base, (pages * PAGE_SIZE as usize) as u64) {
+				Ok(Some(mapped)) => Some(mapped),
+				Ok(None) => None,
+				Err(_) => {
+					for i in 0..pages as u64 {
+						// NEVER-MAPPED: allocated in this call and refused before any mapping was
+						// made or any address published.
+						// SAFETY: the span was allocated by this call and has never been mapped.
+						unsafe { frame::deallocate(base + i * PAGE_SIZE) };
+					}
+					domain.uncharge_dma(bytes);
+					return Err(MemoryError::OutOfMemory);
+				}
+			},
+			None => None,
+		};
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), frames, size: pages * PAGE_SIZE as usize, mappings: SpinLock::new(Vec::new()), domain: domain.clone(), device, translation: SpinLock::new(translation), orphaned: AtomicBool::new(false) }).ok_or(MemoryError::OutOfMemory)
 	}
 
 	pub fn size(&self) -> usize {
@@ -231,10 +268,22 @@ impl DmaBuffer {
 		&self.frames
 	}
 
-	// The physical address a driver hands its device for DMA (the first frame).
-	#[cfg(test)]
-	pub fn phys_base(&self) -> u64 {
+	// THE ADDRESS THE DEVICE USES, which is not always a physical one.
+	//
+	// Where the device is translated this is an IOVA the kernel can revoke; where it is not, it is
+	// the raw physical address `SYS_DMA_BUFFER_PHYS` has always handed out - an integer nothing
+	// constrains the device to, which is the exposure P02M0153 exists to replace and which remains
+	// only under the explicit `trusted-untranslated` policy.
+	pub fn device_address(&self) -> u64 {
+		if let Some((_, address)) = *self.translation.lock() {
+			return address.get();
+		}
 		self.frames.first().copied().unwrap_or(0)
+	}
+
+	// Whether this buffer's address is one the kernel can take back.
+	pub fn is_translated(&self) -> bool {
+		self.translation.lock().is_some()
 	}
 
 	// Claim the right to map this buffer into `cr3`, under one lock - see the note on
@@ -308,6 +357,26 @@ impl Drop for DmaBuffer {
 		// And a buffer orphaned by a TERMINATION is not retired at all yet: its owner never said
 		// the device was finished with it, and retiring puts the frames back in circulation while a
 		// descriptor may still name them. They wait for the device to be stopped instead.
+		// THE TRANSLATION COMES DOWN BEFORE THE FRAMES GO ANYWHERE. Until the unmap and the
+		// invalidation have both completed the device may still resolve this address, so a frame
+		// released here would be one handed to its next owner while a descriptor can still reach it.
+		// An unconfirmed release quarantines: the pages are lost rather than reused.
+		let released = match self.translation.lock().take() {
+			Some((id, _)) => match crate::iommu::unmap_for_device(id) {
+				Ok(dma::Release::FramesReusable) => true,
+				_ => {
+					crate::serial_println!("dma: an unmap did not complete - {} frame(s) are QUARANTINED rather than returned", self.frames.len());
+					false
+				}
+			},
+			None => true,
+		};
+		if !released {
+			// Deliberately leaked: see above. Nothing here is recoverable by a later pass, because
+			// nothing can establish that the device stopped being able to reach them.
+			let _ = core::mem::take(&mut self.frames);
+			return;
+		}
 		let frames = core::mem::take(&mut self.frames);
 		let frames = match (self.device, self.orphaned.load(Ordering::Acquire)) {
 			// Held, or - if the table is full - leaked inside `hold`. Either way nothing to retire

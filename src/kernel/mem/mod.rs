@@ -24,6 +24,49 @@ static HHDM_OFFSET: AtomicU64 = AtomicU64::new(0);
 // physical layout stays inspectable at runtime - SYS_MEMMAP_GET reads it for `lsmem`.
 static MEMMAP: SpinLock<Vec<abi::MemmapRegion>> = SpinLock::new(Vec::new());
 
+// WHAT FIRMWARE SAID ABOUT MEMORY AND PROCESSOR AFFINITY, normalized. Empty on a machine whose
+// firmware described none, which is every machine this tree has booted so far.
+//
+// PUBLISHED ONCE, BEFORE THE FRAME ALLOCATOR IS PARTITIONED, and read-only afterwards. The order is
+// the point: a parser cannot use `within_direct_map` before the direct-map bound exists, and the
+// allocator cannot be divided into node pools after it has started handing frames out.
+static TOPOLOGY: SpinLock<Option<topology::Topology>> = SpinLock::new(None);
+
+pub fn set_topology(found: topology::Topology) {
+	*TOPOLOGY.lock() = Some(found);
+}
+
+// Which node owns a physical address, as the allocator's free path asks it.
+pub fn topology_node_of(physical: u64) -> topology::Affinity {
+	match TOPOLOGY.lock().as_ref() {
+		Some(found) => found.node_of_address(physical),
+		None => topology::Affinity::Unknown,
+	}
+}
+
+// Which node a PROCESSOR belongs to, by its hardware id - the join the CPU binding is made through.
+pub fn topology_node_of_cpu(hardware_id: u64) -> topology::Affinity {
+	match TOPOLOGY.lock().as_ref() {
+		Some(found) => found.node_of_cpu(hardware_id),
+		None => topology::Affinity::Unknown,
+	}
+}
+
+// How far one node is from another, for the preferred-allocation order.
+pub fn topology_distance(from: topology::NodeId, to: topology::NodeId) -> u8 {
+	match TOPOLOGY.lock().as_ref() {
+		Some(found) => found.distance(from, to),
+		None => topology::REMOTE_DISTANCE,
+	}
+}
+
+// Run `f` against the topology, if there is one.
+pub fn with_topology<R>(f: impl FnOnce(&topology::Topology) -> R) -> Option<R> {
+	TOPOLOGY.lock().as_ref().map(f)
+}
+
+pub mod numa;
+
 pub fn hhdm_offset() -> u64 {
 	HHDM_OFFSET.load(Ordering::Relaxed)
 }
@@ -171,8 +214,28 @@ pub fn memmap_get(index: usize) -> Option<abi::MemmapRegion> {
 #[cfg(target_arch = "x86_64")]
 pub fn init(regions: &[MemRegion], hhdm: u64) {
 	HHDM_OFFSET.store(hhdm, Ordering::Relaxed);
+	// THE BOUND FIRST, AND THAT IS PHASE ONE OF P02M0152's M1.
+	//
+	// `within_direct_map` is the check every firmware pointer is validated against, and it answers
+	// from this number - so until it is published, "is this address somewhere I can read" answers
+	// NO for everything. The topology reader below then found no SRAT on a machine that has one, and
+	// said so, and the machine ran with no topology. It is published from the map rather than from
+	// the retained copy because retaining needs the heap, and the heap is three lines further down.
+	//
+	// Idempotent and monotonic - `fetch_max` - so the call at the end of this function, which runs
+	// once the map has been retained, neither undoes nor duplicates this one.
+	publish_direct_map_limit(regions);
 	frame::init(regions);
 	heap::init();
+	// THE TOPOLOGY IS READ HERE, BETWEEN THE HEAP AND THE PARTITION, and the position is the whole
+	// of P02M0152's M1.
+	//
+	// It cannot be earlier: an SRAT pointer is a firmware address, and the check that says whether
+	// this kernel may read it is `within_direct_map` - which answers about a bound published two
+	// lines above. It cannot be later: `upgrade_to_heap` is where the free pool is divided into node
+	// pools, and dividing an allocator that has already handed frames out means partitioning a state
+	// nobody recorded. The heap has to exist first because the parsers allocate.
+	numa::discover();
 	// The heap is up now: the frame allocator's run table moves onto it (so
 	// fragmentation is bounded by memory, not a fixed table), and the memory map
 	// can be retained (Vec) for runtime inspection.

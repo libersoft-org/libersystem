@@ -22,6 +22,10 @@ CONSTANTS
     RevocationModeled, \* whether `ObjectHeader::revoke` exists in this configuration. It is TEST-ONLY
                        \* in the tree, so the production result may not be cited from a run with it
                        \* enabled - which is why it is a constant and not an always-available action.
+    CoversModeled,  \* whether the `outcome` ghost records anything. It exists for the COVER
+                    \* properties - which need the smallest configuration to reach them, not the
+                    \* largest - and it triples a state space wherever it is on. Off, the variable is
+                    \* constant and costs nothing, which is what keeps `propagation` affordable.
     BatchMax,       \* how many capabilities one send may carry. `sys_channel_send_caps` takes a
                     \* batch and returns ALL of them when it is refused, so one is not enough to see
                     \* the rule that matters: two is.

@@ -24,6 +24,15 @@ buddy = { path = "../buddy" }
 # out is what let a real QEMU device tree be handed to it on a host, which immediately found that
 # `timebase_frequency` had never once returned a value.
 fdt = { path = "../fdt" }
+# The DMA/IOVA contract and the IOMMU backend interface. In a crate for the same reason `buddy` is:
+# every rule in it is about an operation that did NOT complete - a refused unmap, an invalidation
+# nobody confirmed - and a host can drive every one of those orders where a booted kernel with an
+# emulated IOMMU cannot.
+dma = { path = "../dma" }
+# Firmware memory and CPU affinity, normalized and validated. In a crate for the same reason `buddy`
+# is: the interesting cases are tables that are wrong - a truncated SRAT, a matrix that is not square,
+# two nodes claiming one page - and a host can produce every one of them where QEMU can produce none.
+topology = { path = "../topology" }
 # The secondary-CPU start rules: which logical id a core is offered, and for how long it keeps it.
 # In a crate for the same reason `buddy` is - the cases that matter are a refused firmware call, a
 # core released late, a tree that forgot the core reading it, and QEMU has a switch for none of them.

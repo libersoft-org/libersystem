@@ -29,10 +29,14 @@ VARIABLES
     peeked,       \* the message identity the receiver inspected, 0 for none
     nextId,       \* the monotonic message identity `Message::new` hands out
     lastUse,      \* what the last abstract object operation was performed against
+    outcome,      \* what the last action that ENDED something was, when `CoversModeled` - see the
+                  \* cover properties. A ghost, and a configuration's choice: it exists to show that
+                  \* the dangerous transitions are REACHED, which the smallest configuration proves
+                  \* as well as the largest and far more cheaply.
     objgen        \* the object's CURRENT generation. A capability captured one when it was made, and
                   \* the two differing is what makes a handle to a destroyed object detectable.
 
-vars == <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+vars == <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 Sender == CHOOSE p \in Procs : TRUE
 Receiver == CHOOSE p \in Procs : p # Sender
@@ -49,6 +53,7 @@ TypeOK ==
     /\ peeked \in 0..MaxId
     /\ nextId \in 1..(MaxId + 1)
     /\ lastUse \in Caps
+    /\ outcome \in {"none", "sent", "restored", "abandoned", "payload-failed", "published", "copyout-failed", "dropped-into-closed"}
     /\ objgen \in 1..MaxGen
 
 (***************************************************************************)
@@ -80,6 +85,7 @@ Init ==
     /\ peeked = 0
     /\ nextId = 1
     /\ lastUse = NoCap
+    /\ outcome = "none"
     /\ objgen = 1
 
 (***************************************************************************)
@@ -108,7 +114,7 @@ Take(p, i) ==
     /\ xfer' = [xfer EXCEPT ![p] = Append(xfer[p], table[p][i].cap)]
     /\ xferSlot' = [xferSlot EXCEPT ![p] = Append(xferSlot[p], i)]
     /\ table' = [table EXCEPT ![p][i] = [state |-> "Reserved", cap |-> NoCap, gen |-> table[p][i].gen]]
-    /\ UNCHANGED <<closed, charge, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, charge, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 \* Recycle a slot under the generation rule: at the ceiling it RETIRES rather than wrapping.
 Recycle(p, i) ==
@@ -125,7 +131,7 @@ CommitTake(p) ==
                    IF \E k \in 1..Len(xferSlot[p]) : xferSlot[p][k] = i THEN Recycle(p, i) ELSE table[p][i]]]
     /\ charge' = [charge EXCEPT ![p] = charge[p] - Len(xferSlot[p])]
     /\ xferSlot' = [xferSlot EXCEPT ![p] = <<>>]
-    /\ UNCHANGED <<closed, booked, xfer, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, booked, xfer, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 \* `restore_taken`, FOR EVERY CAPABILITY THE SEND WAS CARRYING. All or nothing: a refused send costs
 \* the caller nothing, not even the handles it named - so a batch comes back whole, to the same
@@ -146,6 +152,7 @@ RestoreTake(p) ==
             /\ UNCHANGED charge
     /\ xfer' = [xfer EXCEPT ![p] = <<>>]
     /\ xferSlot' = [xferSlot EXCEPT ![p] = <<>>]
+    /\ outcome' = IF CoversModeled THEN "restored" ELSE "none"
     /\ UNCHANGED <<closed, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
 
 \* `abandon_taken`: the transfer can no longer be resolved either way. The capabilities are GONE and
@@ -158,6 +165,7 @@ AbandonTake(p) ==
     /\ charge' = [charge EXCEPT ![p] = charge[p] - Len(xferSlot[p])]
     /\ xfer' = [xfer EXCEPT ![p] = <<>>]
     /\ xferSlot' = [xferSlot EXCEPT ![p] = <<>>]
+    /\ outcome' = IF CoversModeled THEN "abandoned" ELSE "none"
     /\ UNCHANGED <<closed, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
 
 \* `send_inner`: room in the ring, then the charge, then the message. A refused send charges nothing.
@@ -173,6 +181,7 @@ Enqueue(p) ==
     /\ nextId' = nextId + 1
     /\ bytes' = bytes + 1
     /\ xfer' = [xfer EXCEPT ![p] = <<>>]
+    /\ outcome' = IF CoversModeled THEN "sent" ELSE "none"
     /\ UNCHANGED <<table, closed, charge, booked, xferSlot, inflight, held, holder, installed, committed, peeked, lastUse, objgen>>
 
 (***************************************************************************)
@@ -188,7 +197,7 @@ Book(p) ==
          /\ table' = [table EXCEPT ![p][i] = [state |-> "Booked", cap |-> NoCap, gen |-> table[p][i].gen]]
          /\ booked' = [booked EXCEPT ![p] = Append(booked[p], i)]
     /\ charge' = [charge EXCEPT ![p] = charge[p] + 1]
-    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 \* `release_reservation`: the booking goes back, slot and quota together.
 Unbook(p) ==
@@ -202,7 +211,7 @@ Unbook(p) ==
        /\ table' = [table EXCEPT ![p][i] = [state |-> "Free", cap |-> NoCap, gen |-> table[p][i].gen]]
        /\ booked' = [booked EXCEPT ![p] = Tail(booked[p])]
     /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
-    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 \* `peek_identified`: the receiver learns the head's identity and shape. It holds no lock afterwards,
 \* so anything may happen to the queue before it comes back.
@@ -210,7 +219,7 @@ Peek(p) ==
     /\ held = NoMsg
     /\ Len(queue) > 0
     /\ peeked' = queue[1].id
-    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, nextId, lastUse, outcome, objgen>>
 
 \* `recv_identified`: the message leaves the queue AND TAKES ITS SLOT WITH IT. Nothing is announced
 \* as free here - the message can still come back.
@@ -227,7 +236,7 @@ Dequeue(p) ==
     /\ queue' = Tail(queue)
     /\ inflight' = inflight + 1
     /\ committed' = FALSE
-    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, installed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, installed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 \* The payload copy faulted BEFORE the commit: the message goes back to the head, still charged,
 \* still holding the slot it never gave up, and the booking is released.
@@ -246,6 +255,7 @@ PayloadCopyFails(p) ==
        /\ table' = [table EXCEPT ![p][i] = [state |-> "Free", cap |-> NoCap, gen |-> table[p][i].gen]]
        /\ booked' = [booked EXCEPT ![p] = Tail(booked[p])]
     /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
+    /\ outcome' = IF CoversModeled THEN "payload-failed" ELSE "none"
     /\ UNCHANGED <<closed, xfer, xferSlot, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
 
 \* `commit_delivery`: the payload is in the caller's buffer. THE POINT OF NO RETURN - the queued
@@ -258,7 +268,7 @@ CommitDelivery(p) ==
     /\ held' = [held EXCEPT !.slotHeld = FALSE]
     /\ inflight' = inflight - 1
     /\ bytes' = bytes - 1
-    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, holder, installed, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, holder, installed, peeked, nextId, lastUse, outcome, objgen>>
 
 \* `insert_reserved`: into the slot this booking owns. Charges nothing - `reserve` already paid.
 Install(p) ==
@@ -272,7 +282,7 @@ Install(p) ==
        /\ booked' = [booked EXCEPT ![p] = Tail(booked[p])]
        /\ installed' = Append(installed, i)
     /\ held' = [held EXCEPT !.caps = Tail(held.caps)]
-    /\ UNCHANGED <<closed, charge, xfer, xferSlot, queue, inflight, holder, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, charge, xfer, xferSlot, queue, inflight, holder, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 \* `insert_reserved` INTO A CLOSED TABLE. The same barrier `restore_taken` stands behind: there is
 \* nobody to install for, so the capability is dropped and the quota `reserve` charged is refunded -
@@ -288,6 +298,7 @@ InstallIntoClosed(p) ==
        /\ booked' = [booked EXCEPT ![p] = Tail(booked[p])]
     /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
     /\ held' = [held EXCEPT !.caps = Tail(held.caps)]
+    /\ outcome' = IF CoversModeled THEN "dropped-into-closed" ELSE "none"
     /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
 
 \* The handle numbers reached userspace. The capability is PUBLISHED and the receive is over.
@@ -302,6 +313,7 @@ Publish(p) ==
     /\ held' = NoMsg
     /\ holder' = "none"
     /\ committed' = FALSE
+    /\ outcome' = IF CoversModeled THEN "published" ELSE "none"
     /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, bytes, peeked, nextId, lastUse, objgen>>
 
 \* The handle-number copyout faulted AFTER the commit. The message cannot go back - its capabilities
@@ -327,6 +339,7 @@ CopyoutFails(p) ==
     /\ held' = NoMsg
     /\ holder' = "none"
     /\ committed' = FALSE
+    /\ outcome' = IF CoversModeled THEN "copyout-failed" ELSE "none"
     /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, bytes, peeked, nextId, lastUse, objgen>>
 
 (***************************************************************************)
@@ -351,7 +364,7 @@ Duplicate(p, i, j, r) ==
     /\ table' = [table EXCEPT ![p][j] =
                   [state |-> "Live", cap |-> [table[p][i].cap EXCEPT !.rights = r], gen |-> table[p][j].gen]]
     /\ charge' = [charge EXCEPT ![p] = charge[p] + 1]
-    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 \* `lookup_typed(handle, ObjectType, Rights)` followed by a type-correct operation. The abstraction is
 \* deliberate: USE stands for "an operation this object supports", not for a claim that every
@@ -371,7 +384,7 @@ Usable(p, i, t) ==
 Use(p, i, t) ==
     /\ Usable(p, i, t)
     /\ lastUse' = table[p][i].cap
-    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, objgen>>
+    /\ UNCHANGED <<outcome, table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, objgen>>
 
 \* `ObjectHeader::revoke`, WHICH IS TEST-ONLY IN THE TREE. Bumping the object's generation makes
 \* every capability that captured the old one detectably stale. The production authority model has
@@ -381,14 +394,14 @@ Revoke ==
     /\ RevocationModeled
     /\ objgen < MaxGen
     /\ objgen' = objgen + 1
-    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse>>
+    /\ UNCHANGED <<outcome, table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse>>
 
 Close(p, i) ==
     /\ ~closed[p]
     /\ table[p][i].state = "Live"
     /\ table' = [table EXCEPT ![p][i] = Recycle(p, i)]
     /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
-    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 \* `close_all`: the table takes nothing new. A slot with a transfer in flight is NOT reclaimed -
 \* its capability is elsewhere and one of commit/restore is still to come.
@@ -410,7 +423,7 @@ Terminate(p) ==
                    ELSE [state |-> "Free", cap |-> NoCap, gen |-> table[p][i].gen]]]
     /\ charge' = [charge EXCEPT ![p] =
                    charge[p] - Cardinality({i \in 1..Slots : table[p][i].state = "Live"})]
-    /\ UNCHANGED <<booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
 
 \* A SYSTEM WITH NOTHING LEFT TO DO IS NOT A DEADLOCK. Every process has terminated, no transfer is
 \* outstanding and no message is in flight - so the only behaviour left is to stay there. Saying that
@@ -431,6 +444,11 @@ Next ==
     \/ Revoke
     \/ \E p \in Procs : CommitTake(p) \/ RestoreTake(p) \/ AbandonTake(p) \/ Enqueue(p)
     \/ \E p \in Procs : Book(p) \/ Unbook(p) \/ Peek(p) \/ Dequeue(p) \/ CommitDelivery(p)
+    \* THE PRE-COMMIT FAILURE, WHICH THIS RELATION DID NOT CONTAIN. It was defined, commented and
+    \* never taken - so every invariant passed over a model in which a receive could not fail before
+    \* its commit, which is one of the two outcomes the whole milestone is about. The cover property
+    \* `NoPayloadFailure` is what noticed: it could not be refuted.
+    \/ \E p \in Procs : PayloadCopyFails(p)
     \/ \E p \in Procs : Install(p) \/ InstallIntoClosed(p) \/ Publish(p) \/ CopyoutFails(p) \/ Terminate(p)
 
 Spec == Init /\ [][Next]_vars
@@ -549,4 +567,35 @@ RevokedSnapshotCannotOperate ==
 \* receive took is either still held or has been given back.
 ReceiveIsTransactional ==
     (IsMsg(held) /\ ~committed) => Len(installed) = 0
+(***************************************************************************)
+(* THE COVER PROPERTIES, WRITTEN AS THEIR OWN NEGATIONS.                    *)
+(*                                                                         *)
+(* An invariant that passes because its dangerous action is never enabled   *)
+(* is a failed gate, and nothing in a passing run says which of the two     *)
+(* happened. So each of these says "this never happens" - and the gate      *)
+(* requires TLC to REFUTE it. A cover that stops being refuted is a         *)
+(* transition that has quietly become unreachable.                          *)
+(*                                                                         *)
+(* They read the `outcome` ghost, which a configuration turns on: reaching  *)
+(* a transition is proved as cheaply in the smallest configuration as in    *)
+(* the largest, and the ghost triples a state space wherever it is on.      *)
+(***************************************************************************)
+
+NoPublish == outcome # "published"
+NoCopyoutFailure == outcome # "copyout-failed"
+NoPayloadFailure == outcome # "payload-failed"
+NoRestore == outcome # "restored"
+NoAbandon == outcome # "abandoned"
+NoDropIntoClosed == outcome # "dropped-into-closed"
+
+\* Generation exhaustion, which is the boundary `MaxGen` exists to make reachable.
+NoRetirement == \A p \in Procs : \A i \in 1..Slots : table[p][i].state # "Retired"
+
+\* A close arriving while a transfer is outstanding - the interleaving this whole model was written
+\* for. If this stops being refuted, the race is no longer being explored.
+NoCloseRacingTransfer ==
+    \A p \in Procs : ~(closed[p] /\ \E i \in 1..Slots : table[p][i].state = "Reserved")
+
+\* Both ways a receive can end, and both must be reachable: one of them is the point of no return.
+NoDeliveredCapability == \A i \in 1..Slots : ~HoldsCap(table[Receiver][i])
 =============================================================================

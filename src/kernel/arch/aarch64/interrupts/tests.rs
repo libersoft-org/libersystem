@@ -6,6 +6,16 @@ use crate::object::interrupt::Interrupt;
 // delivered through the GICv2m frame. There is no bindable wired vector.
 crate::tagged_test!(gicv2m_msi_binds_and_dispatch_signals_the_driver, [Interrupt, Drivers, ArchAarch64], id = "kernel.arch.aarch64.interrupts.gicv2m_msi_binds_and_dispatch_signals_the_driver", covers = ["kernel"]);
 fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
+	// AND ONLY WHERE THERE IS AN MSI BACKEND AT ALL. QEMU's `virt` has a GICv2m frame with GICv2 and
+	// an ITS with `its=on`; a GICv3 machine with the ITS OFF has neither, so `acquire_msi` has no
+	// vector to hand out and this test's premise - "every device interrupt is MSI-X delivered
+	// through the GICv2m frame" - is simply false there. Saying so is the honest answer: the profile
+	// exists to exercise the timer and IPI paths, and asking it an MSI question proves nothing about
+	// either.
+	if super::MSI_LEN.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+		crate::serial_println!("gicv2m: skipped - this machine has no MSI frame and no ITS, so there is no device interrupt to bind");
+		return;
+	}
 	// A frame stands in for a device's MSI-X table: acquire_msi programs entry 0 into it
 	// (message address = the GICv2m frame's MSI_SETSPI_NS, message data = the SPI).
 	let table = frame::allocate().expect("a frame for the fake MSI-X table");
@@ -42,6 +52,15 @@ fn gicv2m_msi_inventory_reports_the_timer_and_msi_vectors() {
 	assert_eq!(timer.bound, 1, "the timer is always the kernel's own");
 	// After the timer, each entry is a GICv2m MSI SPI. Acquiring one for a fake device
 	// makes it appear in the inventory as an MSI vector owned by that device index.
+	//
+	// THE TIMER HALF IS TRUE ON EVERY PROFILE and is asserted above; the MSI half needs a machine
+	// that HAS MSIs. A GICv3 with the ITS off has neither a GICv2m frame nor an ITS, and the
+	// inventory there is the timer and nothing else - which is the correct inventory for that
+	// machine rather than a missing entry.
+	if super::MSI_LEN.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+		crate::serial_println!("gicv2m: the timer entry is checked; this machine has no MSI backend, so there is no MSI entry to look for");
+		return;
+	}
 	let table = frame::allocate().expect("a frame for the fake MSI-X table");
 	let vector = acquire_msi(table, 0, 9).expect("acquire an MSI SPI");
 	let mut seen = false;
@@ -70,7 +89,17 @@ fn a_gicv2m_spi_above_255_keeps_its_identity() {
 	// QEMU virt's frame starts at SPI 80, so the range is stood up here instead. Every result is
 	// taken BEFORE the frame's real range is put back, so a failing assertion cannot leave the
 	// following tests looking at a machine that does not exist.
+	//
+	// AND ONLY ON A MACHINE WHOSE MSIs REALLY GO THROUGH A GICv2m FRAME. Under the GICv3/ITS
+	// profile an MSI is an LPI: `acquire_msi` returns `LPI_BASE + slot`, the stood-up SPI range is
+	// not consulted at all, and this test asserted 256 against 8192. That is not a defect in either
+	// path - it is a test asking a GICv2m question of a machine that has no GICv2m, and the honest
+	// answer is to say so rather than to widen the assertion until both answers pass.
 	use core::sync::atomic::Ordering;
+	if super::USING_ITS.load(Ordering::Relaxed) {
+		crate::serial_println!("gicv2m: skipped - this machine's MSIs are LPIs through the ITS, so there is no SPI frame to identify");
+		return;
+	}
 	let base = super::BASE_SPI.load(Ordering::Relaxed);
 	let len = super::MSI_LEN.load(Ordering::Relaxed);
 	super::BASE_SPI.store(256, Ordering::Relaxed);

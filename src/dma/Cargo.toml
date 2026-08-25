@@ -1,0 +1,12 @@
+[package]
+name = "dma"
+# The product version lives only in /product.conf; Cargo's optional package version is unused here
+# and omitted.
+edition = "2024"
+description = "The portable DMA/IOVA contract and the kernel-owned IOMMU backend interface, in a crate a host can drive every failure order through"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+warnings = "deny"

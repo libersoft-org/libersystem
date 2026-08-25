@@ -20,6 +20,37 @@
 
 mod boot;
 mod dtb;
+
+// THE DEVICE TREE'S ADDRESS, KEPT so the topology can be read after boot has finished with it.
+//
+// The tree is parsed once during bring-up and the result is consumed field by field; nothing keeps
+// it. P02M0152 needs `numa-node-id` and `/distance-map` at a LATER moment - after the direct-map
+// bound exists and before the frame allocator is partitioned - and re-parsing from the pointer is
+// cheaper and smaller than retaining a `BootInfo` that is mostly already spent.
+static DEVICE_TREE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+// WHETHER THIS BOOT WENT THROUGH THE DEVICE-TREE PATH AT ALL, which is not the same question as
+// whether the hint is non-zero: QEMU hands this port a boot argument of ZERO and the tree is found
+// at the address `dtb::locate` falls back to. Gating on the address alone read that boot as having
+// no tree, and the topology it does publish was never looked at.
+static DEVICE_TREE_TAKEN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+pub fn remember_device_tree(hint: u64) {
+	DEVICE_TREE.store(hint, core::sync::atomic::Ordering::Release);
+	DEVICE_TREE_TAKEN.store(true, core::sync::atomic::Ordering::Release);
+}
+
+// What the tree says, re-read. `None` where this boot was handed no tree at all - the UEFI/no-DT
+// profiles, which make no topology claim and are named as such.
+pub fn device_tree_boot_info() -> Option<fdt::BootInfo> {
+	if !DEVICE_TREE_TAKEN.load(core::sync::atomic::Ordering::Acquire) {
+		return None;
+	}
+	let hint = DEVICE_TREE.load(core::sync::atomic::Ordering::Acquire);
+	// SAFETY: the same pointer this port's bring-up parsed, and `dtb::parse` validates the blob's
+	// header before reading any of it.
+	unsafe { dtb::parse(hint) }
+}
+
 mod exceptions;
 mod gic;
 // The GICv3 ITS: the MSI controller a GICv3 machine has instead of a v2m frame.

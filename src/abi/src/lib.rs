@@ -454,6 +454,15 @@ pub const VIRTIO_AVAIL_F_NO_INTERRUPT: u16 = 1;
 // virtio device offers it and a modern driver must accept it.
 pub const VIRTIO_F_VERSION_1: u32 = 1 << 0;
 
+// VIRTIO_F_ACCESS_PLATFORM (feature bit 33) = bit 1 of the second feature word.
+//
+// "THE ADDRESSES I GIVE YOU ARE NOT PHYSICAL ONES." A device behind an IOMMU is configured with
+// `iommu_platform=on` and then REQUIRES this bit: a driver that does not acknowledge it is telling
+// the device it will program raw physical addresses, and the device refuses `FEATURES_OK` rather
+// than accept descriptors it would translate wrongly. It is what makes a driver's buffers the
+// kernel's revocable IOVAs rather than integers nothing constrains.
+pub const VIRTIO_F_ACCESS_PLATFORM: u32 = 1 << 1;
+
 // The MSI-X vector fields' reset value: no vector mapped (the device raises legacy INTx).
 pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
 

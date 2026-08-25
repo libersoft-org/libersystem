@@ -14,7 +14,8 @@ fn dma_buffer_uses_a_contiguous_span_and_refunds_its_charge() {
 	for pair in frames.windows(2) {
 		assert_eq!(pair[1], pair[0] + PAGE_SIZE, "DMA frames are physically contiguous");
 	}
-	assert_eq!(dma.phys_base(), frames[0]);
+	assert_eq!(dma.device_address(), frames[0], "an untranslated buffer answers with the physical address it always did");
+	assert!(!dma.is_translated(), "and says that is what it is");
 	drop(dma);
 	assert_eq!(domain.account().dma().used(), 0, "the DMA charge is refunded");
 }

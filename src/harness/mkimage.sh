@@ -253,7 +253,7 @@ stage_signed_boot_manifest() {
 	local image="$1" staged_kernel="$2" arch="$3" payload="${4:-}" payload_name="${5:-}"
 	local out="$BUILD/boot.manifest2.$$"
 	local release
-	release="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p' "$REPO_ROOT/product.conf" | head -1)"
+	release="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p;/^PRODUCT_VERSION=/q' "$REPO_ROOT/product.conf")"
 	local -a rows=(--row "kernel:kernel=$staged_kernel")
 	# THE PAYLOAD THIS MEDIUM CARRIES, whichever of the two it is. A boot medium that hands the
 	# kernel a system volume as a module is a medium whose manifest has to cover that whole image -

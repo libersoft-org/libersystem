@@ -735,6 +735,18 @@ fn sys_dma_buffer_phys(handle: u64, offset: u64) -> i64 {
 	if dma.device().is_none() {
 		return ERR_INVALID;
 	}
+	// A TRANSLATED BUFFER ANSWERS WITH ITS IOVA, and a physical address never leaves the kernel for
+	// it. The two cases are deliberately the same syscall: a driver asks for the address its device
+	// uses, and which kind of address that is depends on whether the device is behind an IOMMU -
+	// which is the kernel's business rather than the driver's. Under an enforcing profile the answer
+	// is revocable; under `trusted-untranslated` it is the raw integer it always was.
+	if dma.is_translated() {
+		let base = dma.device_address();
+		if offset >= dma.size() as u64 {
+			return ERR_INVALID;
+		}
+		return (base + offset) as i64;
+	}
 	let frames = dma.frames();
 	let page = (offset / PAGE_SIZE) as usize;
 	if page >= frames.len() {

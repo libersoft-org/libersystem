@@ -317,7 +317,12 @@ pub fn is_initialized() -> bool {
 	PREEMPTION_ENABLED.load(Ordering::Acquire)
 }
 
-fn current_cpu_id() -> usize {
+// WHICH CORE IS ASKING. Public because the NUMA binding needs it to answer "where am I", and that
+// question is asked from outside the scheduler - by an allocation that would rather be local.
+//
+// ONLY VALID ONCE PER-CPU STATE EXISTS, which is why `smp::numa::local_node` gates on the binding
+// count before it calls this rather than after.
+pub fn current_cpu_id() -> usize {
 	arch::percpu::this_cpu().cpu_id() as usize
 }
 
@@ -413,6 +418,43 @@ pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObje
 	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
 	let arg = process.install(object, rights).expect("out of memory for a kernel thread's bootstrap handle");
 	Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack")
+}
+
+// A process of its own, and every thread put into it shares one handle table.
+//
+// `prepare_with_object` gives each thread a process of its own, which is what a kernel thread
+// usually wants and exactly what a test of two threads racing over one table must not have: the
+// races the capability model is about - a close arriving between a take and its send, two receivers
+// naming one message - only exist between threads that share the table they are racing over.
+#[cfg(test)]
+pub fn prepare_shared_process(object: Arc<dyn KernelObject>, rights: Rights) -> (Arc<Process>, u64) {
+	prepare_shared_process_in(root_domain(), object, rights)
+}
+
+// The same, accounted to a Domain of the caller's choosing - which is how a test puts a destination
+// at its handle quota without limiting the root Domain every other test is using.
+#[cfg(test)]
+pub fn prepare_shared_process_in(domain: Arc<Domain>, object: Arc<dyn KernelObject>, rights: Rights) -> (Arc<Process>, u64) {
+	let process = Process::new(kernel_as(), domain).expect("out of memory for a shared process");
+	let handle = process.install(object, rights).expect("out of memory for a bootstrap handle");
+	(process, handle)
+}
+
+// A thread in an already-existing process. See `prepare_shared_process`.
+#[cfg(test)]
+pub fn prepare_in_process(entry: extern "C" fn(u64), argument: u64, process: &Arc<Process>) -> Arc<Thread> {
+	Thread::new(entry, argument, process.clone()).expect("out of memory for a kernel thread stack")
+}
+
+// Release a prepared thread onto a NAMED core's run queue.
+//
+// The placement half of P02M0152's M3, and the only way to ask for one: `start_thread` puts a
+// thread on the current core, which is what ordinary spawning does and keeps doing. A caller that
+// wants a specific core has to say so, which is what makes "this thread ran on node 1" checkable
+// rather than hoped for.
+#[cfg(test)]
+pub fn start_thread_on(cpu: usize, thread: &Arc<Thread>) -> bool {
+	start_and_enqueue(cpu, thread.clone())
 }
 
 // Release a prepared thread onto the run queue.

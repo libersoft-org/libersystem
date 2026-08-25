@@ -108,6 +108,19 @@ is a point where the syscall may yield, allocate, copy user memory, or have its 
 | `Dequeue` | `Channel::recv_identified` | same |
 | `ReturnToHead` | `Channel::return_to_head` | same |
 | `CommitDelivery` | `Channel::commit_delivery` | same, plus the charge release before it |
+| `Init`'s live slot | `HandleTable::try_place` (every `insert`/`try_insert` path) | the process's handle-table lock |
+
+THE LAST ROW IS NOT AN ACTION OF THE MODEL, and saying so is the point. `Transfer.tla` follows ONE
+capability - `TheCap`, live in the sender's slot 1 at `Init` - through the queue to the receiver, and
+`TransferIsLinear` counts the copies of that one. A process creating a second object is not a step of
+that behaviour; it is the start of another. The trace sink records it as `SEED` anyway, because a
+checker that saw a `Take` from a slot it never saw filled would have nothing to check the take
+against.
+
+What the host checker holds a `SEED` to is what the model's `NoForgery` is about: a capability may
+not appear where the accounting says none should be. It may not displace a live one, it may not land
+in a slot a transfer is holding, and it may not appear in a table that has closed. Those three are
+refused; the mere fact of a new capability is not.
 
 TWO LOCKS ARE TWO ACTIONS. `sys_channel_send` takes the handle-table lock to take the capability,
 RELEASES it, then takes the peer's inbox lock to enqueue - so "send" is at least three model actions

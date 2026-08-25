@@ -218,6 +218,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// Increment 4: parse the device tree (the shared FDT parser), seed the portable
 	// frame allocator, and bring up the kernel heap in the higher half.
 	use super::paging;
+	super::remember_device_tree(dtb);
 	let boot_info = unsafe { super::dtb::parse(dtb) };
 	let mut ram_banks = boot_info.map(|bi| (bi.ram_regions, bi.ram_region_count));
 	let (ram_top, cpu_count, pcie_ecam, _plic_base, fwcfg_base) = match boot_info {
@@ -350,6 +351,10 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	crate::mem::frame::init(&regions[..region_count]);
 	crate::serial_println!("riscv64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
 	crate::mem::heap::init();
+	// THE TOPOLOGY BEFORE THE PARTITION, and after the heap - the same order x86's `mem::init` uses
+	// and for the same two reasons: the reader allocates, and the frame allocator cannot be divided
+	// into node pools once it has started handing frames out. See `mem::numa`.
+	crate::mem::numa::discover();
 	crate::mem::frame::upgrade_to_heap();
 	// Reserve every top-level entry the kernel's two growing windows can ever need, while the
 	// kernel's is still the only address space in existence. This is what `mem::init` does on
@@ -517,6 +522,9 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 		super::enable_interrupts();
 		super::syscall::init();
 		crate::device::init();
+		// The DMA isolation state, once the devices that will master the bus are known. Outside
+		// `device::init` because that function holds the device table's lock while it fills it.
+		crate::dma_policy::init();
 		publish_embedded_boot_info();
 		crate::test_main();
 		super::exit_qemu(true);
@@ -645,6 +653,9 @@ fn run_system_manager() {
 	// Populate the kernel device table from the PCI scan so DeviceManager can enumerate
 	// the virtio devices (the same one-time boot scan the other kmains do).
 	crate::device::init();
+	// The DMA isolation state, once the devices that will master the bus are known. Outside
+	// `device::init` because that function holds the device table's lock while it fills it.
+	crate::dma_policy::init();
 
 	publish_embedded_boot_info();
 

@@ -1686,3 +1686,78 @@ fn a_gicv3_without_an_its_declares_none() {
 	assert_eq!(info.gic_its, 0);
 	assert_eq!(info.gic_msi, 0, "and no v2m frame either");
 }
+
+// ---------------------------------------------------------------------------------------------
+// NUMA: which bank and which hart belong to which node, and how far apart the nodes are.
+// ---------------------------------------------------------------------------------------------
+
+// A two-node machine of the shape QEMU emits for `-numa node,...` on `virt`: a memory node and two
+// cpus per NUMA node, and a `/distance-map` giving the non-local distance.
+fn two_node_machine(distances: bool) -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x1000_0000).prop_u32("numa-node-id", 0).end();
+	builder.begin("memory@50000000").prop("device_type", b"memory\0").prop_reg64(0x5000_0000, 0x1000_0000).prop_u32("numa-node-id", 1).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0);
+	builder.begin("cpu@0").prop_u32("reg", 0).prop_u32("numa-node-id", 0).end();
+	builder.begin("cpu@1").prop_u32("reg", 1).prop_u32("numa-node-id", 0).end();
+	builder.begin("cpu@2").prop_u32("reg", 2).prop_u32("numa-node-id", 1).end();
+	builder.begin("cpu@3").prop_u32("reg", 3).prop_u32("numa-node-id", 1).end();
+	builder.end();
+	if distances {
+		let mut matrix: Vec<u8> = Vec::new();
+		for (from, to, distance) in [(0u32, 0u32, 10u32), (0, 1, 21), (1, 0, 31), (1, 1, 10)] {
+			matrix.extend_from_slice(&from.to_be_bytes());
+			matrix.extend_from_slice(&to.to_be_bytes());
+			matrix.extend_from_slice(&distance.to_be_bytes());
+		}
+		builder.begin("distance-map").prop_str("compatible", "numa-distance-map-v1").prop("distance-matrix", &matrix).end();
+	}
+	builder.end();
+	builder.finish()
+}
+
+#[test]
+fn every_bank_and_every_hart_carries_the_node_the_tree_gave_it() {
+	let info = at(two_node_machine(true)).parse().expect("a two-node tree parses");
+	assert_eq!(info.ram_region_count, 2);
+	assert_eq!(info.ram_regions[0], (0x4000_0000, 0x1000_0000));
+	assert_eq!(info.ram_region_nodes[0], 0);
+	assert_eq!(info.ram_regions[1], (0x5000_0000, 0x1000_0000));
+	assert_eq!(info.ram_region_nodes[1], 1);
+	assert_eq!(info.cpu_count, 4);
+	assert_eq!(&info.cpu_node_ids[..4], &[0, 0, 1, 1]);
+}
+
+#[test]
+fn a_distance_map_is_read_as_directed_triples() {
+	let info = at(two_node_machine(true)).parse().expect("parses");
+	assert_eq!(info.numa_distance_count, 4);
+	assert_eq!(info.numa_distances[0], (0, 0, 10));
+	assert_eq!(info.numa_distances[1], (0, 1, 21));
+	// ASYMMETRIC, AND KEPT SO. The way back is a different cell in a real machine's map, and a
+	// reader that stored one number per pair would quietly halve it.
+	assert_eq!(info.numa_distances[2], (1, 0, 31));
+	assert_eq!(info.numa_distances[3], (1, 1, 10));
+}
+
+#[test]
+fn a_tree_with_no_numa_properties_says_unknown_rather_than_node_zero() {
+	// THE DEFAULT MATTERS AS MUCH AS THE PARSE. A single-node machine's banks have no
+	// `numa-node-id`, and reporting them as node zero would make an allocator believe in a locality
+	// the firmware never claimed - which is indistinguishable, later, from a real one-node machine.
+	let info = at(machine(|_| {})).parse().expect("parses");
+	assert_eq!(info.ram_region_count, 1);
+	assert_eq!(info.ram_region_nodes[0], NUMA_NODE_UNKNOWN);
+	assert_eq!(info.cpu_node_ids[0], NUMA_NODE_UNKNOWN);
+	assert_eq!(info.numa_distance_count, 0, "and no distance map is no distances, not a fabricated one");
+}
+
+#[test]
+fn a_two_node_tree_without_a_distance_map_still_places_its_memory() {
+	let info = at(two_node_machine(false)).parse().expect("parses");
+	assert_eq!(info.ram_region_nodes[0], 0);
+	assert_eq!(info.ram_region_nodes[1], 1);
+	assert_eq!(info.numa_distance_count, 0);
+}

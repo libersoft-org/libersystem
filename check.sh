@@ -22,6 +22,28 @@ declare -A GATES=(
 	# configuration. It runs TLC from the JAR pinned in `toolchain.lock` with NO NETWORK, and names
 	# `./bootstrap.sh tla2tools` when the artifact is absent rather than fetching one.
 	["capability-model"]="tools/check-capability-model.sh"
+	# P02M0152 M5's gate: a two-node QEMU machine, read from its SRAT and SLIT, with the frame
+	# allocator partitioned per node - and placement proved by the physical addresses that come back
+	# rather than by timing, which an emulated topology cannot show.
+	["qemu-numa"]="tools/check-qemu-numa.sh"
+	# P02M0153 M6's host half: the virtio-iommu wire codec, its feature negotiation and its event
+	# parser, driven against malformed and hostile answers a real device does not readily produce.
+	["virtio-iommu-protocol"]="tools/check-virtio-iommu-protocol.sh"
+	# P02M0153 M6's other half, and the one that is isolation evidence rather than enumeration: a
+	# QEMU profile with a virtio-iommu and two hostile `edu` endpoints, each told to reach memory it
+	# was never given. What is checked is the SENTINEL MEMORY, not the error code.
+	["qemu-virtio-iommu-x86_64"]="tools/check-qemu-virtio-iommu-x86_64.sh"
+	# P02M0154 M5: the other direction. `capability-model` explores what the model can do; this
+	# replays what the KERNEL did against it, and requires the checker to refuse eleven deliberate
+	# defects before it is trusted with a real trace.
+	["capability-trace"]="tools/check-capability-trace.sh"
+	# P02M0154 M6's other half: the same five defects in the KERNEL rather than in the model, each
+	# required to be caught by the QEMU conformance fixture. Builds and boots a mutated kernel from a
+	# COPY of the tree - nothing here writes a source file.
+	["implementation-mutations"]="tools/check-implementation-mutations.sh"
+	# P02M0154 M6: the gate that proves the gate can fail. Six deliberate defects, each required to be
+	# caught by the invariant that names it, and nine covers each required to be REFUTED.
+	["model-mutations"]="tools/check-model-mutations.sh"
 	# P02M0150's gate: the two trust profiles differ in the BINARY. The test key's private half is
 	# published on purpose, which is exactly why a release loader must contain none of it.
 	["trust-profile"]="tools/check-trust-profile.sh"

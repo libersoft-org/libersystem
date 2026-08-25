@@ -14,7 +14,8 @@
 # The mutations are on a COPY. Nothing here writes the specification.
 set -euo pipefail
 
-cd "$(dirname "$0")/../.."
+HERE="$(cd "$(dirname "$0")" && pwd)"
+cd "$HERE/../.."
 SPEC="docs/spec/capability"
 JAR=".build/tools/tla2tools.jar"
 
@@ -29,23 +30,31 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 cp "$SPEC"/*.tla "$SPEC"/*.cfg "$work/"
 
-# Replace `old` with `new` in the copy, exactly once.
+# Replace `old` with `new` in a file, exactly once. A replacement that matches nothing - or matches
+# twice - is a gate that has quietly stopped testing what it names, so it is an error rather than a
+# skip.
+replace() {
+	python3 "$HERE/model-mutate.py" "$1" "$2" "$3"
+}
+
 mutate() {
-	python3 - "$work/Transfer.tla" "$1" "$2" <<'PY'
-import io, sys
-path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
-text = io.open(path).read()
-found = text.count(old)
-if found != 1:
-	sys.stderr.write("the mutation matches %d places, and a mutation must match exactly one\n" % found)
-	raise SystemExit(1)
-io.open(path, "w").write(text.replace(old, new))
-PY
+	replace "$work/Transfer.tla" "$1" "$2"
 }
 
 run_mutation() {
-	local name="$1" config="$2" expected="$3" old="$4" new="$5"
+	local name="$1" config="$2" expected="$3" old="$4" new="$5" cfg_old="${6:-}" cfg_new="${7:-}"
 	cp "$SPEC/Transfer.tla" "$work/Transfer.tla"
+	cp "$SPEC/$config.cfg" "$work/$config.cfg"
+	# SOME MUTATIONS NEED A CONFIGURATION THAT OFFERS WHAT THEY BREAK. A rule that a duplicate may
+	# not widen is unbreakable where no widening derivation is on offer - the action is simply
+	# disabled, and a mutation that cannot be reached proves nothing about the invariant that would
+	# have caught it.
+	if [[ -n "$cfg_old" ]]; then
+		replace "$work/$config.cfg" "$cfg_old" "$cfg_new" || {
+			echo "model-mutations: $name's configuration mutation no longer matches" >&2
+			return 1
+		}
+	fi
 	mutate "$old" "$new" || {
 		echo "model-mutations: $name could not be applied - the specification no longer contains what it breaks" >&2
 		return 1
@@ -56,12 +65,12 @@ run_mutation() {
 		echo "model-mutations: $name PASSED the model - the gate does not catch it" >&2
 		return 1
 	fi
-	if grep -aq "Invariant $expected is violated" "$out" || grep -aq "Temporal properties were violated" "$out"; then
+	if grep -aq "Invariant $expected is violated" "$out" || grep -aq "Action property $expected is violated" "$out"; then
 		echo "model-mutations: $name is caught by $expected"
 		return 0
 	fi
 	echo "model-mutations: $name failed, but not as $expected" >&2
-	grep -aE "^Error" "$out" | head -3 >&2
+	grep -aE -m 3 "^Error" "$out" >&2
 	return 1
 }
 
@@ -76,7 +85,9 @@ run_mutation generations-wrap spike GenerationsOnlyAdvance \
 # 2. A duplicate may be asked for rights the original does not have.
 run_mutation duplicate-widens handles AuthorityNeverWidens \
 	'    /\ r \subseteq table[p][i].cap.rights' \
-	'    /\ TRUE' || status=1
+	'    /\ TRUE' \
+	'    MintedRights = {"USE", "DUPLICATE", "TRANSFER"}' \
+	'    MintedRights = {"USE", "DUPLICATE"}' || status=1
 
 # 3. A transfer CLONES rather than moves: the source slot keeps its capability.
 run_mutation transfer-clones spike TransferIsLinear \
@@ -93,13 +104,48 @@ run_mutation dequeue-by-position transactions-single MessageIdentityStable \
 	'    /\ peeked = Head(queue).id' \
 	'    /\ TRUE' || status=1
 
-# 6. An install does not consume the booking it used, so one booking installs twice.
-run_mutation install-keeps-booking spike QuotaConserved \
+# 6. An install does not consume the booking it used, so one booking installs twice - and the index
+#    it named is Live and booked at once, which is what `SlotOwnershipUnique` is for.
+run_mutation install-keeps-booking spike SlotOwnershipUnique \
 	"       /\\ table' = [table EXCEPT ![p][i] = [state |-> \"Live\", cap |-> Head(held.caps), gen |-> table[p][i].gen]]
        /\\ booked' = [booked EXCEPT ![p] = Tail(booked[p])]
        /\\ installed' = Append(installed, i)" \
 	"       /\\ table' = [table EXCEPT ![p][i] = [state |-> \"Live\", cap |-> Head(held.caps), gen |-> table[p][i].gen]]
        /\\ UNCHANGED booked
        /\\ installed' = Append(installed, i)" || status=1
+
+# THE COVER PROPERTIES, EACH ONE REQUIRED TO BE REFUTED. An invariant that passes because its
+# dangerous action is never enabled is a failed gate, and a passing run does not say which of the two
+# happened - so every transition this model is about has to be shown REACHED, by asking TLC to prove
+# it never happens and requiring it to fail.
+cover() {
+	local name="$1" config="$2"
+	cp "$SPEC/Transfer.tla" "$work/Transfer.tla"
+	cp "$SPEC/$config.cfg" "$work/cover.cfg"
+	# The configuration keeps its constants and checks ONE thing: that this never happens.
+	python3 - "$work/cover.cfg" "$name" <<'PYEOF'
+import io, sys
+path, name = sys.argv[1], sys.argv[2]
+text = io.open(path).read()
+head = text.split("SPECIFICATION")[0]
+io.open(path, "w").write(head + "SPECIFICATION Spec\n\nINVARIANTS\n    " + name + "\n")
+PYEOF
+	local out="$work/cover-$name.log"
+	if java -XX:+UseParallelGC -cp "$JAR" tlc2.TLC -metadir "$work/meta-cover-$name" -cleanup -workers 4 \
+		-config "$work/cover.cfg" "$work/Transfer.tla" >"$out" 2>&1; then
+		echo "model-mutations: cover $name was NOT reached - the transition it names is unreachable in $config" >&2
+		return 1
+	fi
+	grep -aq "Invariant $name is violated" "$out" || {
+		echo "model-mutations: cover $name failed for another reason" >&2
+		grep -aE -m 2 "^Error" "$out" >&2
+		return 1
+	}
+	echo "model-mutations: cover $name is reached"
+}
+
+for name in NoPublish NoCopyoutFailure NoPayloadFailure NoRestore NoAbandon NoDropIntoClosed NoRetirement NoCloseRacingTransfer NoDeliveredCapability; do
+	cover "$name" spike || status=1
+done
 
 exit "$status"

@@ -80,6 +80,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "dma"
+version = "0.0.0"
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -161,6 +165,7 @@ dependencies = [
  "bmp",
  "bootproto",
  "buddy",
+ "dma",
  "fdt",
  "flac",
  "fscore",
@@ -175,6 +180,7 @@ dependencies = [
  "system-manifest",
  "term",
  "tga",
+ "topology",
  "vorbis",
  "wav",
  "wavpack",
@@ -424,6 +430,10 @@ name = "toml_writer"
 version = "1.1.2+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d56353a2a665ad0f41a421187180aab746c8c325620617ad883a99a1cbe66d2"
+
+[[package]]
+name = "topology"
+version = "0.0.0"
 
 [[package]]
 name = "unicode-ident"

@@ -251,6 +251,19 @@ pub struct XhciDevice {
 	pub msix_table_phys: u64,
 }
 
+// The identity of one function, or `None` where nothing is there.
+//
+// The public form of `read_function`, for a caller that has a bus address and needs the device
+// behind it - P02M0153's fixture, which works with a function this kernel binds no driver to.
+#[cfg(test)]
+pub fn probe_function<A: ConfigAccess>(bus: u8, dev: u8, func: u8) -> Option<PciDevice> {
+	let vendor = A::read16(bus, dev, func, 0x00);
+	if vendor == 0xFFFF || vendor == 0 {
+		return None;
+	}
+	Some(read_function::<A>(bus, dev, func))
+}
+
 // Read the full identity of one present function.
 fn read_function<A: ConfigAccess>(bus: u8, dev: u8, func: u8) -> PciDevice {
 	PciDevice { bus, dev, func, vendor: A::read16(bus, dev, func, 0x00), device_id: A::read16(bus, dev, func, 0x02), class: A::read8(bus, dev, func, 0x0b), subclass: A::read8(bus, dev, func, 0x0a), prog_if: A::read8(bus, dev, func, 0x09), header_type: A::read8(bus, dev, func, 0x0e) }

@@ -1,0 +1,13 @@
+[package]
+name = "trace-check"
+# The product version lives only in /product.conf; Cargo's optional package version is unused here
+# and omitted.
+edition = "2024"
+description = "Replay a kernel capability trace against the model's action relation"
+
+[[bin]]
+name = "trace-check"
+path = "src/main.rs"
+
+[lints.rust]
+warnings = "deny"

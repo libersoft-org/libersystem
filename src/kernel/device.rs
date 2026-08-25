@@ -145,7 +145,25 @@ pub fn acquire_bus_master(index: usize) -> bool {
 	let mut owners = OWNERS.lock();
 	let Some(entry) = table.get(index) else { return false };
 	let Some(count) = owners.get_mut(index) else { return false };
+	// THE DMA THREAT MODEL IS DECIDED HERE, at the one moment a device gains the ability to reach
+	// memory on its own. A driver that declared it needs translation does not master the bus without
+	// it - and a refusal is a refusal: there is no fall-back to untranslated DMA, because falling
+	// back is the failure P02M0153's Goal names in as many words.
+	//
+	// Everything in this tree is `trusted-untranslated` today, so what this call does at present is
+	// RECORD the degraded state by name rather than change any outcome. That is the point of putting
+	// it in before there is an IOMMU: when one arrives, the decision is already where it belongs.
+	if crate::dma_policy::admit(entry.device_type, entry.bus, entry.dev, entry.func) == dma::BindDecision::Refused {
+		return false;
+	}
 	if *count == 0 {
+		// ATTACHED BEFORE IT CAN MASTER THE BUS, and refused if the attach does not confirm. The
+		// window between "this device can reach memory" and "this device is translated" is the one
+		// place untranslated DMA could happen under an enforcing profile, and the way to have no
+		// such window is to do them in this order.
+		if crate::iommu::present() && !crate::iommu::attach_for(index, entry.bus, entry.dev, entry.func) {
+			return false;
+		}
 		crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, true);
 	}
 	*count += 1;
@@ -174,6 +192,12 @@ pub fn release_bus_master(index: usize) {
 	}
 	*count -= 1;
 	if *count == 0 {
+		// BUS MASTERING GOES FIRST, then the translation. The reverse order would leave a window in
+		// which the device can still master the bus and is no longer translated, which is the same
+		// hole as the acquire path's, arrived at from the other side.
 		crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, false);
+		if crate::iommu::present() {
+			crate::iommu::detach_for(index, entry.bus, entry.dev, entry.func);
+		}
 	}
 }

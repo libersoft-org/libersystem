@@ -1,0 +1,12 @@
+[package]
+name = "topology"
+# The product version lives only in /product.conf; Cargo's optional package version is unused here
+# and omitted.
+edition = "2024"
+description = "Firmware memory and CPU affinity, normalized and validated, in a crate a host can feed malformed tables to"
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+warnings = "deny"

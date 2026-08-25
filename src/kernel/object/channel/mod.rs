@@ -159,6 +159,19 @@ pub struct Channel {
 	// The peer endpoint, held weakly so the two ends do not form a reference
 	// cycle. Upgrading fails once the peer has been dropped (its handles closed).
 	peer: SpinLock<Option<Weak<Channel>>>,
+	// This endpoint's identity in the conformance trace. The model's `queue` is ONE channel's, so
+	// every queue action says whose inbox it touched - see `object::trace`.
+	trace_id: u16,
+}
+
+// Hands out the trace identities above. Wrapping is deliberate and harmless: the trace is read one
+// recording at a time, and two endpoints that share a number across 32767 creations are not both
+// alive inside one.
+static NEXT_CHANNEL_TRACE: AtomicUsize = AtomicUsize::new(0);
+
+fn next_channel_trace() -> u16 {
+	let n = NEXT_CHANNEL_TRACE.fetch_add(1, Ordering::Relaxed);
+	super::trace::CHANNEL_PARTY | (n as u16 & 0x7fff)
 }
 
 impl Channel {
@@ -179,8 +192,8 @@ impl Channel {
 	// short - a denial of service needing no privilege at all.
 	pub fn try_create_with_depth(depth: usize) -> Option<(Arc<Channel>, Arc<Channel>)> {
 		let limit = if depth == 0 { CHANNEL_QUEUE_DEFAULT } else { depth.clamp(1, CHANNEL_QUEUE_MAX) };
-		let a = crate::mem::heap::try_arc(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None) })?;
-		let b = crate::mem::heap::try_arc(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None) })?;
+		let a = crate::mem::heap::try_arc(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None), trace_id: next_channel_trace() })?;
+		let b = crate::mem::heap::try_arc(Channel { header: ObjectHeader::new(), inbox: SpinLock::new(VecDeque::new()), limit, in_flight: AtomicUsize::new(0), peer: SpinLock::new(None), trace_id: next_channel_trace() })?;
 		*a.peer.lock() = Some(Arc::downgrade(&b));
 		*b.peer.lock() = Some(Arc::downgrade(&a));
 		Some((a, b))
@@ -273,6 +286,7 @@ impl Channel {
 					return Err((ChannelError::Full, msg.caps));
 				}
 			}
+			super::trace::channel_event(super::trace::ENQUEUE, peer.trace_id, msg.id, super::trace::OK);
 			inbox.push_back(msg);
 		}
 		// The peer endpoint is now readable: wake any thread blocked waiting on it.
@@ -387,6 +401,7 @@ impl Channel {
 	// longer refunded on the way out of the queue, so a message returned here was never unaccounted
 	// and the domain's `ipc_queue` figure never understated what is outstanding.
 	pub fn return_to_head(&self, mut message: Message) {
+		super::trace::channel_event(super::trace::RETURN_TO_HEAD, self.trace_id, message.id, super::trace::OK);
 		{
 			let mut inbox = self.inbox.lock();
 			// Back into the slot it never gave up: the reservation becomes a queued message again,
@@ -407,6 +422,7 @@ impl Channel {
 	// well before the caller knows whether it can take it. Past here the message cannot go back, so
 	// this is the only place besides `return_to_head` where a receive ends.
 	pub fn commit_delivery(&self, message: &mut Message) {
+		super::trace::channel_event(super::trace::COMMIT_DELIVERY, self.trace_id, message.id, super::trace::OK);
 		message.release_queue_charge();
 		let freed = {
 			let inbox = self.inbox.lock();
@@ -446,6 +462,7 @@ impl Channel {
 			}
 		};
 		if let Some(msg) = popped {
+			super::trace::channel_event(super::trace::DEQUEUE, self.trace_id, msg.id, super::trace::OK);
 			// As above: the charge travels with the message and is released when delivery commits.
 			return Ok(msg);
 		}
@@ -472,6 +489,7 @@ impl Channel {
 	// The same, plus the identity that lets a caller act on the message it just looked at.
 	pub fn peek_identified(&self) -> Result<(u64, usize, usize), ChannelError> {
 		if let Some(msg) = self.inbox.lock().front() {
+			super::trace::channel_event(super::trace::PEEK, self.trace_id, msg.id, super::trace::OK);
 			return Ok((msg.id, msg.bytes.len(), msg.caps.len()));
 		}
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }

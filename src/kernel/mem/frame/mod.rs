@@ -45,6 +45,7 @@ use crate::sync::SpinLock;
 // signature, and a free that overlaps an already-free block is refused inside the allocator, so the
 // signature is unreachable from any caller rather than merely unobserved.
 use buddy::Buddy;
+use topology::{Affinity, NodeId};
 
 // The table's floor, for a pool too small for the worst-case sizing below to matter. The real bound
 // is computed from the pool - see `worst_case_runs`.
@@ -83,6 +84,20 @@ struct Run {
 	pages: u64,
 }
 
+// One buddy allocator and the node it belongs to.
+//
+// `node: None` is two different things that behave identically: the single pool of a machine with no
+// topology, and the pool for unaffiliated memory on a machine that has one. Both are "frames with no
+// locality anyone can claim", which is exactly how they must be treated.
+struct Pool {
+	node: Option<NodeId>,
+	buddy: Buddy,
+}
+
+// One per memory-bearing node, plus the unaffiliated one. Bounded here so the allocation order can
+// be computed on the stack - see `preference`.
+const MAX_POOLS: usize = topology::MAX_NODES + 1;
+
 struct FrameAllocator {
 	// The fixed pre-heap table (boot seeding only) and its live length.
 	//
@@ -90,9 +105,15 @@ struct FrameAllocator {
 	// are handed out before there is anywhere to put a bitmap. A handful of runs is all boot needs.
 	seed: [Run; SEED_RUNS],
 	seed_len: usize,
-	// The buddy allocator, built at `upgrade_to_heap` and the only allocator from then on. While
-	// this is `Some`, the run table above is empty and unused - every operation delegates here.
-	buddy: Option<Buddy>,
+	// WHERE FREE FRAMES LIVE once the heap is up. Empty until `upgrade_to_heap`; from then on the
+	// run table above is empty and unused and every operation delegates here.
+	//
+	// ONE POOL ON A MACHINE WITH NO TOPOLOGY, which is every machine this tree has booted so far -
+	// and on that machine every line below behaves exactly as it did when this was a single
+	// `Option<Buddy>`. A machine whose firmware described more than one memory-bearing node gets one
+	// pool per node plus one for memory no node owns, and the difference is which pool an address
+	// routes to. Nothing else about the allocator changes.
+	pools: Vec<Pool>,
 	// The heap-backed run table. Kept for the window between the heap coming up and the buddy
 	// being built, and as the fallback if the buddy's metadata cannot be reserved.
 	heap: Option<Vec<Run>>,
@@ -131,7 +152,7 @@ impl FrameAllocator {
 		Self {
 			seed: [Run { base: 0, pages: 0 }; SEED_RUNS],
 			seed_len: 0,
-			buddy: None,
+			pools: Vec::new(),
 			heap: None,
 			free_count: 0,
 			total_count: 0,
@@ -331,6 +352,60 @@ impl FrameAllocator {
 	}
 
 	// The current run table, whichever backing it lives in.
+	// WHICH POOL AN ADDRESS BELONGS TO, and the answer comes from the ADDRESS rather than from the
+	// CPU asking. That is the whole rule a free has to obey: a frame freed on a remote core is still
+	// the frame of the node that owns it, and a routing that used the current CPU would migrate
+	// pages between pools through every cross-core free.
+	fn pool_of(&self, phys: u64) -> Option<usize> {
+		if self.pools.len() == 1 {
+			return Some(0);
+		}
+		let node = crate::mem::topology_node_of(phys);
+		if let Affinity::Node(node) = node
+			&& let Some(at) = self.pools.iter().position(|pool| pool.node == Some(node))
+		{
+			let (base, pages) = self.pools[at].buddy.extent();
+			if phys >= base && phys < base + pages * PAGE_SIZE {
+				return Some(at);
+			}
+		}
+		// Unaffiliated, or affiliated with a node whose pool does not cover it - which is memory the
+		// topology described and the seeding could not place. Either way it is nobody's locality.
+		self.pools.iter().position(|pool| pool.node.is_none())
+	}
+
+	// The order pools are tried for an allocation, most preferred first.
+	//
+	// A `None` preference is the neutral order - the pools as they were built, which is node order
+	// then unknown - and it is what every allocation gets until a caller has a node to ask for.
+	//
+	// ON THE STACK, NOT THE HEAP. This runs with the allocator's lock held, and the global allocator's
+	// `grow` calls `frame::allocate` - straight back into the lock this thread is holding, on a
+	// SpinLock, forever. The file says so twice about other paths; this is the third, and it cost a
+	// hung test to find. The array is bounded by the topology's own node bound plus the
+	// unaffiliated pool.
+	fn preference(&self, want: Option<NodeId>, order: &mut [usize; MAX_POOLS]) -> usize {
+		let count = self.pools.len().min(MAX_POOLS);
+		for (slot, at) in order.iter_mut().take(count).zip(0..count) {
+			*slot = at;
+		}
+		let Some(want) = want else { return count };
+		// An insertion sort over at most seventeen entries, which is smaller than the machinery a
+		// general sort would need and allocates nothing.
+		let key = |at: usize| match self.pools[at].node {
+			Some(node) => (crate::mem::topology_distance(want, node) as u32, node.0),
+			None => (u32::MAX, u32::MAX),
+		};
+		for i in 1..count {
+			let mut j = i;
+			while j > 0 && key(order[j - 1]) > key(order[j]) {
+				order.swap(j - 1, j);
+				j -= 1;
+			}
+		}
+		count
+	}
+
 	fn runs(&self) -> &[Run] {
 		match &self.heap {
 			Some(v) => v,
@@ -405,7 +480,7 @@ impl FrameAllocator {
 		if pages == 0 {
 			return;
 		}
-		if self.buddy.is_some() {
+		if !self.pools.is_empty() {
 			// Refuse a span this allocator did not hand out, exactly as the run table does: the
 			// ownership record is the check, and it is the same one either way.
 			if !self.check_owned_free(base, pages) {
@@ -418,7 +493,11 @@ impl FrameAllocator {
 			// to two owners.
 			// The question belongs to the allocator's representation - "already free" means free at
 			// any order covering the page - so it is asked THERE rather than reconstructed here.
-			let already = self.buddy.as_ref().is_some_and(|buddy| buddy.any_free(base, pages));
+			// ASKED OF THE POOL THAT OWNS THE ADDRESS. On a machine with one pool that is the same
+			// question it always was; on a machine with several, asking the wrong pool would answer
+			// about a bitmap that does not cover this page.
+			let at = self.pool_of(base);
+			let already = at.is_some_and(|at| self.pools[at].buddy.any_free(base, pages));
 			if already {
 				note_refused_free();
 				crate::serial_println!("frame: WARNING: double free refused - {pages} page(s) at {base:#x} are already free");
@@ -442,7 +521,10 @@ impl FrameAllocator {
 			// A check that refuses an operation must leave the state it found. Nothing here mutates
 			// until the operation is known to be legal.
 			self.mark_owned(base, pages, false);
-			let taken = self.buddy.as_mut().expect("checked").free_span(base, pages);
+			let taken = match at {
+				Some(at) => self.pools[at].buddy.free_span(base, pages),
+				None => 0,
+			};
 			self.free_count += taken as usize;
 			if taken != pages {
 				// The buddy could not frame all of it - the span reaches outside its extent. The
@@ -515,8 +597,40 @@ impl FrameAllocator {
 	}
 
 	// Take one page off the head of the first run.
-	fn take_one(&mut self) -> Option<u64> {
-		if let Some(buddy) = self.buddy.as_mut() {
+	// One frame from `want`'s pool and nowhere else.
+	#[cfg(test)]
+	fn take_one_strict(&mut self, want: NodeId) -> Option<u64> {
+		let at = self.pools.iter().position(|pool| pool.node == Some(want))?;
+		let base = self.pools[at].buddy.alloc(0)?;
+		// The same checks the neutral path makes, in the same order. A strict allocation is not a
+		// less-checked one.
+		if !self.check_not_owned(base, 1) {
+			let (order, seq) = self.previous_handout(base);
+			crate::serial_println!("frame: DOUBLE ALLOCATION - the buddy handed out {base:#x} at order 0 as allocation {}, and it was already on loan from order {order} as allocation {seq}", self.allocations.wrapping_add(1));
+			DOUBLE_ALLOCATIONS.fetch_add(1, core::sync::atomic::Ordering::AcqRel);
+			self.refuse_duplicate(base, 1, false);
+			return None;
+		}
+		self.free_count -= 1;
+		self.note_handout(base, 1, 0);
+		self.mark_owned(base, 1, true);
+		Some(base)
+	}
+
+	// One frame, preferring `want`'s pool. `None` is the neutral order.
+	fn take_one_from(&mut self, want: Option<NodeId>) -> Option<u64> {
+		if !self.pools.is_empty() {
+			let mut order = [0usize; MAX_POOLS];
+			let count = self.preference(want, &mut order);
+			let mut chosen = None;
+			for at in order.iter().take(count).copied() {
+				if let Some(base) = self.pools[at].buddy.alloc(0) {
+					chosen = Some((at, base));
+					break;
+				}
+			}
+			let (at, base) = chosen?;
+			let buddy = &mut self.pools[at].buddy;
 			// The injection frees the block straight back, so the SAME address comes out of the
 			// next `alloc` while this one is still being handed to a caller. That is precisely the
 			// state a mis-set bit produces, reached without a mis-set bit.
@@ -526,7 +640,6 @@ impl FrameAllocator {
 			// exhausts the pool then subtracts past zero, several tests later, in a place that has
 			// nothing to do with this. An injection that leaves the system inconsistent tests the
 			// inconsistency instead of the thing it was aimed at.
-			let base = buddy.alloc(0)?;
 			let duplicated = injected_duplicate();
 			if duplicated {
 				buddy.free(base, 0);
@@ -573,8 +686,26 @@ impl FrameAllocator {
 	// First-fit a physically contiguous span of `pages`, taking it off the head
 	// of the first run large enough.
 	fn take_contiguous(&mut self, pages: u64) -> Option<u64> {
-		if let Some(buddy) = self.buddy.as_mut() {
-			let base = buddy.alloc_contiguous(pages)?;
+		self.take_contiguous_from(pages, None)
+	}
+
+	// A CONTIGUOUS SPAN COMES FROM ONE POOL OR FROM NONE. Assembling one from two nodes would hand a
+	// device a run whose halves are on different memory controllers while the descriptor says it is
+	// one buffer - and the pools are separate bitmaps, so it cannot happen by construction. This
+	// says so where a reader looks for it.
+	fn take_contiguous_from(&mut self, pages: u64, want: Option<NodeId>) -> Option<u64> {
+		if !self.pools.is_empty() {
+			let mut order = [0usize; MAX_POOLS];
+			let count = self.preference(want, &mut order);
+			let mut chosen = None;
+			for at in order.iter().take(count).copied() {
+				if let Some(base) = self.pools[at].buddy.alloc_contiguous(pages) {
+					chosen = Some((at, base));
+					break;
+				}
+			}
+			let (at, base) = chosen?;
+			let _ = at;
 			// The order a contiguous request is served from: `pages` rounded up to a power of two.
 			let order: u8 = pages.next_power_of_two().trailing_zeros() as u8;
 			if !self.check_not_owned(base, pages) {
@@ -712,6 +843,11 @@ pub fn upgrade_to_heap() {
 		(extent, allocator.total_count, words, frames)
 	};
 	let buddy = extent.and_then(|(base, pages)| Buddy::new(base, pages));
+	// THE NODE POOLS ARE BUILT HERE, WITH THE LOCK RELEASED, for the same reason the buddy's
+	// metadata is: `Buddy::new` and the vector holding them both call the global allocator, whose
+	// `grow` calls `frame::allocate`. Building them under the lock this function is about to take
+	// would be a core spinning on itself.
+	let node_pools = buddy.as_ref().and_then(|buddy| node_pools(buddy.extent()));
 
 	// The run table, reserved ONLY as the fallback. Sized for the worst case the pool can reach
 	// rather than for what a healthy one looks like - see `worst_case_runs` - because that is what
@@ -779,7 +915,7 @@ pub fn upgrade_to_heap() {
 	let _ = (owned_words, owned_frames);
 
 	let mut allocator = ALLOCATOR.lock();
-	if allocator.heap.is_some() || allocator.buddy.is_some() {
+	if allocator.heap.is_some() || !allocator.pools.is_empty() {
 		return;
 	}
 	if let Some(mut table) = runs {
@@ -803,7 +939,7 @@ pub fn upgrade_to_heap() {
 	// Move the pool into the buddy and empty the seed table behind it. From here every allocation
 	// and every free goes through the bitmap, and a free cannot be lost because there is no table
 	// to fill - which is the property P02M0120 exists for.
-	if let Some(mut buddy) = buddy {
+	if let Some(buddy) = buddy {
 		// Seeded from the table as it stands NOW, under the lock that installs the result, with
 		// nothing allocating in between. `free_span` only writes bits that are already reserved,
 		// so this whole block is allocation-free - which is the property that makes it safe to do
@@ -812,23 +948,190 @@ pub fn upgrade_to_heap() {
 		// A run that falls outside the extent cannot happen (the extent came from this same table
 		// and frames only leave it), but `free` refuses one rather than trusting the argument, and
 		// a refusal shows up as a shortfall in the count below.
+		let mut pools = match node_pools {
+			// ONE POOL, and every line of the allocator then behaves exactly as it did before node
+			// pools existed. This is the path every machine this tree has booted takes.
+			// ALLOC-OK: once at `upgrade_to_heap`, on the boot path, with the allocator's lock released - see the note above.
+			None => alloc::vec![Pool { node: None, buddy }],
+			// One per memory-bearing node, plus this one for memory no node owns. The unaffiliated
+			// pool spans the whole extent because unowned memory is scattered through it; no address
+			// is ever in two pools' free lists, because every address routes by ownership.
+			Some(mut per_node) => {
+				// ALLOC-OK: one push into a vector built a few lines ago on the boot path; bounded by the node count.
+				per_node.push(Pool { node: None, buddy });
+				per_node
+			}
+		};
+		// Seeded from the table as it stands NOW, under the lock that installs the result, with
+		// nothing allocating in between. Each run is SPLIT at the topology's boundaries so every
+		// page lands in the pool that owns it - a run handed whole to one pool would put a node's
+		// memory in another node's bitmap, which is the mistake the whole partition exists to avoid.
 		let mut offered = 0u64;
 		let mut seeded = 0u64;
 		for index in 0..allocator.runs().len() {
 			let run = allocator.runs()[index];
-			seeded += buddy.free_span(run.base, run.pages);
 			offered += run.pages;
+			for_each_piece(run.base, run.pages, |base, pages, node| {
+				if pages == 0 {
+					return;
+				}
+				let fits = |pool: &Pool| {
+					let (pool_base, pool_pages) = pool.buddy.extent();
+					pool_base <= base && base + pages * PAGE_SIZE <= pool_base + pool_pages * PAGE_SIZE
+				};
+				let at = pools.iter().position(|pool| pool.node == node && fits(pool)).or_else(|| pools.iter().position(|pool| pool.node.is_none()));
+				if let Some(at) = at {
+					seeded += pools[at].buddy.free_span(base, pages);
+				}
+			});
 		}
 		if seeded != offered {
 			crate::serial_println!("frame: the buddy took {seeded} of {offered} free frames; the rest fell outside its extent and are lost");
 		}
-		let free = buddy.free_pages();
-		let metadata = buddy.metadata_bytes();
-		allocator.buddy = Some(buddy);
+		let free: u64 = pools.iter().map(|pool| pool.buddy.free_pages()).sum();
+		let metadata: usize = pools.iter().map(|pool| pool.buddy.metadata_bytes()).sum();
+		let count = pools.len();
+		allocator.pools = pools;
 		allocator.free_count = free as usize;
 		allocator.seed_len = 0;
-		crate::serial_println!("memory: buddy allocator up - {free} free frames, {} KiB of metadata", metadata / 1024);
+		if count == 1 {
+			crate::serial_println!("memory: buddy allocator up - {free} free frames, {} KiB of metadata", metadata / 1024);
+		} else {
+			crate::serial_println!("memory: buddy allocator up - {free} free frames across {count} pool(s), {} KiB of metadata", metadata / 1024);
+		}
 	}
+}
+
+// One buddy per memory-bearing node, or `None` where a partition is not warranted or not possible.
+//
+// REFUSED RATHER THAN APPROXIMATED. A machine whose node extents INTERLEAVE cannot be partitioned
+// this way - a buddy owns one contiguous extent - and the honest answer is one pool with a line
+// saying why, not a partition that puts half a node's memory somewhere else. Everything still works;
+// it simply has no locality, which is what a machine with no topology has too.
+fn node_pools(extent: (u64, u64)) -> Option<Vec<Pool>> {
+	let (extent_base, extent_pages) = extent;
+	let extent_end = extent_base + extent_pages * PAGE_SIZE;
+	let spans = crate::mem::with_topology(|found| {
+		let mut spans: Vec<(NodeId, u64, u64)> = Vec::new();
+		for node in found.memory_bearing_nodes() {
+			let mut low = u64::MAX;
+			let mut high = 0u64;
+			for range in found.ranges().iter().filter(|range| range.node == node) {
+				low = low.min(range.base.max(extent_base));
+				high = high.max(range.end().min(extent_end));
+			}
+			if low < high {
+				// ALLOC-OK: boot path, bounded by `topology::MAX_NODES`, which the topology refused to exceed.
+				spans.push((node, low, high));
+			}
+		}
+		spans
+	})?;
+	if spans.len() < 2 {
+		return None;
+	}
+	// Disjoint, or nothing. Sorted first so the check is a single pass.
+	let mut sorted = spans.clone();
+	sorted.sort_by_key(|(_, low, _)| *low);
+	for pair in sorted.windows(2) {
+		if pair[0].2 > pair[1].1 {
+			crate::serial_println!("memory: the firmware's node extents overlap; running with one pool and no locality");
+			return None;
+		}
+	}
+	let mut pools = Vec::new();
+	for (node, low, high) in sorted {
+		// Aligned outward to whole pages, which `Buddy::new` requires of its base.
+		let base = low & !(PAGE_SIZE - 1);
+		let pages = (high - base).div_ceil(PAGE_SIZE);
+		let Some(buddy) = Buddy::new(base, pages) else {
+			crate::serial_println!("memory: node {}'s pool could not be sized; running with one pool and no locality", node.0);
+			return None;
+		};
+		// ALLOC-OK: boot path, one entry per memory-bearing node and bounded by the same node bound.
+		pools.push(Pool { node: Some(node), buddy });
+	}
+	Some(pools)
+}
+
+// Split one free run at the topology's boundaries and hand each piece to `visit`: the parts each
+// node owns, and the parts nobody does.
+//
+// A CALLBACK RATHER THAN A LIST, because this runs with the allocator's lock held and a list would
+// be a heap allocation - which is the deadlock `preference` describes. A machine with no topology
+// gets one piece, the whole run, owned by nobody: the single-pool case, unchanged.
+fn for_each_piece(base: u64, pages: u64, mut visit: impl FnMut(u64, u64, Option<NodeId>)) {
+	let end = base + pages * PAGE_SIZE;
+	let described = crate::mem::with_topology(|found| {
+		let mut at = base;
+		for range in found.ranges() {
+			if range.end() <= at || range.base >= end {
+				continue;
+			}
+			// The gap before this range belongs to nobody.
+			if range.base > at {
+				visit(at, (range.base - at) / PAGE_SIZE, None);
+				at = range.base;
+			}
+			let piece_end = range.end().min(end);
+			if piece_end > at {
+				visit(at, (piece_end - at) / PAGE_SIZE, Some(range.node));
+				at = piece_end;
+			}
+		}
+		if at < end {
+			visit(at, (end - at) / PAGE_SIZE, None);
+		}
+	});
+	if described.is_none() {
+		visit(base, pages, None);
+	}
+}
+
+// What each pool holds, for the boot report.
+//
+// THE SUM IS CHECKED AGAINST THE WHOLE, because "the totals equal the sum of the node pools plus the
+// unknown pool" is an invariant of the partition and not an observation about it. A pool whose free
+// count has drifted from the allocator's is a pool whose frees went somewhere else.
+pub fn report_pools() {
+	let allocator = ALLOCATOR.lock();
+	if allocator.pools.len() < 2 {
+		return;
+	}
+	let mut summed = 0u64;
+	for pool in &allocator.pools {
+		let free = pool.buddy.free_pages();
+		summed += free;
+		let (base, pages) = pool.buddy.extent();
+		match pool.node {
+			Some(node) => crate::serial_println!("numa:   pool node {}: {free} free frames of {pages}, extent {base:#x}", node.0),
+			None => crate::serial_println!("numa:   pool unaffiliated: {free} free frames, extent {base:#x} ({pages} frames)"),
+		}
+	}
+	if summed as usize != allocator.free_count {
+		crate::serial_println!("numa: WARNING - the pools hold {summed} free frames and the allocator counts {}; a free has gone somewhere unrecorded", allocator.free_count);
+	}
+}
+
+// How many pools serve allocations. One on every machine with no topology.
+#[cfg(test)]
+pub fn pool_count() -> usize {
+	ALLOCATOR.lock().pools.len()
+}
+
+// Whether the pools' free counts add up to the allocator's.
+//
+// THE INVARIANT THE PARTITION IS ONLY VALID UNDER: the totals equal the sum of the node pools plus
+// the unaffiliated pool. A frame returned to the wrong pool leaves the TOTAL right and this sum
+// wrong, which is exactly the cross-node corruption the routing exists to prevent.
+#[cfg(test)]
+pub fn pools_agree_with_total() -> bool {
+	let allocator = ALLOCATOR.lock();
+	if allocator.pools.is_empty() {
+		return true;
+	}
+	let summed: u64 = allocator.pools.iter().map(|pool| pool.buddy.free_pages()).sum();
+	summed as usize == allocator.free_count
 }
 
 // How many runs the live table can hold, and whether it is the heap-backed one. For the test that
@@ -851,13 +1154,13 @@ pub fn on_heap() -> bool {
 // needs to know, because every caller goes through the same four functions either way.
 #[cfg(test)]
 pub fn on_buddy() -> bool {
-	ALLOCATOR.lock().buddy.is_some()
+	!ALLOCATOR.lock().pools.is_empty()
 }
 
 // Bytes of buddy metadata, or 0 when the run table is still in charge.
 #[cfg(test)]
 pub fn buddy_metadata_bytes() -> usize {
-	ALLOCATOR.lock().buddy.as_ref().map(|buddy| buddy.metadata_bytes()).unwrap_or(0)
+	ALLOCATOR.lock().pools.iter().map(|pool| pool.buddy.metadata_bytes()).sum()
 }
 
 // The frame pool's totals: (total usable frames fixed at init, frames currently free).
@@ -1091,11 +1394,52 @@ fn injected_failure() -> bool {
 }
 
 // Allocate one physical frame, returning its physical address.
+// A frame from THIS NODE OR NOTHING.
+//
+// Strict means strict: a caller that asks for node 1 and would rather have node 0's memory than fail
+// is asking for `allocate_preferred`. The difference is the whole contract - a strict allocation that
+// quietly fell back would make "this buffer is local" a statement nobody can rely on.
+// TEST-ONLY UNTIL A KERNEL CALLER ASKS FOR LOCALITY. The contract is what M2 owes, and the
+// callers that will use it - a kernel stack for a thread placed on a node, a page table for an
+// address space that lives there - are M3's. Exposing it without a caller would be a public
+// surface nothing exercises; exposing it to the conformance suite is what proves it works.
+#[cfg(test)]
+pub fn allocate_strict(node: NodeId) -> Option<u64> {
+	if injected_failure() {
+		return None;
+	}
+	ALLOCATOR.lock().take_one_strict(node)
+}
+
+// A frame from this node if there is one, then from the nearest node that has one, then from memory
+// no node owns. One deterministic order, and it is `preference`'s.
+#[cfg(test)]
+pub fn allocate_preferred(node: NodeId) -> Option<u64> {
+	if injected_failure() {
+		return None;
+	}
+	ALLOCATOR.lock().take_one_from(Some(node))
+}
+
+// The same contract for a contiguous span. A span never spans two pools - see `take_contiguous_from`.
+#[cfg(test)]
+pub fn allocate_contiguous_preferred(pages: usize, node: NodeId) -> Option<u64> {
+	if pages == 0 || injected_failure() {
+		return None;
+	}
+	ALLOCATOR.lock().take_contiguous_from(pages as u64, Some(node))
+}
+
 pub fn allocate() -> Option<u64> {
 	if injected_failure() {
 		return None;
 	}
-	ALLOCATOR.lock().take_one()
+	// LOCAL ONCE THERE IS A LOCAL TO BE. `local_node` answers `None` until bring-up has bound a core
+	// to a node, which is the readiness point P02M0152's M2 names - an allocation must not ask which
+	// CPU it is on before per-CPU state exists. On a machine with no topology it is one relaxed
+	// atomic load and the answer is always `None`, so the ordinary path costs what it always did.
+	let want = crate::smp::numa::local_node();
+	ALLOCATOR.lock().take_one_from(want)
 }
 
 // Allocate `pages` physically CONTIGUOUS frames, returning the base address of
@@ -1400,8 +1744,10 @@ pub fn set_owned_bit_for_test(phys: u64, owned: bool) {
 #[cfg(test)]
 pub fn audit() -> Option<(u64, u64)> {
 	let allocator = ALLOCATOR.lock();
-	let buddy = allocator.buddy.as_ref()?;
 	let bits = allocator.owned.as_ref()?;
+	if allocator.pools.is_empty() {
+		return None;
+	}
 	let (record_base, record_frames) = (allocator.owned_base, allocator.owned_frames);
 	// Counts first, and the walk only when they differ. The record's bits are a popcount over
 	// `record_frames / 64` words - 16k words on a 4 GiB machine - against a walk that asks
@@ -1424,7 +1770,11 @@ pub fn audit() -> Option<(u64, u64)> {
 		owned_pages += value.count_ones() as u64;
 	}
 	let free_by_record = record_frames - owned_pages;
-	if free_by_record == buddy.free_pages() {
+	// ACROSS EVERY POOL. The record is one bitmap over the whole of physical memory and the pools
+	// divide it, so the question "do the two views agree" is asked of the sum - and a page that
+	// moved between pools without being recorded shows up here exactly as a page that vanished.
+	let free_in_pools: u64 = allocator.pools.iter().map(|pool| pool.buddy.free_pages()).sum();
+	if free_by_record == free_in_pools {
 		return None;
 	}
 	// They disagree. Now find WHERE, because the count alone names nothing.
@@ -1433,7 +1783,11 @@ pub fn audit() -> Option<(u64, u64)> {
 	for index in 0..record_frames {
 		let phys = record_base + index * PAGE_SIZE;
 		let owned = bits[(index / 64) as usize] & (1 << (index % 64)) != 0;
-		if buddy.is_free_page(phys) == owned {
+		let free_somewhere = allocator.pools.iter().any(|pool| {
+			let (base, pages) = pool.buddy.extent();
+			phys >= base && phys < base + pages * PAGE_SIZE && pool.buddy.is_free_page(phys)
+		});
+		if free_somewhere == owned {
 			if wrong == 0 {
 				first = phys;
 			}

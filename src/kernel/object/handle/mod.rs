@@ -160,6 +160,11 @@ pub struct HandleTable {
 	// `close_all` was not the terminal barrier its name and its use imply, and that is what this
 	// makes it.
 	closed: bool,
+	// WHICH TABLE THIS IS, in the model's vocabulary. The model's `Procs` is a small set of tables,
+	// and a trace has to say which one an action was in; the conformance driver names them and every
+	// other table is zero. One byte in both configurations, because the alternative is a `cfg` on
+	// every line that reads it.
+	trace_id: u16,
 	// The Domain whose handle quota this table charges. None for tables not tied
 	// to a Domain (e.g. unit-test tables), which skip accounting entirely.
 	domain: Option<Arc<Domain>>,
@@ -190,7 +195,19 @@ fn retire_or_recycle(slot: &mut Slot, free: &mut Vec<u32>, index: usize) {
 
 impl HandleTable {
 	pub const fn new() -> Self {
-		Self { slots: Vec::new(), free: Vec::new(), booked: Vec::new(), closed: false, domain: None }
+		Self { slots: Vec::new(), free: Vec::new(), booked: Vec::new(), closed: false, trace_id: 0, domain: None }
+	}
+
+	// Name this table for the conformance trace. See `trace_id`.
+	#[cfg(test)]
+	pub fn set_trace_id(&mut self, id: u16) {
+		self.trace_id = id;
+	}
+
+	// One line at each boundary. In a production build `handle_event` reaches an empty `record`, so
+	// this is a call the optimiser removes rather than a branch anybody pays for.
+	fn trace(&self, action: u8, slot: u16, generation: u32, rights: u32, outcome: u8) {
+		super::trace::handle_event(action, self.trace_id, slot, generation, rights, outcome);
 	}
 
 	// Bind this table to a Domain so inserts/closes charge its handle quota.
@@ -220,8 +237,10 @@ impl HandleTable {
 	fn try_place(&mut self, cap: Capability) -> Result<Handle, Capability> {
 		if let Some(index) = self.free.pop() {
 			let slot = &mut self.slots[index as usize];
+			let (generation, carried) = (slot.generation, cap.rights.bits());
 			slot.cap = Some(cap);
-			return Ok(Handle::new(slot.generation, index));
+			self.trace(super::trace::SEED, index as u16, generation, carried, super::trace::OK);
+			return Ok(Handle::new(generation, index));
 		}
 		// BOTH VECTORS, and the free list first in intent: this reserved only `slots`, so a fresh
 		// slot appended here left `free` with no room for the index it will one day carry. Every
@@ -242,7 +261,9 @@ impl HandleTable {
 			return Err(cap);
 		}
 		let index = self.slots.len() as u32;
+		let carried = cap.rights.bits();
 		self.slots.push(Slot { cap: Some(cap), generation: 1, reserved: false });
+		self.trace(super::trace::SEED, index as u16, 1, carried, super::trace::OK);
 		Ok(Handle::new(1, index))
 	}
 
@@ -338,15 +359,18 @@ impl HandleTable {
 			self.booked.push(index);
 		}
 		let Some(domain) = &self.domain else {
+			self.trace(super::trace::BOOK, count as u16, 0, 0, super::trace::OK);
 			return true;
 		};
 		for taken in 0..count {
 			if !domain.try_charge_handle() {
 				domain.uncharge_handles(taken as u64);
 				self.unbook(before);
+				self.trace(super::trace::BOOK, count as u16, 0, 0, super::trace::REFUSED);
 				return false;
 			}
 		}
+		self.trace(super::trace::BOOK, count as u16, 0, 0, super::trace::OK);
 		true
 	}
 
@@ -373,6 +397,7 @@ impl HandleTable {
 		// existed at the time. Returning a handle into a dead process's table would leave a live
 		// capability in a process that has finished tearing down.
 		if self.closed {
+			self.trace(super::trace::INSTALL_INTO_CLOSED, 0, 0, cap.rights.bits(), super::trace::OK);
 			drop(cap);
 			if self.booked.pop().is_some()
 				&& let Some(domain) = &self.domain
@@ -384,11 +409,14 @@ impl HandleTable {
 		// INTO THE SLOT THIS RESERVATION OWNS. `place` searched the free list, which another thread
 		// may have emptied since the booking - and answered with the zero handle when it had, after
 		// the hardware was programmed or the message committed.
+		let carried = cap.rights.bits();
 		match self.booked.pop() {
 			Some(index) => {
 				let slot = &mut self.slots[index as usize];
 				slot.cap = Some(cap);
-				Handle::new(slot.generation, index)
+				let generation = slot.generation;
+				self.trace(super::trace::INSTALL, index as u16, generation, carried, super::trace::OK);
+				Handle::new(generation, index)
 			}
 			// No booking: the caller reserved less than it installs, which is a contract error
 			// rather than a race. `place` is the honest fallback - it charges nothing, and a handle
@@ -399,6 +427,7 @@ impl HandleTable {
 
 	// Give back part of a reservation that was not used.
 	pub fn release_reservation(&mut self, count: usize) {
+		self.trace(super::trace::UNBOOK, count as u16, 0, 0, super::trace::OK);
 		// The booked slots go back too, not only the quota: they were taken out of circulation by
 		// `reserve` and nothing else can use them until they are returned.
 		let give_back = count.min(self.booked.len());
@@ -615,11 +644,23 @@ impl HandleTable {
 		let slot = self.slots.get_mut(index).ok_or(HandleError::BadHandle)?;
 		let cap = slot.cap.take().ok_or(HandleError::BadHandle)?;
 		slot.reserved = true;
+		let generation = slot.generation;
+		let carried = cap.rights.bits();
+		self.trace(super::trace::TAKE, index as u16, generation, carried, super::trace::OK);
 		Ok(cap)
 	}
 
 	// The transfer happened: the handle value dies now, and the quota is refunded.
 	pub fn commit_taken(&mut self, handle: Handle) {
+		self.trace(super::trace::COMMIT_TAKE, handle.index() as u16, handle.generation(), 0, super::trace::OK);
+		self.resolve_taken(handle);
+	}
+
+	// The half `commit_taken` and `abandon_taken` share: the slot goes back under the generation
+	// rules and the quota is refunded. Split out so each of the two emits ITS OWN action and only
+	// its own - a trace in which an abandon is followed by a commit describes a transfer resolved
+	// twice, which is not what happened.
+	fn resolve_taken(&mut self, handle: Handle) {
 		let index = handle.index() as usize;
 		if let Some(slot) = self.slots.get_mut(index) {
 			slot.reserved = false;
@@ -646,7 +687,8 @@ impl HandleTable {
 	// and the quota is refunded. What differs is only where the capability went - to the peer on a
 	// commit, nowhere at all here.
 	pub fn abandon_taken(&mut self, handle: Handle) {
-		self.commit_taken(handle);
+		self.trace(super::trace::ABANDON_TAKE, handle.index() as u16, handle.generation(), 0, super::trace::OK);
+		self.resolve_taken(handle);
 	}
 
 	// The transfer did not happen: the capability goes back to the handle it came from, still
@@ -657,6 +699,7 @@ impl HandleTable {
 	// is dropped here and the quota refunded, which is what `close_all` would have done to it had it
 	// been present at the time.
 	pub fn restore_taken(&mut self, handle: Handle, cap: Capability) {
+		self.trace(super::trace::RESTORE_TAKE, handle.index() as u16, handle.generation(), cap.rights.bits(), if self.closed { super::trace::REFUSED } else { super::trace::OK });
 		if self.closed {
 			drop(cap);
 			if let Some(index) = self.slots.get_mut(handle.index() as usize) {
@@ -681,6 +724,7 @@ impl HandleTable {
 
 	pub fn close(&mut self, handle: Handle) -> Result<(), HandleError> {
 		let index = handle.index() as usize;
+		self.trace(super::trace::CLOSE, index as u16, handle.generation(), 0, super::trace::OK);
 		let slot = self.slots.get_mut(index).ok_or(HandleError::BadHandle)?;
 		if slot.cap.is_none() || slot.generation != handle.generation() {
 			return Err(HandleError::BadHandle);
@@ -740,6 +784,7 @@ impl HandleTable {
 	}
 
 	pub fn close_all(&mut self) {
+		self.trace(super::trace::TERMINATE, 0, 0, 0, super::trace::OK);
 		// From here the table takes nothing new: a transfer that has not resolved yet has no owner
 		// left to restore to. See `closed`.
 		self.closed = true;

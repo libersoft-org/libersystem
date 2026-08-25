@@ -134,6 +134,21 @@ pub fn set_bus_master(bus: u8, dev: u8, func: u8, on: bool) {
 	common::set_bus_master::<Access>(bus, dev, func, on);
 }
 
+// One function's memory BAR, resolved live from configuration space: its assigned base and its
+// probed size.
+//
+// FOR A FUNCTION THIS KERNEL BINDS NO DRIVER TO. The device table admits resolved virtio and xHCI
+// functions only, and P02M0153's fixture needs the PCI `edu` device - which is neither. Retaining a
+// window for an arbitrary function is what that fixture needs and what this provides; it does not
+// map anything or grant anything, it reads two registers.
+#[cfg(test)]
+pub fn function_bar(bus: u8, dev: u8, func: u8, index: usize) -> Option<(u64, u64)> {
+	let device = common::probe_function::<Access>(bus, dev, func)?;
+	let base = common::bar_address::<Access>(&device, index)?;
+	let size = common::bar_size::<Access>(&device, index)?;
+	if base == 0 || size == 0 { None } else { Some((base, size)) }
+}
+
 // One function's COMMAND register, read back - test-only, see `arch::common::pci::command`.
 #[cfg(test)]
 pub fn command(bus: u8, dev: u8, func: u8) -> u16 {

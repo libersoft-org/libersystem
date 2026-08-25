@@ -115,7 +115,7 @@ if [[ -f "$volume" ]]; then
 	cp "$volume" "$work/volume-disk.img"
 	# The signed manifest inside a LiberFS image, found by its own magic: there is no host tool that
 	# writes this format, and this needs to change a byte rather than a file.
-	at="$(grep -abo 'LBRMAN' "$work/volume-disk.img" | head -1 | cut -d: -f1)"
+	at="$(grep -abo -m 1 'LBRMAN' "$work/volume-disk.img" | cut -d: -f1)"
 	[[ -n "$at" ]] || fail "the system volume carries no signed manifest"
 	printf '\x01' | dd of="$work/volume-disk.img" bs=1 seek=$((at + 40)) count=1 conv=notrunc status=none
 	vars="$work/vars.vol.fd"

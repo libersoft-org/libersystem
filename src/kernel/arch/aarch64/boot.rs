@@ -399,6 +399,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// whose size it does not know yet, which is the same as not asking.
 	crate::mem::set_hhdm_offset(paging::KERNEL_VA_OFFSET);
 	crate::mem::set_direct_map_extent(BOOT_DIRECT_MAP_EXTENT);
+	super::remember_device_tree(dtb);
 	let tree = unsafe { super::dtb::parse(dtb) };
 	let controller = tree.as_ref().map_or(GicProfile::MISSING, GicProfile::from_tree);
 	// A NO-DT BOOT GETS ONE NAMED DESCRIPTOR AND MAKES NO DISCOVERY CLAIM. The AAVMF/U-Boot path
@@ -444,7 +445,20 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	let mut ram_banks = boot_info.map(|bi| (bi.ram_regions, bi.ram_region_count));
 	let (ram_top, cpu_count, fwcfg_base) = match boot_info {
 		Some(bi) => {
-			crate::serial_println!("aarch64: DTB parsed - RAM {:#x}..{:#x} ({} MB), {} CPU(s)", bi.ram_base, bi.ram_base + bi.ram_size, bi.ram_size / (1024 * 1024), bi.cpu_count);
+			// EVERY BANK, NOT THE FIRST RUN. `ram_base`/`ram_size` describe the first contiguous run
+			// and always have; on a machine whose banks belong to different NUMA nodes they are no
+			// longer one run, so a line that printed only those two numbers said a 512 MiB machine
+			// had 256 MiB.
+			crate::serial_println!("aarch64: DTB parsed - {} bank(s), {} CPU(s)", bi.ram_region_count, bi.cpu_count);
+			for index in 0..bi.ram_region_count {
+				let (base, len) = bi.ram_regions[index];
+				let node = bi.ram_region_nodes[index];
+				if node == fdt::NUMA_NODE_UNKNOWN {
+					crate::serial_println!("aarch64:   RAM {:#x}..{:#x} ({} MB)", base, base + len, len / (1024 * 1024));
+				} else {
+					crate::serial_println!("aarch64:   RAM {:#x}..{:#x} ({} MB), node {node}", base, base + len, len / (1024 * 1024));
+				}
+			}
 			// The boot stub already maps the 256 GB device region (BOOT_L1[256]), so
 			// the PCIe ECAM is reachable through phys_to_virt; just point PCI at it.
 			if bi.pcie_ecam != 0 {
@@ -564,6 +578,12 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	for hole in &holes[..hole_count] {
 		crate::serial_println!("aarch64: reserved {:#x}..{:#x} ({} KiB) - handed over by the loader", hole.start, hole.end, (hole.end - hole.start) / 1024);
 	}
+	// WHAT WAS ACTUALLY HANDED TO THE ALLOCATOR, region by region. The free-frame total below is a
+	// sum, and a sum cannot say which bank went missing - which is what a machine reporting half its
+	// memory needs somebody to be able to read.
+	for region in &regions[..region_count] {
+		crate::serial_println!("aarch64:   seeding {:#x}..{:#x} ({} MB)", region.base, region.base + region.length, region.length / (1024 * 1024));
+	}
 	crate::mem::frame::init(&regions[..region_count]);
 	crate::serial_println!("aarch64: frame allocator up - {} MB free DRAM", paging::frames_free() * 4 / 1024);
 	crate::mem::heap::init();
@@ -574,6 +594,10 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// call is doing the work of a comment.
 	crate::mem::heap::reserve_window();
 	crate::syscall::reserve_kernel_vmap();
+	// THE TOPOLOGY BEFORE THE PARTITION, and after the heap - the same order x86's `mem::init` uses
+	// and for the same two reasons: the reader allocates, and the frame allocator cannot be divided
+	// into node pools once it has started handing frames out. See `mem::numa`.
+	crate::mem::numa::discover();
 	crate::mem::frame::upgrade_to_heap();
 
 	// The MSI controller, now that its tables can be allocated: a GICv2m frame's SPI range, or a
@@ -771,6 +795,9 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	#[cfg(test)]
 	{
 		crate::device::init();
+		// The DMA isolation state, once the devices that will master the bus are known. Outside
+		// `device::init` because that function holds the device table's lock while it fills it.
+		crate::dma_policy::init();
 		publish_embedded_boot_info();
 		crate::test_main();
 		super::exit_qemu(true)
@@ -911,6 +938,9 @@ fn run_system_manager() {
 	// enumerate the virtio devices and spawn their drivers (the same one-time boot
 	// scan the x86 kmain does before starting userspace).
 	crate::device::init();
+	// The DMA isolation state, once the devices that will master the bus are known. Outside
+	// `device::init` because that function holds the device table's lock while it fills it.
+	crate::dma_policy::init();
 
 	publish_embedded_boot_info();
 

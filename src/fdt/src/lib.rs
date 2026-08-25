@@ -43,6 +43,10 @@ pub struct BootInfo {
 	// worse answer than sixteen banks of a seventeen-bank machine.
 	pub ram_regions: [(u64, u64); MAX_RAM_REGIONS],
 	pub ram_region_count: usize,
+	// WHICH NUMA NODE EACH BANK BELONGS TO, parallel to `ram_regions`. `NUMA_NODE_UNKNOWN` where the
+	// tree said nothing - which is not node zero: a bank with no `numa-node-id` is a bank whose
+	// affinity firmware did not state, and inventing one steers allocations at a guess.
+	pub ram_region_nodes: [u32; MAX_RAM_REGIONS],
 	// CPUs THE TREE DECLARES USABLE, and their HARDWARE ids - not a count to iterate from zero.
 	//
 	// `cpu_count` was every `cpu@` node the walk saw, disabled ones included, and the `reg` that
@@ -56,6 +60,12 @@ pub struct BootInfo {
 	// `cpu@` node seen, so a caller can report the difference rather than leaving it invisible.
 	pub cpu_count: u32,
 	pub cpu_ids: [u64; MAX_CPUS],
+	// The same for processors, parallel to `cpu_ids`.
+	pub cpu_node_ids: [u32; MAX_CPUS],
+	// The `distance-map` node's matrix, as (from, to, distance) triples in the tree's own node
+	// numbering. Empty on a machine with one node or none.
+	pub numa_distances: [(u32, u32, u8); MAX_NUMA_CELLS],
+	pub numa_distance_count: usize,
 	pub cpu_nodes: u32,
 	// PCIe ECAM config-space base (0 if the tree has no pcie node).
 	pub pcie_ecam: u64,
@@ -158,6 +168,13 @@ const MAX_CELLS: u32 = 2;
 // How many separate RAM banks the reader will carry. Boards in this tree declare one or two; the
 // array is generous so the cap is not a limit anyone meets.
 pub const MAX_RAM_REGIONS: usize = 16;
+
+// "The tree did not say." Not a node id, and deliberately not zero - see `ram_region_nodes`.
+pub const NUMA_NODE_UNKNOWN: u32 = u32::MAX;
+
+// The distance matrix is one triple per ordered pair, so eight nodes is sixty-four of them. Bounded
+// here because the count comes from the tree.
+pub const MAX_NUMA_CELLS: usize = 64;
 
 // How many CPUs the logical-to-hardware id table holds (KERN-ARCH-008).
 //
@@ -640,6 +657,17 @@ impl Fdt {
 			let mut ram_size: u64 = 0;
 			let mut ram_regions = [(0u64, 0u64); MAX_RAM_REGIONS];
 			let mut ram_region_count = 0usize;
+			let mut ram_region_nodes = [NUMA_NODE_UNKNOWN; MAX_RAM_REGIONS];
+			// The `numa-node-id` of the memory node being walked, and of the cpu node being walked.
+			// Read where they appear and committed at the node's end, like `reg` is - the property
+			// may come before or after the ones that decide whether the node counts at all.
+			let mut d1_memory_node = NUMA_NODE_UNKNOWN;
+			let mut cpu_node_id = NUMA_NODE_UNKNOWN;
+			let mut cpu_node_ids = [NUMA_NODE_UNKNOWN; MAX_CPUS];
+			// The distance map, which is a node of its own rather than a property of the others.
+			let mut numa_distances = [(0u32, 0u32, 0u8); MAX_NUMA_CELLS];
+			let mut numa_distance_count = 0usize;
+			let mut in_distance_map = false;
 			let mut cpu_count: u32 = 0;
 			let mut cpu_ids = [0u64; MAX_CPUS];
 			let mut cpu_nodes: u32 = 0;
@@ -715,6 +743,10 @@ impl Fdt {
 							d1_memory = self.str_eq(name, "memory") || self.str_starts(name, "memory@");
 							d1_memory_typed = false;
 							d1_memory_ok = true;
+							// The NUMA distance map, which is a node of the root rather than a
+							// property of anything. QEMU emits it as `/distance-map` when the
+							// machine was given distances.
+							in_distance_map = self.str_eq(name, "distance-map");
 							d1_cpus = self.str_eq(name, "cpus");
 							d1_chosen = self.str_eq(name, "chosen");
 						} else if depth == 2 && d1_cpus && self.str_starts(name, "cpu@") {
@@ -780,6 +812,7 @@ impl Fdt {
 							{
 								if (cpu_count as usize) < MAX_CPUS {
 									cpu_ids[cpu_count as usize] = id;
+									cpu_node_ids[cpu_count as usize] = cpu_node_id;
 									cpu_phandles[cpu_count as usize] = cpu_phandle;
 									cpu_count += 1;
 								}
@@ -788,6 +821,7 @@ impl Fdt {
 							cpu_ok = true;
 							cpu_reg = None;
 							cpu_phandle = 0;
+							cpu_node_id = NUMA_NODE_UNKNOWN;
 						}
 						if depth == 1 {
 							// THE MEMORY NODE'S BANKS, COMMITTED NOW THAT IT IS FINISHED.
@@ -813,6 +847,7 @@ impl Fdt {
 									}
 									if ram_region_count < MAX_RAM_REGIONS {
 										ram_regions[ram_region_count] = (a, s);
+										ram_region_nodes[ram_region_count] = d1_memory_node;
 										ram_region_count += 1;
 									} else {
 										// AN EXPLICIT REFUSAL RATHER THAN A SILENT DROP. Everything
@@ -827,6 +862,8 @@ impl Fdt {
 							d1_memory_typed = false;
 							d1_memory_ok = true;
 							d1_memory_reg = None;
+							d1_memory_node = NUMA_NODE_UNKNOWN;
+							in_distance_map = false;
 							d1_cpus = false;
 							d1_chosen = false;
 						}
@@ -1004,6 +1041,27 @@ impl Fdt {
 							// hole. A store into a hole is not a fault the allocator can attribute:
 							// it simply goes nowhere.
 							d1_memory_reg = Some((val, len));
+						} else if depth == 1 && d1_memory && len == 4 && self.str_eq(pname, "numa-node-id") {
+							d1_memory_node = self.be32(val);
+						} else if depth == 2 && in_cpu && len == 4 && self.str_eq(pname, "numa-node-id") {
+							cpu_node_id = self.be32(val);
+						} else if in_distance_map && self.str_eq(pname, "distance-matrix") {
+							// TRIPLES OF CELLS: from, to, distance. The distance is a u32 in the
+							// tree and a byte here, because a distance above 255 is not a distance
+							// any of this reasons about - it is refused rather than truncated.
+							let mut q = val;
+							let end = val + len as u64;
+							while q + 12 <= end && numa_distance_count < MAX_NUMA_CELLS {
+								let from = self.be32(q);
+								let to = self.be32(q + 4);
+								let distance = self.be32(q + 8);
+								q += 12;
+								if distance > u8::MAX as u32 {
+									continue;
+								}
+								numa_distances[numa_distance_count] = (from, to, distance as u8);
+								numa_distance_count += 1;
+							}
 						} else if depth == 1 && d1_memory && self.str_eq(pname, "device_type") {
 							// The specification's own test for a memory node, which this parser did
 							// not read at all: the unit name says where to look and this says what
@@ -1113,6 +1171,10 @@ impl Fdt {
 				let mut j = i;
 				while j > 0 && ram_regions[j - 1].0 > ram_regions[j].0 {
 					ram_regions.swap(j - 1, j);
+					// THE NODE TRAVELS WITH ITS BANK. The two arrays are parallel, and sorting one
+					// without the other would attach every bank's affinity to whichever bank landed
+					// in its slot - a NUMA topology that is exactly as wrong as it is plausible.
+					ram_region_nodes.swap(j - 1, j);
 					j -= 1;
 				}
 				i += 1;
@@ -1121,7 +1183,14 @@ impl Fdt {
 			let mut k = 0usize;
 			while k < ram_region_count {
 				let (base, size) = ram_regions[k];
-				if merged > 0 {
+				// TWO BANKS THAT TOUCH ARE ONE BANK ONLY IF THEY BELONG TO THE SAME NODE. On a
+				// two-node machine QEMU emits banks that are exactly adjacent - 0x4000_0000 and
+				// 0x5000_0000, one node each - and merging them produces a single range whose
+				// affinity is whichever half was written first. The topology then says half the
+				// machine's memory is local to a node it is not on, and every allocation steered by
+				// it is wrong in a way nothing reports.
+				let same_node = merged == 0 || ram_region_nodes[merged - 1] == ram_region_nodes[k];
+				if merged > 0 && same_node {
 					let (held_base, held_size) = ram_regions[merged - 1];
 					// `checked_add` throughout: every one of these numbers came off the medium, and
 					// the end of a bank is exactly where the old arithmetic overflowed.
@@ -1138,6 +1207,7 @@ impl Fdt {
 					}
 				}
 				ram_regions[merged] = (base, size);
+				ram_region_nodes[merged] = ram_region_nodes[k];
 				merged += 1;
 				k += 1;
 			}
@@ -1171,7 +1241,7 @@ impl Fdt {
 					off += 8;
 				}
 			}
-			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, cpu_count: cpu_count.max(1), cpu_ids, cpu_nodes, pcie_ecam, plic_base, gic_dist, gic_dist_size, gic_cpu, gic_cpu_size, gic_version, gic_msi, gic_msi_size, gic_its, gic_its_size, pci_msi_rid_base, pci_msi_devid_base, pci_msi_length, imsic_base, imsic_size, imsic_guest_index_bits, imsic_group_index_bits, imsic_num_ids, imsic_harts, imsic_hart_count, fwcfg_base, modules_start, modules_end })
+			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, ram_region_nodes, cpu_count: cpu_count.max(1), cpu_ids, cpu_node_ids, numa_distances, numa_distance_count, cpu_nodes, pcie_ecam, plic_base, gic_dist, gic_dist_size, gic_cpu, gic_cpu_size, gic_version, gic_msi, gic_msi_size, gic_its, gic_its_size, pci_msi_rid_base, pci_msi_devid_base, pci_msi_length, imsic_base, imsic_size, imsic_guest_index_bits, imsic_group_index_bits, imsic_num_ids, imsic_harts, imsic_hart_count, fwcfg_base, modules_start, modules_end })
 		}
 	}
 }
