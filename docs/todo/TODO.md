@@ -220,7 +220,7 @@ or preventing further development of `v1`.
 - [x] [P02M0144 - The build says nothing it cannot back up](P02M0144.md)
 - [x] [P02M0145 - The development profile does not boot, and nothing was going to tell us](P02M0145.md)
 - [x] [P02M0146 - The scenarios run on one architecture, and the runner says they run on three](P02M0146.md)
-- [ ] [P02M0147 - A full-screen program is launched without the terminal it is about to take over](P02M0147.md)
+- [x] [P02M0147 - A full-screen program is launched without the terminal it is about to take over](P02M0147.md)
 - [x] [P02M0148 - `shutdown` tears the system down and then does not stop the machine](P02M0148.md)
 - [x] [P02M0149 - A provider was rebuilt, its consumer was not, and only the packager noticed](P02M0149.md)
 - [x] [P02M0150 - A digest beside a payload is not a boot trust chain](P02M0150.md)
