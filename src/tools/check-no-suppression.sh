@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # A warning is answered by changing the code, never by switching the lint off.
 #
-# P02M0144 exists because that rule was not written down anywhere. Ninety-one attributes had
+# This exists because that rule was not written down anywhere. Ninety-one attributes had
 # accumulated under `src/` - fifty-five of them `#![allow(dead_code)]` at the top of a whole file -
 # and they hid more than they showed: the x86_64 kernel printed twenty warnings and held a hundred
 # and forty. Worse, the coverage was uneven, so the same code was reported on one target and silent

@@ -1,6 +1,6 @@
 // sort - order a file's lines, run as its own sandboxed ELF.
 //
-// IN MEMORY, WITH A STATED CEILING. P02M0101 describes spilling sorted runs to a granted scratch
+// IN MEMORY, WITH A STATED CEILING. The design describes spilling sorted runs to a granted scratch
 // directory and merging them, and that is the right shape for an input larger than the Domain's
 // budget - but it needs a per-launch scratch grant that does not exist yet, and inventing an
 // ambient `/tmp` to fake it would be exactly the assumption this system does not make. So this

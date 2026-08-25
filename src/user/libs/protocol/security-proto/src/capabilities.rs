@@ -1,4 +1,4 @@
-// WHAT A GENERATED ENCODER DOES WITH A CAPABILITY IT WAS GIVEN (P02M0090, WIRE-001).
+// WHAT A GENERATED ENCODER DOES WITH A CAPABILITY IT WAS GIVEN (WIRE-001).
 //
 // `pipeline-result` is the honest case rather than a fixture: it carries `group: handle<task-group>`
 // beside a plain `stages: u32`, so its three encoders each have to answer what happens to the

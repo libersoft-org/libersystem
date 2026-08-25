@@ -157,7 +157,7 @@ pub fn send_startup(dest_lapic: u32, vector: u8) {
 // stream and a listing nobody reads - are enforced by a deadline, and a deadline cannot be reached
 // from a test that only pumps the scheduler: a hundred thousand passes advance this counter by a
 // few hundred ticks, so a thirty-second bound is about a million pumps away. Both were built and
-// removed during P02M0109 for want of this.
+// removed for want of this.
 pub fn ticks() -> u64 {
 	let base = TICKS.load(Ordering::Relaxed);
 	#[cfg(test)]

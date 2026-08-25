@@ -94,7 +94,7 @@ pub const MAX_HOLES: usize = 2 + MAX_MODULES;
 // translation fault - not attributable to whoever allocated it, and not reproducible without that
 // much memory.
 //
-// This is the same defect as the `DIRECT_MAP_LIMIT` work in P02M0133 seen from the ALLOCATOR's side
+// This is the same defect as the `DIRECT_MAP_LIMIT` work seen from the ALLOCATOR's side
 // rather than the firmware-pointer side, and the rule is the one that milestone states: nothing may
 // enter the allocator before `phys_to_virt` on it is guaranteed to translate.
 //

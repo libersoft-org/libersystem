@@ -620,7 +620,7 @@ fn a_thread_blocked_on_a_channel_wakes_when_the_last_peer_handle_drops() {
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static BLOCKED: AtomicBool = AtomicBool::new(false);
 	static RESUMED: AtomicBool = AtomicBool::new(false);
-	// P02M0088's open observation, reduced to the two objects it is about. `Channel::is_readable`
+	// The open observation, reduced to the two objects it is about. `Channel::is_readable`
 	// is "inbox non-empty OR peer closed", so dropping the last peer handle must make a blocked
 	// wait ready - a thread that waits forever on a channel whose peer is gone is a hang with no
 	// error, and the shape this tree has closed several times elsewhere.
@@ -2226,7 +2226,7 @@ fn a_set_that_was_told_it_joined_is_a_set_that_will_be_woken() {
 
 tagged_test!(a_wait_set_registration_is_charged_to_the_domain_that_holds_it, [Process, Syscall, Memory], id = "kernel.kernel.a_wait_set_registration_is_charged_to_the_domain_that_holds_it", covers = ["kernel"]);
 fn a_wait_set_registration_is_charged_to_the_domain_that_holds_it() {
-	// P02M0117 listed "a per-Domain bound on registrations" as done and it was not. What existed was
+	// "A per-Domain bound on registrations" was listed as done and it was not. What existed was
 	// `MAX_WAIT_SET_MEMBERS` - a PER-SET ceiling - and the handle quota, which charges a Domain ONE
 	// handle for a set holding 256 members plus 256 scheduler observer entries. Neither bounds the
 	// registrations, which is where the memory is.

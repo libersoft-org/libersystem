@@ -3,7 +3,7 @@
 //! SEPARATE FROM THE KERNEL SO IT CAN BE DRIVEN HARD. This is the kernel's physical frame
 //! allocator and it used to live inside `kernel::mem::frame`, where the only way to exercise it was
 //! to boot a guest: a few thousand allocations per architecture, in whatever order that boot
-//! happened to produce, at up to ninety minutes a run on riscv64. P02M0120 was opened on a defect
+//! happened to produce, at up to ninety minutes a run on riscv64. This crate exists for a defect
 //! seen ONCE in exactly that setting - eighty double allocations of one page, on the last page of the
 //! first usable region - and "run the suite again and hope" is not a way to find it.
 //!
@@ -18,7 +18,7 @@
 //! model that knows where every page is, over pool shapes chosen to be the shape of the sighting.
 //! Nothing about the allocator changed in the move; what changed is how many times it can be asked.
 //!
-//! The run table it replaces answered three things badly, and P02M0120 names them:
+//! The run table it replaces answered three things badly:
 //!
 //!   - its metadata grew with FRAGMENTATION rather than with memory, so the bound had to be
 //!     guessed and a free past the guess was lost;

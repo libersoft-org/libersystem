@@ -13,7 +13,7 @@ shared-image = ["resources-proto/shared-image"]
 [dependencies]
 resources-proto = { path = "../../protocol/resources-proto" }
 
-# A WARNING IS AN ERROR HERE. P02M0144 took ninety-one `allow` attributes out of this tree and found
+# A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to
 # call, a field whose comment said it kept a DMA buffer alive and which nothing read, a HAL entry
 # all three backends declared and none called. None of that was reported, because the reporting had

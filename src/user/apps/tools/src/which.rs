@@ -55,7 +55,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			exit();
 		}
 		// A name that did not resolve was reported on stderr as it was found; there is no exit
-		// status to carry it yet (P02M0102 adds one), so the diagnostic is the whole answer.
+		// status to carry it yet, so the diagnostic is the whole answer.
 		let _ = found_all;
 	}
 	exit();

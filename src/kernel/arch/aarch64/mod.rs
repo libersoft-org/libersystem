@@ -24,7 +24,7 @@ mod dtb;
 // THE DEVICE TREE'S ADDRESS, KEPT so the topology can be read after boot has finished with it.
 //
 // The tree is parsed once during bring-up and the result is consumed field by field; nothing keeps
-// it. P02M0152 needs `numa-node-id` and `/distance-map` at a LATER moment - after the direct-map
+// it. The topology reader needs `numa-node-id` and `/distance-map` at a LATER moment - after the direct-map
 // bound exists and before the frame allocator is partitioned - and re-parsing from the pointer is
 // cheaper and smaller than retaining a `BootInfo` that is mostly already spent.
 static DEVICE_TREE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
@@ -342,7 +342,7 @@ pub mod syscall {
 			// could see that a process had finished and never whether it succeeded, and
 			// ProcessService - which keeps an entry that is stopped with no status, because that is
 			// what a launch which has not started yet looks like - held every program it ever
-			// launched for the life of the system. That is the observation P02M0088 carried as "a
+			// launched for the life of the system. That is the observation recorded as "a
 			// ring-3 child is not woken on aarch64": the child woke, ran and exited exactly as it
 			// should, and the bookkeeping never learned it had.
 			if let Some(thread) = crate::sched::current_thread() {

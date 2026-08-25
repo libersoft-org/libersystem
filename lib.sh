@@ -104,7 +104,7 @@ ensure() {
 # organises docs/DYNAMIC_EXECUTABLES.tsv around: which tools were converted together, and what each
 # group's shared-object footprint is.
 #
-# They are NOT a scoping mechanism, and used as one they were the measured problem P02M0118 opens with:
+# They are NOT a scoping mechanism, and used as one they were the measured problem:
 # wave 5 selects `image,audio,service,process,storage`, and because `service` and `process` are on a
 # third of the suite each, that is 109 of 205 tests for a one-tool change. `./verify.sh` answers that
 # question from the dependency graph instead.
@@ -114,7 +114,7 @@ for tool in cat write rm ls du mkdir rmdir snap volume lsvol lsblk; do TOOL_WAVE
 for tool in date log config set lsdev lsusb lssvc usage ps run perm start stop beep; do TOOL_WAVES[$tool]=3; done
 for tool in ping ip nslookup tcp nc arp httpd ss traceroute; do TOOL_WAVES[$tool]=4; done
 for tool in imgview imgconv audioconv audiorec play graphics_probe lico licoedit licoview; do TOOL_WAVES[$tool]=5; done
-# Wave 6: the P02M0101 command family. They are their own wave because they share a shape - the
+# Wave 6: the text-processing command family. They are their own wave because they share a shape - the
 # bounded window read, the shared parsers, the volume bundle - so a regression in that shape shows
 # as a wave rather than as one tool, and because measuring them beside the image and audio tools
 # would mix a kilobyte of argument parsing with a megabyte of codec.
@@ -141,7 +141,7 @@ WAVE_TAGS[6]='service,process,storage,permission-service'
 # `./verify.sh` answers the question now, from a model that is derived rather than written: crate
 # directories and `[[bin]]` entries give ownership, the three Cargo dependency kinds and
 # services/manifest.toml's providers give the edges, and what remains is declared once in
-# src/tools/verify-model/model/registry.toml with a reason attached. See docs/todo/P02M0118.md.
+# src/tools/verify-model/model/registry.toml with a reason attached.
 
 # The directories whose content can end up in the system volume.
 #

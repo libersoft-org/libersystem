@@ -1244,7 +1244,7 @@ fn receiving_into_the_volume_costs_one_buffer_rather_than_two() {
 	});
 }
 
-// P02M0109, fourth round: the residue of the reserved stream's commit.
+// The fourth audit round: the residue of the reserved stream's commit.
 
 #[test]
 fn a_reserved_stream_commit_leaves_the_reservation_whole() {
@@ -1768,7 +1768,7 @@ fn a_shrunk_directory_table_has_room_for_the_insert_that_follows_it() {
 	assert!(names.iter().any(|entry| entry.name == "after"), "the entry inserted after the shrink is there");
 }
 
-// P02M0131, sixth round.
+// The sixth audit round.
 
 #[test]
 fn every_refused_stream_begin_leaves_the_reservation_whole() {

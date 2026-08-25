@@ -1354,7 +1354,7 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 		Err(error) => failures.push(format!("lib.sh: {error}")),
 	}
 
-	// The permission fixture's twelve consumers against the map that classifies them (P02M0138).
+	// The permission fixture's twelve consumers against the map that classifies them.
 	// The classification decides which cached result a consumer may use, so a consumer nobody
 	// classified, an entry whose test was deleted, a duplicate or a drifted class is a real defect
 	// and not a bookkeeping detail.

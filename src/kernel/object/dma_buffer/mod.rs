@@ -219,7 +219,7 @@ impl DmaBuffer {
 		// interface does not yet carry the direction of the intended use. That is a WEAKER claim
 		// than the contract can express - `Direction` is there and the model checks it - and it is
 		// stated rather than dressed up: narrowing it needs the create syscall to say which way the
-		// buffer is used, which is P02M0153's M4 for the two endpoints it migrates.
+		// buffer is used, which the protected endpoints will need when they are migrated.
 		let translation = match device.filter(|_| crate::iommu::present()) {
 			Some(index) => match crate::iommu::map_device_buffer(index, base, (pages * PAGE_SIZE as usize) as u64) {
 				Ok(Some(mapped)) => Some(mapped),
@@ -272,7 +272,7 @@ impl DmaBuffer {
 	//
 	// Where the device is translated this is an IOVA the kernel can revoke; where it is not, it is
 	// the raw physical address `SYS_DMA_BUFFER_PHYS` has always handed out - an integer nothing
-	// constrains the device to, which is the exposure P02M0153 exists to replace and which remains
+	// constrains the device to, which is the exposure translated DMA exists to replace and which remains
 	// only under the explicit `trusted-untranslated` policy.
 	pub fn device_address(&self) -> u64 {
 		if let Some((_, address)) = *self.translation.lock() {

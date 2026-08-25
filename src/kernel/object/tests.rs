@@ -837,7 +837,7 @@ fn an_unmap_cannot_steal_a_mapping_that_is_still_being_made() {
 // The conformance fixture: the real handle and channel code, driven through every fault class the
 // model has, with the trace printed for a host checker to replay.
 //
-// WHAT THIS IS AND IS NOT. It is the implementation SIDE of P02M0154's trace relation: the actions
+// WHAT THIS IS AND IS NOT. It is the implementation SIDE of the trace relation: the actions
 // this kernel actually took, in the model's vocabulary, so a checker can ask whether each one was an
 // enabled model step. It is not a proof that every model trace is a Rust execution - it is a sample,
 // and the milestone says so in as many words.

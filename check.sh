@@ -13,44 +13,44 @@ source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 # argument, which is exactly the shape that became six recipe names.
 declare -A GATES=(
 	["development-gate"]="tools/check-development-gate.sh"
-	# P02M0151's gate: every symbol in an architecture's compiled contract is a path that
+	# Every symbol in an architecture's compiled contract is a path that
 	# architecture can execute. Twenty `todo!()` bodies used to answer the x86 loader hand-off on the
 	# two ports that never arrive through it, and nothing but a paragraph of prose separated "dormant
 	# by construction" from "unfinished".
 	["arch-surface"]="tools/check-arch-surface.sh"
-	# P02M0154's gate: the capability transfer model, explored exhaustively under each published
+	# The capability transfer model, explored exhaustively under each published
 	# configuration. It runs TLC from the JAR pinned in `toolchain.lock` with NO NETWORK, and names
 	# `./bootstrap.sh tla2tools` when the artifact is absent rather than fetching one.
 	["capability-model"]="tools/check-capability-model.sh"
-	# P02M0152 M5's gate: a two-node QEMU machine, read from its SRAT and SLIT, with the frame
+	# A two-node QEMU machine, read from its SRAT and SLIT, with the frame
 	# allocator partitioned per node - and placement proved by the physical addresses that come back
 	# rather than by timing, which an emulated topology cannot show.
 	["qemu-numa"]="tools/check-qemu-numa.sh"
-	# P02M0153 M6's host half: the virtio-iommu wire codec, its feature negotiation and its event
+	# The virtio-iommu wire codec, its feature negotiation and its event
 	# parser, driven against malformed and hostile answers a real device does not readily produce.
 	["virtio-iommu-protocol"]="tools/check-virtio-iommu-protocol.sh"
-	# P02M0153 M6's other half, and the one that is isolation evidence rather than enumeration: a
+	# The other half of that, and the one that is isolation evidence rather than enumeration: a
 	# QEMU profile with a virtio-iommu and two hostile `edu` endpoints, each told to reach memory it
 	# was never given. What is checked is the SENTINEL MEMORY, not the error code.
 	["qemu-virtio-iommu-x86_64"]="tools/check-qemu-virtio-iommu-x86_64.sh"
-	# P02M0154 M5: the other direction. `capability-model` explores what the model can do; this
+	# The other direction. `capability-model` explores what the model can do; this
 	# replays what the KERNEL did against it, and requires the checker to refuse eleven deliberate
 	# defects before it is trusted with a real trace.
 	["capability-trace"]="tools/check-capability-trace.sh"
-	# P02M0154 M6's other half: the same five defects in the KERNEL rather than in the model, each
+	# The same five defects in the KERNEL rather than in the model, each
 	# required to be caught by the QEMU conformance fixture. Builds and boots a mutated kernel from a
 	# COPY of the tree - nothing here writes a source file.
 	["implementation-mutations"]="tools/check-implementation-mutations.sh"
-	# P02M0154 M6: the gate that proves the gate can fail. Six deliberate defects, each required to be
+	# The gate that proves the gate can fail. Six deliberate defects, each required to be
 	# caught by the invariant that names it, and nine covers each required to be REFUTED.
 	["model-mutations"]="tools/check-model-mutations.sh"
-	# P02M0150's gate: the two trust profiles differ in the BINARY. The test key's private half is
+	# The two trust profiles differ in the BINARY. The test key's private half is
 	# published on purpose, which is exactly why a release loader must contain none of it.
 	["trust-profile"]="tools/check-trust-profile.sh"
-	# P02M0150's other gate: the boot that must NOT happen. One successful signed boot proves the
+	# The boot that must NOT happen. One successful signed boot proves the
 	# pieces fit; only a refused one proves the check is load-bearing.
 	["signed-boot"]="tools/check-signed-boot.sh"
-	# P02M0150 M5: the firmware verifies the LOADER, or the loader does not run. Preflights its four
+	# The firmware verifies the LOADER, or the loader does not run. Preflights its four
 	# host tools by name and skips nothing when one is missing.
 	["secure-boot"]="tools/check-secure-boot.sh"
 	# The other configuration of the same source, compiled. `development-gate` above checks which
@@ -93,8 +93,8 @@ declare -A GATES=(
 	# `deallocate` - a rule in a comment is a rule the next diff does not read.
 	["frame-retirement"]="tools/check-frame-retirement.sh"
 	# The hand-written bootstrap ladder and the generated role plan describe the same wiring while
-	# P02M0141 migrates from one to the other, and two descriptions of one fact is what that
-	# milestone exists to remove. Until the ladder is empty they are compared, tag by tag and in
+	# the tree migrates from one to the other, and two descriptions of one fact is what that
+	# migration exists to remove. Until the ladder is empty they are compared, tag by tag and in
 	# order - a role in the wrong position has already displaced every read after it.
 	["bootstrap-plan"]="tools/check-bootstrap-plan.py"
 	# A hand-written `extern` declaration and the generated function it is forwarded to are joined
@@ -111,9 +111,9 @@ declare -A GATES=(
 	# attributes had accumulated, hiding a hundred and twenty more warnings than the build printed -
 	# and hiding them UNEVENLY, so the same code was reported on one target and silent on another.
 	["no-suppression"]="tools/check-no-suppression.sh"
-	# P02M0143's M4 produced a manifest and a host-tested verifier, and the two defects it actually
-	# had were in neither: the x86_64 boot medium carried no manifest at all, and the kernel read
-	# from a boot medium was checked against nothing. A verifier that is right about files nobody
+	# The boot manifest and its host-tested verifier were written first, and the two defects the
+	# system actually had were in neither: the x86_64 boot medium carried no manifest at all, and the
+	# kernel read from a boot medium was checked against nothing. A verifier that is right about files nobody
 	# reads is not integrity - this asks the loader's question of the media on disk.
 	["boot-manifest"]="tools/check-boot-manifest.sh"
 	# The `--artifact` fast path knows a library's DEPENDENCIES, or it reports an artifact as

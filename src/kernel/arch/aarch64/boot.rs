@@ -697,7 +697,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// into a different number of LOGICAL IDS - and the id is the index into this table, the run
 	// queues and the stack array. `smpboot::Topology` reduces the list to the cores that may be
 	// started and answers how many ids that can produce; the failure cases are host tests rather
-	// than a comment (P02M0151 M5).
+	// than a comment.
 	let (declared, cpu_nodes) = match boot_info {
 		Some(bi) => (bi.cpu_ids, bi.cpu_nodes),
 		None => ([0u64; fdt::MAX_CPUS], 0),

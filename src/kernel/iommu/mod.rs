@@ -412,9 +412,9 @@ pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	if domain_of(index as u32).is_some() {
 		return true;
 	}
-	// THE GENERATION IS THE BINDING'S. P02M0098 owns binding identity and this milestone does not
-	// recreate it: what is used here is the owner count's transition, which is a weaker token than a
-	// real binding generation and is stated as such rather than dressed up as one.
+	// THE GENERATION IS THE BINDING'S. Binding identity is the driver lifecycle's to own and this
+	// does not recreate it: what is used here is the owner count's transition, which is a weaker token
+	// than a real binding generation and is stated as such rather than dressed up as one.
 	let generation = 1;
 	match attach_endpoint(bus, dev, func, generation) {
 		Ok(domain) => {

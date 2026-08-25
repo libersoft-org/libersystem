@@ -1,6 +1,6 @@
 # The capability transfer model, and the code it is a model of
 
-This is P02M0154 M1: the state and atomic-action map, frozen BEFORE the specification is written.
+This is the state and atomic-action map, frozen BEFORE the specification is written.
 Its purpose is to make the later TLA+ specification checkable against something other than memory -
 every model variable and every model action names the Rust item it abstracts, and every place the
 implementation can be interrupted between two of them is written down here rather than discovered
@@ -29,7 +29,7 @@ naming the combinations is what makes them checkable:
 | `Retired` | `generation == u32::MAX`, index never returned to `free` | nothing - terminal |
 | `Closed` (table-wide) | `closed: true` after `close_all` | nothing - terminal |
 
-`TransferReserved` is the state that was unrepresentable before P02M0121: `cap: None` and absent
+`TransferReserved` is the state that used to be unrepresentable: `cap: None` and absent
 from the free list, which no caller could test and `close_all` therefore could not respect. The
 model keeps it distinct because the two ways out of it - commit and restore - have different
 ownership outcomes, and because a process termination may arrive while a slot is in it.

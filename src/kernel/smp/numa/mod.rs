@@ -68,7 +68,7 @@ pub fn cpu_node(cpu: usize) -> Affinity {
 // How many online cores this node has. An unconfirmed core is in no node's count.
 //
 // The per-node mask, in the one form anything in this kernel needs: a count. A bitmask would be an
-// interface for a scheduler policy that P02M0152 explicitly does not add, and adding one to make a
+// interface for a scheduler policy this tree explicitly does not add, and adding one to make a
 // test easier is how a milestone grows an API nobody asked for.
 #[cfg(test)]
 pub fn online_on(node: NodeId) -> usize {
@@ -80,7 +80,7 @@ pub fn online_on(node: NodeId) -> usize {
 // answers and a caller that cannot tell them apart cannot report either.
 // TEST-ONLY UNTIL SOMETHING ASKS FOR A PLACEMENT. The hint is what M3 owes and it is exercised
 // directly; the callers that will use it are a service asking for a thread on a node, which
-// P02M0152 explicitly does not add - "the scheduler exposes enough placement to prove topology is
+// this tree explicitly does not add - "the scheduler exposes enough placement to prove topology is
 // used and stops there". A public API with no caller would be the opposite of that.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -112,7 +112,7 @@ pub fn place_on(node: NodeId) -> Result<usize, Refusal> {
 
 // The node the CALLING core is on, for an allocation that wants to be local.
 //
-// `None` before bring-up has bound anything, which is the readiness point P02M0152's M2 names: an
+// `None` before bring-up has bound anything, which is the readiness point the contract names: an
 // allocation must not ask which CPU it is on before per-CPU state exists, and this answers `None`
 // rather than guessing until it does.
 pub fn local_node() -> Option<NodeId> {

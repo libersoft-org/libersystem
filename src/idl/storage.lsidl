@@ -175,7 +175,7 @@ interface volume {
 	/// generator emitted nothing for it, so wrapping this return removed the binding rather than
 	/// improving it, and the service answered a listing it could not read with an empty one - the
 	/// exact "a failure looks like an empty answer" semantics this contract spent a round removing
-	/// everywhere else. The generator emits the shape now (P02M0090), so the contract states it.
+	/// everywhere else. The generator emits the shape now, so the contract states it.
 	///
 	/// The two failures are DIFFERENT failures and a caller can tell them apart: `err` means the
 	/// stream never started - the path was refused, the directory is not there, the volume could

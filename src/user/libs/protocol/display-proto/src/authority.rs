@@ -1,4 +1,4 @@
-// WHAT `@rights` ON A HANDLE PARAMETER ACTUALLY DOES (P02M0102, IDL-004).
+// WHAT `@rights` ON A HANDLE PARAMETER ACTUALLY DOES (IDL-004).
 //
 // `display.lsidl` declares `bind: func(@rights(manage) task: handle<task>)`, and the generator turns
 // that into a call to `codec::handle_carries` ahead of the service, refusing with the schema's own

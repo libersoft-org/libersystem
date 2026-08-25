@@ -275,7 +275,7 @@ feature-flag bit and update this section.
   `4C424653-0001-4000-8000-4C6962657246` (the LiberFS partition type), or - on a
   disk with no partition table at all - the whole device, block 0 being 512-byte
   sector 0. (It used to be sector 32768, clearing a factory archive at the start
-  of the disk; that archive was retired in P02M0108 and there is nothing in front of
+  of the disk; that archive was retired and there is nothing in front of
   the volume to skip.)
 - Which of those two applies is decided **before anything is written**, and only
   one answer permits laying a filesystem over a whole device: LBA 0 and LBA 1

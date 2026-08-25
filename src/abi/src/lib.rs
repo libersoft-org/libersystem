@@ -98,7 +98,7 @@ pub const SYS_WAIT: u64 = 23;
 //   a0 = size in bytes
 //   a1 = a DeviceMemory handle with WRITE, naming the device the buffer is for (0 = none)
 //
-// The second argument arrived with P02M0133's DMA lifetime rule - the kernel holds a dead driver's
+// The second argument arrived with the DMA lifetime rule - the kernel holds a dead driver's
 // frames until that device is confirmed stopped - and this line did not mention it. Three stale
 // syscall comments were corrected in this milestone and a fourth appeared within the day, which is
 // the argument for generating these definitions rather than for a fifth correction.
@@ -520,7 +520,7 @@ pub struct DeviceInfo {
 	// The kernel's PCI scan resolves class, subclass and programming interface for every function
 	// and retains them for `lspci` - so the bytes existed, and the one consumer that most needs
 	// them could not see them. Binding by `device_type` alone means every driver is selected by a
-	// vendor-defined number, which is what P02M0098 exists to stop: standard class/subclass/
+	// vendor-defined number, which is what the driver-binding rules exist to stop: standard class/subclass/
 	// interface is how a driver claims a FAMILY of hardware rather than one model.
 	//
 	// THE STRUCT GREW: 40 bytes to 48, and the comment here used to say it did not.

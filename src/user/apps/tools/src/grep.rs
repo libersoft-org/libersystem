@@ -1,7 +1,7 @@
 // grep - print the lines of a file that contain a fixed string, as its own sandboxed ELF.
 //
 // FIXED STRING, not a regular expression. A regex engine is a real piece of work with its own
-// bounds to prove, and P02M0101 says it is added once and shared when `find` and `grep` both want
+// bounds to prove, and the design says it is added once and shared when `find` and `grep` both want
 // it - so this searches for the bytes it was given, and says so in its help rather than accepting a
 // pattern it would silently mis-read.
 //

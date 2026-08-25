@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # The hand-written bootstrap ladder and the generated role plan must say the same thing.
 #
-# P02M0141 moves the wiring of every managed service out of `service_manager/bootstrap.rs` - where
+# The migration moves the wiring of every managed service out of `service_manager/bootstrap.rs` - where
 # it is twenty-three `if name == b"..."` branches, each calling a bespoke function with the
 # capabilities that service happens to need - and into `services/manifest.toml`, where it is data a
 # generator turns into a plan. The migration is one service at a time, which means both descriptions

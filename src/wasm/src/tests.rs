@@ -748,7 +748,7 @@ fn rounding_keeps_the_sign_of_a_zero_result() {
 // ---------------------------------------------------------------------------------------------
 // The refusal corpus: one module per rule the validator and the parser now enforce.
 //
-// EVERY ONE OF THESE WAS ACCEPTED BY THE TREE BEFORE P02M0134, and most of them ran. That ordering
+// EVERY ONE OF THESE WAS ONCE ACCEPTED BY THE TREE, and most of them ran. That ordering
 // is the point of a corpus rather than a test list: a refusal test written after the refusal exists
 // passes for reasons nobody checked. Each case below names what the old engine did with it.
 // ---------------------------------------------------------------------------------------------
@@ -2022,7 +2022,7 @@ fn memory_grow_is_charged_for_the_pages_it_zeroes() {
 	assert_eq!(inst.memory().len(), 17 * 65536);
 }
 
-// P02M0134, sixth round.
+// The sixth audit round.
 
 // A SECTION MAY NOT READ ITS NEIGHBOUR'S BYTES. A count that runs past the section's own declared
 // size used to be served from whatever followed - the next section's content - and only the

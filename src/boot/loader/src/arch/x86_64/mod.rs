@@ -73,7 +73,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		None => crate::read_boot_file(bs, root, INIT_PKG_FILE).expect("loader: cannot read init.pkg"),
 	};
 	// Optional. The system volume is a filesystem on the disk now, not an archive handed over at
-	// boot (P02M0108), so a shipping image carries no `volume.pkg` at all - it survives only as the
+	// boot, so a shipping image carries no `volume.pkg` at all - it survives only as the
 	// kernel test suite's fixture. A machine without one boots exactly as before; the module is
 	// simply absent, which is what the kernel's lookup already expects.
 	// THROUGH THE SAME FALLBACK AS EVERYTHING ELSE. This read the factory archive ONLY through the
@@ -171,7 +171,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	//
 	// The interval rather than a per-descriptor map, because the contiguous map is load-bearing
 	// twice: the kernel derives its `DIRECT_MAP_LIMIT` from the top of the same memory map and
-	// bounds every firmware pointer against it (P02M0133). Leaving holes UNMAPPED would make that
+	// bounds every firmware pointer against it. Leaving holes UNMAPPED would make that
 	// bound describe addresses that fault; mapping them uncacheable keeps the bound exactly true
 	// while removing the write-back mapping over things that are not memory, which is the part of
 	// the finding that is an architecture violation rather than waste.

@@ -1,7 +1,7 @@
 // Every Cargo crate in the tree, and the edges its manifest states.
 //
 // Read from the manifests rather than from `cargo metadata`, and that is a deliberate choice
-// P02M0118 argues at length: `cargo metadata` resolves ONE configuration, and in this tree the default
+// The reason, at length: `cargo metadata` resolves ONE configuration, and in this tree the default
 // configuration is the wrong one. `tools` reaches its twenty client libraries only through
 // `shared-image`; all fifteen protocol crates reach `ipc-client` only through
 // `channel-client-impl`; and the image is built `--no-default-features --features shared-image`. A
@@ -56,7 +56,7 @@ pub struct Dependency {
 //
 // This is what makes tool-level scoping work at all. Fifty-odd programs live in the one `tools`
 // crate, so collapsing them to their crate would make every tool change a change to every tool -
-// the driver-crate problem P02M0118 names, at fifty times the size. A `[[bin]]` names exactly one
+// the same driver-crate problem, at fifty times the size. A `[[bin]]` names exactly one
 // source file, and services/manifest.toml records providers per PROGRAM, so keeping programs
 // distinct is also what lets a change to `flac` reach `audioconv` and `play` and nothing else.
 #[derive(Clone, Debug)]

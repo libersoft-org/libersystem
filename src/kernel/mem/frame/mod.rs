@@ -40,7 +40,7 @@ use crate::sync::SpinLock;
 
 // The buddy allocator lives in its own crate so a HOST can drive it: the bitmap arithmetic is
 // pure, and inside the kernel the only way to exercise it was to boot a guest a few thousand
-// allocations at a time. See `src/buddy` - and P02M0120, which was opened on a defect seen once in
+// allocations at a time. See `src/buddy` - and the defect seen once in
 // exactly that setting and closed on 2026-08-14: 14.4 million host operations never produced the
 // signature, and a free that overlaps an already-free block is refused inside the allocator, so the
 // signature is unreachable from any caller rather than merely unobserved.
@@ -938,7 +938,7 @@ pub fn upgrade_to_heap() {
 
 	// Move the pool into the buddy and empty the seed table behind it. From here every allocation
 	// and every free goes through the bitmap, and a free cannot be lost because there is no table
-	// to fill - which is the property P02M0120 exists for.
+	// to fill - which is the property the buddy allocator exists for.
 	if let Some(buddy) = buddy {
 		// Seeded from the table as it stands NOW, under the lock that installs the result, with
 		// nothing allocating in between. `free_span` only writes bits that are already reserved,
@@ -1189,7 +1189,7 @@ pub fn free_count() -> usize {
 // symptom arrives weeks later as an allocation failure with no cause attached.
 //
 // So: counted always, not only under test, because a number nobody can read in production is not a
-// measurement. This is the cheap half of P02M0120 and the thing that says whether the buddy allocator
+// measurement. This is the cheap half of that work and the thing that says whether the buddy allocator
 // below it actually fixed anything - measure first, and be willing to record that it did not pay.
 // Printed by x86_64's halt path, which is the one boot tail that reaches an end and reports.
 #[cfg(any(target_arch = "x86_64", test))]
@@ -1435,7 +1435,7 @@ pub fn allocate() -> Option<u64> {
 		return None;
 	}
 	// LOCAL ONCE THERE IS A LOCAL TO BE. `local_node` answers `None` until bring-up has bound a core
-	// to a node, which is the readiness point P02M0152's M2 names - an allocation must not ask which
+	// to a node, which is the readiness point the contract names - an allocation must not ask which
 	// CPU it is on before per-CPU state exists. On a machine with no topology it is one relaxed
 	// atomic load and the answer is always `None`, so the ordinary path costs what it always did.
 	let want = crate::smp::numa::local_node();

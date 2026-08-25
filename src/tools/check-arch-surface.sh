@@ -7,7 +7,7 @@
 # riscv64 `riscv64::boot::riscv64_main`, each bringing up its own console, page tables, per-CPU
 # register, interrupt controller, timer, syscall vector and secondary cores. But a static scan and a
 # reader both saw unfinished interrupt and timer glue, and the only thing separating the two
-# readings was a paragraph of prose. P02M0151 removed the bodies by removing the requirement: the
+# readings was a paragraph of prose. The bodies went by removing the requirement: the
 # hand-off compiles for x86_64 alone. This keeps them from coming back one convenient stub at a time.
 #
 # A TEST FAULT PROBE IS NOT AN EXCEPTION TO THIS. The suites deliberately fault to prove a handler

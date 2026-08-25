@@ -284,7 +284,7 @@ stage_signed_boot_manifest() {
 
 # WHICH volume this boot medium is paired with.
 #
-# The loader has read `etc/system-volume.uuid` since P02M0129 and nothing ever wrote it, so every
+# The loader has long read `etc/system-volume.uuid` and nothing ever wrote it, so every
 # image this tree built took the "the boot medium names no system volume" fallback and said so in
 # its own boot log - a mechanism that looked implemented and was dead. Two LiberSystem disks in one
 # machine then let the firmware's block-handle order decide which one booted.
@@ -315,7 +315,7 @@ stage_volume_pairing() {
 	fi
 	assert_pairing_matches_volume "$uuid_file" "$BUILD/system-volume-${arch}.img"
 	# `::/etc` already exists when the bootstrap set was staged, and when the boot manifest was
-	# written before this - which is every medium, since P02M0143 gave them all one.
+	# written before this - which is every medium, since they all carry one now.
 	ensure_dir "$image" ::/etc
 	stamp_epoch "$uuid_file"
 	mcopy -i "$image" "$uuid_file" ::/etc/system-volume.uuid
@@ -462,7 +462,7 @@ make_img() {
 	# The second partition is what makes this an installed system rather than a boot medium. The
 	# storage service finds it by the LiberFS type GUID rather than by device order, and the
 	# loader finds it by its superblock - firmware exposes a partition as its own block handle, so
-	# LBA 0 of that handle is the volume's own start (P02M0108).
+	# LBA 0 of that handle is the volume's own start.
 	#
 	# The ESP is fixed at 32 MiB: it needs the loader, the kernel and the init fallback, and every
 	# byte beyond that is a byte the system volume does not get.
@@ -501,7 +501,7 @@ make_img() {
 	stage_boot_manifest "$esp" "$staged" x86_64
 	stage_volume_pairing "$esp" x86_64
 	# No volume archive: the system volume is a filesystem in partition 2, and the archive exists
-	# only as the kernel test suite's fixture (P02M0108).
+	# only as the kernel test suite's fixture.
 
 	# splice the populated FAT filesystem into the ESP region of the disk
 	dd if="$esp" of="$out" bs=512 seek="$esp_start" conv=notrunc status=none

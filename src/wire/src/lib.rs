@@ -931,7 +931,7 @@ pub mod cbor {
 	}
 }
 
-// AUTHORITY A RECEIVED HANDLE MUST ALREADY CARRY (P02M0102, IDL-004).
+// AUTHORITY A RECEIVED HANDLE MUST ALREADY CARRY (IDL-004).
 //
 // A schema can declare `@rights(...)` on a handle parameter, and until now nothing read it: the
 // annotation reached the ABI signature and no generated code. So what a service was entitled to

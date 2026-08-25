@@ -126,7 +126,7 @@ fn a_fragmenting_workload_loses_no_pages_and_says_so() {
 	// `lost_pages` is that count, and it is compiled in rather than `#[cfg(test)]` - a number
 	// nobody can read in production is not a measurement. What is asserted here is the DELTA
 	// across this test's own work, never the absolute value: the counter belongs to the whole
-	// machine and seven other cores are running while this does. P02M0117 retired four tests that
+	// machine and seven other cores are running while this does. Four tests were retired that
 	// asserted numbers belonging to the machine rather than to themselves.
 	//
 	// This is the guard rather than the demonstration. Driving the table to its ceiling would mean

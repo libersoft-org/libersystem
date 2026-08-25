@@ -2,7 +2,7 @@
 //! through one.
 //!
 //! SEPARATE FROM THE KERNEL SO THE LOADER CAN HAVE IT, AND SO A HOST CAN TEST IT. This was
-//! `kernel::arch::common::dtb` and the loader could not reach it, which is why P02M0129 spent two
+//! `kernel::arch::common::dtb` and the loader could not reach it, which is why the audit spent two
 //! rounds recording that the post-`ExitBootServices` UART is a hard-coded QEMU address on both
 //! device-tree targets: taking it from the tree needed this parser, and moving the parser was "a
 //! refactor worth doing on its own terms rather than for six diagnostic lines". This is that

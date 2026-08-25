@@ -991,7 +991,7 @@ fn the_fadt_says_which_instruction_reaches_psci() {
 	assert_eq!(firmware::acpi_at(short, here).psci_conduit(), None, "an ACPI 1.0 FADT has no ARM boot flags");
 }
 
-// P02M0129, sixth round: the stride, the whole-number rule and the second `GetMemoryMap`.
+// The sixth audit round: the stride, the whole-number rule and the second `GetMemoryMap`.
 #[test]
 fn a_descriptor_stride_that_cannot_be_one_is_refused() {
 	let _guard = guard();

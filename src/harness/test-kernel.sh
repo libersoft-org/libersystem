@@ -185,7 +185,7 @@ progress_count() {
 #
 # This used to end with `pkill -f "qemu-system-$ARCH"`, which matches by PATTERN - so a watchdog left
 # behind by a run whose cargo and QEMU had been killed kept polling its own log, saw no progress, and
-# shot down an unrelated guest started minutes later. That happened while debugging P02M0133 and cost
+# shot down an unrelated guest started minutes later. That happened while debugging a stack fault and cost
 # a measurement: the victim run reported `FAIL (exit 101, 54s)` with `signal: 9, SIGKILL` over a
 # guest log full of passing tests, which reads exactly like a kernel defect and is not one.
 #

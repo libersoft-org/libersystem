@@ -1,6 +1,6 @@
 // What a host can ask this allocator that a booted guest cannot.
 //
-// P02M0120's last item was one defect: eighty `DOUBLE ALLOCATION` lines naming one page, seen once
+// The last item was one defect: eighty `DOUBLE ALLOCATION` lines naming one page, seen once
 // on riscv64, on the last page of the first usable region, and never reproduced. Four deliberate
 // attempts to arrange the failing boot's allocation history did not reproduce it, and fourteen full
 // suites since did not either. It is CLOSED (2026-08-14) - by the search below finding nothing over
@@ -154,7 +154,7 @@ impl Pool {
 // The gate runs them on every sweep, so their default size is chosen to cost a couple of seconds -
 // enough that a defect in the arithmetic is very unlikely to survive a day of ordinary development.
 // The CAMPAIGN is a different question and is asked once rather than continuously: `BUDDY_SOAK=100`
-// multiplies the work, and the number of operations that answer produced belongs in P02M0120 rather
+// multiplies the work, and the number of operations that answer produced belongs in the notes rather
 // than in every run of `check.sh`.
 fn soak() -> u64 {
 	std::env::var("BUDDY_SOAK").ok().and_then(|value| value.parse().ok()).unwrap_or(1).max(1)

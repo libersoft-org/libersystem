@@ -3586,7 +3586,7 @@ fn an_upcase_table_is_read_as_well_as_checksummed() {
 	}
 }
 
-// P02M0125, sixth round: the volumes this backend was never asked to look at.
+// The sixth audit round: the volumes this backend was never asked to look at.
 //
 // Every test above builds a well-formed image or interrupts this driver's own operation. What none
 // of them does is hand it a volume that was ALREADY inconsistent - which is the premise every crash

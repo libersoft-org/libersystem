@@ -13,7 +13,7 @@
 // it: `redirect_out` exists to be the shell's expansion of `>` and has no stdout of its own.
 //
 // A DESTINATION THAT FAILS DOES NOT STOP THE PIPELINE, BY DEFAULT - and this is a deliberate
-// disagreement with P02M0101's text, which asks for fail-fast as the default and continue as the
+// disagreement with the design's text, which asks for fail-fast as the default and continue as the
 // option. Both policies are here; the default is the other one.
 //
 // The reason is what the line MEANS. `cmd | tee log | grep error` is a line somebody typed to see

@@ -56,7 +56,7 @@ dependencies = []
 
 # An image without a kernel or a loader does not boot, so `Manifest::parse` requires all four
 # kinds. This fixture predated that rule and had stopped parsing at all - which nothing noticed,
-# because no gate ran this crate's suite. That is the inventory defect P02M0118 was written about,
+# because no gate ran this crate's suite. That is the inventory defect the model was written about,
 # found by the gate that now runs all fifty-eight of them.
 #
 # One owner for all four: the rule under test is that each KIND is provided exactly once, and

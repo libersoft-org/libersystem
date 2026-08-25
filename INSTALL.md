@@ -142,7 +142,7 @@ sudo dd if=.build/boot/libersystem.img of=/dev/sdX bs=4M conv=fsync status=progr
 ./verify.sh --sweep                          # every target, whole suite, one revision
 ```
 
-A scoped verification of a codec change is about 2% of a full one, because it skips the two emulated targets rather than because it runs fewer tests. See [**Testing**](./docs/TESTING.md) for the model behind it, and `docs/todo/P02M0118.md` for the measurements.
+A scoped verification of a codec change is about 2% of a full one, because it skips the two emulated targets rather than because it runs fewer tests. See [**Testing**](./docs/TESTING.md) for the model behind it and the measurements.
 
 The pieces it calls can be run directly when you already know what you want:
 

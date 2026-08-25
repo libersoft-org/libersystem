@@ -351,11 +351,11 @@ enum PermissionScenario {
 	ScopedGrants,
 }
 
-// THE FROZEN PERMISSION FIXTURE COHORT (P02M0138).
+// THE FROZEN PERMISSION FIXTURE COHORT.
 //
 // Twelve tests drive `run_permission_scenario`. Eleven take the same path through package parsing,
 // service creation, channel topology, governed launches, pipelines and a real shell session; the
-// twelfth continues into scoped graphics/audio grants. That split is about to matter - P02M0139
+// twelfth continues into scoped graphics/audio grants. That split is about to matter - the work
 // caches one result per class - and it is also the thing a reader most easily gets wrong, because
 // nothing in a test's body says which class it belongs to.
 //
@@ -392,7 +392,7 @@ pub(crate) const PERMISSION_COHORT: [(&str, PermissionCohort); 12] = [
 // The marker each consumer puts in its own body. It fails IN THE GUEST on a class that disagrees
 // with the map or on an ID the map does not know, so the classification cannot be wrong at runtime
 // while looking right to a source scan.
-// HOW MANY TIMES THE EXPENSIVE FIXTURE ACTUALLY RAN, per guest run and per class (P02M0139).
+// HOW MANY TIMES THE EXPENSIVE FIXTURE ACTUALLY RAN, per guest run and per class.
 //
 // Twelve tests drive one scenario and nothing counts how often it is built, so "eleven base setups
 // and one scoped setup" is a claim about the fixture that nobody could check. The count is the
@@ -462,7 +462,7 @@ pub(crate) struct PermissionScenarioResult {
 	probe_summary: alloc::vec::Vec<u8>,
 	date_read: alloc::vec::Vec<u8>,
 	date_summary: alloc::vec::Vec<u8>,
-	// What the P02M0101 command tools printed through the governed launch path: `pwd` from its
+	// What the text-processing command tools printed through the governed launch path: `pwd` from its
 	// launch context alone, then `wc` and `head` over a volume file through the bounded read.
 	command_read: alloc::vec::Vec<u8>,
 	request_read: alloc::vec::Vec<u8>,
@@ -498,7 +498,7 @@ pub(crate) struct PermissionScenarioResult {
 // stand-ins, proving its acquire -> present -> focus -> key-quit -> release sequence, then
 // launches `play` through a playback-only audio grant. The kernel only brokers the initial
 // capabilities.
-// THE FIXTURE CACHE (P02M0139).
+// THE FIXTURE CACHE.
 //
 // Twelve tests drive one expensive scenario. Eleven of them take the same path - package parsing,
 // four services, the channel topology, the governed launches, the pipelines and a real shell session
@@ -629,7 +629,7 @@ fn publish_permission_fixture(cell: &'static sync::SpinLock<PermissionFixture>, 
 
 // The limits the fixture's own domain runs under. Generous rather than tight: this is a container to
 // take down, not a resource test, and a limit hit here would be a fixture failure masquerading as a
-// PermissionManager decision - the exact confusion P02M0138 spent four probe rounds untangling.
+// PermissionManager decision - the exact confusion four probe rounds were spent untangling.
 const PERMISSION_FIXTURE_MEMORY: u64 = 512 * 1024 * 1024;
 
 // One scenario, from an empty domain to a reaped one.
@@ -825,7 +825,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	let (_input_scope_server, input_scope_client) = Channel::create();
 	let (_audio_scope_server, audio_scope_client) = Channel::create();
 
-	// EVERY PROCESS THIS SCENARIO STARTS LANDS IN ONE DOMAIN OF ITS OWN (P02M0139), which is what
+	// EVERY PROCESS THIS SCENARIO STARTS LANDS IN ONE DOMAIN OF ITS OWN, which is what
 	// makes the fixture takeable-down as a unit. It used to spawn into the root domain, where its
 	// services and governed tools were indistinguishable from everything else the guest was running
 	// and could only be left behind.
@@ -1148,7 +1148,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		stream_reads.push(read);
 	}
 
-	// The P02M0101 command tools, through the same governed path as everything else.
+	// The text-processing command tools, through the same governed path as everything else.
 	//
 	// `pwd` holds NO capability: its answer comes from the launch context, so this is the one
 	// launch here that proves a tool can be useful with nothing granted at all. `wc` and `head`
@@ -1170,7 +1170,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		program_elf(&package, volume, b"cut"),
 	] {
 		if staged.is_none() {
-			return Err("a P02M0101 command tool is not staged in the volume");
+			return Err("a text-processing command tool is not staged in the volume");
 		}
 	}
 	let mut command_read: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
@@ -1215,7 +1215,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		sched::run_until_idle();
 		let reply = perm_client.recv().map_err(|_| "PermissionManager did not answer a command tool run")?;
 		if reply.bytes.len() < 5 || reply.bytes[4] == 0 {
-			return Err("PermissionManager refused a P02M0101 command tool");
+			return Err("PermissionManager refused a text-processing command tool");
 		}
 		// A tool writes its answer in as many messages as it likes, AND a tool that walks a
 		// directory does not produce its first message on the first pass: a listing is a
@@ -1271,7 +1271,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		// Required at bootstrap and unused by anything typed here. A dead peer is the honest stand-in:
 		// the net builtins would report the service unavailable, which is true.
 		let (_dead_net, shell_net) = Channel::create();
-		// THE SHELL BELONGS TO THE FIXTURE TOO (P02M0139). It was spawned into the root domain
+		// THE SHELL BELONGS TO THE FIXTURE TOO. It was spawned into the root domain
 		// while the comment above the services claimed everything this scenario starts lands in the
 		// fixture's own - true of the tools, which ProcessService creates and which therefore
 		// inherit the caller's domain, and not true of this one, which the test starts itself. So
@@ -1320,7 +1320,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 			&b"cat 3>&1\n"[..],
 			&b"cd x | grep y\n"[..],
 			&b"cat < $NOTHING\n"[..],
-			// THE TOOLS ADDED FOR P02M0101, at the layer a person reaches them. `watch` and `less`
+			// THE TEXT-PROCESSING TOOLS, at the layer a person reaches them. `watch` and `less`
 			// own the terminal while they run, so they are not typed here - a test that took the
 			// alternate screen would be reading its own redraws. `tee` is the one of the three that
 			// composes, and this is it in the shape it is for: a producer, a copy to a file, and a
@@ -1385,7 +1385,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 	send_cap(&perm_client, &run, graphics_stdout, Rights::ALL)?;
 	sched::run_until_idle();
 	let run_reply = perm_client.recv().map_err(|_| "PermissionManager did not answer graphics_probe run")?;
-	// A REFUSAL IS ALSO AN OBSERVATION (P02M0138). Whether the manager starts `graphics_probe` at
+	// A REFUSAL IS ALSO AN OBSERVATION. Whether the manager starts `graphics_probe` at
 	// all is one of the decisions `permission_manager_mints_scoped_application_grants` exists to
 	// assert, and this used to return Err - so every focused mutation of the scoped mint made the
 	// SCENARIO fail and the test's own assertions were never reached. A mint that comes back empty
@@ -1395,7 +1395,7 @@ fn build_permission_scenario_in(scenario: PermissionScenario, fixture_domain: &a
 		return Err("PermissionManager's graphics_probe run reply is malformed");
 	}
 	let graphics_started = run_reply.bytes[4] != 0;
-	// AN EMPTY READ IS AN OBSERVATION, NOT A FIXTURE FAILURE (P02M0138).
+	// AN EMPTY READ IS AN OBSERVATION, NOT A FIXTURE FAILURE.
 	//
 	// This was `?` with `map_err`, so a `graphics_probe` whose scoped grants were incomplete failed
 	// the SCENARIO - and `permission_manager_mints_scoped_application_grants`, whose entire job is
@@ -3259,7 +3259,7 @@ fn launch_from_volume(volume: &[u8], name: &[u8], correlation: u32) -> object::c
 // (src/user/services/storage/src/service.rs).
 //
 // It was 65536 (32 MiB in), clearing a factory archive at LBA 0 that the service seeded a fresh
-// volume from. The archive is retired (P02M0108): the volume is built as a filesystem, so there is
+// volume from. The archive is retired: the volume is built as a filesystem, so there is
 // nothing in front of it to skip and it starts at the beginning of its container.
 const FALLBACK_START_SECTOR: u64 = 0;
 
@@ -3547,7 +3547,7 @@ impl StorageHarness {
 	// archive.
 	//
 	// The archive used to be laid on the disk raw and the service formatted a volume and seeded
-	// itself from it. That seeding is gone (P02M0108) - the system volume is built as a filesystem
+	// itself from it. That seeding is gone - the system volume is built as a filesystem
 	// now - so the fixture has to be a filesystem too. Formatting it here with the same crate the
 	// service mounts means the fixture cannot drift from the format under test.
 	//
@@ -4340,7 +4340,7 @@ impl StorageHarness {
 	// Time `rounds` heartbeat round-trips on one client, with `crowd` other clients connected and
 	// silent. Returns the nanoseconds per round trip.
 	//
-	// The measurement P02M0117 exists for. What is being fixed there is a SLOPE - the cost of a pass
+	// The measurement this exists for. What is being fixed is a SLOPE - the cost of a pass
 	// against the number of clients the service listens to - and there was no harness that reported
 	// it, so "it got faster" was a feeling and "it hung" was the whole signal a failure gave. Three
 	// numbers at three crowd sizes say in one run what a night of bisecting does not.

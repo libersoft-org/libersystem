@@ -72,7 +72,7 @@ done
 
 # Every image needs the whole system built first, and the volume needs the kernel on it.
 # --kernel-on-volume: a shipping medium's loader reads the kernel off the system volume, which is
-# what P02M0108 set out to do. Builds leave it off so a test run's ESP kernel is the one that boots.
+# the point of shipping one. Builds leave it off so a test run's ESP kernel is the one that boots.
 LIBER_KERNEL_STRIP="$strip" "$REPO_ROOT/build.sh" --arch x86_64 --kernel-on-volume >&2
 
 kernel="$BUILD_DIR/cargo/kernel/x86_64-unknown-none/debug/kernel"

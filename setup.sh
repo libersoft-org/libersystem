@@ -68,7 +68,7 @@ APT_PACKAGES=(
 	libssl-dev # OpenSSL headers required to build Taplo schema support
 
 	# THESE THREE ARE NOT BUILD DEPENDENCIES. Nothing in `./build.sh` touches them: they belong to
-	# ONE gate - the Secure Boot profile in P02M0150 M5, which signs the EFI loader with a test
+	# ONE gate - the Secure Boot profile, which signs the EFI loader with a test
 	# certificate and enrols a PK/KEK/db into a private OVMF variable store. They are installed here
 	# so a developer's machine can run the whole check suite, and the gate still PREFLIGHTS each one
 	# by name rather than assuming setup ran: a verification that skips itself when a tool is missing

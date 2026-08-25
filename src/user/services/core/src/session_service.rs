@@ -58,7 +58,7 @@ struct Job {
 	id: u32,
 	name: String,
 	stopped: bool,
-	// THE HANDLE AND WHAT IT IS, IN ONE VALUE (P02M0102, IDL-003).
+	// THE HANDLE AND WHAT IT IS, IN ONE VALUE (IDL-003).
 	//
 	// This was a `u64` and a `bool` beside it. The two are driven by different syscalls and only
 	// the kernel can say a group is finished - it does once every member has terminated, so a

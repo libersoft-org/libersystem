@@ -455,8 +455,8 @@ Spec == Init /\ [][Next]_vars
 
 (***************************************************************************)
 (* THE SAFETY INVARIANTS. Every one is a sentence from `MODEL_MAP.md`, and  *)
-(* the names are the ones P02M0154 M4 fixes so a configuration cannot       *)
-(* quietly check a weaker property under a familiar name.                   *)
+(* the names are fixed so that a configuration cannot quietly check a      *)
+(* weaker property under a familiar name.                                  *)
 (***************************************************************************)
 
 \* Every place a capability may be, counted. ONE AUTHORITY, ONE PLACE.

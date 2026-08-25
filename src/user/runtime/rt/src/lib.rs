@@ -2266,7 +2266,7 @@ pub unsafe fn object_info(handle: u64) -> Option<ObjectInfo> {
 	}
 }
 
-// THE RIGHTS AND TYPE BEHIND A HANDLE, AS ONE EXPORTED SYMBOL (P02M0102, IDL-004).
+// THE RIGHTS AND TYPE BEHIND A HANDLE, AS ONE EXPORTED SYMBOL (IDL-004).
 //
 // The generated server dispatch has to be able to refuse a handle that does not carry the authority
 // its schema declares, and it lives in `wire`, which depends on `abi` alone - no syscall wrapper, and

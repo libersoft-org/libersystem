@@ -557,7 +557,7 @@ pub enum RoleKind {
 	/// supervisor holds its own copy.
 	Privilege,
 	/// The root-Domain handle. Whoever holds it can stop the machine and kill every process on it;
-	/// P02M0141's M11 removes every one of these in favour of a narrow SystemPower service, and
+	/// The migration removes every one of these in favour of a narrow SystemPower service, and
 	/// this kind exists so the ones that remain can be counted.
 	Power,
 	/// The init package as a read-only memory object.
@@ -899,7 +899,7 @@ impl Manifest {
 		// The root-Domain handle carries `MANAGE`, and the kernel's own comment beside
 		// `sys_system_power` says what that means: whoever holds it can already `sys_domain_kill`
 		// the whole system. It reaches DeviceManager so the Power key works, and DeviceManager
-		// passes it on to the two keyboard drivers. That is the authority leak P02M0141 exists to
+		// passes it on to the two keyboard drivers. That is the authority leak the migration exists to
 		// close, and until M11 replaces it with a narrow SystemPower service this list is what
 		// stops a THIRD holder appearing unnoticed.
 		//

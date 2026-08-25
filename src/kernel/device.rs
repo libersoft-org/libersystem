@@ -148,7 +148,8 @@ pub fn acquire_bus_master(index: usize) -> bool {
 	// THE DMA THREAT MODEL IS DECIDED HERE, at the one moment a device gains the ability to reach
 	// memory on its own. A driver that declared it needs translation does not master the bus without
 	// it - and a refusal is a refusal: there is no fall-back to untranslated DMA, because falling
-	// back is the failure P02M0153's Goal names in as many words.
+	// back is the failure the isolation claim names in as many words: it must never silently become
+	// untranslated DMA.
 	//
 	// Everything in this tree is `trusted-untranslated` today, so what this call does at present is
 	// RECORD the degraded state by name rather than change any outcome. That is the point of putting

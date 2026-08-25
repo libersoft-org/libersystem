@@ -39,9 +39,9 @@ pub struct Degraded {
 //
 // ENFORCEMENT IS A FACT, ESTABLISHED RATHER THAN ASSUMED. It is on only when a backend has brought
 // an IOMMU up and read back its own configuration, and this tree has no such backend yet - so this
-// says so explicitly rather than leaning on a static's initial value. When P02M0153's `virtio-iommu`
-// backend lands, its bring-up is what this calls, and its confirmed bypass-off transition is what
-// turns the answer into `true`.
+// says so explicitly rather than leaning on a static's initial value. The `virtio-iommu` backend's
+// bring-up is what this calls, and its confirmed bypass-off transition is what turns the answer
+// into `true`.
 pub fn init() {
 	// The bring-up is the answer. `iommu::init` returns whether a controller was found, negotiated
 	// what an enforcing profile needs, and READ BACK its own bypass byte as off - and nothing short
@@ -61,7 +61,7 @@ pub fn enforcing() -> bool {
 // WHICH DEVICE TYPES REFUSE TO RUN UNTRANSLATED. Empty, and the emptiness is a decision worth being
 // explicit about rather than a gap.
 //
-// P02M0153's M4 asks for the protected slice's endpoints to declare `iommu-required`. The mechanism
+// The protected slice's endpoints are meant to declare `iommu-required`. The mechanism
 // is here and is exercised - `admit` refuses a type in this list on a machine with no enforcement,
 // and a kernel test drives exactly that. What the list does NOT contain is `virtio-net`, because
 // putting it there removes networking from every profile that has no `virtio-iommu` in it: the
@@ -118,7 +118,7 @@ pub fn degraded_devices() -> Vec<Degraded> {
 //
 // SAID AT THE END RATHER THAN PER DEVICE, because the question a reader has is "is anything reaching
 // memory untranslated", and the answer is a list rather than a scattering of lines. A system with an
-// enforcing IOMMU and an empty list is the only shape that carries P02M0153's claim.
+// enforcing IOMMU and an empty list is the only shape that carries the isolation claim.
 pub fn report() {
 	crate::iommu::report();
 	let degraded = degraded_devices();

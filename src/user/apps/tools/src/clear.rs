@@ -3,7 +3,7 @@
 // It was a shell builtin, and it moved out here because it changes NO SESSION STATE: it writes two
 // escape sequences to whatever terminal it inherited and exits. The shell keeps the builtins that
 // have to touch what only the shell holds - the working directory, the variable table, the jobs -
-// and everything else is a program, which is the split P02M0031 and P02M0095 are about.
+// and everything else is a program, which is the split the shell design is about.
 //
 // It needs no capability for the same reason `pwd` does not: stdout is inherited, not granted.
 

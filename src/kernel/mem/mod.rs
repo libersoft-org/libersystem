@@ -214,7 +214,7 @@ pub fn memmap_get(index: usize) -> Option<abi::MemmapRegion> {
 #[cfg(target_arch = "x86_64")]
 pub fn init(regions: &[MemRegion], hhdm: u64) {
 	HHDM_OFFSET.store(hhdm, Ordering::Relaxed);
-	// THE BOUND FIRST, AND THAT IS PHASE ONE OF P02M0152's M1.
+	// THE BOUND FIRST, AND THAT IS PHASE ONE OF BRING-UP.
 	//
 	// `within_direct_map` is the check every firmware pointer is validated against, and it answers
 	// from this number - so until it is published, "is this address somewhere I can read" answers
@@ -228,7 +228,7 @@ pub fn init(regions: &[MemRegion], hhdm: u64) {
 	frame::init(regions);
 	heap::init();
 	// THE TOPOLOGY IS READ HERE, BETWEEN THE HEAP AND THE PARTITION, and the position is the whole
-	// of P02M0152's M1.
+	// of this ordering.
 	//
 	// It cannot be earlier: an SRAT pointer is a firmware address, and the check that says whether
 	// this kernel may read it is `within_direct_map` - which answers about a bound published two

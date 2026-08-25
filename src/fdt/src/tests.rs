@@ -301,7 +301,7 @@ fn the_real_riscv64_virt_tree_parses_and_carries_the_timebase() {
 #[test]
 fn the_console_of_each_real_machine_is_found_at_the_address_that_was_hard_coded() {
 	// THE LOAD-BEARING TEST OF THIS CRATE. Both loaders carry a UART address written down from
-	// QEMU - `0x0900_0000` for aarch64 and `0x1000_0000` for riscv64 - and P02M0129 has recorded
+	// QEMU - `0x0900_0000` for aarch64 and `0x1000_0000` for riscv64 - and the audit has recorded
 	// twice that on a machine that is not `virt` those stores go somewhere nobody chose.
 	//
 	// Discovery replaces the constant, and this is the evidence that it replaces it with the SAME
@@ -768,7 +768,7 @@ fn a_record_that_runs_past_its_block_is_refused_rather_than_read() {
 	assert_eq!(at(bad_nameoff).console(), None);
 }
 
-// P02M0129, sixth round.
+// The sixth audit round.
 
 #[test]
 fn a_memory_node_is_named_and_typed_and_enabled() {
@@ -1324,7 +1324,7 @@ fn a_reservation_list_that_does_not_terminate_reserves_nothing() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// The ARM interrupt controller, read from the machine rather than from a constant (P02M0151 M2).
+// The ARM interrupt controller, read from the machine rather than from a constant.
 // ---------------------------------------------------------------------------------------------
 
 // A GICv2 node the way QEMU's virt machine writes it: two ranges in one `reg`, distributor first.

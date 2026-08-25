@@ -11,7 +11,7 @@ path = "src/lib.rs"
 [dependencies]
 # THE FIRST EXTERNAL DEPENDENCY IN THE BOOT CHAIN, and it is here rather than in `bootproto`
 # deliberately: the format crate stays dependency-free and the kernel, which shares it, never
-# compiles any of this. P02M0150 M1 says what this is - "use an established `no_std` verifier and do
+# compiles any of this. The rule is - "use an established `no_std` verifier and do
 # not implement curve or signature arithmetic in this tree" - and signature arithmetic written from
 # scratch is the one kind of code where being wrong is invisible until it matters.
 ed25519-dalek = { version = "2", default-features = false }

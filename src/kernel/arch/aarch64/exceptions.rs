@@ -490,7 +490,7 @@ pub fn init_vectors() {
 // A trap arrived on a stack pointer that is not on the running thread's kernel stack.
 //
 // THIS IS THE REPORT THAT DID NOT EXIST, and its absence is what made the aarch64 failure in
-// P02M0133 cost four days. The old vector saved its frame wherever `SP` pointed; when that was not
+// This cost four days. The old vector saved its frame wherever `SP` pointed; when that was not
 // mapped, the save faulted, re-entered the vector, and looped - producing no output at all while
 // walking `SP` down through the kernel window and overwriting whatever it passed. Every hypothesis
 // about that failure had to be built from its end state, and every one of them was wrong.

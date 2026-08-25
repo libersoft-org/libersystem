@@ -421,7 +421,7 @@ impl volume::Service for VolStub {
 		if path.is_empty() { Err(Error::NotFound) } else { Ok(()) }
 	}
 
-	// The seven P02M0101 ops. Each answers from its arguments alone, because what this stub proves
+	// The seven path ops. Each answers from its arguments alone, because what this stub proves
 	// is the CODEC: that the values a client sent arrive as themselves, and that a handle travelled
 	// out-of-band rather than through the byte stream.
 	fn stat(&mut self, path: String) -> Result<FileInfo, Error> {

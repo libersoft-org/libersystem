@@ -330,7 +330,7 @@ STUB
 MATRIX
 
 	# And the summary must exit with what it printed. This is a claim about the tracked script's
-	# text: `report_build_summary` computes `status` and, before P02M0137, returned from the EXIT
+	# text: `report_build_summary` computes `status` and once returned from the EXIT
 	# trap without it - so a build that announced `status=1` exited 0.
 	cases=$((cases + 1))
 	summary_function="$(awk '/^report_build_summary\(\) \{$/, /^\}$/' "$wrapper")"

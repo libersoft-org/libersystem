@@ -922,7 +922,7 @@ unsafe fn run_tool_under_manifest(procsvc: u64, name: &[u8], args: &[u8], cwd: &
 		// THE PLACEHOLDER IS NOT OPTIONAL. A program that reads `SELECTED_FILE` has to find the tag
 		// in a fixed position whether or not it was opened over a file: `recv_tagged` BLOCKS, and a
 		// tag read where nothing was sent consumes the message that was actually next and then waits
-		// forever for one nobody will send. That is the ordered-bootstrap hazard P02M0102 records,
+		// forever for one nobody will send. That is the recorded ordered-bootstrap hazard,
 		// and it reappeared here the moment a grant became conditional.
 		//
 		// Sent only to the programs that READ it, because sending it to the other fifty would shift
@@ -987,7 +987,7 @@ struct StageRequest<'a> {
 //
 // Each stage's stdio goes over in ONE message carrying ordered capabilities - stdout first,
 // stdin second when it has one - because a receiver cannot tell a second message that was
-// never sent from the next handoff in its bootstrap sequence. That is what the P02M0090
+// never sent from the next handoff in its bootstrap sequence. That is what the handle-migration
 // multi-capability work exists for, and it is why this needs no "does this stage have
 // stdin?" agreement between the two sides.
 unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd: &[u8], environment: &[EnvVar], clients: &mut Clients, audit: &mut Vec<AuditEntry>) -> Option<Vec<StartResult>> {
@@ -1082,7 +1082,7 @@ unsafe fn run_pipeline_under_manifest(procsvc: u64, stages: &[StageRequest], cwd
 			}
 			prepared.push((started, manager_side));
 		}
-		// COMMIT, IN ONE TRANSITION (P02M0102, IDL-002).
+		// COMMIT, IN ONE TRANSITION (IDL-002).
 		//
 		// This released the stages one koid at a time, and the comment where the loop handled a
 		// refusal said what that cost: "past the first release the transaction can no longer be

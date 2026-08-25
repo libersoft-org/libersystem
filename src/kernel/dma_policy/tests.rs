@@ -17,9 +17,9 @@ crate::tagged_test!(binding_without_translation_is_recorded_by_name_and_only_onc
 fn binding_without_translation_is_recorded_by_name_and_only_once() {
 	forget_degraded_for_test();
 	// THE STATE IS SET RATHER THAN ASSUMED. This test's subject is what happens when there is no
-	// enforcement, and it must say the same thing on the ordinary profile and on P02M0153's
-	// enforcing one - a test whose premise is the machine it happens to run on is a test that
-	// changes meaning when the machine does.
+	// enforcement, and it must say the same thing on the ordinary profile and on the enforcing one -
+	// a test whose premise is the machine it happens to run on is a test that changes meaning when the
+	// machine does.
 	let was = enforcing();
 	set_enforcing(false);
 

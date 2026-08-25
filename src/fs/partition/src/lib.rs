@@ -6,8 +6,8 @@
 //! licence to lay a filesystem over the whole device from sector zero. That is where a
 //! protective MBR, a GPT header and a partition entry array live.
 //!
-//! P02M0113 established the rule for the mount ("I could not tell" may not be read as "there
-//! is nothing here") and P02M0114 applied it to a GPT that IS recognised. The negative case -
+//! The rule was established for the mount ("I could not tell" may not be read as "there
+//! is nothing here") and then applied to a GPT that IS recognised. The negative case -
 //! LBA 1 does not begin with `EFI PART` - stayed exactly as dangerous as it had been: an
 //! ordinary MBR-partitioned disk, a hybrid MBR, a GPT whose signature is damaged while its
 //! backup is intact, a superfloppy carrying FAT or ext4 at LBA 0, and any disk holding

@@ -709,7 +709,7 @@ impl<'a> Iterator for Symbols<'a> {
 	}
 }
 
-// THE ONE PLACE THAT SAYS WHAT A LOADABLE IMAGE MUST SATISFY (P02M0129, LDR-011).
+// THE ONE PLACE THAT SAYS WHAT A LOADABLE IMAGE MUST SATISFY (LDR-011).
 //
 // Three backends load the kernel and each checked a different subset. x86_64 asserted page
 // alignment and W^X in a loop of its own; aarch64 asserted `ET_EXEC` and nothing about the segments

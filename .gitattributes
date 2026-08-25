@@ -6,6 +6,6 @@
 # reader would notice its absence.
 #
 # `git diff --check` flags it as trailing whitespace, which was invisible while the file changed a
-# row at a time and became 223 findings the moment it was regenerated whole (P02M0134, WASM-004).
+# row at a time and became 223 findings the moment it was regenerated whole (WASM-004).
 # This says the file's whitespace is content, so the check stays useful everywhere else.
 src/wasm/tests/spec-run-cases.tsv -whitespace

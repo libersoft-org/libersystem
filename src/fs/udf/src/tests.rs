@@ -1051,7 +1051,7 @@ fn an_image_from_an_independent_formatter_mounts() {
 	// Descriptor covers to 446, not 448 - and this test was what said so, immediately.
 	let Some(dir) = udftools_image("blank.udf") else {
 		// SAID OUT LOUD. A skipped conformance test that looks identical to a passing one is how a
-		// gate stops checking, which is the whole subject of P02M0112.
+		// gate stops checking, which is the whole subject of that gate's own audit.
 		std::eprintln!("SKIPPED an_image_from_an_independent_formatter_mounts: udftools is not installed");
 		return;
 	};

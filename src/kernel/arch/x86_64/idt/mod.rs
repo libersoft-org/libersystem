@@ -137,7 +137,7 @@ pub fn set_gate(vector: usize, handler: extern "x86-interrupt" fn(InterruptStack
 // Only the page-fault and #GP handlers looked at the privilege level; every other vector called the
 // fatal halt path whatever raised it. So `ud2`, a divide by zero, a bound-range check or an
 // alignment fault from ring 3 stopped every CPU rather than the one process that executed it -
-// which is the property P02M0119 established for user copies and had never held for user faults.
+// which is the property the exception table established for user copies and had never held for user faults.
 //
 // The low two bits of the saved code selector are the CPL, so this is one comparison, and it
 // belongs in front of every vector rather than in the two that happened to have it.

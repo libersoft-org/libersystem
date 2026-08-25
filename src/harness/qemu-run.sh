@@ -121,7 +121,7 @@ qemu_append_debug_args() {
 #
 # This used to copy `volume.pkg` - a factory ARCHIVE - to LBA 0, and the storage service formatted
 # a filesystem 32 MiB further in and seeded it from that archive on every boot. The volume is now
-# built as a real LiberFS image (P02M0108), so the disk carries the volume itself: the same bytes the
+# built as a real LiberFS image, so the disk carries the volume itself: the same bytes the
 # loader reads and the storage service mounts, in one place rather than two.
 #
 # The image is copied rather than attached directly because a guest writes to its system volume,

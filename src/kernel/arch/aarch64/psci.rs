@@ -39,7 +39,7 @@ const MAX_CPUS: usize = 8;
 //
 // What remains true and is not fixed here: there is no guard page between these slices, so an
 // overflow walks into the previous core's memory with no fault at all. The exception vectors now
-// catch it at the next trap, which is a catch and not a stop - see P02M0133.
+// catch it at the next trap, which is a catch and not a stop.
 const SEC_STACK_SIZE: u64 = 16384;
 
 // ALIGNED TO 16, WHICH IT WAS NOT, AND THAT WAS THE DEFECT THIS MILESTONE IS NAMED FOR.

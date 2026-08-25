@@ -109,7 +109,7 @@ struct Role {
 //
 // NO `Power`. The manifest schema still has that kind and `system-manifest` still understands it -
 // as the tripwire that REFUSES it, since the list of services allowed to hold the root Domain is
-// empty. P02M0141 converted the last one, so no manifest row can produce it and this executor has
+// empty. The last one was converted, so no manifest row can produce it and this executor has
 // no arm to deliver it with. `build.rs` fails the build rather than emitting one.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RoleKind {
@@ -1236,7 +1236,7 @@ unsafe fn start_stopped_service(broker: &mut Broker, idx: usize, state: &mut [St
 //
 // READ FROM THE DECLARATION, NOT WRITTEN OUT AGAIN. This was a hand-written list of three names
 // beside a manifest column that already named the same three - two editable sources for one fact,
-// which is what P02M0141 exists to remove, sitting inside the milestone that removes it. The
+// which is what the migration exists to remove, sitting inside the work that removes it. The
 // mechanism is still `relaunch_service` below, which knows how to re-run one bootstrap per name;
 // `check-bootstrap-plan` compares the two so the policy cannot come to claim a service the
 // mechanism cannot bring back.

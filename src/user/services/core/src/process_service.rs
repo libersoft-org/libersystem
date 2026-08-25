@@ -458,7 +458,7 @@ impl<'a> Processes<'a> {
 				// reason to live is its bootstrap channel, and whether it has reached the end of it
 				// by the time the list request is drained is not something the test controls. The
 				// discriminator this branch adds is still right; it is not the whole race, and
-				// P02M0120 records the sighting.
+				// The sighting is recorded with the allocator's own evidence.
 				//
 				// `completion_valid` is the discriminator the state does not carry: the kernel sets
 				// it from `exit_status()`, which exists only once the process has actually finished.

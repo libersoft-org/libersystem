@@ -552,7 +552,7 @@ pub fn launched_but_not_covered(test: &KernelTest, touched: &BTreeSet<String>, g
 	touched.iter().filter(|component| component.starts_with("bin.") && graph.contains(component) && !test.covers.contains(component)).cloned().collect()
 }
 
-// THE PERMISSION FIXTURE'S COHORT, audited from the kernel test sources (P02M0138).
+// THE PERMISSION FIXTURE'S COHORT, audited from the kernel test sources.
 //
 // Twelve tests drive one expensive fixture and split into two classes. The classification lives in
 // `PERMISSION_COHORT` in `src/kernel/tests.rs` and each consumer repeats its own class in its own
@@ -607,7 +607,7 @@ pub fn audit_permission_cohort(map_text: &str, consumer_text: &str) -> Vec<Strin
 	// The planner regression is hermetic - it writes its own suite and puts `bin.permission_manager`
 	// on it - which is what keeps it from agreeing with the declarations by construction, and also
 	// means deleting the real declaration from `applications.rs` leaves it green. Nothing else was
-	// checking the tracked file, so the zero-selected-tests defect P02M0138 exists to fix could have
+	// checking the tracked file, so the zero-selected-tests defect this exists to fix could have
 	// come back without a single test failing. This is the lock, and it reads the declaration where
 	// the planner reads it: the `tagged_test!` carrying that stable id.
 	for (id, _) in &declared {
@@ -628,7 +628,7 @@ pub fn audit_permission_cohort(map_text: &str, consumer_text: &str) -> Vec<Strin
 	// One consumer of the fixture that classified itself nowhere. Counting is enough: any specific
 	// name this could report would be the helper-name oracle this check exists to avoid.
 	//
-	// The accessor is `permission_scenario_result` since P02M0139 split the cache from the scenario.
+	// The accessor is `permission_scenario_result` since the cache was split from the scenario.
 	// The fixture's own regressions call `permission_result_for_regression` instead - a different
 	// name because they are a different thing: they drive the state machine on cells of their own
 	// and assert nothing about PermissionManager, so they are not cohort members and must not be

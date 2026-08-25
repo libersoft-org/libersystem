@@ -452,7 +452,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 	// The factory layout starts at sector ZERO, so "falling back" meant laying a
 	// filesystem over the protective MBR, the GPT header, the entry array and whatever
 	// else the disk carried. "The disk's content must never deny storage" is the wrong
-	// rule when the content is a partition table - P02M0113 established that a mount answers
+	// rule when the content is a partition table - it was established that a mount answers
 	// "I could not tell" by changing nothing, and this is the same rule one layer down.
 	//
 	// So the service refuses, and the whole point is what the disk looks like afterwards.
@@ -610,7 +610,7 @@ fn garbage_where_the_superblock_should_be_cannot_kill_the_storage_service() {
 	//
 	// The bytes are a PKGARCH1 header claiming a ~137 GB entry table, which is what this test was
 	// originally written for: the seeding path sized a read buffer straight off that word. That
-	// path is deleted (P02M0108), so what the case guards now is the general property - and the
+	// path is deleted, so what the case guards now is the general property - and the
 	// property CHANGED with the fourth audit. It used to demand an empty volume formatted over the
 	// garbage, on the reasoning that unrecognised bytes are as good as no bytes.
 	//

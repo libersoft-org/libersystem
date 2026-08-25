@@ -39,7 +39,7 @@ use crate::sync::SpinLock;
 //
 // The overflow is still a fault rather than silent corruption - the guard page below every stack is
 // what makes it one - and making that fault SURVIVABLE is a separate piece of work, recorded in
-// P02M0133: a guard page whose fault cannot be reported is a guard that only changes the symptom.
+// A guard page whose fault cannot be reported is a guard that only changes the symptom.
 pub const KERNEL_STACK_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

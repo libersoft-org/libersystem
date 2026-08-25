@@ -44,7 +44,7 @@
 //       interrupts: IRQ_BASE, HandlerFn, register (the x86 INTx registry; the other two are MSI)
 //     THESE ARE NOT ENTRIES ON THE OTHER TWO BACKENDS AT ALL. They used to be, answered by twenty
 //     `todo!()` bodies nothing could reach - and a body like that is indistinguishable, to a reader
-//     and to a static scan, from an unfinished port. P02M0151 removed the requirement rather than the
+//     and to a static scan, from an unfinished port. The requirement was removed rather than the
 //     symptom: `kmain`, the ACPI MADT walk, the INIT-SIPI-SIPI wake, the real-mode trampoline and
 //     everything reached only from them are `#[cfg(target_arch = "x86_64")]`, so a port that does not
 //     arrive that way defines none of it. `tools/check-arch-surface.sh` keeps it that way.
@@ -60,7 +60,7 @@
 //
 // WHAT THIS COSTS, and it is smaller than it was. Nothing type-checks the three boot PROLOGUES
 // against each other, so a machine-level step added to one is silently absent from the others until
-// a test notices. The boot TAIL is no longer in that class: P02M0142 moved the part that carries
+// a test notices. The boot TAIL is no longer in that class: the part that carries
 // policy - the recovery ladder, the crash-notify channel, the readiness wait, the idle hook that
 // watches for a lost SystemManager, the shell hand-off - into `main::boot_userspace`, which all
 // three entries call. What remains per-arch is the machine, which is the least portable thing a

@@ -2,7 +2,7 @@
 //
 // THE PROFILE DECIDES WHAT THIS TEST PROVES, and it says which. The ordinary harness boots one node,
 // where the whole claim is that nothing was invented: no topology, one pool, `Unknown` for every
-// address. P02M0152's two-node profile boots the same tests with a real topology under them, and the
+// address. The two-node profile boots the same tests with a real topology under them, and the
 // assertions swap over - which is what makes the same file evidence in both directions rather than a
 // test that passes by not running.
 

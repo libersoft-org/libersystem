@@ -17,7 +17,7 @@
 #
 # `[~]` COUNTS AS OPEN. It is a useful third state in a long document - "partly done" is a real thing
 # to say - and it is not a state that may make a milestone read as finished to the one check that
-# exists to prevent exactly that. P02M0129 passed this gate as COMPLETE over its own text saying its
+# exists to prevent exactly that. One document passed this gate as COMPLETE over its own text saying its
 # adversarial tests do not exist, because the marker its test item used was not the one being
 # counted. One item in the whole tree at the time, which is why closing it while it was one was
 # cheap.
@@ -30,7 +30,7 @@ todo_dir="$(dirname "$index")"
 check_index() {
 	local index="$1" todo_dir="$2" failed=0
 	while IFS= read -r line; do
-		# `- [x] [P02M0120 - title](P02M0120.md)` - the file is the last parenthesised group.
+		# `- [x] [<id> - title](<id>.md)` - the file is the last parenthesised group.
 		local mark file
 		mark="${line:3:1}"
 		file="${line##*\(}"
@@ -54,7 +54,7 @@ check_index() {
 
 # Prove the gate REFUSES before letting it approve. The tree is consistent right now, so a run over
 # the tree proves only that the tree is consistent - it would pass just as well if the `grep` above
-# had stopped matching, which is how the six gates of P02M0112 came to report success for a month.
+# had stopped matching, which is how six gates came to report success for a month.
 self_test() {
 	local scratch
 	scratch="$(mktemp -d)"
@@ -78,7 +78,7 @@ self_test() {
 	fi
 
 	# And the PARTLY-done marker, which is the one that slipped through: `[~]` is a third state a
-	# long document legitimately wants, and P02M0129 read as COMPLETE over its own text saying its
+	# long document legitimately wants, and one read as COMPLETE over its own text saying its
 	# adversarial tests do not exist because this gate was counting only `[ ]`. A fixture belongs
 	# beside the `[ ]` one for the same reason that one is here.
 	printf '# P99M0003\n\nStatus: DONE.\n\n- [x] finished\n- [~] partly done\n' >"$scratch/P99M0003.md"

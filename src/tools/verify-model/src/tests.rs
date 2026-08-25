@@ -1,4 +1,4 @@
-// Two kinds of test, and the second kind is the one P02M0118 argues for at length.
+// Two kinds of test, and the second kind is the one this model argues for at length.
 //
 // The property tests pin the selector's shape: monotonicity, determinism, idempotence,
 // full-absorption, total ownership. The NEGATIVE fixtures pin what each validator must REJECT,
@@ -162,7 +162,7 @@ fn an_unknown_path_selects_everything() {
 #[test]
 fn documentation_selects_nothing_and_says_so() {
 	let model = model();
-	let plan = plan_for(&model, &["docs/todo/P02M0118.md"]);
+	let plan = plan_for(&model, &["docs/TESTING.md"]);
 	assert!(plan.nothing_to_do, "a documentation change has nothing to verify");
 	assert!(plan.items.is_empty());
 	assert!(!plan.full);
@@ -1727,7 +1727,7 @@ fn the_edges_a_component_is_evidence_about_are_the_ones_walked_out_of_it() {
 	assert!(union.iter().all(|kind| plan.edge_kinds.contains(*kind)));
 }
 
-// The permission fixture's cohort audit (P02M0138). Text in, problems out - so every defect the
+// The permission fixture's cohort audit. Text in, problems out - so every defect the
 // audit exists to catch is written here as a fixture rather than waiting for someone to make the
 // mistake in the tree.
 const COHORT_MAP: &str = r#"
@@ -1806,7 +1806,7 @@ fn a_declaration_the_map_does_not_know_is_a_failure() {
 }
 
 // ---------------------------------------------------------------------------------------------
-// P02M0138: a PermissionManager change selects the tests that can detect a regression in it.
+// A PermissionManager change selects the tests that can detect a regression in it.
 //
 // HERMETIC IN THE DIMENSION THAT MATTERS. `kerneltests::discover` reads the compiled test binaries
 // out of `.build` to learn which tests exist per target, so a regression built on the discovered

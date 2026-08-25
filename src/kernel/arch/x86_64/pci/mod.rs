@@ -121,7 +121,7 @@ pub fn set_bus_master(bus: u8, dev: u8, func: u8, on: bool) {
 // probed size.
 //
 // FOR A FUNCTION THIS KERNEL BINDS NO DRIVER TO. The device table admits resolved virtio and xHCI
-// functions only, and P02M0153's fixture needs the PCI `edu` device - which is neither. Retaining a
+// functions only, and the IOMMU fixture needs the PCI `edu` device - which is neither. Retaining a
 // window for an arbitrary function is what that fixture needs and what this provides; it does not
 // map anything or grant anything, it reads two registers.
 #[cfg(test)]

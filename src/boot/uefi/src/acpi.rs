@@ -3,7 +3,7 @@
 //! A machine that boots this loader through UEFI describes itself with a device tree or with ACPI,
 //! and the device-tree half is the `fdt` crate. This is the other half: the RSDP the firmware puts
 //! in its configuration table, the XSDT it points at, and SPCR - the Serial Port Console
-//! Redirection table, which exists for exactly the question P02M0129 has been carrying since it
+//! Redirection table, which exists for exactly the question the audit has been carrying since it
 //! opened. "Where does this machine's serial console live" had one answer in this tree and it was a
 //! literal copied from QEMU.
 //!

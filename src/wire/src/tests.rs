@@ -2,7 +2,7 @@
 //
 // `src/wire` had no tests: its primitives were exercised through `src/proto`, which is good
 // coverage of the generated SHAPES and none of the crate's own boundaries. Every case below is one
-// of those boundaries, and the ones marked with a defect were reachable before P02M0090f.
+// of those boundaries, and the ones marked with a defect were reachable before the handle migration.
 
 use super::*;
 

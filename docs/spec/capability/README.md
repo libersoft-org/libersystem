@@ -1,7 +1,7 @@
 # The capability transfer model
 
 An executable specification of the handle and channel state machines, and the configurations TLC
-explores it under. It is P02M0154's, and its claim is deliberately finite: for each published
+Its claim is deliberately finite: for each published
 configuration, every reachable state satisfies the listed invariants. That is stronger than a design
 argument and weaker than a proof of the kernel - TLC explores a bounded abstraction of the parts
 `MODEL_MAP.md` names, and nothing here says anything about unmodeled code, unsafe Rust, assembly,

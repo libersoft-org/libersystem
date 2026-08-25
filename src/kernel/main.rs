@@ -608,7 +608,7 @@ fn crash_seen(crash_rx: &object::channel::Channel, koid: u64) -> bool {
 // THE POINT WHERE THE RETRY LADDER STOPS APPLYING is a CHANGE in this number. SystemManager creates
 // one child Domain and spawns ServiceManager into it, early - so a manager that faults after that
 // leaves a branch full of running processes with no owner. Starting a replacement beside it would
-// be two managers over one tree, which is worse than starting again, and P02M0141's M11 says so in
+// be two managers over one tree, which is worse than starting again, and the supervisor contract says so in
 // as many words: the pre-online ladder applies only BEFORE the control-plane Domain exists.
 //
 // Counted rather than tested for emptiness, and compared against what was there when the ladder

@@ -1,6 +1,6 @@
 //! A `fscore::BlockDevice` over the firmware's Block I/O protocol, and the enumeration built on it.
 //!
-//! This is the whole trick P02M0108 rests on: the split between loader and kernel is not which
+//! This is the whole trick the volume format rests on: the split between loader and kernel is not which
 //! filesystem code runs, it is who supplies the block device. Before `ExitBootServices` the
 //! firmware does; afterwards `virtio_blk` does. LiberFS above that line is the same crate,
 //! unchanged, reading the same volume.

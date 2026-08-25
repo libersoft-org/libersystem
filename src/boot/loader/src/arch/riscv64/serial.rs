@@ -5,7 +5,7 @@
 // This file used to carry a fixed physical address - a 16550 at 0x1000_0000, QEMU's `virt` - and store to it
 // directly. UEFI promises an identity map for RAM and nothing at all about a device region at an
 // address the loader made up, so on a machine that is not `virt` every post-`ExitBootServices` line
-// went into whatever lives there. P02M0129 carried that as an open finding for three rounds because
+// went into whatever lives there. That was an open audit finding for three rounds because
 // closing it needed a device-tree reader the loader did not have.
 //
 // It has one now (`fdt`), and an SPCR reader for machines with no device tree (`uefi::acpi`), and

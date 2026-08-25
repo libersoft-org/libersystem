@@ -380,7 +380,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// THE READS ARE IN THE ORDER THE LAUNCHER SENDS, and that order is `VOCABULARY`: Permission
 		// before Volumes before AppAssets. It has to be, because `recv_tagged` BLOCKS and a tag read
 		// out of turn consumes the message that was actually next - which is the ordered-bootstrap
-		// hazard P02M0102 records, reached again here by reading three grants in the wrong sequence.
+		// recorded hazard, reached again here by reading three grants in the wrong sequence.
 		//
 		// THE NARROW LAUNCH BROKER AND NOTHING MORE. `lico` cannot create a process; it can ask
 		// PermissionManager to start a NAMED program, which then runs under that program's own
@@ -907,7 +907,7 @@ impl Manager {
 	// AS BYTES RATHER THAN STRINGS, and that is a shared-image constraint rather than taste: a
 	// `Vec<String>` here instantiates `RawVec<String>::grow_one` in whichever crate the linker
 	// happens to place it, and the shared-library graph refuses an import with no declared provider.
-	// The same defect P02M0102 hit with a `Vec<u64>`, and the same answer - do not create the
+	// The same defect hit once with a `Vec<u64>`, and the same answer - do not create the
 	// instantiation.
 	fn names_of(&self, panel: usize) -> Vec<Vec<u8>> {
 		let mut names: Vec<Vec<u8>> = Vec::new();

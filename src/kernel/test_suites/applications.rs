@@ -1085,7 +1085,7 @@ fn a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline() {
 	// what this pins is that the refusal reaches the person rather than the pipe.
 	assert!(says(b"cannot open for writing"), "an unwritable destination is reported: {:?}", core::str::from_utf8(out));
 	// `redirect_in motd.txt | tee teed.txt | wc` TYPED AT THE PROMPT: a three-stage line whose
-	// middle stage is the tool P02M0101 asks for, on a volume where its destination cannot be
+	// middle stage is the tool under test, on a volume where its destination cannot be
 	// opened. Both halves of `tee`'s documented policy are visible in one row - the destination is
 	// named as refused, and the stream carries on to the far end.
 	assert!(says(b"2 13 83 83"), "tee passed the stream on through a typed line: {:?}", core::str::from_utf8(out));
@@ -1148,7 +1148,7 @@ fn a_governed_pipeline_starts_as_one_transaction_and_carries_data() {
 
 tagged_test!(a_volume_stats_renames_truncates_and_touches, [Service, Storage, Filesystem], id = "kernel.applications.a_volume_stats_renames_truncates_and_touches", covers = ["libermemfs", "storage"]);
 fn a_volume_stats_renames_truncates_and_touches() {
-	// The four path verbs P02M0101 adds to the volume contract, over a memory volume that
+	// The four path verbs the text-processing tools add to the volume contract, over a memory volume that
 	// implements all four. Every one of them answered "not implemented" before this milestone, and
 	// every caller that wanted a file's size read its whole parent directory to find out.
 	let (_volume, package) = scenario_packages().expect("scenario packages");
@@ -1306,7 +1306,7 @@ tagged_test!(
 	]
 );
 fn the_command_tools_run_governed_and_read_in_windows() {
-	// Three of P02M0101's tools launched by PermissionManager, each with exactly the grants its
+	// Three of the text-processing tools launched by PermissionManager, each with exactly the grants its
 	// manifest declares, printing to a stdout the launcher forwarded.
 	//
 	// `pwd` IS THE INTERESTING ONE: it holds no capability at all and still answers, because a
@@ -1690,7 +1690,7 @@ fn the_memory_volumes_bound_expensive_streams() {
 
 tagged_test!(a_services_round_trip_against_its_client_count, [Service, Storage, Stress], id = "kernel.applications.a_services_round_trip_against_its_client_count", covers = ["kernel"]);
 fn a_services_round_trip_against_its_client_count() {
-	// The measurement P02M0117 asked for FIRST, before anything touches the serve loop.
+	// The measurement taken FIRST, before anything touches the serve loop.
 	//
 	// What that milestone fixes is a slope: `wait_any` takes a fresh array of handles on every call,
 	// so the kernel registers a waiter on every channel in it and takes them all out again - once
@@ -1712,7 +1712,7 @@ fn a_services_round_trip_against_its_client_count() {
 	}
 }
 
-// P02M0139: the fixture boundary itself. These drive the REAL state machine on cells of their own,
+// The fixture boundary itself. These drive the REAL state machine on cells of their own,
 // so they never poison a class a cohort consumer will ask for - which is why they can live in the
 // ordinary suite and run in every full sweep rather than only when someone remembers them.
 //

@@ -163,7 +163,7 @@ pub fn set_from_user(value: bool) {
 
 // The portable hook the scheduler calls with the incoming thread's kernel stack extent. aarch64
 // uses it to bound what its exception vectors will save a frame onto, after a stack pointer that
-// was not on any stack turned every fault into an unbounded, silent runaway (P02M0133). Nothing
+// was not on any stack turned every fault into an unbounded, silent runaway. Nothing
 // here does that yet, so this records nothing rather than pretending to check.
 //
 // Worth keeping in mind before this stays empty by default: the same failure is possible on any

@@ -3830,11 +3830,11 @@ fn overwriting_a_cached_entry_evicts_nothing() {
 	assert!(fs.dcache.contains_key(&(0, format!("name{:04}", DCACHE_MAX - 1).as_bytes().to_vec())), "the largest key survived the overwrite");
 }
 
-// P02M0116: the third audit's follow-ups, and the three regressions P02M0114 opened.
+// The third audit's follow-ups, and the three regressions the mark-walk work opened.
 
 #[test]
 fn a_directory_that_splits_lists_in_key_order() {
-	// `collect_dir_entries` is documented as returning entries in key order, and P02M0114
+	// `collect_dir_entries` is documented as returning entries in key order, and the mark walk
 	// replaced its recursion with a LIFO stack that pushed children 0..=count and popped
 	// the last one FIRST. Records inside a leaf stayed sorted, so the reversal only shows
 	// once a directory is big enough to have an internal node - and every directory test
@@ -3868,7 +3868,7 @@ fn a_directory_that_splits_lists_in_key_order() {
 
 #[test]
 fn removing_an_unknown_type_inode_returns_its_blocks() {
-	// P02M0114 taught the mark walk to reserve an unknown-type inode's blocks - file-shaped,
+	// The mark walk was taught to reserve an unknown-type inode's blocks - file-shaped,
 	// which is what `Inode::parse` builds it as - and did not follow that into the other
 	// end. `drop_deleted_inode` branched on `== TYPE_FILE`, and an unknown type is neither
 	// that nor a directory with a root, so removing the record dropped NOTHING: the blocks
@@ -3902,7 +3902,7 @@ fn removing_an_unknown_type_inode_returns_its_blocks() {
 		assert!(inode.extents.len() > EXTENTS_INLINE, "the map must spill, or the chain is not under test");
 		let held: Vec<u64> = inode.extents.iter().flat_map(|e| [e.physical, e.csum]).chain([inode.spill]).collect();
 		for &b in held.iter() {
-			assert!(fs.is_alloc(b), "block {b} behind the record is reserved, as P02M0114 arranged");
+			assert!(fs.is_alloc(b), "block {b} behind the record is reserved, as the mark walk arranges");
 		}
 		fs.remove(b"frag.bin").unwrap();
 		// what a transaction drops is freed one commit later - the superseded generation
@@ -4510,7 +4510,7 @@ fn an_extent_count_above_the_pool_is_refused_before_it_is_allocated_for() {
 // A write that cannot allocate the block buffer for a spilled extent map says so, and does not take
 // the process down.
 //
-// The mount side of this rule was P02M0123's work: `load_spill` bounds `extent_count` and reserves
+// The mount side of this rule was done separately: `load_spill` bounds `extent_count` and reserves
 // fallibly. The WRITE side kept two infallible allocations - a `to_vec()` of the whole spilled map,
 // and a `vec![0u8; BLOCK_SIZE]` per chain block - and the first one scales with how fragmented the
 // file is, which is the case that reaches memory pressure in the first place.
@@ -4600,7 +4600,7 @@ fn a_spilled_extent_map_that_cannot_allocate_its_block_says_so() {
 // mutation writes a fresh, correctly checksummed generation holding it twice. Every later read is
 // decided by which path it walks, and fsck's report arrives after the damage rather than before it.
 //
-// `fsck` has carried the routing interval since P02M0114; a writable mount never ran it. The interval
+// `fsck` has carried the routing interval since the mark walk landed; a writable mount never ran it. The interval
 // now rides along with the free-map walk, which visits these blocks anyway.
 #[test]
 fn an_inode_leaf_outside_the_range_that_routes_to_it_makes_the_mount_read_only() {

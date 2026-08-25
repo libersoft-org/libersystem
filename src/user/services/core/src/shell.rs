@@ -399,7 +399,7 @@ impl Jobs {
 			return None;
 		}
 		let name_str: &str = core::str::from_utf8(name).unwrap_or("");
-		// The kind travels WITH the handle now (P02M0102, IDL-003), so the session cannot be handed
+		// The kind travels WITH the handle now (IDL-003), so the session cannot be handed
 		// a group described as a process.
 		let target = if group { JobTarget::Group(proc) } else { JobTarget::Process(proc) };
 		match session::Client::new(ChannelTransport { chan: self.session }).job_register(name_str, &stopped, &target) {

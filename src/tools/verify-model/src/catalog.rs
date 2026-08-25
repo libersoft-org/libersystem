@@ -102,10 +102,10 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
 const GATES: [(&str, &str); 40] = [
 	("development-gate", "harness.tools"),
-	// P02M0151's gate: no unreachable body in the compiled architecture surface. Its subject is the
+	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
 	("arch-surface", "kernel"),
-	// P02M0154's gate: the capability transfer model. Its subject is the handle and channel state
+	// The capability transfer model. Its subject is the handle and channel state
 	// machines, so a kernel change selects it - the specification is a model OF that code, and a
 	// change to it that the model no longer describes is exactly what this is for.
 	("capability-model", "kernel"),
@@ -114,18 +114,18 @@ const GATES: [(&str, &str); 40] = [
 	("qemu-numa", "kernel"),
 	("qemu-virtio-iommu-x86_64", "kernel"),
 	("implementation-mutations", "kernel"),
-	// P02M0154 M6's gate: the model's invariants proved capable of failing. Same subject as the model
+	// The model's invariants proved capable of failing. Same subject as the model
 	// itself, because a mutation is a statement about the code the model describes.
 	("model-mutations", "kernel"),
-	// P02M0150's gate: which keys a loader carries. Its subject is the loader, so a boot change
+	// Which keys a loader carries. Its subject is the loader, so a boot change
 	// selects it - and the two profiles differing only in a comment is the failure it exists for.
 	("trust-profile", "bin.libersystem-loader"),
-	// P02M0150's negative gate: a medium whose signed manifest was altered must stop the boot. Its
+	// The boot that must NOT happen: a medium whose signed manifest was altered must stop it. Its
 	// subject is the loader and the media the harness stages, so a boot change selects it.
 	("signed-boot", "bin.libersystem-loader"),
-	// P02M0150 M5's gate: the firmware's own verification of the loader. Subject is the loader.
+	// The firmware's own verification of the loader. Subject is the loader.
 	("secure-boot", "bin.libersystem-loader"),
-	// P02M0145's gate: the development configuration COMPILES. Its subject is every services and
+	// The development configuration COMPILES. Its subject is every services and
 	// drivers crate at once, which is a set no single component names - so it takes the
 	// always-selected label for the reason the entry above it does, and for a second one: the fault
 	// it catches is a source change that only the other configuration reads, and a change like that
@@ -147,37 +147,37 @@ const GATES: [(&str, &str); 40] = [
 	("milestone-index", "harness.tools"),
 	("verify-model", "verify-model"),
 	("verify-model-tests", "verify-model"),
-	// The 1 -> 4 handle migration's gate (P02M0090f): building a capability list from ONE received
+	// The 1 -> 4 handle migration's gate: building a capability list from ONE received
 	// handle is banned outside the runtime primitive. It was added to `check.sh` and not here, so
 	// `verify-model check` reported a gate nothing would ever select - which is the same class of
 	// drift the two lists exist to catch, caught by them.
 	("single-cap-receive", "harness.tools"),
-	// P02M0133's gate: an infallible allocation on a kernel path ring 3 can drive. Its subject is
+	// An infallible allocation on a kernel path ring 3 can drive. Its subject is
 	// the kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
 	// It arrived in `check.sh` before it arrived here, and `verify-model check` said so on the next
 	// run, which is the drift these two lists exist to catch.
 	("kernel-allocations", "kernel"),
-	// P02M0127's gate: the `--artifact` fast path must know a library's dependency closure, or it
+	// The `--artifact` fast path must know a library's dependency closure, or it
 	// reports an artifact current after a crate it compiles against changed - which makes every test
 	// result taken on that artifact meaningless. Registered in `check.sh` on 2026-08-12 and not
 	// here, so `verify-model check` had been reporting it as unselectable ever since.
 	("targeted-cache", "harness.tools"),
-	// P02M0144's gate: a warning answered by switching the lint off. Its subject is every crate
+	// A warning answered by switching the lint off. Its subject is every crate
 	// under `src/`, so it belongs to the harness and every change selects it - which is right, since
 	// the attribute it refuses can be added anywhere and costs milliseconds to look for.
 	("no-suppression", "harness.tools"),
-	// P02M0143's gate: every source the loader may boot from carries a manifest naming what will be
+	// Every source the loader may boot from carries a manifest naming what will be
 	// read from it. Its subject is the staging - `mkpackages`, `mkimage.sh`, `qemu-run.sh` - and the
 	// media they write, so it belongs to the harness and every change selects it.
 	("boot-manifest", "harness.tools"),
-	// P02M0104's gate: the boot harness tested against fakes - the scenario oracles, the broker's
+	// The boot harness tested against fakes - the scenario oracles, the broker's
 	// reply framing, the instance identity records and the preflight producers. Its subject is the
 	// harness itself, so a harness change selects it, and it needs no guest and no QEMU.
 	//
 	// REGISTERED LATE, which is the drift the entries above keep describing: it went into `check.sh`
 	// first and `verify-model check` would have reported it as a gate nothing selects.
 	("boot-harness", "harness.tools"),
-	// P02M0100's gate: a hand-written `extern` declaration and the generated function it is
+	// A hand-written `extern` declaration and the generated function it is
 	// forwarded to are joined by a bare jump, so a signature that disagrees is a silent
 	// argument-register mismatch rather than a link error. One such pair made every transactional
 	// write in the system return "no answer" and compiled without a warning. Its subject is the
@@ -186,20 +186,20 @@ const GATES: [(&str, &str); 40] = [
 	// does: it reads source, costs milliseconds, and a pair that drifts apart is not something to
 	// find only when the change that broke it is far behind.
 	("forwarded-abi", "harness.tools"),
-	// P02M0141's migration gate: while the bootstrap ladder and the generated role plan both
+	// The migration gate: while the bootstrap ladder and the generated role plan both
 	// describe the wiring, they must agree. Its subject is the manifest and the supervisor, and it
 	// reads source rather than building anything.
 	("bootstrap-plan", "harness.tools"),
-	// P02M0137's gate: the dynamic-report checker's own exit contract, mode dispatch and refusal
+	// The dynamic-report checker's own exit contract, mode dispatch and refusal
 	// behaviour, against a disposable fixture. The subject is that checker, which is harness tooling.
 	("dynamic-report-regressions", "harness.tools"),
-	// P02M0133's second gate: a frame a page table ever pointed at goes back through `frame::retire`,
+	// A frame a page table ever pointed at goes back through `frame::retire`,
 	// and every plain `deallocate` says why no core can still translate it. Its subject is the
 	// kernel, so a kernel change selects it. Registered here in the same commit as `check.sh` this
 	// time - the two gates before it both arrived on one side first and were reported as
 	// unselectable on the next run, which is the drift these lists exist to catch.
 	("frame-retirement", "kernel"),
-	// P02M0140's two: generated or compiled artifacts below `src`, in the working tree and anywhere
+	// Two gates over one subject: generated or compiled artifacts below `src`, in the working tree and anywhere
 	// in reachable history. They were Justfile recipes that nothing called and nothing selected;
 	// moving them into `check.sh` is what makes a change to the tree able to select them, and this
 	// is the other half of that - registered in the same change, not on the next run.
@@ -209,7 +209,7 @@ const GATES: [(&str, &str); 40] = [
 	// target either.
 	("source-hygiene", "harness.tools"),
 	("source-history-hygiene", "harness.tools"),
-	// P02M0141's second gate: every LSIDL interface a manifest role names must be one LSIDL
+	// Every LSIDL interface a manifest role names must be one LSIDL
 	// defines. Its subject is the manifest and the IDL, neither of which is a crate, and it reads
 	// declarations rather than generated bindings - so it takes the always-selected label for the
 	// same reason `milestone-index` and `forwarded-abi` do, and costs milliseconds.

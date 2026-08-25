@@ -9,7 +9,7 @@
 #
 # This was a Justfile recipe with a bash shebang inside it, which is what a recipe becomes when it
 # is a program. `build.sh --arch riscv64 --part loader` reached it through `just`, so the ONE thing
-# in the build path that still needed `just` installed was this file's contents (P02M0140).
+# in the build path that still needed `just` installed was this file's contents.
 set -euo pipefail
 
 cd "$(dirname "$0")/../boot/loader"

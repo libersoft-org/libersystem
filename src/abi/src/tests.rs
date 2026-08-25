@@ -143,7 +143,7 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
 //
 // THE SNAPSHOT ABOVE CANNOT NOTICE WHAT IT WAS NEVER TOLD ABOUT, and that is not a hypothetical:
-// `SYS_DEVICE_QUIESCED = 74` was added by P02M0133, the table still ended at 73, and the guard meant
+// `SYS_DEVICE_QUIESCED = 74` was added, the table still ended at 73, and the guard meant
 // to catch exactly this - `assert_eq!(SYSCALLS.len(), 73)` - was comparing the list against its own
 // length. The suite stayed green over a syscall the kernel dispatches and the runtime wraps.
 //

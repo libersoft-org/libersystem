@@ -130,7 +130,7 @@ static SCHED: AtomicPtr<CpuSched> = AtomicPtr::new(core::ptr::null_mut());
 // The real answer is the one the audit that raised this named: an INTRUSIVE run queue, where the
 // link lives in the `Thread` and enqueue moves pointers rather than growing a container. Then there
 // is nothing to book because there is nothing to allocate. That is a rewrite of this file's data
-// structure and it is a task rather than a patch - recorded in P02M0133 with this evidence, because
+// structure and it is a task rather than a patch - recorded with this evidence, because
 // the next person to have the obvious idea should find out here that it was tried.
 //
 // Measured on aarch64 with eight cores online: the full suite stopped at the seventh test with the
@@ -448,7 +448,7 @@ pub fn prepare_in_process(entry: extern "C" fn(u64), argument: u64, process: &Ar
 
 // Release a prepared thread onto a NAMED core's run queue.
 //
-// The placement half of P02M0152's M3, and the only way to ask for one: `start_thread` puts a
+// The placement half of the NUMA contract, and the only way to ask for one: `start_thread` puts a
 // thread on the current core, which is what ordinary spawning does and keeps doing. A caller that
 // wants a specific core has to say so, which is what makes "this thread ran on node 1" checkable
 // rather than hoped for.

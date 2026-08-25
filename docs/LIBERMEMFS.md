@@ -93,7 +93,7 @@ is a fixed implementation-defined cost already bounded by `MAX_ENTRIES`, so the 
 hundred kilobytes whatever the capacity. (Corrected 2026-08-10: true of entries that EXIST, and not
 of the capacity a directory KEEPS. `Vec::remove` does not shrink, so an emptied directory holds its
 slots - 56 bytes each, measured - and repeating the cycle across directories retains hundreds of
-megabytes that no accounting here sees. See P02M0131.) Charging it would mean writing an allocator-internals
+megabytes that no accounting here sees.) Charging it would mean writing an allocator-internals
 guess into the capacity semantics - a 20-byte volume that can hold nothing - and the guess would be
 wrong on the next allocator. A caller sizing a reserved volume should treat the capacity as
 bounding stored bytes and names, not as the volume's total cost to the heap.

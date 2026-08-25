@@ -17,7 +17,7 @@ bootproto = { path = "../boot/protocol" }
 # Shared kernel/userspace ABI constants (syscalls, errors, rights, package format).
 abi = { path = "../abi" }
 # The physical-frame buddy allocator. It is pure bitmap arithmetic, so it lives in a crate a host
-# can drive tens of millions of operations through - which is what P02M0120's one unexplained
+# can drive tens of millions of operations through - which is what the one unexplained
 # double allocation needed and could never get from a guest boot.
 buddy = { path = "../buddy" }
 # The flattened device tree reader, shared with the loader. It was `arch::common::dtb`; moving it
@@ -38,7 +38,7 @@ topology = { path = "../topology" }
 # core released late, a tree that forgot the core reading it, and QEMU has a switch for none of them.
 smpboot = { path = "../smpboot" }
 # LiberFS, for the test suite only: the storage scenarios hand StorageService a disk, and since
-# the factory archive was retired (P02M0108) that disk has to carry a real filesystem rather than a
+# the factory archive was retired that disk has to carry a real filesystem rather than a
 # package to make one from. Building the fixture with the same crate the service mounts means the
 # test cannot drift from the format it is testing against.
 liberfs = { path = "../fs/liberfs" }
@@ -95,7 +95,7 @@ webp = { path = "../user/libs/image/webp" }
 [profile.release]
 lto = true
 
-# A WARNING IS AN ERROR HERE. P02M0144 took ninety-one `allow` attributes out of this tree and found
+# A WARNING IS AN ERROR HERE. A sweep took ninety-one `allow` attributes out of this tree and found
 # a hundred and twenty warnings underneath them - a duplicate register read a driver was told to
 # call, a field whose comment said it kept a DMA buffer alive and which nothing read, a HAL entry
 # all three backends declared and none called. None of that was reported, because the reporting had

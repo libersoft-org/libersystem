@@ -5,7 +5,7 @@
 // part that is a decision rather than a conversation - that a machine without a controller reports
 // no enforcement rather than assuming it, and that the two states the rest of the kernel reads agree
 // with each other. The wire format and every failure order are host-tested in the `dma` crate, and
-// the QEMU profile is P02M0153's own gate.
+// the QEMU profile has a gate of its own.
 
 use super::*;
 
@@ -35,7 +35,7 @@ fn draining_faults_without_a_controller_is_bounded_and_empty() {
 	assert!(taken <= out.len(), "a drain never writes past the buffer it was given");
 }
 
-// THE HOSTILE ENDPOINT. Every case below is one of P02M0153 M6's required cases, driven against
+// THE HOSTILE ENDPOINT. Every case below is one of the required isolation cases, driven against
 // QEMU's `edu` device - a PCI function whose DMA engine copies between an arbitrary physical address
 // and its own buffer on command. It is the closest thing in reach to a malicious driver.
 //

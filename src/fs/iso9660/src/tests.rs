@@ -1171,7 +1171,7 @@ fn a_window_read_of_a_large_file_does_not_stage_the_whole_thing() {
 	assert_eq!(&wide[..8], &[0u8; 8], "the head sector's bytes past the written content");
 }
 
-// P02M0126, sixth round: what a hostile disc can make this backend DO, and the namespaces it can
+// The sixth audit round: what a hostile disc can make this backend DO, and the namespaces it can
 // make ambiguous.
 //
 // The round before bounded how much MEMORY a crafted image can make this backend spend - the walk

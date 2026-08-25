@@ -89,9 +89,9 @@
 - shell scripts
 - Rust Doom
 - Native compilers - wasm, c, rust,...
-- M0042 (old numbering) - app package format
-- P02M0006k - console login and lock
-- P02M0006f - non-US keyboard layout
+- app package format
+- console login and lock
+- non-US keyboard layout
 - When phase 2 is done, check if all matches with CONCEPT_EN/CZ.md
 - Look for other FS compatibility (NTFS, ext4, xfs etc.)
 - check for necessary utilities - https://popcon.debian.org/by_inst

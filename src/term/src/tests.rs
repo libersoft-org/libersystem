@@ -1329,7 +1329,7 @@ fn every_cursor_move_settles_the_deferred_wrap() {
 	assert!(!term.screen.wrap_pending(), "clear() homes the cursor, so it settles the wrap");
 }
 
-// P02M0128, sixth round.
+// The sixth audit round.
 
 #[test]
 fn the_bare_alternate_screen_switch_does_not_move_the_cursor() {

@@ -850,7 +850,7 @@ fn process_service_lists_every_started_program() {
 		assert_eq!(le_u32(&reply.bytes, 0), correlation, "the reply echoes the correlation id");
 		assert_eq!(reply.bytes[4], 1, "the launch succeeded");
 		// The live process the launch handed back, kept so the state of each child can be READ
-		// rather than inferred from the list (P02M0088's open observation).
+		// rather than inferred from the list - the open observation.
 		children.push(reply.caps[0].object().into_any_arc().downcast::<object::process::Process>().expect("the launch reply carries a Process"));
 		// The end this test keeps. While it lives, the child's blocking receive cannot return.
 		held.push(bootstrap_kernel);
@@ -1312,7 +1312,7 @@ fn a_service_that_cannot_be_restarted_is_left_failed_rather_than_reported_up() {
 	//           and - the part that matters - it is not left being reported as running either.
 	//
 	// Twenty of twenty-three services are in this class today, because their bootstrap cannot be
-	// re-run: `relaunch_service` says so in as many words. P02M0141 is what shrinks that number,
+	// re-run: `relaunch_service` says so in as many words. The generated role plan is what shrinks that number,
 	// and until it reaches zero the honest answer for the rest is a state that says so.
 	//
 	// Driven at the harness rather than through a whole boot: what is being measured is that a
