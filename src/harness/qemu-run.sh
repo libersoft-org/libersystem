@@ -858,7 +858,11 @@ qemu_run_x86_64() {
 	local ovmf_vars="$QEMU_BUILD_DIR/ovmf-vars.$$.fd"
 	cp "$ovmf_vars_src" "$ovmf_vars"
 
-	# WHETHER THIS MACHINE HAS AN IOMMU IN IT: `IOMMU=1 ./run.sh`.
+	# WHETHER THIS MACHINE HAS AN IOMMU IN IT: `./run.sh --iommu`.
+	#
+	# `IOMMU` is the plumbing, not the interface - the same shape as `SMP`, `MEM` and `SERIAL` above
+	# it: `run.sh` owns the flag and exports the variable, and this layer is the one that speaks to
+	# QEMU. Nothing outside `run.sh` and the gates sets it by hand.
 	#
 	# The isolation this system implements was exercised by one gate and by no ordinary run, so a
 	# developer boot printed a page of DEGRADED ISOLATION lines describing the HARNESS rather than

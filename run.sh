@@ -12,7 +12,8 @@ DISPLAYS_ALL="vnc spice"
 
 help() {
 	usage_and_exit <<EOF
-usage: run.sh [--arch ARCH] [--image PATH] [--attach PATH[,PATH...]] [--display D[,D...]] [--debug]
+usage: run.sh [--arch ARCH] [--image PATH] [--attach PATH[,PATH...]] [--display D[,D...]]
+              [--iommu] [--debug]
 
 Boots the system in QEMU, headless, with the serial console on your terminal. On x86_64, omitting
 --image boots .build/boot/libersystem.iso.
@@ -29,10 +30,10 @@ Boots the system in QEMU, headless, with the serial console on your terminal. On
   --spice-addr A  SPICE bind address (default 0.0.0.0 - EVERY interface, and with no password and
                   no TLS: use 127.0.0.1 on a network you do not trust)
   --spice-port P  SPICE port (default 5930)
-  --debug         wait for GDB on :1234, no KVM
-  IOMMU=1         x86_64 only: put a virtio-iommu in the machine and every virtio endpoint behind
+  --iommu         x86_64 only: put a virtio-iommu in the machine and every virtio endpoint behind
                   it, so the boot reports real isolation instead of a page of DEGRADED lines. Off
                   by default: virtio-gpu does not come up behind a translating controller yet
+  --debug         wait for GDB on :1234, no KVM
   --gdb           ATTACH gdb to a guest already waiting - run in a second panel after --debug,
                   and it boots nothing itself
   -h, --help      this text
@@ -132,6 +133,10 @@ while [[ $# -gt 0 ]]; do
 		[[ "$2" =~ ^[0-9]+$ ]] || die "--spice-port takes a number, got '$2'"
 		export SPICE_PORT="$2"
 		shift 2
+		;;
+	--iommu)
+		export IOMMU=1
+		shift
 		;;
 	--debug)
 		debug=1

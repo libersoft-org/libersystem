@@ -231,6 +231,7 @@ or preventing further development of `v1`.
 - [x] [P02M0155 - The loader searches every disk in the machine for a file that is not there](P02M0155.md)
 - [ ] [P02M0156 - A check that skips what it cannot read has already answered yes](P02M0156.md)
 - [ ] [P02M0157 - The firmware described something the tables cannot hold, and the kernel used it anyway](P02M0157.md)
+- [ ] [P02M0158 - The boot report names the same device twice and the same component two ways](P02M0158.md)
 
 ### Definition of done (phase 2)
 
