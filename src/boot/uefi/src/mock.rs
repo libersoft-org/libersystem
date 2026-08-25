@@ -76,6 +76,10 @@ pub struct State {
 	pub file_reads_before_failure: usize,
 	pub file_reads: usize,
 	pub file_opened: Vec<Vec<u16>>,
+	// The status `Open` answers with. `EFI_NOT_FOUND` is the firmware saying it read the directory
+	// and the path is not in it, which is a different fact from any other failure - and the one the
+	// loader must not answer with a scan of every disk in the machine.
+	pub file_open_status: Status,
 	// The GOP mode the firmware reports.
 	pub gop: Option<GopConfig>,
 }
@@ -92,7 +96,7 @@ pub struct GopConfig {
 
 impl State {
 	const fn new() -> State {
-		State { disks: Vec::new(), descriptors: Vec::new(), refuse_memory_type: None, map_key: 1, key_changes: 0, exit_status: crate::STATUS_SUCCESS, exit_refusals: 0, exit_attempts: 0, allocations: Vec::new(), handle_buffers: Vec::new(), frees: Vec::new(), forced_pages: Vec::new(), file_bytes: Vec::new(), file_declared_size: 0, file_read_chunk: 0, file_reads_before_failure: usize::MAX, file_reads: 0, file_opened: Vec::new(), gop: None }
+		State { disks: Vec::new(), descriptors: Vec::new(), refuse_memory_type: None, map_key: 1, key_changes: 0, exit_status: crate::STATUS_SUCCESS, exit_refusals: 0, exit_attempts: 0, allocations: Vec::new(), handle_buffers: Vec::new(), frees: Vec::new(), forced_pages: Vec::new(), file_bytes: Vec::new(), file_declared_size: 0, file_read_chunk: 0, file_reads_before_failure: usize::MAX, file_reads: 0, file_opened: Vec::new(), file_open_status: crate::STATUS_SUCCESS, gop: None }
 	}
 }
 
@@ -320,6 +324,10 @@ unsafe extern "efiapi" fn file_open(_this: *mut FileProtocol, out: *mut *mut Fil
 		}
 	}
 	state().file_opened.push(wide);
+	let status = state().file_open_status;
+	if crate::is_error(status) {
+		return status;
+	}
 	unsafe { *out = file_protocol() };
 	crate::STATUS_SUCCESS
 }

@@ -228,6 +228,7 @@ or preventing further development of `v1`.
 - [x] [P02M0152 - Memory has a topology, not one global distance](P02M0152.md)
 - [x] [P02M0153 - Virtio-IOMMU confines the first x86_64 QEMU endpoints](P02M0153.md)
 - [x] [P02M0154 - The capability transfer rules have a machine-checked bounded model](P02M0154.md)
+- [ ] [P02M0155 - The loader searches every disk in the machine for a file that is not there](P02M0155.md)
 
 ### Definition of done (phase 2)
 

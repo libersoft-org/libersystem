@@ -47,6 +47,9 @@ mod firmware {
 	pub fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> Option<&'static [u8]> {
 		unsafe { file::read_file(bs, root, name) }
 	}
+	pub fn read_file_reported(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> file::FirmwareRead {
+		unsafe { file::read_file_reported(bs, root, name) }
+	}
 	pub fn each_disk(bs: *mut BootServices, visit: impl FnMut(disk::FirmwareDisk) -> bool) {
 		unsafe { disk::each_disk(bs, visit) }
 	}
@@ -537,6 +540,49 @@ fn a_map_that_moves_between_the_two_calls_is_retried_and_converges() {
 // This returned a slice of the DECLARED length however much had arrived, so a file whose `FileInfo`
 // said one megabyte and whose second read failed became a one-megabyte slice with a tail of whatever
 // those freshly allocated pages held - handed on as a kernel image, a bootstrap package or a volume.
+// A FILE THE VOLUME DOES NOT HOLD IS NOT A VOLUME THAT COULD NOT BE READ.
+//
+// The reader answered `Option`, so both arrived at the loader as `None` - and the loader reads
+// `None` as "this firmware did not mount the medium" and falls back to scanning every Block I/O
+// device in the machine for the file itself. On a shipping medium, whose manifest deliberately
+// carries no factory archive, that scan looked for a file no medium in the machine has and spent
+// about half a minute failing to find it, on every boot.
+#[test]
+fn a_file_the_volume_does_not_hold_is_absent_rather_than_unreadable() {
+	let _guard = guard();
+	state().file_bytes = vec![0u8; 16];
+	state().file_declared_size = 16;
+
+	// The firmware read the directory and the name is not in it.
+	state().file_open_status = crate::STATUS_NOT_FOUND;
+	assert!(matches!(firmware::read_file_reported(mock::boot_services(), mock::file_protocol(), "volume.pkg"), file::FirmwareRead::Absent), "EFI_NOT_FOUND is an answer about the medium, not a firmware that could not answer");
+
+	// Any other refusal is this firmware failing, and another reader of the same medium may do
+	// better - which is what the block-level backend is for.
+	state().file_open_status = crate::STATUS_INVALID_PARAMETER;
+	assert!(matches!(firmware::read_file_reported(mock::boot_services(), mock::file_protocol(), "volume.pkg"), file::FirmwareRead::Failed), "a refusal that is not NOT_FOUND says nothing about what the medium holds");
+
+	// And a file that IS there still reads.
+	state().file_open_status = crate::STATUS_SUCCESS;
+	let file::FirmwareRead::Bytes(bytes) = firmware::read_file_reported(mock::boot_services(), mock::file_protocol(), "volume.pkg") else {
+		panic!("a file that is there is read");
+	};
+	assert_eq!(bytes.len(), 16);
+}
+
+// A name this reader cannot encode is not a medium that lacks the file, either: the block backend
+// takes paths this one cannot express, so the fallback is the right answer and `Absent` would stop
+// it.
+#[test]
+fn a_name_the_encoder_cannot_express_does_not_read_as_absent() {
+	let _guard = guard();
+	state().file_bytes = vec![0u8; 16];
+	state().file_declared_size = 16;
+	let long = "a-file-name-longer-than-the-sixty-four-units-the-encoder-is-given-which-is-quite-a-lot-of-characters";
+	assert!(matches!(firmware::read_file_reported(mock::boot_services(), mock::file_protocol(), long), file::FirmwareRead::Failed));
+	assert!(state().file_opened.is_empty(), "and the firmware was never asked to open anything");
+}
+
 // A short read is not a file.
 #[test]
 fn a_file_that_short_reads_is_not_a_file() {
@@ -550,6 +596,11 @@ fn a_file_that_short_reads_is_not_a_file() {
 
 	let answer = firmware::read_file(mock::boot_services(), mock::file_protocol(), "kernel");
 	assert!(answer.is_none(), "a file that stopped arriving is not returned");
+	// AND IT IS NOT ABSENT. Something is there and this reader could not get it, which is exactly
+	// the case the block-level fallback exists for - so it must not be reported as "the medium does
+	// not carry this file", which ends the read.
+	state().file_reads = 0;
+	assert!(matches!(firmware::read_file_reported(mock::boot_services(), mock::file_protocol(), "kernel"), file::FirmwareRead::Failed), "a file that is there and stops arriving is a failure to read, not an absence");
 	// And the pages went back rather than being left holding a partial image.
 	assert!(!state().frees.is_empty(), "the allocation was released");
 	assert!(state().allocations.is_empty(), "and nothing was left allocated");

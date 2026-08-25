@@ -96,18 +96,19 @@ fn init_package_starts_system_manager() {
 	let (kernel_ep, _manager) = spawn_system_manager().expect("SystemManager should start from the init package");
 	sched::run_until_idle();
 	// Seven StorageService instances: the system volume, media, iso, udf, usb, and the two
-	// memory volumes (ram and tmp). They report the same line, so the count is what says the
-	// whole set came up.
+	// memory volumes (ram and tmp). They NAME THEMSELVES now, so this asserts the set that came up
+	// rather than a count of identical strings - seven anonymous reports could be the same volume
+	// mounted seven times and this suite could not have told the difference.
 	let online_reports: [&[u8]; 23] = [
 		b"LogService: online",
 		b"DeviceManager: online",
-		b"StorageService: online",
-		b"StorageService: online",
-		b"StorageService: online",
-		b"StorageService: online",
-		b"StorageService: online",
-		b"StorageService: online",
-		b"StorageService: online",
+		b"StorageService: online (vol://system)",
+		b"StorageService: online (vol://media)",
+		b"StorageService: online (vol://iso)",
+		b"StorageService: online (vol://udf)",
+		b"StorageService: online (vol://usb)",
+		b"StorageService: online (vol://ram)",
+		b"StorageService: online (vol://tmp)",
 		b"ProcessService: online",
 		b"ConfigService: online",
 		b"AudioService: online",
@@ -667,7 +668,7 @@ fn system_manager_recovery_escalates_after_repeated_crashes() {
 	// reason rather than the crash.
 	let (console_far, console_near) = object::channel::Channel::create();
 	console_input::attach(console_far);
-	let up = supervise(&crash_rx, 3, 8, "test", || {
+	let up = supervise(&crash_rx, 3, 8, || {
 		attempts += 1;
 		let (reports, _peer) = object::channel::Channel::create();
 		Some((reports, sched::spawn(user_fault_thread_body, 0).process().clone()))
@@ -711,7 +712,7 @@ fn system_manager_recovery_survives_a_clean_start() {
 	let mut resident: Option<alloc::sync::Arc<object::process::Process>> = None;
 	let (console_far, console_near) = object::channel::Channel::create();
 	console_input::attach(console_far);
-	let up = supervise(&crash_rx, 3, 8, "test", || {
+	let up = supervise(&crash_rx, 3, 8, || {
 		let process = sched::spawn(resident_body, 0).process().clone();
 		resident = Some(process.clone());
 		let (reports, _peer) = object::channel::Channel::create();
@@ -727,7 +728,7 @@ fn system_manager_recovery_survives_a_clean_start() {
 	// AND THE SAME LADDER MUST REFUSE ONE THAT LEFT. Nothing faults here either; the difference is
 	// only that the process is gone, which is exactly the case the crash channel cannot report.
 	let mut attempts: u32 = 0;
-	let departed = supervise(&crash_rx, 3, 8, "test", || {
+	let departed = supervise(&crash_rx, 3, 8, || {
 		attempts += 1;
 		let (reports, _peer) = object::channel::Channel::create();
 		Some((reports, sched::spawn(departed_body, 0).process().clone()))

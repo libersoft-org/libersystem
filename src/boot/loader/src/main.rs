@@ -41,7 +41,6 @@ use uefi::{BootServices, Handle, Status, SystemTable};
 // can exercise it. The loader is a UEFI binary and cannot run a test; the algorithms it used to
 // hold could not either, which is why the hostile-firmware cases in this milestone were argued in
 // code and never run.
-use uefi::file::read_file;
 pub(crate) use uefi::gop::locate_framebuffer;
 use uefi::memory::{alloc_pages, alloc_scratch_pages};
 
@@ -135,6 +134,10 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// The heap has to exist before the filesystem crates are used, and cannot outlive boot
 	// services.
 	heap::init(bs);
+	// WHICH DEVICE THIS IMAGE CAME OFF, asked of the firmware before anything is read. Both readers
+	// of the boot medium use it: the Simple File System path opens the volume on it, and the block
+	// path matches it against the enumeration rather than guessing at the medium's contents.
+	unsafe { BOOT_DEVICE = uefi::disk::loaded_image_device(bs, image_handle) };
 	// The firmware normally mounts the boot volume for us. When it does not - a medium its Simple
 	// File System driver declines - the FAT backend below reads it through the block protocol
 	// instead, which is the whole reason that crate is linked.
@@ -271,56 +274,64 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	}
 
 	impl blockio::ReadsFiles for FirmwareVolume {
-		// WHAT THIS BACKEND CANNOT TELL YOU, said rather than glossed. `read_file` answers with an
-		// option: the firmware's own status is not carried back, so "not there" and "there and
-		// unreadable" arrive here as the same `None`. Every answer is therefore `Absent`, and the
-		// downgrade `FileRead::Unreadable` exists to catch is one this path cannot catch - which is
-		// a fact about the Simple File System reader rather than a decision taken here, and the one
-		// place a caller might otherwise assume all three backends are equally sharp.
+		// AND NOW IT CAN TELL YOU. This answered `Absent` for every failure, because the firmware's
+		// own status was dropped by the reader under it - so the downgrade `FileRead::Unreadable`
+		// exists to catch was catchable on the two block backends and not on this one, which is the
+		// backend every machine whose firmware mounts the ESP actually uses. A signed manifest
+		// DAMAGED rather than removed read as absent, and `assemble_bootstrap` fell back to the
+		// text manifest beside it: an attacker performs a downgrade by corrupting one file instead
+		// of forging anything.
+		//
+		// `read_file_reported` carries the status back, so present-and-unreadable is now what it is.
 		fn read_file(&mut self, path: &[u8]) -> blockio::FileRead {
-			match self.read_bytes(path) {
-				Some(bytes) => blockio::FileRead::Bytes(bytes),
-				None => blockio::FileRead::Absent,
-			}
-		}
-	}
-
-	impl FirmwareVolume {
-		fn read_bytes(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
 			let mut name = [0u8; 128];
 			if path.len() >= name.len() {
-				return None;
+				return blockio::FileRead::Unreadable;
 			}
 			// AND THE LIMIT THE FIRMWARE READER ACTUALLY HAS. This accepted any path under 128 bytes
-			// while `read_file` encodes into `MAX_PATH_UNITS` UTF-16 units, so the same bootstrap
+			// while the encoder takes `MAX_PATH_UNITS` UTF-16 units, so the same bootstrap
 			// list could work through Block I/O and fail through Simple File System - on a machine
 			// with both, with the file simply absent and nothing said. Counted in UTF-16 units, not
 			// bytes, because a non-ASCII path makes the two differ and it is units the firmware
 			// counts. One unit is reserved for the terminator, as in the encoder.
-			let units = core::str::from_utf8(path).ok()?.chars().map(char::len_utf16).sum::<usize>();
-			if units + 1 > uefi::file::MAX_PATH_UNITS {
-				return None;
+			//
+			// A name this reader cannot express is `Unreadable` rather than `Absent`: it is a
+			// statement about the reader, and answering "the volume does not have it" would be the
+			// same silent downgrade one level down.
+			let Ok(text) = core::str::from_utf8(path) else {
+				return blockio::FileRead::Unreadable;
+			};
+			if text.chars().map(char::len_utf16).sum::<usize>() + 1 > uefi::file::MAX_PATH_UNITS {
+				return blockio::FileRead::Unreadable;
 			}
 			for (i, &b) in path.iter().enumerate() {
 				name[i] = if b == b'/' { b'\\' } else { b };
 			}
-			let name = core::str::from_utf8(&name[..path.len()]).ok()?;
-			let bytes = unsafe { read_file(self.bs, self.root, name) }?;
+			// `/` and `\` are both ASCII, so the translation above cannot land inside a multi-byte
+			// sequence and this cannot fail - but it is checked rather than asserted.
+			let Ok(name) = core::str::from_utf8(&name[..path.len()]) else {
+				return blockio::FileRead::Unreadable;
+			};
+			let bytes = match unsafe { uefi::file::read_file_reported(self.bs, self.root, name) } {
+				uefi::file::FirmwareRead::Bytes(bytes) => bytes,
+				uefi::file::FirmwareRead::Absent => return blockio::FileRead::Absent,
+				uefi::file::FirmwareRead::Failed => return blockio::FileRead::Unreadable,
+			};
 			let mut owned = alloc::vec::Vec::new();
 			let copied = owned.try_reserve_exact(bytes.len()).is_ok();
 			if copied {
 				owned.extend_from_slice(bytes);
 			}
-			// THE PAGES GO BACK. `read_file` hands out an unowned slice in fresh LOADER_DATA pages,
+			// THE PAGES GO BACK. The reader hands out an unowned slice in fresh LOADER_DATA pages,
 			// and this copies out of it - so leaving it behind permanently removed one file's worth
 			// of RAM from the machine, once per bootstrap-list entry. Loader data becomes
 			// `MEM_BOOTLOADER`, which the kernel never seeds as usable, so it is not reclaimed later
 			// either. Freed on the failure path too, which is the one a `try_reserve` makes reachable.
 			//
-			// SAFETY: `bytes` is exactly what `read_file` returned and nothing refers to it now - the
+			// SAFETY: `bytes` is exactly what the reader returned and nothing refers to it now - the
 			// copy above is complete.
 			unsafe { uefi::file::free_file(self.bs, bytes) };
-			if copied { Some(owned) } else { None }
+			if copied { blockio::FileRead::Bytes(owned) } else { blockio::FileRead::Unreadable }
 		}
 	}
 
@@ -352,7 +363,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 			}
 		}
 		with_boot_medium(bs, |disk| {
-			let Some(mut fs) = fat::FatFs::mount(disk) else { return false };
+			let Some(mut fs) = fat::FatFs::mount_read_only(disk) else { return false };
 			match blockio::assemble_bootstrap(&mut fs) {
 				abi::bootstrap::Selection::Verified(archive) => unsafe {
 					// A retain that fails is not an answer, so the scan goes on rather than
@@ -511,7 +522,10 @@ pub(crate) const LIVE_VOLUME_FILE: &str = "system-volume.img";
 // Does nothing when a disk already answered - an installed system's own volume wins over an image
 // that happens to be lying on the boot medium beside it.
 pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) {
-	if unsafe { BOOTSTRAP }.is_some() {
+	// AND A SOURCE THAT REFUSED IS ALSO AN ANSWER. The same pair `bootstrap_from_boot_medium`
+	// guards on: "this volume named programs and its manifest refused them" ends the boot, and
+	// reading another source's list afterwards is the fallback that a refusal exists to prevent.
+	if unsafe { BOOTSTRAP }.is_some() || unsafe { BOOTSTRAP_REFUSED }.is_some() {
 		return;
 	}
 	let Ok(mut fs) = liberfs::LiberFs::mount(blockio::ImageDisk { bytes }) else { return };
@@ -547,13 +561,24 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 	// The bootstrap set, packed into the archive format the kernel already unpacks. This is
 	// what retires `init.pkg` as an artifact: the same bytes reach the kernel, assembled from
 	// files that exist on the volume rather than from a package built beside it.
-	match blockio::assemble_bootstrap(&mut fs) {
-		abi::bootstrap::Selection::Verified(archive) => unsafe {
-			BOOTSTRAP = retain(bs, &archive);
-			BOOTSTRAP_SOURCE = SOURCE_SYSTEM_VOLUME;
-		},
-		abi::bootstrap::Selection::Invalid(reason) => unsafe { BOOTSTRAP_REFUSED = Some(reason) },
-		abi::bootstrap::Selection::Unavailable => {}
+	//
+	// ONCE PER BOOT, NOT ONCE PER READ. `main` reads this volume up to three times - the kernel, the
+	// signed manifest, the text manifest - and every one of them re-assembled the whole set:
+	// re-reading `etc/bootstrap.list` and then every program it names, off the same volume, to build
+	// an archive that was thrown away because `BOOTSTRAP` already held one. The boot log carried the
+	// receipt as `bootstrap set verified against a SIGNED etc/boot.manifest2`, printed twice.
+	//
+	// The guard is the same pair `bootstrap_from_boot_medium` already uses: a set that was assembled,
+	// or a source that refused, are both answers and neither is improved by asking again.
+	if unsafe { BOOTSTRAP }.is_none() && unsafe { BOOTSTRAP_REFUSED }.is_none() {
+		match blockio::assemble_bootstrap(&mut fs) {
+			abi::bootstrap::Selection::Verified(archive) => unsafe {
+				BOOTSTRAP = retain(bs, &archive);
+				BOOTSTRAP_SOURCE = SOURCE_SYSTEM_VOLUME;
+			},
+			abi::bootstrap::Selection::Invalid(reason) => unsafe { BOOTSTRAP_REFUSED = Some(reason) },
+			abi::bootstrap::Selection::Unavailable => {}
+		}
 	}
 	// A LiberFS volume without this file is still the system volume; a second one is not going to
 	// be more right. Stop rather than read the same name off another disk, which is how a machine
@@ -583,13 +608,36 @@ pub(crate) fn read_boot_file(bs: *mut BootServices, root: Option<*mut uefi::File
 	} else {
 		None
 	};
+	// A FILE THE MEDIUM DOES NOT CARRY IS NOT A FIRMWARE THAT DID NOT MOUNT IT.
+	//
+	// This fell through to the block-level scan on ANY unsuccessful firmware read, and the scan is
+	// not cheap: it walks every Block I/O handle in the machine and mounts FAT on each, and a FAT
+	// mount audits the volume's whole ownership map. On a shipping medium - which carries a system
+	// volume and no factory archive, by design - the archive read reached firmware that answered
+	// `EFI_NOT_FOUND`, and the loader then spent about half a minute searching every disk for a
+	// file no medium in the machine has, discarded the `None` it started with, and printed a line
+	// claiming the firmware had not mounted a volume it had been reading from since before the
+	// banner.
+	//
+	// `Absent` ends the read here. The fallback is for a medium this firmware cannot read, and
+	// nothing else.
 	if let Some(root) = root
 		&& let Some(firmware_name) = firmware_name
-		&& let Some(bytes) = unsafe { read_file(bs, root, firmware_name) }
 	{
-		return Some(bytes);
+		match unsafe { uefi::file::read_file_reported(bs, root, firmware_name) } {
+			uefi::file::FirmwareRead::Bytes(bytes) => return Some(bytes),
+			uefi::file::FirmwareRead::Absent => return None,
+			// Something is there and this reader could not get it, or the name is one it cannot
+			// encode. The block backend takes both.
+			uefi::file::FirmwareRead::Failed => {
+				arch::serial::write_str("loader: the firmware could not read ");
+				arch::serial::write_str(name);
+				arch::serial::write_str(" off the boot volume; reading the medium as FAT\n");
+			}
+		}
+	} else {
+		arch::serial::write_str("loader: the firmware did not mount the boot volume; reading it as FAT\n");
 	}
-	arch::serial::write_str("loader: the firmware did not mount the boot volume; reading it as FAT\n");
 	read_from_fat(bs, name.as_bytes())
 }
 
@@ -688,6 +736,9 @@ fn read_verified_kernel_from_boot_medium(bs: *mut BootServices, root: Option<*mu
 
 // The boot medium, chosen once.
 static mut BOOT_MEDIUM: Option<blockio::FirmwareDisk> = None;
+// The handle the firmware said this image was loaded from, when it named one this loader can also
+// reach as a block device. Set once, before anything reads a medium.
+static mut BOOT_DEVICE: Option<Handle> = None;
 
 // Visit the boot medium: the one already chosen, or every device until one answers - and then that
 // one is the boot medium for every later read.
@@ -696,7 +747,30 @@ static mut BOOT_MEDIUM: Option<blockio::FirmwareDisk> = None;
 // time, so a machine without a firmware-mounted root could take its kernel from one stick and its
 // bootstrap files from another. The medium is chosen once and then read from; if it does not carry
 // a file, no other medium is asked for it.
+//
+// AND IT IS CHOSEN BY IDENTITY WHERE THE FIRMWARE STATES ONE. The latch used to happen only when
+// the visitor said "found it", so a search that MISSED chose nothing and the next read paid the
+// whole enumeration again - and the choice, when it did happen, was "the first FAT volume that
+// happened to carry the file being asked for", which on a machine with a stick in it is a guess
+// about which medium this system booted from. `EFI_LOADED_IMAGE_PROTOCOL` names the device; a
+// handle that matches it IS the boot medium whatever it does or does not hold.
+//
+// The content scan below stays for the firmware that mounts the ESP without exposing it as a block
+// device - U-Boot does exactly that, and a `LoadedImage` handle with no Block I/O on it matches
+// nothing here.
 fn with_boot_medium(bs: *mut BootServices, mut visit: impl FnMut(blockio::FirmwareDisk) -> bool) {
+	if let (None, Some(want)) = (unsafe { BOOT_MEDIUM }, unsafe { BOOT_DEVICE }) {
+		unsafe {
+			blockio::each_disk(bs, |disk| {
+				if disk.handle() == want {
+					BOOT_MEDIUM = Some(disk);
+					true
+				} else {
+					false
+				}
+			});
+		}
+	}
 	if let Some(disk) = unsafe { BOOT_MEDIUM } {
 		visit(disk);
 		return;
@@ -722,7 +796,7 @@ fn with_boot_medium(bs: *mut BootServices, mut visit: impl FnMut(blockio::Firmwa
 pub(crate) fn read_from_fat(bs: *mut BootServices, path: &[u8]) -> Option<&'static [u8]> {
 	let mut found: Option<&'static [u8]> = None;
 	with_boot_medium(bs, |disk| {
-		let Some(mut fs) = fat::FatFs::mount(disk) else { return false };
+		let Some(mut fs) = fat::FatFs::mount_read_only(disk) else { return false };
 		match fs.read_file(path) {
 			Ok(bytes) => {
 				found = retain(bs, &bytes);
@@ -784,12 +858,9 @@ fn retain(bs: *mut BootServices, bytes: &[u8]) -> Option<&'static [u8]> {
 
 // Open the FAT volume the loader image was loaded from and return its root directory.
 pub(crate) fn open_boot_volume(bs: *mut BootServices, image_handle: Handle) -> Option<*mut uefi::FileProtocol> {
-	let mut li: *mut c_void = core::ptr::null_mut();
-	let status = unsafe { ((*bs).handle_protocol)(image_handle, &uefi::LOADED_IMAGE_PROTOCOL_GUID, &mut li) };
-	if uefi::is_error(status) || li.is_null() {
-		return None;
-	}
-	let device = unsafe { (*(li as *mut uefi::LoadedImage)).device_handle };
+	// The same handle `with_boot_medium` matches against: one question asked of the firmware, one
+	// answer, used by both readers of this medium.
+	let device = unsafe { uefi::disk::loaded_image_device(bs, image_handle) }?;
 
 	let mut sfs: *mut c_void = core::ptr::null_mut();
 	let status = unsafe { ((*bs).handle_protocol)(device, &uefi::SIMPLE_FILE_SYSTEM_PROTOCOL_GUID, &mut sfs) };

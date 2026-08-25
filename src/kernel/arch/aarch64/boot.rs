@@ -950,5 +950,5 @@ fn run_system_manager() {
 	// at a prompt that would never appear, and one lost afterwards left an ownerless control plane
 	// nothing watched. Four hundred rounds is the budget this machine needs; the rest is policy and
 	// lives in one place.
-	crate::boot_userspace(crate::arch::NAME, 400);
+	crate::boot_userspace(400);
 }

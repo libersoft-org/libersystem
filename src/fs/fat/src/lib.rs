@@ -62,6 +62,15 @@ pub const MAX_DIR_BYTES: usize = 256 * 1024 * 1024;
 // unbounded allocation, not that files must be small.
 pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 
+// The most one device request moves, when consecutive clusters are read together.
+//
+// The readers coalesce a contiguous run into a single `read_blocks`, and this is what keeps that
+// request a size a device stack is actually exercised with: firmware ATA and USB drivers split
+// large transfers internally, but nothing in this tree has ever handed one an eighteen-megabyte
+// read. A mebibyte is 2048 sectors - three orders of magnitude fewer round-trips than a sector at a
+// time - and it also bounds how far ahead of the caller's buffer a read may grow.
+const MAX_RUN_BYTES: usize = 1024 * 1024;
+
 // A block device: foreign media is read and written one 512-byte sector at a time, by
 // absolute LBA (its block index). The trait is the shared fs-core one (a block is
 // exactly `buf.len()` bytes, so FAT's 512-byte sectors, ISO/UDF's 2048-byte blocks and
@@ -285,21 +294,74 @@ impl ChainCursor {
 	}
 }
 
+// WHAT A MOUNT ESTABLISHED ABOUT ITS OWN VOLUME.
+//
+// This was a `degraded: bool`, and the flag's own comment said the distinction it could not make:
+// "'not checked' and 'checked and sound' must not look alike". While every mount audited, the two
+// never met - `false` meant checked and sound because there was no other way to get it. A mount that
+// deliberately skips the audit (see `mount_read_only`) creates the third state, and collapsing it
+// into either of the other two states something untrue: that the volume was found consistent, or
+// that it was found damaged.
+//
+// Only `Audited` writes. The other two refuse, for reasons a caller can now tell apart.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Trust {
+	// The ownership map was walked and names each cluster once, and the mirrored FAT copies agree.
+	// This is the premise every crash-safety claim in this crate rests on, and the only state in
+	// which it will mutate a volume.
+	Audited,
+	// Nothing was checked. The mount asked not to be audited because it will never write.
+	NotAudited,
+	// Checked and not sound: a cross-link, a chain that leaves the heap, copies of the allocation
+	// map that disagree, a volume whose own flags say its last writer did not finish - or a check
+	// that could not be completed, which proves nothing and is treated as failing.
+	Unsound,
+}
+
+// One cached sector of the active FAT, and which sector it is.
+#[derive(Default)]
+struct FatSector {
+	sector: Option<u64>,
+	bytes: Vec<u8>,
+}
+
 pub struct FatFs<D: BlockDevice> {
 	dev: D,
 	geo: Geometry,
 	// The wall clock (Unix seconds, UTC) new directory entries are stamped with; 0
 	// (unset) still yields the valid DOS epoch date 1980-01-01.
 	clock: u64,
-	// Set when a rollback could not be written, which means the FAT on the medium no longer
-	// describes its own contents: mirrored copies that disagree, an entry torn across two sectors,
-	// or clusters marked in use with nothing naming them. Every later mutation is refused with
-	// `ReadOnly` rather than layered on top of a table that cannot be trusted.
+	// What this mount established about its volume's allocation map, and therefore whether it will
+	// write to it. See `Trust`.
+	trust: Trust,
+	// The last sector of the active FAT this mount read, and which sector it is.
 	//
-	// The alternative is to carry on and hope the next write repairs it, which is how a torn FAT12
-	// entry becomes two files sharing a cluster. A mount that stops mutating keeps the damage at
-	// whatever the failed write left, where a repair tool can still see it.
-	degraded: bool,
+	// A CHAIN WALK USED TO RE-READ THE TABLE ONCE PER CLUSTER. `next_cluster` read the FAT sector
+	// holding its entry, allocated a `Vec` to do it, decoded four bytes and threw the sector away -
+	// so following a chain of N clusters cost N device reads of the table plus N allocations, on
+	// top of the N reads of the data. One FAT16 sector holds 256 entries and a FAT32 sector 128, and
+	// a chain runs through them in order, so all but one hop in every 256 was a re-read of bytes the
+	// driver had just had in its hand.
+	//
+	// It matters most exactly where reads are dearest: the loader walks these chains over the
+	// firmware's Block I/O protocol, where each one is a command round-trip to an optical or USB
+	// device. The mount-time ownership audit walks every chain on the volume, so an ESP carrying an
+	// 18 MB file cost around forty-eight thousand of them.
+	//
+	// TWO SLOTS, BECAUSE EVERY CHAIN WALK HAS TWO CURSORS. `ChainCursor` carries Floyd's cycle
+	// detection: the fast pointer takes one step per hop and the slow pointer one per two, so at any
+	// moment they are reading entries half a chain apart - which, for a chain longer than one
+	// sector's worth of entries, is two different sectors. One slot serves the fast hop, is evicted
+	// by the slow one, and misses again on the next fast hop: measured on a 2000-cluster chain, a
+	// single-slot cache cost 1747 device requests where eight would do. Two slots and an exact LRU
+	// over them is what the access pattern actually is.
+	//
+	// Invalidated by `write_fs_sectors`, which is the one path any FAT byte is written through. A
+	// cache that can go stale under `set_fat_entry` would be worse than none: the driver would then
+	// allocate against its own out-of-date picture of what is free.
+	fat_cache: [FatSector; 2],
+	// The slot to replace next - the least recently used of the two.
+	fat_cache_lru: usize,
 	// The volume's case-folding rule. exFAT keeps it on the medium as the Up-case Table and every
 	// implementation must use the one it finds; the classic families fold ASCII by rule, so they
 	// get a table that says exactly that.
@@ -387,6 +449,24 @@ pub enum MountError {
 // ABORTS the process, which for this crate is StorageService and every volume it serves. The API
 // has had `FsError::NoMemory` since the shared error type grew it; what was missing was the paths
 // that could return it.
+// One FAT entry, decoded out of the sector (or FAT12 sector pair) that holds it.
+//
+// A free function because `next_cluster` reaches it two ways - from the cached sector, which borrows
+// the mount, and from a freshly read pair, which does not - and having one copy of the widths is
+// what keeps those two paths from drifting.
+fn decode_fat_entry(kind: Kind, buf: &[u8], within: usize, cluster: u32) -> u32 {
+	match kind {
+		Kind::Fat12 => {
+			let v = u16::from_le_bytes([buf[within], buf[within + 1]]);
+			if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
+		}
+		Kind::Fat16 => u16::from_le_bytes([buf[within], buf[within + 1]]) as u32,
+		Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]),
+		// FAT32 entries are 28-bit: the top nibble belongs to the medium.
+		Kind::Fat32 => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
+	}
+}
+
 pub(crate) fn try_zeroed(len: usize) -> Result<Vec<u8>, FsError> {
 	let mut buf: Vec<u8> = Vec::new();
 	buf.try_reserve_exact(len).map_err(|_| FsError::NoMemory)?;
@@ -407,14 +487,33 @@ impl<D: BlockDevice> FatFs<D> {
 	// not there when the truth may be a cable. The other backends in this tree grew a `_checked`
 	// mount for exactly this; `mount` stays as the convenience over it, so no caller had to change.
 	pub fn mount_checked(dev: D) -> Result<FatFs<D>, MountError> {
-		Self::mount_inner(dev)
+		Self::mount_inner(dev, true)
 	}
 
 	pub fn mount(dev: D) -> Option<FatFs<D>> {
-		Self::mount_inner(dev).ok()
+		Self::mount_inner(dev, true).ok()
 	}
 
-	fn mount_inner(mut dev: D) -> Result<FatFs<D>, MountError> {
+	// A MOUNT THAT WILL NEVER WRITE, AND DOES NOT PAY FOR THE PROMISE IT DOES NOT NEED.
+	//
+	// The ownership audit and the FAT-mirror comparison exist to protect WRITES: they establish that
+	// the allocation map describes the volume's own contents before this driver starts changing it.
+	// A reader changes nothing, so what the audit buys it is nothing - and what it costs is a walk
+	// of every directory and every cluster chain on the medium, at mount, before the first byte is
+	// read. The loader pays that on every FAT volume in the machine, on media where each cluster hop
+	// is a firmware round-trip, to read files it then checks against a signed manifest - which is a
+	// far stronger statement about the bytes than a cross-link audit is.
+	//
+	// A crafted chain still cannot make this hang: every walk goes through `ChainCursor`, which
+	// carries Floyd cycle detection whether or not the volume was audited.
+	//
+	// The mount records that nothing was checked. It refuses writes for that reason and says so
+	// through `trust()`, because "not checked" and "checked and sound" must not look alike.
+	pub fn mount_read_only(dev: D) -> Option<FatFs<D>> {
+		Self::mount_inner(dev, false).ok()
+	}
+
+	fn mount_inner(mut dev: D, audit: bool) -> Result<FatFs<D>, MountError> {
 		let mut boot = [0u8; SECTOR_SIZE];
 		if !dev.read_block(0, &mut boot) {
 			// THE DEVICE, not the medium. This is the distinction the whole type exists for: a
@@ -460,7 +559,7 @@ impl<D: BlockDevice> FatFs<D> {
 			// statement about the format.
 			return Err(MountError::Io);
 		}
-		let mut fs = FatFs { dev, geo, clock: 0, degraded: false, upcase: dir::Upcase::ascii(), exfat_root: None };
+		let mut fs = FatFs { dev, geo, clock: 0, trust: Trust::NotAudited, upcase: dir::Upcase::ascii(), exfat_root: None, fat_cache: Default::default(), fat_cache_lru: 0 };
 		// An exFAT volume without a readable Up-case Table is refused rather than mounted with a
 		// guess: every name decision on it - lookup, collision, the hash written into an entry set -
 		// would be this driver's opinion instead of the volume's, and the damage is silent.
@@ -477,7 +576,7 @@ impl<D: BlockDevice> FatFs<D> {
 			// volume in that state is how a recoverable inconsistency becomes an unrecoverable one.
 			// A repair tool clears the flag; this driver does not.
 			if u16::from_le_bytes([boot[106], boot[107]]) & 0x02 != 0 {
-				fs.degraded = true;
+				fs.trust = Trust::Unsound;
 			}
 		}
 		// WHAT THE VOLUME ALREADY SAYS, BEFORE THIS DRIVER WRITES A WORD OF IT.
@@ -503,8 +602,11 @@ impl<D: BlockDevice> FatFs<D> {
 		// rest of the crate's guarantees rest on. An audit that cannot RUN - a heap too short for
 		// the bitmap - is also read-only, because "not checked" and "checked and sound" must not
 		// look alike.
-		if !fs.degraded && fs.audit_ownership().is_err() {
-			fs.degraded = true;
+		//
+		// AND A MOUNT MAY DECLINE IT. `mount_read_only` does, because the premise it establishes is
+		// one only a writer needs - see there.
+		if audit && fs.trust != Trust::Unsound && fs.audit_ownership().is_err() {
+			fs.trust = Trust::Unsound;
 		}
 		// AND THE MIRRORED COPIES HAVE TO AGREE. `set_fat_entry` keeps future writes identical
 		// across every copy, which is not the same as checking what is already on the medium: when
@@ -517,8 +619,11 @@ impl<D: BlockDevice> FatFs<D> {
 		// Degrading rather than refusing: the volume is readable through the copy this build uses,
 		// and the operator's repair tool needs to be able to mount it. What must not continue is
 		// writing to a volume whose two records of the allocation map are not the same record.
-		if !fs.degraded && fs.mirrors_disagree() {
-			fs.degraded = true;
+		if audit && fs.trust != Trust::Unsound && fs.mirrors_disagree() {
+			fs.trust = Trust::Unsound;
+		}
+		if audit && fs.trust == Trust::NotAudited {
+			fs.trust = Trust::Audited;
 		}
 		Ok(fs)
 	}
@@ -526,8 +631,16 @@ impl<D: BlockDevice> FatFs<D> {
 	// Whether this mount refuses to mutate, and why it might. Public so an operator's tools and the
 	// service layer can tell a read-only mount from a full one rather than discovering it at the
 	// first write.
+	//
+	// Anything but `Audited` refuses: a volume that failed its audit and a volume nobody audited are
+	// both volumes this driver will not write through. Which of the two it is comes from `trust`.
 	pub fn is_degraded(&self) -> bool {
-		self.degraded
+		self.trust != Trust::Audited
+	}
+
+	// What this mount actually established about its volume.
+	pub fn trust(&self) -> Trust {
+		self.trust
 	}
 
 	// Walk the live namespace and check that no cluster is named twice.
@@ -1014,7 +1127,7 @@ impl<D: BlockDevice> FatFs<D> {
 					// The medium may be carrying a directory entry naming this file. Refusing every
 					// later mutation is what keeps that at "one uncertain commit" rather than
 					// letting a retry allocate over it.
-					self.degraded = true;
+					self.trust = Trust::Unsound;
 				}
 				return Err(failure.reported());
 			}
@@ -1297,18 +1410,38 @@ impl<D: BlockDevice> FatFs<D> {
 		// step the break skipped. `read_file_range` over the same chain refused it, because its
 		// advance sits in the loop body rather than behind an early exit, so one volume had two
 		// readers that disagreed about whether it was corrupt.
+		//
+		// CONSECUTIVE CLUSTERS ARE ONE READ. The walk is unchanged - every cluster still passes
+		// through the cursor, in order, with its bounds and its cycle detection - but a cluster that
+		// follows the previous one on the medium extends the pending run instead of being read on
+		// its own. A file written contiguously, which is every file `mcopy` puts on an ESP, becomes
+		// a handful of device requests rather than one per 512 bytes of it.
 		let mut chain = ChainCursor::new(first, false, max);
+		// The run waiting to be read: where it starts and how many clusters it covers.
+		let mut run_first: u32 = 0;
+		let mut run_len: u32 = 0;
+		let per_run = (MAX_RUN_BYTES / cluster_bytes).max(1) as u32;
 		while let ChainState::Cluster(cluster) = chain.state(self)? {
-			let sec = self.cluster_fs_sector(cluster);
-			let mut buf = try_zeroed(cluster_bytes)?;
-			self.read_fs_sectors(sec, self.geo.sectors_per_cluster, &mut buf)?;
-			out.try_reserve(buf.len()).map_err(|_| FsError::NoMemory)?;
-			out.extend_from_slice(&buf);
-			if out.len() >= limit {
+			// Extend the pending run, or read it and start a new one at this cluster.
+			if run_len > 0 && run_len < per_run && cluster == run_first.saturating_add(run_len) {
+				run_len += 1;
+			} else {
+				if run_len > 0 {
+					self.read_run(&mut out, run_first, run_len)?;
+				}
+				run_first = cluster;
+				run_len = 1;
+			}
+			// The declared length is reached when the pending run is read, not before: `out` does
+			// not grow until then.
+			if out.len() + run_len as usize * cluster_bytes >= limit {
 				chain.settle(self)?;
 				break;
 			}
 			chain.advance(self)?;
+		}
+		if run_len > 0 {
+			self.read_run(&mut out, run_first, run_len)?;
 		}
 		// A chain that ended before it produced the bytes it was read for is a truncated file, not
 		// a short one: the entry's own length says how much is there and the FAT does not have it.
@@ -1372,15 +1505,42 @@ impl<D: BlockDevice> FatFs<D> {
 		let count = self.nfc_run(first, limit as u64)?;
 		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
 		let mut out: Vec<u8> = Vec::new();
-		for i in 0..count {
-			let sec = self.cluster_fs_sector(first + i);
-			let mut buf = try_zeroed(cluster_bytes)?;
-			self.read_fs_sectors(sec, self.geo.sectors_per_cluster, &mut buf)?;
-			out.try_reserve(buf.len()).map_err(|_| FsError::NoMemory)?;
-			out.extend_from_slice(&buf);
+		// A NoFatChain run is contiguous BY DEFINITION - that is what the flag means - and this read
+		// it one cluster at a time anyway. The only bound left is how much one device request may
+		// move.
+		let per_run = (MAX_RUN_BYTES / cluster_bytes).max(1) as u32;
+		let mut done: u32 = 0;
+		while done < count {
+			let run = per_run.min(count - done);
+			self.read_run(&mut out, first + done, run)?;
+			done += run;
 		}
 		out.truncate(limit);
 		Ok(out)
+	}
+
+	// Append `count` consecutive clusters starting at `first` to `out`, in one device request.
+	//
+	// Read straight into the tail of `out` rather than through a per-cluster scratch buffer: the
+	// scratch was allocated, filled, copied out and dropped once per cluster, which on a large file
+	// is an allocation per 512 bytes of it.
+	fn read_run(&mut self, out: &mut Vec<u8>, first: u32, count: u32) -> Result<(), FsError> {
+		if count == 0 {
+			return Ok(());
+		}
+		let cluster_bytes = (self.geo.sectors_per_cluster * self.geo.bytes_per_sector) as usize;
+		let Some(want) = cluster_bytes.checked_mul(count as usize) else {
+			return Err(FsError::Invalid);
+		};
+		let base = out.len();
+		out.try_reserve(want).map_err(|_| FsError::NoMemory)?;
+		out.resize(base + want, 0);
+		let sec = self.cluster_fs_sector(first);
+		let Some(sectors) = self.geo.sectors_per_cluster.checked_mul(count) else {
+			return Err(FsError::Invalid);
+		};
+		self.read_fs_sectors(sec, sectors, &mut out[base..])?;
+		Ok(())
 	}
 
 	// Bound an exFAT NoFatChain run off untrusted media: `size` bytes as contiguous
@@ -1418,18 +1578,62 @@ impl<D: BlockDevice> FatFs<D> {
 
 	// Read `count` logical sectors starting at fs sector `sec` into `buf`, expanding each
 	// logical sector to its 512-byte device sectors.
+	// ONE DEVICE REQUEST FOR THE WHOLE SPAN, not one per 512-byte sector.
+	//
+	// This read a sector at a time into a stack buffer and copied it out, so a caller asking for a
+	// whole cluster - or, since the readers below coalesce, a whole contiguous run of them - was
+	// turned back into single-sector I/O on the way down. `BlockDevice::read_blocks` exists for
+	// exactly this and every backing that can move a span in one go implements it; the trait's
+	// default still loops for the ones that cannot.
 	fn read_fs_sectors(&mut self, sec: u64, count: u32, buf: &mut [u8]) -> Result<(), FsError> {
 		let ratio = (self.geo.bytes_per_sector / SECTOR_SIZE as u32) as u64;
 		let total = count as u64 * ratio;
-		for i in 0..total {
-			let off = i as usize * SECTOR_SIZE;
-			let mut s = [0u8; SECTOR_SIZE];
-			if !self.dev.read_block(sec * ratio + i, &mut s) {
-				return Err(FsError::Io);
-			}
-			buf[off..off + SECTOR_SIZE].copy_from_slice(&s);
+		if total == 0 {
+			return Ok(());
+		}
+		// The buffer is the span, exactly. Every caller sizes it from the same geometry, and a
+		// mismatch is a caller bug rather than something the medium can cause - but the block layer
+		// derives its block size from `buf.len() / count`, so it is checked rather than assumed.
+		if buf.len() as u64 != total * SECTOR_SIZE as u64 {
+			return Err(FsError::Invalid);
+		}
+		let Some(first) = sec.checked_mul(ratio) else {
+			return Err(FsError::Invalid);
+		};
+		if !self.dev.read_blocks(first, total, buf) {
+			return Err(FsError::Io);
 		}
 		Ok(())
+	}
+
+	// The active FAT's sector `sec`, from the cache when it is the one already held.
+	//
+	// The caller decodes an entry out of the slice; nothing else may be borrowed from `self` across
+	// the call, which is why the geometry a decoder needs is read before it.
+	fn fat_sector(&mut self, sec: u64) -> Result<&[u8], FsError> {
+		let bps = self.geo.bytes_per_sector as usize;
+		// An INDEX rather than a reference, so the miss path below is free to take `&mut self`.
+		let slot = match self.fat_cache.iter().position(|held| held.sector == Some(sec) && held.bytes.len() == bps) {
+			Some(hit) => hit,
+			None => {
+				let slot = self.fat_cache_lru;
+				if self.fat_cache[slot].bytes.len() != bps {
+					self.fat_cache[slot].bytes = try_zeroed(bps)?;
+				}
+				// Nothing valid while the read is in flight: a failure part-way must not leave a
+				// slot claiming to hold a sector it holds half of.
+				self.fat_cache[slot].sector = None;
+				let mut buf = core::mem::take(&mut self.fat_cache[slot].bytes);
+				let read = self.read_fs_sectors(sec, 1, &mut buf);
+				self.fat_cache[slot].bytes = buf;
+				read?;
+				self.fat_cache[slot].sector = Some(sec);
+				slot
+			}
+		};
+		// Exact LRU over two entries: whichever slot was just used, the other one is next to go.
+		self.fat_cache_lru = 1 - slot;
+		Ok(&self.fat_cache[slot].bytes)
 	}
 
 	// The FAT entry for `cluster` - the next cluster in its chain - read from the first
@@ -1453,20 +1657,23 @@ impl<D: BlockDevice> FatFs<D> {
 		let sectors: u32 = if byte_off % bps as u64 == bps as u64 - 1 { 2 } else { 1 };
 		let sec = fat_base as u64 + byte_off / bps as u64;
 		let within = (byte_off % bps as u64) as usize;
-		let mut buf = try_zeroed((bps * sectors) as usize)?;
-		self.read_fs_sectors(sec, sectors, &mut buf)?;
-		Ok(match self.geo.kind {
-			Kind::Fat12 => {
-				let v = u16::from_le_bytes([buf[within], buf[within + 1]]);
-				if cluster & 1 == 1 { (v >> 4) as u32 } else { (v & 0x0FFF) as u32 }
-			}
-			Kind::Fat16 => u16::from_le_bytes([buf[within], buf[within + 1]]) as u32,
-			Kind::ExFat => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]),
-			Kind::Fat32 => u32::from_le_bytes([buf[within], buf[within + 1], buf[within + 2], buf[within + 3]]) & 0x0FFF_FFFF,
-		})
+		// Read before the slice is borrowed: the cached sector borrows `self`, so nothing else may
+		// be read out of it while the decode below holds that borrow.
+		let kind = self.geo.kind;
+		// THE ONE-SECTOR CASE IS THE CACHED ONE, and it is every case but a FAT12 entry that
+		// straddles a sector boundary - which is rare, family-specific, and needs a pair rather than
+		// the single sector the cache holds.
+		if sectors != 1 {
+			let mut pair = try_zeroed((bps * sectors) as usize)?;
+			self.read_fs_sectors(sec, sectors, &mut pair)?;
+			return Ok(decode_fat_entry(kind, &pair, within, cluster));
+		}
+		let buf = self.fat_sector(sec)?;
+		Ok(decode_fat_entry(kind, buf, within, cluster))
 	}
 
 	// True when a FAT entry is an end-of-chain marker for the family's width.
+	// (the decoder for the entry itself is a free function below - it borrows nothing)
 	fn is_end(&self, cluster: u32) -> bool {
 		match self.geo.kind {
 			Kind::Fat12 => cluster >= 0x0FF8,
@@ -1497,6 +1704,16 @@ impl<D: BlockDevice> FatFs<D> {
 	// Write `count` logical sectors of `buf` starting at fs sector `sec`, expanding each
 	// logical sector to its 512-byte device sectors. The write mirror of read_fs_sectors.
 	fn write_fs_sectors(&mut self, sec: u64, count: u32, buf: &[u8]) -> Result<(), FsError> {
+		// EVERY FAT BYTE THIS DRIVER WRITES GOES THROUGH HERE, so this is where the read cache is
+		// dropped. Unconditionally, rather than only for sectors inside a FAT region: the test is
+		// cheap, writes are rare beside reads, and a cache invalidated by a rule someone has to keep
+		// in step with the layout is a cache that will one day serve a stale allocation map.
+		//
+		// The one write that does not pass through here is the exFAT VolumeDirty flag, which is
+		// sector 0 of the boot region and can never be a FAT sector.
+		for held in &mut self.fat_cache {
+			held.sector = None;
+		}
 		let ratio = (self.geo.bytes_per_sector / SECTOR_SIZE as u32) as u64;
 		let total = count as u64 * ratio;
 		for i in 0..total {
@@ -1555,7 +1772,7 @@ impl<D: BlockDevice> FatFs<D> {
 	// originals back - including the copy that failed, because its first sector may have landed.
 	// If a restore write fails too, the volume is past repairing from here and the mount degrades.
 	fn set_fat_entry(&mut self, cluster: u32, val: u32) -> Result<(), FsError> {
-		if self.degraded {
+		if self.is_degraded() {
 			return Err(FsError::ReadOnly);
 		}
 		if cluster < 2 || cluster > self.max_cluster() {
@@ -1621,7 +1838,7 @@ impl<D: BlockDevice> FatFs<D> {
 	fn restore_fat_sectors(&mut self, undo: Vec<(u64, Vec<u8>)>, sectors: u32) {
 		for (sec, original) in undo.into_iter().rev() {
 			if self.write_fs_sectors(sec, sectors, &original).is_err() {
-				self.degraded = true;
+				self.trust = Trust::Unsound;
 			}
 		}
 	}
@@ -1670,7 +1887,7 @@ impl<D: BlockDevice> FatFs<D> {
 						// clusters are now marked in use with no entry naming them - a leak the
 						// next mount cannot tell from a live file, and one that grows with every
 						// retry. Refusing further mutations keeps it at a leak.
-						self.degraded = true;
+						self.trust = Trust::Unsound;
 						break;
 					}
 				}
@@ -2112,7 +2329,7 @@ impl<D: BlockDevice> FatFs<D> {
 	// them, but not a remove of a file with no clusters - and "most mutations" is not a read-only
 	// mount.
 	fn ensure_writable(&self) -> Result<(), FsError> {
-		if self.degraded {
+		if self.is_degraded() {
 			return Err(FsError::ReadOnly);
 		}
 		Ok(())
@@ -2194,7 +2411,7 @@ impl<D: BlockDevice> FatFs<D> {
 				if !failure.placed {
 					let _ = self.exfat_free(first);
 				} else {
-					self.degraded = true;
+					self.trust = Trust::Unsound;
 				}
 				return Err(failure.reported());
 			}
@@ -2343,7 +2560,7 @@ impl<D: BlockDevice> FatFs<D> {
 				// a live one. Put the terminator back and release it.
 				bytes.truncate(bytes.len() - cluster_bytes);
 				if self.set_fat_entry(last, EXFAT_EOC).is_err() || self.exfat_free(grow).is_err() {
-					self.degraded = true;
+					self.trust = Trust::Unsound;
 				}
 				return Err(error);
 			}
@@ -2561,7 +2778,7 @@ impl<D: BlockDevice> FatFs<D> {
 						// clusters are now marked in use with no entry naming them - a leak the
 						// next mount cannot tell from a live file, and one that grows with every
 						// retry. Refusing further mutations keeps it at a leak.
-						self.degraded = true;
+						self.trust = Trust::Unsound;
 						break;
 					}
 				}
@@ -2595,7 +2812,7 @@ impl<D: BlockDevice> FatFs<D> {
 			// further mutation keeps that at a leak rather than letting the next allocation hand out
 			// a cluster the bitmap already claims. The milestone's summary of this - "undo the
 			// bitmap, or degrade" - was true of neither half.
-			self.degraded = true;
+			self.trust = Trust::Unsound;
 			return Err(FsError::Io);
 		}
 		Ok(chain)
@@ -2643,7 +2860,7 @@ impl<D: BlockDevice> FatFs<D> {
 		// already run - so the volume is degraded instead, which keeps it at a leak rather than
 		// letting the next allocation hand out a cluster the bitmap still claims.
 		if self.write_dir_bytes(&bm_dir, &bm).is_err() {
-			self.degraded = true;
+			self.trust = Trust::Unsound;
 			return Err(FsError::Io);
 		}
 		Ok(())
@@ -2673,7 +2890,7 @@ impl<D: BlockDevice> FatFs<D> {
 		// a write that half-landed leaves clusters marked in use with nothing naming them, and only
 		// refusing further mutation keeps that at a leak.
 		if self.write_dir_bytes(&bm_dir, &bm).is_err() {
-			self.degraded = true;
+			self.trust = Trust::Unsound;
 			return Err(FsError::Io);
 		}
 		Ok(())

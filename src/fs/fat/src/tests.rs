@@ -1597,20 +1597,130 @@ fn a_grow_cluster_reaches_the_chain_only_zeroed() {
 }
 
 // A device that counts its sector reads, for pinning I/O-cost bounds.
+//
+// TWO NUMBERS, BECAUSE THEY BOUND DIFFERENT THINGS. `reads` is sectors moved, which is what an
+// allocation scan's cost is measured in. `requests` is CALLS - and on a real medium each one is a
+// command round-trip, which is what a per-sector reader actually pays and what coalescing removes.
+// Counting only sectors made the difference between "one request for a megabyte" and "two thousand
+// requests for the same megabyte" invisible.
 struct CountingDisk {
 	inner: MemDisk,
 	reads: usize,
+	requests: usize,
 }
 
 impl BlockDevice for CountingDisk {
 	fn read_block(&mut self, lba: u64, buf: &mut [u8]) -> bool {
 		self.reads += 1;
+		self.requests += 1;
 		self.inner.read_block(lba, buf)
+	}
+
+	// The span, in one call - and counted as one. It forwards to the INNER disk, whose own default
+	// loops `read_block` on itself, so nothing is double counted here.
+	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
+		self.reads += count as usize;
+		self.requests += 1;
+		self.inner.read_blocks(index, count, buf)
 	}
 
 	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
 		self.inner.write_block(lba, buf)
 	}
+}
+
+// A fixture with one large file on it, and the disk it lives on.
+//
+// 512-byte clusters, which is `build_fat`'s geometry and the geometry `mformat` gives the ESP this
+// system boots from - so the cluster counts here are the ones a real boot walks.
+fn volume_with_a_large_file(clusters: usize) -> Vec<u8> {
+	let mut fs = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).unwrap();
+	fs.write_file(b"BIG.BIN", &vec![0x77u8; clusters * 512]).unwrap();
+	core::mem::take(&mut fs.dev.data)
+}
+
+#[test]
+fn walking_a_chain_reads_the_allocation_table_once_per_sector_of_it() {
+	// `next_cluster` read the FAT sector holding its entry, decoded two bytes and threw the sector
+	// away - once per cluster. A FAT16 sector holds 256 entries and a chain runs through them in
+	// order, so 255 of every 256 hops re-read bytes the driver had just had in its hand.
+	//
+	// A ranged read at the far end of a file is the isolated form of the walk: it follows the whole
+	// chain and reads exactly one cluster of data at the end of it, so what is counted here is the
+	// table walk and almost nothing else.
+	const CLUSTERS: usize = 2000;
+	let data = volume_with_a_large_file(CLUSTERS);
+	let mut fs = FatFs::mount(CountingDisk { inner: MemDisk { data }, reads: 0, requests: 0 }).unwrap();
+	fs.dev.reads = 0;
+	fs.dev.requests = 0;
+	let mut tail = [0u8; 4];
+	let got = fs.read_file_range(b"BIG.BIN", (CLUSTERS as u64 - 1) * 512, &mut tail).unwrap();
+	assert_eq!(got, tail.len(), "the ranged read reaches the end of the chain");
+	assert_eq!(tail, [0x77; 4], "and lands on the file's own bytes");
+	// 2000 hops span eight FAT sectors, and this measures 11 requests with the root directory and
+	// the data cluster in the number. Before the cache it was 3002 - one table read per hop, twice
+	// over, because Floyd's two cursors each take one.
+	assert!(fs.dev.requests < 64, "walking {CLUSTERS} clusters cost {} device requests", fs.dev.requests);
+}
+
+#[test]
+fn a_contiguous_file_is_read_in_runs_rather_than_a_request_per_cluster() {
+	// `read_fs_sectors` issued one device request per 512-byte sector, so reading a file was one
+	// round-trip per sector of it however contiguous it was on the medium. On the loader's media -
+	// a firmware Block I/O protocol over an emulated ATAPI CD - that is the whole cost of the read.
+	const CLUSTERS: usize = 2000;
+	let payload = vec![0x77u8; CLUSTERS * 512];
+	let data = volume_with_a_large_file(CLUSTERS);
+	let mut fs = FatFs::mount(CountingDisk { inner: MemDisk { data }, reads: 0, requests: 0 }).unwrap();
+	fs.dev.reads = 0;
+	fs.dev.requests = 0;
+	let read = fs.read_file(b"BIG.BIN").unwrap();
+	assert_eq!(read, payload, "coalescing must not change what is read");
+	// Every sector of the file is still moved - that is the read - but not one request each.
+	assert!(fs.dev.reads >= CLUSTERS, "the whole file is still read: {} sectors", fs.dev.reads);
+	// 12 requests, measured. Before the coalescing it was 5001: one per sector of the file, plus the
+	// table walk on top.
+	assert!(fs.dev.requests < 64, "reading {CLUSTERS} contiguous clusters cost {} device requests", fs.dev.requests);
+}
+
+#[test]
+fn a_read_only_mount_does_not_audit_and_does_not_claim_it_did() {
+	// THE THIRD STATE. `degraded: bool` had two, and its own comment said the distinction it could
+	// not make: "not checked" and "checked and sound" must not look alike. A mount that skips the
+	// audit because it will never write is neither of the two the flag could express.
+	let mut img = build_fat(Kind::Fat16, &[File { path: "A.TXT", data: &[b'a'; 600] }, File { path: "B.TXT", data: &[b'b'; 600] }]);
+	// The cross-link from `a_volume_that_already_cross_links_two_files_mounts_read_only`: B's second
+	// cluster points at A's first, in both copies, so the mirror check has nothing of its own to say.
+	let bps = 512usize;
+	let fat_size = (5000 * 2usize).div_ceil(bps) * bps;
+	for copy in 0..FATS {
+		let at = bps + copy * fat_size;
+		img[at + 5 * 2..at + 5 * 2 + 2].copy_from_slice(&2u16.to_le_bytes());
+	}
+	let audited = FatFs::mount(MemDisk { data: img.clone() }).expect("a cross-linked volume still mounts");
+	assert_eq!(audited.trust(), Trust::Unsound, "the audit ran and the volume failed it");
+
+	let unaudited = FatFs::mount_read_only(MemDisk { data: img.clone() }).expect("and so does a read-only mount of it");
+	assert_eq!(unaudited.trust(), Trust::NotAudited, "nothing was checked, and that is what it says - not that the volume is sound, and not that it is damaged");
+	assert!(unaudited.is_degraded(), "a mount that checked nothing still refuses to write");
+
+	let healthy = FatFs::mount(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).expect("a well-formed volume mounts");
+	assert_eq!(healthy.trust(), Trust::Audited, "and only a volume that was walked and found sound is writable");
+	let unchecked = FatFs::mount_read_only(MemDisk { data: build_fat(Kind::Fat16, ROOT) }).expect("read-only too");
+	assert_eq!(unchecked.trust(), Trust::NotAudited, "the same healthy volume, unaudited, does not report itself audited");
+}
+
+#[test]
+fn a_read_only_mount_does_not_walk_the_whole_volume_to_open_it() {
+	// The audit's own comment names its cost: "every directory read once, every chain followed
+	// once". That is a walk of the WHOLE medium before the first byte is read, and it buys a
+	// premise only a writer needs. The loader pays it on every FAT volume in the machine, over a
+	// firmware block protocol, to read files it then checks against a signed manifest.
+	const CLUSTERS: usize = 2000;
+	let data = volume_with_a_large_file(CLUSTERS);
+	let audited = FatFs::mount(CountingDisk { inner: MemDisk { data: data.clone() }, reads: 0, requests: 0 }).unwrap();
+	let unaudited = FatFs::mount_read_only(CountingDisk { inner: MemDisk { data }, reads: 0, requests: 0 }).unwrap();
+	assert!(unaudited.dev.reads * 10 < audited.dev.reads, "the audited mount read {} sectors and the read-only one {}", audited.dev.reads, unaudited.dev.reads);
 }
 
 #[test]
@@ -1619,7 +1729,7 @@ fn a_write_on_a_full_volume_reads_the_fat_once_not_per_cluster() {
 	// two sectors for each of the thousands of allocated clusters it skips on a
 	// fuller volume. A small write must cost on the order of one FAT image read.
 	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
-	let mut fs = FatFs::mount(CountingDisk { inner, reads: 0 }).unwrap();
+	let mut fs = FatFs::mount(CountingDisk { inner, reads: 0, requests: 0 }).unwrap();
 	let chunk = vec![0x5Au8; 500 * 512];
 	for i in 0..8u32 {
 		let name = alloc::format!("FILL{i}.BIN");
@@ -1836,7 +1946,7 @@ fn a_zero_length_read_reads_no_data_cluster() {
 	// to read one whole cluster and discard it - the read must cost only the
 	// directory scan.
 	let inner = MemDisk { data: build_fat(Kind::Fat16, ROOT) };
-	let mut fs = FatFs::mount(CountingDisk { inner, reads: 0 }).unwrap();
+	let mut fs = FatFs::mount(CountingDisk { inner, reads: 0, requests: 0 }).unwrap();
 	// HELLO.TXT is the first root entry: claim size 0, keep its first cluster.
 	let root_off = classic_root_off(&fs.dev.inner.data);
 	fs.dev.inner.data[root_off + 28..root_off + 32].copy_from_slice(&0u32.to_le_bytes());
@@ -3189,7 +3299,7 @@ fn scanning_the_fat_does_not_cost_more_reads_than_reading_it_whole() {
 	// each FAT sector read once, plus at most one extra where an entry straddles a boundary.
 	for (label, kind) in [("fat12", Kind::Fat12), ("fat16", Kind::Fat16), ("fat32", Kind::Fat32)] {
 		let inner = MemDisk { data: build_fat(kind, ROOT) };
-		let mut fs = FatFs::mount(CountingDisk { inner, reads: 0 }).unwrap();
+		let mut fs = FatFs::mount(CountingDisk { inner, reads: 0, requests: 0 }).unwrap();
 		let fat_sectors = fs.geo.fat_size as usize;
 		fs.dev.reads = 0;
 		fs.free_bytes().unwrap();

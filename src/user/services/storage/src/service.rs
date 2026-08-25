@@ -226,8 +226,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// 3. report in over the bootstrap channel (the supervisor that started us is
 	//    listening there), then serve generated volume requests until the client side
 	//    closes.
+	// AND WHICH VOLUME IT CAME UP ON. Seven instances of this service run on an ordinary boot - the
+	// system volume, media, iso, udf, usb and the two memory volumes - and every one of them
+	// reported the same indistinguishable line. A boot log said `StorageService: online` seven times
+	// with nothing to tell them apart, and the kernel's boot suite had to assert a COUNT of them
+	// because a count was all the line supported. Naming the volume makes the same report say which
+	// of the seven it is, and lets that suite assert the SET that came up.
 	unsafe {
-		send_blocking(bootstrap, b"StorageService: online", 0);
+		// ALLOC-OK: one line, once, on this service's own bootstrap path.
+		let mut report: Vec<u8> = Vec::new();
+		report.extend_from_slice(b"StorageService: online (vol://");
+		report.extend_from_slice(vol.name());
+		report.push(b')');
+		send_blocking(bootstrap, &report, 0);
 	}
 	serve_volume(&mut vol, service, admin);
 }

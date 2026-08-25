@@ -303,7 +303,15 @@ fn boot_main() {
 	// Perf-trace anchor: publish the calibrated TSC frequency so the host trace tool can
 	// convert the ring-3 `\x1ePERF` cycle markers to wall-clock time.
 	serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());
-	serial_println!("boot OK - entering the userspace shell (type 'help', or 'exit' to halt)");
+	// WHAT IS ACTUALLY TRUE AT THIS POINT. The line said "entering the userspace shell" and was
+	// followed by every driver binding, every service starting and the product banner before a
+	// prompt appeared - so the one line a reader takes as "the boot finished" was printed in the
+	// middle of it. The kernel IS up here, which is the fact worth a line; the shell says so itself
+	// when it is.
+	//
+	// `boot OK` is kept verbatim at the front: `screenshot.sh` waits for it and `perf-trace.py`
+	// anchors on it, and both are looking for exactly this moment.
+	serial_println!("boot OK - kernel is up, starting userspace");
 	// Serial input goes interrupt-driven HERE, in this port's prologue, because it is the machine
 	// and not the policy: route the UART's legacy IRQ (COM1 = ISA IRQ 4) to the BSP and enable the
 	// receive interrupt, so a typed byte reaches the shell at once rather than on the next
@@ -313,7 +321,7 @@ fn boot_main() {
 	arch::serial::enable_rx_irq();
 	// THREE HUNDRED ROUNDS, which is what `console_shell_loop` used to wait on this port before the
 	// wait moved inside the supervised attempt.
-	boot_userspace("x86_64", 300);
+	boot_userspace(300);
 	serial_println!("halting");
 }
 
@@ -369,6 +377,9 @@ pub(crate) fn console_shell_loop() {
 	// the shell must be pumped whenever an interrupt arrives, not only when a serial
 	// byte does. Polling serial (rather than blocking on it) keeps that interrupt
 	// path live while no one is typing on the wire.
+	// AND THE HINT, WHERE THE SHELL ACTUALLY IS. It used to ride on the kernel's `boot OK` line,
+	// thirty lines and a whole userspace bring-up before anything could read a command.
+	serial_println!("shell attached - type 'help', or 'exit' to halt");
 	console_input::feed_serial(b'\n');
 	while console_input::shell_listening() {
 		if let Some(byte) = arch::serial::read_byte() {
@@ -647,7 +658,7 @@ fn root_child_domains() -> usize {
 // `settle_rounds` is a caller's number because the machines differ by an order of magnitude:
 // riscv64 under TCG needs thousands of passes where x86_64 needs hundreds. A number that differs by
 // target is a parameter, not a reason for three functions.
-fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, settle_rounds: u32, log: &'static str, mut spawn: impl FnMut() -> Option<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>)>) -> bool {
+fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, settle_rounds: u32, mut spawn: impl FnMut() -> Option<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>)>) -> bool {
 	use object::KernelObject;
 	let branches_before: usize = root_child_domains();
 	for attempt in 0..=max_restarts {
@@ -692,7 +703,7 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, settle_roun
 		for _ in 0..settle_rounds {
 			sched::run_until_idle();
 			while let Ok(message) = reports.recv() {
-				serial_println!("{}: userspace: {}", log, core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
+				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
 			}
 			if console_input::shell_listening() {
 				listening = true;
@@ -749,8 +760,12 @@ fn serial_rx_interrupt(_vector: u32) {
 // plane on two targets of three and nothing noticed. None of that machinery needed porting: it
 // carries no `cfg` and compiled on every target already. Two entries simply did not call it.
 //
-// `log` is the prefix a port's boot lines carry; `settle_rounds` is how long the readiness wait may
-// take on this machine (see `supervise`).
+// `settle_rounds` is how long the readiness wait may take on this machine (see `supervise`).
+//
+// THE ARCHITECTURE IS NOT NEWS ON ITS OWN LOG. Every forwarded userspace line carried the port's
+// name - `x86_64: userspace: Shell: online` - on a machine that has exactly one architecture, in a
+// serial log that belongs to one boot of it. The prefix that says which of the three produced a log
+// is the log's own name, not a repetition on every line inside it.
 // WHAT THIS MACHINE IS, printed once by every port rather than by one of them.
 //
 // Both lines are baselines: "every bus-mastering device is untranslated" and "one node, no locality"
@@ -766,11 +781,10 @@ fn report_machine() {
 		serial_println!("numa: {bound} of {} core(s) bound to a node", smp::cpu_count());
 	}
 	mem::numa::report();
-	dma_policy::report();
 }
 
 #[cfg(not(test))]
-pub(crate) fn boot_userspace(log: &'static str, settle_rounds: u32) {
+pub(crate) fn boot_userspace(settle_rounds: u32) {
 	report_machine();
 	const MAX_RESTARTS: u32 = 3;
 	// Pump the serial console from the scheduler's idle spin: virtio-gpu polls its
@@ -781,7 +795,7 @@ pub(crate) fn boot_userspace(log: &'static str, settle_rounds: u32) {
 	sched::set_idle_hook(serial_console_pump);
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
-	let up = supervise(&crash_rx, MAX_RESTARTS, settle_rounds, log, || match spawn_system_manager() {
+	let up = supervise(&crash_rx, MAX_RESTARTS, settle_rounds, || match spawn_system_manager() {
 		Ok((ep, process)) => Some((ep, process)),
 		Err(reason) => {
 			serial_println!("recovery: could not start SystemManager: {}", reason);
@@ -789,6 +803,11 @@ pub(crate) fn boot_userspace(log: &'static str, settle_rounds: u32) {
 		}
 	});
 	if up {
+		// AND NOW THE DMA ISOLATION STATE, because now it is a fact. The devices bound while the
+		// service set came up, so this is the first point at which "is anything reaching memory
+		// untranslated" - and therefore what the controller is actually doing - has an answer.
+		// See `dma_policy::report`.
+		dma_policy::report();
 		// SET HERE AND NOT BEFORE. From this point a SystemManager that ends is a control plane
 		// with no owner, and the idle hook reboots rather than letting the machine run on as though
 		// somebody were still supervising. Before the shell is listening there is nothing to own.

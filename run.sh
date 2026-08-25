@@ -30,6 +30,9 @@ Boots the system in QEMU, headless, with the serial console on your terminal. On
                   no TLS: use 127.0.0.1 on a network you do not trust)
   --spice-port P  SPICE port (default 5930)
   --debug         wait for GDB on :1234, no KVM
+  IOMMU=1         x86_64 only: put a virtio-iommu in the machine and every virtio endpoint behind
+                  it, so the boot reports real isolation instead of a page of DEGRADED lines. Off
+                  by default: virtio-gpu does not come up behind a translating controller yet
   --gdb           ATTACH gdb to a guest already waiting - run in a second panel after --debug,
                   and it boots nothing itself
   -h, --help      this text

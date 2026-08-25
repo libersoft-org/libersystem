@@ -2667,7 +2667,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("serve bootstrap");
 	sched::run_until_idle();
 	let storage_online = storage_boot_kernel.recv().expect("StorageService online report");
-	assert_eq!(&storage_online.bytes[..], b"StorageService: online");
+	assert_eq!(&storage_online.bytes[..], b"StorageService: online (vol://system)");
 	let online = boot_kernel.recv().expect("AudioService online report");
 	assert_eq!(&online.bytes[..], b"AudioService: online");
 	match scenario {
@@ -3697,7 +3697,10 @@ impl StorageHarness {
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
-				assert_eq!(&report.bytes[..], b"StorageService: online");
+				// The volume this instance came up on follows the line, and WHICH volume depends on
+				// the tag the caller bootstrapped it with - so the shape is what is asserted here
+				// and the exact name where a test knows it.
+				assert!(report.bytes.starts_with(b"StorageService: online (vol://"), "unexpected report: {:?}", core::str::from_utf8(&report.bytes));
 				return harness;
 			}
 		}
@@ -3725,7 +3728,7 @@ impl StorageHarness {
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
-				assert_eq!(&report.bytes[..], b"StorageService: online");
+				assert!(report.bytes.starts_with(b"StorageService: online (vol://"), "unexpected report: {:?}", core::str::from_utf8(&report.bytes));
 				return harness;
 			}
 		}
@@ -3762,7 +3765,8 @@ impl StorageHarness {
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
-				assert_eq!(&report.bytes[..], b"StorageService: online");
+				// A RAMDISK archive IS the system volume, so this one knows its name.
+				assert_eq!(&report.bytes[..], b"StorageService: online (vol://system)");
 				return harness;
 			}
 		}
@@ -4071,7 +4075,7 @@ impl StorageHarness {
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
-				return &report.bytes[..] == b"StorageService: online";
+				return &report.bytes[..] == b"StorageService: online (vol://system)";
 			}
 		}
 		false

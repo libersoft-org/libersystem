@@ -21,6 +21,14 @@ const BOUNCE_BYTES: usize = 8 * 1024;
 
 #[derive(Clone, Copy)]
 pub struct FirmwareDisk {
+	// The firmware handle this device was found on.
+	//
+	// Kept so a caller can ask WHICH device this is rather than inferring it from what was read off
+	// it. The loader needs exactly that: the medium it booted from is the one whose handle the
+	// firmware named in `EFI_LOADED_IMAGE_PROTOCOL`, and identifying it by "the first FAT volume
+	// that answered" is the same guess as taking the first LiberFS volume found - the guess this
+	// tree's volume pairing exists to retire.
+	handle: Handle,
 	proto: *mut BlockIo,
 	media_id: u32,
 	block_size: u32,
@@ -34,6 +42,11 @@ pub struct FirmwareDisk {
 }
 
 impl FirmwareDisk {
+	// The firmware handle this device was enumerated on.
+	pub fn handle(&self) -> Handle {
+		self.handle
+	}
+
 	// The geometry the firmware reported, for a caller deciding whether this device can hold the
 	// volume it is looking for - and for a test asserting the enumeration reported what the firmware
 	// said, in the order it said it.
@@ -98,6 +111,76 @@ impl BlockDevice for FirmwareDisk {
 		let status = unsafe { ((*self.proto).read_blocks)(self.proto, self.media_id, first, buf.len(), buf.as_mut_ptr() as *mut c_void) };
 		!uefi::is_error(status)
 	}
+
+	// A CONTIGUOUS SPAN IS ONE FIRMWARE REQUEST.
+	//
+	// The trait's default loops `read_block`, and this protocol's entry point already takes a byte
+	// count - so a filesystem asking for a whole cluster run was turned into one `ReadBlocks` call
+	// per 512-byte sector on the way down. On an emulated ATAPI CD that is one command round-trip
+	// per sector, and reading an 18 MB file off the boot medium meant thirty-five thousand of them.
+	//
+	// The bounce path stays per block on purpose: the aligned scratch buffer is one filesystem block
+	// long, so a span that needs it cannot be moved in one piece, and refusing the read instead
+	// would break exactly the firmware the bounce exists for.
+	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
+		if count == 0 {
+			return true;
+		}
+		let device_block = self.block_size as u64;
+		if device_block == 0 || buf.len() as u64 % count != 0 {
+			return false;
+		}
+		let block = buf.len() as u64 / count;
+		if block % device_block != 0 {
+			return false;
+		}
+		if self.io_align > 1 && (buf.as_ptr() as usize) % self.io_align as usize != 0 {
+			let block = block as usize;
+			for i in 0..count as usize {
+				if !self.read_block(index + i as u64, &mut buf[i * block..(i + 1) * block]) {
+					return false;
+				}
+			}
+			return true;
+		}
+		// The same arithmetic the single-block path checks, over the whole span: every number here
+		// came from a filesystem parsing a medium this loader does not trust.
+		let span = block / device_block;
+		let Some(first) = index.checked_mul(span) else {
+			return false;
+		};
+		let Some(total) = span.checked_mul(count) else {
+			return false;
+		};
+		let Some(last) = first.checked_add(total) else {
+			return false;
+		};
+		if last > self.last_block.saturating_add(1) {
+			return false;
+		}
+		let status = unsafe { ((*self.proto).read_blocks)(self.proto, self.media_id, first, buf.len(), buf.as_mut_ptr() as *mut c_void) };
+		!uefi::is_error(status)
+	}
+}
+
+// The device the firmware loaded this image FROM, when it names one.
+//
+// `EFI_LOADED_IMAGE_PROTOCOL` carries it, so the boot medium is a fact the firmware states rather
+// than something a loader has to deduce from what it manages to read. Firmware that mounts the ESP
+// without exposing it as a block device names a handle with no Block I/O on it, and a caller that
+// matches against the enumeration simply finds nothing - which is the honest answer there.
+//
+// # Safety
+// `bs` must be the live `BootServices` table and `image_handle` the handle this image was entered
+// with, before `ExitBootServices`.
+pub unsafe fn loaded_image_device(bs: *mut BootServices, image_handle: Handle) -> Option<Handle> {
+	let mut li: *mut c_void = core::ptr::null_mut();
+	let status = unsafe { ((*bs).handle_protocol)(image_handle, &uefi::LOADED_IMAGE_PROTOCOL_GUID, &mut li) };
+	if uefi::is_error(status) || li.is_null() {
+		return None;
+	}
+	let device = unsafe { (*(li as *mut uefi::LoadedImage)).device_handle };
+	if device.is_null() { None } else { Some(device) }
 }
 
 // Every block device the firmware knows about, in the order it reports them.
@@ -135,7 +218,7 @@ pub unsafe fn each_disk(bs: *mut BootServices, mut visit: impl FnMut(FirmwareDis
 		if !present || block_size == 0 {
 			continue;
 		}
-		if visit(FirmwareDisk { proto, media_id, block_size, last_block, io_align }) {
+		if visit(FirmwareDisk { handle, proto, media_id, block_size, last_block, io_align }) {
 			break;
 		}
 	}

@@ -470,6 +470,28 @@ pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
 // are below 0x40), so one `device_type` field classifies every discovered device.
 pub const DEVICE_TYPE_XHCI: u32 = 0x100;
 
+// The name for a device-type code, beside the codes it names.
+//
+// It lived in `lsirq` and nowhere else, so every other reporter of a device printed the raw number:
+// the kernel's DMA isolation report said "device type 2 at 00:01.0" two lines above the same log
+// writing `driver.virtio-blk`, and "type 256" for the xHCI - a number that is a name in exactly one
+// place in the tree. One table, beside the constants, and both readers use it.
+pub fn device_type_name(device_type: u32) -> &'static str {
+	match device_type {
+		VIRTIO_TYPE_NET => "virtio-net",
+		VIRTIO_TYPE_BLOCK => "virtio-blk",
+		VIRTIO_TYPE_CONSOLE => "virtio-console",
+		VIRTIO_TYPE_RNG => "virtio-rng",
+		VIRTIO_TYPE_GPU => "virtio-gpu",
+		VIRTIO_TYPE_INPUT => "virtio-input",
+		VIRTIO_TYPE_SOUND => "virtio-snd",
+		DEVICE_TYPE_XHCI => "xhci",
+		// A code this build does not classify. The NUMBER is kept, because a reader chasing an
+		// unrecognised device needs it and "unknown" alone sends them back to the source.
+		_ => "unknown",
+	}
+}
+
 // What `device_info` writes about one discovered device. The kernel resolves these
 // from the device's PCI configuration at boot; a driver maps the device's MMIO BAR
 // (via a DeviceMemory capability from `device_acquire`) and, for a virtio device,

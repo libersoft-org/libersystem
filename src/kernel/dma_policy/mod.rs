@@ -90,8 +90,13 @@ pub fn admit(device_type: u16, bus: u8, dev: u8, func: u8) -> BindDecision {
 	decision
 }
 
-// LOUD ONCE, NOT LOUD EVERY TIME. A driver that opens its device repeatedly would otherwise turn an
-// audit record into a log flood, and a flood is how something stops being read.
+// RECORDED, NOT PRINTED. `report` is what prints, once the devices have bound, and its own comment
+// says why: "the answer is a list rather than a scattering of lines". This printed a line per device
+// as well, so a boot with eleven untranslated endpoints carried twenty-two lines saying so - the
+// scattering AND the list it exists to replace.
+//
+// The record is still deduplicated: a driver that opens its device repeatedly must not grow the
+// list it is audited from.
 fn record_degraded(entry: Degraded) {
 	let mut degraded = DEGRADED.lock();
 	if degraded.iter().any(|held| *held == entry) {
@@ -103,7 +108,6 @@ fn record_degraded(entry: Degraded) {
 		return;
 	}
 	degraded.push(entry);
-	crate::serial_println!("dma: DEGRADED ISOLATION - device type {} at {:02x}:{:02x}.{} masters the bus UNTRANSLATED", entry.device_type, entry.bus, entry.dev, entry.func);
 }
 
 // Everything currently running untranslated. The report a supervisor reads, and what a test asserts
@@ -119,7 +123,15 @@ pub fn degraded_devices() -> Vec<Degraded> {
 // SAID AT THE END RATHER THAN PER DEVICE, because the question a reader has is "is anything reaching
 // memory untranslated", and the answer is a list rather than a scattering of lines. A system with an
 // enforcing IOMMU and an empty list is the only shape that carries the isolation claim.
+//
+// AND "THE END" HAS TO BE ONE. This was called from the machine report at the top of
+// `boot_userspace`, before a single driver had bound - so it printed `0 device(s) master the bus
+// untranslated` and was then followed by ten lines naming devices that do, which is the exact
+// scattering it exists to replace, under a summary contradicting it. The devices bind in userspace;
+// the summary is printed once they have, which is the first moment its own sentence is true.
 pub fn report() {
+	// AND THE CONTROLLER'S OWN STATE WITH IT. What this machine has to translate WITH and who is
+	// running untranslated are one question with two halves, and a reader wants them together.
 	crate::iommu::report();
 	let degraded = degraded_devices();
 	if enforcing() && degraded.is_empty() {
@@ -128,7 +140,7 @@ pub fn report() {
 	}
 	crate::serial_println!("dma: DEGRADED ISOLATION - {} device(s) master the bus untranslated (enforcing={})", degraded.len(), enforcing());
 	for entry in &degraded {
-		crate::serial_println!("dma:   type {} at {:02x}:{:02x}.{}", entry.device_type, entry.bus, entry.dev, entry.func);
+		crate::serial_println!("dma:   {} at {:02x}:{:02x}.{}", abi::device_type_name(entry.device_type as u32), entry.bus, entry.dev, entry.func);
 	}
 }
 

@@ -70,21 +70,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	exit();
 }
 
-// The device-type name for an owning device's type code (the ABI's classification).
-fn device_type_name(device_type: u32) -> &'static str {
-	match device_type {
-		VIRTIO_TYPE_NET => "virtio-net",
-		VIRTIO_TYPE_BLOCK => "virtio-blk",
-		VIRTIO_TYPE_CONSOLE => "virtio-console",
-		VIRTIO_TYPE_RNG => "virtio-rng",
-		VIRTIO_TYPE_GPU => "virtio-gpu",
-		VIRTIO_TYPE_INPUT => "virtio-input",
-		VIRTIO_TYPE_SOUND => "virtio-snd",
-		DEVICE_TYPE_XHCI => "xhci",
-		_ => "unknown",
-	}
-}
-
 // Append one in-use vector to `out`, as an aligned table row or a JSON object. An
 // MSI-X vector's owner is resolved to its device type through the free device-info
 // query. The table columns match the header: vector, type, bound, device, device-type.

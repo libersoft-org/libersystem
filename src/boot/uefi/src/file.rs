@@ -40,22 +40,62 @@ pub unsafe fn free_file(bs: *mut BootServices, bytes: &[u8]) {
 // described the boundary even for its own reader. `MAX_PATH_UNITS` is the one both check against.
 pub const MAX_PATH_UNITS: usize = 64;
 
+// What the firmware said when it was asked for a file.
+//
+// THE STATUS, AND NOT MERELY ITS ABSENCE. `read_file` answers `Option`, so "this volume does not
+// hold that path" and "this volume could not be read" reached the caller as one `None` - and the
+// loader reads `None` as "the firmware did not mount the medium" and starts a block-level scan of
+// every disk in the machine looking for the file itself. On a medium that simply does not carry the
+// file, that scan cannot succeed and is paid in full: the medium is a CD, the scan mounts every FAT
+// volume it meets, and a mount walks the volume's whole ownership map.
+//
+// The two are different facts about a medium and only one of them is what the fallback is for.
+pub enum FirmwareRead {
+	Bytes(&'static [u8]),
+	// The volume was open and it does not hold this path. There is nothing another reader of the
+	// SAME medium would find.
+	Absent,
+	// The firmware could not be asked - a name this reader cannot encode - or was asked and named a
+	// failure. Another reader of the same medium may well do better, which is what the block-level
+	// FAT backend is for.
+	Failed,
+}
+
 // # Safety
 // `bs` and `root` must be live firmware objects, before `ExitBootServices`. The returned slice is
 // `'static` BY ASSERTION and not by fact: it borrows pages this function allocated, and the caller
 // gives them back with `free_file`. Holding it past that read is a use-after-free (UEFI-005).
 pub unsafe fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> Option<&'static [u8]> {
+	match unsafe { read_file_reported(bs, root, name) } {
+		FirmwareRead::Bytes(bytes) => Some(bytes),
+		_ => None,
+	}
+}
+
+// The same read, saying WHICH of the two failures happened.
+//
+// # Safety
+// The same contract as `read_file`, which is a thin wrapper over this.
+pub unsafe fn read_file_reported(bs: *mut BootServices, root: *mut uefi::FileProtocol, name: &str) -> FirmwareRead {
 	let mut wname = [0u16; MAX_PATH_UNITS];
 	// A name that does not fit is not this name: opening a truncated path would open a different
-	// file, which is worse than not opening one.
+	// file, which is worse than not opening one. `Failed` rather than `Absent`, because this says
+	// nothing about the medium - the block-level backend takes longer paths than this encoder does.
 	if !to_utf16(name, &mut wname) {
-		return None;
+		return FirmwareRead::Failed;
 	}
 
 	let mut file: *mut uefi::FileProtocol = core::ptr::null_mut();
 	let status = unsafe { ((*root).open)(root, &mut file, wname.as_ptr(), uefi::FILE_MODE_READ, 0) };
 	if uefi::is_error(status) || file.is_null() {
-		return None;
+		// THE ONE STATUS THAT IS AN ANSWER ABOUT THE MEDIUM. `EFI_NOT_FOUND` from `Open` is the
+		// firmware saying it read the directory and this path is not in it. Everything else - a
+		// device error, an unsupported volume, a null handle returned with a success status - is
+		// this firmware failing to answer, and another reader of the same medium may still succeed.
+		if status == uefi::STATUS_NOT_FOUND {
+			return FirmwareRead::Absent;
+		}
+		return FirmwareRead::Failed;
 	}
 	// EVERY PATH BELOW CLOSES THE FILE. Two of them used to return without doing so, and a handle
 	// left open is a firmware object that can still move the memory map - the one thing that must
@@ -74,9 +114,11 @@ pub unsafe fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, na
 	let status = unsafe { ((*file).get_info)(file, &uefi::FILE_INFO_GUID, &mut info_size, info as *mut c_void) };
 	let status = if status == uefi::STATUS_BUFFER_TOO_SMALL {
 		if info_size > 64 * 1024 {
-			return None;
+			return FirmwareRead::Failed;
 		}
-		heap_buf.try_reserve_exact(info_size).ok()?;
+		if heap_buf.try_reserve_exact(info_size).is_err() {
+			return FirmwareRead::Failed;
+		}
 		heap_buf.resize(info_size, 0);
 		info = heap_buf.as_mut_ptr();
 		unsafe { ((*file).get_info)(file, &uefi::FILE_INFO_GUID, &mut info_size, info as *mut c_void) }
@@ -84,12 +126,14 @@ pub unsafe fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, na
 		status
 	};
 	if uefi::is_error(status) || info_size < core::mem::size_of::<uefi::FileInfo>() {
-		return None;
+		return FirmwareRead::Failed;
 	}
 	let file_size = unsafe { (*(info as *const uefi::FileInfo)).file_size } as usize;
 
 	let pages = file_size.div_ceil(PAGE_SIZE as usize).max(1);
-	let phys = unsafe { alloc_pages(bs, pages) }?;
+	let Some(phys) = (unsafe { alloc_pages(bs, pages) }) else {
+		return FirmwareRead::Failed;
+	};
 
 	// Read the whole file (loop until the firmware stops handing back bytes).
 	let mut read_total = 0usize;
@@ -104,12 +148,13 @@ pub unsafe fn read_file(bs: *mut BootServices, root: *mut uefi::FileProtocol, na
 	// A SHORT READ IS NOT A FILE. This returned `from_raw_parts(phys, file_size)` however much had
 	// arrived, so a file whose `FileInfo` said one megabyte and whose second read failed became a
 	// one-megabyte slice whose tail was whatever those freshly allocated pages held - handed on as
-	// a kernel image, a bootstrap package or a volume. The pages go back and the answer is None.
+	// a kernel image, a bootstrap package or a volume. The pages go back, and the answer is that
+	// something IS there and this reader could not get it - not that the medium lacks the file.
 	if read_total != file_size {
 		unsafe { ((*bs).free_pages)(phys, pages) };
-		return None;
+		return FirmwareRead::Failed;
 	}
-	Some(unsafe { core::slice::from_raw_parts(phys as *const u8, file_size) })
+	FirmwareRead::Bytes(unsafe { core::slice::from_raw_parts(phys as *const u8, file_size) })
 }
 
 // Closes its handle however the scope ends.

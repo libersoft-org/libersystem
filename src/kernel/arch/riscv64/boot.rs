@@ -662,5 +662,5 @@ fn run_system_manager() {
 	// THE SHARED BOOT TAIL - see the note in the aarch64 port. Four thousand rounds because this
 	// machine settles an order of magnitude more slowly under TCG than the other two, which is a
 	// number this caller passes rather than a reason for a third copy of the policy.
-	crate::boot_userspace(crate::arch::NAME, 4000);
+	crate::boot_userspace(4000);
 }

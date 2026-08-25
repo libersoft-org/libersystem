@@ -388,6 +388,25 @@ qemu_prepare_usb_image() {
 	fi
 }
 
+# The per-device virtio options this machine's endpoints carry.
+#
+# `iommu_platform=on` is how a device tells the guest "the addresses you hand me are not physical
+# ones" - `VIRTIO_F_ACCESS_PLATFORM`. It belongs on every endpoint behind a translating controller
+# and on none in front of one: a device without it programs raw physical addresses, and under an
+# IOMMU that has left bypass those are somebody else's memory. A driver that does not acknowledge
+# the bit gets `FEATURES_OK` refused, which is the loud half; the quiet half is a device that was
+# never told, and there is no message for that at all.
+#
+# One place, so an endpoint cannot be added to this profile without it.
+qemu_virtio_opts() {
+	local base="${1:-}"
+	if [[ "${IOMMU:-0}" == "1" ]]; then
+		[[ -n "$base" ]] && base="$base,"
+		base="${base}iommu_platform=on"
+	fi
+	printf '%s' "$base"
+}
+
 qemu_attach_virtio_blk() {
 	local -n arr=$1
 	local file="$2"
@@ -839,6 +858,38 @@ qemu_run_x86_64() {
 	local ovmf_vars="$QEMU_BUILD_DIR/ovmf-vars.$$.fd"
 	cp "$ovmf_vars_src" "$ovmf_vars"
 
+	# WHETHER THIS MACHINE HAS AN IOMMU IN IT: `IOMMU=1 ./run.sh`.
+	#
+	# The isolation this system implements was exercised by one gate and by no ordinary run, so a
+	# developer boot printed a page of DEGRADED ISOLATION lines describing the HARNESS rather than
+	# the system, and the profile that proves the controller works was one nobody boots by hand.
+	# This is the whole machine under translation: the controller, and every virtio endpoint told
+	# `iommu_platform=on` so it asks the guest for `VIRTIO_F_ACCESS_PLATFORM`.
+	#
+	# IT IS NOT THE DEFAULT, AND THE REASON IS MEASURED RATHER THAN CAUTIOUS. Under a translating
+	# controller `virtio-blk` (x4), `virtio-net`, `virtio-console`, `virtio-input`, `virtio-pointer`
+	# and `virtio-snd` all bind and run - and `virtio-gpu` does not: not one control-queue request
+	# completes, so `GET_DISPLAY_INFO` times out into its fallback size, `RESOURCE_CREATE_2D` fails,
+	# the driver exits, and DeviceManager restarts it three times and gives up. Measured on
+	# 2026-08-25, and the same with `virtio-gpu-pci` in place of `virtio-vga`, so it is the driver or
+	# the DMA path under it rather than the VGA-compatible device model. A default that costs the
+	# display is not a default.
+	#
+	# The suite does not get one either: `qemu-virtio-iommu-x86_64` owns the enforcing profile, boots
+	# the shipping image under it and asserts the bypass-off transition, the hostile cases and that
+	# ordinary traffic still works. Putting a controller under the whole suite would change what
+	# sixty tests are testing without adding a claim that gate does not already make.
+	#
+	# `boot-bypass=on` because the firmware's own drivers read the boot medium before this kernel
+	# exists; the kernel takes it out of bypass and reads the byte back, which is what makes
+	# `enforcing` a fact rather than a hope.
+	local iommu="${IOMMU:-0}"
+	# Two option strings, because not every virtio device here takes the same ones: `virtio-vga` and
+	# the sound device are attached without `disable-legacy=on` and must not acquire it now.
+	local virtio_opts virtio_plain
+	virtio_opts="$(IOMMU="$iommu" qemu_virtio_opts disable-legacy=on)"
+	virtio_plain="$(IOMMU="$iommu" qemu_virtio_opts)"
+
 	local qemu_args=(
 		-machine q35
 		-m "${MEM:-4G}"
@@ -848,12 +899,15 @@ qemu_run_x86_64() {
 		-boot d
 		-serial "${SERIAL:-stdio}"
 	)
+	# BEFORE THE ENDPOINTS IT TRANSLATES, which is the order the gate boots and the order QEMU
+	# realizes devices in.
+	[[ "$iommu" == "1" ]] && qemu_args+=(-device "virtio-iommu-pci,boot-bypass=on")
 
 	# System volume disk: carries the LiberFS volume itself.
 	local volume_image="$QEMU_BUILD_DIR/system-volume-x86_64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${artifact_suffix}.img"
 	if qemu_prepare_system_disk "$volume_image" "$virtio_disk"; then
-		qemu_attach_virtio_blk qemu_args "$virtio_disk" vblk "disable-legacy=on"
+		qemu_attach_virtio_blk qemu_args "$virtio_disk" vblk "$virtio_opts"
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
@@ -911,11 +965,11 @@ qemu_run_x86_64() {
 		fi
 		hostfwd="hostfwd=tcp:127.0.0.1:$port-:80"
 	fi
-	qemu_attach_virtio_net qemu_args vnet0 "$hostfwd" "disable-legacy=on"
+	qemu_attach_virtio_net qemu_args vnet0 "$hostfwd" "$virtio_opts"
 
 	# virtio-serial + virtconsole: mirrors a second console to a file.
 	qemu_args+=(
-		-device virtio-serial-pci,disable-legacy=on
+		-device "virtio-serial-pci,$virtio_opts"
 		-device virtconsole,chardev=vcon
 		-chardev "file,id=vcon,path=$QEMU_BUILD_DIR/virtio-console${artifact_suffix}.out"
 	)
@@ -931,9 +985,9 @@ qemu_run_x86_64() {
 
 	# Keep media disks after USB in PCI discovery order, matching the historical
 	# runner and the volume/device inventory expected by the boot chain.
-	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "disable-legacy=on"
-	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "disable-legacy=on"
-	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "disable-legacy=on"
+	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "$virtio_opts"
+	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "$virtio_opts"
+	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "$virtio_opts"
 
 	# Display backends: parse DISPLAYS env for vnc/spice.
 	qemu_parse_displays qemu-run
@@ -953,7 +1007,7 @@ qemu_run_x86_64() {
 		# The development channel is present in the cold test configuration too: the same
 		# second port on every target is what lets a scenario runner drive a boot over
 		# identical framing, including where the persistent profile does not exist.
-		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-x86_64-test.sock" "disable-legacy=on"
+		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-x86_64-test.sock" "$virtio_opts"
 		# A BRIDGE WITH SOMETHING BEHIND IT, so the PCI walk has a second bus to find. The x86
 		# enumeration followed no bridges and the q35 default topology puts everything on bus 0,
 		# so recursive enumeration could be written and never executed - it is the topology, not
@@ -1007,11 +1061,11 @@ qemu_run_x86_64() {
 	fi
 
 	# Interactive-only devices: virtio-input keyboard/tablet, virtio-vga, virtio-sound.
-	qemu_args+=(-device virtio-keyboard-pci,disable-legacy=on)
-	qemu_args+=(-device virtio-tablet-pci,disable-legacy=on)
-	qemu_args+=(-vga none -device virtio-vga)
+	qemu_args+=(-device "virtio-keyboard-pci,$virtio_opts")
+	qemu_args+=(-device "virtio-tablet-pci,$virtio_opts")
+	qemu_args+=(-vga none -device "virtio-vga${virtio_plain:+,$virtio_plain}")
 	qemu_append_audio qemu_args
-	qemu_args+=(-device virtio-sound-pci,audiodev=snd0)
+	qemu_args+=(-device "virtio-sound-pci,audiodev=snd0${virtio_plain:+,$virtio_plain}")
 
 	# USB passthrough: real USB device (interactive only).
 	if [[ -n "${USB_HOST:-}" ]]; then
@@ -1024,7 +1078,7 @@ qemu_run_x86_64() {
 	# nothing a normal or production boot is built from.
 	if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
 		qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
-		qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "disable-legacy=on"
+		qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "$virtio_opts"
 	fi
 
 	# Interactive control sockets used by screenshot.sh and lab.py.
