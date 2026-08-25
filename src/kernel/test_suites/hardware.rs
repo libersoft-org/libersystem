@@ -290,7 +290,7 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	send_cap(&service_boot_kernel, b"SERVE", service_server, Rights::ALL).expect("the SERVE handoff should send");
 	sched::run_until_idle();
 	let online = service_boot_kernel.recv().expect("the usb StorageService should report in");
-	assert_eq!(&online.bytes[..], b"StorageService: online", "the instance should come up without touching the media (the mount is lazy)");
+	assert_eq!(&online.bytes[..], b"StorageService: online (vol://usb)", "the instance should come up without touching the media (the mount is lazy)");
 
 	// one generated volume.open request for a seeded file, plus the quit sentinel.
 	let uri: &[u8] = b"vol://usb/hello.txt";

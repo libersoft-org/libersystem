@@ -27,6 +27,19 @@ command -v qemu-system-x86_64 >/dev/null || fail "qemu-system-x86_64 is required
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
+# THE ESP THIS GATE TESTS COMES OUT OF THE ISO IT NAMES.
+#
+# It used to be `$BUILD/efiboot.img`, which is a BY-PRODUCT: every medium this tree assembles writes
+# that one path, so whichever `mkimage` ran last owns it. Any gate before this one that runs the test
+# suite leaves the TEST medium there - which carries the factory archive and no system volume - and
+# this gate then either fails on a file it never meant to read (`::/system-volume.img not found`) or,
+# worse, passes having proved the refusal on a medium nobody ships. The gate already requires the
+# shipping ISO two lines up; this reads the ESP out of THAT.
+esp="$work/esp.img"
+xorriso -osirrox on -indev "$ISO" -extract /boot/efiboot.img "$esp" >/dev/null 2>&1 || fail "could not read /boot/efiboot.img out of $ISO"
+[[ -s "$esp" ]] || fail "the ESP extracted from $ISO is empty"
+chmod u+w "$esp"
+
 # One boot, one medium, one serial log.
 boot_medium() {
 	local efi="$1" log="$2" vars="$work/vars.$$.fd"
@@ -45,7 +58,7 @@ boot_medium() {
 # and the second is the more likely of the two to happen quietly. So: this medium loads a kernel,
 # and then the same medium with one byte changed does not.
 efi="$work/efiboot.img"
-cp "$BUILD/efiboot.img" "$efi"
+cp "$esp" "$efi"
 good_log="$work/good.log"
 boot_medium "$efi" "$good_log"
 grep -aq "loader: kernel loaded" "$good_log" || {
@@ -58,7 +71,7 @@ grep -aq "loader: kernel loaded" "$good_log" || {
 # which is the distinction M4 draws, seen from the outside.
 echo "signed-boot: the unaltered medium boots and loads a kernel (with no system volume attached, which is the absent-source case)"
 
-cp "$BUILD/efiboot.img" "$efi"
+cp "$esp" "$efi"
 
 # THE ALTERATION IS ONE BYTE OF THE SIGNED MANIFEST, and it is made where a tamperer would make it:
 # on the medium, after the build. The digest of a payload is what it names, so this is the "manifest
@@ -91,7 +104,7 @@ echo "signed-boot: the loader refused an altered signed manifest and loaded no k
 # published as a module, so the manifest covers the whole of it - and a byte changed inside it must
 # stop the boot the same way. This one is refused AFTER the kernel is loaded, because that is where
 # the image is read; what matters is that it is refused rather than mounted.
-cp "$BUILD/efiboot.img" "$efi"
+cp "$esp" "$efi"
 mcopy -i "$efi" ::/system-volume.img "$work/volume.img" || fail "the medium carries no system volume image"
 printf '\x01' | dd of="$work/volume.img" bs=1 seek=$((1024 * 1024)) count=1 conv=notrunc status=none
 mcopy -o -i "$efi" "$work/volume.img" ::/system-volume.img
@@ -111,7 +124,7 @@ fi
 # downgrade is performed without forging anything, and this is the boot that refuses it.
 volume="$BUILD/system-volume-x86_64.img"
 if [[ -f "$volume" ]]; then
-	cp "$BUILD/efiboot.img" "$efi"
+	cp "$esp" "$efi"
 	cp "$volume" "$work/volume-disk.img"
 	# The signed manifest inside a LiberFS image, found by its own magic: there is no host tool that
 	# writes this format, and this needs to change a byte rather than a file.

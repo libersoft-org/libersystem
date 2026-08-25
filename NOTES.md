@@ -1,5 +1,7 @@
 # Bugs / changes
 
+- when running the app from shell as "xxx.lsexe" and not just "xxx", it doesn't work
+- when image is opened through imgview (like: vol://system/wallpapers> imgview logo.webp) and then escape is pressed, then command line is stuck, CTRL+C helps, but it takes a few seconds before it reacts
 - rename uname to sysver
 - make boot faster (multicore + other optimizations)
 - move creating ISO and IMG from run.sh to build.sh + its command line parameters

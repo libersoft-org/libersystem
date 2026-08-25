@@ -283,6 +283,18 @@ if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 	last="$(grep -h -E '^[[:alnum:]_]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" | tail -1 | sed -E 's/\.\.\..*$//' || true)"
 	[[ -n "$last" ]] || last="unknown"
 	echo "[test-$ARCH] TIMEOUT after $LIMIT; last test: $last" >&2
+	# NO TEST AT ALL RAN, AND THE LOADER SAYS WHY.
+	#
+	# The suite boots ITS kernel off the ESP, and the loader prefers the SYSTEM VOLUME's whenever the
+	# volume carries one - `./image.sh` puts one there and `./build.sh --part volume` does not. So a
+	# tree where a shipping image was assembled after the last test build boots the SHIPPING kernel
+	# under the test harness: userspace comes up, the guest sits at a shell, no test ever runs, and
+	# the only thing said about it is "last test: unknown". Three minutes of nothing, twice, before
+	# the guest log was read closely enough to notice which kernel had booted.
+	if [[ "$last" == "unknown" ]] && grep -aq "loader: kernel read from the system volume" "$GUEST_LOG" 2>/dev/null; then
+		echo "[test-$ARCH] and NOTHING ran: the loader took its kernel off the SYSTEM VOLUME, not the medium this suite staged." >&2
+		echo "[test-$ARCH] A volume carrying a kernel is what \`./image.sh\` produces; rebuild the test-shaped one with:  ./build.sh --part volume" >&2
+	fi
 	exit 124
 fi
 if [[ "$BUILD_ONLY" == "1" ]]; then

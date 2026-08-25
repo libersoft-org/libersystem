@@ -85,13 +85,20 @@ pub mod riscv64;
 #[cfg(target_arch = "riscv64")]
 pub use self::riscv64::*;
 
-// The human-readable name of the compile-target architecture, for the boot log. Only the boot log
-// asks, and the test build has no boot.
+// The human-readable name of the compile-target architecture, for the boot log - the ONE place the
+// port's own name is written, so a machine cannot report one name in its banner and another
+// anywhere else.
+//
+// THE CFGS ARE ASYMMETRIC, AND THAT IS WHAT THE PORTS ARE. x86_64's only reader is `boot_main`,
+// which is the boot tail and carries `not(test)`, so a test build with this constant in it would
+// have a constant nobody reads. The device-tree ports print their banner from a prologue that has
+// no such gate - it is compiled into the test kernel too, because the test kernel boots the same
+// way - so on those two the constant has a reader in both builds and must exist in both.
 #[cfg(all(not(test), target_arch = "x86_64"))]
 pub const NAME: &str = "x86_64";
-#[cfg(all(not(test), target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 pub const NAME: &str = "aarch64";
-#[cfg(all(not(test), target_arch = "riscv64"))]
+#[cfg(target_arch = "riscv64")]
 pub const NAME: &str = "riscv64";
 
 #[cfg(test)]

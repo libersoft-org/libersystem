@@ -306,7 +306,7 @@ fn system_volume_spans_the_disks_capacity() {
 		sched::run_until_idle();
 		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
 		if let Ok(report) = boot_kernel.recv() {
-			assert_eq!(&report.bytes[..], b"StorageService: online", "the service should come up on the prepared disk");
+			assert_eq!(&report.bytes[..], b"StorageService: online (vol://system)", "the service should come up on the prepared disk");
 			online = true;
 			break 'serve;
 		}
@@ -420,7 +420,7 @@ fn system_volume_lands_in_a_gpt_partition() {
 		sched::run_until_idle();
 		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
 		if let Ok(report) = boot_kernel.recv() {
-			assert_eq!(&report.bytes[..], b"StorageService: online", "the service should come up on the GPT disk");
+			assert_eq!(&report.bytes[..], b"StorageService: online (vol://system)", "the service should come up on the GPT disk");
 			online = true;
 			break 'serve;
 		}
@@ -482,7 +482,7 @@ fn a_degenerate_gpt_entry_cannot_kill_the_storage_service() {
 		sched::run_until_idle();
 		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
 		if let Ok(report) = boot_kernel.recv() {
-			assert_eq!(&report.bytes[..], b"StorageService: online", "if it reports at all it reports online");
+			assert_eq!(&report.bytes[..], b"StorageService: online (vol://system)", "if it reports at all it reports online");
 			online = true;
 			break 'serve;
 		}
@@ -516,7 +516,7 @@ fn storage_on_disk(disk: &mut alloc::collections::BTreeMap<u64, alloc::vec::Vec<
 		sched::run_until_idle();
 		pump_block_stand_in(&blk_host, disk, capacity);
 		if let Ok(report) = boot_kernel.recv() {
-			assert_eq!(&report.bytes[..], b"StorageService: online", "if it reports at all it reports online");
+			assert_eq!(&report.bytes[..], b"StorageService: online (vol://system)", "if it reports at all it reports online");
 			return true;
 		}
 	}

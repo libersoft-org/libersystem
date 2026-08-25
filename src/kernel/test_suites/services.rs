@@ -1204,7 +1204,7 @@ fn config_set_survives_a_service_reboot() {
 		sched::run_until_idle();
 		pump_block_stand_in(&blk_host, &mut disk, CAPACITY);
 		if let Ok(report) = storage_boot_kernel.recv() {
-			assert_eq!(&report.bytes[..], b"StorageService: online");
+			assert_eq!(&report.bytes[..], b"StorageService: online (vol://system)");
 			online = true;
 			break;
 		}

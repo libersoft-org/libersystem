@@ -76,9 +76,14 @@ work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
 # One medium, with whichever loader it was given.
+#
+# THE ESP COMES OUT OF THE ISO, not out of `$BUILD/efiboot.img`. That path is a BY-PRODUCT every
+# medium this tree assembles writes, so whichever `mkimage` ran last owns it - and a gate before this
+# one that runs the test suite leaves the TEST medium there. This gate would then have proved its
+# claim about a medium nobody ships, and said nothing about it. Same reasoning as `check-signed-boot`.
 medium_with() {
 	local loader="$1" out="$2"
-	cp "$BUILD/efiboot.img" "$out"
+	cp "$esp" "$out"
 	mcopy -o -i "$out" "$loader" ::/EFI/BOOT/BOOTX64.EFI
 }
 
@@ -95,7 +100,11 @@ boot() {
 	rm -f "$store"
 }
 
-[[ -f "$BUILD/efiboot.img" ]] || fail "no $BUILD/efiboot.img - run ./image.sh --format iso"
+[[ -f "$BUILD/libersystem.iso" ]] || fail "no $BUILD/libersystem.iso - run ./image.sh --format iso"
+esp="$work/esp.img"
+xorriso -osirrox on -indev "$BUILD/libersystem.iso" -extract /boot/efiboot.img "$esp" >/dev/null 2>&1 || fail "could not read /boot/efiboot.img out of $BUILD/libersystem.iso"
+[[ -s "$esp" ]] || fail "the ESP extracted from $BUILD/libersystem.iso is empty"
+chmod u+w "$esp"
 
 signed_medium="$work/signed.img"
 medium_with "$signed" "$signed_medium"

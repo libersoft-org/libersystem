@@ -2,10 +2,10 @@ format=liber-dynamic-wave-report-v2
 target	wave	tools	object_bytes	pie_bytes	unique_provider_bytes	private_bytes	shared_bytes	test_command
 x86_64-unknown-none	1	12	77016	86048	487912	356352	507904	./test.sh --tags service,process,storage
 x86_64-unknown-none	2	11	166184	148096	637192	614400	675840	./test.sh --tags service,process,storage
-x86_64-unknown-none	3	14	96240	122960	849488	692224	913408	./test.sh --tags service,process,storage
+x86_64-unknown-none	3	14	96240	122960	849480	692224	913408	./test.sh --tags service,process,storage
 x86_64-unknown-none	4	9	95600	94680	624400	450560	622592	./test.sh --tags service,process
-x86_64-unknown-none	5	9	501152	337888	2741576	856064	2797568	./test.sh --tags image,audio,service,process,storage
-x86_64-unknown-none	6	20	358168	324016	971592	1118208	1187840	./test.sh --tags service,process,storage,permission-service
+x86_64-unknown-none	5	9	501152	337888	2752560	847872	2809856	./test.sh --tags image,audio,service,process,storage
+x86_64-unknown-none	6	20	358176	324016	971584	1118208	1187840	./test.sh --tags service,process,storage,permission-service
 aarch64-unknown-none	1	12	90536	94800	560520	360448	544768	./test.sh --tags service,process,storage
 aarch64-unknown-none	2	11	181736	156064	729984	737280	729088	./test.sh --tags service,process,storage
 aarch64-unknown-none	3	14	104248	128272	963320	872448	962560	./test.sh --tags service,process,storage
@@ -15,6 +15,6 @@ aarch64-unknown-none	6	20	374016	333048	1149984	1441792	1286144	./test.sh --tags
 riscv64gc-unknown-none-elf	1	12	96096	102544	568560	409600	462848	./test.sh --tags service,process,storage
 riscv64gc-unknown-none-elf	2	11	192888	175160	728136	790528	602112	./test.sh --tags service,process,storage
 riscv64gc-unknown-none-elf	3	14	105016	136560	966800	942080	819200	./test.sh --tags service,process,storage
-riscv64gc-unknown-none-elf	4	9	110408	111640	718368	602112	561152	./test.sh --tags service,process
+riscv64gc-unknown-none-elf	4	9	110408	111640	718360	602112	561152	./test.sh --tags service,process
 riscv64gc-unknown-none-elf	5	9	551136	388816	2854344	1294336	2244608	./test.sh --tags image,audio,service,process,storage
 riscv64gc-unknown-none-elf	6	20	397232	360808	1068672	1531904	1024000	./test.sh --tags service,process,storage,permission-service

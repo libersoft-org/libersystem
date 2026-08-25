@@ -362,7 +362,10 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	}
 
 	crate::serial_println!("{} kernel is starting ...", crate::product::NAME);
-	crate::serial_println!("arch: aarch64 | EL{el} | DTB {dtb:#x}");
+	// THROUGH `arch::NAME`, like x86_64's banner, rather than a second copy of the string. The
+	// constant had exactly one reader left and the two ports that also name themselves spelled it out
+	// by hand, so the port name had three sources and the shared one was the unused one.
+	crate::serial_println!("arch: {} | EL{el} | DTB {dtb:#x}", crate::arch::NAME);
 
 	// The low boot stub already enabled the MMU: TTBR0 = a low identity map (for
 	// the hand-off), TTBR1 = the higher-half kernel plus a physical direct map. The

@@ -172,7 +172,9 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// magic at the target. The UEFI path also carries a GOP framebuffer, so the kernel
 	// draws its earliest boot log to the display instead of programming ramfb itself.
 	let (dtb, uefi_fb) = decode_boot_arg(arg);
-	crate::serial_println!("riscv64: hart {hartid}, DTB @ {dtb:#x}");
+	// THROUGH `arch::NAME`, like the banners on the other two ports - see the note in the aarch64
+	// prologue.
+	crate::serial_println!("arch: {} | hart {hartid} | DTB {dtb:#x}", crate::arch::NAME);
 
 	// The loader's hand-off, taken BEFORE anything else looks at the boot argument - it must not
 	// sit inside a device-tree branch, because under UEFI the firmware exposes no DTB and
