@@ -232,6 +232,7 @@ or preventing further development of `v1`.
 - [ ] [P02M0156 - A check that skips what it cannot read has already answered yes](P02M0156.md)
 - [ ] [P02M0157 - The firmware described something the tables cannot hold, and the kernel used it anyway](P02M0157.md)
 - [ ] [P02M0158 - The boot report names the same device twice and the same component two ways](P02M0158.md)
+- [ ] [P02M0159 - Every boot exercises the degraded DMA path and none exercises the isolated one](P02M0159.md)
 
 ### Definition of done (phase 2)
 
