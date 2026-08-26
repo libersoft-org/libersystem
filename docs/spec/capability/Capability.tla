@@ -50,8 +50,19 @@ RightSets == SUBSET Rights
 \* whose object is not the type the caller asked for, and that refusal is authority rather than
 \* convenience - a channel handle used as a memory object would be a type confusion inside the
 \* kernel, reachable from ring 3.
-NoCap == [obj |-> "none", type |-> "none", rights |-> {}, objgen |-> 0]
-Caps == [obj: Objects, type: Types, rights: RightSets, objgen: 1..MaxGen] \cup {NoCap}
+\* AND IT REMEMBERS WHAT IT WAS DERIVED FROM, which is the only way "authority never widens" can be
+\* stated as the sentence it is.
+\*
+\* `AuthorityNeverWidens` used to say `rights \subseteq MintedRights` - a GLOBAL ceiling, true of a
+\* derived capability that is wider than the one it came from as long as both stay under the mint. So
+\* deleting the source-rights guard from `Duplicate` could not violate it, and the mutation that was
+\* supposed to prove otherwise deleted the guard AND shrank `MintedRights` in the same run: what fired
+\* the invariant was the second change, and the mutation passed while saying nothing about the first.
+\*
+\* `from` is the right set of the capability this one descends from, and the mint's own is the mint.
+\* Containment is then checked at every link rather than only against the root.
+NoCap == [obj |-> "none", type |-> "none", rights |-> {}, from |-> {}, objgen |-> 0]
+Caps == [obj: Objects, type: Types, rights: RightSets, from: RightSets, objgen: 1..MaxGen] \cup {NoCap}
 IsCap(c) == c # NoCap
 
 (*************************************************************************)

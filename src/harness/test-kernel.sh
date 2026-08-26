@@ -99,7 +99,12 @@ aarch64)
 	# 99.4% before the three tests that tipped it, which means any addition at all would have. The
 	# tests that tipped it were cheapened first and re-checked to still fail without their fixes;
 	# what is left is not a hot spot to split but a budget that stopped matching the work.
-	FULL_TIMEOUT=60m
+	# 70m FROM 2026-08-26. The suite grew again - this round added kernel tests for the IOMMU's
+	# present-but-failed state - and `verify-model check` said the budget had fallen under the
+	# measured cost plus its fifth BEFORE a sweep spent an hour finding out at the wall. That is the
+	# whole point of the rule: 60m was 3600 s against a 3606 s floor, six seconds short, and a run
+	# that ends at the wall reports a TIMEOUT that reads exactly like a hang.
+	FULL_TIMEOUT=70m
 	TAG_TIMEOUT=15m
 	;;
 riscv64)
@@ -277,10 +282,16 @@ if [[ "$VERBOSE" == "1" ]]; then print_full_logs; fi
 # NO TEST AT ALL RAN, AND THE LOADER SAYS WHY.
 #
 # The suite boots ITS kernel off the ESP, and the loader prefers the SYSTEM VOLUME's whenever the
-# volume carries one - `./image.sh` puts one there and `./build.sh --part volume` does not. So a tree
-# where a shipping image was assembled after the last test build boots the SHIPPING kernel under the
-# test harness: userspace comes up, the guest sits at a shell, and no test ever runs. Nothing about
-# that looks like a build-order problem from the outside, which is why it has to be said here.
+# volume carries one. So a test medium built from a volume that has a kernel on it boots the wrong
+# kernel: userspace comes up, the guest sits at a shell, and no test ever runs. Nothing about that
+# looks like a build problem from the outside, which is why it has to be said here.
+#
+# NO LONGER REACHABLE BY BUILDING IN AN ORDINARY ORDER, and kept anyway. The two shapes of the system
+# volume used to share one path, so `./image.sh` and `./build.sh --part volume` overwrote each
+# other's and whichever ran last decided which kernel this suite booted. They have their own names
+# now - `check-build-order.sh` holds the tree to that - so an ordinary sequence of commands cannot
+# produce this state. A tree can still be in it for other reasons, and a diagnosis that costs nothing
+# is worth keeping for the day one is.
 #
 # Returns 0 when it recognised the case and printed it, so a caller can stop rather than add a
 # diagnosis about a crash that did not happen.
@@ -288,7 +299,7 @@ wrong_kernel_diagnosis() {
 	grep -aq "loader: kernel read from the system volume" "$GUEST_LOG" 2>/dev/null || return 1
 	grep -haq "^test tags:" "$RUN_LOG" "$GUEST_LOG" 2>/dev/null && return 1
 	echo "[test-$ARCH] NOTHING ran: the loader took its kernel off the SYSTEM VOLUME, not the medium this suite staged." >&2
-	echo "[test-$ARCH] A volume carrying a kernel is what \`./image.sh\` produces; rebuild the test-shaped one with:  ./build.sh --arch $ARCH --part volume" >&2
+	echo "[test-$ARCH] The test medium is built from the shape with no kernel on it; rebuild it with:  ./build.sh --arch $ARCH --part volume" >&2
 	return 0
 }
 

@@ -87,40 +87,83 @@ const IDENTITIES_USED: u32 = 63;
 // hart * 4096`, which is true only of a flat, hart-indexed array whose file N belongs to hart N -
 // and the AIA binding describes machines where none of that holds.
 pub fn configure(info: &fdt::BootInfo) -> Result<(), &'static str> {
-	if info.imsic_base == 0 {
+	configure_layout(&Layout::from_tree(info))
+}
+
+// WHAT `configure` ACTUALLY READS, as a value rather than as seven fields of a much larger struct.
+//
+// The refusals below are the whole of this port's claim about which machines it can address, and a
+// test that wants to drive them needs to build a machine that differs in ONE of them. Pulling them
+// out is what lets it: `BootInfo` carries the RAM map, the CPU list and two other interrupt
+// controllers, none of which this decision looks at.
+#[derive(Clone, Copy)]
+pub struct Layout {
+	pub base: u64,
+	pub size: u64,
+	pub guest_index_bits: u32,
+	pub group_index_bits: u32,
+	pub num_ids: u32,
+	pub harts: [u64; fdt::MAX_CPUS],
+	pub hart_count: u32,
+}
+
+impl Layout {
+	pub fn from_tree(info: &fdt::BootInfo) -> Layout {
+		Layout { base: info.imsic_base, size: info.imsic_size, guest_index_bits: info.imsic_guest_index_bits, group_index_bits: info.imsic_group_index_bits, num_ids: info.imsic_num_ids, harts: info.imsic_harts, hart_count: info.imsic_hart_count }
+	}
+}
+
+pub fn configure_layout(info: &Layout) -> Result<(), &'static str> {
+	if info.base == 0 {
 		return Err("the tree describes no supervisor IMSIC");
 	}
-	if !crate::mem::within_direct_map(info.imsic_base, info.imsic_size) {
+	if !crate::mem::within_direct_map(info.base, info.size) {
 		// An address `phys_to_virt` does not translate; writing an MSI there would be a store into
 		// whatever the arithmetic produced.
 		return Err("the interrupt files lie outside the direct map");
 	}
-	if info.imsic_guest_index_bits != 0 {
+	if info.guest_index_bits != 0 {
 		return Err("the files are guest-indexed, which this kernel does not address");
 	}
-	if info.imsic_group_index_bits != 0 {
+	if info.group_index_bits != 0 {
 		return Err("the files are group-indexed, which this kernel does not address");
 	}
-	if info.imsic_num_ids != 0 && info.imsic_num_ids < IDENTITIES_USED {
+	if info.num_ids != 0 && info.num_ids < IDENTITIES_USED {
 		return Err("the controller carries fewer identities than the MSI window arms");
 	}
-	let files = info.imsic_hart_count;
+	let files = info.hart_count;
 	if files == 0 {
 		return Err("the tree ties the interrupt files to no hart");
 	}
-	if u64::from(files) * HART_STRIDE as u64 > info.imsic_size {
+	if u64::from(files) * HART_STRIDE as u64 > info.size {
 		return Err("the region is smaller than the files the tree declares");
 	}
-	for (index, &hart) in info.imsic_harts[..files as usize].iter().enumerate() {
+	for (index, &hart) in info.harts[..files as usize].iter().enumerate() {
 		if hart != index as u64 {
 			// A machine whose harts are sparse or listed out of order. Addressing it needs the file
 			// INDEX rather than the hart id, which is a translation this port does not carry.
 			return Err("a file's index is not its hart id, which is the only layout this kernel addresses");
 		}
 	}
-	IMSIC_S_BASE.store(info.imsic_base as usize, Ordering::Relaxed);
+	IMSIC_S_BASE.store(info.base as usize, Ordering::Relaxed);
 	FILE_COUNT.store(files, Ordering::Release);
 	Ok(())
+}
+
+// The layout this port is currently pointed at, as a `BootInfo` `configure` would accept.
+//
+// FOR THE TEST THAT DRIVES THE REFUSALS. Each case it checks is this machine's own accepted layout
+// with ONE field changed, so what the refusal is attributed to is the change rather than a fixture
+// that was never a valid machine to begin with - and the accepted value is what puts the port back
+// afterwards.
+#[cfg(test)]
+pub fn snapshot_for_test() -> Layout {
+	let files = FILE_COUNT.load(Ordering::Acquire);
+	let mut harts = [0u64; fdt::MAX_CPUS];
+	for (index, slot) in harts.iter_mut().enumerate() {
+		*slot = index as u64;
+	}
+	Layout { base: base() as u64, size: u64::from(files) * HART_STRIDE as u64, guest_index_bits: 0, group_index_bits: 0, num_ids: IDENTITIES_USED, harts, hart_count: files }
 }
 
 // Whether `hart` has an interrupt file, and so can be the target of a device MSI.
@@ -136,6 +179,23 @@ fn base() -> usize {
 // device's MSI-X table entry stores so its DMA write lands in that hart's IMSIC.
 pub fn msi_address(hart: u64) -> u64 {
 	(base() + hart as usize * HART_STRIDE) as u64
+}
+
+// THE WHOLE S-MODE FILE WINDOW, for a translated endpoint that named no doorbell of its own.
+//
+// A device's MSI lands in one hart's interrupt file, and which hart is chosen when the vector is
+// bound - so the range a domain has to carry is every file, not the one this core happens to be on.
+// `None` on a machine whose IMSIC this port refused: there is no address to map, and handing one out
+// would be programming the layout the boot declined.
+pub fn msi_window() -> Option<(u64, u64)> {
+	if !usable() {
+		return None;
+	}
+	let files = FILE_COUNT.load(Ordering::Acquire) as u64;
+	if files == 0 {
+		return None;
+	}
+	Some((base() as u64, files * HART_STRIDE as u64))
 }
 
 // Select an IMSIC register on THIS hart and write it (siselect then sireg).

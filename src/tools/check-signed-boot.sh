@@ -10,6 +10,8 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
+# The pairing question, asked through the same code that writes it - see the file for why.
+source "src/tools/volume-pairing.sh"
 BUILD=".build/boot"
 ISO="$BUILD/libersystem.iso"
 OVMF_CODE="${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
@@ -122,27 +124,39 @@ fi
 # selected source - and a signed manifest inside it that cannot be READ must stop the boot rather
 # than send the loader on to the text manifest sitting beside it. Damaging one file is how a
 # downgrade is performed without forging anything, and this is the boot that refuses it.
-volume="$BUILD/system-volume-x86_64.img"
+# THE BOOTABLE SHAPE BY NAME. The system volume is built in two shapes - with a kernel on it for a
+# shipping medium, without one for the test harness - and naming them apart is what makes this read
+# deterministic rather than a question about which command was most recent.
+volume="$BUILD/system-volume-bootable-x86_64.img"
+if [[ ! -f "$volume" ]]; then
+	echo "signed-boot: no bootable system volume at $volume, so the selected-source cases are not run" >&2
+	echo "signed-boot:   build it with:  ./build.sh --arch x86_64 --kernel-on-volume --part volume" >&2
+fi
 if [[ -f "$volume" ]]; then
 	# THE MEDIUM AND THE VOLUME HAVE TO HAVE BEEN BUILT TOGETHER, and this says so before the case
 	# rather than after it.
 	#
-	# The loader selects a system volume by the uuid the medium names in `etc/system-volume.uuid`. If
-	# the two were built in the wrong order - `./image.sh` before `./build.sh --part volume`, which
-	# regenerates the volume AND its uuid - the medium names a volume that is not there, the loader
-	# refuses it as unpaired, and the case below never reaches the volume's manifest at all. It then
-	# reported "a damaged signed manifest on the selected volume did NOT stop the boot", which is a
-	# sentence about the trust chain and was a sentence about the build order. Three diagnosis cycles
-	# in one round went to that.
-	paired="$(mcopy -i "$esp" ::/etc/system-volume.uuid - 2>/dev/null | tr -d '\r\n')"
-	actual="$(dd if="$volume" bs=1 skip=80 count=16 status=none | od -An -tx1 | tr -d ' \n')"
-	if [[ -z "$paired" ]]; then
-		fail "the medium names no system volume, so the selected-source rule below has no selected source"
-	fi
-	if [[ "$paired" != "$actual" ]]; then
-		echo "signed-boot: the medium is paired with volume $paired and the volume beside it is $actual" >&2
+	# The loader selects a system volume by the uuid the medium names in its SIGNED manifest, and this
+	# checks that the medium beside this volume names THIS volume. It used to be an order-of-commands
+	# check, because both shapes of the volume were written to one path: an `./image.sh` before a
+	# `./build.sh --part volume` left the medium naming a volume that no longer existed, the loader
+	# refused it as unpaired, and the case below never reached the volume's manifest - reporting "a
+	# damaged signed manifest on the selected volume did NOT stop the boot", which is a sentence
+	# about the trust chain and was a sentence about the build. Three diagnosis cycles went to that.
+	# The shapes have their own names now, so this is a consistency check rather than an order one,
+	# and what it catches is a half-rebuilt tree rather than a wrong sequence.
+	#
+	# READ OUT OF THE MANIFEST, because that is where the pairing lives now. It used to be
+	# `etc/system-volume.uuid`, plain text beside the manifest, which nothing signed - so deleting one
+	# unsigned file turned the pairing off and the loader took the first LiberFS volume the firmware
+	# enumerated. The header's fields before the uuid are variable-length strings, so this asks
+	# whether the volume's own superblock uuid is IN the signed bytes rather than parsing to it: a
+	# sixteen-byte value does not appear there by accident.
+	mcopy -i "$esp" ::/etc/boot.manifest2 "$work/medium.manifest2" 2>/dev/null || fail "the medium carries no signed manifest, so it names no system volume"
+	if ! manifest_names_volume "$work/medium.manifest2" "$volume"; then
+		echo "signed-boot: the medium's signed manifest does not name the volume beside it ($(volume_superblock_uuid "$volume"))" >&2
 		echo "signed-boot:   they were not built together - the loader will refuse this volume as unpaired, and no case below would be testing what it says" >&2
-		echo "signed-boot:   rebuild in order:  ./build.sh --arch x86_64 --part volume && ./image.sh --format iso" >&2
+		echo "signed-boot:   rebuild both from the same tree:  ./build.sh --arch x86_64 --kernel-on-volume --part volume && ./image.sh --format iso" >&2
 		exit 1
 	fi
 	cp "$esp" "$efi"
@@ -163,13 +177,28 @@ if [[ -f "$volume" ]]; then
 		-drive "format=raw,file=$work/volume-disk.img,if=none,id=vol0" \
 		-device virtio-blk-pci,drive=vol0 \
 		-serial "file:$volume_log" >/dev/null 2>&1 || true
-	if grep -aq "cannot be read - refusing to boot from it rather than falling back\|does not check out\|was refused" "$volume_log"; then
-		echo "signed-boot: a selected volume whose signed manifest is damaged stops the boot instead of falling back to the text one"
-	else
-		echo "signed-boot: a damaged signed manifest on the selected volume did NOT stop the boot" >&2
+	# TWO ASSERTIONS, BECAUSE ONE OF THEM WAS ANSWERED BY THE WRONG CODE PATH.
+	#
+	# This greped for "cannot be read - refusing to boot from it rather than falling back", which is
+	# the message `assemble_bootstrap` prints about the BOOTSTRAP SET. So the case went green on a
+	# boot where the bootstrap set was refused and the KERNEL on the same volume fell through to the
+	# text manifest and booted UNAUTHENTICATED - a downgrade performed by damaging one file, which is
+	# exactly what this case exists to catch. The gate was asserting that something refused, not that
+	# the thing it is named for did.
+	#
+	# "Stops the boot" means no kernel was loaded. The message is what says why. Neither alone is the
+	# claim, and a message from an adjacent path satisfies neither.
+	if grep -aq "loader: kernel loaded" "$volume_log"; then
+		echo "signed-boot: a damaged signed manifest on the selected volume did NOT stop the boot - a kernel was loaded anyway" >&2
 		sed -n '1,40p' "$volume_log" >&2
 		exit 1
 	fi
+	if ! grep -aq "signed manifest is there and could not be read\|does not check out\|was refused" "$volume_log"; then
+		echo "signed-boot: the boot stopped and did not say the selected volume's signed manifest was the reason" >&2
+		sed -n '1,40p' "$volume_log" >&2
+		exit 1
+	fi
+	echo "signed-boot: a selected volume whose signed manifest is damaged stops the boot instead of falling back to the text one"
 else
 	echo "signed-boot: no system volume image to test the selected-source rule against" >&2
 	exit 1
@@ -252,8 +281,9 @@ fi
 # perfectly valid, each signed by the same key - composed into a system nobody ever built or tested.
 #
 # So: the volume keeps its release and is the selected source, and the medium's manifest is re-signed
-# for another one. The volume's kernel is verified first and fixes which release this boot is; the
-# medium is then a different one.
+# for another one. Which of the two is verified FIRST is not what this case is about - the medium's
+# is, because that is where the pairing lives - and either order latches one release and refuses the
+# other. What is checked is the message, and the message names the rule rather than the order.
 if [[ -f "$volume" ]]; then
 	mixed="$work/mixed.manifest2"
 	if resign_with "$mixed" --release 9.9.9; then

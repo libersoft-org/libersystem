@@ -412,7 +412,20 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	let controller = if controller.usable() {
 		controller
 	} else if tree.is_none() {
-		crate::serial_println!("aarch64: no device tree - falling back to the {} descriptor; this boot makes no controller-topology claim", QEMU_VIRT_GICV2.name);
+		// A NAMED PROFILE AUTHORISES THIS, NOT THE ABSENCE OF A TREE.
+		//
+		// The AAVMF/U-Boot path hands the kernel no device tree, and it works only because these
+		// addresses are QEMU's. That makes it a single-node regression profile, and the milestone
+		// says so: the static descriptor may be selected by an explicitly named profile and not as
+		// the general answer for every machine that publishes no tree. A real UEFI board with no
+		// tree used to take this branch too and start writing to QEMU `virt`'s GIC addresses.
+		//
+		// The authorising value comes from the boot path over fw_cfg, which is the same mechanism
+		// that says "a harness is watching" everywhere else in this kernel. Nothing else selects it.
+		if !super::boot_profile_authorises_no_dt() {
+			panic!("aarch64: this machine published no device tree and no profile authorises the {} descriptor - refusing to write to addresses no firmware named", QEMU_VIRT_GICV2.name);
+		}
+		crate::serial_println!("aarch64: no device tree, and the {} profile authorises its descriptor; this boot makes no controller-topology claim", QEMU_VIRT_GICV2.name);
 		QEMU_VIRT_GICV2
 	} else {
 		// A TREE THAT DESCRIBES NO CONTROLLER THIS KERNEL CAN DRIVE IS FATAL, and it is fatal here
@@ -783,6 +796,10 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// use - the aarch64 arch backend (context switch, per-CPU, read/write_cr3, timer)
 	// satisfies its whole contract.
 	crate::smp::set_cpu_count(cpu_count as usize);
+	// THE BOOT CORE'S OWN AFFINITY, into the portable table the NUMA binding and the wake IPI read.
+	// It used to hold the subscript `0`, which is the right answer only on a machine whose first
+	// core's MPIDR affinity happens to be zero.
+	crate::smp::set_lapic_id(0, mpidr & super::psci::MPIDR_AFFINITY);
 	// Said out loud here, from the portable counter every port increments as a core reports in.
 	// x86_64 prints the same line from its own prologue; a port that wakes cores and never says how
 	// many answered is one whose secondary bring-up can regress in silence.

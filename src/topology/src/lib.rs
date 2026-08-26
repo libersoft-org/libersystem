@@ -209,12 +209,20 @@ impl Topology {
 
 	// The order a preferred allocation walks: the node itself, then the rest by increasing distance.
 	//
-	// ONE DETERMINISTIC TIE RULE, and it is the node id. Two nodes at equal distance must be tried in
-	// an order that does not depend on how the table happened to be written, or the same machine
-	// gives different placements on different boots for no reason anybody can see.
+	// THE REQUESTED NODE IS FIRST BY CONSTRUCTION, not because its distance happens to be smallest.
+	// The key was `(distance, node id)` and `distance(n, n)` is `LOCAL_DISTANCE` - and firmware is
+	// allowed to declare an off-diagonal distance of exactly that, which is a machine reporting two
+	// nodes equally near and is accepted rather than refused. On such a machine node 0 sorted ahead
+	// of a requested node 1 on the tie rule alone, so `allocate_preferred(1)` reached for node 0's
+	// memory first. "Tries the requested node, then increasing firmware distance" is the contract,
+	// and a tie rule is not allowed to reorder its first word.
+	//
+	// ONE DETERMINISTIC TIE RULE FOR THE REST, and it is the node id. Two nodes at equal distance
+	// must be tried in an order that does not depend on how the table happened to be written, or the
+	// same machine gives different placements on different boots for no reason anybody can see.
 	pub fn fallback_order(&self, from: NodeId) -> Vec<NodeId> {
 		let mut order: Vec<NodeId> = self.nodes.clone();
-		order.sort_by_key(|node| (self.distance(from, *node), node.0));
+		order.sort_by_key(|node| (*node != from, self.distance(from, *node), node.0));
 		order
 	}
 

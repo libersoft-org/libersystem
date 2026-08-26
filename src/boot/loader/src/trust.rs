@@ -154,7 +154,10 @@ pub(crate) struct Expected {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VolumeIdentity {
-	// A source that is not a volume. Its manifest must name none.
+	// A source that is not a volume - the boot medium. Its manifest's volume field is not a claim
+	// about the source; it is the PAIRING, naming which volume this medium belongs with, and zero
+	// there means it names none. So there is nothing to compare it against, and the value is read
+	// out of the verified manifest rather than checked against something read elsewhere.
 	NotAVolume,
 	// A volume, and the boot medium said which one. Anything else is a signed release being used on
 	// a volume it was not made for, which is what pairing exists to stop.
@@ -239,12 +242,12 @@ pub(crate) fn verify_for<'a>(bytes: &'a [u8], expected: &Expected, scratch: &mut
 				return None;
 			}
 		}
-		VolumeIdentity::NotAVolume => {
-			if manifest.volume_uuid != [0u8; 16] {
-				crate::arch::serial::write_str("loader: the manifest names a volume and this source is not one - refusing to boot from it\n");
-				return None;
-			}
-		}
+		// THE PAIRING IS THE POINT OF THIS FIELD ON A BOOT MEDIUM, so a non-zero value here is not a
+		// contradiction to refuse - it is the medium saying which volume it belongs with, signed.
+		// This used to require a zero, because the pairing lived beside the manifest as a plain text
+		// file that nothing signed: anyone who could write the medium could repoint it at another
+		// signed volume, or delete it and get "any signed volume, whichever disk enumerates first".
+		VolumeIdentity::NotAVolume => {}
 	}
 	if !same_release(manifest.release) {
 		crate::arch::serial::write_str("loader: this source belongs to a different release than the one already verified in this boot - refusing to compose a system from two of them\n");

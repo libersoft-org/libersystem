@@ -133,6 +133,20 @@ pub fn set_bus_master(bus: u8, dev: u8, func: u8, on: bool) {
 	common::set_bus_master::<Access>(bus, dev, func, on);
 }
 
+// WHERE THIS PORT'S INTERRUPTS ARE WRITTEN, for a translated endpoint that named no doorbell of its
+// own.
+//
+// A device's MSI is a memory write, so behind a translating IOMMU it needs a mapping like any other
+// write. An endpoint that reports an MSI reserved region says where; one that offers no PROBE at
+// all, or lists no such region, says nothing - and used to end up with no doorbell mapping and no
+// interrupts, silently. This is the address that endpoint would have named.
+pub fn msi_doorbell() -> Option<(u64, u64)> {
+	// The GIC's `GITS_TRANSLATER` on a GICv3/ITS machine, or the v2m frame on a GICv2m one - both
+	// come from the device tree, so this port answers from what it discovered rather than from a
+	// constant. A machine whose controller has no doorbell register raises no MSIs to translate.
+	crate::arch::interrupts::msi_doorbell()
+}
+
 // One function's memory BAR, resolved live from configuration space: its assigned base and its
 // probed size.
 //

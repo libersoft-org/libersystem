@@ -162,7 +162,7 @@ pub fn acquire_bus_master(index: usize) -> bool {
 		// window between "this device can reach memory" and "this device is translated" is the one
 		// place untranslated DMA could happen under an enforcing profile, and the way to have no
 		// such window is to do them in this order.
-		if crate::iommu::present() && !crate::iommu::attach_for(index, entry.bus, entry.dev, entry.func) {
+		if crate::iommu::translating() && !crate::iommu::attach_for(index, entry.bus, entry.dev, entry.func) {
 			return false;
 		}
 		crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, true);
@@ -197,7 +197,7 @@ pub fn release_bus_master(index: usize) {
 		// which the device can still master the bus and is no longer translated, which is the same
 		// hole as the acquire path's, arrived at from the other side.
 		crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, false);
-		if crate::iommu::present() {
+		if crate::iommu::translating() {
 			crate::iommu::detach_for(index, entry.bus, entry.dev, entry.func);
 		}
 		// AND THE AUDIT RECORD GOES WITH IT. `admit` wrote the degraded row when this device was

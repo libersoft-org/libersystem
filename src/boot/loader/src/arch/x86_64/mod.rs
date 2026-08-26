@@ -70,7 +70,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// for a machine whose system volume is missing or unreadable.
 	let init_pkg: &[u8] = match unsafe { crate::BOOTSTRAP } {
 		Some(archive) => archive,
-		None => crate::read_boot_file(bs, root, INIT_PKG_FILE).expect("loader: cannot read init.pkg"),
+		None => crate::read_verified_package(bs, root, INIT_PKG_FILE).expect("loader: cannot read init.pkg"),
 	};
 	// Optional. The system volume is a filesystem on the disk now, not an archive handed over at
 	// boot, so a shipping image carries no `volume.pkg` at all - it survives only as the
@@ -82,7 +82,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// declines to mount it. On exactly that firmware, and only there, the module was silently
 	// absent: a boot that looks identical and a test fixture that is not delivered, on the machines
 	// this loader has a fallback for in the first place.
-	let volume_pkg = crate::read_boot_file(bs, root, VOLUME_PKG_FILE);
+	let volume_pkg = crate::read_verified_package(bs, root, VOLUME_PKG_FILE);
 	serial::write_str("loader: packages loaded\n");
 
 	// Load the kernel ELF: allocate + copy each PT_LOAD segment, record its

@@ -27,18 +27,21 @@ static BOUND: AtomicUsize = AtomicUsize::new(0);
 pub fn bind_online() -> usize {
 	let count = crate::smp::cpu_count();
 	let mut bindings = BINDINGS.lock();
-	if !bindings.is_empty() {
-		return BOUND.load(Ordering::Acquire);
-	}
-	// ALLOC-OK: once at boot, bounded by the core count the bring-up established.
-	if bindings.try_reserve(count).is_err() {
-		return 0;
-	}
-	for _ in 0..count {
-		bindings.push(AtomicU32::new(UNBOUND));
+	if bindings.is_empty() {
+		// ALLOC-OK: once at boot, bounded by the core count the bring-up established.
+		if bindings.try_reserve(count).is_err() {
+			return 0;
+		}
+		for _ in 0..count {
+			bindings.push(AtomicU32::new(UNBOUND));
+		}
 	}
 	let mut bound = 0usize;
-	for cpu in 0..count {
+	for cpu in 0..bindings.len() {
+		if bindings[cpu].load(Ordering::Acquire) != UNBOUND {
+			bound += 1;
+			continue;
+		}
 		// A CORE THAT IS NOT ONLINE GETS NO BINDING, asked of the fact rather than of a stand-in.
 		//
 		// This used to read the core's controller id and treat zero as "never answered", because
@@ -56,6 +59,34 @@ pub fn bind_online() -> usize {
 	}
 	BOUND.store(bound, Ordering::Release);
 	bound
+}
+
+// Bind ONE core, called by that core as it comes online.
+//
+// THE SWEEP ABOVE HAPPENS ONCE AND SOME CORES ARRIVE AFTER IT.
+//
+// Bring-up gives a core a bounded window to report in, and a core that misses it is correctly kept
+// online rather than disowned - the compare-exchange in `smpboot` exists for exactly that race. But
+// the portable online bit is set by the core ITSELF, after bring-up has already moved on, so a core
+// landing in that window was not online when `bind_online` swept and the sweep returned early on
+// every later call. It was scheduled on, it allocated memory, and it belonged to no node for the
+// rest of the boot. A core now binds itself when it arrives, and the sweep fills in whoever was
+// already there.
+pub fn bind_self(cpu: usize) {
+	let bindings = BINDINGS.lock();
+	// Before the sweep has sized the table there is nothing to write into, and nothing to miss
+	// either: `bind_online` will reach this core because it is online by the time it runs.
+	let Some(slot) = bindings.get(cpu) else { return };
+	if slot.load(Ordering::Acquire) != UNBOUND {
+		return;
+	}
+	let hardware = crate::smp::lapic_id(cpu);
+	if let Affinity::Node(node) = crate::mem::topology_node_of_cpu(hardware) {
+		slot.store(node.0, Ordering::Release);
+		BOUND.fetch_add(1, Ordering::AcqRel);
+		crate::serial_println!("numa: core {cpu} arrived after the topology sweep and bound itself to node {}", node.0);
+	}
+	drop(bindings);
 }
 
 // Which node a logical CPU is on. `Unknown` for a core firmware said nothing about, and for every

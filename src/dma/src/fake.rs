@@ -185,5 +185,10 @@ impl Backend for Fake {
 
 // A fault event with the shape a test usually wants, so a queued one is one line rather than seven.
 pub fn event(endpoint: u32, domain: u32, address: u64, access: Access, reason: Fault) -> FaultEvent {
-	FaultEvent { endpoint: EndpointId(endpoint), domain: DomainId(domain), generation: Generation(1), address: DmaAddress(address), access, reason }
+	FaultEvent { endpoint: EndpointId(endpoint), domain: DomainId(domain), generation: Generation(1), address: Some(DmaAddress(address)), access, reason }
+}
+
+// The same, for a controller that faulted and did not record where.
+pub fn event_without_address(endpoint: u32, domain: u32, access: Access, reason: Fault) -> FaultEvent {
+	FaultEvent { endpoint: EndpointId(endpoint), domain: DomainId(domain), generation: Generation(1), address: None, access, reason }
 }

@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 42] = [
+const GATES: [(&str, &str); 43] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -109,9 +109,14 @@ const GATES: [(&str, &str); 42] = [
 	// profiles exercise, so a kernel change selects it - and it is slow, because two of the three
 	// ports are emulated here.
 	("qemu-arch-profiles", "kernel"),
-	// The staged tree's provider chains, and the seven ways the check that reads them can be given
+	// The staged tree's provider chains, and the eight ways the check that reads them can be given
 	// input it cannot read. Its subject is what the build stages, so a userspace change selects it.
 	("staged-consistency", "userspace.build"),
+	// The system volume's two shapes are two artifacts, built in both orders. Its subject is what
+	// the build produces rather than what any component contains - one name for a volume with a
+	// kernel and a volume without one meant whichever command ran last decided what every consumer
+	// read - so a change to what the build stages is what selects it.
+	("build-order", "userspace.build"),
 	// The capability transfer model. Its subject is the handle and channel state
 	// machines, so a kernel change selects it - the specification is a model OF that code, and a
 	// change to it that the model no longer describes is exactly what this is for.

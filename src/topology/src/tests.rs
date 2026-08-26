@@ -615,7 +615,14 @@ fn a_distance_nearer_than_local_is_refused_rather_than_preferred() {
 	// Exactly local between two different nodes is not refused: a machine may report two nodes that
 	// are equally near, and that is a claim about the machine rather than a contradiction.
 	let equal = [(0u32, 0u32, 10u8), (0, 1, 10), (1, 0, 10), (1, 1, 10)];
-	assert!(from_device_tree(&banks, &cpus, &equal).is_ok());
+	let equally_near = from_device_tree(&banks, &cpus, &equal).expect("equally near is a machine, not a contradiction");
+	// AND ON THAT MACHINE THE REQUESTED NODE IS STILL FIRST. The fallback order sorted by
+	// `(distance, node id)` and `distance(n, n)` is this same `10`, so node 0 won the tie against a
+	// REQUESTED node 1 - and every preferred allocation for node 1 reached into node 0 before
+	// touching the memory it asked for. A tie rule may order the fallbacks; it may not displace the
+	// node the caller named.
+	assert_eq!(equally_near.fallback_order(NodeId(1)), &[NodeId(1), NodeId(0)], "the requested node leads, whatever firmware says the distance is");
+	assert_eq!(equally_near.fallback_order(NodeId(0)), &[NodeId(0), NodeId(1)]);
 }
 
 #[test]

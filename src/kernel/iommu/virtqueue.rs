@@ -119,14 +119,19 @@ impl VirtQueue {
 	}
 
 	// Submit a two-descriptor chain - the request the device READS, and the tail it WRITES - and
-	// poll until it completes.
+	// poll until it completes. `Some(written)` is how many bytes the device says it put in the tail.
 	//
 	// BOUNDED, because the device on the other end is emulated by something this milestone's threat
 	// model does not trust. A device that never completes a request must not be able to stop the
 	// kernel; it gets a refusal, and the caller treats that as unconfirmed.
-	pub fn request(&mut self, request_physical: u64, request_len: u32, tail_physical: u64, tail_len: u32) -> bool {
+	//
+	// THE LENGTH IS RETURNED RATHER THAN JUDGED HERE. This answered `bool`, so the only thing a
+	// caller could learn was "the device completed the chain" - and the caller is the one that knows
+	// where in the tail its status byte sits. A queue cannot decide whether four bytes are enough
+	// without knowing what was asked for.
+	pub fn request(&mut self, request_physical: u64, request_len: u32, tail_physical: u64, tail_len: u32) -> Option<u32> {
 		if self.size < 2 {
-			return false;
+			return None;
 		}
 		let head = self.next_descriptor % self.size;
 		let second = (head + 1) % self.size;
@@ -168,23 +173,29 @@ impl VirtQueue {
 				// SAFETY: an element inside this queue's own used ring - `slot` is below the ring size.
 				let (id, written) = unsafe { (read32(element), read32(element + 4)) };
 				if id != head as u32 {
-					return false;
+					return None;
 				}
 				// The device may write less than the tail holds; it may never claim to have written
 				// more, and a length past the buffer is a device describing memory it was not given.
 				if written > tail_len {
-					return false;
+					return None;
 				}
-				return true;
+				return Some(written);
 			}
 			core::hint::spin_loop();
 		}
-		false
+		None
 	}
 
 	// Take one device-written record off the used ring, if the device has queued one. Used for the
-	// EVENT queue, where the device fills buffers the driver supplied.
-	pub fn poll_used(&mut self) -> Option<u16> {
+	// EVENT queue, where the device fills buffers the driver supplied. `(id, written)` is the
+	// descriptor the device completed and how many bytes it put in the buffer.
+	//
+	// BOTH FIELDS OF THE USED ELEMENT, NOT THE SLOT INDEX. This returned `self.used_seen % self.size`
+	// - a number this side computed - and threw away the id and the length the DEVICE wrote. The
+	// caller then copied a full record's worth of bytes out of a buffer that may have been filled
+	// with fewer, or with none, and the tail of the previous report was read as part of this one.
+	pub fn poll_used(&mut self) -> Option<(u32, u32)> {
 		// SAFETY: this queue's own used ring.
 		let used = unsafe { read16(self.used + 2) };
 		if used == self.used_seen {
@@ -192,14 +203,19 @@ impl VirtQueue {
 		}
 		let slot = self.used_seen % self.size;
 		self.used_seen = self.used_seen.wrapping_add(1);
-		Some(slot)
+		core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+		let element = self.used + 4 + slot as u64 * 8;
+		// SAFETY: an element inside this queue's own used ring - `slot` is below the ring size.
+		let (id, written) = unsafe { (read32(element), read32(element + 4)) };
+		Some((id, written))
 	}
 
 	// Offer one buffer to the device on this queue - the shape the event queue needs, where the
-	// device writes and the driver reads.
-	pub fn offer(&mut self, physical: u64, len: u32) {
+	// device writes and the driver reads. Answers the descriptor id the buffer went out on, so the
+	// caller can check that what comes back is what it offered.
+	pub fn offer(&mut self, physical: u64, len: u32) -> Option<u16> {
 		if self.size == 0 {
-			return;
+			return None;
 		}
 		let head = self.next_descriptor % self.size;
 		self.next_descriptor = self.next_descriptor.wrapping_add(1);
@@ -214,5 +230,6 @@ impl VirtQueue {
 			core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 			write16(self.notify, 1);
 		}
+		Some(head)
 	}
 }

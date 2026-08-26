@@ -170,6 +170,29 @@ pub fn unbind(vector: u32) {
 // index, retained for the `lsirq` inventory. `dest` (the x86 LAPIC target) is unused:
 // GICv2m MSIs route through the distributor, which enable_msi_spi points at the boot
 // core.
+// WHERE A DEVICE WRITES TO RAISE AN INTERRUPT ON THIS MACHINE.
+//
+// A translated endpoint's MSI is a memory write and needs a mapping like any other. Which register
+// it is depends on which controller this machine has - a v2m frame's `MSI_SETSPI_NS`, or an ITS's
+// `GITS_TRANSLATER` - and a machine with neither raises no MSI to translate. Answered as the PAGE
+// holding the register, because a mapping is made of pages.
+pub fn msi_doorbell() -> Option<(u64, u64)> {
+	const PAGE: u64 = 0x1000;
+	let at = if USING_ITS.load(Ordering::Acquire) {
+		super::its::translater()
+	} else {
+		let frame = FRAME_BASE.load(Ordering::Acquire);
+		if frame == 0 {
+			return None;
+		}
+		frame + MSI_SETSPI_NS
+	};
+	if at == 0 {
+		return None;
+	}
+	Some((at & !(PAGE - 1), PAGE))
+}
+
 // Give back a vector whose Interrupt never reached its owner - see the x86_64 `release_unused_msi`
 // for why this is a free rather than a retire.
 pub fn release_unused_msi(vector: u32) {

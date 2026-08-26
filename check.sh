@@ -18,11 +18,16 @@ declare -A GATES=(
 	# two ports that never arrive through it, and nothing but a paragraph of prose separated "dormant
 	# by construction" from "unfinished".
 	["arch-surface"]="tools/check-arch-surface.sh"
-	# The staged-tree consistency check, mutated until it refuses. Seven ways an
+	# The staged-tree consistency check, mutated until it refuses. Eight ways an
 	# identity note can be unreadable, missing or contradictory, each applied to the real staged tree
 	# and put back - because what a check does with input it cannot read IS the check, and this one
-	# used to skip all seven and print that everything matched.
+	# used to skip all of them and print that everything matched.
 	["staged-consistency"]="tools/check-staged-consistency.sh"
+	# The system volume's two shapes are two artifacts, built in both orders. One name for a volume
+	# with a kernel and a volume without one meant whichever command ran last decided what every
+	# consumer read - a suite booting the shipping kernel, an ISO naming a volume that no longer
+	# existed - and five investigations in one round ended at the order of two commands.
+	["build-order"]="tools/check-build-order.sh"
 	# Every named interrupt and SMP profile, booted, with an oracle per claim.
 	# A GICv2, a GICv3 without its ITS, one with it, and a RISC-V AIA, at one core and at four - each
 	# of which used to be a runner knob turned by hand once, with its output pasted into a document.

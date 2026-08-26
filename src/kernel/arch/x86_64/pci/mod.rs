@@ -117,6 +117,19 @@ pub fn set_bus_master(bus: u8, dev: u8, func: u8, on: bool) {
 	common::set_bus_master::<Access>(bus, dev, func, on);
 }
 
+// WHERE THIS PORT'S INTERRUPTS ARE WRITTEN, for a translated endpoint that named no doorbell of its
+// own.
+//
+// A device's MSI is a memory write, so behind a translating IOMMU it needs a mapping like any other
+// write. An endpoint that reports an MSI reserved region says where; one that offers no PROBE at
+// all, or lists no such region, says nothing - and used to end up with no doorbell mapping and no
+// interrupts, silently. This is the address that endpoint would have named.
+pub fn msi_doorbell() -> Option<(u64, u64)> {
+	// The local-APIC message window: `0xFEE00000 | dest << 12`, so the whole megabyte belongs to it
+	// and every destination in this machine is inside the one range.
+	Some((0xFEE0_0000, 0x10_0000))
+}
+
 // One function's memory BAR, resolved live from configuration space: its assigned base and its
 // probed size.
 //

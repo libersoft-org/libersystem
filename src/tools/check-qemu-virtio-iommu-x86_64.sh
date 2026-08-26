@@ -103,6 +103,20 @@ fi
 #    everything, including what should work, and satisfy every check above.
 ISO="$BUILD/libersystem.iso"
 [[ -f "$ISO" ]] || fail "no $ISO - run ./image.sh --format iso, which is what the ordinary-traffic half boots"
+# AND IT IS THIS BUILD'S IMAGE, not whichever one is lying about.
+#
+# Existence was the whole test, so an image built before the change under test satisfied both the
+# ordinary-traffic phase and the default-machine phase - and this gate would then have proved the
+# default profile of a kernel nobody had just changed. That is the exact class of false green this
+# tree's verification milestone exists to remove, in the gate that proves the isolation default.
+KERNEL_ELF="$BUILD/cargo/kernel/x86_64-unknown-none/debug/kernel"
+if [[ -f "$KERNEL_ELF" && "$KERNEL_ELF" -nt "$ISO" ]]; then
+	echo "qemu-virtio-iommu: $ISO is older than the kernel it is supposed to carry" >&2
+	echo "qemu-virtio-iommu:   image:  $(date -r "$ISO" '+%Y-%m-%d %H:%M:%S')" >&2
+	echo "qemu-virtio-iommu:   kernel: $(date -r "$KERNEL_ELF" '+%Y-%m-%d %H:%M:%S')" >&2
+	echo "qemu-virtio-iommu:   rebuild the image from this tree:  ./image.sh --format iso" >&2
+	exit 1
+fi
 [[ -f "$OVMF_CODE" ]] || fail "no OVMF firmware at $OVMF_CODE"
 echo "qemu-virtio-iommu: booting the shipping image with an ordinary virtio-net endpoint behind the controller"
 traffic="$work/traffic.log"
@@ -151,6 +165,20 @@ echo "qemu-virtio-iommu: booting the DEFAULT machine, the way an ordinary run do
 default_log="$work/default.log"
 timeout 120 ./run.sh --smp 4 --serial "file:$default_log" >/dev/null 2>&1 || true
 [[ -s "$default_log" ]] || fail "the default run produced no serial output"
+# AND IT DID NOT DIE AFTER SAYING SO.
+#
+# `|| true` is not optional here - an ordinary run does not exit, so the timeout is what ends it -
+# but it also swallowed every way the guest could fail. A boot that printed all the lines below and
+# panicked ten seconds later passed this phase. The greps that follow assert the absence of degraded
+# rows and of faults; these assert the absence of the boot ending badly, which is the same kind of
+# check and was the one missing.
+for bad in "KERNEL PANIC" "GUEST RESET" "loader: FATAL"; do
+	if grep -aq "$bad" "$default_log"; then
+		echo "qemu-virtio-iommu: the default run printed '$bad' - the machine may be translated and it did not survive the boot" >&2
+		grep -a -m 5 -B 2 "$bad" "$default_log" >&2
+		exit 1
+	fi
+done
 
 grep -aq "dma: every bus-mastering device is translated" "$default_log" || {
 	echo "qemu-virtio-iommu: the DEFAULT run is not translated - an ordinary boot walks the degraded path" >&2
@@ -171,11 +199,23 @@ if grep -aq "iommu: FAULT" "$default_log"; then
 fi
 # THE DISPLAY DRIVER IN PARTICULAR. It is the one that could not run behind a controller at all, and
 # it is the reason this was opt-in until the IOVA allocator stopped handing out the null address.
-grep -aq "driver.virtio-gpu: online (" "$default_log" || {
+# EXACTLY ONCE, which is what tells a driver that came up from one that keeps coming up.
+#
+# The line was asserted to be present and nothing looked at how many times. A driver that binds,
+# dies and is restarted prints it again on each attempt, and a restart loop is indistinguishable
+# from a clean bring-up by presence alone - on the very driver this milestone's default profile
+# exists to prove works behind the controller.
+gpu_lines="$(grep -ac "driver.virtio-gpu: online (" "$default_log" || true)"
+if [[ "$gpu_lines" -eq 0 ]]; then
 	echo "qemu-virtio-iommu: virtio-gpu did not come up on the default translated machine" >&2
 	grep -a "virtio-gpu\|devmgr\|DeviceManager:" "$default_log" >&2 || true
 	exit 1
-}
+fi
+if [[ "$gpu_lines" -gt 1 ]]; then
+	echo "qemu-virtio-iommu: virtio-gpu reported itself online $gpu_lines times - it is restarting, not running" >&2
+	grep -a "virtio-gpu" "$default_log" >&2 || true
+	exit 1
+fi
 echo "qemu-virtio-iommu:   the default machine is translated, nothing is degraded, nothing faulted, and the display driver runs"
 
 # AND `--no-iommu` STILL REACHES THE OTHER MACHINE, because a system that can only boot one of them

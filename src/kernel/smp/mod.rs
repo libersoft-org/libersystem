@@ -116,17 +116,20 @@ pub fn cpu_count() -> usize {
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn set_cpu_count(count: usize) {
 	CPU_COUNT.store(count, Ordering::Relaxed);
-	// Publish each core's interrupt-controller id for the cross-core wake-IPI path
-	// (the x86 path fills this from the MADT as APs report in). On QEMU virt
-	// (cortex-a72) the MPIDR affinity is the linear core index and the GICv2 SGI
-	// target list addresses CPU interface N for core N, so the id is the index.
+	// Size the core-id table. It is filled by `set_lapic_id`, from each core as it reports in.
+	//
+	// IT USED TO BE FILLED WITH `0..N` HERE, and that number is not an id - it is a subscript. On
+	// QEMU's `virt` the MPIDR affinity happens to be the linear core index, so the two agreed and
+	// nothing noticed; on a machine whose affinities are sparse - which is most real ones, where
+	// cluster and core sit in different fields - they do not. `numa::bind_online` reads this table
+	// and asks the firmware topology which node that HARDWARE id belongs to, so a subscript standing
+	// in for an affinity binds the wrong node or none, and the wake-IPI path addresses the wrong
+	// core. The index is no longer a plausible answer; a core that has not reported reads as 0, and
+	// `is_online` is what says whether it reported.
 	if LAPIC_IDS.load(Ordering::Acquire).is_null() && count > 0 {
 		// ALLOC-OK: boot, the core id table, built during SMP bring-up
 		let mut ids: Vec<AtomicU64> = Vec::with_capacity(count);
-		for i in 0..count {
-			// ALLOC-OK: CPU bring-up at boot; bounded by MAX_CPUS.
-			ids.push(AtomicU64::new(i as u64));
-		}
+		ids.resize_with(count, || AtomicU64::new(0));
 		LAPIC_IDS.store(Vec::leak(ids).as_mut_ptr(), Ordering::Release);
 	}
 }
@@ -143,6 +146,11 @@ pub fn online_count() -> usize {
 pub fn mark_online(cpu: usize) {
 	mark_in_mask(cpu);
 	ONLINE.fetch_add(1, Ordering::Release);
+	// AND IT TAKES ITS NODE WITH IT. The topology sweep runs once, and a core that arrives after it
+	// - which bring-up permits, and `smpboot`'s compare-exchange exists to keep online - was never
+	// seen by it. Binding here means "online" and "placed" are one transition rather than two with a
+	// window between them.
+	numa::bind_self(cpu);
 }
 
 // The interrupt-controller id of the core with CPU id `cpu` (0 for a core that never reported in).
@@ -163,11 +171,12 @@ pub fn lapic_id(cpu: usize) -> u64 {
 	unsafe { (*base.add(cpu)).load(Ordering::Relaxed) }
 }
 
-// Record the real interrupt-controller id (hart id) of CPU `cpu`. riscv64 uses this
-// because the SBI/OpenSBI boot hart is not necessarily hart 0, so the CPU-id -> hart-id
-// map is not the identity `set_cpu_count` assumes; each hart records its own on entry so
-// the cross-hart wake IPI targets the right hart.
-#[cfg(target_arch = "riscv64")]
+// Record the real interrupt-controller id of CPU `cpu` - a hart id on riscv64, an MPIDR affinity on
+// aarch64. Both ports need it for the same reason: the CPU-id -> hardware-id map is not the identity
+// `set_cpu_count` used to assume. The SBI boot hart is not necessarily hart 0, and an MPIDR affinity
+// is a cluster and a core in separate fields rather than a running count - so each core records its
+// own on entry, and the wake IPI and the NUMA binding both ask the table rather than the subscript.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 pub fn set_lapic_id(cpu: usize, id: u64) {
 	// A core recording its controller id is a core that reached this code, which is what the mask is
 	// about. The two are set together so they cannot disagree.
@@ -334,6 +343,9 @@ extern "C" fn ap_entry() -> ! {
 	report(cpu_id, lapic_id as u64);
 	mark_in_mask(cpu_id);
 	ONLINE.fetch_add(1, Ordering::Release);
+	// The same pairing the device-tree ports make in `mark_online`: a core that came online after
+	// the topology sweep binds itself rather than staying on no node for the boot.
+	numa::bind_self(cpu_id);
 	crate::sched::cpu_idle_loop()
 }
 

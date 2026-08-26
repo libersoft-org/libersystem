@@ -684,12 +684,6 @@ impl FrameAllocator {
 		Some(base)
 	}
 
-	// First-fit a physically contiguous span of `pages`, taking it off the head
-	// of the first run large enough.
-	fn take_contiguous(&mut self, pages: u64) -> Option<u64> {
-		self.take_contiguous_from(pages, None)
-	}
-
 	// A CONTIGUOUS SPAN COMES FROM ONE POOL OR FROM NONE. Assembling one from two nodes would hand a
 	// device a run whose halves are on different memory controllers while the descriptor says it is
 	// one buffer - and the pools are separate bitmaps, so it cannot happen by construction. This
@@ -1465,6 +1459,12 @@ pub fn allocate() -> Option<u64> {
 // Allocate `pages` physically CONTIGUOUS frames, returning the base address of
 // the span - the allocation DMA buffers ride, so a device sees one run. None if
 // no free run is large enough.
+//
+// LOCAL ON THE SAME TERMS AS THE SINGLE-FRAME PATH. `allocate` asks `local_node()` and passes the
+// answer down; this called `take_contiguous`, which passes `None`, so the one allocation whose whole
+// purpose is a device reaching memory was the one that ignored which node the memory is on. The
+// contract says contiguous follows the same strict/preferred rule as everything else, and
+// `take_contiguous_from` already takes the node - it was simply never given one.
 pub fn allocate_contiguous(pages: usize) -> Option<u64> {
 	if pages == 0 {
 		return None;
@@ -1472,7 +1472,8 @@ pub fn allocate_contiguous(pages: usize) -> Option<u64> {
 	if injected_failure() {
 		return None;
 	}
-	ALLOCATOR.lock().take_contiguous(pages as u64)
+	let want = crate::smp::numa::local_node();
+	ALLOCATOR.lock().take_contiguous_from(pages as u64, want)
 }
 
 // Return a physical frame to the pool (re-coalescing with its neighbors, so

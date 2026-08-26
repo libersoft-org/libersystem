@@ -82,7 +82,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// serve block reads on the server end until that client closes.
 		let (blk_server, blk_client): (u64, u64) = match channel() {
 			Some(pair) => pair,
-			None => common::online_and_stand(bootstrap, b"driver.virtio-blk: online"),
+			// ADDRESSED AND SAID WHY, like every other exit from this function. This reported the
+			// bare `driver.virtio-blk: online` while its neighbour eight lines up goes through
+			// `describe` - so two instances failing the same way printed the same string, and the
+			// word was "online" for a driver with no service channel to be online on.
+			None => {
+				let mut line = [0u8; 64];
+				let n = common::describe(&mut line, b"virtio-blk", &device, b"no channel");
+				common::online_and_stand(bootstrap, &line[..n])
+			}
 		};
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-blk", &device, if ok { b"volume archive" } else { b"" });

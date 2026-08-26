@@ -37,6 +37,7 @@ LOADER_EFI="${LOADER_EFI:-$REPO_ROOT/.build/cargo/loader/x86_64-unknown-uefi/deb
 # product metadata (single source of truth)
 # shellcheck source=/dev/null
 source "$REPO_ROOT/product.conf"
+source "$REPO_ROOT/src/tools/volume-pairing.sh"
 
 BUILD="$REPO_ROOT/.build/boot"
 SLUG="$(echo "$PRODUCT_NAME" | tr '[:upper:]' '[:lower:]')"
@@ -225,7 +226,7 @@ stage_bootstrap_files() {
 # manifest with the kernel alone, which is still a source that can be checked rather than one the
 # loader has to take on trust.
 stage_boot_manifest() {
-	local image="$1" staged_kernel="$2" arch="${3:-}" payload="${4:-}" payload_name="${5:-}"
+	local image="$1" staged_kernel="$2" arch="${3:-}" payload="${4:-}" payload_name="${5:-}" pair_arch="${6:-}"
 	local out="$BUILD/boot.manifest.$$"
 	if [[ -n "$arch" ]]; then
 		cp "$BUILD/bootstrap-${arch}/etc/boot.manifest" "$out"
@@ -238,7 +239,7 @@ stage_boot_manifest() {
 	stamp_epoch "$out"
 	mcopy -i "$image" "$out" ::/etc/boot.manifest
 	rm -f "$out"
-	stage_signed_boot_manifest "$image" "$staged_kernel" "$arch" "$payload" "$payload_name"
+	stage_signed_boot_manifest "$image" "$staged_kernel" "$arch" "$payload" "$payload_name" "$pair_arch"
 }
 
 # The SIGNED manifest for this medium, beside the text one.
@@ -249,8 +250,16 @@ stage_boot_manifest() {
 #
 # A medium without a bootstrap set gets a manifest with the kernel alone: still a source that can be
 # checked rather than one the loader has to take on trust.
+#
+# AND IT NAMES THE VOLUME THIS MEDIUM IS PAIRED WITH, in the one field of the manifest header made
+# for it. That value used to be a zero and the pairing lived beside the manifest as a plain text
+# file, `etc/system-volume.uuid`, which nothing signed - so anyone who could write the medium could
+# repoint it at another signed volume, or DELETE it, which is easier still: the loader then falls
+# back to "any signed volume", chosen by whichever disk the firmware enumerates first. That is the
+# behaviour the pairing was written to remove, reachable by removing one unsigned file. It is policy
+# metadata, so it goes in the signed header rather than in a payload row beside the kernel.
 stage_signed_boot_manifest() {
-	local image="$1" staged_kernel="$2" arch="$3" payload="${4:-}" payload_name="${5:-}"
+	local image="$1" staged_kernel="$2" arch="$3" payload="${4:-}" payload_name="${5:-}" pair_arch="${6:-}"
 	local out="$BUILD/boot.manifest2.$$"
 	local release
 	release="$(sed -n 's/^PRODUCT_VERSION="\(.*\)"/\1/p;/^PRODUCT_VERSION=/q' "$REPO_ROOT/product.conf")"
@@ -272,9 +281,13 @@ stage_signed_boot_manifest() {
 			rows+=(--row "program:libexec/$(basename "$program")=$program")
 		done
 	fi
+	local paired=00000000000000000000000000000000
+	if [[ -n "$pair_arch" ]]; then
+		paired="$(resolve_volume_pairing "$pair_arch")"
+	fi
 	(cd "$REPO_ROOT/src/tools/sign-manifest" && cargo run --quiet -- \
 		--profile test-trust --product LiberSystem --arch "${arch:-x86_64}" --source boot-medium \
-		--release "$release" --volume-uuid 00000000000000000000000000000000 \
+		--release "$release" --volume-uuid "$paired" \
 		"${rows[@]}" --out "$out") >&2 || die "the boot medium's manifest could not be signed"
 	ensure_dir "$image" ::/etc
 	stamp_epoch "$out"
@@ -282,21 +295,25 @@ stage_signed_boot_manifest() {
 	rm -f "$out"
 }
 
-# WHICH volume this boot medium is paired with.
+# WHICH volume this boot medium is paired with, as the value the signed manifest carries.
 #
-# The loader has long read `etc/system-volume.uuid` and nothing ever wrote it, so every
-# image this tree built took the "the boot medium names no system volume" fallback and said so in
-# its own boot log - a mechanism that looked implemented and was dead. Two LiberSystem disks in one
-# machine then let the firmware's block-handle order decide which one booted.
+# The loader has long read a pairing and nothing ever wrote it, so every image this tree built took
+# the "the boot medium names no system volume" fallback and said so in its own boot log - a mechanism
+# that looked implemented and was dead. Two LiberSystem disks in one machine then let the firmware's
+# block-handle order decide which one booted.
 #
-# The value comes from the sidecar `mkpackages` writes from the same `FormatOpts.uuid` the
-# superblock got, and `assert_pairing_matches_volume` checks it against the superblock actually on
-# the image - because a pairing file naming a volume the image does not contain is WORSE than none:
-# the loader then declines the volume that is really there.
-stage_volume_pairing() {
-	local image="$1" arch="${2:-x86_64}"
-	local uuid_file="$BUILD/system-volume-${arch}.uuid"
-	local volume="$BUILD/system-volume-${arch}.img"
+# The value comes from the sidecar `mkpackages` writes from the same `FormatOpts.uuid` the superblock
+# got, and it is checked against the superblock actually on the image - because a pairing naming a
+# volume the image does not contain is WORSE than none: the loader then declines the volume that is
+# really there.
+#
+# IT IS PRINTED RATHER THAN STAGED. It used to be `mcopy`d in as `etc/system-volume.uuid`, an
+# unsigned file the loader trusted to choose which volume to boot. Now it goes into the manifest that
+# is signed over this medium, and there is no second copy of it anywhere for anyone to edit.
+resolve_volume_pairing() {
+	local arch="${1:-x86_64}"
+	local uuid_file="$BUILD/system-volume-bootable-${arch}.uuid"
+	local volume="$BUILD/system-volume-bootable-${arch}.img"
 	if [[ ! -f "$uuid_file" ]]; then
 		# A MEDIUM CARRYING A VOLUME AND NO PAIRING IS A BUILD ERROR, not a warning.
 		#
@@ -308,36 +325,26 @@ stage_volume_pairing() {
 		# A medium that deliberately names nothing - the shipping ISO stages no set - has no volume
 		# either, and that stays permitted and says so.
 		if [[ -f "$volume" ]]; then
-			die "the medium carries $volume and no pairing file at $uuid_file - the loader would fall back to firmware enumeration order, which is what the pairing exists to stop"
+			die "the medium carries $volume and no pairing at $uuid_file - the loader would fall back to firmware enumeration order, which is what the pairing exists to stop"
 		fi
 		echo "mkimage: no system volume on this medium, so it names none" >&2
+		printf '00000000000000000000000000000000'
 		return 0
 	fi
-	assert_pairing_matches_volume "$uuid_file" "$BUILD/system-volume-${arch}.img"
-	# `::/etc` already exists when the bootstrap set was staged, and when the boot manifest was
-	# written before this - which is every medium, since they all carry one now.
-	ensure_dir "$image" ::/etc
-	stamp_epoch "$uuid_file"
-	mcopy -i "$image" "$uuid_file" ::/etc/system-volume.uuid
+	assert_pairing_matches_volume "$uuid_file" "$volume"
+	tr -d '[:space:]-' <"$uuid_file" | tr 'A-F' 'a-f'
 }
 
-# The pairing file and the volume's own superblock must agree. Checked HERE, in the image gate,
+# The pairing and the volume's own superblock must agree. Checked HERE, where the pairing is written,
 # rather than at boot: at boot the only thing the loader can do about a mismatch is decline the
-# volume, which is the failure this is meant to prevent.
-#
-# The uuid is 16 raw bytes at offset 80 of the LiberFS superblock, which is block 0 of the image.
+# volume, which is the failure this is meant to prevent. `check-signed-boot.sh` asks the same
+# question of a finished medium, through the same code, because a check that only runs where a value
+# is WRITTEN says nothing about a medium assembled before the value changed.
 assert_pairing_matches_volume() {
-	local uuid_file="$1" volume="$2"
-	# A pairing naming a volume that is not on THIS medium is legitimate - that is the multi-disk
-	# case the mechanism is for, an ESP naming a volume on another disk - so there is nothing to
-	# compare and nothing wrong. Said out loud rather than left as a bare `return 0`, which reads as
-	# neither a decision nor an oversight.
-	[[ -f "$volume" ]] || return 0
-	local declared actual
-	declared="$(tr -d '[:space:]-' <"$uuid_file" | tr 'A-F' 'a-f')"
-	actual="$(dd if="$volume" bs=1 skip=80 count=16 status=none | od -An -tx1 | tr -d ' \n')"
-	if [[ "$declared" != "$actual" ]]; then
-		die "the pairing file names volume $declared but the system volume's superblock says $actual - the loader would decline the volume that is actually on this image"
+	local uuid_file="$1" volume="$2" declared
+	declared="$(cat "$uuid_file")"
+	if ! pairing_matches_volume "$declared" "$volume"; then
+		die "the pairing names volume $(tr -d '[:space:]-' <"$uuid_file" | tr 'A-F' 'a-f') but the system volume's superblock says $(volume_superblock_uuid "$volume") - the loader would decline the volume that is actually on this image"
 	fi
 }
 
@@ -372,7 +379,7 @@ make_iso() {
 	# booted the archive-carrying ISO. The device-tree runners do build their own ESP - but the
 	# x86_64 runner calls this script and boots what it returns, which is how a shipping medium and
 	# a test medium had become one artifact in the first place.
-	local payload="$BUILD/system-volume-x86_64.img" payload_name="system-volume.img"
+	local payload="$BUILD/system-volume-bootable-x86_64.img" payload_name="system-volume.img"
 	if [[ "$test_medium" == "1" ]]; then
 		# Architecture-qualified in the build directory, staged under the plain name the kernel
 		# looks it up by. The unqualified BUILD file no longer exists: every architecture wrote it,
@@ -381,7 +388,10 @@ make_iso() {
 		payload_name="$VOLUME_PACKAGE"
 		[[ -f "$payload" ]] || die "testiso: no volume package at $payload (run \`just packages\`)"
 	else
-		[[ -f "$payload" ]] || die "iso: no system volume at $payload (run \`just system-volume\`)"
+		# A SHAPE THAT IS NOT THERE IS LOUDLY ABSENT, which is the improvement. Before the two shapes
+		# had two names, a consumer always found A file and could not tell which one it was, so it
+		# read the wrong one silently; now it may find none, and the answer to that names the command.
+		[[ -f "$payload" ]] || die "iso: no bootable system volume at $payload - build it with:  ./build.sh --arch x86_64 --kernel-on-volume --part volume"
 	fi
 	# The init package is counted whether or not it is staged: it is the smaller of the two payloads
 	# and over-sizing a FAT image by a few megabytes is cheaper than getting it wrong.
@@ -407,13 +417,12 @@ make_iso() {
 		stage_bootstrap_files "$efi_img" x86_64
 		stage_boot_manifest "$efi_img" "$staged" x86_64 "$payload" "$payload_name"
 	else
-		stage_boot_manifest "$efi_img" "$staged" "" "$payload" "$payload_name"
-		# THE SHIPPING MEDIUM ONLY. It carries the system volume as a file on this same filesystem,
-		# so naming that volume is true of it. The TEST medium carries the factory archive and no
-		# volume at all - a pairing file there would name a volume the medium does not have, which
-		# is the one case worse than no pairing: the loader would decline whatever volume it did
-		# find rather than fall back cleanly.
-		stage_volume_pairing "$efi_img" x86_64
+		# THE SHIPPING MEDIUM NAMES ITS VOLUME. It carries the system volume as a file on this same
+		# filesystem, so naming that volume is true of it. The TEST medium above carries the factory
+		# archive and no volume at all - naming one there would name a volume the medium does not
+		# have, which is the one case worse than no pairing: the loader would decline whatever volume
+		# it did find rather than fall back cleanly.
+		stage_boot_manifest "$efi_img" "$staged" "" "$payload" "$payload_name" x86_64
 	fi
 	stamp_epoch "$payload"
 	mcopy -i "$efi_img" "$payload" "::/$payload_name"
@@ -498,8 +507,7 @@ make_img() {
 	# `libexec/`, assembled by the same loader code. `init.pkg` was the second mechanism for this
 	# one job, and the only one of the two whose programs could not be replaced individually.
 	stage_bootstrap_files "$esp" x86_64
-	stage_boot_manifest "$esp" "$staged" x86_64
-	stage_volume_pairing "$esp" x86_64
+	stage_boot_manifest "$esp" "$staged" x86_64 "" "" x86_64
 	# No volume archive: the system volume is a filesystem in partition 2, and the archive exists
 	# only as the kernel test suite's fixture.
 
@@ -509,7 +517,7 @@ make_img() {
 
 	# Lay the system volume into partition 2. Built by `just system-volume`, which runs after the
 	# kernel so the image carries the kernel that was just linked.
-	local volume="$BUILD/system-volume-x86_64.img"
+	local volume="$BUILD/system-volume-bootable-x86_64.img"
 	if [[ -f "$volume" ]]; then
 		local sys_start sys_sectors
 		sys_start="$(sgdisk -i 2 "$out" | awk '/^First sector:/ {print $3}')"
@@ -590,7 +598,7 @@ image_input_key() {
 		printf 'bootstrap=absent\n'
 	fi
 	# The pairing sidecar, which decides which volume the medium declares itself paired with.
-	local uuid_file="$BUILD/system-volume-x86_64.uuid"
+	local uuid_file="$BUILD/system-volume-bootable-x86_64.uuid"
 	if [[ -f "$uuid_file" ]]; then
 		sha256sum "$uuid_file"
 	else
@@ -599,7 +607,7 @@ image_input_key() {
 	# BOTH payloads are hashed, whichever medium is being built: the shipping ISO carries the
 	# system volume and the test ISO the archive, and keying on only one would serve a stale image
 	# whenever the other changed. `mode=` above already separates the two outputs.
-	sha256sum "$0" "$REPO_ROOT/src/tools/stage-kernel.sh" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg" "$BUILD/volume-x86_64.pkg" "$BUILD/system-volume-x86_64.img"
+	sha256sum "$0" "$REPO_ROOT/src/tools/stage-kernel.sh" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg" "$BUILD/volume-x86_64.pkg" "$BUILD/system-volume-bootable-x86_64.img"
 }
 
 key="$(image_input_key | sha256sum | awk '{print $1}')"

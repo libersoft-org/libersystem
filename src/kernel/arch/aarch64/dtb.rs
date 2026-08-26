@@ -39,6 +39,19 @@ unsafe fn locate(hint: u64) -> Option<u64> {
 	if hint != 0 && unsafe { at(hint) }.is_valid() {
 		return Some(hint);
 	}
+	// A POINTER THAT WAS GIVEN AND IS NOT AN FDT IS AN ERROR, not an absence.
+	//
+	// Firmware handing over a blob that does not carry an FDT header is firmware this kernel cannot
+	// believe about anything, and the fallbacks below are for a boot path that published NO pointer
+	// at all - the fixed address this tree's runner loads a dumped tree at, and a scan of low DRAM.
+	// Going looking for a tree somewhere else, after being told where one is and finding it is not
+	// there, is how a corrupt pointer ended up selecting a static QEMU descriptor: `parse` answered
+	// `None`, which is the same value a machine with no tree produces, and the caller could not tell
+	// the two apart.
+	if hint != 0 {
+		crate::serial_println!("dtb: the boot path published a device tree at {hint:#x} and there is no FDT header there - this kernel will not go looking for another one");
+		return None;
+	}
 	if unsafe { at(QEMU_DTB_ADDR) }.is_valid() {
 		return Some(QEMU_DTB_ADDR);
 	}

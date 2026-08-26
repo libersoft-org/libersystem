@@ -198,7 +198,7 @@ fn read_uuid(mut device: disk::FirmwareDisk) -> Option<([u8; 16], [u8; 16])> {
 // TWO LIBERSYSTEM VOLUMES IN ONE MACHINE, in either handle order.
 //
 // This is the finding the loader's milestone is named for. The boot medium names the volume it
-// belongs to (`etc/system-volume.uuid`), the volume carries that identity in its superblock, and the
+// belongs to (in its own signed manifest), the volume carries that identity in its superblock, and the
 // loader is supposed to pair them - so that two LiberSystem disks in one machine do not both match
 // and let the firmware's handle order decide which system boots. The mechanism was finished and had
 // never been run: it lives in a UEFI binary.

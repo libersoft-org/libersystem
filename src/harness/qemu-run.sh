@@ -600,7 +600,15 @@ qemu_build_esp() {
 	printf '%s  kernel\n' "$(sha256sum "$STAGED_KERNEL" | cut -d" " -f1)" >>"$manifest"
 	mcopy -i "$ESP" "$manifest" ::/etc/boot.manifest
 	rm -f "$manifest"
-	stage_signed_boot_manifest "$ESP" "$bootstrap" "$arch"
+	# THE FACTORY ARCHIVE IS COVERED BY THE MANIFEST, because the loader hands it to the kernel.
+	#
+	# It is staged below and used to be staged with nothing vouching for it - a `package:` row was
+	# what the manifest format has always had for exactly this, and no producer wrote one for this
+	# medium. The loader now checks the row before publishing the archive as a boot module, so a
+	# medium that carries the file and does not name it is a medium the loader refuses. Resolved
+	# before the manifest is signed, because the row has to be in it.
+	local volume_pkg="$QEMU_BUILD_DIR/volume-${arch}.pkg"
+	stage_signed_boot_manifest "$ESP" "$bootstrap" "$arch" "$volume_pkg"
 	# ONE BYTE OF THE SIGNED MANIFEST, FOR THE GATE THAT PROVES THE REFUSAL. The x86_64 signed-boot
 	# gate builds its own medium out of the shipping ISO; these two ports have no shipping ISO, and
 	# their medium is assembled here - so a gate that means to boot a TAMPERED one on them has to be
@@ -615,8 +623,8 @@ qemu_build_esp() {
 		echo "qemu-run: the signed manifest on this ESP was DAMAGED on purpose (DAMAGE_SIGNED_MANIFEST=1)" >&2
 	fi
 	# The factory archive still travels for the tests that read it as a fixture.
-	local volume_pkg="$QEMU_BUILD_DIR/volume-${arch}.pkg"
 	[[ -f "$volume_pkg" ]] && mcopy -i "$ESP" "$volume_pkg" ::/volume.pkg
+	return 0
 }
 
 # The SIGNED manifest for the boot medium, beside the text one.
@@ -627,7 +635,7 @@ qemu_build_esp() {
 # Signed with the published test key, through the tool that owns it. A build that cannot sign is a
 # build that stops here rather than staging a medium whose signed manifest is missing or stale.
 stage_signed_boot_manifest() {
-	local esp="$1" bootstrap="$2" arch="$3"
+	local esp="$1" bootstrap="$2" arch="$3" package="${4:-}"
 	local out="$QEMU_BUILD_DIR/boot.manifest2.$$"
 	# The release the manifest names, out of the one file that holds it.
 	local PRODUCT_VERSION_FOR_MANIFEST
@@ -640,6 +648,11 @@ stage_signed_boot_manifest() {
 			[[ -f "$program" ]] || continue
 			rows+=(--row "program:libexec/$(basename "$program")=$program")
 		done
+	fi
+	# The factory archive, under the destination it is staged at. A medium that carries it and does
+	# not name it is one the loader refuses rather than one it takes on trust.
+	if [[ -n "$package" && -f "$package" ]]; then
+		rows+=(--row "package:volume.pkg=$package")
 	fi
 	(cd "$HERE/../tools/sign-manifest" && cargo run --quiet -- \
 		--profile test-trust --product LiberSystem --arch "$arch" --source boot-medium \

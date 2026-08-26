@@ -152,6 +152,20 @@ pub fn boot_profile() -> Option<&'static str> {
 	}
 }
 
+// Whether this boot is the named QEMU no-device-tree regression profile.
+//
+// A BOOT WITH NO TREE HAS NO WAY TO NAME ITSELF, and that is the honest answer rather than a gap to
+// paper over. The machine description is the tree; without one there is no fw-cfg node to read a
+// profile from and no firmware table this port parses. So the authorisation is compiled in, and the
+// harness that boots the profile is what sets it.
+//
+// The default is NO. A machine that publishes no device tree gets a named refusal instead of QEMU
+// `virt`'s GIC addresses - which is what a real ARM UEFI server, describing itself through ACPI this
+// port does not read, would otherwise have been given.
+pub fn boot_profile_authorises_no_dt() -> bool {
+	option_env!("LIBER_NO_DT_PROFILE").is_some_and(|value| value == "1")
+}
+
 // Write the CPU's model name into `out`, returning the byte count. aarch64 exposes
 // no brand string; decode MIDR_EL1's implementer + part number to a name (a small
 // table of the parts we run on), falling back to the raw ids. Feeds `lscpu`.

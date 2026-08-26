@@ -249,10 +249,16 @@ pub fn encode_probe(endpoint: u32) -> Vec<u8> {
 //
 // EVERY PROPERTY IS SKIPPED BY ITS OWN DECLARED LENGTH, so a type this driver does not know costs it
 // nothing - which is the point of the length field and the only way this survives a device that
-// reports more than it did when this was written. A property whose length runs past the buffer ends
-// the walk: the device is describing memory it did not send, and the properties behind it cannot be
-// located any more.
-pub fn decode_probe(properties: &[u8]) -> Vec<ProbedRegion> {
+// reports more than it did when this was written.
+//
+// A LIST THAT WAS CUT SHORT IS AN ERROR, NOT A SHORTER LIST. A property whose length runs past the
+// buffer ends the walk - the device is describing memory it did not send, and nothing behind it can
+// be located any more - and this used to return whatever had been collected before that point, which
+// the caller could not tell from a complete answer. What may be missing is a reserved hole the
+// allocator must avoid or the doorbell the endpoint's interrupts go through, so the answer is
+// refused rather than trimmed. The same rule as the status byte, applied to the reply that says
+// which addresses this domain must not use.
+pub fn decode_probe(properties: &[u8]) -> Result<Vec<ProbedRegion>, Fault> {
 	let mut out = Vec::new();
 	let mut at = 0usize;
 	while at + PROBE_PROPERTY_HEADER <= properties.len() {
@@ -263,24 +269,32 @@ pub fn decode_probe(properties: &[u8]) -> Vec<ProbedRegion> {
 			break;
 		}
 		let body = at + PROBE_PROPERTY_HEADER;
-		let Some(end) = body.checked_add(length) else { break };
+		let Some(end) = body.checked_add(length) else { return Err(Fault::Malformed) };
 		if end > properties.len() {
-			break;
+			return Err(Fault::Malformed);
 		}
 		if kind == PROBE_T_RESV_MEM && length >= PROBE_RESV_MEM_LEN {
 			let subtype = properties[body];
 			let start = le64(properties, body + 4);
 			// INCLUSIVE ON THE WIRE, a length everywhere else. A region whose end is below its start
-			// is a device contradicting itself and is dropped rather than turned into a huge one.
+			// is a device contradicting itself and is dropped rather than turned into a huge one, and
+			// one ending at the top of the address space is a length this arithmetic cannot express -
+			// which wrapped to zero rather than saying so.
 			let last = le64(properties, body + 12);
 			if last >= start {
+				let Some(len) = (last - start).checked_add(1) else { return Err(Fault::Malformed) };
 				let kind = if subtype == RESV_MEM_T_MSI { RegionKind::MsiDoorbell } else { RegionKind::Reserved };
-				out.push(ProbedRegion { kind, base: start, len: last - start + 1 });
+				// ALLOC-OK: one row per property the device published, bounded by the probe buffer it
+				// was given - and the reservation is fallible, because a device chooses the count.
+				if out.try_reserve(1).is_err() {
+					return Err(Fault::NoSpace);
+				}
+				out.push(ProbedRegion { kind, base: start, len });
 			}
 		}
 		at = end;
 	}
-	out
+	Ok(out)
 }
 
 // The device's answer. A tail shorter than the specification's is not a status, and a status this
@@ -316,25 +330,24 @@ pub fn decode_fault(bytes: &[u8], generation: Generation, domain: DomainId) -> R
 	let reason = bytes[0];
 	let flags = le32(bytes, 4);
 	let endpoint = le32(bytes, 8);
-	let address = le64(bytes, 16);
-	// The address is only meaningful when the device says it is.
-	if flags & FAULT_F_ADDRESS == 0 {
-		return Err(Fault::Malformed);
-	}
-	let access = if flags & FAULT_F_WRITE != 0 {
-		Access::Write
-	} else if flags & FAULT_F_READ != 0 {
-		Access::Read
-	} else {
-		return Err(Fault::Malformed);
-	};
+	// The address is only meaningful when the device says it is - and a report that does not say so
+	// is a report with no address, not a malformed one. The flag exists precisely so a controller
+	// that faulted without recording the address can still say that it faulted.
+	let address = if flags & FAULT_F_ADDRESS != 0 { Some(DmaAddress(le64(bytes, 16))) } else { None };
+	// A DIRECTION THIS SIDE DOES NOT RECOGNISE IS STILL A FAULT. An execute fault, or one whose
+	// flags name nothing this port knows, used to be dropped; a read is the conservative reading
+	// and the reason field carries the news either way.
+	let access = if flags & FAULT_F_WRITE != 0 { Access::Write } else { Access::Read };
+	// EVERY OTHER REASON IS UNCONFIRMED, including ones added after this was written - which is what
+	// `decode_status` in this same file already does for status codes, and what this did not do for
+	// fault reasons. A fault whose reason this code cannot name is still a fault, and refusing it
+	// discarded the report rather than the reason.
 	let reason = match reason {
 		FAULT_R_DOMAIN => Fault::UnknownEndpoint,
 		FAULT_R_MAPPING => Fault::NotMapped,
-		FAULT_R_UNKNOWN => Fault::Unconfirmed,
-		_ => return Err(Fault::Malformed),
+		_ => Fault::Unconfirmed,
 	};
-	Ok(FaultEvent { endpoint: EndpointId(endpoint), domain, generation, address: DmaAddress(address), access, reason })
+	Ok(FaultEvent { endpoint: EndpointId(endpoint), domain, generation, address, access, reason })
 }
 
 // The seam between the codec above and a virtqueue. One method wide on purpose.
@@ -544,6 +557,6 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		answer.resize(size + TAIL_LEN, 0);
 		self.transport.request(&encode_probe(endpoint.0), &mut answer, size)?;
 		decode_status(&answer[size..])?;
-		Ok(decode_probe(&answer[..size]))
+		decode_probe(&answer[..size])
 	}
 }

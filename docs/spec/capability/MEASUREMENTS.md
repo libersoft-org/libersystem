@@ -4,6 +4,13 @@ A configuration's numbers are part of its result. A later run that explores fewe
 DIFFERENT result and may not quietly replace a committed one - which is why the digests of the
 specification and the configuration are recorded beside the counts.
 
+WHICH OF THESE THE GATE HOLDS THE TREE TO, said here rather than left to be inferred: the distinct
+state count, the search depth and the three digests. `check-capability-model.sh` compares those four
+and nothing else. Wall clock and peak resident are context for whoever has to decide whether a
+configuration is worth running, and they are properties of the machine that ran it - so a row reading
+"not captured" is the honest entry for a run that did not measure them, and inventing a plausible one
+would be exactly the kind of unchecked number the rest of this document exists to prevent.
+
 ## `spike.cfg`
 
 The smallest configuration that can show a transfer racing a close: two processes, one transferable
@@ -20,8 +27,8 @@ takes.
 | Search depth | 27 |
 | Wall clock | 2 s at four workers |
 | Peak resident | 650 MiB (the JVM's default heap on this machine, not a measured requirement) |
-| `Transfer.tla` | `8771f894c4838099…` |
-| `Capability.tla` | `a539b0b25f2317ce…` |
+| `Transfer.tla` | `aeb29adfeddf0ac8…` |
+| `Capability.tla` | `3c9cd782da8819a0…` |
 | `spike.cfg` | `826bd323a669ac51…` |
 
 Checked: `TypeOK`, `TransferIsLinear`, `AuthorityNeverWidens`, `NoForgery`, `QuotaConserved`,
@@ -114,10 +121,10 @@ cannot show an all-or-nothing rule - and it is what `FailedSendRestores` is chec
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| Distinct states | 1304022 |
-| Search depth | 28 |
-| Wall clock | 36 s at four workers |
-| Peak resident | 1.6 GiB |
+| Distinct states | 13356126 |
+| Search depth | 36 |
+| Wall clock | not captured in the run that produced these counts |
+| Peak resident | not captured in the run that produced these counts |
 | `transactions-batch.cfg` | `f33ce6d32989fd86…` |
 
 ### What the batch cost to model, and what that cost bought
@@ -131,6 +138,36 @@ absent from the model, both of them about when a take may happen:
   which is the model being wrong rather than the kernel.
 - A take is bounded by the RESERVATIONS outstanding, not by what is in hand. The syscall takes every
   capability it is going to send and then sends them; it never takes another after the send.
+
+### And the receive half of it, which was unreachable until 2026-08-26
+
+The count above was 1304022 at depth 28, and it described a configuration that modelled a batch on
+the SEND side only. `Book` was guarded by `Len(booked[p]) = 0`, so a receiver could hold at most one
+booking, while `Dequeue` requires one booking per capability in the message it takes. A
+two-capability message could therefore be built, queued - and never dequeued. It sat at the head of
+the queue for the rest of every behaviour, and every rule about the receive side of a batch was
+checked over a batch of one: install both, publish both, roll both back, close between the first
+install and the second.
+
+This is the same defect the send side had before 2026-08-25 - `BatchMax = 2` with one minted
+capability - found in the half nobody looked at when that one was fixed. `Book` is now bounded by
+`BatchMax`, and six covers say the states are reached rather than merely permitted:
+`NoTwoBookings`, `NoTwoCapMessageDequeued`, `NoTwoCapsInstalled`, `NoTwoCapsPublished`,
+`NoTwoCapPayloadFailure` and `NoCloseBetweenTwoInstalls`. Each is refuted by
+`check-model-mutations.sh`, and that refutation is the evidence.
+
+The state count rose by a factor of ten and the depth by eight, which is the shape of the answer: a
+whole transaction that no behaviour could previously enter. Every invariant still holds.
+
+### `AuthorityNeverWidens` was a ceiling and is now a chain
+
+Also 2026-08-26, and it affects every configuration's specification digest rather than its counts.
+The invariant read `c.rights \subseteq MintedRights` - a global ceiling. Nothing in it related a
+derived capability to the one it came from, so deleting the source-rights guard from `Duplicate`
+could not violate the invariant named for that guard, and the mutation that was supposed to prove
+otherwise deleted the guard AND shrank `MintedRights` in the same run: what fired the invariant was
+the second edit. A capability now carries `from`, the right set it descends from, a mint's source is
+itself, and the invariant states containment at every link. The mutation changes one thing.
 
 ## `transactions-single.cfg`
 

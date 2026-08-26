@@ -109,6 +109,61 @@ fn a_machine_whose_imsic_this_kernel_refused_hands_out_no_msi_vector() {
 	let table = frame::allocate().expect("a frame for the fake MSI-X table");
 	assert!(crate::arch::imsic::usable(), "this machine's IMSIC was accepted, which is what makes the refusal below a change");
 
+	// THE REFUSAL IS DRIVEN, NOT ASSERTED. This set the flag directly, which proved that `usable()`
+	// gates `acquire_msi` and nothing about the boundary the test is named for: that a TREE
+	// describing a layout this port cannot address takes the MSI path out of service. Each of these
+	// is a machine `configure` must refuse, and every one of them is a layout the AIA binding
+	// permits and this kernel's `base + hart * 4096` arithmetic does not describe.
+	let accepted = crate::arch::imsic::snapshot_for_test();
+	for (what, info) in [
+		("no supervisor IMSIC at all", {
+			let mut b = accepted;
+			b.base = 0;
+			b
+		}),
+		("guest-indexed files", {
+			let mut b = accepted;
+			b.guest_index_bits = 1;
+			b
+		}),
+		("group-indexed files", {
+			let mut b = accepted;
+			b.group_index_bits = 2;
+			b
+		}),
+		("fewer identities than the window arms", {
+			let mut b = accepted;
+			b.num_ids = 8;
+			b
+		}),
+		("files tied to no hart", {
+			let mut b = accepted;
+			b.hart_count = 0;
+			b
+		}),
+		("a region smaller than the files it declares", {
+			let mut b = accepted;
+			b.size = 0x800;
+			b
+		}),
+		("harts that are not their own file index", {
+			let mut b = accepted;
+			b.harts[0] = 9;
+			b
+		}),
+	] {
+		let refused = crate::arch::imsic::configure_layout(&info);
+		assert!(refused.is_err(), "{what} is a layout this port cannot address, and `configure` must say so rather than compute an address inside it");
+		// AND THE REFUSAL LEAVES THE PREVIOUS VALUE ALONE, which is the half that makes the boot's
+		// `disarm` necessary: without it the machine keeps the address it was given before.
+		assert!(crate::arch::imsic::usable(), "a refusal on its own does not disarm - the boot path does, and that is what the next line drives");
+		crate::arch::imsic::disarm();
+		assert!(!crate::arch::imsic::usable(), "the boot's answer to a refusal is to take the MSI path out of service");
+		assert!(acquire_msi(table, 0, 21).is_none(), "and a disarmed machine hands out no vector rather than programming the address it refused: {what}");
+		crate::arch::imsic::set_usable_for_test(true);
+		crate::arch::imsic::configure_layout(&accepted).expect("the machine this test runs on is still the one it started on");
+	}
+
 	crate::arch::imsic::set_usable_for_test(false);
 	assert!(acquire_msi(table, 0, 21).is_none(), "a refused machine hands out no vector rather than programming the address it refused");
 

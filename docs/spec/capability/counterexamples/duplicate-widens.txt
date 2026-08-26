@@ -13,7 +13,7 @@ State 1: <Initial predicate>
 /\ charge = (p1 :> 1 @@ p2 :> 0)
 /\ holder = "none"
 /\ inflight = 0
-/\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}]
+/\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
 /\ table = ( p1 :>
       << [ state |-> "Live",
@@ -21,20 +21,33 @@ State 1: <Initial predicate>
                [ objgen |-> 1,
                  obj |-> o1,
                  type |-> t1,
-                 rights |-> {"USE", "DUPLICATE"} ],
+                 rights |-> {"USE", "DUPLICATE", "TRANSFER"},
+                 from |-> {"USE", "DUPLICATE", "TRANSFER"} ],
            gen |-> 1 ],
          [ state |-> "Free",
            cap |->
-               [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}],
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
            gen |-> 1 ] >> @@
   p2 :>
       << [ state |-> "Free",
            cap |->
-               [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}],
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
            gen |-> 1 ],
          [ state |-> "Free",
            cap |->
-               [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}],
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
            gen |-> 1 ] >> )
 /\ peeked = 0
 /\ queue = <<>>
@@ -46,7 +59,7 @@ State 1: <Initial predicate>
 /\ bytes = 0
 /\ objgen = 1
 
-State 2: <Duplicate line 377, col 5 to line 387, col 162 of module Transfer>
+State 2: <Duplicate line 387, col 5 to line 398, col 162 of module Transfer>
 /\ outcome = "none"
 /\ nextId = 1
 /\ lastAsk = "none"
@@ -54,7 +67,7 @@ State 2: <Duplicate line 377, col 5 to line 387, col 162 of module Transfer>
 /\ charge = (p1 :> 2 @@ p2 :> 0)
 /\ holder = "none"
 /\ inflight = 0
-/\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}]
+/\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
 /\ table = ( p1 :>
       << [ state |-> "Live",
@@ -62,23 +75,33 @@ State 2: <Duplicate line 377, col 5 to line 387, col 162 of module Transfer>
                [ objgen |-> 1,
                  obj |-> o1,
                  type |-> t1,
-                 rights |-> {"USE", "DUPLICATE"} ],
+                 rights |-> {"USE", "DUPLICATE", "TRANSFER"},
+                 from |-> {"USE", "DUPLICATE", "TRANSFER"} ],
            gen |-> 1 ],
          [ state |-> "Live",
            cap |->
                [ objgen |-> 1,
                  obj |-> o1,
                  type |-> t1,
-                 rights |-> {"USE", "DUPLICATE", "TRANSFER"} ],
+                 rights |-> {"USE", "DUPLICATE"},
+                 from |-> {"USE", "DUPLICATE", "TRANSFER"} ],
            gen |-> 1 ] >> @@
   p2 :>
       << [ state |-> "Free",
            cap |->
-               [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}],
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
            gen |-> 1 ],
          [ state |-> "Free",
            cap |->
-               [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}],
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
            gen |-> 1 ] >> )
 /\ peeked = 0
 /\ queue = <<>>
@@ -90,4 +113,112 @@ State 2: <Duplicate line 377, col 5 to line 387, col 162 of module Transfer>
 /\ bytes = 0
 /\ objgen = 1
 
-5 states generated, 5 distinct states found, 3 states left on queue.
+State 3: <Close line 437, col 5 to line 441, col 162 of module Transfer>
+/\ outcome = "none"
+/\ nextId = 1
+/\ lastAsk = "none"
+/\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
+/\ charge = (p1 :> 1 @@ p2 :> 0)
+/\ holder = "none"
+/\ inflight = 0
+/\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
+/\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
+/\ table = ( p1 :>
+      << [ state |-> "Free",
+           cap |->
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
+           gen |-> 2 ],
+         [ state |-> "Live",
+           cap |->
+               [ objgen |-> 1,
+                 obj |-> o1,
+                 type |-> t1,
+                 rights |-> {"USE", "DUPLICATE"},
+                 from |-> {"USE", "DUPLICATE", "TRANSFER"} ],
+           gen |-> 1 ] >> @@
+  p2 :>
+      << [ state |-> "Free",
+           cap |->
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
+           gen |-> 1 ],
+         [ state |-> "Free",
+           cap |->
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
+           gen |-> 1 ] >> )
+/\ peeked = 0
+/\ queue = <<>>
+/\ committed = FALSE
+/\ installed = <<>>
+/\ closed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ booked = (p1 :> <<>> @@ p2 :> <<>>)
+/\ bytes = 0
+/\ objgen = 1
+
+State 4: <Duplicate line 387, col 5 to line 398, col 162 of module Transfer>
+/\ outcome = "none"
+/\ nextId = 1
+/\ lastAsk = "none"
+/\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
+/\ charge = (p1 :> 2 @@ p2 :> 0)
+/\ holder = "none"
+/\ inflight = 0
+/\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
+/\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
+/\ table = ( p1 :>
+      << [ state |-> "Live",
+           cap |->
+               [ objgen |-> 1,
+                 obj |-> o1,
+                 type |-> t1,
+                 rights |-> {"USE", "DUPLICATE", "TRANSFER"},
+                 from |-> {"USE", "DUPLICATE"} ],
+           gen |-> 2 ],
+         [ state |-> "Live",
+           cap |->
+               [ objgen |-> 1,
+                 obj |-> o1,
+                 type |-> t1,
+                 rights |-> {"USE", "DUPLICATE"},
+                 from |-> {"USE", "DUPLICATE", "TRANSFER"} ],
+           gen |-> 1 ] >> @@
+  p2 :>
+      << [ state |-> "Free",
+           cap |->
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
+           gen |-> 1 ],
+         [ state |-> "Free",
+           cap |->
+               [ objgen |-> 0,
+                 obj |-> "none",
+                 type |-> "none",
+                 rights |-> {},
+                 from |-> {} ],
+           gen |-> 1 ] >> )
+/\ peeked = 0
+/\ queue = <<>>
+/\ committed = FALSE
+/\ installed = <<>>
+/\ closed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ booked = (p1 :> <<>> @@ p2 :> <<>>)
+/\ bytes = 0
+/\ objgen = 1
+
+324 states generated, 164 distinct states found, 120 states left on queue.

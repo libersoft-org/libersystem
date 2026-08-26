@@ -209,14 +209,56 @@ fn a_transport_that_never_answers_is_unconfirmed_rather_than_assumed() {
 }
 
 #[test]
-fn a_malformed_event_is_dropped_and_the_good_ones_behind_it_are_still_read() {
+fn a_domain_built_from_a_probe_never_allocates_inside_a_region_the_endpoint_reserved() {
+	// THE ANSWER IS APPLIED, NOT PRINTED. `install_probed_regions` used to log a reserved hole under
+	// a comment saying "the space is told rather than trusted to avoid it by accident" - and the
+	// space was not told, because the domain had already been created whole by then. Probing before
+	// the attach is what lets the reservations be part of the domain, and this is that end to end:
+	// a device reports a hole, the domain is built with it, and the allocator steps over it.
+	let mut properties = Vec::new();
+	// A reserved region at 0x2000, one page.
+	properties.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
+	properties.extend_from_slice(&(PROBE_RESV_MEM_LEN as u16).to_le_bytes());
+	properties.push(RESV_MEM_T_RESERVED);
+	properties.extend_from_slice(&[0u8; 3]);
+	properties.extend_from_slice(&0x2000u64.to_le_bytes());
+	properties.extend_from_slice(&0x2fffu64.to_le_bytes());
+	let regions = decode_probe(&properties).expect("a complete answer");
+	assert_eq!(regions, alloc::vec![ProbedRegion { kind: RegionKind::Reserved, base: 0x2000, len: 0x1000 }]);
+
+	let reserved: Vec<Reserved> = regions.iter().filter(|r| r.kind == RegionKind::Reserved).map(|r| Reserved { base: r.base, len: r.len }).collect();
+	let config = Config::parse(&config_bytes()).expect("valid");
+	let features = negotiate(REQUIRED | F_BYPASS_CONFIG).expect("negotiated");
+	let device = VirtioIommu::new(Wire::ok(), config, features, Generation(1)).expect("a backend");
+	let mut iommu = Iommu::new(device, 8);
+	let domain = iommu.create_domain(0x1000, 0x4000, reserved, Generation(1)).expect("a domain");
+	let endpoint = EndpointId(0x0100);
+	iommu.attach(domain, endpoint).expect("attached");
+	let requirements = Requirements::new(64, 0x1000, 8, true).expect("a device this shape exists");
+
+	let first = iommu.map(domain, 0x10_0000, 0x1000, Direction::ToDevice, &requirements).expect("room below the hole");
+	assert_eq!(iommu.address_of(first), Some(DmaAddress(0x1000)));
+	let second = iommu.map(domain, 0x11_0000, 0x1000, Direction::ToDevice, &requirements).expect("room above it");
+	assert_eq!(iommu.address_of(second), Some(DmaAddress(0x3000)), "the page the endpoint reserved is stepped over, not handed to it");
+}
+
+#[test]
+fn a_record_too_short_to_be_a_fault_is_dropped_and_a_less_detailed_one_is_not() {
+	// THE TWO ARE NOT THE SAME THING, and they used to be. A record shorter than the structure is a
+	// device that did not send a fault report; a record that IS one and does not carry an address is
+	// a controller reporting a real fault it did not record the address of. Refusing the second
+	// discarded exactly the message the fault queue exists to deliver.
 	let mut wire = Wire::ok();
-	// A record too short to be a fault.
+	// A record too short to be a fault. Still dropped: there is nothing here to read.
 	wire.events.push(alloc::vec![0u8; 8]);
-	// One whose address flag is not set: the device is saying it does not know where.
+	// One whose address flag is not set: the controller is saying it does not know where.
 	let mut no_address = alloc::vec![0u8; FAULT_LEN];
 	no_address[0] = FAULT_R_MAPPING;
 	no_address[4..8].copy_from_slice(&FAULT_F_WRITE.to_le_bytes());
+	no_address[8..12].copy_from_slice(&0x0100u32.to_le_bytes());
+	// A NON-ZERO ADDRESS FIELD BEHIND A CLEAR FLAG. The field is not meaningful, so it must not be
+	// read - and reading it would be this side inventing a number the flag said to ignore.
+	no_address[16..24].copy_from_slice(&0xFFFF_FFFFu64.to_le_bytes());
 	wire.events.push(no_address);
 	// And a well-formed one.
 	let mut good = alloc::vec![0u8; FAULT_LEN];
@@ -228,21 +270,36 @@ fn a_malformed_event_is_dropped_and_the_good_ones_behind_it_are_still_read() {
 
 	let mut iommu = backend(wire);
 	iommu.attach(DomainId(1), EndpointId(0x0100)).expect("attached");
-	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: DmaAddress(0), access: Access::Read, reason: Fault::NotMapped }; 4];
+	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: None, access: Access::Read, reason: Fault::NotMapped }; 4];
 	let taken = iommu.drain_faults(&mut out);
-	assert_eq!(taken, 1, "two rubbish records were dropped and the real one was still read");
+	assert_eq!(taken, 2, "the short record was dropped, and BOTH real faults were read");
 	assert_eq!(out[0].endpoint, EndpointId(0x0100));
-	assert_eq!(out[0].address, DmaAddress(0xDEAD_0000));
+	assert_eq!(out[0].address, None, "no address, rather than the field the flag said to ignore");
 	assert_eq!(out[0].access, Access::Write);
 	assert_eq!(out[0].reason, Fault::NotMapped);
+	assert_eq!(out[1].address, Some(DmaAddress(0xDEAD_0000)));
+	assert_eq!(out[1].access, Access::Write);
 }
 
 #[test]
 fn an_unknown_fault_reason_is_not_turned_into_one_this_code_recognises() {
+	// AND IT IS NOT DROPPED EITHER. It became `Malformed` and `drain_faults` threw it away, so a
+	// controller reporting a reason added after this was written reported nothing at all. The rule
+	// `decode_status` has always used for status codes is the right one here too: a meaning this
+	// code does not know is a state it does not know, which is `Unconfirmed`.
 	let mut raw = alloc::vec![0u8; FAULT_LEN];
 	raw[0] = 200;
 	raw[4..8].copy_from_slice(&(FAULT_F_READ | FAULT_F_ADDRESS).to_le_bytes());
-	assert_eq!(decode_fault(&raw, Generation(1), DomainId(1)), Err(Fault::Malformed));
+	raw[16..24].copy_from_slice(&0x4000u64.to_le_bytes());
+	let event = decode_fault(&raw, Generation(1), DomainId(1)).expect("a fault this code cannot name is still a fault");
+	assert_eq!(event.reason, Fault::Unconfirmed, "not NotMapped, not UnknownEndpoint - unconfirmed");
+	assert_eq!(event.address, Some(DmaAddress(0x4000)), "and everything it DID say is still read");
+	// A direction this port does not recognise is read conservatively rather than refused: an
+	// execute fault names no read and no write bit, and it is still a fault.
+	let mut exec_only = alloc::vec![0u8; FAULT_LEN];
+	exec_only[0] = FAULT_R_MAPPING;
+	exec_only[4..8].copy_from_slice(&FAULT_F_ADDRESS.to_le_bytes());
+	assert_eq!(decode_fault(&exec_only, Generation(1), DomainId(1)).expect("still a fault").access, Access::Read);
 }
 
 #[test]
@@ -290,7 +347,7 @@ fn a_fault_names_the_domain_of_the_endpoint_that_raised_it() {
 	iommu.attach(DomainId(1), EndpointId(0x0100)).expect("attached");
 	iommu.attach(DomainId(2), EndpointId(0x0200)).expect("attached");
 
-	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: DmaAddress(0), access: Access::Read, reason: Fault::NotMapped }; 4];
+	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: None, access: Access::Read, reason: Fault::NotMapped }; 4];
 	assert_eq!(iommu.drain_faults(&mut out), 2);
 	assert_eq!(out[0].endpoint, EndpointId(0x0200), "the device names the requester");
 	assert_eq!(out[0].domain, DomainId(2), "and this side resolves which domain that requester is in");
@@ -309,7 +366,7 @@ fn a_binding_is_stamped_with_the_generation_it_was_made_under() {
 	let mut iommu = backend(wire);
 	iommu.attach(DomainId(1), EndpointId(0x0100)).expect("attached");
 	iommu.set_generation(Generation(7));
-	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: DmaAddress(0), access: Access::Read, reason: Fault::NotMapped }; 2];
+	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: None, access: Access::Read, reason: Fault::NotMapped }; 2];
 	assert_eq!(iommu.drain_faults(&mut out), 1);
 	assert_eq!(out[0].generation, Generation(1), "the generation the binding was made under, not the one current now");
 }
@@ -365,9 +422,12 @@ fn a_probe_reads_the_doorbell_the_device_reports_and_skips_what_it_does_not_know
 }
 
 #[test]
-fn a_probe_property_that_runs_past_the_buffer_ends_the_walk() {
-	// A device describing memory it did not send. Everything behind it is unlocatable, so the walk
-	// stops rather than reading whatever follows as another property.
+fn a_probe_property_that_runs_past_the_buffer_refuses_the_whole_answer() {
+	// A device describing memory it did not send. Everything behind it is unlocatable - so this used
+	// to stop the walk and hand back what had been read so far, which the caller could not tell from
+	// a complete list. What may be behind the cut is the doorbell this endpoint's interrupts go
+	// through or a hole its allocator must avoid, and a domain built from half an answer is a domain
+	// built on the assumption that the missing half said nothing.
 	let mut properties = Vec::new();
 	properties.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
 	properties.extend_from_slice(&(PROBE_RESV_MEM_LEN as u16).to_le_bytes());
@@ -377,8 +437,10 @@ fn a_probe_property_that_runs_past_the_buffer_ends_the_walk() {
 	properties.extend_from_slice(&0xfeef_ffffu64.to_le_bytes());
 	properties.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
 	properties.extend_from_slice(&4096u16.to_le_bytes());
-	assert_eq!(decode_probe(&properties).len(), 1, "the good one before it is still read");
-	// A region whose end is below its start is a device contradicting itself.
+	assert_eq!(decode_probe(&properties), Err(Fault::Malformed), "a good property before the cut does not make a cut answer usable");
+	// A region whose end is below its start is a device contradicting itself. THAT one is dropped
+	// rather than refused: the device sent everything it said it would, and one self-contradicting
+	// range is not a truncated list.
 	let mut backwards = Vec::new();
 	backwards.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
 	backwards.extend_from_slice(&(PROBE_RESV_MEM_LEN as u16).to_le_bytes());
@@ -386,7 +448,17 @@ fn a_probe_property_that_runs_past_the_buffer_ends_the_walk() {
 	backwards.extend_from_slice(&[0u8; 3]);
 	backwards.extend_from_slice(&0x2000u64.to_le_bytes());
 	backwards.extend_from_slice(&0x1000u64.to_le_bytes());
-	assert!(decode_probe(&backwards).is_empty());
-	// And a zero type terminates the list.
-	assert!(decode_probe(&[0, 0, 0, 0]).is_empty());
+	assert_eq!(decode_probe(&backwards), Ok(Vec::new()));
+	// A region ending at the top of the address space is a length this arithmetic cannot express,
+	// and it used to wrap to zero rather than say so.
+	let mut to_the_top = Vec::new();
+	to_the_top.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
+	to_the_top.extend_from_slice(&(PROBE_RESV_MEM_LEN as u16).to_le_bytes());
+	to_the_top.push(RESV_MEM_T_MSI);
+	to_the_top.extend_from_slice(&[0u8; 3]);
+	to_the_top.extend_from_slice(&0u64.to_le_bytes());
+	to_the_top.extend_from_slice(&u64::MAX.to_le_bytes());
+	assert_eq!(decode_probe(&to_the_top), Err(Fault::Malformed));
+	// And a zero type terminates the list, which is a COMPLETE answer with nothing in it.
+	assert_eq!(decode_probe(&[0, 0, 0, 0]), Ok(Vec::new()));
 }

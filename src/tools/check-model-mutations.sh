@@ -101,11 +101,26 @@ run_mutation generations-wrap spike GenerationsOnlyAdvance \
 	'THEN [state |-> "Free", cap |-> NoCap, gen |-> 1]' || status=1
 
 # 2. A duplicate may be asked for rights the original does not have.
+#
+# THE CONFIGURATION CHANGE OFFERS THE DERIVATION; IT DOES NOT MOVE THE CEILING THE INVARIANT READS.
+#
+# This used to remove the guard AND shrink `MintedRights`, and `AuthorityNeverWidens` was then a
+# global ceiling - so deleting the guard alone could not violate it, and what fired the invariant was
+# the second edit. The case passed while proving nothing about the first. The invariant now states
+# containment against the immediate SOURCE, so the guard's absence is exactly what it catches.
+#
+# What the configuration still has to offer is a reachable widening. `handles.cfg` derives either the
+# whole right set or `{USE}`, and a `{USE}` capability cannot be a duplicate's source because it does
+# not carry `DUPLICATE` - so with the guard gone there was no step that could widen anything. Adding
+# `{USE, DUPLICATE}` gives the search a capability that is narrower than its source and may still be
+# duplicated from, which is the shape every real attenuated handle has. That is the helper's own
+# stated reason for taking a configuration mutation: "a rule that a duplicate may not widen is
+# unbreakable where no widening derivation is on offer".
 run_mutation duplicate-widens handles AuthorityNeverWidens \
 	'    /\ r \subseteq table[p][i].cap.rights' \
 	'    /\ TRUE' \
-	'    MintedRights = {"USE", "DUPLICATE", "TRANSFER"}' \
-	'    MintedRights = {"USE", "DUPLICATE"}' || status=1
+	'    DerivedRights = {{"USE", "DUPLICATE", "TRANSFER"}, {"USE"}}' \
+	'    DerivedRights = {{"USE", "DUPLICATE", "TRANSFER"}, {"USE", "DUPLICATE"}, {"USE"}}' || status=1
 
 # 3. A transfer CLONES rather than moves: the source slot keeps its capability.
 run_mutation transfer-clones spike TransferIsLinear \
@@ -175,6 +190,13 @@ done
 # result was published for a model that could not reach its own subject. These are the covers that
 # would have said so.
 for name in NoBatchOfTwo NoMessageOfTwo NoBatchOfTwoRestored; do
+	cover "$name" transactions-batch || status=1
+done
+# AND THE RECEIVE HALF OF IT, which was unreachable for the mirror-image reason: `Book` capped a
+# receiver at one booking while `Dequeue` demands one per capability, so a two-capability message
+# could be built and never taken. Every rule about installing two, publishing two, rolling two back
+# and closing between the two was checked over a batch of one.
+for name in NoTwoBookings NoTwoCapMessageDequeued NoTwoCapsInstalled NoTwoCapsPublished NoTwoCapPayloadFailure NoCloseBetweenTwoInstalls; do
 	cover "$name" transactions-batch || status=1
 done
 # And the queue really holds more than one message where the configuration says it does - which is

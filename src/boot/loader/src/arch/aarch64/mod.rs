@@ -56,7 +56,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// the other, and the wrong one last.
 	let init_pkg = match unsafe { crate::BOOTSTRAP } {
 		Some(archive) => Some(archive),
-		None => crate::read_boot_file(bs, root, crate::INIT_PKG_FILE),
+		None => crate::read_verified_package(bs, root, crate::INIT_PKG_FILE),
 	};
 	// The factory archive too, when the medium carries one: the kernel test suite uses it as its
 	// fixture, and a shipping medium simply has none.
@@ -66,7 +66,7 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// declines to mount it. On exactly that firmware, and only there, the module was silently
 	// absent: a boot that looks identical and a test fixture that is not delivered, on the machines
 	// this loader has a fallback for in the first place.
-	let volume_pkg = crate::read_boot_file(bs, root, crate::VOLUME_PKG_FILE);
+	let volume_pkg = crate::read_verified_package(bs, root, crate::VOLUME_PKG_FILE);
 	let boot_info = build_boot_info(bs, dtb, init_pkg, volume_pkg);
 
 	// ExitBootServices is the last firmware call; after it no service may be used.

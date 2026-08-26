@@ -220,7 +220,7 @@ impl DmaBuffer {
 		// than the contract can express - `Direction` is there and the model checks it - and it is
 		// stated rather than dressed up: narrowing it needs the create syscall to say which way the
 		// buffer is used, which the protected endpoints will need when they are migrated.
-		let translation = match device.filter(|_| crate::iommu::present()) {
+		let translation = match device.filter(|_| crate::iommu::translating()) {
 			Some(index) => match crate::iommu::map_device_buffer(index, base, (pages * PAGE_SIZE as usize) as u64) {
 				Ok(Some(mapped)) => Some(mapped),
 				Ok(None) => None,

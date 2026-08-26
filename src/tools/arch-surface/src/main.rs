@@ -110,6 +110,9 @@ enum Tok {
 	CloseBracket,
 	Hash,
 	Semicolon,
+	// A `cfg` predicate's argument separator. `all(test, unix)` is two arguments and `all(test)` is
+	// one, and telling them apart is what makes "every arm is a test arm" a question with an answer.
+	Comma,
 	Other,
 }
 
@@ -253,6 +256,7 @@ fn tokenize(text: &str) -> Vec<Token> {
 			b'}' => Tok::CloseBrace,
 			b'(' => Tok::OpenParen,
 			b')' => Tok::CloseParen,
+			b',' => Tok::Comma,
 			b'[' => Tok::OpenBracket,
 			b']' => Tok::CloseBracket,
 			b'#' => Tok::Hash,
@@ -299,7 +303,23 @@ pub fn scan(text: &str) -> Vec<Finding> {
 	out
 }
 
-// Read `#[ ... ]` starting at `at`, answering whether it is `cfg(test)` and where it ends.
+// Read `#[ ... ]` starting at `at`, answering whether it gates the item on TESTS and where it ends.
+//
+// THE PREDICATE, NOT THE WORDS IN IT. This answered yes for any attribute containing both `cfg` and
+// `test` anywhere inside it, which is three different mistakes at once:
+//
+//   `#[cfg(not(test))]`                  production code, skipped as test-only
+//   `#[cfg(any(test, target_arch = ..))]` production on that target, skipped as test-only
+//   `#[cfg_attr(test, doc = "..")]`      production code with one attribute applied under test
+//
+// All three are ordinary shapes and all three took the whole item out of the scan, so a placeholder
+// body inside any of them was invisible to a gate whose entire job is finding them. `cfg_attr` in
+// particular is not a gate at all - it applies an ATTRIBUTE conditionally and leaves the item
+// compiled either way.
+//
+// So the predicate is walked: `test` is a test gate, `not(..)` inverts whatever it wraps, `all`
+// wants every argument, `any` wants one, and anything else is a term this scanner cannot evaluate
+// and does not treat as a gate.
 fn read_attribute(tokens: &[Token], at: usize) -> (bool, usize) {
 	let mut i = at + 1;
 	if tokens.get(i).map(|t| t.kind) == Some(Tok::Bang) {
@@ -310,8 +330,6 @@ fn read_attribute(tokens: &[Token], at: usize) -> (bool, usize) {
 	}
 	let start = i;
 	let mut depth = 0usize;
-	let mut saw_cfg = false;
-	let mut saw_test = false;
 	while i < tokens.len() {
 		match tokens[i].kind {
 			Tok::OpenBracket => depth += 1,
@@ -321,22 +339,104 @@ fn read_attribute(tokens: &[Token], at: usize) -> (bool, usize) {
 					break;
 				}
 			}
-			Tok::Word => {
-				// `cfg(test)` and `cfg_attr(test, ...)` both gate on the same predicate, and both
-				// used to be handled by a filter that looked only for the exact text `#[cfg(test)]`.
-				if tokens[i].text == "cfg" || tokens[i].text == "cfg_attr" {
-					saw_cfg = true;
-				}
-				if tokens[i].text == "test" {
-					saw_test = true;
-				}
-			}
 			_ => {}
 		}
 		i += 1;
 	}
-	let _ = start;
-	(saw_cfg && saw_test, i + 1)
+	// `#[` `cfg` `(` .. `)` `]` - the predicate is what sits between the parentheses after `cfg`.
+	// Only `cfg` gates an item; `cfg_attr` conditions an attribute and the item is compiled anyway.
+	let gates = tokens.get(start + 1).is_some_and(|t| t.kind == Tok::Word && t.text == "cfg") && tokens.get(start + 2).is_some_and(|t| t.kind == Tok::OpenParen) && predicate_is_test(tokens, start + 2);
+	(gates, i + 1)
+}
+
+// Whether the `cfg` predicate whose opening parenthesis is at `open` is one that holds ONLY under
+// test. `true` means the item does not exist in a production build and the scan may skip it.
+fn predicate_is_test(tokens: &[Token], open: usize) -> bool {
+	// The single term inside the parentheses, or - for `all`/`any`/`not` - the arguments it takes.
+	let close = matching_paren(tokens, open);
+	let Some(close) = close else { return false };
+	let inner = open + 1;
+	if inner >= close {
+		return false;
+	}
+	match tokens[inner].kind {
+		Tok::Word if tokens[inner].text == "test" && inner + 1 == close => true,
+		Tok::Word if matches!(tokens[inner].text.as_str(), "not" | "all" | "any") && tokens.get(inner + 1).is_some_and(|t| t.kind == Tok::OpenParen) => {
+			let group = inner + 1;
+			let args = arguments(tokens, group);
+			match tokens[inner].text.as_str() {
+				// A negation is never a test gate. `not(test)` is the PRODUCTION half of a split,
+				// which is the case that sent this scanner past whole production functions, and
+				// `not(unix)` is not about tests at all. `not(not(test))` would be, and answering
+				// `false` for it scans an item that could have been skipped - which is the safe
+				// direction for a gate whose failure mode is skipping.
+				"not" => false,
+				// `all(test, unix)` needs `test` to hold, so it cannot be compiled without it: ONE
+				// test arm makes the whole conjunction test-only.
+				"all" => args.iter().any(|&a| term_is_test(tokens, a)),
+				// `any(test, unix)` compiles wherever EITHER holds, so it is production code on
+				// unix. Every arm has to be a test arm for the item to be absent from a production
+				// build.
+				_ => !args.is_empty() && args.iter().all(|&a| term_is_test(tokens, a)),
+			}
+		}
+		_ => false,
+	}
+}
+
+// One argument of an `all`/`any`/`not` list: either the bare word `test`, or a nested predicate.
+fn term_is_test(tokens: &[Token], at: usize) -> bool {
+	if tokens[at].kind == Tok::Word && tokens[at].text == "test" {
+		return !tokens.get(at + 1).is_some_and(|t| t.kind == Tok::OpenParen);
+	}
+	if tokens[at].kind == Tok::Word && matches!(tokens[at].text.as_str(), "not" | "all" | "any") && tokens.get(at + 1).is_some_and(|t| t.kind == Tok::OpenParen) {
+		// `predicate_is_test` reads the operator from the token before the parenthesis, which is
+		// exactly what `at` is, so the same walk answers a nested list.
+		return predicate_is_test(tokens, at + 1);
+	}
+	false
+}
+
+// Where the group opened at `open` closes.
+fn matching_paren(tokens: &[Token], open: usize) -> Option<usize> {
+	let mut depth = 0usize;
+	for (offset, token) in tokens.iter().enumerate().skip(open) {
+		match token.kind {
+			Tok::OpenParen => depth += 1,
+			Tok::CloseParen => {
+				depth -= 1;
+				if depth == 0 {
+					return Some(offset);
+				}
+			}
+			_ => {}
+		}
+	}
+	None
+}
+
+// The index of each top-level argument inside the group opened at `open`.
+fn arguments(tokens: &[Token], open: usize) -> Vec<usize> {
+	let Some(close) = matching_paren(tokens, open) else { return Vec::new() };
+	let mut out = Vec::new();
+	let mut depth = 0usize;
+	let mut expect = true;
+	for (offset, token) in tokens.iter().enumerate().take(close).skip(open + 1) {
+		match token.kind {
+			Tok::OpenParen => depth += 1,
+			Tok::CloseParen => depth -= 1,
+			Tok::Comma if depth == 0 => {
+				expect = true;
+				continue;
+			}
+			_ => {}
+		}
+		if expect && depth == 0 {
+			out.push(offset);
+			expect = false;
+		}
+	}
+	out
 }
 
 // Where the item starting at `at` ends: past its block, or past its semicolon.
@@ -467,6 +567,12 @@ fn run_self_test() -> Result<(), String> {
 		("a panic-only body wrapped in unsafe", "pub unsafe fn entry() {\n\tunsafe { panic!(\"no\") }\n}\n"),
 		("a panic-only body with a trailing semicolon", "fn entry() {\n\tpanic!(\"no\");\n}\n"),
 		("a panic-only body on one line", "fn entry() { panic!(\"no\") }\n"),
+		// THE THREE SHAPES THAT USED TO BE SKIPPED AS TEST-ONLY. Each is production code, and the
+		// attribute filter answered yes to all of them because it looked for the words `cfg` and
+		// `test` anywhere inside the attribute rather than reading the predicate.
+		("a placeholder under cfg(not(test)), which is the production half of a split", "#[cfg(not(test))]\nfn entry() { todo!() }\n"),
+		("a placeholder under cfg(any(test, target_arch)), which compiles on that target", "#[cfg(any(test, target_arch = \"x86_64\"))]\nfn entry() { todo!() }\n"),
+		("a placeholder under cfg_attr(test, ..), which gates an attribute and not the item", "#[cfg_attr(test, doc = \"under test\")]\nfn entry() { todo!() }\n"),
 	];
 	let must_accept: &[(&str, &str)] = &[
 		("a panic after a check, which is a refusal and not a stub", "fn entry(n: u64) -> u64 {\n\tif n == 0 {\n\t\tpanic!(\"the firmware published no interrupt files\");\n\t}\n\tn\n}\n"),
@@ -475,7 +581,12 @@ fn run_self_test() -> Result<(), String> {
 		("a brace inside a comment", "fn entry() {\n\t// }\n\tuse_it()\n}\n"),
 		("a placeholder inside a cfg(test) module", "#[cfg(test)]\nmod tests {\n\tfn probe() {\n\t\ttodo!(\"a deliberate test fault\")\n\t}\n}\n"),
 		("a placeholder in a cfg(test) function with no block of its own", "#[cfg(test)]\nfn probe() { todo!() }\nfn live() { work() }\n"),
-		("a placeholder under cfg_attr(test, ...)", "#[cfg_attr(test, doc = \"a fixture\")]\n#[cfg(test)]\nfn probe() { todo!() }\n"),
+		// A `cfg_attr` beside a REAL gate. The fixture used to be only this, so it passed on the
+		// `#[cfg(test)]` below it and said nothing about the `cfg_attr` it was named for - which is
+		// why the `must_find` list above now carries a bare one.
+		("a placeholder under cfg_attr(test, ...) beside a real cfg(test)", "#[cfg_attr(test, doc = \"a fixture\")]\n#[cfg(test)]\nfn probe() { todo!() }\n"),
+		("a placeholder under cfg(all(test, target_arch)), which needs test to compile at all", "#[cfg(all(test, target_arch = \"x86_64\"))]\nfn probe() { todo!() }\n"),
+		("a placeholder under cfg(any(test, doc)), where every arm is a test arm", "#[cfg(any(test, test))]\nfn probe() { todo!() }\n"),
 		("a trait method with no body at all", "trait Port {\n\tfn entry(&self) -> u64;\n}\n"),
 		("a panic! in a nested block", "fn entry() {\n\tloop {\n\t\tpanic!(\"stop\")\n\t}\n}\n"),
 	];

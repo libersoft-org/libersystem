@@ -56,6 +56,9 @@ pub struct Wire {
 	// The direct-map address of the event buffer the device writes into.
 	event_buffer: u64,
 	event_physical: u64,
+	// The descriptor the event buffer is outstanding on. A completion naming any other descriptor is
+	// not this buffer coming back, and reading the buffer for it would be reading whatever is there.
+	event_descriptor: Option<u16>,
 }
 
 impl Transport for Wire {
@@ -72,9 +75,25 @@ impl Transport for Wire {
 			core::ptr::write_bytes((scratch + 2048) as *mut u8, 0, tail.len());
 		}
 		let physical = self.requests.scratch_physical();
-		if !self.requests.request(physical, request.len() as u32, physical + 2048, tail.len() as u32) {
+		let Some(written) = self.requests.request(physical, request.len() as u32, physical + 2048, tail.len() as u32) else {
 			// THE DEVICE DID NOT ANSWER. Not a failure of the operation - a failure to learn
 			// anything about it, which is the one state a caller must never round down to success.
+			return Err(Fault::Unconfirmed);
+		};
+		// AND A DEVICE THAT WROTE NOTHING DID NOT ANSWER EITHER.
+		//
+		// The scratch tail is zeroed above, and `VIRTIO_IOMMU_S_OK` is zero, so an answer the device
+		// never wrote decoded as the device confirming the request. A completion carrying a length of
+		// zero was accepted because the only length check was against writing too MUCH: the range was
+		// closed at one end. Attach, map, unmap and detach all came back confirmed from a device that
+		// completed the descriptor and touched no memory, and the kernel then recorded an isolation
+		// nothing had established and freed IOVAs and frames on the strength of it.
+		//
+		// The status byte has to be INSIDE what the device wrote, which is why the offset is compared
+		// rather than the length alone - a probe's status sits after its properties, so "some bytes
+		// arrived" is not the same question as "the status arrived".
+		if (written as usize) <= status_at {
+			crate::serial_println!("iommu: the device completed request type {} without writing its status ({written} byte(s), status at {status_at}) - the operation is unconfirmed", request.first().copied().unwrap_or(0));
 			return Err(Fault::Unconfirmed);
 		}
 		// SAFETY: as above; the device wrote into the second half of this queue's own frame.
@@ -93,14 +112,39 @@ impl Transport for Wire {
 		Ok(())
 	}
 
+	// WHAT THE DEVICE WROTE, AND ONLY THAT.
+	//
+	// This copied a full `FAULT_LEN` out of the event buffer whatever the device had put there, and
+	// handed the same buffer back without clearing it. A report shorter than a whole record was
+	// therefore completed with the tail of the PREVIOUS one, and a device that moved the used index
+	// without writing anything had the driver decode a stale report as a fresh fault. The descriptor
+	// id was not looked at either, so a completion for something else was read as this buffer coming
+	// back.
 	fn take_event(&mut self, out: &mut [u8]) -> usize {
-		let Some(_slot) = self.events.poll_used() else { return 0 };
-		let len = out.len().min(dma::virtio_iommu::FAULT_LEN);
-		// SAFETY: the event buffer is this module's own frame, and the device was given exactly its
-		// length.
+		let Some((id, written)) = self.events.poll_used() else { return 0 };
+		let expected = self.event_descriptor.take();
+		// The buffer goes back either way: a completion this side cannot account for still means the
+		// device has one fewer buffer to write into, and a fault queue with none is a fault queue.
+		let hand_back = |wire: &mut Self| {
+			// CLEARED BEFORE IT IS OFFERED. The next report may be shorter than this one, and what
+			// is not overwritten is what was here.
+			// SAFETY: this module's own frame, for exactly the length the device is given.
+			unsafe { core::ptr::write_bytes(wire.event_buffer as *mut u8, 0, dma::virtio_iommu::FAULT_LEN) };
+			wire.event_descriptor = wire.events.offer(wire.event_physical, dma::virtio_iommu::FAULT_LEN as u32);
+		};
+		// COMPARED WITHOUT TRUNCATING. A used-ring id is 32 bits on the wire and a descriptor index
+		// is 16, so narrowing the device's number before comparing would let a bogus id alias onto
+		// the one this side is waiting for.
+		if expected.map(u32::from) != Some(id) {
+			crate::serial_println!("iommu: the device completed descriptor {id} on the event queue and the fault buffer is on {expected:?} - the report is not read");
+			hand_back(self);
+			return 0;
+		}
+		let len = out.len().min(dma::virtio_iommu::FAULT_LEN).min(written as usize);
+		// SAFETY: the event buffer is this module's own frame, and the length is bounded above by
+		// both the caller's buffer and the record size the device was given.
 		unsafe { core::ptr::copy_nonoverlapping(self.event_buffer as *const u8, out.as_mut_ptr(), len) };
-		// Give the buffer back so the device can report the next one.
-		self.events.offer(self.event_physical, dma::virtio_iommu::FAULT_LEN as u32);
+		hand_back(self);
 		len
 	}
 }
@@ -156,10 +200,20 @@ pub fn init() -> bool {
 	let Some(index) = find_controller() else {
 		return false;
 	};
+	// PRESENT IS A FACT ABOUT THE BUS, NOT ABOUT THE BRING-UP, and it is recorded HERE - at the point
+	// the controller was found - rather than after it came up.
+	//
+	// It was stored in the success arm only, so a controller that failed feature negotiation, queue
+	// creation or the bypass read-back left `present()` answering false. `dma_policy::init` reads
+	// exactly that value to decide whether this machine was SUPPOSED to be isolated, so the one case
+	// a protected driver must refuse - isolation was available and something went wrong with it -
+	// became indistinguishable from a machine that never had a controller, and `virtio-net` bound
+	// degraded instead of being refused. The line below announced that every such driver would be
+	// refused, one statement before the code made that untrue.
+	PRESENT.store(true, Ordering::Release);
 	match bring_up(index) {
 		Ok(controller) => {
 			*CONTROLLER.lock() = Some(controller);
-			PRESENT.store(true, Ordering::Release);
 			crate::serial_println!("iommu: virtio-iommu is translating - bypass is off and read back as off");
 			true
 		}
@@ -168,13 +222,49 @@ pub fn init() -> bool {
 			// profile expected enforcement and does not have it, and every `iommu-required` driver
 			// is about to be refused. Said loudly for that reason.
 			crate::serial_println!("iommu: virtio-iommu present but NOT enforcing ({reason:?}) - every driver that requires translation will be refused");
+			// AND IT IS LEFT INERT RATHER THAN HALF CONFIGURED. A bring-up can fail after the device
+			// has been reset, acknowledged, given feature bits and had queues written into it, and
+			// walking away there leaves a device that masters the bus with rings this kernel has
+			// stopped tracking. The reset puts it back where the boot found it and the bus-master bit
+			// goes with it.
+			quiesce_controller(index);
 			false
 		}
 	}
 }
 
+// Put a controller that did not come up back to where the boot found it: FAILED status, device
+// reset, bus mastering off. Best effort by nature - the device is one that has already misbehaved -
+// but it costs nothing and the alternative is a bus master nothing owns.
+fn quiesce_controller(index: usize) {
+	let Some((bar, common_offset, bus, dev, func)) = crate::device::with(index, |entry| (entry.bar_phys, entry.common_offset, entry.bus, entry.dev, entry.func)) else {
+		return;
+	};
+	let common = crate::mem::hhdm_offset() + bar + common_offset as u64;
+	// SAFETY: this device's own common configuration structure, mapped by `bring_up` before it
+	// failed; the two writes are the specification's reset sequence and touch nothing else.
+	unsafe {
+		write8(common + abi::VIRTIO_CFG_DEVICE_STATUS, abi::VIRTIO_STATUS_FAILED);
+		write8(common + abi::VIRTIO_CFG_DEVICE_STATUS, 0);
+	}
+	crate::arch::pci::set_bus_master(bus, dev, func, false);
+	crate::serial_println!("iommu: the controller was reset and no longer masters the bus");
+}
+
 pub fn present() -> bool {
 	PRESENT.load(Ordering::Acquire)
+}
+
+// Whether there is a controller to ASK, which is a different question from whether one is on the bus.
+//
+// `present` is about the machine: a controller was found, so this machine was supposed to be
+// isolated, and a protected driver refuses when it is not. `translating` is about this boot: the
+// controller came up and there is something to attach endpoints to and map buffers through. They
+// were one value until a controller that failed bring-up was found to be indistinguishable from a
+// machine that never had one - and the three callers that want to USE a controller want this one,
+// while the policy that decides what a failure MEANS wants the other.
+pub fn translating() -> bool {
+	CONTROLLER.lock().is_some()
 }
 
 fn find_controller() -> Option<usize> {
@@ -281,7 +371,9 @@ fn bring_up(index: usize) -> Result<Controller, Fault> {
 	let mut events = VirtQueue::create(common, QUEUE_EVENT, notify_base, notify_multiplier, 16).ok_or(Fault::NoSpace)?;
 	let event_physical = events.scratch_physical();
 	let event_buffer = events.scratch_virtual();
-	events.offer(event_physical, dma::virtio_iommu::FAULT_LEN as u32);
+	// SAFETY: the queue's own scratch frame, cleared before the device is given it.
+	unsafe { core::ptr::write_bytes(event_buffer as *mut u8, 0, dma::virtio_iommu::FAULT_LEN) };
+	let event_descriptor = events.offer(event_physical, dma::virtio_iommu::FAULT_LEN as u32);
 	// SAFETY: the common configuration structure, as above.
 	unsafe { write8(common + abi::VIRTIO_CFG_DEVICE_STATUS, abi::VIRTIO_STATUS_ACKNOWLEDGE | abi::VIRTIO_STATUS_DRIVER | abi::VIRTIO_STATUS_FEATURES_OK | abi::VIRTIO_STATUS_DRIVER_OK) };
 	let _ = &mut requests;
@@ -309,7 +401,7 @@ fn bring_up(index: usize) -> Result<Controller, Fault> {
 		return Err(Fault::Unconfirmed);
 	}
 
-	let wire = Wire { requests, events, event_buffer, event_physical };
+	let wire = Wire { requests, events, event_buffer, event_physical, event_descriptor };
 	let backend = VirtioIommu::new(wire, config, accepted, Generation(1))?;
 	Ok(Controller { iommu: dma::Iommu::new(backend, 64), common, device_config })
 }
@@ -374,14 +466,37 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 	let endpoint = requester_of(bus, dev, func);
 	with(|controller| {
 		let config = *controller.iommu().backend().config();
-		// The domain's address space is the device's published input range. What must be carved out
-		// of it, and what must be mapped one-to-one inside it, is what the device is asked below -
-		// it cannot be asked before the endpoint exists, so the space starts whole and the answers
-		// are applied to it.
 		let iommu = controller.iommu();
-		let domain = iommu.create_domain(config.input_start, config.input_len(), alloc::vec::Vec::new(), Generation(generation))?;
+		// THE ENDPOINT IS ASKED BEFORE IT IS ATTACHED, and the domain is built from the answer.
+		//
+		// This ran the other way round - create, attach, then probe - under a comment saying the
+		// device "cannot be asked before the endpoint exists". It can: a PROBE names a requester id,
+		// which a function on the bus has whether or not it belongs to a domain. Asking afterwards
+		// meant the address space was created whole and the reserved holes arrived too late to be
+		// carved out of it, so they were printed instead - and the allocator could hand a device an
+		// address inside a range the device itself had declared unusable.
+		let regions = match iommu.probe(endpoint) {
+			Ok(regions) => regions,
+			Err(reason) => {
+				// AN ENDPOINT WHOSE HOLES ARE UNKNOWN IS NOT ATTACHED. This used to be a warning
+				// after the fact, with the endpoint already translating; now there is nothing to
+				// warn about, because nothing has been built yet.
+				crate::serial_println!("iommu: endpoint {:#x} could not be probed ({reason:?}) - its reserved regions are unknown, so it is not attached", endpoint.0);
+				return Err(reason);
+			}
+		};
+		let mut reserved: alloc::vec::Vec<dma::Reserved> = alloc::vec::Vec::new();
+		// ALLOC-OK: one entry per reserved region this endpoint published, at binding time.
+		if reserved.try_reserve(regions.len()).is_err() {
+			return Err(Fault::NoSpace);
+		}
+		for region in regions.iter().filter(|r| r.kind == dma::RegionKind::Reserved) {
+			crate::serial_println!("iommu: endpoint {:#x} reserves {:#x}+{:#x} - its domain never allocates there", endpoint.0, region.base, region.len);
+			reserved.push(dma::Reserved { base: region.base, len: region.len });
+		}
+		let domain = iommu.create_domain(config.input_start, config.input_len(), reserved, Generation(generation))?;
 		iommu.attach(domain, endpoint)?;
-		install_probed_regions(iommu, domain, endpoint);
+		install_doorbell(iommu, domain, endpoint, &regions);
 		Ok(domain)
 	})
 	.unwrap_or(Err(Fault::Unconfirmed))
@@ -390,7 +505,7 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 // Whether the doorbell fact has been printed. Every endpoint on a machine writes the same one.
 static DOORBELL_REPORTED: AtomicBool = AtomicBool::new(false);
 
-// Ask the device what this endpoint's domain must treat specially, and do it.
+// Map the doorbell this endpoint's interrupts are written to.
 //
 // AN INTERRUPT IS A MEMORY WRITE, and this is the function that fact costs. A translated endpoint
 // puts its MSI on the bus like any other write, so the doorbell goes through the same domain as its
@@ -405,36 +520,46 @@ static DOORBELL_REPORTED: AtomicBool = AtomicBool::new(false);
 // A FAILURE HERE IS NOT FATAL AND IS NOT SILENT. The endpoint is attached and translating either
 // way; what it loses is interrupt delivery, which is a driver that does not work rather than a
 // driver that reaches memory it should not. So it is named and the boot goes on.
-fn install_probed_regions(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::DomainId, endpoint: dma::EndpointId) {
-	let regions = match iommu.probe(endpoint) {
-		Ok(regions) => regions,
-		Err(reason) => {
-			crate::serial_println!("iommu: endpoint {:#x} could not be probed ({reason:?}) - its reserved regions are unknown", endpoint.0);
-			return;
-		}
-	};
-	for region in regions {
-		match region.kind {
-			// THE DEVICE WRITES ITS DOORBELL. `ToDevice` is the direction that reads, and mapping it
-			// that way produced a translation the interrupt controller's address had - and that
-			// refused the one access anybody makes to it. QEMU's trace named it exactly:
-			// `virt_start=0xfee00000 ... flags=1`, a read-only mapping, and the MSI arriving as
-			// `flag=2`.
-			dma::RegionKind::MsiDoorbell => match iommu.map_identity(domain, region.base, region.len, dma::Direction::FromDevice) {
-				// SAID ONCE, NOT ONCE PER DOMAIN. Every endpoint on this machine writes the same
-				// doorbell, so a line per domain is eleven copies of one fact - the scattering the
-				// boot report keeps being cleaned of. A failure is per-domain and is always printed:
-				// that one IS about this endpoint.
-				Ok(_) => {
-					if !DOORBELL_REPORTED.swap(true, Ordering::AcqRel) {
-						crate::serial_println!("iommu: every domain carries the MSI doorbell at {:#x}+{:#x}, mapped one to one - a device's interrupt is a memory write and goes through its own domain", region.base, region.len);
-					}
+fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::DomainId, endpoint: dma::EndpointId, regions: &[dma::ProbedRegion]) {
+	let mut mapped = false;
+	for region in regions.iter().filter(|r| r.kind == dma::RegionKind::MsiDoorbell) {
+		// THE DEVICE WRITES ITS DOORBELL. `ToDevice` is the direction that reads, and mapping it
+		// that way produced a translation the interrupt controller's address had - and that
+		// refused the one access anybody makes to it. QEMU's trace named it exactly:
+		// `virt_start=0xfee00000 ... flags=1`, a read-only mapping, and the MSI arriving as
+		// `flag=2`.
+		match iommu.map_identity(domain, region.base, region.len, dma::Direction::FromDevice) {
+			// SAID ONCE, NOT ONCE PER DOMAIN. Every endpoint on this machine writes the same
+			// doorbell, so a line per domain is eleven copies of one fact - the scattering the
+			// boot report keeps being cleaned of. A failure is per-domain and is always printed:
+			// that one IS about this endpoint.
+			Ok(_) => {
+				mapped = true;
+				if !DOORBELL_REPORTED.swap(true, Ordering::AcqRel) {
+					crate::serial_println!("iommu: every domain carries the MSI doorbell at {:#x}+{:#x}, mapped one to one - a device's interrupt is a memory write and goes through its own domain", region.base, region.len);
 				}
-				Err(reason) => crate::serial_println!("iommu: domain {} could not map its MSI doorbell at {:#x}+{:#x} ({reason:?}) - this endpoint's interrupts will not be delivered", domain.0, region.base, region.len),
-			},
-			// Nothing is mapped in a reserved hole, and nothing may be allocated there either. The
-			// space is told rather than trusted to avoid it by accident.
-			dma::RegionKind::Reserved => crate::serial_println!("iommu: domain {} has a reserved hole at {:#x}+{:#x}", domain.0, region.base, region.len),
+			}
+			Err(reason) => crate::serial_println!("iommu: domain {} could not map its MSI doorbell at {:#x}+{:#x} ({reason:?}) - this endpoint's interrupts will not be delivered", domain.0, region.base, region.len),
+		}
+	}
+	// AN ENDPOINT THAT REPORTED NO DOORBELL STILL HAS ONE.
+	//
+	// A device that does not offer `F_PROBE`, or offers it and lists no MSI region, left this
+	// function with nothing to do - and the endpoint then lost every interrupt for exactly the
+	// reason above, silently, which is the failure the mapping was added to fix. The platform's own
+	// doorbell is the fallback, and it is mapped the same way: one to one, written by the device.
+	if !mapped {
+		let Some((base, len)) = crate::arch::pci::msi_doorbell() else {
+			crate::serial_println!("iommu: endpoint {:#x} reported no MSI doorbell and this port names none - its interrupts will not be delivered", endpoint.0);
+			return;
+		};
+		match iommu.map_identity(domain, base, len, dma::Direction::FromDevice) {
+			Ok(_) => {
+				if !DOORBELL_REPORTED.swap(true, Ordering::AcqRel) {
+					crate::serial_println!("iommu: every domain carries this port's MSI doorbell at {base:#x}+{len:#x}, mapped one to one - the endpoint reported none of its own");
+				}
+			}
+			Err(reason) => crate::serial_println!("iommu: domain {} could not map this port's MSI doorbell at {base:#x}+{len:#x} ({reason:?}) - this endpoint's interrupts will not be delivered", domain.0),
 		}
 	}
 }
@@ -485,7 +610,17 @@ pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 			let mut domains = DOMAINS.lock();
 			// ALLOC-OK: one row per device the boot scan resolved, and this is a binding transition
 			// rather than an interrupt.
+			//
+			// AND A ROW THAT CANNOT BE RECORDED UNDOES THE ATTACH. This returned `false` and walked
+			// away, leaving the endpoint attached in the hardware to a domain nothing knew about -
+			// so `domain_of` answered `None`, the next attempt built a SECOND domain for the same
+			// endpoint, and the first was unreachable for the life of the boot. There is one state
+			// worse than failing to attach, and it is attaching and forgetting.
 			if domains.try_reserve(1).is_err() {
+				drop(domains);
+				let endpoint = requester_of(bus, dev, func);
+				let undone = with(|controller| controller.iommu().revoke_endpoint(domain, endpoint)).is_some();
+				crate::serial_println!("iommu: {:02x}:{:02x}.{} attached and its row could not be recorded - the attach was {}", bus, dev, func, if undone { "undone" } else { "NOT undone, and this endpoint is translating under a domain nothing tracks" });
 				return false;
 			}
 			domains.push((index as u32, domain));
@@ -526,7 +661,7 @@ pub fn poll_faults() {
 	// this can print stays inside this call for as long as it keeps producing, and it is the same
 	// endpoint that decides how long that is.
 	const MOST_PER_CALL: usize = 64;
-	let mut out = [dma::FaultEvent { endpoint: dma::EndpointId(0), domain: dma::DomainId(0), generation: Generation(0), address: dma::DmaAddress(0), access: dma::Access::Read, reason: Fault::NotMapped }; 8];
+	let mut out = [dma::FaultEvent { endpoint: dma::EndpointId(0), domain: dma::DomainId(0), generation: Generation(0), address: None, access: dma::Access::Read, reason: Fault::NotMapped }; 8];
 	let mut reported = 0usize;
 	while reported < MOST_PER_CALL {
 		let taken = drain_faults(&mut out);
@@ -534,7 +669,13 @@ pub fn poll_faults() {
 			return;
 		}
 		for event in out.iter().take(taken) {
-			crate::serial_println!("iommu: FAULT endpoint {:#x} domain {} {:?} at {:#x}: {:?}", event.endpoint.0, event.domain.0, event.access, event.address.get(), event.reason);
+			// SAID WITH THE ADDRESS WHEN THERE IS ONE. A report the controller sent without an
+			// address is a real fault reported in less detail, and printing a zero for it would be
+			// this side inventing a number the device did not send.
+			match event.address {
+				Some(address) => crate::serial_println!("iommu: FAULT endpoint {:#x} domain {} {:?} at {:#x}: {:?}", event.endpoint.0, event.domain.0, event.access, address.get(), event.reason),
+				None => crate::serial_println!("iommu: FAULT endpoint {:#x} domain {} {:?} at an address the controller did not report: {:?}", event.endpoint.0, event.domain.0, event.access, event.reason),
+			}
 		}
 		reported += taken;
 	}

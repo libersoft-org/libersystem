@@ -11,23 +11,80 @@ use super::*;
 
 crate::tagged_test!(a_machine_without_a_controller_does_not_claim_enforcement, [Dma, Kernel], id = "kernel.iommu.a_machine_without_a_controller_does_not_claim_enforcement", covers = ["kernel"]);
 fn a_machine_without_a_controller_does_not_claim_enforcement() {
-	// The ordinary harness profile has no `virtio-iommu`, and the answer must be a measured no.
-	// A controller that IS present and came up would make this test's premise false, and the
-	// assertion is written so that it says so rather than silently passing.
-	if present() {
-		assert!(with(|controller| controller.still_enforcing()).unwrap_or(false), "a controller that came up reports bypass off");
-		assert!(crate::dma_policy::enforcing(), "and the policy agrees with it");
-		return;
+	// THREE STATES, NOT TWO, and the middle one is the whole point of `present`.
+	//
+	// `present()` is a fact about the BUS - a controller was found - and `enforcing()` is a fact
+	// about the bring-up. `PRESENT` used to be stored in the success arm only, so the two were the
+	// same question asked twice, and a controller that failed feature negotiation, queue creation or
+	// the bypass read-back left `present()` answering false. `dma_policy` reads exactly that to
+	// decide whether this machine was SUPPOSED to be isolated, so the one case a protected driver
+	// must refuse became indistinguishable from a machine that never had a controller.
+	match (present(), crate::dma_policy::enforcing()) {
+		// A controller on the bus, translating. `with` has one to hand out.
+		(true, true) => {
+			assert!(with(|controller| controller.still_enforcing()).unwrap_or(false), "a controller that came up reports bypass off");
+			assert!(translating(), "there is a controller to attach endpoints to");
+			assert!(crate::dma_policy::isolation_expected(), "a machine with a controller expects isolation");
+		}
+		// A controller on the bus that did not come up. Isolation was available and is not here,
+		// which is the case a protected driver refuses rather than degrades into.
+		(true, false) => {
+			assert!(with(|_| ()).is_none(), "a controller that failed bring-up is not handed out to callers");
+			assert!(!translating(), "and there is nothing to attach endpoints to or map buffers through");
+			assert!(crate::dma_policy::isolation_expected(), "the bus still has one, so this machine expected isolation and does not have it");
+		}
+		// No controller at all: the ordinary harness profile, and every machine whose firmware
+		// offers none. Untranslated DMA is the only DMA there is and nothing pretends otherwise.
+		(false, false) => {
+			assert!(with(|_| ()).is_none(), "and there is no controller to ask");
+			assert!(!translating(), "nor one to map through");
+			assert!(!crate::dma_policy::isolation_expected(), "a machine that never had one does not expect isolation");
+		}
+		(false, true) => panic!("enforcement without a controller on the bus is not a state this kernel has"),
 	}
-	assert!(!crate::dma_policy::enforcing(), "no controller means no enforcement, and nothing may pretend otherwise");
-	assert!(with(|_| ()).is_none(), "and there is no controller to ask");
+}
+
+crate::tagged_test!(a_controller_that_did_not_come_up_is_not_a_machine_without_one, [Dma, Kernel], id = "kernel.iommu.a_controller_that_did_not_come_up_is_not_a_machine_without_one", covers = ["kernel"]);
+fn a_controller_that_did_not_come_up_is_not_a_machine_without_one() {
+	// THE CONSEQUENCE OF THE MIDDLE STATE, driven through the policy that reads it.
+	//
+	// The two facts are set here rather than taken from the machine this happens to run on, because
+	// the subject is what the policy DOES with them and that must be the same answer on every
+	// profile. `isolation_expected` is the fact about the bus; `enforcing` is the fact about the
+	// bring-up. Their four combinations are three real machines and one impossible one.
+	let was_expected = crate::dma_policy::isolation_expected();
+	let was_enforcing = crate::dma_policy::enforcing();
+	const PROTECTED: u16 = abi::VIRTIO_TYPE_NET as u16;
+
+	// A controller on the bus that did not come up: the driver that declared it needs translation
+	// does not run. This is the state that used to be recorded as "no controller", and a protected
+	// driver then bound DEGRADED - untranslated DMA on a machine that was supposed to be isolated.
+	crate::dma_policy::set_isolation_expected(true);
+	crate::dma_policy::set_enforcing(false);
+	assert_eq!(crate::dma_policy::policy_for(PROTECTED), dma::Policy::IommuRequired);
+	assert_eq!(crate::dma_policy::admit(PROTECTED, 0, 2, 0), dma::BindDecision::Refused, "isolation was available and is not here - this driver does not run");
+
+	// The same machine once the controller is translating.
+	crate::dma_policy::set_enforcing(true);
+	assert_eq!(crate::dma_policy::admit(PROTECTED, 0, 2, 0), dma::BindDecision::Translated);
+
+	// And a machine that never had one: untranslated is the only DMA there is, and networking is
+	// not withdrawn over isolation this machine never offered.
+	crate::dma_policy::set_isolation_expected(false);
+	crate::dma_policy::set_enforcing(false);
+	assert_eq!(crate::dma_policy::policy_for(PROTECTED), dma::Policy::TrustedUntranslated);
+	assert_eq!(crate::dma_policy::admit(PROTECTED, 0, 2, 0), dma::BindDecision::DegradedUntranslated);
+
+	crate::dma_policy::forget_degraded(0, 2, 0);
+	crate::dma_policy::set_isolation_expected(was_expected);
+	crate::dma_policy::set_enforcing(was_enforcing);
 }
 
 crate::tagged_test!(draining_faults_without_a_controller_is_bounded_and_empty, [Dma, Kernel], id = "kernel.iommu.draining_faults_without_a_controller_is_bounded_and_empty", covers = ["kernel"]);
 fn draining_faults_without_a_controller_is_bounded_and_empty() {
 	// The fault path is polled from the kernel's own loop, so it has to be safe to call on a machine
 	// with no IOMMU at all - the alternative is a call site that has to know, and one that forgets.
-	let mut out = [dma::FaultEvent { endpoint: dma::EndpointId(0), domain: dma::DomainId(0), generation: dma::Generation(0), address: dma::DmaAddress(0), access: dma::Access::Read, reason: dma::Fault::NotMapped }; 4];
+	let mut out = [dma::FaultEvent { endpoint: dma::EndpointId(0), domain: dma::DomainId(0), generation: dma::Generation(0), address: None, access: dma::Access::Read, reason: dma::Fault::NotMapped }; 4];
 	let taken = drain_faults(&mut out);
 	if !present() {
 		assert_eq!(taken, 0, "no controller reports no faults");

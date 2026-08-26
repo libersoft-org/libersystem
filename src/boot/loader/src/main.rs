@@ -146,7 +146,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// WHICH LiberFS volume is this installation's. A superblock identifies LiberFS; it does not
 	// identify the system that owns it, so two LiberSystem disks in one machine used to let the
 	// firmware's block-handle order decide which one booted. The boot medium names its volume by
-	// uuid in `etc/system-volume.uuid`, and when it does, nothing else may be the system volume.
+	// uuid in its own SIGNED manifest, and when it does, nothing else may be the system volume.
 	// A medium without the file keeps the old behaviour and says so, because a rescue stick is
 	// exactly the medium that has no paired volume.
 	unsafe { PAIRED_UUID = read_pairing(bs, root) };
@@ -184,6 +184,18 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 					}
 					announce_release(&manifest);
 				}
+				// PRESENT AND UNREADABLE IS BETRAYAL, NOT ABSENCE - which `assemble_bootstrap` has
+				// said for the bootstrap set all along, and this path could not say because every
+				// failure to read arrived here as one value.
+				//
+				// Damaging one file on the volume dropped its KERNEL from "signed" to "checksummed":
+				// the read failed, this fell to the arm below, and a `test-trust` build accepted the
+				// text manifest - a checksum list an attacker recomputes along with the payload. That
+				// is a downgrade performed without forging anything, and it is the case the
+				// selected-source rule exists for.
+				VolumeRead::Unreadable => {
+					panic!("loader: the system volume's signed manifest is there and could not be read - refusing to fall back to the checksum one");
+				}
 				_ => {
 					// See `assemble_bootstrap`: a signed manifest that is ABSENT used to drop this
 					// source to the text one, which is a checksum list an attacker recomputes along
@@ -210,6 +222,14 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		VolumeRead::NoVolume => {
 			arch::serial::write_str("loader: no LiberFS volume on any block device; using the boot volume\n");
 			read_verified_kernel_from_boot_medium(bs, root)
+		}
+		// A SELECTED VOLUME THAT FAILED IS THE END OF THE BOOT.
+		//
+		// Not a fallback: the pairing named this volume, or this machine has exactly one, and the
+		// read of its kernel failed. Continuing to the boot medium here is how a machine whose disk
+		// is going bad silently boots an older kernel off its ESP.
+		VolumeRead::Unreadable => {
+			panic!("loader: the system volume was selected and its kernel could not be read - refusing to boot something else instead");
 		}
 		VolumeRead::NotOnVolume => {
 			arch::serial::write_str("loader: system volume found but it has no kernel; using the boot volume\n");
@@ -370,28 +390,30 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 			}
 		}
 		with_boot_medium(bs, |disk| {
-			let Some(mut fs) = fat::FatFs::mount_read_only(disk) else { return false };
+			let Some(mut fs) = fat::FatFs::mount_read_only(disk) else { return Visit::NotAMedium };
 			match blockio::assemble_bootstrap(&mut fs, &trust::Expected::medium()) {
 				abi::bootstrap::Selection::Verified(archive) => unsafe {
-					// A retain that fails is not an answer, so the scan goes on rather than
-					// stopping on a medium that gave nothing.
 					match retain(bs, &archive) {
 						Some(retained) => {
 							BOOTSTRAP = Some(retained);
 							BOOTSTRAP_SOURCE = SOURCE_BOOT_MEDIUM;
-							true
 						}
-						None => false,
+						// A retain that fails leaves this boot without a bootstrap set, and it does
+						// not send the search to another disk to find one: the medium is this one.
+						None => {}
 					}
+					Visit::Mounted { done: true }
 				},
 				// SELECTED AND FAILED. The scan stops: a medium that names programs and cannot be
 				// checked is not one to look past.
 				abi::bootstrap::Selection::Invalid(reason) => {
 					unsafe { BOOTSTRAP_REFUSED = Some(reason) };
-					true
+					Visit::Mounted { done: true }
 				}
-				// A FAT volume without a bootstrap list is not the boot medium; the next might be.
-				abi::bootstrap::Selection::Unavailable => false,
+				// A FAT medium with no bootstrap list is still the boot medium - it mounted - and
+				// this boot simply has no set on it. It used to send the scan to the next disk,
+				// which is how a kernel from one stick met a bootstrap set from another.
+				abi::bootstrap::Selection::Unavailable => Visit::Mounted { done: true },
 			}
 		});
 	}
@@ -452,10 +474,21 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 // survive `ExitBootServices` and the kernel image must.
 pub(crate) enum VolumeRead {
 	Read(&'static [u8]),
-	// No block device carried a LiberFS superblock.
+	// No block device carried a LiberFS superblock. The one answer policy may consider another
+	// source for: the volume this medium wants is not in the machine.
 	NoVolume,
-	// A LiberFS volume was found, but not this file - or its bytes could not be retained.
+	// A LiberFS volume was found and this file is not on it.
 	NotOnVolume,
+	// A LiberFS volume was found and the read FAILED, which is not the same thing.
+	//
+	// M4's rule is that a source, once selected, either answers or stops the boot: a missing named
+	// file, an I/O failure or malformed metadata is `Invalid` and none of them falls through to
+	// another disk or to the ESP. All three used to arrive here as `NotOnVolume` - the file is not
+	// there, `fs.read_file` returned an error, and `retain` had no memory for the bytes - and the
+	// caller printed "the system volume has no kernel" and read the boot medium's copy instead. A
+	// volume the pairing NAMED, whose kernel could not be read off a failing disk, quietly booted
+	// somebody else's kernel and said nothing that would let anyone tell.
+	Unreadable,
 }
 
 // The bootstrap archive assembled from the volume, if there was one. Read in the SAME mount as
@@ -479,39 +512,88 @@ const SOURCE_BOOT_MEDIUM: &str = "the boot medium (the system volume did not ans
 // The uuid of the volume this boot medium is paired with, when it names one.
 static mut PAIRED_UUID: Option<[u8; 16]> = None;
 
-// Read `etc/system-volume.uuid` off the boot medium: 32 hex digits, dashes and surrounding
-// whitespace ignored, so the file can be written in either of the two spellings people use.
+// Which system volume this boot medium is paired with: the uuid in its own signed manifest, and
+// `None` when it names none.
 fn read_pairing(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) -> Option<[u8; 16]> {
-	// The parse lives with the rule it feeds - `uefi::disk::parse_pairing`, beside `choose_volume` -
-	// so both halves of the pairing mechanism are in one place and both are tested. What stays here
-	// is the reading.
-	// NOT FREED HERE, deliberately. A UUID is 36 bytes and this read costs a whole page of
-	// LOADER_DATA that the kernel never seeds as usable - but `read_boot_file` has TWO sources, the
-	// firmware read (page-backed, freeable) and the FAT fallback (its own buffer, not), and the
-	// return type does not say which. Handing the wrong one to `free_pages` is worse than the leak.
-	// Closing this needs the ownership expressed in the type; see LDR-012.
-	// A FILE THAT IS THERE AND UNREADABLE IS NOT A MEDIUM WITH NO PAIRING.
+	// OUT OF THE SIGNED MANIFEST, NOT OUT OF A FILE BESIDE IT.
 	//
-	// Every outcome used to collapse through `Option`: no file, an unreadable file, and 36 bytes of
-	// something that is not a UUID all became `None`, and the caller reads `None` as "this medium
-	// names no system volume" and takes the FIRST LiberFS volume the firmware enumerates. That is
-	// the exact behaviour the pairing exists to prevent - two LiberSystem disks in one machine,
-	// enumeration order deciding which one boots - reinstated by a typo in the file that was meant
-	// to stop it.
+	// The pairing used to be `etc/system-volume.uuid`, plain text, read straight off the medium and
+	// used to decide which volume this machine boots. Nothing signed it. Anyone who could write the
+	// ESP could repoint it at a different signed volume - or simply DELETE it, which is easier and
+	// worse: the loader read the absence as "this medium names no volume" and took the first LiberFS
+	// volume the firmware enumerated, which is exactly the behaviour the pairing exists to remove.
+	// One unsigned file could turn the whole mechanism off.
 	//
-	// So the two are distinguished. A medium with no pairing file is the rescue stick the fallback
-	// is for. A medium whose pairing file cannot be parsed is a medium that says which volume it
-	// wants and cannot be understood, and this refuses rather than guessing at it.
-	let Some(bytes) = read_boot_file(bs, root, "etc/system-volume.uuid") else {
+	// The value now travels in the boot medium's own signed manifest, in the header field made for
+	// it, and it is read only after that manifest has been verified for THIS product, THIS
+	// architecture and this source kind. A medium whose manifest names no volume - a rescue stick,
+	// the test medium - answers zero and keeps the fallback, and it says so.
+	let Some(bytes) = read_boot_file(bs, root, "etc/boot.manifest2") else {
+		// A MEDIUM WITH NO SIGNED MANIFEST NAMES NO VOLUME, and on an authenticated build that is
+		// not a medium to boot at all - which the kernel and bootstrap reads below refuse for
+		// themselves. Here it means only that there is no pairing to be had.
+		if !trust::IS_TEST_TRUST {
+			arch::serial::write_str("loader: the boot medium carries no SIGNED manifest, so it names no system volume and this build cannot take one on trust\n");
+		}
 		return None;
 	};
-	match uefi::disk::parse_pairing(bytes) {
-		Some(uuid) => Some(uuid),
-		None => {
-			arch::serial::write_str("loader: FATAL - the boot medium carries a pairing file that is not a uuid, so which volume it wants cannot be established\n");
-			arch::halt();
-		}
+	let mut scratch = alloc::vec::Vec::new();
+	if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + bytes.len()).is_err() {
+		arch::serial::write_str("loader: FATAL - no room to verify the boot medium's signed manifest\n");
+		arch::halt();
 	}
+	scratch.resize(bootproto::manifest::DOMAIN.len() + bytes.len(), 0);
+	let Some(manifest) = trust::verify_for(bytes, &trust::Expected::medium(), &mut scratch) else {
+		// A MEDIUM WHOSE MANIFEST IS THERE AND DOES NOT VERIFY IS NOT A MEDIUM WITH NO PAIRING. It
+		// is a medium that says which volume it wants and cannot be believed, and every later read
+		// from it is about to be refused for the same reason. Stopping here says which.
+		arch::serial::write_str("loader: FATAL - the boot medium's signed manifest was refused, so which volume it names cannot be established\n");
+		arch::halt();
+	};
+	// The release this boot is, latched by the first thing verified - and on a paired machine that
+	// is this manifest, before any volume has been chosen.
+	announce_release(&manifest);
+	if manifest.volume_uuid == [0u8; 16] { None } else { Some(manifest.volume_uuid) }
+}
+
+// Read a PACKAGE off the boot medium and check it against the medium's signed manifest.
+//
+// THE BUILD SIGNED THESE ROWS AND THE LOADER HAD NEVER READ ONE. `sign-manifest` writes a
+// `package:` row for whichever payload a medium carries, and `KIND_PACKAGE` appeared in no loader
+// source file at all - so `init.pkg` and `volume.pkg` were read off the ESP and published to the
+// kernel as boot modules with nothing compared. On a machine whose system volume is missing or
+// unreadable, `init.pkg` IS the userspace, arriving unverified down the fallback the signed path
+// exists to make unnecessary.
+//
+// A package that is absent is absent; one that is there and is not what the manifest records, or is
+// not in the manifest at all, stops the boot. There is no third answer: a module the kernel is about
+// to run is not something to hand over with a warning.
+pub(crate) fn read_verified_package(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>, name: &str) -> Option<&'static [u8]> {
+	let bytes = read_boot_file(bs, root, name)?;
+	let Some(signed) = read_boot_file(bs, root, "etc/boot.manifest2") else {
+		// The same profile split every other read on this medium makes: an authenticated build does
+		// not publish an unverified module, and a test-trust one says what it is doing.
+		if !trust::IS_TEST_TRUST {
+			panic!("loader: a package is on the boot medium and the medium carries no SIGNED manifest - refusing to hand it to the kernel");
+		}
+		arch::serial::write_str(
+			"loader: THIS PACKAGE IS NOT AUTHENTICATED - the boot medium carries no signed manifest, and this build accepts it
+",
+		);
+		return Some(bytes);
+	};
+	let mut scratch = alloc::vec::Vec::new();
+	if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + signed.len()).is_err() {
+		panic!("loader: no room to verify the boot medium's signed manifest");
+	}
+	scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
+	let Some(manifest) = trust::verify_for(signed, &trust::Expected::medium(), &mut scratch) else {
+		panic!("loader: the boot medium's signed manifest was refused - see the line above");
+	};
+	if !blockio::covered_by(&manifest, bootproto::manifest::KIND_PACKAGE, name.as_bytes(), bytes) {
+		panic!("loader: a package on the boot medium is not what its SIGNED manifest records - refusing to hand it to the kernel");
+	}
+	Some(bytes)
 }
 
 // The live medium's system volume, read once. It is needed twice - to assemble the bootstrap set
@@ -565,6 +647,17 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 	}) else {
 		return VolumeRead::NoVolume;
 	};
+	// A VOLUME WAS FOUND AND NOTHING NAMED IT.
+	//
+	// `choose_volume` with no pairing takes the first LiberFS volume the firmware enumerates, which
+	// is the block-handle order this whole mechanism exists to stop deciding things. That is the
+	// right answer for a rescue stick - a medium deliberately paired with nothing, booting whatever
+	// system is in the machine - and it is not an answer an authenticated release may give, because
+	// the release cannot say which system it just booted. The build refuses to produce such a medium
+	// when it carries a volume; this refuses to boot one.
+	if want.is_none() && !trust::IS_TEST_TRUST {
+		panic!("loader: a LiberFS volume is in this machine and the boot medium's signed manifest names none - refusing to pick one by firmware enumeration order");
+	}
 	// The bootstrap set, packed into the archive format the kernel already unpacks. This is
 	// what retires `init.pkg` as an artifact: the same bytes reach the kernel, assembled from
 	// files that exist on the volume rather than from a package built beside it.
@@ -593,9 +686,15 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 	match fs.read_file(path) {
 		Ok(bytes) => match retain(bs, &bytes) {
 			Some(retained) => VolumeRead::Read(retained),
-			None => VolumeRead::NotOnVolume,
+			// Out of firmware pages. The file is on the volume and this boot cannot hold it, which
+			// is a failure of the read rather than an absence.
+			None => VolumeRead::Unreadable,
 		},
-		Err(_) => VolumeRead::NotOnVolume,
+		// A NAME THAT IS NOT ON THE VOLUME IS THE ONE ABSENCE. Everything else the filesystem
+		// answers with - a bad extent, a short read, a disk returning an error - is the selected
+		// source failing, and the difference is what decides whether this boot may look elsewhere.
+		Err(liberfs::FsError::NotFound) => VolumeRead::NotOnVolume,
+		Err(_) => VolumeRead::Unreadable,
 	}
 }
 
@@ -771,7 +870,7 @@ static mut BOOT_DEVICE: Option<Handle> = None;
 // The content scan below stays for the firmware that mounts the ESP without exposing it as a block
 // device - U-Boot does exactly that, and a `LoadedImage` handle with no Block I/O on it matches
 // nothing here.
-fn with_boot_medium(bs: *mut BootServices, mut visit: impl FnMut(blockio::FirmwareDisk) -> bool) {
+fn with_boot_medium(bs: *mut BootServices, mut visit: impl FnMut(blockio::FirmwareDisk) -> Visit) {
 	if let (None, Some(want)) = (unsafe { BOOT_MEDIUM }, unsafe { BOOT_DEVICE }) {
 		unsafe {
 			blockio::each_disk(bs, |disk| {
@@ -788,16 +887,34 @@ fn with_boot_medium(bs: *mut BootServices, mut visit: impl FnMut(blockio::Firmwa
 		visit(disk);
 		return;
 	}
+	// THE LATCH IS THE MOUNT, NOT THE FIND, and the two are different answers so the visitor gives
+	// two.
+	//
+	// It latched on `true`, which every visitor returned only when the file it wanted was read - so
+	// a medium that mounted cleanly and did not carry THAT file was forgotten, and the next read
+	// walked and re-mounted every disk in the machine again. Worse than the cost: with two FAT media
+	// present, each file was independently taken from whichever disk happened to have it, which is a
+	// boot assembled from two systems - the thing this function's own comment says it exists to
+	// stop. A medium that mounts is the medium; what it does or does not hold comes after.
 	unsafe {
-		blockio::each_disk(bs, |disk| {
-			if visit(disk) {
+		blockio::each_disk(bs, |disk| match visit(disk) {
+			Visit::NotAMedium => false,
+			Visit::Mounted { done } => {
 				BOOT_MEDIUM = Some(disk);
-				true
-			} else {
-				false
+				done
 			}
 		});
 	}
+}
+
+// What a `with_boot_medium` visitor found on one disk.
+#[derive(Clone, Copy)]
+pub(crate) enum Visit {
+	// Not a FAT volume, or not one this loader can mount. Keep looking, and remember nothing.
+	NotAMedium,
+	// It mounted. This IS the boot medium from here on, whether or not the file being looked for was
+	// on it - `done` only says whether the scan has anything left to do.
+	Mounted { done: bool },
 }
 
 // Read a file from a FAT medium the firmware did not mount for us.
@@ -809,15 +926,14 @@ fn with_boot_medium(bs: *mut BootServices, mut visit: impl FnMut(blockio::Firmwa
 pub(crate) fn read_from_fat(bs: *mut BootServices, path: &[u8]) -> Option<&'static [u8]> {
 	let mut found: Option<&'static [u8]> = None;
 	with_boot_medium(bs, |disk| {
-		let Some(mut fs) = fat::FatFs::mount_read_only(disk) else { return false };
-		match fs.read_file(path) {
-			Ok(bytes) => {
-				found = retain(bs, &bytes);
-				true
-			}
-			// A FAT volume without this file is not the one we want; the next medium might be.
-			Err(_) => false,
+		let Some(mut fs) = fat::FatFs::mount_read_only(disk) else { return Visit::NotAMedium };
+		// MOUNTED IS THE ANSWER, whether or not this file is on it. A FAT medium missing one file is
+		// still this boot's medium, and looking for that file on a second one is how a system gets
+		// assembled out of two.
+		if let Ok(bytes) = fs.read_file(path) {
+			found = retain(bs, &bytes);
 		}
+		Visit::Mounted { done: true }
 	});
 	found
 }

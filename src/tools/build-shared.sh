@@ -244,14 +244,26 @@ public_arch() {
 # section it came out of was hashed as whatever bytes happened to follow, and a note that was not
 # this note's format at all was hashed as if it were. A digest computed off a header nobody validated
 # is a number, not an identity.
+# The identity note's type field: `LIBER_IDENTITY_NOTE_TYPE` in `bootproto::elf`, which is where the
+# packager's own reader gets it. That reader also checks the exact padded length and that the padding
+# is zero; this one does not, and does not need to - the packager asserts those independently on
+# every artifact, and a trailing byte cannot change a digest taken over exactly `descsz` bytes.
+IDENTITY_NOTE_TYPE=1
+
 staged_identity_digest() {
-	local elf="$1" note="$2" len namesz name section_len
+	local elf="$1" note="$2" len namesz name section_len note_type
 	llvm-objcopy --dump-section .note.liber.identity="$note" "$elf" /dev/null 2>/dev/null || return 1
 	section_len="$(stat -c%s "$note")"
 	# A note shorter than its own header is not a note.
 	[[ "$section_len" -ge 20 ]] || return 1
 	namesz="$(od -An -tu4 -j0 -N4 "$note" | tr -d ' ')"
 	len="$(od -An -tu4 -j4 -N4 "$note" | tr -d ' ')"
+	# AND THE THIRD FIELD OF THE HEADER, which was the one left unread. `namesz`, `descsz` and the
+	# name bytes were all checked and the TYPE - the field that says what kind of note this is - was
+	# not, so a section carrying the right name and a record of some other format was hashed as this
+	# one. It is one more `od` beside the two above.
+	note_type="$(od -An -tu4 -j8 -N4 "$note" | tr -d ' ')"
+	[[ "$note_type" == "$IDENTITY_NOTE_TYPE" ]] || return 1
 	# The name is "LIBER\0", six bytes padded to eight - which is what makes the twenty-byte header
 	# twenty rather than sixteen, so a different namesz means the record is not where this reader
 	# thinks it is.
@@ -304,8 +316,17 @@ verify_staged_provider_chains() {
 			[[ -n "$recorded" ]] || continue
 			provider="${recorded#provider=}"
 			provider="${provider%%:*}"
-			if [[ -n "${recorded_providers[$provider]:-}" && "${recorded_providers[$provider]}" != "$recorded" ]]; then
-				echo "build-shared: $artifact records $provider twice with different digests - its identity note contradicts itself" >&2
+			# TWICE IS TWICE, whether or not the two agree. This compared the rows and complained
+			# only when they DISAGREED, so a note recording one provider twice with the same digest
+			# passed - and an edge set with a repeated edge is not the set the build produced. The
+			# identity note is generated from a sorted provider list, one line each, so a repeat is
+			# never something a real build writes.
+			if [[ -n "${recorded_providers[$provider]:-}" ]]; then
+				if [[ "${recorded_providers[$provider]}" != "$recorded" ]]; then
+					echo "build-shared: $artifact records $provider twice with different digests - its identity note contradicts itself" >&2
+				else
+					echo "build-shared: $artifact records $provider twice - its identity note is not the edge set this build produced" >&2
+				fi
 				inconsistent=1
 			fi
 			recorded_providers[$provider]="$recorded"

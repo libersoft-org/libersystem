@@ -135,7 +135,20 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	let arch = env::var("CARGO_CFG_TARGET_ARCH").expect("architecture set by main");
 	let stem = conf_get(conf, "SYSTEM_VOLUME");
 	let name = stem.strip_suffix(".img").unwrap_or(stem);
-	let out_img: PathBuf = out_dir.join(format!("{name}-{arch}.img"));
+	// TWO SHAPES, TWO NAMES.
+	//
+	// A volume with a kernel on it and a volume without one are different artifacts with different
+	// consumers - a shipping medium needs the first, the test harness needs the second - and they
+	// were written to the same path. Whichever command ran last therefore decided what every
+	// consumer read, and each of them took it on trust: a suite run after `./image.sh` booted the
+	// SHIPPING kernel off the volume and sat at a shell until the watchdog fired, and a
+	// `--part volume` after an `./image.sh` left the ISO naming a uuid the volume no longer had.
+	//
+	// Both builds are correct and complete. The defect is one name, and this is the same fix the
+	// kernel slot beside it already got: name the file after what is in it.
+	let bootable = env::args().any(|arg| arg.starts_with("--with-kernel="));
+	let shape = if bootable { "-bootable" } else { "" };
+	let out_img: PathBuf = out_dir.join(format!("{name}{shape}-{arch}.img"));
 	let manifest: PathBuf = kernel_anchor();
 
 	// Everything the archive carries, at the same destinations.
@@ -320,7 +333,10 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 		hex.push_str(&format!("{byte:02x}"));
 	}
 	hex.push('\n');
-	let out_uuid: PathBuf = out_dir.join(format!("{name}-{arch}.uuid"));
+	// The pairing belongs to the image it was derived from, so it carries the same shape suffix.
+	// A shipping medium's pairing naming the TEST volume's uuid is the failure that made the loader
+	// decline the volume it could see, correctly and for a reason nothing on the medium explained.
+	let out_uuid: PathBuf = out_dir.join(format!("{name}{shape}-{arch}.uuid"));
 	write_if_changed(&out_uuid, hex.as_bytes());
 }
 

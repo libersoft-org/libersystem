@@ -101,6 +101,7 @@ def main() -> None:
 	ap.add_argument("--window", type=float, default=3.0, help="seconds to collect markers after the command")
 	ap.add_argument("--boot-timeout", type=float, default=30.0, help="seconds to wait for boot")
 	ap.add_argument("--require", action="append", default=None, help="marker label the trace must contain (repeatable); default: the command's own start/end pair")
+	ap.add_argument("--self-calibrate", action="store_true", help="measure without the kernel's tsc_hz anchor, from host wall-clock (a few percent out)")
 	args = ap.parse_args()
 	if args.window <= 0:
 		sys.exit("perf-trace: --window must be positive; a window of zero collects nothing and would report it as a trace")
@@ -151,8 +152,22 @@ def main() -> None:
 
 	if tsc_hz:
 		print(f"perf-trace: tsc_hz = {tsc_hz} ({tsc_hz / 1e9:.3f} GHz)")
+	elif not args.self_calibrate:
+		# THE ANCHOR'S CONDITION IS ASSERTED HERE, and nowhere else it was.
+		#
+		# The kernel prints `tsc_hz` only when a boot profile is named over fw_cfg - which is the
+		# right rule, and nothing checked that it still held. A warning and a self-calibration meant
+		# the day the condition stopped matching, every trace quietly became a few percent estimate
+		# derived from host wall-clock, and the report looked exactly the same. This tool is the
+		# thing that boots that profile, so this is where the condition has a witness.
+		sys.exit(
+			"perf-trace: the guest published no tsc_hz anchor. The kernel emits it only when a boot\n"
+			"            profile is named over fw_cfg (DEV_PROFILE=1), so either the guest was not\n"
+			"            started that way or that condition has stopped matching. Pass\n"
+			"            --self-calibrate to measure anyway, from host wall-clock, a few percent out."
+		)
 	else:
-		print("perf-trace: WARNING tsc_hz anchor not seen; will self-calibrate from host wall-clock")
+		print("perf-trace: WARNING tsc_hz anchor not seen; self-calibrating from host wall-clock, which is a few percent out")
 
 	# Phase 2: send the command and collect the markers it triggers.
 	markers = []  # (label, tsc, host_recv_time, val)

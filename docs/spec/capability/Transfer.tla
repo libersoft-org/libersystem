@@ -65,7 +65,7 @@ TypeOK ==
 (***************************************************************************)
 TheObject == CHOOSE o \in Objects : TRUE
 TheType == CHOOSE t \in Types : TRUE
-TheCap == [obj |-> TheObject, type |-> TheType, rights |-> MintedRights, objgen |-> 1]
+TheCap == [obj |-> TheObject, type |-> TheType, rights |-> MintedRights, from |-> MintedRights, objgen |-> 1]
 
 \* ONE MINTED CAPABILITY PER OBJECT, WHICH IS WHAT MAKES A BATCH OF TWO REACHABLE.
 \*
@@ -80,7 +80,8 @@ TheCap == [obj |-> TheObject, type |-> TheType, rights |-> MintedRights, objgen 
 Sorted(S) == CHOOSE seq \in [1..Cardinality(S) -> S] :
                  /\ \A a, b \in 1..Cardinality(S) : a # b => seq[a] # seq[b]
 ObjectSeq == Sorted(Objects)
-MintedFor(o) == [obj |-> o, type |-> TheType, rights |-> MintedRights, objgen |-> 1]
+\* A MINT DESCENDS FROM THE MINT. Nothing is above it, so its own right set is its source.
+MintedFor(o) == [obj |-> o, type |-> TheType, rights |-> MintedRights, from |-> MintedRights, objgen |-> 1]
 Minted == Cardinality(Objects)
 
 Init ==
@@ -209,9 +210,18 @@ Enqueue(p) ==
 (***************************************************************************)
 
 \* `HandleTable::reserve`: a CONCRETE slot leaves circulation and the quota is charged now.
+\*
+\* AS MANY AS THE MESSAGE NEEDS, WHICH IS WHY THE RECEIVE SIDE OF A BATCH IS REACHABLE AT ALL.
+\*
+\* This was `Len(booked[p]) = 0`, so a receiver could hold at most ONE booking - while `Dequeue`
+\* requires `Len(booked[p]) >= Len(Head(queue).caps)`. A two-capability message could therefore be
+\* sent and queued and never taken: it sat at the head forever, and every rule about the receive half
+\* of a batch - install both, publish both, roll both back, close between the first install and the
+\* second - was checked over a batch of one. It is the same defect the send side had, in the half
+\* that was not looked at when that one was fixed.
 Book(p) ==
     /\ ~closed[p]
-    /\ Len(booked[p]) = 0
+    /\ Len(booked[p]) < BatchMax
     /\ \E i \in 1..Slots :
          /\ table[p][i].state = "Free"
          /\ table' = [table EXCEPT ![p][i] = [state |-> "Booked", cap |-> NoCap, gen |-> table[p][i].gen]]
@@ -381,8 +391,9 @@ Duplicate(p, i, j, r) ==
     /\ r \subseteq table[p][i].cap.rights
     /\ r # {}
     /\ table[p][j].state = "Free"
+    \* THE DERIVED CAPABILITY RECORDS WHERE IT CAME FROM, which is what `AuthorityNeverWidens` reads.
     /\ table' = [table EXCEPT ![p][j] =
-                  [state |-> "Live", cap |-> [table[p][i].cap EXCEPT !.rights = r], gen |-> table[p][j].gen]]
+                  [state |-> "Live", cap |-> [table[p][i].cap EXCEPT !.rights = r, !.from = table[p][i].cap.rights], gen |-> table[p][j].gen]]
     /\ charge' = [charge EXCEPT ![p] = charge[p] + 1]
     /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
@@ -524,7 +535,17 @@ TransferIsLinear == \A o \in Objects : CopiesOf(o) =< 1
 
 \* AUTHORITY NEVER WIDENS: nothing anywhere carries more than the capability it descends from, and
 \* a transfer adds nothing at all.
-AuthorityNeverWidens == \A c \in AllCaps : c.rights \subseteq MintedRights
+\*
+\* STATED AT EVERY LINK, NOT ONLY AGAINST THE MINT. This was `c.rights \subseteq MintedRights`, which
+\* is a ceiling rather than a chain: a derive that handed out MORE than its source satisfied it as
+\* long as the result stayed under the mint, so removing the source-rights guard from `Duplicate` did
+\* not violate the invariant named for that guard. `from` carries the source's rights, and a mint's
+\* source is itself - so the second conjunct is the old statement, and the first is the one the name
+\* has always promised.
+AuthorityNeverWidens ==
+    \A c \in AllCaps :
+      /\ c.rights \subseteq c.from
+      /\ c.from \subseteq MintedRights
 
 \* NO FORGERY: every capability that exists names an object that was minted, at the generation it
 \* was minted against. Nothing in the transition relation can produce another.
@@ -656,4 +677,18 @@ NoTwoQueuedMessages == Len(queue) < 2
 
 \* And the rollback that only means something at length two: a refused send returns ALL of them.
 NoBatchOfTwoRestored == ~(outcome = "restored" /\ Cardinality({o \in Objects : CopiesOf(o) = 1}) > 1)
+
+\* AND THE RECEIVE HALF OF THAT BATCH, WHICH NOTHING COVERED.
+\*
+\* The three above are all about the SENDER: a batch of two taken, a message of two queued, a refused
+\* send returning both. The receiver's side was never asked about, and it was unreachable - `Book`
+\* capped a receiver at one booking while `Dequeue` demanded one per capability, so a two-capability
+\* message could be built and could never be taken. Each of these is refuted where the batch
+\* configuration reaches it, and that refutation is what says the whole lifecycle runs.
+NoTwoBookings == \A p \in Procs : Len(booked[p]) < 2
+NoTwoCapMessageDequeued == ~(IsMsg(held) /\ Len(held.caps) = 2)
+NoTwoCapsInstalled == Len(installed) < 2
+NoTwoCapsPublished == ~(outcome = "published" /\ Len(installed) = 2)
+NoTwoCapPayloadFailure == ~(outcome = "payload-failed" /\ Len(queue) > 0 /\ Len(Head(queue).caps) = 2)
+NoCloseBetweenTwoInstalls == ~(outcome = "dropped-into-closed" /\ Len(installed) = 1)
 =============================================================================

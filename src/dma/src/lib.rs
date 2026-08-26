@@ -241,7 +241,12 @@ pub struct FaultEvent {
 	pub endpoint: EndpointId,
 	pub domain: DomainId,
 	pub generation: Generation,
-	pub address: DmaAddress,
+	// WHERE, WHEN THE CONTROLLER KNOWS. A fault report carries a flag saying whether its address
+	// field means anything, and a controller is entitled to clear it - the access faulted, and which
+	// address it was aimed at was not recorded. That is a less detailed report of a real fault, and
+	// it used to be refused as malformed and dropped without a word, which turned the one message
+	// the fault queue exists to carry into silence.
+	pub address: Option<DmaAddress>,
 	pub access: Access,
 	pub reason: Fault,
 }
@@ -882,21 +887,21 @@ impl<B: Backend> Iommu<B> {
 	pub fn translate(&mut self, endpoint: EndpointId, address: DmaAddress, access: Access) -> Result<u64, Fault> {
 		let Some((domain, generation)) = self.domains.iter().find(|(_, d)| d.endpoints.contains(&endpoint) && d.attached_confirmed).map(|(id, d)| (*id, d.generation)) else {
 			// Not attached anywhere: there is no domain in which this address means anything.
-			self.faults.record(FaultEvent { endpoint, domain: DomainId(0), generation: Generation(0), address, access, reason: Fault::UnknownEndpoint });
+			self.faults.record(FaultEvent { endpoint, domain: DomainId(0), generation: Generation(0), address: Some(address), access, reason: Fault::UnknownEndpoint });
 			return Err(Fault::UnknownEndpoint);
 		};
 		let found = self.mappings.values().find(|m| m.domain == domain && m.state == MappingState::Live && address.get() >= m.iova.get() && address.get() < m.iova.get() + m.len).copied();
 		let Some(mapping) = found else {
-			self.faults.record(FaultEvent { endpoint, domain, generation, address, access, reason: Fault::NotMapped });
+			self.faults.record(FaultEvent { endpoint, domain, generation, address: Some(address), access, reason: Fault::NotMapped });
 			return Err(Fault::NotMapped);
 		};
 		// A mapping made under a previous binding does not answer to this one, however live it looks.
 		if mapping.generation != generation {
-			self.faults.record(FaultEvent { endpoint, domain, generation, address, access, reason: Fault::StaleGeneration });
+			self.faults.record(FaultEvent { endpoint, domain, generation, address: Some(address), access, reason: Fault::StaleGeneration });
 			return Err(Fault::StaleGeneration);
 		}
 		if !mapping.direction.permits(access) {
-			self.faults.record(FaultEvent { endpoint, domain, generation, address, access, reason: Fault::Permission });
+			self.faults.record(FaultEvent { endpoint, domain, generation, address: Some(address), access, reason: Fault::Permission });
 			return Err(Fault::Permission);
 		}
 		Ok(mapping.physical + (address.get() - mapping.iova.get()))

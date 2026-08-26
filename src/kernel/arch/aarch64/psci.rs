@@ -385,6 +385,11 @@ extern "C" fn secondary_idle(cpu_id: u64) -> ! {
 	super::gic::init_secondary();
 	SEC_MPIDR[cpu_id as usize].store(mpidr, Ordering::Relaxed);
 	SMP_ONLINE.fetch_add(1, Ordering::Release);
+	// AND INTO THE PORTABLE TABLE TOO, before the core counts as online. The affinity lived only in
+	// this arch-private array while `numa::bind_online` read the portable one - which held the core's
+	// subscript - so the node lookup was done with a number no firmware table has ever been keyed on.
+	// Recorded first, because marking online is what triggers this core's binding.
+	crate::smp::set_lapic_id(cpu_id as usize, mpidr & MPIDR_AFFINITY);
 	// Also count this core in the portable online tally the scheduler and tests read.
 	crate::smp::mark_online(cpu_id as usize);
 	super::enable_interrupts();

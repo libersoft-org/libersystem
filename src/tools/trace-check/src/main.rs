@@ -40,6 +40,10 @@ const CHANNEL_PARTY: u16 = 0x8000;
 const OK: u8 = 0;
 const REFUSED: u8 = 1;
 
+// The largest queue a channel may be configured with (`CHANNEL_QUEUE_MAX` in the kernel). The model
+// checks `QueueBounded` against its own `QueueLimit`; the trace's bound is the implementation's.
+const CHANNEL_QUEUE_MAX: usize = 4096;
+
 // `Rights::TRANSFER`, as `abi` numbers it: the eighth bit. A take requires it, which is the one
 // rights check in the model's transfer path.
 const RIGHT_TRANSFER: u32 = 1 << 7;
@@ -66,6 +70,14 @@ enum SlotState {
 struct Slot {
 	state: SlotState,
 	generation: u32,
+	// WHAT THE SLOT HOLDS, so a take can be checked against it rather than against itself.
+	//
+	// The slot carried a state and a generation and nothing else, so `TAKE` read `event.rights` -
+	// the rights declared by the very event being checked - to decide whether the capability carried
+	// TRANSFER. A trace in which a take widened its own rights therefore passed: the checker was
+	// asking the claim whether the claim was true. The rights are recorded when the capability
+	// arrives, from `SEED` or from `INSTALL`, and compared when it is taken.
+	rights: u32,
 }
 
 #[derive(Default)]
@@ -86,7 +98,7 @@ impl Table {
 		while self.slots.len() <= index as usize {
 			self.slots.push(None);
 		}
-		self.slots[index as usize].get_or_insert(Slot { state: SlotState::Free, generation })
+		self.slots[index as usize].get_or_insert(Slot { state: SlotState::Free, generation, rights: 0 })
 	}
 
 	// Recycle, mirroring `retire_or_recycle`: the generation advances, and a slot at the end of its
@@ -184,6 +196,7 @@ impl Model {
 				generations_agree(&standing, event.generation, "a placed capability")?;
 				let slot = table.slot(event.slot, event.generation);
 				slot.state = SlotState::Live;
+				slot.rights = event.rights;
 				covers.seed += 1;
 			}
 			// `Take(p, i)`: the slot is Live and the capability carries TRANSFER.
@@ -197,8 +210,16 @@ impl Model {
 					return Err(format!("a take from a slot that is {:?}", slot.state));
 				}
 				generations_agree(&slot, event.generation, "a take")?;
-				if event.rights & RIGHT_TRANSFER == 0 {
+				// AGAINST WHAT THE SLOT HOLDS, not against what the event says it holds. The event's
+				// own rights are the claim under test; reading them here made the check circular, so
+				// a take that widened its rights on the way out was indistinguishable from one that
+				// did not. `AuthorityNeverWidens` in the model says a capability never carries more
+				// than its source, and this is the trace-side half of that sentence.
+				if slot.rights & RIGHT_TRANSFER == 0 {
 					return Err(String::from("a take of a capability that does not carry TRANSFER"));
+				}
+				if event.rights & !slot.rights != 0 {
+					return Err(format!("a take that named rights {:#x} for a slot holding {:#x} - authority widened on the way out", event.rights, slot.rights));
 				}
 				table.slot(event.slot, event.generation).state = SlotState::Reserved;
 				table.outstanding.push(event.slot);
@@ -276,7 +297,9 @@ impl Model {
 				}
 				let standing = *slot;
 				generations_agree(&standing, event.generation, "an install")?;
-				table.slot(event.slot, event.generation).state = SlotState::Live;
+				let slot = table.slot(event.slot, event.generation);
+				slot.state = SlotState::Live;
+				slot.rights = event.rights;
 				covers.install += 1;
 			}
 			// `InstallIntoClosed(p)`: the barrier `restore_taken` stands behind.
@@ -310,7 +333,19 @@ impl Model {
 				covers.terminate += 1;
 			}
 			// `Enqueue(p)`, `Peek(p)`, `Dequeue(p)`, `ReturnToHead`, `CommitDelivery`.
-			ENQUEUE => self.queue(event.party).pending.push_back(event.message),
+			// `Enqueue(p)`: and the queue is BOUNDED, which the model states as an invariant and this
+			// did not check at all. A channel's depth is a quota the kernel charges against, so a
+			// trace showing more messages queued on one endpoint than any channel may hold is a
+			// trace showing that charge failing - and it used to be accepted as an ordinary push.
+			// The ceiling here is the largest a channel can be configured to, not the default: a
+			// trace comes from a running system whose endpoints may have been given any of them.
+			ENQUEUE => {
+				let queue = self.queue(event.party);
+				if queue.pending.len() >= CHANNEL_QUEUE_MAX {
+					return Err(format!("a message queued onto an endpoint already holding {} - past what any channel may hold", queue.pending.len()));
+				}
+				queue.pending.push_back(event.message);
+			}
 			PEEK => {
 				let queue = self.queue(event.party);
 				let Some(front) = queue.pending.front() else {

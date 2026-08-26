@@ -26,6 +26,7 @@ This is an early-stage project under active development. It is not yet a general
 - [**LSIDL**](./docs/LSIDL.md) - the **LiberSystem Interface Definition Language**: the language services are described in, from which the wire codec, clients, servers, and docs are generated.
 - [**System interfaces**](./docs/gen/system.md) - the generated reference for the **`liber:system` package**: every record, enum and service interface, as defined in the LSIDL sources.
 - [**LiberFS**](./docs/LIBERFS.md) - the **native filesystem**: the copy-on-write, extent-mapped, checksummed and snapshotting on-disk format, and how it compares with FAT, NTFS, ext4, XFS, Btrfs and ZFS.
+- [**Architectures**](./docs/ARCHITECTURES.md) - **what each port actually runs on**: entry path, machine description, interrupt controller, timer, SMP bring-up and the emulated profiles each one is proven on.
 - [**Testing**](./docs/TESTING.md) - **what to run after a change**: the planner that answers it, the dependency model behind it, and how a scoped verification stays trustworthy.
 - [**Debugging**](./docs/DEBUG.md) - the **debugging toolbox**: the lab harness that drives a live instance, timing and tracing, GDB, packet capture, and the test suite.
 - [**Performance notes**](./docs/PERF.md) - **measured before/after numbers** for the changes whose goal was a performance improvement.

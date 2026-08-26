@@ -134,6 +134,19 @@ pub fn set_bus_master(bus: u8, dev: u8, func: u8, on: bool) {
 	common::set_bus_master::<Access>(bus, dev, func, on);
 }
 
+// WHERE THIS PORT'S INTERRUPTS ARE WRITTEN, for a translated endpoint that named no doorbell of its
+// own.
+//
+// A device's MSI is a memory write, so behind a translating IOMMU it needs a mapping like any other
+// write. An endpoint that reports an MSI reserved region says where; one that offers no PROBE at
+// all, or lists no such region, says nothing - and used to end up with no doorbell mapping and no
+// interrupts, silently. This is the address that endpoint would have named.
+pub fn msi_doorbell() -> Option<(u64, u64)> {
+	// An IMSIC S-mode interrupt file, one 4 KiB page per hart at `base + hart * stride`. The first
+	// hart's file is where this port's MSI addresses start; the span covers every hart's.
+	crate::arch::imsic::msi_window()
+}
+
 // One function's memory BAR, resolved live from configuration space: its assigned base and its
 // probed size.
 //
