@@ -293,9 +293,21 @@ for arch in "${archs[@]}"; do
 	mkdir -p "$BUILD_DIR/state"
 	# Each part records the digest of the sources IT reads, so a loader-only edit does not
 	# invalidate a userspace that no byte of it touched, and vice versa.
+	#
+	# AND THE VOLUME PART HAS TWO STAMPS, because it has two shapes. The volume with a kernel on it
+	# and the volume without one became two artifacts with two names; the RECORD of what was built
+	# stayed one file, so `./image.sh` wrote the stamp and `./test.sh` read it and concluded the
+	# userspace was current - while the shape the suite actually boots, the one without a kernel, may
+	# not have been rebuilt since the sources changed. Edit userspace, `./image.sh`, `./test.sh`: the
+	# staleness check passed and the suite booted an old volume. That is the original defect with a
+	# different subject, and naming the artifacts apart was not enough while their receipts shared a
+	# name.
+	volume_stamp="volume"
+	[[ "$kernel_on_volume" == "1" ]] || volume_stamp="volume-test"
 	for part in "${parts[@]}"; do
 		case "$part" in
 		loader) printf '%s\n' "$(source_digest boot/loader)" >"$BUILD_DIR/state/built-$arch-$part" ;;
+		volume) printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$volume_stamp" ;;
 		*) printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$part" ;;
 		esac
 	done

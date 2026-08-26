@@ -160,8 +160,46 @@ require_no_stray_qemu() {
 	# it.
 	pids="$(pgrep -f "^([^ ]*/)?$pattern " 2>/dev/null || true)"
 	[[ -z "$pids" ]] && return 0
-	die "a $pattern is already running (PID ${pids//$'\n'/, }) and holds this architecture's disk images.
-    It is probably a run left behind. Stop it and try again:  kill ${pids//$'\n'/ }"
+
+	# AND THEN ASK WHETHER IT HOLDS ANYTHING OF OURS, because the name alone does not say so.
+	#
+	# This refused on ANY `qemu-system-$arch` anywhere on the machine and asserted that it "holds
+	# this architecture's disk images" - a sentence it had not checked. On a shared machine that is
+	# wrong twice over: it fails a gate for a reason that is not about this tree, and its remedy
+	# line tells the operator to `kill` a PID that may belong to somebody else's work. It did
+	# exactly that here: an unrelated project's VM, in its own session, holding one qcow2 under its
+	# own scratch directory and not one file of this tree's, failed `qemu-virtio-iommu` and then
+	# `qemu-numa` - two gates reporting a DMA defect and a NUMA defect, neither of which had run.
+	#
+	# The question the check means to ask is answerable exactly: a process's open files are in
+	# `/proc/<pid>/fd`, and the images two runs contend over are the shared ones under `.build`. A
+	# gate's private copy in its own temp directory conflicts with nobody and is not looked for.
+	local build holders="" opaque="" pid held target fd
+	build="$(cd "$BUILD_DIR" && pwd -P)"
+	for pid in $pids; do
+		# Not readable means not answerable - and an unanswered question is reported as one rather
+		# than resolved in whichever direction is easier to write.
+		if [[ ! -r "/proc/$pid/fd" ]]; then
+			opaque+="$pid "
+			continue
+		fi
+		held=""
+		for fd in "/proc/$pid/fd"/*; do
+			target="$(readlink "$fd" 2>/dev/null)" || continue
+			if [[ "$target" == "$build/"* ]]; then
+				held="$target"
+				break
+			fi
+		done
+		[[ -n "$held" ]] && holders+="$pid ($held) "
+	done
+
+	if [[ -n "$holders" ]]; then
+		die "a $pattern already holds this tree's disk images: $holders
+    It is probably a run left behind. Stop it and try again:  kill ${holders%% *}"
+	fi
+	[[ -n "$opaque" ]] && note "a $pattern is running (PID ${opaque% }) whose open files cannot be read, so whether it holds this tree's images is unknown - continuing"
+	return 0
 }
 
 require_built() {
@@ -184,7 +222,12 @@ require_built() {
 	# the artifacts cannot: that a build looked at these sources.
 	# `volume` is the part that produces the image the suite boots, and it is the last of the
 	# chain that feeds it, so its stamp is the one that dates the userspace.
-	local stamp="$BUILD_DIR/state/built-$arch-volume"
+	#
+	# THE TEST SHAPE'S STAMP, not the bootable one's. They are two artifacts and therefore two
+	# receipts: `./image.sh` builds the volume WITH a kernel and writes `built-$arch-volume`, and this
+	# suite boots the one WITHOUT and must be told about that one. Reading the shared stamp meant an
+	# `./image.sh` vouched for a test volume it had not touched.
+	local stamp="$BUILD_DIR/state/built-$arch-volume-test"
 	[[ -f "$stamp" ]] || die "no build stamp for $arch - run: ./build.sh --arch $arch"
 	if [[ "$(cat "$stamp")" != "$(source_digest "${VOLUME_SOURCES[@]}")" ]]; then
 		die "the $arch build does not match the sources

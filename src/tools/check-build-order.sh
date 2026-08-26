@@ -19,6 +19,15 @@ BUILD=".build/boot"
 ARCH=x86_64
 TEST_SHAPE="$BUILD/system-volume-$ARCH.img"
 BOOT_SHAPE="$BUILD/system-volume-bootable-$ARCH.img"
+# A SHAPE IS THREE FILES, not one. The image is what a consumer boots, the uuid beside it is what a
+# medium's pairing is checked against, and the stamp is the receipt `test.sh` reads to decide the
+# userspace is current. Naming the images apart while the other two stayed shared left the same
+# defect in the two files nobody looks at: an `./image.sh` that refreshed the test shape's receipt
+# vouches for a build it never ran.
+TEST_UUID="$BUILD/system-volume-$ARCH.uuid"
+BOOT_UUID="$BUILD/system-volume-bootable-$ARCH.uuid"
+TEST_STAMP=".build/state/built-$ARCH-volume-test"
+BOOT_STAMP=".build/state/built-$ARCH-volume"
 
 fail() {
 	echo "build-order: $*" >&2
@@ -34,27 +43,59 @@ digest() {
 	sha256sum "$1" | cut -d' ' -f1
 }
 
-# Both shapes have to exist before either order can be tested.
+# THE STAMP IS THE ONE FILE WHOSE CONTENT CANNOT ANSWER THIS. Both shapes are built from the same
+# sources, so both receipts hold the same digest - and a command that rewrites the OTHER shape's
+# receipt writes bytes identical to the ones already there. A content comparison sees nothing and
+# passes, while the harm is exactly that a receipt was issued for a build that did not happen. What
+# distinguishes them is whether the file was written at all, so the stamp is compared by
+# modification time and the two artifacts, whose bytes do differ when they are wrong, by content.
+written_at() {
+	[[ -f "$1" ]] || {
+		echo "absent"
+		return
+	}
+	stat -c '%y' "$1"
+}
+
+# Print each of a shape's three files with the identity that can answer for it.
+shape_state() {
+	printf 'img=%s uuid=%s stamp=%s' "$(digest "$1")" "$(digest "$2")" "$(written_at "$3")"
+}
+
+# Both shapes have to exist before either order can be tested - all three files of each, because a
+# shape with a missing receipt is a shape whose consumer refuses to run rather than one that is fine.
 [[ -f "$TEST_SHAPE" ]] || fail "no test-shape volume at $TEST_SHAPE - build it with:  ./build.sh --arch $ARCH --part volume"
 [[ -f "$BOOT_SHAPE" ]] || fail "no bootable volume at $BOOT_SHAPE - build it with:  ./build.sh --arch $ARCH --kernel-on-volume --part volume"
+[[ -f "$TEST_UUID" ]] || fail "no pairing beside the test shape at $TEST_UUID - build it with:  ./build.sh --arch $ARCH --part volume"
+[[ -f "$BOOT_UUID" ]] || fail "no pairing beside the bootable shape at $BOOT_UUID - build it with:  ./build.sh --arch $ARCH --kernel-on-volume --part volume"
+[[ -f "$TEST_STAMP" ]] || fail "no build stamp for the test shape at $TEST_STAMP - build it with:  ./build.sh --arch $ARCH --part volume"
+[[ -f "$BOOT_STAMP" ]] || fail "no build stamp for the bootable shape at $BOOT_STAMP - build it with:  ./build.sh --arch $ARCH --kernel-on-volume --part volume"
+
+# AND THE TWO PAIRINGS DIFFER, for the same reason the two images must. The uuid is derived from the
+# volume's contents, so two shapes that share one are two names over one artifact.
+[[ "$(digest "$TEST_UUID")" != "$(digest "$BOOT_UUID")" ]] || fail "both shapes carry the same pairing, so a medium built for one names the other just as well"
 
 # THE SHAPES ARE DIFFERENT ARTIFACTS. If they were equal, naming them apart would have changed
 # nothing and this gate would pass on a tree where the defect was still present.
 [[ "$(digest "$TEST_SHAPE")" != "$(digest "$BOOT_SHAPE")" ]] || fail "both shapes have the same contents, so this gate cannot tell them apart and neither can a consumer"
 
 # ORDER ONE: the shipping shape, then the test shape. The test build must not disturb the shipping one.
-before="$(digest "$BOOT_SHAPE")"
+before="$(shape_state "$BOOT_SHAPE" "$BOOT_UUID" "$BOOT_STAMP")"
 ./build.sh --arch "$ARCH" --part volume >/dev/null 2>&1 || fail "./build.sh --part volume failed"
-after="$(digest "$BOOT_SHAPE")"
-[[ "$before" == "$after" ]] || fail "building the test shape changed the bootable one - they are not two artifacts"
-echo "build-order: building the test shape left the bootable one untouched"
+after="$(shape_state "$BOOT_SHAPE" "$BOOT_UUID" "$BOOT_STAMP")"
+[[ "$before" == "$after" ]] || fail "building the test shape disturbed the bootable one - they are not two artifacts
+    before: $before
+    after:  $after"
+echo "build-order: building the test shape left the bootable image, pairing and stamp untouched"
 
 # ORDER TWO: the test shape, then the shipping shape. The shipping build must not disturb the test one.
-before="$(digest "$TEST_SHAPE")"
+before="$(shape_state "$TEST_SHAPE" "$TEST_UUID" "$TEST_STAMP")"
 ./build.sh --arch "$ARCH" --kernel-on-volume --part volume >/dev/null 2>&1 || fail "./build.sh --kernel-on-volume --part volume failed"
-after="$(digest "$TEST_SHAPE")"
-[[ "$before" == "$after" ]] || fail "building the bootable shape changed the test one - they are not two artifacts"
-echo "build-order: building the bootable shape left the test one untouched"
+after="$(shape_state "$TEST_SHAPE" "$TEST_UUID" "$TEST_STAMP")"
+[[ "$before" == "$after" ]] || fail "building the bootable shape disturbed the test one - they are not two artifacts
+    before: $before
+    after:  $after"
+echo "build-order: building the bootable shape left the test image, pairing and stamp untouched"
 
 # AND THE MEDIUM NAMES THE VOLUME IT WAS BUILT WITH. This is the half the order used to break: the
 # ISO carries a pairing derived from the volume's CONTENTS, and a `--part volume` after an
@@ -77,4 +118,4 @@ elif [[ -f "$ISO" ]]; then
 	echo "build-order: the ISO predates the current bootable volume, so its pairing is a staleness question and signed-boot asks it"
 fi
 
-echo "build-order: the two shapes are two artifacts, and neither command disturbs the other's"
+echo "build-order: the two shapes are two artifacts of three files each, and neither command disturbs the other's"

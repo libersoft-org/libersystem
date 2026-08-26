@@ -54,7 +54,11 @@ done
 	cd "$WORK"
 	# shellcheck disable=SC1091
 	source ./lib.sh
-	source_digest "${VOLUME_SOURCES[@]}" >".build/state/built-x86_64-volume"
+	# THE STAMP THE SUITE READS, which is the test shape's. This forged `built-x86_64-volume` while
+	# `test.sh` moved to `built-x86_64-volume-test`; a fixture that forges the wrong receipt does not
+	# fail as a wrong answer, it fails as "no build stamp" - a mutation gate that stops testing
+	# mutations and starts refusing to run.
+	source_digest "${VOLUME_SOURCES[@]}" >".build/state/built-x86_64-volume-test"
 )
 
 # The preflight enumerates the tree with `git ls-files`, so the copy needs a repository of its own.
