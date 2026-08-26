@@ -70,7 +70,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		device.driver_ok();
 		let queue: Queue = match queue {
 			Some(q) => q,
-			None => common::online_and_stand(bootstrap, b"driver.virtio-blk: online"),
+			None => {
+				let mut line = [0u8; 64];
+				let n = common::describe(&mut line, b"virtio-blk", &device, b"no request queue");
+				common::online_and_stand(bootstrap, &line[..n])
+			}
 		};
 		let ok: bool = verify_archive(&queue);
 		// create the block-read service channel; hand the client end up to
@@ -80,7 +84,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(pair) => pair,
 			None => common::online_and_stand(bootstrap, b"driver.virtio-blk: online"),
 		};
-		let report: &[u8] = if ok { b"driver.virtio-blk: online (volume archive on disk)" } else { b"driver.virtio-blk: online" };
+		let mut line = [0u8; 64];
+		let n = common::describe(&mut line, b"virtio-blk", &device, if ok { b"volume archive" } else { b"" });
+		let report: &[u8] = &line[..n];
 		send_blocking(bootstrap, report, blk_client);
 		// the disk's capacity in 512-byte sectors, from the virtio-blk device config
 		// (bytes 0..8), answered to OP_CAPACITY requests.

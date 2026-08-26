@@ -405,7 +405,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(p) => p,
 			None => exit(),
 		};
-		send_blocking(bootstrap, b"driver.virtio-gpu: online", far);
+		let mut line = [0u8; 64];
+		let n = common::describe(&mut line, b"virtio-gpu", &device, b"");
+		send_blocking(bootstrap, &line[..n], far);
 		serve(&device, &gpu, backing, service, irq)
 	}
 }

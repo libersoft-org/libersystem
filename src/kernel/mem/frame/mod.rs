@@ -33,6 +33,7 @@
 // any core.
 
 use bootproto::MemRegion;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use alloc::vec::Vec;
 
@@ -994,6 +995,9 @@ pub fn upgrade_to_heap() {
 		allocator.pools = pools;
 		allocator.free_count = free as usize;
 		allocator.seed_len = 0;
+		// WHAT THE ALLOCATOR STARTED WITH, kept so the later report can say what was spent rather
+		// than print a second number that looks like the same one.
+		FREE_AT_START.store(free as usize, Ordering::Release);
 		if count == 1 {
 			crate::serial_println!("memory: buddy allocator up - {free} free frames, {} KiB of metadata", metadata / 1024);
 		} else {
@@ -1167,6 +1171,22 @@ pub fn buddy_metadata_bytes() -> usize {
 pub fn totals() -> (usize, usize) {
 	let allocator = ALLOCATOR.lock();
 	(allocator.total_count, allocator.free_count)
+}
+
+// How many frames were free when the allocator came up.
+//
+// Kept so the later report can say what early boot SPENT rather than print a second free count that
+// looks like the first one with nothing saying they are different moments.
+static FREE_AT_START: AtomicUsize = AtomicUsize::new(0);
+
+// THE CFG IS ITS CALLER'S, NOT A CONVENIENCE. The only reader is the x86_64 boot report -
+// `boot_main`, which the two device-tree ports do not have: they call `boot_userspace` directly and
+// print their own memory lines from their own prologues. A test build has no `boot_main` either. This
+// tree denies dead code rather than suppressing the warning, so the cfg names exactly the build where
+// a caller exists rather than an attribute saying nobody should look.
+#[cfg(all(not(test), target_arch = "x86_64"))]
+pub fn free_at_start() -> usize {
+	FREE_AT_START.load(Ordering::Acquire)
 }
 
 // The number of frames currently free.

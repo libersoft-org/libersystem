@@ -470,6 +470,12 @@ impl Stack {
 		self.ip
 	}
 
+	// The netmask this interface is configured with, so a report can say what it got rather than
+	// only that it got something.
+	pub fn mask(&self) -> Ipv4Addr {
+		self.mask
+	}
+
 	pub fn gateway(&self) -> Ipv4Addr {
 		self.gateway
 	}

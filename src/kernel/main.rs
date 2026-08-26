@@ -285,7 +285,13 @@ fn boot_main() {
 		serial_println!("random: WARNING: no hardware random source on this machine - SYS_RANDOM_GET will refuse, and nothing here can produce a key or a token");
 	}
 	serial_println!("smp: {} of {} cores online", smp::online_count(), smp::cpu_count());
-	serial_println!("memory: {} physical frames free", mem::frame::free_count());
+	// WHICH MOMENT THIS IS, AND WHAT HAPPENED SINCE THE OTHER ONE. `memory: buddy allocator up`
+	// prints a free count too, so the report carried two nearly-equal numbers with nothing saying
+	// they were different moments - which reads as a rounding error rather than as a measurement.
+	// The difference is what the kernel spent bringing itself up, and it is the interesting half.
+	let free_now = mem::frame::free_count();
+	let at_start = mem::frame::free_at_start();
+	serial_println!("memory: {free_now} frames free after early boot ({} taken since the allocator came up)", at_start.saturating_sub(free_now));
 	// The pages this boot has handed back and been unable to record. Zero here on any healthy
 	// machine, and the point is that it is PRINTED rather than only counted: the run table is
 	// bounded, so under fragmentation a free can be dropped, and the machine then gets slowly
@@ -300,9 +306,17 @@ fn boot_main() {
 	// A machine accumulating retirements is reporting a SHOOTDOWN problem, and losing the page is
 	// only its receipt; one number for both said "memory problem" for either.
 	serial_println!("memory: {} page(s) retired for good, {} page(s) lost in all, {} free(s) refused", mem::frame::retired_pages(), mem::frame::lost_pages(), mem::frame::refused_frees());
-	// Perf-trace anchor: publish the calibrated TSC frequency so the host trace tool can
-	// convert the ring-3 `\x1ePERF` cycle markers to wall-clock time.
-	serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());
+	// Perf-trace anchor: publish the calibrated TSC frequency so the host trace tool can convert the
+	// ring-3 `\x1ePERF` cycle markers to wall-clock time.
+	//
+	// ONLY WHERE SOMETHING READS IT. This was printed on every boot, so the one line in the report
+	// addressed to a program rather than to a person was shown to every person who ever booted this
+	// system - uppercase, unformatted, and meaningless to them. The trace tool runs the guest with
+	// the development profile named over fw_cfg, which is exactly the condition "a harness is
+	// watching", and the same condition the boot line above uses.
+	if arch::boot_profile().is_some() {
+		serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());
+	}
 	// WHAT IS ACTUALLY TRUE AT THIS POINT. The line said "entering the userspace shell" and was
 	// followed by every driver binding, every service starting and the product banner before a
 	// prompt appeared - so the one line a reader takes as "the boot finished" was printed in the

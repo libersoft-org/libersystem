@@ -129,10 +129,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			};
 			let max_x: i32 = axis_max(&device, AXIS_X);
 			let max_y: i32 = axis_max(&device, AXIS_Y);
-			send_blocking(bootstrap, b"driver.virtio-pointer: online", consumer);
+			// ONE NAME PER DEVICE TYPE, AND THE ROLE AS DETAIL. This announced itself as
+			// `virtio-pointer` while the kernel's DMA audit called the same PCI function
+			// `virtio-input`, so two reports one screen apart named the same device two ways and
+			// nothing in the output connected them - on a machine that has two `virtio-input`
+			// functions, which is this one.
+			let mut line = [0u8; 64];
+			let n = common::describe(&mut line, b"virtio-input", &device, b"pointer");
+			send_blocking(bootstrap, &line[..n], consumer);
 			pointer_loop(irq, &mut eventq, pool_virt, pool_phys, slots, producer, max_x, max_y)
 		} else {
-			send_blocking(bootstrap, b"driver.virtio-input: online", 0);
+			let mut line = [0u8; 64];
+			let n = common::describe(&mut line, b"virtio-input", &device, b"keyboard");
+			send_blocking(bootstrap, &line[..n], 0);
 			event_loop(irq, &mut eventq, pool_virt, pool_phys, slots, key_sink)
 		}
 	}

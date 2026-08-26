@@ -175,7 +175,8 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 						panic!("loader: no room to verify the system volume's signed manifest");
 					}
 					scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
-					let Some(manifest) = trust::verify(signed, &mut scratch) else {
+					let expected = trust::Expected::volume(unsafe { PAIRED_UUID });
+					let Some(manifest) = trust::verify_for(signed, &expected, &mut scratch) else {
 						panic!("loader: the system volume's signed manifest was refused - see the line above");
 					};
 					if !blockio::covered_by(&manifest, bootproto::manifest::KIND_KERNEL, KERNEL_FILE.as_bytes(), &bytes) {
@@ -184,13 +185,19 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 					announce_release(&manifest);
 				}
 				_ => {
+					// See `assemble_bootstrap`: a signed manifest that is ABSENT used to drop this
+					// source to the text one, which is a checksum list an attacker recomputes along
+					// with the payload. Whether this build takes that is a profile, and it says so.
+					if !trust::IS_TEST_TRUST {
+						panic!("loader: the system volume carries no SIGNED manifest, and this build authenticates what it boots - refusing rather than falling back to the text one");
+					}
 					let VolumeRead::Read(manifest) = read_from_system_volume(bs, b"etc/boot.manifest") else {
 						panic!("loader: the system volume has a kernel and no manifest of either kind - refusing to boot from it");
 					};
 					if !blockio::digests_ok(&manifest, KERNEL_FILE.as_bytes(), &bytes) {
 						panic!("loader: the kernel does not match etc/boot.manifest on the system volume");
 					}
-					arch::serial::write_str("loader: kernel verified against the system volume's etc/boot.manifest\n");
+					arch::serial::write_str("loader: THIS KERNEL IS NOT AUTHENTICATED - the system volume carries no signed manifest, and this build accepts the checksum one\n");
 				}
 			}
 			bytes
@@ -341,7 +348,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		}
 		if let Some(root) = root {
 			let mut volume = FirmwareVolume { bs, root };
-			match blockio::assemble_bootstrap(&mut volume) {
+			match blockio::assemble_bootstrap(&mut volume, &trust::Expected::medium()) {
 				// RETURN ONLY WHEN THE RETAIN SUCCEEDED. This returned either way, so an
 				// allocation failure here skipped the FAT scan that would have answered.
 				abi::bootstrap::Selection::Verified(archive) => {
@@ -364,7 +371,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		}
 		with_boot_medium(bs, |disk| {
 			let Some(mut fs) = fat::FatFs::mount_read_only(disk) else { return false };
-			match blockio::assemble_bootstrap(&mut fs) {
+			match blockio::assemble_bootstrap(&mut fs, &trust::Expected::medium()) {
 				abi::bootstrap::Selection::Verified(archive) => unsafe {
 					// A retain that fails is not an answer, so the scan goes on rather than
 					// stopping on a medium that gave nothing.
@@ -529,7 +536,7 @@ pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) 
 		return;
 	}
 	let Ok(mut fs) = liberfs::LiberFs::mount(blockio::ImageDisk { bytes }) else { return };
-	match blockio::assemble_bootstrap(&mut fs) {
+	match blockio::assemble_bootstrap(&mut fs, &trust::Expected::volume(unsafe { PAIRED_UUID })) {
 		abi::bootstrap::Selection::Verified(archive) => unsafe {
 			BOOTSTRAP = retain(bs, &archive);
 			BOOTSTRAP_SOURCE = SOURCE_LIVE_IMAGE;
@@ -571,7 +578,7 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 	// The guard is the same pair `bootstrap_from_boot_medium` already uses: a set that was assembled,
 	// or a source that refused, are both answers and neither is improved by asking again.
 	if unsafe { BOOTSTRAP }.is_none() && unsafe { BOOTSTRAP_REFUSED }.is_none() {
-		match blockio::assemble_bootstrap(&mut fs) {
+		match blockio::assemble_bootstrap(&mut fs, &trust::Expected::volume(unsafe { PAIRED_UUID })) {
 			abi::bootstrap::Selection::Verified(archive) => unsafe {
 				BOOTSTRAP = retain(bs, &archive);
 				BOOTSTRAP_SOURCE = SOURCE_SYSTEM_VOLUME;
@@ -707,7 +714,8 @@ fn boot_medium_manifest(bs: *mut BootServices, root: Option<*mut uefi::FileProto
 		panic!("loader: no room to verify the boot medium's signed manifest");
 	}
 	scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
-	let Some(manifest) = trust::verify(signed, &mut scratch) else {
+	let expected = trust::Expected::medium();
+	let Some(manifest) = trust::verify_for(signed, &expected, &mut scratch) else {
 		panic!("loader: the boot medium's signed manifest was refused - see the line above");
 	};
 	Some(manifest)
@@ -724,13 +732,18 @@ fn read_verified_kernel_from_boot_medium(bs: *mut BootServices, root: Option<*mu
 		announce_release(&manifest);
 		return bytes;
 	}
+	// The third of the same fallback: a signed manifest that is ABSENT, on the medium this loader
+	// itself came off. Whether this build takes it is the same profile decision, said the same way.
+	if !trust::IS_TEST_TRUST {
+		panic!("loader: the boot medium carries no SIGNED manifest, and this build authenticates what it boots - refusing rather than falling back to the text one");
+	}
 	let Some(manifest) = read_boot_file(bs, root, "etc/boot.manifest") else {
 		panic!("loader: the boot medium has a kernel and no manifest of either kind - refusing to boot from it");
 	};
 	if !blockio::digests_ok(manifest, KERNEL_FILE.as_bytes(), bytes) {
 		panic!("loader: the kernel does not match etc/boot.manifest on the boot medium");
 	}
-	arch::serial::write_str("loader: kernel verified against the boot medium's etc/boot.manifest\n");
+	arch::serial::write_str("loader: THIS KERNEL IS NOT AUTHENTICATED - the boot medium carries no signed manifest, and this build accepts the checksum one\n");
 	bytes
 }
 

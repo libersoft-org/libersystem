@@ -66,6 +66,12 @@ pub struct Virtio {
 	// driver opts into MSI-X with set_msix_vector). setup_queue programs each queue's
 	// MSI-X vector field from this.
 	msix_vector: u16,
+	// WHICH FUNCTION THIS IS, so a driver can say which device it is talking about. Two devices of
+	// one type are otherwise indistinguishable in a report, and this machine has four `virtio-blk`
+	// functions and two `virtio-input` ones: four identical lines are one line nobody can use.
+	bus: u8,
+	dev: u8,
+	func: u8,
 	// The word-0 (device-specific) feature bits the negotiation accepted: the
 	// intersection of what the device offered and what the driver wanted.
 	features_word0: u32,
@@ -223,7 +229,7 @@ pub unsafe fn negotiate_features(mmio_base: u64, info: &DeviceInfo, want_word0: 
 			w8(common + CFG_DEVICE_STATUS, STATUS_FAILED);
 			return None;
 		}
-		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64, msix_vector: VIRTIO_MSI_NO_VECTOR, features_word0, capability: 0 })
+		Some(Virtio { common, device: mmio_base + info.device_offset as u64, notify: mmio_base + info.notify_offset as u64, notify_multiplier: info.notify_multiplier, isr: mmio_base + info.isr_offset as u64, msix_vector: VIRTIO_MSI_NO_VECTOR, bus: info.bus, dev: info.dev, func: info.func, features_word0, capability: 0 })
 	}
 }
 
@@ -232,6 +238,11 @@ impl Virtio {
 	// can tell which of its wanted features the device granted.
 	pub fn features_word0(&self) -> u32 {
 		self.features_word0
+	}
+
+	// The PCI function this device is, for a driver that has to say which device it means.
+	pub fn address(&self) -> (u8, u8, u8) {
+		(self.bus, self.dev, self.func)
 	}
 
 	// Route this device's config-change and queue interrupts to MSI-X table entry

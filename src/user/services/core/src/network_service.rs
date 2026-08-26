@@ -143,11 +143,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		{
 			let mut drx: Vec<u8> = alloc::vec![0u8; frame_max];
 			let mut dtx: Vec<u8> = alloc::vec![0u8; frame_max];
+			// WHAT IT GOT, NOT ONLY THAT IT GOT SOMETHING. Every other line in the boot report
+			// carries its own fact - the frame count, the core count, the volume name, the release -
+			// and this one said a transaction had completed and left the reader to go and look.
 			if do_dhcp(frames, &mut stack, &mut drx, &mut dtx) {
-				print(b"network: configured via DHCP\n");
+				print(b"network: configured via DHCP - ");
+				print_address(&stack);
+				print(b"\n");
 				lease = LeaseClock::bound(&stack);
 			} else {
-				print(b"network: DHCP unanswered, using static config\n");
+				print(b"network: DHCP unanswered, using static config - ");
+				print_address(&stack);
+				print(b"\n");
 			}
 		}
 		// 4. report in, then serve the network and the client at once (serve announces
@@ -1129,6 +1136,57 @@ unsafe fn lease_due(frames: u64, stack: &mut Stack, lease: &mut LeaseClock, rx: 
 // received frames for the replies, and on success apply the learned address / mask /
 // gateway / DNS to the stack. Returns whether a lease was obtained (false = the
 // caller keeps the static configuration).
+// `a.b.c.d/prefix via gateway`, built in a fixed buffer because a service has no formatter.
+fn push(line: &mut [u8; 64], at: &mut usize, bytes: &[u8]) {
+	for byte in bytes {
+		if *at < line.len() {
+			line[*at] = *byte;
+			*at += 1;
+		}
+	}
+}
+
+fn push_decimal(line: &mut [u8; 64], at: &mut usize, value: u8) {
+	let mut digits = [0u8; 3];
+	let mut count = 0usize;
+	let mut v = value;
+	loop {
+		digits[count] = b'0' + v % 10;
+		count += 1;
+		v /= 10;
+		if v == 0 {
+			break;
+		}
+	}
+	while count > 0 {
+		count -= 1;
+		let digit = digits[count];
+		push(line, at, &[digit]);
+	}
+}
+
+fn push_ipv4(line: &mut [u8; 64], at: &mut usize, octets: [u8; 4]) {
+	for (index, octet) in octets.iter().enumerate() {
+		if index > 0 {
+			push(line, at, b".");
+		}
+		push_decimal(line, at, *octet);
+	}
+}
+
+unsafe fn print_address(stack: &Stack) {
+	let mut line = [0u8; 64];
+	let mut at = 0usize;
+	push_ipv4(&mut line, &mut at, stack.ip().0);
+	// The mask as a prefix length, which is how a reader thinks of it.
+	let prefix: u32 = stack.mask().0.iter().map(|byte| byte.count_ones()).sum();
+	push(&mut line, &mut at, b"/");
+	push_decimal(&mut line, &mut at, prefix as u8);
+	push(&mut line, &mut at, b" via ");
+	push_ipv4(&mut line, &mut at, stack.gateway().0);
+	unsafe { print(&line[..at]) };
+}
+
 unsafe fn do_dhcp(frames: u64, stack: &mut Stack, rx: &mut [u8], tx: &mut [u8]) -> bool {
 	unsafe {
 		// Broadcast a DISCOVER and wait for the server's OFFER.

@@ -18,6 +18,16 @@ declare -A GATES=(
 	# two ports that never arrive through it, and nothing but a paragraph of prose separated "dormant
 	# by construction" from "unfinished".
 	["arch-surface"]="tools/check-arch-surface.sh"
+	# The staged-tree consistency check, mutated until it refuses. Seven ways an
+	# identity note can be unreadable, missing or contradictory, each applied to the real staged tree
+	# and put back - because what a check does with input it cannot read IS the check, and this one
+	# used to skip all seven and print that everything matched.
+	["staged-consistency"]="tools/check-staged-consistency.sh"
+	# Every named interrupt and SMP profile, booted, with an oracle per claim.
+	# A GICv2, a GICv3 without its ITS, one with it, and a RISC-V AIA, at one core and at four - each
+	# of which used to be a runner knob turned by hand once, with its output pasted into a document.
+	# aarch64 and riscv64 are emulated here, so this is minutes rather than seconds.
+	["qemu-arch-profiles"]="tools/check-qemu-arch-profiles.sh"
 	# The capability transfer model, explored exhaustively under each published
 	# configuration. It runs TLC from the JAR pinned in `toolchain.lock` with NO NETWORK, and names
 	# `./bootstrap.sh tla2tools` when the artifact is absent rather than fetching one.
@@ -36,7 +46,7 @@ declare -A GATES=(
 	# The other direction. `capability-model` explores what the model can do; this
 	# replays what the KERNEL did against it, and requires the checker to refuse eleven deliberate
 	# defects before it is trusted with a real trace.
-	["capability-trace"]="tools/check-capability-trace.sh"
+	["capability-trace"]="tools/check-capability-trace.sh --require-live"
 	# The same five defects in the KERNEL rather than in the model, each
 	# required to be caught by the QEMU conformance fixture. Builds and boots a mutated kernel from a
 	# COPY of the tree - nothing here writes a source file.

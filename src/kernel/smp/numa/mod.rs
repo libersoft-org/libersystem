@@ -39,13 +39,16 @@ pub fn bind_online() -> usize {
 	}
 	let mut bound = 0usize;
 	for cpu in 0..count {
-		// A CORE THAT IS NOT ONLINE GETS NO BINDING. `online_count` is a tally rather than a mask,
-		// so what stands in for "this core answered" is its hardware id being recorded - which is
-		// what bring-up does when a core reports in.
-		let hardware = crate::smp::lapic_id(cpu);
-		if cpu > 0 && hardware == 0 {
+		// A CORE THAT IS NOT ONLINE GETS NO BINDING, asked of the fact rather than of a stand-in.
+		//
+		// This used to read the core's controller id and treat zero as "never answered", because
+		// `online_count` was a tally and said nothing about WHICH cores. That is right on a machine
+		// whose boot core is APIC 0 and wrong on one where the SBI boot hart is not hart zero - hart
+		// 0 is then an ordinary online secondary, and it got no node binding at all.
+		if !crate::smp::is_online(cpu) {
 			continue;
 		}
+		let hardware = crate::smp::lapic_id(cpu);
 		if let Affinity::Node(node) = crate::mem::topology_node_of_cpu(hardware) {
 			bindings[cpu].store(node.0, Ordering::Release);
 			bound += 1;

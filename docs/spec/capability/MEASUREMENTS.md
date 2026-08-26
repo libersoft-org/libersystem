@@ -16,13 +16,13 @@ takes.
 | TLC | 2.19 of 08 August 2024 (rev 5a47802), from the JAR pinned in `toolchain.lock` |
 | Java | OpenJDK 25.0.4.1 (the pin's floor is 11) |
 | Result | model checking completed, no error |
-| Distinct states | 12660 |
-| Search depth | 25 |
-| Wall clock | 2.5 s, one worker |
+| Distinct states | 45092 |
+| Search depth | 27 |
+| Wall clock | 2 s at four workers |
 | Peak resident | 650 MiB (the JVM's default heap on this machine, not a measured requirement) |
-| `Transfer.tla` | `fa9b382edc90d029…` |
-| `Capability.tla` | `2ba66b6734ec973e…` |
-| `spike.cfg` | `e7ec796cb7a9b596…` |
+| `Transfer.tla` | `8771f894c4838099…` |
+| `Capability.tla` | `a539b0b25f2317ce…` |
+| `spike.cfg` | `826bd323a669ac51…` |
 
 Checked: `TypeOK`, `TransferIsLinear`, `AuthorityNeverWidens`, `NoForgery`, `QuotaConserved`,
 `QueueBounded`, `SlotOwnershipUnique`, `PostCommitCopyoutIsTerminal`, `ClosedProcessCannotResurrect`,
@@ -61,9 +61,9 @@ one type to ask for.
 | Result | model checking completed, no error |
 | Distinct states | 607859 |
 | Search depth | 30 |
-| Wall clock | 54 s, one worker |
+| Wall clock | 17 s at four workers |
 | Peak resident | 2.1 GiB |
-| `handles.cfg` | `dc4a6a3cc5c6dd1c…` |
+| `handles.cfg` | `217315560a0f7b8a…` |
 
 `TransferIsLinear` is NOT checked here, and that is the point of the split: it counts one authority
 in one place, which is exact only while nothing duplicates. Two capabilities for one object are two
@@ -93,9 +93,9 @@ the spike's state count is identical with and without the constant, which is how
 | Result | model checking completed, no error |
 | Distinct states | 25320 |
 | Search depth | 26 |
-| Wall clock | 3.4 s, one worker |
+| Wall clock | 2 s at four workers |
 | Peak resident | 1.0 GiB |
-| `revoke-test-only.cfg` | `c258c64577626888…` |
+| `revoke-test-only.cfg` | `193ee13587a2172b…` |
 
 ### Watched to fail
 
@@ -114,11 +114,11 @@ cannot show an all-or-nothing rule - and it is what `FailedSendRestores` is chec
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| Distinct states | 51216 |
-| Search depth | 25 |
-| Wall clock | 6.1 s, one worker |
+| Distinct states | 1304022 |
+| Search depth | 28 |
+| Wall clock | 36 s at four workers |
 | Peak resident | 1.6 GiB |
-| `transactions-batch.cfg` | `7b9ffe65d576aca4…` |
+| `transactions-batch.cfg` | `f33ce6d32989fd86…` |
 
 ### What the batch cost to model, and what that cost bought
 
@@ -142,11 +142,11 @@ be interrupted at is what this configuration is for.
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| Distinct states | 35592 |
-| Search depth | 34 |
-| Wall clock | 4.2 s, one worker |
+| Distinct states | 6728673 |
+| Search depth | 37 |
+| Wall clock | 2 min 56 s at four workers |
 | Peak resident | 1.2 GiB |
-| `transactions-single.cfg` | `4a7b947d0f58f9c7…` |
+| `transactions-single.cfg` | `af0f65b81bb6ecd0…` |
 
 ## `propagation.cfg`
 
@@ -160,9 +160,9 @@ verb. `TransferIsLinear` is not checked here for the same reason as in `handles.
 | Result | model checking completed, no error |
 | Distinct states | 2998061 |
 | Search depth | 35 |
-| Wall clock | 303 s at one worker, 76 s at four |
+| Wall clock | 1 min 24 s at four workers |
 | Peak resident | 2.4 GiB |
-| `propagation.cfg` | `992983e156ee2971…` |
+| `propagation.cfg` | `dc50be81c8c75893…` |
 
 THE MOST EXPENSIVE CONFIGURATION BY AN ORDER OF MAGNITUDE, and it is the third process that costs
 it: every action is quantified over the process set, so a third actor multiplies the interleavings

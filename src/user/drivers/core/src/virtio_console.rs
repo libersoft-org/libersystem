@@ -28,7 +28,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(q) => write_console(&q, BANNER),
 			None => false,
 		};
-		let report: &[u8] = if ok { b"driver.virtio-console: online (console tx ok)" } else { b"driver.virtio-console: online" };
+		let mut line = [0u8; 64];
+		let n = common::describe(&mut line, b"virtio-console", &device, if ok { b"tx ok" } else { b"tx failed" });
+		let report: &[u8] = &line[..n];
 		common::online_and_stand(bootstrap, report)
 	}
 }

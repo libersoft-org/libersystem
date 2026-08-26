@@ -195,6 +195,22 @@ the allocator, IPC and the loader, so if touching counted, every test would cove
 selection would be the full suite wearing new metadata. A name the model does not know fails the
 gate.
 
+### The suite runs untranslated, and an ordinary run does not
+
+`./run.sh` boots a machine with a `virtio-iommu` in it and every virtio endpoint behind it. `./test.sh`
+does not, and the difference is deliberate rather than an oversight.
+
+Putting a controller under the whole suite would change what several hundred tests are testing -
+every one of them would then be exercising the translated DMA path as well as its own subject -
+without adding a claim that is not already made somewhere sharper. The enforcing profile has its own
+gate, `qemu-virtio-iommu-x86_64`, which boots the shipping image under a controller, requires the
+kernel to confirm it took the device out of bypass, drives five hostile cases at real memory through
+a device told to reach past its mapping, requires a real DHCP lease through the translated path, and
+then boots the DEFAULT machine to check that an ordinary run really is the isolated one.
+
+So: a failing test is a failure of what the test is about, and a failure that appears only under
+translation belongs to that gate. `./run.sh --no-iommu` reproduces the machine the suite boots.
+
 ## Shadow and trust
 
 A scoped answer should not be believed because it is plausible - and the machinery that will enforce

@@ -37,6 +37,37 @@ static ONLINE: AtomicUsize = AtomicUsize::new(1);
 // sized by the machine's real core count.
 static LAPIC_IDS: AtomicPtr<AtomicU64> = AtomicPtr::new(core::ptr::null_mut());
 
+// WHICH CORES REPORTED IN, as a mask rather than as a tally.
+//
+// `online_count` says HOW MANY and nothing about WHICH, so every reader that needed the second had
+// to invent a stand-in. The one that mattered read a core's controller id and treated zero as "never
+// answered" - which is right on a machine whose boot core is APIC 0 and wrong on one where the SBI
+// boot hart is not hart zero, because hart 0 is then an ordinary secondary and the NUMA binding pass
+// skipped it. A bit per core is the fact itself.
+static ONLINE_MASK: AtomicU64 = AtomicU64::new(1);
+
+// Whether the core with CPU id `cpu` reported in. The boot core is online by definition: it is the
+// one asking.
+pub fn is_online(cpu: usize) -> bool {
+	if cpu == 0 {
+		return true;
+	}
+	if cpu >= 64 {
+		// Beyond what one word holds. Said rather than answered wrongly: this tree's `MAX_CPUS` is
+		// larger than 64, so a mask this narrow would quietly report the cores above it as offline,
+		// and the tally is the honest fallback for them until the mask is widened.
+		return cpu < online_count();
+	}
+	ONLINE_MASK.load(Ordering::Acquire) & (1u64 << cpu) != 0
+}
+
+// Called by a core once it holds its own id and its per-CPU state - the same moment it is counted.
+fn mark_in_mask(cpu: usize) {
+	if cpu < 64 {
+		ONLINE_MASK.fetch_or(1u64 << cpu, Ordering::AcqRel);
+	}
+}
+
 // The CPU id and LAPIC id the next application processor reads on entry.
 //
 // "A single slot suffices, the AP has consumed both long before the next wake
@@ -109,7 +140,8 @@ pub fn online_count() -> usize {
 // aarch64 (PSCI) and riscv64 (SBI HSM) secondaries come up through their arch bring-up
 // path and call this once their per-CPU state is initialized.
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-pub fn mark_online() {
+pub fn mark_online(cpu: usize) {
+	mark_in_mask(cpu);
 	ONLINE.fetch_add(1, Ordering::Release);
 }
 
@@ -137,6 +169,9 @@ pub fn lapic_id(cpu: usize) -> u64 {
 // the cross-hart wake IPI targets the right hart.
 #[cfg(target_arch = "riscv64")]
 pub fn set_lapic_id(cpu: usize, id: u64) {
+	// A core recording its controller id is a core that reached this code, which is what the mask is
+	// about. The two are set together so they cannot disagree.
+	mark_in_mask(cpu);
 	let base = LAPIC_IDS.load(Ordering::Acquire);
 	if !base.is_null() && cpu < cpu_count() {
 		unsafe { (*base.add(cpu)).store(id, Ordering::Relaxed) };
@@ -297,6 +332,7 @@ extern "C" fn ap_entry() -> ! {
 	// Publish the topology entry before counting the core online, so the BSP cannot
 	// observe a completed bring-up while the entry is still stale.
 	report(cpu_id, lapic_id as u64);
+	mark_in_mask(cpu_id);
 	ONLINE.fetch_add(1, Ordering::Release);
 	crate::sched::cpu_idle_loop()
 }

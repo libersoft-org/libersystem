@@ -439,7 +439,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 						// disagreeing with itself, not a driver that ran and failed, and the two are
 						// worth telling apart: one is a packaging fault and the other is a bug.
 						state[idx] = STATE_DRIVER_MISSING;
-						print(b"devmgr: ");
+						print(b"DeviceManager: ");
 						print(driver_name);
 						print(b" is named by the registry and not on the volume; trying the next candidate\n");
 						continue;
@@ -516,7 +516,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 				if state[idx] == STATE_ONLINE {
 					break;
 				}
-				print(b"devmgr: ");
+				print(b"DeviceManager: ");
 				print(driver_name);
 				print(b" did not bind; its resources are released and the next candidate follows\n");
 			}
@@ -935,7 +935,7 @@ fn registry_candidates(info: &DeviceInfo) -> Vec<&'static Entry> {
 	candidates.sort_by(|left, right| right.priority.cmp(&left.priority));
 	for pair in candidates.windows(2) {
 		if pair[0].priority == pair[1].priority {
-			unsafe { print(b"devmgr: two registry entries match one device at the same priority; leaving it unbound\n") };
+			unsafe { print(b"DeviceManager: two registry entries match one device at the same priority; leaving it unbound\n") };
 			return Vec::new();
 		}
 	}

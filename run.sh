@@ -39,6 +39,10 @@ Boots the system in QEMU, headless, with the serial console on your terminal. On
                   and it boots nothing itself
   -h, --help      this text
 
+The machine this boots has a virtio-iommu in it and every virtio endpoint behind it, so an ordinary
+run exercises the isolation the system claims. ./test.sh does NOT: the suite runs untranslated, and
+the enforcing profile has its own gate. See docs/TESTING.md.
+
 build, image and run are separate steps:
 
     ./build.sh                          # 1. compile

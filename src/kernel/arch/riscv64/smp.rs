@@ -111,7 +111,7 @@ extern "C" fn riscv64_secondary_main(cpu_id: u64, hartid: u64) -> ! {
 	super::apic::init_ap();
 	SMP_ONLINE.fetch_add(1, Ordering::Release);
 	// Also count this core in the portable online tally the scheduler and tests read.
-	crate::smp::mark_online();
+	crate::smp::mark_online(cpu_id as usize);
 	super::enable_interrupts();
 	// The BSP brings the scheduler up (allocate + init) after waking us: spin until it
 	// has, then park in the scheduler idle loop so threads can be scheduled onto this
@@ -170,6 +170,10 @@ impl smpboot::Firmware for Hsm {
 			smpboot::Event::Online { target, logical_id } => {
 				crate::serial_println!("riscv64:   cpu {logical_id} up (hart {target})")
 			}
+			// ONLINE, AND SEEN LATE. The hart claimed its logical id while this side was giving up on
+			// it, so it is running under that id - which is a different fact from an abandoned one and
+			// must not be reported as it.
+			smpboot::Event::LateArrival { target, logical_id } => crate::serial_println!("riscv64:   cpu {logical_id} up (hart {target}) - it claimed its id after the wait expired, so this boot saw it late"),
 			smpboot::Event::PoolExhausted { target } => crate::serial_println!("riscv64: hart {target} has no logical id left in the per-CPU pool ({}); it stays parked", fdt::MAX_CPUS),
 		}
 	}

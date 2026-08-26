@@ -13,7 +13,7 @@
 // EID is claimed through stopei (0x15C). Each hart programs only its own file, so a
 // device's MSI targets the hart that acquired it (the one running the setup syscall).
 
-use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // The S-mode IMSIC files: one 4 KiB page per hart, HART_STRIDE apart. A device MSI targets hart H by
 // writing its EID to that hart's page.
@@ -28,6 +28,41 @@ use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 const IMSIC_S_DEFAULT: usize = 0x2800_0000;
 const HART_STRIDE: usize = 0x1000;
 static IMSIC_S_BASE: AtomicUsize = AtomicUsize::new(IMSIC_S_DEFAULT);
+
+// Whether the interrupt files may be touched at all.
+//
+// A BOOT THAT READ A TREE AND REFUSED WHAT IT SAID DOES NOT FALL BACK TO A COMPILED ADDRESS. That is
+// the architecture milestone's own sentence - a static QEMU descriptor cannot be selected by a boot
+// which has a DT - and this port broke it in the one case that matters: `configure` refuses every
+// layout it cannot address and deliberately leaves the previous value alone, so a machine whose
+// IMSIC this kernel cannot reach kept the `qemu-virt-aia` address and started writing MSIs into it.
+// Naming the refusal, which it did, is much better than defaulting silently and is still a boot
+// driving hardcoded addresses on a machine that told it not to.
+//
+// So a refused tree DISARMS the path instead. The kernel comes up, says why, and hands out no MSI:
+// a machine with no MSI is a machine with fewer working devices, and a machine writing into an
+// address the firmware never claimed is one whose failures have no bottom.
+static USABLE: AtomicBool = AtomicBool::new(true);
+
+// Take the MSI path out of service, naming the fact rather than leaving an address in place.
+pub fn disarm() {
+	USABLE.store(false, Ordering::Release);
+}
+
+// Whether this port may arm and deliver MSIs on this machine.
+pub fn usable() -> bool {
+	USABLE.load(Ordering::Acquire)
+}
+
+// PUT IT BACK, so a test can drive the refusal without taking the rest of the suite with it.
+//
+// A test that disarms and cannot re-arm is a test that breaks every interrupt-driven case after it
+// on the same boot, which is worse than not testing this at all. `#[cfg(test)]`, so the production
+// build has no way to un-refuse a machine it refused.
+#[cfg(test)]
+pub fn set_usable_for_test(usable: bool) {
+	USABLE.store(usable, Ordering::Release);
+}
 
 // Indirect-CSR register selects for siselect.
 const EIDELIVERY: usize = 0x70; // interrupt delivery enable
@@ -134,6 +169,13 @@ unsafe fn ireg_read(select: usize) -> usize {
 // Bring up THIS hart's IMSIC S-file: enable interrupt delivery and accept any priority,
 // so an EID a device targets here raises the hart's S-mode external interrupt.
 pub fn init_hart() {
+	// A hart whose machine has no IMSIC this kernel may use arms nothing. The registers below are
+	// indirect CSRs on the running hart, so this is a refusal to take part rather than a write that
+	// goes somewhere wrong - but the address the rest of the path would use is the one this exists
+	// to stop being used.
+	if !usable() {
+		return;
+	}
 	unsafe {
 		ireg_write(EIDELIVERY, 1);
 		ireg_write(EITHRESHOLD, 0);

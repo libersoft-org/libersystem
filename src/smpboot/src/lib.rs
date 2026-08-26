@@ -133,6 +133,10 @@ pub enum Event {
 	Abandoned { target: u64, logical_id: u64 },
 	/// The core claimed its id and reported in.
 	Online { target: u64, logical_id: u64 },
+	/// The core claimed its id AFTER this side had timed out waiting for it. It is online - it holds
+	/// the id and is running under it - and the boot took longer to see it than the bound allowed.
+	/// The distinction is the caller's to report; what must not happen is disowning a running core.
+	LateArrival { target: u64, logical_id: u64 },
 	/// More secondaries than there are slots. Defensive: [`Topology::resolve`] already parks the
 	/// remainder, so reaching this means the caller sized something from a different number.
 	PoolExhausted { target: u64 },
@@ -165,6 +169,9 @@ pub struct Outcome {
 	pub refused: usize,
 	/// Attempts that timed out. Their ids are spoken for until reset.
 	pub abandoned: usize,
+	/// Cores that claimed their id after this side gave up waiting. Counted in `online` as well,
+	/// because they ARE online; this is how many of them the boot noticed late.
+	pub late: usize,
 	/// How many logical ids this boot has handed out and not taken back, the boot core's included.
 	///
 	/// NOT `online + 1`. An abandoned id leaves a gap, so a core that came up after one holds an id
@@ -232,13 +239,32 @@ impl<'a> Bringup<'a> {
 				continue;
 			}
 			if !fw.await_report(out.online as u32 + 1) {
-				// ABANDONED, NOT RETURNED. The firmware took the call, so this core may still be
-				// on its way with this id in hand; the id and its stack stay its own for the life
-				// of the boot and the next target gets the following one.
-				self.slots[next_id].store(SLOT_ABANDONED, Ordering::Release);
-				next_id += 1;
-				out.abandoned += 1;
-				fw.note(Event::Abandoned { target, logical_id });
+				// ABANDONED, NOT RETURNED, AND NOT IF IT ARRIVED. The firmware took the call, so
+				// this core may still be on its way with this id in hand; the id and its stack stay
+				// its own for the life of the boot and the next target gets the following one.
+				//
+				// COMPARE-EXCHANGE, BECAUSE THE ARRIVAL IS A RACE THIS SIDE CAN LOSE. `claim` takes
+				// the id with a compare-exchange from `PENDING` to `ONLINE`; this used to write
+				// `ABANDONED` unconditionally, so a core that claimed its id in the window between
+				// the last poll and this store kept running - using per-CPU state under an id the
+				// table now said had been abandoned, and uncounted by `online`. Nothing handed the
+				// id out twice, so it was never a collision; it was a running core the boot did not
+				// know about, which every reader of that state was then wrong about.
+				match self.slots[next_id].compare_exchange(SLOT_PENDING, SLOT_ABANDONED, Ordering::AcqRel, Ordering::Acquire) {
+					Ok(_) => {
+						next_id += 1;
+						out.abandoned += 1;
+						fw.note(Event::Abandoned { target, logical_id });
+					}
+					// It arrived while this was giving up on it. It IS online, and the lateness is
+					// its own fact rather than a reason to disown a working core.
+					Err(_) => {
+						out.online += 1;
+						out.late += 1;
+						next_id += 1;
+						fw.note(Event::LateArrival { target, logical_id });
+					}
+				}
 				continue;
 			}
 			out.online += 1;

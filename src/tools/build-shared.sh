@@ -220,14 +220,50 @@ artifact_cache_dir="$build_root/cache/$target"
 # sweep can be written without keeping a list of patterns true.
 build_scratch="$build_root/tmp"
 
+# The name `./build.sh --arch` accepts, from a target triple.
+#
+# CUTTING AT THE FIRST DASH IS NOT THE MAPPING. It happens to be right for two of the three targets
+# and wrong for the one whose triple carries an extension: `riscv64gc-unknown-none-elf` became
+# `--arch riscv64gc`, so the one message printed to somebody whose build just failed named a command
+# that fails differently.
+public_arch() {
+	case "$1" in
+	x86_64-*) echo "x86_64" ;;
+	aarch64-*) echo "aarch64" ;;
+	riscv64gc-*) echo "riscv64" ;;
+	*) echo "${1%%-*}" ;;
+	esac
+}
+
 # The sha256 of the identity record inside a staged ELF - the same number a consumer records for it.
 # The note is a 20-byte ELF note header (namesz, descsz, type, "LIBER\0\0\0") followed by the record
 # and its padding, so the record is `descsz` bytes at offset 20.
+#
+# EVERY FIELD OF THE HEADER IS CHECKED, not just the one that is used. `descsz` was read and required
+# to be non-zero and nothing else was looked at - so a note whose declared length ran past the
+# section it came out of was hashed as whatever bytes happened to follow, and a note that was not
+# this note's format at all was hashed as if it were. A digest computed off a header nobody validated
+# is a number, not an identity.
 staged_identity_digest() {
-	local elf="$1" note="$2" len
+	local elf="$1" note="$2" len namesz name section_len
 	llvm-objcopy --dump-section .note.liber.identity="$note" "$elf" /dev/null 2>/dev/null || return 1
+	section_len="$(stat -c%s "$note")"
+	# A note shorter than its own header is not a note.
+	[[ "$section_len" -ge 20 ]] || return 1
+	namesz="$(od -An -tu4 -j0 -N4 "$note" | tr -d ' ')"
 	len="$(od -An -tu4 -j4 -N4 "$note" | tr -d ' ')"
+	# The name is "LIBER\0", six bytes padded to eight - which is what makes the twenty-byte header
+	# twenty rather than sixteen, so a different namesz means the record is not where this reader
+	# thinks it is.
+	[[ "$namesz" == "6" ]] || return 1
+	# The header is namesz(4) + descsz(4) + type(4), so the name starts at offset 12 and is padded
+	# from six bytes to eight - which is what makes the whole header twenty rather than sixteen.
+	name="$(head -c 18 "$note" | tail -c 6 | tr -d '\0')"
+	[[ "$name" == "LIBER" ]] || return 1
 	[[ -n "$len" && "$len" -gt 0 ]] || return 1
+	# AND THE RECORD MUST BE INSIDE THE SECTION IT CAME OUT OF. A declared length past the end is a
+	# note describing bytes the file does not contain.
+	[[ "$((20 + len))" -le "$section_len" ]] || return 1
 	# HEAD READS THE FILE, TAIL READS THE PIPE. `tail ... | head -c` is the same bytes and a
 	# pipeline that can fail for no reason: under `pipefail` the reader stops at its byte count, the
 	# writer takes SIGPIPE, and the whole pipeline reports failure on a digest that was computed
@@ -235,23 +271,50 @@ staged_identity_digest() {
 	head -c "$((20 + len))" "$note" | tail -c "$len" | sha256sum | awk '{print $1}'
 }
 
+# WHAT A CHECK DOES WITH INPUT IT CANNOT READ IS THE CHECK.
+#
+# This had three fail-open branches on one screen: a provider whose identity could not be read became
+# an EMPTY digest, a consumer whose note could not be dumped was skipped, and a provider missing from
+# the map was skipped. Delete a provider a consumer records and this exited zero saying every library
+# matched the providers staged beside it. Every one of them is now a refusal that names the artifact.
 verify_staged_provider_chains() {
 	local note file artifact provider recorded expected inconsistent=0
 	local -A staged_digests=()
+	local -A recorded_providers=()
 	note="$(mktemp "$build_scratch/staged-identity.XXXXXX")"
 	while IFS= read -r file; do
 		artifact="$(basename "$file" .lslib)"
-		staged_digests[$artifact]="$(staged_identity_digest "$file" "$note" || true)"
+		if ! staged_digests[$artifact]="$(staged_identity_digest "$file" "$note")"; then
+			echo "build-shared: $file carries no identity note this reader can validate - a staged library without one cannot be checked against anything" >&2
+			inconsistent=1
+			continue
+		fi
 	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f 2>/dev/null | sort)
 	while IFS= read -r file; do
 		artifact="$(basename "$file" .lslib)"
-		llvm-objcopy --dump-section .note.liber.identity="$note" "$file" /dev/null 2>/dev/null || continue
+		if ! llvm-objcopy --dump-section .note.liber.identity="$note" "$file" /dev/null 2>/dev/null; then
+			echo "build-shared: $file has no .note.liber.identity section - it was not staged by this build" >&2
+			inconsistent=1
+			continue
+		fi
+		# THE EDGES AS A SET, not one at a time. A duplicate row for one provider is a note that
+		# contradicts itself, and it used to be two comparisons that both passed.
+		recorded_providers=()
 		while IFS= read -r recorded; do
 			[[ -n "$recorded" ]] || continue
 			provider="${recorded#provider=}"
 			provider="${provider%%:*}"
+			if [[ -n "${recorded_providers[$provider]:-}" && "${recorded_providers[$provider]}" != "$recorded" ]]; then
+				echo "build-shared: $artifact records $provider twice with different digests - its identity note contradicts itself" >&2
+				inconsistent=1
+			fi
+			recorded_providers[$provider]="$recorded"
 			expected="${staged_digests[$provider]:-}"
-			[[ -n "$expected" ]] || continue
+			if [[ -z "$expected" ]]; then
+				echo "build-shared: $artifact was built against $provider, and no readable $provider is staged beside it" >&2
+				inconsistent=1
+				continue
+			fi
 			if [[ "$recorded" != "provider=$provider:$expected" ]]; then
 				echo "build-shared: $artifact was built against $provider ${recorded#provider=$provider:}, and the staged $provider is $expected" >&2
 				inconsistent=1
@@ -261,7 +324,7 @@ verify_staged_provider_chains() {
 	rm -f "$note"
 	if ((inconsistent)); then
 		echo "build-shared: the staged tree for $target is inconsistent - a provider was replaced and a library that records it was not rebuilt" >&2
-		echo "build-shared: clear it and build again:  rm -rf .build/image/$target && ./build.sh --arch ${target%%-*}" >&2
+		echo "build-shared: clear it and build again:  rm -rf .build/image/$target && ./build.sh --arch $(public_arch "$target")" >&2
 		return 1
 	fi
 }

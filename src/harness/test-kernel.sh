@@ -274,6 +274,24 @@ if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\ttest_driver\tend\n' "$(dat
 elapsed=$((SECONDS - START_SECONDS))
 if [[ "$VERBOSE" == "1" ]]; then print_full_logs; fi
 
+# NO TEST AT ALL RAN, AND THE LOADER SAYS WHY.
+#
+# The suite boots ITS kernel off the ESP, and the loader prefers the SYSTEM VOLUME's whenever the
+# volume carries one - `./image.sh` puts one there and `./build.sh --part volume` does not. So a tree
+# where a shipping image was assembled after the last test build boots the SHIPPING kernel under the
+# test harness: userspace comes up, the guest sits at a shell, and no test ever runs. Nothing about
+# that looks like a build-order problem from the outside, which is why it has to be said here.
+#
+# Returns 0 when it recognised the case and printed it, so a caller can stop rather than add a
+# diagnosis about a crash that did not happen.
+wrong_kernel_diagnosis() {
+	grep -aq "loader: kernel read from the system volume" "$GUEST_LOG" 2>/dev/null || return 1
+	grep -haq "^test tags:" "$RUN_LOG" "$GUEST_LOG" 2>/dev/null && return 1
+	echo "[test-$ARCH] NOTHING ran: the loader took its kernel off the SYSTEM VOLUME, not the medium this suite staged." >&2
+	echo "[test-$ARCH] A volume carrying a kernel is what \`./image.sh\` produces; rebuild the test-shaped one with:  ./build.sh --arch $ARCH --part volume" >&2
+	return 0
+}
+
 if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
 	if [[ "$BUILD_ONLY" == "1" ]]; then
@@ -291,10 +309,7 @@ if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 	# under the test harness: userspace comes up, the guest sits at a shell, no test ever runs, and
 	# the only thing said about it is "last test: unknown". Three minutes of nothing, twice, before
 	# the guest log was read closely enough to notice which kernel had booted.
-	if [[ "$last" == "unknown" ]] && grep -aq "loader: kernel read from the system volume" "$GUEST_LOG" 2>/dev/null; then
-		echo "[test-$ARCH] and NOTHING ran: the loader took its kernel off the SYSTEM VOLUME, not the medium this suite staged." >&2
-		echo "[test-$ARCH] A volume carrying a kernel is what \`./image.sh\` produces; rebuild the test-shaped one with:  ./build.sh --part volume" >&2
-	fi
+	if [[ "$last" == "unknown" ]]; then wrong_kernel_diagnosis; fi
 	exit 124
 fi
 if [[ "$BUILD_ONLY" == "1" ]]; then
@@ -315,6 +330,14 @@ if [[ "$status" -eq 0 ]] && ! grep -hEq '^test suite complete: [0-9]+ passed' "$
 	# asking for. The old wording here was "QEMU exited successfully", which reads as benign
 	# and sent one investigation looking for a clean shutdown; the guest did not exit, it
 	# died in a way that leaves no message because the fault outran the fault handler.
+	# WHICH KERNEL BOOTED IS ASKED FIRST, because if it was the wrong one there was no guest reset to
+	# investigate. This diagnosis fired only on a TIMEOUT, and the same cause reaches here just as
+	# often: a shipping kernel boots, comes up to a shell, never writes the debug-exit port, and QEMU
+	# is killed - which looks exactly like a triple fault to everything downstream. Five separate
+	# investigations in one round started from "GUEST RESET" and ended at the build order.
+	if wrong_kernel_diagnosis; then
+		exit 1
+	fi
 	echo "[test-$ARCH] GUEST RESET: QEMU ended without the debug-exit signal, so the guest reset or powered off" >&2
 	echo "[test-$ARCH] the last line of the guest log names the test it happened in; every test after it never ran" >&2
 	exit 1

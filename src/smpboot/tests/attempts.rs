@@ -85,6 +85,7 @@ impl Firmware for Fake<'_> {
 			Event::Refused { target, logical_id, status } => format!("refused {target} id {logical_id} status {status}"),
 			Event::Abandoned { target, logical_id } => format!("abandoned {target} id {logical_id}"),
 			Event::Online { target, logical_id } => format!("online {target} id {logical_id}"),
+			Event::LateArrival { target, logical_id } => format!("late {target} id {logical_id}"),
 			Event::PoolExhausted { target } => format!("exhausted {target}"),
 		});
 	}
@@ -277,4 +278,66 @@ fn an_id_nobody_was_offered_cannot_be_claimed() {
 	let b = Bringup::new(&s);
 	assert!(!b.claim(1));
 	assert_eq!(b.state(1), SLOT_FREE);
+}
+
+// A CORE THAT ARRIVES WHILE THIS SIDE IS GIVING UP ON IT IS ONLINE, NOT ABANDONED.
+//
+// The arriving core takes its id with a compare-exchange from PENDING to ONLINE; the boot core's
+// timeout used to write ABANDONED over whatever was there. A core that claimed its id in the window
+// between the last poll and that store kept running - under an id the table then said had been
+// abandoned, and uncounted by `online`. No id was ever handed out twice, so it was not a collision:
+// it was a working core the boot did not know it had, and every reader of that state was wrong
+// about it.
+#[test]
+fn a_core_that_claims_its_id_after_the_timeout_is_online_and_late() {
+	let table = slots(4);
+	let bringup = Bringup::new(&table);
+	// The firmware takes the call and this side times out - and the core claims its id from inside
+	// `await_report`, which is exactly the window the race lives in.
+	struct LateFirmware<'a> {
+		bringup: &'a Bringup<'a>,
+		events: Vec<String>,
+	}
+	impl Firmware for LateFirmware<'_> {
+		fn start(&mut self, _target: u64, _logical_id: u64) -> i64 {
+			0
+		}
+		fn await_report(&mut self, _reported: u32) -> bool {
+			// The core arrives while this is deciding it has not.
+			assert!(self.bringup.claim(1), "the arriving core takes the id it was offered");
+			false
+		}
+		fn note(&mut self, event: Event) {
+			self.events.push(match event {
+				Event::Refused { target, logical_id, status } => format!("refused {target} id {logical_id} status {status}"),
+				Event::Abandoned { target, logical_id } => format!("abandoned {target} id {logical_id}"),
+				Event::Online { target, logical_id } => format!("online {target} id {logical_id}"),
+				Event::LateArrival { target, logical_id } => format!("late {target} id {logical_id}"),
+				Event::PoolExhausted { target } => format!("exhausted {target}"),
+			});
+		}
+	}
+	let mut fw = LateFirmware { bringup: &bringup, events: Vec::new() };
+	let outcome = bringup.run(&[7], &mut fw);
+
+	assert_eq!(outcome.online, 1, "a core that is running is online");
+	assert_eq!(outcome.late, 1, "and the boot noticed it late, which is its own fact");
+	assert_eq!(outcome.abandoned, 0, "nothing was abandoned - the core arrived");
+	assert_eq!(outcome.ids_used, 2, "the boot core's id and this one's");
+	assert_eq!(bringup.state(1), SLOT_ONLINE, "the slot says what the core is doing, not what this side gave up on");
+	assert_eq!(fw.events, vec!["late 7 id 1".to_string()]);
+}
+
+#[test]
+fn a_core_that_really_never_arrives_is_still_abandoned() {
+	// The other side of the same compare-exchange: nothing claimed the id, so the timeout wins it.
+	let table = slots(4);
+	let bringup = Bringup::new(&table);
+	let mut fw = Fake::new(&bringup, &[(7, Behaviour::Never)]);
+	let outcome = bringup.run(&[7], &mut fw);
+	assert_eq!(outcome.abandoned, 1);
+	assert_eq!(outcome.online, 0);
+	assert_eq!(outcome.late, 0);
+	assert_eq!(bringup.state(1), SLOT_ABANDONED, "an id nobody took stays spoken for until reset");
+	assert!(!bringup.claim(1), "and a core arriving after that is refused rather than given state that may be somebody else's");
 }

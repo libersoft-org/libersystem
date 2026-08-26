@@ -440,7 +440,19 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 		super::idle_halt();
 		spins += 1;
 	}
-	crate::serial_println!("aarch64: timer IRQs delivered - {} ticks", super::gic::ticks() - start);
+	// A COUNT IS NOT A RESULT UNTIL SOMETHING REFUSES ONE. This printed whatever it had counted,
+	// including zero, and a boot that delivered no timer interrupt at all produced a line shaped
+	// exactly like a boot that delivered five. What follows on this machine - every timeout, every
+	// preemption, every sleep - is then measured against a clock that does not tick, and the only
+	// evidence of it was a number nobody was reading.
+	let delivered = super::gic::ticks() - start;
+	if delivered == 0 {
+		crate::serial_println!("aarch64: NO TIMER IRQ WAS DELIVERED in {spins} spins - the interrupt path is not carrying the generic timer, and everything timed on this machine is on a clock that does not tick");
+	} else if delivered < 5 {
+		crate::serial_println!("aarch64: timer IRQs delivered - {delivered} ticks, fewer than the 5 this waited for; the timer is running and the path is slower than this expects");
+	} else {
+		crate::serial_println!("aarch64: timer IRQs delivered - {delivered} ticks");
+	}
 
 	// The tree read above, reused: the RAM size and CPU count come from the same parse that named
 	// the interrupt controller, because two parses of one blob are two chances to disagree.

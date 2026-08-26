@@ -29,6 +29,7 @@ VARIABLES
     peeked,       \* the message identity the receiver inspected, 0 for none
     nextId,       \* the monotonic message identity `Message::new` hands out
     lastUse,      \* what the last abstract object operation was performed against
+    lastAsk,      \* the type that operation ASKED for - the other half of what type sealing means
     outcome,      \* what the last action that ENDED something was, when `CoversModeled` - see the
                   \* cover properties. A ghost, and a configuration's choice: it exists to show that
                   \* the dangerous transitions are REACHED, which the smallest configuration proves
@@ -36,7 +37,7 @@ VARIABLES
     objgen        \* the object's CURRENT generation. A capability captured one when it was made, and
                   \* the two differing is what makes a handle to a destroyed object detectable.
 
-vars == <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+vars == <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 Sender == CHOOSE p \in Procs : TRUE
 Receiver == CHOOSE p \in Procs : p # Sender
@@ -53,6 +54,7 @@ TypeOK ==
     /\ peeked \in 0..MaxId
     /\ nextId \in 1..(MaxId + 1)
     /\ lastUse \in Caps
+    /\ lastAsk \in Types \cup {"none"}
     /\ outcome \in {"none", "sent", "restored", "abandoned", "payload-failed", "published", "copyout-failed", "dropped-into-closed"}
     /\ objgen \in 1..MaxGen
 
@@ -65,13 +67,30 @@ TheObject == CHOOSE o \in Objects : TRUE
 TheType == CHOOSE t \in Types : TRUE
 TheCap == [obj |-> TheObject, type |-> TheType, rights |-> MintedRights, objgen |-> 1]
 
+\* ONE MINTED CAPABILITY PER OBJECT, WHICH IS WHAT MAKES A BATCH OF TWO REACHABLE.
+\*
+\* `Init` used to mint exactly one capability whatever `Objects` held, so a configuration asking for
+\* a two-capability batch could not produce one: `BatchMax = 2` said the model would CARRY two and
+\* nothing could ever put a second one anywhere. The rule that batch is there to check - a refused
+\* send returns ALL of them, and a duplicate source is refused - was therefore only ever checked over
+\* a batch of one, which is the length at which "all of them" and "it" are the same sentence.
+\*
+\* The order is fixed rather than chosen, so a configuration's node count does not depend on which
+\* member of `Objects` TLC happens to pick first.
+Sorted(S) == CHOOSE seq \in [1..Cardinality(S) -> S] :
+                 /\ \A a, b \in 1..Cardinality(S) : a # b => seq[a] # seq[b]
+ObjectSeq == Sorted(Objects)
+MintedFor(o) == [obj |-> o, type |-> TheType, rights |-> MintedRights, objgen |-> 1]
+Minted == Cardinality(Objects)
+
 Init ==
     /\ table = [p \in Procs |->
                  [i \in 1..Slots |->
-                   IF p = Sender /\ i = 1 THEN [state |-> "Live", cap |-> TheCap, gen |-> 1]
-                   ELSE EmptySlot]]
+                   IF p = Sender /\ i =< Minted /\ i =< Slots
+                     THEN [state |-> "Live", cap |-> MintedFor(ObjectSeq[i]), gen |-> 1]
+                     ELSE EmptySlot]]
     /\ closed = [p \in Procs |-> FALSE]
-    /\ charge = [p \in Procs |-> IF p = Sender THEN 1 ELSE 0]
+    /\ charge = [p \in Procs |-> IF p = Sender THEN Minted ELSE 0]
     /\ booked = [p \in Procs |-> <<>>]
     /\ xfer = [p \in Procs |-> <<>>]
     /\ xferSlot = [p \in Procs |-> <<>>]
@@ -85,6 +104,7 @@ Init ==
     /\ peeked = 0
     /\ nextId = 1
     /\ lastUse = NoCap
+    /\ lastAsk = "none"
     /\ outcome = "none"
     /\ objgen = 1
 
@@ -114,7 +134,7 @@ Take(p, i) ==
     /\ xfer' = [xfer EXCEPT ![p] = Append(xfer[p], table[p][i].cap)]
     /\ xferSlot' = [xferSlot EXCEPT ![p] = Append(xferSlot[p], i)]
     /\ table' = [table EXCEPT ![p][i] = [state |-> "Reserved", cap |-> NoCap, gen |-> table[p][i].gen]]
-    /\ UNCHANGED <<closed, charge, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<closed, charge, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* Recycle a slot under the generation rule: at the ceiling it RETIRES rather than wrapping.
 Recycle(p, i) ==
@@ -131,7 +151,7 @@ CommitTake(p) ==
                    IF \E k \in 1..Len(xferSlot[p]) : xferSlot[p][k] = i THEN Recycle(p, i) ELSE table[p][i]]]
     /\ charge' = [charge EXCEPT ![p] = charge[p] - Len(xferSlot[p])]
     /\ xferSlot' = [xferSlot EXCEPT ![p] = <<>>]
-    /\ UNCHANGED <<closed, booked, xfer, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<closed, booked, xfer, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* `restore_taken`, FOR EVERY CAPABILITY THE SEND WAS CARRYING. All or nothing: a refused send costs
 \* the caller nothing, not even the handles it named - so a batch comes back whole, to the same
@@ -153,7 +173,7 @@ RestoreTake(p) ==
     /\ xfer' = [xfer EXCEPT ![p] = <<>>]
     /\ xferSlot' = [xferSlot EXCEPT ![p] = <<>>]
     /\ outcome' = IF CoversModeled THEN "restored" ELSE "none"
-    /\ UNCHANGED <<closed, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, objgen>>
 
 \* `abandon_taken`: the transfer can no longer be resolved either way. The capabilities are GONE and
 \* the slots that were holding their places must not hold them forever.
@@ -166,7 +186,7 @@ AbandonTake(p) ==
     /\ xfer' = [xfer EXCEPT ![p] = <<>>]
     /\ xferSlot' = [xferSlot EXCEPT ![p] = <<>>]
     /\ outcome' = IF CoversModeled THEN "abandoned" ELSE "none"
-    /\ UNCHANGED <<closed, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, booked, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, objgen>>
 
 \* `send_inner`: room in the ring, then the charge, then the message. A refused send charges nothing.
 Enqueue(p) ==
@@ -182,7 +202,7 @@ Enqueue(p) ==
     /\ bytes' = bytes + 1
     /\ xfer' = [xfer EXCEPT ![p] = <<>>]
     /\ outcome' = IF CoversModeled THEN "sent" ELSE "none"
-    /\ UNCHANGED <<table, closed, charge, booked, xferSlot, inflight, held, holder, installed, committed, peeked, lastUse, objgen>>
+    /\ UNCHANGED <<table, closed, charge, booked, xferSlot, inflight, held, holder, installed, committed, peeked, lastUse, lastAsk, objgen>>
 
 (***************************************************************************)
 (* THE RECEIVE SIDE.                                                        *)
@@ -197,7 +217,7 @@ Book(p) ==
          /\ table' = [table EXCEPT ![p][i] = [state |-> "Booked", cap |-> NoCap, gen |-> table[p][i].gen]]
          /\ booked' = [booked EXCEPT ![p] = Append(booked[p], i)]
     /\ charge' = [charge EXCEPT ![p] = charge[p] + 1]
-    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* `release_reservation`: the booking goes back, slot and quota together.
 Unbook(p) ==
@@ -211,7 +231,7 @@ Unbook(p) ==
        /\ table' = [table EXCEPT ![p][i] = [state |-> "Free", cap |-> NoCap, gen |-> table[p][i].gen]]
        /\ booked' = [booked EXCEPT ![p] = Tail(booked[p])]
     /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
-    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* `peek_identified`: the receiver learns the head's identity and shape. It holds no lock afterwards,
 \* so anything may happen to the queue before it comes back.
@@ -219,7 +239,7 @@ Peek(p) ==
     /\ held = NoMsg
     /\ Len(queue) > 0
     /\ peeked' = queue[1].id
-    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* `recv_identified`: the message leaves the queue AND TAKES ITS SLOT WITH IT. Nothing is announced
 \* as free here - the message can still come back.
@@ -236,7 +256,7 @@ Dequeue(p) ==
     /\ queue' = Tail(queue)
     /\ inflight' = inflight + 1
     /\ committed' = FALSE
-    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, installed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, installed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* The payload copy faulted BEFORE the commit: the message goes back to the head, still charged,
 \* still holding the slot it never gave up, and the booking is released.
@@ -256,7 +276,7 @@ PayloadCopyFails(p) ==
        /\ booked' = [booked EXCEPT ![p] = Tail(booked[p])]
     /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
     /\ outcome' = IF CoversModeled THEN "payload-failed" ELSE "none"
-    /\ UNCHANGED <<closed, xfer, xferSlot, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, xfer, xferSlot, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, objgen>>
 
 \* `commit_delivery`: the payload is in the caller's buffer. THE POINT OF NO RETURN - the queued
 \* byte charge is released and the queue slot is really free.
@@ -268,7 +288,7 @@ CommitDelivery(p) ==
     /\ held' = [held EXCEPT !.slotHeld = FALSE]
     /\ inflight' = inflight - 1
     /\ bytes' = bytes - 1
-    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, holder, installed, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, holder, installed, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* `insert_reserved`: into the slot this booking owns. Charges nothing - `reserve` already paid.
 Install(p) ==
@@ -282,7 +302,7 @@ Install(p) ==
        /\ booked' = [booked EXCEPT ![p] = Tail(booked[p])]
        /\ installed' = Append(installed, i)
     /\ held' = [held EXCEPT !.caps = Tail(held.caps)]
-    /\ UNCHANGED <<closed, charge, xfer, xferSlot, queue, inflight, holder, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<closed, charge, xfer, xferSlot, queue, inflight, holder, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* `insert_reserved` INTO A CLOSED TABLE. The same barrier `restore_taken` stands behind: there is
 \* nobody to install for, so the capability is dropped and the quota `reserve` charged is refunded -
@@ -299,7 +319,7 @@ InstallIntoClosed(p) ==
     /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
     /\ held' = [held EXCEPT !.caps = Tail(held.caps)]
     /\ outcome' = IF CoversModeled THEN "dropped-into-closed" ELSE "none"
-    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, holder, installed, committed, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, xfer, xferSlot, queue, inflight, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, objgen>>
 
 \* The handle numbers reached userspace. The capability is PUBLISHED and the receive is over.
 Publish(p) ==
@@ -314,7 +334,7 @@ Publish(p) ==
     /\ holder' = "none"
     /\ committed' = FALSE
     /\ outcome' = IF CoversModeled THEN "published" ELSE "none"
-    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<table, closed, charge, booked, xfer, xferSlot, queue, inflight, bytes, peeked, nextId, lastUse, lastAsk, objgen>>
 
 \* The handle-number copyout faulted AFTER the commit. The message cannot go back - its capabilities
 \* have left it - so what is recoverable is recovered: every installed handle is closed.
@@ -340,7 +360,7 @@ CopyoutFails(p) ==
     /\ holder' = "none"
     /\ committed' = FALSE
     /\ outcome' = IF CoversModeled THEN "copyout-failed" ELSE "none"
-    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, bytes, peeked, nextId, lastUse, objgen>>
+    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, bytes, peeked, nextId, lastUse, lastAsk, objgen>>
 
 (***************************************************************************)
 (* CLOSE AND TERMINATION, which may arrive between any two of the above.    *)
@@ -364,7 +384,7 @@ Duplicate(p, i, j, r) ==
     /\ table' = [table EXCEPT ![p][j] =
                   [state |-> "Live", cap |-> [table[p][i].cap EXCEPT !.rights = r], gen |-> table[p][j].gen]]
     /\ charge' = [charge EXCEPT ![p] = charge[p] + 1]
-    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* `lookup_typed(handle, ObjectType, Rights)` followed by a type-correct operation. The abstraction is
 \* deliberate: USE stands for "an operation this object supports", not for a claim that every
@@ -383,6 +403,12 @@ Usable(p, i, t) ==
 
 Use(p, i, t) ==
     /\ Usable(p, i, t)
+    \* THE TYPE THE OPERATION ASKED FOR, recorded beside the capability it ran against. `lastUse`
+    \* held only the capability, so `TypeSealing` could ask what type that capability HAS and not
+    \* what type was WANTED - and "the capability's type is one of the types" is true by
+    \* construction, so the invariant held whatever `Usable` did. The two are only equal because
+    \* `Usable` makes them equal, which is the thing being checked.
+    /\ lastAsk' = t
     /\ lastUse' = table[p][i].cap
     /\ UNCHANGED <<outcome, table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, objgen>>
 
@@ -394,14 +420,14 @@ Revoke ==
     /\ RevocationModeled
     /\ objgen < MaxGen
     /\ objgen' = objgen + 1
-    /\ UNCHANGED <<outcome, table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse>>
+    /\ UNCHANGED <<outcome, table, closed, charge, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk>>
 
 Close(p, i) ==
     /\ ~closed[p]
     /\ table[p][i].state = "Live"
     /\ table' = [table EXCEPT ![p][i] = Recycle(p, i)]
     /\ charge' = [charge EXCEPT ![p] = charge[p] - 1]
-    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<closed, booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* `close_all`: the table takes nothing new. A slot with a transfer in flight is NOT reclaimed -
 \* its capability is elsewhere and one of commit/restore is still to come.
@@ -423,7 +449,7 @@ Terminate(p) ==
                    ELSE [state |-> "Free", cap |-> NoCap, gen |-> table[p][i].gen]]]
     /\ charge' = [charge EXCEPT ![p] =
                    charge[p] - Cardinality({i \in 1..Slots : table[p][i].state = "Live"})]
-    /\ UNCHANGED <<booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, outcome, objgen>>
+    /\ UNCHANGED <<booked, xfer, xferSlot, queue, inflight, held, holder, installed, committed, bytes, peeked, nextId, lastUse, lastAsk, outcome, objgen>>
 
 \* A SYSTEM WITH NOTHING LEFT TO DO IS NOT A DEADLOCK. Every process has terminated, no transfer is
 \* outstanding and no message is in flight - so the only behaviour left is to stay there. Saying that
@@ -459,36 +485,50 @@ Spec == Init /\ [][Next]_vars
 (* weaker property under a familiar name.                                  *)
 (***************************************************************************)
 
-\* Every place a capability may be, counted. ONE AUTHORITY, ONE PLACE.
-CopiesInSlots == Cardinality({<<p, i>> \in Procs \X (1..Slots) : HoldsCap(table[p][i])})
-CopiesInXfer == Cardinality({<<p, k>> \in Procs \X (1..BatchMax) : k =< Len(xfer[p])})
-CopiesInQueue == IF Len(queue) = 0 THEN 0 ELSE Len(queue[1].caps)
-CopiesInHeld == IF IsMsg(held) THEN Len(held.caps) ELSE 0
+\* EVERY PLACE A CAPABILITY MAY BE, and every capability in it.
+\*
+\* These counted the FIRST queued message and nothing behind it, and the queue holds more than one
+\* message in `transactions-single.cfg` - so a second queued capability was in the state space, was
+\* explored, and was looked at by none of the three invariants below. `AllCaps` is the whole set,
+\* named once, so an invariant cannot quantify over less than the model holds by accident.
+CapsInSlots == {table[p][i].cap : <<p, i>> \in {<<q, j>> \in Procs \X (1..Slots) : HoldsCap(table[q][j])}}
+CapsInXfer == UNION {{xfer[p][k] : k \in 1..Len(xfer[p])} : p \in Procs}
+CapsInQueue == UNION {{queue[m].caps[k] : k \in 1..Len(queue[m].caps)} : m \in 1..Len(queue)}
+CapsInHeld == IF IsMsg(held) THEN {held.caps[k] : k \in 1..Len(held.caps)} ELSE {}
+AllCaps == CapsInSlots \cup CapsInXfer \cup CapsInQueue \cup CapsInHeld
+
+\* How many authority-bearing copies of ONE OBJECT's capability exist, wherever they are.
+CopiesOf(o) ==
+    Cardinality({<<p, i>> \in Procs \X (1..Slots) : HoldsCap(table[p][i]) /\ table[p][i].cap.obj = o})
+      + Cardinality({<<p, k>> \in Procs \X (1..BatchMax) : k =< Len(xfer[p]) /\ xfer[p][k].obj = o})
+      + Cardinality({<<m, k>> \in (1..QueueLimit) \X (1..BatchMax) :
+                       /\ m =< Len(queue)
+                       /\ k =< Len(queue[m].caps)
+                       /\ queue[m].caps[k].obj = o})
+      + (IF IsMsg(held) THEN Cardinality({k \in 1..BatchMax : k =< Len(held.caps) /\ held.caps[k].obj = o}) ELSE 0)
 
 \* TRANSFER IS LINEAR: absent DUPLICATE, one capability has exactly one authority-bearing owner
 \* through take, queue, delivery, commit and rollback. Success neither copies it nor loses it.
 \*
-\* COUNTED OVER THE OBJECT, WHICH IS EXACT ONLY WHILE NOTHING DUPLICATES. The minted capability in
-\* this configuration carries USE and TRANSFER and not DUPLICATE, so one authority means one
-\* instance. A configuration that models `HandleTable::duplicate` needs an instance identity on the
-\* capability - two capabilities for one object are then two owners and not a violation - and that
-\* is what `handles.cfg` adds rather than something this weakens.
-TransferIsLinear == CopiesInSlots + CopiesInXfer + CopiesInQueue + CopiesInHeld =< 1
+\* PER OBJECT, NOT OVER THE WHOLE SYSTEM. This used to add every location's total and require the
+\* sum to be at most one, which says something stronger than linearity and different from it: that
+\* the whole machine holds at most one capability. Two capabilities for two objects is an ordinary
+\* state and this reported it as a violation - so a configuration could not model a batch of two and
+\* keep this invariant, and the batch configuration was left with one object and an unreachable
+\* batch rather than the invariant being stated correctly.
+\*
+\* EXACT ONLY WHILE NOTHING DUPLICATES, which is why the two configurations that model
+\* `HandleTable::duplicate` do not check it: there, two capabilities for one object are two owners
+\* and not a violation, and telling them apart needs an instance identity this model does not carry.
+TransferIsLinear == \A o \in Objects : CopiesOf(o) =< 1
 
 \* AUTHORITY NEVER WIDENS: nothing anywhere carries more than the capability it descends from, and
 \* a transfer adds nothing at all.
-AuthorityNeverWidens ==
-    /\ \A p \in Procs, i \in 1..Slots :
-         HoldsCap(table[p][i]) => table[p][i].cap.rights \subseteq TheCap.rights
-    /\ \A p \in Procs : \A k \in 1..Len(xfer[p]) : xfer[p][k].rights \subseteq TheCap.rights
-    /\ (Len(queue) > 0 /\ Len(queue[1].caps) > 0) => queue[1].caps[1].rights \subseteq TheCap.rights
+AuthorityNeverWidens == \A c \in AllCaps : c.rights \subseteq MintedRights
 
-\* NO FORGERY: every capability that exists names the object that was minted, at the generation it
+\* NO FORGERY: every capability that exists names an object that was minted, at the generation it
 \* was minted against. Nothing in the transition relation can produce another.
-NoForgery ==
-    /\ \A p \in Procs, i \in 1..Slots :
-         HoldsCap(table[p][i]) => table[p][i].cap.obj = TheObject /\ table[p][i].cap.objgen = TheCap.objgen
-    /\ \A p \in Procs : \A k \in 1..Len(xfer[p]) : xfer[p][k].obj = TheObject
+NoForgery == \A c \in AllCaps : c.obj \in Objects /\ c.objgen = 1
 
 \* QUOTA CONSERVED: the handle ledger equals the slots it represents, at every point of every
 \* transfer - including the ones inside a two-lock operation.
@@ -552,7 +592,7 @@ MessageIdentityStable == IsMsg(held) => held.id = peeked
 \* right it needed and the object's live generation. A capability that carried less could not have
 \* been used, which is `lookup_typed` refusing rather than a caller remembering to check.
 TypeSealing ==
-    IsCap(lastUse) => /\ lastUse.type \in Types
+    IsCap(lastUse) => /\ lastUse.type = lastAsk
                       /\ "USE" \in lastUse.rights
 
 \* A REVOKED SNAPSHOT CANNOT OPERATE: a capability that captured an older object generation is not
@@ -598,4 +638,22 @@ NoCloseRacingTransfer ==
 
 \* Both ways a receive can end, and both must be reachable: one of them is the point of no return.
 NoDeliveredCapability == \A i \in 1..Slots : ~HoldsCap(table[Receiver][i])
+
+\* THE BATCH IS REALLY A BATCH, AND THE QUEUE REALLY HOLDS MORE THAN ONE.
+\*
+\* These exist because the batch configuration did not model a batch. It set `BatchMax = 2` and one
+\* object, and `Init` minted one capability - so no second capability could be put anywhere, the
+\* all-or-nothing rule was checked over a batch of length one, and the duplicate-source refusal the
+\* configuration was named for was unreachable. Nothing said so: every invariant held, the run
+\* finished, and a passing result was published for a model that could not reach its own subject.
+\*
+\* Each is refuted where its configuration is supposed to reach it, and that refutation is the
+\* evidence. Where a configuration is NOT supposed to - a queue of two needs `QueueLimit > 1` - the
+\* property is simply not listed in it.
+NoBatchOfTwo == \A p \in Procs : Len(xfer[p]) < 2
+NoMessageOfTwo == \A m \in 1..Len(queue) : Len(queue[m].caps) < 2
+NoTwoQueuedMessages == Len(queue) < 2
+
+\* And the rollback that only means something at length two: a refused send returns ALL of them.
+NoBatchOfTwoRestored == ~(outcome = "restored" /\ Cardinality({o \in Objects : CopiesOf(o) = 1}) > 1)
 =============================================================================

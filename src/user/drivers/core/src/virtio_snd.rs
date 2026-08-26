@@ -296,7 +296,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    the service channel, not the bootstrap channel, so DeviceManager being stopped
 		//    after boot does not tear us down.
 		let (service, far): (u64, u64) = channel().unwrap_or_else(|| exit());
-		send_blocking(bootstrap, b"driver.virtio-snd: online", far);
+		let mut line = [0u8; 64];
+		let n = common::describe(&mut line, b"virtio-snd", &device, b"");
+		send_blocking(bootstrap, &line[..n], far);
 		serve(&ctl, &mut tx, &mut rx, irq, stream, capture, service)
 	}
 }

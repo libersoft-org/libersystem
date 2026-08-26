@@ -132,13 +132,159 @@ const fn nibble(byte: u8) -> u8 {
 	}
 }
 
-// Whether this manifest was signed by a key this loader carries, and what it says if it was.
+// WHAT THIS BOOT IS, so a signature can be checked against it rather than only checked.
 //
-// THREE REFUSALS, AND THEY ARE DIFFERENT MACHINES TO BE STANDING IN FRONT OF: bytes that are not a
-// manifest, a manifest naming a key this loader does not have, and a manifest whose signature does
-// not check out. The first is a medium that predates signing; the second is somebody else's
-// release; the third is tampering.
-pub(crate) fn verify<'a>(bytes: &'a [u8], scratch: &mut [u8]) -> Option<bootproto::manifest::Manifest<'a>> {
+// A SIGNATURE OVER FACTS NOBODY COMPARES IS A SIGNATURE OVER NOTHING. The manifest format signs the
+// product, the architecture, the kind of source and the volume's identity, and every one of those
+// was decoded and then ignored: what the check asserted was "a key this loader carries signed this
+// manifest", and what it was read as asserting was "…and this manifest is for THIS machine, THIS
+// architecture and THIS source". A correctly signed manifest for another product, another port or
+// another medium passed. So the caller now has to say what it expects before it can ask.
+pub(crate) struct Expected {
+	pub product: &'static [u8],
+	pub arch: u8,
+	pub source_kind: u8,
+	// Which volume this manifest must be for. THREE STATES, BECAUSE THERE ARE THREE SITUATIONS and
+	// two of them are not "no uuid": a boot medium is not a volume and its manifest must name none;
+	// a paired volume must be the one the medium named; and a volume reached without a pairing file
+	// is a volume this boot cannot put a name to, which is a weaker claim than either and is stated
+	// as one rather than being folded into a wildcard or a refusal.
+	pub volume_uuid: VolumeIdentity,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumeIdentity {
+	// A source that is not a volume. Its manifest must name none.
+	NotAVolume,
+	// A volume, and the boot medium said which one. Anything else is a signed release being used on
+	// a volume it was not made for, which is what pairing exists to stop.
+	Exactly([u8; 16]),
+	// A volume, and this boot has nothing to compare its name against - the medium named none. The
+	// manifest must still be a volume's, so a boot-medium manifest cannot be presented as one.
+	Unnamed,
+}
+
+// The architecture this loader was built for. A cfg rather than a value passed in: a loader cannot
+// be wrong about which port it is, and nothing should be able to tell it otherwise.
+pub(crate) const THIS_ARCH: u8 = if cfg!(target_arch = "x86_64") {
+	bootproto::manifest::ARCH_X86_64
+} else if cfg!(target_arch = "aarch64") {
+	bootproto::manifest::ARCH_AARCH64
+} else {
+	bootproto::manifest::ARCH_RISCV64
+};
+
+// The product this loader belongs to. Compiled in for the same reason the keys are.
+//
+// THE THIRD COPY OF `PRODUCT_NAME`, and that is a fact worth writing down rather than a thing to be
+// pleased about: `product.conf` is the single source of truth, and `mkpackages` and `mkimage.sh` both
+// hold the literal too. They agree today. If one of them ever did not, every boot would refuse for a
+// reason that reads like tampering - so whoever changes the product's name changes it in all four
+// places, and the milestone that gives the loader a build script reading `product.conf` removes this
+// one.
+pub(crate) const THIS_PRODUCT: &[u8] = b"LiberSystem";
+
+impl Expected {
+	pub(crate) fn source(source_kind: u8, volume_uuid: VolumeIdentity) -> Expected {
+		Expected { product: THIS_PRODUCT, arch: THIS_ARCH, source_kind, volume_uuid }
+	}
+
+	// A volume, named by the boot medium's pairing file where it has one.
+	pub(crate) fn volume(paired: Option<[u8; 16]>) -> Expected {
+		let identity = match paired {
+			Some(uuid) => VolumeIdentity::Exactly(uuid),
+			None => VolumeIdentity::Unnamed,
+		};
+		Expected::source(bootproto::manifest::SOURCE_SYSTEM_VOLUME, identity)
+	}
+
+	// The medium this loader itself came off. Not a volume.
+	pub(crate) fn medium() -> Expected {
+		Expected::source(bootproto::manifest::SOURCE_BOOT_MEDIUM, VolumeIdentity::NotAVolume)
+	}
+}
+
+// Whether this manifest was signed by a key this loader carries AND was written for this boot.
+//
+// FIVE REFUSALS, AND THEY ARE DIFFERENT MACHINES TO BE STANDING IN FRONT OF: bytes that are not a
+// manifest, a manifest naming a key this loader does not have, a manifest whose signature does not
+// check out, a manifest signed for a different product or port, and one signed for a different
+// source or volume. The first is a medium that predates signing; the second is somebody else's
+// release; the third is tampering; the last two are a valid release being pointed at a machine it
+// was not made for.
+pub(crate) fn verify_for<'a>(bytes: &'a [u8], expected: &Expected, scratch: &mut [u8]) -> Option<bootproto::manifest::Manifest<'a>> {
+	let manifest = verify(bytes, scratch)?;
+	if manifest.product != expected.product {
+		crate::arch::serial::write_str("loader: the manifest is signed for another product - refusing to boot from it\n");
+		return None;
+	}
+	if manifest.arch != expected.arch {
+		crate::arch::serial::write_str("loader: the manifest is signed for another architecture - refusing to boot from it\n");
+		return None;
+	}
+	if manifest.source_kind != expected.source_kind {
+		crate::arch::serial::write_str("loader: the manifest is signed for another kind of source - refusing to boot from it\n");
+		return None;
+	}
+	match expected.volume_uuid {
+		VolumeIdentity::Exactly(uuid) => {
+			if manifest.volume_uuid != uuid {
+				crate::arch::serial::write_str("loader: the manifest is signed for a different volume than the one this medium is paired with - refusing to boot from it\n");
+				return None;
+			}
+		}
+		VolumeIdentity::Unnamed => {
+			if manifest.volume_uuid == [0u8; 16] {
+				crate::arch::serial::write_str("loader: this source is a volume and its manifest names none - refusing to boot from it\n");
+				return None;
+			}
+		}
+		VolumeIdentity::NotAVolume => {
+			if manifest.volume_uuid != [0u8; 16] {
+				crate::arch::serial::write_str("loader: the manifest names a volume and this source is not one - refusing to boot from it\n");
+				return None;
+			}
+		}
+	}
+	if !same_release(manifest.release) {
+		crate::arch::serial::write_str("loader: this source belongs to a different release than the one already verified in this boot - refusing to compose a system from two of them\n");
+		return None;
+	}
+	Some(manifest)
+}
+
+// THE RELEASE THIS BOOT IS, LATCHED BY THE FIRST THING VERIFIED.
+//
+// Every manifest was verified on its own and none was compared with any other, so a kernel from one
+// signed release and a bootstrap set from another - each perfectly valid, each signed by the same
+// key - composed into a system nobody ever built or tested. The first verification in a boot fixes
+// which release this is; every later one has to agree.
+static mut RELEASE: [u8; bootproto::manifest::MAX_NAME_BYTES] = [0u8; bootproto::manifest::MAX_NAME_BYTES];
+static mut RELEASE_LEN: usize = 0;
+
+fn same_release(release: &[u8]) -> bool {
+	// SAFETY: the loader is single-threaded and this is reached only from its own boot path. The
+	// raw pointer rather than a reference is what keeps this from being a shared reference to a
+	// mutable static, which the compiler refuses for the reason this comment exists.
+	unsafe {
+		let held: *mut u8 = (&raw mut RELEASE).cast();
+		if RELEASE_LEN == 0 {
+			if release.len() > bootproto::manifest::MAX_NAME_BYTES {
+				return false;
+			}
+			core::ptr::copy_nonoverlapping(release.as_ptr(), held, release.len());
+			RELEASE_LEN = release.len();
+			return true;
+		}
+		if RELEASE_LEN != release.len() {
+			return false;
+		}
+		core::slice::from_raw_parts(held, RELEASE_LEN) == release
+	}
+}
+
+// Whether this manifest was signed by a key this loader carries, and what it says if it was.
+fn verify<'a>(bytes: &'a [u8], scratch: &mut [u8]) -> Option<bootproto::manifest::Manifest<'a>> {
 	let manifest = match bootproto::manifest::Manifest::decode(bytes) {
 		Ok(manifest) => manifest,
 		Err(reason) => {

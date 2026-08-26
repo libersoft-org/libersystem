@@ -1,0 +1,16 @@
+# The product version lives only in /product.conf; Cargo's optional package
+# version is unused here and omitted.
+[package]
+name = "arch-surface"
+edition = "2024"
+description = "Finds production architecture-contract members whose whole body is a placeholder"
+
+[[bin]]
+name = "arch-surface"
+path = "src/main.rs"
+
+[dependencies]
+
+# A WARNING IS AN ERROR HERE, for the same reason it is in every other host tool in this tree.
+[lints.rust]
+warnings = "deny"

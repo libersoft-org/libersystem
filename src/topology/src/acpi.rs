@@ -76,6 +76,25 @@ pub fn parse_srat(bytes: &[u8], into: &mut Builder) -> Result<(), Error> {
 		if entry_len < 2 || at + entry_len > length {
 			return Err(Error::Truncated);
 		}
+		// A KNOWN TYPE WHOSE LENGTH CONTRADICTS ITS OWN DEFINITION IS TRUNCATED, NOT UNKNOWN.
+		//
+		// The guards below used to be part of each match arm, so a `SRAT_PROCESSOR_LOCAL_APIC` with
+		// a length of twelve fell past all of them into the catch-all and was skipped in the same
+		// silence as a structure type this reader has never heard of. Those are opposite facts:
+		// firmware describing a type this does not read is entitled to; firmware saying "this is a
+		// processor record" and not supplying the fields a processor record has is a damaged table,
+		// and the CPU it dropped is exactly the kind of loss nothing downstream can notice.
+		let declared = match kind {
+			SRAT_PROCESSOR_LOCAL_APIC => Some(16usize),
+			SRAT_PROCESSOR_LOCAL_X2APIC => Some(24),
+			SRAT_MEMORY => Some(40),
+			_ => None,
+		};
+		if let Some(needed) = declared
+			&& entry_len < needed
+		{
+			return Err(Error::Truncated);
+		}
 		match kind {
 			SRAT_PROCESSOR_LOCAL_APIC if entry_len >= 16 => {
 				let flags = le32(bytes, at + 4);

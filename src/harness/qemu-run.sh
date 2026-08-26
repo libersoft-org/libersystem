@@ -26,6 +26,10 @@
 #   SPICE_ADDR= SPICE bind address (default 127.0.0.1)
 #   AUDIO_WAV= capture virtio-sound output to this WAV file (overrides spice/none)
 #   QEMU_EXTRA= extra QEMU arguments
+#   DAMAGE_SIGNED_MANIFEST=1
+#             aarch64/riscv64 UEFI: flip one byte of the signed manifest on the ESP this script
+#             assembles, so a gate can prove the loader refuses a tampered one on the two ports that
+#             have no shipping ISO to tamper with. Used by `check-signed-boot.sh` and nothing else.
 #   USB_HOST= vendorid:productid for USB passthrough (x86_64 interactive only)
 #   UEFI=1    boot through own UEFI loader (aarch64/riscv64 only)
 #   GIC=      aarch64: which interrupt controller the machine has - 2 (default: GICv2 with a
@@ -597,6 +601,19 @@ qemu_build_esp() {
 	mcopy -i "$ESP" "$manifest" ::/etc/boot.manifest
 	rm -f "$manifest"
 	stage_signed_boot_manifest "$ESP" "$bootstrap" "$arch"
+	# ONE BYTE OF THE SIGNED MANIFEST, FOR THE GATE THAT PROVES THE REFUSAL. The x86_64 signed-boot
+	# gate builds its own medium out of the shipping ISO; these two ports have no shipping ISO, and
+	# their medium is assembled here - so a gate that means to boot a TAMPERED one on them has to be
+	# able to say so. Off unless asked for, named beside the other harness knobs at the top of this
+	# file, and used by `check-signed-boot.sh` alone.
+	if [[ "${DAMAGE_SIGNED_MANIFEST:-0}" == "1" ]]; then
+		local damaged="$QEMU_BUILD_DIR/damaged.$$.manifest2"
+		mcopy -i "$ESP" ::/etc/boot.manifest2 "$damaged" || die "there is no signed manifest on this ESP to damage"
+		printf '\x01' | dd of="$damaged" bs=1 seek=40 count=1 conv=notrunc status=none
+		mcopy -o -i "$ESP" "$damaged" ::/etc/boot.manifest2
+		rm -f "$damaged"
+		echo "qemu-run: the signed manifest on this ESP was DAMAGED on purpose (DAMAGE_SIGNED_MANIFEST=1)" >&2
+	fi
 	# The factory archive still travels for the tests that read it as a fixture.
 	local volume_pkg="$QEMU_BUILD_DIR/volume-${arch}.pkg"
 	[[ -f "$volume_pkg" ]] && mcopy -i "$ESP" "$volume_pkg" ::/volume.pkg
@@ -888,7 +905,16 @@ qemu_run_x86_64() {
 	# `boot-bypass=on` because the firmware's own drivers read the boot medium before this kernel
 	# exists; the kernel takes it out of bypass and reads the byte back, which is what makes
 	# `enforcing` a fact rather than a hope.
-	local iommu="${IOMMU:-1}"
+	local iommu
+	if [[ -n "${IOMMU:-}" ]]; then
+		# Asked for explicitly, by `--no-iommu` or by a gate that owns its own profile.
+		iommu="$IOMMU"
+	elif [[ "${TEST:-0}" == "1" ]]; then
+		# The suite, which stays untranslated - see the note above.
+		iommu=0
+	else
+		iommu=1
+	fi
 	# Two option strings, because not every virtio device here takes the same ones: `virtio-vga` and
 	# the sound device are attached without `disable-legacy=on` and must not acquire it now.
 	local virtio_opts virtio_plain

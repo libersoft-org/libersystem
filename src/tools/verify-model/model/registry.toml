@@ -152,6 +152,10 @@ path = "clean.sh"
 component = "harness.scripts"
 
 [[ownership]]
+path = "update.sh"
+component = "harness.scripts"
+
+[[ownership]]
 path = "format.sh"
 component = "harness.scripts"
 

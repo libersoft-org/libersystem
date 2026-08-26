@@ -386,7 +386,7 @@ extern "C" fn secondary_idle(cpu_id: u64) -> ! {
 	SEC_MPIDR[cpu_id as usize].store(mpidr, Ordering::Relaxed);
 	SMP_ONLINE.fetch_add(1, Ordering::Release);
 	// Also count this core in the portable online tally the scheduler and tests read.
-	crate::smp::mark_online();
+	crate::smp::mark_online(cpu_id as usize);
 	super::enable_interrupts();
 	// The BSP brings the scheduler up (allocate + init) after waking us: spin until it
 	// has, then park in the scheduler idle loop so threads can be scheduled onto this
@@ -428,6 +428,8 @@ impl smpboot::Firmware for Psci {
 			}
 			smpboot::Event::Abandoned { target, logical_id } => crate::serial_println!("aarch64: core mpidr {target:#x} took CPU_ON and never reported in; logical id {logical_id} is abandoned rather than reused"),
 			smpboot::Event::Online { target: _, logical_id } => crate::serial_println!("aarch64:   cpu {} up (mpidr={:#x})", logical_id, SEC_MPIDR[logical_id as usize].load(Ordering::Relaxed) & 0xff_ffff),
+			// ONLINE, AND SEEN LATE - see the same arm on the other port.
+			smpboot::Event::LateArrival { target, logical_id } => crate::serial_println!("aarch64:   cpu {} up (mpidr={:#x}) - it claimed its id after the wait expired, so this boot saw it late", logical_id, target),
 			smpboot::Event::PoolExhausted { target } => {
 				crate::serial_println!("aarch64: core mpidr {target:#x} has no logical id left in the per-CPU pool ({MAX_CPUS}); it stays parked")
 			}

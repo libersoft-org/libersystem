@@ -13,63 +13,27 @@
 # A TEST FAULT PROBE IS NOT AN EXCEPTION TO THIS. The suites deliberately fault to prove a handler
 # runs, and those live in `tests.rs` files or behind `#[cfg(test)]`, which is what makes them
 # identifiable as tests rather than as a hole in the contract.
+# THE THIRD CONSTRUCT, AND WHY THIS STOPPED BEING A LINE SCAN. The sentence this gate enforces names
+# three answers - `todo!`, `unimplemented!` and an unconditional placeholder panic - and only the
+# first two were ever searched for. A function whose entire production body is `panic!("not on this
+# port")` passed, which is the same stub wearing a different macro.
+#
+# It could not simply be added to the pattern. A `panic!` in architecture code is very often CORRECT:
+# a firmware value this port cannot address, a state the machine must not be in, a table that
+# contradicts itself. Banning the macro would push those refusals into silent fallbacks, which is the
+# failure this tree keeps finding. Telling a refusal from a stub needs the ITEM, not the line - so the
+# scan is a small Rust program that walks the file as tokens, knows what is inside a comment, a string
+# or a character literal, and matches a `#[cfg(test)]` item by its real extent rather than by guessing
+# where a block ends. The filter it replaces skipped whatever followed that attribute until the braces
+# looked balanced, which is right for a braced module and wrong for every other shape it takes.
 set -euo pipefail
 
-cd "$(dirname "$0")/.."
-root="kernel/arch"
-status=0
+cd "$(dirname "$0")/../.."
+SCANNER="src/tools/arch-surface/Cargo.toml"
 
-# The scan skips `tests.rs` files entirely, and inside every other file it drops the `#[cfg(test)]`
-# blocks before looking. The block filter is line-based and deliberately simple: a `#[cfg(test)]`
-# attribute turns the scan off until the brace depth returns to what it was.
-scan() {
-	local file="$1"
-	awk '
-		/^[[:space:]]*#\[cfg\(test\)\]/ { skipping = 1; depth = 0; next }
-		skipping {
-			n = gsub(/\{/, "{"); m = gsub(/\}/, "}")
-			depth += n - m
-			if (depth <= 0 && (n > 0 || m > 0)) skipping = 0
-			next
-		}
-		/todo!\(|unimplemented!\(/ {
-			if ($0 ~ /^[[:space:]]*\/\//) next
-			printf "%s:%d:%s\n", FILENAME, FNR, $0
-		}
-	' "$file"
-}
-
-while IFS= read -r file; do
-	found="$(scan "$file")"
-	if [[ -n "$found" ]]; then
-		echo "$found" | while IFS= read -r line; do
-			echo "arch-surface: $line" >&2
-		done
-		status=1
-	fi
-done < <(find "$root" -name '*.rs' ! -name 'tests.rs' | sort)
-
-# Prove the gate REFUSES before letting it approve: a tree that is clean proves nothing about a scan
-# that has stopped matching, which is how six gates in this tree once reported success for a month.
-self_test() {
-	local scratch
-	scratch="$(mktemp -d)"
-	trap 'rm -rf "$scratch"' RETURN
-	mkdir -p "$scratch/arch/fake"
-	printf 'pub fn live() {\n\ttodo!("not done")\n}\n' >"$scratch/arch/fake/mod.rs"
-	if [[ -z "$(scan "$scratch/arch/fake/mod.rs")" ]]; then
-		echo "arch-surface: SELF-TEST FAILED - an unreachable body in a production file was not seen" >&2
-		return 1
-	fi
-	printf '#[cfg(test)]\nmod tests {\n\tpub fn probe() {\n\t\ttodo!("a deliberate test fault")\n\t}\n}\n' >"$scratch/arch/fake/mod.rs"
-	if [[ -n "$(scan "$scratch/arch/fake/mod.rs")" ]]; then
-		echo "arch-surface: SELF-TEST FAILED - a test-only body was reported as a contract hole" >&2
-		return 1
-	fi
-}
-self_test || exit 1
-
-if ((status == 0)); then
-	echo "arch-surface: no unreachable bodies in the compiled architecture surface ($(find "$root" -name '*.rs' ! -name 'tests.rs' | wc -l) file(s))"
-fi
-exit "$status"
+# THE SCANNER PROVES IT REFUSES BEFORE IT IS TRUSTED TO APPROVE. Fifteen sources, six that must be
+# reported and nine that must not - a panic after a check, a brace inside a string, a placeholder
+# under `#[cfg(test)]` with no block of its own. A clean tree proves nothing about a scan that has
+# stopped matching, which is how this gate came to be enforcing two thirds of its own sentence.
+cargo run --quiet --offline --manifest-path "$SCANNER" -- --self-test || exit 1
+cargo run --quiet --offline --manifest-path "$SCANNER" -- src/kernel/arch || exit 1

@@ -205,11 +205,18 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// catches corruption, a half-written image and artifacts from two different builds mixed
 	// together. It does NOT catch an OLD image - an old one carries its own old manifest and agrees
 	// with itself - and it is not a signature: whoever can rewrite one file can rewrite both.
+	// THE VOLUME'S IDENTITY, TAKEN BEFORE ITS MANIFESTS EXIST.
+	//
+	// It used to be derived further down from the whole staged set, manifests included, which is why
+	// the signed manifest could not carry it: a manifest naming the uuid would change the uuid. Taken
+	// over the PAYLOAD, the two stop being circular - and a volume's identity is what it holds rather
+	// than what it says about what it holds. The same number formats the filesystem below.
+	let volume_id: [u8; 16] = volume_uuid(&staged);
 	staged.push((String::from("etc/boot.manifest"), boot_manifest(&staged)));
 	// AND THE SIGNED ONE BESIDE IT. The text manifest proves the content matches what is next to it;
 	// this one proves who said so. Both are staged so a loader built before signing existed still
 	// boots this volume - the loader prefers the signed one wherever it finds it.
-	staged.push((String::from("etc/boot.manifest2"), signed_manifest(&staged, arch_of_build())));
+	staged.push((String::from("etc/boot.manifest2"), signed_manifest(&staged, arch_of_build(), bootproto::manifest::SOURCE_SYSTEM_VOLUME, volume_id)));
 
 	// The SAME files, written out for staging on the boot medium's own filesystem.
 	//
@@ -222,7 +229,10 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 		fallback.push((String::from("etc/bootstrap.list"), bootstrap.clone().into_bytes()));
 		// EACH SOURCE CARRIES ITS OWN, over what actually sits there.
 		fallback.push((String::from("etc/boot.manifest"), boot_manifest(&fallback)));
-		fallback.push((String::from("etc/boot.manifest2"), signed_manifest(&fallback, arch_of_build())));
+		// THE SOURCE THIS SET IS ACTUALLY STAGED ON. This said `system-volume` for a set written to
+		// the BOOT MEDIUM, so the one field that says which source a manifest is for was wrong for
+		// half of what this tool produces - which nothing noticed while nothing compared it.
+		fallback.push((String::from("etc/boot.manifest2"), signed_manifest(&fallback, arch_of_build(), bootproto::manifest::SOURCE_BOOT_MEDIUM, [0u8; 16])));
 		// Architecture-qualified, like `init-<arch>.pkg` beside it. An unqualified directory is the
 		// same trap that put x86_64 programs on a riscv64 ESP: every architecture's build writes
 		// it, so it holds whichever built last.
@@ -259,8 +269,8 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// This is not an installation identity, and the difference matters: every machine installed from
 	// one image still shares this. Regenerating at INSTALL time is the other half and is a task on
 	// this milestone; what this closes is a constant that could not tell two IMAGES apart.
-	let uuid: [u8; 16] = volume_uuid(&staged);
-	let opts = liberfs::FormatOpts { uuid, label: b"system".to_vec(), compress: false };
+	// The identity taken above, over the payload rather than over the payload plus its manifests.
+	let opts = liberfs::FormatOpts { uuid: volume_id, label: b"system".to_vec(), compress: false };
 	let mut fs_image = liberfs::LiberFs::format_opts(Image { bytes: vec![0u8; size], block: BLOCK }, (size / BLOCK) as u64, opts).unwrap_or_else(|error| panic!("mkpackages: cannot format a {size}-byte system volume: {error:?}"));
 
 	let mut made: BTreeSet<String> = BTreeSet::new();
@@ -306,7 +316,7 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 	// volume and `mkimage.sh` lays the ESP down; the sidecar is how the value crosses between them,
 	// and the image gate then asserts it against the superblock actually on the volume.
 	let mut hex = String::with_capacity(33);
-	for byte in uuid {
+	for byte in volume_id {
 		hex.push_str(&format!("{byte:02x}"));
 	}
 	hex.push('\n');
@@ -520,7 +530,7 @@ fn arch_of_build() -> u8 {
 // Neither manifest lists itself, and neither lists the other: they are the things being compared
 // against. A failure here stops the build, because a volume staged with a manifest that does not
 // verify is a volume whose next boot refuses it.
-fn signed_manifest(files: &[(String, Vec<u8>)], arch: u8) -> Vec<u8> {
+fn signed_manifest(files: &[(String, Vec<u8>)], arch: u8, source_kind: u8, volume_uuid: [u8; 16]) -> Vec<u8> {
 	let release = product_version();
 	let covered: Vec<&(String, Vec<u8>)> = files.iter().filter(|(name, _)| name != "etc/boot.manifest" && name != "etc/boot.manifest2").collect();
 	let mut rows: Vec<bootproto::manifest::Row<'_>> = covered
@@ -540,7 +550,7 @@ fn signed_manifest(files: &[(String, Vec<u8>)], arch: u8) -> Vec<u8> {
 			digest: bootproto::sha256::digest(bytes),
 		})
 		.collect();
-	let header = bootproto::manifest::Header { key_id: sign_manifest::TEST_KEY_ID, product: b"LiberSystem", arch, source_kind: bootproto::manifest::SOURCE_SYSTEM_VOLUME, release: release.as_bytes(), volume_uuid: [0; 16] };
+	let header = bootproto::manifest::Header { key_id: sign_manifest::TEST_KEY_ID, product: b"LiberSystem", arch, source_kind, release: release.as_bytes(), volume_uuid };
 	sign_manifest::sign_with_test_key(&header, &mut rows).unwrap_or_else(|e| panic!("mkpackages: the signed manifest could not be made: {e}"))
 }
 

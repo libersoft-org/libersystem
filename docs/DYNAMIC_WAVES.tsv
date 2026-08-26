@@ -10,11 +10,11 @@ aarch64-unknown-none	1	12	90536	94800	560520	360448	544768	./test.sh --tags serv
 aarch64-unknown-none	2	11	181736	156064	729984	737280	729088	./test.sh --tags service,process,storage
 aarch64-unknown-none	3	14	104248	128272	963320	872448	962560	./test.sh --tags service,process,storage
 aarch64-unknown-none	4	9	105104	100904	715768	606208	663552	./test.sh --tags service,process
-aarch64-unknown-none	5	9	505512	340560	3021800	1236992	2895872	./test.sh --tags image,audio,service,process,storage
-aarch64-unknown-none	6	20	374016	333048	1149984	1441792	1286144	./test.sh --tags service,process,storage,permission-service
-riscv64gc-unknown-none-elf	1	12	96096	102544	568560	409600	462848	./test.sh --tags service,process,storage
+aarch64-unknown-none	5	9	505504	340560	3034288	1236992	2908160	./test.sh --tags image,audio,service,process,storage
+aarch64-unknown-none	6	20	374024	333040	1149984	1441792	1286144	./test.sh --tags service,process,storage,permission-service
+riscv64gc-unknown-none-elf	1	12	96112	102544	568560	409600	462848	./test.sh --tags service,process,storage
 riscv64gc-unknown-none-elf	2	11	192888	175160	728136	790528	602112	./test.sh --tags service,process,storage
 riscv64gc-unknown-none-elf	3	14	105016	136560	966800	942080	819200	./test.sh --tags service,process,storage
 riscv64gc-unknown-none-elf	4	9	110408	111640	718360	602112	561152	./test.sh --tags service,process
-riscv64gc-unknown-none-elf	5	9	551136	388816	2854344	1294336	2244608	./test.sh --tags image,audio,service,process,storage
+riscv64gc-unknown-none-elf	5	9	551120	388816	2868336	1294336	2252800	./test.sh --tags image,audio,service,process,storage
 riscv64gc-unknown-none-elf	6	20	397232	360808	1068672	1531904	1024000	./test.sh --tags service,process,storage,permission-service

@@ -39,7 +39,18 @@ if [[ "$status" != 101 || ! -f "$object" ]] || ! grep -q 'Type:.*REL' <<<"$objec
 	if [[ "$status" != 101 ]]; then
 		echo "build-consumer-object: $consumer exited $status, not the expected 101 from the final-link shim collision (see $errors)" >&2
 	elif [[ ! -f "$object" ]]; then
-		echo "build-consumer-object: $consumer stopped at the expected link failure but emitted no object at $object; cargo did not re-invoke rustc, so --emit never ran" >&2
+		# A COMPILE ERROR AND A MISSING RE-INVOCATION LOOK THE SAME FROM HERE, and they are not the
+		# same thing at all: one is the programmer's to fix and is printed in `$errors`, the other is
+		# this technique not working. Reporting only the second sent a reader looking at the build
+		# system for an ordinary borrow-check error, twice, on a change to one line of a service.
+		if grep -q '^error\[\?[A-Z0-9]*\]\?:' "$errors"; then
+			echo "build-consumer-object: $consumer DID NOT COMPILE - the errors are below, and the object was never reached" >&2
+			# `sed` rather than `head`: under `pipefail` a reader that stops early takes the writer
+			# down with SIGPIPE and the pipeline reports failure on output that was produced fine.
+			grep -A 12 '^error' "$errors" | sed -n '1,60p' >&2
+		else
+			echo "build-consumer-object: $consumer stopped at the expected link failure but emitted no object at $object; cargo did not re-invoke rustc, so --emit never ran (see $errors)" >&2
+		fi
 	else
 		echo "build-consumer-object: $consumer emitted $object, but it is $(awk '/Type:/{print $2}' <<<"$object_header") rather than ET_REL" >&2
 	fi

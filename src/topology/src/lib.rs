@@ -260,14 +260,27 @@ pub fn from_device_tree(banks: &[(u64, u64, u32)], cpus: &[(u64, u32)], distance
 			builder.add_cpu(*hardware_id, NodeId(*node));
 		}
 	}
-	// The tree's matrix arrives as directed triples rather than as a square, so the square is
-	// rebuilt from them - and a triple naming a node no bank or processor mentions still defines the
-	// node, because a memoryless CPU-less node is a legal topology.
+	// The tree's matrix arrives as directed triples rather than as a square, so the square is rebuilt
+	// from them - OVER THE NODES THE TRIPLES NAME, in order, rather than over a range of raw ids.
+	// Sizing it by the largest id turned a legal two-node tree numbered 0 and 16 into a
+	// seventeen-row square, which `MAX_NODES` refused as too many nodes.
 	if !distances.is_empty() {
-		let mut size = 0usize;
+		let mut ids: Vec<NodeId> = Vec::new();
 		for (from, to, _) in distances {
-			size = size.max(*from as usize + 1).max(*to as usize + 1);
+			for raw in [*from, *to] {
+				let id = NodeId(raw);
+				if !ids.contains(&id) {
+					ids.push(id);
+				}
+				// A TRIPLE DEFINES ITS NODES. The comment here has always said a triple naming a
+				// node no bank or processor mentions still defines it, because a memoryless
+				// CPU-less node is a legal topology - and the loop never told the builder, so such
+				// a node was absent from the topology it was supposed to define.
+				builder.note_node(id);
+			}
 		}
+		ids.sort();
+		let size = ids.len();
 		if size > MAX_NODES {
 			return Err(Error::TooManyNodes);
 		}
@@ -283,10 +296,20 @@ pub fn from_device_tree(banks: &[(u64, u64, u32)], cpus: &[(u64, u32)], distance
 				cells.push(if from == to { LOCAL_DISTANCE } else { REMOTE_DISTANCE });
 			}
 		}
+		// TWO TRIPLES FOR ONE PAIR THAT DISAGREE ARE A CONTRADICTION, not a last-writer-wins. The
+		// builder already refuses a memory range claimed by two nodes and a CPU placed on two; the
+		// distance table was the one place where the later record silently replaced the earlier one.
+		let mut stated: Vec<(usize, usize)> = Vec::new();
 		for (from, to, distance) in distances {
-			cells[*from as usize * size + *to as usize] = *distance;
+			let a = ids.iter().position(|id| id.0 == *from).expect("collected above");
+			let b = ids.iter().position(|id| id.0 == *to).expect("collected above");
+			if stated.contains(&(a, b)) && cells[a * size + b] != *distance {
+				return Err(Error::MalformedMatrix);
+			}
+			stated.push((a, b));
+			cells[a * size + b] = *distance;
 		}
-		builder.set_matrix(size, cells);
+		builder.set_matrix_for(ids, cells);
 	}
 	builder.build()
 }
@@ -300,6 +323,8 @@ pub struct Builder {
 	nodes: Vec<NodeId>,
 	matrix: Vec<u8>,
 	matrix_size: usize,
+	// Which node each row and column of `matrix` belongs to, in order.
+	matrix_ids: Vec<NodeId>,
 }
 
 impl Builder {
@@ -325,11 +350,23 @@ impl Builder {
 		self.cpus.push((hardware_id, node));
 	}
 
-	// The SLIT, in the firmware's own node numbering. Rearranged into this topology's node order by
-	// `build`, which is the only place that knows what that order is.
-	pub fn set_matrix(&mut self, size: usize, cells: Vec<u8>) {
-		self.matrix_size = size;
+	// The firmware's distance table, and WHICH NODE EACH ROW IS FOR.
+	//
+	// THE ROWS CARRY THEIR IDS RATHER THAN BEING INDEXED BY THEM. A SLIT is dense by construction -
+	// row N is proximity domain N - so for that reader the two are the same thing. A device tree's
+	// is not: it arrives as directed triples naming arbitrary `numa-node-id` values, and the reader
+	// that rebuilt a square from them sized it by the LARGEST id it saw. Two nodes numbered 0 and 16
+	// then needed a seventeen-row square, which `MAX_NODES` refused as too many nodes - a legal
+	// two-node topology turned away over its numbering.
+	pub fn set_matrix_for(&mut self, ids: Vec<NodeId>, cells: Vec<u8>) {
+		self.matrix_size = ids.len();
+		self.matrix_ids = ids;
 		self.matrix = cells;
+	}
+
+	// The same table from a reader whose rows ARE its ids, which is every ACPI SLIT.
+	pub fn set_matrix(&mut self, size: usize, cells: Vec<u8>) {
+		self.set_matrix_for((0..size).map(|i| NodeId(i as u32)).collect(), cells);
 	}
 
 	// Check everything at once, and refuse rather than repair.
@@ -399,6 +436,9 @@ impl Builder {
 			if self.matrix.len() != self.matrix_size * self.matrix_size {
 				return Err(Error::MalformedMatrix);
 			}
+			if self.matrix_ids.len() != self.matrix_size {
+				return Err(Error::MalformedMatrix);
+			}
 			for index in 0..self.matrix_size {
 				if self.matrix[index * self.matrix_size + index] != LOCAL_DISTANCE {
 					// A diagonal that is not the local distance describes a node that is not local
@@ -406,19 +446,31 @@ impl Builder {
 					return Err(Error::MalformedMatrix);
 				}
 			}
+			// AND NOTHING IS NEARER THAN LOCAL. Only the diagonal was checked, so firmware stating
+			// `distance(0, 1) = 0` produced a fallback order in which a REMOTE node sorted ahead of
+			// the local one - every allocation steered away from the memory it was steering towards.
+			// A table that says that is malformed, not a preference to honour.
+			for from in 0..self.matrix_size {
+				for to in 0..self.matrix_size {
+					if from != to && self.matrix[from * self.matrix_size + to] < LOCAL_DISTANCE {
+						return Err(Error::MalformedMatrix);
+					}
+				}
+			}
 			let size = self.nodes.len();
 			let mut cells = Vec::new();
 			if cells.try_reserve(size * size).is_err() {
 				return Err(Error::TooManyNodes);
 			}
+			// The row a node's distances are in, found by its id rather than assumed to BE its id.
+			let row_of = |node: &NodeId| self.matrix_ids.iter().position(|id| id == node);
 			for from in &self.nodes {
 				for to in &self.nodes {
-					let (a, b) = (from.0 as usize, to.0 as usize);
-					if a >= self.matrix_size || b >= self.matrix_size {
+					let (Some(a), Some(b)) = (row_of(from), row_of(to)) else {
 						// A node the matrix does not cover. The table describes a machine whose
 						// distance matrix is smaller than its node list.
 						return Err(Error::UnknownNode);
-					}
+					};
 					cells.push(self.matrix[a * self.matrix_size + b]);
 				}
 			}

@@ -87,18 +87,30 @@ for name in strict_fails_where_preferred_falls_back a_contiguous_span_never_cros
 	grep -aq "kernel.mem.numa.$name\.\.\..*\[ok\]" "$log" || fail "kernel.mem.numa.$name did not run or did not pass"
 	echo "qemu-numa:   $name passed"
 done
-# AND THE PLACEMENT HALF: a thread asked for node 1 ran on a core whose normalized node is 1. The
-# test reports a weaker claim - "it was queued there" - when the other core never picked it up, and
-# that report is a `numa-fixture:` line, which the check below refuses.
+# AND THE PLACEMENT HALF: a thread asked for node 1 ran on a core whose normalized node is 1.
 for name in only_cores_that_came_up_are_bound_to_a_node placement_names_a_core_of_the_node_it_was_asked_for a_thread_placed_on_a_node_runs_on_a_core_of_that_node; do
 	grep -aq "kernel.smp.numa.$name\.\.\..*\[ok\]" "$log" || fail "kernel.smp.numa.$name did not run or did not pass"
 	echo "qemu-numa:   $name passed"
 done
-if grep -aq "numa-fixture: skipped" "$log"; then
-	echo "qemu-numa: a placement test reported itself skipped on the two-node profile" >&2
-	grep -a "numa-fixture:" "$log" >&2
-	exit 1
-fi
+# EVERY WEAKER OUTCOME, NOT ONE SPELLING OF IT.
+#
+# The placement test passes on a weaker claim when the target core never picked the thread up: it
+# says so on a `numa-fixture:` line and returns success. The comment here said that line was what the
+# check below refuses; the check looked for `numa-fixture: skipped`, and the line the test actually
+# prints is `numa-fixture: the thread was queued on cpu N of node M and that core drains its own
+# queue`. So the one outcome this gate exists to reject was the one it let through.
+#
+# Any `numa-fixture:` line at all is now the refusal. The tests print one only when they could not
+# make their full claim - a run where every placement really ran produces none.
+weak_placement() {
+	local where="$1" file="$2"
+	if grep -aq "numa-fixture:" "$file"; then
+		echo "qemu-numa: a placement test could not make its full claim on the $where profile" >&2
+		grep -a "numa-fixture:" "$file" >&2
+		exit 1
+	fi
+}
+weak_placement "two-node" "$log"
 
 # 5. AND THE TWO DEVICE-TREE PORTS, on their DIRECT-BOOT profiles.
 #
@@ -135,11 +147,7 @@ for port in aarch64 riscv64; do
 	for node in 0 1; do
 		grep -aq "numa:   pool node $node:" "$port_log" || fail "$port: node $node has no pool of its own"
 	done
-	if grep -aq "numa-fixture: skipped" "$port_log"; then
-		echo "qemu-numa: a placement test reported itself skipped on the $port profile" >&2
-		grep -a "numa-fixture:" "$port_log" >&2
-		exit 1
-	fi
+	weak_placement "$port" "$port_log"
 	echo "qemu-numa:   $port: $(grep -a -m 1 -o 'numa:   node 0: .*' "$port_log")"
 	echo "qemu-numa:   $port: $(grep -a -m 1 -o 'numa:   node 1: .*' "$port_log")"
 done

@@ -100,6 +100,13 @@ pub fn acquire_msi_unique(table_phys: u64, _dest: u8, owner: u32) -> Option<u32>
 }
 
 fn program_acquired(slot: usize, table_phys: u64) -> Option<u32> {
+	// A MACHINE WHOSE IMSIC THIS KERNEL COULD NOT ADDRESS HANDS OUT NO VECTOR. The boot said so and
+	// took the path out of service; programming a table entry now would write the compiled address
+	// this port refused to use, which is the whole point of having refused it.
+	if !super::imsic::usable() {
+		REGISTRY.free(slot);
+		return None;
+	}
 	let eid = EID_BASE + slot as u32;
 	let hart = super::percpu::this_cpu().lapic_id();
 	// A HART WITH NO INTERRUPT FILE IS NOT AN MSI TARGET. `msi_address` is `base + hart * stride`,

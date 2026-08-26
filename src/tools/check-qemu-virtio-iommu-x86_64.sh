@@ -141,4 +141,51 @@ grep -aq "network: configured via DHCP" "$traffic" || {
 	exit 1
 }
 echo "qemu-virtio-iommu:   a DHCP lease was obtained through the enforcing controller - real packets both ways"
-echo "qemu-virtio-iommu: the controller transitioned out of bypass, five hostile cases were refused by the hardware, and an ordinary endpoint still works"
+
+# 6. AND THE DEFAULT MACHINE IS THIS ONE. Every phase above builds its own QEMU command line, so all
+#    of them would keep passing on a day when `run.sh` quietly stopped putting a controller in the
+#    machine it boots - which is exactly the state this milestone found the tree in, where the
+#    isolated path was proved by one gate and walked by nobody. So the last phase boots the way a
+#    developer does, with no flags, and asks the boot what machine it is.
+echo "qemu-virtio-iommu: booting the DEFAULT machine, the way an ordinary run does"
+default_log="$work/default.log"
+timeout 120 ./run.sh --smp 4 --serial "file:$default_log" >/dev/null 2>&1 || true
+[[ -s "$default_log" ]] || fail "the default run produced no serial output"
+
+grep -aq "dma: every bus-mastering device is translated" "$default_log" || {
+	echo "qemu-virtio-iommu: the DEFAULT run is not translated - an ordinary boot walks the degraded path" >&2
+	grep -a "iommu:\|dma:" "$default_log" >&2 || echo "    (it printed no isolation lines at all)" >&2
+	exit 1
+}
+# A degraded row names a device reaching memory untranslated. On the default machine there are none,
+# and asserting the ABSENCE is what keeps one from creeping back in unnoticed.
+if grep -aq "dma: DEGRADED ISOLATION" "$default_log"; then
+	echo "qemu-virtio-iommu: the default run left endpoints untranslated" >&2
+	grep -a "dma:" "$default_log" >&2
+	exit 1
+fi
+if grep -aq "iommu: FAULT" "$default_log"; then
+	echo "qemu-virtio-iommu: a device faulted on the default machine" >&2
+	grep -a "iommu: FAULT" "$default_log" >&2
+	exit 1
+fi
+# THE DISPLAY DRIVER IN PARTICULAR. It is the one that could not run behind a controller at all, and
+# it is the reason this was opt-in until the IOVA allocator stopped handing out the null address.
+grep -aq "driver.virtio-gpu: online (" "$default_log" || {
+	echo "qemu-virtio-iommu: virtio-gpu did not come up on the default translated machine" >&2
+	grep -a "virtio-gpu\|devmgr\|DeviceManager:" "$default_log" >&2 || true
+	exit 1
+}
+echo "qemu-virtio-iommu:   the default machine is translated, nothing is degraded, nothing faulted, and the display driver runs"
+
+# AND `--no-iommu` STILL REACHES THE OTHER MACHINE, because a system that can only boot one of them
+# has not made isolation optional - it has made the machine without it unreachable, and that machine
+# is every one whose firmware offers no IOMMU.
+echo "qemu-virtio-iommu: booting --no-iommu, the machine without one"
+plain_log="$work/plain.log"
+timeout 120 ./run.sh --no-iommu --smp 4 --serial "file:$plain_log" >/dev/null 2>&1 || true
+grep -aq "iommu: no virtio-iommu on this machine" "$plain_log" || fail "--no-iommu still put a controller in the machine"
+grep -aq "dma: DEGRADED ISOLATION" "$plain_log" || fail "--no-iommu did not report the degraded state it is for"
+echo "qemu-virtio-iommu:   --no-iommu boots the untranslated machine and says so"
+
+echo "qemu-virtio-iommu: the controller transitioned out of bypass, five hostile cases were refused by the hardware, an ordinary endpoint passes real traffic, and the DEFAULT machine is the isolated one"

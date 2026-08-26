@@ -568,3 +568,96 @@ fn a_free_routed_by_the_freeing_cpu_corrupts_the_pools() {
 	assert_eq!(pools.free_total(), 12, "and every count still adds up, which is why a count cannot catch this");
 	assert!(!pools.consistent(), "the model must refuse a frame sitting in a pool that does not own it");
 }
+
+// SPARSE, LARGE AND CONTRADICTORY FIRMWARE NUMBERS.
+//
+// The readers were exercised with nodes numbered 0 and 1, which is the one numbering where a raw
+// firmware id and a dense index are the same number - so every place that confused the two passed.
+
+#[test]
+fn a_two_node_tree_numbered_sparsely_is_the_same_topology_as_one_numbered_densely() {
+	// `numa-node-id` is an arbitrary u32 and real firmware uses arbitrary values. Sizing the
+	// synthesised distance square by the LARGEST id turned this into a 258-row square, which
+	// `MAX_NODES` refused as too many nodes - a legal two-node tree turned away over its numbering.
+	let banks = [(0x4000_0000u64, 0x1000_0000u64, 3u32), (0x5000_0000, 0x1000_0000, 257)];
+	let cpus = [(0u64, 3u32), (1, 3), (2, 257), (3, 257)];
+	let distances = [(3u32, 3u32, 10u8), (3, 257, 21), (257, 3, 21), (257, 257, 10)];
+	let topology = from_device_tree(&banks, &cpus, &distances).expect("a legal two-node tree");
+	assert_eq!(topology.nodes(), &[NodeId(3), NodeId(257)], "the nodes keep the numbers the firmware gave them");
+	assert_eq!(topology.distance(NodeId(3), NodeId(3)), LOCAL_DISTANCE);
+	assert_eq!(topology.distance(NodeId(3), NodeId(257)), 21);
+	assert_eq!(topology.distance(NodeId(257), NodeId(3)), 21);
+	// And the fallback order is the same shape it would be for nodes 0 and 1.
+	assert_eq!(topology.fallback_order(NodeId(257)), alloc::vec![NodeId(257), NodeId(3)]);
+}
+
+#[test]
+fn a_node_only_the_distance_map_mentions_is_in_the_topology() {
+	// A memoryless, CPU-less node is a legal topology, and the reader's own comment has always said
+	// a triple naming one still defines it. The loop never told the builder, so it did not.
+	let banks = [(0x4000_0000u64, 0x1000_0000u64, 0u32)];
+	let cpus = [(0u64, 0u32)];
+	let distances = [(0u32, 0u32, 10u8), (0, 1, 21), (1, 0, 21), (1, 1, 10)];
+	let topology = from_device_tree(&banks, &cpus, &distances).expect("a tree with an empty node");
+	assert_eq!(topology.nodes(), &[NodeId(0), NodeId(1)], "the node the triples define is in the topology");
+	assert_eq!(topology.distance(NodeId(0), NodeId(1)), 21);
+}
+
+#[test]
+fn a_distance_nearer_than_local_is_refused_rather_than_preferred() {
+	// Only the diagonal was checked, so firmware stating `distance(0, 1) = 0` sorted a REMOTE node
+	// ahead of the local one in every fallback order - each allocation steered away from the memory
+	// it was steering towards.
+	let banks = [(0x4000_0000u64, 0x1000_0000u64, 0u32), (0x5000_0000, 0x1000_0000, 1)];
+	let cpus = [(0u64, 0u32), (1, 1)];
+	let backwards = [(0u32, 0u32, 10u8), (0, 1, 0), (1, 0, 21), (1, 1, 10)];
+	assert_eq!(from_device_tree(&banks, &cpus, &backwards).err(), Some(Error::MalformedMatrix));
+	// Exactly local between two different nodes is not refused: a machine may report two nodes that
+	// are equally near, and that is a claim about the machine rather than a contradiction.
+	let equal = [(0u32, 0u32, 10u8), (0, 1, 10), (1, 0, 10), (1, 1, 10)];
+	assert!(from_device_tree(&banks, &cpus, &equal).is_ok());
+}
+
+#[test]
+fn two_distance_triples_for_one_pair_that_disagree_are_a_contradiction() {
+	// The builder already refuses a memory range claimed by two nodes and a CPU placed on two. The
+	// distance table was the one place where the later record silently replaced the earlier one.
+	let banks = [(0x4000_0000u64, 0x1000_0000u64, 0u32), (0x5000_0000, 0x1000_0000, 1)];
+	let cpus = [(0u64, 0u32), (1, 1)];
+	let contradictory = [(0u32, 0u32, 10u8), (0, 1, 21), (0, 1, 31), (1, 0, 21), (1, 1, 10)];
+	assert_eq!(from_device_tree(&banks, &cpus, &contradictory).err(), Some(Error::MalformedMatrix));
+	// The same triple twice with the same value is redundant, not contradictory.
+	let redundant = [(0u32, 0u32, 10u8), (0, 1, 21), (0, 1, 21), (1, 0, 21), (1, 1, 10)];
+	assert!(from_device_tree(&banks, &cpus, &redundant).is_ok());
+}
+
+#[test]
+fn a_known_srat_record_whose_length_contradicts_its_type_is_truncated() {
+	// "A type this reader has never heard of" and "a type it knows, whose mandatory fields are not
+	// there" are opposite facts, and both used to fall into the same catch-all and be skipped in the
+	// same silence. Firmware describing more than this reads is entitled to; firmware saying "this
+	// is a processor record" without a processor record's fields is a damaged table, and the CPU it
+	// drops is exactly the loss nothing downstream can notice.
+	let mut short_cpu = srat_cpu(1, 4, 1);
+	short_cpu.truncate(12);
+	short_cpu[1] = 12;
+	assert_eq!(parse_srat(&srat(&[short_cpu]), &mut Builder::new()).err(), Some(Error::Truncated));
+
+	let mut short_memory = srat_memory(1, 0x4000_0000, 0x1000_0000, 1);
+	short_memory.truncate(20);
+	short_memory[1] = 20;
+	assert_eq!(parse_srat(&srat(&[short_memory]), &mut Builder::new()).err(), Some(Error::Truncated));
+
+	let mut short_x2 = srat_x2apic(1, 4, 1);
+	short_x2.truncate(16);
+	short_x2[1] = 16;
+	assert_eq!(parse_srat(&srat(&[short_x2]), &mut Builder::new()).err(), Some(Error::Truncated));
+
+	// AND A TYPE THIS READER GENUINELY DOES NOT KNOW IS STILL SKIPPED. The distinction is the point:
+	// a generic initiator or a memory-side cache structure is firmware describing more than this
+	// reads, and refusing those would refuse machines that are perfectly well described.
+	let unknown = alloc::vec![0x0Au8, 16, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+	let mut builder = Builder::new();
+	assert!(parse_srat(&srat(&[unknown, srat_cpu(1, 4, 1)]), &mut builder).is_ok());
+	assert_eq!(builder.build().expect("a topology").cpus().len(), 1, "and the record behind it was still read");
+}

@@ -696,7 +696,7 @@ fn virtio_snd_driver_captures_a_period_from_the_device() {
 	sched::run_until_idle();
 
 	let report = kernel_ep.recv().expect("the virtio-snd driver should report in");
-	assert_eq!(&report.bytes[..], b"driver.virtio-snd: online", "unexpected driver report");
+	assert!(report.bytes.starts_with(b"driver.virtio-snd: online ("), "unexpected driver report: {:?}", core::str::from_utf8(&report.bytes));
 	let service = report.caps.first().expect("the driver transfers its service channel").object().clone().into_any_arc().downcast::<object::channel::Channel>().expect("the service channel is a channel");
 
 	// One capture period. The reply is the period itself; an EMPTY reply is the driver saying this

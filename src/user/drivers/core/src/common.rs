@@ -48,6 +48,50 @@ pub unsafe fn bringup_features(bootstrap: u64, want_word0: u32) -> Virtio {
 
 // Report in over the bootstrap channel, then stand holding the device until
 // DeviceManager drops the channel.
+// A driver's report, with the device it is about.
+//
+// FOUR IDENTICAL LINES ARE ONE LINE THE READER CANNOT USE. A machine with four `virtio-blk`
+// functions printed `driver.virtio-blk: online` four times, and the information that would have told
+// them apart was six lines further down in the kernel's DMA audit, which lists the same four devices
+// by address. So the address comes with the report: `driver.virtio-blk: online (00:01.0)`.
+//
+// `detail` is whatever else the driver has to say about itself - a role, a self-test result - and is
+// empty for most. The whole line is built in a fixed buffer because a driver has no formatter.
+pub fn describe(out: &mut [u8; 64], name: &[u8], device: &Virtio, detail: &[u8]) -> usize {
+	let (bus, dev, func) = device.address();
+	let mut n = 0usize;
+	push(out, &mut n, b"driver.");
+	push(out, &mut n, name);
+	push(out, &mut n, b": online (");
+	push(out, &mut n, &hex2(bus));
+	push(out, &mut n, b":");
+	push(out, &mut n, &hex2(dev));
+	push(out, &mut n, b".");
+	push(out, &mut n, &[b'0' + (func % 10)]);
+	if !detail.is_empty() {
+		push(out, &mut n, b", ");
+		push(out, &mut n, detail);
+	}
+	push(out, &mut n, b")");
+	n
+}
+
+// Append what fits and drop what does not: a report that runs off the end of its buffer is a report,
+// and a driver that panicked while writing one is a device that never came up.
+fn push(out: &mut [u8; 64], at: &mut usize, bytes: &[u8]) {
+	for byte in bytes {
+		if *at < out.len() {
+			out[*at] = *byte;
+			*at += 1;
+		}
+	}
+}
+
+fn hex2(byte: u8) -> [u8; 2] {
+	const HEX: &[u8; 16] = b"0123456789abcdef";
+	[HEX[(byte >> 4) as usize], HEX[(byte & 0xf) as usize]]
+}
+
 pub unsafe fn online_and_stand(bootstrap: u64, report: &[u8]) -> ! {
 	unsafe {
 		let mut buf: [u8; 16] = [0u8; 16];

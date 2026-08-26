@@ -96,7 +96,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(pair) => pair,
 			None => exit(),
 		};
-		send_blocking(bootstrap, b"driver.virtio-net: online", frames_far);
+		let mut line = [0u8; 64];
+		let n = common::describe(&mut line, b"virtio-net", &device, b"");
+		send_blocking(bootstrap, &line[..n], frames_far);
 		let mut macmsg: [u8; 11] = [0u8; 11];
 		macmsg[..3].copy_from_slice(b"MAC");
 		macmsg[3..9].copy_from_slice(&mac);

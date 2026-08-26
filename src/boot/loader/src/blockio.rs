@@ -117,7 +117,7 @@ impl<D: BlockDevice> ReadsFiles for fat::FatFs<D> {
 // The state machine is `abi::bootstrap::assemble`, beside the list parser it uses and the archive
 // writer it ends with, because this is a UEFI binary and nothing inside one can be tested. What
 // stays here is the reading and the reporting.
-pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> abi::bootstrap::Selection {
+pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F, expected: &crate::trust::Expected) -> abi::bootstrap::Selection {
 	// WHICH MANIFEST, AND THE SIGNED ONE WINS WHEREVER IT EXISTS. A source carrying `boot.manifest2`
 	// is one that was signed, and reading the text manifest beside it instead would be choosing the
 	// weaker of two answers about the same bytes. A source with only the text one is a medium made
@@ -139,7 +139,7 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> abi::bootstrap::S
 			return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::OutOfMemory);
 		}
 		scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
-		let Some(manifest) = crate::trust::verify(&signed, &mut scratch) else {
+		let Some(manifest) = crate::trust::verify_for(&signed, expected, &mut scratch) else {
 			return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::NoManifest);
 		};
 		let verdict = abi::bootstrap::assemble(
@@ -156,10 +156,25 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F) -> abi::bootstrap::S
 		}
 		return verdict;
 	}
+	// A SOURCE WITH NO SIGNED MANIFEST IS A DOWNGRADE, AND WHETHER THIS BUILD TAKES ONE IS A PROFILE.
+	//
+	// The signed manifest being ABSENT dropped this source to the text one, which is a checksum list
+	// an attacker recomputes along with the payload. So the whole authenticity claim could be removed
+	// by DELETING one file rather than by forging anything - no signature broken, no key needed. A
+	// present-but-damaged one was already refused correctly; absence was the hole.
+	//
+	// A release build refuses. A `test-trust` build may take it, because a medium made before signing
+	// is a real thing to be able to boot while developing - and it says so on the console rather than
+	// letting a boot that is not authenticated look like one that is.
+	if !crate::trust::IS_TEST_TRUST {
+		crate::arch::serial::write_str("loader: this source carries no SIGNED manifest, and this build authenticates what it boots - refusing rather than falling back to the text one\n");
+		return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::NoManifest);
+	}
 	let Some(manifest) = fs.read(b"etc/boot.manifest") else {
 		crate::arch::serial::write_str("loader: this source has no manifest of either kind - refusing to boot from it\n");
 		return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::NoManifest);
 	};
+	crate::arch::serial::write_str("loader: THIS SOURCE IS NOT AUTHENTICATED - it carries no signed manifest, and this build accepts the checksum one\n");
 	let verdict = abi::bootstrap::assemble(|path| fs.read(path), |path, bytes| digests_ok(&manifest, path, bytes));
 	if matches!(verdict, abi::bootstrap::Selection::Verified(_)) {
 		// SAY THAT IT CHECKED. A check that is silent when it passes cannot be told apart in a boot

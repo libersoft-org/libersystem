@@ -93,3 +93,32 @@ fn a_vector_whose_identity_stayed_armed_is_never_handed_out_again() {
 	unbind(next);
 	unsafe { frame::deallocate(table) };
 }
+
+// A MACHINE WHOSE IMSIC THIS KERNEL COULD NOT ADDRESS HANDS OUT NO VECTOR.
+//
+// `imsic::configure` refuses every layout this port cannot address and deliberately leaves the
+// previous value alone, so a boot that READ a tree and refused what it described used to keep the
+// compiled `qemu-virt-aia` address and start writing MSIs into it - a static descriptor selected by
+// a boot which has a DT, which the architecture contract forbids in as many words. Naming the
+// refusal, which it did, is much better than defaulting silently and is still hardcoded addresses on
+// a machine that said otherwise. The boot now takes the MSI path out of service instead, and this is
+// the half of that a test can drive: what `disarm` costs, and that it costs it before any address is
+// programmed into a device's table.
+crate::tagged_test!(a_machine_whose_imsic_this_kernel_refused_hands_out_no_msi_vector, [Interrupt, Drivers, ArchRiscv64], id = "kernel.arch.riscv64.interrupts.a_machine_whose_imsic_this_kernel_refused_hands_out_no_msi_vector", covers = ["kernel"]);
+fn a_machine_whose_imsic_this_kernel_refused_hands_out_no_msi_vector() {
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	assert!(crate::arch::imsic::usable(), "this machine's IMSIC was accepted, which is what makes the refusal below a change");
+
+	crate::arch::imsic::set_usable_for_test(false);
+	assert!(acquire_msi(table, 0, 21).is_none(), "a refused machine hands out no vector rather than programming the address it refused");
+
+	// AND THE REGISTRY IS NOT LEFT HOLDING THE SLOT. A refusal that consumed an EID would run the
+	// machine out of vectors on a path that never delivers one.
+	crate::arch::imsic::set_usable_for_test(true);
+	let vector = acquire_msi(table, 0, 21).expect("and the same acquire works once the machine is usable again");
+	release_msi_for_device(21);
+	assert!(!is_bound(vector));
+
+	// SAFETY: allocated above and never handed to a device - no vector was ever programmed into it.
+	unsafe { frame::deallocate(table) };
+}

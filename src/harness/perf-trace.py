@@ -8,6 +8,11 @@
 # and the gpu driver all sit on one timeline. The kernel publishes its calibrated TSC
 # frequency once at boot as "\x1ePERF tsc_hz <hz>", which converts cycles to time.
 #
+# DEV_PROFILE=1 IS REQUIRED, and it is what makes the guest emit that anchor. It used to be printed
+# on every boot, which meant every ordinary boot showed one line addressed to this program - so the
+# kernel now emits it only when a profile is named over fw_cfg, which is the condition "a harness is
+# watching".
+#
 # This tool connects to the QEMU serial unix socket, captures the boot tsc_hz anchor,
 # sends a command (default "help"), collects the markers it triggers, and prints a
 # timeline in milliseconds plus a per-phase breakdown (shell produce -> console render
@@ -19,7 +24,7 @@
 # Typical session (start a guest of your own; do NOT pattern-kill QEMU - this used to say
 # `pkill -9 qemu-system-x86`, which takes down every QEMU the user owns, including ones this has
 # nothing to do with):
-#   SERIAL="unix:/tmp/ls-ser.sock,server,nowait" DISPLAYS=vnc VNC_ADDR=127.0.0.1:9 \
+#   DEV_PROFILE=1 SERIAL="unix:/tmp/ls-ser.sock,server,nowait" DISPLAYS=vnc VNC_ADDR=127.0.0.1:9 \
 #     harness/qemu-run.sh x86_64 ../.build/cargo/kernel/x86_64-unknown-none/debug/kernel >/tmp/qemu.log 2>&1 &
 #   harness/perf-trace.py            # connects, waits for boot, runs `help`, prints the trace
 #

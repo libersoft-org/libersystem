@@ -462,10 +462,16 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 		Some((bi, Ok(()))) => {
 			crate::serial_println!("riscv64: IMSIC S-mode files from the device tree at {:#x}+{:#x}, {} hart(s)", bi.imsic_base, bi.imsic_size, bi.imsic_hart_count);
 		}
-		// NAMED, NOT SILENTLY DEFAULTED. The descriptor still stands so the no-DT regression profile
-		// boots unchanged, but a tree that was read and refused says which fact refused it.
+		// REFUSED, AND THE PATH GOES WITH IT. A boot that read a tree and could not address what it
+		// described used to keep the compiled `qemu-virt-aia` address and start writing MSIs into
+		// it - a static descriptor selected by a boot which HAS a DT, which the architecture
+		// contract forbids in as many words. It named the refusal, which is much better than
+		// defaulting silently, and it was still hardcoded addresses on a machine that had said
+		// otherwise. Now the MSI path is taken out of service: fewer working devices on a machine
+		// this kernel cannot drive, rather than writes into an address the firmware never claimed.
 		Some((_, Err(reason))) => {
-			crate::serial_println!("riscv64: the device tree's IMSIC is not one this kernel addresses - {reason}; using the qemu-virt-aia descriptor, which makes no discovery claim")
+			super::imsic::disarm();
+			crate::serial_println!("riscv64: the device tree's IMSIC is not one this kernel addresses - {reason}; no MSI is armed on this machine, and the compiled qemu-virt-aia address is NOT used because this boot has a tree")
 		}
 		None => crate::serial_println!("riscv64: no device tree to read the IMSIC from - using the qemu-virt-aia descriptor, which makes no discovery claim"),
 	}
@@ -522,6 +528,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	{
 		super::apic::init();
 		super::enable_interrupts();
+		report_timer();
 		super::syscall::init();
 		crate::device::init();
 		// The DMA isolation state, once the devices that will master the bus are known. Outside
@@ -541,6 +548,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 		// no port demos.
 		super::apic::init();
 		super::enable_interrupts();
+		report_timer();
 		super::syscall::init();
 		run_system_manager();
 		crate::serial_println!("riscv64: halting");
@@ -590,6 +598,34 @@ fn decode_boot_arg(arg: u64) -> (u64, Option<BootFb>) {
 		BootFb { phys: f.addr, width: f.width, height: f.height, stride: f.pitch, red_shift: f.red_shift, red_size: f.red_size, green_shift: f.green_shift, green_size: f.green_size, blue_shift: f.blue_shift, blue_size: f.blue_size }
 	});
 	(dtb, fb)
+}
+
+// THE TIMER, PROVED RATHER THAN ARMED.
+//
+// This port armed the S-mode timer and said nothing about whether it ever fired, so on riscv64 a boot
+// carried no evidence at all that the interrupt path delivers the one interrupt everything timed is
+// measured against - while the aarch64 prologue has counted and reported it for as long as it has
+// existed. One port proving its timer and the other not is not a difference between the machines; it
+// is a difference between what was written down, and a gate that means to require the same fact of
+// both cannot.
+//
+// Zero is named for what it is. A boot that delivered no timer interrupt looked, on the port that did
+// report, exactly like one that delivered five - which is the defect this wording exists to remove.
+fn report_timer() {
+	let start = super::apic::ticks();
+	let mut spins: u64 = 0;
+	while super::apic::ticks() < start + 5 && spins < 2_000_000_000 {
+		super::idle_halt();
+		spins += 1;
+	}
+	let delivered = super::apic::ticks() - start;
+	if delivered == 0 {
+		crate::serial_println!("riscv64: NO TIMER IRQ WAS DELIVERED in {spins} spins - the interrupt path is not carrying the S-mode timer, and everything timed on this machine is on a clock that does not tick");
+	} else if delivered < 5 {
+		crate::serial_println!("riscv64: timer IRQs delivered - {delivered} ticks, fewer than the 5 this waited for; the timer is running and the path is slower than this expects");
+	} else {
+		crate::serial_println!("riscv64: timer IRQs delivered - {delivered} ticks");
+	}
 }
 
 // Bring up the kernel framebuffer console on `fb` (its physical base drawn through the
