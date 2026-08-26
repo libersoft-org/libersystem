@@ -612,10 +612,21 @@ fn self_test(reference: &[Event]) {
 
 	type Mutation = (&'static str, &'static str, fn(&[Event], &dyn Fn(&[Event], u8, usize) -> usize) -> Vec<Event>);
 	let mutations: &[Mutation] = &[
+		// ON THE SEED, NOT ON THE TAKE, because that is where the checker now reads the rights from.
+		//
+		// This cleared TRANSFER on the take event itself, which was the right mutation while `TAKE`
+		// read `event.rights`. Hardening that check to read `slot.rights` - so a take could not
+		// answer its own question - left this mutation editing a field the rule no longer consults.
+		// The trace still changes; it just stops being a trace with the defect in it, so the checker
+		// accepts it and the self-test reports the checker accepting a defect it was never shown.
+		// A fix to the checked thing invalidating the check that guards it is the failure this whole
+		// self-test exists for, and it happened here.
 		("a take of a capability without TRANSFER", "does not carry TRANSFER", |events, nth| {
 			let mut out = events.to_vec();
 			let at = nth(events, TAKE, 0);
-			out[at].rights &= !RIGHT_TRANSFER;
+			let (party, slot, generation) = (out[at].party, out[at].slot, out[at].generation);
+			let seed = out[..at].iter().rposition(|e| e.action == SEED && e.party == party && e.slot == slot && e.generation == generation).unwrap_or_else(|| die(String::from("the reference trace's first take has no seed to strip TRANSFER from - this mutation no longer tests anything")));
+			out[seed].rights &= !RIGHT_TRANSFER;
 			out
 		}),
 		("a take presenting a stale generation", "presented generation", |events, nth| {
@@ -712,7 +723,14 @@ fn self_test(reference: &[Event]) {
 			Ok(covers) => {
 				let missing = missing_covers(&covers);
 				if missing.is_empty() {
-					die(format!("the checker ACCEPTED \"{name}\" - it does not test what it claims to"));
+					// TWO THINGS LOOK IDENTICAL HERE AND ONLY ONE OF THEM IS A HOLE IN THE CHECKER.
+					// The other is a mutation that no longer reaches the rule it was written for -
+					// which is what happened when `TAKE` was hardened to read `slot.rights` instead
+					// of `event.rights` and this suite's TRANSFER case went on clearing a field
+					// nothing consults. It still CHANGED the trace, so it is not caught by asking
+					// whether the mutation did anything; it has to be read. Naming both suspects
+					// costs one sentence and saves the reader from auditing the checker first.
+					die(format!("the checker ACCEPTED \"{name}\".\n  Either the checker does not test what it claims to, or this mutation no longer reaches the rule it was written for - check which field the rule actually reads before auditing the checker."));
 				}
 				format!("{} step(s) the trace never reached: {}", missing.len(), missing.join(", "))
 			}

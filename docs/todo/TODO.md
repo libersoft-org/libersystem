@@ -23,7 +23,7 @@ storage, a CLI and framebuffer console. Every milestone has a QEMU-tested gate.
 - [x] [P00M0014 - Domain hierarchy and lifecycle](P00M0014.md)
 - [x] [P00M0015 - Init package and the first userspace process](P00M0015.md)
 - [x] [P00M0016 - Framebuffer text console](P00M0016.md)
-- [x] [P00M0017 - StorageService over a ramdisk + vol:// access](P00M0017.md)
+- [x] [P00M0017 - StorageService over a ramdisk + `vol://` access](P00M0017.md)
 - [x] [P00M0018 - Simple CLI + basic System Graph](P00M0018.md)
 
 ### Definition of done (phase 0)
@@ -74,12 +74,12 @@ successor version. Any older roadmap wording such as "freeze" or "finalize" is
 therefore interpreted only as recording the current contract, never as closing
 or preventing further development of `v1`.
 
-- [x] [P02M0001 - Event streams in the IDL toolchain (the P01M0008-deferred `stream<T>`)](P02M0001.md)
-- [x] [P02M0002 - Interrupt-driven I/O + virtio-input keyboard (the driver-framework gap for RX devices)](P02M0002.md)
+- [x] [P02M0001 - Event streams in the IDL toolchain (`stream<T>`)](P02M0001.md)
+- [x] [P02M0002 - Interrupt-driven I/O + virtio-input keyboard](P02M0002.md)
 - [x] [P02M0003 - virtio-net receive path + the link/IP layer (Ethernet, ARP, IPv4, ICMP)](P02M0003.md)
 - [x] [P02M0004 - NetworkService, UDP/TCP, and the net tools as standalone programs](P02M0004.md)
 - [x] [P02M0005 - TimeService: wall-clock time (RTC + NTP)](P02M0005.md)
-- [x] [P02M0006 - Interactive console: line editor, history, and cursor](P02M0006.md)
+- [x] [P02M0006 - Interactive console: line editor, history, and the console subsystem](P02M0006.md)
 - [x] [P02M0007 - Pointer/mouse plumbing (virtio-input pointer + InputService)](P02M0007.md)
 - [x] [P02M0008 - Observability (full System Graph, tracing, counters, CBOR)](P02M0008.md)
 - [x] [P02M0009 - Security hardening: app sandbox, permission manifests, PermissionManager](P02M0009.md)
@@ -234,9 +234,9 @@ or preventing further development of `v1`.
 - [ ] [P02M0158 - The boot report names the same device twice and the same component two ways](P02M0158.md)
 - [ ] [P02M0159 - Every boot exercises the degraded DMA path and none exercises the isolated one](P02M0159.md)
 - [ ] [P02M0160 - One artifact has two required shapes and one name, so the last build wins](P02M0160.md)
-- [ ] [P02M0161 - Every driver family invents its own online-and-stop wire](P02M0161.md)
+- [ ] [P02M0161 - Every driver family invents its own bring-up wire](P02M0161.md)
 - [ ] [P02M0162 - A bind that fails part-way leaves the parts that succeeded](P02M0162.md)
-- [ ] [P02M0163 - Every driver is selected by a vendor number the standards identity is sitting next to](P02M0163.md)
+- [ ] [P02M0163 - Discovery holds two kinds of device and the binding unit is an index into that table](P02M0163.md)
 - [ ] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
 - [ ] [P02M0165 - A driver that stops answering looks exactly like one that is busy](P02M0165.md)
 - [ ] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)

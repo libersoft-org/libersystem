@@ -35,13 +35,40 @@ check_index() {
 		mark="${line:3:1}"
 		file="${line##*\(}"
 		file="${file%%\)*}"
-		[[ "$mark" == "x" ]] || continue
 		[[ "$file" == *.md ]] || continue
-		[[ -f "$todo_dir/$file" ]] || {
+		if [[ ! -f "$todo_dir/$file" ]]; then
+			# Only a row claiming DONE is worth failing over here; an open row naming a file that
+			# does not exist yet is a plan, which is what this index is for.
+			[[ "$mark" == "x" ]] || continue
 			echo "milestone-index: $file is in the index and not in $todo_dir" >&2
 			failed=1
 			continue
-		}
+		fi
+
+		# THE TITLE IS PART OF THE CLAIM, AND IT DRIFTS SILENTLY.
+		#
+		# This gate was written because a checkbox here is "the only summary of a milestone anybody
+		# sees without opening the file" - and the title beside it is the rest of that summary. Two
+		# milestones were retitled in one afternoon, and the index went on describing them by what
+		# they used to be about: one still promised a stop that had moved to another milestone, the
+		# other named a selection rule that had been deleted as wrong. Nothing caught it, for the
+		# same reason nothing caught the checkbox: the news lives in one file and the summary in
+		# another. Checked on every row, done or not, because an open milestone is the one a reader
+		# is deciding whether to pick up.
+		local row_title doc_title rest
+		rest="${line#*\] \[}"
+		row_title="${rest%%\]*}"
+		doc_title="$(head -1 "$todo_dir/$file")"
+		doc_title="${doc_title#\# }"
+		if [[ "$row_title" != "$doc_title" ]]; then
+			echo "milestone-index: the index calls $file" >&2
+			echo "    \"$row_title\"" >&2
+			echo "  and the document calls itself" >&2
+			echo "    \"$doc_title\"" >&2
+			failed=1
+		fi
+
+		[[ "$mark" == "x" ]] || continue
 		local open
 		open="$(grep -cE '^- \[[ ~]\]' "$todo_dir/$file" || true)"
 		if [[ "$open" != "0" ]]; then
@@ -60,13 +87,21 @@ self_test() {
 	scratch="$(mktemp -d)"
 	trap 'rm -rf "$scratch"' RETURN
 
-	printf '# P99M0001\n\nStatus: DONE.\n\n- [x] finished\n' >"$scratch/P99M0001.md"
-	printf '# P99M0002\n\nStatus: IN PROGRESS.\n\n- [x] finished\n- [ ] not finished\n' >"$scratch/P99M0002.md"
+	printf '# P99M0001 - a\n\nStatus: DONE.\n\n- [x] finished\n' >"$scratch/P99M0001.md"
+	printf '# P99M0002 - b\n\nStatus: IN PROGRESS.\n\n- [x] finished\n- [ ] not finished\n' >"$scratch/P99M0002.md"
 
 	# A consistent index is accepted.
 	printf -- '- [x] [P99M0001 - a](P99M0001.md)\n- [ ] [P99M0002 - b](P99M0002.md)\n' >"$scratch/ok.md"
 	if ! check_index "$scratch/ok.md" "$scratch" 2>/dev/null; then
 		echo "milestone-index: SELF-TEST FAILED - a consistent index was refused" >&2
+		exit 1
+	fi
+
+	# A title the document no longer uses, on a row that is NOT marked done - which is where the
+	# drift was actually found.
+	printf -- '- [x] [P99M0001 - a](P99M0001.md)\n- [ ] [P99M0002 - what it used to be about](P99M0002.md)\n' >"$scratch/stale-title.md"
+	if check_index "$scratch/stale-title.md" "$scratch" 2>/dev/null; then
+		echo "milestone-index: SELF-TEST FAILED - an index row describing a milestone by a title the document no longer carries was accepted" >&2
 		exit 1
 	fi
 

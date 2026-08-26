@@ -83,8 +83,11 @@ esac
 # emulation multiplier.
 case "$ARCH" in
 x86_64)
+	# Under KVM. Nothing here is within an order of magnitude of the emulated ports, and the overall
+	# timeout bounds a wedge in fifteen minutes whatever the stall window says.
 	FULL_TIMEOUT=15m
 	TAG_TIMEOUT=3m
+	STALL_DEFAULT=900
 	;;
 aarch64)
 	# 45m, matching riscv64: both are TCG-emulated, and the asymmetry was arbitrary.
@@ -105,7 +108,14 @@ aarch64)
 	# whole point of the rule: 60m was 3600 s against a 3606 s floor, six seconds short, and a run
 	# that ends at the wall reports a TIMEOUT that reads exactly like a hang.
 	FULL_TIMEOUT=70m
-	TAG_TIMEOUT=15m
+	# 45m, NOT 15m, AND THE STALL WINDOW WITH IT. Measured 2026-08-26 on a quiet machine (load 0.9):
+	# `kernel.applications.imgconv_governed_working_set_is_measured` alone takes 1206 s on this
+	# target at one core. Both bounds were 15m, so that single test could not pass either of them -
+	# `qemu-arch-profiles` died on the stall window and `--tags image` died on the tag timeout, both
+	# reporting shapes that read as a hang. The same test costs 589 s on emulated riscv64 and is
+	# instant under KVM, which is why 15m held everywhere it had been looked at.
+	TAG_TIMEOUT=45m
+	STALL_DEFAULT=2400
 	;;
 riscv64)
 	# 90m. Measured 2026-08-10: the suite declared 217 tests and 45 minutes bought 82 of them, with
@@ -119,11 +129,18 @@ riscv64)
 	# for this target and fails when the budget falls under it, which is what stops the next drift
 	# from being discovered forty-five minutes into a sweep.
 	FULL_TIMEOUT=90m
-	TAG_TIMEOUT=15m
+	# The same reasoning as aarch64 above, with this target's own numbers: the imgconv test costs
+	# 589 s here and the slowest test seen in a passing run 696 s. That fits inside 15m, which is
+	# why this port passed while aarch64 did not - a margin of three minutes, which is not a margin.
+	TAG_TIMEOUT=45m
+	STALL_DEFAULT=2400
 	;;
 *)
+	# An architecture nothing here names yet: the conservative budgets, and a stall window the
+	# overall timeout will beat anyway.
 	FULL_TIMEOUT=15m
 	TAG_TIMEOUT=3m
+	STALL_DEFAULT=900
 	;;
 esac
 
@@ -172,7 +189,13 @@ fi
 # The default is generous on purpose. The slowest single test on emulated riscv64 runs into minutes,
 # and a watchdog that fires on a slow test is worse than none: it would turn a passing run into a
 # failure and teach everyone to raise it until it never fires.
-STALL="${TEST_STALL:-900}"
+#
+# AND IT DID EXACTLY THAT, because one number cannot serve three targets that differ by an order of
+# magnitude. 900 s was calibrated against emulated riscv64, where the slowest test is 696 s - a
+# margin of three minutes. On aarch64 the same test costs 1206 s, so the watchdog turned two passing
+# runs into failures and named a different innocent test each time. The window is per-target now,
+# beside the wall-clock budgets it belongs with; `TEST_STALL` still overrides it.
+STALL="${TEST_STALL:-$STALL_DEFAULT}"
 STALL_MARK="$RUN_LOG.stall"
 : >"$STALL_MARK"
 rm -f "$STALL_MARK.hit"
