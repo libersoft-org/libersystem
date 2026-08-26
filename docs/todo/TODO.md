@@ -171,7 +171,7 @@ or preventing further development of `v1`.
 - [x] [P02M0095 - Native executable artifacts (`.lsexe`)](P02M0095.md)
 - [x] [P02M0096 - Image conversion tool (`imgconv`)](P02M0096.md)
 - [x] [P02M0097 - Userspace source and system-volume layout cleanup](P02M0097.md)
-- [ ] [P02M0098 - Declarative driver binding and lifecycle core](P02M0098.md)
+- [ ] [P02M0098 - A device claim is a count, so two drivers can own one device](P02M0098.md)
 - [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md)
 - [x] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [x] [P02M0101 - Additional system utilities](P02M0101.md)
@@ -234,6 +234,12 @@ or preventing further development of `v1`.
 - [x] [P02M0158 - The boot report names the same device twice and the same component two ways](P02M0158.md)
 - [x] [P02M0159 - Every boot exercises the degraded DMA path and none exercises the isolated one](P02M0159.md)
 - [ ] [P02M0160 - One artifact has two required shapes and one name, so the last build wins](P02M0160.md)
+- [ ] [P02M0161 - Every driver family invents its own online-and-stop wire](P02M0161.md)
+- [ ] [P02M0162 - A bind that fails part-way leaves the parts that succeeded](P02M0162.md)
+- [ ] [P02M0163 - Every driver is selected by a vendor number the standards identity is sitting next to](P02M0163.md)
+- [ ] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
+- [ ] [P02M0165 - A driver that stops answering looks exactly like one that is busy](P02M0165.md)
+- [ ] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)
 
 ### Definition of done (phase 2)
 
