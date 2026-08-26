@@ -233,6 +233,7 @@ or preventing further development of `v1`.
 - [x] [P02M0157 - The firmware described something the tables cannot hold, and the kernel used it anyway](P02M0157.md)
 - [x] [P02M0158 - The boot report names the same device twice and the same component two ways](P02M0158.md)
 - [x] [P02M0159 - Every boot exercises the degraded DMA path and none exercises the isolated one](P02M0159.md)
+- [ ] [P02M0160 - One artifact has two required shapes and one name, so the last build wins](P02M0160.md)
 
 ### Definition of done (phase 2)
 
