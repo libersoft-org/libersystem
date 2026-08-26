@@ -8,6 +8,7 @@
 
 SCRIPT_NAME=check.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+install_guest_cleanup
 
 # name -> command, run from src/. The static-injection family shares one script and differs by its
 # argument, which is exactly the shape that became six recipe names.

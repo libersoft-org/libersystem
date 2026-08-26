@@ -77,6 +77,11 @@ shape_state() {
 
 # AND EACH PAIRING NAMES ITS OWN IMAGE, which "they differ" does not say.
 #
+# CHECKED HERE AND AGAIN AFTER EACH BUILD. Asking only at the start says the tree was consistent
+# BEFORE this gate did anything, which is the one moment the gate did not create - a build that
+# writes a sidecar for a volume it did not write would go straight past. Each order below re-asks it
+# about the shape it just built.
+#
 # Two sidecars swapped between the shapes are still different from each other, both still exist, and
 # every check above passes - while each medium names the volume it is not paired with, which is the
 # defect this milestone is about wearing a different hat. `pairing_matches_volume` is the check M4
@@ -96,6 +101,7 @@ after="$(shape_state "$BOOT_SHAPE" "$BOOT_UUID" "$BOOT_STAMP")"
 [[ "$before" == "$after" ]] || fail "building the test shape disturbed the bootable one - they are not two artifacts
     before: $before
     after:  $after"
+pairing_matches_volume "$(cat "$TEST_UUID")" "$TEST_SHAPE" || fail "the test build left a pairing at $TEST_UUID that does not name the volume it just wrote"
 echo "build-order: building the test shape left the bootable image, pairing and stamp untouched"
 
 # ORDER TWO: the test shape, then the shipping shape. The shipping build must not disturb the test one.
@@ -105,6 +111,7 @@ after="$(shape_state "$TEST_SHAPE" "$TEST_UUID" "$TEST_STAMP")"
 [[ "$before" == "$after" ]] || fail "building the bootable shape disturbed the test one - they are not two artifacts
     before: $before
     after:  $after"
+pairing_matches_volume "$(cat "$BOOT_UUID")" "$BOOT_SHAPE" || fail "the bootable build left a pairing at $BOOT_UUID that does not name the volume it just wrote"
 echo "build-order: building the bootable shape left the test image, pairing and stamp untouched"
 
 # AND THE MEDIUM NAMES THE VOLUME IT WAS BUILT WITH. This is the half the order used to break: the

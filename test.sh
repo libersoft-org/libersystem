@@ -7,6 +7,7 @@
 
 SCRIPT_NAME=test.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
+install_guest_cleanup
 
 help() {
 	usage_and_exit <<EOF

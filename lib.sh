@@ -36,8 +36,14 @@ guest_cleanup() {
 	# `test-kernel.sh` uses to decide a guest is ITS OWN rather than any QEMU on the machine:
 	# ancestry is what makes the victim ours, and a process name is not - the name matches every
 	# QEMU on a shared machine, including other people's.
-	local victim
-	for victim in $(_guest_descendants $$); do
+	# `$BASHPID`, NOT `$$` - AND CAPTURED BEFORE THE SUBSTITUTION. `$$` keeps the original shell's pid
+	# inside a subshell, so it names the wrong tree there; `$BASHPID` names the right one, but written
+	# as `$(_guest_descendants "$BASHPID")` it is expanded INSIDE the command substitution, which is
+	# itself a subshell with no descendants - so the sweep silently found nothing. Both were live
+	# defects here within an hour, in opposite directions: the first killed the gate that was running
+	# it, the second quietly stopped cleaning up at all.
+	local me="$BASHPID" victim
+	for victim in $(_guest_descendants "$me"); do
 		kill -TERM "$victim" 2>/dev/null || true
 	done
 }
@@ -50,9 +56,16 @@ _guest_descendants() {
 	done
 }
 
-trap guest_cleanup EXIT
-trap 'guest_cleanup; exit 130' INT
-trap 'guest_cleanup; exit 143' TERM
+# INSTALLED BY THE ENTRY POINTS, NOT HERE. This file is sourced by nested subshells that want one
+# helper out of it - `check-implementation-mutations.sh` sources it inside `( cd "$WORK"; ... )` just
+# to reuse `source_digest` - and installing a trap there gives a short-lived subshell the authority
+# to sweep a tree it does not own. That killed the mutation gate with SIGTERM before it had copied
+# the tree. A script that wants this calls `install_guest_cleanup` after sourcing.
+install_guest_cleanup() {
+	trap guest_cleanup EXIT
+	trap 'guest_cleanup; exit 130' INT
+	trap 'guest_cleanup; exit 143' TERM
+}
 
 # CARGO ON THE PATH, FOUND RATHER THAN REQUIRED.
 #
