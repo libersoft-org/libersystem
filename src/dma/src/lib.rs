@@ -117,27 +117,67 @@ pub struct MappingId(pub u64);
 // frame above 4 GiB however correct everything else is. `plan` below answers with a direct mapping,
 // a scatter/gather list, or a bounce - and refuses rather than handing back a plan the device
 // cannot execute.
+// THE FIELDS ARE PRIVATE AND THE CONSTRUCTOR CAN REFUSE, because two of the four have values that
+// are not descriptions of any device. An alignment of zero made `permits` divide by it; a zero
+// length made it evaluate `end - 1` at zero and underflow. Both were reachable by any caller,
+// because every field was public and nothing was ever checked - the type described a device and
+// then accepted numbers no device has.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Requirements {
 	// How many bits of address the device puts on the bus. 32 for a legacy engine, 64 for a modern
 	// one.
-	pub address_bits: u32,
-	// The alignment every segment must satisfy.
-	pub alignment: u64,
+	address_bits: u32,
+	// The alignment every segment must satisfy. A power of two, and never zero.
+	alignment: u64,
 	// How many segments the device's descriptor format can hold. One means "contiguous or bounce".
-	pub max_segments: usize,
+	max_segments: usize,
 	// Whether the device's accesses are coherent with the CPU's caches. Where they are not, the
 	// `sync` calls below are not advisory.
-	pub coherent: bool,
+	coherent: bool,
 }
 
 impl Requirements {
+	// What a device can do, or a refusal naming what could not be true of one.
+	pub fn new(address_bits: u32, alignment: u64, max_segments: usize, coherent: bool) -> Result<Self, Fault> {
+		// A device that puts no bits on the bus does not master it; one that puts more than 64 is
+		// naming an address space that does not exist.
+		if address_bits == 0 || address_bits > 64 {
+			return Err(Fault::Malformed);
+		}
+		// Alignment is a power of two - a segment boundary is not an arbitrary modulus - and a
+		// device with no alignment requirement states one byte rather than zero.
+		if alignment == 0 || !alignment.is_power_of_two() {
+			return Err(Fault::Malformed);
+		}
+		// A descriptor format that holds no segments describes nothing that can be programmed.
+		if max_segments == 0 {
+			return Err(Fault::Malformed);
+		}
+		Ok(Self { address_bits, alignment, max_segments, coherent })
+	}
+
+	pub fn alignment(&self) -> u64 {
+		self.alignment
+	}
+
+	pub fn max_segments(&self) -> usize {
+		self.max_segments
+	}
+
+	pub fn coherent(&self) -> bool {
+		self.coherent
+	}
+
 	// The highest address this device can name, inclusive.
 	pub fn ceiling(&self) -> u64 {
 		if self.address_bits >= 64 { u64::MAX } else { (1u64 << self.address_bits) - 1 }
 	}
 
 	pub fn permits(&self, address: u64, len: u64) -> bool {
+		// A zero-length span has no last byte, so there is no question here to answer yes to.
+		if len == 0 {
+			return false;
+		}
 		match address.checked_add(len) {
 			// `len` bytes from `address` must END at or below the ceiling; the ceiling is inclusive
 			// so the exclusive end may be one past it.
@@ -186,7 +226,11 @@ pub struct Confirmed(());
 
 impl Confirmed {
 	// Called by a backend when - and only when - the hardware has confirmed the operation.
-	pub const fn by_backend() -> Self {
+	//
+	// `pub(crate)`, so the sentence above is enforced rather than asserted: every `Backend` lives in
+	// this crate, and a caller outside it could otherwise mint the token that means "the hardware
+	// says this took effect" without having asked any hardware.
+	pub(crate) const fn by_backend() -> Self {
 		Confirmed(())
 	}
 }
@@ -225,6 +269,13 @@ pub trait Backend {
 	// Whether this backend can enforce all three directions. A backend that cannot must not be used
 	// for an enforcing profile - mapping everything read-write would silently drop half the claim.
 	fn enforces_directions(&self) -> bool;
+	// What this endpoint's domain must treat specially - reserved holes, and the doorbell its
+	// interrupts are written to. The default is "nothing to report", which is the honest answer for
+	// a backend that has no way to ask its hardware; a backend that CAN ask must not use it.
+	fn probe(&mut self, endpoint: EndpointId) -> Result<Vec<ProbedRegion>, Fault> {
+		let _ = endpoint;
+		Ok(Vec::new())
+	}
 }
 
 // Which side of the threat model a driver is on.
@@ -277,6 +328,30 @@ pub struct Reserved {
 	pub len: u64,
 }
 
+// What a backend reports about one address range an endpoint's domain must treat specially.
+//
+// A DEVICE'S INTERRUPT IS A MEMORY WRITE, and that is the fact this type exists for. An endpoint
+// behind a translating IOMMU puts its MSI on the bus like any other write, so the doorbell address
+// goes through the same translation as its DMA - and a domain with no mapping for it drops the
+// interrupt silently. Nothing faults, nothing is logged, and the driver simply never wakes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProbedRegion {
+	pub kind: RegionKind,
+	pub base: u64,
+	// Length in bytes. Inclusive ends are a wire detail; this is a length like every other here.
+	pub len: u64,
+}
+
+// How a reported region must be treated. The two are opposites, so they are not a flag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RegionKind {
+	// Nothing may be mapped here. The range is taken out of the space and never handed out.
+	Reserved,
+	// A doorbell the endpoint writes to raise an interrupt. It must be mapped ONE TO ONE, because
+	// the address the device writes is fixed by the interrupt controller and not by this allocator.
+	MsiDoorbell,
+}
+
 // The addresses this domain may hand out, and which of them are in use.
 //
 // A FREED IOVA IS NOT IMMEDIATELY REUSABLE, and that is the whole design. An address goes back into
@@ -326,7 +401,23 @@ impl IovaSpace {
 		if len == 0 || alignment == 0 || !alignment.is_power_of_two() {
 			return Err(Fault::Malformed);
 		}
-		let mut at = self.base.next_multiple_of(alignment);
+		// ZERO IS NEVER HANDED OUT, and this is not tidiness.
+		//
+		// A device is given these addresses to put in its own descriptors, and a null address means
+		// "there is none" to a device exactly as it does to software. A `virtio` device treats a
+		// queue whose descriptor table sits at address zero as a queue that was never programmed:
+		// QEMU's `virtio_init_region_cache` returns early on a zero address and builds no mapping
+		// for the ring, so the device never reads the ring, never fills a buffer and never raises an
+		// interrupt - and nothing anywhere reports an error, because from the device's side there is
+		// simply no queue there.
+		//
+		// It was measured. With a `virtio-iommu` in the machine, this space's first-fit search starts
+		// at the negotiated input range's base, which QEMU publishes as zero, so the FIRST ring
+		// allocated in a domain landed on IOVA 0. `virtio-net` transmitted, the host answered, and
+		// its receive queue was never looked at once. Without an IOMMU the same driver works, because
+		// a physical frame is never at address zero.
+		let floor = self.base.max(alignment);
+		let mut at = floor.next_multiple_of(alignment);
 		while at.saturating_add(len) <= self.end() {
 			if !self.overlaps_any(at, len) {
 				self.taken.insert(at, len);
@@ -339,6 +430,27 @@ impl IovaSpace {
 			}
 		}
 		Err(Fault::NoSpace)
+	}
+
+	// Claim ONE SPECIFIC range rather than the next free one.
+	//
+	// For an address the allocator does not get to choose: an MSI doorbell is where the interrupt
+	// controller says it is, so the only mapping that can work for it is one to itself. Every other
+	// rule still applies - it must be inside the negotiated input range and overlap nothing - and a
+	// range that breaks either is a refusal rather than a silent overlap.
+	pub fn take_exact(&mut self, at: u64, len: u64) -> Result<DmaAddress, Fault> {
+		if len == 0 {
+			return Err(Fault::Malformed);
+		}
+		let Some(end) = at.checked_add(len) else { return Err(Fault::Malformed) };
+		if at < self.base || end > self.end() {
+			return Err(Fault::OutOfRange);
+		}
+		if self.overlaps_any(at, len) {
+			return Err(Fault::Overlaps);
+		}
+		self.taken.insert(at, len);
+		Ok(DmaAddress(at))
 	}
 
 	// The first address past whatever occupies `at`. Used to step the search rather than scan.
@@ -410,11 +522,11 @@ pub fn plan(segments: &[Segment], requirements: &Requirements) -> Result<Plan, F
 	}
 	let total: u64 = segments.iter().map(|s| s.len).sum();
 	let reachable = segments.iter().all(|s| requirements.permits(s.physical, s.len));
-	if reachable && segments.len() <= requirements.max_segments {
+	if reachable && segments.len() <= requirements.max_segments() {
 		return Ok(Plan::Direct(segments.to_vec()));
 	}
 	// A device that cannot address a single page of anything cannot be staged for either.
-	if requirements.ceiling() < requirements.alignment {
+	if requirements.ceiling() < requirements.alignment() {
 		return Err(Fault::OutOfRange);
 	}
 	Ok(Plan::Bounce { len: total })
@@ -482,7 +594,14 @@ impl FaultLog {
 
 	fn record(&mut self, event: FaultEvent) {
 		self.total += 1;
-		if self.recent.len() == self.capacity {
+		// A LOG THAT KEEPS NOTHING STILL COUNTS. With a capacity of zero the ring below would call
+		// `remove(0)` on an empty vector, so the one configuration that keeps no history was the one
+		// that panicked instead of keeping none.
+		if self.capacity == 0 {
+			self.dropped += 1;
+			return;
+		}
+		if self.recent.len() >= self.capacity {
 			// The OLDEST goes, so what is kept is what just happened. A ring that dropped the newest
 			// would answer "what is attacking me now" with the first thing that ever went wrong.
 			self.recent.remove(0);
@@ -576,7 +695,7 @@ impl<B: Backend> Iommu<B> {
 		};
 		let iova = {
 			let state = self.domains.get_mut(&domain).ok_or(Fault::UnknownEndpoint)?;
-			state.space.allocate(len, requirements.alignment)?
+			state.space.allocate(len, requirements.alignment())?
 		};
 		// The address the DEVICE will name has to be one the device can name. An IOVA above a 32-bit
 		// engine's ceiling is as useless as a physical address above it.
@@ -600,6 +719,42 @@ impl<B: Backend> Iommu<B> {
 				Err(reason)
 			}
 		}
+	}
+
+	// Map an address TO ITSELF, and take that exact range out of the space.
+	//
+	// The one mapping an allocator may not choose the address of. `probe` names the doorbell its
+	// endpoint writes interrupts to; that address is the interrupt controller's, so the only mapping
+	// that can carry an MSI through translation is an identity one. Everything else is `map`'s: the
+	// address is claimed first, the backend is asked, and a backend that refuses leaves nothing
+	// behind.
+	pub fn map_identity(&mut self, domain: DomainId, address: u64, len: u64, direction: Direction) -> Result<MappingId, Fault> {
+		if len == 0 {
+			return Err(Fault::Malformed);
+		}
+		let generation = self.domains.get(&domain).ok_or(Fault::UnknownEndpoint)?.generation;
+		let iova = {
+			let state = self.domains.get_mut(&domain).ok_or(Fault::UnknownEndpoint)?;
+			state.space.take_exact(address, len)?
+		};
+		match self.backend.map(domain, iova, address, len, direction) {
+			Ok(_confirmed) => {
+				let id = MappingId(self.next_mapping);
+				self.next_mapping += 1;
+				self.mappings.insert(id, Mapping { id, domain, iova, physical: address, len, direction, generation, state: MappingState::Live });
+				Ok(id)
+			}
+			Err(reason) => {
+				let state = self.domains.get_mut(&domain).expect("checked above");
+				let _ = state.space.release(iova);
+				Err(reason)
+			}
+		}
+	}
+
+	// What the backend says this endpoint's domain must treat specially.
+	pub fn probe(&mut self, endpoint: EndpointId) -> Result<Vec<ProbedRegion>, Fault> {
+		self.backend.probe(endpoint)
 	}
 
 	pub fn mapping(&self, id: MappingId) -> Option<&Mapping> {
@@ -642,26 +797,72 @@ impl<B: Backend> Iommu<B> {
 		Ok(Release::Quarantined)
 	}
 
-	// The endpoint goes away - a clean unbind or a crash. Detach and invalidate, and quarantine
-	// everything if either does not confirm. The lifecycle above this owns the reset and containment
-	// policy; what this owes it is a confirmed answer or an explicit failure, never a guess.
+	// This mapping is finished with, and the caller does not have to know who finished it.
+	//
+	// TWO OWNERS REACH THE SAME MAPPING and they do not agree on who goes first: the buffer that
+	// holds the frames closes its own translation, and the endpoint revoke takes down every
+	// translation in the domain. Whichever arrives second used to be told `NotMapped` - because
+	// `begin_close` refuses anything that is not `Live` - and a kernel that reads that as "the
+	// unmap did not complete" quarantines frames the first owner had already released cleanly.
+	//
+	// So a terminal state is an ANSWER here rather than an error. `Released` means somebody
+	// completed the unmap and the invalidation; `Quarantined` means somebody could not, and that
+	// verdict does not improve by being asked again. Only an id this table never had, or a close
+	// that fails now, is a failure.
+	pub fn close(&mut self, id: MappingId) -> Result<Release, Fault> {
+		match self.mappings.get(&id).ok_or(Fault::NotMapped)?.state {
+			MappingState::Released => return Ok(Release::FramesReusable),
+			MappingState::Quarantined => return Ok(Release::Quarantined),
+			MappingState::Live => self.begin_close(id)?,
+			// Somebody began the close and did not finish it. Finishing it is exactly what this does.
+			MappingState::Closing => {}
+		}
+		self.finish_close(id)
+	}
+
+	// The endpoint goes away - a clean unbind or a crash. Every translation in the domain comes down
+	// first, then the endpoint leaves, and anything that did not confirm is quarantined. The
+	// lifecycle above this owns the reset and containment policy; what this owes it is a confirmed
+	// answer or an explicit failure, never a guess.
+	//
+	// THE UNMAPS GO BEFORE THE DETACH, and the order is not a preference. A `virtio-iommu` destroys a
+	// domain when its last endpoint detaches, so an unmap sent afterwards names a domain the device
+	// no longer has and is answered `NOENT`. Detaching first also used to mean the mappings were
+	// marked `Released` with their addresses handed back while the device had never been told to
+	// drop a single translation - the frames were declared reusable on the strength of a detach
+	// alone, which is the one thing this crate exists to refuse.
 	pub fn revoke_endpoint(&mut self, domain: DomainId, endpoint: EndpointId) -> Result<Release, Fault> {
-		let detached = self.backend.detach(domain, endpoint);
-		let invalidated = if detached.is_ok() { self.backend.invalidate(domain) } else { Err(Fault::Unconfirmed) };
-		let confirmed = detached.is_ok() && invalidated.is_ok();
 		let live: Vec<MappingId> = self.mappings.values().filter(|m| m.domain == domain && matches!(m.state, MappingState::Live | MappingState::Closing)).map(|m| m.id).collect();
+		// Each one on its own, because one translation the device refuses to drop must not condemn
+		// the frames of the ones it dropped cleanly.
+		let mut unmapped: Vec<(MappingId, bool)> = Vec::new();
+		for id in live {
+			let mapping = *self.mappings.get(&id).expect("listed above");
+			let ok = self.backend.unmap(mapping.domain, mapping.iova, mapping.len).is_ok();
+			unmapped.push((id, ok));
+		}
+		let invalidated = self.backend.invalidate(domain).is_ok();
+		let detached = self.backend.detach(domain, endpoint).is_ok();
+		// An endpoint still attached, or an invalidation nobody confirmed, condemns every mapping in
+		// the domain however cleanly its own unmap went: the device may still be resolving any of
+		// them out of a cache the kernel was never told was flushed.
+		let endpoint_gone = invalidated && detached;
 		let state = self.domains.get_mut(&domain).ok_or(Fault::UnknownEndpoint)?;
 		state.endpoints.retain(|e| *e != endpoint);
 		if state.endpoints.is_empty() {
 			state.attached_confirmed = false;
 		}
-		for id in live {
+		let mut every_one = true;
+		for (id, unmap_ok) in unmapped {
+			let confirmed = unmap_ok && endpoint_gone;
+			every_one &= confirmed;
 			let mapping = self.mappings.get_mut(&id).expect("listed above");
 			mapping.state = if confirmed { MappingState::Released } else { MappingState::Quarantined };
+			let iova = mapping.iova;
 			let space = &mut self.domains.get_mut(&domain).expect("checked above").space;
-			let _ = if confirmed { space.release(mapping.iova) } else { space.quarantine(mapping.iova) };
+			let _ = if confirmed { space.release(iova) } else { space.quarantine(iova) };
 		}
-		if confirmed { Ok(Release::FramesReusable) } else { Ok(Release::Quarantined) }
+		if every_one && endpoint_gone { Ok(Release::FramesReusable) } else { Ok(Release::Quarantined) }
 	}
 
 	// REBIND. The binding's generation moves, so every mapping made under the old one is stale by

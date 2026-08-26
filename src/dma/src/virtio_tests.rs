@@ -14,27 +14,37 @@ struct Wire {
 	answers: Vec<u8>,
 	sent: Vec<Vec<u8>>,
 	events: Vec<Vec<u8>>,
+	// What the device writes into the properties area of a probe answer.
+	properties: Vec<u8>,
 	broken: bool,
 }
 
 impl Wire {
 	fn ok() -> Self {
-		Self { answers: Vec::new(), sent: Vec::new(), events: Vec::new(), broken: false }
+		Self { answers: Vec::new(), sent: Vec::new(), events: Vec::new(), properties: Vec::new(), broken: false }
 	}
 
 	fn answering(status: u8) -> Self {
-		Self { answers: alloc::vec![status], sent: Vec::new(), events: Vec::new(), broken: false }
+		Self { answers: alloc::vec![status], sent: Vec::new(), events: Vec::new(), properties: Vec::new(), broken: false }
 	}
 }
 
 impl Transport for Wire {
-	fn request(&mut self, request: &[u8], tail: &mut [u8]) -> Result<(), Fault> {
+	fn request(&mut self, request: &[u8], answer: &mut [u8], status_at: usize) -> Result<(), Fault> {
 		self.sent.push(request.to_vec());
 		if self.broken {
 			return Err(Fault::Unconfirmed);
 		}
+		// Whatever a test queued for the device-writable part, then the status where the caller says
+		// it goes - which is the layout the real device writes.
+		if !self.properties.is_empty() {
+			let n = self.properties.len().min(answer.len());
+			answer[..n].copy_from_slice(&self.properties[..n]);
+		}
 		let status = if self.answers.is_empty() { S_OK } else { self.answers.remove(0) };
-		tail[0] = status;
+		if status_at < answer.len() {
+			answer[status_at] = status;
+		}
 		Ok(())
 	}
 
@@ -247,7 +257,7 @@ fn the_whole_contract_runs_against_this_backend_exactly_as_it_does_against_the_f
 	let domain = iommu.create_domain(0x1000, 0x10_0000, Vec::new(), Generation(1)).expect("a domain");
 	let endpoint = EndpointId(0x0100);
 	iommu.attach(domain, endpoint).expect("attached");
-	let requirements = Requirements { address_bits: 64, alignment: 0x1000, max_segments: 8, coherent: true };
+	let requirements = Requirements::new(64, 0x1000, 8, true).expect("a device this shape exists");
 	let id = iommu.map(domain, 0x8000_0000, 0x1000, Direction::FromDevice, &requirements).expect("mapped");
 	let address = iommu.address_of(id).expect("an address");
 	assert_eq!(iommu.translate(endpoint, address, Access::Write), Ok(0x8000_0000));
@@ -255,4 +265,128 @@ fn the_whole_contract_runs_against_this_backend_exactly_as_it_does_against_the_f
 	iommu.begin_close(id).expect("closing");
 	assert_eq!(iommu.finish_close(id), Ok(Release::FramesReusable));
 	assert_eq!(iommu.translate(endpoint, address, Access::Write), Err(Fault::NotMapped));
+}
+
+fn fault_event(endpoint: u32, address: u64) -> Vec<u8> {
+	let mut bytes = alloc::vec![0u8; FAULT_LEN];
+	bytes[0] = FAULT_R_MAPPING;
+	bytes[4..8].copy_from_slice(&(FAULT_F_WRITE | FAULT_F_ADDRESS).to_le_bytes());
+	bytes[8..12].copy_from_slice(&endpoint.to_le_bytes());
+	bytes[16..24].copy_from_slice(&address.to_le_bytes());
+	bytes
+}
+
+#[test]
+fn a_fault_names_the_domain_of_the_endpoint_that_raised_it() {
+	// TWO ENDPOINTS IN TWO DOMAINS - which is every machine this backend was written for, because
+	// each bus-mastering device is given a domain of its own. The attribution used to take the FIRST
+	// entry of the attachment list for every event, so every fault after the first device named the
+	// wrong domain, and the quarantine and stale-generation decisions taken on it were about a
+	// binding that had not faulted.
+	let mut wire = Wire::ok();
+	wire.events.push(fault_event(0x0200, 0xDEAD_0000));
+	wire.events.push(fault_event(0x0099, 0xBEEF_0000));
+	let mut iommu = backend(wire);
+	iommu.attach(DomainId(1), EndpointId(0x0100)).expect("attached");
+	iommu.attach(DomainId(2), EndpointId(0x0200)).expect("attached");
+
+	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: DmaAddress(0), access: Access::Read, reason: Fault::NotMapped }; 4];
+	assert_eq!(iommu.drain_faults(&mut out), 2);
+	assert_eq!(out[0].endpoint, EndpointId(0x0200), "the device names the requester");
+	assert_eq!(out[0].domain, DomainId(2), "and this side resolves which domain that requester is in");
+	// An endpoint this backend holds no binding for is not attributed to somebody else's domain.
+	assert_eq!(out[1].endpoint, EndpointId(0x0099));
+	assert_eq!(out[1].domain, DomainId(0), "no domain, rather than the wrong one");
+}
+
+#[test]
+fn a_binding_is_stamped_with_the_generation_it_was_made_under() {
+	// A rebind moves the generation, and the bindings made before it do not move with it: a fault
+	// from the older binding must still name the generation that binding was made under, which is
+	// what lets a stale completion be told from a current one.
+	let mut wire = Wire::ok();
+	wire.events.push(fault_event(0x0100, 0x1000));
+	let mut iommu = backend(wire);
+	iommu.attach(DomainId(1), EndpointId(0x0100)).expect("attached");
+	iommu.set_generation(Generation(7));
+	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: DmaAddress(0), access: Access::Read, reason: Fault::NotMapped }; 2];
+	assert_eq!(iommu.drain_faults(&mut out), 1);
+	assert_eq!(out[0].generation, Generation(1), "the generation the binding was made under, not the one current now");
+}
+
+// A device that publishes a probe buffer, which the ordinary fixture does not: the two are different
+// machines and the probe path only exists on the second.
+fn probing_backend(wire: Wire, probe_size: u32) -> VirtioIommu<Wire> {
+	let mut bytes = config_bytes();
+	bytes[32..36].copy_from_slice(&probe_size.to_le_bytes());
+	let config = Config::parse(&bytes).expect("a valid config");
+	let features = negotiate(REQUIRED | F_BYPASS_CONFIG | F_PROBE).expect("features");
+	VirtioIommu::new(wire, config, features, Generation(1)).expect("a backend")
+}
+
+#[test]
+fn a_probe_reads_the_doorbell_the_device_reports_and_skips_what_it_does_not_know() {
+	// THE DEVICE IS ASKED RATHER THAN THE ADDRESS COMPILED IN. `negotiate` has acknowledged `F_PROBE`
+	// since this backend was written and nothing ever sent a probe, so the reserved regions were an
+	// empty list by omission - and the one that matters is the doorbell every endpoint writes its
+	// interrupts to.
+	let mut wire = Wire::ok();
+	let mut properties = Vec::new();
+	// A property type this driver does not know, skipped by its own declared length.
+	properties.extend_from_slice(&0x0abcu16.to_le_bytes());
+	properties.extend_from_slice(&8u16.to_le_bytes());
+	properties.extend_from_slice(&[0xffu8; 8]);
+	// The MSI doorbell, inclusive on the wire.
+	properties.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
+	properties.extend_from_slice(&(PROBE_RESV_MEM_LEN as u16).to_le_bytes());
+	properties.push(RESV_MEM_T_MSI);
+	properties.extend_from_slice(&[0u8; 3]);
+	properties.extend_from_slice(&0xfee0_0000u64.to_le_bytes());
+	properties.extend_from_slice(&0xfeef_ffffu64.to_le_bytes());
+	// A hole nothing may be mapped in.
+	properties.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
+	properties.extend_from_slice(&(PROBE_RESV_MEM_LEN as u16).to_le_bytes());
+	properties.push(RESV_MEM_T_RESERVED);
+	properties.extend_from_slice(&[0u8; 3]);
+	properties.extend_from_slice(&0x1000u64.to_le_bytes());
+	properties.extend_from_slice(&0x1fffu64.to_le_bytes());
+	wire.properties = properties;
+
+	let mut iommu = probing_backend(wire, 256);
+	let regions = iommu.probe(EndpointId(0x0100)).expect("probed");
+	assert_eq!(regions.len(), 2, "the unknown property was skipped by its length, not stumbled over");
+	assert_eq!(regions[0], ProbedRegion { kind: RegionKind::MsiDoorbell, base: 0xfee0_0000, len: 0x10_0000 }, "inclusive on the wire, a length here");
+	assert_eq!(regions[1], ProbedRegion { kind: RegionKind::Reserved, base: 0x1000, len: 0x1000 });
+	// The request is the one the specification defines: type, endpoint, and the reserved tail.
+	let sent = iommu.transport().sent.last().expect("a request was sent");
+	assert_eq!(sent.len(), REQ_PROBE_LEN);
+	assert_eq!(sent[0], T_PROBE);
+	assert_eq!(u32::from_le_bytes([sent[4], sent[5], sent[6], sent[7]]), 0x0100);
+}
+
+#[test]
+fn a_probe_property_that_runs_past_the_buffer_ends_the_walk() {
+	// A device describing memory it did not send. Everything behind it is unlocatable, so the walk
+	// stops rather than reading whatever follows as another property.
+	let mut properties = Vec::new();
+	properties.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
+	properties.extend_from_slice(&(PROBE_RESV_MEM_LEN as u16).to_le_bytes());
+	properties.push(RESV_MEM_T_MSI);
+	properties.extend_from_slice(&[0u8; 3]);
+	properties.extend_from_slice(&0xfee0_0000u64.to_le_bytes());
+	properties.extend_from_slice(&0xfeef_ffffu64.to_le_bytes());
+	properties.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
+	properties.extend_from_slice(&4096u16.to_le_bytes());
+	assert_eq!(decode_probe(&properties).len(), 1, "the good one before it is still read");
+	// A region whose end is below its start is a device contradicting itself.
+	let mut backwards = Vec::new();
+	backwards.extend_from_slice(&PROBE_T_RESV_MEM.to_le_bytes());
+	backwards.extend_from_slice(&(PROBE_RESV_MEM_LEN as u16).to_le_bytes());
+	backwards.push(RESV_MEM_T_MSI);
+	backwards.extend_from_slice(&[0u8; 3]);
+	backwards.extend_from_slice(&0x2000u64.to_le_bytes());
+	backwards.extend_from_slice(&0x1000u64.to_le_bytes());
+	assert!(decode_probe(&backwards).is_empty());
+	// And a zero type terminates the list.
+	assert!(decode_probe(&[0, 0, 0, 0]).is_empty());
 }

@@ -59,7 +59,7 @@ pub struct Wire {
 }
 
 impl Transport for Wire {
-	fn request(&mut self, request: &[u8], tail: &mut [u8]) -> Result<(), Fault> {
+	fn request(&mut self, request: &[u8], tail: &mut [u8], status_at: usize) -> Result<(), Fault> {
 		if request.len() > 2048 || tail.len() > 2048 {
 			return Err(Fault::Malformed);
 		}
@@ -82,8 +82,13 @@ impl Transport for Wire {
 		// A NON-ZERO STATUS IS NAMED WITH THE REQUEST THAT EARNED IT. Which request type the device
 		// refused, and with which code, is the difference between "the kernel's own check refused
 		// this" and "the device did" - and the two are indistinguishable from the typed fault alone.
-		if tail.first().copied().unwrap_or(0) != 0 {
-			crate::serial_println!("iommu: the device refused request type {} with status {}", request.first().copied().unwrap_or(0), tail[0]);
+		//
+		// AT THE OFFSET THE CALLER GAVE, not at zero. This read `tail[0]`, which is the status only
+		// while a request's device-writable part IS the tail; a probe's is not, so the first
+		// successful probe printed "the device refused request type 5 with status 1" - the 1 being
+		// the low byte of a property type.
+		if tail.get(status_at).copied().unwrap_or(0) != 0 {
+			crate::serial_println!("iommu: the device refused request type {} with status {}", request.first().copied().unwrap_or(0), tail[status_at]);
 		}
 		Ok(())
 	}
@@ -369,15 +374,69 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 	let endpoint = requester_of(bus, dev, func);
 	with(|controller| {
 		let config = *controller.iommu().backend().config();
-		// The domain's address space is the device's published input range, minus nothing: the
-		// reserved regions this device reports would go here, and this fixture's QEMU controller
-		// publishes none.
+		// The domain's address space is the device's published input range. What must be carved out
+		// of it, and what must be mapped one-to-one inside it, is what the device is asked below -
+		// it cannot be asked before the endpoint exists, so the space starts whole and the answers
+		// are applied to it.
 		let iommu = controller.iommu();
 		let domain = iommu.create_domain(config.input_start, config.input_len(), alloc::vec::Vec::new(), Generation(generation))?;
 		iommu.attach(domain, endpoint)?;
+		install_probed_regions(iommu, domain, endpoint);
 		Ok(domain)
 	})
 	.unwrap_or(Err(Fault::Unconfirmed))
+}
+
+// Whether the doorbell fact has been printed. Every endpoint on a machine writes the same one.
+static DOORBELL_REPORTED: AtomicBool = AtomicBool::new(false);
+
+// Ask the device what this endpoint's domain must treat specially, and do it.
+//
+// AN INTERRUPT IS A MEMORY WRITE, and this is the function that fact costs. A translated endpoint
+// puts its MSI on the bus like any other write, so the doorbell goes through the same domain as its
+// DMA - and a domain with no mapping for it drops the interrupt. Nothing faults, because a write the
+// IOMMU cannot translate is not a request the device asked a question about; nothing is logged; the
+// driver simply waits for an interrupt that was never delivered.
+//
+// It was measured rather than reasoned about: with a `virtio-iommu` in the machine, `virtio-net`
+// transmitted, the host answered, and the guest never saw a packet. QEMU's own trace showed one
+// unmatched translation in the whole boot - `addr=0xfee00000`, the x86 MSI doorbell.
+//
+// A FAILURE HERE IS NOT FATAL AND IS NOT SILENT. The endpoint is attached and translating either
+// way; what it loses is interrupt delivery, which is a driver that does not work rather than a
+// driver that reaches memory it should not. So it is named and the boot goes on.
+fn install_probed_regions(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::DomainId, endpoint: dma::EndpointId) {
+	let regions = match iommu.probe(endpoint) {
+		Ok(regions) => regions,
+		Err(reason) => {
+			crate::serial_println!("iommu: endpoint {:#x} could not be probed ({reason:?}) - its reserved regions are unknown", endpoint.0);
+			return;
+		}
+	};
+	for region in regions {
+		match region.kind {
+			// THE DEVICE WRITES ITS DOORBELL. `ToDevice` is the direction that reads, and mapping it
+			// that way produced a translation the interrupt controller's address had - and that
+			// refused the one access anybody makes to it. QEMU's trace named it exactly:
+			// `virt_start=0xfee00000 ... flags=1`, a read-only mapping, and the MSI arriving as
+			// `flag=2`.
+			dma::RegionKind::MsiDoorbell => match iommu.map_identity(domain, region.base, region.len, dma::Direction::FromDevice) {
+				// SAID ONCE, NOT ONCE PER DOMAIN. Every endpoint on this machine writes the same
+				// doorbell, so a line per domain is eleven copies of one fact - the scattering the
+				// boot report keeps being cleaned of. A failure is per-domain and is always printed:
+				// that one IS about this endpoint.
+				Ok(_) => {
+					if !DOORBELL_REPORTED.swap(true, Ordering::AcqRel) {
+						crate::serial_println!("iommu: every domain carries the MSI doorbell at {:#x}+{:#x}, mapped one to one - a device's interrupt is a memory write and goes through its own domain", region.base, region.len);
+					}
+				}
+				Err(reason) => crate::serial_println!("iommu: domain {} could not map its MSI doorbell at {:#x}+{:#x} ({reason:?}) - this endpoint's interrupts will not be delivered", domain.0, region.base, region.len),
+			},
+			// Nothing is mapped in a reserved hole, and nothing may be allocated there either. The
+			// space is told rather than trusted to avoid it by accident.
+			dma::RegionKind::Reserved => crate::serial_println!("iommu: domain {} has a reserved hole at {:#x}+{:#x}", domain.0, region.base, region.len),
+		}
+	}
 }
 
 // Install one translation for a device that is behind the IOMMU, and hand back the address the
@@ -385,7 +444,12 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 pub fn map_for_device(domain: dma::DomainId, physical: u64, len: u64, direction: dma::Direction) -> Result<(dma::MappingId, dma::DmaAddress), Fault> {
 	with(|controller| {
 		let config = *controller.iommu().backend().config();
-		let requirements = dma::Requirements { address_bits: 64, alignment: config.smallest_page(), max_segments: 1, coherent: true };
+		// The device's own smallest page is the alignment, and it is a power of two by construction -
+		// `smallest_page` derives it from the bitmap the device published. A device that published none
+		// leaves nothing to map through.
+		let Ok(requirements) = dma::Requirements::new(64, config.smallest_page(), 1, true) else {
+			return Err(Fault::Unconfirmed);
+		};
 		let iommu = controller.iommu();
 		let id = match iommu.map(domain, physical, len, direction, &requirements) {
 			Ok(id) => id,
@@ -456,8 +520,15 @@ pub fn detach_for(index: usize, bus: u8, dev: u8, func: u8) {
 // Take whatever the device has reported and record it. Bounded by a fixed buffer, so a flooding
 // endpoint does bounded work per call and cannot decide how much the kernel allocates.
 pub fn poll_faults() {
+	// THE CEILING IS THE BOUND, and it is a whole number of drains rather than a buffer size. This
+	// used to loop until the queue answered empty, with a comment saying the work was bounded -
+	// which was true of each drain and not of the loop around them. An endpoint faulting faster than
+	// this can print stays inside this call for as long as it keeps producing, and it is the same
+	// endpoint that decides how long that is.
+	const MOST_PER_CALL: usize = 64;
 	let mut out = [dma::FaultEvent { endpoint: dma::EndpointId(0), domain: dma::DomainId(0), generation: Generation(0), address: dma::DmaAddress(0), access: dma::Access::Read, reason: Fault::NotMapped }; 8];
-	loop {
+	let mut reported = 0usize;
+	while reported < MOST_PER_CALL {
 		let taken = drain_faults(&mut out);
 		if taken == 0 {
 			return;
@@ -465,7 +536,12 @@ pub fn poll_faults() {
 		for event in out.iter().take(taken) {
 			crate::serial_println!("iommu: FAULT endpoint {:#x} domain {} {:?} at {:#x}: {:?}", event.endpoint.0, event.domain.0, event.access, event.address.get(), event.reason);
 		}
+		reported += taken;
 	}
+	// STOPPED, AND SAID SO. A drain that gives up quietly is indistinguishable from a queue that ran
+	// dry, and the difference is exactly what a storm looks like. What is left stays queued on the
+	// device and is reported at the next binding transition; the log keeps its own total either way.
+	crate::serial_println!("iommu: {MOST_PER_CALL} fault(s) reported and more are queued - stopping here so one endpoint cannot hold this core");
 }
 
 // Map a DMA buffer's pages for the device at `index`, if that device is behind the IOMMU.
@@ -485,12 +561,12 @@ fn domain_of(index: u32) -> Option<dma::DomainId> {
 
 // Close one translation. The frames behind it are reusable only when this says `FramesReusable`.
 pub fn unmap_for_device(id: dma::MappingId) -> Result<dma::Release, Fault> {
-	with(|controller| {
-		let iommu = controller.iommu();
-		iommu.begin_close(id)?;
-		iommu.finish_close(id)
-	})
-	.unwrap_or(Err(Fault::Unconfirmed))
+	// `close` rather than the two phases by hand, because the endpoint revoke reaches the same
+	// mapping and there is no order between them: a driver that exits drops its device capability
+	// and its DMA buffers in whatever order the process teardown runs them. Whichever arrives second
+	// finds a mapping already taken down, and `close` answers with the verdict the first one reached
+	// instead of reporting a failure that already happened successfully.
+	with(|controller| controller.iommu().close(id)).unwrap_or(Err(Fault::Unconfirmed))
 }
 
 // The endpoint is going away. Everything it could reach stops being reachable, or is quarantined.

@@ -49,6 +49,10 @@ unsafe fn read16(at: u64) -> u16 {
 	unsafe { core::ptr::read_volatile(at as *const u16) }
 }
 
+unsafe fn read32(at: u64) -> u32 {
+	unsafe { core::ptr::read_volatile(at as *const u32) }
+}
+
 unsafe fn write32(at: u64, value: u32) {
 	unsafe { core::ptr::write_volatile(at as *mut u32, value) }
 }
@@ -147,8 +151,30 @@ impl VirtQueue {
 			// SAFETY: the used ring's index field, in this queue's own frame.
 			let used = unsafe { read16(self.used + 2) };
 			if used != self.used_seen {
+				// WHICH ELEMENT THE DEVICE JUST WROTE. One chain is in flight per call, so the
+				// completion is the element at the index this driver had not consumed yet.
+				let slot = self.used_seen % self.size;
 				self.used_seen = used;
 				core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
+				// A COMPLETION IS NOT A CHANGED INDEX. This used to return true on the index
+				// moving, which is the device saying "something finished" and nothing more - so a
+				// device that completed a DIFFERENT chain, or claimed to have written more bytes
+				// than the buffer holds, was read as this request succeeding. The threat model for
+				// this milestone includes a device that is wrong, and this is the one place its
+				// answer is turned into a fact.
+				//
+				// Each used-ring element is `{ id: u32, len: u32 }` after the 4-byte header.
+				let element = self.used + 4 + slot as u64 * 8;
+				// SAFETY: an element inside this queue's own used ring - `slot` is below the ring size.
+				let (id, written) = unsafe { (read32(element), read32(element + 4)) };
+				if id != head as u32 {
+					return false;
+				}
+				// The device may write less than the tail holds; it may never claim to have written
+				// more, and a length past the buffer is a device describing memory it was not given.
+				if written > tail_len {
+					return false;
+				}
 				return true;
 			}
 			core::hint::spin_loop();

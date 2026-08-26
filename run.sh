@@ -13,7 +13,7 @@ DISPLAYS_ALL="vnc spice"
 help() {
 	usage_and_exit <<EOF
 usage: run.sh [--arch ARCH] [--image PATH] [--attach PATH[,PATH...]] [--display D[,D...]]
-              [--iommu] [--debug]
+              [--no-iommu] [--debug]
 
 Boots the system in QEMU, headless, with the serial console on your terminal. On x86_64, omitting
 --image boots .build/boot/libersystem.iso.
@@ -30,9 +30,10 @@ Boots the system in QEMU, headless, with the serial console on your terminal. On
   --spice-addr A  SPICE bind address (default 0.0.0.0 - EVERY interface, and with no password and
                   no TLS: use 127.0.0.1 on a network you do not trust)
   --spice-port P  SPICE port (default 5930)
-  --iommu         x86_64 only: put a virtio-iommu in the machine and every virtio endpoint behind
-                  it, so the boot reports real isolation instead of a page of DEGRADED lines. Off
-                  by default: virtio-gpu does not come up behind a translating controller yet
+  --no-iommu      x86_64: boot WITHOUT a virtio-iommu. The default machine has one and every virtio
+                  endpoint behind it. Reach for this to reproduce a machine whose firmware offers no
+                  IOMMU, or to bisect a driver that misbehaves only under translation - the boot
+                  then reports DEGRADED ISOLATION, which is that machine's real state
   --debug         wait for GDB on :1234, no KVM
   --gdb           ATTACH gdb to a guest already waiting - run in a second panel after --debug,
                   and it boots nothing itself
@@ -134,8 +135,8 @@ while [[ $# -gt 0 ]]; do
 		export SPICE_PORT="$2"
 		shift 2
 		;;
-	--iommu)
-		export IOMMU=1
+	--no-iommu)
+		export IOMMU=0
 		shift
 		;;
 	--debug)

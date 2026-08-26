@@ -129,5 +129,16 @@ grep -aq "NetworkService: online" "$traffic" || {
 	grep -a -m 10 "virtio_net\|devmgr\|iommu:" "$traffic" >&2 || true
 	exit 1
 }
-echo "qemu-virtio-iommu:   ordinary virtio-net traffic works through the enforcing controller"
+# AND PACKETS ACTUALLY CROSSED, which "the service is online" does not say. This used to end at the
+# line above, so the claim in this gate's own name - ordinary TRAFFIC works - rested on a service
+# printing that it had started. A DHCP lease is the cheapest proof that is really traffic: the guest
+# put a DISCOVER on the wire through a translated descriptor ring and read an OFFER and an ACK back
+# through another, so both directions of the DMA path carried real packets. QEMU's user networking
+# answers it without any host setup, so requiring it costs nothing and proves the thing.
+grep -aq "network: configured via DHCP" "$traffic" || {
+	echo "qemu-virtio-iommu: no DHCP lease behind the enforcing controller - the service started but no packet crossed the translated path" >&2
+	grep -a -m 10 "network:\|NetworkService\|iommu: FAULT" "$traffic" >&2 || true
+	exit 1
+}
+echo "qemu-virtio-iommu:   a DHCP lease was obtained through the enforcing controller - real packets both ways"
 echo "qemu-virtio-iommu: the controller transitioned out of bypass, five hostile cases were refused by the hardware, and an ordinary endpoint still works"

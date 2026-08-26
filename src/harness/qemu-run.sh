@@ -858,36 +858,37 @@ qemu_run_x86_64() {
 	local ovmf_vars="$QEMU_BUILD_DIR/ovmf-vars.$$.fd"
 	cp "$ovmf_vars_src" "$ovmf_vars"
 
-	# WHETHER THIS MACHINE HAS AN IOMMU IN IT: `./run.sh --iommu`.
+	# THIS MACHINE HAS AN IOMMU IN IT, AND THAT IS THE DEFAULT: `./run.sh --no-iommu` takes it out.
 	#
 	# `IOMMU` is the plumbing, not the interface - the same shape as `SMP`, `MEM` and `SERIAL` above
 	# it: `run.sh` owns the flag and exports the variable, and this layer is the one that speaks to
 	# QEMU. Nothing outside `run.sh` and the gates sets it by hand.
 	#
-	# The isolation this system implements was exercised by one gate and by no ordinary run, so a
-	# developer boot printed a page of DEGRADED ISOLATION lines describing the HARNESS rather than
-	# the system, and the profile that proves the controller works was one nobody boots by hand.
-	# This is the whole machine under translation: the controller, and every virtio endpoint told
-	# `iommu_platform=on` so it asks the guest for `VIRTIO_F_ACCESS_PLATFORM`.
+	# WHY IT IS THE DEFAULT. The isolation this system implements was exercised by one gate and by no
+	# ordinary run, so every developer boot walked the degraded path and none walked the isolated one
+	# - and a defect that stopped `virtio-net` receiving a single packet and `virtio-gpu` starting at
+	# all lived there in the quiet for as long as that was true. A default is where the bugs are
+	# found. This is the whole machine under translation: the controller, and every virtio endpoint
+	# told `iommu_platform=on` so it asks the guest for `VIRTIO_F_ACCESS_PLATFORM`.
 	#
-	# IT IS NOT THE DEFAULT, AND THE REASON IS MEASURED RATHER THAN CAUTIOUS. Under a translating
-	# controller `virtio-blk` (x4), `virtio-net`, `virtio-console`, `virtio-input`, `virtio-pointer`
-	# and `virtio-snd` all bind and run - and `virtio-gpu` does not: not one control-queue request
-	# completes, so `GET_DISPLAY_INFO` times out into its fallback size, `RESOURCE_CREATE_2D` fails,
-	# the driver exits, and DeviceManager restarts it three times and gives up. Measured on
-	# 2026-08-25, and the same with `virtio-gpu-pci` in place of `virtio-vga`, so it is the driver or
-	# the DMA path under it rather than the VGA-compatible device model. A default that costs the
-	# display is not a default.
+	# It was opt-in until 2026-08-26 because `virtio-gpu` did not come up behind a translating
+	# controller, which was recorded here as a measurement and was a real one. The cause was not the
+	# display driver: this domain's IOVA allocator handed the first ring in each domain the address
+	# ZERO, and a virtio device reads a queue whose descriptor table is at zero as a queue that was
+	# never programmed. One allocator line, and both drivers work.
 	#
-	# The suite does not get one either: `qemu-virtio-iommu-x86_64` owns the enforcing profile, boots
-	# the shipping image under it and asserts the bypass-off transition, the hostile cases and that
-	# ordinary traffic still works. Putting a controller under the whole suite would change what
-	# sixty tests are testing without adding a claim that gate does not already make.
+	# THE SUITE DOES NOT FOLLOW, and that is deliberate rather than an oversight. `test.sh` runs
+	# untranslated; `qemu-virtio-iommu-x86_64` owns the enforcing profile, boots the shipping image
+	# under it and asserts the bypass-off transition, the hostile cases and a real DHCP lease through
+	# the controller. Putting a controller under the whole suite would change what sixty tests are
+	# testing without adding a claim that gate does not already make. So an ordinary RUN is
+	# translated and the suite is not; `run.sh --help` says so, because a split nobody is told about
+	# is a surprise rather than a decision.
 	#
 	# `boot-bypass=on` because the firmware's own drivers read the boot medium before this kernel
 	# exists; the kernel takes it out of bypass and reads the byte back, which is what makes
 	# `enforcing` a fact rather than a hope.
-	local iommu="${IOMMU:-0}"
+	local iommu="${IOMMU:-1}"
 	# Two option strings, because not every virtio device here takes the same ones: `virtio-vga` and
 	# the sound device are attached without `disable-legacy=on` and must not acquire it now.
 	local virtio_opts virtio_plain

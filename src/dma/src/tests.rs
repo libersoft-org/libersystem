@@ -10,7 +10,7 @@ use super::fake::{Call, Fake, Injection, event};
 use super::*;
 
 fn requirements() -> Requirements {
-	Requirements { address_bits: 64, alignment: 4096, max_segments: 8, coherent: true }
+	Requirements::new(64, 4096, 8, true).expect("a device this shape exists")
 }
 
 fn iommu() -> (Iommu<Fake>, DomainId) {
@@ -269,7 +269,7 @@ fn a_fault_storm_does_bounded_work() {
 
 #[test]
 fn an_address_limited_device_gets_a_bounce_rather_than_an_address_it_cannot_name() {
-	let limited = Requirements { address_bits: 32, alignment: 4096, max_segments: 4, coherent: false };
+	let limited = Requirements::new(32, 4096, 4, false).expect("a device this shape exists");
 	let low = alloc::vec![Segment { physical: 0x1_000, len: 0x1000 }];
 	assert_eq!(plan(&low, &limited), Ok(Plan::Direct(low.clone())), "a page it can name is reached where it is");
 	let high = alloc::vec![Segment { physical: 0x1_0000_0000, len: 0x1000 }];
@@ -278,7 +278,7 @@ fn an_address_limited_device_gets_a_bounce_rather_than_an_address_it_cannot_name
 
 #[test]
 fn too_many_segments_for_the_descriptor_format_is_also_a_bounce() {
-	let narrow = Requirements { address_bits: 64, alignment: 4096, max_segments: 2, coherent: true };
+	let narrow = Requirements::new(64, 4096, 2, true).expect("a device this shape exists");
 	let many: Vec<Segment> = (0..4).map(|i| Segment { physical: 0x1000 * (i + 1), len: 0x1000 }).collect();
 	assert_eq!(plan(&many, &narrow), Ok(Plan::Bounce { len: 0x4000 }));
 	let few: Vec<Segment> = many[..2].to_vec();
@@ -291,7 +291,7 @@ fn an_iova_the_device_cannot_name_is_refused_with_its_address_given_back() {
 	// and the refusal must not consume one of them.
 	let mut iommu = Iommu::new(Fake::new(), 8);
 	let domain = iommu.create_domain(0x1_0000_0000, 0x10_0000, Vec::new(), Generation(1)).expect("a domain");
-	let limited = Requirements { address_bits: 32, alignment: 4096, max_segments: 4, coherent: true };
+	let limited = Requirements::new(32, 4096, 4, true).expect("a device this shape exists");
 	assert_eq!(iommu.map(domain, 0x1000, 0x1000, Direction::ToDevice, &limited), Err(Fault::OutOfRange));
 	assert_eq!(iommu.live_addresses(domain), 0, "the address it could not use went back into the space");
 }
@@ -333,4 +333,146 @@ fn the_kernels_ledger_and_the_hardwares_agree_after_every_operation() {
 		let address = iommu.mapping(*id).map(|m| m.iova).expect("recorded");
 		assert!(iommu.backend().translates(domain, address).is_none(), "a closed mapping translates nothing");
 	}
+}
+
+// THE TEARDOWN ORDER, AND THE TWO OWNERS THAT REACH THE SAME MAPPING.
+//
+// A driver that exits drops a device capability and a set of DMA buffers, and the process teardown
+// runs them in whatever order it runs them. Both reach the same translations - the device capability
+// through the endpoint revoke, each buffer through its own close - so whichever arrives second finds
+// work already done. These four say what each of those arrivals must answer.
+
+#[test]
+fn a_revoked_endpoint_has_every_translation_taken_down_before_it_leaves() {
+	let (mut iommu, domain) = iommu();
+	let endpoint = EndpointId(7);
+	iommu.attach(domain, endpoint).expect("attached");
+	for _ in 0..3 {
+		iommu.map(domain, 0x8000_0000, 0x1000, Direction::Bidirectional, &requirements()).expect("mapped");
+	}
+	assert_eq!(iommu.backend().installed_ranges(), 3);
+	assert_eq!(iommu.revoke_endpoint(domain, endpoint), Ok(Release::FramesReusable));
+	// THE HARDWARE'S OWN IDEA OF ITS STATE, not the ledger's. The revoke used to mark every mapping
+	// released without asking the device to drop one, so this count stayed at three while the kernel
+	// declared the frames reusable.
+	assert_eq!(iommu.backend().installed_ranges(), 0, "a revoke that releases frames has unmapped every one of them");
+	// AND THE UNMAPS GO BEFORE THE DETACH. A virtio-iommu destroys a domain when its last endpoint
+	// leaves, so an unmap sent afterwards names a domain the device no longer has.
+	let calls = iommu.backend().calls();
+	let detach = calls.iter().position(|c| matches!(c, Call::Detach(..))).expect("detached");
+	let unmaps: Vec<usize> = calls.iter().enumerate().filter(|(_, c)| matches!(c, Call::Unmap(..))).map(|(i, _)| i).collect();
+	assert_eq!(unmaps.len(), 3, "one unmap per mapping");
+	assert!(unmaps.iter().all(|u| *u < detach), "every translation comes down while the endpoint is still attached");
+}
+
+#[test]
+fn a_mapping_the_endpoint_revoke_already_released_closes_as_released() {
+	let (mut iommu, domain) = iommu();
+	let endpoint = EndpointId(7);
+	iommu.attach(domain, endpoint).expect("attached");
+	let id = iommu.map(domain, 0x8000_0000, 0x1000, Direction::Bidirectional, &requirements()).expect("mapped");
+	assert_eq!(iommu.revoke_endpoint(domain, endpoint), Ok(Release::FramesReusable));
+	// The buffer that owns the frames arrives second. It used to be told `NotMapped`, because
+	// `begin_close` refuses anything that is not `Live` - and a kernel reading that as "the unmap
+	// did not complete" quarantined frames the revoke had already released cleanly.
+	assert_eq!(iommu.close(id), Ok(Release::FramesReusable), "the verdict the first owner reached, not an error");
+	assert_eq!(iommu.mapping(id).map(|m| m.state), Some(MappingState::Released));
+	assert_eq!(iommu.backend().calls().iter().filter(|c| matches!(c, Call::Unmap(..))).count(), 1, "and the device is not asked twice");
+}
+
+#[test]
+fn a_mapping_the_revoke_quarantined_stays_quarantined_however_often_it_is_closed() {
+	let (mut iommu, domain) = iommu();
+	let endpoint = EndpointId(7);
+	iommu.attach(domain, endpoint).expect("attached");
+	let id = iommu.map(domain, 0x8000_0000, 0x1000, Direction::Bidirectional, &requirements()).expect("mapped");
+	iommu.backend_mut_for_test().inject(Injection::Detach, Fault::Unconfirmed);
+	assert_eq!(iommu.revoke_endpoint(domain, endpoint), Ok(Release::Quarantined));
+	// A verdict of "nobody knows whether the device can still reach this" does not improve by being
+	// asked again, and must never soften into a release.
+	assert_eq!(iommu.close(id), Ok(Release::Quarantined));
+	assert_eq!(iommu.close(id), Ok(Release::Quarantined));
+	assert_eq!(iommu.quarantined_mappings(), 1);
+	assert_eq!(iommu.live_addresses(domain), 0);
+}
+
+#[test]
+fn one_translation_the_device_will_not_drop_does_not_condemn_the_frames_of_the_others() {
+	let (mut iommu, domain) = iommu();
+	let endpoint = EndpointId(7);
+	iommu.attach(domain, endpoint).expect("attached");
+	let ids: Vec<MappingId> = (0..3).map(|_| iommu.map(domain, 0x8000_0000, 0x1000, Direction::Bidirectional, &requirements()).expect("mapped")).collect();
+	// One unmap refused - the injection fires once and clears - so the first mapping is condemned
+	// and the two behind it are not.
+	iommu.backend_mut_for_test().inject(Injection::Unmap, Fault::Unconfirmed);
+	assert_eq!(iommu.revoke_endpoint(domain, endpoint), Ok(Release::Quarantined), "a revoke with anything quarantined is not a clean release");
+	assert_eq!(iommu.quarantined_mappings(), 1, "only the one the device would not drop");
+	assert_eq!(iommu.mapping(ids[0]).map(|m| m.state), Some(MappingState::Quarantined));
+	assert_eq!(iommu.mapping(ids[1]).map(|m| m.state), Some(MappingState::Released));
+	assert_eq!(iommu.mapping(ids[2]).map(|m| m.state), Some(MappingState::Released));
+	assert_eq!(iommu.quarantined_addresses(domain), 1);
+}
+
+#[test]
+fn requirements_refuse_the_numbers_no_device_has() {
+	assert!(Requirements::new(64, 0, 8, true).is_err(), "an alignment of zero is a modulus by zero, not a device");
+	assert!(Requirements::new(64, 4096 + 1, 8, true).is_err(), "a segment boundary is a power of two");
+	assert!(Requirements::new(64, 4096, 0, true).is_err(), "a descriptor format holding no segments programs nothing");
+	assert!(Requirements::new(0, 4096, 8, true).is_err(), "a device putting no bits on the bus does not master it");
+	assert!(Requirements::new(65, 4096, 8, true).is_err(), "and 65 bits is an address space that does not exist");
+	let ok = Requirements::new(32, 4096, 8, false).expect("a legacy engine");
+	assert!(!ok.permits(0x1000, 0), "a zero-length span has no last byte to be in range");
+	assert!(ok.permits(0x1000, 0x1000));
+	assert!(!ok.permits(0x1001, 0x1000), "and the alignment still bites");
+}
+
+#[test]
+fn a_fault_log_that_keeps_nothing_counts_what_it_dropped_rather_than_panicking() {
+	let mut log = FaultLog::new(0);
+	log.record(event(7, 1, 0x1000, Access::Write, Fault::NotMapped));
+	log.record(event(7, 1, 0x2000, Access::Read, Fault::Permission));
+	assert_eq!(log.total(), 2, "a log that keeps nothing still counts");
+	assert_eq!(log.dropped(), 2);
+	assert!(log.recent().is_empty());
+}
+
+#[test]
+fn a_device_is_never_given_the_null_address() {
+	// ZERO IS NOT AN ADDRESS TO A DEVICE ANY MORE THAN IT IS TO SOFTWARE, and a first-fit allocator
+	// whose space starts at zero hands it out first. A `virtio` device reads a queue whose descriptor
+	// table is at address zero as a queue that was never programmed - it builds no mapping for the
+	// ring, never looks at it, never fills a buffer and never raises an interrupt, and reports
+	// nothing, because from its side there is no queue there.
+	//
+	// Measured before it was fixed: with a controller in the machine, the first ring allocated in a
+	// domain landed on IOVA 0, `virtio-net` transmitted, the host answered, and its receive queue was
+	// never read once.
+	let mut iommu = Iommu::new(Fake::new(), 8);
+	let domain = iommu.create_domain(0, 0x10_0000, Vec::new(), Generation(1)).expect("a domain based at zero");
+	let id = iommu.map(domain, 0x8000_0000, 0x1000, Direction::Bidirectional, &requirements()).expect("mapped");
+	let first = iommu.address_of(id).expect("an address");
+	assert_ne!(first, DmaAddress(0), "the first mapping in a domain based at zero must not be given the null address");
+	assert_eq!(first, DmaAddress(4096), "and it is the first aligned address above it rather than an arbitrary gap");
+	// The rule holds for a whole domain's worth of allocations, not just the first.
+	for _ in 0..8 {
+		let id = iommu.map(domain, 0x8000_0000, 0x1000, Direction::Bidirectional, &requirements()).expect("mapped");
+		assert_ne!(iommu.address_of(id), Some(DmaAddress(0)));
+	}
+}
+
+#[test]
+fn an_identity_mapping_lands_on_the_address_it_was_asked_for() {
+	// The one mapping whose address the allocator does not choose: a doorbell is where the interrupt
+	// controller says it is, so the only mapping that can carry an MSI is one to itself.
+	let (mut iommu, domain) = iommu();
+	let id = iommu.map_identity(domain, 0x2_0000, 0x1000, Direction::FromDevice).expect("identity mapped");
+	assert_eq!(iommu.address_of(id), Some(DmaAddress(0x2_0000)));
+	assert_eq!(iommu.mapping(id).map(|m| m.physical), Some(0x2_0000), "iova and physical are the same address, which is what identity means");
+	// And the range is out of the space afterwards, so nothing else is handed it.
+	let other = iommu.map(domain, 0x8000_0000, 0x1000, Direction::ToDevice, &requirements()).expect("mapped");
+	assert_ne!(iommu.address_of(other), Some(DmaAddress(0x2_0000)));
+	// Asking twice for the same range is a refusal rather than a second mapping over the first.
+	assert_eq!(iommu.map_identity(domain, 0x2_0000, 0x1000, Direction::FromDevice).err(), Some(Fault::Overlaps));
+	// And a range outside the negotiated input range is refused rather than mapped somewhere else.
+	assert_eq!(iommu.map_identity(domain, 0xF000_0000, 0x1000, Direction::FromDevice).err(), Some(Fault::OutOfRange));
 }

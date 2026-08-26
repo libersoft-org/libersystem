@@ -200,5 +200,10 @@ pub fn release_bus_master(index: usize) {
 		if crate::iommu::present() {
 			crate::iommu::detach_for(index, entry.bus, entry.dev, entry.func);
 		}
+		// AND THE AUDIT RECORD GOES WITH IT. `admit` wrote the degraded row when this device was
+		// asking to master the bus; it is not mastering it any more, and a list of "devices reaching
+		// memory untranslated" that keeps a device which gave the bus back is a list reporting a
+		// machine nobody is running.
+		crate::dma_policy::forget_degraded(entry.bus, entry.dev, entry.func);
 	}
 }

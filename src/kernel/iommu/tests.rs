@@ -85,10 +85,24 @@ fn a_mapping_is_reachable_to_its_last_byte_and_not_one_past_it() {
 		return;
 	}
 	// One page mapped for this endpoint, and the page after it deliberately not.
+	//
+	// THE PAGE AFTER IT IN THE DEVICE'S ADDRESS SPACE, which is the only space this case is about.
+	// The two sentinels are separate frames wherever the allocator put them; what makes the second
+	// one "one past the mapping" is that `address + 0x1000` is mapped in this domain to it and to
+	// nothing else - so it is mapped explicitly rather than hoped for, and then taken away again,
+	// leaving a number the device knows the shape of and may not resolve.
 	let inside = super::edu::Sentinel::new(0x11).expect("a frame");
 	let outside = super::edu::Sentinel::new(0x22).expect("a frame");
 	let domain = attach_endpoint(edu.bus, edu.dev, edu.func, 1).expect("the fixture's endpoint attaches");
 	let (mapping, address) = map_for_device(domain, inside.physical, 0x1000, dma::Direction::FromDevice).expect("one page mapped");
+	// A second mapping, immediately after the first, only so this case knows which number is the
+	// first byte past the mapping. It is closed before the transfers, so the address is one the
+	// domain has no translation for.
+	if let Ok((neighbour, next_address)) = map_for_device(domain, outside.physical, 0x1000, dma::Direction::FromDevice) {
+		let adjacent = next_address.get() == address.get() + 0x1000;
+		let _ = unmap_for_device(neighbour);
+		assert!(adjacent, "the allocator did not place the second mapping immediately after the first, so this case cannot say which address is one past the end");
+	}
 
 	edu.set_bus_master(true);
 	// The last byte of the mapping is reachable: a one-byte transfer at the far end must land.
@@ -142,18 +156,37 @@ fn an_unmapped_address_is_unreachable_once_its_frame_belongs_to_somebody_else() 
 		crate::serial_println!("iommu-fixture: case 7 skipped - no enforcing IOMMU on this machine");
 		return;
 	}
-	// A page the device is given, then taken away - and a sentinel put in its place, which is the
-	// state a stale descriptor actually threatens: the frame's NEXT owner.
+	// A page the device is given, then taken away - and THE SAME FRAME handed to somebody else,
+	// which is the state a stale descriptor actually threatens.
+	//
+	// THIS CASE USED TO BE UNFAILABLE. It allocated `first`, unmapped it, and then allocated `next`
+	// while `first` was still alive and still owned its frame - so `next` was a DIFFERENT frame, and
+	// the stale translation under test pointed at `first`'s. The assertion read `next.intact()`,
+	// which was true with an IOMMU, without one, and against a backend that ignored every unmap.
+	//
+	// So the frame is released first and the claim is made only if the allocator really handed the
+	// same one back. If it did not, this case cannot be made on this boot and says so instead of
+	// passing: a case that reports success without having tested anything is worse than one that
+	// reports it could not run.
 	let first = super::edu::Sentinel::new(0x44).expect("a frame");
+	let contested = first.physical;
 	let domain = attach_endpoint(edu.bus, edu.dev, edu.func, 1).expect("attached");
-	let (mapping, address) = map_for_device(domain, first.physical, 0x1000, dma::Direction::FromDevice).expect("mapped");
+	let (mapping, address) = map_for_device(domain, contested, 0x1000, dma::Direction::FromDevice).expect("mapped");
 	assert_eq!(unmap_for_device(mapping), Ok(dma::Release::FramesReusable), "the unmap and its invalidation both completed");
+	// The frame goes back to the allocator, and the next owner asks for one.
+	drop(first);
 	let next = super::edu::Sentinel::new(0x55).expect("the frame's next owner");
+	if next.physical != contested {
+		crate::serial_println!("iommu-fixture: case 7 INCONCLUSIVE - the allocator returned {:#x} rather than the released {:#x}, so no second owner holds the contested frame", next.physical, contested);
+		let _ = revoke_endpoint(domain, edu.bus, edu.dev, edu.func);
+		poll_faults();
+		return;
+	}
 	edu.set_bus_master(true);
 	let _ = edu.transfer(address.get(), 0x1000, true);
 	edu.set_bus_master(false);
 	assert!(next.intact(), "a device reached an address after its mapping was revoked, and changed the frame's next owner");
-	crate::serial_println!("iommu-fixture: case 7 PASSED - DMA to a revoked address did not reach the frame's next owner");
+	crate::serial_println!("iommu-fixture: case 7 PASSED - DMA to a revoked address did not reach the frame's next owner, and the next owner holds the same frame");
 	let _ = revoke_endpoint(domain, edu.bus, edu.dev, edu.func);
 	poll_faults();
 }
@@ -186,7 +219,15 @@ fn one_numeric_address_means_different_memory_to_two_endpoints() {
 	let _ = first.transfer(address_a.get(), 0x1000, true);
 	first.set_bus_master(false);
 	assert!(theirs.intact(), "endpoint A reached endpoint B's page through a number that means nothing in A's domain any more");
-	crate::serial_println!("iommu-fixture: case 5 PASSED - the same numeric address is domain-local, and A cannot reach B through it");
+
+	// AND B STILL WORKS. Half of "the domains are independent" is that A cannot reach B; the other
+	// half is that taking A's translation down did not take B's with it - an invalidation that flushed
+	// the whole device rather than one domain would pass the assertion above and break this one.
+	second.set_bus_master(true);
+	let _ = second.transfer(address_b.get(), 0x1000, true);
+	second.set_bus_master(false);
+	assert!(!theirs.intact(), "endpoint B could no longer reach its own live mapping after A's was closed");
+	crate::serial_println!("iommu-fixture: case 5 PASSED - the same numeric address is domain-local, A cannot reach B through it, and B still reaches its own");
 
 	let _ = unmap_for_device(mapping_b);
 	let _ = revoke_endpoint(domain_a, first.bus, first.dev, first.func);

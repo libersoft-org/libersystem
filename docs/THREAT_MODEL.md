@@ -102,26 +102,46 @@ Must NOT be able to:
   its DMA access, and only the supervisor decides whether to restart it.
 ```
 
-**The first of those is enforced for the CPU and not for the device, and that is a
-stated limit rather than an oversight.** There is no IOMMU. A DMA capability hands
-the driver the buffer's raw physical addresses so it can program the device's
-descriptor rings, and nothing between the device and RAM checks what those rings
-contain. A driver that programs its device to read or write outside its own buffer
-succeeds. The kernel's own mappings bound where the DRIVER may reach; they do not
-bound where its DEVICE may reach.
+**Whether the first of those is enforced for the DEVICE depends on the machine, and
+which machine this is is reported on every boot rather than assumed.** There are two
+cases and the system says which one it is in.
 
-So a driver holding a DMA-capable device is, for memory-safety purposes, inside the
-TCB, and the properties above hold against a driver that is buggy or hostile in
-software but not against one that turns its device into an arbitrary read/write
-primitive. Three things narrow the window and none of them closes it: bus mastering
-stays disabled until ownership is established, reclaim requires a quiescence claim
-from the holder of the device's own DeviceMemory capability, and a faulted driver's
-DMA frames are quarantined rather than reused immediately.
+**Under an enforcing profile it holds.** On an x86_64 machine carrying a
+`virtio-iommu`, the kernel brings the controller up, takes it out of boot bypass and
+reads its own bypass byte back before any driver is allowed to master the bus. Each
+bus-mastering endpoint is then attached to a domain of its own, and a DMA buffer is
+mapped into that domain before its address is given to anybody - so what a driver
+receives is an address that means something only inside its device's domain and
+nothing at all outside it. Equal numeric addresses in two domains resolve to
+different memory. A device told to read or write past its mapping is refused by the
+hardware, and the refusal is recorded as a fault rather than inferred. Closing a
+mapping unmaps and invalidates it and only then returns the frames; a step that does
+not confirm quarantines the frames instead of recycling them. The boot prints
+`dma: every bus-mastering device is translated` when this is the state, and a driver
+that declared it needs translation does not bind on a machine that has a controller
+which failed to come up.
 
-Closing it means per-device IOMMU domains with only live DMA capabilities mapped in.
-That is tracked as a non-goal below, with the same standing as the others: known,
-priced, and not yet done. `AI/audit/drivers.md` reports this boundary from the driver
-side as DRV-015 and it is the same boundary.
+**Without one it does not, and the system says so.** On a machine with no
+`virtio-iommu`, a DMA capability hands the driver the buffer's raw physical addresses
+and nothing between the device and RAM checks what its descriptor rings contain. A
+driver that programs its device to read or write outside its own buffer succeeds. The
+kernel's own mappings bound where the DRIVER may reach; they do not bound where its
+DEVICE may reach. That state is not silent: every device running that way is listed
+by name in the boot report under `dma: DEGRADED ISOLATION`.
+
+So a driver holding a DMA-capable device is inside the memory-safety TCB exactly
+when its device is untranslated. Under an enforcing profile it leaves that TCB, and
+what remains trusted is named: the `virtio-iommu` device model, this kernel's backend
+for it, and the hypervisor. Nothing here is a claim about a native VT-d, AMD-Vi,
+SMMU or RISC-V IOMMU backend, about aarch64 or riscv64, or about physical hardware -
+those need separately qualified backends and separately measured evidence.
+
+Three things narrow the window on a machine that has no controller, and none of them
+closes it: bus mastering stays disabled until ownership is established, reclaim
+requires a quiescence claim from the holder of the device's own DeviceMemory
+capability, and a faulted driver's DMA frames are quarantined rather than reused
+immediately. `AI/audit/drivers.md` reports this boundary from the driver side as
+DRV-015 and it is the same boundary.
 
 ## 3. Enforced boundaries
 
@@ -228,23 +248,27 @@ The following are out of scope here and are tracked in the Concept's
 "no ambient authority" property; they extend policy and coverage on top of it.
 
 ```text
-- a signed/immutable system image, verified boot, and a package trust chain. Said precisely,
-  because a reader may otherwise assume UEFI Secure Boot covers the boot chain: Secure Boot verifies
-  the LOADER BINARY and stops there. Nothing verifies the kernel, the bootstrap list, the early
-  modules, or the system volume they come from, and nothing binds them to the loader that read them.
-  An attacker who can modify the boot or system volume replaces the kernel or early userspace and
-  owns the machine before a single capability exists. Closing it means a signed boot manifest rooted
-  in a key the loader authenticates, binding the system UUID, kernel, bootstrap list, every module
-  and the image by length and strong digest, verified BEFORE any fixed-address placement, with
-  revocation and a monotonic rollback version whose storage is explicit;
+- freshness, measured boot, physical-firmware qualification and production key operations.
+  AUTHENTICITY ITSELF IS ENFORCED and is not on this list: the loader carries a compiled-in public
+  key, and every kernel and early module it executes or hands to the kernel is covered by a signed
+  manifest - a canonical record over each artifact's kind, path, length and SHA-256 digest, verified
+  with Ed25519 BEFORE the bytes are parsed as an ELF, before a destination is derived from them and
+  before anything is placed. A source whose signed manifest is present and damaged stops the boot
+  rather than falling back. On x86_64 the loader itself is authenticated first, by an OVMF firmware
+  with a platform key enrolled, and the gate proves the negative: an unsigned or bit-modified loader
+  does not run at all. What is NOT covered: anti-rollback (a validly signed OLD image is accepted),
+  TPM measurement and attestation, physical firmware enrollment and NVRAM behaviour, and production
+  key custody, rotation and revocation - the format has a key-id boundary, the operations behind it
+  are not this repository's to prove;
 - fine-grained portals (mic/camera/screenshot) and network policy granularity;
 - side-channel and timing attacks (Spectre-class microarchitectural leaks);
 - physical attacks (cold boot, bus probing) and encrypted user volumes;
 - denial of service via resource exhaustion beyond the Domain limits already
   enforced (a full ResourceManager policy is deferred);
 - a formally verified kernel (the TCB is trusted, not proven);
-- IOMMU isolation of DMA-capable devices. Until per-device IOMMU domains exist,
-  a driver holding such a device can reach any physical memory through it, so
-  DMA-capable drivers count as TCB members for memory safety - see 2.2, which
-  states this rather than implying it.
+- IOMMU isolation on every machine and every architecture. The x86_64
+  `virtio-iommu` profile enforces it and 2.2 says what that buys; a machine with
+  no controller does not, and its DMA-capable drivers remain TCB members for
+  memory safety. Native VT-d, AMD-Vi, SMMU and RISC-V IOMMU backends, and the
+  aarch64 and riscv64 runtime profiles, are not implemented.
 ```

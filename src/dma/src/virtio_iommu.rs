@@ -21,7 +21,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{Access, Backend, Confirmed, Direction, DmaAddress, DomainId, EndpointId, Fault, FaultEvent, Generation};
+use crate::{Access, Backend, Confirmed, Direction, DmaAddress, DomainId, EndpointId, Fault, FaultEvent, Generation, ProbedRegion, RegionKind};
 
 // Feature bits, as the specification numbers them.
 pub const F_INPUT_RANGE: u64 = 1 << 0;
@@ -38,6 +38,15 @@ pub const T_DETACH: u8 = 0x02;
 pub const T_MAP: u8 = 0x03;
 pub const T_UNMAP: u8 = 0x04;
 pub const T_PROBE: u8 = 0x05;
+
+// Property types the device may report. Only one is understood; anything else is skipped by its
+// declared length, which is what the length field is for.
+pub const PROBE_T_NONE: u16 = 0;
+pub const PROBE_T_RESV_MEM: u16 = 1;
+// The twelve low bits are the type; the top four are reserved and must not be read as part of it.
+pub const PROBE_TYPE_MASK: u16 = 0x0fff;
+pub const RESV_MEM_T_RESERVED: u8 = 0;
+pub const RESV_MEM_T_MSI: u8 = 1;
 
 // Status codes.
 pub const S_OK: u8 = 0;
@@ -74,6 +83,13 @@ pub const REQ_ATTACH_LEN: usize = 20;
 pub const REQ_DETACH_LEN: usize = 20;
 pub const REQ_MAP_LEN: usize = 36;
 pub const REQ_UNMAP_LEN: usize = 28;
+// head(4) + endpoint(4) + reserved(64). What the DEVICE writes after it is `probe_size` bytes of
+// properties and then the tail, which is why the probe's device-writable buffer is not `TAIL_LEN`.
+pub const REQ_PROBE_LEN: usize = 72;
+// One property header: `le16 type` (the low twelve bits) and `le16 length`.
+pub const PROBE_PROPERTY_HEADER: usize = 4;
+// A `RESV_MEM` property's body: subtype(1) + reserved(3) + start(8) + end(8).
+pub const PROBE_RESV_MEM_LEN: usize = 20;
 pub const TAIL_LEN: usize = 4;
 pub const FAULT_LEN: usize = 24;
 
@@ -217,6 +233,56 @@ pub fn encode_unmap(domain: u32, virt_start: u64, len: u64) -> Result<Vec<u8>, F
 	Ok(out)
 }
 
+// Ask what one endpoint's domain must treat specially.
+//
+// The reserved field is 64 bytes of zeroes the device ignores; it is written out rather than
+// skipped, because the request's length is what tells the device which request this is.
+pub fn encode_probe(endpoint: u32) -> Vec<u8> {
+	let mut out = Vec::with_capacity(REQ_PROBE_LEN);
+	out.extend_from_slice(&[T_PROBE, 0, 0, 0]);
+	out.extend_from_slice(&endpoint.to_le_bytes());
+	out.resize(REQ_PROBE_LEN, 0);
+	out
+}
+
+// What the device wrote back, as regions rather than as bytes.
+//
+// EVERY PROPERTY IS SKIPPED BY ITS OWN DECLARED LENGTH, so a type this driver does not know costs it
+// nothing - which is the point of the length field and the only way this survives a device that
+// reports more than it did when this was written. A property whose length runs past the buffer ends
+// the walk: the device is describing memory it did not send, and the properties behind it cannot be
+// located any more.
+pub fn decode_probe(properties: &[u8]) -> Vec<ProbedRegion> {
+	let mut out = Vec::new();
+	let mut at = 0usize;
+	while at + PROBE_PROPERTY_HEADER <= properties.len() {
+		let kind = u16::from_le_bytes([properties[at], properties[at + 1]]) & PROBE_TYPE_MASK;
+		let length = u16::from_le_bytes([properties[at + 2], properties[at + 3]]) as usize;
+		// A zero type terminates the list, which is how the device says "that is all of them".
+		if kind == PROBE_T_NONE {
+			break;
+		}
+		let body = at + PROBE_PROPERTY_HEADER;
+		let Some(end) = body.checked_add(length) else { break };
+		if end > properties.len() {
+			break;
+		}
+		if kind == PROBE_T_RESV_MEM && length >= PROBE_RESV_MEM_LEN {
+			let subtype = properties[body];
+			let start = le64(properties, body + 4);
+			// INCLUSIVE ON THE WIRE, a length everywhere else. A region whose end is below its start
+			// is a device contradicting itself and is dropped rather than turned into a huge one.
+			let last = le64(properties, body + 12);
+			if last >= start {
+				let kind = if subtype == RESV_MEM_T_MSI { RegionKind::MsiDoorbell } else { RegionKind::Reserved };
+				out.push(ProbedRegion { kind, base: start, len: last - start + 1 });
+			}
+		}
+		at = end;
+	}
+	out
+}
+
 // The device's answer. A tail shorter than the specification's is not a status, and a status this
 // code does not know is not an success.
 pub fn decode_status(tail: &[u8]) -> Result<(), Fault> {
@@ -273,9 +339,15 @@ pub fn decode_fault(bytes: &[u8], generation: Generation, domain: DomainId) -> R
 
 // The seam between the codec above and a virtqueue. One method wide on purpose.
 pub trait Transport {
-	// Hand the device a request and place its tail in `tail`. Returns only once the device has
-	// answered - which for this device means the operation has TAKEN EFFECT, not been accepted.
-	fn request(&mut self, request: &[u8], tail: &mut [u8]) -> Result<(), Fault>;
+	// Hand the device a request and place what it writes in `answer`. Returns only once the device
+	// has answered - which for this device means the operation has TAKEN EFFECT, not been accepted.
+	//
+	// `status_at` is where the status byte sits inside `answer`: zero for every request whose
+	// device-writable part IS the tail, and `probe_size` for a probe, which the device fills with
+	// properties first. The transport is told rather than left to assume, because a transport that
+	// assumes reads a property's type as a status - which is what one did, printing a refusal for
+	// every successful probe.
+	fn request(&mut self, request: &[u8], answer: &mut [u8], status_at: usize) -> Result<(), Fault>;
 	// Take one raw event off the event queue, if there is one. Returns how many bytes were written.
 	fn take_event(&mut self, out: &mut [u8]) -> usize;
 }
@@ -286,10 +358,15 @@ pub struct VirtioIommu<T: Transport> {
 	config: Config,
 	features: u64,
 	next_domain: u32,
-	// The endpoint each domain is attached to, so a detach names what an attach named.
-	attached: Vec<(DomainId, EndpointId)>,
-	// Which binding generation the events are stamped with. Carried rather than derived: the device
-	// reports an endpoint, and which binding that endpoint is under is the kernel's knowledge.
+	// Every live binding: which domain an endpoint is in, and the generation it was attached under.
+	//
+	// THE DEVICE REPORTS AN ENDPOINT AND NOTHING ELSE. A fault event names the requester that
+	// faulted; which domain that requester is in, and which binding of it, is knowledge only this
+	// side has - so it is kept here rather than guessed at from whichever binding happens to be
+	// first. The generation is stamped at attach so a later rebind does not restamp the bindings
+	// that came before it.
+	attached: Vec<(DomainId, EndpointId, Generation)>,
+	// The generation the NEXT attach is stamped with. The kernel owns what it means; this holds it.
 	generation: Generation,
 }
 
@@ -311,13 +388,21 @@ impl<T: Transport> VirtioIommu<T> {
 		self.features
 	}
 
+	// The wire this backend speaks over. For a test that means to check WHAT was sent rather than
+	// only what came back - the two are different claims and the second alone would pass a backend
+	// that sent the wrong request and got a polite answer.
+	#[cfg(test)]
+	pub fn transport(&self) -> &T {
+		&self.transport
+	}
+
 	pub fn set_generation(&mut self, generation: Generation) {
 		self.generation = generation;
 	}
 
 	fn send(&mut self, request: &[u8]) -> Result<Confirmed, Fault> {
 		let mut tail = [0u8; TAIL_LEN];
-		self.transport.request(request, &mut tail)?;
+		self.transport.request(request, &mut tail, 0)?;
 		decode_status(&tail)?;
 		// THE STATUS IS THE COMPLETION. See the note at the top of this file: this device writes it
 		// only once the operation has taken effect, which is what lets a confirmed unmap be a
@@ -343,7 +428,14 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		// Likewise: a domain with nothing attached does not exist. Detaching what is left is the
 		// destruction, and it must CONFIRM - a domain believed destroyed while an endpoint is still
 		// attached is an endpoint still translating.
-		let attached: Vec<EndpointId> = self.attached.iter().filter(|(d, _)| *d == domain).map(|(_, e)| *e).collect();
+		//
+		// THE TRANSLATIONS ARE NOT THIS METHOD'S TO REMOVE, and that is a division of labour rather
+		// than an omission: a backend holds no list of what is mapped in a domain - the generic layer
+		// above it does - so a `domain_destroy` that tried to unmap would be guessing at a list it
+		// cannot have. `Iommu::revoke_endpoint` takes every translation down while the endpoint is
+		// still attached and only then detaches, so by the time this is reached the domain has
+		// nothing left to translate.
+		let attached: Vec<EndpointId> = self.attached.iter().filter(|(d, _, _)| *d == domain).map(|(_, e, _)| *e).collect();
 		for endpoint in attached {
 			self.detach(domain, endpoint)?;
 		}
@@ -357,13 +449,13 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		// FLAGS ZERO, and deliberately so: `VIRTIO_IOMMU_ATTACH_F_BYPASS` attaches an endpoint that
 		// is not translated at all, which is the one thing an enforcing profile must never send.
 		let confirmed = self.send(&encode_attach(domain.0, endpoint.0, 0))?;
-		self.attached.push((domain, endpoint));
+		self.attached.push((domain, endpoint, self.generation));
 		Ok(confirmed)
 	}
 
 	fn detach(&mut self, domain: DomainId, endpoint: EndpointId) -> Result<Confirmed, Fault> {
 		let confirmed = self.send(&encode_detach(domain.0, endpoint.0))?;
-		self.attached.retain(|pair| *pair != (domain, endpoint));
+		self.attached.retain(|(d, e, _)| !(*d == domain && *e == endpoint));
 		Ok(confirmed)
 	}
 
@@ -402,11 +494,22 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 			}
 			// A malformed record is DROPPED and the drain continues: one bad event must not stop
 			// the kernel reading the good ones behind it.
-			let domain = self.attached.first().map_or(DomainId(0), |(d, _)| *d);
-			if let Ok(event) = decode_fault(&raw[..taken.min(FAULT_LEN)], self.generation, domain) {
-				out[written] = event;
-				written += 1;
+			//
+			// THE BINDING COMES FROM THE ENDPOINT THE DEVICE NAMED. This used to take the first
+			// entry of `attached` for every event, so on a machine with more than one endpoint -
+			// which is every machine this backend was written for - each fault after the first
+			// device named the wrong domain, and the quarantine and stale-generation decisions
+			// taken on it were about a binding that had not faulted. An endpoint this side has no
+			// binding for keeps `DomainId(0)`, which is not a domain this backend ever hands out.
+			let Ok(mut event) = decode_fault(&raw[..taken.min(FAULT_LEN)], self.generation, DomainId(0)) else {
+				continue;
+			};
+			if let Some((domain, _, generation)) = self.attached.iter().find(|(_, e, _)| *e == event.endpoint) {
+				event.domain = *domain;
+				event.generation = *generation;
 			}
+			out[written] = event;
+			written += 1;
 		}
 		written
 	}
@@ -416,5 +519,31 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		// mapping's direction, so all three directions are expressible. The feature that carries
 		// them is `MAP_UNMAP`, which `new` refuses to build without.
 		self.features & F_MAP_UNMAP != 0
+	}
+
+	// ASK THE DEVICE RATHER THAN COMPILE IN AN ADDRESS.
+	//
+	// `negotiate` has acknowledged `F_PROBE` since this backend was written and nothing ever sent a
+	// probe, so the reserved regions were an empty list by omission - and the one that matters is the
+	// MSI doorbell. An endpoint whose domain has no mapping for it writes its interrupt into an
+	// address the IOMMU cannot translate, the write is dropped, no fault is raised because a dropped
+	// write is not a translation the device asked about, and the driver waits forever for an
+	// interrupt that was never delivered. That is what this returns the regions for.
+	fn probe(&mut self, endpoint: EndpointId) -> Result<Vec<ProbedRegion>, Fault> {
+		// A device that did not offer the feature has nothing to say, and asking anyway would be a
+		// request it is entitled to answer with an error.
+		if self.features & F_PROBE == 0 || self.config.probe_size == 0 {
+			return Ok(Vec::new());
+		}
+		// The device writes the properties and then the tail, so one buffer holds both.
+		let size = self.config.probe_size as usize;
+		let mut answer = Vec::new();
+		if answer.try_reserve_exact(size + TAIL_LEN).is_err() {
+			return Err(Fault::NoSpace);
+		}
+		answer.resize(size + TAIL_LEN, 0);
+		self.transport.request(&encode_probe(endpoint.0), &mut answer, size)?;
+		decode_status(&answer[size..])?;
+		Ok(decode_probe(&answer[..size]))
 	}
 }

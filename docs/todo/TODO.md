@@ -226,7 +226,7 @@ or preventing further development of `v1`.
 - [ ] [P02M0150 - A digest beside a payload is not a boot trust chain](P02M0150.md) - REOPENED 2026-08-26
 - [x] [P02M0151 - The architecture boundary contains no panic-shaped compatibility contract](P02M0151.md)
 - [x] [P02M0152 - Memory has a topology, not one global distance](P02M0152.md)
-- [ ] [P02M0153 - Virtio-IOMMU confines the first x86_64 QEMU endpoints](P02M0153.md) - REOPENED 2026-08-26
+- [x] [P02M0153 - Virtio-IOMMU confines the first x86_64 QEMU endpoints](P02M0153.md)
 - [ ] [P02M0154 - The capability transfer rules have a machine-checked bounded model](P02M0154.md) - REOPENED 2026-08-26
 - [x] [P02M0155 - The loader searches every disk in the machine for a file that is not there](P02M0155.md)
 - [ ] [P02M0156 - A check that skips what it cannot read has already answered yes](P02M0156.md)

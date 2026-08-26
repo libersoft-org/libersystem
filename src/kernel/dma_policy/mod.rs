@@ -46,7 +46,12 @@ pub fn init() {
 	// The bring-up is the answer. `iommu::init` returns whether a controller was found, negotiated
 	// what an enforcing profile needs, and READ BACK its own bypass byte as off - and nothing short
 	// of all three is enforcement.
-	set_enforcing(crate::iommu::init());
+	let enforcing = crate::iommu::init();
+	// AND WHETHER THIS MACHINE WAS SUPPOSED TO BE ISOLATED IS A DIFFERENT QUESTION, asked of the bus
+	// rather than of the bring-up: a controller that is present and did not come up is the case a
+	// protected driver must refuse, and a machine with no controller is the case it must not.
+	set_isolation_expected(crate::iommu::present());
+	set_enforcing(enforcing);
 }
 
 // Called by the IOMMU backend once translation is confirmed - and by nothing else.
@@ -58,23 +63,43 @@ pub fn enforcing() -> bool {
 	ENFORCING.load(Ordering::Acquire)
 }
 
-// WHICH DEVICE TYPES REFUSE TO RUN UNTRANSLATED. Empty, and the emptiness is a decision worth being
-// explicit about rather than a gap.
+// WHICH DEVICE TYPES REFUSE TO RUN UNTRANSLATED, on a machine that has an IOMMU to be translated by.
 //
-// The protected slice's endpoints are meant to declare `iommu-required`. The mechanism
-// is here and is exercised - `admit` refuses a type in this list on a machine with no enforcement,
-// and a kernel test drives exactly that. What the list does NOT contain is `virtio-net`, because
-// putting it there removes networking from every profile that has no `virtio-iommu` in it: the
-// ordinary harness, every developer's run, and every machine whose firmware offers no IOMMU. That is
-// a shipping decision about which profiles a system supports, not a fact about the driver, and it
-// belongs to whoever declares a profile rather than to the milestone that built the mechanism.
+// THE LIST WAS EMPTY, AND THE EMPTINESS WAS THE PROBLEM. The mechanism was built, exercised by a
+// kernel test and declared by nothing: every production device type answered `TrustedUntranslated`,
+// so a system claiming to confine its bus-mastering endpoints had no endpoint that insisted on being
+// confined. The argument for leaving it empty was real - putting `virtio-net` in an unconditional
+// list removes networking from every profile with no controller in it, which is the ordinary
+// harness, every developer's run and every machine whose firmware offers no IOMMU - but the
+// conclusion did not follow. What was wrong was the word "unconditional", not the list.
+//
+// SO THE POLICY ASKS THE MACHINE FIRST. A machine with no `virtio-iommu` on its bus is one where
+// untranslated DMA is the only DMA there is, and a protected driver runs there exactly as it did
+// before. A machine that HAS one and did not bring it up is a different machine: isolation was
+// available and something went wrong with it, and that is precisely the case where a driver that
+// declared it needs translation must not quietly run without it. `isolation_expected` is what tells
+// those two apart, and `iommu::init` sets it from whether a controller was found on the bus rather
+// than from whether the bring-up succeeded.
 //
 // The EDU fixture needs no row: it has no driver and never binds through this path at all.
-const IOMMU_REQUIRED_TYPES: &[u16] = &[];
+const IOMMU_REQUIRED_TYPES: &[u16] = &[abi::VIRTIO_TYPE_NET as u16];
+
+// Whether this machine has an IOMMU at all - not whether it is working. See the list above.
+static ISOLATION_EXPECTED: AtomicBool = AtomicBool::new(false);
+
+// Called by the IOMMU bring-up once it knows whether the machine carries a controller, and by
+// nothing else. A machine that carries one is held to the list above; a machine that does not is not.
+pub fn set_isolation_expected(expected: bool) {
+	ISOLATION_EXPECTED.store(expected, Ordering::Release);
+}
+
+pub fn isolation_expected() -> bool {
+	ISOLATION_EXPECTED.load(Ordering::Acquire)
+}
 
 // THE POLICY EVERY DEVICE IS UNDER, in one place rather than at each call site.
 pub fn policy_for(device_type: u16) -> Policy {
-	if IOMMU_REQUIRED_TYPES.contains(&device_type) { Policy::IommuRequired } else { Policy::TrustedUntranslated }
+	if isolation_expected() && IOMMU_REQUIRED_TYPES.contains(&device_type) { Policy::IommuRequired } else { Policy::TrustedUntranslated }
 }
 
 // May this device master the bus, and under what terms?
@@ -108,6 +133,19 @@ fn record_degraded(entry: Degraded) {
 		return;
 	}
 	degraded.push(entry);
+}
+
+// The device has given the bus back, so it is no longer one of the devices reaching memory
+// untranslated - and the audit list must stop saying it is.
+//
+// THE RECORD HAS THE SAME LIFETIME AS THE OWNERSHIP IT DESCRIBES. `admit` writes the row at the
+// moment a driver ASKS to master the bus, which is the right moment to take the decision and the
+// wrong one to make the record permanent: a driver that asked, failed to bind and released was
+// audited forever as reaching memory untranslated. A boot with a driver that does not come up
+// printed one more degraded row than there were degraded devices, beside a device summary that
+// counted correctly - two adjacent lines disagreeing about the same machine.
+pub fn forget_degraded(bus: u8, dev: u8, func: u8) {
+	DEGRADED.lock().retain(|held| !(held.bus == bus && held.dev == dev && held.func == func));
 }
 
 // Everything currently running untranslated. The report a supervisor reads, and what a test asserts
