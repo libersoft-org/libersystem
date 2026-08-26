@@ -300,7 +300,11 @@ run_arch() {
 }
 
 if [[ ${#archs[@]} -eq 1 ]]; then
-	run_arch "${archs[0]}"
+	# Backgrounded and waited for, for the reason `guest_cleanup` in lib.sh gives: a foreground child
+	# defers this script's traps until it finishes. The multi-architecture path below already does
+	# this, because it had to.
+	run_arch "${archs[0]}" &
+	wait $! || exit $?
 	exit 0
 fi
 

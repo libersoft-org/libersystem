@@ -75,6 +75,16 @@ shape_state() {
 # volume's contents, so two shapes that share one are two names over one artifact.
 [[ "$(digest "$TEST_UUID")" != "$(digest "$BOOT_UUID")" ]] || fail "both shapes carry the same pairing, so a medium built for one names the other just as well"
 
+# AND EACH PAIRING NAMES ITS OWN IMAGE, which "they differ" does not say.
+#
+# Two sidecars swapped between the shapes are still different from each other, both still exist, and
+# every check above passes - while each medium names the volume it is not paired with, which is the
+# defect this milestone is about wearing a different hat. `pairing_matches_volume` is the check M4
+# made shared for exactly this question, so this is two calls rather than a second copy of it.
+pairing_matches_volume "$(cat "$TEST_UUID")" "$TEST_SHAPE" || fail "the test shape's pairing at $TEST_UUID does not name the volume beside it"
+pairing_matches_volume "$(cat "$BOOT_UUID")" "$BOOT_SHAPE" || fail "the bootable shape's pairing at $BOOT_UUID does not name the volume beside it"
+echo "build-order: each shape's pairing names its own image"
+
 # THE SHAPES ARE DIFFERENT ARTIFACTS. If they were equal, naming them apart would have changed
 # nothing and this gate would pass on a tree where the defect was still present.
 [[ "$(digest "$TEST_SHAPE")" != "$(digest "$BOOT_SHAPE")" ]] || fail "both shapes have the same contents, so this gate cannot tell them apart and neither can a consumer"

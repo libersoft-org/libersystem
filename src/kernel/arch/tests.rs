@@ -24,6 +24,17 @@ fn concurrent_maps_on_shared_tables_strand_nothing() {
 	static FRAMES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 	static ARRIVE: AtomicU64 = AtomicU64::new(0);
 	static STRANDED: AtomicU64 = AtomicU64::new(0);
+	// A WORKER THAT NEVER MET ITS PARTNER IS NOT A STRANDED LEAF, and it used to be counted as one.
+	//
+	// The rendezvous bound below is a SPIN count, so what it measures is how much work the host got
+	// through, not how long anything waited. Under TCG on a loaded machine that is a different
+	// quantity: this test failed twice in the full aarch64 suite - always straight after the 1205 s
+	// shootdown test - and passed in 60 s on the same eight cores when run on a fresh guest. Both
+	// failures read `left: 2`, which is what the counter says when one worker gives up at the barrier
+	// and the other then waits for a partner that has gone. Two days of this were spent looking for a
+	// page-table race that is not there, because the number could not say which of the two had
+	// happened. Now it can.
+	static BARRIER_LOST: AtomicU64 = AtomicU64::new(0);
 	static DONE: AtomicU64 = AtomicU64::new(0);
 
 	extern "C" fn worker(which: u64) {
@@ -38,8 +49,11 @@ fn concurrent_maps_on_shared_tables_strand_nothing() {
 			while ARRIVE.load(Ordering::SeqCst) < 2 * (round + 1) {
 				core::hint::spin_loop();
 				spins += 1;
+				// THE BOUND IS UNCHANGED ON PURPOSE. Raising it would be sizing a spin budget from a
+				// guess about a machine nobody has measured in this state; separating the counter
+				// costs nothing and turns the next run into that measurement.
 				if spins > 2_000_000_000 {
-					STRANDED.fetch_add(1, Ordering::SeqCst);
+					BARRIER_LOST.fetch_add(1, Ordering::SeqCst);
 					DONE.fetch_add(1, Ordering::SeqCst);
 					return;
 				}
@@ -70,6 +84,7 @@ fn concurrent_maps_on_shared_tables_strand_nothing() {
 	FRAMES[1].store(frame::allocate().expect("worker frame 1"), Ordering::SeqCst);
 	ARRIVE.store(0, Ordering::SeqCst);
 	STRANDED.store(0, Ordering::SeqCst);
+	BARRIER_LOST.store(0, Ordering::SeqCst);
 	DONE.store(0, Ordering::SeqCst);
 	sched::spawn_on(1, worker, 0);
 	sched::spawn_on(2, worker, 1);
@@ -79,6 +94,10 @@ fn concurrent_maps_on_shared_tables_strand_nothing() {
 		spins += 1;
 		assert!(spins < 20_000_000_000, "the PT stress workers did not finish");
 	}
+	// THE BARRIER FIRST, because a worker that never met its partner did not exercise the property
+	// at all - and a test that says nothing when it did not run is the shape this tree has a gate
+	// named after. Loud, and distinct from the defect it used to be confused with.
+	assert_eq!(BARRIER_LOST.load(Ordering::SeqCst), 0, "the workers never met at the barrier, so the concurrent-map property was never exercised - this is a starved or over-slow machine, not a stranded leaf");
 	assert_eq!(STRANDED.load(Ordering::SeqCst), 0, "a concurrent map on a shared intermediate level stranded a leaf");
 	// Every round linked one fresh leaf table into the tree; dropping the space must
 	// hand them all back (an orphaned table would stay allocated - the frame leak).

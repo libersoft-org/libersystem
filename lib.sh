@@ -14,6 +14,46 @@ BUILD_DIR="$REPO_ROOT/.build"
 
 ARCHS_ALL=(x86_64 aarch64 riscv64)
 
+# ENDING ONE OF THESE SCRIPTS ENDS THE GUESTS IT STARTED.
+#
+# `timeout 300 ./run.sh --arch aarch64` ends the SCRIPT and not the `qemu-system-aarch64` underneath
+# it, so an interrupted run leaves a guest holding a write lock on the disk images under
+# `.build/boot`. The next run then fails with a QEMU lock error naming an IMAGE rather than the run
+# that holds it - a diagnosis `test.sh` already warns is unreadable when it happens for other reasons.
+#
+# `timeout` HANDLES ITS OWN EXPIRY CORRECTLY - measured, not assumed: it puts its child in a new
+# process group and signals the GROUP, so a grandchild dies with it. The hole is only the other
+# ending, where something kills the script and nothing ever signals that group.
+#
+# TWO HALVES, AND THE TRAP ALONE IS NOT ENOUGH. Three designs were tried before this one and the
+# first two were refuted by measurement; P02M0156 records them. What governs the problem is that
+# BASH DEFERS A TRAP WHILE A FOREGROUND CHILD IS RUNNING: a `kill` of `./check.sh` sat queued behind
+# `eval "$cmd"` and the trap would not have run until the gate finished on its own, which is the
+# moment there is nothing left to clean up. So the callers below run their long child in the
+# BACKGROUND and `wait` for it, because `wait` is interruptible and a foreground command is not.
+guest_cleanup() {
+	# Deepest first, so a parent is never signalled before its children. The walk is the one
+	# `test-kernel.sh` uses to decide a guest is ITS OWN rather than any QEMU on the machine:
+	# ancestry is what makes the victim ours, and a process name is not - the name matches every
+	# QEMU on a shared machine, including other people's.
+	local victim
+	for victim in $(_guest_descendants $$); do
+		kill -TERM "$victim" 2>/dev/null || true
+	done
+}
+
+_guest_descendants() {
+	local parent="$1" child
+	for child in $(ps -o pid= --ppid "$parent" 2>/dev/null); do
+		_guest_descendants "$child"
+		printf '%s\n' "$child"
+	done
+}
+
+trap guest_cleanup EXIT
+trap 'guest_cleanup; exit 130' INT
+trap 'guest_cleanup; exit 143' TERM
+
 # CARGO ON THE PATH, FOUND RATHER THAN REQUIRED.
 #
 # `setup.sh` cannot put it there: `rustup` adds `~/.cargo/bin` through the shell PROFILE, and the

@@ -209,7 +209,11 @@ run_gate() {
 	local name="$1" cmd="${GATES[$1]:-}" status=0
 	[[ -n "$cmd" ]] || die "unknown gate '$name' (--list to see them)"
 	note "gate: $name"
-	(cd "$SRC_DIR" && eval "$cmd") || status=$?
+	# Backgrounded and waited for, so a signal to this script is acted on now rather than after the
+	# gate finishes - see `guest_cleanup` in lib.sh. A gate is also a SUBSHELL, which is why a trap
+	# inside the gate script itself does not help: it never hears the signal.
+	(cd "$SRC_DIR" && eval "$cmd") &
+	wait $! || status=$?
 	if [[ "$status" -ne 0 ]]; then
 		# Bash reports a killed child as 128 + the signal number.
 		if [[ "$status" -gt 128 ]]; then
