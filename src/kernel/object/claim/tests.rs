@@ -219,3 +219,51 @@ fn a_claim_handle_cannot_leave_the_process_that_took_it() {
 	assert_eq!(RELEASED.load(Ordering::SeqCst), abi::CLAIM_STATE_FREE as i64, "and the handle it refused to move is the one that ends the binding");
 	assert_eq!(device::claim_state(index), Some(ClaimState::Free));
 }
+
+crate::tagged_test!(a_teardown_that_runs_out_of_time_is_latched_terminal_and_a_late_finish_releases_nothing, [Object, Kernel, Pci], id = "kernel.object.claim.a_teardown_that_runs_out_of_time_is_latched_terminal_and_a_late_finish_releases_nothing", covers = ["kernel"]);
+fn a_teardown_that_runs_out_of_time_is_latched_terminal_and_a_late_finish_releases_nothing() {
+	// THE RACE M6 IS BUILT AROUND, both outcomes, on one synthetic device.
+	//
+	// When DeviceManager dies, the last close of its claim handle starts a forced teardown before
+	// any new manager exists to bound it - so the deadline is the CLAIM'S OWN, minted at the release
+	// from a constant of the kernel's. A new manager reads the state to find out what it may do.
+	//
+	// The half that has to be latched IN THE KERNEL: a binding marked terminal in userspace while
+	// the kernel's claim stays `Releasing` is two authorities over one device, and a late teardown
+	// reaching `Free` would put the frames and vectors back into circulation against a state a
+	// manager has already been told is final.
+	let index = device::add_synthetic_device();
+	let key = device::claim(index).expect("a fresh synthetic slot claims");
+
+	// BEFORE THE DEADLINE: the snapshot reports what is happening and changes nothing.
+	let snapshot = device::snapshot(index).expect("a synthetic slot answers");
+	assert_eq!(snapshot.state, abi::CLAIM_STATE_CLAIMED, "a live claim reads as claimed");
+	assert_eq!(snapshot.generation, key.generation, "and the snapshot names the binding, not the row");
+	assert_eq!(snapshot.release_deadline, 0, "nothing is being torn down, so there is no deadline to answer by");
+
+	// The ordinary path: a release that confirms reaches `Free` and the deadline is spent with it.
+	assert_eq!(device::release_claim(key), Ok(device::ClaimState::Free));
+	let after = device::snapshot(index).expect("still a slot");
+	assert_eq!(after.state, abi::CLAIM_STATE_FREE);
+	assert_eq!(after.release_deadline, 0, "a settled claim carries no deadline");
+
+	// AND THE OTHER SIDE. A second binding, torn down past its deadline: the snapshot LATCHES it.
+	let second = device::claim(index).expect("free again, so claimable again");
+	assert_ne!(second.generation, key.generation, "a new claim is a new binding");
+	device::begin_release_for_test(second).expect("the teardown starts");
+	let releasing = device::snapshot(index).expect("still a slot");
+	assert_eq!(releasing.state, abi::CLAIM_STATE_RELEASING, "a teardown under way reads as releasing");
+	assert!(releasing.release_deadline > 0, "and it carries the deadline it must confirm by");
+
+	// Wind the deadline into the past - which is what a teardown that does not complete looks like
+	// from outside - and read again. The read is what latches, atomically, under the claim lock.
+	device::expire_release_for_test(index);
+	let latched = device::snapshot(index).expect("still a slot");
+	assert_eq!(latched.state, abi::CLAIM_STATE_QUARANTINED, "the deadline passed and nothing observed the device go quiet");
+
+	// A LATE COMPLETION RELEASES NOTHING. This is the half that would silently undo the latch:
+	// the teardown finishes, reports confirmed, and the claim must stay terminal anyway.
+	assert_eq!(device::finish_release_for_test(index, true), device::ClaimState::Quarantined, "a completion after the latch releases nothing");
+	assert_eq!(device::claim_state(index), Some(device::ClaimState::Quarantined));
+	assert_eq!(device::claim(index), Err(ClaimError::Quarantined), "and it is not claimed again this boot");
+}

@@ -494,6 +494,29 @@ pub fn add_synthetic_device() -> usize {
 	index
 }
 
+// Start a teardown without running it, so a test can hold a claim in `Releasing` and look at what
+// the deadline does. The real path is `release_claim`, which does this and then the work.
+#[cfg(test)]
+pub fn begin_release_for_test(key: abi::ClaimKey) -> Result<(), ClaimError> {
+	begin_release(key)
+}
+
+// Wind a live teardown's deadline into the past, which is what one that does not complete looks
+// like from outside. A test cannot wait two seconds of wall clock for it and should not have to.
+#[cfg(test)]
+pub fn expire_release_for_test(index: usize) {
+	let mut claims = CLAIMS.lock();
+	if let Some(slot) = claims.get_mut(index) {
+		slot.release_deadline = 1;
+	}
+}
+
+// Finish a teardown started by `begin_release_for_test`, so the LATE completion can be driven.
+#[cfg(test)]
+pub fn finish_release_for_test(index: usize, confirmed: bool) -> ClaimState {
+	finish_release(index, confirmed)
+}
+
 // Put a synthetic slot one generation below the ceiling, so the retirement branch is reachable in a
 // test instead of being a line nobody has ever executed.
 #[cfg(test)]

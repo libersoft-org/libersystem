@@ -472,3 +472,94 @@ fn an_unconfirmed_teardown_ignores_the_intent_entirely() {
 		assert!(record.state == BindingState::Quarantined, "{:?} still ends quarantined", core::str::from_utf8(intent.name()).unwrap_or("?"));
 	}
 }
+
+// ------------------------------------------------------- the races that are reachable
+//
+// REACHABLE IN THIS TREE, which is what makes it a table and not a wish. A cartesian product of
+// every event against every other is a way of never finishing; a named list is a plan.
+//
+// A DEVICE REMOVED MID-BIND IS NOT ON IT. The scan runs once and no removal event exists, so that
+// test could only pass by first inventing the mechanism it tests.
+
+#[test]
+fn a_ready_that_arrives_after_the_deadline_does_not_undo_the_timeout() {
+	// ONCE THE FORCED PATH HAS BEEN ENTERED THE OUTCOME IS DECIDED. The alternative is a report that
+	// says a driver came up when the manager had already torn it down - and by then its claim is
+	// released and its process signalled, so "it is up" would be a claim about nothing.
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Binding, None));
+	assert!(record.move_to(BindingState::Stopping, Some(FailureCause::HandshakeTimeout)));
+	assert!(record.move_to(BindingState::Backoff, Some(FailureCause::HandshakeTimeout)));
+	// The late `READY`. The table has no edge from `Backoff` to `Online`, so it is refused by the
+	// same rule every other illegal transition is - not by a special case somebody remembered.
+	assert!(!record.move_to(BindingState::Online, None), "a late READY is late, and late is not up");
+	assert!(record.state == BindingState::Backoff);
+}
+
+#[test]
+fn a_crash_between_publish_and_subscribe_withdraws_what_was_published() {
+	// A driver that reached `Online` published; a consumer had not yet asked. The binding ending
+	// must take the publication with it, or a subscriber arriving next finds a provider whose
+	// server is gone - which is a failure nobody can attribute.
+	let published = ProviderId::new(BindingId::new(0, 3, 0, 1), 0, 1);
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Binding, None));
+	assert!(record.move_to(BindingState::Online, None));
+	assert!(record.move_to(BindingState::Stopping, Some(FailureCause::DriverExited)));
+	// Whatever the catalogue does next, the id it withdraws is THIS binding's - and the next
+	// binding's providers are distinguishable from it by the generation.
+	let after_rebind = ProviderId::new(BindingId::new(0, 3, 0, 2), 0, 2);
+	assert!(published != after_rebind);
+	assert!(published.binding.same_function(after_rebind.binding));
+}
+
+#[test]
+fn a_watchdog_expiry_racing_a_clean_exit_reaches_one_verdict_and_not_two() {
+	// Both events are about the same binding and both are queued; the queue is what makes them
+	// ORDERED rather than simultaneous. Whichever is first decides, and the second finds a record
+	// that has already moved - refused by the table, not by a flag somebody has to remember to set.
+	let mut queue = BindingQueue::new();
+	assert!(queue.push(BindingEvent::Wedged { generation: 1 }));
+	assert!(queue.push(BindingEvent::Exited { generation: 1 }));
+	assert!(queue.pop(1) == Some(BindingEvent::Wedged { generation: 1 }), "first in, first out");
+
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Binding, None));
+	assert!(record.move_to(BindingState::Online, None));
+	assert!(record.move_to(BindingState::Stopping, Some(FailureCause::HandshakeTimeout)));
+	// The exit arrives second and finds a node already stopping. `Stopping -> Stopping` is not in
+	// the table, so it changes nothing and the verdict stays the one that was reached first.
+	assert!(!record.move_to(BindingState::Stopping, Some(FailureCause::DriverExited)));
+	assert!(record.failure == Some(FailureCause::HandshakeTimeout), "the first verdict stands");
+}
+
+#[test]
+fn a_manager_restart_with_drivers_still_live_cannot_mistake_them_for_a_fresh_binding() {
+	// The reconstruction's race. A new manager arrives while the old drivers are still being torn
+	// down; every event still coming from them carries the OLD generation, and the node it would
+	// belong to holds a new one or none at all.
+	let mut queue = BindingQueue::new();
+	assert!(queue.push(BindingEvent::Ready { generation: 1 }));
+	assert!(queue.push(BindingEvent::Offered { generation: 1 }));
+	// A node with no binding - which is what a fresh manager's node looks like - drains them all.
+	assert!(queue.pop(0).is_none());
+	assert!(queue.is_empty(), "nothing from the previous manager's binding survives to be acted on");
+}
+
+#[test]
+fn a_stopped_that_arrives_after_the_deadline_does_not_turn_a_forced_teardown_back_into_a_clean_one() {
+	// THE ONE THE MILESTONE NAMES EXPLICITLY. Once the forced path has been entered the outcome is
+	// decided; a late answer is recorded as late and changes nothing, because the alternative is a
+	// report that says a driver flushed when the manager had already stopped waiting.
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Binding, None));
+	assert!(record.move_to(BindingState::Online, None));
+	// The stop deadline expired: the teardown is forced, and it did not confirm.
+	assert!(record.move_to(BindingState::Stopping, Some(FailureCause::HandshakeTimeout)));
+	assert!(record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed)));
+	// `STOPPED` arrives now. There is no edge out of quarantine at all, so it cannot be read as a
+	// clean flush - and the cause the record carries still says what actually happened.
+	assert!(!record.move_to(BindingState::Backoff, Some(FailureCause::DriverExited)));
+	assert!(!record.move_to(BindingState::Failed, Some(FailureCause::DriverExited)));
+	assert!(record.failure == Some(FailureCause::TeardownUnconfirmed), "the report still says the teardown was not confirmed");
+}

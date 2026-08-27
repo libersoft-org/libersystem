@@ -580,6 +580,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// server end), and the channel SystemGraphService queries the `supervisor` interface
 	// on (the supervisor serves it). Both are minted when the shell and SystemGraphService
 	// bootstrap, and stood on in the supervise loop.
+	// THE DEVICEMANAGER SUBTREE, owned here. DeviceManager launches every driver into a child
+	// Domain of its own, so killing this one takes the drivers with it - which is what has to happen
+	// before a replacement manager binds anything, or the old drivers would still hold claims the
+	// new one is about to hand out.
+	let mut device_manager_domain: u64 = 0;
 	let mut admin_server: u64 = 0;
 	// A second admin channel: the one PermissionManager grants to the sandboxed `stop`
 	// command (the supervisor capability), so `stop` run as its own ELF reaches the
@@ -612,7 +617,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Absent && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
 				// bring-up waits for the report, but it is the honest name for the window between
 				// a process existing and a service answering, and it is what a later non-blocking
@@ -853,7 +858,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					let before: u64 = epoch_of(procs[cfg]);
 					// A real crash: kill the live instance out from under its clients.
 					signal(procs[cfg], SIG_KILL);
-					if restart_service(&mut broker, cfg, &mut state, &mut channels, &mut procs, &mut sup, &mut stats_server, policy.restart_budget, park, &mut buf) {
+					if restart_service(&mut broker, cfg, &mut state, &mut channels, &mut procs, &mut sup, &mut stats_server, policy.restart_budget, park, &mut device_manager_domain, &mut buf) {
 						send_blocking(bootstrap, b"ConfigService: restarted", 0);
 						// REPORTED ONLY IF IT IS TRUE. The epoch is the process koid and the kernel
 						// never reuses one, so a replacement that shared its predecessor's epoch
@@ -968,7 +973,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// rather than threaded out through `start_service`: the end is recorded there when the role
 		// is delivered, and this is the only place that needs it.
 		let admin_server3: u64 = kept.end_of(b"console_service", b"ADMIN");
-		supervise(power, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, admin_server3, stats_server, stats_server2, &driver_state, log_client, park, &mut buf);
+		supervise(power, &mut state, &mut desired, &mut channels, &mut sup, &failure_reason, &mut procs, &package, &mut broker, &mut canary_proc, &mut canary_ctrl, &mut canary_sup, &policy, admin_server, admin_server2, admin_server3, stats_server, stats_server2, &driver_state, log_client, park, &mut device_manager_domain, &mut buf);
 	}
 	exit();
 }
@@ -1217,7 +1222,7 @@ fn is_goodbye(request: &[u8]) -> bool {
 // failure the service is left Failed (the caller escalates). Clients holding
 // channels to the dead instance reconnect through the broker (serve_resolve above) -
 // that is the whole point.
-unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], stats_server: &mut u64, budget: u32, park: u64, buf: &mut [u8]) -> bool {
+unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N], channels: &mut [u64; N], procs: &mut [u64; N], sup: &mut [Supervised; N], stats_server: &mut u64, budget: u32, park: u64, device_manager_domain: &mut u64, buf: &mut [u8]) -> bool {
 	unsafe {
 		sup[idx].failure = Failure::Crashed;
 		// THE INSTANCE BEING REPLACED IS RECORDED BEFORE IT IS GONE, with its own epoch, so a late
@@ -1250,6 +1255,18 @@ unsafe fn restart_service(broker: &mut Broker, idx: usize, state: &mut [State; N
 		let budget_spent: bool = restartable(idx) && sup[idx].restarts >= budget;
 		broker.lifecycle.record(idx, State::Stopping, State::Failed, epoch, if budget_spent { Reason::BudgetSpent } else { Reason::Replaced });
 		state[idx] = State::Failed;
+		// THE SUBTREE GOES WITH THE SERVICE THAT OWNED IT, before anything else is decided.
+		//
+		// DeviceManager's drivers live in child Domains of the one this supervisor created for it,
+		// and every one of them holds a device claim. A manager that dies while its drivers keep
+		// running leaves those claims held by processes nobody supervises - so whatever happens
+		// next, a replacement or an escalation, must not happen with them still live.
+		if MANIFEST[idx].name == b"device_manager" && *device_manager_domain != 0 {
+			print(b"ServiceManager: DeviceManager is gone; killing the driver subtree beneath it before anything rebinds\n");
+			domain_kill(*device_manager_domain);
+			close(*device_manager_domain);
+			*device_manager_domain = 0;
+		}
 		if !restartable(idx) {
 			return false;
 		}
@@ -1470,7 +1487,7 @@ unsafe fn sleep_ticks(park: u64, ticks: u64) {
 // dropped from the wait set. The canary is restarted per policy; an admin message
 // drives a reverse-dependency stop; a stats request is answered over the `supervisor`
 // interface. Returns when nothing is left to watch.
-unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, admin_server3: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, buf: &mut [u8]) {
+unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; N], channels: &mut [u64; N], sup: &mut [Supervised; N], reason: &[String; N], procs: &mut [u64; N], package: &Package, broker: &mut Broker, canary_proc: &mut u64, canary_ctrl: &mut u64, canary_sup: &mut Supervised, policy: &Policy, admin_server: u64, admin_server2: u64, admin_server3: u64, stats_server: u64, stats_server2: u64, drivers: &[(&'static [u8], bool)], log_client: u64, park: u64, device_manager_domain: &mut u64, buf: &mut [u8]) {
 	unsafe {
 		let mut admin: u64 = admin_server;
 		let mut admin2: u64 = admin_server2;
@@ -1564,7 +1581,7 @@ unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; 
 							emit_event(log_client, MANIFEST[idx].name, b"crashed");
 							console_report(MANIFEST[idx].name, b"crashed");
 							if MANIFEST[idx].restart == Restart::Transparent {
-								if restart_service(broker, idx, state, channels, procs, sup, &mut stats, policy.restart_budget, park, buf) {
+								if restart_service(broker, idx, state, channels, procs, sup, &mut stats, policy.restart_budget, park, device_manager_domain, buf) {
 									emit_event(log_client, MANIFEST[idx].name, b"restarted");
 									console_report(MANIFEST[idx].name, b"restarted");
 								} else {
