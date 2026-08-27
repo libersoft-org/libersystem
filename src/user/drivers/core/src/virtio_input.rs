@@ -126,12 +126,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			let mut line = [0u8; 64];
 			let n = common::describe(&mut line, b"virtio-input", &device, b"pointer");
 			common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::INPUT, consumer)]);
-			pointer_loop(irq, &mut eventq, pool_virt, pool_phys, slots, producer, max_x, max_y)
+			pointer_loop(bootstrap, &bind, irq, &mut eventq, pool_virt, pool_phys, slots, producer, max_x, max_y)
 		} else {
 			let mut line = [0u8; 64];
 			let n = common::describe(&mut line, b"virtio-input", &device, b"keyboard");
 			common::online(bootstrap, &bind, &line[..n], &[]);
-			event_loop(irq, &mut eventq, pool_virt, pool_phys, slots, key_sink)
+			event_loop(bootstrap, &bind, irq, &mut eventq, pool_virt, pool_phys, slots, key_sink)
 		}
 	}
 }
@@ -171,12 +171,16 @@ unsafe fn axis_max(device: &Virtio, axis: u16) -> i32 {
 // the device filled (translating key presses to console input), re-post the drained
 // buffers, and re-arm the interrupt. MSI-X is edge-triggered, so there is no ISR line
 // to deassert and no GSI to unmask - the interrupt_ack just clears the pending flag.
-unsafe fn event_loop(irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, key_sink: u64) -> ! {
+unsafe fn event_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, key_sink: u64) -> ! {
 	unsafe {
 		let mut mods: Mods = Mods::default();
 		loop {
-			// block until the keyboard raises its MSI-X interrupt.
-			wait(irq, 0);
+			// Block until the keyboard raises its MSI-X interrupt - OR until the manager asks
+			// whether this driver is still answering. An input device that nobody is typing on is
+			// idle, and idle is not wedged.
+			if common::wait_or_answer(bootstrap, bind, &[irq]).is_none() {
+				exit();
+			}
 			// drain the buffers the device filled, re-posting each as we go.
 			while let Some((id, _len)) = eventq.take_used() {
 				if id < slots {
@@ -208,14 +212,18 @@ struct Pointer {
 // position and buttons to InputService (which maps them to the text-cell grid). The
 // send coalesces motion within one interrupt (the latest position wins). Retires if
 // InputService closes its end.
-unsafe fn pointer_loop(irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, sink: u64, max_x: i32, max_y: i32) -> ! {
+unsafe fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, sink: u64, max_x: i32, max_y: i32) -> ! {
 	unsafe {
 		let bound_x: i32 = if max_x > 0 { max_x } else { REL_RANGE };
 		let bound_y: i32 = if max_y > 0 { max_y } else { REL_RANGE };
 		let mut state: Pointer = Pointer::default();
 		let mut sent: Pointer = Pointer { x: -1, y: -1, buttons: 0 };
 		loop {
-			wait(irq, 0);
+			// The manager's channel joins the interrupt this loop already waits on: a pointer
+			// nobody is moving is idle, and idle is not wedged.
+			if common::wait_or_answer(bootstrap, bind, &[irq]).is_none() {
+				exit();
+			}
 			let mut synced: bool = false;
 			let mut wheel: i32 = 0;
 			while let Some((id, _len)) = eventq.take_used() {

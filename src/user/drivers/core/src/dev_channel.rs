@@ -103,7 +103,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		common::online(bootstrap, &bind, b"driver.dev-channel: online (transport)", &[(driver_protocol::provider::CONSOLE_BYTES, bytes_far)]);
 		let mut port: Port = Port { device: &device, irq, tx: &mut tx, virt: tx_virt, phys: tx_phys, busy: false };
-		pump(&device, irq, bootstrap, bytes, &mut rx, &mut port, rx_virt, &rx_phys)
+		pump(&device, &bind, irq, bootstrap, bytes, &mut rx, &mut port, rx_virt, &rx_phys)
 	}
 }
 
@@ -169,7 +169,7 @@ impl Port<'_> {
 // after one. Both queues share the device's single MSI-X vector, so the wait inside a
 // transmit drain can consume the very interrupt that announced newly arrived bytes; draining
 // first means the loop never blocks while work is already queued, whichever wait observed it.
-unsafe fn pump(device: &Virtio, irq: u64, bootstrap: u64, bytes: u64, rx: &mut Queue, port: &mut Port, rx_virt: u64, rx_phys: &[u64]) -> ! {
+unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, bytes: u64, rx: &mut Queue, port: &mut Port, rx_virt: u64, rx_phys: &[u64]) -> ! {
 	unsafe {
 		let mut outbound: Vec<u8> = alloc::vec![0u8; MAX_FRAME];
 		let mut bytes: u64 = bytes;
@@ -264,9 +264,20 @@ unsafe fn adopt(device: &Virtio, irq: u64, bootstrap: u64, dead: u64, rx: &mut Q
 			loop {
 				match try_recv(bootstrap, &mut buf) {
 					Polled::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BYTES" => return handle,
-					Polled::Message { handle, .. } => {
+					// THE MANAGER'S PING LANDS HERE, in the branch that used to close whatever
+					// arrived and say nothing. This driver already reads its bootstrap without
+					// blocking, so the ping is answered by the loop that was already looking.
+					Polled::Message { len, handle } => {
 						if handle != 0 {
 							close(handle);
+						}
+						if let Ok(header) = driver_protocol::Header::decode(&buf[..len])
+							&& header.generation == bind.generation
+							&& header.opcode == driver_protocol::Opcode::Ping
+							&& let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
+							&& !common::pong(bootstrap, bind, sequence)
+						{
+							exit();
 						}
 					}
 					Polled::Empty => break,

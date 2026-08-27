@@ -409,7 +409,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-gpu", &device, b"");
 		common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::DISPLAY, far)]);
-		serve(&device, &gpu, backing, service, irq)
+		serve(bootstrap, &bind, &device, &gpu, backing, service, irq)
 	}
 }
 
@@ -424,7 +424,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // host-supported resolution renders in full. "FB" hands back the framebuffer
 // (allocated geometry + current size + a MAP|TRANSFER dup of the backing); "FLUSH"
 // presents the current rectangle (backing -> host resource -> display).
-unsafe fn serve(device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, irq: u64) -> ! {
+unsafe fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, irq: u64) -> ! {
 	unsafe {
 		let mut cur_w: u32 = backing.w;
 		let mut cur_h: u32 = backing.h;
@@ -434,7 +434,23 @@ unsafe fn serve(device: &Virtio, gpu: &Gpu, mut backing: Backing, service: u64, 
 			// with no deadline; the poll fallback is a housekeeping wake (WAIT_PERIODIC), so
 			// it never counts as pending progress for the scheduler's boot driver (or the
 			// kernel tests).
-			let ready: i64 = if irq != 0 { wait_any(&[service, irq], 0) } else { wait_any_periodic(&[service], clock() + POLL_TICKS) };
+			// The manager's channel joins the set this loop already waits on. The polled branch
+			// keeps its period: a display that must re-read its size on a timer still has to
+			// answer, so the ping rides the same wait rather than a second one.
+			let ready: i64 = if irq != 0 {
+				match common::wait_or_answer(bootstrap, bind, &[service, irq]) {
+					Some(at) => at as i64,
+					None => exit(),
+				}
+			} else {
+				wait_any_periodic(&[service, bootstrap], clock() + POLL_TICKS)
+			};
+			if irq == 0 && ready == 1 {
+				if !common::answer_ping(bootstrap, bind) {
+					exit();
+				}
+				continue;
+			}
 			if ready != 0 {
 				if irq != 0 {
 					// acknowledge the display event (write the read bits back to events_clear)

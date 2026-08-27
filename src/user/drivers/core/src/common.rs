@@ -381,6 +381,118 @@ pub unsafe fn stand(bootstrap: u64, bind: &Bind) -> ! {
 	}
 }
 
+// The same combined wait for a driver that already waits on SEVERAL handles - an interrupt and a
+// service channel, typically. Answers the index into `handles` that is ready, or None when the
+// manager dropped the channel.
+//
+// A driver calls this instead of `wait_any` and changes nothing else: the manager's channel joins
+// the set it was already waiting on, so the ping is answered by the loop being supervised rather
+// than by a second one that would keep answering after the first had stopped working.
+pub unsafe fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Option<usize> {
+	unsafe {
+		let mut set: [u64; 8] = [0; 8];
+		let count: usize = handles.len().min(set.len() - 1);
+		set[..count].copy_from_slice(&handles[..count]);
+		set[count] = bootstrap;
+		loop {
+			// DRAINED FIRST, for the reason `serve_or_answer` gives: `wait_any` answers with the
+			// first ready index, so a handle that is always ready starves everything after it - and
+			// what comes after it here is the channel a watchdog is asking on.
+			match drain_control(bootstrap, bind) {
+				Control::Continue => {}
+				Control::Ended => return None,
+			}
+			for (at, &handle) in handles[..count].iter().enumerate() {
+				if poll_ready(handle) {
+					return Some(at);
+				}
+			}
+			if wait_any(&set[..count + 1], 0) < 0 {
+				return None;
+			}
+		}
+	}
+}
+
+// WAIT FOR WORK OR FOR A PING, AND ANSWER THE PING HERE.
+//
+// A driver with a service loop of its own cannot stand on `stand`, and a driver parked in
+// `recv_blocking(server)` cannot answer anything - so an IDLE driver would look exactly like a
+// wedged one, which is the distinction this whole mechanism exists to make. This is the combined
+// wait, and it belongs in the driver's own loop: a second loop answering pings would be a driver
+// whose watchdog is petted by something other than the path being supervised.
+//
+// Answers true when `server` has a request to read. False means the manager dropped the channel,
+// which ends the driver the way it always has.
+pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool {
+	unsafe {
+		loop {
+			// THE MANAGER'S CHANNEL IS DRAINED FIRST, EVERY PASS, and that is not a nicety.
+			//
+			// `wait_any` answers with the FIRST ready index, so a server with work always waiting on
+			// it starves everything after it in the set - and a busy driver would never see a ping,
+			// which is precisely the driver a watchdog must not kill. Measured: every virtio-blk in
+			// the machine was declared wedged while serving StorageService as fast as it could.
+			match drain_control(bootstrap, bind) {
+				Control::Continue => {}
+				Control::Ended => return false,
+			}
+			if poll_ready(server) {
+				return true;
+			}
+			// Nothing on either: park until one of them speaks.
+			if wait_any(&[server, bootstrap], 0) < 0 {
+				return false;
+			}
+		}
+	}
+}
+
+// What draining the manager's channel decided.
+enum Control {
+	// Nothing terminal: pings were answered, if any.
+	Continue,
+	// The manager dropped the channel or sent something that ends this driver.
+	Ended,
+}
+
+// Answer every `PING` waiting on `bootstrap` right now, without blocking.
+unsafe fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
+	unsafe {
+		let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+		loop {
+			let (len, _handle) = match try_recv(bootstrap, &mut buf) {
+				Polled::Message { len, handle } => (len, handle),
+				Polled::Empty => return Control::Continue,
+				Polled::Closed => return Control::Ended,
+			};
+			let Ok(header) = proto::Header::decode(&buf[..len]) else { continue };
+			// A frame from a binding that is over is not this binding's: dropped rather than
+			// answered, because answering it would tell the manager a generation it has moved on
+			// from is alive.
+			if header.generation != bind.generation {
+				continue;
+			}
+			match header.opcode {
+				proto::Opcode::Ping => {
+					let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
+					if !pong(bootstrap, bind, sequence) {
+						return Control::Ended;
+					}
+				}
+				_ => return Control::Ended,
+			}
+		}
+	}
+}
+
+// Answer one `PING` that is already waiting on `bootstrap`, for a loop that does its own waiting.
+//
+// False when the manager dropped the channel or sent anything else, which ends the driver.
+pub unsafe fn answer_ping(bootstrap: u64, bind: &Bind) -> bool {
+	unsafe { matches!(drain_control(bootstrap, bind), Control::Continue) }
+}
+
 // "I am here, and this is the number you asked me with."
 pub unsafe fn pong(bootstrap: u64, bind: &Bind, sequence: u32) -> bool {
 	let mut payload = [0u8; proto::SEQUENCE_PAYLOAD_LEN];

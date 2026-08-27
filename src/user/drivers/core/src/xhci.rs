@@ -454,7 +454,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// their text - a report, then the literal `USBBUS`, then `POINTER` - which meant the
 		// manager was parsing strings to decide what a capability was for.
 		common::online(bootstrap, &bind, report.as_bytes(), &[(driver_protocol::provider::BLOCK, blk_client), (driver_protocol::provider::USB_BUS, usbq_client), (driver_protocol::provider::POINTER, ptr_client)]);
-		service_loop(&mut hc, &mut slots, hids, storage, blk_server, usbq_server, irq);
+		service_loop(bootstrap, &bind, &mut hc, &mut slots, hids, storage, blk_server, usbq_server, irq);
 	}
 }
 
@@ -989,13 +989,15 @@ unsafe fn wait_command(hc: &mut Xhci, hids: &mut Hids) -> Option<u32> {
 // unplugged one is torn down. The loop sleeps on the controller's MSI-X
 // interrupt and both channels at once, and the synchronous BOT waits service HID
 // events inline, so typing is never lost behind disk traffic.
-unsafe fn service_loop(hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, irq: u64) -> ! {
+unsafe fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, irq: u64) -> ! {
 	unsafe {
 		post_reports(hc, &mut hids);
 		let mut req: [u8; 16] = [0u8; 16];
 		loop {
-			let waitset: [u64; 3] = [irq, blk_server, usbq];
-			wait_any(&waitset, 0);
+			// The manager's channel joins the three this loop already waits on.
+			if common::wait_or_answer(bootstrap, bind, &[irq, blk_server, usbq]).is_none() {
+				exit();
+			}
 			// the interrupt: drain the event ring (HID reports feed the console and
 			// the pointer sink; a port-status change marks the bus for the reconcile
 			// below), acknowledge, and clear the interrupter's pending flag so the

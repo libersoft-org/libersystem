@@ -108,7 +108,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		macmsg[3..9].copy_from_slice(&mac);
 		macmsg[9..11].copy_from_slice(&(mtu as u16).to_le_bytes());
 		send_blocking(frames, &macmsg, 0);
-		move_frames(&device, irq, frames, &mut rx, &tx, rx_virt, &rx_phys, tx_virt, tx_phys, slot)
+		move_frames(bootstrap, &bind, &device, irq, frames, &mut rx, &tx, rx_virt, &rx_phys, tx_virt, tx_phys, slot)
 	}
 }
 
@@ -134,16 +134,24 @@ unsafe fn transmit_frame(tx: &Queue, tx_virt: u64, tx_phys: u64, slot: u64, fram
 // message: transmit the frame the service handed back. The channel closing
 // (NetworkService gone) leaves us draining the device alone.
 #[allow(clippy::too_many_arguments)]
-unsafe fn move_frames(device: &Virtio, irq: u64, frames: u64, rx: &mut Queue, tx: &Queue, rx_virt: u64, rx_phys: &[u64], tx_virt: u64, tx_phys: u64, slot: u64) -> ! {
+unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq: u64, frames: u64, rx: &mut Queue, tx: &Queue, rx_virt: u64, rx_phys: &[u64], tx_virt: u64, tx_phys: u64, slot: u64) -> ! {
 	unsafe {
 		let mut frame: Vec<u8> = alloc::vec![0u8; (slot - NET_HDR_LEN) as usize];
 		let mut service_open: bool = true;
 		loop {
+			// THE MANAGER'S CHANNEL JOINS THE SET THIS LOOP ALREADY WAITS ON, so the ping is
+			// answered by the path being supervised rather than by a second loop that would keep
+			// answering after this one had stopped working.
 			let ready: i64 = if service_open {
-				wait_any(&[irq, frames], 0)
+				match common::wait_or_answer(bootstrap, bind, &[irq, frames]) {
+					Some(at) => at as i64,
+					None => exit(),
+				}
 			} else {
-				wait(irq, 0);
-				0
+				match common::wait_or_answer(bootstrap, bind, &[irq]) {
+					Some(_) => 0,
+					None => exit(),
+				}
 			};
 			if ready == 0 {
 				while let Some((id, len)) = rx.take_used() {

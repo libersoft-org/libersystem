@@ -100,7 +100,7 @@ struct RawDriver {
 	// reads a deadline of 0 as NO TIMEOUT, so an entry declaring zero would look like the most
 	// responsive driver in the machine, and an entry that may name any deadline it likes is an entry
 	// that can opt out.
-	#[serde(default)]
+	#[serde(default, rename = "heartbeat-deadline")]
 	heartbeat_deadline: Option<u32>,
 }
 

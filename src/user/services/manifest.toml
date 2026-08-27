@@ -1418,6 +1418,7 @@ providers = []
 lifecycle = "boot-critical"
 match = [{ transport = "virtio-pci", virtio-type = 2 }]
 provides = [{ kind = "block", most = 1 }]
+heartbeat-deadline = 100
 
 [[programs]]
 name = "virtio_console"
@@ -1432,6 +1433,7 @@ providers = []
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 3 }]
 provides = [{ kind = "console-bytes", most = 1 }]
+heartbeat-deadline = 100
 
 [[programs]]
 name = "dev_channel"
@@ -1455,6 +1457,7 @@ match = [
 ]
 priority = "quirk"
 provides = [{ kind = "console-bytes", most = 1 }]
+heartbeat-deadline = 100
 
 [[programs]]
 name = "dev_agent"
@@ -1479,6 +1482,7 @@ providers = []
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 16 }]
 provides = [{ kind = "display", most = 1 }]
+heartbeat-deadline = 100
 
 [[programs]]
 name = "virtio_input"
@@ -1493,6 +1497,7 @@ providers = []
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 18 }]
 provides = [{ kind = "input", most = 1 }]
+heartbeat-deadline = 100
 
 [[programs]]
 name = "virtio_net"
@@ -1507,6 +1512,7 @@ providers = []
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 1 }]
 provides = [{ kind = "net", most = 1 }]
+heartbeat-deadline = 100
 
 [[programs]]
 name = "virtio_snd"
@@ -1521,6 +1527,7 @@ providers = []
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 25 }]
 provides = [{ kind = "audio", most = 1 }]
+heartbeat-deadline = 100
 
 [[programs]]
 name = "volume"
@@ -1575,6 +1582,7 @@ provides = [
 	{ kind = "usb-bus", most = 1 },
 	{ kind = "pointer", most = 1 },
 ]
+heartbeat-deadline = 100
 
 [[factory_files]]
 name = "audio-demo"

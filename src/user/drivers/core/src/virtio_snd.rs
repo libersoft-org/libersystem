@@ -300,7 +300,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-snd", &device, b"");
 		common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::AUDIO, far)]);
-		serve(&ctl, &mut tx, &mut rx, irq, stream, capture, service)
+		serve(bootstrap, &bind, &ctl, &mut tx, &mut rx, irq, stream, capture, service)
 	}
 }
 
@@ -313,11 +313,16 @@ unsafe fn config_u32(device: &Virtio, offset: u64) -> u32 {
 // to play, an empty message that ends playback, or a one-byte command. A playback period is
 // received straight into the transmit DMA page; the first period of a session lazily configures and
 // starts the output stream. Exits when the client closes.
-unsafe fn serve(ctl: &Ctl, tx: &mut Tx, rx: &mut Rx, irq: u64, stream: u32, capture: Option<u32>, service: u64) -> ! {
+unsafe fn serve(bootstrap: u64, bind: &common::Bind, ctl: &Ctl, tx: &mut Tx, rx: &mut Rx, irq: u64, stream: u32, capture: Option<u32>, service: u64) -> ! {
 	unsafe {
 		let mut started: bool = false;
 		let mut capturing: bool = false;
 		loop {
+			// The manager's ping is answered by THIS loop. A driver parked waiting for its next
+			// period is idle, not wedged, and only a combined wait can tell the two apart.
+			if !common::serve_or_answer(bootstrap, bind, service) {
+				exit();
+			}
 			// receive straight into the period region of the transmit DMA page.
 			let period: &mut [u8] = core::slice::from_raw_parts_mut(tx.period_virt as *mut u8, PERIOD_BYTES as usize);
 			match recv_blocking(service, period) {

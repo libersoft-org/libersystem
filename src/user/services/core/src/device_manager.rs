@@ -383,6 +383,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// could be reported at the end of a phase and asked about never again. It outlives both
 		// phases now, because it is what the provider-catalogue interface is served from.
 		let mut catalogue = Catalogue::new();
+		// One node per device, for the life of this program - see `launch_boot_drivers`. Both
+		// bring-up phases append to this, and what supervises a driver afterwards reads it.
+		let mut nodes: Vec<Node> = Vec::new();
 		// THE BOOT WIRE'S SHAPE, NOT THIS PROGRAM'S LIMIT, and the difference is the whole of M7.
 		//
 		// These were four named locals - `block_client`, `block2_client`, `block3_client`,
@@ -407,7 +410,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// program has finished starting drivers - and so its death is noticed and answered.
 		#[cfg(feature = "development")]
 		let mut dev: DevAgent = DevAgent::default();
-		launch_boot_drivers(&package, &mut catalogue, power, console_input, device_privilege, &mut buf, &mut boot_blocks);
+		launch_boot_drivers(&package, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut boot_blocks);
 
 		// 3. report in once the disks are bound, transferring the block service channel up
 		//    the boot chain, then the second/third/fourth block disks' service channels (the
@@ -432,19 +435,37 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				dev.supervise(&mut buf);
 				continue;
 			}
-			// A CATALOGUE QUERY IS ANSWERED WITHOUT LEAVING THIS LOOP. The wait covers the
-			// supervisor's channel and the catalogue's together, so a client asking what is
-			// published does not have to wait for a supervisor message and cannot delay one.
-			if catalogue_service != 0 && wait_any(&[bootstrap, catalogue_service], 0) == 1 {
-				serve_catalogue_once(catalogue_service, &catalogue, &mut buf);
+			// THE WATCHDOG RUNS ON EVERY PASS OF THIS LOOP, and the wait comes back for it.
+			//
+			// A driver that stopped answering is torn down through the same machinery a crashed one
+			// is: `advance` reads the event and the transaction rolls back. Anything it leaves
+			// terminal stays terminal - there is no volume to reload a driver from at this point,
+			// so a rebind is P02M0165 M6's subject and not this loop's.
+			let soonest: u64 = tick_heartbeats(&mut nodes);
+			for at in 0..nodes.len() {
+				let name: &[u8] = nodes[at].driver_name();
+				let _ = advance(&mut nodes[at], name, &mut catalogue);
+			}
+			// ONE WAIT, AND ONLY A READY BOOTSTRAP FALLS THROUGH TO THE RECEIVE.
+			//
+			// Anything else goes round: a catalogue query is answered and a DEADLINE means the
+			// watchdog has something to do. Falling through on the deadline was the first version
+			// and it disarmed the whole mechanism - `recv_blocking` parks until the supervisor
+			// speaks, so a driver could go quiet and nothing would look again until something
+			// unrelated happened to arrive.
+			let ready: i64 = if catalogue_service != 0 { wait_any(&[bootstrap, catalogue_service], soonest) } else { wait(bootstrap, soonest) };
+			if ready != 0 {
+				if ready == 1 && catalogue_service != 0 {
+					serve_catalogue_once(catalogue_service, &catalogue, &mut buf);
+				}
 				continue;
 			}
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
 					#[cfg(feature = "development")]
-					launch_volume_drivers(handle, &mut catalogue, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev);
 					#[cfg(not(feature = "development"))]
-					launch_volume_drivers(handle, &mut catalogue, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys);
 					if handle != 0 {
 						close(handle);
 					}
@@ -496,15 +517,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // device's MMIO capability and info. Each disk's block-read service channel is routed up
 // (system / media / iso / udf, in discovery order). The non-bootstrap drivers are skipped
 // here - they load from the volume in phase 2, once it is mounted.
-unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], boot_blocks: &mut [u64; BOOT_BLOCK_TAGS.len()]) {
+unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], boot_blocks: &mut [u64; BOOT_BLOCK_TAGS.len()]) {
 	unsafe {
 		let count: u64 = device_count();
 		// ONE NODE PER BOOT-CRITICAL DEVICE, and they come up TOGETHER. Four disks used to be bound
 		// one after another, each waiting out its own handshake before the next was started; they
 		// are independent devices and there was never a reason for the fourth to wait on the first.
-		let mut nodes: Vec<Node> = Vec::new();
-		let mut names: Vec<&'static [u8]> = Vec::new();
-		let mut infos: Vec<DeviceInfo> = Vec::new();
+		// NODES OUTLIVE BRING-UP. They were locals in each phase, so a device could be supervised
+		// only while the function that bound it was still running - which is until the boot chain
+		// moves on. A node is per-DEVICE and lives for the life of this program, which is what M2 of
+		// the transactional-bind milestone says it is and what a heartbeat needs it to be.
+		let first_node: usize = nodes.len();
 		let mut i: u64 = 0;
 		while i < count {
 			let mut info: DeviceInfo = DeviceInfo::default();
@@ -535,16 +558,15 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, powe
 			// of this code.
 			if gate_on_requirements(&mut node, entry, catalogue) && begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege) {
 				nodes.push(node);
-				names.push(entry.name);
-				infos.push(info);
 			}
 			i += 1;
 		}
 		// THE CENTRAL WAIT, and every disk answers into it. A driver that never reports in costs
 		// its own share of the boot window and nothing else's.
-		while pump(&mut nodes, buf) {
-			for at in 0..nodes.len() {
-				match advance(&mut nodes[at], names[at], catalogue) {
+		while pump(nodes, first_node, buf) {
+			for at in first_node..nodes.len() {
+				let name: &[u8] = nodes[at].driver_name();
+				match advance(&mut nodes[at], name, catalogue) {
 					Step::Waiting => {}
 					Step::Online => {
 						// PUBLISHED, NOT ROUTED. Everything a committed binding offered goes into
@@ -559,7 +581,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, powe
 					Step::Again => {
 						let entry = nodes[at].candidates[nodes[at].candidate];
 						let Some(elf) = package.lookup(entry.artifact) else { continue };
-						let info = infos[at];
+						let info = nodes[at].info;
 						begin_bind(&mut nodes[at], &info, elf, entry.name, 0, power, console_input, device_privilege);
 					}
 					Step::NextCandidate | Step::Done => {}
@@ -600,7 +622,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, powe
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -616,8 +638,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, power: 
 		// This used to be a loop that bound one device at a time, each waiting out its own
 		// handshake. The devices are independent - a sound card has nothing to say about a network
 		// card - and the only thing that made them sequential was where the wait was written.
-		let mut nodes: Vec<Node> = Vec::new();
-		let mut infos: Vec<DeviceInfo> = Vec::new();
+		let first_node: usize = nodes.len();
 		let mut i: u64 = 0;
 		while i < count {
 			let idx: usize = i as usize;
@@ -647,19 +668,17 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, power: 
 			}
 			state[idx] = STATE_FAILED;
 			nodes.push(Node::new(i, &info, candidates));
-			infos.push(info);
 			i += 1;
 		}
 		// Open the first candidate on every node. A device whose first candidate cannot even be
 		// opened falls through to the next one in the loop below, exactly as it did when this was
 		// sequential.
-		for at in 0..nodes.len() {
-			let info = infos[at];
-			start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+		for at in first_node..nodes.len() {
+			start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 		}
-		while pump(&mut nodes, buf) {
-			for at in 0..nodes.len() {
-				let name: &[u8] = nodes[at].candidates[nodes[at].candidate].name;
+		while pump(nodes, first_node, buf) {
+			for at in first_node..nodes.len() {
+				let name: &[u8] = nodes[at].driver_name();
 				match advance(&mut nodes[at], name, catalogue) {
 					Step::Waiting => {}
 					Step::Online => {
@@ -672,8 +691,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, power: 
 					// The same candidate, once more. The window and the attempt budget have already
 					// said there is room for it.
 					Step::Again => {
-						let info = infos[at];
-						start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+						start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 					}
 					// EACH CANDIDATE IN TURN, most specific first, and the next one only after the
 					// last is gone - which the rollback has just guaranteed. Every rejection is
@@ -687,8 +705,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, power: 
 						nodes[at].candidate += 1;
 						nodes[at].attempt = 0;
 						if nodes[at].candidate < nodes[at].candidates.len() {
-							let info = infos[at];
-							start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+							start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 						}
 					}
 					Step::Done => {}
@@ -708,7 +725,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, power: 
 // duration of one syscall - not, as it was, for the whole handshake. That is what makes a dozen
 // devices coming up at once cost one mapping at a time rather than a dozen.
 #[allow(clippy::too_many_arguments)]
-unsafe fn start_candidate(node: &mut Node, storage: u64, info: &DeviceInfo, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &Catalogue, state: &mut [u8]) {
+unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &Catalogue, state: &mut [u8]) {
 	unsafe {
 		loop {
 			if node.candidate >= node.candidates.len() {
@@ -735,7 +752,8 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, info: &DeviceInfo, key_
 				continue;
 			};
 			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
-			let opened: bool = begin_bind(node, info, elf, driver_name, key_producer, power, console_input, device_privilege);
+			let info = node.info;
+			let opened: bool = begin_bind(node, &info, elf, driver_name, key_producer, power, console_input, device_privilege);
 			unmap_object(file);
 			close(file);
 			if opened {
@@ -1549,7 +1567,7 @@ const MAX_NODES_IN_FLIGHT: usize = abi::MAX_WAIT_HANDLES / 2;
 // Wait for one thing to happen anywhere, and queue it on the node it belongs to.
 //
 // Returns false when there is nothing in flight to wait for, which is the loop's exit condition.
-unsafe fn pump(nodes: &mut [Node], buf: &mut [u8]) -> bool {
+unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, buf: &mut [u8]) -> bool {
 	unsafe {
 		// The wait set, and which node each entry belongs to. Rebuilt every pass because what is in
 		// flight changes every pass.
@@ -1560,8 +1578,16 @@ unsafe fn pump(nodes: &mut [Node], buf: &mut [u8]) -> bool {
 		// The earliest deadline anywhere, so the wait ends when the FIRST node runs out rather than
 		// when the last one does.
 		let mut soonest: u64 = 0;
+		// THE WATCHDOG RUNS DURING BRING-UP TOO, over EVERY node and not only the ones this phase is
+		// binding. Phase two takes seconds, and a driver bound in phase one that nothing pinged for
+		// the length of it was declared wedged for being unattended rather than for being wedged -
+		// which is a supervisor reporting its own inattention as a driver fault.
+		let beats: u64 = tick_heartbeats(nodes);
+		if beats != 0 {
+			soonest = beats;
+		}
 		for (at, node) in nodes.iter().enumerate() {
-			if !node.in_flight() || set + 2 > abi::MAX_WAIT_HANDLES {
+			if at < in_flight_from || !node.in_flight() || set + 2 > abi::MAX_WAIT_HANDLES {
 				continue;
 			}
 			let Some(binding) = &node.binding else { continue };
@@ -1591,8 +1617,8 @@ unsafe fn pump(nodes: &mut [Node], buf: &mut [u8]) -> bool {
 			// the rest of the window on a cooperative scheduler.
 			let now: u64 = clock();
 			let mut timed_out: bool = false;
-			for node in nodes.iter_mut() {
-				if !node.in_flight() {
+			for (at, node) in nodes.iter_mut().enumerate() {
+				if at < in_flight_from || !node.in_flight() {
 					continue;
 				}
 				if node.incident.attempt_deadline() > now {
@@ -1607,8 +1633,8 @@ unsafe fn pump(nodes: &mut [Node], buf: &mut [u8]) -> bool {
 			// progress here would spin; the honest answer is to time out everything in flight,
 			// because a manager that cannot wait cannot supervise.
 			if !timed_out {
-				for node in nodes.iter_mut() {
-					if !node.in_flight() {
+				for (at, node) in nodes.iter_mut().enumerate() {
+					if at < in_flight_from || !node.in_flight() {
 						continue;
 					}
 					let generation: u64 = node.id.generation;
@@ -2109,6 +2135,70 @@ unsafe fn serve_catalogue_once(service: u64, catalogue: &Catalogue, buf: &mut [u
 		if let Some(written) = proto::system::provider_catalogue::dispatch(&mut view, &request, &mut request_handles, &mut reply, &mut reply_handles) {
 			send_blocking(service, &reply[..written], 0);
 		}
+	}
+}
+
+// PING WHAT IS DUE, AND DECLARE WEDGED WHAT DID NOT ANSWER.
+//
+// Called from the stand loop's every pass, whether it woke on a channel or on the deadline: an
+// expiry that only fires when nothing else happens is a watchdog a busy machine switches off.
+//
+// Answers the soonest tick any supervised node needs the wait back at, or 0 for "nothing to wake
+// for" - which the wait reads as no timeout, correctly, because there is then nothing to time out.
+unsafe fn tick_heartbeats(nodes: &mut [Node]) -> u64 {
+	unsafe {
+		let now: u64 = clock();
+		let mut soonest: u64 = 0;
+		for node in nodes.iter_mut() {
+			if !node.beat.supervised() || node.record.state != BindingState::Online {
+				continue;
+			}
+			let Some(binding) = &node.binding else { continue };
+			let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
+			if node.beat.awaiting {
+				if now >= node.beat.expires {
+					// NOT ANSWERED INSIDE THE DEADLINE ITS ENTRY DECLARED. Queued as an event so it
+					// runs through the same state machine as a crash - the teardown is the same
+					// transaction and the same counter, and only the reason differs.
+					unsafe {
+						print(b"DeviceManager: WEDGE seq=");
+						let mut n = [0u8; 8];
+						let mut at = 0;
+						let mut v = node.beat.sequence;
+						if v == 0 {
+							n[0] = b'0';
+							at = 1;
+						}
+						while v > 0 && at < 8 {
+							n[at] = b'0' + (v % 10) as u8;
+							v /= 10;
+							at += 1;
+						}
+						print(&n[..at]);
+						print(b"\n");
+					}
+					node.push(BindingEvent::Wedged { generation });
+					node.beat.awaiting = false;
+				}
+			} else if now >= node.beat.due {
+				node.beat.sequence = node.beat.sequence.wrapping_add(1);
+				let mut payload = [0u8; driver_protocol::SEQUENCE_PAYLOAD_LEN];
+				driver_protocol::encode_sequence(node.beat.sequence, &mut payload);
+				if send_frame(channel, driver_protocol::Opcode::Ping, generation, &payload, 0, 0) {
+					node.beat.awaiting = true;
+					node.beat.expires = now.saturating_add(node.beat.deadline as u64);
+				} else {
+					// The channel is gone, which is a driver that ended rather than one that is
+					// slow. The exit event will arrive on its own; this only stops asking.
+					node.beat.due = now.saturating_add(node.beat.deadline as u64);
+				}
+			}
+			let wake = node.beat.wake_at();
+			if wake != 0 && (soonest == 0 || wake < soonest) {
+				soonest = wake;
+			}
+		}
+		soonest
 	}
 }
 

@@ -102,7 +102,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		for i in 0..8u64 {
 			capacity_sectors |= (device.config_read(i) as u64) << (i * 8);
 		}
-		serve_blocks(&queue, blk_server, capacity_sectors, has_flush, size_max)
+		serve_blocks(bootstrap, &bind, &queue, blk_server, capacity_sectors, has_flush, size_max)
 	}
 }
 
@@ -224,7 +224,7 @@ impl Span {
 // negotiated the flush feature and trivially (write-through cache) when it did not;
 // the reply is [status u32]. The data crosses as a shared buffer handle, never
 // copied through the channel.
-unsafe fn serve_blocks(queue: &Queue, blk_server: u64, capacity_sectors: u64, has_flush: bool, size_max: u64) -> ! {
+unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_server: u64, capacity_sectors: u64, has_flush: bool, size_max: u64) -> ! {
 	unsafe {
 		// the fixed control page (header + status) and the growable data span.
 		let dma: i64 = dma_buffer_create_for(queue.capability, 4096);
@@ -241,6 +241,12 @@ unsafe fn serve_blocks(queue: &Queue, blk_server: u64, capacity_sectors: u64, ha
 		let max_sectors: u64 = (size_max / SECTOR as u64).max(1);
 		let mut req: [u8; 16] = [0u8; 16];
 		loop {
+			// THE MANAGER'S PING IS ANSWERED BY THIS LOOP, not by a second one. An idle driver
+			// parked in `recv_blocking` would otherwise look exactly like a wedged one, which is
+			// the distinction the whole mechanism exists to make.
+			if !common::serve_or_answer(bootstrap, bind, blk_server) {
+				exit();
+			}
 			match recv_blocking(blk_server, &mut req) {
 				Received::Message { len, handle } if len >= 16 => {
 					let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
