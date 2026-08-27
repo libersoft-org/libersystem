@@ -235,7 +235,7 @@ or preventing further development of `v1`.
 - [ ] [P02M0159 - Every boot exercises the degraded DMA path and none exercises the isolated one](P02M0159.md)
 - [x] [P02M0160 - One artifact has two required shapes and one name, so the last build wins](P02M0160.md)
 - [x] [P02M0161 - Every driver family invents its own bring-up wire](P02M0161.md)
-- [ ] [P02M0162 - A bind that fails part-way leaves the parts that succeeded](P02M0162.md)
+- [x] [P02M0162 - A bind that fails part-way leaves the parts that succeeded](P02M0162.md)
 - [x] [P02M0163 - Discovery holds two kinds of device and the binding unit is an index into that table](P02M0163.md)
 - [x] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
 - [x] [P02M0165 - A driver that stops answering looks exactly like one that is busy](P02M0165.md)

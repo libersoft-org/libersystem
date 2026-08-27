@@ -667,3 +667,37 @@ fn every_state_and_every_cause_has_exactly_one_name() {
 		names[at] = name;
 	}
 }
+
+#[test]
+fn the_first_incident_is_clamped_by_the_boot_and_a_later_one_is_not() {
+	// THE FIRST really does compete with the boot: the kernel's recovery ladder reboots the machine
+	// when its window runs out, so a bind that outlasts it is a bind nothing will see the end of.
+	let window = 300;
+	let share = 3; // a third of the window for one device's bring-up
+	// Opening at tick 10 with the boot's deadline at 50: the boot's is sooner, so it wins.
+	assert!(IncidentWindow::deadline(window, share, 50, 10) == 50);
+	// Opening at tick 10 with the boot's deadline at 500: this incident's own slice is sooner.
+	assert!(IncidentWindow::deadline(window, share, 500, 10) == 110);
+}
+
+#[test]
+fn a_recovery_long_after_the_boot_is_not_born_already_expired() {
+	// THE DEFECT THIS ARITHMETIC EXISTS TO PREVENT, and it was live until 2026-08-27: the clamp was
+	// unconditional, so an hour after boot every recovery got a deadline in the PAST and every bind
+	// failed instantly for arithmetic about a boot that had finished long ago.
+	let window = 300;
+	let share = 3;
+	let boot_deadline = 400; // long gone
+	let now = 360_000; // an hour later at 100 ticks a second
+	let deadline = IncidentWindow::deadline(window, share, boot_deadline, now);
+	assert!(deadline > now, "a recovery must get time it can actually spend");
+	assert!(deadline == now + 100, "and its full slice, because nothing is competing with it any more");
+}
+
+#[test]
+fn a_boot_that_published_no_window_bounds_nothing_by_it() {
+	// Zero is "not published", and the manager then falls back to its per-attempt deadline - which
+	// is what it did before a window existed, so an old supervisor still starts a new manager.
+	assert!(IncidentWindow::deadline(0, 3, 500, 10) == 0);
+	assert!(IncidentWindow::deadline(300, 0, 500, 10) == 0);
+}

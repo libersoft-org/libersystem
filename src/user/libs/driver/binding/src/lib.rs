@@ -479,3 +479,36 @@ impl ProviderId {
 		Self { binding, slot, generation }
 	}
 }
+
+// ------------------------------------------------------- the incident window
+
+// WHEN ONE BIND-OR-RECOVER ATTEMPT-CHAIN MUST BE OVER.
+//
+// AN INCIDENT, NOT A NODE AND NOT A BOOT. Measuring from a node's first `BIND` ever would mean a
+// driver that ran happily for an hour and then crashed has no budget left to be rebound with; its
+// recovery would be `Failed` on arithmetic about a boot that finished long ago.
+//
+// Here rather than in the manager for the reason the state table is here: the arithmetic below has
+// two clamps and an off-by-one between them decides whether a machine recovers, and that is not
+// something to reason about inside a `no_std` binary nobody can drive.
+pub struct IncidentWindow;
+
+impl IncidentWindow {
+	// The deadline one incident gets, given the boot window's length, the boot's own deadline and
+	// the instant the incident opens.
+	//
+	// `boot_deadline` of 0 means none was published, or the boot's own has already been spent on
+	// the first incident - either way nothing clamps this one.
+	pub fn deadline(window: u64, share: u64, boot_deadline: u64, now: u64) -> u64 {
+		if window == 0 || share == 0 {
+			return 0;
+		}
+		let slice = window / share;
+		let own = now.saturating_add(slice);
+		// THE CLAMP APPLIES ONLY WHILE THERE IS STILL A BOOT TO OUTLAST. An hour after boot, `own`
+		// is far past a boot deadline that expired long ago - and clamping to it would hand the
+		// recovery a deadline ALREADY IN THE PAST, which is a budget spent before the work it
+		// bounds was asked for.
+		if boot_deadline > now && boot_deadline < own { boot_deadline } else { own }
+	}
+}

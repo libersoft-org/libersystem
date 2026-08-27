@@ -128,16 +128,12 @@ impl Incident {
 			if window == 0 {
 				return Incident { deadline: 0, teardown_reserve: 0 };
 			}
-			let slice: u64 = window / BIND_SHARE_OF_WINDOW;
-			let mut deadline: u64 = clock().saturating_add(slice);
-			// THE FIRST INCIDENT MAY NOT OUTLAST THE BOOT. `BOOT_DEADLINE` is zero for every
-			// incident after the first, because ServiceManager hands it over once - so this clamp
-			// applies exactly where it should and nowhere else, with no flag to keep in step.
-			let boot: u64 = BOOT_DEADLINE.load(core::sync::atomic::Ordering::Relaxed);
-			if boot != 0 && boot < deadline {
-				deadline = boot;
-			}
-			Incident { deadline, teardown_reserve: slice / TEARDOWN_SHARE_OF_BIND }
+			// THE ARITHMETIC IS `driver_binding`'s, where it can be DRIVEN. Two clamps and an
+			// off-by-one between them decide whether a machine recovers, and that is not something
+			// to reason about inside a binary nobody can run on a host - which is how the clamp
+			// came to be unconditional and every recovery an hour after boot born already expired.
+			let deadline: u64 = driver_binding::IncidentWindow::deadline(window, BIND_SHARE_OF_WINDOW, BOOT_DEADLINE.load(core::sync::atomic::Ordering::Relaxed), clock());
+			Incident { deadline, teardown_reserve: (window / BIND_SHARE_OF_WINDOW) / TEARDOWN_SHARE_OF_BIND }
 		}
 	}
 
