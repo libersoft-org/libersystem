@@ -386,6 +386,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// One node per device, for the life of this program - see `launch_boot_drivers`. Both
 		// bring-up phases append to this, and what supervises a driver afterwards reads it.
 		let mut nodes: Vec<Node> = Vec::new();
+		// The connections minted from the catalogue's root. Bounded: a server that mints a channel
+		// per request without a bound is a server a client can exhaust.
+		let mut catalogue_clients = CatalogueClients::new();
 		// THE BOOT WIRE'S SHAPE, NOT THIS PROGRAM'S LIMIT, and the difference is the whole of M7.
 		//
 		// These were four named locals - `block_client`, `block2_client`, `block3_client`,
@@ -453,10 +456,26 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// and it disarmed the whole mechanism - `recv_blocking` parks until the supervisor
 			// speaks, so a driver could go quiet and nothing would look again until something
 			// unrelated happened to arrive.
-			let ready: i64 = if catalogue_service != 0 { wait_any(&[bootstrap, catalogue_service], soonest) } else { wait(bootstrap, soonest) };
+			// The wait set: the supervisor's channel, the catalogue's root, and every connection
+			// minted from it. One wait, so a catalogue query cannot delay a supervisor message and
+			// a supervisor message cannot delay a query.
+			let mut waiting: [u64; MAX_CATALOGUE_CLIENTS + 2] = [0; MAX_CATALOGUE_CLIENTS + 2];
+			let mut waiting_count: usize = 1;
+			waiting[0] = bootstrap;
+			if catalogue_service != 0 {
+				waiting[waiting_count] = catalogue_service;
+				waiting_count += 1;
+			}
+			for &client in catalogue_clients.live() {
+				waiting[waiting_count] = client;
+				waiting_count += 1;
+			}
+			let ready: i64 = wait_any(&waiting[..waiting_count], soonest);
 			if ready != 0 {
-				if ready == 1 && catalogue_service != 0 {
-					serve_catalogue_once(catalogue_service, &catalogue, &mut buf);
+				if ready > 0 {
+					let at: usize = ready as usize;
+					let is_root: bool = catalogue_service != 0 && at == 1;
+					serve_catalogue_once(waiting[at], is_root, &mut catalogue_clients, &catalogue, &nodes, &mut buf);
 				}
 				continue;
 			}
@@ -1080,6 +1099,11 @@ struct Node {
 	// after the process is gone cannot ask the process anything.
 	last_opcode: u16,
 	last_frame_at: u64,
+	// WHICH of the chosen entry's rules matched this device. See `BindingRecord.rule`.
+	matched_rule: u32,
+	// How many resources the current bind granted: the MMIO window, an interrupt where the entry
+	// takes one, and whatever else it asked for.
+	granted_resources: u32,
 	// Why this node was asked to stop, if it was. `Fault` for everything that was not asked.
 	stop_intent: driver_binding::StopIntent,
 	// What the last teardown found, if there has been one. Rendered by P02M0166; kept here because
@@ -1154,7 +1178,7 @@ impl Heartbeat {
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default(), stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None }
 	}
 
 	// Queue one event for this node.
@@ -1507,6 +1531,11 @@ impl Catalogue {
 	// about: two controllers of one kind each publishing one is not one controller publishing two.
 	fn count_for(&self, binding: BindingId, kind: u16) -> usize {
 		self.entries.iter().filter(|entry| entry.as_ref().is_some_and(|provider| provider.binding_is(binding) && provider.kind == kind)).count()
+	}
+
+	// How many providers this binding has published, of any kind.
+	fn count_for_binding(&self, binding: BindingId) -> usize {
+		self.entries.iter().filter(|entry| entry.as_ref().is_some_and(|provider| provider.binding_is(binding))).count()
 	}
 
 	// How many providers of `kind` are published. The answer a subscriber wants, and the one the
@@ -1963,7 +1992,8 @@ fn cause_name(cause: FailureCause) -> &'static [u8] {
 		FailureCause::IommuRequired => b"its DMA policy demands translation on a machine that is not enforcing it",
 		FailureCause::ResourceExhausted => b"a quota or an allocation refused",
 		FailureCause::SpawnFailed => b"the process could not be started",
-		FailureCause::HandshakeTimeout => b"it did not answer inside the window",
+		FailureCause::HandshakeTimeout => b"it never answered its bind at all",
+		FailureCause::Hung => b"it came up and then stopped answering its control path",
 		FailureCause::DriverExited => b"it exited without saying anything",
 		FailureCause::DriverReported(code) => code.name(),
 		FailureCause::TeardownUnconfirmed => b"the release did not confirm, so the device may still be live",
@@ -2189,6 +2219,11 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 				resource_count += 1;
 			}
 		}
+		node.granted_resources = resource_count as u32;
+		// WHICH RULE CHOSE THIS DRIVER, recorded where the choice is still in hand. An entry may
+		// declare several and "virtio_console bound it" does not say which applied - the pinned
+		// development console and the ordinary one are the same artifact under two rules.
+		node.matched_rule = node.candidates.get(node.candidate).and_then(|entry| entry.rules.iter().position(|rule| rule.matches(info))).unwrap_or(0) as u32;
 		// `BIND` - the device, and the count of what follows. No capability travels with it.
 		let mut payload = [0u8; driver_protocol::MAX_PAYLOAD];
 		let payload_len = driver_protocol::encode_bind(info, resource_count as u16, &mut payload);
@@ -2282,7 +2317,10 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					print(b"DeviceManager: ");
 					print(driver_name);
 					print(b" stopped answering its control path inside the deadline its registry entry declares\n");
-					FailureCause::HandshakeTimeout
+					// `hung`, NOT `handshake-timeout`. A driver that came up and then went quiet is
+					// a different fact from one that never answered at all, and a reader cannot act
+					// on "it did not answer" without knowing which.
+					FailureCause::Hung
 				}
 				BindingEvent::Withdrawn { token, .. } => {
 					let withdrawn = catalogue.withdraw(node.id, token);
@@ -2396,12 +2434,74 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 // would have a window between them: a provider added after the read and before the registration
 // would be in neither, which is the same race as a service started later seeing nothing. The
 // generated stream opens FROM the snapshot, so there is no second step to lose anything in.
-struct CatalogueView<'a>(&'a Catalogue);
+struct CatalogueView<'a> {
+	catalogue: &'a Catalogue,
+	nodes: &'a [Node],
+}
 
 impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
+	// EVERY DEVICE NODE'S BINDING, IN ONE READ, so `lsdev` and the System Graph render the same
+	// enums rather than each deriving a state. The graph's unconditional `Running` was not a bug in
+	// the graph so much as the absence of anything else to say.
+	fn bindings(&mut self) -> Vec<proto::system::BindingRecord> {
+		self.nodes
+			.iter()
+			.map(|node| proto::system::BindingRecord {
+				bus: node.id.bus as u32,
+				dev: node.id.dev as u32,
+				func: node.id.func as u32,
+				generation: node.id.generation,
+				state: binding_state_wire(node.record.state),
+				cause: failure_cause_wire(node.record.failure),
+				attempts: node.record.attempts,
+				// The driver chosen for it, or empty where nothing matched - which is a fact about
+				// the machine and not an absence.
+				artifact: alloc::string::String::from_utf8_lossy(node.driver_name()).into_owned(),
+				rule: node.matched_rule,
+				providers: self.catalogue.count_for_binding(node.id) as u32,
+				resources: node.granted_resources,
+			})
+			.collect()
+	}
+
 	fn subscribe(&mut self, kind: proto::system::ProviderKind) -> Vec<proto::system::ProviderInfo> {
 		let wire: u16 = provider_kind_wire(kind);
-		self.0.entries.iter().filter_map(|entry| entry.as_ref()).filter(|provider| provider.kind == wire).map(|provider| proto::system::ProviderInfo { kind, bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation }).collect()
+		self.catalogue.entries.iter().filter_map(|entry| entry.as_ref()).filter(|provider| provider.kind == wire).map(|provider| proto::system::ProviderInfo { kind, bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation }).collect()
+	}
+}
+
+// The typed state a binding state is. One mapping, in the one place the two vocabularies meet, so a
+// divergence is a compile error rather than a surface quietly reporting the wrong thing.
+fn binding_state_wire(state: BindingState) -> proto::system::BindingState {
+	match state {
+		BindingState::Unbound => proto::system::BindingState::Unbound,
+		BindingState::DependencyPending => proto::system::BindingState::DependencyPending,
+		BindingState::Binding => proto::system::BindingState::Binding,
+		BindingState::Online => proto::system::BindingState::Online,
+		BindingState::Stopping => proto::system::BindingState::Stopping,
+		BindingState::Backoff => proto::system::BindingState::Backoff,
+		BindingState::Failed => proto::system::BindingState::Failed,
+		BindingState::Quarantined => proto::system::BindingState::Quarantined,
+		BindingState::Disabled => proto::system::BindingState::Disabled,
+	}
+}
+
+// The same for the cause. `None` is what a binding that has not failed says - an absent field would
+// be one every reader has to guess about.
+fn failure_cause_wire(cause: Option<FailureCause>) -> proto::system::FailureCause {
+	match cause {
+		None => proto::system::FailureCause::None,
+		Some(FailureCause::DriverMissing) => proto::system::FailureCause::DriverMissing,
+		Some(FailureCause::ProtocolMismatch) => proto::system::FailureCause::ProtocolMismatch,
+		Some(FailureCause::ClaimRefused) => proto::system::FailureCause::ClaimRefused,
+		Some(FailureCause::IommuRequired) => proto::system::FailureCause::IommuRequired,
+		Some(FailureCause::ResourceExhausted) => proto::system::FailureCause::ResourceExhausted,
+		Some(FailureCause::SpawnFailed) => proto::system::FailureCause::SpawnFailed,
+		Some(FailureCause::HandshakeTimeout) => proto::system::FailureCause::HandshakeTimeout,
+		Some(FailureCause::DriverExited) => proto::system::FailureCause::DriverExited,
+		Some(FailureCause::DriverReported(_)) => proto::system::FailureCause::DriverReportedFailure,
+		Some(FailureCause::TeardownUnconfirmed) => proto::system::FailureCause::TeardownUnconfirmed,
+		Some(FailureCause::Hung) => proto::system::FailureCause::Hung,
 	}
 }
 
@@ -2423,20 +2523,83 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 
 // Answer one catalogue request. Non-blocking by construction: the caller only reaches this when the
 // channel is ready, and one request is one reply.
-unsafe fn serve_catalogue_once(service: u64, catalogue: &Catalogue, buf: &mut [u8]) {
+// How many clients may hold a connection to the catalogue at once.
+//
+// A BOUND, because a server that mints a channel per request without one is a server a client can
+// exhaust. `lsdev` and the System Graph are two; the rest is headroom.
+const MAX_CATALOGUE_CLIENTS: usize = 8;
+
+// The client connections minted from the catalogue's root, and the root itself at index 0.
+struct CatalogueClients {
+	channels: [u64; MAX_CATALOGUE_CLIENTS],
+	count: usize,
+}
+
+impl CatalogueClients {
+	const fn new() -> Self {
+		Self { channels: [0; MAX_CATALOGUE_CLIENTS], count: 0 }
+	}
+
+	fn live(&self) -> &[u64] {
+		&self.channels[..self.count]
+	}
+}
+
+// Answer one catalogue request on `channel`.
+//
+// THE ROOT MINTS CONNECTIONS AND THE CONNECTIONS CARRY REQUESTS, which is the shape every other
+// multi-client server in this tree has. It was a single typed dispatch, and `service_connect` -
+// which is how every consumer reaches a service here - sends the reserved CONNECT opcode and waits:
+// so the first thing that ever asked for the catalogue hung the boot, because nothing answered it.
+unsafe fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut CatalogueClients, catalogue: &Catalogue, nodes: &[Node], buf: &mut [u8]) -> bool {
 	unsafe {
-		let ReceivedCaps::Message { len, handles } = recv_caps_blocking(service, buf) else { return };
+		let ReceivedCaps::Message { len, handles } = recv_caps_blocking(channel, buf) else { return false };
 		for &handle in handles.as_slice() {
 			close(handle);
 		}
-		let mut view = CatalogueView(catalogue);
-		let mut reply = [0u8; 1024];
+		if len >= 2 {
+			let op: u16 = u16::from_le_bytes([buf[0], buf[1]]);
+			if op == HEARTBEAT_OP {
+				send_blocking(channel, b"PONG", 0);
+				return true;
+			}
+			if op == CONNECT_OP && is_root {
+				print(b"DeviceManager: minting a catalogue connection\n");
+				match channel_pair_for_catalogue(clients) {
+					Some(theirs) => {
+						send_blocking(channel, &[], theirs);
+					}
+					None => {
+						send_blocking(channel, &[], 0);
+					}
+				}
+				return true;
+			}
+		}
+		let mut view = CatalogueView { catalogue, nodes };
+		let mut reply = [0u8; 4096];
 		let mut request_handles = wire::Handles::new();
 		let mut reply_handles = wire::Handles::new();
 		let request: Vec<u8> = buf[..len].to_vec();
 		if let Some(written) = proto::system::provider_catalogue::dispatch(&mut view, &request, &mut request_handles, &mut reply, &mut reply_handles) {
-			send_blocking(service, &reply[..written], 0);
+			send_blocking(channel, &reply[..written], 0);
 		}
+		true
+	}
+}
+
+// Mint one client connection, keeping the server end. None once the bound is reached, which the
+// caller answers with a zero handle rather than by growing.
+unsafe fn channel_pair_for_catalogue(clients: &mut CatalogueClients) -> Option<u64> {
+	unsafe {
+		if clients.count >= MAX_CATALOGUE_CLIENTS {
+			print(b"DeviceManager: the provider catalogue has as many clients as it will hold; refusing another\n");
+			return None;
+		}
+		let (mine, theirs) = channel()?;
+		clients.channels[clients.count] = mine;
+		clients.count += 1;
+		Some(theirs)
 	}
 }
 

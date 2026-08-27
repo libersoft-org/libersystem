@@ -616,6 +616,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Absent && deps_satisfied(MANIFEST[i].deps, &state) {
+				unsafe {
+					print(b"SM: start ");
+					print(MANIFEST[i].name);
+					print(b"\n");
+				}
 				let mut proc_handle: u64 = 0;
 				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
@@ -848,7 +853,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//     system volume, which stopping DeviceManager makes unavailable. The broker
 	//     stands for the life of the system (the supervise loop serves resolves and
 	//     restarts config on a runtime crash the same way).
-	let mut broker: Broker = Broker { config: config_client, device: device_client, graph: graph_client, process: broker_process, storage_admin: broker_storage_admin, lifecycle };
+	let mut broker: Broker = Broker { config: config_client, device: device_client, device_manager: kept.end_of(b"device_manager", b"SERVE"), graph: graph_client, process: broker_process, storage_admin: broker_storage_admin, lifecycle };
 	if selftest && canary_ctrl != 0 {
 		if let Some(cfg) = index_of(b"config_service") {
 			if state[cfg] == State::Ready && procs[cfg] != 0 {
@@ -1127,6 +1132,9 @@ unsafe fn drain_closed(channel: u64, buf: &mut [u8]) {
 struct Broker {
 	config: u64,
 	device: u64,
+	// DeviceManager's provider-catalogue client, held so a restarted SystemGraphService gets the
+	// binding snapshot again rather than falling back to reporting a constant.
+	device_manager: u64,
 	graph: u64,
 	process: u64,
 	storage_admin: u64,
@@ -1361,7 +1369,11 @@ unsafe fn relaunch_service(broker: &mut Broker, idx: usize, state: &mut [State; 
 				close(*stats_server);
 				*stats_server = 0;
 			}
-			bootstrap_system_graph_service(manager_side, procs, state, device, root, stats_server)
+			// A RESTARTED GRAPH GETS THE SAME TWO CONNECTIONS. `broker.device_manager` is the
+			// supervisor's own catalogue client; without it a graph that came back after a restart
+			// would report every device `running` again, which is the defect this milestone is
+			// about arriving through the back door.
+			bootstrap_system_graph_service(manager_side, procs, state, device, broker.device_manager, root, stats_server)
 		} else {
 			bootstrap_serve(manager_side, root)
 		};

@@ -17,16 +17,30 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use ipc_client::ChannelTransport;
 use proto::system::device::{self, Service};
-use proto::system::{DeviceEntry, DeviceType, Error};
+use proto::system::{BindingRecord, DeviceEntry, DeviceType, Error, provider_catalogue};
 use rt::*;
 
 include!(concat!(env!("OUT_DIR"), "/roles_device_service.rs"));
 
-// The kernel device table, behind the generated Device contract.
-struct Devices;
+// The kernel device table, behind the generated Device contract - plus the binding snapshot, which
+// this service does not hold and does not derive: it FORWARDS it, verbatim, from the one process
+// that does. A second rendering is how one surface comes to report a constant where a state belongs.
+struct Devices {
+	bindings: u64,
+}
 
 impl Service for Devices {
+	fn bindings(&mut self) -> Result<Vec<BindingRecord>, Error> {
+		if self.bindings == 0 {
+			// A boot that granted no catalogue connection has nothing to forward, and saying so is
+			// better than an empty list a caller would read as "no devices are bound".
+			return Err(Error::Closed);
+		}
+		provider_catalogue::Client::new(ChannelTransport { chan: self.bindings }).bindings().ok_or(Error::Closed)
+	}
+
 	fn list(&mut self) -> Result<Vec<DeviceEntry>, Error> {
 		let mut out: Vec<DeviceEntry> = Vec::new();
 		let count: u64 = unsafe { device_count() };
@@ -86,9 +100,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		unsafe { fail_bootstrap(bootstrap, error.tag(), error.reason()) };
 	}
 	let service: u64 = roles[0];
+	// The catalogue connection, if the plan handed one over. Its position in `BOOTSTRAP_ROLES` is
+	// generated from the manifest, so this reads by name rather than by a number written twice.
+	let bindings: u64 = if roles.len() > 1 { roles[1] } else { 0 };
 
 	// 3. serve generated list/get requests until the client side closes.
-	let mut devices: Devices = Devices;
+	let mut devices: Devices = Devices { bindings };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {

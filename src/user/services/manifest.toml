@@ -555,7 +555,7 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/device_service.lsexe"
-providers = ["device-proto", "wire", "lsrt"]
+providers = ["device-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
 name = "display_service"
@@ -1915,7 +1915,16 @@ program = "device_service"
 restart = "transparent"
 state_class = "reconstructible"
 state_scope = "service"
-dependencies = ["log_service", "process_service"]
+dependencies = ["log_service", "process_service", "device_manager"]
+
+# The binding snapshot, forwarded verbatim from the one process that holds it. Not derived here: a
+# second rendering is how one surface comes to report a constant where a state belongs.
+[[services.roles]]
+tag = "BINDINGS"
+kind = "factory"
+provider = "device_manager"
+source = "SERVE"
+interface = "liber:device@1/provider-catalogue"
 
 [[services.roles]]
 tag = "SERVE"
@@ -2617,6 +2626,15 @@ tag = "DEVICE"
 kind = "client"
 provider = "device_service"
 interface = "liber:device@1/device"
+
+# The binding snapshot, from the one process that holds it. The graph used to report every device
+# node as `running` unconditionally, because it had nothing else to say - this is the something.
+[[services.roles]]
+tag = "BINDINGS"
+kind = "factory"
+provider = "device_manager"
+source = "SERVE"
+interface = "liber:device@1/provider-catalogue"
 
 [[services.roles]]
 tag = "SUPERVISOR"

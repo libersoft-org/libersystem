@@ -17,10 +17,10 @@ use driver_protocol::DriverFailureCode;
 // THERE IS NO `Removed`. Nothing rescans, so no removal event exists to enter it, and a state
 // nothing can produce is a state every reader has to reason about for nothing.
 //
-// ONE MORE IS STILL TO COME, added by the milestone that first PRODUCES it: `Disabled`, where an
-// operator first has a way to set it. `DependencyPending` arrived when a declared requirement first
-// had something to wait for. They belong to this enum wherever they are added - one enum, in one
-// file.
+// BOTH OF THE LATER TWO HAVE ARRIVED, each with the milestone that first PRODUCED it:
+// `DependencyPending` when a declared requirement first had something to wait for, and `Disabled`
+// when an operator first had a way to set it. One enum, in one file, which is what stopped five
+// milestones each inventing their own numbers and strings for the same thing.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BindingState {
 	// Where a node starts, and what invites a bind. A FAILED bind must never land here: it would be
@@ -34,6 +34,10 @@ pub enum BindingState {
 	// waiting HARDER, not waiting less - and `Unbound` invites an immediate bind that would fail for
 	// the reason the node is already recording.
 	DependencyPending,
+	// An operator turned it off. NOT `Unbound`, which is where a node STARTS and what invites a
+	// rebind - a disabled device that read as unbound would be bound again by the next thing that
+	// looked at it, which is the opposite of what was asked for.
+	Disabled,
 	// The transaction is open: a driver has been selected and resources are being assembled.
 	Binding,
 	// The driver said `READY` with the current generation.
@@ -57,6 +61,7 @@ impl BindingState {
 		match self {
 			BindingState::Unbound => b"unbound",
 			BindingState::DependencyPending => b"waiting for a dependency",
+			BindingState::Disabled => b"disabled by an operator",
 			BindingState::Binding => b"binding",
 			BindingState::Online => b"online",
 			BindingState::Stopping => b"stopping",
@@ -108,6 +113,18 @@ impl BindingState {
 				| (BindingState::Backoff, BindingState::DependencyPending)
 				| (BindingState::Stopping, BindingState::DependencyPending)
 				| (BindingState::Failed, BindingState::DependencyPending)
+				// P02M0166's. A disable on a binding that is RUNNING goes through the teardown like
+				// any other stop, carrying the stop intent so it does not rebind; one on a binding
+				// that is not running has nothing to tear down and lands directly.
+				| (BindingState::Binding, BindingState::Disabled)
+				| (BindingState::Stopping, BindingState::Disabled)
+				| (BindingState::Unbound, BindingState::Disabled)
+				| (BindingState::Backoff, BindingState::Disabled)
+				| (BindingState::Failed, BindingState::Disabled)
+				| (BindingState::DependencyPending, BindingState::Disabled)
+				// And back. `enable` is the only way out, and it goes to `Unbound` because that is
+				// what invites the bind an enable is asking for.
+				| (BindingState::Disabled, BindingState::Unbound)
 		)
 	}
 }
@@ -142,10 +159,7 @@ impl StopIntent {
 		match self {
 			StopIntent::Fault => Some(if attempts_left { BindingState::Backoff } else { BindingState::Failed }),
 			StopIntent::DependencyLost => Some(BindingState::DependencyPending),
-			// P02M0166 adds `Disabled` and this arm with it; until then an operator disable lands
-			// where a spent budget does, which is terminal and honest rather than a state that does
-			// not exist yet.
-			StopIntent::OperatorDisable => Some(BindingState::Failed),
+			StopIntent::OperatorDisable => Some(BindingState::Disabled),
 			StopIntent::Shutdown => None,
 		}
 	}
@@ -189,6 +203,13 @@ pub enum FailureCause {
 	HandshakeTimeout,
 	// It exited without saying anything.
 	DriverExited,
+	// It came up and then stopped answering its control path. RETRYABLE: nothing about a driver
+	// going quiet says the device is unusable.
+	//
+	// A DIFFERENT CAUSE FROM `handshake-timeout`, which is a driver that never answered AT ALL. The
+	// two were one cause until this milestone had to render them, and a reader cannot act on "it did
+	// not answer" without knowing whether it had ever been up.
+	Hung,
 	// It said `FAILED`, and this is what it said.
 	DriverReported(DriverFailureCode),
 	// The release did not confirm. NOT IN EITHER COLUMN: it never reaches the question, because it
@@ -199,7 +220,7 @@ pub enum FailureCause {
 impl FailureCause {
 	pub fn retryable(self) -> bool {
 		match self {
-			FailureCause::HandshakeTimeout | FailureCause::DriverExited | FailureCause::SpawnFailed => true,
+			FailureCause::HandshakeTimeout | FailureCause::DriverExited | FailureCause::SpawnFailed | FailureCause::Hung => true,
 			FailureCause::DriverReported(code) => code.retryable(),
 			FailureCause::DriverMissing | FailureCause::ProtocolMismatch | FailureCause::ClaimRefused | FailureCause::IommuRequired | FailureCause::ResourceExhausted => false,
 			// Asked and answered `false` so the match is total, but the state machine never gets
@@ -218,7 +239,8 @@ impl FailureCause {
 			FailureCause::SpawnFailed => b"spawn-failed",
 			FailureCause::HandshakeTimeout => b"handshake-timeout",
 			FailureCause::DriverExited => b"driver-exited",
-			FailureCause::DriverReported(_) => b"driver-reported",
+			FailureCause::DriverReported(_) => b"driver-reported-failure",
+			FailureCause::Hung => b"hung",
 			FailureCause::TeardownUnconfirmed => b"teardown-unconfirmed",
 		}
 	}

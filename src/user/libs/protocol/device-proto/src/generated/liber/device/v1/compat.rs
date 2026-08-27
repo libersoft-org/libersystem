@@ -18,6 +18,30 @@ fn device_entry_wire_is_stable() {
 	assert_eq!(DeviceEntry::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn binding_state_wire_is_stable() {
+	let sample = BindingState::Unbound;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(BindingState::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn failure_cause_wire_is_stable() {
+	let sample = FailureCause::None;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(FailureCause::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn binding_record_wire_is_stable() {
+	let sample = BindingRecord { bus: 7, dev: 7, func: 7, generation: 7, state: BindingState::Unbound, cause: FailureCause::None, attempts: 7, artifact: String::from("x"), rule: 7, providers: 7, resources: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(BindingRecord::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn provider_kind_wire_is_stable() {
 	let sample = ProviderKind::Block;
 	let bytes = sample.encode_vec().expect("encode");

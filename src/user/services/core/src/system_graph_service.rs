@@ -29,7 +29,7 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::{ChannelTransport, SvcTransport};
-use proto::system::{Component, ComponentState, ComponentType, Counters, DeviceEntry, DeviceType, Error, Graph, TraceSpan, device, supervisor, system_graph};
+use proto::system::{BindingRecord, BindingState, Component, ComponentState, ComponentType, Counters, DeviceEntry, DeviceType, Error, FailureCause, Graph, TraceSpan, device, provider_catalogue, supervisor, system_graph};
 use rt::*;
 
 // One component node the supervisor registered: its name and dependency edges (the
@@ -49,7 +49,53 @@ struct Node {
 struct GraphService {
 	nodes: Vec<Node>,
 	device: Option<SvcTransport>,
+	// DeviceManager's binding snapshot. THE ONE SOURCE for what a device node's state is: the graph
+	// used to write `ComponentState::Running` for every device unconditionally, which is the surface
+	// that looks most like a status display being the one showing none.
+	bindings: u64,
 	supervisor_client: u64,
+}
+
+// A binding state as the graph's component state. The two vocabularies meet HERE and nowhere else,
+// so a state added to one and forgotten in the other is a compile error.
+//
+// `Binding` and `Stopping` are both `Starting`: a node in transition is neither up nor down, and
+// calling either of them running or failed would be the same kind of lie the constant was.
+fn component_state(state: BindingState) -> ComponentState {
+	match state {
+		BindingState::Online => ComponentState::Running,
+		// A node in transition is neither up nor down, and calling either of them running or failed
+		// would be the same kind of lie the constant was. `Restarting` is what this surface has for
+		// it, and a backoff is exactly that.
+		BindingState::Binding | BindingState::Stopping | BindingState::Backoff => ComponentState::Restarting,
+		BindingState::Failed | BindingState::Quarantined => ComponentState::Failed,
+		// WAITING, NOT BROKEN. A device nothing binds and one waiting for a declared provider are
+		// facts about the machine - a machine without a NIC is a machine, not a broken image - so
+		// they read as `Pending` rather than `Failed`.
+		BindingState::Unbound | BindingState::DependencyPending => ComponentState::Pending,
+		// And one an operator turned off is STOPPED, which is what was asked for.
+		BindingState::Disabled => ComponentState::Stopped,
+	}
+}
+
+// The cause's name, for the node's `last_failure`. Empty for a binding that has not failed - a
+// binding waiting for a provider has not failed, and rendering it as one would report a machine
+// without a NIC as a broken image.
+fn cause_text(cause: FailureCause) -> &'static [u8] {
+	match cause {
+		FailureCause::None => b"",
+		FailureCause::DriverMissing => b"driver-missing",
+		FailureCause::ProtocolMismatch => b"protocol-mismatch",
+		FailureCause::ClaimRefused => b"claim-refused",
+		FailureCause::IommuRequired => b"iommu-required",
+		FailureCause::ResourceExhausted => b"resource-exhausted",
+		FailureCause::SpawnFailed => b"spawn-failed",
+		FailureCause::HandshakeTimeout => b"handshake-timeout",
+		FailureCause::DriverExited => b"driver-exited",
+		FailureCause::DriverReportedFailure => b"driver-reported-failure",
+		FailureCause::TeardownUnconfirmed => b"teardown-unconfirmed",
+		FailureCause::Hung => b"hung",
+	}
 }
 
 impl system_graph::Service for GraphService {
@@ -80,8 +126,22 @@ impl system_graph::Service for GraphService {
 			_ => Vec::new(),
 		};
 		spans.push(TraceSpan { name: String::from("device.list"), duration_ns: unsafe { clock_ns() }.wrapping_sub(list_start) });
-		for d in &devices {
-			components.push(Component { name: device_name(d), r#type: ComponentType::Device, state: ComponentState::Running, deps: alloc::vec![String::from("device_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts: 0, watchdog_trips: 0, last_failure: String::new() } });
+		// THE BINDINGS, from the one process that holds them. Asked once and matched to the device
+		// nodes by index, so the graph renders what DeviceManager decided rather than a constant.
+		let bindings: Vec<BindingRecord> = if self.bindings != 0 { provider_catalogue::Client::new(ChannelTransport { chan: self.bindings }).bindings().unwrap_or_default() } else { Vec::new() };
+		for (at, d) in devices.iter().enumerate() {
+			// A DEVICE WITH NO BINDING RECORD IS `Unknown`, NOT `Running`. That is the honest answer
+			// for a node DeviceManager has not spoken about, and it is the whole difference from
+			// what this line used to say.
+			let (state, failure) = match bindings.get(at) {
+				Some(record) => (component_state(record.state), String::from_utf8_lossy(cause_text(record.cause)).into_owned()),
+				// A DEVICE DEVICEMANAGER HAS NOT SPOKEN ABOUT IS `Pending`, NOT `Running`. That is
+				// the honest answer for a node with no record, and it is the whole difference from
+				// what this line used to say.
+				None => (ComponentState::Pending, String::new()),
+			};
+			let restarts: u32 = bindings.get(at).map_or(0, |record| record.attempts);
+			components.push(Component { name: device_name(d), r#type: ComponentType::Device, state, deps: alloc::vec![String::from("device_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts, watchdog_trips: 0, last_failure: failure } });
 		}
 
 		// Supervisor history: query the ServiceManager supervisor and fold each managed
@@ -148,6 +208,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    our clients reach us on ("SERVE"), which ends the bootstrap. Each NODE carries a
 	//    component's name + dependency edges as its payload and a read-only handle to its
 	//    Process as the transferred handle.
+	// The binding snapshot's client, or 0 on a boot that granted none - in which case the device
+	// nodes carry no state rather than an invented one.
+	let mut bindings_client: u64 = 0;
 	let service: u64 = loop {
 		match unsafe { recv_blocking(bootstrap, &mut buf) } {
 			Received::Message { len, handle } => {
@@ -155,6 +218,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					nodes.push(parse_node(&buf[4..len], handle));
 				} else if len >= 10 && &buf[..10] == b"SUPERVISOR" {
 					supervisor_client = handle;
+				} else if len >= 8 && &buf[..8] == b"BINDINGS" {
+					bindings_client = handle;
 				} else if len >= 6 && &buf[..6] == b"DEVICE" {
 					device_client = handle;
 				} else if len >= 5 && &buf[..5] == b"SERVE" {
@@ -177,7 +242,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    name requires: the supervisor mints a fresh connection per client from this root, so a
 	//    client that lost its channel when this process was replaced can ask for another. A
 	//    service served on one channel can be restarted, but nobody can reconnect to it.
-	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, supervisor_client };
+	let mut graph: GraphService = GraphService { nodes, device: if device_client != 0 { Some(SvcTransport::new(bootstrap, CAP_DEVICE, device_client)) } else { None }, bindings: bindings_client, supervisor_client };
 	let mut request: [u8; 256] = [0u8; 256];
 	let mut reply: [u8; 4096] = [0u8; 4096];
 	unsafe {

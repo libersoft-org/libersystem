@@ -4,13 +4,15 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use base_proto::generated::liber::base::v1::Error;
-use device_proto::generated::liber::device::v1::{DeviceEntry, UsbDevice};
+use device_proto::generated::liber::device::v1::{BindingRecord, DeviceEntry, UsbDevice};
 
 unsafe extern "Rust" {
 	#[link_name = "liber_channel_liber_device_device_list"]
 	fn device_list(chan: u64) -> Option<Result<Vec<DeviceEntry>, Error>>;
 	#[link_name = "liber_channel_liber_device_device_get"]
 	fn device_get(chan: u64, index: &u32) -> Option<Result<DeviceEntry, Error>>;
+	#[link_name = "liber_channel_liber_device_device_bindings"]
+	fn device_bindings(chan: u64) -> Option<Result<Vec<BindingRecord>, Error>>;
 	#[link_name = "liber_channel_liber_device_usb_list"]
 	fn usb_list(chan: u64) -> Option<Result<Vec<UsbDevice>, Error>>;
 }
@@ -35,6 +37,13 @@ impl DeviceClient {
 	#[inline(always)]
 	pub fn get(&mut self, index: &u32) -> Option<Result<DeviceEntry, Error>> {
 		unsafe { device_get(self.chan, index) }
+	}
+
+	// The binding of every device node, forwarded from DeviceManager. See the interface: this is
+	// not derived anywhere on the way.
+	#[inline(always)]
+	pub fn bindings(&mut self) -> Option<Result<Vec<BindingRecord>, Error>> {
+		unsafe { device_bindings(self.chan) }
 	}
 }
 

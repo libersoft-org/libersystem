@@ -46,6 +46,36 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 	unsafe {
 		let mut client = DeviceClient::new(devsvc);
+		// THE BINDINGS FIRST, because they are what this command is for: which driver a device got,
+		// under which rule, in which state and why. The device table alone says what hardware is
+		// present, which is the smaller half.
+		//
+		// An older DeviceManager, or a boot that granted no catalogue connection, answers an error
+		// rather than an empty list - and an empty list would read as "nothing is bound", which is a
+		// different claim about the machine.
+		match client.bindings() {
+			Some(Ok(records)) => {
+				if let Some(mode) = mode {
+					let mut out = String::from("[");
+					for (i, r) in records.iter().enumerate() {
+						if i > 0 {
+							out.push(',');
+						}
+						out.push_str(&r.to_json());
+					}
+					out.push(']');
+					print(mode.render(out).as_bytes());
+					print(b"\n");
+					exit();
+				}
+				for r in &records {
+					print(r.to_text().as_bytes());
+					print(b"\n");
+				}
+			}
+			Some(Err(_)) => eprint(b"lsdev: this system does not answer the binding query; showing the device table only\n"),
+			None => eprint(b"lsdev: service unavailable\n"),
+		}
 		match client.list() {
 			Some(Ok(entries)) => {
 				if let Some(mode) = mode {

@@ -4,9 +4,10 @@
 
 use super::*;
 
-const EVERY_STATE: [BindingState; 8] = [
+const EVERY_STATE: [BindingState; 9] = [
 	BindingState::Unbound,
 	BindingState::DependencyPending,
+	BindingState::Disabled,
 	BindingState::Binding,
 	BindingState::Online,
 	BindingState::Stopping,
@@ -17,7 +18,7 @@ const EVERY_STATE: [BindingState; 8] = [
 
 // The table, written out a second time and independently, so this test disagrees with the
 // implementation rather than restating it.
-const LEGAL: [(BindingState, BindingState); 18] = [
+const LEGAL: [(BindingState, BindingState); 25] = [
 	(BindingState::Unbound, BindingState::Binding),
 	(BindingState::Binding, BindingState::Online),
 	(BindingState::Binding, BindingState::Backoff),
@@ -37,6 +38,14 @@ const LEGAL: [(BindingState, BindingState); 18] = [
 	(BindingState::Backoff, BindingState::DependencyPending),
 	(BindingState::Stopping, BindingState::DependencyPending),
 	(BindingState::Failed, BindingState::DependencyPending),
+	// P02M0166's, added by the milestone where an operator first has a way to reach it.
+	(BindingState::Binding, BindingState::Disabled),
+	(BindingState::Stopping, BindingState::Disabled),
+	(BindingState::Unbound, BindingState::Disabled),
+	(BindingState::Backoff, BindingState::Disabled),
+	(BindingState::Failed, BindingState::Disabled),
+	(BindingState::DependencyPending, BindingState::Disabled),
+	(BindingState::Disabled, BindingState::Unbound),
 ];
 
 #[test]
@@ -76,8 +85,16 @@ fn quarantined_is_terminal_for_the_boot() {
 fn a_failed_bind_never_lands_back_where_a_bind_begins() {
 	// `Unbound` is what INVITES a bind. A failed bind landing there is a bind that immediately
 	// happens again with nothing recorded about why the last one did not work.
+	//
+	// ONE STATE MAY REACH IT, AND IT IS NOT A FAILURE: `Disabled`, on an `enable`. An operator
+	// asking for the device back is asking for exactly the bind `Unbound` invites, which is why
+	// that is where it lands - and why this test names the exception rather than dropping the rule.
 	for &from in EVERY_STATE.iter() {
-		assert!(!from.may_move_to(BindingState::Unbound), "something can reach Unbound again");
+		if from == BindingState::Disabled {
+			assert!(from.may_move_to(BindingState::Unbound), "enable is what takes a node out of Disabled");
+			continue;
+		}
+		assert!(!from.may_move_to(BindingState::Unbound), "something that FAILED can reach Unbound again");
 	}
 }
 
@@ -439,7 +456,7 @@ fn a_confirmed_teardown_lands_where_the_intent_says_and_not_where_a_fault_would(
 	assert!(StopIntent::Fault.confirmed_lands_at(false) == Some(BindingState::Failed), "no attempts left");
 	assert!(StopIntent::DependencyLost.confirmed_lands_at(true) == Some(BindingState::DependencyPending));
 	assert!(StopIntent::DependencyLost.confirmed_lands_at(false) == Some(BindingState::DependencyPending), "a lost dependency is not spent by attempts");
-	assert!(StopIntent::OperatorDisable.confirmed_lands_at(true) != Some(BindingState::Backoff), "an operator's stop must not start it again");
+	assert!(StopIntent::OperatorDisable.confirmed_lands_at(true) == Some(BindingState::Disabled), "an operator's stop lands disabled, never back at a bind");
 	// A shutdown describes NO next state: the manager is going away, so there is no next binding for
 	// a state to be about, and entering one nobody will read is a state nobody wrote down.
 	assert!(StopIntent::Shutdown.confirmed_lands_at(true).is_none());
@@ -562,4 +579,91 @@ fn a_stopped_that_arrives_after_the_deadline_does_not_turn_a_forced_teardown_bac
 	assert!(!record.move_to(BindingState::Backoff, Some(FailureCause::DriverExited)));
 	assert!(!record.move_to(BindingState::Failed, Some(FailureCause::DriverExited)));
 	assert!(record.failure == Some(FailureCause::TeardownUnconfirmed), "the report still says the teardown was not confirmed");
+}
+
+// ------------------------------------------------------- the operator's four verbs
+
+#[test]
+fn a_disable_on_a_running_binding_goes_through_the_teardown_and_a_stopped_one_does_not() {
+	// The distinction the table is for: there is either a device to quieten or there is not, and a
+	// disable that skipped the teardown on a running binding would leave a driver holding hardware
+	// nobody is supervising.
+	let mut running = BindingRecord::new();
+	assert!(running.move_to(BindingState::Binding, None));
+	assert!(running.move_to(BindingState::Online, None));
+	assert!(!running.move_to(BindingState::Disabled, None), "a running binding has a device to give back first");
+	assert!(running.move_to(BindingState::Stopping, None));
+	assert!(running.move_to(BindingState::Disabled, None), "and lands disabled once that confirmed");
+
+	// Nothing to tear down: straight there, from every state that has no claim in hand.
+	for from in [BindingState::Unbound, BindingState::Backoff, BindingState::Failed, BindingState::DependencyPending] {
+		assert!(from.may_move_to(BindingState::Disabled), "a node that holds nothing is disabled directly");
+	}
+}
+
+#[test]
+fn quarantined_is_out_of_reach_of_every_verb_for_this_boot() {
+	// Its resources are charged and out of circulation precisely because nothing confirmed the
+	// device was quiet, and an operator saying so does not make it so. `disable`, `enable` and
+	// `select` are still ACCEPTED as policy - they are about the NEXT bind - but none of them moves
+	// this node, and the table is what makes that true rather than a check somebody wrote once.
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Binding, None));
+	assert!(record.move_to(BindingState::Stopping, Some(FailureCause::DriverExited)));
+	assert!(record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed)));
+	for to in EVERY_STATE {
+		assert!(!record.state.may_move_to(to), "quarantine has no exit, including for an operator");
+	}
+}
+
+#[test]
+fn hung_and_handshake_timeout_are_two_causes_because_a_reader_acts_on_them_differently() {
+	// They were one cause until this milestone had to RENDER them, and "it did not answer" cannot be
+	// acted on without knowing whether the driver had ever been up: one is a driver that never
+	// started, the other is one that stopped.
+	assert!(FailureCause::Hung != FailureCause::HandshakeTimeout);
+	assert!(FailureCause::Hung.name() == b"hung");
+	assert!(FailureCause::HandshakeTimeout.name() == b"handshake-timeout");
+	// Both retryable, and for the same reason: nothing about a driver going quiet says the DEVICE
+	// is unusable.
+	assert!(FailureCause::Hung.retryable());
+	assert!(FailureCause::HandshakeTimeout.retryable());
+}
+
+#[test]
+fn every_state_and_every_cause_has_exactly_one_name() {
+	// One vocabulary, so `lsdev`, the System Graph and the boot log cannot each invent their own.
+	// Distinctness is the property: two states sharing a name is a surface that cannot tell them
+	// apart, which is what the constant `Running` in the graph was.
+	let mut seen: [&[u8]; 9] = [b""; 9];
+	for (at, state) in EVERY_STATE.iter().enumerate() {
+		let name = state.name();
+		assert!(!name.is_empty());
+		for earlier in seen.iter().take(at) {
+			assert!(*earlier != name, "two states share a name");
+		}
+		seen[at] = name;
+	}
+	let causes = [
+		FailureCause::DriverMissing,
+		FailureCause::ProtocolMismatch,
+		FailureCause::ClaimRefused,
+		FailureCause::IommuRequired,
+		FailureCause::ResourceExhausted,
+		FailureCause::SpawnFailed,
+		FailureCause::HandshakeTimeout,
+		FailureCause::DriverExited,
+		FailureCause::DriverReported(DriverFailureCode::InternalError),
+		FailureCause::TeardownUnconfirmed,
+		FailureCause::Hung,
+	];
+	let mut names: [&[u8]; 11] = [b""; 11];
+	for (at, cause) in causes.iter().enumerate() {
+		let name = cause.name();
+		assert!(!name.is_empty());
+		for earlier in names.iter().take(at) {
+			assert!(*earlier != name, "two causes share a name");
+		}
+		names[at] = name;
+	}
 }

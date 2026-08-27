@@ -608,7 +608,7 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 		// DEVPRIV is appended AFTER CONSOLE, and every launcher of device_manager owes it: the
 		// bootstrap is read positionally, so `recv_tagged` checks the tag of the next message rather
 		// than searching for one, and anything inserted in the middle shifts every read after it.
-		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, graph_client, stats_server) {
+		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, kept.end_of(b"device_manager", b"SERVE"), graph_client, stats_server) {
 			return (State::Failed, Reason::BootstrapRefused);
 		}
 		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
@@ -765,7 +765,7 @@ pub(super) unsafe fn stop_service(control: u64, up: u64, buf: &mut [u8]) -> Stat
 // ("SERVE"), kept in `*graph_client` for the shell. SystemGraphService comes up after
 // every component it observes, so their handles are all captured and their state is
 // Running when its node set is built.
-pub(super) unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], state: &[State; N], device_client: u64, graph_client: &mut u64, stats_server: &mut u64) -> bool {
+pub(super) unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[u64; N], state: &[State; N], device_client: u64, device_manager_catalogue: u64, graph_client: &mut u64, stats_server: &mut u64) -> bool {
 	unsafe {
 		let mut i: usize = 0;
 		while i < N {
@@ -802,6 +802,14 @@ pub(super) unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[
 				}
 			}
 			None => return false,
+		}
+		// THE BINDING SNAPSHOT, from the one process that holds it. Sent right after DEVICE, to
+		// match the receive order - and OPTIONAL in exactly one way: a boot that granted this
+		// supervisor no DeviceManager catalogue client sends the tag carrying nothing, because the
+		// read is positional and a missing message would shift every one after it.
+		let bindings: u64 = if device_manager_catalogue != 0 { service_connect(device_manager_catalogue).unwrap_or(0) } else { 0 };
+		if !send_blocking(manager_side, b"BINDINGS", bindings) {
+			return false;
 		}
 		// A fresh SUPERVISOR channel: the supervisor keeps the server end (in
 		// `*stats_server`) and serves the supervisor interface on it, so SystemGraphService

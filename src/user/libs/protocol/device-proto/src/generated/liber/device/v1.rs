@@ -129,6 +129,249 @@ impl DeviceEntry {
 	}
 }
 
+/// Where a device binding is. One vocabulary, defined once: `lsdev`, the System Graph and the boot
+/// log render the same enum rather than each deriving a state of its own - which is what made the
+/// graph's unconditional `running` possible to write.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BindingState {
+	Unbound = 0,
+	DependencyPending = 1,
+	Binding = 2,
+	Online = 3,
+	Stopping = 4,
+	Backoff = 5,
+	Failed = 6,
+	Quarantined = 7,
+	Disabled = 8,
+}
+
+impl BindingState {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BindingState> {
+		let mut r = Reader::new(bytes);
+		let value = BindingState::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BindingState> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BindingState::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<BindingState> {
+		match r.u8()? {
+			0 => Some(BindingState::Unbound),
+			1 => Some(BindingState::DependencyPending),
+			2 => Some(BindingState::Binding),
+			3 => Some(BindingState::Online),
+			4 => Some(BindingState::Stopping),
+			5 => Some(BindingState::Backoff),
+			6 => Some(BindingState::Failed),
+			7 => Some(BindingState::Quarantined),
+			8 => Some(BindingState::Disabled),
+			_ => None,
+		}
+	}
+}
+
+/// Why a binding is not up. A STATE and a CAUSE are not alternatives - "quarantined" and "hung" are
+/// two halves of one answer - so a record carries both, and `none` is what a binding that has not
+/// failed says rather than an absent field every reader has to guess about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FailureCause {
+	None = 0,
+	DriverMissing = 1,
+	ProtocolMismatch = 2,
+	ClaimRefused = 3,
+	IommuRequired = 4,
+	ResourceExhausted = 5,
+	SpawnFailed = 6,
+	HandshakeTimeout = 7,
+	DriverExited = 8,
+	DriverReportedFailure = 9,
+	TeardownUnconfirmed = 10,
+	Hung = 11,
+}
+
+impl FailureCause {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<FailureCause> {
+		let mut r = Reader::new(bytes);
+		let value = FailureCause::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<FailureCause> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = FailureCause::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<FailureCause> {
+		match r.u8()? {
+			0 => Some(FailureCause::None),
+			1 => Some(FailureCause::DriverMissing),
+			2 => Some(FailureCause::ProtocolMismatch),
+			3 => Some(FailureCause::ClaimRefused),
+			4 => Some(FailureCause::IommuRequired),
+			5 => Some(FailureCause::ResourceExhausted),
+			6 => Some(FailureCause::SpawnFailed),
+			7 => Some(FailureCause::HandshakeTimeout),
+			8 => Some(FailureCause::DriverExited),
+			9 => Some(FailureCause::DriverReportedFailure),
+			10 => Some(FailureCause::TeardownUnconfirmed),
+			11 => Some(FailureCause::Hung),
+			_ => None,
+		}
+	}
+}
+
+/// One device node's binding, as DeviceManager holds it.
+///
+/// The node is stable from the boot scan onward, so a record exists for a device nothing binds -
+/// which is a fact about the machine and not an absence.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BindingRecord {
+	pub bus: u32,
+	pub dev: u32,
+	pub func: u32,
+	/// The claim generation of the current binding, or of the last one that ended. 0 for a node
+	/// that has never been claimed.
+	pub generation: u64,
+	pub state: BindingState,
+	pub cause: FailureCause,
+	/// Automatic attempts spent on the current incident.
+	pub attempts: u32,
+	/// The driver artifact chosen for it, or empty where nothing matched.
+	pub artifact: String,
+	/// WHICH of that entry's match rules chose it. An entry may declare several - a kind and a
+	/// pinned address, say - and "virtio_console bound it" does not say which of them applied.
+	/// `system-manifest` refuses two entries whose rules overlap at one priority, so the artifact
+	/// and this index together name the rule uniquely.
+	pub rule: u32,
+	/// How many providers this binding has published.
+	pub providers: u32,
+	/// How many resources the bind granted it - the MMIO window, an interrupt, and whatever its
+	/// registry entry asked for.
+	pub resources: u32,
+}
+
+impl BindingRecord {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<BindingRecord> {
+		let mut r = Reader::new(bytes);
+		let value = BindingRecord::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<BindingRecord> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = BindingRecord::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.bus)?;
+		w.u32(self.dev)?;
+		w.u32(self.func)?;
+		w.u64(self.generation)?;
+		self.state.write(w)?;
+		self.cause.write(w)?;
+		w.u32(self.attempts)?;
+		w.bytes_lp(self.artifact.as_bytes())?;
+		w.u32(self.rule)?;
+		w.u32(self.providers)?;
+		w.u32(self.resources)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<BindingRecord> {
+		let bus = r.u32()?;
+		let dev = r.u32()?;
+		let func = r.u32()?;
+		let generation = r.u64()?;
+		let state = BindingState::read(r)?;
+		let cause = FailureCause::read(r)?;
+		let attempts = r.u32()?;
+		let artifact = r.string_lp()?;
+		let rule = r.u32()?;
+		let providers = r.u32()?;
+		let resources = r.u32()?;
+		Some(BindingRecord { bus, dev, func, generation, state, cause, attempts, artifact, rule, providers, resources })
+	}
+}
+
 /// The Device service contract: enumerate the devices the kernel discovered on the
 /// bus, or look one up by its table index. Typed enumeration over the kernel device
 /// table (the same table DeviceManager binds drivers to).
@@ -140,10 +383,16 @@ pub mod device {
 
 	pub const OP_LIST: u16 = 1;
 	pub const OP_GET: u16 = 2;
+	pub const OP_BINDINGS: u16 = 3;
 
 	pub trait Service {
 		fn list(&mut self) -> Result<Vec<DeviceEntry>, Error>;
 		fn get(&mut self, index: u32) -> Result<DeviceEntry, Error>;
+		/// The binding of every device node, FORWARDED VERBATIM from DeviceManager - which is the only
+		/// process that holds them. Not derived here: a second rendering is how one surface comes to
+		/// report a constant where a state belongs, and `lsdev` and the System Graph must not be able
+		/// to disagree about what a device is doing.
+		fn bindings(&mut self) -> Result<Vec<BindingRecord>, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -224,6 +473,48 @@ pub mod device {
 						Err(v4) => {
 							w.u8(0)?;
 							v4.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_BINDINGS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.bindings();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v5) => {
+							w.u8(1)?;
+							if v5.len() > u16::MAX as usize {
+								return None;
+							}
+							w.u16(v5.len() as u16)?;
+							for v7 in v5.iter() {
+								v7.write(w)?;
+							}
+						}
+						Err(v6) => {
+							w.u8(0)?;
+							v6.write(w)?;
 						}
 					}
 					Some(())
@@ -353,13 +644,13 @@ pub mod device {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v5 = r.u16()? as usize;
-						let mut v6 = Vec::new();
-						v6.try_reserve_exact(v5).ok()?;
-						for _ in 0..v5 {
-							v6.push(DeviceEntry::read(r)?);
+						let v8 = r.u16()? as usize;
+						let mut v9 = Vec::new();
+						v9.try_reserve_exact(v8).ok()?;
+						for _ in 0..v8 {
+							v9.push(DeviceEntry::read(r)?);
 						}
-						v6
+						v9
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -406,6 +697,50 @@ pub mod device {
 			}
 			decoded
 		}
+		pub fn bindings(&mut self) -> Option<Result<Vec<BindingRecord>, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_BINDINGS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let v10 = r.u16()? as usize;
+						let mut v11 = Vec::new();
+						v11.try_reserve_exact(v10).ok()?;
+						for _ in 0..v10 {
+							v11.push(BindingRecord::read(r)?);
+						}
+						v11
+					})
+				} else {
+					Err(Error::read(r)?)
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -422,6 +757,14 @@ pub mod device {
 	fn channel_invoke_get(chan: u64, index: &u32) -> Option<Result<DeviceEntry, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.get(index)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_device_bindings")]
+	fn channel_invoke_bindings(chan: u64) -> Option<Result<Vec<BindingRecord>, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.bindings()
 	}
 }
 
@@ -581,13 +924,69 @@ pub mod provider_catalogue {
 	use alloc::vec::Vec;
 
 	pub const OP_SUBSCRIBE: u16 = 1;
+	pub const OP_BINDINGS: u16 = 2;
 
 	pub trait Service {
 		fn subscribe(&mut self, kind: ProviderKind) -> Vec<ProviderInfo>;
+		/// Every device node's binding, in one read. `lsdev` and the System Graph both ask this rather
+		/// than each deriving a state - the log is not a third rendering to compare against, because it
+		/// is a history of transitions and this is a moment.
+		fn bindings(&mut self) -> Vec<BindingRecord>;
 	}
 
-	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handles: &mut Handles, _out: &mut [u8], _reply_handles: &mut Handles) -> Option<usize> {
-		None
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:device")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_BINDINGS => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.bindings();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					if result.len() > u16::MAX as usize {
+						return None;
+					}
+					w.u16(result.len() as u16)?;
+					for v12 in result.iter() {
+						v12.write(w)?;
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => return None,
+						}
+					}
+					return None;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
 	}
 
 	pub fn subscribe_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<ProviderInfo>)> {
@@ -729,6 +1128,47 @@ pub mod provider_catalogue {
 			}
 			Some(reply_handles.first())
 		}
+		pub fn bindings(&mut self) -> Option<Vec<BindingRecord>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_BINDINGS)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = {
+					let v13 = r.u16()? as usize;
+					let mut v14 = Vec::new();
+					v14.try_reserve_exact(v13).ok()?;
+					for _ in 0..v13 {
+						v14.push(BindingRecord::read(r)?);
+					}
+					v14
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -737,6 +1177,14 @@ pub mod provider_catalogue {
 	fn channel_invoke_subscribe(chan: u64, kind: &ProviderKind) -> Option<u64> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.subscribe(kind)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_provider_catalogue_bindings")]
+	fn channel_invoke_bindings(chan: u64) -> Option<Vec<BindingRecord>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.bindings()
 	}
 }
 
@@ -852,19 +1300,19 @@ pub mod usb {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v7) => {
+						Ok(v15) => {
 							w.u8(1)?;
-							if v7.len() > u16::MAX as usize {
+							if v15.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v7.len() as u16)?;
-							for v9 in v7.iter() {
-								v9.write(w)?;
+							w.u16(v15.len() as u16)?;
+							for v17 in v15.iter() {
+								v17.write(w)?;
 							}
 						}
-						Err(v8) => {
+						Err(v16) => {
 							w.u8(0)?;
-							v8.write(w)?;
+							v16.write(w)?;
 						}
 					}
 					Some(())
@@ -994,13 +1442,13 @@ pub mod usb {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v10 = r.u16()? as usize;
-						let mut v11 = Vec::new();
-						v11.try_reserve_exact(v10).ok()?;
-						for _ in 0..v10 {
-							v11.push(UsbDevice::read(r)?);
+						let v18 = r.u16()? as usize;
+						let mut v19 = Vec::new();
+						v19.try_reserve_exact(v18).ok()?;
+						for _ in 0..v18 {
+							v19.push(UsbDevice::read(r)?);
 						}
-						v11
+						v19
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1118,6 +1566,244 @@ impl DeviceEntry {
 		self.r#type.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mmio-len");
 		crate::codec::cbor::uint(out, self.mmio_len as u64);
+	}
+}
+
+impl BindingState {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			BindingState::Unbound => out.push_str("\"unbound\""),
+			BindingState::DependencyPending => out.push_str("\"dependency-pending\""),
+			BindingState::Binding => out.push_str("\"binding\""),
+			BindingState::Online => out.push_str("\"online\""),
+			BindingState::Stopping => out.push_str("\"stopping\""),
+			BindingState::Backoff => out.push_str("\"backoff\""),
+			BindingState::Failed => out.push_str("\"failed\""),
+			BindingState::Quarantined => out.push_str("\"quarantined\""),
+			BindingState::Disabled => out.push_str("\"disabled\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			BindingState::Unbound => out.push_str("unbound"),
+			BindingState::DependencyPending => out.push_str("dependency-pending"),
+			BindingState::Binding => out.push_str("binding"),
+			BindingState::Online => out.push_str("online"),
+			BindingState::Stopping => out.push_str("stopping"),
+			BindingState::Backoff => out.push_str("backoff"),
+			BindingState::Failed => out.push_str("failed"),
+			BindingState::Quarantined => out.push_str("quarantined"),
+			BindingState::Disabled => out.push_str("disabled"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			BindingState::Unbound => crate::codec::cbor::text(out, "unbound"),
+			BindingState::DependencyPending => crate::codec::cbor::text(out, "dependency-pending"),
+			BindingState::Binding => crate::codec::cbor::text(out, "binding"),
+			BindingState::Online => crate::codec::cbor::text(out, "online"),
+			BindingState::Stopping => crate::codec::cbor::text(out, "stopping"),
+			BindingState::Backoff => crate::codec::cbor::text(out, "backoff"),
+			BindingState::Failed => crate::codec::cbor::text(out, "failed"),
+			BindingState::Quarantined => crate::codec::cbor::text(out, "quarantined"),
+			BindingState::Disabled => crate::codec::cbor::text(out, "disabled"),
+		}
+	}
+}
+
+impl FailureCause {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			FailureCause::None => out.push_str("\"none\""),
+			FailureCause::DriverMissing => out.push_str("\"driver-missing\""),
+			FailureCause::ProtocolMismatch => out.push_str("\"protocol-mismatch\""),
+			FailureCause::ClaimRefused => out.push_str("\"claim-refused\""),
+			FailureCause::IommuRequired => out.push_str("\"iommu-required\""),
+			FailureCause::ResourceExhausted => out.push_str("\"resource-exhausted\""),
+			FailureCause::SpawnFailed => out.push_str("\"spawn-failed\""),
+			FailureCause::HandshakeTimeout => out.push_str("\"handshake-timeout\""),
+			FailureCause::DriverExited => out.push_str("\"driver-exited\""),
+			FailureCause::DriverReportedFailure => out.push_str("\"driver-reported-failure\""),
+			FailureCause::TeardownUnconfirmed => out.push_str("\"teardown-unconfirmed\""),
+			FailureCause::Hung => out.push_str("\"hung\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			FailureCause::None => out.push_str("none"),
+			FailureCause::DriverMissing => out.push_str("driver-missing"),
+			FailureCause::ProtocolMismatch => out.push_str("protocol-mismatch"),
+			FailureCause::ClaimRefused => out.push_str("claim-refused"),
+			FailureCause::IommuRequired => out.push_str("iommu-required"),
+			FailureCause::ResourceExhausted => out.push_str("resource-exhausted"),
+			FailureCause::SpawnFailed => out.push_str("spawn-failed"),
+			FailureCause::HandshakeTimeout => out.push_str("handshake-timeout"),
+			FailureCause::DriverExited => out.push_str("driver-exited"),
+			FailureCause::DriverReportedFailure => out.push_str("driver-reported-failure"),
+			FailureCause::TeardownUnconfirmed => out.push_str("teardown-unconfirmed"),
+			FailureCause::Hung => out.push_str("hung"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			FailureCause::None => crate::codec::cbor::text(out, "none"),
+			FailureCause::DriverMissing => crate::codec::cbor::text(out, "driver-missing"),
+			FailureCause::ProtocolMismatch => crate::codec::cbor::text(out, "protocol-mismatch"),
+			FailureCause::ClaimRefused => crate::codec::cbor::text(out, "claim-refused"),
+			FailureCause::IommuRequired => crate::codec::cbor::text(out, "iommu-required"),
+			FailureCause::ResourceExhausted => crate::codec::cbor::text(out, "resource-exhausted"),
+			FailureCause::SpawnFailed => crate::codec::cbor::text(out, "spawn-failed"),
+			FailureCause::HandshakeTimeout => crate::codec::cbor::text(out, "handshake-timeout"),
+			FailureCause::DriverExited => crate::codec::cbor::text(out, "driver-exited"),
+			FailureCause::DriverReportedFailure => crate::codec::cbor::text(out, "driver-reported-failure"),
+			FailureCause::TeardownUnconfirmed => crate::codec::cbor::text(out, "teardown-unconfirmed"),
+			FailureCause::Hung => crate::codec::cbor::text(out, "hung"),
+		}
+	}
+}
+
+impl BindingRecord {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"bus\":");
+		let _ = write!(out, "{}", self.bus);
+		out.push(',');
+		out.push_str("\"dev\":");
+		let _ = write!(out, "{}", self.dev);
+		out.push(',');
+		out.push_str("\"func\":");
+		let _ = write!(out, "{}", self.func);
+		out.push(',');
+		out.push_str("\"generation\":");
+		let _ = write!(out, "{}", self.generation);
+		out.push(',');
+		out.push_str("\"state\":");
+		self.state.to_json_into(out);
+		out.push(',');
+		out.push_str("\"cause\":");
+		self.cause.to_json_into(out);
+		out.push(',');
+		out.push_str("\"attempts\":");
+		let _ = write!(out, "{}", self.attempts);
+		out.push(',');
+		out.push_str("\"artifact\":");
+		crate::codec::json_escape(&self.artifact, out);
+		out.push(',');
+		out.push_str("\"rule\":");
+		let _ = write!(out, "{}", self.rule);
+		out.push(',');
+		out.push_str("\"providers\":");
+		let _ = write!(out, "{}", self.providers);
+		out.push(',');
+		out.push_str("\"resources\":");
+		let _ = write!(out, "{}", self.resources);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("bus=");
+		let _ = write!(out, "{}", self.bus);
+		out.push_str(", ");
+		out.push_str("dev=");
+		let _ = write!(out, "{}", self.dev);
+		out.push_str(", ");
+		out.push_str("func=");
+		let _ = write!(out, "{}", self.func);
+		out.push_str(", ");
+		out.push_str("generation=");
+		let _ = write!(out, "{}", self.generation);
+		out.push_str(", ");
+		out.push_str("state=");
+		self.state.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("cause=");
+		self.cause.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("attempts=");
+		let _ = write!(out, "{}", self.attempts);
+		out.push_str(", ");
+		out.push_str("artifact=");
+		out.push_str(&self.artifact);
+		out.push_str(", ");
+		out.push_str("rule=");
+		let _ = write!(out, "{}", self.rule);
+		out.push_str(", ");
+		out.push_str("providers=");
+		let _ = write!(out, "{}", self.providers);
+		out.push_str(", ");
+		out.push_str("resources=");
+		let _ = write!(out, "{}", self.resources);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 11);
+		crate::codec::cbor::text(out, "bus");
+		crate::codec::cbor::uint(out, self.bus as u64);
+		crate::codec::cbor::text(out, "dev");
+		crate::codec::cbor::uint(out, self.dev as u64);
+		crate::codec::cbor::text(out, "func");
+		crate::codec::cbor::uint(out, self.func as u64);
+		crate::codec::cbor::text(out, "generation");
+		crate::codec::cbor::uint(out, self.generation as u64);
+		crate::codec::cbor::text(out, "state");
+		self.state.to_cbor_into(out);
+		crate::codec::cbor::text(out, "cause");
+		self.cause.to_cbor_into(out);
+		crate::codec::cbor::text(out, "attempts");
+		crate::codec::cbor::uint(out, self.attempts as u64);
+		crate::codec::cbor::text(out, "artifact");
+		crate::codec::cbor::text(out, &self.artifact);
+		crate::codec::cbor::text(out, "rule");
+		crate::codec::cbor::uint(out, self.rule as u64);
+		crate::codec::cbor::text(out, "providers");
+		crate::codec::cbor::uint(out, self.providers as u64);
+		crate::codec::cbor::text(out, "resources");
+		crate::codec::cbor::uint(out, self.resources as u64);
 	}
 }
 
