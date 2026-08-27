@@ -161,10 +161,25 @@ pub unsafe fn handshake(bootstrap: u64) -> (Bind, Resources) {
 
 // Offer a provider this driver serves. HELD UNPUBLISHED by the manager until `ready`, and closed on
 // `failed` - so a driver that dies half way through announcing itself announces nothing.
-pub unsafe fn offer(bootstrap: u64, bind: &Bind, provider_kind: u16, handle: u64) -> bool {
-	let mut payload = [0u8; proto::U16_PAYLOAD_LEN];
-	proto::encode_u16(provider_kind, &mut payload);
+// `token` is this driver's OWN name for the publication, unique only within this driver. It is what
+// a later withdrawal names; the identity the rest of the system uses is the manager's and is never
+// something a driver chooses. A driver that publishes one provider of each kind may use the kind as
+// its token and lose nothing.
+pub unsafe fn offer(bootstrap: u64, bind: &Bind, provider_kind: u16, token: u16, handle: u64) -> bool {
+	let mut payload = [0u8; proto::OFFER_PAYLOAD_LEN];
+	proto::encode_offer(provider_kind, token, &mut payload);
 	unsafe { send_frame_with(bootstrap, proto::Opcode::Offer, bind.generation, &payload, handle) }
+}
+
+// "The provider I published under this token is going away."
+//
+// AFTER the handshake, and not terminal: this driver stays bound and its other publications stay
+// published. `token` is the one this driver chose when it offered - `online` uses the offer's
+// position in its own list, so the first offer is token 0.
+pub unsafe fn withdraw(bootstrap: u64, bind: &Bind, token: u16) -> bool {
+	let mut payload = [0u8; proto::U16_PAYLOAD_LEN];
+	proto::encode_u16(token, &mut payload);
+	unsafe { send_frame(bootstrap, proto::Opcode::Withdraw, bind.generation, &payload) }
 }
 
 // "I am up." Terminal: nothing this driver sends afterwards is part of the handshake.
@@ -291,11 +306,15 @@ pub unsafe fn online(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16,
 	unsafe {
 		print(report);
 		print(b"\n");
-		for &(kind, handle) in offers {
+		// THE TOKEN IS THE POSITION IN THIS DRIVER'S OWN OFFER LIST, which is unique within this
+		// driver by construction and costs a driver author no thought at all. The kind would do for
+		// every driver in the tree today, because none publishes two of one kind - and that is
+		// exactly the assumption a token exists to stop being load-bearing.
+		for (token, &(kind, handle)) in offers.iter().enumerate() {
 			if handle == 0 {
 				continue;
 			}
-			if !offer(bootstrap, bind, kind, handle) {
+			if !offer(bootstrap, bind, kind, token as u16, handle) {
 				return false;
 			}
 		}
@@ -318,7 +337,7 @@ pub unsafe fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], servi
 	unsafe {
 		print(report);
 		print(b"\n");
-		if service != 0 && !offer(bootstrap, bind, provider_kind, service) {
+		if service != 0 && !offer(bootstrap, bind, provider_kind, 0, service) {
 			exit();
 		}
 		if !ready(bootstrap, bind) {

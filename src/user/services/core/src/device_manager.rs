@@ -167,7 +167,7 @@ impl Incident {
 // WHERE A BINDING IS AND WHY, from the crate that owns the answer. Not a `u8` per device with a
 // meaning each reader remembers: `state[idx]` is a small integer set at a few points, and the
 // transitions between its values are wherever somebody happened to write them.
-use driver_binding::{BindingEvent, BindingId, BindingQueue, BindingRecord, BindingState, FailureCause};
+use driver_binding::{BindingEvent, BindingId, BindingQueue, BindingRecord, BindingState, FailureCause, ProviderId};
 
 // How long the development agent has to report in before DeviceManager stops waiting for it, in
 // clock ticks (a hundred to the second, so this is two seconds).
@@ -477,6 +477,7 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 		let mut nodes: Vec<Node> = Vec::new();
 		let mut names: Vec<&'static [u8]> = Vec::new();
 		let mut infos: Vec<DeviceInfo> = Vec::new();
+		let mut catalogue = Catalogue::new();
 		let mut i: u64 = 0;
 		while i < count {
 			let mut info: DeviceInfo = DeviceInfo::default();
@@ -501,7 +502,11 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 				continue;
 			};
 			let mut node = Node::new(i, &info, alloc::vec![entry]);
-			if begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege) {
+			// A BOOT-CRITICAL DRIVER DECLARING A REQUIREMENT WOULD BE A CYCLE, and `system-manifest`
+			// refuses one - but the gate is asked here anyway rather than assumed, because "no
+			// boot driver has requirements today" is a fact about the manifest and not a property
+			// of this code.
+			if gate_on_requirements(&mut node, entry, &catalogue) && begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege) {
 				nodes.push(node);
 				names.push(entry.name);
 				infos.push(info);
@@ -512,25 +517,16 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 		// its own share of the boot window and nothing else's.
 		while pump(&mut nodes, buf) {
 			for at in 0..nodes.len() {
-				match advance(&mut nodes[at], names[at]) {
+				match advance(&mut nodes[at], names[at], &mut catalogue) {
 					Step::Waiting => {}
 					Step::Online => {
-						// the first virtio-blk disk is the writable system volume; a second is
-						// routed up separately as the read-only FAT media volume, a third as the
-						// read-only ISO9660 volume, a fourth as the read-only UDF volume.
-						let handle: u64 = nodes[at].offers.take(driver_protocol::provider::BLOCK);
-						if *block_client == 0 {
-							*block_client = handle;
-						} else if *block2_client == 0 {
-							*block2_client = handle;
-						} else if *block3_client == 0 {
-							*block3_client = handle;
-						} else if *block4_client == 0 {
-							*block4_client = handle;
-						}
-						// ANYTHING STILL HELD IS A PROVIDER NOBODY ROUTES, closed rather than
-						// leaked: a handle this service keeps forever is a channel the driver
-						// waits on forever.
+						// PUBLISHED, NOT ROUTED. Everything a committed binding offered goes into
+						// the catalogue with an identity this service minted; who gets which is a
+						// question asked once below, over everything that came up, rather than at
+						// the moment each driver happened to answer.
+						let id = nodes[at].id;
+						let entry = nodes[at].candidates[nodes[at].candidate];
+						catalogue.publish_all(id, entry, &mut nodes[at].offers);
 						nodes[at].offers.close_all();
 					}
 					// A BOOT DRIVER HAS ONE CANDIDATE, so the two rollback answers differ only in
@@ -546,6 +542,20 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 				}
 			}
 		}
+		// WHO GETS WHICH DISK, asked once over everything that came up rather than as each driver
+		// answered. The first virtio-blk disk is the writable system volume; a second is routed up
+		// as the read-only FAT media volume, a third as the ISO9660 volume, a fourth as the UDF
+		// volume.
+		//
+		// STILL BY ARRIVAL ORDER, AND THAT IS THE NEXT ITEM'S SUBJECT, not this one's. What has
+		// changed is that the order is now a decision made in one place over a catalogue, instead
+		// of four named variables filled by whichever driver finished first - which is what has to
+		// be true before a ROLE can replace it.
+		report_catalogue(&catalogue);
+		*block_client = catalogue.take(driver_protocol::provider::BLOCK);
+		*block2_client = catalogue.take(driver_protocol::provider::BLOCK);
+		*block3_client = catalogue.take(driver_protocol::provider::BLOCK);
+		*block4_client = catalogue.take(driver_protocol::provider::BLOCK);
 	}
 }
 
@@ -576,6 +586,10 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 		// card - and the only thing that made them sequential was where the wait was written.
 		let mut nodes: Vec<Node> = Vec::new();
 		let mut infos: Vec<DeviceInfo> = Vec::new();
+		// ONE CATALOGUE FOR PHASE TWO. Phase one has its own, and the two never overlap: the boot
+		// drivers are done and their block providers routed before a volume exists to load these
+		// from.
+		let mut catalogue = Catalogue::new();
 		let mut i: u64 = 0;
 		while i < count {
 			let idx: usize = i as usize;
@@ -613,25 +627,25 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 		// sequential.
 		for at in 0..nodes.len() {
 			let info = infos[at];
-			start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &mut state);
+			start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &catalogue, &mut state);
 		}
 		while pump(&mut nodes, buf) {
 			for at in 0..nodes.len() {
 				let name: &[u8] = nodes[at].candidates[nodes[at].candidate].name;
-				match advance(&mut nodes[at], name) {
+				match advance(&mut nodes[at], name, &mut catalogue) {
 					Step::Waiting => {}
 					Step::Online => {
 						state[nodes[at].index as usize] = STATE_ONLINE;
 						#[cfg(feature = "development")]
-						route_offers(&mut nodes[at], name, storage, console_input, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer, dev);
+						route_offers(&mut nodes[at], &mut catalogue, name, storage, console_input, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer, dev);
 						#[cfg(not(feature = "development"))]
-						route_offers(&mut nodes[at], name, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer);
+						route_offers(&mut nodes[at], &mut catalogue, name, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer);
 					}
 					// The same candidate, once more. The window and the attempt budget have already
 					// said there is room for it.
 					Step::Again => {
 						let info = infos[at];
-						start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &mut state);
+						start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &catalogue, &mut state);
 					}
 					// EACH CANDIDATE IN TURN, most specific first, and the next one only after the
 					// last is gone - which the rollback has just guaranteed. Every rejection is
@@ -646,7 +660,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 						nodes[at].attempt = 0;
 						if nodes[at].candidate < nodes[at].candidates.len() {
 							let info = infos[at];
-							start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &mut state);
+							start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &catalogue, &mut state);
 						}
 					}
 					Step::Done => {}
@@ -655,6 +669,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 		}
 		close(key_producer);
 		report_state(&state);
+		report_catalogue(&catalogue);
 	}
 }
 
@@ -665,7 +680,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 // duration of one syscall - not, as it was, for the whole handshake. That is what makes a dozen
 // devices coming up at once cost one mapping at a time rather than a dozen.
 #[allow(clippy::too_many_arguments)]
-unsafe fn start_candidate(node: &mut Node, storage: u64, info: &DeviceInfo, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, state: &mut [u8]) {
+unsafe fn start_candidate(node: &mut Node, storage: u64, info: &DeviceInfo, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &Catalogue, state: &mut [u8]) {
 	unsafe {
 		loop {
 			if node.candidate >= node.candidates.len() {
@@ -673,6 +688,12 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, info: &DeviceInfo, key_
 			}
 			let entry = node.candidates[node.candidate];
 			let driver_name: &[u8] = entry.name;
+			// PARKED RATHER THAN LAUNCHED AND FAILED. Asked at every attempt, including a backoff
+			// expiry, because a requirement can go away during a teardown and the event that said
+			// so is spent by the time the delay ends.
+			if !gate_on_requirements(node, entry, catalogue) {
+				return;
+			}
 			let Some((file, mapped, size)) = read_driver(storage, driver_name) else {
 				// The registry names an artifact the volume does not have. That is the image
 				// disagreeing with itself, not a driver that ran and failed, and the two are worth
@@ -707,17 +728,23 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, info: &DeviceInfo, key_
 // extra two told apart by the literal bytes `USBBUS` and `POINTER` in the messages that followed -
 // so what a capability was for was decided by parsing a string the driver chose.
 #[allow(clippy::too_many_arguments)]
-unsafe fn route_offers(node: &mut Node, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let _ = driver_name;
+		// PUBLISHED FIRST, ROUTED SECOND. Everything this binding offered enters the catalogue with
+		// an identity this service minted; what follows takes from the catalogue rather than from
+		// the driver's own message, so a provider that nothing routes is still a provider the
+		// machine has - and is withdrawn with its binding rather than leaked.
+		let entry = node.candidates[node.candidate];
+		catalogue.publish_all(node.id, entry, &mut node.offers);
 		if *net_client == 0 {
-			*net_client = node.offers.take(driver_protocol::provider::NET);
+			*net_client = catalogue.take(driver_protocol::provider::NET);
 		}
 		if *gpu_client == 0 {
-			*gpu_client = node.offers.take(driver_protocol::provider::DISPLAY);
+			*gpu_client = catalogue.take(driver_protocol::provider::DISPLAY);
 		}
 		if *snd_client == 0 {
-			*snd_client = node.offers.take(driver_protocol::provider::AUDIO);
+			*snd_client = catalogue.take(driver_protocol::provider::AUDIO);
 		}
 		// The development channel driver hands up a raw byte channel, and the agent that speaks the
 		// protocol over it is started here rather than by ServiceManager. It exists exactly when the
@@ -726,7 +753,7 @@ unsafe fn route_offers(node: &mut Node, driver_name: &[u8], #[cfg(feature = "dev
 		// is started where that device is bound, and nowhere else.
 		#[cfg(feature = "development")]
 		{
-			let dev_bytes: u64 = node.offers.take(driver_protocol::provider::CONSOLE_BYTES);
+			let dev_bytes: u64 = catalogue.take(driver_protocol::provider::CONSOLE_BYTES);
 			if driver_name == b"dev_channel" && dev_bytes != 0 {
 				// The driver's bootstrap is kept rather than left to leak, because a replacement
 				// agent's wire is handed down over it; and a volume connection of this program's own
@@ -753,7 +780,7 @@ unsafe fn route_offers(node: &mut Node, driver_name: &[u8], #[cfg(feature = "dev
 		// The pointer flavour of virtio_input offers an INPUT provider; the keyboard flavour offers
 		// none, so an absent one is a state rather than a failure.
 		if *input_client == 0 {
-			*input_client = node.offers.take(driver_protocol::provider::INPUT);
+			*input_client = catalogue.take(driver_protocol::provider::INPUT);
 		}
 		// The xHCI driver offers up to three: the USB stick's block service (absent when no
 		// mass-storage device is attached), its bus query channel for the `lsusb` inventory, and a
@@ -761,13 +788,13 @@ unsafe fn route_offers(node: &mut Node, driver_name: &[u8], #[cfg(feature = "dev
 		// were held unpublished until its `READY`, so a controller that died between them published
 		// nothing.
 		if *usb_client == 0 {
-			*usb_client = node.offers.take(driver_protocol::provider::BLOCK);
+			*usb_client = catalogue.take(driver_protocol::provider::BLOCK);
 		}
 		if *usbq_client == 0 {
-			*usbq_client = node.offers.take(driver_protocol::provider::USB_BUS);
+			*usbq_client = catalogue.take(driver_protocol::provider::USB_BUS);
 		}
 		if *usb_pointer == 0 {
-			*usb_pointer = node.offers.take(driver_protocol::provider::POINTER);
+			*usb_pointer = catalogue.take(driver_protocol::provider::POINTER);
 		}
 		// ANYTHING STILL HELD IS A PROVIDER NOBODY ROUTES, and it is closed rather than leaked: a
 		// handle this service keeps forever is a channel the driver waits on forever.
@@ -1105,40 +1132,36 @@ impl Attempt {
 // was decided by parsing a string a driver chose.
 struct Offers {
 	kinds: [u16; driver_protocol::MAX_INITIAL_OFFERS],
+	// The publisher-local token each offer carried. Unique within the driver that sent it, and the
+	// only name that driver has for its own publication.
+	tokens: [u16; driver_protocol::MAX_INITIAL_OFFERS],
 	handles: [u64; driver_protocol::MAX_INITIAL_OFFERS],
 	count: usize,
 }
 
 impl Offers {
 	fn new() -> Self {
-		Self { kinds: [0; driver_protocol::MAX_INITIAL_OFFERS], handles: [0; driver_protocol::MAX_INITIAL_OFFERS], count: 0 }
+		Self { kinds: [0; driver_protocol::MAX_INITIAL_OFFERS], tokens: [0; driver_protocol::MAX_INITIAL_OFFERS], handles: [0; driver_protocol::MAX_INITIAL_OFFERS], count: 0 }
 	}
 
 	// Answers false when the bound is reached, so the caller can refuse the frame and close its
 	// handle rather than accumulate. "Any number" is not a bound, and a driver is a separate process
 	// that may be wrong or malicious.
-	fn push(&mut self, kind: u16, handle: u64) -> bool {
+	fn push(&mut self, kind: u16, token: u16, handle: u64) -> bool {
 		if self.count >= driver_protocol::MAX_INITIAL_OFFERS {
 			return false;
 		}
 		self.kinds[self.count] = kind;
+		self.tokens[self.count] = token;
 		self.handles[self.count] = handle;
 		self.count += 1;
 		true
 	}
 
-	// Take the provider of this kind, or 0. Taking is what makes routing safe to call twice: a
-	// second `take` of one kind answers 0 rather than handing the same capability to two consumers.
-	fn take(&mut self, kind: u16) -> u64 {
-		for index in 0..self.count {
-			if self.kinds[index] == kind && self.handles[index] != 0 {
-				let handle = self.handles[index];
-				self.handles[index] = 0;
-				return handle;
-			}
-		}
-		0
-	}
+	// THERE IS NO `take` HERE ANY MORE. Taking a provider straight off the driver's message is what
+	// routing by arrival order looked like; everything now goes into the catalogue first, where it
+	// has an identity and can be withdrawn. What is left on this struct is what a handshake that
+	// never reached `READY` leaves behind.
 
 	// Everything still held goes, which is what a handshake that did not reach `READY` leaves.
 	unsafe fn close_all(&mut self) {
@@ -1149,6 +1172,170 @@ impl Offers {
 			}
 		}
 		self.count = 0;
+	}
+}
+
+// ------------------------------------------------------- the provider catalogue
+//
+// FOUR NAMED LOCALS, FILLED IN ARRIVAL ORDER, WAS THE DEFECT.
+//
+// `block_client`, `block2_client`, `block3_client` and `block4_client` were four variables, each
+// routed by hand to the service that owns that kind. So a second disk DID have somewhere to go and a
+// fifth did not, and which volume was which depended on which driver finished first. The defect is
+// the fixed count and the hand-written routing, not the existence of a limit - the registry bounds
+// what each entry may publish, on purpose.
+
+// How many providers the catalogue holds at once. A bound, and a stated one: every driver in the
+// image may publish at most `MAX_INITIAL_OFFERS`, and `MAX_NODES_IN_FLIGHT` bounds the drivers - so
+// this is generous rather than arbitrary, and a machine that exceeded it would be refused loudly by
+// `publish` rather than silently losing a disk.
+const MAX_PROVIDERS: usize = 32;
+
+// One published provider.
+struct Provider {
+	id: ProviderId,
+	kind: u16,
+	// The publisher's own name for it, which is what a withdrawal names.
+	token: u16,
+	// The channel the driver serves it on. Zero for a free slot.
+	handle: u64,
+}
+
+// WHAT IS PUBLISHED, BY KIND, WITH THE MANAGER OWNING EVERY IDENTITY IN IT.
+struct Catalogue {
+	entries: [Option<Provider>; MAX_PROVIDERS],
+	// Bumped every time a slot is filled, so a reused slot is never mistaken for the provider that
+	// left it.
+	generation: u32,
+}
+
+impl Catalogue {
+	const fn new() -> Self {
+		Self { entries: [const { None }; MAX_PROVIDERS], generation: 0 }
+	}
+
+	// Take everything a committed binding offered into the catalogue, minting an id for each.
+	//
+	// Answers how many were published. A handle the catalogue has no room for is CLOSED rather than
+	// dropped: a handle this service keeps and never serves is a channel the driver waits on
+	// forever, and one it silently discards is a provider the machine has and cannot see.
+	unsafe fn publish_all(&mut self, binding: BindingId, entry: &'static Entry, offers: &mut Offers) -> usize {
+		unsafe {
+			let mut published: usize = 0;
+			for index in 0..offers.count {
+				let handle = offers.handles[index];
+				if handle == 0 {
+					continue;
+				}
+				offers.handles[index] = 0;
+				// A KIND THIS ENTRY NEVER DECLARED, OR ONE PAST WHAT IT DECLARED. `system-manifest`
+				// checks the declaration is coherent; this checks the driver honoured it, which is
+				// the half no build-time check can do. A compromised driver advertising itself as a
+				// disk is refused here, with its handle closed rather than kept.
+				let kind = offers.kinds[index];
+				let Some(&(_, most)) = entry.provides.iter().find(|&&(declared, _)| declared == kind) else {
+					print(b"DeviceManager: ");
+					print(entry.name);
+					print(b" offered a provider kind it does not declare in `provides`; refused\n");
+					close(handle);
+					continue;
+				};
+				if self.count_for(binding, kind) >= most as usize {
+					print(b"DeviceManager: ");
+					print(entry.name);
+					print(b" offered more providers of one kind than it declares in `provides`; refused\n");
+					close(handle);
+					continue;
+				}
+				let Some(slot) = self.entries.iter().position(Option::is_none) else {
+					print(b"DeviceManager: the provider catalogue is full; a published provider is being closed rather than lost quietly\n");
+					close(handle);
+					continue;
+				};
+				self.generation = self.generation.wrapping_add(1);
+				self.entries[slot] = Some(Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle });
+				published += 1;
+			}
+			offers.count = 0;
+			published
+		}
+	}
+
+	// The channel of the first published provider of `kind` that has not been handed out yet.
+	//
+	// THE ENTRY STAYS. Handing the channel to a consumer does not unpublish the provider - it is
+	// still there, still belongs to its binding, and still has to be withdrawn when that binding
+	// ends. Removing the entry was the first version and it made the catalogue a staging area that
+	// reported nothing: everything routed, so everything read as absent.
+	//
+	// The HANDLE is what moves, and it moves once. A second take of one kind answers 0 rather than
+	// handing one capability to two consumers, which is two consumers competing over one reply queue
+	// and not two connections.
+	fn take(&mut self, kind: u16) -> u64 {
+		for slot in 0..MAX_PROVIDERS {
+			if let Some(provider) = self.entries[slot].as_mut()
+				&& provider.kind == kind
+				&& provider.handle != 0
+			{
+				let handle = provider.handle;
+				provider.handle = 0;
+				return handle;
+			}
+		}
+		0
+	}
+
+	// Withdraw one publication of `binding`, named by the token its publisher chose.
+	//
+	// Answers the id it had, so a caller can say WHICH provider went away rather than that one did.
+	unsafe fn withdraw(&mut self, binding: BindingId, token: u16) -> Option<ProviderId> {
+		unsafe {
+			let slot = self.entries.iter().position(|entry| entry.as_ref().is_some_and(|provider| provider.binding_is(binding) && provider.token == token))?;
+			let provider = self.entries[slot].take()?;
+			if provider.handle != 0 {
+				close(provider.handle);
+			}
+			Some(provider.id)
+		}
+	}
+
+	// Withdraw everything a binding published, which is what the end of that binding means.
+	unsafe fn withdraw_binding(&mut self, binding: BindingId) -> usize {
+		unsafe {
+			let mut gone: usize = 0;
+			for slot in 0..MAX_PROVIDERS {
+				if !self.entries[slot].as_ref().is_some_and(|provider| provider.binding_is(binding)) {
+					continue;
+				}
+				if let Some(provider) = self.entries[slot].take()
+					&& provider.handle != 0
+				{
+					close(provider.handle);
+				}
+				gone += 1;
+			}
+			gone
+		}
+	}
+
+	// How many providers of `kind` THIS BINDING has published, which is what a per-entry bound is
+	// about: two controllers of one kind each publishing one is not one controller publishing two.
+	fn count_for(&self, binding: BindingId, kind: u16) -> usize {
+		self.entries.iter().filter(|entry| entry.as_ref().is_some_and(|provider| provider.binding_is(binding) && provider.kind == kind)).count()
+	}
+
+	// How many providers of `kind` are published. The answer a subscriber wants, and the one the
+	// four fixed locals could only give up to four.
+	fn count_of(&self, kind: u16) -> usize {
+		self.entries.iter().filter(|entry| entry.as_ref().is_some_and(|provider| provider.kind == kind)).count()
+	}
+}
+
+impl Provider {
+	// Whether this provider belongs to that binding - the same function AND the same generation,
+	// because a provider published by a binding that is over is not this binding's.
+	fn binding_is(&self, binding: BindingId) -> bool {
+		self.id.binding == binding
 	}
 }
 
@@ -1369,11 +1556,11 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 			}
 			match header.opcode {
 				driver_protocol::Opcode::Offer => {
-					let Ok(kind) = driver_protocol::decode_offer(header.payload(buf)) else {
+					let Ok((kind, token)) = driver_protocol::decode_offer(header.payload(buf)) else {
 						refuse(&handles);
 						continue;
 					};
-					if node.offers.push(kind, handles.as_slice()[0]) {
+					if node.offers.push(kind, token, handles.as_slice()[0]) {
 						node.push(BindingEvent::Offered { generation });
 					} else {
 						// PAST THE BOUND IS A REFUSAL WITH THE HANDLE CLOSED, not an accumulation.
@@ -1394,10 +1581,45 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 					};
 					node.push(BindingEvent::Failed { generation, code });
 				}
+				driver_protocol::Opcode::Withdraw => {
+					if let Ok(token) = driver_protocol::decode_withdraw(header.payload(buf)) {
+						node.push(BindingEvent::Withdrawn { generation, token });
+					}
+				}
 				// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
 				driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource => refuse(&handles),
 			}
 		}
+	}
+}
+
+// WHETHER EVERY KIND THIS ENTRY DECLARED IS PUBLISHED.
+//
+// EVERY, not the first - starting a bind on the first published requirement is a bind that fails on
+// the second, which spends an attempt and reports a driver failure for a condition that was never
+// the driver's.
+fn requirements_met(entry: &'static Entry, catalogue: &Catalogue) -> bool {
+	entry.requires.iter().all(|&kind| catalogue.count_of(kind) > 0)
+}
+
+// Start this node's current candidate, or park it waiting for what it declared.
+//
+// THE QUESTION IS ASKED AT EVERY ATTEMPT AND NOT ONLY THE FIRST. Reacting to a withdrawal EVENT
+// while a node sits in `Backoff` is not enough: a node can arrive in `Backoff` from `Stopping` after
+// a crash, and if the requirement went away DURING that teardown the event is spent - so the expiry
+// would proceed into a bind gated on a condition that no longer holds. One rule, asked every time,
+// instead of an edge per way of getting there.
+unsafe fn gate_on_requirements(node: &mut Node, entry: &'static Entry, catalogue: &Catalogue) -> bool {
+	unsafe {
+		if requirements_met(entry, catalogue) {
+			return true;
+		}
+		if node.record.move_to(BindingState::DependencyPending, None) {
+			print(b"DeviceManager: ");
+			print(entry.name);
+			print(b" is waiting for a provider it declares in `requires`\n");
+		}
+		false
 	}
 }
 
@@ -1586,12 +1808,22 @@ enum Step {
 // ONE EVENT AT A TIME AND IN ORDER, which is the whole point of the queue: an exit that arrives
 // during a teardown and a `READY` that arrives on the next binding are two events about two
 // bindings, and the generation on each is what keeps them apart.
-unsafe fn advance(node: &mut Node, driver_name: &[u8]) -> Step {
+unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> Step {
 	unsafe {
 		while let Some(event) = node.pop() {
 			let cause: FailureCause = match event {
 				// An offer is progress, not an outcome: it is already held on the node, unpublished.
 				BindingEvent::Offered { .. } => continue,
+				// A LIVE DRIVER RETIRING ONE OF ITS OWN PUBLICATIONS. Not an outcome either: the
+				// driver stays bound and its other providers stay published. Named by the token it
+				// chose, because a driver never sees the identity this service minted.
+				BindingEvent::Withdrawn { token, .. } => {
+					let withdrawn = catalogue.withdraw(node.id, token);
+					print(b"DeviceManager: ");
+					print(driver_name);
+					print(if withdrawn.is_some() { b" withdrew a provider it had published\n" } else { b" withdrew a provider that was not published under that token\n" });
+					continue;
+				}
 				BindingEvent::Ready { .. } => {
 					// THE TRANSACTION COMMITS. What it took stays taken and passes to the caller.
 					node.record.move_to(BindingState::Online, None);
@@ -1620,6 +1852,19 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8]) -> Step {
 					FailureCause::HandshakeTimeout
 				}
 			};
+			// EVERYTHING THIS BINDING PUBLISHED GOES WITH IT, and the count is SAID.
+			//
+			// A provider outliving the binding that published it is a channel whose server is gone:
+			// a consumer holding it waits on a driver that no longer exists, which is a failure
+			// nobody can attribute. And the number is on the line because a forced teardown does not
+			// know whether the work in flight on those channels completed - reporting silently
+			// would let a reader assume it did.
+			let published = catalogue.withdraw_binding(node.id);
+			if published > 0 {
+				print(b"DeviceManager: ");
+				print(driver_name);
+				print(b" went away holding published providers; they are withdrawn and whatever was in flight on them is NOT confirmed\n");
+			}
 			// ROLL BACK WHAT THIS BINDING HELD, through the one order there is. The binding is
 			// TAKEN out of the node first, so an interrupted rollback cannot be re-entered against
 			// handles it has already given back.
@@ -1638,6 +1883,47 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8]) -> Step {
 			return Step::Again;
 		}
 		Step::Waiting
+	}
+}
+
+// WHAT IS PUBLISHED, COUNTED PER KIND.
+//
+// The four named locals could report up to four block providers and had no way to say there were
+// five. This counts what the catalogue holds, so a machine with more disks than the old code had
+// variables says so instead of quietly binding the ones that fit.
+unsafe fn report_catalogue(catalogue: &Catalogue) {
+	unsafe {
+		let mut line = [0u8; 96];
+		let mut at: usize = 0;
+		for (label, kind) in [
+			(b"block".as_slice(), driver_protocol::provider::BLOCK),
+			(b"net", driver_protocol::provider::NET),
+			(b"display", driver_protocol::provider::DISPLAY),
+			(b"audio", driver_protocol::provider::AUDIO),
+			(b"input", driver_protocol::provider::INPUT),
+			(b"usb-bus", driver_protocol::provider::USB_BUS),
+		] {
+			let count = catalogue.count_of(kind);
+			if count == 0 || at + label.len() + 4 >= line.len() {
+				continue;
+			}
+			if at > 0 {
+				line[at] = b',';
+				line[at + 1] = b' ';
+				at += 2;
+			}
+			line[at] = b'0' + (count.min(9) as u8);
+			line[at + 1] = b' ';
+			at += 2;
+			line[at..at + label.len()].copy_from_slice(label);
+			at += label.len();
+		}
+		if at == 0 {
+			return;
+		}
+		print(b"DeviceManager: providers published - ");
+		print(&line[..at]);
+		print(b"\n");
 	}
 }
 
@@ -1789,6 +2075,13 @@ struct Entry {
 	// How specific the match is, as a rank: generic 0, exact 1, quirk 2. Only compared, never
 	// named - the names are the manifest's and `system-manifest` is what checks them.
 	priority: u8,
+	// The provider kinds this entry needs published before it can bind. A driver launched without
+	// them is not one that failed - it is one that was tried too early.
+	requires: &'static [u16],
+	// Which kinds it may publish and at most how many. A BOUND, so a driver cannot publish a kind
+	// it never declared: a compromised one advertising itself as a disk is what this closes.
+	// `system-manifest` refuses a requirement nothing produces and a cycle, at registry-build time.
+	provides: &'static [(u16, u16)],
 	rules: &'static [Rule],
 }
 

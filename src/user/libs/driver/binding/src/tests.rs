@@ -4,8 +4,9 @@
 
 use super::*;
 
-const EVERY_STATE: [BindingState; 7] = [
+const EVERY_STATE: [BindingState; 8] = [
 	BindingState::Unbound,
+	BindingState::DependencyPending,
 	BindingState::Binding,
 	BindingState::Online,
 	BindingState::Stopping,
@@ -16,7 +17,7 @@ const EVERY_STATE: [BindingState; 7] = [
 
 // The table, written out a second time and independently, so this test disagrees with the
 // implementation rather than restating it.
-const LEGAL: [(BindingState, BindingState); 12] = [
+const LEGAL: [(BindingState, BindingState); 18] = [
 	(BindingState::Unbound, BindingState::Binding),
 	(BindingState::Binding, BindingState::Online),
 	(BindingState::Binding, BindingState::Backoff),
@@ -29,6 +30,13 @@ const LEGAL: [(BindingState, BindingState); 12] = [
 	(BindingState::Backoff, BindingState::Binding),
 	(BindingState::Backoff, BindingState::Failed),
 	(BindingState::Failed, BindingState::Binding),
+	// P02M0164's, added by the milestone that first gave a node something to wait for.
+	(BindingState::Unbound, BindingState::DependencyPending),
+	(BindingState::DependencyPending, BindingState::Binding),
+	(BindingState::Binding, BindingState::DependencyPending),
+	(BindingState::Backoff, BindingState::DependencyPending),
+	(BindingState::Stopping, BindingState::DependencyPending),
+	(BindingState::Failed, BindingState::DependencyPending),
 ];
 
 #[test]
@@ -268,4 +276,69 @@ fn one_function_at_one_generation_is_one_binding_however_it_is_reached() {
 	let reached_one_way = BindingId::new(0, 9, 0, 5);
 	let reached_another = BindingId { bus: 0, dev: 9, func: 0, generation: 5 };
 	assert!(reached_one_way == reached_another);
+}
+
+#[test]
+fn a_reused_provider_slot_is_not_the_provider_that_left_it() {
+	// The whole reason a slot carries a generation: a catalogue with a fixed number of slots reuses
+	// them, and a consumer holding an id for a withdrawn provider must not find itself talking to
+	// whatever took its place.
+	let binding = BindingId::new(0, 2, 0, 1);
+	let first = ProviderId::new(binding, 3, 1);
+	let second = ProviderId::new(binding, 3, 2);
+	assert!(first != second, "the same slot, one publication later, is a different provider");
+	assert!(first.binding == second.binding && first.slot == second.slot);
+}
+
+#[test]
+fn two_bindings_of_one_function_publish_distinguishable_providers() {
+	// A driver that crashed and was rebound publishes again. Its providers are NOT the ones it
+	// published before, because the binding they belong to is over - and the id says so without
+	// anyone having to remember to check.
+	let before = ProviderId::new(BindingId::new(0, 5, 0, 1), 0, 1);
+	let after = ProviderId::new(BindingId::new(0, 5, 0, 2), 0, 1);
+	assert!(before != after);
+	assert!(before.binding.same_function(after.binding), "same device, and that is the point: only the binding moved");
+}
+
+#[test]
+fn a_node_waiting_for_a_dependency_has_no_way_back_to_where_a_bind_begins() {
+	// `Unbound` is what INVITES a bind. A node waiting for a provider that then goes away is
+	// waiting harder, not waiting less, and putting it back at `Unbound` would start a bind that
+	// fails for the reason the node is already recording.
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::DependencyPending, None));
+	assert!(!record.move_to(BindingState::Unbound, None), "there is no way back to unbound");
+	// The only way out is a bind, and only when EVERY requirement is published.
+	assert!(record.move_to(BindingState::Binding, None));
+}
+
+#[test]
+fn every_way_of_learning_a_requirement_is_missing_reaches_the_same_state() {
+	// Five different situations, one state - which is what makes it a state rather than five flags.
+	for from in [BindingState::Unbound, BindingState::Binding, BindingState::Backoff, BindingState::Stopping, BindingState::Failed] {
+		assert!(from.may_move_to(BindingState::DependencyPending), "{:?} must be able to say a requirement is missing", core::str::from_utf8(from.name()).unwrap_or("?"));
+	}
+	// And `Online` is not one of them: a node that is UP and loses a requirement has a device to
+	// quieten, so it goes through the teardown like any other loss.
+	assert!(!BindingState::Online.may_move_to(BindingState::DependencyPending));
+	assert!(BindingState::Online.may_move_to(BindingState::Stopping));
+}
+
+#[test]
+fn a_crash_then_a_withdrawal_then_the_backoff_expiry_does_not_bind_on_a_condition_that_is_gone() {
+	// THE WALK THAT THE EVENT-DRIVEN VERSION GETS WRONG.
+	//
+	// Reacting to a withdrawal EVENT while a node sits in `Backoff` is not enough: a node can arrive
+	// in `Backoff` from `Stopping` after a crash, and if the requirement went away DURING that
+	// teardown the event is spent. So every backoff expiry asks the question again rather than
+	// waiting to be told.
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Binding, None));
+	assert!(record.move_to(BindingState::Online, None));
+	assert!(record.move_to(BindingState::Stopping, Some(FailureCause::DriverExited)));
+	assert!(record.move_to(BindingState::Backoff, Some(FailureCause::DriverExited)));
+	// The expiry re-reads `requires` and finds one gone.
+	assert!(record.move_to(BindingState::DependencyPending, None));
+	assert!(record.state == BindingState::DependencyPending);
 }

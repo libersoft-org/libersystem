@@ -125,6 +125,13 @@ pub enum Opcode {
 	Ready = 4,
 	// driver -> manager, terminal. One `DriverFailureCode`.
 	Failed = 5,
+	// driver -> manager, AFTER the handshake. One publisher-local token: the provider this driver
+	// published under that token is going away. Not terminal - the driver stays bound and its other
+	// publications stay published.
+	//
+	// It names the TOKEN and not the manager's identity, because a driver never sees one. That is
+	// the same rule the identity itself is minted under, applied to the other direction.
+	Withdraw = 6,
 }
 
 impl Opcode {
@@ -137,6 +144,7 @@ impl Opcode {
 			3 => Some(Opcode::Offer),
 			4 => Some(Opcode::Ready),
 			5 => Some(Opcode::Failed),
+			6 => Some(Opcode::Withdraw),
 			_ => None,
 		}
 	}
@@ -150,7 +158,7 @@ impl Opcode {
 	// silently discard whatever a driver attached beyond it - capabilities gone, nobody told.
 	pub fn handle_count(self) -> usize {
 		match self {
-			Opcode::Bind | Opcode::Ready | Opcode::Failed => 0,
+			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw => 0,
 			Opcode::Resource | Opcode::Offer => 1,
 		}
 	}
@@ -389,6 +397,11 @@ fn decode_u16(payload: &[u8]) -> Result<u16, FrameError> {
 	Ok(u16::from_le_bytes([payload[0], payload[1]]))
 }
 
+// The publisher-local token a `WITHDRAW` names.
+pub fn decode_withdraw(payload: &[u8]) -> Result<u16, FrameError> {
+	decode_u16(payload)
+}
+
 pub fn decode_resource(payload: &[u8]) -> Result<ResourceKind, FrameError> {
 	let raw = decode_u16(payload)?;
 	ResourceKind::from_u16(raw).ok_or(FrameError::UnknownValue(raw))
@@ -397,8 +410,27 @@ pub fn decode_resource(payload: &[u8]) -> Result<ResourceKind, FrameError> {
 // An offer's provider kind is NOT validated against a closed set here: the set of provider kinds is
 // a later milestone's and does not exist yet. What is bounded here is how many offers one handshake
 // may carry, which is this protocol's business and `MAX_INITIAL_OFFERS`.
-pub fn decode_offer(payload: &[u8]) -> Result<u16, FrameError> {
-	decode_u16(payload)
+// An offer is a KIND and a publisher-local TOKEN.
+//
+// The kind says what the provider is; the token says which of this driver's publications it is. A
+// driver publishing two providers of one kind has to be able to say later which of them is going
+// away, and it cannot name an identity it never sees - the manager assigns those, precisely so that
+// a compromised driver cannot advertise itself as the system disk. The token is the driver's own
+// and unique only within that driver, which is enough to name its own publications and useless for
+// naming anybody else's.
+pub const OFFER_PAYLOAD_LEN: usize = 4;
+
+pub fn encode_offer(kind: u16, token: u16, out: &mut [u8]) -> usize {
+	out[..2].copy_from_slice(&kind.to_le_bytes());
+	out[2..4].copy_from_slice(&token.to_le_bytes());
+	OFFER_PAYLOAD_LEN
+}
+
+pub fn decode_offer(payload: &[u8]) -> Result<(u16, u16), FrameError> {
+	if payload.len() != OFFER_PAYLOAD_LEN {
+		return Err(FrameError::PayloadShape);
+	}
+	Ok((u16::from_le_bytes([payload[0], payload[1]]), u16::from_le_bytes([payload[2], payload[3]])))
 }
 
 pub fn decode_failed(payload: &[u8]) -> Result<DriverFailureCode, FrameError> {

@@ -62,7 +62,8 @@ fn a_version_this_build_does_not_implement_is_refused_and_named() {
 fn an_unknown_opcode_is_refused_rather_than_accepted_as_some_message_arriving() {
 	// Which is the whole of what happens today: `launch_one` treats any message as success.
 	let mut bytes = header(Opcode::Ready, 1, 0).encode();
-	for raw in [0u16, 6, 7, 0xffff] {
+	// 6 is `Withdraw` and is a real opcode; 7 is the next unallocated one.
+	for raw in [0u16, 7, 8, 0xffff] {
 		bytes[6..8].copy_from_slice(&raw.to_le_bytes());
 		assert_eq!(Header::decode(&bytes), Err(FrameError::UnknownOpcode(raw)), "opcode {raw}");
 	}
@@ -179,4 +180,44 @@ fn ready_and_failed_are_the_terminal_frames_and_nothing_else_is() {
 	assert!(!Opcode::Bind.is_terminal());
 	assert!(!Opcode::Resource.is_terminal());
 	assert!(!Opcode::Offer.is_terminal());
+}
+
+#[test]
+fn an_offer_names_a_kind_and_the_publisher_s_own_token() {
+	// The kind says what the provider is; the token says WHICH of this driver's publications it is.
+	// A driver publishing two providers of one kind has no other way to say later which of them is
+	// going away, and it cannot name the identity the manager minted because it never sees one.
+	let mut payload = [0u8; OFFER_PAYLOAD_LEN];
+	assert_eq!(encode_offer(provider::BLOCK, 3, &mut payload), OFFER_PAYLOAD_LEN);
+	assert_eq!(decode_offer(&payload), Ok((provider::BLOCK, 3)));
+
+	// Two publications of ONE kind are told apart by the token and by nothing else, which is the
+	// case the token exists for.
+	let mut first = [0u8; OFFER_PAYLOAD_LEN];
+	let mut second = [0u8; OFFER_PAYLOAD_LEN];
+	encode_offer(provider::BLOCK, 0, &mut first);
+	encode_offer(provider::BLOCK, 1, &mut second);
+	assert_ne!(first, second);
+	assert_eq!(decode_offer(&first).map(|(kind, _)| kind), decode_offer(&second).map(|(kind, _)| kind));
+}
+
+#[test]
+fn a_withdrawal_names_a_token_carries_no_capability_and_does_not_end_the_handshake() {
+	// A withdrawal retires ONE publication. The driver stays bound and its other providers stay
+	// published, so this is not terminal - and it moves no capability, because the capability it is
+	// about is one the manager already holds.
+	assert_eq!(Opcode::from_u16(6), Some(Opcode::Withdraw));
+	assert_eq!(Opcode::Withdraw.handle_count(), 0);
+	assert!(!Opcode::Withdraw.is_terminal());
+	let mut payload = [0u8; U16_PAYLOAD_LEN];
+	encode_u16(7, &mut payload);
+	assert_eq!(decode_withdraw(&payload), Ok(7));
+}
+
+#[test]
+fn an_offer_payload_of_the_old_length_is_refused_rather_than_read_short() {
+	// The offer carried two bytes before the token joined it. A decoder that accepted the shorter
+	// form would read a token of whatever followed - so the length is exact, not a minimum.
+	assert_eq!(decode_offer(&[1, 0]), Err(FrameError::PayloadShape));
+	assert_eq!(decode_offer(&[1, 0, 0, 0, 0]), Err(FrameError::PayloadShape));
 }

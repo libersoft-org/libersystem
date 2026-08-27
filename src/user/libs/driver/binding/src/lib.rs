@@ -17,16 +17,23 @@ use driver_protocol::DriverFailureCode;
 // THERE IS NO `Removed`. Nothing rescans, so no removal event exists to enter it, and a state
 // nothing can produce is a state every reader has to reason about for nothing.
 //
-// Two more are named by later milestones and are added by the milestone that first PRODUCES one, for
-// the same reason: `DependencyPending`, where a declared requirement first has something to wait for,
-// and `Disabled`, where an operator first has a way to set it. They belong to this enum wherever they
-// are added - one enum, in one file.
+// ONE MORE IS STILL TO COME, added by the milestone that first PRODUCES it: `Disabled`, where an
+// operator first has a way to set it. `DependencyPending` arrived when a declared requirement first
+// had something to wait for. They belong to this enum wherever they are added - one enum, in one
+// file.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum BindingState {
 	// Where a node starts, and what invites a bind. A FAILED bind must never land here: it would be
 	// a bind that immediately happens again with nothing recorded about why the last one did not
 	// work.
 	Unbound,
+	// A declared requirement is not published yet. A STATE, NOT A FAILURE: a machine without a NIC
+	// is a machine, not a broken image, and a node here is waiting rather than broken.
+	//
+	// There is no edge back to `Unbound`. A node waiting for a provider that then goes away is
+	// waiting HARDER, not waiting less - and `Unbound` invites an immediate bind that would fail for
+	// the reason the node is already recording.
+	DependencyPending,
 	// The transaction is open: a driver has been selected and resources are being assembled.
 	Binding,
 	// The driver said `READY` with the current generation.
@@ -49,6 +56,7 @@ impl BindingState {
 	pub fn name(self) -> &'static [u8] {
 		match self {
 			BindingState::Unbound => b"unbound",
+			BindingState::DependencyPending => b"waiting for a dependency",
 			BindingState::Binding => b"binding",
 			BindingState::Online => b"online",
 			BindingState::Stopping => b"stopping",
@@ -77,7 +85,30 @@ impl BindingState {
 	// | `Failed` | `Binding` | an operator retry |
 	// | `Quarantined` | - | terminal for the boot |
 	pub fn may_move_to(self, to: BindingState) -> bool {
-		matches!((self, to), (BindingState::Unbound, BindingState::Binding) | (BindingState::Binding, BindingState::Online) | (BindingState::Binding, BindingState::Backoff) | (BindingState::Binding, BindingState::Failed) | (BindingState::Binding, BindingState::Stopping) | (BindingState::Online, BindingState::Stopping) | (BindingState::Stopping, BindingState::Backoff) | (BindingState::Stopping, BindingState::Failed) | (BindingState::Stopping, BindingState::Quarantined) | (BindingState::Backoff, BindingState::Binding) | (BindingState::Backoff, BindingState::Failed) | (BindingState::Failed, BindingState::Binding))
+		matches!(
+			(self, to),
+			(BindingState::Unbound, BindingState::Binding)
+				| (BindingState::Binding, BindingState::Online)
+				| (BindingState::Binding, BindingState::Backoff)
+				| (BindingState::Binding, BindingState::Failed)
+				| (BindingState::Binding, BindingState::Stopping)
+				| (BindingState::Online, BindingState::Stopping)
+				| (BindingState::Stopping, BindingState::Backoff)
+				| (BindingState::Stopping, BindingState::Failed)
+				| (BindingState::Stopping, BindingState::Quarantined)
+				| (BindingState::Backoff, BindingState::Binding)
+				| (BindingState::Backoff, BindingState::Failed)
+				| (BindingState::Failed, BindingState::Binding)
+				// The dependency edges. A node enters this state from wherever it learns a declared
+				// requirement is missing, and leaves it only for a bind - when EVERY requirement is
+				// published, not the first, which would start a bind that fails on the second.
+				| (BindingState::Unbound, BindingState::DependencyPending)
+				| (BindingState::DependencyPending, BindingState::Binding)
+				| (BindingState::Binding, BindingState::DependencyPending)
+				| (BindingState::Backoff, BindingState::DependencyPending)
+				| (BindingState::Stopping, BindingState::DependencyPending)
+				| (BindingState::Failed, BindingState::DependencyPending)
+		)
 	}
 }
 
@@ -216,12 +247,15 @@ pub enum BindingEvent {
 	Closed { generation: u64 },
 	// This attempt spent its share of the boot window.
 	TimedOut { generation: u64 },
+	// A provider this driver published under `token` is going away. NOT terminal: the driver stays
+	// bound and its other publications stay published.
+	Withdrawn { generation: u64, token: u16 },
 }
 
 impl BindingEvent {
 	pub fn generation(self) -> u64 {
 		match self {
-			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } => generation,
+			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } => generation,
 		}
 	}
 }
@@ -340,5 +374,29 @@ impl BindingId {
 	// The same function, one binding later.
 	pub fn rebound(self, generation: u64) -> Self {
 		Self { generation, ..self }
+	}
+}
+
+// ------------------------------------------------------- what a driver publishes
+
+// A PROVIDER'S IDENTITY, WHICH THE MANAGER ASSIGNS AND A DRIVER NEVER CHOOSES.
+//
+// Handing one channel to two subscribers is not two connections - it is two consumers competing
+// over one reply queue - so a connection is minted per consumer and the catalogue entry is what they
+// are minted from. A driver that could choose its own identity could advertise itself as the system
+// disk, which is why the manager mints these and the driver only ever sees its own token.
+//
+// `slot` is the manager's index for this publication and `generation` distinguishes reuse of the
+// slot, so an id that named a withdrawn provider cannot silently name its replacement.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct ProviderId {
+	pub binding: BindingId,
+	pub slot: u16,
+	pub generation: u32,
+}
+
+impl ProviderId {
+	pub const fn new(binding: BindingId, slot: u16, generation: u32) -> Self {
+		Self { binding, slot, generation }
 	}
 }

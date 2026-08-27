@@ -85,6 +85,58 @@ struct RawDriver {
 	rules: Vec<RawMatchRule>,
 	#[serde(default)]
 	priority: MatchPriority,
+	// WHAT THIS ENTRY NEEDS BEFORE IT CAN BIND, as provider kinds. A driver that needs a bus its
+	// controller has not published yet is not a driver that failed - it is one that was tried too
+	// early, and today it is launched anyway and fails.
+	#[serde(default)]
+	requires: Vec<ProviderKindName>,
+	// WHICH KINDS IT MAY PUBLISH, AND HOW MANY. A bound, so a driver cannot publish a kind it never
+	// declared - a compromised one advertising itself as a disk is the case this closes.
+	#[serde(default)]
+	provides: Vec<RawProvides>,
+}
+
+// The provider kinds a manifest may name, spelled once. A closed set for the reason the match rules
+// are closed: a kind this system does not have is a manifest that fails to parse, not a requirement
+// nothing ever satisfies.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProviderKindName {
+	Block,
+	Net,
+	Display,
+	Audio,
+	Input,
+	UsbBus,
+	Pointer,
+	ConsoleBytes,
+}
+
+impl ProviderKindName {
+	// The wire number `driver_protocol::provider` gives this kind. Written here because this crate
+	// is a build-time tool and does not link the driver protocol; the generated registry carries the
+	// numbers, so a disagreement would be a driver whose declaration nothing matches.
+	pub fn wire(self) -> u16 {
+		match self {
+			ProviderKindName::Block => 1,
+			ProviderKindName::Net => 2,
+			ProviderKindName::Display => 3,
+			ProviderKindName::Audio => 4,
+			ProviderKindName::Input => 5,
+			ProviderKindName::UsbBus => 6,
+			ProviderKindName::Pointer => 7,
+			ProviderKindName::ConsoleBytes => 8,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RawProvides {
+	kind: ProviderKindName,
+	// At most this many of that kind. `most = 0` would be a declaration that publishes nothing,
+	// which is what leaving the row out already says.
+	most: u16,
 }
 
 // A match rule, as a CLOSED tagged set rather than free-form key/value pairs.
@@ -405,6 +457,14 @@ pub struct Driver {
 	pub lifecycle: DriverLifecycle,
 	pub rules: Vec<MatchRule>,
 	pub priority: MatchPriority,
+	pub requires: Vec<ProviderKindName>,
+	pub provides: Vec<Provides>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+pub struct Provides {
+	pub kind: ProviderKindName,
+	pub most: u16,
 }
 
 // A match rule the generated registry can evaluate against a discovered node: every predicate that
@@ -792,6 +852,8 @@ impl Manifest {
 			let driver = raw_program.driver.as_ref().map(|raw| Driver {
 				lifecycle: raw.lifecycle,
 				priority: raw.priority,
+				requires: raw.requires.clone(),
+				provides: raw.provides.iter().map(|entry| Provides { kind: entry.kind, most: entry.most }).collect(),
 				rules: raw
 					.rules
 					.iter()
@@ -1346,6 +1408,60 @@ fn validate_references(libraries: &BTreeMap<Name, Library>, programs: &BTreeMap<
 				push_error(errors, format!("libraries.{name}.providers"), "self provider edge");
 			} else if !libraries.contains_key(provider) {
 				push_error(errors, format!("libraries.{name}.providers"), format!("unknown library {provider}"));
+			}
+		}
+	}
+	// WHAT A DRIVER NEEDS AND WHAT IT MAY PUBLISH, checked against each other across the whole
+	// registry - which is the only place either question can be answered.
+	//
+	// A requirement nothing produces is a driver that will wait for ever, and it reads at runtime
+	// exactly like hardware that is absent. A cycle is two drivers each waiting for the other, which
+	// reads the same way again. Both are decidable here, over a closed set of kinds, and neither is
+	// discoverable on a machine without knowing what SHOULD have come up.
+	let mut producers: BTreeMap<ProviderKindName, Vec<&Name>> = BTreeMap::new();
+	for (name, program) in programs {
+		let Some(driver) = &program.driver else { continue };
+		for provides in &driver.provides {
+			producers.entry(provides.kind).or_default().push(name);
+		}
+	}
+	for (name, program) in programs {
+		let Some(driver) = &program.driver else { continue };
+		for kind in &driver.requires {
+			if !producers.contains_key(kind) {
+				push_error(errors, format!("programs.{name}.driver.requires"), format!("{kind:?} is required and no entry in this image declares it in `provides`, so this driver would wait for ever - which reads exactly like hardware that is absent"));
+			}
+			// A driver requiring what it publishes is a cycle of one, and the shortest kind to miss.
+			if driver.provides.iter().any(|provides| provides.kind == *kind) {
+				push_error(errors, format!("programs.{name}.driver.requires"), format!("{kind:?} is both required and provided by this entry, which is a driver waiting for itself"));
+			}
+		}
+		for provides in &driver.provides {
+			if provides.most == 0 {
+				push_error(errors, format!("programs.{name}.driver.provides"), "`most = 0` declares a publication that may never happen, which is what leaving the row out already says");
+			}
+		}
+	}
+	// A STRUCTURAL CYCLE ACROSS ENTRIES. Reachability over "this driver requires a kind that driver
+	// publishes", walked from each entry back to itself.
+	for (name, program) in programs {
+		let Some(driver) = &program.driver else { continue };
+		let mut seen: BTreeSet<&Name> = BTreeSet::new();
+		let mut frontier: Vec<&Name> = Vec::new();
+		for kind in &driver.requires {
+			frontier.extend(producers.get(kind).into_iter().flatten().copied());
+		}
+		while let Some(next) = frontier.pop() {
+			if next == name {
+				push_error(errors, format!("programs.{name}.driver.requires"), "a structural cycle: following what this entry requires leads back to itself, so neither driver can ever bind");
+				break;
+			}
+			if !seen.insert(next) {
+				continue;
+			}
+			let Some(other) = programs.get(next).and_then(|program| program.driver.as_ref()) else { continue };
+			for kind in &other.requires {
+				frontier.extend(producers.get(kind).into_iter().flatten().copied());
 			}
 		}
 	}

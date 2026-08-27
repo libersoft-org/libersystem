@@ -176,7 +176,11 @@ fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<al
 		}
 		match header.opcode {
 			driver_protocol::Opcode::Offer => {
-				if let (Ok(kind), Some(cap)) = (driver_protocol::decode_offer(header.payload(&message.bytes)), message.caps.first()) {
+				// The token is the publisher's own name for the publication and this harness has
+				// no use for it: it collects what a handshake offered and asks by KIND. The real
+				// manager keeps it, because a driver withdrawing one of two providers of one kind
+				// has no other way to say which.
+				if let (Ok((kind, _token)), Some(cap)) = (driver_protocol::decode_offer(header.payload(&message.bytes)), message.caps.first()) {
 					offers.push((kind, cap.object()));
 				}
 			}

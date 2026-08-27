@@ -388,3 +388,50 @@ fn the_xhci_row_is_a_class_triple_and_no_longer_a_liber_system_number() {
 	let ehci = MatchRule { transport: Some(TRANSPORT_PLAIN_PCI), pci_class: Some(0x0c), pci_subclass: Some(0x03), pci_interface: Some(0x20), ..MatchRule::default() };
 	assert!(!xhci.overlaps(ehci), "the programming interface is what distinguishes xHCI from EHCI, and the rule names it");
 }
+
+#[test]
+fn a_requirement_nothing_in_the_image_produces_is_refused_when_the_registry_is_built() {
+	// A driver waiting for a kind no entry declares waits FOR EVER, and at runtime that reads
+	// exactly like hardware that is absent - which is the one thing a machine is allowed to look
+	// like. Decidable here, over a closed set of kinds, and nowhere else.
+	let root = fixture_workspace();
+	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
+	let driver = |extra: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2 }}]\n{extra}", valid_fixture()) };
+
+	// The shape it is built for parses.
+	assert_eq!(errors(&driver("provides = [{ kind = \"block\", most = 1 }]\n")), "", "a driver that publishes what it declares must validate");
+
+	// A requirement with no producer anywhere in the image.
+	let orphan = driver("requires = [\"usb-bus\"]\n");
+	assert!(errors(&orphan).contains("wait for ever"), "{}", errors(&orphan));
+
+	// A driver requiring what it publishes: a cycle of one, and the shortest kind to miss.
+	let itself = driver("requires = [\"block\"]\nprovides = [{ kind = \"block\", most = 1 }]\n");
+	assert!(errors(&itself).contains("waiting for itself"), "{}", errors(&itself));
+
+	// `most = 0` declares a publication that may never happen, which is what leaving the row out
+	// already says.
+	let never = driver("provides = [{ kind = \"block\", most = 0 }]\n");
+	assert!(errors(&never).contains("leaving the row out"), "{}", errors(&never));
+
+	// A kind this system does not have fails to PARSE, like every other closed set here.
+	let unknown = driver("provides = [{ kind = \"quantum\", most = 1 }]\n");
+	assert!(!errors(&unknown).is_empty(), "an unknown provider kind must not parse");
+}
+
+#[test]
+fn two_drivers_each_waiting_for_the_other_are_refused_rather_than_discovered_on_a_machine() {
+	// A STRUCTURAL CYCLE ACROSS ENTRIES. Neither can ever bind, and on a machine both simply never
+	// come up - which looks like two absent devices and is actually a broken image.
+	let root = fixture_workspace();
+	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
+	let entry = |name: &str, kind: &str, wants: &str, virtio: u32| -> String { format!("\n[[programs]]\nname = \"{name}\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/{name}.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = {virtio} }}]\nrequires = [\"{wants}\"]\nprovides = [{{ kind = \"{kind}\", most = 1 }}]\n") };
+	// a publishes block and wants usb-bus; b publishes usb-bus and wants block.
+	let cycle = format!("{}{}{}", valid_fixture(), entry("a_driver", "block", "usb-bus", 2), entry("b_driver", "usb-bus", "block", 16));
+	assert!(errors(&cycle).contains("structural cycle"), "{}", errors(&cycle));
+
+	// AND THE SAME TWO WITHOUT THE CYCLE VALIDATE, so the check is refusing the cycle and not the
+	// shape of the declaration.
+	let fine = format!("{}{}{}", valid_fixture(), entry("a_driver", "block", "usb-bus", 2), entry("b_driver", "usb-bus", "block", 16).replace("requires = [\"block\"]\n", ""));
+	assert_eq!(errors(&fine), "", "one driver requiring another's output is the ordinary case: {}", errors(&fine));
+}

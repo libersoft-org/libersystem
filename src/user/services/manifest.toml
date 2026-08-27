@@ -1417,6 +1417,7 @@ providers = []
 [programs.driver]
 lifecycle = "boot-critical"
 match = [{ transport = "virtio-pci", virtio-type = 2 }]
+provides = [{ kind = "block", most = 1 }]
 
 [[programs]]
 name = "virtio_console"
@@ -1430,6 +1431,7 @@ providers = []
 [programs.driver]
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 3 }]
+provides = [{ kind = "console-bytes", most = 1 }]
 
 [[programs]]
 name = "dev_channel"
@@ -1452,6 +1454,7 @@ match = [
 	{ transport = "virtio-pci", virtio-type = 3, pci-address = { bus = 0, dev = 30, func = 0 } },
 ]
 priority = "quirk"
+provides = [{ kind = "console-bytes", most = 1 }]
 
 [[programs]]
 name = "dev_agent"
@@ -1475,6 +1478,7 @@ providers = []
 [programs.driver]
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 16 }]
+provides = [{ kind = "display", most = 1 }]
 
 [[programs]]
 name = "virtio_input"
@@ -1488,6 +1492,7 @@ providers = []
 [programs.driver]
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 18 }]
+provides = [{ kind = "input", most = 1 }]
 
 [[programs]]
 name = "virtio_net"
@@ -1501,6 +1506,7 @@ providers = []
 [programs.driver]
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 1 }]
+provides = [{ kind = "net", most = 1 }]
 
 [[programs]]
 name = "virtio_snd"
@@ -1514,6 +1520,7 @@ providers = []
 [programs.driver]
 lifecycle = "controller"
 match = [{ transport = "virtio-pci", virtio-type = 25 }]
+provides = [{ kind = "audio", most = 1 }]
 
 [[programs]]
 name = "volume"
@@ -1563,6 +1570,11 @@ providers = []
 [programs.driver]
 lifecycle = "controller"
 match = [{ transport = "plain-pci", pci-class = 0x0c, pci-subclass = 0x03, pci-interface = 0x30 }]
+provides = [
+	{ kind = "block", most = 1 },
+	{ kind = "usb-bus", most = 1 },
+	{ kind = "pointer", most = 1 },
+]
 
 [[factory_files]]
 name = "audio-demo"
