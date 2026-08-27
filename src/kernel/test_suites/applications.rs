@@ -720,6 +720,19 @@ fn decode_flac_samples(bytes: &[u8]) -> alloc::vec::Vec<i16> {
 	samples
 }
 
+// `Memory` IS A TAG OF THIS TEST, AND THE ASSERTIONS BELOW ARE WHY.
+//
+// It was taken off here on 2026-08-27 and put back the same day. The reasoning for removing it was
+// that an application test which merely allocates is not a memory test - which is a sound rule and
+// the wrong test to apply it to. This one asserts on the measured peak of three conversions, on the
+// 4K peak fitting `IMGCONV_MEMORY_LIMIT`, and on a conversion under an 80 MB Domain failing with a
+// typed diagnostic while leaving its destination byte-for-byte intact. That is memory governance,
+// not memory traffic, and a change to the Domain accounting should reach it.
+//
+// WHAT WAS ACTUALLY WRONG WAS THE CALLER. This test costs 1149 SECONDS on an emulated aarch64, and
+// `qemu-arch-profiles` reached it eight times by asking for the whole `memory` tag to assert five
+// things about interrupt controllers. The tag was honest; the question was not. The gate now names
+// the tags it needs, and this test is not among them.
 tagged_test!(imgconv_governed_working_set_is_measured, [Image, Memory, Process, Service, Storage], id = "kernel.applications.imgconv_governed_working_set_is_measured", covers = ["bin.imgconv", "imgconv", "png", "webp"]);
 fn imgconv_governed_working_set_is_measured() {
 	use object::domain::{Domain, UNLIMITED};

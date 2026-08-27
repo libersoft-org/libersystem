@@ -38,8 +38,18 @@ profile+=" -numa node,nodeid=0,memdev=m0,cpus=0-1 -numa node,nodeid=1,memdev=m1,
 profile+=" -numa dist,src=0,dst=1,val=21 -numa dist,src=1,dst=0,val=21"
 
 echo "qemu-numa: booting the two-node profile"
-QEMU_EXTRA="$profile" ./test.sh --arch x86_64 --tags memory,smp --smp 4 >"$work/run.log" 2>&1 || {
-	echo "qemu-numa: the memory suite failed on the two-node profile" >&2
+# `--tags numa`, NOT `memory,smp`, AND THIS FILE ALREADY KNEW WHY.
+#
+# Three of its own assertions name `kernel.mem.numa.*` and `kernel.smp.numa.*`, every one of which
+# carries `Numa`; the rest are greps over what the BOOT printed and need no test at all. `memory,smp`
+# ran the whole memory suite to reach seven named tests - and `Memory` is also on the application
+# suite, so it pulled in `kernel.applications.imgconv_governed_working_set_is_measured`, which is an
+# image-conversion working-set measurement and takes 1149 seconds on an emulated target.
+#
+# The direct-boot ports below already do it this way, and say so in as many words: "The NUMA tests
+# carry their own tag for exactly this reason." That reasoning was never brought back up here.
+QEMU_EXTRA="$profile" ./test.sh --arch x86_64 --tags numa --smp 4 >"$work/run.log" 2>&1 || {
+	echo "qemu-numa: the numa tests failed on the two-node profile" >&2
 	tail -20 "$work/run.log" >&2
 	exit 1
 }
@@ -128,7 +138,11 @@ profile_dt+=" -numa node,nodeid=0,memdev=m0,cpus=0-1 -numa node,nodeid=1,memdev=
 profile_dt+=" -numa dist,src=0,dst=1,val=21 -numa dist,src=1,dst=0,val=21"
 for port in aarch64 riscv64; do
 	echo "qemu-numa: booting the two-node $port direct profile"
-	UEFI=0 QEMU_EXTRA="$profile_dt" ./test.sh --arch "$port" --tags numa --smp 4 --timeout 1800 >"$work/$port.log" 2>&1 || {
+	# NO `--timeout` OF THIS GATE'S OWN. 1800s is tighter than the harness picks for an emulated
+	# target and tighter than the stall detector that decides whether a run is WEDGED (2400s of
+	# silence) - so slow was always reported before wedged could be distinguished. Two authorities
+	# over one window; the harness owns the emulated calibration.
+	UEFI=0 QEMU_EXTRA="$profile_dt" ./test.sh --arch "$port" --tags numa --smp 4 >"$work/$port.log" 2>&1 || {
 		echo "qemu-numa: the numa tests failed on the two-node $port profile" >&2
 		tail -20 "$work/$port.log" >&2
 		exit 1

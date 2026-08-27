@@ -93,6 +93,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => 0,
 	};
 
+	// 1e. the boot window, in monotonic ticks: the absolute deadline this attempt's window closes
+	//     at, and the length it was computed from. Relayed down like the mode flag - this process
+	//     bounds nothing itself, but DeviceManager cannot invent a bind budget and ServiceManager
+	//     is what keeps the length across a DeviceManager restart.
+	//
+	//     ZERO WHEN ABSENT, AND THAT IS NOT FATAL. Every hop treats a zero window as "no budget was
+	//     published" and falls back to its own default. A boot that stops because a supervisor
+	//     could not be told how long it had would be a worse failure than one that runs on the
+	//     compiled-in number.
+	let (boot_deadline, boot_window): (u64, u64) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, .. } if len >= 7 + 16 && &buf[..7] == b"BOOTWIN" => (u64::from_le_bytes(buf[7..15].try_into().unwrap_or([0; 8])), u64::from_le_bytes(buf[15..23].try_into().unwrap_or([0; 8]))),
+		_ => (0, 0),
+	};
+
 	// 2. find ServiceManager in the package and spawn it, handing it one end of a
 	//    fresh control channel as its bootstrap.
 	let archive: &[u8] = unsafe { core::slice::from_raw_parts(pkg_base as *const u8, pkg_len) };
@@ -152,10 +166,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(sm_side, b"SYSPOWER", power_client);
 		let mode_msg: [u8; 5] = [b'M', b'O', b'D', b'E', mode];
 		send_blocking(sm_side, &mode_msg, 0);
-		// The three console/display capabilities, last, in the order they arrived.
-		if console_cap_count > 0 {
-			send_caps(sm_side, b"CONSOLECAPS", &console_caps[..console_cap_count]);
-		}
+		// The three console/display capabilities, in the order they arrived.
+		//
+		// SENT WHETHER OR NOT THERE ARE ANY. It used to be skipped when the count was zero, which
+		// desynchronises everything after it: the next hop reads this bootstrap POSITIONALLY, so a
+		// missing message means its CONSOLECAPS read consumes whatever came next instead. That was
+		// harmless while this was the last message and stopped being harmless the moment one was
+		// added after it. An empty CONSOLECAPS is what "the boot granted none" looks like on the
+		// wire, and every reader downstream already treats a zero capability as not granted.
+		send_caps(sm_side, b"CONSOLECAPS", &console_caps[..console_cap_count]);
+		// The boot window, last, in the position it arrived in.
+		let mut window_msg: [u8; 7 + 16] = [0u8; 7 + 16];
+		window_msg[..7].copy_from_slice(b"BOOTWIN");
+		window_msg[7..15].copy_from_slice(&boot_deadline.to_le_bytes());
+		window_msg[15..].copy_from_slice(&boot_window.to_le_bytes());
+		send_blocking(sm_side, &window_msg, 0);
 	}
 
 	// 4. relay every report ServiceManager sends up to the kernel. ServiceManager's

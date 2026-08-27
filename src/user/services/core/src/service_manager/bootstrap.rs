@@ -469,6 +469,23 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 					if role.tag == b"SYSPOWER" {
 						return Some((role.tag.to_vec(), service_connect(power)?));
 					}
+					// THE BOOT WINDOW, AND THE DEADLINE ONLY THE FIRST TIME.
+					//
+					// `swap(0)` is the rule, not an optimisation: the boot's own deadline belongs to
+					// the bind that competes with the boot, and there is exactly one of those. Every
+					// DeviceManager started afterwards - a restart, a recovery hours later - reads a
+					// zero deadline and bounds itself by the LENGTH alone, measured from its own now.
+					// A deadline in the past handed to a recovery is a budget that was spent before
+					// the work it is meant to bound was asked for.
+					if role.tag == b"BOOTWIN" {
+						let deadline: u64 = super::BOOT_DEADLINE.swap(0, core::sync::atomic::Ordering::Relaxed);
+						let window: u64 = super::BOOT_WINDOW.load(core::sync::atomic::Ordering::Relaxed);
+						let mut message: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+						message.extend_from_slice(b"BOOTWIN");
+						message.extend_from_slice(&deadline.to_le_bytes());
+						message.extend_from_slice(&window.to_le_bytes());
+						return Some((message, 0));
+					}
 					if role.tag == b"CONSOLE" || role.tag == b"DEVPRIV" {
 						let privilege: u64 = if role.tag == b"CONSOLE" { console_input } else { device_manager };
 						if privilege == 0 {

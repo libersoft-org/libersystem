@@ -1871,6 +1871,14 @@ kind = "privilege"
 provider = "kernel"
 presence = "optional"
 
+# How long this boot is allowed to take, in monotonic ticks, so a driver that never answers is
+# bounded by the same window the kernel's recovery ladder measures the whole chain against. Carries
+# no capability: an absolute deadline and a length, both little-endian.
+[[services.roles]]
+tag = "BOOTWIN"
+kind = "payload"
+provider = "service_manager"
+
 [[services]]
 name = "device_service"
 program = "device_service"

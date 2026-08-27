@@ -93,7 +93,13 @@ fn init_package_starts_system_manager() {
 	// DeviceManager's virtio-blk backs), the graceful-shutdown ordering check
 	// (ServiceManager confirms the reverse-dependency teardown order the `poweroff`
 	// path uses is valid against the live manifest), followed by the two managers.
-	let (kernel_ep, _manager) = spawn_system_manager().expect("SystemManager should start from the init package");
+	// A GENEROUS WINDOW, BECAUSE THIS SUITE IS NOT MEASURING ONE. The two numbers are the boot
+	// budget DeviceManager derives its per-device bind slice from; this test asserts on what the
+	// chain reports, not on how long it took, so it hands over a window nothing here can exhaust.
+	// A test that passed a tight one would be timing an emulator, which is what the profile gates
+	// found out the hard way.
+	const TEST_BOOT_WINDOW: u64 = 100_000;
+	let (kernel_ep, _manager) = spawn_system_manager(arch::apic::ticks().saturating_add(TEST_BOOT_WINDOW), TEST_BOOT_WINDOW).expect("SystemManager should start from the init package");
 	sched::run_until_idle();
 	// Seven StorageService instances: the system volume, media, iso, udf, usb, and the two
 	// memory volumes (ram and tmp). They NAME THEMSELVES now, so this asserts the set that came up
@@ -668,7 +674,7 @@ fn system_manager_recovery_escalates_after_repeated_crashes() {
 	// reason rather than the crash.
 	let (console_far, console_near) = object::channel::Channel::create();
 	console_input::attach(console_far);
-	let up = supervise(&crash_rx, 3, 8, || {
+	let up = supervise(&crash_rx, 3, 8, |_, _| {
 		attempts += 1;
 		let (reports, _peer) = object::channel::Channel::create();
 		Some((reports, sched::spawn(user_fault_thread_body, 0).process().clone()))
@@ -712,7 +718,7 @@ fn system_manager_recovery_survives_a_clean_start() {
 	let mut resident: Option<alloc::sync::Arc<object::process::Process>> = None;
 	let (console_far, console_near) = object::channel::Channel::create();
 	console_input::attach(console_far);
-	let up = supervise(&crash_rx, 3, 8, || {
+	let up = supervise(&crash_rx, 3, 8, |_, _| {
 		let process = sched::spawn(resident_body, 0).process().clone();
 		resident = Some(process.clone());
 		let (reports, _peer) = object::channel::Channel::create();
@@ -728,7 +734,7 @@ fn system_manager_recovery_survives_a_clean_start() {
 	// AND THE SAME LADDER MUST REFUSE ONE THAT LEFT. Nothing faults here either; the difference is
 	// only that the process is gone, which is exactly the case the crash channel cannot report.
 	let mut attempts: u32 = 0;
-	let departed = supervise(&crash_rx, 3, 8, || {
+	let departed = supervise(&crash_rx, 3, 8, |_, _| {
 		attempts += 1;
 		let (reports, _peer) = object::channel::Channel::create();
 		Some((reports, sched::spawn(departed_body, 0).process().clone()))

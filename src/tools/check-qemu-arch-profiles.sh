@@ -66,7 +66,20 @@ timer_ticked() {
 # TLB shootdown acknowledgement and secondary-core scheduling at four. Each is a test that already
 # exists and drives the path end to end; what was missing was running them HERE, on the profile, and
 # requiring them by name. The tag set is the one the milestone permits in place of the full suite.
-TAGS="boot,smp,interrupt,paging,scheduler,drivers,memory"
+# `memory` IS NOT HERE, AND ITS ABSENCE IS THE POINT.
+#
+# It pulled in `kernel.applications.imgconv_governed_working_set_is_measured`, which is tagged
+# `[Image, Memory, Process, Service, Storage]` and takes 1149 SECONDS on an emulated aarch64 - 83% of
+# a 23-minute profile, run eight times, for two and a half hours per gate. It is an image-conversion
+# working-set measurement. This gate is about which interrupt controller the machine has.
+#
+# NOTHING THIS GATE ASSERTS IS LOST. Its oracles are the MSI pair and three multi-core tests, and
+# `a_shootdown_is_answered_by_every_other_core` - the only one carrying `Memory` - also carries
+# `Scheduler` and `Smp`, so it still runs. What goes is coverage the DEFAULT machine already provides
+# and this profile has no claim on.
+#
+# Measured 2026-08-27, which is why the number above is a number and not "slow".
+TAGS="boot,smp,interrupt,paging,scheduler,drivers"
 # MSI acquire, program, bind, dispatch and release - the delivery and the teardown - on whichever MSI
 # controller this machine has. Set per profile, because a GICv3 with its ITS turned OFF has no MSI
 # backend at all: asking it an MSI question proves nothing, and that profile exists for the timer and
@@ -103,7 +116,29 @@ run_profile() {
 	#
 	# Two authorities over one window is the thing this tree keeps removing. The harness owns the
 	# emulated calibration; this gate asks it to run and lets it decide.
-	if ! env "$@" ./test.sh --arch "$arch" --tags "$TAGS" --smp "$cores" >"$out" 2>&1; then
+	# A PROFILE WITH NO MSI BACKEND CANNOT BRING UP THE SERVICES THAT NEED ONE, and asking it to is
+	# this gate contradicting its own configuration.
+	#
+	# `boot` pulls in `kernel.boot.init_package_starts_system_manager`, which requires EVERY manifest
+	# service to report online. On a GICv3 with its ITS turned off there is no MSI controller at all -
+	# `MSI_ORACLE` is empty for exactly that reason, and the gicv2m test declines the machine in as
+	# many words - so virtio_net, virtio_gpu, virtio_snd and xhci cannot be given an interrupt, and
+	# NetworkService, DisplayService and everything waiting behind them never start.
+	#
+	# Measured 2026-08-27 on `aarch64 gicv3 at 1 core(s)`: `6 of 10 device(s) online`, four drivers
+	# refused with `resource-exhausted`, and the boot test failed on seven missing services. Nothing
+	# was wrong with the kernel; the profile was asked for something it is defined not to have.
+	#
+	# WHAT THE PROFILE STILL PROVES IS UNCHANGED: the controller it discovered and its timer ticks are
+	# asserted by this gate directly off the log, and the multi-core oracles arrive through
+	# `scheduler` and `smp`. Only the whole-system boot assertion goes, and only where it is
+	# structurally unsatisfiable.
+	local tags="$TAGS"
+	if [[ -z "$MSI_ORACLE" ]]; then
+		tags="${TAGS//boot,/}"
+		echo "arch-profiles:     no MSI backend on this profile - not requiring a full service bring-up"
+	fi
+	if ! env "$@" ./test.sh --arch "$arch" --tags "$tags" --smp "$cores" >"$out" 2>&1; then
 		echo "arch-profiles: the integration suite failed on $arch $label at $cores core(s)" >&2
 		tail -20 "$out" >&2
 		exit 1

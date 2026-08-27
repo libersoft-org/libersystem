@@ -278,7 +278,10 @@ fn input_service_streams_keys_only_with_display_focus() {
 	assert_eq!(frames, 6, "three key-down frames are followed by three synthetic releases");
 }
 
-tagged_test!(display_service_restores_the_console_surface, [Service, Console, Display, Memory], id = "kernel.services.display_service_restores_the_console_surface", covers = ["kernel", "term"]);
+// `Memory` GOES FOR THE REASON THE IMAGE SUITE'S DOES: this test is about a display service
+// restoring a console surface, and it allocates on the way. What it CATCHES is already recorded in
+// `covers` below and is unchanged by this; what moves is only which changes select it.
+tagged_test!(display_service_restores_the_console_surface, [Service, Console, Display], id = "kernel.services.display_service_restores_the_console_surface", covers = ["kernel", "term"]);
 fn display_service_restores_the_console_surface() {
 	use object::address_space::AddressSpace;
 	use object::channel::{Channel, Message};

@@ -495,7 +495,9 @@ fn resident_manager_lost() -> bool {
 	control_plane_lost(SYSTEM_IS_UP.load(core::sync::atomic::Ordering::Relaxed), manager.as_ref())
 }
 
-fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>), &'static str> {
+// `boot_deadline` is the absolute tick at which THIS attempt's window closes, and `window_ticks` the
+// length it was computed from. Both cross the hand-off: see the `BOOTWIN` message at the end.
+fn spawn_system_manager(boot_deadline: u64, window_ticks: u64) -> Result<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>), &'static str> {
 	use alloc::sync::Arc;
 	use object::KernelObject;
 	use object::channel::Message;
@@ -610,6 +612,35 @@ fn spawn_system_manager() -> Result<(alloc::sync::Arc<object::channel::Channel>,
 	let privileges: alloc::vec::Vec<Capability> = [PrivilegeKind::DisplayController, PrivilegeKind::ConsoleInputSource, PrivilegeKind::ConsoleSink, PrivilegeKind::DeviceManager].into_iter().map(|kind| Capability::new(Privilege::create(kind).expect("the four privilege capabilities, minted at boot before any userspace allocation") as Arc<dyn KernelObject>, Rights::TRANSFER | Rights::DUPLICATE)).collect();
 	// ALLOC-OK: boot, before userspace exists - a tag on the same handover path.
 	kernel_ep.send(Message::new(b"CONSOLECAPS".to_vec(), privileges)).map_err(|_| "failed to hand SystemManager the console capabilities")?;
+
+	// THE BOOT WINDOW, IN THE ONE UNIT BOTH SIDES SPEAK.
+	//
+	// Userspace has to bound its own bring-up work - a driver that never answers must not be given
+	// the whole boot - and until this message existed it had no way to know how long the boot was
+	// allowed to take. The two units tried before this one both failed for the same reason: the
+	// enforcer could not observe them. Seconds are not a fixed number of settle passes, and the
+	// settle count itself was a local loop variable inside `supervise` that no syscall exposes.
+	// Monotonic ticks are what `wait_any` already takes and what `clock()` already returns.
+	//
+	// TWO NUMBERS, NOT ONE, AND THE SECOND IS NOT REDUNDANT. The deadline is when THIS boot's window
+	// closes and is what the first bind must respect, because that one really does compete with the
+	// boot. The length is what a recovery an hour from now needs: a deadline that has passed is not
+	// a budget, and `deadline - now` read at the moment of arrival measures what was LEFT of the
+	// window rather than what the window is. A driver crashing after an hour of service would
+	// otherwise be rebound against arithmetic about a boot that finished long ago.
+	//
+	// Last in the sequence, like every addition to this bootstrap: it is read positionally at every
+	// hop, so anything inserted in the middle shifts every read after it and stops the chain where
+	// it stands.
+	// ALLOC-OK: boot, the last message of the hand-off, before userspace exists.
+	let mut window_msg = alloc::vec::Vec::with_capacity(7 + 16);
+	// ALLOC-OK: as above
+	window_msg.extend_from_slice(b"BOOTWIN");
+	// ALLOC-OK: as above
+	window_msg.extend_from_slice(&boot_deadline.to_le_bytes());
+	// ALLOC-OK: as above
+	window_msg.extend_from_slice(&window_ticks.to_le_bytes());
+	kernel_ep.send(Message::new(window_msg, alloc::vec::Vec::new())).map_err(|_| "failed to hand SystemManager the boot window")?;
 	Ok((kernel_ep, process))
 }
 
@@ -683,7 +714,10 @@ fn root_child_domains() -> usize {
 // EACH ATTEMPT COMPUTES ONE ABSOLUTE DEADLINE and the loop ends on it. That value is the one thing
 // called "the boot window" on both sides of the hand-off; publishing a second one beside this loop
 // would leave two authorities over it, disagreeing the first time a round took longer than the last.
-fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_ticks: u64, mut spawn: impl FnMut() -> Option<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>)>) -> bool {
+// `spawn` is handed this attempt's absolute deadline and the window it was computed from, because
+// the boot budget has to cross the hand-off with the bootstrap and there is no later message to put
+// it in - see `spawn_system_manager`.
+fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_ticks: u64, mut spawn: impl FnMut(u64, u64) -> Option<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>)>) -> bool {
 	use object::KernelObject;
 	let branches_before: usize = root_child_domains();
 	for attempt in 0..=max_restarts {
@@ -699,7 +733,20 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		// recovery ladder has reported SUCCESS when nothing had been started - and the boot then
 		// carried on as though userspace were up. A failed spawn is a failed attempt: retry it like
 		// a crash, and let the ladder run out if it keeps failing.
-		let Some((reports, process)) = spawn() else {
+		// THE WINDOW OPENS BEFORE THE SPAWN, NOT AFTER IT.
+		//
+		// `started` used to be taken after the process was loaded and its first drain had run, so
+		// the budget excluded the part of the boot this function is most responsible for. It also
+		// meant the deadline did not exist yet when the bootstrap was assembled - and the bootstrap
+		// is where it has to be published, because DeviceManager cannot derive a bind budget from a
+		// number the kernel keeps to itself.
+		//
+		// ONE VALUE, TWO READERS. The loop below ends on this deadline and the hand-off carries the
+		// same one. Computing it twice - once here and once for userspace - is two authorities over
+		// one window that agree only until a round runs long.
+		let started = arch::apic::ticks();
+		let deadline = started.saturating_add(window_ticks);
+		let Some((reports, process)) = spawn(deadline, window_ticks) else {
 			serial_println!("recovery: SystemManager did not start (attempt {} of {})", attempt + 1, max_restarts + 1);
 			continue;
 		};
@@ -725,8 +772,6 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		// it - so this is the boot log and the backpressure relief in one loop.
 		let mut listening = false;
 		let mut gone = false;
-		let started = arch::apic::ticks();
-		let deadline = started.saturating_add(window_ticks);
 		while arch::apic::ticks() < deadline {
 			// BOUNDED, not merely called. A thread that yields and requeues itself keeps this core's
 			// run queue non-empty for as long as it likes, and the unbounded form would never come
@@ -832,7 +877,7 @@ pub(crate) fn boot_userspace(window_ticks: u64) {
 	sched::set_idle_hook(serial_console_pump);
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
-	let up = supervise(&crash_rx, MAX_RESTARTS, window_ticks, || match spawn_system_manager() {
+	let up = supervise(&crash_rx, MAX_RESTARTS, window_ticks, |deadline, window| match spawn_system_manager(deadline, window) {
 		Ok((ep, process)) => Some((ep, process)),
 		Err(reason) => {
 			serial_println!("recovery: could not start SystemManager: {}", reason);

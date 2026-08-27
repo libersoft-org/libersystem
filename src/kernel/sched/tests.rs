@@ -261,28 +261,35 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	while RAN_AT.load(Ordering::SeqCst) == 0 {
 		core::hint::spin_loop();
 	}
-	let woken = cycles_over_twenty(true);
+	// THREE MEASUREMENTS, BECAUSE TWO CANNOT SAY WHAT THE THIRD IS FOR.
+	//
+	// The woken trip is measured TWICE. The spread between those two is this machine's noise floor,
+	// measured on the machine, in the run, under whatever load it happens to be under - and the
+	// signal has to beat it. A threshold derived only from the tick period is a guess about noise;
+	// this is not.
+	//
+	// It was three attempts to learn that. A fixed 4 ms bound became a coin toss under emulation;
+	// counting tick boundaries could not resolve a trip longer than a tick; cycles with a derived
+	// threshold passed at 12,802,144 against 12,896,476 and then FAILED the next run at 15,238,936
+	// against 12,820,216 - the same machine, the same kernel, the noise landing the other way and
+	// tripping the "the wake made it worse" branch. Noise larger than the threshold makes both
+	// verdicts luck.
+	let woken_first = cycles_over_twenty(true);
 	let unwoken = cycles_over_twenty(false);
-	// THE THRESHOLD IS DERIVED FROM WHAT IS BEING MEASURED, not chosen.
-	//
-	// If the target core really sits halted until its next tick, twenty suppressed trips pay half a
-	// tick period each - ten tick periods, which is a tenth of a second, which is `hz / 10` cycles.
-	// A quarter of that is asked for, so noise has room and the signal does not have to be perfect.
-	//
-	// AND A DIFFERENCE FAR BELOW IT IS NOT A FAILURE. It means the core is NOT staying halted: under
-	// TCG the guest takes interrupts often enough that `idle_halt` returns almost at once, so the
-	// wake saves nothing measurable and a broken one would cost nothing either. Measured on aarch64
-	// at 8 cores on 2026-08-27: 25,778,695 cycles woken against 25,902,205 suppressed - half a
-	// percent, which passed a bare `<` and would have failed the next run for no reason. x86_64 the
-	// same day: 46,899,458 against 520,103,828, which is the signal this test is for.
+	let woken_second = cycles_over_twenty(true);
+	let woken = (woken_first + woken_second) / 2;
+	let noise = woken_first.abs_diff(woken_second);
+	// The floor a HALTED core would cost: twenty trips waiting half a tick period each is ten tick
+	// periods, a tenth of a second, `hz / 10` cycles. A quarter of it leaves room for a real signal
+	// that is not perfect. Whichever of the two is larger is what the signal must beat.
 	let expected = arch::tsc::hz() / 10;
-	let margin = expected / 4;
-	crate::serial_println!("    twenty remote spawns: {woken} cycles woken, {unwoken} suppressed (a halted core would cost about {expected} more)");
-	if unwoken >= woken.saturating_add(margin) {
+	let floor = core::cmp::max(noise, expected / 4);
+	crate::serial_println!("    twenty remote spawns: {woken} cycles woken (noise {noise}), {unwoken} suppressed; a halted core would cost about {expected} more");
+	if unwoken > woken.saturating_add(floor) {
 		return;
 	}
-	assert!(woken < unwoken.saturating_add(margin), "twenty woken remote spawns cost {woken} cycles and twenty with the wake suppressed cost {unwoken}: the wake made it WORSE, which no scheduling accident explains");
-	crate::serial_println!("    the two are within {margin} cycles of each other - this machine's idle cores do not stay halted long enough for the wake to save anything, so there is nothing here to measure");
+	assert!(woken <= unwoken.saturating_add(floor), "twenty woken remote spawns cost {woken} cycles against {unwoken} with the wake suppressed, a gap wider than this machine's own noise of {noise}: the wake made it WORSE, which no scheduling accident explains");
+	crate::serial_println!("    the gap is inside a floor of {floor} - this machine's idle cores do not stay halted long enough for the wake to save anything, so there is nothing here to measure");
 }
 
 crate::tagged_test!(a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself, [Scheduler, Kernel], id = "kernel.sched.a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself", covers = ["kernel"]);

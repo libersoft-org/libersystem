@@ -785,6 +785,47 @@ pub unsafe fn wait_any(handles: &[u64], deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline, 0) as i64 }
 }
 
+// A TIMER OBJECT, WHICH IS WHAT A PURE SLEEP NEEDS.
+//
+// `wait` resolves its handle before it looks at the deadline and `wait_any` refuses an empty set,
+// so neither can express "wake me at tick N and nothing else" - the callers that needed it all
+// happened to have a channel to park on, and passed that. A caller with no such handle, or one
+// whose channel might legitimately wake it early, has to arm something.
+pub unsafe fn timer_create() -> i64 {
+	unsafe { syscall(SYS_TIMER_CREATE, 0, 0, 0, 0) as i64 }
+}
+
+// Arm `timer` to fire at an absolute tick deadline (see `clock`).
+pub unsafe fn timer_set(timer: u64, deadline: u64) -> i64 {
+	unsafe { syscall(SYS_TIMER_SET, timer, deadline, 0, 0) as i64 }
+}
+
+// Park until `deadline` (absolute ticks) and nothing else wakes it early.
+//
+// PERIODIC, so the sleep does not read as pending progress: the kernel's boot driver settles across
+// it. A plain wait would make anything sleeping look like work in flight and hold the settle loop
+// open for the length of the delay - which for a bring-up backoff is exactly backwards, since the
+// point of the delay is to NOT be doing anything.
+//
+// Silently returns at once if a timer cannot be created. A sleep that cannot be performed is a
+// missing delay, and a caller that treated that as fatal would turn a shortage into a failed boot.
+pub unsafe fn sleep_until(deadline: u64) {
+	unsafe {
+		if clock() >= deadline {
+			return;
+		}
+		let timer: i64 = timer_create();
+		if timer < 0 {
+			return;
+		}
+		timer_set(timer as u64, deadline);
+		// The deadline is passed to the wait as well as armed on the timer: the wake comes from
+		// whichever answers first, and a timer that somehow never fires still ends here.
+		wait_periodic(timer as u64, deadline);
+		close(timer as u64);
+	}
+}
+
 // `wait_any` whose deadline is a recurring housekeeping wake (see wait_periodic).
 pub unsafe fn wait_any_periodic(handles: &[u64], deadline: u64) -> i64 {
 	unsafe { syscall(SYS_WAIT_ANY, handles.as_ptr() as u64, handles.len() as u64, deadline, WAIT_PERIODIC) as i64 }
@@ -2533,6 +2574,72 @@ pub unsafe fn recv_caps_blocking(channel: u64, buf: &mut [u8]) -> ReceivedCaps {
 				return ReceivedCaps::Closed;
 			};
 			return ReceivedCaps::Message { len: len as usize, handles };
+		}
+	}
+}
+
+// What a capability-aware receive WITH A DEADLINE answers. `Closed` and `TimedOut` are two
+// different facts and a caller that cannot tell them apart cannot act correctly on either: a closed
+// channel is a peer that is gone, a timeout is a peer that is still there and has not answered.
+pub enum DeadlineCaps {
+	Message { len: usize, handles: wire::Handles },
+	Closed,
+	TimedOut,
+}
+
+// `recv_caps_blocking` with an absolute deadline in monotonic ticks (see `clock`).
+//
+// A SUPERVISOR CANNOT USE THE UNBOUNDED FORM. `recv_caps_blocking` waits forever, which is right
+// for a server whose whole job is to answer its clients and wrong for a manager waiting on a
+// process it started: a driver that never sends its `READY` would hold the manager for the life of
+// the machine, and every other device would wait behind a device nobody is using.
+//
+// `deadline` of 0 means no deadline, matching `wait` - so a caller with no budget behaves exactly
+// as it did before.
+pub unsafe fn recv_caps_deadline(channel: u64, buf: &mut [u8], deadline: u64) -> DeadlineCaps {
+	unsafe {
+		let mut raw = [0u64; MAX_MESSAGE_CAPS];
+		loop {
+			let (len, count) = recv_message_caps(channel, buf, &mut raw);
+			if len == ERR_WOULD_BLOCK {
+				// CHECKED BEFORE THE WAIT AND AFTER IT. Before, because a deadline already passed
+				// must not buy one more wait; after, because `wait` returns for reasons other than
+				// the deadline and a caller that trusted its return value alone would loop.
+				if deadline != 0 && clock() >= deadline {
+					return DeadlineCaps::TimedOut;
+				}
+				wait(channel, deadline);
+				if deadline != 0 && clock() >= deadline {
+					// One last look: the message may have arrived in the same tick the deadline
+					// did, and reporting a timeout over a delivered answer would fail a bind that
+					// actually succeeded.
+					let (len, count) = recv_message_caps(channel, buf, &mut raw);
+					if len == ERR_WOULD_BLOCK {
+						return DeadlineCaps::TimedOut;
+					}
+					if len < 0 {
+						return DeadlineCaps::Closed;
+					}
+					let Some(handles) = wire::Handles::try_from_array(&raw, count) else {
+						for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
+							close(handle);
+						}
+						return DeadlineCaps::Closed;
+					};
+					return DeadlineCaps::Message { len: len as usize, handles };
+				}
+				continue;
+			}
+			if len < 0 {
+				return DeadlineCaps::Closed;
+			}
+			let Some(handles) = wire::Handles::try_from_array(&raw, count) else {
+				for &handle in raw[..count.min(MAX_MESSAGE_CAPS)].iter() {
+					close(handle);
+				}
+				return DeadlineCaps::Closed;
+			};
+			return DeadlineCaps::Message { len: len as usize, handles };
 		}
 	}
 }

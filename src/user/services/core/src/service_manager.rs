@@ -352,6 +352,21 @@ impl Supervised {
 	}
 }
 
+// THE BOOT WINDOW, KEPT FOR THE LIFE OF THIS SUPERVISOR.
+//
+// Statics rather than two more parameters through `start_service`, which already takes sixty: this
+// is one value per PROCESS, set once from the bootstrap and read wherever a service is launched.
+// `console_service` keeps its sink the same way and for the same reason.
+//
+// THE DEADLINE IS SPENT ONCE, WHICH IS WHAT MAKES THE TWO DIFFERENT. `BOOT_WINDOW` is the LENGTH
+// the kernel allowed this machine's boot and it never changes; `BOOT_DEADLINE` is the instant that
+// boot's window closes, and it is handed to the FIRST DeviceManager and swapped to zero as it goes.
+// Only that first bind competes with the boot. A DeviceManager restarted an hour later gets the
+// length and no deadline, because a deadline an hour in the past is not a budget - it is a
+// guarantee that every recovery fails on arithmetic before it reaches a device.
+static BOOT_DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static BOOT_WINDOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -429,6 +444,25 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		(len, 3) if len >= 11 && &buf[..11] == b"CONSOLECAPS" => (console_caps[0], console_caps[1], console_caps[2], 0),
 		_ => (0, 0, 0, 0),
 	};
+
+	// 1e. the boot window, in monotonic ticks: when THIS boot's window closes, and how long it was.
+	//
+	//     THIS SUPERVISOR IS WHERE THE LENGTH LIVES, and that is the whole reason it is read here
+	//     rather than passed straight through. An absolute deadline expires. A driver that crashes
+	//     an hour into the system's life still needs a budget to be rebound with, and deriving one
+	//     from a boot that finished long ago gives it a negative number - a recovery that fails on
+	//     arithmetic rather than on anything about the device. DeviceManager cannot keep the length
+	//     itself either: it is the process being restarted, so whatever it held died with it.
+	//
+	//     So: the length is kept here for the life of the system and handed to every DeviceManager
+	//     this supervisor starts, and the deadline goes with it only for the first one - that is
+	//     the bind that really does compete with the boot.
+	let (boot_deadline, boot_window): (u64, u64) = match unsafe { recv_blocking(bootstrap, &mut buf) } {
+		Received::Message { len, .. } if len >= 7 + 16 && &buf[..7] == b"BOOTWIN" => (u64::from_le_bytes(buf[7..15].try_into().unwrap_or([0; 8])), u64::from_le_bytes(buf[15..23].try_into().unwrap_or([0; 8]))),
+		_ => (0, 0),
+	};
+	BOOT_DEADLINE.store(boot_deadline, core::sync::atomic::Ordering::Relaxed);
+	BOOT_WINDOW.store(boot_window, core::sync::atomic::Ordering::Relaxed);
 
 	// 2. bring the services up in dependency order. Each pass starts every pending
 	//    service whose dependencies are all Running; repeat until a pass makes no

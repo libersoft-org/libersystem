@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 43] = [
+const GATES: [(&str, &str); 44] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -211,6 +211,16 @@ const GATES: [(&str, &str); 43] = [
 	// time - the two gates before it both arrived on one side first and were reported as
 	// unselectable on the next run, which is the drift these lists exist to catch.
 	("frame-retirement", "kernel"),
+	// Every staged driver carries a `.liberdrv.note` declaring the protocol version its own
+	// source emits, and the count in the volume is floored from the manifest. Its subject is
+	// `driver-protocol`, where the version the note declares lives: bump it and every staged
+	// artifact has to be rebuilt to agree.
+	//
+	// A SINGLE SUBJECT UNDERSTATES IT, and that is worth saying rather than hiding. The gate also
+	// fails when a linker script stops KEEP-ing the section - `userspace.link.*` - and the table
+	// this list is written in holds one subject per gate. The protocol version is the failure worth
+	// catching early; a dropped KEEP is caught by the same gate on the next change that selects it.
+	("driver-protocol-note", "driver-protocol"),
 	// Two gates over one subject: generated or compiled artifacts below `src`, in the working tree and anywhere
 	// in reachable history. They were Justfile recipes that nothing called and nothing selected;
 	// moving them into `check.sh` is what makes a change to the tree able to select them, and this
