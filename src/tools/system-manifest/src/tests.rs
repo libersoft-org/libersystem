@@ -337,3 +337,54 @@ fn the_driver_registry_refuses_what_it_says_it_refuses() {
 	let misplaced = with(ORDINARY).replace("role = \"driver\"", "role = \"tool\"").replace("destination = \"drivers/a_driver.lsexe\"", "destination = \"bin/a_driver.lsexe\"");
 	assert!(errors(&misplaced).contains("nothing will consult"), "{}", errors(&misplaced));
 }
+
+#[test]
+fn an_ordinary_ethernet_controller_is_not_offered_to_the_virtio_network_driver() {
+	// THE TEST THAT KEEPS THE FIRST DRAFT'S BUG OUT.
+	//
+	// P02M0163's first draft prescribed moving the virtio rows to PCI class. For `virtio_net` that
+	// is class `02/00` - Ethernet controller - which matches EVERY network card ever made, and
+	// hands a virtio driver hardware it cannot drive. The prescription was deleted; this is what
+	// stops it coming back.
+	//
+	// The real rule pins the TRANSPORT, so the question a rule asks is "is this a virtio-pci
+	// function whose virtio type is 1", and a plain Ethernet controller answers no at the first
+	// predicate.
+	let virtio_net = MatchRule { transport: Some(TRANSPORT_VIRTIO_PCI), virtio_type: Some(1), ..MatchRule::default() };
+	let ordinary_nic = MatchRule { transport: Some(TRANSPORT_PLAIN_PCI), pci_class: Some(0x02), pci_subclass: Some(0x00), ..MatchRule::default() };
+	assert!(!virtio_net.overlaps(ordinary_nic), "a virtio-pci rule and a plain-pci rule name disjoint sets of functions");
+
+	// AND THE VERSION THAT WOULD HAVE BEEN WRONG, so the difference is on the record rather than in
+	// a comment: a virtio-net rule written as a class match DOES collide with every Ethernet card.
+	let by_class_alone = MatchRule { pci_class: Some(0x02), pci_subclass: Some(0x00), ..MatchRule::default() };
+	assert!(by_class_alone.overlaps(ordinary_nic), "which is exactly why the rule is not written that way");
+}
+
+#[test]
+fn two_identical_controllers_do_not_collide_and_a_pinned_one_narrows() {
+	// Two functions of one kind are one rule matching twice, which is what a driver per device
+	// means - not an ambiguity. The registry's ambiguity check is about two ENTRIES that could both
+	// claim one function, and one entry claiming two functions is the ordinary case.
+	let console = MatchRule { transport: Some(TRANSPORT_VIRTIO_PCI), virtio_type: Some(3), ..MatchRule::default() };
+	let pinned = MatchRule { transport: Some(TRANSPORT_VIRTIO_PCI), virtio_type: Some(3), pci_address: Some(PciAddress { bus: 0, dev: 30, func: 0 }), ..MatchRule::default() };
+	// They DO overlap - the pinned one is a subset - and that is arbitration by priority rather
+	// than ambiguity, which is why the registry compares priorities before it refuses.
+	assert!(console.overlaps(pinned), "a narrowing overlaps what it narrows; the priority is what separates them");
+
+	// Two rules that differ on the virtio type cannot both match one function, whatever else they
+	// leave unasked.
+	let block = MatchRule { transport: Some(TRANSPORT_VIRTIO_PCI), virtio_type: Some(2), ..MatchRule::default() };
+	assert!(!console.overlaps(block));
+}
+
+#[test]
+fn the_xhci_row_is_a_class_triple_and_no_longer_a_liber_system_number() {
+	// `device-type = 256` was `DEVICE_TYPE_XHCI`, a constant invented for this table, standing in
+	// for the class triple the PCI scan had already resolved. A number this system made up is not a
+	// standards identity, and a rule written against one cannot be checked against a specification.
+	let xhci = MatchRule { transport: Some(TRANSPORT_PLAIN_PCI), pci_class: Some(0x0c), pci_subclass: Some(0x03), pci_interface: Some(0x30), ..MatchRule::default() };
+	// A USB controller that is NOT xHCI - the same class and subclass, an earlier interface - is a
+	// different controller, and the interface byte is what says so.
+	let ehci = MatchRule { transport: Some(TRANSPORT_PLAIN_PCI), pci_class: Some(0x0c), pci_subclass: Some(0x03), pci_interface: Some(0x20), ..MatchRule::default() };
+	assert!(!xhci.overlaps(ehci), "the programming interface is what distinguishes xHCI from EHCI, and the rule names it");
+}
