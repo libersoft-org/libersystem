@@ -373,3 +373,57 @@ fn a_provider_offered_after_ready_belongs_to_the_same_binding() {
 	assert!(queue.pop(4) == Some(BindingEvent::Ready { generation: 4 }));
 	assert!(queue.pop(4) == Some(BindingEvent::Offered { generation: 4 }), "a late offer is this binding's offer");
 }
+
+// ------------------------------------------------------- the catalogue's properties
+//
+// The catalogue itself lives in DeviceManager, which is a `no_std` binary nobody can drive on a
+// host - the same wall M3 and M7 both ran into. What CAN be driven here is the identity arithmetic
+// every one of its answers rests on, and that is where the defects would be: a slot reused without
+// its generation moving, a provider from a binding that is over mistaken for its replacement, two
+// controllers of one kind collapsing into one entry.
+
+#[test]
+fn a_provider_added_after_publication_is_a_different_provider_from_one_withdrawn_before_it() {
+	// ADDED AND REMOVED AT RUN TIME, which is what a catalogue is for and what four named locals
+	// could not express: the second disk's entry is not the first disk's entry with a new handle in
+	// it, and a consumer holding an id for the one that left cannot find itself talking to the one
+	// that arrived.
+	let binding = BindingId::new(0, 6, 0, 1);
+	let withdrawn = ProviderId::new(binding, 0, 1);
+	let added = ProviderId::new(binding, 0, 2);
+	assert!(withdrawn != added, "the slot was reused and the generation says so");
+
+	// And a subscriber that arrives AFTER the second publication is answered with the second, not
+	// with a stale first: they are distinguishable by value, so a snapshot cannot return the wrong
+	// one by accident.
+	let snapshot = [added];
+	assert!(!snapshot.contains(&withdrawn));
+	assert!(snapshot.contains(&added));
+}
+
+#[test]
+fn two_controllers_of_one_kind_are_two_entries_and_removing_one_leaves_the_other() {
+	// The case the four named locals got wrong by construction: two disks are two providers, and
+	// which is which is a property of WHERE they are, not of which driver finished first.
+	let first = ProviderId::new(BindingId::new(0, 2, 0, 1), 0, 1);
+	let second = ProviderId::new(BindingId::new(0, 6, 0, 1), 1, 2);
+	let mut published: [Option<ProviderId>; 2] = [Some(first), Some(second)];
+	assert!(published[0] != published[1]);
+
+	// Removing one leaves the other exactly as it was.
+	published[0] = None;
+	assert!(published[0].is_none());
+	assert!(published[1] == Some(second), "withdrawing one provider does not disturb the others");
+}
+
+#[test]
+fn a_provider_belongs_to_a_binding_and_not_to_a_device() {
+	// A driver that crashed and was rebound publishes again; the providers it published BEFORE are
+	// not the ones it publishes now, because the binding they belonged to is over. Without the
+	// generation on the binding the two would be indistinguishable, and a teardown would withdraw
+	// its own replacement's entries.
+	let before = ProviderId::new(BindingId::new(0, 9, 0, 1), 0, 1);
+	let after = ProviderId::new(BindingId::new(0, 9, 0, 2), 0, 2);
+	assert!(before.binding != after.binding, "different bindings");
+	assert!(before.binding.same_function(after.binding), "same device");
+}

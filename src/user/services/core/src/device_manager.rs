@@ -1025,6 +1025,9 @@ struct Node {
 	// identity - `ClaimKey` addresses a binding by it, and one name that grows a field for every
 	// table that wants to find it is not a name.
 	index: u64,
+	// What the kernel reported about this function. Held on the node because a rebind needs it and
+	// a parallel array indexed the same way is one that can fall out of step.
+	info: DeviceInfo,
 	// Where this node's binding is and why it got there. Survives every binding on this node.
 	record: BindingRecord,
 	// What is bound now, if anything.
@@ -1040,11 +1043,57 @@ struct Node {
 	candidate: usize,
 	// One ordered queue. Two nodes are independent; one node never handles two events at once.
 	queue: BindingQueue,
+	// The heartbeat, armed when this node comes `Online` and only for an entry that declared a
+	// deadline.
+	beat: Heartbeat,
+}
+
+// WHETHER THIS DRIVER'S CONTROL PATH IS MAKING PROGRESS.
+//
+// A different question from whether its device is busy, and a driver may not pet its watchdog
+// through an unrelated child - which is why the answer travels on the control channel and echoes a
+// number the manager chose.
+#[derive(Clone, Copy, Default)]
+struct Heartbeat {
+	// The entry's declared deadline in ticks, or 0 for a driver that is not supervised this way.
+	deadline: u32,
+	// The sequence the outstanding `PING` was sent with, and whether one is outstanding.
+	sequence: u32,
+	awaiting: bool,
+	// When the next `PING` is due, and when an outstanding one stops being answerable.
+	due: u64,
+	expires: u64,
+}
+
+impl Heartbeat {
+	// Arm from the entry's declared deadline. The cadence is `heartbeat_period` and not a second
+	// number: a driver always gets one whole period to answer inside the deadline it declared.
+	unsafe fn arm(&mut self, deadline: Option<u32>) {
+		unsafe {
+			let Some(deadline) = deadline else {
+				*self = Heartbeat::default();
+				return;
+			};
+			*self = Heartbeat { deadline, sequence: 0, awaiting: false, due: clock().saturating_add(driver_protocol::heartbeat_period(deadline) as u64), expires: 0 };
+		}
+	}
+
+	fn supervised(&self) -> bool {
+		self.deadline != 0
+	}
+
+	// The soonest tick this node needs the wait to come back at, or 0 for "nothing to wake for".
+	fn wake_at(&self) -> u64 {
+		if !self.supervised() {
+			return 0;
+		}
+		if self.awaiting { self.expires } else { self.due }
+	}
 }
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new() }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default() }
 	}
 
 	// Queue one event for this node.
@@ -1061,6 +1110,14 @@ impl Node {
 	fn pop(&mut self) -> Option<BindingEvent> {
 		let generation: u64 = if self.binding.is_some() { self.id.generation } else { 0 };
 		self.queue.pop(generation)
+	}
+
+	// The driver this node is currently trying, or an empty name for a node with none left.
+	fn driver_name(&self) -> &'static [u8] {
+		match self.candidates.get(self.candidate) {
+			Some(entry) => entry.name,
+			None => b"",
+		}
 	}
 
 	// Whether this node still has work in flight - a driver that has been sent `BIND` and has not
@@ -1635,6 +1692,15 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 					};
 					node.push(BindingEvent::Failed { generation, code });
 				}
+				driver_protocol::Opcode::Pong => {
+					if let Ok(sequence) = driver_protocol::decode_sequence(header.payload(buf)) {
+						node.push(BindingEvent::Ponged { generation, sequence });
+					}
+				}
+				// A `PING` coming the wrong way, like `BIND` and `RESOURCE` below: refused rather
+				// than ignored, because a driver asking the manager whether IT is alive is a driver
+				// that has misunderstood which end of this channel it is on.
+				driver_protocol::Opcode::Ping => refuse(&handles),
 				driver_protocol::Opcode::Withdraw => {
 					if let Ok(token) = driver_protocol::decode_withdraw(header.payload(buf)) {
 						node.push(BindingEvent::Withdrawn { generation, token });
@@ -1885,6 +1951,33 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// A LIVE DRIVER RETIRING ONE OF ITS OWN PUBLICATIONS. Not an outcome either: the
 				// driver stays bound and its other providers stay published. Named by the token it
 				// chose, because a driver never sees the identity this service minted.
+				// AN ANSWER THAT ECHOES THE NUMBER IT WAS ASKED WITH, and nothing else counts.
+				//
+				// This is the whole of what `rt::heartbeat` gets wrong: it returns true for ANY
+				// message, so a driver emitting unrelated traffic reads as responsive and a busy
+				// driver and a wedged one look the same. A pong with a sequence nobody is waiting
+				// for - a duplicate, one from an earlier round, one invented - does NOT reset the
+				// watchdog. Stale GENERATIONS never reach here at all: `pop` drops them.
+				BindingEvent::Ponged { sequence, .. } => {
+					if node.beat.awaiting && sequence == node.beat.sequence {
+						node.beat.awaiting = false;
+						node.beat.due = clock().saturating_add(driver_protocol::heartbeat_period(node.beat.deadline) as u64);
+					} else {
+						print(b"DeviceManager: ");
+						print(driver_name);
+						print(b" answered a ping nobody asked; the watchdog is not reset by it\n");
+					}
+					continue;
+				}
+				// A WEDGED DRIVER IS TORN DOWN LIKE A CRASHED ONE. The teardown is the same
+				// transaction and the same retry-and-quarantine counter; what differs is the reason
+				// for starting it, which is what the record carries.
+				BindingEvent::Wedged { .. } => {
+					print(b"DeviceManager: ");
+					print(driver_name);
+					print(b" stopped answering its control path inside the deadline its registry entry declares\n");
+					FailureCause::HandshakeTimeout
+				}
 				BindingEvent::Withdrawn { token, .. } => {
 					let withdrawn = catalogue.withdraw(node.id, token);
 					print(b"DeviceManager: ");
@@ -1900,6 +1993,10 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					node.record.move_to(BindingState::Online, None);
 					let entry = node.candidates[node.candidate];
 					catalogue.publish_all(node.id, entry, &mut node.offers);
+					// SUPERVISION STARTS WHERE THE DRIVER SAYS IT IS UP, not at the bind: before
+					// `READY` the bind budget is what bounds it, and two deadlines over one
+					// interval is two authorities that disagree the first time one is slower.
+					node.beat.arm(entry.heartbeat_deadline);
 					return Step::Online;
 				}
 				// A `FAILED` FRAME IS ABOUT THE DRIVER, NEVER ABOUT ONE OF ITS CHILDREN.
@@ -2211,6 +2308,10 @@ struct Entry {
 	// it never declared: a compromised one advertising itself as a disk is what this closes.
 	// `system-manifest` refuses a requirement nothing produces and a cycle, at registry-build time.
 	provides: &'static [(u16, u16)],
+	// How long this driver may take to answer a `PING`, in ticks. `None` is "not heartbeat-
+	// supervised", which is the honest state for a driver that stands on its channel and does
+	// nothing else - and the registry refuses 0, because `wait_any` reads that as no timeout at all.
+	heartbeat_deadline: Option<u32>,
 	rules: &'static [Rule],
 }
 

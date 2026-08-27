@@ -250,12 +250,18 @@ pub enum BindingEvent {
 	// A provider this driver published under `token` is going away. NOT terminal: the driver stays
 	// bound and its other publications stay published.
 	Withdrawn { generation: u64, token: u16 },
+	// It answered a `PING` with this sequence. Whether that COUNTS is not this event's business:
+	// an answer echoing a number nobody asked with is still an answer that arrived, and the reader
+	// is what decides it does not reset the watchdog.
+	Ponged { generation: u64, sequence: u32 },
+	// Its control path stopped answering inside the deadline its registry entry declared.
+	Wedged { generation: u64 },
 }
 
 impl BindingEvent {
 	pub fn generation(self) -> u64 {
 		match self {
-			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } => generation,
+			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } | BindingEvent::Ponged { generation, .. } | BindingEvent::Wedged { generation } => generation,
 		}
 	}
 }

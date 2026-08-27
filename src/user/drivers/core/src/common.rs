@@ -343,8 +343,47 @@ pub unsafe fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], servi
 		if !ready(bootstrap, bind) {
 			exit();
 		}
-		let mut buf: [u8; 16] = [0u8; 16];
-		let _ = recv_blocking(bootstrap, &mut buf);
+		stand(bootstrap, bind);
 	}
-	exit();
+}
+
+// Stand holding the device, answering the manager's `PING` until it drops the channel.
+//
+// A DRIVER THAT ONLY BLOCKS IS INDISTINGUISHABLE FROM A WEDGED ONE. It used to be a single
+// `recv_blocking` whose result was discarded: any message ended the driver and no message was ever
+// answered, so "is this driver's control path making progress" had no way to be asked. The answer
+// echoes the sequence it was asked with, on the same channel and through the same frame codec as
+// every other event.
+pub unsafe fn stand(bootstrap: u64, bind: &Bind) -> ! {
+	unsafe {
+		let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
+		loop {
+			let Received::Message { len, .. } = recv_blocking(bootstrap, &mut buf) else { exit() };
+			let Ok(header) = proto::Header::decode(&buf[..len]) else { continue };
+			// A FRAME FROM A BINDING THAT IS OVER IS NOT THIS BINDING'S. Dropped rather than
+			// answered: answering it would tell the manager a generation it has moved on from is
+			// alive.
+			if header.generation != bind.generation {
+				continue;
+			}
+			match header.opcode {
+				proto::Opcode::Ping => {
+					let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
+					if !pong(bootstrap, bind, sequence) {
+						exit();
+					}
+				}
+				// Anything else on this channel ends the stand, which is what dropping the channel
+				// has always meant.
+				_ => exit(),
+			}
+		}
+	}
+}
+
+// "I am here, and this is the number you asked me with."
+pub unsafe fn pong(bootstrap: u64, bind: &Bind, sequence: u32) -> bool {
+	let mut payload = [0u8; proto::SEQUENCE_PAYLOAD_LEN];
+	proto::encode_sequence(sequence, &mut payload);
+	unsafe { send_frame(bootstrap, proto::Opcode::Pong, bind.generation, &payload) }
 }

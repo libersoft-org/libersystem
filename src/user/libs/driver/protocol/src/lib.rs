@@ -132,6 +132,17 @@ pub enum Opcode {
 	// It names the TOKEN and not the manager's identity, because a driver never sees one. That is
 	// the same rule the identity itself is minted under, applied to the other direction.
 	Withdraw = 6,
+	// manager -> driver, after the handshake. One sequence number. "Are you making progress on your
+	// CONTROL path?" - which is a different question from whether the device is busy, and a driver
+	// may not pet its watchdog through an unrelated child.
+	Ping = 7,
+	// driver -> manager, the answer, echoing the sequence it was asked with.
+	//
+	// THE SEQUENCE IS WHY THIS IS NOT `rt::heartbeat`. That one counts ANY message as a pong -
+	// `matches!(try_recv(..), Polled::Message { .. })` - so a driver emitting unrelated traffic
+	// reads as responsive, and a busy driver and a wedged one look the same. An answer that does not
+	// echo the number it was asked with is not an answer to this question.
+	Pong = 8,
 }
 
 impl Opcode {
@@ -145,6 +156,8 @@ impl Opcode {
 			4 => Some(Opcode::Ready),
 			5 => Some(Opcode::Failed),
 			6 => Some(Opcode::Withdraw),
+			7 => Some(Opcode::Ping),
+			8 => Some(Opcode::Pong),
 			_ => None,
 		}
 	}
@@ -158,7 +171,7 @@ impl Opcode {
 	// silently discard whatever a driver attached beyond it - capabilities gone, nobody told.
 	pub fn handle_count(self) -> usize {
 		match self {
-			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw => 0,
+			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Ping | Opcode::Pong => 0,
 			Opcode::Resource | Opcode::Offer => 1,
 		}
 	}
@@ -395,6 +408,46 @@ fn decode_u16(payload: &[u8]) -> Result<u16, FrameError> {
 		return Err(FrameError::PayloadShape);
 	}
 	Ok(u16::from_le_bytes([payload[0], payload[1]]))
+}
+
+// A `PING` or `PONG` carries a sequence and nothing else.
+//
+// NOT THE GENERATION: P02M0161 put that in the frame HEADER, on every frame in both directions, so a
+// second copy in the body is a second thing that can disagree with the first.
+pub const SEQUENCE_PAYLOAD_LEN: usize = 4;
+
+pub fn encode_sequence(sequence: u32, out: &mut [u8]) -> usize {
+	out[..4].copy_from_slice(&sequence.to_le_bytes());
+	SEQUENCE_PAYLOAD_LEN
+}
+
+pub fn decode_sequence(payload: &[u8]) -> Result<u32, FrameError> {
+	if payload.len() != SEQUENCE_PAYLOAD_LEN {
+		return Err(FrameError::PayloadShape);
+	}
+	Ok(u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]))
+}
+
+// The longest a driver may be given to answer a `PING`, in monotonic ticks.
+//
+// NOT A NEW NUMBER. ServiceManager already carries a justified one - 100 ticks, about a second at
+// the 100-ticks-per-second monotonic clock, with an operator override. A driver deadline is the same
+// question about a different subject, so it takes the same ceiling rather than a second constant
+// that drifts from it.
+//
+// AND THE LOWER BOUND IS NOT PEDANTRY: `wait_any` reads a deadline of 0 as NO TIMEOUT, so an entry
+// declaring zero would not be supervised strictly - it would not be supervised at all, and would
+// look like the most responsive driver in the machine.
+pub const MAX_HEARTBEAT_DEADLINE: u32 = 100;
+
+// How often to ping, given the deadline an entry declared: half of it, ROUNDED UP.
+//
+// Half of a deadline of 1 is 0, and a period of zero is either a busy loop or - through the same
+// `wait_any` rule as above - no timeout at all. Both are the failures this bound exists to prevent,
+// reached by arithmetic. Rounding up means an entry asking for a longer deadline is pinged LESS
+// often and never the other way round, and a driver always has one whole period to answer in.
+pub fn heartbeat_period(deadline: u32) -> u32 {
+	deadline.div_ceil(2).max(1)
 }
 
 // The publisher-local token a `WITHDRAW` names.

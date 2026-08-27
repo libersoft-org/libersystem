@@ -94,6 +94,14 @@ struct RawDriver {
 	// declared - a compromised one advertising itself as a disk is the case this closes.
 	#[serde(default)]
 	provides: Vec<RawProvides>,
+	// HOW LONG THIS DRIVER MAY TAKE TO ANSWER A `PING`, in monotonic ticks. Absent means it is not
+	// heartbeat-supervised, which is the honest state for a driver that stands on its channel and
+	// does nothing else. `0 < deadline <= MAX_HEARTBEAT_DEADLINE` where it is present: `wait_any`
+	// reads a deadline of 0 as NO TIMEOUT, so an entry declaring zero would look like the most
+	// responsive driver in the machine, and an entry that may name any deadline it likes is an entry
+	// that can opt out.
+	#[serde(default)]
+	heartbeat_deadline: Option<u32>,
 }
 
 // The provider kinds a manifest may name, spelled once. A closed set for the reason the match rules
@@ -459,7 +467,13 @@ pub struct Driver {
 	pub priority: MatchPriority,
 	pub requires: Vec<ProviderKindName>,
 	pub provides: Vec<Provides>,
+	pub heartbeat_deadline: Option<u32>,
 }
+
+// The longest a driver may be given to answer a `PING`, in monotonic ticks. The same number
+// `driver_protocol::MAX_HEARTBEAT_DEADLINE` is, and the same one ServiceManager's watchdog already
+// uses for services - one question about two subjects, not two constants that drift.
+pub const MAX_HEARTBEAT_DEADLINE: u32 = 100;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct Provides {
@@ -854,6 +868,7 @@ impl Manifest {
 				priority: raw.priority,
 				requires: raw.requires.clone(),
 				provides: raw.provides.iter().map(|entry| Provides { kind: entry.kind, most: entry.most }).collect(),
+				heartbeat_deadline: raw.heartbeat_deadline,
 				rules: raw
 					.rules
 					.iter()
@@ -1277,6 +1292,12 @@ fn validate_program_shape(raw: &RawProgram, name: &Name, destination: &RelativeP
 		// meaning is defined by the field beside it, and `{ pci-product = 0x1000 }` with no vendor
 		// names a part number in nobody's catalogue. Both parse, both generate, and both match
 		// whatever happens to share the number.
+		// THE HEARTBEAT DEADLINE'S BOUNDS, and the lower one is not pedantry.
+		match driver.heartbeat_deadline {
+			Some(0) => push_error(errors, format!("{location}.driver.heartbeat-deadline"), "a deadline of 0 is read by `wait_any` as NO timeout, so this driver would not be supervised strictly - it would not be supervised at all, and would look like the most responsive driver in the machine. Leave the key out to say it is not heartbeat-supervised"),
+			Some(deadline) if deadline > MAX_HEARTBEAT_DEADLINE => push_error(errors, format!("{location}.driver.heartbeat-deadline"), format!("{deadline} ticks is past the shared ceiling of {MAX_HEARTBEAT_DEADLINE}; an entry that may name any deadline it likes is an entry that can opt out")),
+			_ => {}
+		}
 		for (index, rule) in driver.rules.iter().enumerate() {
 			let at = format!("{location}.driver.match[{index}]");
 			// 1. The transport and the virtio type cite one specification between them. Either

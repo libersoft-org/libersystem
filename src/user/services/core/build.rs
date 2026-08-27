@@ -67,8 +67,9 @@ fn generate_driver_registry(manifest: &Manifest) {
 			.join(", ");
 		let requires = driver.requires.iter().map(|kind| kind.wire().to_string()).collect::<Vec<_>>().join(", ");
 		let provides = driver.provides.iter().map(|entry| format!("({}, {})", entry.kind.wire(), entry.most)).collect::<Vec<_>>().join(", ");
+		let heartbeat = option32(driver.heartbeat_deadline);
 		entries.push_str(&format!(
-			"\tEntry {{ name: b\"{}\", artifact: b\"{}\", boot_critical: {boot_critical}, priority: {priority}, requires: &[{requires}], provides: &[{provides}], rules: &[{rules}] }},\n",
+			"\tEntry {{ name: b\"{}\", artifact: b\"{}\", boot_critical: {boot_critical}, priority: {priority}, requires: &[{requires}], provides: &[{provides}], heartbeat_deadline: {heartbeat}, rules: &[{rules}] }},\n",
 			program.name,
 			// The staged file name. A pinned driver is looked up in `init.pkg` by this rather than
 			// by its program name, and deriving one from the other is how the two come to disagree.
