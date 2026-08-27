@@ -289,7 +289,7 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 		let current_el: u64;
 		core::arch::asm!("mrs {0}, CurrentEL", out(reg) current_el, options(nomem, nostack));
 		let psci_conduit = psci_conduit(current_el, dtb);
-		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: regions_phys, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit, rsdp: 0, smp_trampoline: 0, dtb, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] } };
+		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: regions_phys, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit, rsdp: 0, smp_trampoline: 0, dtb, root: crate::root_selection() };
 	}
 	phys
 }
@@ -310,7 +310,7 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 // answer, and not the same as picking the more common instruction and hoping.
 fn psci_conduit(current_el: u64, dtb: u64) -> u32 {
 	let (discovered_dtb, rsdp) = crate::console::firmware_tables();
-	let tree = if dtb != 0 { dtb, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] } } else { discovered_dtb, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] } };
+	let tree = if dtb != 0 { dtb } else { discovered_dtb };
 	let discovered = if tree != 0 {
 		unsafe { fdt::Fdt::new(tree, crate::console::identity_map) }.psci_conduit().map(|conduit| match conduit {
 			fdt::PsciConduit::Hvc => bootproto::PSCI_HVC,

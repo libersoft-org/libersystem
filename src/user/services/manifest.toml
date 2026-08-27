@@ -2203,6 +2203,17 @@ kind = "client"
 provider = "device_service"
 interface = "liber:device@1/device"
 
+# THE OPERATOR'S WRITE, held apart from the read above. A tool granted `DEVICE` renders a device
+# list; one granted this CHANGES a binding. This manager mints it for the operator path and for
+# nothing else - which is what makes "DeviceManager owns the decision" true rather than said.
+[[services.roles]]
+tag = "DEVPOLICY"
+kind = "client"
+provider = "device_manager"
+source = "SERVE"
+interface = "liber:device@1/device-policy-admin"
+presence = "optional"
+
 [[services.roles]]
 tag = "AUDIO"
 kind = "client"
