@@ -393,6 +393,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// after bring-up; 0 until they do, and a boot that grants neither simply has no operator
 		// path rather than a half-built one.
 		let mut policy_service: u64 = 0;
+		// The connections minted from the policy endpoint's root. One table per endpoint, because a
+		// request arriving on one must not be answered by the other's view.
+		let mut policy_clients = CatalogueClients::new();
 		let mut policy_config: u64 = 0;
 		// THE BOOT WIRE'S SHAPE, NOT THIS PROGRAM'S LIMIT, and the difference is the whole of M7.
 		//
@@ -464,7 +467,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// The wait set: the supervisor's channel, the catalogue's root, and every connection
 			// minted from it. One wait, so a catalogue query cannot delay a supervisor message and
 			// a supervisor message cannot delay a query.
-			let mut waiting: [u64; MAX_CATALOGUE_CLIENTS + 3] = [0; MAX_CATALOGUE_CLIENTS + 3];
+			let mut waiting: [u64; MAX_CATALOGUE_CLIENTS * 2 + 3] = [0; MAX_CATALOGUE_CLIENTS * 2 + 3];
 			let mut waiting_count: usize = 1;
 			waiting[0] = bootstrap;
 			if catalogue_service != 0 {
@@ -476,6 +479,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				waiting[waiting_count] = policy_service;
 				waiting_count += 1;
 			}
+			let policy_clients_at: usize = waiting_count;
+			for &client in policy_clients.live() {
+				waiting[waiting_count] = client;
+				waiting_count += 1;
+			}
 			for &client in catalogue_clients.live() {
 				waiting[waiting_count] = client;
 				waiting_count += 1;
@@ -484,8 +492,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			if ready != 0 {
 				if ready > 0 {
 					let at: usize = ready as usize;
-					if policy_service != 0 && at == policy_at {
-						serve_policy_once(policy_service, &mut nodes, policy_config, &mut buf);
+					if policy_service != 0 && (at == policy_at || (at >= policy_clients_at && at < policy_clients_at + policy_clients.live().len())) {
+						serve_policy_once(waiting[at], at == policy_at, &mut policy_clients, &mut nodes, policy_config, &mut buf);
 					} else {
 						let is_root: bool = catalogue_service != 0 && at == 1;
 						serve_catalogue_once(waiting[at], is_root, &mut catalogue_clients, &catalogue, &nodes, &mut buf);
@@ -2504,6 +2512,20 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 		Ok(PolicyOutcome::Accepted)
 	}
 
+	fn incident(&mut self, index: u32) -> Result<proto::system::IncidentReport, proto::system::Error> {
+		let Some(node) = self.nodes.iter().find(|node| node.index == index as u64) else {
+			return Err(proto::system::Error::NotFound);
+		};
+		// A BINDING THAT HAS NEVER FAILED ANSWERS `present: false`, not an error. "Nothing has gone
+		// wrong here" is a fact an operator asked for; an error would read as "the question could
+		// not be answered", which is a different thing.
+		let Some(report) = node.incident_report else {
+			return Ok(proto::system::IncidentReport { present: false, bus: 0, dev: 0, func: 0, generation: 0, state: proto::system::BindingState::Unbound, cause: proto::system::FailureCause::None, last_opcode: 0, silent_for: 0, attempts: 0, domain_known: false, memory_used: 0, memory_peak: 0, handles_used: 0, threads_used: 0, dma_used: 0 });
+		};
+		let domain = report.domain.unwrap_or_default();
+		Ok(proto::system::IncidentReport { present: true, bus: report.binding.bus as u32, dev: report.binding.dev as u32, func: report.binding.func as u32, generation: report.binding.generation, state: binding_state_wire(report.state), cause: failure_cause_wire(Some(report.cause)), last_opcode: report.last_opcode as u32, silent_for: report.silent_for, attempts: report.attempts, domain_known: report.domain.is_some(), memory_used: domain.memory_used, memory_peak: domain.memory_peak, handles_used: domain.handles_used, threads_used: domain.threads_used, dma_used: domain.dma_used })
+	}
+
 	fn stored(&mut self, index: u32) -> Result<alloc::string::String, proto::system::Error> {
 		let Some(node) = self.nodes.iter().find(|node| node.index == index as u64) else {
 			return Err(proto::system::Error::NotFound);
@@ -2730,11 +2752,33 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 // channel is ready, and one request is one reply.
 // Answer one operator request. The endpoint is narrow by design and single-client: exactly one
 // connection is minted for the operator path, so there is nothing here to multiplex.
-unsafe fn serve_policy_once(service: u64, nodes: &mut [Node], config: u64, buf: &mut [u8]) {
+unsafe fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients, nodes: &mut [Node], config: u64, buf: &mut [u8]) {
 	unsafe {
 		let ReceivedCaps::Message { len, handles } = recv_caps_blocking(service, buf) else { return };
 		for &handle in handles.as_slice() {
 			close(handle);
+		}
+		// THE ROOT MINTS CONNECTIONS HERE TOO. Same shape as the catalogue, and for the same reason:
+		// `service_connect` is how every consumer in this tree reaches a service, and it sends the
+		// reserved CONNECT opcode and WAITS. PermissionManager is the only consumer here, and it
+		// asked before anything else could - so an endpoint that could not answer hung the boot.
+		if len >= 2 {
+			let op: u16 = u16::from_le_bytes([buf[0], buf[1]]);
+			if op == HEARTBEAT_OP {
+				send_blocking(service, b"PONG", 0);
+				return;
+			}
+			if op == CONNECT_OP && is_root {
+				match channel_pair_for_catalogue(clients) {
+					Some(theirs) => {
+						send_blocking(service, &[], theirs);
+					}
+					None => {
+						send_blocking(service, &[], 0);
+					}
+				}
+				return;
+			}
 		}
 		let mut view = PolicyView { nodes, config };
 		let mut reply = [0u8; 1024];

@@ -1068,6 +1068,112 @@ impl PolicyOutcome {
 /// The division is the whole of the authority question: DeviceManager owns the DECISION and exposes
 /// these four verbs; ConfigService holds the bytes under a prefix DeviceManager alone writes. A
 /// component that can write the config file therefore cannot change a binding.
+/// The bounded capture P02M0165 takes when a binding goes wrong, BEFORE the process is gone.
+///
+/// A FIXED LIST, so it cannot grow into a diagnostic subsystem: no device payload, no memory dump,
+/// no log excerpt - each of those is unbounded in a different way, and a capture whose size depends
+/// on what the driver was doing is one that fails on the driver that most needs capturing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct IncidentReport {
+	/// Whether there has been one at all. A binding that has never failed answers `false` and every
+	/// field below is zero - which is a different fact from "it failed and used nothing".
+	pub present: bool,
+	pub bus: u32,
+	pub dev: u32,
+	pub func: u32,
+	pub generation: u64,
+	pub state: BindingState,
+	pub cause: FailureCause,
+	/// The last frame the driver sent, and how long before the capture. `silent-for` is `u64::MAX`
+	/// where it never sent one - never spoke is not "a long time ago".
+	pub last_opcode: u32,
+	pub silent_for: u64,
+	pub attempts: u32,
+	/// The binding's own Domain counters at that moment. `domain-known` is false where the Domain
+	/// was already gone or never made, which is worth recording rather than reporting zeros.
+	pub domain_known: bool,
+	pub memory_used: u64,
+	pub memory_peak: u64,
+	pub handles_used: u64,
+	pub threads_used: u64,
+	pub dma_used: u64,
+}
+
+impl IncidentReport {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<IncidentReport> {
+		let mut r = Reader::new(bytes);
+		let value = IncidentReport::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<IncidentReport> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = IncidentReport::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.boolean(self.present)?;
+		w.u32(self.bus)?;
+		w.u32(self.dev)?;
+		w.u32(self.func)?;
+		w.u64(self.generation)?;
+		self.state.write(w)?;
+		self.cause.write(w)?;
+		w.u32(self.last_opcode)?;
+		w.u64(self.silent_for)?;
+		w.u32(self.attempts)?;
+		w.boolean(self.domain_known)?;
+		w.u64(self.memory_used)?;
+		w.u64(self.memory_peak)?;
+		w.u64(self.handles_used)?;
+		w.u64(self.threads_used)?;
+		w.u64(self.dma_used)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<IncidentReport> {
+		let present = r.boolean()?;
+		let bus = r.u32()?;
+		let dev = r.u32()?;
+		let func = r.u32()?;
+		let generation = r.u64()?;
+		let state = BindingState::read(r)?;
+		let cause = FailureCause::read(r)?;
+		let last_opcode = r.u32()?;
+		let silent_for = r.u64()?;
+		let attempts = r.u32()?;
+		let domain_known = r.boolean()?;
+		let memory_used = r.u64()?;
+		let memory_peak = r.u64()?;
+		let handles_used = r.u64()?;
+		let threads_used = r.u64()?;
+		let dma_used = r.u64()?;
+		Some(IncidentReport { present, bus, dev, func, generation, state, cause, last_opcode, silent_for, attempts, domain_known, memory_used, memory_peak, handles_used, threads_used, dma_used })
+	}
+}
+
 // interface `device-policy-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
 pub mod device_policy_admin {
 	use super::*;
@@ -1076,12 +1182,17 @@ pub mod device_policy_admin {
 
 	pub const OP_APPLY: u16 = 1;
 	pub const OP_STORED: u16 = 2;
+	pub const OP_INCIDENT: u16 = 3;
 
 	pub trait Service {
 		fn apply(&mut self, index: u32, verb: PolicyVerb, artifact: String) -> Result<PolicyOutcome, Error>;
 		/// What is stored for this device right now, so an operator can see a preference before a
 		/// reboot applies it.
 		fn stored(&mut self, index: u32) -> Result<String, Error>;
+		/// The last incident on this binding. The CAPTURE belongs where the teardown is - P02M0165 -
+		/// and the DISPLAY belongs here; that division is what keeps it from becoming a diagnostic
+		/// subsystem.
+		fn incident(&mut self, index: u32) -> Result<IncidentReport, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1159,6 +1270,43 @@ pub mod device_policy_admin {
 						Err(v15) => {
 							w.u8(0)?;
 							v15.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_INCIDENT => {
+				let index = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.incident(index);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v16) => {
+							w.u8(1)?;
+							v16.write(w)?;
+						}
+						Err(v17) => {
+							w.u8(0)?;
+							v17.write(w)?;
 						}
 					}
 					Some(())
@@ -1332,6 +1480,39 @@ pub mod device_policy_admin {
 			}
 			decoded
 		}
+		pub fn incident(&mut self, index: &u32) -> Option<Result<IncidentReport, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_INCIDENT)?;
+			w.u32(corr)?;
+			w.u32(*index)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(IncidentReport::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -1348,6 +1529,14 @@ pub mod device_policy_admin {
 	fn channel_invoke_stored(chan: u64, index: &u32) -> Option<Result<String, Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.stored(index)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_device_policy_admin_incident")]
+	fn channel_invoke_incident(chan: u64, index: &u32) -> Option<Result<IncidentReport, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.incident(index)
 	}
 }
 
@@ -1405,8 +1594,8 @@ pub mod provider_catalogue {
 						return None;
 					}
 					w.u16(result.len() as u16)?;
-					for v16 in result.iter() {
-						v16.write(w)?;
+					for v18 in result.iter() {
+						v18.write(w)?;
 					}
 					Some(())
 				})();
@@ -1592,13 +1781,13 @@ pub mod provider_catalogue {
 					return None;
 				}
 				let value = {
-					let v17 = r.u16()? as usize;
-					let mut v18 = Vec::new();
-					v18.try_reserve_exact(v17).ok()?;
-					for _ in 0..v17 {
-						v18.push(BindingRecord::read(r)?);
+					let v19 = r.u16()? as usize;
+					let mut v20 = Vec::new();
+					v20.try_reserve_exact(v19).ok()?;
+					for _ in 0..v19 {
+						v20.push(BindingRecord::read(r)?);
 					}
-					v18
+					v20
 				};
 				r.finish()?;
 				Some(value)
@@ -1740,19 +1929,19 @@ pub mod usb {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v19) => {
+						Ok(v21) => {
 							w.u8(1)?;
-							if v19.len() > u16::MAX as usize {
+							if v21.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v19.len() as u16)?;
-							for v21 in v19.iter() {
-								v21.write(w)?;
+							w.u16(v21.len() as u16)?;
+							for v23 in v21.iter() {
+								v23.write(w)?;
 							}
 						}
-						Err(v20) => {
+						Err(v22) => {
 							w.u8(0)?;
-							v20.write(w)?;
+							v22.write(w)?;
 						}
 					}
 					Some(())
@@ -1882,13 +2071,13 @@ pub mod usb {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v22 = r.u16()? as usize;
-						let mut v23 = Vec::new();
-						v23.try_reserve_exact(v22).ok()?;
-						for _ in 0..v22 {
-							v23.push(UsbDevice::read(r)?);
+						let v24 = r.u16()? as usize;
+						let mut v25 = Vec::new();
+						v25.try_reserve_exact(v24).ok()?;
+						for _ in 0..v24 {
+							v25.push(UsbDevice::read(r)?);
 						}
-						v23
+						v25
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -2474,6 +2663,177 @@ impl PolicyOutcome {
 			PolicyOutcome::Refused => crate::codec::cbor::text(out, "refused"),
 			PolicyOutcome::NotStored => crate::codec::cbor::text(out, "not-stored"),
 		}
+	}
+}
+
+impl IncidentReport {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"present\":");
+		if self.present {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"bus\":");
+		let _ = write!(out, "{}", self.bus);
+		out.push(',');
+		out.push_str("\"dev\":");
+		let _ = write!(out, "{}", self.dev);
+		out.push(',');
+		out.push_str("\"func\":");
+		let _ = write!(out, "{}", self.func);
+		out.push(',');
+		out.push_str("\"generation\":");
+		let _ = write!(out, "{}", self.generation);
+		out.push(',');
+		out.push_str("\"state\":");
+		self.state.to_json_into(out);
+		out.push(',');
+		out.push_str("\"cause\":");
+		self.cause.to_json_into(out);
+		out.push(',');
+		out.push_str("\"last-opcode\":");
+		let _ = write!(out, "{}", self.last_opcode);
+		out.push(',');
+		out.push_str("\"silent-for\":");
+		let _ = write!(out, "{}", self.silent_for);
+		out.push(',');
+		out.push_str("\"attempts\":");
+		let _ = write!(out, "{}", self.attempts);
+		out.push(',');
+		out.push_str("\"domain-known\":");
+		if self.domain_known {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push(',');
+		out.push_str("\"memory-used\":");
+		let _ = write!(out, "{}", self.memory_used);
+		out.push(',');
+		out.push_str("\"memory-peak\":");
+		let _ = write!(out, "{}", self.memory_peak);
+		out.push(',');
+		out.push_str("\"handles-used\":");
+		let _ = write!(out, "{}", self.handles_used);
+		out.push(',');
+		out.push_str("\"threads-used\":");
+		let _ = write!(out, "{}", self.threads_used);
+		out.push(',');
+		out.push_str("\"dma-used\":");
+		let _ = write!(out, "{}", self.dma_used);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("present=");
+		if self.present {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("bus=");
+		let _ = write!(out, "{}", self.bus);
+		out.push_str(", ");
+		out.push_str("dev=");
+		let _ = write!(out, "{}", self.dev);
+		out.push_str(", ");
+		out.push_str("func=");
+		let _ = write!(out, "{}", self.func);
+		out.push_str(", ");
+		out.push_str("generation=");
+		let _ = write!(out, "{}", self.generation);
+		out.push_str(", ");
+		out.push_str("state=");
+		self.state.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("cause=");
+		self.cause.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("last-opcode=");
+		let _ = write!(out, "{}", self.last_opcode);
+		out.push_str(", ");
+		out.push_str("silent-for=");
+		let _ = write!(out, "{}", self.silent_for);
+		out.push_str(", ");
+		out.push_str("attempts=");
+		let _ = write!(out, "{}", self.attempts);
+		out.push_str(", ");
+		out.push_str("domain-known=");
+		if self.domain_known {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
+		out.push_str(", ");
+		out.push_str("memory-used=");
+		let _ = write!(out, "{}", self.memory_used);
+		out.push_str(", ");
+		out.push_str("memory-peak=");
+		let _ = write!(out, "{}", self.memory_peak);
+		out.push_str(", ");
+		out.push_str("handles-used=");
+		let _ = write!(out, "{}", self.handles_used);
+		out.push_str(", ");
+		out.push_str("threads-used=");
+		let _ = write!(out, "{}", self.threads_used);
+		out.push_str(", ");
+		out.push_str("dma-used=");
+		let _ = write!(out, "{}", self.dma_used);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 16);
+		crate::codec::cbor::text(out, "present");
+		crate::codec::cbor::boolean(out, self.present);
+		crate::codec::cbor::text(out, "bus");
+		crate::codec::cbor::uint(out, self.bus as u64);
+		crate::codec::cbor::text(out, "dev");
+		crate::codec::cbor::uint(out, self.dev as u64);
+		crate::codec::cbor::text(out, "func");
+		crate::codec::cbor::uint(out, self.func as u64);
+		crate::codec::cbor::text(out, "generation");
+		crate::codec::cbor::uint(out, self.generation as u64);
+		crate::codec::cbor::text(out, "state");
+		self.state.to_cbor_into(out);
+		crate::codec::cbor::text(out, "cause");
+		self.cause.to_cbor_into(out);
+		crate::codec::cbor::text(out, "last-opcode");
+		crate::codec::cbor::uint(out, self.last_opcode as u64);
+		crate::codec::cbor::text(out, "silent-for");
+		crate::codec::cbor::uint(out, self.silent_for as u64);
+		crate::codec::cbor::text(out, "attempts");
+		crate::codec::cbor::uint(out, self.attempts as u64);
+		crate::codec::cbor::text(out, "domain-known");
+		crate::codec::cbor::boolean(out, self.domain_known);
+		crate::codec::cbor::text(out, "memory-used");
+		crate::codec::cbor::uint(out, self.memory_used as u64);
+		crate::codec::cbor::text(out, "memory-peak");
+		crate::codec::cbor::uint(out, self.memory_peak as u64);
+		crate::codec::cbor::text(out, "handles-used");
+		crate::codec::cbor::uint(out, self.handles_used as u64);
+		crate::codec::cbor::text(out, "threads-used");
+		crate::codec::cbor::uint(out, self.threads_used as u64);
+		crate::codec::cbor::text(out, "dma-used");
+		crate::codec::cbor::uint(out, self.dma_used as u64);
 	}
 }
 

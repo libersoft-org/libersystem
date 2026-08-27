@@ -12,9 +12,11 @@ enum provider-kind(block=1,net=2,display=3,audio=4,input=5,usb-bus=6,pointer=7,c
 record provider-info(kind:provider-kind,bus:u32,dev:u32,func:u32,binding-generation:u64,slot:u32,provider-generation:u32)
 enum policy-verb(disable=0,enable=1,select=2,retry=3)
 enum policy-outcome(accepted=0,no-such-device=1,not-a-candidate=2,quarantined=3,busy=4,refused=5,not-stored=6)
+record incident-report(present:bool,bus:u32,dev:u32,func:u32,generation:u64,state:binding-state,cause:failure-cause,last-opcode:u32,silent-for:u64,attempts:u32,domain-known:bool,memory-used:u64,memory-peak:u64,handles-used:u64,threads-used:u64,dma-used:u64)
 interface device-policy-admin
 method device-policy-admin.apply op=1 (index:u32:rights=,verb:policy-verb:rights=,artifact:string:rights=) -> result<policy-outcome, liber:base@1::error>
 method device-policy-admin.stored op=2 (index:u32:rights=) -> result<string, liber:base@1::error>
+method device-policy-admin.incident op=3 (index:u32:rights=) -> result<incident-report, liber:base@1::error>
 interface provider-catalogue
 method provider-catalogue.subscribe op=1 (kind:provider-kind:rights=) -> stream<provider-info>
 method provider-catalogue.bindings op=2 () -> list<binding-record>

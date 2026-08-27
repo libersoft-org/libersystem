@@ -26,4 +26,7 @@ macro_rules! forward {
 forward!("liber_channel_liber_device_device_list", "liber_channel_impl_liber_device_device_list");
 forward!("liber_channel_liber_device_device_get", "liber_channel_impl_liber_device_device_get");
 forward!("liber_channel_liber_device_device_bindings", "liber_channel_impl_liber_device_device_bindings");
+forward!("liber_channel_liber_device_device_policy_admin_apply", "liber_channel_impl_liber_device_device_policy_admin_apply");
+forward!("liber_channel_liber_device_device_policy_admin_stored", "liber_channel_impl_liber_device_device_policy_admin_stored");
+forward!("liber_channel_liber_device_device_policy_admin_incident", "liber_channel_impl_liber_device_device_policy_admin_incident");
 forward!("liber_channel_liber_device_usb_list", "liber_channel_impl_liber_device_usb_list");

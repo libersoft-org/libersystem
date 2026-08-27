@@ -216,7 +216,10 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		b"log" => Some(granted("log", alloc::vec![Capability::Log, Capability::Time])),
 		b"snap" => Some(granted("snap", alloc::vec![Capability::Storage])),
 		b"volume" => Some(granted("volume", alloc::vec![Capability::Storage])),
-		b"lsdev" => Some(granted("lsdev", alloc::vec![Capability::Device])),
+		// THE DEVICE OPERATOR COMMAND holds both halves: the READ that renders the list, and the
+		// WRITE that changes a binding. They are separate capabilities because nothing else in the
+		// system needs the second - a tool that renders devices gets `device` and gets no closer.
+		b"lsdev" => Some(granted("lsdev", alloc::vec![Capability::Device, Capability::DevicePolicy])),
 		b"config" => Some(granted("config", alloc::vec![Capability::Config])),
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),

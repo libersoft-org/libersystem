@@ -178,11 +178,45 @@ enum policy-outcome {
 /// The division is the whole of the authority question: DeviceManager owns the DECISION and exposes
 /// these four verbs; ConfigService holds the bytes under a prefix DeviceManager alone writes. A
 /// component that can write the config file therefore cannot change a binding.
+/// The bounded capture P02M0165 takes when a binding goes wrong, BEFORE the process is gone.
+///
+/// A FIXED LIST, so it cannot grow into a diagnostic subsystem: no device payload, no memory dump,
+/// no log excerpt - each of those is unbounded in a different way, and a capture whose size depends
+/// on what the driver was doing is one that fails on the driver that most needs capturing.
+record incident-report {
+	/// Whether there has been one at all. A binding that has never failed answers `false` and every
+	/// field below is zero - which is a different fact from "it failed and used nothing".
+	present:      bool,
+	bus:          u32,
+	dev:          u32,
+	func:         u32,
+	generation:   u64,
+	state:        binding-state,
+	cause:        failure-cause,
+	/// The last frame the driver sent, and how long before the capture. `silent-for` is `u64::MAX`
+	/// where it never sent one - never spoke is not "a long time ago".
+	last-opcode:  u32,
+	silent-for:   u64,
+	attempts:     u32,
+	/// The binding's own Domain counters at that moment. `domain-known` is false where the Domain
+	/// was already gone or never made, which is worth recording rather than reporting zeros.
+	domain-known: bool,
+	memory-used:  u64,
+	memory-peak:  u64,
+	handles-used: u64,
+	threads-used: u64,
+	dma-used:     u64,
+}
+
 interface device-policy-admin {
 	@op(1) apply: func(index: u32, verb: policy-verb, artifact: string) -> result<policy-outcome, error>;
 	/// What is stored for this device right now, so an operator can see a preference before a
 	/// reboot applies it.
 	@op(2) stored: func(index: u32) -> result<string, error>;
+	/// The last incident on this binding. The CAPTURE belongs where the teardown is - P02M0165 -
+	/// and the DISPLAY belongs here; that division is what keeps it from becoming a diagnostic
+	/// subsystem.
+	@op(3) incident: func(index: u32) -> result<incident-report, error>;
 }
 
 /// The provider catalogue, served by DeviceManager - the only process that holds it.
