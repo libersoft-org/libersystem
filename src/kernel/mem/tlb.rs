@@ -144,7 +144,10 @@ pub fn shootdown() -> bool {
 			crate::serial_println!("tlb: shootdown {generation} timed out with {}/{} acknowledgements", acknowledged(cpus, me, generation), targets);
 			for cpu in 0..cpus.min(MAX_CPUS) {
 				if cpu != me && ACK_GENERATION[cpu].load(Ordering::Acquire) < generation {
-					crate::serial_println!("tlb:   cpu {cpu} is at generation {} and was asked for {generation}", ACK_GENERATION[cpu].load(Ordering::Acquire));
+					// AND WHETHER IT LOOKED. A core that has serviced nothing since the last report is
+					// a core taking no interrupts and running no idle loop; one whose count moved is a
+					// core that looked and was too late, which is a different thing to go and fix.
+					crate::serial_println!("tlb:   cpu {cpu} is at generation {} and was asked for {generation}; it has serviced {} time(s) since boot (this core: {})", ACK_GENERATION[cpu].load(Ordering::Acquire), SERVICED[cpu].load(Ordering::Relaxed), SERVICED[me].load(Ordering::Relaxed));
 				}
 			}
 			complete = false;
@@ -210,8 +213,22 @@ fn acknowledged(cpus: usize, me: usize, generation: u64) -> usize {
 // Act on a pending request for THIS core, if there is one. Called from the wake-IPI
 // handler and from the idle loop, so a core notices whether it was interrupted or was
 // already about to look at its run queue.
+// HOW MANY TIMES EACH CORE HAS LOOKED, which is the one number that tells a late acknowledgement
+// from a core that is not looking at all.
+//
+// A timeout says "cpu N is at generation X and was asked for Y" and that is where the diagnosis
+// stopped: it does not say whether cpu N ran this function and found nothing, or never ran it. Those
+// are different defects - a lost interrupt against a core that is wedged or has interrupts masked -
+// and on aarch64 the distinction was guessed at twice before it was measured.
+//
+// Relaxed: it is read only by a human, in a report that is already printing.
+static SERVICED: [AtomicU64; MAX_CPUS] = [const { AtomicU64::new(0) }; MAX_CPUS];
+
 pub fn service_pending() {
 	let me = arch::percpu::this_cpu().cpu_id() as usize;
+	if me < MAX_CPUS {
+		SERVICED[me].fetch_add(1, Ordering::Relaxed);
+	}
 	// Unreachable on a machine `shootdown` will act on: it refuses outright past `MAX_CPUS`, so no
 	// request is ever published for a core this array cannot hold. Kept because this runs from an
 	// interrupt handler and returning is the only safe thing to do with an index that would panic.

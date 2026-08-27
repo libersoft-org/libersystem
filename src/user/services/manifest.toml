@@ -135,6 +135,14 @@ owner = "display-proto"
 path = "user/libs/protocol/display-proto"
 
 [[sources]]
+owner = "driver-binding"
+path = "user/libs/driver/binding"
+
+[[sources]]
+owner = "driver-protocol"
+path = "user/libs/driver/protocol"
+
+[[sources]]
 owner = "drivers"
 path = "user/drivers/core"
 

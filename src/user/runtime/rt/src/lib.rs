@@ -1265,6 +1265,33 @@ pub unsafe fn send_blocking(channel: u64, bytes: &[u8], xfer: u64) -> bool {
 	}
 }
 
+// Send `bytes` and move one handle with LESS AUTHORITY THAN THIS PROCESS HOLDS, blocking while the
+// peer's queue is full.
+//
+// The receiver gets the intersection of the handle's rights and `rights`. A mask naming a right the
+// handle does not hold is not an error, because an intersection cannot widen; a send that fails
+// leaves this process's handle open at the same value with its rights unchanged.
+//
+// What it is for: a device capability is minted here WITH RIGHT_TRANSFER, because this process is
+// the one that hands it over, and arrives at the driver WITHOUT it - one attenuating move, and no
+// second one. The rule it states is about the HOLDER: a driver cannot pass its device on.
+pub unsafe fn send_blocking_attenuated(channel: u64, bytes: &[u8], xfer: u64, rights: u32) -> bool {
+	let transfer = CapTransfer { handle: xfer, rights, _pad: 0 };
+	unsafe {
+		loop {
+			let result: u64 = syscall(SYS_CHANNEL_SEND_ATTENUATED, channel, bytes.as_ptr() as u64, bytes.len() as u64, &transfer as *const CapTransfer as u64);
+			let signed: i64 = result as i64;
+			if signed == ERR_WOULD_BLOCK {
+				if wait_writable(channel) < 0 {
+					yield_now();
+				}
+				continue;
+			}
+			return signed == 0;
+		}
+	}
+}
+
 // Try to send `bytes` (and optionally one transferred handle) without blocking: returns
 // true on delivery, false if the queue is full (WOULD_BLOCK) or the peer is gone. Used
 // for droppable traffic - e.g. mouse reports to a program that may not be reading them.
@@ -2352,8 +2379,43 @@ pub unsafe fn waitset_wait(set: u64, deadline: u64, flags: u64) -> i64 {
 	unsafe { syscall(SYS_WAITSET_WAIT, set, deadline, flags, 0) as i64 }
 }
 
-pub unsafe fn device_acquire(index: u64, privilege: u64) -> i64 {
-	unsafe { syscall(SYS_DEVICE_ACQUIRE, index, privilege, 0, 0) as i64 }
+// TAKE THE DEVICE AT `index`, exclusively, and learn everything one binding needs.
+//
+// `device_acquire` is gone with the syscall behind it: it minted a `DeviceMemory` for anyone with
+// the privilege who named an index, counted owners instead of having one, and answered with nothing
+// the caller could later release the device by. This answers with a `ClaimGrant` - the key, the MMIO
+// capability that goes on to the driver, and the claim handle that STAYS here.
+//
+// The claim handle carries neither RIGHT_TRANSFER nor RIGHT_DUPLICATE, so it cannot leave this
+// process; closing it is a forced release of the device.
+//
+// `ERR_ALREADY_CLAIMED` means somebody else holds it, which is worth waiting on. `ERR_UNSUPPORTED`
+// means it is quarantined or retired, which lasts the rest of the boot.
+pub unsafe fn device_claim(index: u64, privilege: u64) -> Result<ClaimGrant, i64> {
+	let mut grant = ClaimGrant::default();
+	let result: i64 = unsafe { syscall(SYS_DEVICE_CLAIM, index, privilege, &mut grant as *mut ClaimGrant as u64, 0) as i64 };
+	if result < 0 { Err(result) } else { Ok(grant) }
+}
+
+// End the binding this claim handle names, and answer with the state the device reached: one of the
+// CLAIM_STATE_* codes - `FREE`, or `QUARANTINED` where the teardown could not be confirmed.
+//
+// Everything the binding derived stops working here, whatever process it ended up in: the MMIO
+// mapping is torn out of the address space it was in, the MSI vectors are masked, and the IOMMU
+// teardown is confirmed before any frame or vector goes back into circulation. Nothing asks the
+// driver for anything.
+pub unsafe fn device_release(claim: u64) -> i64 {
+	unsafe { syscall(SYS_DEVICE_RELEASE, claim, 0, 0, 0) as i64 }
+}
+
+// Read a claim handle: which binding it names, what state the device is in, and whether the release
+// has settled. The handle is waitable, so a manager parked in `wait_any` reads this once woken
+// rather than polling it.
+pub unsafe fn device_claim_info(claim: u64) -> Result<ClaimInfo, i64> {
+	let mut info = ClaimInfo::default();
+	let size: u64 = core::mem::size_of::<ClaimInfo>() as u64;
+	let result: i64 = unsafe { syscall(SYS_DEVICE_CLAIM_INFO, claim, &mut info as *mut ClaimInfo as u64, size, 0) as i64 };
+	if result < 0 { Err(result) } else { Ok(info) }
 }
 
 // Acquire an MSI-X Interrupt capability for device `index`: the kernel allocates a
@@ -2362,8 +2424,11 @@ pub unsafe fn device_acquire(index: u64, privilege: u64) -> i64 {
 // handle, or a negative error. The driver `wait`s on the handle for its device, then
 // `interrupt_ack`s it (a no-op clear for MSI) and writes its MSI-X vector into the
 // virtio transport (set_msix_vector).
-pub unsafe fn device_msix_acquire(index: u64, privilege: u64) -> i64 {
-	unsafe { syscall(SYS_DEVICE_MSIX_ACQUIRE, index, privilege, 0, 0) as i64 }
+// THE CLAIM IS THE AUTHORITY AND IT NAMES THE DEVICE. This took an index plus an ambient
+// DeviceManager privilege, so nothing anywhere said which BINDING the vector belonged to - and
+// ending that binding had no way to find it.
+pub unsafe fn device_msix_acquire(claim: u64) -> i64 {
+	unsafe { syscall(SYS_DEVICE_MSIX_ACQUIRE, claim, 0, 0, 0) as i64 }
 }
 
 // Reboot or power off the machine: `action` is POWER_REBOOT or POWER_OFF. On success

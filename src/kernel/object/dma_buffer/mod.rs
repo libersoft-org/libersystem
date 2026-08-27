@@ -38,6 +38,12 @@ pub struct DmaBuffer {
 	// stop being the device's business when the DEVICE stops - which no shootdown, no quota and no
 	// handle count can observe.
 	device: Option<u32>,
+	//
+	// WHICH BINDING is deliberately NOT here. A revocation needs "everything derived from the
+	// previous claim" to be a set it can name, and `device::register_derived` already holds exactly
+	// that - one row per capability a binding derived. A key copied onto the object as well would be
+	// a second answer to the same question, which is the shape of defect M7 removes from the IOMMU
+	// backend one layer down.
 	// THE TRANSLATION, WHERE THERE IS ONE. Present exactly when the device this buffer was created
 	// for is behind an enforcing IOMMU: the address handed to the driver is then the IOVA rather
 	// than the physical address, and the frames are not reusable until the unmap and the

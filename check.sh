@@ -95,6 +95,11 @@ declare -A GATES=(
 	["identity-note"]="tools/check-static-injection.sh identity-note"
 	["volume-layout"]="tools/check-volume-layout.sh ../.build/boot/volume-x86_64.pkg"
 	["milestone-index"]="tools/check-milestone-index.sh"
+	# THE DRIVER PROTOCOL VERSION, IN THE BYTES THAT SHIPPED. It is read before a driver is given a
+	# device, so a note that did not survive the link and the strip would make that refusal a check
+	# of nothing - silently, because a driver with no note reads exactly like one that declares no
+	# version.
+	["driver-protocol-note"]="tools/check-driver-protocol-note.sh"
 	# Generated or compiled artifacts below src, in the working tree and anywhere in reachable
 	# history. Two Justfile recipes that nothing called; cheap enough to be part of "check it", and
 	# a tree that has committed a build output does not un-commit it by nobody looking.

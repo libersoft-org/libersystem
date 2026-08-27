@@ -48,12 +48,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-protocol"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "drivers"
 version = "0.0.0"
 dependencies = [
+ "driver-protocol",
  "ipc-client",
  "proto",
  "rt",
+ "wire",
 ]
 
 [[package]]

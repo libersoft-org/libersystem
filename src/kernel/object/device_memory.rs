@@ -27,6 +27,15 @@ pub struct DeviceMemory {
 	// proves that device has been stopped. Both ends of that are capabilities to this object, so
 	// the index it names belongs on it rather than in a number passed alongside.
 	index: Option<u32>,
+	// WHICH BINDING OF THAT DEVICE THIS CAPABILITY BELONGS TO, when it was minted under a claim.
+	//
+	// The index alone cannot answer it. A device is claimed, released and claimed again, and the
+	// index is the same every time - so "everything derived from the PREVIOUS claim" is not a set
+	// the index can name. The key carries the generation, which makes it one: ending a claim revokes
+	// exactly the capabilities stamped with that generation and leaves the next binding's alone.
+	//
+	// `None` for the bare MMIO windows the tests mint, which belong to no binding.
+	claim: Option<abi::ClaimKey>,
 	// Physical base of the MMIO region.
 	phys_base: u64,
 	// Length of the region in bytes.
@@ -49,17 +58,30 @@ impl DeviceMemory {
 	// FALLIBLY, here and in `for_device`: `sys_device_acquire` mints them.
 	#[cfg(test)]
 	pub fn new(phys_base: u64, len: usize) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: None, claim: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
 	}
 
-	// The same, for entry `index` of the device table - what `sys_device_acquire` mints.
+	#[cfg(test)]
+	// The same, for entry `index` of the device table but under no claim - what the kernel's own
+	// bring-up suites mint, standing in for a DeviceManager on a device the booted system has
+	// already claimed. Nothing minted this way is revocable, because there is no binding to revoke.
 	pub fn for_device(index: u32, phys_base: u64, len: usize) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: Some(index), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: Some(index), claim: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+	}
+
+	// The real one: minted under a claim, and stamped with it - what `SYS_DEVICE_CLAIM` hands out.
+	pub fn for_claim(key: abi::ClaimKey, phys_base: u64, len: usize) -> Option<Arc<Self>> {
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: Some(key.device_index), claim: Some(key), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
 	}
 
 	// The device-table entry this capability is for, if it is for one.
 	pub fn device_index(&self) -> Option<u32> {
 		self.index
+	}
+
+	// The binding this capability was derived from, if it was derived from one.
+	pub fn claim(&self) -> Option<abi::ClaimKey> {
+		self.claim
 	}
 
 	// Number of pages the region spans (at least one), counted from the aligned base so an
@@ -98,6 +120,14 @@ impl DeviceMemory {
 		self.mapped_at.store(virt, Ordering::Release);
 	}
 
+	// Where this region is mapped, for the test that asks whether a revocation reached the address
+	// space rather than only the handle. The two are different claims and the second alone would
+	// pass a revocation that left a live mapping of device registers behind.
+	#[cfg(test)]
+	pub fn mapped_at_for_test(&self) -> u64 {
+		self.mapped_at.load(Ordering::Acquire)
+	}
+
 	// The physical offset within the first mapped page.
 	//
 	// A region whose physical base is not page-aligned is mapped from the page BELOW it,
@@ -113,39 +143,57 @@ impl DeviceMemory {
 	pub fn aligned_phys_base(&self) -> u64 {
 		self.phys_base - self.page_offset()
 	}
+
+	// Tear this region's mapping out of the address space it was mapped in, and give its virtual range
+	// back. Idempotent: the address is taken with a swap, so a revocation and the drop that follows it
+	// do not both unmap - and the second caller finds nothing to do rather than unmapping a range
+	// something else has since been given.
+	//
+	// A METHOD RATHER THAN A `Drop` BODY, because ending a device claim has to reach it while the
+	// object is still alive and still held by whoever it was sent to. A handle that refuses is not
+	// evidence that a MAPPING is gone: the driver has a raw virtual address it has been using for as
+	// long as it has been running, and revoking the capability does not touch it. This does.
+	pub fn teardown_mapping(&self) {
+		let base = self.mapped_at.swap(0, Ordering::AcqRel);
+		if base == 0 || base == Self::RESERVED {
+			return;
+		}
+		let space = self.mapped_in.lock().take();
+		for i in 0..self.pages() {
+			match &space {
+				// the address space it was mapped in, which is the only one this mapping was ever in.
+				Some(space) => {
+					space.unmap(base + i as u64 * PAGE_SIZE);
+				}
+				// nothing recorded a space: a mapping made before this object learned to remember
+				// one, or none at all. Leave the tables alone rather than unmap a page out of
+				// whichever space happens to be active.
+				None => {}
+			}
+		}
+		crate::syscall::free_vrange(space.as_deref(), base, self.pages() as u64 * PAGE_SIZE);
+	}
 }
 
 impl_kernel_object!(DeviceMemory, DeviceMemory);
 
 impl Drop for DeviceMemory {
 	fn drop(&mut self) {
-		// A DRIVER HAS LET THE DEVICE GO. On the last one for this device the count reaches zero and
-		// bus mastering is turned off - so a driver that CRASHED disables its own device without
-		// knowing the rule exists, because its handle dies with its process. A capability naming no
-		// device-table entry (the tests mint bare MMIO windows) counts against nothing.
-		if let Some(index) = self.index {
-			crate::device::release_bus_master(index as usize);
+		// NOTHING IS DRIVING THIS DEVICE ANY MORE, so it does not master the bus.
+		//
+		// This used to decrement an owner COUNT and turn bus mastering off at the 1 -> 0 transition.
+		// The count is gone - it was the way two owners could be represented, which is the state the
+		// claim exists to make impossible - and the property it delivered is kept: a driver that
+		// CRASHED disables its own device without knowing the rule exists, because its handle dies
+		// with its process and this is the one MMIO capability its binding derived.
+		//
+		// The CLAIM does not end here. It belongs to whoever took it, which is not the driver, and
+		// only a release ends it: a device whose driver died is not free for the next claimant until
+		// the teardown has been run and confirmed. What ends here is the device's ability to reach
+		// memory, which is the part that must not wait for anybody.
+		if let Some(key) = self.claim {
+			crate::device::mmio_capability_dropped(key);
 		}
-		// Tear down the mapping so the VA window is not left pointing at the device
-		// after the capability is gone, and return its address range to the window's
-		// pool. The physical range is hardware, not owned RAM, so nothing is freed.
-		let base = self.mapped_at.load(Ordering::Acquire);
-		let space = self.mapped_in.lock().take();
-		if base != 0 {
-			for i in 0..self.pages() {
-				match &space {
-					// the address space it was mapped in, which is the only one this
-					// mapping was ever in.
-					Some(space) => {
-						space.unmap(base + i as u64 * PAGE_SIZE);
-					}
-					// nothing recorded a space: a mapping made before this object learned
-					// to remember one, or none at all. Leave the tables alone rather than
-					// unmap a page out of whichever space happens to be active.
-					None => {}
-				}
-			}
-			crate::syscall::free_vrange(space.as_deref(), base, self.pages() as u64 * PAGE_SIZE);
-		}
+		self.teardown_mapping();
 	}
 }

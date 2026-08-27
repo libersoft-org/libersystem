@@ -201,7 +201,18 @@ fn a_shootdown_makes_another_core_stop_using_the_old_translation() {
 	// shootdown waits for acknowledgement, and only then is the old frame reusable.
 	assert_eq!(paging::unmap_page(SHARED_VA), Some(first), "the address was mapped to the first frame");
 	paging::map_page(SHARED_VA, second, paging::WRITABLE);
-	crate::mem::tlb::shootdown();
+	// THE ANSWER IS PART OF THE MECHANISM AND THIS DISCARDED IT.
+	//
+	// `shootdown` returns whether every other core acknowledged, and a `false` is not a weaker
+	// version of the same outcome - it is the mechanism saying the old frame is NOT reusable yet.
+	// The assertion below asks whether the reader sees the new frame, which is only promised when
+	// the answer was `true`; ignoring it meant a shootdown that TIMED OUT was reported as a
+	// translation that survived a completed flush. Two different defects, one message, and the one
+	// it named was the one that had not happened.
+	//
+	// Watched on aarch64 at 8 cores under TCG on 2026-08-27: the shootdown timed out at 6/7 with
+	// `cpu 1 is at generation 1 and was asked for 2`, and this test blamed a stale translation.
+	let complete = crate::mem::tlb::shootdown();
 
 	STAGE.store(3, Ordering::Release);
 	let mut spins = 0u64;
@@ -212,7 +223,11 @@ fn a_shootdown_makes_another_core_stop_using_the_old_translation() {
 	}
 
 	assert_eq!(SAW_FIRST.load(Ordering::Acquire), FIRST, "the reader's first read should see the first frame");
-	assert_eq!(SAW_SECOND.load(Ordering::Acquire), SECOND, "after the shootdown the reader must see the NEW frame, not the translation it had cached");
+	// WHICH OF THE TWO WENT WRONG, said apart. A shootdown that did not complete has not made the
+	// old frame reusable and does not promise the reader has forgotten anything - so requiring the
+	// new frame after one is asking the mechanism for something it declined to do.
+	assert!(complete, "the shootdown did not complete - every other core must acknowledge before the old frame is reusable, and the identity of the core that did not answer is on the line above this one");
+	assert_eq!(SAW_SECOND.load(Ordering::Acquire), SECOND, "the shootdown COMPLETED and the reader still saw its cached translation, which is the flush not working rather than not finishing");
 
 	assert_eq!(paging::unmap_page(SHARED_VA), Some(second));
 	crate::mem::tlb::shootdown();

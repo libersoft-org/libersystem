@@ -60,36 +60,25 @@ const REL_RANGE: i32 = 0x7fff;
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
-		// 1. bring the device up (recv "DEVICE" + MMIO cap, map, negotiate to FEATURES_OK).
-		let mut device: Virtio = common::bringup(bootstrap);
+		// 1. THE WHOLE HANDSHAKE FIRST: one `BIND` naming the device and how many resources
+		//    follow, then each resource saying which kind it is. This used to be five named byte
+		//    strings read one at a time, in an order this driver had to know without being told, and
+		//    an absent one was indistinguishable from a malformed one.
+		let (bind, resources) = common::handshake(bootstrap);
+		let mut device: Virtio = common::bringup_bound(bootstrap, &bind, &resources, 0);
 		// 2. self-identify. A virtio-input device is a keyboard or a pointer (mouse /
 		//    tablet); the same binary drives both. The device's config tells which: a
 		//    pointer reports EV_ABS (a tablet) or EV_REL (a mouse) events.
 		let is_pointer: bool = ev_supported(&device, EV_ABS as u8) || ev_supported(&device, EV_REL as u8);
-		// 3. receive our device's Interrupt capability ("IRQ" + handle).
-		let irq: u64 = recv_irq(bootstrap);
-		// DeviceManager supplies one producer endpoint shared by every keyboard driver.
-		// Pointer instances receive it too but never emit key events.
-		let mut key_buf: [u8; 8] = [0; 8];
-		let key_sink: u64 = match recv_blocking(bootstrap, &mut key_buf) {
-			Received::Message { len, handle } if len >= 4 && &key_buf[..4] == b"KEYS" => handle,
-			_ => 0,
-		};
-		// The power capability, arriving beside KEYS because the same two drivers own the
-		// Power key. `SYS_SYSTEM_POWER` requires it; a driver handed none finds the key
-		// inert rather than halting the machine on a right it does not hold.
-		let power: u64 = match recv_blocking(bootstrap, &mut key_buf) {
-			Received::Message { len, handle } if len >= 8 && &key_buf[..8] == b"SYSPOWER" => handle,
-			_ => 0,
-		};
-		keys::set_power(power);
-		// And the ConsoleInputSource capability, which `SYS_CONSOLE_FEED` requires. Same
-		// arrival, same reason: a keyboard that may not type is inert rather than privileged.
-		let console_input: u64 = match recv_blocking(bootstrap, &mut key_buf) {
-			Received::Message { len, handle } if len >= 7 && &key_buf[..7] == b"CONSOLE" => handle,
-			_ => 0,
-		};
-		keys::set_console_input(console_input);
+		// 3. the rest of what the handshake brought. DeviceManager supplies one producer endpoint
+		//    shared by every keyboard driver; pointer instances receive it too but never emit key
+		//    events. `SYS_SYSTEM_POWER` and `SYS_CONSOLE_FEED` each require their capability, and a
+		//    driver handed none finds the key inert rather than halting the machine on a right it
+		//    does not hold - which is why a zero here is a state and not a failure.
+		let irq: u64 = resources.irq;
+		let key_sink: u64 = resources.keys;
+		keys::set_power(resources.syspower);
+		keys::set_console_input(resources.console);
 		// route this device's interrupts to MSI-X table entry 0: DeviceManager acquired
 		// an MSI-X Interrupt (device_msix_acquire), so the kernel has already programmed
 		// the table and enabled MSI-X - we just point the device's config and queue
@@ -136,12 +125,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// functions, which is this one.
 			let mut line = [0u8; 64];
 			let n = common::describe(&mut line, b"virtio-input", &device, b"pointer");
-			send_blocking(bootstrap, &line[..n], consumer);
+			common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::INPUT, consumer)]);
 			pointer_loop(irq, &mut eventq, pool_virt, pool_phys, slots, producer, max_x, max_y)
 		} else {
 			let mut line = [0u8; 64];
 			let n = common::describe(&mut line, b"virtio-input", &device, b"keyboard");
-			send_blocking(bootstrap, &line[..n], 0);
+			common::online(bootstrap, &bind, &line[..n], &[]);
 			event_loop(irq, &mut eventq, pool_virt, pool_phys, slots, key_sink)
 		}
 	}
@@ -175,18 +164,6 @@ unsafe fn axis_max(device: &Virtio, axis: u16) -> i32 {
 			i += 1;
 		}
 		max as i32
-	}
-}
-
-// Receive the "IRQ" message carrying this device's Interrupt capability, which
-// DeviceManager acquired and transferred to us. Exits if it does not arrive.
-unsafe fn recv_irq(bootstrap: u64) -> u64 {
-	unsafe {
-		let mut buf: [u8; 16] = [0u8; 16];
-		match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"IRQ" => handle,
-			_ => exit(),
-		}
 	}
 }
 

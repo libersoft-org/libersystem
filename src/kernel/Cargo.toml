@@ -16,6 +16,11 @@ path = "main.rs"
 bootproto = { path = "../boot/protocol" }
 # Shared kernel/userspace ABI constants (syscalls, errors, rights, package format).
 abi = { path = "../abi" }
+# THE DRIVER BRING-UP WIRE, for the test suites only in spirit but declared here because the kernel
+# has one dependency list. Two of its hardware suites spawn a REAL userspace driver and stand in for
+# DeviceManager while it comes up, so they have to speak the same handshake DeviceManager speaks -
+# and speaking it from a hand-written copy of the frame layout is how the two would drift.
+driver-protocol = { path = "../user/libs/driver/protocol" }
 # The physical-frame buddy allocator. It is pure bitmap arithmetic, so it lives in a crate a host
 # can drive tens of millions of operations through - which is what the one unexplained
 # double allocation needed and could never get from a guest boot.

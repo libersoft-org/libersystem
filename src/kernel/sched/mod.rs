@@ -101,11 +101,27 @@ struct CpuSched {
 	inner: SpinLock<CpuSchedInner>,
 	// Saved stack pointer of this core's idle/bootstrap context.
 	idle_sp: AtomicU64,
+	// THE DEADLINE OF A BOUNDED DRAIN RUNNING ON THIS CORE, or `NO_DEADLINE`.
+	//
+	// It lives here and not in `run_until_idle_until`'s locals because of WHERE the decision has to
+	// be made. The drain does not get control between reschedules: `reschedule` stashes the pump's
+	// stack in the core's IDLE slot rather than requeueing it as a thread, so the pump resumes only
+	// when `run_queue.pop_front()` finds nothing. A thread that yields and requeues itself keeps the
+	// queue non-empty forever, and the pump never comes back to look at a deadline held in its own
+	// frame. That was tried and it hung - the test that hung is
+	// `a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself`, which is what it is for.
+	drain_deadline: AtomicU64,
 }
 
 impl CpuSched {
 	const fn new() -> Self {
-		Self { inner: SpinLock::new(CpuSchedInner { run_queue: RunQueue::new(), current: None, zombie: None }), idle_sp: AtomicU64::new(0) }
+		Self { inner: SpinLock::new(CpuSchedInner { run_queue: RunQueue::new(), current: None, zombie: None }), idle_sp: AtomicU64::new(0), drain_deadline: AtomicU64::new(NO_DEADLINE) }
+	}
+
+	// Whether a bounded drain on this core has run out of time.
+	fn drain_expired(&self) -> bool {
+		let deadline = self.drain_deadline.load(Ordering::Acquire);
+		deadline != NO_DEADLINE && arch::apic::ticks() >= deadline
 	}
 }
 
@@ -347,8 +363,12 @@ pub fn root_domain() -> Arc<Domain> {
 }
 
 // A handle to the kernel address space (shared higher-half kernel mappings).
+//
+// PUBLIC TO THE TEST BUILD, because a test that needs AN address space to hand to something does not
+// always run on a thread. `current_thread()` answers `None` in the runner's own context, and a test
+// that reached for it there died on the `expect` rather than on the thing it was checking.
 #[cfg(test)]
-fn kernel_as() -> Arc<AddressSpace> {
+pub fn kernel_as() -> Arc<AddressSpace> {
 	// ALLOC-OK: an `Option<Arc<AddressSpace>>` out of the guard - a refcount bump.
 	KERNEL_AS.lock().clone().expect("scheduler not initialized")
 }
@@ -387,6 +407,30 @@ fn start_and_enqueue(cpu: usize, thread: Arc<Thread>) -> bool {
 
 #[cfg(test)]
 pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
+	spawn_on_maybe_waking(cpu, entry, arg, true)
+}
+
+// The same spawn WITHOUT the wake, so a test can measure the trip both ways on the machine it is
+// running on.
+//
+// It exists because measuring the wake against a fixed number does not survive emulation. The test
+// that owns this property first compared a wall-clock trip against 4 ms, which closed under TCG -
+// a woken trip there costs milliseconds, because every guest instruction costs about twenty-five
+// times what it does natively. Counting TICK BOUNDARIES replaced it and inherited a weaker form of
+// the same assumption: boundary-counting discriminates only while a trip is SHORTER than a tick, and
+// at 100 Hz a cross-core spawn on an oversubscribed emulated machine can exceed 10 ms - at which
+// point a working IPI crosses a boundary every time too, and the test fails on a kernel with nothing
+// wrong with it. Measured 2026-08-27 on aarch64 gicv2 at 4 cores.
+//
+// A CONTROL CANCELS WHAT A BUDGET HAS TO GUESS. Both trips pay the same emulator, the same host
+// load and the same scheduler; the only difference between them is the thing being measured.
+#[cfg(test)]
+pub fn spawn_on_unwoken(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> {
+	spawn_on_maybe_waking(cpu, entry, arg, false)
+}
+
+#[cfg(test)]
+fn spawn_on_maybe_waking(cpu: usize, entry: extern "C" fn(u64), arg: u64, wake: bool) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
 	// A KERNEL thread. Nothing here has a caller that could carry a refusal back to
 	// somebody who could act on it - these are boot-time and test-time spawns - so an
@@ -394,7 +438,7 @@ pub fn spawn_on(cpu: usize, entry: extern "C" fn(u64), arg: u64) -> Arc<Thread> 
 	// below, and that one returns None.
 	let thread = Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack");
 	start_and_enqueue(cpu, thread.clone());
-	if cpu != current_cpu_id() {
+	if wake && cpu != current_cpu_id() {
 		arch::apic::send_wake_ipi(crate::smp::lapic_id(cpu));
 	}
 	thread
@@ -1037,9 +1081,41 @@ fn run_idle_hook() {
 // and this returns - the caller's standing loop re-enters, and each entry's
 // check_deadlines wakes whatever housekeeping came due.
 pub fn run_until_idle() {
+	run_until_idle_until(NO_DEADLINE);
+}
+
+// The same, bounded by an ABSOLUTE TICK DEADLINE. Answers false when the deadline cut it short.
+//
+// IT HAS TO BE RESPECTED IN BOTH HALVES OF THIS FUNCTION, and that is the whole reason it exists.
+// Capping the wait alone is not enough: the body is `while !run_queue.is_empty() { reschedule }` and
+// only THEN a bounded wait, so a thread that yields and requeues itself keeps the queue non-empty
+// and the drain never reaches the part where a deadline is consulted. A caller that thought it had
+// bounded this by passing a deadline to the wait would have bounded nothing against exactly the
+// workload a boot that is failing to settle produces.
+//
+// So: the drain checks the deadline BETWEEN reschedules, and the wait sleeps until whichever comes
+// first of the nearest progress deadline and this one.
+pub fn run_until_idle_until(outer: u64) -> bool {
 	let cpu = current_cpu_id();
+	// PUBLISHED, so the switch path can read it. See `CpuSched::drain_deadline` for why a local
+	// would not be enough - and for the test that proved it.
+	//
+	// The previous value is restored rather than cleared: a bounded drain nested inside another must
+	// not hand the outer one an unbounded window on its way out.
+	let previous = cpu_sched(cpu).drain_deadline.swap(outer, Ordering::AcqRel);
+	let result = run_until_idle_bounded(cpu, outer);
+	cpu_sched(cpu).drain_deadline.store(previous, Ordering::Release);
+	result
+}
+
+fn run_until_idle_bounded(cpu: usize, outer: u64) -> bool {
+	let expired = |outer: u64| outer != NO_DEADLINE && arch::apic::ticks() >= outer;
 	loop {
 		while !cpu_sched(cpu).inner.lock().run_queue.is_empty() {
+			if expired(outer) {
+				reap(cpu_sched(cpu));
+				return false;
+			}
 			reschedule(Disposition::Requeue);
 		}
 		// Wake anything already past its deadline - a periodic wait does not count as
@@ -1048,8 +1124,15 @@ pub fn run_until_idle() {
 		if !cpu_sched(cpu).inner.lock().run_queue.is_empty() {
 			continue;
 		}
+		if expired(outer) {
+			reap(cpu_sched(cpu));
+			return false;
+		}
 		match min_deadline() {
 			Some(deadline) => {
+				// WHICHEVER COMES FIRST. A wait that slept to the nearest progress deadline would
+				// overshoot the caller's window by however far away that deadline happened to be.
+				let deadline = if outer == NO_DEADLINE { deadline } else { core::cmp::min(deadline, outer) };
 				// Wait for the nearest deadline by HALTING between checks, not busy-spinning.
 				// A spinning BSP pegs a host core at 100% AND - because the idle hook polls
 				// the serial UART (an `inb` on the LSR) every pass - floods KVM with port-I/O
@@ -1084,10 +1167,12 @@ pub fn run_until_idle() {
 				}
 				check_deadlines();
 			}
+			// Nothing runnable and nothing waiting: idle, whatever the caller's window says.
 			None => break,
 		}
 	}
 	reap(cpu_sched(cpu));
+	true
 }
 
 // Idle loop for application processors: run any ready thread, otherwise HALT until
@@ -1147,9 +1232,35 @@ fn reap(sched: &CpuSched) {
 // was killed while it spun in ring 3 is retired right here - the one kill point a
 // never-syscalling loop cannot dodge.
 pub fn on_timer_preempt(from_user: bool) {
+	// EVERY CORE ANSWERS A SHOOTDOWN ON ITS OWN TICK, whatever it is running.
+	//
+	// The wake IPI was the only thing that could make a BUSY core look, and `mem::tlb` already says
+	// in as many words why that is not enough: "the wake IPI is serviced by the handler only when
+	// the core takes it, and a core that masks interrupts for a lock, or is already inside this
+	// function, does not." That argument was applied to the requester's wait and not to the target.
+	//
+	// MEASURED, not assumed. On aarch64 at 8 cores the shootdown timed out at 6/7 every time, and
+	// the six that answered were the six sitting in `cpu_idle_loop` - which services on its own. The
+	// instrumentation added for this says it plainly: `cpu 1 is at generation 1 and was asked for 2;
+	// it has serviced 19 time(s) since boot` while the requester had looked 200,000,576 times. A
+	// core running a thread never looked at all.
+	//
+	// The cost is one relaxed load per tick per core, and it bounds a shootdown by one tick on any
+	// core that is running anything - which is the case the IPI was supposed to cover. It is not a
+	// claim that the IPI works: it removes the dependency on the IPI being the only thing that can.
+	//
+	// AFTER the preemption gate, and that placement was learned rather than chosen. It went before it
+	// first, on the reasoning that a shootdown is owed by every core whether or not this one is
+	// preemptible yet - and x86_64 died on the first tick of the boot with a null dereference in
+	// `percpu::this_cpu`. That flag is not only a policy switch: nothing has published this core's
+	// per-CPU block until it is set, and `service_pending` asks the block which core it is on.
+	//
+	// Nothing is lost by waiting. Before preemption is enabled there are no other cores running
+	// threads, so there is no busy core holding a stale translation for this to reach.
 	if !PREEMPTION_ENABLED.load(Ordering::Relaxed) {
 		return;
 	}
+	crate::mem::tlb::service_pending();
 	let sched = cpu_sched(current_cpu_id());
 	if from_user {
 		// No Arc is held across the never-returning Retire (the closure yields a
@@ -1250,6 +1361,27 @@ fn reschedule(disp: Disposition) {
 	reap(sched);
 
 	let mut guard = sched.inner.lock();
+	// THE DRAIN'S WINDOW ENDS A THREAD'S TURN, and this is the only place it can.
+	//
+	// Only for a REQUEUE: a thread that is blocking or retiring is leaving anyway, and both of those
+	// paths already return to the idle context. This is the yielding thread, which would otherwise
+	// be handed straight back its own turn for as long as it cares to take it.
+	if matches!(disp, Disposition::Requeue) && guard.current.is_some() && sched.drain_expired() {
+		let prev = guard.current.take().expect("checked on the line above");
+		let old_sp = prev.kstack_ptr_addr();
+		prev.set_state(ThreadState::Ready);
+		// ALLOC-OK: the intrusive `RunQueue` moves pointers - the link lives in the `Thread`.
+		guard.run_queue.push_back(prev);
+		let new_sp = sched.idle_sp.load(Ordering::Acquire);
+		drop(guard);
+		// The idle context runs on this core's boot stack, which no Thread describes.
+		arch::percpu::use_idle_stack();
+		check_switch_target("IDLE", new_sp);
+		switch_address_space(KERNEL_CR3.load(Ordering::Acquire));
+		unsafe { arch::context::switch_context(old_sp, new_sp) };
+		restore_interrupts(resume_if);
+		return;
+	}
 	let next = guard.run_queue.pop_front();
 	let prev = guard.current.take();
 

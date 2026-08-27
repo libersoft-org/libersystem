@@ -44,6 +44,11 @@ const STATE_DRIVER_MISSING: u8 = 4;
 // before giving up on its device.
 const MAX_DRIVER_RESTARTS: u32 = 3;
 
+// WHERE A BINDING IS AND WHY, from the crate that owns the answer. Not a `u8` per device with a
+// meaning each reader remembers: `state[idx]` is a small integer set at a few points, and the
+// transitions between its values are wherever somebody happened to write them.
+use driver_binding::{BindingRecord, BindingState, FailureCause};
+
 // How long the development agent has to report in before DeviceManager stops waiting for it, in
 // clock ticks (a hundred to the second, so this is two seconds).
 //
@@ -214,7 +219,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//      nothing rather than typing on an authority it does not hold. Optional, like the
 		//      drivers' own handling of it, so a boot that granted none still starts.
 		let console_input: u64 = recv_tagged(bootstrap, &mut buf, b"CONSOLE").unwrap_or(0);
-		// 1b3. and the DeviceManager privilege, which is what `device_acquire`,
+		// 1b3. and the DeviceManager privilege, which is what `device_claim`,
 		//      `device_msix_acquire` and `interrupt_bind` now require. Without it this program takes
 		//      no device out of the kernel and no driver is launched - which is the right failure:
 		//      ungated, those syscalls handed any process the BAR of any PCI device, and on a
@@ -356,12 +361,20 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 					continue;
 				}
 			};
-			let mut handle: u64 = 0;
+			let mut offers = Offers::new();
 			let mut dm_chan: u64 = 0;
-			if launch_one(i, &info, elf, driver_name, 0, power, console_input, device_privilege, buf, &mut handle, &mut dm_chan) {
+			// THE CLAIM STAYS HERE. It is what this service holds the device by: waitable, and the
+			// only thing that can end the binding without the driver's cooperation.
+			let mut claim: u64 = 0;
+			// ONE RECORD PER NODE, carrying where its binding is and why it got there. Nothing reads
+			// it yet beyond the boot log; the milestone that renders it reads THIS rather than
+			// inventing a second vocabulary.
+			let mut record = BindingRecord::new();
+			if launch_one(i, &info, elf, driver_name, 0, power, console_input, device_privilege, buf, &mut offers, &mut dm_chan, &mut claim, &mut record) {
 				// the first virtio-blk disk is the writable system volume; a second is routed
 				// up separately as the read-only FAT media volume, a third as the read-only
 				// ISO9660 volume, a fourth as the read-only UDF volume.
+				let handle: u64 = offers.take(driver_protocol::provider::BLOCK);
 				if *block_client == 0 {
 					*block_client = handle;
 				} else if *block2_client == 0 {
@@ -446,18 +459,25 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 					}
 				};
 				let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
-				let mut handle: u64 = 0;
+				let mut offers = Offers::new();
 				let mut dm_chan: u64 = 0;
-				if launch_one(i, &info, elf, driver_name, key_producer, power, console_input, device_privilege, buf, &mut handle, &mut dm_chan) {
+				let mut claim: u64 = 0;
+				let mut record = BindingRecord::new();
+				if launch_one(i, &info, elf, driver_name, key_producer, power, console_input, device_privilege, buf, &mut offers, &mut dm_chan, &mut claim, &mut record) {
 					state[idx] = STATE_ONLINE;
-					if driver_name == b"virtio_net" {
-						*net_client = handle;
+					// ROUTED BY WHAT THE PROVIDER IS, not by which driver sent it and in what order.
+					// Every one of these used to be "the handle that came with the report", with the
+					// xHCI driver's extra two told apart by the literal bytes `USBBUS` and `POINTER`
+					// in the messages that followed - so what a capability was for was decided by
+					// parsing a string the driver chose.
+					if *net_client == 0 {
+						*net_client = offers.take(driver_protocol::provider::NET);
 					}
-					if driver_name == b"virtio_gpu" {
-						*gpu_client = handle;
+					if *gpu_client == 0 {
+						*gpu_client = offers.take(driver_protocol::provider::DISPLAY);
 					}
-					if driver_name == b"virtio_snd" {
-						*snd_client = handle;
+					if *snd_client == 0 {
+						*snd_client = offers.take(driver_protocol::provider::AUDIO);
 					}
 					// The development channel driver hands up a raw byte channel, and the agent
 					// that speaks the protocol over it is started here rather than by
@@ -466,7 +486,9 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 					// artifact registry out of the address space that holds a device capability -
 					// so it is started where that device is bound, and nowhere else.
 					#[cfg(feature = "development")]
-					if driver_name == b"dev_channel" && handle != 0 {
+					let dev_bytes: u64 = offers.take(driver_protocol::provider::CONSOLE_BYTES);
+					#[cfg(feature = "development")]
+					if driver_name == b"dev_channel" && dev_bytes != 0 {
 						// The driver's bootstrap is kept rather than left to leak, because a
 						// replacement agent's wire is handed down over it; and a volume connection of
 						// this program's own is opened, because the one these drivers were read
@@ -479,36 +501,34 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 						// architectures - for a number that never needed to be unguessable.
 						random_insecure(&mut dev.nonce);
 						dev.console_input = console_input;
-						dev.bootstrap = start_dev_agent(dev.storage, handle, console_input, &dev.nonce);
+						dev.bootstrap = start_dev_agent(dev.storage, dev_bytes, console_input, &dev.nonce);
 						if dev.bootstrap == 0 {
 							print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
 						}
 					}
-					// The pointer flavour of virtio_input hands up an event channel (non-zero
-					// handle); the keyboard flavour hands up nothing (handle 0), so a non-zero
-					// virtio_input handle is the pointer's INPUT channel for InputService.
-					if driver_name == b"virtio_input" && handle != 0 {
-						*input_client = handle;
+					// The pointer flavour of virtio_input offers an INPUT provider; the keyboard
+					// flavour offers none, so an absent one is a state rather than a failure.
+					if *input_client == 0 {
+						*input_client = offers.take(driver_protocol::provider::INPUT);
 					}
-					// The xhci driver hands up the USB stick's block-service channel (handle 0
-					// when no mass-storage device is attached), routed to the usb StorageService,
-					// then its USB bus query channel under "USBBUS" (the `lsusb` inventory) and
-					// its pointer-event channel under "POINTER" (a USB pointing device).
-					if driver_name == b"xhci" {
-						if handle != 0 {
-							*usb_client = handle;
-						}
-						if let Received::Message { len, handle: usbq } = recv_blocking(dm_chan, buf)
-							&& len >= 6 && &buf[..6] == b"USBBUS"
-						{
-							*usbq_client = usbq;
-						}
-						if let Received::Message { len, handle: ptr } = recv_blocking(dm_chan, buf)
-							&& len >= 7 && &buf[..7] == b"POINTER"
-						{
-							*usb_pointer = ptr;
-						}
+					// The xHCI driver offers up to three: the USB stick's block service (absent
+					// when no mass-storage device is attached), its bus query channel for the
+					// `lsusb` inventory, and a pointer-event channel for a USB pointing device.
+					// All three arrived in ONE handshake and were held unpublished until its
+					// `READY`, so a controller that died between them published nothing.
+					if *usb_client == 0 {
+						*usb_client = offers.take(driver_protocol::provider::BLOCK);
 					}
+					if *usbq_client == 0 {
+						*usbq_client = offers.take(driver_protocol::provider::USB_BUS);
+					}
+					if *usb_pointer == 0 {
+						*usb_pointer = offers.take(driver_protocol::provider::POINTER);
+					}
+					// ANYTHING STILL HELD IS A PROVIDER NOBODY ROUTES, and it is closed rather than
+					// leaked: a handle this service keeps forever is a channel the driver waits on
+					// forever.
+					offers.close_all();
 				}
 				unmap_object(file);
 				close(file);
@@ -672,6 +692,285 @@ unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
 	}
 }
 
+// ------------------------------------------------------- one bind, one transaction
+//
+// BIND USED TO BE A SEQUENCE OF STEPS THAT EACH SUCCEEDED SEPARATELY: map the ELF, spawn the
+// process, hand over the device, wait for a report. A failure part-way left whatever the earlier
+// steps did - the claim taken, the process running, the capability handed over - and the process
+// handle was DROPPED after `spawn`, so nothing could end the process a failed bind had started.
+//
+// This is what the attempt has taken so far, and it is filled in as each thing is taken rather than
+// reconstructed afterwards. A rollback that has to work out what happened is a rollback that gets it
+// wrong on the path nobody exercises.
+struct Attempt {
+	// The driver's process, with MANAGE - what `spawn` returns and nothing used to keep.
+	process: u64,
+	// This service's end of the bootstrap channel.
+	channel: u64,
+	// The claim handle, and the key it names. Closing the handle would release the device on its
+	// own; releasing it explicitly is how the terminal state is LEARNED rather than assumed.
+	claim: u64,
+	key: ClaimKey,
+}
+
+impl Attempt {
+	fn new() -> Self {
+		Self { process: 0, channel: 0, claim: 0, key: ClaimKey::default() }
+	}
+
+	// THE TRANSACTION COMMITS: what it took stays taken, and passes to whoever asked for the bind.
+	//
+	// CONSUMES the value rather than zeroing its fields, which is the difference between "these
+	// handles are somebody else's now" and "somebody remembered to blank three variables". There is
+	// no `Drop` here to disarm - a rollback that ran on every drop would have to be disarmed on this
+	// path, and a disarm that is forgotten leaks a device silently.
+	fn commit(self) {}
+
+	// UNDO WHAT WAS TAKEN, IN REVERSE, and answer with where the node lands.
+	//
+	// The order is the property:
+	//
+	//   1. `SIG_KILL` the process - not a request it can decline, because a driver that failed its
+	//      handshake is not a driver whose cooperation is available;
+	//   2. close this service's own handles to it, including every provider it offered and nobody
+	//      routed;
+	//   3. release the claim by its key, which is what performs the device teardown - bus mastering
+	//      off, the mapping revoked, interrupts masked, the IOMMU unmap confirmed. The teardown
+	//      cannot be confirmed BEFORE this step, because the release is what starts it.
+	//
+	// IDEMPOTENT, because an interrupted rollback is the case that leaves the mess: every field is
+	// zeroed as it is given back, so a second call finds nothing to do.
+	//
+	// The answer is `Quarantined` when the release did not confirm - and that is the one stated
+	// exception to "either completes or leaves nothing": its frames, vectors and grants stay charged
+	// and out of circulation, because the alternative is handing back memory a device may still be
+	// writing to.
+	unsafe fn roll_back(&mut self, offers: &mut Offers) -> BindingState {
+		unsafe {
+			if self.process != 0 {
+				signal(self.process, SIG_KILL);
+				close(self.process);
+				self.process = 0;
+			}
+			offers.close_all();
+			if self.channel != 0 {
+				close(self.channel);
+				self.channel = 0;
+			}
+			if self.claim == 0 {
+				// Nothing was taken, so there is nothing to confirm and nothing to quarantine.
+				return BindingState::Backoff;
+			}
+			let outcome = device_release(self.claim);
+			close(self.claim);
+			self.claim = 0;
+			if outcome == CLAIM_STATE_QUARANTINED as i64 { BindingState::Quarantined } else { BindingState::Backoff }
+		}
+	}
+}
+
+// ------------------------------------------------- the manager half of the wire
+
+// The providers one driver offered during its handshake, HELD UNPUBLISHED until it says `READY`.
+//
+// A driver that dies half way through announcing itself announces nothing: everything collected
+// here is closed on a `FAILED` or a peer-close, and only a `READY` hands it on. Held by KIND rather
+// than by arrival order, which is what the manager used to route on - it read the literal bytes
+// `USBBUS` and `POINTER` out of two messages that followed the report, so what a capability was for
+// was decided by parsing a string a driver chose.
+struct Offers {
+	kinds: [u16; driver_protocol::MAX_INITIAL_OFFERS],
+	handles: [u64; driver_protocol::MAX_INITIAL_OFFERS],
+	count: usize,
+}
+
+impl Offers {
+	fn new() -> Self {
+		Self { kinds: [0; driver_protocol::MAX_INITIAL_OFFERS], handles: [0; driver_protocol::MAX_INITIAL_OFFERS], count: 0 }
+	}
+
+	// Answers false when the bound is reached, so the caller can refuse the frame and close its
+	// handle rather than accumulate. "Any number" is not a bound, and a driver is a separate process
+	// that may be wrong or malicious.
+	fn push(&mut self, kind: u16, handle: u64) -> bool {
+		if self.count >= driver_protocol::MAX_INITIAL_OFFERS {
+			return false;
+		}
+		self.kinds[self.count] = kind;
+		self.handles[self.count] = handle;
+		self.count += 1;
+		true
+	}
+
+	// Take the provider of this kind, or 0. Taking is what makes routing safe to call twice: a
+	// second `take` of one kind answers 0 rather than handing the same capability to two consumers.
+	fn take(&mut self, kind: u16) -> u64 {
+		for index in 0..self.count {
+			if self.kinds[index] == kind && self.handles[index] != 0 {
+				let handle = self.handles[index];
+				self.handles[index] = 0;
+				return handle;
+			}
+		}
+		0
+	}
+
+	// Everything still held goes, which is what a handshake that did not reach `READY` leaves.
+	unsafe fn close_all(&mut self) {
+		for index in 0..self.count {
+			if self.handles[index] != 0 {
+				unsafe { close(self.handles[index]) };
+				self.handles[index] = 0;
+			}
+		}
+		self.count = 0;
+	}
+}
+
+// How a handshake ended.
+enum HandshakeResult {
+	Ready,
+	Failed(driver_protocol::DriverFailureCode),
+	Closed,
+}
+
+// Send one frame, optionally moving one capability with it under `mask`.
+unsafe fn send_frame(channel: u64, opcode: driver_protocol::Opcode, generation: u64, payload: &[u8], handle: u64, mask: u32) -> bool {
+	unsafe {
+		let mut frame = [0u8; driver_protocol::HEADER_LEN + driver_protocol::MAX_PAYLOAD];
+		let header = driver_protocol::Header { version: driver_protocol::VERSION, opcode, generation, payload_len: payload.len() as u32 };
+		frame[..driver_protocol::HEADER_LEN].copy_from_slice(&header.encode());
+		frame[driver_protocol::HEADER_LEN..driver_protocol::HEADER_LEN + payload.len()].copy_from_slice(payload);
+		let bytes = &frame[..driver_protocol::HEADER_LEN + payload.len()];
+		if handle == 0 { send_blocking(channel, bytes, 0) } else { send_blocking_attenuated(channel, bytes, handle, mask) }
+	}
+}
+
+// READ UNTIL THE HANDSHAKE ENDS: offers, then exactly one `READY` or one `FAILED`.
+//
+// EVERY REFUSAL CLOSES WHAT ARRIVED WITH IT, and "what arrived" includes the handles this reader
+// never looked at - the capability-aware receive is what makes that possible at all, because the
+// ordinary one takes the first and drops the rest.
+//
+// A FRAME CARRYING A STALE GENERATION IS DROPPED RATHER THAN ACTED ON. A process being replaced
+// cannot touch its replacement's state: its `READY` is not this binding's `READY`, and its offer is
+// a capability from a binding that is over.
+unsafe fn read_handshake_result(channel: u64, generation: u64, buf: &mut [u8], offers: &mut Offers) -> HandshakeResult {
+	unsafe {
+		loop {
+			let ReceivedCaps::Message { len, handles } = recv_caps_blocking(channel, buf) else {
+				offers.close_all();
+				return HandshakeResult::Closed;
+			};
+			let refuse = |handles: &wire::Handles| {
+				for &handle in handles.as_slice() {
+					close(handle);
+				}
+			};
+			let Ok(header) = driver_protocol::Header::decode(&buf[..len]) else {
+				refuse(&handles);
+				continue;
+			};
+			if header.check_handles(handles.as_slice().len()).is_err() || header.generation != generation {
+				refuse(&handles);
+				continue;
+			}
+			match header.opcode {
+				driver_protocol::Opcode::Offer => {
+					let Ok(kind) = driver_protocol::decode_offer(header.payload(buf)) else {
+						refuse(&handles);
+						continue;
+					};
+					if !offers.push(kind, handles.as_slice()[0]) {
+						// PAST THE BOUND IS A REFUSAL WITH THE HANDLE CLOSED, not an accumulation.
+						refuse(&handles);
+					}
+				}
+				driver_protocol::Opcode::Ready => {
+					if driver_protocol::decode_ready(header.payload(buf)).is_err() {
+						continue;
+					}
+					return HandshakeResult::Ready;
+				}
+				driver_protocol::Opcode::Failed => {
+					let code = match driver_protocol::decode_failed(header.payload(buf)) {
+						Ok(code) => code,
+						// A `FAILED` whose code is not one of the five is still a failure, and the
+						// least it can be taken for is the one that says nothing about a retry.
+						Err(_) => driver_protocol::DriverFailureCode::InternalError,
+					};
+					offers.close_all();
+					return HandshakeResult::Failed(code);
+				}
+				// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
+				driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource => refuse(&handles),
+			}
+		}
+	}
+}
+
+// GIVE THE ATTEMPT BACK AND STOP TRYING.
+//
+// The node lands where the table allows a failed bind to land, and never in `Unbound`: that is where
+// a node STARTS and what invites a bind, so a failed bind landing there is a bind that immediately
+// happens again with nothing recorded about why the last one did not work.
+//
+// `Backoff` when the teardown confirmed and there is something a later attempt could change,
+// `Failed` when there is not, `Quarantined` when the release could not be confirmed - which outranks
+// both, because a device that may still be live is not a device to try again on.
+unsafe fn give_up(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Offers, cause: FailureCause, driver_name: &[u8]) -> bool {
+	unsafe {
+		// THE PATH THROUGH THE TABLE DEPENDS ON WHETHER A DEVICE WAS TAKEN, and flattening that was
+		// wrong. `Binding -> Failed` is for a transaction that failed BEFORE the claim; once there
+		// is a device to quieten, the table's only way out is `Binding -> Stopping -> Failed`,
+		// because `Stopping` is what "there is a teardown to run" means. Going straight to `Failed`
+		// records a node that never had a device, which is a different story about the same boot.
+		let took_the_device = txn.claim != 0;
+		if took_the_device {
+			record.move_to(BindingState::Stopping, Some(cause));
+		}
+		let after = txn.roll_back(offers);
+		// The rollback says whether the device is quiet. `give_up` is only called once the decision
+		// to stop trying has been made, so the confirmed outcome is `Failed` rather than `Backoff`.
+		let landed = if after == BindingState::Quarantined { BindingState::Quarantined } else { BindingState::Failed };
+		let state = if record.move_to(landed, Some(cause)) { landed } else { record.state };
+		print(b"DeviceManager: ");
+		print(driver_name);
+		print(b" did not bind (");
+		print(cause.name());
+		print(b") - the node is ");
+		print(state.name());
+		print(b"\n");
+		false
+	}
+}
+
+// GIVE THE ATTEMPT BACK AND TRY AGAIN. Answers false when the teardown did not confirm, which ends
+// the node rather than rebinding over a device that may still be writing to memory.
+unsafe fn retry_or_quarantine(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Offers, cause: FailureCause, driver_name: &[u8]) -> bool {
+	unsafe {
+		// Through `Stopping` for the same reason `give_up` does it: there is a device to quieten, and
+		// the table has no edge from `Binding` to `Backoff` once one has been taken.
+		if txn.claim != 0 {
+			record.move_to(BindingState::Stopping, Some(cause));
+		}
+		let after = txn.roll_back(offers);
+		if after == BindingState::Quarantined {
+			record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed));
+			print(b"DeviceManager: ");
+			print(driver_name);
+			print(b" - the teardown did not confirm, so this device is quarantined for the boot\n");
+			return false;
+		}
+		record.move_to(BindingState::Backoff, Some(cause));
+		print(b"DeviceManager: restarting ");
+		print(driver_name);
+		print(b"\n");
+		// The next pass reopens the transaction from `Backoff`, which the table allows.
+		true
+	}
+}
+
 // Launch (and, on a crash during bring-up, restart) the driver for device `i`,
 // handing it only that device's MMIO capability and info. Returns true once the
 // driver reports in. If a started driver crashes before reporting, the kernel tears
@@ -679,93 +978,154 @@ unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
 // then re-acquires a fresh capability and respawns it, up to a few times - the
 // driver crash/restart cycle. Drivers do not crash in normal operation, so the
 // restart path is dormant on a healthy boot.
-unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], service_handle: &mut u64, control_out: &mut u64) -> bool {
+unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], offers: &mut Offers, control_out: &mut u64, claim_out: &mut u64, record: &mut BindingRecord) -> bool {
 	unsafe {
-		let info_size: usize = core::mem::size_of::<DeviceInfo>();
 		let mut attempt: u32 = 0;
 		loop {
-			let cap: i64 = device_acquire(i, device_privilege);
+			// ONE TRANSACTION PER ATTEMPT. Everything taken below is recorded in it as it is taken,
+			// and `give_up` hands all of it back in reverse - so there is no path out of this loop
+			// that leaves a claim, a process, a handle or a provider behind.
+			let mut txn = Attempt::new();
+			*claim_out = 0;
+			if !record.move_to(BindingState::Binding, None) {
+				print(b"DeviceManager: refusing an illegal transition into binding for ");
+				print(driver_name);
+				print(b"\n");
+				return false;
+			}
+			record.attempts = attempt + 1;
+			let grant: ClaimGrant = match device_claim(i, device_privilege) {
+				Ok(grant) => grant,
+				// NOT RETRYABLE, and named as such: the device is held by somebody else and waiting
+				// changes nothing this service controls.
+				Err(_) => return give_up(record, &mut txn, offers, FailureCause::ClaimRefused, driver_name),
+			};
+			txn.claim = grant.claim;
+			txn.key = grant.key;
+			record.generation = grant.key.generation;
 			let (dm_side, driver_side): (u64, u64) = match channel() {
 				Some(pair) => pair,
-				None => return false,
+				None => return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name),
 			};
-			if cap < 0 || spawn(elf, driver_side) < 0 {
-				return false;
+			txn.channel = dm_side;
+			// THE PROCESS HANDLE IS KEPT. It used to be dropped the moment `spawn` returned, so
+			// nothing could end the process a failed bind had started - which is what made "leaves
+			// nothing behind" untrue in the one case it is written for.
+			let process: i64 = spawn(elf, driver_side);
+			if process < 0 {
+				return give_up(record, &mut txn, offers, FailureCause::SpawnFailed, driver_name);
 			}
-			// hand the driver "DEVICE" + its DeviceInfo + the transferred MMIO cap.
-			buf[..6].copy_from_slice(b"DEVICE");
-			let info_bytes: &[u8] = core::slice::from_raw_parts(info as *const DeviceInfo as *const u8, info_size);
-			buf[6..6 + info_size].copy_from_slice(info_bytes);
-			if !send_blocking(dm_side, &buf[..6 + info_size], cap as u64) {
-				return false;
-			}
-			// the interrupt-driven drivers (virtio-input, virtio-net, virtio-snd, xhci,
-			// virtio-gpu, dev-channel) also need their device's Interrupt capability,
-			// transferred as a second "IRQ" message. Each takes its own per-device MSI-X
-			// vector (edge-triggered, with no INTx sharing). The gpu routes only its CONFIG
-			// vector to it (display changes); its control queue stays polled. The dev channel
-			// is idle almost always, so it must block on its interrupt rather than poll: a
-			// spinning driver starves the cooperative scheduler for the guest's whole life.
-			// The remaining polling drivers (blk/console) get none, so their device IRQs stay
-			// silent.
+			txn.process = process as u64;
+			// ASSEMBLE THE RESOURCE LIST BEFORE ANNOUNCING ITS LENGTH.
+			//
+			// `BIND` states how many `RESOURCE` frames follow, and that number is this service's own
+			// count of the list it is ABOUT TO SEND - not a number read out of the registry entry,
+			// which has no resource list to read one from. A promise about what is already in hand
+			// is the only kind that can be kept, and the driver's receive loop is bounded by it:
+			// state one too many and the driver waits forever for a frame that is not coming.
+			//
+			// The interrupt-driven drivers (virtio-input, virtio-net, virtio-snd, xhci, virtio-gpu,
+			// dev-channel) each take their own per-device MSI-X vector, edge-triggered with no INTx
+			// sharing. The gpu routes only its CONFIG vector to it and keeps its control queue
+			// polled; the dev channel is idle almost always and must block on its interrupt rather
+			// than poll, because a spinning driver starves the cooperative scheduler for the guest's
+			// whole life. The remaining polling drivers get none, so their device IRQs stay silent.
+			let mut resources: [(u16, u64); 5] = [(0u16, 0u64); 5];
+			let mut resource_count: usize = 0;
+			// The device's own MMIO capability is always first and always present.
+			resources[resource_count] = (driver_protocol::ResourceKind::Device as u16, grant.memory);
+			resource_count += 1;
 			let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel";
 			if use_msix {
-				let irq: i64 = device_msix_acquire(i, device_privilege);
+				let irq: i64 = device_msix_acquire(grant.claim);
 				if irq < 0 {
-					return false;
+					return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name);
 				}
-				buf[..3].copy_from_slice(b"IRQ");
-				if !send_blocking(dm_side, &buf[..3], irq as u64) {
-					return false;
-				}
+				resources[resource_count] = (driver_protocol::ResourceKind::Irq as u16, irq as u64);
+				resource_count += 1;
 			}
 			if driver_name == b"virtio_input" || driver_name == b"xhci" {
 				let sink: i64 = duplicate(key_producer, RIGHT_SEND | RIGHT_TRANSFER);
-				if sink < 0 || !send_blocking(dm_side, b"KEYS", sink as u64) {
-					return false;
+				if sink < 0 {
+					return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name);
 				}
-				// The same two drivers own the Power key, so they get the capability that
-				// makes it work. A duplicate per driver: two keyboards each hold their own,
-				// and this service keeps the one it was handed.
-				// A CONNECTION OF ITS OWN, not a copy of an authority. These two used to be handed
-				// a duplicate of the root-Domain handle - which can kill every process on the
-				// machine - so that the Power key would work. What they get now can ask for a
-				// reboot and nothing else, on a channel nobody else answers on.
-				let grant: Option<u64> = service_connect(power);
-				match grant {
-					Some(connection) if send_blocking(dm_side, b"SYSPOWER", connection) => {}
-					Some(connection) => {
-						close(connection);
-						return false;
-					}
-					None => return false,
-				}
-				// The capability that lets those keystrokes reach the console at all. A
-				// duplicate per driver, for the same reason as POWER.
+				resources[resource_count] = (driver_protocol::ResourceKind::Keys as u16, sink as u64);
+				resource_count += 1;
+				// A CONNECTION OF ITS OWN, not a copy of an authority. These two used to be handed a
+				// duplicate of the root-Domain handle - which can kill every process on the machine -
+				// so that the Power key would work. What they get now can ask for a reboot and
+				// nothing else, on a channel nobody else answers on.
+				let Some(connection) = service_connect(power) else { return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name) };
+				resources[resource_count] = (driver_protocol::ResourceKind::SysPower as u16, connection);
+				resource_count += 1;
+				// The capability that lets those keystrokes reach the console at all. A duplicate
+				// per driver, for the same reason as the power connection.
 				if console_input != 0 {
 					let feed: i64 = duplicate(console_input, RIGHT_TRANSFER);
-					if feed < 0 || !send_blocking(dm_side, b"CONSOLE", feed as u64) {
-						return false;
+					if feed < 0 {
+						return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name);
 					}
+					resources[resource_count] = (driver_protocol::ResourceKind::Console as u16, feed as u64);
+					resource_count += 1;
 				}
 			}
-			match recv_blocking(dm_side, buf) {
-				Received::Message { len, handle } => {
-					*service_handle = handle;
+			// `BIND` - the device, and the count of what follows. No capability travels with it.
+			let mut payload = [0u8; driver_protocol::MAX_PAYLOAD];
+			let payload_len = driver_protocol::encode_bind(info, resource_count as u16, &mut payload);
+			if !send_frame(dm_side, driver_protocol::Opcode::Bind, grant.key.generation, &payload[..payload_len], 0, 0) {
+				return give_up(record, &mut txn, offers, FailureCause::DriverExited, driver_name);
+			}
+			for &(kind, handle) in resources[..resource_count].iter() {
+				let mut kind_payload = [0u8; driver_protocol::U16_PAYLOAD_LEN];
+				driver_protocol::encode_u16(kind, &mut kind_payload);
+				// THE DEVICE CAPABILITY ARRIVES WITHOUT RIGHT_TRANSFER, through one attenuating
+				// move. It is minted here WITH it, because this process is the one that hands it
+				// over and cannot do that with a capability it may not move - minting it without
+				// TRANSFER outright would break the boot on the first try, right here. The rule is
+				// about the HOLDER: a driver cannot pass its device on.
+				let mask: u32 = if kind == driver_protocol::ResourceKind::Device as u16 { RIGHT_READ | RIGHT_WRITE | RIGHT_MAP } else { RIGHTS_ALL };
+				if !send_frame(dm_side, driver_protocol::Opcode::Resource, grant.key.generation, &kind_payload, handle, mask) {
+					return give_up(record, &mut txn, offers, FailureCause::DriverExited, driver_name);
+				}
+			}
+			match read_handshake_result(dm_side, grant.key.generation, buf, offers) {
+				HandshakeResult::Ready => {
+					// THE TRANSACTION COMMITS. What it took stays taken and passes to the caller:
+					// the claim handle this service holds the device by, and the bootstrap channel.
 					*control_out = dm_side;
-					print(&buf[..len]);
-					print(b"\n");
+					*claim_out = txn.claim;
+					record.move_to(BindingState::Online, None);
+					txn.commit();
 					return true;
 				}
-				Received::Closed => {
-					// the driver crashed before reporting in: restart it a few times.
-					if attempt >= MAX_DRIVER_RESTARTS {
-						return false;
+				HandshakeResult::Failed(code) => {
+					// A DRIVER THAT SAID WHY. Retryability is read off the code rather than decided
+					// again here: `device-not-responding` and `out-of-memory` are the two a second
+					// attempt can change, and the other three describe a driver that has read its
+					// device and will not drive it however many times it is asked.
+					print(b"DeviceManager: ");
+					print(driver_name);
+					print(if code.retryable() { b" reported a retryable failure\n" } else { b" reported a permanent failure\n" });
+					if !code.retryable() || attempt >= MAX_DRIVER_RESTARTS {
+						return give_up(record, &mut txn, offers, FailureCause::DriverReported(code), driver_name);
 					}
 					attempt += 1;
-					print(b"DeviceManager: restarting ");
-					print(driver_name);
-					print(b"\n");
+					// BACK THROUGH THE TEARDOWN. The device was taken, so the only way to another
+					// attempt is to give it back first - and a release that does not confirm ends
+					// the node here rather than rebinding over a device that may still be live.
+					if !retry_or_quarantine(record, &mut txn, offers, FailureCause::DriverReported(code), driver_name) {
+						return false;
+					}
+				}
+				HandshakeResult::Closed => {
+					// the driver crashed before reporting in: restart it a few times.
+					if attempt >= MAX_DRIVER_RESTARTS {
+						return give_up(record, &mut txn, offers, FailureCause::DriverExited, driver_name);
+					}
+					attempt += 1;
+					if !retry_or_quarantine(record, &mut txn, offers, FailureCause::DriverExited, driver_name) {
+						return false;
+					}
 				}
 			}
 		}

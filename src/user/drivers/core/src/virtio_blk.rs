@@ -52,7 +52,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// negotiate the flush feature (a real write barrier) plus the device's own
 		// transfer limits (size_max / seg_max), which bound a request's span - the
 		// device's numbers, not a driver constant.
-		let device = common::bringup_features(bootstrap, FEATURE_FLUSH | FEATURE_SIZE_MAX | FEATURE_SEG_MAX);
+		let (bind, device) = common::bringup_features(bootstrap, FEATURE_FLUSH | FEATURE_SIZE_MAX | FEATURE_SEG_MAX);
 		let has_flush: bool = device.features_word0() & FEATURE_FLUSH != 0;
 		// One data descriptor per request (the span is physically contiguous), so
 		// seg_max >= 1 always holds; size_max caps the one segment's bytes.
@@ -73,7 +73,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => {
 				let mut line = [0u8; 64];
 				let n = common::describe(&mut line, b"virtio-blk", &device, b"no request queue");
-				common::online_and_stand(bootstrap, &line[..n])
+				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0)
 			}
 		};
 		let ok: bool = verify_archive(&queue);
@@ -89,13 +89,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => {
 				let mut line = [0u8; 64];
 				let n = common::describe(&mut line, b"virtio-blk", &device, b"no channel");
-				common::online_and_stand(bootstrap, &line[..n])
+				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0)
 			}
 		};
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-blk", &device, if ok { b"volume archive" } else { b"" });
 		let report: &[u8] = &line[..n];
-		send_blocking(bootstrap, report, blk_client);
+		common::online(bootstrap, &bind, report, &[(driver_protocol::provider::BLOCK, blk_client)]);
 		// the disk's capacity in 512-byte sectors, from the virtio-blk device config
 		// (bytes 0..8), answered to OP_CAPACITY requests.
 		let mut capacity_sectors: u64 = 0;

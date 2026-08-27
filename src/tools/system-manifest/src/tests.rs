@@ -254,6 +254,25 @@ fn the_driver_registry_refuses_what_it_says_it_refuses() {
 	let cycle = ORDINARY.replace("controller", "boot-critical");
 	assert!(errors(&with(&cycle)).contains("cannot be staged on it"), "{}", errors(&with(&cycle)));
 
+	// AND THE CONVERSE, WHICH IS WHAT KEEPS THE BOOTSTRAP EXCEPTION SMALL.
+	//
+	// The cycle check alone stops a boot-critical driver from being staged on the volume; on its own
+	// it says nothing about the other direction, and `init.pkg` is the thing that grows quietly - it
+	// is read before any storage exists, so everything in it is loaded on every boot whether the
+	// hardware is there or not. Pinning anything else is refused, so widening the exception means
+	// declaring a driver BOOT-CRITICAL, which is a deliberate act with its own refusal above it.
+	//
+	// The two together are the rule: pinned if and only if boot-critical.
+	//
+	// BUILT RATHER THAN PATCHED. A `.replace("stage = \"volume\"", ..)` over the whole fixture hits
+	// the FIRST program in it, which is not the driver under test - so the case passed while proving
+	// something about an unrelated entry. Watched: with the check removed the assertion still failed,
+	// but the message named `programs.tool`.
+	let pinned = format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"pinned\"\ndestination = \"a_driver.lsexe\"\n{ORDINARY}", valid_fixture());
+	let reported = errors(&pinned);
+	assert!(reported.contains("only a boot-critical driver belongs in init.pkg"), "a driver pinned without being boot-critical must be refused: {reported}");
+	assert!(reported.contains("a_driver"), "and the refusal must name the entry it is about: {reported}");
+
 	// TWO ENTRIES THAT CAN MATCH ONE NODE at the same priority means the answer depends on
 	// enumeration order, which is what the milestone forbids by name.
 	let second = "\n[[programs]]\nname = \"b_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/b_driver.lsexe\"\n";

@@ -349,8 +349,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// 1. bring the device up (recv "DEVICE" + MMIO cap, map, negotiate to FEATURES_OK),
 		//    then receive the config-change Interrupt capability ("IRQ") DeviceManager
 		//    acquired for us.
-		let mut device: Virtio = common::bringup(bootstrap);
-		let irq: u64 = recv_irq(bootstrap);
+		let (bind, resources) = common::handshake(bootstrap);
+		let mut device: Virtio = common::bringup_bound(bootstrap, &bind, &resources, 0);
+		let irq: u64 = resources.irq;
 		// 2. set up the control queue (queue 0) and go live. The queue stays polled
 		//    (NO_VECTOR - set_msix_vector runs after setup_queue on purpose); only the
 		//    device's CONFIG vector is routed to our interrupt, so it fires exactly for
@@ -407,21 +408,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-gpu", &device, b"");
-		send_blocking(bootstrap, &line[..n], far);
+		common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::DISPLAY, far)]);
 		serve(&device, &gpu, backing, service, irq)
-	}
-}
-
-// Receive the "IRQ" message carrying the device's Interrupt capability (the
-// config-change vector), which DeviceManager acquired and transferred to us.
-// Returns 0 when it does not arrive - the serve loop then falls back to polling.
-unsafe fn recv_irq(bootstrap: u64) -> u64 {
-	unsafe {
-		let mut buf: [u8; 16] = [0u8; 16];
-		match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if len >= 3 && &buf[..3] == b"IRQ" => handle,
-			_ => 0,
-		}
 	}
 }
 

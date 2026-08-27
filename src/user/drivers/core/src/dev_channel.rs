@@ -61,8 +61,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// Bring the device up and take its MSI-X Interrupt, then route this device's
 		// interrupts to table entry 0 (DeviceManager acquired it and the kernel programmed
 		// the table), before the queues are set up so each queue is told the vector.
-		let mut device: Virtio = common::bringup(bootstrap);
-		let irq: u64 = recv_irq(bootstrap);
+		let (bind, resources) = common::handshake(bootstrap);
+		let mut device: Virtio = common::bringup_bound(bootstrap, &bind, &resources, 0);
+		let irq: u64 = resources.irq;
 		device.set_msix_vector(0);
 		// Single port, exactly like the console device: receiveq = 0, transmitq = 1.
 		let mut rx: Queue = match device.setup_queue(0) {
@@ -100,21 +101,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(pair) => pair,
 			None => exit(),
 		};
-		send_blocking(bootstrap, b"driver.dev-channel: online (transport)", bytes_far);
+		common::online(bootstrap, &bind, b"driver.dev-channel: online (transport)", &[(driver_protocol::provider::CONSOLE_BYTES, bytes_far)]);
 		let mut port: Port = Port { device: &device, irq, tx: &mut tx, virt: tx_virt, phys: tx_phys, busy: false };
 		pump(&device, irq, bootstrap, bytes, &mut rx, &mut port, rx_virt, &rx_phys)
-	}
-}
-
-// Receive the "IRQ" message carrying this device's Interrupt capability, which
-// DeviceManager acquired and transferred to us. Exits if it does not arrive.
-unsafe fn recv_irq(bootstrap: u64) -> u64 {
-	unsafe {
-		let mut buf: [u8; 16] = [0u8; 16];
-		match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"IRQ" => handle,
-			_ => exit(),
-		}
 	}
 }
 

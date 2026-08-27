@@ -402,7 +402,10 @@ fn bring_up(index: usize) -> Result<Controller, Fault> {
 	}
 
 	let wire = Wire { requests, events, event_buffer, event_physical, event_descriptor };
-	let backend = VirtioIommu::new(wire, config, accepted, Generation(1))?;
+	// NO GENERATION HERE ANY MORE. The backend used to be built with one and keep it as a
+	// controller-wide value; binding identity belongs to the domain, which `attach_endpoint` creates
+	// with the claim's generation.
+	let backend = VirtioIommu::new(wire, config, accepted)?;
 	Ok(Controller { iommu: dma::Iommu::new(backend, 64), common, device_config })
 }
 
@@ -597,14 +600,16 @@ pub fn map_for_device(domain: dma::DomainId, physical: u64, len: u64, direction:
 // Returns whether the endpoint is attached and confirmed. A device that is already attached is
 // already attached - the count above this is what decides when that happens, and asking twice is
 // not an error.
-pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8) -> bool {
+pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8, generation: u64) -> bool {
 	if domain_of(index as u32).is_some() {
 		return true;
 	}
-	// THE GENERATION IS THE BINDING'S. Binding identity is the driver lifecycle's to own and this
-	// does not recreate it: what is used here is the owner count's transition, which is a weaker token
-	// than a real binding generation and is stated as such rather than dressed up as one.
-	let generation = 1;
+	// THE GENERATION IS THE BINDING'S, and it now arrives as one. This passed a hardcoded `1` under a
+	// comment saying binding identity was the driver lifecycle's to own and that the constant was a
+	// weaker token stated as such. The lifecycle owns it now: the caller is `device::claim`, the
+	// number is the claim's, and a mapping made under a previous binding of this device is stale by
+	// arithmetic rather than by bookkeeping - which is the fault `StaleGeneration` was written for
+	// and could not reach while every binding was generation 1.
 	match attach_endpoint(bus, dev, func, generation) {
 		Ok(domain) => {
 			let mut domains = DOMAINS.lock();
@@ -637,19 +642,29 @@ pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 }
 
 // The device is done. Everything it could reach stops being reachable, or is quarantined.
-pub fn detach_for(index: usize, bus: u8, dev: u8, func: u8) {
-	let Some(domain) = domain_of(index as u32) else { return };
+// ANSWERS WHETHER THE TEARDOWN WAS CONFIRMED, because the claim's terminal state is that answer.
+// This returned nothing and printed the unconfirmed case, so a caller had no way to tell a device
+// that is quiet from one whose mappings may still be live - and the release above has to distinguish
+// them: a confirmed teardown frees the slot, an unconfirmed one quarantines it.
+pub fn detach_for(index: usize, bus: u8, dev: u8, func: u8) -> bool {
+	// NOTHING ATTACHED IS NOTHING TO CONFIRM, and that is a success rather than a failure: a device
+	// this controller never translated has no mapping that could outlive its binding.
+	let Some(domain) = domain_of(index as u32) else { return true };
 	DOMAINS.lock().retain(|(device, _)| *device != index as u32);
-	match revoke_endpoint(domain, bus, dev, func) {
-		Ok(dma::Release::FramesReusable) => {}
-		other => crate::serial_println!("iommu: {:02x}:{:02x}.{} was not confirmed detached ({other:?}) - its pages stay quarantined", bus, dev, func),
-	}
+	let confirmed = match revoke_endpoint(domain, bus, dev, func) {
+		Ok(dma::Release::FramesReusable) => true,
+		other => {
+			crate::serial_println!("iommu: {:02x}:{:02x}.{} was not confirmed detached ({other:?}) - its pages stay quarantined", bus, dev, func);
+			false
+		}
+	};
 	// A BINDING CHANGE IS WHEN THE FAULTS ARE COLLECTED. Bounded, and said plainly: this kernel
 	// polls the event queue at binding transitions and at boot rather than on an interrupt, so a
 	// fault raised between two of those moments is reported late. It is never LOST - the device
 	// keeps it queued - and it is never unbounded, because the drain is bounded by the buffer.
 	// Interrupt-driven delivery is not implemented here.
 	poll_faults();
+	confirmed
 }
 
 // Take whatever the device has reported and record it. Bounded by a fixed buffer, so a flooding

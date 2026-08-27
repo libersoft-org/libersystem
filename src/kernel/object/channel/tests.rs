@@ -323,3 +323,115 @@ fn receives_in_flight_never_let_the_queue_pass_its_limit() {
 	assert_eq!(fill(1), 1, "the freed slot is usable");
 	assert_eq!(fill(1), 0, "and it was exactly one");
 }
+
+crate::tagged_test!(an_attenuating_send_narrows_what_arrives_and_cannot_widen_it, [Channel, Ipc, Handle, Kernel, Syscall], id = "kernel.object.channel.an_attenuating_send_narrows_what_arrives_and_cannot_widen_it", covers = ["kernel"]);
+fn an_attenuating_send_narrows_what_arrives_and_cannot_widen_it() {
+	// `SYS_CHANNEL_SEND` moves a handle with the rights it already has, so "arrives without
+	// RIGHT_TRANSFER" was not a property of the existing primitive and had to become one.
+	//
+	// Two things are checked, and the second is the one an implementation is likely to get wrong: a
+	// mask naming a right the capability does NOT hold is not an error and does not grant it,
+	// because the receiver gets an INTERSECTION and an intersection cannot widen.
+	static ARRIVED_RIGHTS: AtomicU64 = AtomicU64::new(u64::MAX);
+	static ONWARD: AtomicI64 = AtomicI64::new(0);
+	static OK: AtomicBool = AtomicBool::new(false);
+	extern "C" fn sender(channel: u64) {
+		unsafe {
+			let full = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
+			// A CAPABILITY THAT GENUINELY LACKS SOMETHING. `SYS_MEMORY_OBJECT_CREATE` mints with
+			// every right, so a mask naming one of them intersects to itself and proves nothing -
+			// this test asserted otherwise on its first run and was wrong about the tree, which is
+			// what the run was for. Duplicating narrows, so this handle really has no EXECUTE.
+			let memory = arch::syscall::invoke(syscall::SYS_HANDLE_DUPLICATE, full, (abi::RIGHT_READ | abi::RIGHT_WRITE | abi::RIGHT_TRANSFER) as u64, 0, 0);
+			assert!(!syscall::sys_is_err(memory), "a narrowed duplicate is what this test sends");
+			arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, full, 0, 0, 0);
+			let payload = *b"cap";
+			// The mask asks for READ and WRITE - which the capability has - and for RIGHT_EXECUTE,
+			// which the narrowed handle above does not. Asking for it is not an error, because an
+			// intersection cannot widen.
+			let transfer = abi::CapTransfer { handle: memory, rights: abi::RIGHT_READ | abi::RIGHT_WRITE | abi::RIGHT_EXECUTE, _pad: 0 };
+			let sent = arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_ATTENUATED, channel, payload.as_ptr() as u64, payload.len() as u64, &transfer as *const abi::CapTransfer as u64);
+			assert_eq!(sent as i64, 0, "the attenuating send delivers");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, memory, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "and the sender's handle is spent, exactly as an ordinary transfer spends it");
+		}
+	}
+	extern "C" fn receiver(channel: u64) {
+		unsafe {
+			let mut buf = [0u8; 8];
+			let mut transferred = 0u64;
+			loop {
+				let length = arch::syscall::invoke(syscall::SYS_CHANNEL_RECV, channel, buf.as_mut_ptr() as u64, buf.len() as u64, &mut transferred as *mut u64 as u64);
+				if !syscall::sys_is_err(length) {
+					break;
+				}
+				sched::yield_now();
+			}
+			assert_ne!(transferred, 0, "the capability arrived");
+			let mut info = abi::ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
+			let size = core::mem::size_of::<abi::ObjectInfo>() as u64;
+			assert_eq!(arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, transferred, &mut info as *mut _ as u64, size, 0) as i64, 1);
+			ARRIVED_RIGHTS.store(info.rights as u64, Ordering::SeqCst);
+			// AND IT CANNOT BE PASSED ON. Without RIGHT_TRANSFER the move is refused, which is the
+			// rule the whole call exists to state: the holder is the end of the line.
+			let (mut onward, mut peer): (u64, u64) = (0, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut onward as *mut u64 as u64, &mut peer as *mut u64 as u64, 0, 0) as i64, 0, "a channel to try to pass it on over");
+			let payload = *b"x";
+			ONWARD.store(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND, onward, payload.as_ptr() as u64, payload.len() as u64, transferred) as i64, Ordering::SeqCst);
+			OK.store(true, Ordering::SeqCst);
+		}
+	}
+	let (sender_end, receiver_end) = Channel::create();
+	sched::spawn_with_object(sender, sender_end, Rights::ALL);
+	sched::spawn_with_object(receiver, receiver_end, Rights::ALL);
+	sched::run_until_idle();
+	assert!(OK.load(Ordering::SeqCst), "both halves ran");
+	let arrived = ARRIVED_RIGHTS.load(Ordering::SeqCst) as u32;
+	assert_eq!(arrived & abi::RIGHT_READ, abi::RIGHT_READ, "what the mask asked for and the capability had");
+	assert_eq!(arrived & abi::RIGHT_WRITE, abi::RIGHT_WRITE);
+	assert_eq!(arrived & abi::RIGHT_EXECUTE, 0, "and NOT what the mask asked for and the capability did not have");
+	assert_eq!(arrived & abi::RIGHT_TRANSFER, 0, "the holder cannot pass it on");
+	assert_eq!(ONWARD.load(Ordering::SeqCst), syscall::ERR_ACCESS_DENIED, "and the attempt to is refused rather than ignored");
+}
+
+crate::tagged_test!(an_attenuating_send_that_fails_leaves_the_sender_exactly_where_it_was, [Channel, Ipc, Handle, Kernel, Syscall], id = "kernel.object.channel.an_attenuating_send_that_fails_leaves_the_sender_exactly_where_it_was", covers = ["kernel"]);
+fn an_attenuating_send_that_fails_leaves_the_sender_exactly_where_it_was() {
+	// The handle still open, at the SAME value, with its rights UNCHANGED.
+	//
+	// The last of those is what a careless implementation loses: narrowing the capability in place
+	// and putting it back would make the restore a widening operation, and a send that failed would
+	// have quietly cost the sender authority it never gave away.
+	static SAME_HANDLE: AtomicBool = AtomicBool::new(false);
+	static RIGHTS_AFTER: AtomicU64 = AtomicU64::new(0);
+	static REFUSAL: AtomicI64 = AtomicI64::new(0);
+	static OK: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(_arg: u64) {
+		unsafe {
+			let memory = arch::syscall::invoke(syscall::SYS_MEMORY_OBJECT_CREATE, 4096, 0, 0, 0);
+			let mut before = abi::ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
+			let size = core::mem::size_of::<abi::ObjectInfo>() as u64;
+			arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, memory, &mut before as *mut _ as u64, size, 0);
+			// A channel whose peer is CLOSED: the send cannot be delivered, which is what makes
+			// this a failure the sender has to be left untouched by.
+			let (mut near, mut far): (u64, u64) = (0, 0);
+			assert_eq!(arch::syscall::invoke(syscall::SYS_CHANNEL_CREATE, &mut near as *mut u64 as u64, &mut far as *mut u64 as u64, 0, 0) as i64, 0);
+			arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, far, 0, 0, 0);
+			let dead = near;
+			let payload = *b"x";
+			let transfer = abi::CapTransfer { handle: memory, rights: abi::RIGHT_READ, _pad: 0 };
+			REFUSAL.store(arch::syscall::invoke(syscall::SYS_CHANNEL_SEND_ATTENUATED, dead, payload.as_ptr() as u64, payload.len() as u64, &transfer as *const abi::CapTransfer as u64) as i64, Ordering::SeqCst);
+			let mut after = abi::ObjectInfo { koid: 0, object_type: 0, rights: 0, generation: 0, size: 0 };
+			let readable = arch::syscall::invoke(syscall::SYS_OBJECT_INFO_GET, memory, &mut after as *mut _ as u64, size, 0) as i64;
+			SAME_HANDLE.store(readable == 1 && after.koid == before.koid, Ordering::SeqCst);
+			RIGHTS_AFTER.store(after.rights as u64, Ordering::SeqCst);
+			OK.store(true, Ordering::SeqCst);
+		}
+	}
+	sched::spawn_with_object(body, crate::object::event::Event::create().expect("a test event"), Rights::ALL);
+	sched::run_until_idle();
+	assert!(OK.load(Ordering::SeqCst), "the probe thread ran to completion");
+	assert!(REFUSAL.load(Ordering::SeqCst) < 0, "the send was refused");
+	assert!(SAME_HANDLE.load(Ordering::SeqCst), "the handle is still open and still names the same object");
+	let rights = RIGHTS_AFTER.load(Ordering::SeqCst) as u32;
+	assert_eq!(rights & abi::RIGHT_WRITE, abi::RIGHT_WRITE, "and the mask that would have been applied did NOT touch what the sender holds");
+	assert_eq!(rights & abi::RIGHT_TRANSFER, abi::RIGHT_TRANSFER, "including the right the send itself needed");
+}

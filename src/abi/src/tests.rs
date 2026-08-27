@@ -138,6 +138,14 @@ const SYSCALLS: &[(u64, u64, &str)] = named![
 	(SYS_WAITSET_WAIT, 72),
 	(SYS_RANDOM_INSECURE, 73),
 	(SYS_DEVICE_QUIESCED, 74),
+	// THE DEVICE CLAIM. `SYS_DEVICE_ACQUIRE` (43) is retired and its number is not reused: it minted
+	// a `DeviceMemory` for anyone with the privilege who named an index, counted owners instead of
+	// having one, and answered with nothing the caller could later release the device by.
+	(SYS_DEVICE_CLAIM, 77),
+	(SYS_DEVICE_RELEASE, 78),
+	(SYS_DEVICE_CLAIM_INFO, 79),
+	// One attenuating move: the device capability arrives at its driver without RIGHT_TRANSFER.
+	(SYS_CHANNEL_SEND_ATTENUATED, 80),
 ];
 
 // Every `pub const SYS_*` the crate declares, read out of its own source at compile time.
@@ -304,6 +312,7 @@ fn every_wire_stable_numeric_family_is_frozen_and_complete() {
 		(OBJECT_TYPE_PROCESS_GROUP, 11),
 		(OBJECT_TYPE_PRIVILEGE, 12),
 		(OBJECT_TYPE_WAIT_SET, 13),
+		(OBJECT_TYPE_CLAIM, 14),
 	];
 	const PROC_STATES: &[(u64, u64, &str)] = named![(PROC_STATE_RUNNING, 0), (PROC_STATE_STOPPED, 1), (PROC_STATE_FAILED, 2)];
 	// The POSIX numbers, deliberately: a program written against `kill -9` means nine.
@@ -390,6 +399,7 @@ fn the_error_codes_are_what_they_were() {
 		(ERR_ABI_MISMATCH, -12),
 		(ERR_UNSUPPORTED, -13),
 		(ERR_INTERRUPTED, -14),
+		(ERR_ALREADY_CLAIMED, -15),
 	];
 	for (index, &(code, expected, _)) in ERRORS.iter().enumerate() {
 		assert_eq!(code, expected, "an error code moved");
@@ -687,7 +697,38 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		_pad => 10,
 	);
 
-	// AND EVERY `repr(C)` STRUCT THE CRATE DECLARES IS ONE OF THEM. Nine structs, nine assertions,
+	// THE DEVICE CLAIM'S FOUR. `ClaimKey` carries its padding EXPLICITLY, for the reason `DeviceInfo`
+	// does: a `u32` followed by a `u64` gets four bytes of implicit padding, and a wire struct whose
+	// padding is implicit is one whose bytes depend on the compiler agreeing with itself across
+	// three targets.
+	assert_layout!(
+		covered, ClaimKey, 16, 8,
+		device_index => 0,
+		_pad => 4,
+		generation => 8,
+	);
+	assert_layout!(
+		covered, ClaimInfo, 24, 8,
+		key => 0,
+		state => 16,
+		settled => 20,
+	);
+	assert_layout!(
+		covered, ClaimGrant, 32, 8,
+		key => 0,
+		memory => 16,
+		claim => 24,
+	);
+	// The fourth argument of `SYS_CHANNEL_SEND_ATTENUATED`, read out of the caller's memory because
+	// the syscall ABI has no fifth register to put it in.
+	assert_layout!(
+		covered, CapTransfer, 16, 8,
+		handle => 0,
+		rights => 8,
+		_pad => 12,
+	);
+
+	// AND EVERY `repr(C)` STRUCT THE CRATE DECLARES IS ONE OF THEM. Thirteen structs, thirteen assertions,
 	// and nothing said the two numbers had to match - so a tenth marshalled struct would have had no
 	// layout assertion and no padding check, and the properties above would have covered the nine
 	// somebody remembered.

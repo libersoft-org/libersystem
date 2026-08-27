@@ -234,11 +234,12 @@ impl Rx {
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
 		// 1. bring the device up (recv "DEVICE" + MMIO cap, map, negotiate to FEATURES_OK).
-		let mut device: Virtio = common::bringup(bootstrap);
+		let (bind, resources) = common::handshake(bootstrap);
+		let mut device: Virtio = common::bringup_bound(bootstrap, &bind, &resources, 0);
 		// 2. receive our device's MSI-X Interrupt capability ("IRQ" + handle) and route
 		//    this device's interrupts to MSI-X table entry 0 (DeviceManager acquired it via
 		//    device_msix_acquire, so the kernel has programmed the table and enabled MSI-X).
-		let irq: u64 = recv_irq(bootstrap);
+		let irq: u64 = resources.irq;
 		device.set_msix_vector(0);
 		// 3. set up control (0), event (1, drained-never), and transmit (2) queues, then
 		//    go live. The receive (capture) queue is not used. The transmit queue is
@@ -298,21 +299,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let (service, far): (u64, u64) = channel().unwrap_or_else(|| exit());
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-snd", &device, b"");
-		send_blocking(bootstrap, &line[..n], far);
+		common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::AUDIO, far)]);
 		serve(&ctl, &mut tx, &mut rx, irq, stream, capture, service)
-	}
-}
-
-// Receive the "IRQ" message carrying this device's Interrupt capability, which
-// DeviceManager acquired (device_msix_acquire) and transferred to us. Exits if it
-// does not arrive.
-unsafe fn recv_irq(bootstrap: u64) -> u64 {
-	unsafe {
-		let mut buf: [u8; 16] = [0u8; 16];
-		match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"IRQ" => handle,
-			_ => exit(),
-		}
 	}
 }
 

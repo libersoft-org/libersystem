@@ -1,0 +1,16 @@
+[package]
+name = "driver-protocol"
+# The product version lives only in /product.conf; Cargo's optional package version is unused here
+# and omitted.
+edition = "2024"
+description = "The bring-up wire between DeviceManager and a driver: one frame format, five opcodes"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+abi = { path = "../../../../abi" }
+
+# A WARNING IS AN ERROR HERE, as everywhere else in this tree.
+[lints.rust]
+warnings = "deny"

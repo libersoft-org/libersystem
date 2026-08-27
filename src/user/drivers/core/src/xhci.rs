@@ -35,7 +35,7 @@ use rt::*;
 
 use crate::usb_hid::{Hids, KEY_SINK, PTR_SINK, configure_hid, handle_hid_event, post_reports};
 use crate::usb_storage::{STATUS_ERR, Storage, configure_storage, reply_block, serve_block_request};
-use drivers::keys;
+use drivers::{common, keys};
 
 // Capability registers (at the mapped BAR base).
 const CAP_CAPLENGTH: u64 = 0x00; // u8: operational-register offset
@@ -366,39 +366,26 @@ impl Slots {
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
-		let mut buf: [u8; 96] = [0u8; 96];
-		let info_size: usize = core::mem::size_of::<DeviceInfo>();
-		// receive "DEVICE" + DeviceInfo + the DeviceMemory capability.
-		let (device_handle, _info): (u64, DeviceInfo) = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if handle != 0 && len >= 6 + info_size && &buf[..6] == b"DEVICE" => (handle, (buf.as_ptr().add(6) as *const DeviceInfo).read_unaligned()),
-			_ => exit(),
-		};
-		// receive "IRQ" + the controller's MSI-X Interrupt capability (the keyboard
-		// service loop blocks on it; bring-up itself polls).
+		// ONE HANDSHAKE, and it is the same one every other driver speaks: a `BIND` naming the
+		// device and how many resources follow, then each resource saying which kind it is. This was
+		// five named byte strings read one at a time, in an order this driver had to know without
+		// being told - and this driver is the one that reads the most of them.
+		let (bind, resources) = common::handshake(bootstrap);
+		let device_handle: u64 = resources.device;
+		if device_handle == 0 {
+			common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::ResourceUnusable);
+		}
 		DEVICE.store(device_handle, core::sync::atomic::Ordering::Relaxed);
-		let irq: u64 = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"IRQ" => handle,
-			_ => exit(),
-		};
-		let key_sink: u64 = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if len >= 4 && &buf[..4] == b"KEYS" => handle,
-			_ => 0,
-		};
-		// The power capability, arriving beside KEYS because the same two drivers own the
-		// Power key. `SYS_SYSTEM_POWER` requires it; a driver handed none finds the key
-		// inert rather than halting the machine on a right it does not hold.
-		let power: u64 = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if len >= 8 && &buf[..8] == b"SYSPOWER" => handle,
-			_ => 0,
-		};
-		keys::set_power(power);
-		// And the ConsoleInputSource capability, which `SYS_CONSOLE_FEED` requires. Same
-		// arrival, same reason: a keyboard that may not type is inert rather than privileged.
-		let console_input: u64 = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if len >= 7 && &buf[..7] == b"CONSOLE" => handle,
-			_ => 0,
-		};
-		keys::set_console_input(console_input);
+		// The controller's MSI-X Interrupt: the keyboard service loop blocks on it, bring-up polls.
+		let irq: u64 = resources.irq;
+		if irq == 0 {
+			common::failed(bootstrap, &bind, driver_protocol::DriverFailureCode::ResourceUnusable);
+		}
+		let key_sink: u64 = resources.keys;
+		// A driver handed no power or console capability finds those keys inert rather than halting
+		// the machine on a right it does not hold, so a zero here is a state and not a failure.
+		keys::set_power(resources.syspower);
+		keys::set_console_input(resources.console);
 		KEY_SINK.store(key_sink, Ordering::Relaxed);
 		// map the controller's register file.
 		let base: u64 = syscall(SYS_DEVICE_MEMORY_MAP, device_handle, 0, 0, 0);
@@ -463,9 +450,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if storage.is_some() {
 			report.push(b" (storage)");
 		}
-		send_blocking(bootstrap, report.as_bytes(), blk_client);
-		send_blocking(bootstrap, b"USBBUS", usbq_client);
-		send_blocking(bootstrap, b"POINTER", ptr_client);
+		// THREE PROVIDERS, ONE HANDSHAKE. They used to be three messages the manager told apart by
+		// their text - a report, then the literal `USBBUS`, then `POINTER` - which meant the
+		// manager was parsing strings to decide what a capability was for.
+		common::online(bootstrap, &bind, report.as_bytes(), &[(driver_protocol::provider::BLOCK, blk_client), (driver_protocol::provider::USB_BUS, usbq_client), (driver_protocol::provider::POINTER, ptr_client)]);
 		service_loop(&mut hc, &mut slots, hids, storage, blk_server, usbq_server, irq);
 	}
 }

@@ -89,7 +89,21 @@ run_profile() {
 	# tests that assert them ran here. The milestone permits exactly this set in place of the full
 	# suite, and running it is what puts those tests on the profile rather than only on the default
 	# machine.
-	if ! env "$@" ./test.sh --arch "$arch" --tags "$TAGS" --smp "$cores" --timeout 1800 >"$out" 2>&1; then
+	# AND THE HARNESS'S OWN BOUND, NOT ONE OF THIS GATE'S.
+	#
+	# This passed `--timeout 1800`, which is TIGHTER than what `test.sh` picks for a tag subset on an
+	# emulated target (45m) and tighter than the stall detector that decides whether a run is wedged
+	# (2400s of silence). A timeout below the stall bound means SLOW is always reported before WEDGED
+	# can be distinguished - which is the defect P02M0156 is named after, arrived at from the other
+	# side: not a gate that skips itself green, but one that cannot tell the two failures apart.
+	#
+	# Measured 2026-08-27: `aarch64 gicv2 at 4 core(s)` hit the 1800s bound with 82 tests passed, none
+	# failed, and the boot still making progress - `DeviceManager: 10 of 10 device(s) online` four
+	# lines from the end. That is a slow machine reported as a broken one.
+	#
+	# Two authorities over one window is the thing this tree keeps removing. The harness owns the
+	# emulated calibration; this gate asks it to run and lets it decide.
+	if ! env "$@" ./test.sh --arch "$arch" --tags "$TAGS" --smp "$cores" >"$out" 2>&1; then
 		echo "arch-profiles: the integration suite failed on $arch $label at $cores core(s)" >&2
 		tail -20 "$out" >&2
 		exit 1

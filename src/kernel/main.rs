@@ -669,10 +669,21 @@ fn root_child_domains() -> usize {
 // the shell attaches and the round succeeded; the manager faults or ends while the wait runs and
 // the ladder retries; the budget runs out and the round FAILED, which is not a boot that settled.
 //
-// `settle_rounds` is a caller's number because the machines differ by an order of magnitude:
-// riscv64 under TCG needs thousands of passes where x86_64 needs hundreds. A number that differs by
-// target is a parameter, not a reason for three functions.
-fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, settle_rounds: u32, mut spawn: impl FnMut() -> Option<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>)>) -> bool {
+// `window_ticks` is a caller's number because the machines differ by an order of magnitude: riscv64
+// under TCG needs far longer than x86_64 does. A number that differs by target is a parameter, not a
+// reason for three functions.
+//
+// IT IS A DURATION IN TICKS AND IT USED TO BE A COUNT OF LOOP PASSES, and the difference is what
+// makes it usable outside this function. `for _ in 0..settle_rounds { run_until_idle(); .. }` is a
+// local counter: a round is not a fixed amount of time - `idle_halt()` wakes on any interrupt - so
+// "300 rounds is about N seconds" stopped being true on a busier machine, and nothing outside this
+// loop could read it, convert it or wait on it. A budget in a unit the enforcer cannot observe is
+// not a budget, and userspace's whole loop is already built on absolute tick deadlines.
+//
+// EACH ATTEMPT COMPUTES ONE ABSOLUTE DEADLINE and the loop ends on it. That value is the one thing
+// called "the boot window" on both sides of the hand-off; publishing a second one beside this loop
+// would leave two authorities over it, disagreeing the first time a round took longer than the last.
+fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_ticks: u64, mut spawn: impl FnMut() -> Option<(alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>)>) -> bool {
 	use object::KernelObject;
 	let branches_before: usize = root_child_domains();
 	for attempt in 0..=max_restarts {
@@ -714,8 +725,13 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, settle_roun
 		// it - so this is the boot log and the backpressure relief in one loop.
 		let mut listening = false;
 		let mut gone = false;
-		for _ in 0..settle_rounds {
-			sched::run_until_idle();
+		let started = arch::apic::ticks();
+		let deadline = started.saturating_add(window_ticks);
+		while arch::apic::ticks() < deadline {
+			// BOUNDED, not merely called. A thread that yields and requeues itself keeps this core's
+			// run queue non-empty for as long as it likes, and the unbounded form would never come
+			// back to look at the deadline - which is the shape of a boot that is failing to settle.
+			sched::run_until_idle_until(deadline);
 			while let Ok(message) = reports.recv() {
 				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
 			}
@@ -733,12 +749,19 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, settle_roun
 			arch::idle_halt();
 		}
 		if listening {
+			// WHAT THE WINDOW ACTUALLY COST, printed every boot rather than measured once.
+			//
+			// The three targets' budgets are numbers somebody has to choose, and a number chosen
+			// once from a single measurement decays the moment a machine or an emulator changes.
+			// This is the measurement, in the log, on every boot: a budget being approached is
+			// visible before it is exceeded.
+			serial_println!("recovery: the chain settled in {} of {} tick(s) of this target's boot window", arch::apic::ticks().saturating_sub(started), window_ticks);
 			return true;
 		}
 		if gone {
 			serial_println!("recovery: SystemManager (koid {}) is gone while the chain was coming up (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
 		} else {
-			serial_println!("recovery: no interactive shell after {} rounds (attempt {} of {})", settle_rounds, attempt + 1, max_restarts + 1);
+			serial_println!("recovery: no interactive shell within this target's boot window of {} tick(s) (attempt {} of {})", window_ticks, attempt + 1, max_restarts + 1);
 		}
 	}
 	false
@@ -774,7 +797,7 @@ fn serial_rx_interrupt(_vector: u32) {
 // plane on two targets of three and nothing noticed. None of that machinery needed porting: it
 // carries no `cfg` and compiled on every target already. Two entries simply did not call it.
 //
-// `settle_rounds` is how long the readiness wait may take on this machine (see `supervise`).
+// `window_ticks` is how long the readiness wait may take on this machine (see `supervise`).
 //
 // THE ARCHITECTURE IS NOT NEWS ON ITS OWN LOG. Every forwarded userspace line carried the port's
 // name - `x86_64: userspace: Shell: online` - on a machine that has exactly one architecture, in a
@@ -798,7 +821,7 @@ fn report_machine() {
 }
 
 #[cfg(not(test))]
-pub(crate) fn boot_userspace(settle_rounds: u32) {
+pub(crate) fn boot_userspace(window_ticks: u64) {
 	report_machine();
 	const MAX_RESTARTS: u32 = 3;
 	// Pump the serial console from the scheduler's idle spin: virtio-gpu polls its
@@ -809,7 +832,7 @@ pub(crate) fn boot_userspace(settle_rounds: u32) {
 	sched::set_idle_hook(serial_console_pump);
 	let (crash_tx, crash_rx) = object::channel::Channel::create();
 	fault::set_crash_notify(crash_tx);
-	let up = supervise(&crash_rx, MAX_RESTARTS, settle_rounds, || match spawn_system_manager() {
+	let up = supervise(&crash_rx, MAX_RESTARTS, window_ticks, || match spawn_system_manager() {
 		Ok((ep, process)) => Some((ep, process)),
 		Err(reason) => {
 			serial_println!("recovery: could not start SystemManager: {}", reason);

@@ -45,6 +45,16 @@ pub struct DeviceEntry {
 	pub class: u8,
 	pub subclass: u8,
 	pub prog_if: u8,
+	// WHETHER THIS ENTRY DESCRIBES A FUNCTION THAT IS ACTUALLY ON THE BUS.
+	//
+	// True for everything the boot scan resolved, which is everything on a real machine. False for
+	// the synthetic entries the claim tests append: those exist so a test can name a device nothing
+	// else is driving, and their bus/dev/func name a function this machine does not have - on the
+	// ECAM ports that address is outside the mapped window, so a config-space write to it is a fault
+	// rather than a write nobody reads.
+	//
+	// Read by `bus_master`, which is the only thing here that touches config space.
+	pub on_bus: bool,
 }
 
 static DEVICES: SpinLock<Vec<DeviceEntry>> = SpinLock::new(Vec::new());
@@ -86,7 +96,7 @@ pub fn init() {
 		// I/O APIC by construction.
 		crate::arch::pci::set_intx_disabled(v.pci.bus, v.pci.dev, v.pci.func, true);
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if });
+		table.push(DeviceEntry { device_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if, on_bus: true });
 	}
 	for x in crate::arch::pci::scan_xhci() {
 		// The xHCI controller joins the same table: its whole register file lives in
@@ -94,14 +104,13 @@ pub fn init() {
 		// operational/runtime/doorbell offsets from the capability registers at the base.
 		crate::arch::pci::set_intx_disabled(x.pci.bus, x.pci.dev, x.pci.func, true);
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if });
+		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true });
 	}
-	// One ownership count per device, all zero: nothing is driving anything yet, and enumeration
-	// left every device with bus mastering off.
-	let mut owners = OWNERS.lock();
-	owners.clear();
-	// ALLOC-OK: sized once at boot from the table just built.
-	owners.resize(table.len(), 0);
+	// One claim slot per device, all `Free`: nothing is driving anything yet, and enumeration left
+	// every device with bus mastering off.
+	let len = table.len();
+	drop(table);
+	reset_claims(len);
 }
 
 // The number of discovered devices.
@@ -126,84 +135,421 @@ pub fn with<R>(index: usize, f: impl FnOnce(&DeviceEntry) -> R) -> Option<R> {
 	table.get(index).map(f)
 }
 
-// HOW MANY DRIVERS HOLD EACH DEVICE, and therefore whether it may write to memory.
+// ------------------------------------------------------------------- the claim
 //
-// `sys_device_acquire` mints a FRESH `DeviceMemory` per call, so two acquisitions of one device are
-// two independent objects with no refcount between them - which is why "nobody owns it" needed
-// defining before bus mastering could follow ownership at all. One count per device-table index is
-// enough, and the kernel already keys per-device bookkeeping this way in `dma_buffer::release_for`.
+// WHO OWNS THIS DEVICE, held by the kernel so that nothing else has to be trusted to respect it.
 //
-// Parallel to `DEVICES` and taken under the SAME lock as the config-space write below, so two
-// acquisitions racing cannot leave the PCI bit disagreeing with the count.
-static OWNERS: SpinLock<Vec<u32>> = SpinLock::new(Vec::new());
+// This was a REFERENCE COUNT. `acquire_bus_master` incremented `OWNERS[index]` and turned bus
+// mastering on at the 0 -> 1 transition, and nothing refused a second acquisition - so two drivers
+// naming one index both got a `DeviceMemory` for its BAR and both drove it. Exclusivity was not
+// enforced anywhere; it held because `DeviceManager` happens to launch one driver per device, which
+// is a property of today's userspace and not of the kernel. A count is a way of REPRESENTING two
+// owners, so the count is what had to go: a device is claimed by exactly one holder or by none.
 
-// A driver has taken the device at `index`: count it, and on the 0 -> 1 transition let the device
-// master the bus. False when the index names no device, in which case NOTHING changed - a failed
-// acquisition must not leave a device able to write to memory.
-pub fn acquire_bus_master(index: usize) -> bool {
+// The four states a device-table slot can be in, and there is exactly one list of them - `abi` has
+// the codes userspace reads and this is the same four by the same names. Two lists is how a state
+// ends up meaning different things in two places.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClaimState {
+	// Nothing holds it. The only state a new claim may begin from.
+	Free,
+	// Exactly one holder.
+	Claimed,
+	// A teardown is under way. A new claim does NOT begin here: the previous holder's mappings and
+	// vectors may still exist, and a claim that started now would be a second binding overlapping
+	// the first.
+	Releasing,
+	// The teardown could not be CONFIRMED, so nothing it held goes back into circulation and the
+	// device is not claimable again for the life of the boot.
+	Quarantined,
+}
+
+impl ClaimState {
+	// The wire code userspace reads out of `ClaimInfo`. `abi`'s values, not this file's: they cross
+	// the syscall boundary, so they belong where userspace can see them.
+	pub fn code(self) -> u32 {
+		match self {
+			ClaimState::Free => abi::CLAIM_STATE_FREE,
+			ClaimState::Claimed => abi::CLAIM_STATE_CLAIMED,
+			ClaimState::Releasing => abi::CLAIM_STATE_RELEASING,
+			ClaimState::Quarantined => abi::CLAIM_STATE_QUARANTINED,
+		}
+	}
+}
+
+// Why a claim or a release was refused. Each maps to one errno at the syscall boundary, and they are
+// distinct because a caller that cannot tell them apart cannot retry correctly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClaimError {
+	// The index names no device.
+	NoSuchDevice,
+	// Somebody else holds it, or is in the middle of giving it back. Worth waiting on.
+	AlreadyClaimed,
+	// Its teardown was never confirmed. Not worth waiting on - this is the rest of the boot.
+	Quarantined,
+	// The slot ran out of generations. Also the rest of the boot; see `claim`.
+	Retired,
+	// The DMA policy refused it, or the IOMMU would not confirm the attach. The device is not
+	// isolated and therefore does not master the bus.
+	Refused,
+	// The key names a generation that is no longer current: it belongs to a PREVIOUS binding of this
+	// device, and applying it would reach whoever holds the device now.
+	Stale,
+}
+
+struct ClaimSlot {
+	state: ClaimState,
+	// The generation of the current claim, or of the last one that ended. 0 before the first, which
+	// is why generations start at 1 and no real key ever carries 0.
+	generation: u64,
+	// Generation space exhausted: never claimed again this boot. See `claim`.
+	retired: bool,
+}
+
+// Parallel to `DEVICES` and taken under the SAME lock as the config-space write below, so two
+// acquisitions racing cannot leave the PCI bit disagreeing with the state.
+static CLAIMS: SpinLock<Vec<ClaimSlot>> = SpinLock::new(Vec::new());
+
+// Size the claim table from the device table. Called by `init` once the devices are known.
+fn reset_claims(len: usize) {
+	let mut claims = CLAIMS.lock();
+	claims.clear();
+	// ALLOC-OK: sized once at boot from the table just built.
+	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false });
+}
+
+// What state the device at `index` is in, or None if the index names no device.
+pub fn claim_state(index: usize) -> Option<ClaimState> {
+	CLAIMS.lock().get(index).map(|slot| slot.state)
+}
+
+// Whether `key` names the CURRENT binding of its device.
+//
+// This is the arithmetic the whole milestone rests on: "everything derived from the previous claim"
+// is a set a comparison can name, so a mapping or a release carrying an old generation is refused
+// without any bookkeeping about what was derived when.
+pub fn claim_is_current(key: abi::ClaimKey) -> bool {
+	let claims = CLAIMS.lock();
+	match claims.get(key.device_index as usize) {
+		Some(slot) => slot.state == ClaimState::Claimed && slot.generation == key.generation,
+		None => false,
+	}
+}
+
+// Take the device at `index`. The FIRST claim succeeds and any other is refused.
+//
+// The generation is minted here and it does not wrap: `checked_add` rather than `wrapping_add`, and
+// a slot that runs out is RETIRED for the life of the boot rather than wrapped onto a number a dead
+// handle still names. That is the rule handle slots already follow, and the reason is the same - a
+// wrapped generation makes a stale key valid again, which is the one thing the key exists to
+// prevent. At one claim per microsecond a `u64` lasts about six hundred thousand years, so the
+// branch is unreachable in practice and cheap to be right about.
+pub fn claim(index: usize) -> Result<abi::ClaimKey, ClaimError> {
 	let table = DEVICES.lock();
-	let mut owners = OWNERS.lock();
-	let Some(entry) = table.get(index) else { return false };
-	let Some(count) = owners.get_mut(index) else { return false };
+	let mut claims = CLAIMS.lock();
+	let Some(entry) = table.get(index) else { return Err(ClaimError::NoSuchDevice) };
+	let Some(slot) = claims.get_mut(index) else { return Err(ClaimError::NoSuchDevice) };
+	match slot.state {
+		ClaimState::Claimed | ClaimState::Releasing => return Err(ClaimError::AlreadyClaimed),
+		ClaimState::Quarantined => return Err(ClaimError::Quarantined),
+		ClaimState::Free => {}
+	}
+	if slot.retired {
+		return Err(ClaimError::Retired);
+	}
+	let Some(generation) = slot.generation.checked_add(1) else {
+		slot.retired = true;
+		crate::serial_println!("device: {index} has run out of binding generations and is retired for this boot - a wrapped generation would make a dead binding's mappings valid again");
+		return Err(ClaimError::Retired);
+	};
 	// THE DMA THREAT MODEL IS DECIDED HERE, at the one moment a device gains the ability to reach
 	// memory on its own. A driver that declared it needs translation does not master the bus without
 	// it - and a refusal is a refusal: there is no fall-back to untranslated DMA, because falling
-	// back is the failure the isolation claim names in as many words: it must never silently become
-	// untranslated DMA.
-	//
-	// Everything in this tree is `trusted-untranslated` today, so what this call does at present is
-	// RECORD the degraded state by name rather than change any outcome. That is the point of putting
-	// it in before there is an IOMMU: when one arrives, the decision is already where it belongs.
+	// back is the failure the isolation claim names in as many words.
 	if crate::dma_policy::admit(entry.device_type, entry.bus, entry.dev, entry.func) == dma::BindDecision::Refused {
+		return Err(ClaimError::Refused);
+	}
+	// ATTACHED BEFORE IT CAN MASTER THE BUS, and refused if the attach does not confirm. The window
+	// between "this device can reach memory" and "this device is translated" is the one place
+	// untranslated DMA could happen under an enforcing profile, and the way to have no such window
+	// is to do them in this order.
+	//
+	// AND THE GENERATION IS THIS BINDING'S. `attach_for` used to pass a hardcoded 1 and say so in
+	// its own comment; it now takes the number minted three lines up, which is what makes a mapping
+	// from a previous binding refusable by arithmetic.
+	//
+	// AN ENTRY THAT IS NOT ON THE BUS HAS NO ENDPOINT TO TRANSLATE, for the same reason it has no
+	// config space to write: there is no function there. Asking the controller to probe one is asking
+	// about hardware that does not exist, and under an ENFORCING profile the honest refusal that
+	// comes back would make a synthetic entry unclaimable - which is the opposite of what it is for.
+	//
+	// Found by `check.sh --gate qemu-virtio-iommu-x86_64`, which is exactly the profile that can tell
+	// this apart from a device that is merely absent: `endpoint 0xffff could not be probed
+	// (NotMapped) - its reserved regions are unknown, so it is not attached`.
+	if entry.on_bus && crate::iommu::translating() && !crate::iommu::attach_for(index, entry.bus, entry.dev, entry.func, generation) {
+		return Err(ClaimError::Refused);
+	}
+	bus_master(entry, true);
+	slot.state = ClaimState::Claimed;
+	slot.generation = generation;
+	Ok(abi::ClaimKey { device_index: index as u32, _pad: 0, generation })
+}
+
+// Move a live claim into `Releasing`, so nothing new begins while the teardown runs.
+//
+// A KEY NAMING A STALE GENERATION IS REFUSED rather than applied to whoever holds the device now.
+// That is the whole reason the key carries a generation: without it, a release from a driver that
+// died three bindings ago tears down the current one.
+fn begin_release(key: abi::ClaimKey) -> Result<(), ClaimError> {
+	let mut claims = CLAIMS.lock();
+	let Some(slot) = claims.get_mut(key.device_index as usize) else { return Err(ClaimError::NoSuchDevice) };
+	if slot.generation != key.generation {
+		return Err(ClaimError::Stale);
+	}
+	match slot.state {
+		ClaimState::Claimed => {
+			slot.state = ClaimState::Releasing;
+			Ok(())
+		}
+		// Already on its way out, and the caller's key is current - so this is a second release of
+		// one claim. Not an error the caller can act on and not a state change: whoever got here
+		// first owns the teardown.
+		ClaimState::Releasing => Err(ClaimError::AlreadyClaimed),
+		ClaimState::Quarantined => Err(ClaimError::Quarantined),
+		ClaimState::Free => Err(ClaimError::Stale),
+	}
+}
+
+// End the teardown: `Free` when every resource was confirmed given back, `Quarantined` when it was
+// not. A quarantined slot is never claimed again this boot and its frames and vectors never return
+// to circulation.
+fn finish_release(index: usize, confirmed: bool) -> ClaimState {
+	let mut claims = CLAIMS.lock();
+	let Some(slot) = claims.get_mut(index) else { return ClaimState::Quarantined };
+	slot.state = if confirmed { ClaimState::Free } else { ClaimState::Quarantined };
+	slot.state
+}
+
+// RELEASE THE DEVICE, and prove it is quiet before anything it held is reused.
+//
+// The order is the property, and it is the order M5 of this milestone names:
+//
+//   1. bus mastering off - the device cannot start a new transaction;
+//   2. every capability derived from this claim revoked - including the MMIO MAPPING itself, so the
+//      raw virtual address the driver had already mapped faults rather than reaching the BAR;
+//   3. interrupts masked and their vectors held;
+//   4. the IOMMU teardown, CONFIRMED - and only then do frames and vectors go back into circulation.
+//
+// Reversing any pair of these leaves a window: a device that can still master the bus and is no
+// longer translated, or a frame handed to the next allocation while a descriptor still points at it.
+//
+// THIS RUNS WHETHER THE HOLDER COOPERATED OR NOT. Nothing here asks the holder for anything, which
+// is what makes it a forced release rather than a request.
+pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
+	begin_release(key)?;
+	let index = key.device_index as usize;
+	let Some((bus, dev, func)) = with(index, |d| (d.bus, d.dev, d.func)) else {
+		// The device table shrank under a live claim, which cannot happen after boot - but if it
+		// ever did, nothing can be confirmed about hardware that is not described.
+		return Ok(finish_release(index, false));
+	};
+	// 1. BUS MASTERING FIRST. Everything below assumes the device is not starting new transactions.
+	with(index, |entry| bus_master(entry, false));
+	// 2. Everything the claim minted stops working, without the holder's cooperation.
+	revoke_derived(key);
+	// 3. The vectors. Masked and held rather than reissued: a request to stop is not proof of
+	//    stopping, and `SYS_DEVICE_QUIESCED` is the claim that answers it.
+	let vectors = crate::arch::interrupts::release_msi_for_device(index as u32);
+	if vectors != 0 {
+		crate::serial_println!("device: {index} released - {vectors} MSI vector(s) masked");
+	}
+	// 4. And the translation, which is the only step that can fail to CONFIRM. `detach_for` reports
+	//    a detach it could not confirm and leaves the pages quarantined; the claim goes the same way,
+	//    because a device whose mappings may still be live is not a device to hand to anyone else.
+	let confirmed = if crate::iommu::translating() { crate::iommu::detach_for(index, bus, dev, func) } else { true };
+	// AND THE AUDIT RECORD GOES WITH IT. `admit` wrote the degraded row when this device was asking
+	// to master the bus; it is not mastering it any more, and a list of "devices reaching memory
+	// untranslated" that keeps a device which gave the bus back is a list reporting a machine
+	// nobody is running.
+	crate::dma_policy::forget_degraded(bus, dev, func);
+	let state = finish_release(index, confirmed);
+	if state == ClaimState::Quarantined {
+		crate::serial_println!("device: {:02x}:{:02x}.{} was NOT confirmed torn down - device {index} is quarantined for this boot and nothing it held is reused", bus, dev, func);
+	}
+	Ok(state)
+}
+
+// The one MMIO capability a binding derived has gone, so the device stops mastering the bus.
+//
+// NOT A RELEASE. The claim belongs to whoever took it and only a release ends it - a device whose
+// driver died is not free for the next claimant until the teardown has been run and confirmed. What
+// this ends is narrower and must not wait for anybody: nothing holds this device's registers any
+// more, so nothing should be able to write to memory on its behalf.
+//
+// Refused for a STALE key, which is the case that makes this worth a lookup rather than a bare
+// write: a `DeviceMemory` from a previous binding can be dropped at any time - it may have been
+// sitting in a message queue, or in a process being torn down - and turning bus mastering off for
+// whoever holds the device NOW is exactly the cross-binding damage the generation exists to stop.
+pub fn mmio_capability_dropped(key: abi::ClaimKey) {
+	let table = DEVICES.lock();
+	let claims = CLAIMS.lock();
+	let index = key.device_index as usize;
+	let (Some(entry), Some(slot)) = (table.get(index), claims.get(index)) else { return };
+	if slot.state != ClaimState::Claimed || slot.generation != key.generation {
+		return;
+	}
+	bus_master(entry, false);
+}
+
+// Let the device at `index` master the bus, or stop it.
+//
+// ONE PLACE, so that the one kind of entry that must not be written to config space can be excluded
+// in exactly one place rather than at each of the three call sites.
+fn bus_master(entry: &DeviceEntry, on: bool) {
+	// AN ENTRY THAT IS NOT ON THE BUS HAS NO CONFIG SPACE TO WRITE. See `DeviceEntry::on_bus`.
+	if !entry.on_bus {
+		return;
+	}
+	crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, on);
+}
+
+// A DEVICE THE MACHINE DOES NOT HAVE, so that the claim table can be tested without taking a device
+// something else is driving.
+//
+// The hardware suite's bus-master check is what this exists to avoid repeating: it looked for a
+// device nobody was driving and returned quietly when every device on the machine was claimed, which
+// on a healthy boot is most of them. A gate whose subject can vanish is a gate that passes when
+// there was nothing to test. A synthetic entry cannot vanish and cannot be claimed by anything else,
+// so a test that uses one has no way to skip itself green.
+//
+// Nothing reaches the bus for these: they are marked `on_bus: false`, which is what `bus_master`
+// reads, and no BAR of theirs is ever mapped - the tests that use one are about the TABLE.
+
+// Append one, and answer with its index. It stays for the life of the boot, which is the life of the
+// test kernel.
+#[cfg(test)]
+pub fn add_synthetic_device() -> usize {
+	let mut table = DEVICES.lock();
+	let index = table.len();
+	// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed.
+	table.push(DeviceEntry { device_type: u16::MAX, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: 0x1f, func: 7, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false });
+	drop(table);
+	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false });
+	index
+}
+
+// Put a synthetic slot one generation below the ceiling, so the retirement branch is reachable in a
+// test instead of being a line nobody has ever executed.
+#[cfg(test)]
+pub fn exhaust_generations_of(index: usize) {
+	if let Some(slot) = CLAIMS.lock().get_mut(index) {
+		slot.generation = u64::MAX;
+	}
+}
+
+// ------------------------------------------------- what a claim has derived
+//
+// EVERY CAPABILITY THE KERNEL MINTED UNDER A CLAIM, so that ending the claim can end all of them.
+//
+// Weakly, because this table must not be what keeps an object alive: an entry whose object is gone
+// is an entry with nothing left to revoke. It is swept on every release, so a claim that ends takes
+// its own rows out; rows of a claim that never ends live as long as the boot, which is bounded by
+// the devices the boot scan found times the capabilities one binding derives.
+
+struct Derived {
+	key: abi::ClaimKey,
+	object: alloc::sync::Weak<dyn crate::object::KernelObject>,
+}
+
+static DERIVED: SpinLock<Vec<Derived>> = SpinLock::new(Vec::new());
+
+// Record that `object` was minted under `key`. False when the table could not grow, which the caller
+// must treat as a failed mint: a capability the revocation cannot reach is exactly what this
+// milestone exists to make impossible, so it must not be handed out.
+pub fn register_derived(key: abi::ClaimKey, object: alloc::sync::Weak<dyn crate::object::KernelObject>) -> bool {
+	let mut derived = DERIVED.lock();
+	// ALLOC-OK: one row per capability a binding derives, checked before it is taken.
+	if derived.try_reserve(1).is_err() {
 		return false;
 	}
-	if *count == 0 {
-		// ATTACHED BEFORE IT CAN MASTER THE BUS, and refused if the attach does not confirm. The
-		// window between "this device can reach memory" and "this device is translated" is the one
-		// place untranslated DMA could happen under an enforcing profile, and the way to have no
-		// such window is to do them in this order.
-		if crate::iommu::translating() && !crate::iommu::attach_for(index, entry.bus, entry.dev, entry.func) {
-			return false;
-		}
-		crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, true);
-	}
-	*count += 1;
+	derived.push(Derived { key, object });
 	true
 }
 
-// How many drivers hold the device at `index`.
+// Everything minted under `key` stops working, whatever process it ended up in and however many it
+// was passed through.
 //
-// TEST-ONLY. Nothing in the kernel needs to ask - the count exists to drive the two transitions
-// above - but a test that means to check the PCI bit against the kernel's own opinion of who is
-// driving what has to be able to read both.
-#[cfg(test)]
-pub fn bus_master_owners(index: usize) -> u32 {
-	OWNERS.lock().get(index).copied().unwrap_or(0)
+// TWO MECHANISMS, because a handle that refuses is not evidence that a MAPPING is gone. The object's
+// revocation generation is bumped, which invalidates every capability to it at lookup - that is the
+// handle half, and it is O(1). And a `DeviceMemory` that was already mapped has its mapping torn
+// out of the address space it was mapped in, which is the half the driver notices: the raw virtual
+// address it has been using faults instead of reaching the BAR.
+fn revoke_derived(key: abi::ClaimKey) {
+	// TAKEN OUT UNDER THE LOCK AND RELEASED BEFORE THE WORK, because tearing a mapping down takes
+	// the address space's own locks and calling into them from under this one would be a lock order
+	// nothing else in the kernel uses.
+	let mut taken: Vec<alloc::sync::Weak<dyn crate::object::KernelObject>> = Vec::new();
+	{
+		let mut derived = DERIVED.lock();
+		let mut kept: Vec<Derived> = Vec::new();
+		// ALLOC-OK: bounded by the table being swept, on a binding transition.
+		if kept.try_reserve(derived.len()).is_err() || taken.try_reserve(derived.len()).is_err() {
+			// A SWEEP THAT CANNOT ALLOCATE STILL REVOKES. Falling back to the slower shape - one
+			// pass, in place - costs time on a path that runs once per binding and keeps the
+			// property, which is the thing that must not depend on a heap.
+			for row in derived.iter() {
+				if row.key == key {
+					if let Some(object) = row.object.upgrade() {
+						object.header().revoke();
+						revoke_effects_of(&object);
+					}
+				}
+			}
+			derived.retain(|row| row.key != key);
+			return;
+		}
+		for row in derived.drain(..) {
+			if row.key == key {
+				taken.push(row.object);
+			} else {
+				kept.push(row);
+			}
+		}
+		*derived = kept;
+	}
+	for weak in taken {
+		if let Some(object) = weak.upgrade() {
+			object.header().revoke();
+			revoke_effects_of(&object);
+		}
+	}
 }
 
-// A driver has let the device at `index` go - the last `DeviceMemory` for it was dropped. On the
-// 1 -> 0 transition the device stops mastering the bus, so a driver that CRASHED disables its own
-// device without knowing the rule exists: its handle dies with its process.
-pub fn release_bus_master(index: usize) {
-	let table = DEVICES.lock();
-	let mut owners = OWNERS.lock();
-	let (Some(entry), Some(count)) = (table.get(index), owners.get_mut(index)) else { return };
-	if *count == 0 {
-		return;
+// The type-specific half of revocation.
+//
+// A `DeviceMemory` whose mapping is live LOSES THE MAPPING, which is the half a driver notices: the
+// raw virtual address it has been using for as long as it has been running faults instead of
+// reaching the BAR. Revoking the capability alone would not touch it.
+//
+// A `DmaBuffer` is marked as one its owner never released, so its frames are HELD rather than
+// returned to circulation. That is the same rule a terminated process's buffers already follow and
+// for the same reason: a forced release means nobody reset this device, so the physical addresses it
+// was handed may still be sitting in a live descriptor. `SYS_DEVICE_QUIESCED` is the one claim that
+// can say otherwise, and it comes from a driver that has just reset the hardware.
+//
+// An `Interrupt` needs nothing here: the release masks and holds its vector by the same argument,
+// through `release_msi_for_device`, in the order the release states.
+fn revoke_effects_of(object: &alloc::sync::Arc<dyn crate::object::KernelObject>) {
+	if let Some(memory) = object.as_any().downcast_ref::<crate::object::device_memory::DeviceMemory>() {
+		memory.teardown_mapping();
 	}
-	*count -= 1;
-	if *count == 0 {
-		// BUS MASTERING GOES FIRST, then the translation. The reverse order would leave a window in
-		// which the device can still master the bus and is no longer translated, which is the same
-		// hole as the acquire path's, arrived at from the other side.
-		crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, false);
-		if crate::iommu::translating() {
-			crate::iommu::detach_for(index, entry.bus, entry.dev, entry.func);
-		}
-		// AND THE AUDIT RECORD GOES WITH IT. `admit` wrote the degraded row when this device was
-		// asking to master the bus; it is not mastering it any more, and a list of "devices reaching
-		// memory untranslated" that keeps a device which gave the bus back is a list reporting a
-		// machine nobody is running.
-		crate::dma_policy::forget_degraded(entry.bus, entry.dev, entry.func);
+	if let Some(buffer) = object.as_any().downcast_ref::<crate::object::dma_buffer::DmaBuffer>() {
+		buffer.mark_orphaned();
 	}
+}
+
+// Forget every row belonging to an object that is gone, for the tests that ask how big this gets.
+#[cfg(test)]
+pub fn derived_rows() -> usize {
+	DERIVED.lock().len()
 }

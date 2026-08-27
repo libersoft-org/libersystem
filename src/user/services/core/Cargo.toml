@@ -150,6 +150,14 @@ service-logic = { path = "../logic" }
 # Generated LSIDL bindings (the proto codec, clients, and servers) - LogService
 # serves them and the shell + ServiceManager speak them over the log channel.
 proto = { path = "../../../proto" }
+# THE BRING-UP WIRE. The same crate the drivers speak, so the manager and the driver cannot drift:
+# one frame format, one protocol version, one set of provider kinds.
+driver-protocol = { path = "../../libs/driver/protocol" }
+# WHERE A BINDING IS AND WHY, in a crate rather than a module: the record is read by five milestones,
+# and a state table living inside a `no_std` binary is one nobody can drive on a host.
+driver-binding = { path = "../../libs/driver/binding" }
+# The bounded transferred-handle list the capability-aware receive answers with.
+wire = { path = "../../../wire" }
 storage-proto = { path = "../../libs/protocol/storage-proto" }
 bootproto = { path = "../../../boot/protocol" }
 abi = { path = "../../../abi" }

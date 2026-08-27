@@ -207,6 +207,27 @@ fn a_mapping_made_under_an_old_binding_is_nameless_after_a_rebind() {
 }
 
 #[test]
+fn a_hardware_fault_is_stamped_with_the_generation_the_domain_carries() {
+	// THE PROPERTY MOVED HERE, from the virtio backend, and this is the layer that can hold it: a
+	// backend reports an endpoint and the domain it is attached to, and the domain is where the
+	// generation the kernel minted lives. A backend with a generation of its own was a second answer
+	// to the same question, and its `set_generation` moved it for every binding at once - so a fault
+	// from a binding made before the rebind claimed to be from the one after it.
+	//
+	// The event goes in carrying `Generation(0)`, which is what the real backend now reports: the
+	// absence of an answer rather than a binding being named. No binding ever carries 0.
+	let (mut iommu, domain) = iommu();
+	let endpoint = EndpointId(7);
+	iommu.attach(domain, endpoint).expect("attached");
+	iommu.set_generation(domain, Generation(9)).expect("rebound");
+	iommu.backend_mut_for_test().queue_fault(FaultEvent { endpoint, domain, generation: Generation(0), address: Some(DmaAddress(0x2000)), access: Access::Write, reason: Fault::NotMapped });
+	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: None, access: Access::Read, reason: Fault::NotMapped }; 2];
+	assert_eq!(iommu.drain_faults(&mut out), 1);
+	assert_eq!(out[0].generation, Generation(9), "the generation the domain carries, not the zero the backend reported");
+	assert_eq!(iommu.faults().recent().last().map(|e| e.generation), Some(Generation(9)), "and the log holds the stamped event, not the raw one");
+}
+
+#[test]
 fn revoking_an_endpoint_releases_everything_it_could_reach() {
 	let (mut iommu, domain) = iommu();
 	let endpoint = EndpointId(7);

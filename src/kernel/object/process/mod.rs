@@ -499,6 +499,11 @@ impl Process {
 		self.begin_teardown();
 		self.unmap_objects();
 		self.orphan_dma_buffers();
+		// AFTER the DMA buffers are marked and BEFORE the table is closed. Marking first is what
+		// makes the frames of a process that never said its device was done stay out of
+		// circulation; the release then revokes everything that binding derived, and a teardown it
+		// could not confirm leaves the device quarantined rather than free.
+		self.release_claims();
 		self.handles.lock().close_all();
 		self.exited.store(true, Ordering::Release);
 		self.record_in_groups();
@@ -869,6 +874,25 @@ impl Process {
 				dma.mark_orphaned();
 			}
 		}
+	}
+
+	// RELEASE EVERY DEVICE THIS PROCESS WAS HOLDING, before its handle table is closed.
+	//
+	// A DeviceManager that DIED is exactly the case a cold reconstruction has to survive, and it
+	// survives it by finding devices that are `Free`, `Releasing` or `Quarantined` rather than
+	// claimed by a process that no longer exists. `Claim::drop` is the backstop and would reach the
+	// same place - a claim handle carries neither TRANSFER nor DUPLICATE, so the one table entry is
+	// the only durable reference to it - but "whenever the last `Arc` happens to go" is not a moment
+	// a test can pin down, and another core's syscall holding a transient reference would move it.
+	//
+	// Here it is pinned: the release starts at the kill, before `close_all`, and `Claim::release`
+	// runs at most once however it is reached.
+	fn release_claims(&self) {
+		self.handles.lock().for_each_object(|object| {
+			if let Some(claim) = object.as_any().downcast_ref::<crate::object::claim::Claim>() {
+				claim.release();
+			}
+		});
 	}
 
 	fn unmap_objects(&self) {

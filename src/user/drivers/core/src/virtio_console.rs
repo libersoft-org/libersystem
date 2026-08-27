@@ -19,7 +19,7 @@ const BANNER: &[u8] = b"virtio-console driver online: console output over the vi
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	unsafe {
-		let device = common::bringup(bootstrap);
+		let (bind, device) = common::bringup(bootstrap);
 		// single-port virtio-console: receiveq = 0, transmitq = 1.
 		let _rx = device.setup_queue(0);
 		let tx = device.setup_queue(1);
@@ -31,7 +31,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-console", &device, if ok { b"tx ok" } else { b"tx failed" });
 		let report: &[u8] = &line[..n];
-		common::online_and_stand(bootstrap, report)
+		common::online_and_stand(bootstrap, &bind, report, 0, 0)
 	}
 }
 

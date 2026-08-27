@@ -84,6 +84,13 @@ name = "dma"
 version = "0.0.0"
 
 [[package]]
+name = "driver-protocol"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -166,6 +173,7 @@ dependencies = [
  "bootproto",
  "buddy",
  "dma",
+ "driver-protocol",
  "fdt",
  "flac",
  "fscore",

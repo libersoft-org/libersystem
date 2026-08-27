@@ -38,8 +38,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    MSI-X Interrupt capability, then route this device's interrupts to MSI-X
 		//    table entry 0 (DeviceManager acquired it with device_msix_acquire and the
 		//    kernel programmed the table + enabled MSI-X).
-		let mut device: Virtio = common::bringup_features(bootstrap, FEATURE_MTU);
-		let irq: u64 = recv_irq(bootstrap);
+		// THE WHOLE HANDSHAKE AT ONCE. The interrupt used to arrive in a second named message read
+		// by a `recv_irq` of this driver's own, in an order it had to know without being told; now
+		// `BIND` states how many resources follow and each one says which kind it is.
+		let (bind, resources) = common::handshake(bootstrap);
+		let mut device: Virtio = common::bringup_bound(bootstrap, &bind, &resources, FEATURE_MTU);
+		let irq: u64 = resources.irq;
 		device.set_msix_vector(0);
 		// read the NIC's MAC from device-specific config (our Ethernet source), and
 		// the link's MTU when the device reports one - the buffers below follow it.
@@ -98,25 +102,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		};
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-net", &device, b"");
-		send_blocking(bootstrap, &line[..n], frames_far);
+		common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::NET, frames_far)]);
 		let mut macmsg: [u8; 11] = [0u8; 11];
 		macmsg[..3].copy_from_slice(b"MAC");
 		macmsg[3..9].copy_from_slice(&mac);
 		macmsg[9..11].copy_from_slice(&(mtu as u16).to_le_bytes());
 		send_blocking(frames, &macmsg, 0);
 		move_frames(&device, irq, frames, &mut rx, &tx, rx_virt, &rx_phys, tx_virt, tx_phys, slot)
-	}
-}
-
-// Receive the "IRQ" message carrying this device's Interrupt capability, which
-// DeviceManager acquired and transferred to us. Exits if it does not arrive.
-unsafe fn recv_irq(bootstrap: u64) -> u64 {
-	unsafe {
-		let mut buf: [u8; 16] = [0u8; 16];
-		match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if handle != 0 && len >= 3 && &buf[..3] == b"IRQ" => handle,
-			_ => exit(),
-		}
 	}
 }
 

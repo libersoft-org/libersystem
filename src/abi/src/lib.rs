@@ -357,6 +357,40 @@ pub const SYS_PROCESS_GROUP_STATS: u64 = 75;
 // source - which is the use that source's own comment names first - and its only property is that
 // two boots do not share one.
 pub const SYS_BOOT_ID: u64 = 76;
+
+// THE DEVICE CLAIM. `SYS_DEVICE_ACQUIRE` answers with one `DeviceMemory` handle and nothing else,
+// and that handle is precisely what gets sent on to the driver - so after a successful bind the
+// manager holds nothing about the claim at all, and there is no way for it to learn which binding
+// of the device this is, to read what state the device is in, or to take the device back from a
+// driver that has stopped cooperating.
+//
+// `SYS_DEVICE_CLAIM` answers with BOTH: a `ClaimKey` copied into the caller's memory and a Claim
+// handle installed in its table. The key is what stamps every capability derived from this binding;
+// the handle is what STAYS with the manager - minted without RIGHT_TRANSFER and without
+// RIGHT_DUPLICATE, so it cannot leave the Domain that made it - and it is waitable, because a
+// manager built on one `wait_any` loop cannot spin on a status.
+//
+// `SYS_DEVICE_RELEASE` takes the whole key and starts the teardown; a key naming a generation that
+// is no longer current is refused rather than applied to whoever holds the device now.
+// `SYS_DEVICE_CLAIM_INFO` reads the claim's state and its terminal result out of the handle.
+pub const SYS_DEVICE_CLAIM: u64 = 77;
+pub const SYS_DEVICE_RELEASE: u64 = 78;
+pub const SYS_DEVICE_CLAIM_INFO: u64 = 79;
+
+// Move ONE capability with less authority than the sender holds.
+//
+// `SYS_CHANNEL_SEND` moves a handle with the rights it already has; there is no way to hand
+// something over with less than you hold, so "arrives without RIGHT_TRANSFER" was not a property of
+// the existing primitive and had to become one. There is no room for a fifth argument - the ABI
+// carries exactly four and the ordinary send spends all of them - so the last one is a POINTER to a
+// `CapTransfer` in the caller's memory rather than a handle.
+//
+// The receiver gets the INTERSECTION of the capability's rights and the mask. A mask naming a right
+// the capability does not hold is not an error, because an intersection cannot widen. Inside, this
+// is the SAME transactional move the ordinary send performs - a mask applied to an existing
+// transfer, not a second way of moving a capability - so a send that fails leaves the sender's
+// handle open at the same value with its rights unchanged.
+pub const SYS_CHANNEL_SEND_ATTENUATED: u64 = 80;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
@@ -630,6 +664,7 @@ pub const OBJECT_TYPE_DMA_BUFFER: u64 = 10;
 pub const OBJECT_TYPE_PROCESS_GROUP: u64 = 11;
 pub const OBJECT_TYPE_PRIVILEGE: u64 = 12;
 pub const OBJECT_TYPE_WAIT_SET: u64 = 13;
+pub const OBJECT_TYPE_CLAIM: u64 = 14;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -755,6 +790,81 @@ pub const IRQ_KIND_MSI: u32 = 1;
 // IrqInfo::device when no device owns the vector.
 pub const IRQ_NO_DEVICE: u32 = u32::MAX;
 
+// WHICH BINDING OF WHICH DEVICE. `SYS_DEVICE_CLAIM` copies one of these out; every capability the
+// kernel derives from that claim is stamped with it, and `SYS_DEVICE_RELEASE` takes the whole thing
+// back. The generation is what makes "everything from the PREVIOUS claim" a set that arithmetic can
+// name rather than bookkeeping: a release naming a generation that is no longer current is refused
+// instead of being applied to whoever holds the device now.
+//
+// It is a `u64` and it does not wrap. A slot that runs out of generations is retired for the life of
+// the boot rather than wrapped onto a number a dead handle still names - the same rule handle slots
+// already follow.
+#[repr(C)]
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct ClaimKey {
+	pub device_index: u32,
+	pub _pad: u32,
+	pub generation: u64,
+}
+
+// What `SYS_DEVICE_CLAIM` copies out: the whole result of one acquisition.
+//
+// ONE OPERATION OR NONE OF IT. The acquisition installs two handles and copies a key, and each of
+// those can fail - a partial success leaves a claim alive that its would-be owner never learned the
+// name of, which is a device nothing can release and nothing can rebind. So everything the caller
+// gets arrives in one struct through one copy, and a copy that fails takes the whole acquisition
+// with it: both handles closed, the claim released, the caller left where it started.
+//
+// The two handles are why this is not just a `ClaimKey`. `memory` is the device's MMIO capability -
+// what travels on to the driver - and `claim` is what STAYS with the manager.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ClaimGrant {
+	pub key: ClaimKey,
+	pub memory: u64,
+	pub claim: u64,
+}
+
+// What `SYS_DEVICE_CLAIM_INFO` answers with: which binding this claim handle names, what state the
+// device is in, and - once a release has finished - how it ended.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct ClaimInfo {
+	pub key: ClaimKey,
+	// One of the CLAIM_STATE_* codes below.
+	pub state: u32,
+	// 1 once the release has reached a terminal state and `state` will not change again, 0 while the
+	// claim is live. This is the bit the claim handle's readiness is defined by, so a manager parked
+	// in `wait_any` learns the device is back without polling.
+	pub settled: u32,
+}
+
+// The four states a device-table slot can be in. THE SAME FOUR everywhere - two lists is how a state
+// ends up meaning different things in two places.
+//
+// `Free` - nothing holds it and it may be claimed.
+// `Claimed` - exactly one holder.
+// `Releasing` - a teardown is under way; a new claim does not begin until it finishes.
+// `Quarantined` - the teardown could not be CONFIRMED, so no frame or vector it held goes back into
+// circulation and the device is not claimable again for the life of the boot.
+pub const CLAIM_STATE_FREE: u32 = 0;
+pub const CLAIM_STATE_CLAIMED: u32 = 1;
+pub const CLAIM_STATE_RELEASING: u32 = 2;
+pub const CLAIM_STATE_QUARANTINED: u32 = 3;
+
+// The fourth argument of `SYS_CHANNEL_SEND_ATTENUATED`, read out of the caller's memory because the
+// syscall ABI has no fifth register to put it in.
+//
+// `rights` is a MASK, not a demand: the receiver gets the intersection of it and what the capability
+// actually holds, so naming a right the capability does not have is not an error.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct CapTransfer {
+	pub handle: u64,
+	pub rights: u32,
+	pub _pad: u32,
+}
+
 // One PCI function's identity pci_info writes into the caller's buffer: its bus
 // address, vendor and device ids, and class triple - the boot bus scan the kernel
 // retains in full. repr(C) so both sides agree byte-for-byte.
@@ -808,6 +918,14 @@ pub const ERR_UNSUPPORTED: i64 = -13;
 // The pending flag is NOT consumed here: `SYS_SIGNAL_TAKE` is what clears it, so a caller that
 // treats this as an ordinary wakeup and polls `interrupted()` sees exactly one interrupt.
 pub const ERR_INTERRUPTED: i64 = -14;
+
+// SOMEBODY ELSE HAS THIS DEVICE, or is in the middle of giving it back.
+//
+// Its own code rather than the `ERR_INVALID` this used to collapse into, because a caller that
+// cannot tell "somebody else has it" from "you passed nonsense" cannot retry correctly: the first
+// is worth waiting on and the second never will be. A device that is `Quarantined` answers
+// `ERR_UNSUPPORTED` instead - that one is not a wait, it is the rest of the boot.
+pub const ERR_ALREADY_CLAIMED: i64 = -15;
 
 // True if a syscall return value encodes an error (the reserved band [-4095, -1]).
 // A higher-half kernel address has its top bit set and so is never mistaken for

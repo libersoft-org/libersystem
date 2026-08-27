@@ -88,6 +88,20 @@ impl Capability {
 		self.object.clone()
 	}
 
+	// The same capability with less authority: the INTERSECTION of what it holds and `mask`.
+	//
+	// NARROWING ONLY, and structurally so - an intersection cannot widen, so there is no way to use
+	// this to hand out more than the caller had. That is why it exists as an intersection rather
+	// than as an assignment: a mask naming a right the capability does not hold is not an error,
+	// because it cannot become one.
+	//
+	// The generation is CARRIED, not re-snapshotted. Minting a fresh capability with
+	// `Capability::new` would read the object's generation as it is NOW, which would quietly
+	// resurrect a capability whose object was revoked between the lookup and here.
+	pub fn attenuated(&self, mask: Rights) -> Capability {
+		Self { object: self.object.clone(), rights: self.rights & mask, generation: self.generation }
+	}
+
 	// A capability is stale once the object's generation has moved past the one
 	// captured at mint time (i.e. the object was revoked).
 	fn is_valid(&self) -> bool {

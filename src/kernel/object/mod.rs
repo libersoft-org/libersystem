@@ -7,6 +7,7 @@
 
 pub mod address_space;
 pub mod channel;
+pub mod claim;
 pub mod device_memory;
 pub mod dma_buffer;
 pub mod domain;
@@ -53,6 +54,8 @@ pub enum ObjectType {
 	Interrupt,
 	DeviceMemory,
 	DmaBuffer,
+	// A device claim: which binding of which device, and the authority to end it. See `claim`.
+	Claim,
 	ProcessGroup,
 	// A named authority with no object of its own - the display, the console's input
 	// sink, the console's input source. See `privilege`.
@@ -79,6 +82,7 @@ impl ObjectType {
 			ObjectType::Interrupt => abi::OBJECT_TYPE_INTERRUPT,
 			ObjectType::DeviceMemory => abi::OBJECT_TYPE_DEVICE_MEMORY,
 			ObjectType::DmaBuffer => abi::OBJECT_TYPE_DMA_BUFFER,
+			ObjectType::Claim => abi::OBJECT_TYPE_CLAIM,
 			ObjectType::ProcessGroup => abi::OBJECT_TYPE_PROCESS_GROUP,
 			ObjectType::Privilege => abi::OBJECT_TYPE_PRIVILEGE,
 			ObjectType::WaitSet => abi::OBJECT_TYPE_WAIT_SET,
@@ -144,7 +148,10 @@ impl ObjectHeader {
 	}
 
 	// Invalidate all existing capabilities to this object (O(1) revocation).
-	#[cfg(test)]
+	//
+	// NO LONGER TEST-ONLY. Ending a device claim revokes everything derived from it, wherever those
+	// capabilities ended up and however many processes they were passed through - which is this
+	// mechanism, used for the first time by something other than a test.
 	pub fn revoke(&self) {
 		self.generation.fetch_add(1, Ordering::AcqRel);
 	}

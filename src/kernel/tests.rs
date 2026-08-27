@@ -125,6 +125,73 @@ fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::s
 	channel.send(object::channel::Message::new(payload.to_vec(), alloc::vec![cap])).map_err(|_| "bootstrap capability send failed")
 }
 
+// THE MANAGER HALF OF THE DRIVER BRING-UP WIRE, for the two suites that spawn a real driver.
+//
+// Those suites stand in for DeviceManager while a driver comes up, so they have to speak the same
+// handshake it speaks. Built from the shared crate rather than from a hand-written copy of the frame
+// layout: a second copy is how the harness and the service drift, and a harness that drifts reports
+// a driver broken when the protocol moved under it.
+fn send_frame(channel: &object::channel::Channel, opcode: driver_protocol::Opcode, generation: u64, payload: &[u8], object: Option<alloc::sync::Arc<dyn object::KernelObject>>, rights: object::rights::Rights) -> Result<(), &'static str> {
+	let header = driver_protocol::Header { version: driver_protocol::VERSION, opcode, generation, payload_len: payload.len() as u32 };
+	// ALLOC-OK: `#[cfg(test)]`, one frame per handoff.
+	let mut bytes = header.encode().to_vec();
+	bytes.extend_from_slice(payload);
+	let caps = match object {
+		Some(object) => alloc::vec![object::handle::Capability::new(object, rights)],
+		None => alloc::vec::Vec::new(),
+	};
+	channel.send(object::channel::Message::new(bytes, caps)).map_err(|_| "bring-up frame send failed")
+}
+
+// A `BIND` naming the device and how many resources follow.
+fn send_bind(channel: &object::channel::Channel, info: &abi::DeviceInfo, generation: u64, resource_count: u16) -> Result<(), &'static str> {
+	let mut payload = [0u8; driver_protocol::MAX_PAYLOAD];
+	let len = driver_protocol::encode_bind(info, resource_count, &mut payload);
+	send_frame(channel, driver_protocol::Opcode::Bind, generation, &payload[..len], None, object::rights::Rights::NONE)
+}
+
+// One `RESOURCE`, carrying one capability and saying which kind it is.
+fn send_resource(channel: &object::channel::Channel, kind: driver_protocol::ResourceKind, generation: u64, object: alloc::sync::Arc<dyn object::KernelObject>, rights: object::rights::Rights) -> Result<(), &'static str> {
+	let mut payload = [0u8; driver_protocol::U16_PAYLOAD_LEN];
+	driver_protocol::encode_u16(kind as u16, &mut payload);
+	send_frame(channel, driver_protocol::Opcode::Resource, generation, &payload, Some(object), rights)
+}
+
+// Read the driver's half of the handshake: its offers, then its terminal frame.
+//
+// Answers with every provider it offered, by kind, or None if it reported a failure or its channel
+// closed. Offers are held here until the terminal frame for the same reason DeviceManager holds
+// them: a driver that dies half way through announcing itself announces nothing.
+//
+// A frame carrying a generation that is not this binding's is DROPPED. There is one binding per test
+// here, so it can only come from a process that should no longer be speaking.
+fn recv_offers(channel: &object::channel::Channel, generation: u64) -> Option<alloc::vec::Vec<(u16, alloc::sync::Arc<dyn object::KernelObject>)>> {
+	// ALLOC-OK: `#[cfg(test)]`, bounded by `MAX_INITIAL_OFFERS`.
+	let mut offers: alloc::vec::Vec<(u16, alloc::sync::Arc<dyn object::KernelObject>)> = alloc::vec::Vec::new();
+	loop {
+		let message = channel.recv().ok()?;
+		let Ok(header) = driver_protocol::Header::decode(&message.bytes) else { continue };
+		if header.generation != generation {
+			continue;
+		}
+		match header.opcode {
+			driver_protocol::Opcode::Offer => {
+				if let (Ok(kind), Some(cap)) = (driver_protocol::decode_offer(header.payload(&message.bytes)), message.caps.first()) {
+					offers.push((kind, cap.object()));
+				}
+			}
+			driver_protocol::Opcode::Ready => return Some(offers),
+			driver_protocol::Opcode::Failed => return None,
+			_ => {}
+		}
+	}
+}
+
+// The provider of one kind out of what a handshake offered.
+fn offer_of(offers: &[(u16, alloc::sync::Arc<dyn object::KernelObject>)], kind: u16) -> Option<alloc::sync::Arc<dyn object::KernelObject>> {
+	offers.iter().find(|(k, _)| *k == kind).map(|(_, object)| object.clone())
+}
+
 // Create a ramdisk MemoryObject from `volume`, fill it, and hand it to a service's
 // bootstrap channel as "RAMDISK" + the volume's byte length, with a read+map cap.
 fn send_ramdisk(channel: &object::channel::Channel, volume: &[u8]) -> Result<(), &'static str> {
@@ -2075,6 +2142,25 @@ pub(crate) fn device_privilege() -> u64 {
 	let thread = sched::current_thread().expect("a current thread");
 	let privilege = Privilege::create(PrivilegeKind::DeviceManager).expect("a test privilege");
 	thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL).expect("the privilege installs").raw()
+}
+
+// Take a device the way DeviceManager takes it, and answer with everything one binding needs.
+//
+// `SYS_DEVICE_ACQUIRE` is retired: it minted a `DeviceMemory` for anyone with the privilege who
+// named an index, counted owners instead of having one, and answered with nothing the caller could
+// later release the device by. Every test that used to call it goes through here.
+pub(crate) fn claim_device(index: u64) -> Result<abi::ClaimGrant, i64> {
+	let mut grant = abi::ClaimGrant::default();
+	let result = unsafe { arch::syscall::invoke(syscall::SYS_DEVICE_CLAIM, index, device_privilege(), &mut grant as *mut _ as u64, 0) } as i64;
+	if result < 0 { Err(result) } else { Ok(grant) }
+}
+
+// AND GIVE IT BACK, which the old call had no way of doing and no need to.
+//
+// A claim is exclusive now, so a test that takes a device and walks away leaves every later test
+// that names it refused - which would be one test silently deciding what another can check.
+pub(crate) fn release_device(grant: &abi::ClaimGrant) {
+	unsafe { arch::syscall::invoke(syscall::SYS_DEVICE_RELEASE, grant.claim, 0, 0, 0) };
 }
 
 // Kernel-thread body for the driver-crash test: it acquires real driver resources

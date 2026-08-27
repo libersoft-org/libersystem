@@ -22,6 +22,7 @@ use crate::fault::FaultInfo;
 use crate::loader::{self, LoadError};
 use crate::mem::frame::PAGE_SIZE;
 use crate::object::channel::{Channel, ChannelError, Message, RecvRefusal};
+use crate::object::claim::Claim;
 use crate::object::device_memory::DeviceMemory;
 use crate::object::dma_buffer::DmaBuffer;
 use crate::object::domain::Domain;
@@ -42,7 +43,7 @@ use crate::sched;
 // defined once in the abi crate (the single source of truth) and re-exported
 // here so the rest of the kernel keeps referring to them as `syscall::SYS_*` /
 // `syscall::ERR_*`.
-pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_ACQUIRE, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
+pub use abi::{ABI_VERSION, ERR_ABI_MISMATCH, ERR_ACCESS_DENIED, ERR_BAD_HANDLE, ERR_BAD_SYSCALL, ERR_INTERRUPTED, ERR_INVALID, ERR_NO_MEMORY, ERR_NO_THREAD, ERR_NOT_MAPPED, ERR_PEER_CLOSED, ERR_RESOURCE_EXHAUSTED, ERR_TIMED_OUT, ERR_UNSUPPORTED, ERR_WOULD_BLOCK, PROC_STATE_FAILED, PROC_STATE_RUNNING, PROC_STATE_STOPPED, PROP_DMA_LIMIT, PROP_HANDLE_LIMIT, PROP_IPC_QUEUE_LIMIT, PROP_MEMORY_LIMIT, PROP_NAME, PROP_STACK_LIMIT, PROP_THREAD_LIMIT, SIG_CONT, SIG_INT, SIG_KILL, SIG_STOP, SIG_TERM, SYS_ABI_CHECK, SYS_BOOT_ID, SYS_BOOT_PROFILE, SYS_CHANNEL_CREATE, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND, SYS_CHANNEL_SEND_ATTENUATED, SYS_CHANNEL_SEND_CAPS, SYS_CLOCK_GET, SYS_CLOCK_MONO_NS, SYS_CLOCK_RTC, SYS_CONSOLE_ATTACH, SYS_CONSOLE_FEED, SYS_CONSOLE_READLOG, SYS_CPU_INFO, SYS_CPU_NAME, SYS_DEBUG_NOOP, SYS_DEBUG_WRITE, SYS_DEVICE_CLAIM, SYS_DEVICE_CLAIM_INFO, SYS_DEVICE_COUNT, SYS_DEVICE_INFO, SYS_DEVICE_MEMORY_MAP, SYS_DEVICE_MSIX_ACQUIRE, SYS_DEVICE_QUIESCED, SYS_DEVICE_RELEASE, SYS_DMA_BUFFER_CREATE, SYS_DMA_BUFFER_MAP, SYS_DMA_BUFFER_PHYS, SYS_DMA_BUFFER_UNMAP, SYS_DOMAIN_CREATE, SYS_DOMAIN_KILL, SYS_DOMAIN_STATS_GET, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_EVENT_SIGNAL, SYS_FAULT_INFO_GET, SYS_FRAMEBUFFER_MAP, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_INTERRUPT_ACK, SYS_INTERRUPT_BIND, SYS_IRQ_INFO, SYS_MEMMAP_GET, SYS_MEMORY_MAP, SYS_MEMORY_OBJECT_CREATE, SYS_MEMORY_STATS, SYS_MEMORY_UNMAP, SYS_OBJECT_INFO_GET, SYS_OBJECT_PROPERTY_SET, SYS_PCI_INFO, SYS_PROCESS_CREATE, SYS_PROCESS_GROUP_CREATE, SYS_PROCESS_GROUP_SIGNAL, SYS_PROCESS_GROUP_STATS, SYS_PROCESS_LOAD, SYS_PROCESS_LOAD_MODULE, SYS_PROCESS_SIGNAL, SYS_PROCESS_STATS_GET, SYS_RANDOM_GET, SYS_RANDOM_INSECURE, SYS_SIGNAL_CATCH, SYS_SIGNAL_TAKE, SYS_SYSTEM_POWER, SYS_THREAD_CREATE, SYS_THREAD_START, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_TIMER_SET, SYS_USER_EXIT, SYS_WAIT, SYS_WAIT_ANY, SYS_WAITSET_ADD, SYS_WAITSET_CREATE, SYS_WAITSET_REMOVE, SYS_WAITSET_WAIT, SYS_YIELD};
 
 // The sys_is_err helper is only consumed by the in-kernel test harness.
 #[cfg(test)]
@@ -475,7 +476,7 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_RANDOM_GET => sys_random_get(a0, a1),
 		SYS_RANDOM_INSECURE => sys_random_insecure(a0, a1),
 		SYS_INTERRUPT_BIND => sys_interrupt_bind(a0, a1),
-		SYS_DEVICE_MSIX_ACQUIRE => sys_device_msix_acquire(a0, a1),
+		SYS_DEVICE_MSIX_ACQUIRE => sys_device_msix_acquire(a0),
 		SYS_INTERRUPT_ACK => sys_interrupt_ack(a0),
 		SYS_SYSTEM_POWER => sys_system_power(a0, a1),
 		SYS_CONSOLE_FEED => sys_console_feed(a0, a1, a2),
@@ -498,13 +499,21 @@ pub extern "C" fn syscall_dispatch(num: u64, a0: u64, a1: u64, a2: u64, a3: u64)
 		SYS_CONSOLE_ATTACH => sys_console_attach(a0, a1),
 		SYS_DEVICE_COUNT => device::count() as i64,
 		SYS_DEVICE_INFO => sys_device_info(a0, a1, a2),
-		SYS_DEVICE_ACQUIRE => sys_device_acquire(a0, a1),
+		// `SYS_DEVICE_ACQUIRE` IS RETIRED AND ITS NUMBER IS NOT REUSED. It minted a `DeviceMemory`
+		// for anyone with the DeviceManager privilege who named an index, counted owners instead of
+		// having one, and answered with nothing the caller could later release the device by.
+		// `SYS_DEVICE_CLAIM` is what replaced it; a caller still issuing the old number gets
+		// `ERR_BAD_SYSCALL`, which is what a call that no longer exists should say.
+		SYS_DEVICE_CLAIM => sys_device_claim(a0, a1, a2),
+		SYS_DEVICE_RELEASE => sys_device_release(a0),
+		SYS_DEVICE_CLAIM_INFO => sys_device_claim_info(a0, a1, a2),
 		SYS_MEMORY_MAP => sys_memory_map(a0),
 		SYS_MEMORY_UNMAP => sys_memory_unmap(a0),
 		SYS_HANDLE_DUPLICATE => sys_handle_duplicate(a0, a1),
 		SYS_HANDLE_CLOSE => sys_handle_close(a0),
 		SYS_CHANNEL_CREATE => sys_channel_create(a0, a1, a2),
 		SYS_CHANNEL_SEND => sys_channel_send(a0, a1, a2, a3),
+		SYS_CHANNEL_SEND_ATTENUATED => sys_channel_send_attenuated(a0, a1, a2, a3),
 		SYS_CHANNEL_RECV => sys_channel_recv(a0, a1, a2, a3),
 		SYS_CHANNEL_SEND_CAPS => sys_channel_send_caps(a0, a1, a2, a3),
 		SYS_CHANNEL_RECV_CAPS => sys_channel_recv_caps(a0, a1, a2, a3),
@@ -600,11 +609,15 @@ fn sys_memory_object_create(size: u64) -> i64 {
 // it, and both are things only the holder of that device's capability may say.
 fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	let thread = current_thread!();
-	let device: Option<u32> = if device_handle == 0 {
-		None
+	// THE CLAIM COMES WITH THE DEVICE CAPABILITY, which is the point of putting it there: the caller
+	// names a `DeviceMemory` it holds, and the kernel reads BOTH which device this buffer is for and
+	// which binding of it - so ending that binding reaches this buffer without anything having to
+	// remember it was created.
+	let (device, claim): (Option<u32>, Option<abi::ClaimKey>) = if device_handle == 0 {
+		(None, None)
 	} else {
 		match current_typed::<DeviceMemory>(device_handle, ObjectType::DeviceMemory, Rights::WRITE) {
-			Ok(memory) => memory.device_index(),
+			Ok(memory) => (memory.device_index(), memory.claim()),
 			Err(e) => return e,
 		}
 	};
@@ -621,6 +634,14 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	};
 	if !guard.record_dma_buffer(&object) {
 		return ERR_NO_MEMORY;
+	}
+	// RECORDED AS DERIVED BEFORE THE HANDLE EXISTS, for the reason the MMIO capability is: a
+	// capability the revocation cannot reach outlives the claim that justified it, so a table that
+	// cannot grow is a refusal rather than a buffer nothing can revoke.
+	if let Some(key) = claim {
+		if !device::register_derived(key, alloc::sync::Arc::downgrade(&(object.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+			return ERR_RESOURCE_EXHAUSTED;
+		}
 	}
 	install_object(&thread, object, Rights::ALL)
 }
@@ -1073,12 +1094,21 @@ fn sys_device_info(index: u64, buf_ptr: u64, buf_len: u64) -> i64 {
 	}
 }
 
-// Mint a DeviceMemory capability for the MMIO BAR of the virtio device at `index`
-// and install it in the caller's handle table, returning the handle. The caller
-// (DeviceManager) hands it to the matching driver, which maps it with
-// device_memory_map. Returns ERR_INVALID for an out-of-range index. (Gating this
-// to DeviceManager is a PermissionManager policy concern, deferred.)
-fn sys_device_acquire(index: u64, privilege: u64) -> i64 {
+// TAKE THE DEVICE AT `index`, and answer with everything one binding needs.
+//
+// This replaces `SYS_DEVICE_ACQUIRE`, which minted a `DeviceMemory` and nothing else. Two callers
+// naming one index both got one, because the kernel counted owners instead of having one; and the
+// single handle it answered with was precisely the handle that gets sent on to the driver, so after
+// a successful bind the manager held nothing about the claim at all - it could not learn which
+// binding this was, read what state the device was in, or take the device back.
+//
+// The answer is an `abi::ClaimGrant` copied into `grant_ptr`: the key, the MMIO capability that
+// travels to the driver, and the claim handle that stays here.
+//
+// ONE OPERATION OR NONE OF IT. Everything that can fail is listed in the order it is attempted, and
+// every refusal past the claim itself releases the claim before returning - a partial success would
+// leave a device nothing can release and nothing can rebind.
+fn sys_device_claim(index: u64, privilege: u64, grant_ptr: u64) -> i64 {
 	// `privilege` names a DeviceManager. Without it this minted a capability to any device's BAR for
 	// any caller that named an index - see `PrivilegeKind::DeviceManager` for why that is worse than
 	// it sounds on a machine with no IOMMU.
@@ -1086,27 +1116,142 @@ fn sys_device_acquire(index: u64, privilege: u64) -> i64 {
 		return error;
 	}
 	let thread = current_thread!();
-	let memory = match device::with(index as usize, |d| DeviceMemory::for_device(index as u32, d.bar_phys, d.bar_len as usize)) {
-		Some(Some(m)) => m,
-		// The device is there and the heap is not: a refusal the caller can retry, and distinct
-		// from naming a device that does not exist.
-		Some(None) => return ERR_RESOURCE_EXHAUSTED,
-		None => return ERR_INVALID,
-	};
-	// TAKING THE DEVICE IS WHAT LETS IT WRITE TO MEMORY. The count goes up here and comes down in
-	// `DeviceMemory::drop`; the 0 -> 1 transition is what turns bus mastering on. Ordered after the
-	// object exists so a heap refusal above cannot leave a device mastering for a driver that never
-	// got a capability to it.
-	if !device::acquire_bus_master(index as usize) {
+	let size = core::mem::size_of::<abi::ClaimGrant>() as u64;
+	// THE CHEAP REFUSALS FIRST, before anything is taken: an unusable buffer is not a reason to
+	// claim a device and then give it back.
+	if !user_buf_ok(grant_ptr, size) {
 		return ERR_INVALID;
 	}
-	let handle = install_object(&thread, memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER);
-	if handle < 0 {
-		// The table refused the handle, so nothing owns this `DeviceMemory` and its `Drop` will not
-		// run for a capability the caller never received: give the count back by hand.
-		device::release_bus_master(index as usize);
+	// BOTH HANDLES ARE BOOKED BEFORE EITHER OBJECT EXISTS. `insert_reserved` cannot fail, which is
+	// what makes "the second install fails after the first succeeded" - the case most likely to be
+	// got half right - not a state this code can reach. What CAN fail is the booking, and it fails
+	// before anything has moved.
+	if !thread.handles().lock().reserve(2) {
+		return ERR_RESOURCE_EXHAUSTED;
 	}
-	handle
+	let Some((bar_phys, bar_len)) = device::with(index as usize, |d| (d.bar_phys, d.bar_len)) else {
+		thread.handles().lock().release_reservation(2);
+		return ERR_INVALID;
+	};
+	let key = match device::claim(index as usize) {
+		Ok(key) => key,
+		Err(error) => {
+			thread.handles().lock().release_reservation(2);
+			return claim_errno(error);
+		}
+	};
+	// FROM HERE THE DEVICE IS TAKEN, so every refusal below gives it back.
+	let Some(memory) = DeviceMemory::for_claim(key, bar_phys, bar_len as usize) else {
+		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
+	};
+	// RECORDED AS DERIVED BEFORE IT IS HANDED OUT. A capability the revocation cannot reach is
+	// exactly what this milestone exists to make impossible, so a table that cannot grow is a failed
+	// mint rather than a capability that outlives its claim.
+	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
+	}
+	let Some(claim) = Claim::create(key) else {
+		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
+	};
+	// The MMIO capability keeps TRANSFER because DeviceManager is the one that hands it over, and it
+	// arrives at the driver WITHOUT it through the attenuating send. Minting it without TRANSFER
+	// outright would break the boot on the first try - the broker cannot move a capability it may
+	// not move.
+	let memory_handle = thread.handles().lock().insert_reserved(Capability::new(memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER));
+	// AND THE CLAIM HANDLE CARRIES NEITHER TRANSFER NOR DUPLICATE. That is what makes it stay: a
+	// claim handle that can be moved leaves this Domain, survives its killing, and holds the forced
+	// release off exactly when the machine most needs it. WAIT, because the terminal result of a
+	// release arrives on it; MANAGE, because ending the claim is what it is for.
+	let claim_handle = thread.handles().lock().insert_reserved(Capability::new(claim, Rights::READ | Rights::WAIT | Rights::MANAGE));
+	let grant = abi::ClaimGrant { key, memory: memory_handle.raw(), claim: claim_handle.raw() };
+	if let Err(error) = write_user(grant_ptr, grant) {
+		// THE CALLER NEVER LEARNED THE NAME OF ANY OF THIS, so none of it may survive. Closing the
+		// claim handle is what releases the device - its `Drop` is the forced release - and the
+		// order is the MMIO capability first so the claim's teardown finds nothing still holding the
+		// device's registers.
+		let mut table = thread.handles().lock();
+		let _ = table.close(memory_handle);
+		let _ = table.close(claim_handle);
+		return error;
+	}
+	0
+}
+
+// Give a claim back and answer with `error`, for a refusal that happened after the device was taken.
+//
+// The reservation goes too: the two handles were booked and neither was installed.
+fn abandon_claim(thread: &alloc::sync::Arc<Thread>, key: abi::ClaimKey, error: i64) -> i64 {
+	let _ = device::release_claim(key);
+	thread.handles().lock().release_reservation(2);
+	error
+}
+
+// One errno per refusal, and they are distinct on purpose: a caller that cannot tell "somebody else
+// has it" from "you passed nonsense" cannot retry correctly.
+fn claim_errno(error: device::ClaimError) -> i64 {
+	match error {
+		// Nothing is there. Retrying will not make one appear.
+		device::ClaimError::NoSuchDevice => ERR_INVALID,
+		// Somebody has it, or is giving it back. WORTH WAITING ON, which is the whole reason this
+		// is not the ERR_INVALID everything used to collapse into.
+		device::ClaimError::AlreadyClaimed => abi::ERR_ALREADY_CLAIMED,
+		// Not worth waiting on: both of these last the rest of the boot.
+		device::ClaimError::Quarantined | device::ClaimError::Retired => ERR_UNSUPPORTED,
+		// The DMA policy would not admit it, or the IOMMU would not confirm the attach. A policy
+		// refusal rather than a malformed request, and the caller cannot fix it by asking again or
+		// by asking for less.
+		device::ClaimError::Refused => ERR_ACCESS_DENIED,
+		// The key belongs to a previous binding of this device.
+		device::ClaimError::Stale => ERR_INVALID,
+	}
+}
+
+// END THE CLAIM THIS HANDLE NAMES, and answer with the state the device reached.
+//
+// THE KEY TRAVELS INSIDE THE OBJECT rather than through userspace, which is the same guarantee
+// stated more strongly: a release "takes the whole key", and a key that cannot be supplied by the
+// caller cannot be forged by it either. A claim whose device has since been released and re-claimed
+// carries a generation that is no longer current, and `release_claim` refuses it rather than
+// applying it to whoever holds the device now.
+//
+// Requires MANAGE on the claim handle. Answers with the `abi::CLAIM_STATE_*` code the device
+// reached - `Free`, or `Quarantined` where the teardown could not be confirmed.
+fn sys_device_release(claim_handle: u64) -> i64 {
+	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::MANAGE) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	claim.release() as i64
+}
+
+// Read a claim handle: which binding it names, what state that device is in, and whether the
+// release has settled.
+//
+// Reading is not enough on its own and is not meant to be - a manager built on one `wait_any` loop
+// cannot spin on a status, which is why the claim handle is waitable. This is what it reads once the
+// wait has woken it.
+fn sys_device_claim_info(claim_handle: u64, buf_ptr: u64, buf_len: u64) -> i64 {
+	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::READ) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	let size = core::mem::size_of::<abi::ClaimInfo>() as u64;
+	if buf_len < size || !user_buf_ok(buf_ptr, size) {
+		return ERR_INVALID;
+	}
+	let key = claim.key();
+	// THE CLAIM'S OWN OUTCOME WINS OVER THE TABLE'S CURRENT STATE. Once this claim has settled, the
+	// device may already have been claimed by somebody else - and answering `Claimed` for a binding
+	// that ended would be this handle reporting on a binding that is not its own.
+	let state = match claim.outcome() {
+		Some(code) => code,
+		None => device::claim_state(key.device_index as usize).map_or(abi::CLAIM_STATE_FREE, |state| state.code()),
+	};
+	let info = abi::ClaimInfo { key, state, settled: u32::from(claim.is_settled()) };
+	if let Err(error) = write_user(buf_ptr, info) {
+		return error;
+	}
+	0
 }
 
 // "I have stopped this device": release the DMA frames held for it.
@@ -1125,6 +1270,19 @@ fn sys_device_quiesced(device_handle: u64) -> i64 {
 		Ok(m) => m,
 		Err(e) => return e,
 	};
+	// A CLAIM THAT IS NO LONGER CURRENT PROVES NOTHING ABOUT THIS DEVICE.
+	//
+	// The whole authority of this call is "the holder of the capability has just reset the hardware",
+	// and a capability from a PREVIOUS binding is held by somebody who did no such thing to the
+	// device as it is now. Without this, a `DeviceMemory` that outlived its claim - sitting in a
+	// message queue, or in a process being torn down - could release the frames and vectors the
+	// CURRENT driver is still using. Nothing forged it; it simply became a statement about a
+	// different machine, and the generation is what tells the two apart.
+	if let Some(key) = memory.claim() {
+		if !device::claim_is_current(key) {
+			return ERR_ACCESS_DENIED;
+		}
+	}
 	match memory.device_index() {
 		Some(index) => {
 			// The DMA frames AND the MSI vectors. Both were held for the same reason - a request to
@@ -1233,13 +1391,26 @@ fn sys_interrupt_bind(vector: u64, privilege: u64) -> i64 {
 // Unlike the INTx path the device's legacy pin stays disabled (MSI-X replaces it), so
 // the driver gets its own edge-triggered vector with no INTx sharing. ERR_INVALID for
 // an out-of-range index or a device with no MSI-X capability.
-fn sys_device_msix_acquire(index: u64, privilege: u64) -> i64 {
-	// The same authority as the BAR: an MSI-X vector is a line into this machine's interrupt
-	// delivery, and handing one out is DeviceManager's job or nobody's.
-	if let Err(error) = holds_privilege(privilege, PrivilegeKind::DeviceManager) {
-		return error;
-	}
+fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
+	// THE CLAIM IS THE AUTHORITY, AND IT NAMES THE DEVICE.
+	//
+	// This took an index plus an ambient DeviceManager privilege, so nothing anywhere said WHICH
+	// BINDING the vector belonged to - and a revocation had no way to ask. Holding the claim answers
+	// both questions at once and is strictly stronger than the privilege was: the privilege said
+	// "you are a device manager", and this says "you are the one who took THIS device".
 	let thread = current_thread!();
+	let claim = match current_typed::<Claim>(claim_handle, ObjectType::Claim, Rights::MANAGE) {
+		Ok(c) => c,
+		Err(e) => return e,
+	};
+	// A BINDING THAT HAS ENDED DERIVES NOTHING. The claim handle outlives the claim - it settles
+	// rather than disappearing - and minting a vector from a settled one would attach live interrupt
+	// authority to a device somebody else may already hold.
+	if claim.is_settled() {
+		return ERR_ACCESS_DENIED;
+	}
+	let key = claim.key();
+	let index = key.device_index as u64;
 	let (cap, table_phys, bus, dev, func) = match device::with(index as usize, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)) {
 		Some((cap, table_phys, bus, dev, func)) if cap != 0 => (cap, table_phys, bus, dev, func),
 		_ => return ERR_INVALID,
@@ -1312,6 +1483,15 @@ fn sys_device_msix_acquire(index: u64, privilege: u64) -> i64 {
 	if !arch::interrupts::bind_msi(vector, &interrupt) {
 		// The vector raced to another binder. FREED, not retired: MSI-X has not been enabled on the
 		// device yet, so nothing can have been sent and there is no owner to quiesce it.
+		arch::interrupts::release_unused_msi(vector);
+		thread.handles().lock().release_reservation(1);
+		return ERR_RESOURCE_EXHAUSTED;
+	}
+	// RECORDED AS DERIVED BEFORE THE DEVICE IS ALLOWED TO RAISE IT. A vector the revocation cannot
+	// reach keeps delivering to a driver whose binding has ended, which is the interrupt half of the
+	// property this milestone is about; a table that cannot grow gives the vector back rather than
+	// arming one nothing can take away.
+	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(interrupt.clone() as alloc::sync::Arc<dyn KernelObject>))) {
 		arch::interrupts::release_unused_msi(vector);
 		thread.handles().lock().release_reservation(1);
 		return ERR_RESOURCE_EXHAUSTED;
@@ -2249,6 +2429,99 @@ fn sys_channel_send(ch: u64, bytes_ptr: u64, bytes_len: u64, xfer: u64) -> i64 {
 	}
 }
 
+// MOVE ONE CAPABILITY WITH LESS AUTHORITY THAN THE SENDER HOLDS.
+//
+// `sys_channel_send` moves a handle with the rights it already has, so "arrives without TRANSFER"
+// was not a property of the existing primitive and had to become one. There is no room for a fifth
+// argument - the ABI carries exactly four on all three ports and the ordinary send spends all of
+// them - so the last one is a POINTER to an `abi::CapTransfer` in the caller's memory, read through
+// the same `user_buf_ok`/`read_user` path every other pointer argument uses.
+//
+// INSIDE, THIS IS THE SAME TRANSACTIONAL MOVE THE ORDINARY SEND PERFORMS. A mask applied to an
+// existing transfer, not a second way of moving a capability - which matters because the ordinary
+// send was itself fixed for this: it used to look up, clone and send, so two threads naming one
+// handle could both look up, both clone and both send, and one handle became two capabilities
+// without DUPLICATE. A new call that reimplemented the move would have reintroduced exactly that.
+//
+// The receiver gets the INTERSECTION of the capability's rights and the mask. A mask naming a right
+// the capability does not hold is not an error, because an intersection cannot widen.
+fn sys_channel_send_attenuated(ch: u64, bytes_ptr: u64, bytes_len: u64, transfer_ptr: u64) -> i64 {
+	if bytes_len as usize > abi::MAX_MESSAGE_BYTES {
+		return ERR_INVALID;
+	}
+	let size = core::mem::size_of::<abi::CapTransfer>() as u64;
+	if !user_buf_ok(transfer_ptr, size) {
+		return ERR_INVALID;
+	}
+	let transfer: abi::CapTransfer = read_user(transfer_ptr);
+	// A SEND THAT MOVES NOTHING IS NOT THIS CALL. The ordinary send is what carries a bare message,
+	// and accepting handle 0 here would make the attenuating path a second way of doing the same
+	// thing with a mask nobody reads.
+	if transfer.handle == 0 {
+		return ERR_INVALID;
+	}
+	let thread = current_thread!();
+	let object = {
+		let table = thread.handles().lock();
+		match table.lookup_typed(Handle::from_raw(ch), ObjectType::Channel, Rights::SEND) {
+			Ok(object) => object,
+			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+			Err(_) => return ERR_BAD_HANDLE,
+		}
+	};
+	let channel = object.as_any().downcast_ref::<Channel>().expect("type checked by lookup_typed");
+	if !user_buf_ok(bytes_ptr, bytes_len) {
+		return ERR_INVALID;
+	}
+	let bytes = match read_bytes(bytes_ptr, bytes_len as usize) {
+		Ok(bytes) => bytes,
+		Err(error) => return error,
+	};
+	// Bits outside the defined set are dropped rather than refused: `from_bits` is the boundary
+	// hygiene every rights value arriving from ring 3 goes through, and a mask cannot widen anyway.
+	let mask = Rights::from_bits(transfer.rights);
+	let handle = Handle::from_raw(transfer.handle);
+	let mut caps: Vec<Capability> = Vec::new();
+	if caps.try_reserve(1).is_err() {
+		return ERR_NO_MEMORY;
+	}
+	// THE SLOT IS EMPTIED AND RESERVED BEFORE ANYTHING IS COPIED, so a second thread naming the same
+	// handle finds nothing to take. This is the transaction; the mask below is applied inside it.
+	let taken = {
+		let mut table = thread.handles().lock();
+		match table.take_for_transfer(handle, Rights::TRANSFER) {
+			Ok(cap) => cap,
+			Err(HandleError::AccessDenied) => return ERR_ACCESS_DENIED,
+			Err(_) => return ERR_BAD_HANDLE,
+		}
+	};
+	// THE ORIGINAL IS KEPT AND THE ATTENUATED COPY IS WHAT TRAVELS. A refused send has to leave the
+	// sender EXACTLY where it was - the handle still open, at the same value, with its rights
+	// unchanged - and narrowing the capability in place would have made the restore a widening
+	// operation, which is a primitive this kernel should not have at all.
+	caps.push(taken.attenuated(mask));
+	match channel.send_charged_or_return(Message::new(bytes, caps), thread.domain()) {
+		Ok(()) => {
+			// Delivered: the handle value dies now, and its quota is refunded. `taken` is dropped
+			// here having never been installed anywhere.
+			thread.handles().lock().commit_taken(handle);
+			thread.process().record_send();
+			0
+		}
+		Err(err) => {
+			// Undelivered. The attenuated copy the message carried is dropped, and what goes back
+			// into the slot is the capability that came out of it.
+			drop(err.1);
+			thread.handles().lock().restore_taken(handle, taken);
+			match err.0 {
+				ChannelError::Full => ERR_WOULD_BLOCK,
+				ChannelError::PeerClosed => ERR_PEER_CLOSED,
+				_ => ERR_INVALID,
+			}
+		}
+	}
+}
+
 // Report the byte length of the next pending message on the channel WITHOUT
 // dequeuing it (ERR_WOULD_BLOCK when nothing is queued, ERR_PEER_CLOSED once the
 // queue is empty and the peer is gone), so a receiver sizes its buffer exactly
@@ -2987,6 +3260,13 @@ fn object_ready_for(object: &Arc<dyn KernelObject>, writable: bool) -> bool {
 	}
 	if let Some(interrupt) = any.downcast_ref::<Interrupt>() {
 		return interrupt.is_pending();
+	}
+	if let Some(claim) = any.downcast_ref::<Claim>() {
+		// A claim handle becomes ready once its release has SETTLED, so a manager parked in
+		// `wait_any` learns the device is back - `Free`, or `Quarantined` where the teardown could
+		// not be confirmed - without polling for it. It sits in the wait set beside the driver's
+		// process handle, which is the other half of the same question.
+		return claim.is_settled();
 	}
 	if let Some(process) = any.downcast_ref::<Process>() {
 		// A Process handle becomes ready once the process has terminated (exited or

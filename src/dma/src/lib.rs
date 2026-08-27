@@ -908,9 +908,23 @@ impl<B: Backend> Iommu<B> {
 	}
 
 	// Take what the hardware reported, bounded by the caller's buffer, and fold it into the log.
+	//
+	// AND STAMP EACH EVENT WITH THE BINDING IT BELONGS TO, which is this layer's answer and no other.
+	// The backend reports an endpoint and the domain it is attached to and leaves the generation at
+	// zero, because a backend does not own binding identity - it used to hold a controller-wide
+	// generation of its own, which made two parallel answers to "which binding is this" and therefore
+	// no answer at all. The domain carries the generation the kernel minted for that binding, so a
+	// fault from an endpoint whose domain has since been rebound names the generation it was raised
+	// under and is stale by comparison rather than by bookkeeping.
+	//
+	// An endpoint this side has no domain for keeps `Generation(0)`, which is a value no binding ever
+	// carries: generations start at 1.
 	pub fn drain_faults(&mut self, out: &mut [FaultEvent]) -> usize {
 		let taken = self.backend.drain_faults(out);
-		for event in out.iter().take(taken) {
+		for event in out.iter_mut().take(taken) {
+			if let Some(state) = self.domains.get(&event.domain) {
+				event.generation = state.generation;
+			}
 			self.faults.record(*event);
 		}
 		taken

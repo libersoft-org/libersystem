@@ -88,9 +88,10 @@ fn device_table_exposes_virtio_mmio() {
 				VTYPE.store(info.device_type as u64, Ordering::SeqCst);
 				BAR_LEN.store(info.bar_len, Ordering::SeqCst);
 			}
-			let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, device_privilege(), 0, 0);
-			if !syscall::sys_is_err(handle) {
-				MAPPED.store(arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, handle, 0, 0, 0), Ordering::SeqCst);
+			if let Ok(grant) = crate::tests::claim_device(0) {
+				MAPPED.store(arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, grant.memory, 0, 0, 0), Ordering::SeqCst);
+				// Given back, so a later test naming device 0 is not refused by this one.
+				crate::tests::release_device(&grant);
 			}
 		}
 	}
@@ -125,9 +126,9 @@ fn device_table_exposes_the_xhci_controller() {
 					continue;
 				}
 				BAR_LEN.store(info.bar_len, Ordering::SeqCst);
-				let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, i, device_privilege(), 0, 0);
-				if !syscall::sys_is_err(handle) {
-					MAPPED.store(arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, handle, 0, 0, 0), Ordering::SeqCst);
+				if let Ok(grant) = crate::tests::claim_device(i) {
+					MAPPED.store(arch::syscall::invoke(syscall::SYS_DEVICE_MEMORY_MAP, grant.memory, 0, 0, 0), Ordering::SeqCst);
+					crate::tests::release_device(&grant);
 				}
 				break;
 			}
@@ -191,51 +192,41 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let mut msg = alloc::vec::Vec::with_capacity(6 + core::mem::size_of::<abi::DeviceInfo>());
 	msg.extend_from_slice(b"DEVICE");
 	msg.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
-	// THE CAPABILITY IS MINTED THE WAY `sys_device_acquire` MINTS IT - for the device index, not for
+	// THE CAPABILITY IS MINTED THE WAY `SYS_DEVICE_CLAIM` MINTS IT - for the device index, not for
 	// a bare physical range - and the device is taken at the same moment. This harness is standing in
 	// for DeviceManager, and taking the device is what lets it write to memory: a controller handed
 	// only its BAR would bring its rings up, ring the doorbell, and wait forever for a completion the
-	// bus would not let it write. The count comes back down when the driver process dies and the
-	// transferred handle dies with it.
-	assert!(device::acquire_bus_master(index), "the xHCI controller is taken, as DeviceManager takes it");
-	send_cap(&kernel_ep, &msg, DeviceMemory::for_device(index as u32, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE handoff should send");
-	send_cap(&kernel_ep, b"IRQ", interrupt, Rights::ALL).expect("the IRQ handoff should send");
-	// The raw keyboard sink is the third handoff, and it is not optional here: the
-	// driver tolerates an absent sink (it stores handle 0 and carries on) but blocks
-	// for the message itself, so omitting it deadlocks bring-up before the first port
-	// is probed.
+	// bus would not let it write. Bus mastering goes off when the driver process dies and the
+	// transferred capability dies with it; the CLAIM ends with this test kernel.
+	let key = device::claim(index).expect("the xHCI controller is taken, as DeviceManager takes it");
+	// THE HANDSHAKE THIS HARNESS SENDS IS THE ONE DEVICEMANAGER SENDS. `BIND` states how many
+	// resources follow and each one says which kind it is, so the driver no longer has to know an
+	// order nobody told it - which is what the five positional messages here used to require, and
+	// why a capability added at the end of the sequence had to be added at the END.
+	//
+	// Four resources: the device, its interrupt, a key sink, and a console feed. The power
+	// connection is deliberately absent - this harness has no business stopping the machine, and an
+	// absent resource is now a state the driver can see rather than a message it waits for.
 	let (_key_drain, key_sink) = object::channel::Channel::create();
-	send_cap(&kernel_ep, b"KEYS", key_sink, Rights::ALL).expect("the KEYS handoff should send");
-	// The power capability is the fourth, for the same reason: the driver tolerates
-	// handle 0 (the Power key goes inert) but waits for the message. This harness has no
-	// business stopping the machine, so it sends a message carrying nothing rather than a
-	// real root-Domain handle - the shape of the handoff is what bring-up needs, not the
-	// authority behind it.
-	kernel_ep.send(object::channel::Message::new(b"POWER".to_vec(), alloc::vec::Vec::new())).expect("the POWER handoff should send");
-	// And the console-input capability is the fifth, for exactly the same reason the two
-	// above spell out: the driver tolerates handle 0 (its keystrokes go nowhere) and blocks
-	// for the message. This is the cost of a positional bootstrap - every launcher owes every
-	// message - and it is why the capability was added at the END of the sequence, where it
-	// disturbs nothing that reads before it.
-	kernel_ep.send(object::channel::Message::new(b"CONSOLE".to_vec(), alloc::vec::Vec::new())).expect("the CONSOLE handoff should send");
+	let (_console_drain, console_feed) = object::channel::Channel::create();
+	send_bind(&kernel_ep, &info, key.generation, 4).expect("the BIND should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Irq, key.generation, interrupt, Rights::ALL).expect("the IRQ resource should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Keys, key.generation, key_sink, Rights::ALL).expect("the KEYS resource should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Console, key.generation, console_feed, Rights::ALL).expect("the CONSOLE resource should send");
 	sched::run_until_idle();
 
-	let report = kernel_ep.recv().expect("the xhci driver should report in");
-	assert_eq!(&report.bytes[..], b"driver.xhci: online (4 device(s)) (keyboard) (pointer) (storage)", "the driver should expand the hub, address the QEMU USB keyboard and tablet behind it and the stick, and configure all three classes");
-
-	// the report is followed by the bus query channel ("USBBUS"): drive one raw
-	// `usb.list` request over it ([op u16][correlation u32], the generated wire
-	// header) and expect a successful reply naming all four devices' roles - the
+	// EVERY PROVIDER ARRIVES IN ONE HANDSHAKE, HELD UNPUBLISHED UNTIL ITS `READY`. These used to be
+	// three messages told apart by the literal bytes `USBBUS` and `POINTER` - so what a capability
+	// was for was decided by parsing a string the driver chose - and the human report was the
+	// message the harness asserted on, which made changing a boot line's wording able to break this.
+	let offers = recv_offers(&kernel_ep, key.generation).expect("the xhci driver should report READY");
+	// The bus query channel: drive one raw `usb.list` request over it ([op u16][correlation u32],
+	// the generated wire header) and expect a successful reply naming all four devices' roles - the
 	// live inventory `lsusb` reads.
-	let usbq_msg = kernel_ep.recv().expect("the USBBUS message should follow the report");
-	assert_eq!(&usbq_msg.bytes[..], b"USBBUS", "the second message carries the bus query channel");
-	let usbq_cap = usbq_msg.caps.first().expect("the query channel is transferred with it");
-	let usbq = usbq_cap.object().into_any_arc().downcast::<Channel>().expect("the query channel is a channel");
-	// the pointer-event channel follows ("POINTER"): the raw stream a USB pointing
-	// device's reports feed, routed to InputService live.
-	let ptr_msg = kernel_ep.recv().expect("the POINTER message should follow USBBUS");
-	assert_eq!(&ptr_msg.bytes[..], b"POINTER", "the third message carries the pointer-event channel");
-	assert!(ptr_msg.caps.first().is_some(), "the pointer channel is transferred with it");
+	let usbq = offer_of(&offers, driver_protocol::provider::USB_BUS).expect("the driver offers its bus query channel").into_any_arc().downcast::<Channel>().expect("the query channel is a channel");
+	assert!(offer_of(&offers, driver_protocol::provider::POINTER).is_some(), "and its pointer-event channel, the raw stream a USB pointing device's reports feed");
+	assert!(offer_of(&offers, driver_protocol::provider::BLOCK).is_some(), "and the USB stick's block service, because this machine has one attached");
 	let mut list = alloc::vec::Vec::new();
 	list.extend_from_slice(&1u16.to_le_bytes()); // OP_LIST
 	list.extend_from_slice(&1u32.to_le_bytes()); // correlation id
@@ -246,11 +237,9 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let has = |needle: &[u8]| inventory.bytes.windows(needle.len()).any(|w| w == needle);
 	assert!(has(b"hub") && has(b"keyboard") && has(b"pointer") && has(b"storage"), "the inventory should name the hub, the keyboard, the tablet and the stick by role");
 
-	// the report carries the disk's block channel: read sector 0 over it, the same
-	// [op u32][lba u64][count u32] contract driver.virtio-blk serves, and expect a
-	// success status plus a 512-byte shared buffer.
-	let cap = report.caps.first().expect("the block channel is transferred with the report");
-	let blk = cap.object().into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
+	// The stick's block provider: read sector 0 over it, the same [op u32][lba u64][count u32]
+	// contract driver.virtio-blk serves, and expect a success status plus a 512-byte shared buffer.
+	let blk = offer_of(&offers, driver_protocol::provider::BLOCK).expect("the driver offers the stick's block service").into_any_arc().downcast::<Channel>().expect("the block channel is a channel");
 	// first the capacity query (op 2): the reply is [status u32][capacity bytes u64]
 	// and must report the seeded 16 MB stick image.
 	let mut capacity = alloc::vec::Vec::with_capacity(16);
@@ -332,8 +321,8 @@ fn a_physical_address_is_answerable_only_for_a_device_bound_buffer() {
 	static DONE: AtomicBool = AtomicBool::new(false);
 	extern "C" fn body(_arg: u64) {
 		unsafe {
-			let device = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, crate::tests::device_privilege(), 0, 0);
-			assert!(!syscall::sys_is_err(device), "the test acquires device 0");
+			let grant = crate::tests::claim_device(0).expect("the test claims device 0");
+			let device = grant.memory;
 			// Bound, and deliberately NEVER MAPPED - the virtio-gpu framebuffer case.
 			let bound = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, device as u64, 0, 0);
 			assert!(!syscall::sys_is_err(bound), "a device-bound DMA buffer is created");
@@ -369,10 +358,10 @@ fn dma_buffer_maps_and_reports_phys() {
 	static DONE: AtomicBool = AtomicBool::new(false);
 	extern "C" fn body(_arg: u64) {
 		unsafe {
-			let device = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, crate::tests::device_privilege(), 0, 0);
-			if syscall::sys_is_err(device) {
+			let Ok(grant) = crate::tests::claim_device(0) else {
 				return;
-			}
+			};
+			let device = grant.memory;
 			let handle = arch::syscall::invoke(syscall::SYS_DMA_BUFFER_CREATE, 4096, device as u64, 0, 0);
 			if syscall::sys_is_err(handle) {
 				return;
@@ -564,7 +553,9 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 	extern "C" fn body(_arg: u64) {
 		unsafe {
 			// No privilege at all.
-			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "a device may not be acquired without the authority");
+			let mut grant = abi::ClaimGrant::default();
+			let out = &mut grant as *mut _ as u64;
+			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_CLAIM, 0, 0, out, 0) as i64, syscall::ERR_BAD_HANDLE, "a device may not be claimed without the authority");
 			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_MSIX_ACQUIRE, 0, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "nor its MSI-X vectors");
 			assert_eq!(arch::syscall::invoke(syscall::SYS_INTERRUPT_BIND, 0x41, 0, 0, 0) as i64, syscall::ERR_BAD_HANDLE, "nor an interrupt line");
 
@@ -576,13 +567,21 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 				let privilege = Privilege::create(PrivilegeKind::ConsoleSink).expect("a test privilege");
 				thread.handles().lock().try_insert_object(privilege, object::rights::Rights::ALL).expect("installs").raw()
 			};
-			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, wrong, 0, 0) as i64, syscall::ERR_ACCESS_DENIED, "a console authority does not open a device");
+			assert_eq!(arch::syscall::invoke(syscall::SYS_DEVICE_CLAIM, 0, wrong, out, 0) as i64, syscall::ERR_ACCESS_DENIED, "a console authority does not open a device");
 
 			// And with the right one it works, on a machine that has a device to give.
+			// AND WITH THE RIGHT ONE IT WORKS - or the device is already claimed, which is the
+			// authority working too: the refusal that comes back is `ERR_ALREADY_CLAIMED` and not
+			// `ERR_ACCESS_DENIED`, so the caller got past the gate this test is about.
 			let count = arch::syscall::invoke(syscall::SYS_DEVICE_COUNT, 0, 0, 0, 0) as i64;
 			if count > 0 {
-				let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, 0, device_privilege(), 0, 0) as i64;
-				assert!(handle > 0, "the authority is what makes it work");
+				match crate::tests::claim_device(0) {
+					Ok(grant) => {
+						assert!(grant.memory > 0 && grant.claim > 0, "the authority is what makes it work");
+						crate::tests::release_device(&grant);
+					}
+					Err(error) => assert_eq!(error, abi::ERR_ALREADY_CLAIMED, "past the gate, and refused for a reason that is not about authority"),
+				}
 			}
 		}
 		DONE.store(true, Ordering::SeqCst);
@@ -592,46 +591,52 @@ fn taking_a_device_out_of_the_kernel_needs_the_authority_to_do_it() {
 	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
 }
 
-tagged_test!(a_device_masters_the_bus_only_while_a_driver_holds_it, [Pci, Drivers], id = "kernel.hardware.a_device_masters_the_bus_only_while_a_driver_holds_it", covers = ["kernel"]);
-fn a_device_masters_the_bus_only_while_a_driver_holds_it() {
+tagged_test!(a_device_masters_the_bus_only_while_it_is_claimed, [Pci, Drivers], id = "kernel.hardware.a_device_masters_the_bus_only_while_it_is_claimed", covers = ["kernel"]);
+fn a_device_masters_the_bus_only_while_it_is_claimed() {
 	// Bus mastering is permission to write anywhere in physical memory. On these machines there is
 	// no IOMMU, so the PCI command bit IS the whole of the check: a device with it set can put bytes
 	// at any address it likes, and nothing between the device and the DRAM will ask why.
 	//
 	// It used to be turned on at enumeration and never turned off - so from the moment the kernel
-	// walked the bus, every device on it could write to any physical address, with no driver
-	// running and nobody to notice. Now the bit follows OWNERSHIP: `sys_device_acquire` sets it and
-	// `DeviceMemory::drop` clears it, which also means a driver that crashes disables its own device
-	// without knowing the rule exists - its handle dies with its process.
+	// walked the bus, every device on it could write to any physical address, with no driver running
+	// and nobody to notice. Now the bit follows the CLAIM.
 	//
-	// The config register is read back rather than the count, because the count is the kernel's
-	// opinion and the register is what the bus obeys.
+	// THIS TEST NAMES THE DEVICE IT USES, and that is the difference from what stood here before.
+	// The old one searched for a device nobody was driving and returned quietly when every device on
+	// the machine was claimed - which on a healthy boot is most of them. A gate whose subject can
+	// vanish is a gate that passes when there was nothing to test. Device 0 is always there, and
+	// BOTH of the states it can be in have something to assert: if something already holds it, a
+	// second claim is refused and the bit is set; if nothing does, the whole lifecycle is walked.
+	//
+	// The config register is read back rather than the kernel's own record, because the record is
+	// the kernel's opinion and the register is what the bus obeys.
 	use core::sync::atomic::{AtomicBool, Ordering};
 	static DONE: AtomicBool = AtomicBool::new(false);
 	const BUS_MASTER: u16 = 1 << 2;
 	extern "C" fn body(_arg: u64) {
-		// A DEVICE NOBODY IS DRIVING. By the time this runs the suite has started real services, and
-		// the ones holding a device are supposed to have their bit set - so picking index 0 would be
-		// asserting against a driver doing its job. The count is the kernel's record of who holds
-		// what; a device with a count of zero is the case this test is about.
-		let Some(index) = (0..device::count()).find(|&i| device::bus_master_owners(i) == 0) else {
-			// Every device on this machine is driven right now, which is the rule holding rather
-			// than a case to check. Nothing to say.
-			DONE.store(true, Ordering::SeqCst);
-			return;
+		const INDEX: usize = 0;
+		let Some((bus, dev, func)) = device::with(INDEX, |d| (d.bus, d.dev, d.func)) else {
+			// A machine with no devices at all is not a machine this suite runs on: every profile
+			// gives the guest at least the virtio disk it booted from.
+			panic!("device 0 is in the table on every machine this suite runs on");
 		};
-		let (bus, dev, func) = device::with(index, |d| (d.bus, d.dev, d.func)).expect("the device is in the table");
-		unsafe {
-			assert_eq!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "nothing is driving this device, so it may not write to memory");
-
-			let handle = arch::syscall::invoke(syscall::SYS_DEVICE_ACQUIRE, index as u64, device_privilege(), 0, 0) as i64;
-			assert!(handle > 0, "the device is acquired");
-			assert_eq!(device::bus_master_owners(index), 1, "and the kernel records who holds it");
-			assert_ne!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "a driver holds it now, so it may write to memory");
-
-			assert_eq!(arch::syscall::invoke(syscall::SYS_HANDLE_CLOSE, handle as u64, 0, 0, 0) as i64, 0, "the driver lets the device go");
-			assert_eq!(device::bus_master_owners(index), 0, "the count comes back down");
-			assert_eq!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "and the permission goes with it");
+		match device::claim_state(INDEX) {
+			Some(device::ClaimState::Free) => {
+				assert_eq!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "nothing holds this device, so it may not write to memory");
+				let grant = crate::tests::claim_device(INDEX as u64).expect("a free device is claimable");
+				assert_ne!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "a holder has it now, so it may write to memory");
+				assert_eq!(crate::tests::claim_device(INDEX as u64).err(), Some(abi::ERR_ALREADY_CLAIMED), "and a second claim is refused by name");
+				crate::tests::release_device(&grant);
+				assert_eq!(device::claim_state(INDEX), Some(device::ClaimState::Free), "the release confirmed");
+				assert_eq!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "and the permission went with the claim");
+			}
+			Some(device::ClaimState::Claimed) => {
+				// Something is driving it. That is the rule holding rather than a case to skip: the
+				// exclusivity is exactly what is checked against a REAL holder here.
+				assert_ne!(arch::pci::command(bus, dev, func) & BUS_MASTER, 0, "a claimed device is one that may write to memory");
+				assert_eq!(crate::tests::claim_device(INDEX as u64).err(), Some(abi::ERR_ALREADY_CLAIMED), "and nobody else can take it");
+			}
+			other => panic!("device 0 is {other:?}, which is neither of the states a booted machine leaves it in"),
 		}
 		DONE.store(true, Ordering::SeqCst);
 	}
@@ -685,19 +690,21 @@ fn virtio_snd_driver_captures_a_period_from_the_device() {
 
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
 	loader::spawn_elf_process(sched::root_domain(), elf, user_ep, Rights::ALL).expect("the virtio-snd driver should load");
-	let mut message = alloc::vec::Vec::with_capacity(6 + core::mem::size_of::<abi::DeviceInfo>());
-	message.extend_from_slice(b"DEVICE");
-	message.extend_from_slice(unsafe { core::slice::from_raw_parts(&info as *const abi::DeviceInfo as *const u8, core::mem::size_of::<abi::DeviceInfo>()) });
 	// Taken as DeviceManager takes it, so the device may write to the capture buffer at all - see
-	// `a_device_masters_the_bus_only_while_a_driver_holds_it`.
-	assert!(device::acquire_bus_master(index), "the sound device is taken, as DeviceManager takes it");
-	send_cap(&kernel_ep, &message, DeviceMemory::for_device(index as u32, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE handoff should send");
-	send_cap(&kernel_ep, b"IRQ", interrupt, Rights::ALL).expect("the IRQ handoff should send");
+	// `a_device_masters_the_bus_only_while_it_is_claimed`.
+	let key = device::claim(index).expect("the sound device is taken, as DeviceManager takes it");
+	// THE SAME HANDSHAKE DEVICEMANAGER SENDS: one `BIND` naming the device and the two resources
+	// that follow, each saying which kind it is.
+	send_bind(&kernel_ep, &info, key.generation, 2).expect("the BIND should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Irq, key.generation, interrupt, Rights::ALL).expect("the IRQ resource should send");
 	sched::run_until_idle();
 
-	let report = kernel_ep.recv().expect("the virtio-snd driver should report in");
-	assert!(report.bytes.starts_with(b"driver.virtio-snd: online ("), "unexpected driver report: {:?}", core::str::from_utf8(&report.bytes));
-	let service = report.caps.first().expect("the driver transfers its service channel").object().clone().into_any_arc().downcast::<object::channel::Channel>().expect("the service channel is a channel");
+	// THE TYPED FRAME, NOT THE HUMAN LINE. This asserted on the exact text of the driver's report -
+	// so changing a boot line's wording could break a bring-up test, which is the load-bearing
+	// sentence this milestone removed.
+	let offers = recv_offers(&kernel_ep, key.generation).expect("the virtio-snd driver should report READY");
+	let service = offer_of(&offers, driver_protocol::provider::AUDIO).expect("the driver offers its audio provider").into_any_arc().downcast::<object::channel::Channel>().expect("the service channel is a channel");
 
 	// One capture period. The reply is the period itself; an EMPTY reply is the driver saying this
 	// device has no input stream, which on the test configuration would mean the device or the

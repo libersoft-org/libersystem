@@ -30,6 +30,18 @@ SECTIONS
 	.rodata : {
 		*(.rodata .rodata.*)
 		*(.srodata .srodata.*)
+		/* THE DRIVER PROTOCOL NOTE, KEPT ON PURPOSE.
+		 *
+		 * It declares the bring-up protocol version a driver speaks, and it is read from the
+		 * PACKAGED artifact before the driver is given a device - so it has to survive two things
+		 * that would otherwise remove it: the `/DISCARD/` below, which throws away every `.note.*`
+		 * section, and `llvm-strip --strip-all` in `mkpackages`. The section name is one the
+		 * discard does not match, `KEEP` stops `--gc-sections` taking it, and living inside
+		 * `.rodata` makes it SHF_ALLOC, which is what `--strip-all` leaves alone.
+		 *
+		 * A note that vanished would fail SILENTLY: every driver would read as having none, which
+		 * is indistinguishable from a driver that declares no version. */
+		KEEP(*(.liberdrv.note))
 	} :rodata
 
 	. = ALIGN(CONSTANT(MAXPAGESIZE));

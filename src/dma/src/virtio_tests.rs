@@ -75,7 +75,7 @@ fn config_bytes() -> Vec<u8> {
 fn backend(wire: Wire) -> VirtioIommu<Wire> {
 	let config = Config::parse(&config_bytes()).expect("a valid config");
 	let features = negotiate(REQUIRED | F_BYPASS_CONFIG).expect("negotiated");
-	VirtioIommu::new(wire, config, features, Generation(1)).expect("a backend")
+	VirtioIommu::new(wire, config, features).expect("a backend")
 }
 
 #[test]
@@ -229,7 +229,7 @@ fn a_domain_built_from_a_probe_never_allocates_inside_a_region_the_endpoint_rese
 	let reserved: Vec<Reserved> = regions.iter().filter(|r| r.kind == RegionKind::Reserved).map(|r| Reserved { base: r.base, len: r.len }).collect();
 	let config = Config::parse(&config_bytes()).expect("valid");
 	let features = negotiate(REQUIRED | F_BYPASS_CONFIG).expect("negotiated");
-	let device = VirtioIommu::new(Wire::ok(), config, features, Generation(1)).expect("a backend");
+	let device = VirtioIommu::new(Wire::ok(), config, features).expect("a backend");
 	let mut iommu = Iommu::new(device, 8);
 	let domain = iommu.create_domain(0x1000, 0x4000, reserved, Generation(1)).expect("a domain");
 	let endpoint = EndpointId(0x0100);
@@ -308,7 +308,7 @@ fn the_whole_contract_runs_against_this_backend_exactly_as_it_does_against_the_f
 	// `fake`, and here they drive a real codec with no change at all.
 	let config = Config::parse(&config_bytes()).expect("valid");
 	let features = negotiate(REQUIRED | F_BYPASS_CONFIG).expect("negotiated");
-	let device = VirtioIommu::new(Wire::ok(), config, features, Generation(1)).expect("a backend");
+	let device = VirtioIommu::new(Wire::ok(), config, features).expect("a backend");
 	assert!(device.enforces_directions(), "an enforcing profile needs all three directions");
 	let mut iommu = Iommu::new(device, 8);
 	let domain = iommu.create_domain(0x1000, 0x10_0000, Vec::new(), Generation(1)).expect("a domain");
@@ -357,18 +357,24 @@ fn a_fault_names_the_domain_of_the_endpoint_that_raised_it() {
 }
 
 #[test]
-fn a_binding_is_stamped_with_the_generation_it_was_made_under() {
-	// A rebind moves the generation, and the bindings made before it do not move with it: a fault
-	// from the older binding must still name the generation that binding was made under, which is
-	// what lets a stale completion be told from a current one.
+fn the_backend_names_the_domain_and_leaves_the_generation_to_whoever_owns_domains() {
+	// THIS LAYER DOES NOT ANSWER "WHICH BINDING IS THIS". It used to: the struct held a
+	// controller-wide generation with a `set_generation` setter, and every row of `attached` was
+	// stamped from it - a second answer running in parallel with the one the domain carries, and a
+	// stale-generation refusal cannot be decided by two answers. The domain's is the one the kernel
+	// mints, so the domain's is the one that stayed.
+	//
+	// What is left here is what this layer really knows: the endpoint the device named, and the
+	// domain that endpoint is attached to. `Generation(0)` is the absence of an answer rather than a
+	// binding being named - no binding ever carries it, because generations start at 1.
 	let mut wire = Wire::ok();
 	wire.events.push(fault_event(0x0100, 0x1000));
 	let mut iommu = backend(wire);
 	iommu.attach(DomainId(1), EndpointId(0x0100)).expect("attached");
-	iommu.set_generation(Generation(7));
 	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: None, access: Access::Read, reason: Fault::NotMapped }; 2];
 	assert_eq!(iommu.drain_faults(&mut out), 1);
-	assert_eq!(out[0].generation, Generation(1), "the generation the binding was made under, not the one current now");
+	assert_eq!(out[0].domain, DomainId(1), "the domain this endpoint is attached to, which this layer does know");
+	assert_eq!(out[0].generation, Generation(0), "and no generation, because this layer does not hold one");
 }
 
 // A device that publishes a probe buffer, which the ordinary fixture does not: the two are different
@@ -378,7 +384,7 @@ fn probing_backend(wire: Wire, probe_size: u32) -> VirtioIommu<Wire> {
 	bytes[32..36].copy_from_slice(&probe_size.to_le_bytes());
 	let config = Config::parse(&bytes).expect("a valid config");
 	let features = negotiate(REQUIRED | F_BYPASS_CONFIG | F_PROBE).expect("features");
-	VirtioIommu::new(wire, config, features, Generation(1)).expect("a backend")
+	VirtioIommu::new(wire, config, features).expect("a backend")
 }
 
 #[test]

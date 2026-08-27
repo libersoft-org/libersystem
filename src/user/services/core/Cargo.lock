@@ -56,6 +56,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "driver-binding"
+version = "0.0.0"
+dependencies = [
+ "driver-protocol",
+]
+
+[[package]]
+name = "driver-protocol"
+version = "0.0.0"
+dependencies = [
+ "abi",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -294,6 +308,8 @@ version = "0.0.0"
 dependencies = [
  "abi",
  "bootproto",
+ "driver-binding",
+ "driver-protocol",
  "ipc-client",
  "keys",
  "pcm",
@@ -306,6 +322,7 @@ dependencies = [
  "system-manifest",
  "term",
  "wasm",
+ "wire",
 ]
 
 [[package]]

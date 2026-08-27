@@ -51,6 +51,13 @@ development = []
 # Shared ring-3 userspace runtime (entry stub, syscall wrapper, panic handler, and
 # the syscall/IPC helpers); it re-exports the abi constants.
 rt = { path = "../../runtime/rt" }
+# THE BRING-UP WIRE. One frame format shared with DeviceManager, so the two cannot drift: the note a
+# driver carries and the `version` on every frame it sends come from the same constant.
+driver-protocol = { path = "../../libs/driver/protocol" }
+# The bounded transferred-handle list the capability-aware receive answers with. The ordinary
+# receive takes the first and drops the rest, which is silent loss on a path this protocol treats as
+# hostile input.
+wire = { path = "../../../wire" }
 
 # The generated liber:system bindings - the xHCI driver serves the typed `usb`
 # inventory contract on its query channel.

@@ -183,6 +183,39 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	extern "C" fn stamp(_arg: u64) {
 		RAN_AT.store(1, Ordering::SeqCst);
 	}
+	// WHAT TWENTY REMOTE SPAWNS COST IN CYCLES, with or without the wake.
+	//
+	// TICKS CANNOT RESOLVE THIS AND CYCLES CAN. Counting tick boundaries replaced a 4 ms wall-clock
+	// bound, and it discriminates only while a trip is SHORTER than a tick: at 100 Hz that is 10 ms,
+	// and a cross-core spawn under TCG can exceed it - measured on aarch64 at 8 cores on 2026-08-27,
+	// where the woken trip and the suppressed one BOTH crossed exactly one boundary and there was
+	// nothing left to compare. The generic timer counts at tens of megahertz on every port, so the
+	// difference the tick rounds away is thousands of cycles wide.
+	//
+	// THE SUM, NOT THE BEST. Best-of-twenty is wrong for the control: without the wake a trip waits
+	// for the target core's next interrupt, so the LUCKIEST of twenty is the one where that
+	// interrupt was about to fire anyway - which measures nothing. Summed over twenty, an unwoken
+	// trip pays half a tick period on average and a woken one pays none, and that difference is
+	// large next to what the emulator adds to both.
+	fn cycles_over_twenty(wake: bool) -> u64 {
+		use core::sync::atomic::Ordering;
+		let mut total: u64 = 0;
+		for _ in 0..20 {
+			RAN_AT.store(0, Ordering::SeqCst);
+			let start = arch::tsc::now();
+			if wake {
+				sched::spawn_on(1, stamp, 0);
+			} else {
+				sched::spawn_on_unwoken(1, stamp, 0);
+			}
+			while RAN_AT.load(Ordering::SeqCst) == 0 {
+				core::hint::spin_loop();
+			}
+			total = total.saturating_add(arch::tsc::now().wrapping_sub(start));
+		}
+		total
+	}
+
 	if smp::cpu_count() < 2 {
 		return;
 	}
@@ -215,17 +248,105 @@ fn a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick() {
 	// shared host where that fraction is not stable. Twenty trips make "every single one of them
 	// happened to straddle a tick" the only way to pass wrongly, and that is what a broken IPI
 	// looks like: without it, crossing is not luck but the mechanism.
-	let mut best = u64::MAX;
-	for _ in 0..20 {
-		RAN_AT.store(0, Ordering::SeqCst);
-		let start = arch::apic::ticks();
-		sched::spawn_on(1, stamp, 0);
-		while RAN_AT.load(Ordering::SeqCst) == 0 {
-			core::hint::spin_loop();
-		}
-		best = best.min(arch::apic::ticks().wrapping_sub(start));
+	// AND A CONTROL, BECAUSE THE ABSOLUTE NUMBER DOES NOT SURVIVE EMULATION.
+	//
+	// The same twenty trips are measured twice on the same machine, in the same run, differing only
+	// in whether the wake is sent - so the emulator, the host load and the scheduler are paid by both
+	// sides and cancel. What is left is the IPI: without it the target core sits halted until its
+	// next interrupt, which costs half a tick period per trip on average and nothing at all with it.
+	//
+	// A warmup first, whose result is not counted: the first cross-core spawn pays one-time costs.
+	RAN_AT.store(0, Ordering::SeqCst);
+	sched::spawn_on(1, stamp, 0);
+	while RAN_AT.load(Ordering::SeqCst) == 0 {
+		core::hint::spin_loop();
 	}
-	assert_eq!(best, 0, "every one of twenty remote spawns crossed a tick boundary: the wake IPI did not reach the halted core");
+	let woken = cycles_over_twenty(true);
+	let unwoken = cycles_over_twenty(false);
+	// THE THRESHOLD IS DERIVED FROM WHAT IS BEING MEASURED, not chosen.
+	//
+	// If the target core really sits halted until its next tick, twenty suppressed trips pay half a
+	// tick period each - ten tick periods, which is a tenth of a second, which is `hz / 10` cycles.
+	// A quarter of that is asked for, so noise has room and the signal does not have to be perfect.
+	//
+	// AND A DIFFERENCE FAR BELOW IT IS NOT A FAILURE. It means the core is NOT staying halted: under
+	// TCG the guest takes interrupts often enough that `idle_halt` returns almost at once, so the
+	// wake saves nothing measurable and a broken one would cost nothing either. Measured on aarch64
+	// at 8 cores on 2026-08-27: 25,778,695 cycles woken against 25,902,205 suppressed - half a
+	// percent, which passed a bare `<` and would have failed the next run for no reason. x86_64 the
+	// same day: 46,899,458 against 520,103,828, which is the signal this test is for.
+	let expected = arch::tsc::hz() / 10;
+	let margin = expected / 4;
+	crate::serial_println!("    twenty remote spawns: {woken} cycles woken, {unwoken} suppressed (a halted core would cost about {expected} more)");
+	if unwoken >= woken.saturating_add(margin) {
+		return;
+	}
+	assert!(woken < unwoken.saturating_add(margin), "twenty woken remote spawns cost {woken} cycles and twenty with the wake suppressed cost {unwoken}: the wake made it WORSE, which no scheduling accident explains");
+	crate::serial_println!("    the two are within {margin} cycles of each other - this machine's idle cores do not stay halted long enough for the wake to save anything, so there is nothing here to measure");
+}
+
+crate::tagged_test!(a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself, [Scheduler, Kernel], id = "kernel.sched.a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself", covers = ["kernel"]);
+fn a_bounded_drain_gives_up_on_a_thread_that_keeps_requeueing_itself() {
+	// THE HALF A CAPPED WAIT DOES NOT COVER.
+	//
+	// `run_until_idle` is `while !run_queue.is_empty() { reschedule(Requeue) }` and only THEN a
+	// bounded wait. A thread that yields and requeues itself keeps the queue non-empty for as long
+	// as it likes, so a caller that bounded only the wait would have bounded nothing against exactly
+	// the workload a boot failing to settle produces.
+	//
+	// AND THE DRAIN CANNOT CHECK ITS OWN DEADLINE EITHER, which is what this test proved by hanging
+	// for three minutes when it was written that way: `reschedule` stashes the pump's stack in the
+	// core's IDLE slot rather than requeueing it as a thread, so the pump resumes only when
+	// `pop_front()` finds nothing. The deadline lives on `CpuSched` and is read where the switch is
+	// decided.
+	use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+	static STOP: AtomicBool = AtomicBool::new(false);
+	static SPINS: AtomicU64 = AtomicU64::new(0);
+	extern "C" fn yielder(_arg: u64) {
+		while !STOP.load(Ordering::SeqCst) {
+			SPINS.fetch_add(1, Ordering::SeqCst);
+			sched::yield_now();
+		}
+	}
+	STOP.store(false, Ordering::SeqCst);
+	SPINS.store(0, Ordering::SeqCst);
+	sched::spawn(yielder, 0);
+	let deadline = arch::apic::ticks() + 3;
+	let idled = sched::run_until_idle_until(deadline);
+	assert!(!idled, "a thread that requeues itself never lets the queue empty, so this cannot have idled");
+	assert!(arch::apic::ticks() >= deadline, "and it came back because the deadline passed");
+	assert!(SPINS.load(Ordering::SeqCst) > 0, "the thread did run - this is a bounded drain, not a refused spawn");
+	// Let it finish so the queue is clean for whatever runs next.
+	STOP.store(true, Ordering::SeqCst);
+	sched::run_until_idle();
+}
+
+crate::tagged_test!(a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer, [Scheduler, Kernel], id = "kernel.sched.a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer", covers = ["kernel"]);
+fn a_bounded_wait_wakes_on_the_callers_window_and_not_the_nearest_timer() {
+	// THE OTHER HALF: a thread that WAITS past the window.
+	//
+	// With nothing runnable, the wait sleeps to the nearest progress deadline - and if that is
+	// further away than the caller's window, sleeping to it overshoots by the difference. So the
+	// wait sleeps to whichever comes first, and this is the case where they differ.
+	use core::sync::atomic::{AtomicBool, Ordering};
+	static WOKE: AtomicBool = AtomicBool::new(false);
+	extern "C" fn sleeper(_arg: u64) {
+		// A koid nothing ever signals, so only the deadline can end this wait.
+		sched::block_on(u64::MAX, arch::apic::ticks() + 500);
+		WOKE.store(true, Ordering::SeqCst);
+	}
+	WOKE.store(false, Ordering::SeqCst);
+	sched::spawn(sleeper, 0);
+	// Let it reach the block, so the run queue is empty and the wait is what runs.
+	let settle = arch::apic::ticks() + 2;
+	sched::run_until_idle_until(settle);
+	let deadline = arch::apic::ticks() + 3;
+	let idled = sched::run_until_idle_until(deadline);
+	let after = arch::apic::ticks();
+	assert!(!idled, "a thread blocked on a far deadline is not an idle machine");
+	assert!(after >= deadline, "the wait returned at the window");
+	assert!(after < deadline + 100, "and NOT at the sleeper's own deadline, which is hundreds of ticks away: got {after}, window ended at {deadline}");
+	assert!(!WOKE.load(Ordering::SeqCst), "the sleeper has not been woken - this measured the wait, not its subject");
 }
 
 crate::tagged_test!(scheduler_runs_across_cores, [Scheduler], id = "kernel.sched.scheduler_runs_across_cores", covers = ["kernel"]);

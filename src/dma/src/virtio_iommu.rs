@@ -371,26 +371,29 @@ pub struct VirtioIommu<T: Transport> {
 	config: Config,
 	features: u64,
 	next_domain: u32,
-	// Every live binding: which domain an endpoint is in, and the generation it was attached under.
+	// Every live binding: which domain an endpoint is in.
 	//
 	// THE DEVICE REPORTS AN ENDPOINT AND NOTHING ELSE. A fault event names the requester that
-	// faulted; which domain that requester is in, and which binding of it, is knowledge only this
-	// side has - so it is kept here rather than guessed at from whichever binding happens to be
-	// first. The generation is stamped at attach so a later rebind does not restamp the bindings
-	// that came before it.
-	attached: Vec<(DomainId, EndpointId, Generation)>,
-	// The generation the NEXT attach is stamped with. The kernel owns what it means; this holds it.
-	generation: Generation,
+	// faulted; which domain that requester is in is knowledge only this side has - so it is kept
+	// here rather than guessed at from whichever binding happens to be first.
+	//
+	// AND NOT WHICH BINDING. This used to carry a `Generation` too, stamped from a controller-wide
+	// value this struct held and a `set_generation` that moved it. That made two parallel answers to
+	// "which binding is this" - one here and one on the domain, one layer up - and two answers to
+	// that question cannot both be what a stale-generation refusal is decided by. The domain's is
+	// the one the kernel mints, so the domain's is the one that survives; this layer reports the
+	// endpoint and the domain and leaves the generation to whoever owns domains.
+	attached: Vec<(DomainId, EndpointId)>,
 }
 
 impl<T: Transport> VirtioIommu<T> {
 	// Build a backend from a device that has already been probed. `features` must be what
 	// `negotiate` returned for what the device offered, and `config` what it published.
-	pub fn new(transport: T, config: Config, features: u64, generation: Generation) -> Result<Self, Fault> {
+	pub fn new(transport: T, config: Config, features: u64) -> Result<Self, Fault> {
 		if features & REQUIRED != REQUIRED {
 			return Err(Fault::Unconfirmed);
 		}
-		Ok(Self { transport, config, features, next_domain: config.domain_start.max(1), attached: Vec::new(), generation })
+		Ok(Self { transport, config, features, next_domain: config.domain_start.max(1), attached: Vec::new() })
 	}
 
 	pub fn config(&self) -> &Config {
@@ -407,10 +410,6 @@ impl<T: Transport> VirtioIommu<T> {
 	#[cfg(test)]
 	pub fn transport(&self) -> &T {
 		&self.transport
-	}
-
-	pub fn set_generation(&mut self, generation: Generation) {
-		self.generation = generation;
 	}
 
 	fn send(&mut self, request: &[u8]) -> Result<Confirmed, Fault> {
@@ -448,7 +447,7 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		// cannot have. `Iommu::revoke_endpoint` takes every translation down while the endpoint is
 		// still attached and only then detaches, so by the time this is reached the domain has
 		// nothing left to translate.
-		let attached: Vec<EndpointId> = self.attached.iter().filter(|(d, _, _)| *d == domain).map(|(_, e, _)| *e).collect();
+		let attached: Vec<EndpointId> = self.attached.iter().filter(|(d, _)| *d == domain).map(|(_, e)| *e).collect();
 		for endpoint in attached {
 			self.detach(domain, endpoint)?;
 		}
@@ -462,13 +461,13 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		// FLAGS ZERO, and deliberately so: `VIRTIO_IOMMU_ATTACH_F_BYPASS` attaches an endpoint that
 		// is not translated at all, which is the one thing an enforcing profile must never send.
 		let confirmed = self.send(&encode_attach(domain.0, endpoint.0, 0))?;
-		self.attached.push((domain, endpoint, self.generation));
+		self.attached.push((domain, endpoint));
 		Ok(confirmed)
 	}
 
 	fn detach(&mut self, domain: DomainId, endpoint: EndpointId) -> Result<Confirmed, Fault> {
 		let confirmed = self.send(&encode_detach(domain.0, endpoint.0))?;
-		self.attached.retain(|(d, e, _)| !(*d == domain && *e == endpoint));
+		self.attached.retain(|(d, e)| !(*d == domain && *e == endpoint));
 		Ok(confirmed)
 	}
 
@@ -514,12 +513,13 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 			// device named the wrong domain, and the quarantine and stale-generation decisions
 			// taken on it were about a binding that had not faulted. An endpoint this side has no
 			// binding for keeps `DomainId(0)`, which is not a domain this backend ever hands out.
-			let Ok(mut event) = decode_fault(&raw[..taken.min(FAULT_LEN)], self.generation, DomainId(0)) else {
+			// `Generation(0)` is this layer saying it does not know, not a binding it is naming: the
+			// generation is filled in by the caller from the domain, which is where it is held.
+			let Ok(mut event) = decode_fault(&raw[..taken.min(FAULT_LEN)], Generation(0), DomainId(0)) else {
 				continue;
 			};
-			if let Some((domain, _, generation)) = self.attached.iter().find(|(_, e, _)| *e == event.endpoint) {
+			if let Some((domain, _)) = self.attached.iter().find(|(_, e)| *e == event.endpoint) {
 				event.domain = *domain;
-				event.generation = *generation;
 			}
 			out[written] = event;
 			written += 1;
