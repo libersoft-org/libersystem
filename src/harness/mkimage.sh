@@ -529,7 +529,9 @@ make_img() {
 		fi
 		dd if="$volume" of="$out" bs=512 seek="$sys_start" conv=notrunc status=none
 	else
-		echo "mkimage: no system volume at $volume; the image has an empty system partition" >&2
+		# UNREACHABLE, and a `die` rather than a warning because the preflight above refuses this
+		# command without the volume. If it is ever reached, the tree grew a second path here.
+		die "no system volume at $volume - build it with:  ./build.sh --arch x86_64 --kernel-on-volume --part volume"
 	fi
 	mv "$out" "$final"
 
@@ -569,6 +571,19 @@ esac
 # computed - hashing inputs that do not all exist would cache a decision made on a partial tree.
 # The kernel is checked here as the ELF it was given; the builders re-check the stripped copy.
 verify_boot_artifacts "$kernel"
+
+# AND THE SHIPPING MEDIA REQUIRE THE VOLUME THEY CARRY, BEFORE ANY OF IT.
+#
+# `img` used to warn - "the image has an empty system partition" - and then publish the disk anyway,
+# which is precisely the shape P02M0160 M3 exists to remove: silently wrong rather than loudly
+# absent. A medium whose whole purpose is to carry a system volume, published without one, is a
+# medium that fails at boot with nothing on it to explain why.
+if [[ "$cmd" != testiso ]]; then
+	for required in "$BUILD/system-volume-bootable-x86_64.img" "$BUILD/system-volume-bootable-x86_64.uuid"; do
+		[[ -f "$required" ]] || die "no $required - build it with:  ./build.sh --arch x86_64 --kernel-on-volume --part volume"
+	done
+fi
+
 key_file="$output.build-key"
 digest_file="$output.build-digest"
 
@@ -597,17 +612,26 @@ image_input_key() {
 	else
 		printf 'bootstrap=absent\n'
 	fi
-	# The pairing sidecar, which decides which volume the medium declares itself paired with.
-	local uuid_file="$BUILD/system-volume-bootable-x86_64.uuid"
-	if [[ -f "$uuid_file" ]]; then
-		sha256sum "$uuid_file"
-	else
-		printf 'pairing=absent\n'
-	fi
-	# BOTH payloads are hashed, whichever medium is being built: the shipping ISO carries the
-	# system volume and the test ISO the archive, and keying on only one would serve a stale image
-	# whenever the other changed. `mode=` above already separates the two outputs.
-	sha256sum "$0" "$REPO_ROOT/src/tools/stage-kernel.sh" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg" "$BUILD/volume-x86_64.pkg" "$BUILD/system-volume-bootable-x86_64.img"
+	# EACH MEDIUM IS KEYED ON WHAT IT CARRIES, and this hashed both payloads for all three.
+	#
+	# The comment here used to argue that "keying on only one would serve a stale image whenever the
+	# other changed", which mistakes two outputs for two sets of inputs: `mode=` above already gives
+	# the shipping ISO and the test ISO different keys, so each one keying on its OWN payload cannot
+	# collide with the other. What the old rule did instead was make `testiso` - which carries the
+	# factory archive and no volume at all - depend on the bootable volume: on a clean tree that is
+	# `sha256sum` failing on a missing file, before the preflight that would have explained it.
+	sha256sum "$0" "$REPO_ROOT/src/tools/stage-kernel.sh" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg"
+	case "$cmd" in
+	testiso)
+		# The archive it stages, and nothing about a volume it does not carry.
+		sha256sum "$BUILD/volume-x86_64.pkg"
+		;;
+	*)
+		# The bootable volume and the pairing sidecar that says which volume this medium declares
+		# itself paired with. Both are required before the key is computed - see the check above.
+		sha256sum "$BUILD/system-volume-bootable-x86_64.img" "$BUILD/system-volume-bootable-x86_64.uuid"
+		;;
+	esac
 }
 
 key="$(image_input_key | sha256sum | awk '{print $1}')"
