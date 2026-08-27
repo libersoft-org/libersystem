@@ -112,6 +112,54 @@ impl BindingState {
 	}
 }
 
+// WHY A NODE IS IN `Stopping`, which is what decides where it goes next.
+//
+// P02M0162's table sends a CONFIRMED teardown on to `Backoff` and then back to `Binding` - which is
+// right for a driver that died and exactly wrong for one that was asked to stop: the operator stops
+// it and it starts again. The intent is what `Stopping` resolves against, and there are four.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub enum StopIntent {
+	// It crashed, exited, or stopped answering. The ordinary path, and the default.
+	#[default]
+	Fault,
+	// A provider it declared in `requires` went away.
+	DependencyLost,
+	// An operator disabled it. Where it lands is P02M0166's `Disabled`.
+	OperatorDisable,
+	// The machine is going down. No further state is entered at all - the manager is going away, so
+	// there is no next binding to describe.
+	Shutdown,
+}
+
+impl StopIntent {
+	// Where a CONFIRMED teardown under this intent lands, or None for one that describes no next
+	// state because nothing will read it.
+	//
+	// AN UNCONFIRMED TEARDOWN IS NOT HERE, and that is the point: it ends at `Quarantined` whatever
+	// the intent was, because what is unknown is whether the device is still live and no intent
+	// changes that.
+	pub fn confirmed_lands_at(self, attempts_left: bool) -> Option<BindingState> {
+		match self {
+			StopIntent::Fault => Some(if attempts_left { BindingState::Backoff } else { BindingState::Failed }),
+			StopIntent::DependencyLost => Some(BindingState::DependencyPending),
+			// P02M0166 adds `Disabled` and this arm with it; until then an operator disable lands
+			// where a spent budget does, which is terminal and honest rather than a state that does
+			// not exist yet.
+			StopIntent::OperatorDisable => Some(BindingState::Failed),
+			StopIntent::Shutdown => None,
+		}
+	}
+
+	pub fn name(self) -> &'static [u8] {
+		match self {
+			StopIntent::Fault => b"a fault",
+			StopIntent::DependencyLost => b"a dependency it declared went away",
+			StopIntent::OperatorDisable => b"an operator disabled it",
+			StopIntent::Shutdown => b"the machine is going down",
+		}
+	}
+}
+
 // WHY A BINDING IS NOT UP.
 //
 // EVERY VARIANT ANSWERS WHETHER IT IS RETRYABLE, in one place. A flag some variants leave unset is a
@@ -256,12 +304,15 @@ pub enum BindingEvent {
 	Ponged { generation: u64, sequence: u32 },
 	// Its control path stopped answering inside the deadline its registry entry declared.
 	Wedged { generation: u64 },
+	// It answered a `STOP`: everything it accepted is finished or abandoned and its device is quiet.
+	// A PLANNED stop completing, which is a different fact from a channel that simply closed.
+	Stopped { generation: u64 },
 }
 
 impl BindingEvent {
 	pub fn generation(self) -> u64 {
 		match self {
-			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } | BindingEvent::Ponged { generation, .. } | BindingEvent::Wedged { generation } => generation,
+			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } | BindingEvent::Ponged { generation, .. } | BindingEvent::Wedged { generation } | BindingEvent::Stopped { generation } => generation,
 		}
 	}
 }

@@ -427,3 +427,48 @@ fn a_provider_belongs_to_a_binding_and_not_to_a_device() {
 	assert!(before.binding != after.binding, "different bindings");
 	assert!(before.binding.same_function(after.binding), "same device");
 }
+
+// ------------------------------------------------------- the stop intent
+
+#[test]
+fn a_confirmed_teardown_lands_where_the_intent_says_and_not_where_a_fault_would() {
+	// THE CASE THE INTENT EXISTS FOR. P02M0162's table sends a confirmed teardown on to `Backoff`
+	// and then back to `Binding`, which is right for a driver that died and exactly wrong for one
+	// that was asked to stop: the operator stops it and it starts again.
+	assert!(StopIntent::Fault.confirmed_lands_at(true) == Some(BindingState::Backoff));
+	assert!(StopIntent::Fault.confirmed_lands_at(false) == Some(BindingState::Failed), "no attempts left");
+	assert!(StopIntent::DependencyLost.confirmed_lands_at(true) == Some(BindingState::DependencyPending));
+	assert!(StopIntent::DependencyLost.confirmed_lands_at(false) == Some(BindingState::DependencyPending), "a lost dependency is not spent by attempts");
+	assert!(StopIntent::OperatorDisable.confirmed_lands_at(true) != Some(BindingState::Backoff), "an operator's stop must not start it again");
+	// A shutdown describes NO next state: the manager is going away, so there is no next binding for
+	// a state to be about, and entering one nobody will read is a state nobody wrote down.
+	assert!(StopIntent::Shutdown.confirmed_lands_at(true).is_none());
+	assert!(StopIntent::Shutdown.confirmed_lands_at(false).is_none());
+}
+
+#[test]
+fn every_intent_reaches_a_state_the_table_allows_from_stopping() {
+	// A verdict the table refuses is a node stuck in `Stopping` for ever, which is the shape a
+	// state machine defect takes when the two halves are written apart.
+	for intent in [StopIntent::Fault, StopIntent::DependencyLost, StopIntent::OperatorDisable] {
+		for attempts_left in [true, false] {
+			let Some(landed) = intent.confirmed_lands_at(attempts_left) else { continue };
+			assert!(BindingState::Stopping.may_move_to(landed), "{:?} is not reachable from stopping", core::str::from_utf8(landed.name()).unwrap_or("?"));
+		}
+	}
+}
+
+#[test]
+fn an_unconfirmed_teardown_ignores_the_intent_entirely() {
+	// What is unknown is whether the DEVICE is still live, and no intent changes that. Walked
+	// rather than asserted about a value: every intent's node ends in the same place.
+	for intent in [StopIntent::Fault, StopIntent::DependencyLost, StopIntent::OperatorDisable, StopIntent::Shutdown] {
+		let mut record = BindingRecord::new();
+		assert!(record.move_to(BindingState::Binding, None));
+		assert!(record.move_to(BindingState::Online, None));
+		assert!(record.move_to(BindingState::Stopping, Some(FailureCause::DriverExited)));
+		// The teardown did not confirm. The intent is not consulted.
+		assert!(record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed)));
+		assert!(record.state == BindingState::Quarantined, "{:?} still ends quarantined", core::str::from_utf8(intent.name()).unwrap_or("?"));
+	}
+}

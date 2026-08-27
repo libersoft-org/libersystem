@@ -62,8 +62,8 @@ fn a_version_this_build_does_not_implement_is_refused_and_named() {
 fn an_unknown_opcode_is_refused_rather_than_accepted_as_some_message_arriving() {
 	// Which is the whole of what happens today: `launch_one` treats any message as success.
 	let mut bytes = header(Opcode::Ready, 1, 0).encode();
-	// 6 is `Withdraw` and is a real opcode; 7 is the next unallocated one.
-	for raw in [0u16, 7, 8, 0xffff] {
+	// 1 through 10 are allocated; 11 is the next one that is not.
+	for raw in [0u16, 11, 12, 0xffff] {
 		bytes[6..8].copy_from_slice(&raw.to_le_bytes());
 		assert_eq!(Header::decode(&bytes), Err(FrameError::UnknownOpcode(raw)), "opcode {raw}");
 	}
@@ -220,4 +220,92 @@ fn an_offer_payload_of_the_old_length_is_refused_rather_than_read_short() {
 	// form would read a token of whatever followed - so the length is exact, not a minimum.
 	assert_eq!(decode_offer(&[1, 0]), Err(FrameError::PayloadShape));
 	assert_eq!(decode_offer(&[1, 0, 0, 0, 0]), Err(FrameError::PayloadShape));
+}
+
+// ------------------------------------------------------- the heartbeat
+//
+// WHAT `rt::heartbeat` GETS WRONG, refused here one case at a time. That one returns true for ANY
+// `Polled::Message`, so a driver emitting unrelated traffic reads as responsive and a busy driver
+// and a wedged one look the same. A `PING`/`PONG` that was only ADDED, and never proved to refuse
+// the three things the old one accepted, would leave a wedged driver looking healthy for exactly
+// the same reason it does now.
+
+#[test]
+fn a_ping_carries_a_sequence_and_nothing_else() {
+	// NOT THE GENERATION: it is in the frame HEADER, on every frame in both directions, so a second
+	// copy in the body is a second thing that can disagree with the first.
+	assert_eq!(Opcode::from_u16(7), Some(Opcode::Ping));
+	assert_eq!(Opcode::from_u16(8), Some(Opcode::Pong));
+	assert_eq!(Opcode::Ping.handle_count(), 0);
+	assert_eq!(Opcode::Pong.handle_count(), 0);
+	assert!(!Opcode::Ping.is_terminal(), "a ping does not end the handshake; it happens long after it");
+	assert!(!Opcode::Pong.is_terminal());
+	let mut payload = [0u8; SEQUENCE_PAYLOAD_LEN];
+	assert_eq!(encode_sequence(0x0102_0304, &mut payload), SEQUENCE_PAYLOAD_LEN);
+	assert_eq!(decode_sequence(&payload), Ok(0x0102_0304));
+	// The length is exact, not a minimum: a short payload read as a sequence would answer with
+	// whatever followed it.
+	assert_eq!(decode_sequence(&[1, 0]), Err(FrameError::PayloadShape));
+	assert_eq!(decode_sequence(&[1, 0, 0, 0, 0]), Err(FrameError::PayloadShape));
+}
+
+#[test]
+fn a_frame_with_the_wrong_opcode_is_not_a_pong() {
+	// The first of the three `rt::heartbeat` accepts. Every other opcode this protocol has is a
+	// legitimate frame that is NOT an answer to "are you still answering", and the difference is a
+	// comparison rather than "something arrived".
+	for other in [Opcode::Bind, Opcode::Resource, Opcode::Offer, Opcode::Ready, Opcode::Failed, Opcode::Withdraw, Opcode::Ping] {
+		assert_ne!(other, Opcode::Pong, "{other:?} is not a pong");
+	}
+}
+
+#[test]
+fn a_pong_stamped_with_another_generation_is_another_bindings_pong() {
+	// The second. A driver being replaced cannot answer for its replacement: the generation is on
+	// every frame's header, so the two are told apart by arithmetic rather than by timing.
+	let mut payload = [0u8; SEQUENCE_PAYLOAD_LEN];
+	encode_sequence(4, &mut payload);
+	let old = Header { version: VERSION, opcode: Opcode::Pong, generation: 1, payload_len: payload.len() as u32 };
+	let new = Header { version: VERSION, opcode: Opcode::Pong, generation: 2, payload_len: payload.len() as u32 };
+	assert_ne!(old.generation, new.generation);
+	// Both decode; what separates them is which binding is being asked about, and nothing in the
+	// body can say it - which is the whole reason the generation is in the header.
+	let mut bytes = old.encode().to_vec();
+	bytes.extend_from_slice(&payload);
+	assert_eq!(Header::decode(&bytes).map(|header| header.generation), Ok(1));
+}
+
+#[test]
+fn an_out_of_order_sequence_is_a_different_number_and_that_is_the_whole_check() {
+	// The third, and the one `rt::heartbeat` cannot express at all: it has no number to compare.
+	// A duplicate, an answer from an earlier round, or one invented are all "not the sequence that
+	// was asked", which is one comparison rather than three special cases.
+	let mut asked = [0u8; SEQUENCE_PAYLOAD_LEN];
+	let mut answered = [0u8; SEQUENCE_PAYLOAD_LEN];
+	encode_sequence(7, &mut asked);
+	for stale in [6u32, 8, 0, u32::MAX] {
+		encode_sequence(stale, &mut answered);
+		assert_ne!(decode_sequence(&asked), decode_sequence(&answered), "{stale} is not 7");
+	}
+	encode_sequence(7, &mut answered);
+	assert_eq!(decode_sequence(&asked), decode_sequence(&answered));
+}
+
+#[test]
+fn the_cadence_comes_out_of_the_deadline_and_is_never_zero() {
+	// A period of zero is either a busy loop or - `wait_any` reading 0 as no timeout - no bound at
+	// all. Both are the failures this arithmetic exists to prevent, reached BY the arithmetic.
+	assert_eq!(heartbeat_period(1), 1, "half of 1 rounds up to 1, never to 0");
+	assert_eq!(heartbeat_period(2), 1);
+	assert_eq!(heartbeat_period(3), 2, "rounded UP, so a longer deadline is pinged less often");
+	assert_eq!(heartbeat_period(100), 50);
+	// Monotonic in the deadline: an entry asking for longer is never pinged MORE often.
+	let mut previous = 0;
+	for deadline in 1..=MAX_HEARTBEAT_DEADLINE {
+		let period = heartbeat_period(deadline);
+		assert!(period >= previous, "period must not fall as the deadline grows");
+		assert!(period > 0);
+		assert!(period <= deadline, "a driver always gets one whole period inside its deadline");
+		previous = period;
+	}
 }

@@ -441,7 +441,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// is: `advance` reads the event and the transaction rolls back. Anything it leaves
 			// terminal stays terminal - there is no volume to reload a driver from at this point,
 			// so a rebind is P02M0165 M6's subject and not this loop's.
-			let soonest: u64 = tick_heartbeats(&mut nodes);
+			let soonest: u64 = tick_heartbeats(&mut nodes, &mut buf);
 			for at in 0..nodes.len() {
 				let name: &[u8] = nodes[at].driver_name();
 				let _ = advance(&mut nodes[at], name, &mut catalogue);
@@ -502,10 +502,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				#[cfg(feature = "development")]
 				Received::Message { len, handle } if len >= 6 && &buf[..6] == b"DEVREG" => dev.hold_registry(handle),
 				Received::Message { .. } => {
+					// THE DRIVERS GO DOWN BEFORE THIS PROGRAM DOES, and in reverse dependency
+					// order. Answering the supervisor first and exiting would drop every driver
+					// channel at once, which is a forced revocation dressed up as a shutdown.
+					stop_all(&mut nodes, &mut catalogue, driver_binding::StopIntent::Shutdown, &mut buf);
 					send_blocking(bootstrap, b"DeviceManager: stopped", 0);
 					break;
 				}
-				Received::Closed => break,
+				Received::Closed => {
+					// The supervisor is gone and there is nobody left to answer, but the devices are
+					// still live and still this program's to quieten.
+					stop_all(&mut nodes, &mut catalogue, driver_binding::StopIntent::Shutdown, &mut buf);
+					break;
+				}
 			}
 		}
 	}
@@ -563,7 +572,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 		}
 		// THE CENTRAL WAIT, and every disk answers into it. A driver that never reports in costs
 		// its own share of the boot window and nothing else's.
-		while pump(nodes, first_node, buf) {
+		while pump(nodes, first_node, catalogue, buf) {
 			for at in first_node..nodes.len() {
 				let name: &[u8] = nodes[at].driver_name();
 				match advance(&mut nodes[at], name, catalogue) {
@@ -676,7 +685,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 		for at in first_node..nodes.len() {
 			start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 		}
-		while pump(nodes, first_node, buf) {
+		while pump(nodes, first_node, catalogue, buf) {
 			for at in first_node..nodes.len() {
 				let name: &[u8] = nodes[at].driver_name();
 				match advance(&mut nodes[at], name, catalogue) {
@@ -1016,6 +1025,9 @@ unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
 // could end a process a failed bind had started - which is what made "a failed bind leaves nothing
 // behind" untrue in the one case it is written for.
 struct Binding {
+	// The child Domain this driver runs in, and everything it allocates is charged to. Zero only
+	// where creating one failed - see `begin_bind`.
+	domain: u64,
 	process: u64,
 	channel: u64,
 	claim: u64,
@@ -1030,7 +1042,7 @@ impl Binding {
 	// in is the property that matters - so a second implementation would be a second order, and the
 	// two would agree until the day somebody changed one of them.
 	fn into_attempt(self) -> Attempt {
-		Attempt { process: self.process, channel: self.channel, claim: self.claim, key: self.key }
+		Attempt { domain: self.domain, process: self.process, channel: self.channel, claim: self.claim, key: self.key }
 	}
 }
 
@@ -1064,6 +1076,37 @@ struct Node {
 	// The heartbeat, armed when this node comes `Online` and only for an entry that declared a
 	// deadline.
 	beat: Heartbeat,
+	// The last frame this node's driver sent, and when. Two fields, kept because a capture taken
+	// after the process is gone cannot ask the process anything.
+	last_opcode: u16,
+	last_frame_at: u64,
+	// Why this node was asked to stop, if it was. `Fault` for everything that was not asked.
+	stop_intent: driver_binding::StopIntent,
+	// What the last teardown found, if there has been one. Rendered by P02M0166; kept here because
+	// the node outlives the binding it is about, which is the whole reason the node exists.
+	incident_report: Option<Diagnostic>,
+}
+
+// WHAT WAS TRUE WHEN A BINDING WENT WRONG, taken BEFORE the process is gone.
+//
+// A FIXED LIST, written down so it cannot grow into a diagnostic subsystem: the binding and its
+// generation, the state it was in, the cause, the last opcode received and how long ago, the
+// restart count, and the Domain's counters at that moment. No device payload, no memory dump, no
+// log excerpt - each of those is unbounded in a different way, and a capture whose size depends on
+// what the driver was doing is one that fails on the driver that most needs capturing.
+#[derive(Clone, Copy)]
+struct Diagnostic {
+	binding: BindingId,
+	state: BindingState,
+	cause: FailureCause,
+	last_opcode: u16,
+	// Ticks between the last frame and the capture. `u64::MAX` for a binding that never sent one,
+	// which is a different fact from "a long time ago".
+	silent_for: u64,
+	attempts: u32,
+	// The child Domain's counters. `None` where the Domain was already gone or never made, which is
+	// itself worth recording rather than reporting zeros.
+	domain: Option<DomainStats>,
 }
 
 // WHETHER THIS DRIVER'S CONTROL PATH IS MAKING PROGRESS.
@@ -1111,7 +1154,7 @@ impl Heartbeat {
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default() }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default(), stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None }
 	}
 
 	// Queue one event for this node.
@@ -1156,6 +1199,10 @@ impl Node {
 // reconstructed afterwards. A rollback that has to work out what happened is a rollback that gets it
 // wrong on the path nobody exercises.
 struct Attempt {
+	// The child Domain the driver runs in. Rolled back LAST, after the process is gone and the
+	// claim is given back: killing it first would take the process out from under a teardown that
+	// is still reading its handles.
+	domain: u64,
 	// The driver's process, with MANAGE - what `spawn` returns and nothing used to keep.
 	process: u64,
 	// This service's end of the bootstrap channel.
@@ -1168,7 +1215,7 @@ struct Attempt {
 
 impl Attempt {
 	fn new() -> Self {
-		Self { process: 0, channel: 0, claim: 0, key: ClaimKey::default() }
+		Self { domain: 0, process: 0, channel: 0, claim: 0, key: ClaimKey::default() }
 	}
 
 	// THE TRANSACTION COMMITS: what it took stays taken, and passes to whoever asked for the bind.
@@ -1211,12 +1258,27 @@ impl Attempt {
 				self.channel = 0;
 			}
 			if self.claim == 0 {
-				// Nothing was taken, so there is nothing to confirm and nothing to quarantine.
+				// Nothing was taken, so there is nothing to confirm and nothing to quarantine - but
+				// a Domain may still have been created, and a Domain nobody kills is a subtree
+				// charged to this manager for ever.
+				if self.domain != 0 {
+					domain_kill(self.domain);
+					close(self.domain);
+					self.domain = 0;
+				}
 				return BindingState::Backoff;
 			}
 			let outcome = device_release(self.claim);
 			close(self.claim);
 			self.claim = 0;
+			// AND THE DOMAIN LAST, after the process is gone and the device is given back. Killing
+			// it first would take the process out from under a teardown still reading its handles,
+			// and the release above is what performs that teardown.
+			if self.domain != 0 {
+				domain_kill(self.domain);
+				close(self.domain);
+				self.domain = 0;
+			}
 			if outcome == CLAIM_STATE_QUARANTINED as i64 { BindingState::Quarantined } else { BindingState::Backoff }
 		}
 	}
@@ -1490,6 +1552,17 @@ unsafe fn send_frame(channel: u64, opcode: driver_protocol::Opcode, generation: 
 // `Failed` when there is not, `Quarantined` when the release could not be confirmed - which outranks
 // both, because a device that may still be live is not a device to try again on.
 unsafe fn give_up(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Offers, cause: FailureCause, driver_name: &[u8]) -> bool {
+	unsafe { give_up_with(record, txn, offers, cause, driver_binding::StopIntent::Fault, driver_name) }
+}
+
+// The same, for a node that was asked to stop rather than one that failed.
+//
+// THE INTENT IS WHAT `Stopping` RESOLVES AGAINST. P02M0162's table sends a confirmed teardown on to
+// `Backoff` and then back to `Binding`, which is right for a driver that died and exactly wrong for
+// one that was asked to stop: the operator stops it and it starts again. An UNCONFIRMED teardown
+// ignores the intent entirely and ends at `Quarantined`, because what is unknown is whether the
+// device is still live and no intent changes that.
+unsafe fn give_up_with(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Offers, cause: FailureCause, intent: driver_binding::StopIntent, driver_name: &[u8]) -> bool {
 	unsafe {
 		// THE PATH THROUGH THE TABLE DEPENDS ON WHETHER A DEVICE WAS TAKEN, and flattening that was
 		// wrong. `Binding -> Failed` is for a transaction that failed BEFORE the claim; once there
@@ -1503,13 +1576,31 @@ unsafe fn give_up(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Of
 		let after = txn.roll_back(offers);
 		// The rollback says whether the device is quiet. `give_up` is only called once the decision
 		// to stop trying has been made, so the confirmed outcome is `Failed` rather than `Backoff`.
-		let landed = if after == BindingState::Quarantined { BindingState::Quarantined } else { BindingState::Failed };
-		let state = if record.move_to(landed, Some(cause)) { landed } else { record.state };
+		let landed = if after == BindingState::Quarantined {
+			Some(BindingState::Quarantined)
+		} else {
+			// `give_up` is only reached once the decision to stop trying has been made, so there are
+			// no attempts left to spend - which for a fault is `Failed`, and for the other intents is
+			// whatever they say. `Shutdown` answers None: the manager is going away, so there is no
+			// next binding to describe and entering a state nobody will read is a state nobody
+			// wrote down for a reason.
+			intent.confirmed_lands_at(false)
+		};
+		let state = match landed {
+			Some(landed) if record.move_to(landed, Some(cause)) => landed,
+			_ => record.state,
+		};
 		print(b"DeviceManager: ");
 		print(driver_name);
-		print(b" did not bind (");
-		print(cause.name());
-		print(b") - the node is ");
+		if intent == driver_binding::StopIntent::Fault {
+			print(b" did not bind (");
+			print(cause.name());
+			print(b") - the node is ");
+		} else {
+			print(b" was stopped (");
+			print(intent.name());
+			print(b") - the node is ");
+		}
 		print(state.name());
 		print(b"\n");
 		false
@@ -1567,7 +1658,7 @@ const MAX_NODES_IN_FLIGHT: usize = abi::MAX_WAIT_HANDLES / 2;
 // Wait for one thing to happen anywhere, and queue it on the node it belongs to.
 //
 // Returns false when there is nothing in flight to wait for, which is the loop's exit condition.
-unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, buf: &mut [u8]) -> bool {
+unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, catalogue: &mut Catalogue, buf: &mut [u8]) -> bool {
 	unsafe {
 		// The wait set, and which node each entry belongs to. Rebuilt every pass because what is in
 		// flight changes every pass.
@@ -1582,9 +1673,19 @@ unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, buf: &mut [u8]) -> boo
 		// binding. Phase two takes seconds, and a driver bound in phase one that nothing pinged for
 		// the length of it was declared wedged for being unattended rather than for being wedged -
 		// which is a supervisor reporting its own inattention as a driver fault.
-		let beats: u64 = tick_heartbeats(nodes);
+		let beats: u64 = tick_heartbeats(nodes, buf);
 		if beats != 0 {
 			soonest = beats;
+		}
+		// AND A NODE OUTSIDE THIS PHASE'S RANGE CONSUMES ITS OWN EVENTS. Its verdict is not this
+		// loop's to act on - there is no candidate list to advance for a driver another phase bound
+		// - but leaving a wedge queued would mean noticing it and never answering it.
+		for at in 0..in_flight_from {
+			if nodes[at].record.state != BindingState::Online {
+				continue;
+			}
+			let name: &[u8] = nodes[at].driver_name();
+			let _ = advance(&mut nodes[at], name, catalogue);
 		}
 		for (at, node) in nodes.iter().enumerate() {
 			if at < in_flight_from || !node.in_flight() || set + 2 > abi::MAX_WAIT_HANDLES {
@@ -1691,6 +1792,10 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 				refuse(&handles);
 				continue;
 			}
+			// WHEN THIS DRIVER LAST SAID ANYTHING, for the capture. Recorded on the way past rather
+			// than reconstructed later: after the process is gone there is nobody to ask.
+			node.last_opcode = header.opcode as u16;
+			node.last_frame_at = clock();
 			match header.opcode {
 				driver_protocol::Opcode::Offer => {
 					let Ok((kind, token)) = driver_protocol::decode_offer(header.payload(buf)) else {
@@ -1719,14 +1824,34 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 					node.push(BindingEvent::Failed { generation, code });
 				}
 				driver_protocol::Opcode::Pong => {
+					// THE WATCHDOG IS SETTLED HERE, NOT THROUGH THE QUEUE, and the order is why.
+					//
+					// The manager wakes exactly at the deadline it set, drains the channel and then
+					// asks whether the driver answered. With the answer sitting UNREAD in the node's
+					// queue, that question said no - so a driver that replied on time was declared
+					// wedged and its own pong then arrived to a manager that had stopped waiting.
+					// The heartbeat is control-path state, not a lifecycle event, and it is settled
+					// where it is read.
+					//
+					// A MISMATCH STILL BECOMES AN EVENT, because that is the case worth reporting: a
+					// duplicate, one from an earlier round, or a number nobody asked with does NOT
+					// reset the watchdog, and saying so is the whole difference from `rt::heartbeat`.
 					if let Ok(sequence) = driver_protocol::decode_sequence(header.payload(buf)) {
-						node.push(BindingEvent::Ponged { generation, sequence });
+						if node.beat.awaiting && sequence == node.beat.sequence {
+							node.beat.awaiting = false;
+							node.beat.due = clock().saturating_add(driver_protocol::heartbeat_period(node.beat.deadline) as u64);
+						} else {
+							node.push(BindingEvent::Ponged { generation, sequence });
+						}
 					}
 				}
-				// A `PING` coming the wrong way, like `BIND` and `RESOURCE` below: refused rather
-				// than ignored, because a driver asking the manager whether IT is alive is a driver
-				// that has misunderstood which end of this channel it is on.
-				driver_protocol::Opcode::Ping => refuse(&handles),
+				driver_protocol::Opcode::Stopped => {
+					node.push(BindingEvent::Stopped { generation });
+				}
+				// Manager-to-driver opcodes coming the wrong way: refused rather than ignored,
+				// because a driver asking the manager whether IT is alive, or telling it to stop,
+				// is a driver that has misunderstood which end of this channel it is on.
+				driver_protocol::Opcode::Ping | driver_protocol::Opcode::Stop => refuse(&handles),
 				driver_protocol::Opcode::Withdraw => {
 					if let Ok(token) = driver_protocol::decode_withdraw(header.payload(buf)) {
 						node.push(BindingEvent::Withdrawn { generation, token });
@@ -1735,6 +1860,131 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 				// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
 				driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource => refuse(&handles),
 			}
+		}
+	}
+}
+
+// One decimal number into `out`, answering how many bytes it wrote.
+//
+// A capture that cannot be READ is a capture nobody takes seriously, and this program has no
+// formatter - every other line it prints is a fixed byte string. Twenty digits covers `u64::MAX`.
+fn decimal(value: u64, out: &mut [u8; 20]) -> usize {
+	if value == 0 {
+		out[0] = b'0';
+		return 1;
+	}
+	let mut digits = [0u8; 20];
+	let mut at: usize = 0;
+	let mut rest = value;
+	while rest > 0 && at < digits.len() {
+		digits[at] = b'0' + (rest % 10) as u8;
+		rest /= 10;
+		at += 1;
+	}
+	for index in 0..at {
+		out[index] = digits[at - 1 - index];
+	}
+	at
+}
+
+// Print the capture. One line, in the order `Diagnostic` declares its fields, so the log and the
+// struct cannot drift into two different stories about the same incident.
+unsafe fn report_incident(driver_name: &[u8], report: &Diagnostic) {
+	unsafe {
+		let mut number = [0u8; 20];
+		print(b"DeviceManager: incident ");
+		print(driver_name);
+		print(b" at ");
+		let n = decimal(report.binding.bus as u64, &mut number);
+		print(&number[..n]);
+		print(b":");
+		let n = decimal(report.binding.dev as u64, &mut number);
+		print(&number[..n]);
+		print(b".");
+		let n = decimal(report.binding.func as u64, &mut number);
+		print(&number[..n]);
+		print(b" generation ");
+		let n = decimal(report.binding.generation, &mut number);
+		print(&number[..n]);
+		print(b", ");
+		print(report.state.name());
+		print(b", last opcode ");
+		let n = decimal(report.last_opcode as u64, &mut number);
+		print(&number[..n]);
+		if report.silent_for == u64::MAX {
+			print(b" (it never sent one)");
+		} else {
+			print(b" ");
+			let n = decimal(report.silent_for, &mut number);
+			print(&number[..n]);
+			print(b" tick(s) ago");
+		}
+		print(b", attempt ");
+		let n = decimal(report.attempts as u64, &mut number);
+		print(&number[..n]);
+		match report.domain {
+			Some(stats) => {
+				print(b", domain memory ");
+				let n = decimal(stats.memory_used, &mut number);
+				print(&number[..n]);
+				print(b" peak ");
+				let n = decimal(stats.memory_peak, &mut number);
+				print(&number[..n]);
+				print(b", handles ");
+				let n = decimal(stats.handles_used, &mut number);
+				print(&number[..n]);
+				print(b", threads ");
+				let n = decimal(stats.threads_used, &mut number);
+				print(&number[..n]);
+				print(b", dma ");
+				let n = decimal(stats.dma_used, &mut number);
+				print(&number[..n]);
+			}
+			// A DIFFERENT FACT FROM ZEROS. A Domain that was never made or is already gone has no
+			// counters, and printing zeros would say the driver used nothing.
+			None => print(b", no domain counters were readable"),
+		}
+		print(b"\n");
+		// THE CAUSE IS LAST AND IT IS NOT A NUMBER. It is the one field a reader acts on, and a
+		// discriminant would make them count variants in a source file to find out what happened.
+		print(b"DeviceManager:   cause: ");
+		print(cause_name(report.cause));
+		print(b"\n");
+	}
+}
+
+// A name for each cause. `driver-reported` carries the driver's own code, which is the half that
+// explains anything - "the driver said it failed" without saying what it said explains nothing.
+fn cause_name(cause: FailureCause) -> &'static [u8] {
+	match cause {
+		FailureCause::DriverMissing => b"the registry names a driver this image does not contain",
+		FailureCause::ProtocolMismatch => b"its note declares a protocol version this build does not implement",
+		FailureCause::ClaimRefused => b"somebody else holds the device",
+		FailureCause::IommuRequired => b"its DMA policy demands translation on a machine that is not enforcing it",
+		FailureCause::ResourceExhausted => b"a quota or an allocation refused",
+		FailureCause::SpawnFailed => b"the process could not be started",
+		FailureCause::HandshakeTimeout => b"it did not answer inside the window",
+		FailureCause::DriverExited => b"it exited without saying anything",
+		FailureCause::DriverReported(code) => code.name(),
+		FailureCause::TeardownUnconfirmed => b"the release did not confirm, so the device may still be live",
+	}
+}
+
+// Take the bounded capture. See `Diagnostic` for why the list is fixed.
+unsafe fn capture(node: &Node, cause: FailureCause) -> Diagnostic {
+	unsafe {
+		let now: u64 = clock();
+		Diagnostic {
+			binding: node.id,
+			state: node.record.state,
+			cause,
+			last_opcode: node.last_opcode,
+			// NEVER SPOKE IS NOT "A LONG TIME AGO". A binding whose driver sent nothing at all is a
+			// different failure from one that went quiet, and collapsing them would lose the
+			// difference between a driver that never started and one that stopped.
+			silent_for: if node.last_frame_at == 0 { u64::MAX } else { now.saturating_sub(node.last_frame_at) },
+			attempts: node.record.attempts,
+			domain: node.binding.as_ref().filter(|binding| binding.domain != 0).and_then(|binding| domain_stats(binding.domain)),
 		}
 	}
 }
@@ -1828,6 +2078,24 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			return false;
 		}
 		node.record.attempts = node.attempt + 1;
+		// WHAT THIS DEVICE IS DOING, READ BEFORE IT IS ASSUMED FREE.
+		//
+		// A NEW MANAGER CAN LEGITIMATELY ARRIVE AT A DEVICE THAT IS `Releasing`. `Domain::kill` marks
+		// the subtree and `Process::terminate` closes each handle table synchronously, so the claim
+		// handle's last close - and with it the forced teardown - starts promptly; what is
+		// asynchronous is the rest, and the teardown still has to confirm the device is quiet.
+		//
+		// Treating that as a refusal would be a permanent `Failed` for a state that was about to
+		// clear on its own, because `claim-refused` is classified as NOT retryable: a transient
+		// condition promoted to a terminal one by two correct rules meeting.
+		//
+		// AND A BIND IS ATTEMPTED ONLY ON AN OBSERVED `Free`, never on a deadline having merely
+		// passed. "Waits and then binds" is not one of the branches.
+		match observe_claim(node, device_privilege, driver_name) {
+			ClaimReadiness::Bindable => {}
+			ClaimReadiness::WaitAndSeeAgain => return false,
+			ClaimReadiness::Terminal(cause) => return give_up(&mut node.record, &mut txn, &mut node.offers, cause, driver_name),
+		}
 		let grant: ClaimGrant = match device_claim(node.index, device_privilege) {
 			Ok(grant) => grant,
 			// NOT RETRYABLE, and named as such: the device is held by somebody else and waiting
@@ -1849,7 +2117,21 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// nothing could end the process a failed bind had started - which is what made "leaves
 		// nothing behind" untrue in the one case it is written for. It is also the handle the
 		// central wait watches, which is what makes an exit an event rather than a read failing.
-		let process: i64 = spawn(elf, driver_side);
+		// ONE CHILD DOMAIN PER BINDING, and this is the change M5 is actually about: every driver
+		// used to be launched with `spawn`, which is `spawn_in(.., 0)`, and domain 0 means the
+		// SPAWNER'S OWN Domain. So every driver in the system was charged to DeviceManager, and a
+		// driver that exhausted memory exhausted the manager's budget rather than its own.
+		//
+		// NOT RESOURCE-BOUNDED HERE. Limits are ResourceManager's subject; a number invented at this
+		// line would be a policy nobody declared. What the Domain buys without one is ATTRIBUTION -
+		// memory, handles, threads, IPC, DMA and stack, per binding, which `DomainStats` already
+		// reports - and a subtree that can be killed as a unit.
+		let domain: i64 = domain_create(u64::MAX, u64::MAX, u64::MAX);
+		if domain < 0 {
+			return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name);
+		}
+		txn.domain = domain as u64;
+		let process: i64 = spawn_in(elf, driver_side, domain as u64);
 		if process < 0 {
 			return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::SpawnFailed, driver_name);
 		}
@@ -1928,7 +2210,7 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		}
 		// IN FLIGHT. The transaction's holdings become the node's binding, which is what the
 		// central wait watches and what a rollback gives back.
-		node.binding = Some(Binding { process: txn.process, channel: txn.channel, claim: txn.claim, key: txn.key });
+		node.binding = Some(Binding { domain: txn.domain, process: txn.process, channel: txn.channel, claim: txn.claim, key: txn.key });
 		txn.commit();
 		true
 	}
@@ -1984,15 +2266,13 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// driver and a wedged one look the same. A pong with a sequence nobody is waiting
 				// for - a duplicate, one from an earlier round, one invented - does NOT reset the
 				// watchdog. Stale GENERATIONS never reach here at all: `pop` drops them.
-				BindingEvent::Ponged { sequence, .. } => {
-					if node.beat.awaiting && sequence == node.beat.sequence {
-						node.beat.awaiting = false;
-						node.beat.due = clock().saturating_add(driver_protocol::heartbeat_period(node.beat.deadline) as u64);
-					} else {
-						print(b"DeviceManager: ");
-						print(driver_name);
-						print(b" answered a ping nobody asked; the watchdog is not reset by it\n");
-					}
+				// ONLY A MISMATCH REACHES HERE - `drain_channel` settles the answer that was asked
+				// for. A duplicate, one from an earlier round, or a number nobody asked with does
+				// NOT reset the watchdog, and this is where that is said out loud.
+				BindingEvent::Ponged { .. } => {
+					print(b"DeviceManager: ");
+					print(driver_name);
+					print(b" answered a ping nobody asked; the watchdog is not reset by it\n");
 					continue;
 				}
 				// A WEDGED DRIVER IS TORN DOWN LIKE A CRASHED ONE. The teardown is the same
@@ -2041,6 +2321,19 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					print(if code.retryable() { b" reported a retryable failure\n" } else { b" reported a permanent failure\n" });
 					FailureCause::DriverReported(code)
 				}
+				// A PLANNED STOP COMPLETING, which is not a failure and must not be recorded as one.
+				// The node carries the intent it was stopped WITH, and that is what decides where a
+				// confirmed teardown lands - a driver that died goes back round to `Backoff` and
+				// then `Binding`, and an operator's stop that did the same would be a stop that
+				// starts the driver again.
+				BindingEvent::Stopped { .. } => {
+					print(b"DeviceManager: ");
+					print(driver_name);
+					print(b" stopped cleanly: ");
+					print(node.stop_intent.name());
+					print(b"\n");
+					FailureCause::DriverExited
+				}
 				// The process ended, or its channel closed with nothing terminal on it. Both are a
 				// driver that is gone without having said anything.
 				BindingEvent::Exited { .. } | BindingEvent::Closed { .. } => FailureCause::DriverExited,
@@ -2054,6 +2347,12 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					FailureCause::HandshakeTimeout
 				}
 			};
+			// THE CAPTURE COMES FIRST, BEFORE ANYTHING IS GIVEN BACK. The Domain's counters cannot
+			// be read once the Domain is killed, and the process cannot be asked once it is signalled
+			// - so a capture taken after the rollback is a capture of the rollback.
+			let report = capture(node, cause);
+			report_incident(driver_name, &report);
+			node.incident_report = Some(report);
 			// EVERYTHING THIS BINDING PUBLISHED GOES WITH IT, and the count is SAID.
 			//
 			// A provider outliving the binding that published it is a channel whose server is gone:
@@ -2072,8 +2371,11 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			// handles it has already given back.
 			let Some(binding) = node.binding.take() else { return Step::Done };
 			let mut txn = binding.into_attempt();
-			let retryable: bool = cause.retryable() && may_try_again(&node.incident, node.attempt);
-			let alive: bool = if retryable { retry_or_quarantine(&mut node.record, &mut txn, &mut node.offers, cause, driver_name) } else { give_up(&mut node.record, &mut txn, &mut node.offers, cause, driver_name) };
+			// A PLANNED STOP IS NEVER RETRIED, whatever the cause reads as: the whole point of
+			// asking a driver to stop is that it stays stopped.
+			let planned: bool = node.stop_intent != driver_binding::StopIntent::Fault;
+			let retryable: bool = !planned && cause.retryable() && may_try_again(&node.incident, node.attempt);
+			let alive: bool = if retryable { retry_or_quarantine(&mut node.record, &mut txn, &mut node.offers, cause, driver_name) } else { give_up_with(&mut node.record, &mut txn, &mut node.offers, cause, node.stop_intent, driver_name) };
 			if !alive {
 				return Step::Done;
 			}
@@ -2138,6 +2440,124 @@ unsafe fn serve_catalogue_once(service: u64, catalogue: &Catalogue, buf: &mut [u
 	}
 }
 
+// What the claim's state says a bind may do right now.
+enum ClaimReadiness {
+	// Observed `Free`. Bind.
+	Bindable,
+	// `Releasing`, and its deadline has not passed. Come back; do NOT acquire.
+	WaitAndSeeAgain,
+	// Nothing further will happen on this node.
+	Terminal(FailureCause),
+}
+
+// Read the claim before binding, and answer what may be done about it.
+//
+// | state read | what this answers |
+// | `Free` | bind normally |
+// | `Releasing` | come back, bounded by the claim's OWN deadline - which the kernel minted at the release, because the manager that would have supplied one may be the one that died |
+// | `Releasing` still, at that deadline | do NOT acquire: `Quarantined` with `teardown-unconfirmed`, which is the conservative answer and the true one - nothing observed the device go quiet |
+// | `Quarantined` | adopt it; it is already terminal |
+// | `Claimed` | an invariant violation, reported as one - a correct `domain_kill` cannot leave it here, and a manager that quietly rebound over it would be handing out a device somebody still holds |
+unsafe fn observe_claim(node: &mut Node, device_privilege: u64, driver_name: &[u8]) -> ClaimReadiness {
+	unsafe {
+		// A snapshot this manager cannot take is not a licence to assume the device is free.
+		let Some(snapshot) = device_claim_snapshot(node.index, device_privilege) else {
+			return ClaimReadiness::Bindable;
+		};
+		match snapshot.state {
+			CLAIM_STATE_FREE => ClaimReadiness::Bindable,
+			CLAIM_STATE_RELEASING => {
+				// The kernel latches the deadline itself, inside the same read - so a `Releasing`
+				// that comes back here still has time left, and one that ran out came back
+				// `Quarantined` instead. There is no arithmetic to repeat and no second authority.
+				print(b"DeviceManager: ");
+				print(driver_name);
+				print(b"'s device is still being torn down by whoever held it last; not acquiring it yet\n");
+				ClaimReadiness::WaitAndSeeAgain
+			}
+			CLAIM_STATE_QUARANTINED => {
+				print(b"DeviceManager: ");
+				print(driver_name);
+				print(b"'s device is quarantined - nothing observed it go quiet, and it is not claimed again this boot\n");
+				node.record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed));
+				ClaimReadiness::Terminal(FailureCause::TeardownUnconfirmed)
+			}
+			// A CORRECT `domain_kill` CANNOT LEAVE IT HERE. Reported as the invariant violation it
+			// is rather than bound over: a manager that quietly rebound would be handing out a
+			// device somebody still holds.
+			_ => {
+				print(b"DeviceManager: ");
+				print(driver_name);
+				print(b"'s device reads as CLAIMED and this manager holds no claim on it - that is an invariant violation, not a device to rebind over\n");
+				ClaimReadiness::Terminal(FailureCause::ClaimRefused)
+			}
+		}
+	}
+}
+
+// STOP EVERY BOUND DRIVER, DEPENDENTS FIRST.
+//
+// A CONTROLLER BEING STOPPED STOPS ITS CHILDREN FIRST, which here means: a node that REQUIRES a
+// provider kind goes down before whatever publishes that kind. Stopping the provider first would
+// leave its consumer holding a channel whose server has gone, mid-request, and then ask it politely
+// to finish - which is the forced path with a courteous name.
+//
+// NOT BUS REMOVAL. The scan runs once and no removal event exists, so the only ways a controller
+// goes away are a shutdown and a teardown, and both are asked for from inside.
+unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver_binding::StopIntent, buf: &mut [u8]) {
+	unsafe {
+		// The order, by how many OTHER nodes' published kinds a node requires. A node requiring
+		// something is a dependent and goes first; one requiring nothing is a leaf provider and
+		// goes last. A cycle cannot appear here - `system-manifest` refuses one at registry-build
+		// time - so a single ordering pass is enough and there is no fixed point to chase.
+		let mut order: Vec<usize> = (0..nodes.len()).collect();
+		order.sort_by_key(|&at| {
+			let entry = nodes[at].candidates.get(nodes[at].candidate);
+			core::cmp::Reverse(entry.map_or(0, |entry| entry.requires.len()))
+		});
+		for at in order {
+			if nodes[at].record.state != BindingState::Online {
+				continue;
+			}
+			let Some(binding) = &nodes[at].binding else { continue };
+			let (channel, generation): (u64, u64) = (binding.channel, nodes[at].id.generation);
+			nodes[at].stop_intent = intent;
+			// THE PROVIDER IS WITHDRAWN AND NEW CONNECTIONS REFUSED FIRST, so nothing arrives
+			// during the drain. A driver asked to finish while work keeps being handed to it is a
+			// driver that cannot finish.
+			catalogue.withdraw_binding(nodes[at].id);
+			let name: &[u8] = nodes[at].driver_name();
+			if !send_frame(channel, driver_protocol::Opcode::Stop, generation, &[], 0, 0) {
+				// The channel is already gone: there is nothing to ask and nothing to wait for.
+				let _ = advance(&mut nodes[at], name, catalogue);
+				continue;
+			}
+			// A DEADLINE THAT EXPIRES FORCES THE REVOCATION AND SAYS IT WAS FORCED - never that a
+			// clean flush happened. The slice is the teardown reserve this node's incident already
+			// carries, so a stop is bounded by the same budget everything else on this node is.
+			let deadline: u64 = clock().saturating_add(nodes[at].incident.teardown_reserve.max(driver_protocol::MAX_HEARTBEAT_DEADLINE as u64));
+			while clock() < deadline {
+				drain_channel(&mut nodes[at], buf);
+				if nodes[at].queue.is_empty() {
+					wait(channel, deadline);
+					continue;
+				}
+				let _ = advance(&mut nodes[at], name, catalogue);
+				if nodes[at].record.state != BindingState::Online {
+					break;
+				}
+			}
+			if nodes[at].record.state == BindingState::Online {
+				print(b"DeviceManager: ");
+				print(name);
+				print(b" did not answer the stop inside its slice; the teardown is FORCED and nothing here says its work was flushed\n");
+				nodes[at].push(BindingEvent::Wedged { generation });
+				let _ = advance(&mut nodes[at], name, catalogue);
+			}
+		}
+	}
+}
+
 // PING WHAT IS DUE, AND DECLARE WEDGED WHAT DID NOT ANSWER.
 //
 // Called from the stand loop's every pass, whether it woke on a channel or on the deadline: an
@@ -2145,7 +2565,7 @@ unsafe fn serve_catalogue_once(service: u64, catalogue: &Catalogue, buf: &mut [u
 //
 // Answers the soonest tick any supervised node needs the wait back at, or 0 for "nothing to wake
 // for" - which the wait reads as no timeout, correctly, because there is then nothing to time out.
-unsafe fn tick_heartbeats(nodes: &mut [Node]) -> u64 {
+unsafe fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 	unsafe {
 		let now: u64 = clock();
 		let mut soonest: u64 = 0;
@@ -2153,6 +2573,14 @@ unsafe fn tick_heartbeats(nodes: &mut [Node]) -> u64 {
 			if !node.beat.supervised() || node.record.state != BindingState::Online {
 				continue;
 			}
+			// THE ANSWER IS READ WHERE THE QUESTION IS ASKED.
+			//
+			// A node that is already `Online` is not in the bring-up wait set - that set is for
+			// bindings in flight - so nothing was reading its channel, and its `PONG` sat there
+			// unread while the manager decided it had not answered. Every driver in the machine was
+			// declared wedged at sequence 1, which is the shape of a supervisor listening on the
+			// wrong end rather than of a driver that stopped.
+			drain_channel(node, buf);
 			let Some(binding) = &node.binding else { continue };
 			let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
 			if node.beat.awaiting {
@@ -2160,23 +2588,6 @@ unsafe fn tick_heartbeats(nodes: &mut [Node]) -> u64 {
 					// NOT ANSWERED INSIDE THE DEADLINE ITS ENTRY DECLARED. Queued as an event so it
 					// runs through the same state machine as a crash - the teardown is the same
 					// transaction and the same counter, and only the reason differs.
-					unsafe {
-						print(b"DeviceManager: WEDGE seq=");
-						let mut n = [0u8; 8];
-						let mut at = 0;
-						let mut v = node.beat.sequence;
-						if v == 0 {
-							n[0] = b'0';
-							at = 1;
-						}
-						while v > 0 && at < 8 {
-							n[at] = b'0' + (v % 10) as u8;
-							v /= 10;
-							at += 1;
-						}
-						print(&n[..at]);
-						print(b"\n");
-					}
 					node.push(BindingEvent::Wedged { generation });
 					node.beat.awaiting = false;
 				}

@@ -212,7 +212,24 @@ struct ClaimSlot {
 	generation: u64,
 	// Generation space exhausted: never claimed again this boot. See `claim`.
 	retired: bool,
+	// WHEN A TEARDOWN THAT IS UNDER WAY STOPS BEING ANSWERABLE. Zero unless the state is
+	// `Releasing`; stamped fresh at every `Claimed -> Releasing`, from the constant below.
+	//
+	// THE DEADLINE IS THE CLAIM'S OWN AND IT IS MINTED AT THE RELEASE, not inherited from the bind.
+	// "The same hard deadline" fails in both directions: a driver that ran an hour in `Online` has a
+	// bind deadline long past, so a release would be born already expired - and when the manager
+	// that held the claim DIES, the last close starts the release before any new manager exists to
+	// supply one.
+	release_deadline: u64,
 }
+
+// How long a teardown has to confirm before the device is quarantined.
+//
+// A CONSTANT OF THE KERNEL'S, not a value handed in, for the reason above: the party that would hand
+// one in is exactly the party that may have just died. Two seconds at the 100-ticks-per-second
+// monotonic clock - the same order as every other bounded wait in this system, and long enough that
+// only a teardown which is genuinely not completing reaches it.
+const RELEASE_DEADLINE_TICKS: u64 = 200;
 
 // Parallel to `DEVICES` and taken under the SAME lock as the config-space write below, so two
 // acquisitions racing cannot leave the PCI bit disagreeing with the state.
@@ -223,7 +240,7 @@ fn reset_claims(len: usize) {
 	let mut claims = CLAIMS.lock();
 	claims.clear();
 	// ALLOC-OK: sized once at boot from the table just built.
-	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false });
+	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0 });
 }
 
 // What state the device at `index` is in, or None if the index names no device.
@@ -317,6 +334,9 @@ fn begin_release(key: abi::ClaimKey) -> Result<(), ClaimError> {
 	match slot.state {
 		ClaimState::Claimed => {
 			slot.state = ClaimState::Releasing;
+			// A FRESH ABSOLUTE DEADLINE, every time. Immutable once stamped: a teardown that keeps
+			// pushing its own deadline out is not bounded by it.
+			slot.release_deadline = crate::arch::apic::ticks().saturating_add(RELEASE_DEADLINE_TICKS);
 			Ok(())
 		}
 		// Already on its way out, and the caller's key is current - so this is a second release of
@@ -334,8 +354,36 @@ fn begin_release(key: abi::ClaimKey) -> Result<(), ClaimError> {
 fn finish_release(index: usize, confirmed: bool) -> ClaimState {
 	let mut claims = CLAIMS.lock();
 	let Some(slot) = claims.get_mut(index) else { return ClaimState::Quarantined };
+	// A COMPLETION AFTER THE LATCH RELEASES NOTHING, and this is where that is enforced rather than
+	// hoped for. `snapshot` latches `Releasing -> Quarantined` at the deadline; a teardown finishing
+	// afterwards would otherwise put the frames and vectors back into circulation against a state
+	// already declared terminal, which is two authorities over one device.
+	if slot.state == ClaimState::Quarantined {
+		crate::serial_println!("device: {index} finished its teardown after the deadline had already quarantined it - the completion is recorded and releases nothing");
+		return ClaimState::Quarantined;
+	}
 	slot.state = if confirmed { ClaimState::Free } else { ClaimState::Quarantined };
+	slot.release_deadline = 0;
 	slot.state
+}
+
+// WHAT A NEW MANAGER NEEDS TO KNOW ABOUT ONE DEVICE, in one read.
+//
+// The generation, the claim state and the deadline a teardown under way must confirm by. ONE READ
+// ANSWERS BOTH QUESTIONS a reconstruction has - "may I bind this?" and "how long is it reasonable to
+// wait?" - rather than two sources that can disagree.
+//
+// AND IT LATCHES. A binding marked `Quarantined` in userspace while the kernel's claim stays
+// `Releasing` is two authorities again, so the transition happens HERE, atomically, under the same
+// lock every other claim decision is taken under.
+pub fn snapshot(index: usize) -> Option<abi::DeviceClaimSnapshot> {
+	let mut claims = CLAIMS.lock();
+	let slot = claims.get_mut(index)?;
+	if slot.state == ClaimState::Releasing && slot.release_deadline != 0 && crate::arch::apic::ticks() >= slot.release_deadline {
+		slot.state = ClaimState::Quarantined;
+		crate::serial_println!("device: {index} did not confirm its teardown inside the deadline - quarantined, and nothing it held is reused");
+	}
+	Some(abi::DeviceClaimSnapshot { state: slot.state as u32, _pad0: 0, generation: slot.generation, release_deadline: slot.release_deadline })
 }
 
 // RELEASE THE DEVICE, and prove it is quiet before anything it held is reused.
@@ -442,7 +490,7 @@ pub fn add_synthetic_device() -> usize {
 	// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed.
 	table.push(DeviceEntry { device_type: u16::MAX, transport: abi::TRANSPORT_PLAIN_PCI, vendor: 0xffff, product: 0xffff, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: 0x1f, func: 7, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false });
 	drop(table);
-	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false });
+	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0 });
 	index
 }
 

@@ -391,6 +391,15 @@ pub const SYS_DEVICE_CLAIM_INFO: u64 = 79;
 // transfer, not a second way of moving a capability - so a send that fails leaves the sender's
 // handle open at the same value with its rights unchanged.
 pub const SYS_CHANNEL_SEND_ATTENUATED: u64 = 80;
+
+// WHAT A NEW MANAGER MAY ASK ABOUT A DEVICE IT HOLDS NO CLAIM ON.
+//
+// `SYS_DEVICE_CLAIM_INFO` reads a claim through its HANDLE, which is exactly what a reconstruction
+// does not have: the old manager died and its handle died with its Domain. This reads by device
+// INDEX, gated on the DeviceManager privilege, and answers the generation, the claim state and the
+// deadline a teardown under way must confirm by - so "may I bind this?" and "how long is it
+// reasonable to wait?" are one read rather than two sources that can disagree.
+pub const SYS_DEVICE_CLAIM_SNAPSHOT: u64 = 81;
 // Actions for SYS_SYSTEM_POWER.
 pub const POWER_REBOOT: u64 = 0;
 pub const POWER_OFF: u64 = 1;
@@ -873,6 +882,23 @@ pub struct ClaimInfo {
 	// claim is live. This is the bit the claim handle's readiness is defined by, so a manager parked
 	// in `wait_any` learns the device is back without polling.
 	pub settled: u32,
+}
+
+// What `SYS_DEVICE_CLAIM_SNAPSHOT` answers with, for a manager that holds no claim handle.
+//
+// `release_deadline` is 0 unless the state is `Releasing`. It is the CLAIM'S OWN deadline, minted at
+// the release from a constant of the kernel's - not one handed in, because the party that would hand
+// one in is exactly the party that may have just died.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct DeviceClaimSnapshot {
+	// One of the CLAIM_STATE_* codes.
+	pub state: u32,
+	pub _pad0: u32,
+	// The generation of the current claim, or of the last one that ended.
+	pub generation: u64,
+	// Absolute tick by which a teardown under way must confirm, or 0.
+	pub release_deadline: u64,
 }
 
 // The four states a device-table slot can be in. THE SAME FOUR everywhere - two lists is how a state

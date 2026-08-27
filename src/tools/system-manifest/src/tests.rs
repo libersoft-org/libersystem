@@ -435,3 +435,25 @@ fn two_drivers_each_waiting_for_the_other_are_refused_rather_than_discovered_on_
 	let fine = format!("{}{}{}", valid_fixture(), entry("a_driver", "block", "usb-bus", 2), entry("b_driver", "usb-bus", "block", 16).replace("requires = [\"block\"]\n", ""));
 	assert_eq!(errors(&fine), "", "one driver requiring another's output is the ordinary case: {}", errors(&fine));
 }
+
+#[test]
+fn a_heartbeat_deadline_of_zero_or_past_the_ceiling_is_refused() {
+	// A DEADLINE OF ZERO IS NOT STRICT SUPERVISION, IT IS NONE: `wait_any` reads 0 as no timeout,
+	// so an entry declaring it would look like the most responsive driver in the machine. And an
+	// entry that may name any deadline it likes is an entry that can opt out, which is why the
+	// ceiling is one shared policy constant rather than a per-entry opinion.
+	let root = fixture_workspace();
+	let errors = |text: &str| -> String { Manifest::parse(text, &root).err().map(|error| error.to_string()).unwrap_or_default() };
+	let driver = |extra: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2 }}]\n{extra}", valid_fixture()) };
+
+	// Absent is legitimate: a driver that stands on its channel and does nothing else is not
+	// heartbeat-supervised, and saying so by leaving the key out is honest.
+	assert_eq!(errors(&driver("")), "", "a driver with no declared deadline must validate");
+	assert_eq!(errors(&driver("heartbeat-deadline = 1\n")), "", "the shortest legal deadline");
+	assert_eq!(errors(&driver("heartbeat-deadline = 100\n")), "", "the ceiling itself is legal");
+
+	let zero = driver("heartbeat-deadline = 0\n");
+	assert!(errors(&zero).contains("would not be supervised at all"), "{}", errors(&zero));
+	let past = driver("heartbeat-deadline = 101\n");
+	assert!(errors(&past).contains("can opt out"), "{}", errors(&past));
+}

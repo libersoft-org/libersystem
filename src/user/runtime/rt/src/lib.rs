@@ -3092,6 +3092,21 @@ pub unsafe fn set_object_name(handle: u64, name: &str) -> i64 {
 // high-water and limit of memory plus the other resource counters). The handle must carry
 // RIGHT_READ. Returns None if the handle is unknown or not a Domain; a ResourceManager
 // uses this to observe a governed Domain's usage against the budgets it set.
+// What one device's claim is doing, for a manager that holds no handle on it.
+//
+// The reconstruction path: a new DeviceManager arrives after the old one died and must read each
+// claim's state BEFORE binding rather than assuming it is free. `Releasing` is a legitimate answer
+// and NOT a refusal - treating it as one would be a permanent `Failed` for a state that was about
+// to clear on its own, because a claim refused is classified as not retryable.
+pub unsafe fn device_claim_snapshot(index: u64, privilege: u64) -> Option<DeviceClaimSnapshot> {
+	unsafe {
+		let mut snapshot: DeviceClaimSnapshot = DeviceClaimSnapshot::default();
+		let size: u64 = core::mem::size_of::<DeviceClaimSnapshot>() as u64;
+		let ok: i64 = syscall(SYS_DEVICE_CLAIM_SNAPSHOT, index, privilege, &mut snapshot as *mut DeviceClaimSnapshot as u64, size) as i64;
+		if ok < 0 { None } else { Some(snapshot) }
+	}
+}
+
 pub unsafe fn domain_stats(handle: u64) -> Option<DomainStats> {
 	unsafe {
 		let mut stats: DomainStats = DomainStats::default();

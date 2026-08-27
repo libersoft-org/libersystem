@@ -400,6 +400,10 @@ pub unsafe fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Op
 			// what comes after it here is the channel a watchdog is asking on.
 			match drain_control(bootstrap, bind) {
 				Control::Continue => {}
+				Control::Stop => {
+					stopped(bootstrap, bind);
+					return None;
+				}
 				Control::Ended => return None,
 			}
 			for (at, &handle) in handles[..count].iter().enumerate() {
@@ -435,6 +439,10 @@ pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool 
 			// the machine was declared wedged while serving StorageService as fast as it could.
 			match drain_control(bootstrap, bind) {
 				Control::Continue => {}
+				Control::Stop => {
+					stopped(bootstrap, bind);
+					return false;
+				}
 				Control::Ended => return false,
 			}
 			if poll_ready(server) {
@@ -452,6 +460,8 @@ pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool 
 enum Control {
 	// Nothing terminal: pings were answered, if any.
 	Continue,
+	// The manager asked this driver to stop and mean all of it.
+	Stop,
 	// The manager dropped the channel or sent something that ends this driver.
 	Ended,
 }
@@ -480,6 +490,11 @@ unsafe fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
 						return Control::Ended;
 					}
 				}
+				// ASKED TO STOP, AND IT MEANS ALL OF IT. A driver reaching here has nothing in
+				// flight it can finish - the loops that call this are between units of work - so
+				// what it owes is the answer and then its own exit. A driver with something to
+				// drain overrides `Control::Stop` rather than letting this decide for it.
+				proto::Opcode::Stop => return Control::Stop,
 				_ => return Control::Ended,
 			}
 		}
@@ -490,7 +505,24 @@ unsafe fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
 //
 // False when the manager dropped the channel or sent anything else, which ends the driver.
 pub unsafe fn answer_ping(bootstrap: u64, bind: &Bind) -> bool {
-	unsafe { matches!(drain_control(bootstrap, bind), Control::Continue) }
+	unsafe {
+		match drain_control(bootstrap, bind) {
+			Control::Continue => true,
+			Control::Stop => {
+				stopped(bootstrap, bind);
+				false
+			}
+			Control::Ended => false,
+		}
+	}
+}
+
+// "Everything I accepted is finished or abandoned and my device is quiet."
+//
+// Terminal for the binding. A driver sends this and exits; the manager reads it as the confirmation
+// that a PLANNED stop completed, which is what makes it different from a channel that simply closed.
+pub unsafe fn stopped(bootstrap: u64, bind: &Bind) -> bool {
+	unsafe { send_frame(bootstrap, proto::Opcode::Stopped, bind.generation, &[]) }
 }
 
 // "I am here, and this is the number you asked me with."

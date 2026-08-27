@@ -136,6 +136,15 @@ pub enum Opcode {
 	// CONTROL path?" - which is a different question from whether the device is busy, and a driver
 	// may not pet its watchdog through an unrelated child.
 	Ping = 7,
+	// manager -> driver. "Stop, and mean all of it": take no new work, finish or explicitly abandon
+	// what was accepted, flush, quieten the device, and answer `STOPPED`.
+	//
+	// ONE ROUND TRIP, NOT TWO. A separate `QUIESCE` followed by a `STOP` is two crossings for one
+	// transition and the second has nothing left to do.
+	Stop = 9,
+	// driver -> manager, terminal for the binding: everything it accepted is finished or abandoned
+	// and its device is quiet.
+	Stopped = 10,
 	// driver -> manager, the answer, echoing the sequence it was asked with.
 	//
 	// THE SEQUENCE IS WHY THIS IS NOT `rt::heartbeat`. That one counts ANY message as a pong -
@@ -158,6 +167,8 @@ impl Opcode {
 			6 => Some(Opcode::Withdraw),
 			7 => Some(Opcode::Ping),
 			8 => Some(Opcode::Pong),
+			9 => Some(Opcode::Stop),
+			10 => Some(Opcode::Stopped),
 			_ => None,
 		}
 	}
@@ -171,7 +182,7 @@ impl Opcode {
 	// silently discard whatever a driver attached beyond it - capabilities gone, nobody told.
 	pub fn handle_count(self) -> usize {
 		match self {
-			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Ping | Opcode::Pong => 0,
+			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped => 0,
 			Opcode::Resource | Opcode::Offer => 1,
 		}
 	}
@@ -180,6 +191,13 @@ impl Opcode {
 	// refused.
 	pub fn is_terminal(self) -> bool {
 		matches!(self, Opcode::Ready | Opcode::Failed)
+	}
+
+	// Whether this opcode ends the BINDING, which is a different question from ending the handshake.
+	// `STOPPED` is the only one: a driver that has said it has nothing left in flight and a quiet
+	// device has finished being this binding.
+	pub fn ends_the_binding(self) -> bool {
+		matches!(self, Opcode::Stopped)
 	}
 }
 
@@ -261,6 +279,18 @@ pub enum DriverFailureCode {
 }
 
 impl DriverFailureCode {
+	// What the driver said, for a reader. Deliberately not `Debug`: these are read by people, in a
+	// boot log, beside the binding they are about.
+	pub fn name(self) -> &'static [u8] {
+		match self {
+			DriverFailureCode::ResourceUnusable => b"the driver says what it was handed does not work",
+			DriverFailureCode::DeviceNotResponding => b"the driver says the device is not responding",
+			DriverFailureCode::OutOfMemory => b"the driver says it is out of memory",
+			DriverFailureCode::UnsupportedDevice => b"the driver read the device and will not drive it",
+			DriverFailureCode::InternalError => b"the driver does not know what went wrong",
+		}
+	}
+
 	pub fn from_u16(value: u16) -> Option<Self> {
 		match value {
 			1 => Some(DriverFailureCode::ResourceUnusable),
