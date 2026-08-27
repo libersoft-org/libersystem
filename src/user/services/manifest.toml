@@ -1917,20 +1917,25 @@ state_class = "reconstructible"
 state_scope = "service"
 dependencies = ["log_service", "process_service", "device_manager"]
 
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:device@1/device"
+
 # The binding snapshot, forwarded verbatim from the one process that holds it. Not derived here: a
 # second rendering is how one surface comes to report a constant where a state belongs.
+#
+# LAST, like every addition to a role list. These are read POSITIONALLY from the generated
+# `BOOTSTRAP_ROLES`, so putting it first swapped this service's own serve root with the catalogue
+# connection - it served nobody, and the first client to reach for it hung the boot.
 [[services.roles]]
 tag = "BINDINGS"
 kind = "factory"
 provider = "device_manager"
 source = "SERVE"
 interface = "liber:device@1/provider-catalogue"
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:device@1/device"
+presence = "optional"
 
 [[services]]
 name = "display_service"
@@ -2635,6 +2640,7 @@ kind = "factory"
 provider = "device_manager"
 source = "SERVE"
 interface = "liber:device@1/provider-catalogue"
+presence = "optional"
 
 [[services.roles]]
 tag = "SUPERVISOR"

@@ -389,6 +389,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// The connections minted from the catalogue's root. Bounded: a server that mints a channel
 		// per request without a bound is a server a client can exhaust.
 		let mut catalogue_clients = CatalogueClients::new();
+		// The operator endpoint and the ConfigService connection its writes go through. Both arrive
+		// after bring-up; 0 until they do, and a boot that grants neither simply has no operator
+		// path rather than a half-built one.
+		let mut policy_service: u64 = 0;
+		let mut policy_config: u64 = 0;
 		// THE BOOT WIRE'S SHAPE, NOT THIS PROGRAM'S LIMIT, and the difference is the whole of M7.
 		//
 		// These were four named locals - `block_client`, `block2_client`, `block3_client`,
@@ -459,11 +464,16 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// The wait set: the supervisor's channel, the catalogue's root, and every connection
 			// minted from it. One wait, so a catalogue query cannot delay a supervisor message and
 			// a supervisor message cannot delay a query.
-			let mut waiting: [u64; MAX_CATALOGUE_CLIENTS + 2] = [0; MAX_CATALOGUE_CLIENTS + 2];
+			let mut waiting: [u64; MAX_CATALOGUE_CLIENTS + 3] = [0; MAX_CATALOGUE_CLIENTS + 3];
 			let mut waiting_count: usize = 1;
 			waiting[0] = bootstrap;
 			if catalogue_service != 0 {
 				waiting[waiting_count] = catalogue_service;
+				waiting_count += 1;
+			}
+			let policy_at: usize = waiting_count;
+			if policy_service != 0 {
+				waiting[waiting_count] = policy_service;
 				waiting_count += 1;
 			}
 			for &client in catalogue_clients.live() {
@@ -474,8 +484,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			if ready != 0 {
 				if ready > 0 {
 					let at: usize = ready as usize;
-					let is_root: bool = catalogue_service != 0 && at == 1;
-					serve_catalogue_once(waiting[at], is_root, &mut catalogue_clients, &catalogue, &nodes, &mut buf);
+					if policy_service != 0 && at == policy_at {
+						serve_policy_once(policy_service, &mut nodes, policy_config, &mut buf);
+					} else {
+						let is_root: bool = catalogue_service != 0 && at == 1;
+						serve_catalogue_once(waiting[at], is_root, &mut catalogue_clients, &catalogue, &nodes, &mut buf);
+					}
 				}
 				continue;
 			}
@@ -520,6 +534,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// read off the volume.
 				#[cfg(feature = "development")]
 				Received::Message { len, handle } if len >= 6 && &buf[..6] == b"DEVREG" => dev.hold_registry(handle),
+				// The operator endpoint and this program's own ConfigService connection, both
+				// arriving after ConfigService exists - which cannot be at this program's own
+				// bootstrap, because ConfigService depends on the block driver this program binds.
+				Received::Message { len, handle } if len >= 6 && &buf[..6] == b"POLICY" && len < 9 => {
+					policy_service = handle;
+				}
+				Received::Message { len, handle } if len >= 9 && &buf[..9] == b"POLICYCFG" => {
+					policy_config = handle;
+				}
 				Received::Message { .. } => {
 					// THE DRIVERS GO DOWN BEFORE THIS PROGRAM DOES, and in reverse dependency
 					// order. Answering the supervisor first and exiting would drop every driver
@@ -2439,6 +2462,97 @@ struct CatalogueView<'a> {
 	nodes: &'a [Node],
 }
 
+// The operator's endpoint, served by this program and reached only through the one connection
+// PermissionManager mints for the operator path.
+struct PolicyView<'a> {
+	nodes: &'a mut [Node],
+	// This program's OWN ConfigService connection. The bytes live there; the decision lives here.
+	config: u64,
+}
+
+impl proto::system::device_policy_admin::Service for PolicyView<'_> {
+	fn apply(&mut self, index: u32, verb: proto::system::PolicyVerb, artifact: alloc::string::String) -> Result<proto::system::PolicyOutcome, proto::system::Error> {
+		use proto::system::PolicyOutcome;
+		let Some(node) = self.nodes.iter_mut().find(|node| node.index == index as u64) else {
+			return Ok(PolicyOutcome::NoSuchDevice);
+		};
+		let decision = decide_policy(node, verb, &artifact);
+		if decision.outcome != PolicyOutcome::Accepted {
+			return Ok(decision.outcome);
+		}
+		// THE WRITE IS PART OF ACCEPTING IT. A verb that persists and could not be written down has
+		// not been applied, and reporting otherwise would be a preference an operator believes is
+		// stored and is not.
+		if self.config != 0 {
+			let key = policy_key(node.id);
+			let mut client = proto::system::config::Client::new(ChannelTransport { chan: self.config });
+			let written = if decision.remove {
+				client.remove(&key).is_some()
+			} else if let Some(value) = decision.store.clone() {
+				client.set(&proto::system::ConfigEntry { key: key.clone(), value }).is_some()
+			} else {
+				true
+			};
+			if !written {
+				return Ok(PolicyOutcome::NotStored);
+			}
+		} else if decision.store.is_some() || decision.remove {
+			return Ok(PolicyOutcome::NotStored);
+		}
+		// AND NOW THE EFFECT ON THE NODE, which is the half only this program can perform.
+		unsafe { apply_policy(node, verb) };
+		Ok(PolicyOutcome::Accepted)
+	}
+
+	fn stored(&mut self, index: u32) -> Result<alloc::string::String, proto::system::Error> {
+		let Some(node) = self.nodes.iter().find(|node| node.index == index as u64) else {
+			return Err(proto::system::Error::NotFound);
+		};
+		if self.config == 0 {
+			return Ok(alloc::string::String::new());
+		}
+		let key = policy_key(node.id);
+		match proto::system::config::Client::new(ChannelTransport { chan: self.config }).get(&key) {
+			// A DEVICE WITH NO RECORD ANSWERS EMPTY, not an error: "nothing is stored" is a fact an
+			// operator asked for, and an error would read as "the question could not be answered".
+			Some(Ok(value)) => Ok(value),
+			_ => Ok(alloc::string::String::new()),
+		}
+	}
+}
+
+// What a verb does to the node itself. The write has already happened; this is the half no other
+// component can perform.
+unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb) {
+	unsafe {
+		use proto::system::PolicyVerb;
+		match verb {
+			// A DISABLE ON A RUNNING BINDING GOES THROUGH THE TEARDOWN, carrying the intent so it
+			// does not rebind; one on a binding that is not running has nothing to give back.
+			PolicyVerb::Disable => {
+				node.stop_intent = driver_binding::StopIntent::OperatorDisable;
+				if !node.record.move_to(BindingState::Disabled, None) {
+					print(b"DeviceManager: the operator's disable is queued behind this binding's teardown\n");
+				}
+			}
+			// ENABLE GOES TO `Unbound`, which is what INVITES the bind an enable is asking for.
+			PolicyVerb::Enable => {
+				node.stop_intent = driver_binding::StopIntent::Fault;
+				node.record.move_to(BindingState::Unbound, None);
+			}
+			// SELECT CHANGES NOTHING NOW. It is stored, and it applies at the next bind.
+			PolicyVerb::Select => {}
+			// A RETRY GRANTS EXACTLY ONE FURTHER ATTEMPT and does not reset the automatic budget:
+			// without that rule the two mechanisms meet in the table with nothing said, and whoever
+			// implements it decides for themselves whether an operator can spend the budget again.
+			PolicyVerb::Retry => {
+				node.attempt = node.attempt.saturating_sub(1);
+				node.incident = Incident::open();
+			}
+		}
+	}
+}
+
 impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 	// EVERY DEVICE NODE'S BINDING, IN ONE READ, so `lsdev` and the System Graph render the same
 	// enums rather than each deriving a state. The graph's unconditional `Running` was not a bug in
@@ -2468,6 +2582,97 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 		let wire: u16 = provider_kind_wire(kind);
 		self.catalogue.entries.iter().filter_map(|entry| entry.as_ref()).filter(|provider| provider.kind == wire).map(|provider| proto::system::ProviderInfo { kind, bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation }).collect()
 	}
+}
+
+// ------------------------------------------------------- the operator's four verbs
+//
+// DEVICEMANAGER OWNS THE DECISION; CONFIGSERVICE HOLDS THE BYTES. That division is the whole of the
+// authority question here, and it is not made true by saying it: `ConfigService::set` accepts any
+// key from any client holding a connection, and `CAP_CONFIG` is granted to three services today.
+// Any of them could store a WELL-FORMED disable and the load-time re-check would pass it, because
+// that check catches STALENESS and never asks who wrote the record.
+//
+// So the four verbs live on one narrow endpoint of this program's, and the key prefix they persist
+// under is writable by this program alone - `ConfigService::remove` refuses anything outside it.
+// Holding `CAP_CONFIG`, or holding the read-only binding snapshot, gets a component no closer.
+
+// The reserved prefix. One path, no ACL, no policy language.
+const DEVICE_POLICY_PREFIX: &[u8] = b"device.policy.";
+
+// What the operator asked, applied to one node.
+struct PolicyDecision {
+	outcome: proto::system::PolicyOutcome,
+	// The record to write, or None. `enable` writes nothing - it REMOVES, which is a different
+	// operation and the reason `ConfigService` grew one.
+	store: Option<alloc::string::String>,
+	remove: bool,
+}
+
+// Decide what a verb does to this node, WITHOUT applying it.
+//
+// Separated so the decision can be read on its own: what a verb means is a question about the
+// binding's state, and what it costs is a question about ConfigService.
+fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -> PolicyDecision {
+	use proto::system::{PolicyOutcome, PolicyVerb};
+	let none = |outcome: PolicyOutcome| PolicyDecision { outcome, store: None, remove: false };
+	// BOOT-CRITICAL BINDINGS ARE OUT. Their policy would live on a volume that is not mounted when
+	// those bindings are made, which is a dependency the wrong way round.
+	if node.candidates.first().is_some_and(|entry| entry.boot_critical) {
+		return none(PolicyOutcome::Refused);
+	}
+	match verb {
+		PolicyVerb::Retry => {
+			// QUARANTINE IS OUT OF REACH OF THIS ONE, for this boot. Its resources are charged and
+			// out of circulation precisely because nothing confirmed the device was quiet, and an
+			// operator saying so does not make it so.
+			if node.record.state == BindingState::Quarantined {
+				return none(PolicyOutcome::Quarantined);
+			}
+			// AN ACTION, NOT A STORED PREFERENCE. Nothing is written.
+			none(PolicyOutcome::Accepted)
+		}
+		PolicyVerb::Enable => {
+			// AN ENABLE WHILE A DISABLE'S TEARDOWN IS STILL IN FLIGHT IS BUSY. Cancelling the intent
+			// would mean a device that was never observed to be disabled at all, which is worse to
+			// explain than a refusal that says why.
+			if node.record.state == BindingState::Stopping && node.stop_intent == driver_binding::StopIntent::OperatorDisable {
+				return none(PolicyOutcome::Busy);
+			}
+			// NOT A THIRD STORED STATE: the REMOVAL of the disable record, so a device that was
+			// never disabled and one that was enabled again are the same device.
+			PolicyDecision { outcome: PolicyOutcome::Accepted, store: None, remove: true }
+		}
+		PolicyVerb::Disable => PolicyDecision { outcome: PolicyOutcome::Accepted, store: Some(alloc::string::String::from("disabled")), remove: false },
+		PolicyVerb::Select => {
+			// POLICY NARROWS AND NEVER WIDENS. An artifact the registry did not declare for THIS
+			// device is refused rather than obeyed - the whole point of bounding a preference by the
+			// candidate list is that an operator cannot name a driver the image never offered.
+			if !node.candidates.iter().any(|entry| entry.name == artifact.as_bytes()) {
+				return none(PolicyOutcome::NotACandidate);
+			}
+			// AND IT APPLIES AT THE NEXT BIND, never to the binding that is running: rebinding a
+			// live device because a preference changed would take a working driver away at a moment
+			// nobody chose. The operator who wants that has `disable` followed by `enable`.
+			let mut record = alloc::string::String::from("select=");
+			record.push_str(artifact);
+			PolicyDecision { outcome: PolicyOutcome::Accepted, store: Some(record), remove: false }
+		}
+	}
+}
+
+// The config key one device's policy lives under. The BDF, because that is the device's identity -
+// a row number would name whatever the table happened to hold this boot.
+fn policy_key(id: BindingId) -> alloc::string::String {
+	let mut key = alloc::string::String::from_utf8_lossy(DEVICE_POLICY_PREFIX).into_owned();
+	let mut number = [0u8; 20];
+	for (at, part) in [id.bus as u64, id.dev as u64, id.func as u64].into_iter().enumerate() {
+		if at > 0 {
+			key.push('.');
+		}
+		let n = decimal(part, &mut number);
+		key.push_str(core::str::from_utf8(&number[..n]).unwrap_or("0"));
+	}
+	key
 }
 
 // The typed state a binding state is. One mapping, in the one place the two vocabularies meet, so a
@@ -2523,6 +2728,25 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 
 // Answer one catalogue request. Non-blocking by construction: the caller only reaches this when the
 // channel is ready, and one request is one reply.
+// Answer one operator request. The endpoint is narrow by design and single-client: exactly one
+// connection is minted for the operator path, so there is nothing here to multiplex.
+unsafe fn serve_policy_once(service: u64, nodes: &mut [Node], config: u64, buf: &mut [u8]) {
+	unsafe {
+		let ReceivedCaps::Message { len, handles } = recv_caps_blocking(service, buf) else { return };
+		for &handle in handles.as_slice() {
+			close(handle);
+		}
+		let mut view = PolicyView { nodes, config };
+		let mut reply = [0u8; 1024];
+		let mut request_handles = wire::Handles::new();
+		let mut reply_handles = wire::Handles::new();
+		let request: Vec<u8> = buf[..len].to_vec();
+		if let Some(written) = proto::system::device_policy_admin::dispatch(&mut view, &request, &mut request_handles, &mut reply, &mut reply_handles) {
+			send_blocking(service, &reply[..written], 0);
+		}
+	}
+}
+
 // How many clients may hold a connection to the catalogue at once.
 //
 // A BOUND, because a server that mints a channel per request without one is a server a client can
@@ -2564,7 +2788,6 @@ unsafe fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut Catalo
 				return true;
 			}
 			if op == CONNECT_OP && is_root {
-				print(b"DeviceManager: minting a catalogue connection\n");
 				match channel_pair_for_catalogue(clients) {
 					Some(theirs) => {
 						send_blocking(channel, &[], theirs);

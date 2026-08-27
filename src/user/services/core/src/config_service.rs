@@ -201,7 +201,33 @@ impl Service for Config {
 		self.persist();
 		Ok(())
 	}
+
+	// DELETE ONE KEY, AND ONLY UNDER THE RESERVED PREFIX.
+	//
+	// This exists for exactly one thing: an operator `enable` is the REMOVAL of a device's disable
+	// record, not a third stored state - so a device that was never disabled and one that was
+	// enabled again are the same device. A general delete would be a far wider authority than that
+	// question needs, and `set ""` meaning absent would make an empty string a third state nobody
+	// declared.
+	fn remove(&mut self, key: alloc::string::String) -> Result<(), Error> {
+		if !key.starts_with(DEVICE_POLICY_PREFIX) {
+			return Err(Error::Denied);
+		}
+		let before = self.entries.len();
+		self.entries.retain(|entry| entry.key != key);
+		// A KEY THAT WAS NOT THERE IS NOT AN ERROR. `enable` on a device nobody disabled must
+		// succeed: the caller is asking for a state, and the state is already what they asked for.
+		if self.entries.len() != before {
+			self.persist();
+		}
+		Ok(())
+	}
 }
+
+// The one prefix `remove` will touch. DeviceManager alone writes under it - the four operator verbs
+// live on its own narrow endpoint, so a component holding `CAP_CONFIG` can neither write a policy
+// record nor delete one.
+const DEVICE_POLICY_PREFIX: &str = "device.policy.";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {

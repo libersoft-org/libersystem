@@ -20,6 +20,14 @@ interface config {
 	@op(1) get:  func(key: string) -> result<string, error>;
 	@op(2) list: func() -> result<list<config-entry>, error>;
 	@op(3) set:  func(entry: config-entry) -> result<unit, error>;
+	/// Delete a key. NARROW ON PURPOSE: restricted to the reserved device-policy prefix, because
+	/// this exists for one thing - an `enable` is the REMOVAL of a disable record, not a third
+	/// stored state, and a device that was never disabled and one that was enabled again must be
+	/// the same device.
+	///
+	/// Not a general delete, and not a rule that `set ""` means absent - which is how an empty
+	/// string becomes a third state nobody declared.
+	@op(4) remove: func(key: string) -> result<unit, error>;
 }
 
 /// A file the user picked: a capability to its bytes (transferred out-of-band as

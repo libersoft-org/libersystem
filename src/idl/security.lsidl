@@ -33,6 +33,15 @@ enum capability {
 	/// one. It does NOT carry the session's Process handles - `job-signal` acts on the session's
 	/// behalf precisely so a tool granted this cannot take them.
 	session,
+	/// THE OPERATOR'S DEVICE-POLICY ENDPOINT: disable, enable, select among the candidates the
+	/// registry already declared, and retry one now.
+	///
+	/// Separate from `device` on purpose, and that separation is the whole authority argument.
+	/// `device` is the READ - what hardware is present and what its bindings are doing - and every
+	/// tool that renders a device list holds it. This is the WRITE, and it is minted for the
+	/// operator path and for nothing else: holding `device`, or `config` under which the records
+	/// live, gets a component no closer to changing a binding.
+	device-policy,
 	/// A storage client CONFINED TO THE COMPONENT'S OWN ASSET DIRECTORY, and to nothing else.
 	///
 	/// An application that ships data beside itself - LiberCommander's syntax descriptors are the

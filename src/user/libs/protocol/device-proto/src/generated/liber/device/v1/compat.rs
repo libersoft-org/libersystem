@@ -58,6 +58,22 @@ fn provider_info_wire_is_stable() {
 	assert_eq!(ProviderInfo::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn policy_verb_wire_is_stable() {
+	let sample = PolicyVerb::Disable;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(PolicyVerb::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn policy_outcome_wire_is_stable() {
+	let sample = PolicyOutcome::Accepted;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[0];
+	assert_eq!(bytes, golden);
+	assert_eq!(PolicyOutcome::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn usb_device_wire_is_stable() {
 	let sample = UsbDevice { port: 7, speed: String::from("x"), vendor: 7, product: 7, class: 7, r#type: String::from("x") };
 	let bytes = sample.encode_vec().expect("encode");

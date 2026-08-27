@@ -1402,6 +1402,8 @@ pub const CAP_UDF: &[u8] = b"UDF";
 pub const CAP_USB: &[u8] = b"USB";
 pub const CAP_LOG: &[u8] = b"LOG";
 pub const CAP_DEVICE: &[u8] = b"DEVICE";
+// The operator's device-policy endpoint, held apart from the read above.
+pub const CAP_DEVPOLICY: &[u8] = b"DEVPOLICY";
 pub const CAP_PROCESS: &[u8] = b"PROCESS";
 pub const CAP_CONFIG: &[u8] = b"CONFIG";
 pub const CAP_NET: &[u8] = b"NET";

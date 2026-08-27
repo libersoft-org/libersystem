@@ -320,6 +320,7 @@ fn tag_for(cap: Capability) -> &'static [u8] {
 		Capability::Storage => b"STORAGE",
 		Capability::Network => b"NETWORK",
 		Capability::Device => b"DEVICE",
+		Capability::DevicePolicy => b"DEVPOLICY",
 		Capability::Config => b"CONFIG",
 		Capability::Time => b"TIME",
 		Capability::Audio => b"AUDIO",
@@ -350,6 +351,9 @@ struct Clients {
 	storage: u64,
 	network: u64,
 	device: u64,
+	// THE OPERATOR'S WRITE, held apart from the read. A tool granted `device` renders a list; one
+	// granted this changes a binding, and nothing that holds the first is any closer to the second.
+	device_policy: u64,
 	config: u64,
 	time: u64,
 	audio: u64,
@@ -402,6 +406,7 @@ impl Clients {
 			Capability::Storage => self.storage,
 			Capability::Network => self.network,
 			Capability::Device => self.device,
+			Capability::DevicePolicy => self.device_policy,
 			Capability::Config => self.config,
 			Capability::Time => self.time,
 			Capability::Session => self.session,
@@ -1455,6 +1460,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let session: u64 = caps.take(CAP_SESSION);
 	let config: u64 = caps.take(CAP_CONFIG);
 	let device: u64 = caps.take(CAP_DEVICE);
+	// The operator's WRITE. Optional: a boot that granted none has no operator path rather than a
+	// half-built one, and `for_capability` answering 0 refuses the grant by itself.
+	let device_policy: u64 = caps.take(CAP_DEVPOLICY);
 	let audio: u64 = caps.take(CAP_AUDIO);
 	let display_admin: u64 = caps.take(CAP_DISPLAY_ADMIN);
 	let input_admin: u64 = caps.take(CAP_INPUT_ADMIN);
@@ -1495,7 +1503,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, storage_admin, broker: bootstrap };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, storage_admin, broker: bootstrap };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") },
 		handle => handle,

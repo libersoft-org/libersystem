@@ -911,6 +911,446 @@ impl ProviderInfo {
 	}
 }
 
+/// What an operator may do to a binding. FOUR VERBS, and the fourth arrived because a state nothing
+/// can leave is not a policy - it is a way to lose a device until the next boot.
+///
+/// Only `disable` and `select` are PERSISTENT. A retry is an action, not a stored preference; and
+/// `enable` is not a third stored state but the REMOVAL of the disable record, so a device that was
+/// never disabled and one that was enabled again are the same device.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PolicyVerb {
+	/// Turn it off. Persists.
+	Disable = 0,
+	/// Turn it back on: deletes the disable record rather than storing a third state.
+	Enable = 1,
+	/// Prefer one of the candidates the registry ALREADY declared. Persists. Applies at the NEXT
+	/// bind - rebinding a live device because a preference changed would take a working driver away
+	/// at a moment nobody chose.
+	Select = 2,
+	/// Try this binding again, now. An action; nothing is stored.
+	Retry = 3,
+}
+
+impl PolicyVerb {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PolicyVerb> {
+		let mut r = Reader::new(bytes);
+		let value = PolicyVerb::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PolicyVerb> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PolicyVerb::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<PolicyVerb> {
+		match r.u8()? {
+			0 => Some(PolicyVerb::Disable),
+			1 => Some(PolicyVerb::Enable),
+			2 => Some(PolicyVerb::Select),
+			3 => Some(PolicyVerb::Retry),
+			_ => None,
+		}
+	}
+}
+
+/// What a verb did, or why it did not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum PolicyOutcome {
+	/// It was accepted and, where the verb persists, written.
+	Accepted = 0,
+	/// The device index names no node.
+	NoSuchDevice = 1,
+	/// `select` named an artifact the registry never declared for this device. Policy NARROWS and
+	/// never widens, so a preference the registry did not offer is refused rather than obeyed.
+	NotACandidate = 2,
+	/// `retry` on a quarantined binding. Its resources are charged and out of circulation precisely
+	/// because nothing confirmed the device was quiet, and an operator saying so does not make it
+	/// so. `disable`, `enable` and `select` are still accepted on one, because they are about the
+	/// NEXT bind.
+	Quarantined = 3,
+	/// An `enable` arriving while a disable's teardown is still in flight. The operator retries once
+	/// the node reaches `disabled`; cancelling the intent would mean a device that was never
+	/// observed to be disabled at all, which is worse to explain than a refusal that says why.
+	Busy = 4,
+	/// The verb reached a node it cannot apply to - a boot-critical binding, whose policy would live
+	/// on a volume that is not mounted when that binding is made.
+	Refused = 5,
+	/// It could not be written down. The binding is unchanged, which is what a failed write must
+	/// mean rather than a change nothing recorded.
+	NotStored = 6,
+}
+
+impl PolicyOutcome {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<PolicyOutcome> {
+		let mut r = Reader::new(bytes);
+		let value = PolicyOutcome::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<PolicyOutcome> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = PolicyOutcome::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<PolicyOutcome> {
+		match r.u8()? {
+			0 => Some(PolicyOutcome::Accepted),
+			1 => Some(PolicyOutcome::NoSuchDevice),
+			2 => Some(PolicyOutcome::NotACandidate),
+			3 => Some(PolicyOutcome::Quarantined),
+			4 => Some(PolicyOutcome::Busy),
+			5 => Some(PolicyOutcome::Refused),
+			6 => Some(PolicyOutcome::NotStored),
+			_ => None,
+		}
+	}
+}
+
+/// The operator's endpoint. NARROW ON PURPOSE: holding `CAP_CONFIG`, or holding the read-only
+/// binding snapshot, gets a component no closer to it - it is minted for the operator path and for
+/// nothing else, the way every other operator authority in this tree is reached.
+///
+/// The division is the whole of the authority question: DeviceManager owns the DECISION and exposes
+/// these four verbs; ConfigService holds the bytes under a prefix DeviceManager alone writes. A
+/// component that can write the config file therefore cannot change a binding.
+// interface `device-policy-admin` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod device_policy_admin {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_APPLY: u16 = 1;
+	pub const OP_STORED: u16 = 2;
+
+	pub trait Service {
+		fn apply(&mut self, index: u32, verb: PolicyVerb, artifact: String) -> Result<PolicyOutcome, Error>;
+		/// What is stored for this device right now, so an operator can see a preference before a
+		/// reboot applies it.
+		fn stored(&mut self, index: u32) -> Result<String, Error>;
+	}
+
+	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let op = r.u16()?;
+		let corr = r.u32()?;
+		let mut writer = SliceWriter::new(out);
+		if op == PROTOCOL_INFO_OP {
+			r.finish()?;
+			request_handles.clear();
+			let w = &mut writer;
+			w.u32(corr)?;
+			w.bytes_lp(b"liber:device")?;
+			w.u32(1)?;
+			match Handles::try_from_slice(writer.handles()) {
+				Some(taken) => *reply_handles = taken,
+				None => return None,
+			}
+			return Some(writer.pos());
+		}
+		match op {
+			OP_APPLY => {
+				let index = r.u32()?;
+				let verb = PolicyVerb::read(r)?;
+				let artifact = r.string_lp()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.apply(index, verb, artifact);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v12) => {
+							w.u8(1)?;
+							v12.write(w)?;
+						}
+						Err(v13) => {
+							w.u8(0)?;
+							v13.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			OP_STORED => {
+				let index = r.u32()?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.stored(index);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v14) => {
+							w.u8(1)?;
+							w.bytes_lp(v14.as_bytes())?;
+						}
+						Err(v15) => {
+							w.u8(0)?;
+							v15.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
+			_ => return None,
+		}
+		match Handles::try_from_slice(writer.handles()) {
+			Some(taken) => *reply_handles = taken,
+			None => return None,
+		}
+		Some(writer.pos())
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn apply(&mut self, index: &u32, verb: &PolicyVerb, artifact: &str) -> Option<Result<PolicyOutcome, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_APPLY)?;
+			w.u32(corr)?;
+			w.u32(*index)?;
+			verb.write(w)?;
+			w.bytes_lp(artifact.as_bytes())?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(PolicyOutcome::read(r)?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn stored(&mut self, index: &u32) -> Option<Result<String, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_STORED)?;
+			w.u32(corr)?;
+			w.u32(*index)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(r.string_lp()?) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_device_policy_admin_apply")]
+	fn channel_invoke_apply(chan: u64, index: &u32, verb: &PolicyVerb, artifact: &str) -> Option<Result<PolicyOutcome, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.apply(index, verb, artifact)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_device_policy_admin_stored")]
+	fn channel_invoke_stored(chan: u64, index: &u32) -> Option<Result<String, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.stored(index)
+	}
+}
+
 /// The provider catalogue, served by DeviceManager - the only process that holds it.
 ///
 /// `subscribe` answers with everything of that kind published RIGHT NOW and continues
@@ -965,8 +1405,8 @@ pub mod provider_catalogue {
 						return None;
 					}
 					w.u16(result.len() as u16)?;
-					for v12 in result.iter() {
-						v12.write(w)?;
+					for v16 in result.iter() {
+						v16.write(w)?;
 					}
 					Some(())
 				})();
@@ -1152,13 +1592,13 @@ pub mod provider_catalogue {
 					return None;
 				}
 				let value = {
-					let v13 = r.u16()? as usize;
-					let mut v14 = Vec::new();
-					v14.try_reserve_exact(v13).ok()?;
-					for _ in 0..v13 {
-						v14.push(BindingRecord::read(r)?);
+					let v17 = r.u16()? as usize;
+					let mut v18 = Vec::new();
+					v18.try_reserve_exact(v17).ok()?;
+					for _ in 0..v17 {
+						v18.push(BindingRecord::read(r)?);
 					}
-					v14
+					v18
 				};
 				r.finish()?;
 				Some(value)
@@ -1300,19 +1740,19 @@ pub mod usb {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v15) => {
+						Ok(v19) => {
 							w.u8(1)?;
-							if v15.len() > u16::MAX as usize {
+							if v19.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v15.len() as u16)?;
-							for v17 in v15.iter() {
-								v17.write(w)?;
+							w.u16(v19.len() as u16)?;
+							for v21 in v19.iter() {
+								v21.write(w)?;
 							}
 						}
-						Err(v16) => {
+						Err(v20) => {
 							w.u8(0)?;
-							v16.write(w)?;
+							v20.write(w)?;
 						}
 					}
 					Some(())
@@ -1442,13 +1882,13 @@ pub mod usb {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v18 = r.u16()? as usize;
-						let mut v19 = Vec::new();
-						v19.try_reserve_exact(v18).ok()?;
-						for _ in 0..v18 {
-							v19.push(UsbDevice::read(r)?);
+						let v22 = r.u16()? as usize;
+						let mut v23 = Vec::new();
+						v23.try_reserve_exact(v22).ok()?;
+						for _ in 0..v22 {
+							v23.push(UsbDevice::read(r)?);
 						}
-						v19
+						v23
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -1941,6 +2381,99 @@ impl ProviderInfo {
 		crate::codec::cbor::uint(out, self.slot as u64);
 		crate::codec::cbor::text(out, "provider-generation");
 		crate::codec::cbor::uint(out, self.provider_generation as u64);
+	}
+}
+
+impl PolicyVerb {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			PolicyVerb::Disable => out.push_str("\"disable\""),
+			PolicyVerb::Enable => out.push_str("\"enable\""),
+			PolicyVerb::Select => out.push_str("\"select\""),
+			PolicyVerb::Retry => out.push_str("\"retry\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			PolicyVerb::Disable => out.push_str("disable"),
+			PolicyVerb::Enable => out.push_str("enable"),
+			PolicyVerb::Select => out.push_str("select"),
+			PolicyVerb::Retry => out.push_str("retry"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			PolicyVerb::Disable => crate::codec::cbor::text(out, "disable"),
+			PolicyVerb::Enable => crate::codec::cbor::text(out, "enable"),
+			PolicyVerb::Select => crate::codec::cbor::text(out, "select"),
+			PolicyVerb::Retry => crate::codec::cbor::text(out, "retry"),
+		}
+	}
+}
+
+impl PolicyOutcome {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			PolicyOutcome::Accepted => out.push_str("\"accepted\""),
+			PolicyOutcome::NoSuchDevice => out.push_str("\"no-such-device\""),
+			PolicyOutcome::NotACandidate => out.push_str("\"not-a-candidate\""),
+			PolicyOutcome::Quarantined => out.push_str("\"quarantined\""),
+			PolicyOutcome::Busy => out.push_str("\"busy\""),
+			PolicyOutcome::Refused => out.push_str("\"refused\""),
+			PolicyOutcome::NotStored => out.push_str("\"not-stored\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			PolicyOutcome::Accepted => out.push_str("accepted"),
+			PolicyOutcome::NoSuchDevice => out.push_str("no-such-device"),
+			PolicyOutcome::NotACandidate => out.push_str("not-a-candidate"),
+			PolicyOutcome::Quarantined => out.push_str("quarantined"),
+			PolicyOutcome::Busy => out.push_str("busy"),
+			PolicyOutcome::Refused => out.push_str("refused"),
+			PolicyOutcome::NotStored => out.push_str("not-stored"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			PolicyOutcome::Accepted => crate::codec::cbor::text(out, "accepted"),
+			PolicyOutcome::NoSuchDevice => crate::codec::cbor::text(out, "no-such-device"),
+			PolicyOutcome::NotACandidate => crate::codec::cbor::text(out, "not-a-candidate"),
+			PolicyOutcome::Quarantined => crate::codec::cbor::text(out, "quarantined"),
+			PolicyOutcome::Busy => crate::codec::cbor::text(out, "busy"),
+			PolicyOutcome::Refused => crate::codec::cbor::text(out, "refused"),
+			PolicyOutcome::NotStored => crate::codec::cbor::text(out, "not-stored"),
+		}
 	}
 }
 

@@ -42,6 +42,15 @@ pub enum Capability {
 	/// one. It does NOT carry the session's Process handles - `job-signal` acts on the session's
 	/// behalf precisely so a tool granted this cannot take them.
 	Session = 19,
+	/// THE OPERATOR'S DEVICE-POLICY ENDPOINT: disable, enable, select among the candidates the
+	/// registry already declared, and retry one now.
+	///
+	/// Separate from `device` on purpose, and that separation is the whole authority argument.
+	/// `device` is the READ - what hardware is present and what its bindings are doing - and every
+	/// tool that renders a device list holds it. This is the WRITE, and it is minted for the
+	/// operator path and for nothing else: holding `device`, or `config` under which the records
+	/// live, gets a component no closer to changing a binding.
+	DevicePolicy = 20,
 	/// A storage client CONFINED TO THE COMPONENT'S OWN ASSET DIRECTORY, and to nothing else.
 	///
 	/// An application that ships data beside itself - LiberCommander's syntax descriptors are the
@@ -53,7 +62,7 @@ pub enum Capability {
 	/// The client is minted per launch through `volume-admin.open-directory`, so it carries the
 	/// directory as its SCOPE rather than as a convention the holder is trusted to respect: a path
 	/// outside it is refused by the service, and the client cannot mint a broader one.
-	AppAssets = 20,
+	AppAssets = 21,
 	/// The authority to RECORD, minted per launch through `audio-admin.open-captures`.
 	///
 	/// Separate from `audio-stream` on purpose. Playback and capture are the same device and the
@@ -61,7 +70,7 @@ pub enum Capability {
 	/// wrong, "may record" is a microphone. A manifest that could only say `audio-stream` would be
 	/// a manifest that hands the microphone to anything that beeps, so the two are named apart and
 	/// the connection each mints refuses the other's operations.
-	AudioCapture = 21,
+	AudioCapture = 22,
 }
 
 impl Capability {
@@ -124,8 +133,9 @@ impl Capability {
 			17 => Some(Capability::InputKeys),
 			18 => Some(Capability::AudioStream),
 			19 => Some(Capability::Session),
-			20 => Some(Capability::AppAssets),
-			21 => Some(Capability::AudioCapture),
+			20 => Some(Capability::DevicePolicy),
+			21 => Some(Capability::AppAssets),
+			22 => Some(Capability::AudioCapture),
 			_ => None,
 		}
 	}
@@ -1228,6 +1238,7 @@ impl Capability {
 			Capability::InputKeys => out.push_str("\"input-keys\""),
 			Capability::AudioStream => out.push_str("\"audio-stream\""),
 			Capability::Session => out.push_str("\"session\""),
+			Capability::DevicePolicy => out.push_str("\"device-policy\""),
 			Capability::AppAssets => out.push_str("\"app-assets\""),
 			Capability::AudioCapture => out.push_str("\"audio-capture\""),
 		}
@@ -1254,6 +1265,7 @@ impl Capability {
 			Capability::InputKeys => out.push_str("input-keys"),
 			Capability::AudioStream => out.push_str("audio-stream"),
 			Capability::Session => out.push_str("session"),
+			Capability::DevicePolicy => out.push_str("device-policy"),
 			Capability::AppAssets => out.push_str("app-assets"),
 			Capability::AudioCapture => out.push_str("audio-capture"),
 		}
@@ -1280,6 +1292,7 @@ impl Capability {
 			Capability::InputKeys => crate::codec::cbor::text(out, "input-keys"),
 			Capability::AudioStream => crate::codec::cbor::text(out, "audio-stream"),
 			Capability::Session => crate::codec::cbor::text(out, "session"),
+			Capability::DevicePolicy => crate::codec::cbor::text(out, "device-policy"),
 			Capability::AppAssets => crate::codec::cbor::text(out, "app-assets"),
 			Capability::AudioCapture => crate::codec::cbor::text(out, "audio-capture"),
 		}

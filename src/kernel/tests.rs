@@ -2563,6 +2563,15 @@ fn spawn_service(name: &[u8]) -> (alloc::sync::Arc<object::channel::Channel>, al
 	// plan refuses anything wider - correctly. A harness standing in for the supervisor has to
 	// stand in accurately, or the test agrees with nothing that happens on a real boot.
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("serve bootstrap");
+	// AN OPTIONAL ROLE'S TAG STILL TRAVELS, carrying nothing.
+	//
+	// `Optional` is not "may be omitted": these are read POSITIONALLY, so a missing message shifts
+	// every read after it. DeviceService takes a DeviceManager catalogue connection it forwards the
+	// binding snapshot over, and this harness has no DeviceManager - which is exactly the boot that
+	// grants none, and the service answers that query with an error rather than an empty list.
+	if name == b"device_service" {
+		boot_kernel.send(object::channel::Message::new(b"BINDINGS".to_vec(), alloc::vec::Vec::new())).expect("bindings bootstrap");
+	}
 	(boot_kernel, service_client)
 }
 

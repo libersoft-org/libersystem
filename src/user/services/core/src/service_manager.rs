@@ -585,6 +585,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// before a replacement manager binds anything, or the old drivers would still hold claims the
 	// new one is about to hand out.
 	let mut device_manager_domain: u64 = 0;
+	// The server end of DeviceManager's operator endpoint. This supervisor holds it so
+	// PermissionManager can mint the operator's connection from it - and from nowhere else.
+	let mut policy_admin_server: u64 = 0;
 	let mut admin_server: u64 = 0;
 	// A second admin channel: the one PermissionManager grants to the sandboxed `stop`
 	// command (the supervisor capability), so `stop` run as its own ELF reaches the
@@ -616,11 +619,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut i: usize = 0;
 		while i < N {
 			if state[i] == State::Absent && deps_satisfied(MANIFEST[i].deps, &state) {
-				unsafe {
-					print(b"SM: start ");
-					print(MANIFEST[i].name);
-					print(b"\n");
-				}
 				let mut proc_handle: u64 = 0;
 				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut gpu_client, &mut display_client, &mut display_admin, &mut snd_client, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
@@ -966,6 +964,39 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 	}
 	let _ = storage_client;
+
+	// THE OPERATOR ENDPOINT, AFTER CONFIGSERVICE EXISTS AND NOT BEFORE.
+	//
+	// DeviceManager cannot take a ConfigService client at its own bootstrap: ConfigService depends
+	// on StorageService, which depends on the block driver DeviceManager binds - so declaring it as
+	// a role would be a dependency cycle. The policy is about the NEXT bind in any case, and
+	// boot-critical bindings are explicitly out of it, so arriving late costs nothing.
+	//
+	// Two messages, in the order DeviceManager reads them: the endpoint its clients reach the four
+	// verbs on, then its OWN ConfigService connection - the bytes live there, the decision lives in
+	// DeviceManager, and that division is what stops a component holding `CAP_CONFIG` from changing
+	// a binding.
+	unsafe {
+		if let Some(dm) = index_of(b"device_manager")
+			&& channels[dm] != 0
+			&& state[dm] == State::Ready
+		{
+			match channel() {
+				Some((server, client)) => {
+					if send_blocking(channels[dm], b"POLICY", client) {
+						policy_admin_server = server;
+					} else {
+						close(server);
+					}
+				}
+				None => print(b"ServiceManager: no channel for the device policy endpoint; the operator verbs are unreachable this boot\n"),
+			}
+			// A connection of DeviceManager's own, so its writes are its own. Sent whether or not
+			// one could be minted: the read is positional.
+			let config_for_dm: u64 = if config_client != 0 { service_connect(config_client).unwrap_or(0) } else { 0 };
+			send_blocking(channels[dm], b"POLICYCFG", config_for_dm);
+		}
+	}
 
 	// 5. stand as the supervisor. Unlike the earlier design, ServiceManager does not
 	//    exit after bring-up: it blocks on every live control channel at once so it can

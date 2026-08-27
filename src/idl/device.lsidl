@@ -126,6 +126,65 @@ record provider-info {
 	provider-generation: u32,
 }
 
+/// What an operator may do to a binding. FOUR VERBS, and the fourth arrived because a state nothing
+/// can leave is not a policy - it is a way to lose a device until the next boot.
+///
+/// Only `disable` and `select` are PERSISTENT. A retry is an action, not a stored preference; and
+/// `enable` is not a third stored state but the REMOVAL of the disable record, so a device that was
+/// never disabled and one that was enabled again are the same device.
+enum policy-verb {
+	/// Turn it off. Persists.
+	disable = 0,
+	/// Turn it back on: deletes the disable record rather than storing a third state.
+	enable  = 1,
+	/// Prefer one of the candidates the registry ALREADY declared. Persists. Applies at the NEXT
+	/// bind - rebinding a live device because a preference changed would take a working driver away
+	/// at a moment nobody chose.
+	select  = 2,
+	/// Try this binding again, now. An action; nothing is stored.
+	retry   = 3,
+}
+
+/// What a verb did, or why it did not.
+enum policy-outcome {
+	/// It was accepted and, where the verb persists, written.
+	accepted            = 0,
+	/// The device index names no node.
+	no-such-device      = 1,
+	/// `select` named an artifact the registry never declared for this device. Policy NARROWS and
+	/// never widens, so a preference the registry did not offer is refused rather than obeyed.
+	not-a-candidate     = 2,
+	/// `retry` on a quarantined binding. Its resources are charged and out of circulation precisely
+	/// because nothing confirmed the device was quiet, and an operator saying so does not make it
+	/// so. `disable`, `enable` and `select` are still accepted on one, because they are about the
+	/// NEXT bind.
+	quarantined         = 3,
+	/// An `enable` arriving while a disable's teardown is still in flight. The operator retries once
+	/// the node reaches `disabled`; cancelling the intent would mean a device that was never
+	/// observed to be disabled at all, which is worse to explain than a refusal that says why.
+	busy                = 4,
+	/// The verb reached a node it cannot apply to - a boot-critical binding, whose policy would live
+	/// on a volume that is not mounted when that binding is made.
+	refused             = 5,
+	/// It could not be written down. The binding is unchanged, which is what a failed write must
+	/// mean rather than a change nothing recorded.
+	not-stored          = 6,
+}
+
+/// The operator's endpoint. NARROW ON PURPOSE: holding `CAP_CONFIG`, or holding the read-only
+/// binding snapshot, gets a component no closer to it - it is minted for the operator path and for
+/// nothing else, the way every other operator authority in this tree is reached.
+///
+/// The division is the whole of the authority question: DeviceManager owns the DECISION and exposes
+/// these four verbs; ConfigService holds the bytes under a prefix DeviceManager alone writes. A
+/// component that can write the config file therefore cannot change a binding.
+interface device-policy-admin {
+	@op(1) apply: func(index: u32, verb: policy-verb, artifact: string) -> result<policy-outcome, error>;
+	/// What is stored for this device right now, so an operator can see a preference before a
+	/// reboot applies it.
+	@op(2) stored: func(index: u32) -> result<string, error>;
+}
+
 /// The provider catalogue, served by DeviceManager - the only process that holds it.
 ///
 /// `subscribe` answers with everything of that kind published RIGHT NOW and continues
