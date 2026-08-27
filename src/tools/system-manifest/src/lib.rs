@@ -106,15 +106,21 @@ struct RawDriver {
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields, rename_all = "kebab-case")]
 struct RawMatchRule {
-	// The device type the kernel reports. ONE predicate, because it is one field: `DeviceInfo`
-	// carries a single `device_type` and the virtio kinds (net 1, blk 2, console 3, gpu 16,
-	// input 18, sound 25) share its number space with the rest (xHCI 0x100). It was two -
-	// `virtio-type` and `device-type` - and the ambiguity check refused the whole manifest on its
-	// first run, correctly: two names for one field cannot be compared, so `virtio-type = 2` and
-	// `device-type = 256` looked like predicates about different things and therefore compatible.
-	// A vocabulary that claims two questions where the system asks one cannot be reasoned about.
+	// THE TRANSPORT AND THE VIRTIO TYPE, together or not at all.
+	//
+	// `device-type = N` used to be the whole vocabulary, and seven of the eight rows using it were
+	// right by accident: for a virtio function `device_type` IS the virtio specification's own
+	// device type. The eighth said `device-type = 256`, a LiberSystem constant invented for the
+	// table, standing in for the PCI class triple the scan had already resolved. One name for two
+	// number spaces cannot be reasoned about - and no row pinned the transport, so the rule said
+	// "device type 1" where it meant "a virtio-pci function whose virtio type is 1".
+	//
+	// The pair is what makes it a standards identity: the virtio specification defines the number,
+	// and the transport says which specification is being cited.
 	#[serde(default)]
-	device_type: Option<u32>,
+	transport: Option<RawTransport>,
+	#[serde(default)]
+	virtio_type: Option<u32>,
 	// The standards path: how a driver claims a FAMILY of hardware rather than one vendor-defined
 	// model number. `DeviceInfo` carries class, subclass and programming interface since
 	// 2026-08-12; the kernel had resolved all three since the first PCI scan and kept them for
@@ -125,10 +131,33 @@ struct RawMatchRule {
 	pci_subclass: Option<u8>,
 	#[serde(default)]
 	pci_interface: Option<u8>,
+	// THE PART, not the kind. A vendor number says who made a device; it never says what it is, so
+	// it may only NARROW a rule that already names a standard identity. That is what a quirk is: a
+	// rule for a particular part, which says which part it is a quirk for.
+	#[serde(default)]
+	pci_vendor: Option<u16>,
+	#[serde(default)]
+	pci_product: Option<u16>,
 	// The one predicate that names a LOCATION rather than a kind, for a second device of a type
 	// that already has a driver.
 	#[serde(default)]
 	pci_address: Option<RawPciAddress>,
+}
+
+// THE TRANSPORTS THIS SYSTEM DISCOVERS, as a closed set rather than a string.
+//
+// An enum is what makes `transport = "nvme"` a manifest that does not parse instead of a rule that
+// silently never matches - the same argument `deny_unknown_fields` makes for the keys, applied to a
+// value. One variant today, because one is what the scan can answer.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum RawTransport {
+	VirtioPci,
+	// A function that speaks no virtio transport, so its class triple is its whole identity. NOT
+	// the absence of the key: omitting `transport` means "do not ask", and a rule that does not ask
+	// can match a virtio function AND a plain one - which is what made every virtio row overlap the
+	// xHCI row the first time this vocabulary was checked. Naming it is what separates them.
+	PlainPci,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -382,12 +411,22 @@ pub struct Driver {
 // is present must hold. `None` is "do not ask", not "must be absent".
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Default)]
 pub struct MatchRule {
-	pub device_type: Option<u32>,
+	// `Some(TRANSPORT_VIRTIO_PCI)` for a virtio-pci rule; `None` is "do not ask".
+	pub transport: Option<u8>,
+	pub virtio_type: Option<u32>,
 	pub pci_class: Option<u8>,
 	pub pci_subclass: Option<u8>,
 	pub pci_interface: Option<u8>,
+	pub pci_vendor: Option<u16>,
+	pub pci_product: Option<u16>,
 	pub pci_address: Option<PciAddress>,
 }
+
+// What `transport = "virtio-pci"` becomes. The same number `abi::TRANSPORT_VIRTIO_PCI` is, written
+// here because this crate is a build-time tool and does not link the kernel ABI - and the two are
+// kept in step by `check-declared-interfaces`, which reads both.
+pub const TRANSPORT_VIRTIO_PCI: u8 = 1;
+pub const TRANSPORT_PLAIN_PCI: u8 = 0;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct PciAddress {
@@ -409,14 +448,24 @@ impl MatchRule {
 	// set is closed, which is what lets `validate_references` refuse an ambiguous registry when it
 	// is BUILT rather than discover it on a machine that happens to have the device.
 	pub fn overlaps(self, other: MatchRule) -> bool {
-		optional_overlaps32(self.device_type, other.device_type)
+		optional_overlaps32(self.virtio_type, other.virtio_type)
+			&& optional_overlaps(self.transport, other.transport)
 			&& optional_overlaps(self.pci_class, other.pci_class)
 			&& optional_overlaps(self.pci_subclass, other.pci_subclass)
 			&& optional_overlaps(self.pci_interface, other.pci_interface)
+			&& optional_overlaps16(self.pci_vendor, other.pci_vendor)
+			&& optional_overlaps16(self.pci_product, other.pci_product)
 			&& match (self.pci_address, other.pci_address) {
 				(Some(left), Some(right)) => left == right,
 				_ => true,
 			}
+	}
+}
+
+fn optional_overlaps16(left: Option<u16>, right: Option<u16>) -> bool {
+	match (left, right) {
+		(Some(l), Some(r)) => l == r,
+		_ => true,
 	}
 }
 
@@ -740,7 +789,27 @@ impl Manifest {
 			if !destinations.insert(destination.clone()) {
 				push_error(&mut errors, format!("{location}.destination"), "duplicate staged destination");
 			}
-			let driver = raw_program.driver.as_ref().map(|raw| Driver { lifecycle: raw.lifecycle, priority: raw.priority, rules: raw.rules.iter().map(|rule| MatchRule { device_type: rule.device_type, pci_class: rule.pci_class, pci_subclass: rule.pci_subclass, pci_interface: rule.pci_interface, pci_address: rule.pci_address.map(|address| PciAddress { bus: address.bus, dev: address.dev, func: address.func }) }).collect() });
+			let driver = raw_program.driver.as_ref().map(|raw| Driver {
+				lifecycle: raw.lifecycle,
+				priority: raw.priority,
+				rules: raw
+					.rules
+					.iter()
+					.map(|rule| MatchRule {
+						transport: rule.transport.map(|transport| match transport {
+							RawTransport::VirtioPci => TRANSPORT_VIRTIO_PCI,
+							RawTransport::PlainPci => TRANSPORT_PLAIN_PCI,
+						}),
+						virtio_type: rule.virtio_type,
+						pci_class: rule.pci_class,
+						pci_subclass: rule.pci_subclass,
+						pci_interface: rule.pci_interface,
+						pci_vendor: rule.pci_vendor,
+						pci_product: rule.pci_product,
+						pci_address: rule.pci_address.map(|address| PciAddress { bus: address.bus, dev: address.dev, func: address.func }),
+					})
+					.collect(),
+			});
 			if programs.insert(name.clone(), Program { name, owner, role: raw_program.role, linkage: raw_program.linkage, stage: raw_program.stage, destination, providers, development: raw_program.development, driver }).is_some() {
 				push_error(&mut errors, format!("{location}.name"), "duplicate program name");
 			}
@@ -1138,6 +1207,54 @@ fn validate_program_shape(raw: &RawProgram, name: &Name, destination: &RelativeP
 		}
 		if driver.lifecycle != DriverLifecycle::BootCritical && raw.stage == Stage::Pinned {
 			push_error(errors, format!("{location}.stage"), "only a boot-critical driver belongs in init.pkg; everything else loads from the system volume");
+		}
+		// THE KEYS HAVE RELATIONS, AND A CLOSED SET IS NOT A COHERENT ONE.
+		//
+		// Everything above asks whether a rule has predicates; nothing asked whether they mean
+		// anything together. `{ pci-subclass = 3 }` with no class is a rule about a number whose
+		// meaning is defined by the field beside it, and `{ pci-product = 0x1000 }` with no vendor
+		// names a part number in nobody's catalogue. Both parse, both generate, and both match
+		// whatever happens to share the number.
+		for (index, rule) in driver.rules.iter().enumerate() {
+			let at = format!("{location}.driver.match[{index}]");
+			// 1. The transport and the virtio type cite one specification between them. Either
+			//    alone is half a citation: a transport with no type matches every virtio function,
+			//    and a type with no transport is the `device-type` defect under a new name.
+			//    A transport this system does not discover is refused by the parser rather than
+			//    here: `RawTransport` is a closed enum, so the manifest fails to load.
+			match (rule.transport, rule.virtio_type) {
+				(Some(RawTransport::VirtioPci), None) => push_error(errors, at.clone(), "transport names a specification and virtio-type names the number in it; virtio-pci with no type matches every virtio function"),
+				(None, Some(_)) => push_error(errors, at.clone(), "virtio-type is a number defined by the virtio specification, so the rule must say it is a virtio-pci function"),
+				(Some(RawTransport::PlainPci), Some(_)) => push_error(errors, at.clone(), "a function that speaks no virtio transport has no virtio type"),
+				(Some(RawTransport::PlainPci), None) if rule.pci_class.is_none() => push_error(errors, at.clone(), "plain-pci says what a function is NOT; the rule still has to say what it is, which for a plain PCI function is its class"),
+				_ => {}
+			}
+			// 2 and 3. The class triple is a hierarchy, and each level is meaningless without the
+			//    one above it: subclass 3 means one thing under class 0c and another under 03.
+			if rule.pci_subclass.is_some() && rule.pci_class.is_none() {
+				push_error(errors, at.clone(), "pci-subclass is defined WITHIN a class, so a subclass with no class matches whatever happens to share the number");
+			}
+			if rule.pci_interface.is_some() && (rule.pci_class.is_none() || rule.pci_subclass.is_none()) {
+				push_error(errors, at.clone(), "pci-interface is defined within a class AND subclass; both must be named");
+			}
+			// 4. A product number is a part in a vendor's catalogue, and two vendors number
+			//    independently.
+			if rule.pci_product.is_some() && rule.pci_vendor.is_none() {
+				push_error(errors, at.clone(), "pci-product is a part number in a vendor's catalogue, so pci-vendor must say whose");
+			}
+			// 5. VENDOR, PRODUCT AND ADDRESS NARROW; THEY NEVER SELECT.
+			//
+			//    A vendor number says who made a device and an address says where it is plugged in;
+			//    neither says what it IS. A rule built only from them binds a driver to whatever
+			//    occupies a slot, which is how a driver comes to be handed hardware it cannot
+			//    drive. AND THERE IS NO EXCEPTION FOR THE DEVELOPMENT CONSOLE - its rule is
+			//    transport, virtio-type AND address together, which is what the manifest already
+			//    says: the binder's own comment records why OR-ing them would "bind any device at
+			//    that address to the console driver".
+			let names_a_standard: bool = rule.virtio_type.is_some() || rule.pci_class.is_some();
+			if !names_a_standard && (rule.pci_vendor.is_some() || rule.pci_product.is_some() || rule.pci_address.is_some()) {
+				push_error(errors, at, "pci-vendor, pci-product and pci-address may only NARROW a rule that already names a standard identity - a virtio type or a PCI class - because none of them says what a device is");
+			}
 		}
 		// Two rules in ONE entry that overlap are a declaration written twice, which is harmless at
 		// runtime and a sign the author meant two different things.

@@ -218,7 +218,7 @@ fn the_driver_registry_refuses_what_it_says_it_refuses() {
 	// A driver program appended to the ordinary fixture, so everything else about it is valid and
 	// only the thing under test is wrong.
 	let with = |driver: &str| -> String { format!("{}\n[[programs]]\nname = \"a_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/a_driver.lsexe\"\n{driver}", valid_fixture()) };
-	const ORDINARY: &str = "\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{ device-type = 2 }]\n";
+	const ORDINARY: &str = "\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{ transport = \"virtio-pci\", virtio-type = 2 }]\n";
 
 	// The shape it is built for parses, so every refusal below is about the one thing it changes.
 	assert_eq!(errors(&with(ORDINARY)), "", "the ordinary shape must validate");
@@ -228,17 +228,17 @@ fn the_driver_registry_refuses_what_it_says_it_refuses() {
 	assert!(errors(&with("")).contains("binding rules"), "a driver without rules must be refused: {}", errors(&with("")));
 
 	// An empty match list is the same thing written differently.
-	let empty = ORDINARY.replace("[{ device-type = 2 }]", "[]");
+	let empty = ORDINARY.replace("[{ transport = \"virtio-pci\", virtio-type = 2 }]", "[]");
 	assert!(errors(&with(&empty)).contains("selects nothing"), "{}", errors(&with(&empty)));
 
 	// A RULE THE SYSTEM CANNOT ANSWER fails to PARSE rather than never matching. That is what the
 	// closed rule set buys: the difference between a typo caught at build time and a driver that
 	// silently never binds.
-	let unknown = ORDINARY.replace("device-type = 2", "usb-class = 3");
+	let unknown = ORDINARY.replace("virtio-type = 2", "usb-class = 3");
 	assert!(!errors(&with(&unknown)).is_empty(), "a rule naming something discovery does not report must not parse");
 
 	// A RULE WITH NO PREDICATES selects every device on the machine.
-	let everything = ORDINARY.replace("[{ device-type = 2 }]", "[{}]");
+	let everything = ORDINARY.replace("[{ transport = \"virtio-pci\", virtio-type = 2 }]", "[{}]");
 	assert!(errors(&with(&everything)).contains("EVERY device"), "{}", errors(&with(&everything)));
 
 	// A CONJUNCTION NARROWS, so two entries that share a predicate but differ on another do not
@@ -246,8 +246,57 @@ fn the_driver_registry_refuses_what_it_says_it_refuses() {
 	// getting this wrong in the other direction is what the first version did: predicates named for
 	// one field under two names could not be compared at all, and the check refused the real
 	// manifest on its first run.
-	let narrowed = format!("{}{}\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{{ device-type = 2, pci-address = {{ bus = 0, dev = 30, func = 0 }} }}]\npriority = \"quirk\"\n", with(ORDINARY), "\n[[programs]]\nname = \"b_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/b_driver.lsexe\"\n");
+	let narrowed = format!("{}{}\n[programs.driver]\nlifecycle = \"controller\"\nmatch = [{{ transport = \"virtio-pci\", virtio-type = 2, pci-address = {{ bus = 0, dev = 30, func = 0 }} }}]\npriority = \"quirk\"\n", with(ORDINARY), "\n[[programs]]\nname = \"b_driver\"\nowner = \"tool\"\nrole = \"driver\"\nlinkage = \"static\"\nstage = \"volume\"\ndestination = \"drivers/b_driver.lsexe\"\n");
 	assert_eq!(errors(&narrowed), "", "a narrower rule at a higher priority is arbitration, not ambiguity");
+
+	// ------------------------------------------------- the keys have relations
+	//
+	// A CLOSED SET IS NOT A COHERENT ONE. Everything above asks whether a rule HAS predicates;
+	// these ask whether they mean anything together. Each one is watched to refuse, because a
+	// validator nobody has seen refuse is a validator that accepts.
+	let rule = |predicates: &str| -> String { ORDINARY.replace("transport = \"virtio-pci\", virtio-type = 2", predicates) };
+
+	// 1. The transport and the virtio type cite one specification between them, and either alone is
+	//    half a citation.
+	let bare_transport = rule("transport = \"virtio-pci\"");
+	assert!(errors(&with(&bare_transport)).contains("matches every virtio function"), "{}", errors(&with(&bare_transport)));
+	let bare_type = rule("virtio-type = 2");
+	assert!(errors(&with(&bare_type)).contains("virtio-pci function"), "{}", errors(&with(&bare_type)));
+	// And `plain-pci` is a predicate, not an absence: it says what a function is NOT, so the rule
+	// still has to say what it is.
+	let plain_alone = rule("transport = \"plain-pci\"");
+	assert!(errors(&with(&plain_alone)).contains("still has to say what it is"), "{}", errors(&with(&plain_alone)));
+	let plain_with_type = rule("transport = \"plain-pci\", virtio-type = 2");
+	assert!(errors(&with(&plain_with_type)).contains("no virtio type"), "{}", errors(&with(&plain_with_type)));
+
+	// 2 and 3. The class triple is a hierarchy: subclass 3 means one thing under class 0c and
+	//    another under 03, so a level without the one above it matches whatever shares the number.
+	let orphan_subclass = rule("pci-subclass = 3");
+	assert!(errors(&with(&orphan_subclass)).contains("defined WITHIN a class"), "{}", errors(&with(&orphan_subclass)));
+	let orphan_interface = rule("pci-class = 12, pci-interface = 48");
+	assert!(errors(&with(&orphan_interface)).contains("class AND subclass"), "{}", errors(&with(&orphan_interface)));
+
+	// 4. A product number is a part in a vendor's catalogue, and two vendors number independently.
+	let orphan_product = rule("pci-class = 12, pci-product = 4096");
+	assert!(errors(&with(&orphan_product)).contains("vendor's catalogue"), "{}", errors(&with(&orphan_product)));
+
+	// 5. VENDOR, PRODUCT AND ADDRESS NARROW; THEY NEVER SELECT. A rule built only from them binds a
+	//    driver to whatever occupies a slot - which is how a driver comes to be handed hardware it
+	//    cannot drive.
+	let vendor_alone = rule("pci-vendor = 6900");
+	assert!(errors(&with(&vendor_alone)).contains("only NARROW"), "{}", errors(&with(&vendor_alone)));
+	let address_alone = rule("pci-address = { bus = 0, dev = 30, func = 0 }");
+	assert!(errors(&with(&address_alone)).contains("only NARROW"), "{}", errors(&with(&address_alone)));
+	// AND THERE IS NO EXCEPTION FOR THE DEVELOPMENT CONSOLE, which is the rule this milestone very
+	// nearly wrote one for. Its real rule names the transport, the virtio type AND the address -
+	// all three - and that is what the manifest says today.
+	let console = rule("transport = \"virtio-pci\", virtio-type = 3, pci-address = { bus = 0, dev = 30, func = 0 }");
+	assert_eq!(errors(&with(&console)), "", "an address NARROWING a standard identity is exactly what a pinned device is");
+
+	// A QUIRK IS A NARROWING TOO, and this is what one looks like written correctly: a rule that
+	// says which part it is a quirk for, on top of a rule that already says what the device is.
+	let quirk = rule("transport = \"virtio-pci\", virtio-type = 2, pci-vendor = 6900, pci-product = 4162");
+	assert_eq!(errors(&with(&quirk)), "", "a vendor and product narrowing a virtio rule is a quirk, which is what they are for");
 
 	// A BOOT-CRITICAL DRIVER ON THE VOLUME is the self-hosting cycle: it is needed to mount the
 	// volume it would be loaded from.

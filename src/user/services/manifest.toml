@@ -1416,7 +1416,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "boot-critical"
-match = [{ device-type = 2 }]
+match = [{ transport = "virtio-pci", virtio-type = 2 }]
 
 [[programs]]
 name = "virtio_console"
@@ -1429,7 +1429,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
-match = [{ device-type = 3 }]
+match = [{ transport = "virtio-pci", virtio-type = 3 }]
 
 [[programs]]
 name = "dev_channel"
@@ -1448,7 +1448,9 @@ development = true
 # target, and nothing above the port depends on it.
 [programs.driver]
 lifecycle = "controller"
-match = [{ device-type = 3, pci-address = { bus = 0, dev = 30, func = 0 } }]
+match = [
+	{ transport = "virtio-pci", virtio-type = 3, pci-address = { bus = 0, dev = 30, func = 0 } },
+]
 priority = "quirk"
 
 [[programs]]
@@ -1472,7 +1474,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
-match = [{ device-type = 16 }]
+match = [{ transport = "virtio-pci", virtio-type = 16 }]
 
 [[programs]]
 name = "virtio_input"
@@ -1485,7 +1487,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
-match = [{ device-type = 18 }]
+match = [{ transport = "virtio-pci", virtio-type = 18 }]
 
 [[programs]]
 name = "virtio_net"
@@ -1498,7 +1500,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
-match = [{ device-type = 1 }]
+match = [{ transport = "virtio-pci", virtio-type = 1 }]
 
 [[programs]]
 name = "virtio_snd"
@@ -1511,7 +1513,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
-match = [{ device-type = 25 }]
+match = [{ transport = "virtio-pci", virtio-type = 25 }]
 
 [[programs]]
 name = "volume"
@@ -1560,7 +1562,7 @@ providers = []
 
 [programs.driver]
 lifecycle = "controller"
-match = [{ device-type = 256 }]
+match = [{ transport = "plain-pci", pci-class = 0x0c, pci-subclass = 0x03, pci-interface = 0x30 }]
 
 [[factory_files]]
 name = "audio-demo"

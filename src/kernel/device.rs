@@ -45,6 +45,14 @@ pub struct DeviceEntry {
 	pub class: u8,
 	pub subclass: u8,
 	pub prog_if: u8,
+	// WHICH TRANSPORT THIS FUNCTION SPEAKS, and the PCI identity of the part - both resolved by the
+	// same scan that resolved the BAR, both retained for `lspci` alone until a rule could ask for
+	// them. `device_type` is a virtio type only when `transport` says virtio-pci; for anything else
+	// it is a LiberSystem number standing in for a class triple, which is not an identity a rule may
+	// be written against.
+	pub transport: u8,
+	pub vendor: u16,
+	pub product: u16,
 	// WHETHER THIS ENTRY DESCRIBES A FUNCTION THAT IS ACTUALLY ON THE BUS.
 	//
 	// True for everything the boot scan resolved, which is everything on a real machine. False for
@@ -96,7 +104,7 @@ pub fn init() {
 		// I/O APIC by construction.
 		crate::arch::pci::set_intx_disabled(v.pci.bus, v.pci.dev, v.pci.func, true);
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: v.virtio_type, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if, on_bus: true });
+		table.push(DeviceEntry { device_type: v.virtio_type, transport: abi::TRANSPORT_VIRTIO_PCI, vendor: v.pci.vendor, product: v.pci.device_id, bar_phys: v.bar_phys, bar_len: v.region_len, common_offset: v.common.offset, notify_offset: v.notify.offset, notify_multiplier: v.notify.notify_multiplier, isr_offset: v.isr.offset, device_offset: v.device.map_or(0, |cap| cap.offset), device_len: v.device.map_or(0, |cap| cap.length), msix_cap: v.msix_cap, msix_table_phys: v.msix_table_phys, bus: v.pci.bus, dev: v.pci.dev, func: v.pci.func, class: v.pci.class, subclass: v.pci.subclass, prog_if: v.pci.prog_if, on_bus: true });
 	}
 	for x in crate::arch::pci::scan_xhci() {
 		// The xHCI controller joins the same table: its whole register file lives in
@@ -104,7 +112,7 @@ pub fn init() {
 		// operational/runtime/doorbell offsets from the capability registers at the base.
 		crate::arch::pci::set_intx_disabled(x.pci.bus, x.pci.dev, x.pci.func, true);
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
-		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true });
+		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: x.pci.vendor, product: x.pci.device_id, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true });
 	}
 	// One claim slot per device, all `Free`: nothing is driving anything yet, and enumeration left
 	// every device with bus mastering off.
@@ -432,7 +440,7 @@ pub fn add_synthetic_device() -> usize {
 	let mut table = DEVICES.lock();
 	let index = table.len();
 	// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed.
-	table.push(DeviceEntry { device_type: u16::MAX, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: 0x1f, func: 7, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false });
+	table.push(DeviceEntry { device_type: u16::MAX, transport: abi::TRANSPORT_PLAIN_PCI, vendor: 0xffff, product: 0xffff, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: 0x1f, func: 7, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false });
 	drop(table);
 	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false });
 	index

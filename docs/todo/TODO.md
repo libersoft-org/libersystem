@@ -233,7 +233,7 @@ or preventing further development of `v1`.
 - [ ] [P02M0157 - The firmware described something the tables cannot hold, and the kernel used it anyway](P02M0157.md)
 - [ ] [P02M0158 - The boot report names the same device twice and the same component two ways](P02M0158.md)
 - [ ] [P02M0159 - Every boot exercises the degraded DMA path and none exercises the isolated one](P02M0159.md)
-- [ ] [P02M0160 - One artifact has two required shapes and one name, so the last build wins](P02M0160.md)
+- [x] [P02M0160 - One artifact has two required shapes and one name, so the last build wins](P02M0160.md)
 - [x] [P02M0161 - Every driver family invents its own bring-up wire](P02M0161.md)
 - [ ] [P02M0162 - A bind that fails part-way leaves the parts that succeeded](P02M0162.md)
 - [ ] [P02M0163 - Discovery holds two kinds of device and the binding unit is an index into that table](P02M0163.md)

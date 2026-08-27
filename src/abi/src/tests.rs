@@ -605,7 +605,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	// them - the same completeness argument the syscall snapshot is built on.
 	let mut covered: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
 	assert_layout!(
-		covered, DeviceInfo, 48, 8,
+		covered, DeviceInfo, 56, 8,
 		device_type => 0,
 		// The explicit padding must stay where the implicit padding was.
 		_pad0 => 4,
@@ -630,10 +630,20 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		class => 43,
 		subclass => 44,
 		prog_if => 45,
+		// WHICH TRANSPORT, which is a different question from what the function is - and asking
+		// them separately is what stops a rule for a virtio network device from matching every
+		// Ethernet controller ever made.
+		transport => 46,
 		// And the tail bytes, named rather than implicit: this struct is copied to userspace with
 		// `size_of::<T>()` from a value built on the kernel stack. Six of them once; `device_len`
-		// took four, so two are left and the struct is the same 48 bytes.
-		_pad1 => 46,
+		// took four and `transport` a fifth, so one is left before `vendor`, which must land on an
+		// even offset.
+		_pad1 => 47,
+		// The PCI identity of the part, for the quirk rules that are the only thing allowed to name
+		// it. They take the struct from 48 bytes to 56.
+		vendor => 48,
+		product => 50,
+		_pad2 => 52,
 	);
 
 	assert_layout!(

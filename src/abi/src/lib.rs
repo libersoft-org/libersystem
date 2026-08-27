@@ -500,6 +500,21 @@ pub const VIRTIO_F_ACCESS_PLATFORM: u32 = 1 << 1;
 // The MSI-X vector fields' reset value: no vector mapped (the device raises legacy INTx).
 pub const VIRTIO_MSI_NO_VECTOR: u16 = 0xffff;
 
+// WHAT `DeviceInfo::transport` SAYS, and it is deliberately a small closed set.
+//
+// A transport is how a driver TALKS to a function, which is a different question from what the
+// function is. Both are needed to select a driver: "a virtio-pci function whose virtio type is 1"
+// names a network device a virtio driver can drive, while class `02/00` alone names every Ethernet
+// controller ever made - and handing a virtio driver one of those is the bug this separation exists
+// to stop.
+// A function on the PCI bus that speaks no virtio transport: its class triple is its whole
+// identity. A PREDICATE, not an absence - a rule may name it, and the xHCI row does, because
+// "virtio-pci" and "not virtio-pci" are what keep a virtio rule and a class rule from being able
+// to match one function.
+pub const TRANSPORT_PLAIN_PCI: u8 = 0;
+// A virtio-pci function, so `device_type` is the virtio specification's own device type.
+pub const TRANSPORT_VIRTIO_PCI: u8 = 1;
+
 // Non-virtio device type codes live above the virtio id space (modern virtio types
 // are below 0x40), so one `device_type` field classifies every discovered device.
 pub const DEVICE_TYPE_XHCI: u32 = 0x100;
@@ -612,8 +627,29 @@ pub struct DeviceInfo {
 	// Not `repr(packed)`: that would make `bar_len` unaligned and trade a disclosure for a soundness
 	// problem.
 	//
-	// TWO BYTES NOW, not six: `device_len` took four of them, which is why the struct is still 48.
-	pub _pad1: [u8; 2],
+	// WHICH TRANSPORT THIS FUNCTION SPEAKS, so a rule can say "a virtio-pci function whose virtio
+	// type is 1" instead of "device type 1".
+	//
+	// `device_type` conflates two number spaces: for a virtio function it is the virtio
+	// specification's own device type, and for the xHCI controller it is `DEVICE_TYPE_XHCI` - a
+	// LiberSystem constant invented for the table, standing in for the PCI class triple the scan
+	// had already resolved. A rule matching on it alone cannot tell "virtio type 1" from "whatever
+	// else this system decides to number 1 next", and it made every driver selected by a
+	// vendor-defined number.
+	pub transport: u8,
+	// ONE BYTE NOW: `transport` took one of the two, and `vendor` must land on an even offset.
+	pub _pad1: [u8; 1],
+	// THE PCI IDENTITY OF THE PART, resolved by the same scan and retained for `lspci` alone.
+	//
+	// Not an identity a rule may match on ITS OWN - a vendor number says who made a device, not what
+	// it is - but the only way to write a quirk for a particular part, which is what they are for.
+	pub vendor: u16,
+	pub product: u16,
+	// `product` ends at 52 and the alignment is 8. Named rather than left implicit, for the reason
+	// `_pad0` is: this struct is copied to userspace with `size_of::<T>()` from a value built on the
+	// kernel stack, and Rust does not promise that padding in an otherwise initialised value is
+	// initialised.
+	pub _pad2: [u8; 4],
 }
 
 // The framebuffer geometry framebuffer_map writes into the caller's buffer (the

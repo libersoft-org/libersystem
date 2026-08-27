@@ -61,7 +61,7 @@ fn generate_driver_registry(manifest: &Manifest) {
 					Some(address) => format!("Some(Address {{ bus: {}, dev: {}, func: {} }})", address.bus, address.dev, address.func),
 					None => String::from("None"),
 				};
-				format!("Rule {{ device_type: {}, pci_class: {}, pci_subclass: {}, pci_interface: {}, pci_address: {address} }}", option32(rule.device_type), option(rule.pci_class), option(rule.pci_subclass), option(rule.pci_interface),)
+				format!("Rule {{ transport: {}, virtio_type: {}, pci_class: {}, pci_subclass: {}, pci_interface: {}, pci_vendor: {}, pci_product: {}, pci_address: {address} }}", option(rule.transport), option32(rule.virtio_type), option(rule.pci_class), option(rule.pci_subclass), option(rule.pci_interface), option16(rule.pci_vendor), option16(rule.pci_product),)
 			})
 			.collect::<Vec<_>>()
 			.join(", ");
@@ -100,6 +100,13 @@ fn registry_names(manifest: &Manifest, development: bool) -> Vec<String> {
 }
 
 fn option(value: Option<u8>) -> String {
+	match value {
+		Some(value) => format!("Some({value})"),
+		None => String::from("None"),
+	}
+}
+
+fn option16(value: Option<u16>) -> String {
 	match value {
 		Some(value) => format!("Some({value})"),
 		None => String::from("None"),

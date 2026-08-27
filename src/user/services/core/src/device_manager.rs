@@ -44,6 +44,22 @@ const STATE_DRIVER_MISSING: u8 = 4;
 // before giving up on its device.
 const MAX_DRIVER_RESTARTS: u32 = 3;
 
+// Say which budget this launch is working to.
+unsafe fn report_boot_window() {
+	unsafe {
+		let window: u64 = BOOT_WINDOW.load(core::sync::atomic::Ordering::Relaxed);
+		if window == 0 {
+			print(b"DeviceManager: no boot window was published; a bind is bounded by its own deadline alone\n");
+			return;
+		}
+		if BOOT_DEADLINE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
+			print(b"DeviceManager: boot window carried over without the boot's deadline\n");
+		} else {
+			print(b"DeviceManager: boot window and this boot's deadline\n");
+		}
+	}
+}
+
 // EVERY NUMBER THAT BOUNDS A BIND, IN ONE PLACE.
 //
 // They were three constants and a `recv_blocking`, which is to say two of them did not exist. A
@@ -151,7 +167,7 @@ impl Incident {
 // WHERE A BINDING IS AND WHY, from the crate that owns the answer. Not a `u8` per device with a
 // meaning each reader remembers: `state[idx]` is a small integer set at a few points, and the
 // transitions between its values are wherever somebody happened to write them.
-use driver_binding::{BindingRecord, BindingState, FailureCause};
+use driver_binding::{BindingEvent, BindingId, BindingQueue, BindingRecord, BindingState, FailureCause};
 
 // How long the development agent has to report in before DeviceManager stops waiting for it, in
 // clock ticks (a hundred to the second, so this is two seconds).
@@ -341,6 +357,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			_ => {}
 		}
+		// WHAT THIS LAUNCH WAS GIVEN, SAID OUT LOUD, because it is the only way to tell a first
+		// launch from a restart from outside. The first DeviceManager of a boot is handed the
+		// boot's own deadline; every one after it is handed the LENGTH and no deadline, since a
+		// deadline in the past is not a budget. Two lines that differ is what makes "ServiceManager
+		// kept the length" an observation rather than a claim about a variable nobody can see.
+		report_boot_window();
 
 		// 2. phase 1: launch the bootstrap block driver (virtio_blk) for each disk it backs.
 		//    It hands back a block-read service channel, which we route up to ServiceManager
@@ -478,7 +500,7 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 				i += 1;
 				continue;
 			};
-			let mut node = Node::new(i, alloc::vec![entry]);
+			let mut node = Node::new(i, &info, alloc::vec![entry]);
 			if begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege) {
 				nodes.push(node);
 				names.push(entry.name);
@@ -582,7 +604,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 				continue;
 			}
 			state[idx] = STATE_FAILED;
-			nodes.push(Node::new(i, candidates));
+			nodes.push(Node::new(i, &info, candidates));
 			infos.push(info);
 			i += 1;
 		}
@@ -912,43 +934,10 @@ unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
 // Where a device's binding is, and why, is a fact about the device - so it lives here, for the life
 // of this program.
 
-// How many events one node may hold before the oldest is refused.
-//
-// A node's events are the frames of one handshake plus its terminal ones, so the bound is the
-// protocol's own: at most `MAX_INITIAL_OFFERS` offers, one terminal frame, one exit, one claim
-// answer, and a timeout - and a driver that sends more is a driver whose offers are already being
-// refused past the bound.
-const MAX_NODE_EVENTS: usize = driver_protocol::MAX_INITIAL_OFFERS + 4;
-
-// EVERY BINDING EVENT CARRIES THE GENERATION IT IS ABOUT.
-//
-// A process being replaced cannot touch its replacement's state: its `READY` is not this binding's
-// `READY`, and its offer is a capability from a binding that is over. The generation is what tells
-// the two apart, and it is on the event rather than checked at the point of reading, because the
-// event may be read long after the frame that produced it arrived.
-#[derive(Clone, Copy)]
-enum Event {
-	// The driver said it is up.
-	Ready { generation: u64 },
-	// It said it failed, and this is what it said.
-	Failed { generation: u64, code: driver_protocol::DriverFailureCode },
-	// It offered a provider. The handle is held by the node's `Offers` until the binding commits.
-	Offered { generation: u64 },
-	// Its process ended - however it ended.
-	Exited { generation: u64 },
-	// Its channel closed with nothing terminal on it.
-	Closed { generation: u64 },
-	// This attempt spent its share of the boot window.
-	TimedOut { generation: u64 },
-}
-
-impl Event {
-	fn generation(self) -> u64 {
-		match self {
-			Event::Ready { generation } | Event::Failed { generation, .. } | Event::Offered { generation } | Event::Exited { generation } | Event::Closed { generation } | Event::TimedOut { generation } => generation,
-		}
-	}
-}
+// The event kinds and the queue itself are `driver_binding`'s: a ring buffer with a generation
+// filter inside this binary is one nobody can drive on a host, and "an exit racing a restart" is
+// exactly the case that has to be driven rather than reasoned about. Same argument as
+// `BindingState`, same crate.
 
 // What is bound to a node right now: everything the manager holds on the driver's behalf.
 //
@@ -956,7 +945,6 @@ impl Event {
 // could end a process a failed bind had started - which is what made "a failed bind leaves nothing
 // behind" untrue in the one case it is written for.
 struct Binding {
-	generation: u64,
 	process: u64,
 	channel: u64,
 	claim: u64,
@@ -977,8 +965,12 @@ impl Binding {
 
 // One device, for the life of this program.
 struct Node {
-	// The device table index. Stable because the scan runs once: nothing rescans, so there is no
-	// removal event and no identity to invalidate.
+	// THE FUNCTION THIS NODE IS, which is its BDF and nothing else. Its generation moves with each
+	// binding; `id.generation` is 0 for a node that has never been claimed.
+	id: BindingId,
+	// The kernel's row number for the same function, which is a LOOKUP and not part of the
+	// identity - `ClaimKey` addresses a binding by it, and one name that grows a field for every
+	// table that wants to find it is not a name.
 	index: u64,
 	// Where this node's binding is and why it got there. Survives every binding on this node.
 	record: BindingRecord,
@@ -994,51 +986,28 @@ struct Node {
 	candidates: Vec<&'static Entry>,
 	candidate: usize,
 	// One ordered queue. Two nodes are independent; one node never handles two events at once.
-	queue: [Option<Event>; MAX_NODE_EVENTS],
-	head: usize,
-	count: usize,
+	queue: BindingQueue,
 }
 
 impl Node {
-	fn new(index: u64, candidates: Vec<&'static Entry>) -> Node {
-		Node { index, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: [None; MAX_NODE_EVENTS], head: 0, count: 0 }
+	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new() }
 	}
 
-	// Append one event. A full queue REFUSES the new one rather than dropping the oldest: the
-	// oldest is the one whose ordering matters - an exit before a `READY` is a different story from
-	// an exit after it - and a queue that silently forgets its front is a queue that reorders.
-	fn push(&mut self, event: Event) -> bool {
-		if self.count == MAX_NODE_EVENTS {
-			return false;
-		}
-		let at = (self.head + self.count) % MAX_NODE_EVENTS;
-		self.queue[at] = Some(event);
-		self.count += 1;
-		true
+	// Queue one event for this node.
+	fn push(&mut self, event: BindingEvent) -> bool {
+		self.queue.push(event)
 	}
 
-	// Take the oldest, dropping anything about a binding that is over.
+	// Take the oldest event about the binding this node is holding now. A node with no binding has
+	// nothing an event could be about, which the queue answers by draining.
 	//
-	// STALE EVENTS ARE DROPPED HERE AND NOWHERE ELSE, so every reader of this queue gets the same
-	// answer to "is this about the binding I am holding". A duplicate is idempotent because the
-	// state machine that consumes these refuses a transition it has already made.
-	fn pop(&mut self) -> Option<Event> {
-		while self.count > 0 {
-			let event = self.queue[self.head].take();
-			self.head = (self.head + 1) % MAX_NODE_EVENTS;
-			self.count -= 1;
-			let event = event?;
-			let current: u64 = match &self.binding {
-				Some(binding) => binding.generation,
-				// No binding means nothing this event could be about.
-				None => continue,
-			};
-			if event.generation() != current {
-				continue;
-			}
-			return Some(event);
-		}
-		None
+	// THE IDENTITY IS WHAT SAYS WHICH GENERATION, not a copy of the number inside the binding. Two
+	// places holding one value is two places that agree until somebody updates one of them, and the
+	// one that would have been missed is the one a stale event is filtered against.
+	fn pop(&mut self) -> Option<BindingEvent> {
+		let generation: u64 = if self.binding.is_some() { self.id.generation } else { 0 };
+		self.queue.pop(generation)
 	}
 
 	// Whether this node still has work in flight - a driver that has been sent `BIND` and has not
@@ -1331,9 +1300,8 @@ unsafe fn pump(nodes: &mut [Node], buf: &mut [u8]) -> bool {
 				if node.incident.attempt_deadline() > now {
 					continue;
 				}
-				let Some(binding) = &node.binding else { continue };
-				let generation: u64 = binding.generation;
-				node.push(Event::TimedOut { generation });
+				let generation: u64 = node.id.generation;
+				node.push(BindingEvent::TimedOut { generation });
 				timed_out = true;
 			}
 			// NOBODY TIMED OUT AND THE WAIT STILL FAILED, which is a wait this program cannot
@@ -1345,9 +1313,8 @@ unsafe fn pump(nodes: &mut [Node], buf: &mut [u8]) -> bool {
 					if !node.in_flight() {
 						continue;
 					}
-					let Some(binding) = &node.binding else { continue };
-					let generation: u64 = binding.generation;
-					node.push(Event::TimedOut { generation });
+					let generation: u64 = node.id.generation;
+					node.push(BindingEvent::TimedOut { generation });
 				}
 			}
 			return true;
@@ -1358,9 +1325,8 @@ unsafe fn pump(nodes: &mut [Node], buf: &mut [u8]) -> bool {
 		}
 		let which: usize = owner[at];
 		if is_process[at] {
-			let Some(binding) = &nodes[which].binding else { return true };
-			let generation: u64 = binding.generation;
-			nodes[which].push(Event::Exited { generation });
+			let generation: u64 = nodes[which].id.generation;
+			nodes[which].push(BindingEvent::Exited { generation });
 			return true;
 		}
 		// A READABLE CHANNEL IS DRAINED, not read once. Several frames can be waiting - a driver
@@ -1375,14 +1341,14 @@ unsafe fn pump(nodes: &mut [Node], buf: &mut [u8]) -> bool {
 unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 	unsafe {
 		let Some(binding) = &node.binding else { return };
-		let (channel, generation): (u64, u64) = (binding.channel, binding.generation);
+		let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
 		loop {
 			let frame = try_recv_caps(channel, buf);
 			let (len, handles) = match frame {
 				PolledCaps::Message { len, handles } => (len, handles),
 				PolledCaps::Empty => return,
 				PolledCaps::Closed => {
-					node.push(Event::Closed { generation });
+					node.push(BindingEvent::Closed { generation });
 					return;
 				}
 			};
@@ -1408,7 +1374,7 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 						continue;
 					};
 					if node.offers.push(kind, handles.as_slice()[0]) {
-						node.push(Event::Offered { generation });
+						node.push(BindingEvent::Offered { generation });
 					} else {
 						// PAST THE BOUND IS A REFUSAL WITH THE HANDLE CLOSED, not an accumulation.
 						refuse(&handles);
@@ -1416,7 +1382,7 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 				}
 				driver_protocol::Opcode::Ready => {
 					if driver_protocol::decode_ready(header.payload(buf)).is_ok() {
-						node.push(Event::Ready { generation });
+						node.push(BindingEvent::Ready { generation });
 					}
 				}
 				driver_protocol::Opcode::Failed => {
@@ -1426,7 +1392,7 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 						// least it can be taken for is the one that says nothing about a retry.
 						Err(_) => driver_protocol::DriverFailureCode::InternalError,
 					};
-					node.push(Event::Failed { generation, code });
+					node.push(BindingEvent::Failed { generation, code });
 				}
 				// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
 				driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource => refuse(&handles),
@@ -1503,6 +1469,9 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		txn.claim = grant.claim;
 		txn.key = grant.key;
 		node.record.generation = grant.key.generation;
+		// THE SAME FUNCTION, ONE BINDING LATER. The BDF is what survives a rebind and the
+		// generation is what makes the last binding's messages refusable.
+		node.id = node.id.rebound(grant.key.generation);
 		let (dm_side, driver_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
 			None => return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name),
@@ -1591,7 +1560,7 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		}
 		// IN FLIGHT. The transaction's holdings become the node's binding, which is what the
 		// central wait watches and what a rollback gives back.
-		node.binding = Some(Binding { generation: grant.key.generation, process: txn.process, channel: txn.channel, claim: txn.claim, key: txn.key });
+		node.binding = Some(Binding { process: txn.process, channel: txn.channel, claim: txn.claim, key: txn.key });
 		txn.commit();
 		true
 	}
@@ -1622,13 +1591,13 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8]) -> Step {
 		while let Some(event) = node.pop() {
 			let cause: FailureCause = match event {
 				// An offer is progress, not an outcome: it is already held on the node, unpublished.
-				Event::Offered { .. } => continue,
-				Event::Ready { .. } => {
+				BindingEvent::Offered { .. } => continue,
+				BindingEvent::Ready { .. } => {
 					// THE TRANSACTION COMMITS. What it took stays taken and passes to the caller.
 					node.record.move_to(BindingState::Online, None);
 					return Step::Online;
 				}
-				Event::Failed { code, .. } => {
+				BindingEvent::Failed { code, .. } => {
 					// A DRIVER THAT SAID WHY. Retryability is read off the code rather than decided
 					// again here: `device-not-responding` and `out-of-memory` are the two a second
 					// attempt can change, and the other three describe a driver that has read its
@@ -1640,8 +1609,8 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8]) -> Step {
 				}
 				// The process ended, or its channel closed with nothing terminal on it. Both are a
 				// driver that is gone without having said anything.
-				Event::Exited { .. } | Event::Closed { .. } => FailureCause::DriverExited,
-				Event::TimedOut { .. } => {
+				BindingEvent::Exited { .. } | BindingEvent::Closed { .. } => FailureCause::DriverExited,
+				BindingEvent::TimedOut { .. } => {
 					// A DRIVER THAT IS STILL THERE AND HAS NOT ANSWERED, which is the case the
 					// budget exists for: before it, this wait had no end and one silent driver held
 					// the manager - and therefore the boot - for as long as it liked.
@@ -1754,14 +1723,22 @@ struct Address {
 
 #[derive(Clone, Copy)]
 struct Rule {
-	// One field, because `DeviceInfo` has one: the virtio kinds and xHCI share a number space.
-	device_type: Option<u32>,
+	// THE TRANSPORT AND THE VIRTIO TYPE, which cite one specification between them. It was a single
+	// `device_type`, and that conflated the virtio specification's own numbers with a LiberSystem
+	// constant invented for the xHCI row - so a rule could not say "a virtio-pci function whose
+	// virtio type is 1" and had to say "device type 1" instead.
+	transport: Option<u8>,
+	virtio_type: Option<u32>,
 	// The standards identity, which discovery now carries. It was declarable and never satisfied
 	// while `DeviceInfo` had no class byte; the kernel had resolved all three for every function
 	// since the first PCI scan and kept them for `lspci` alone.
 	pci_class: Option<u8>,
 	pci_subclass: Option<u8>,
 	pci_interface: Option<u8>,
+	// The part. Never a rule on its own - `system-manifest` refuses one - only a narrowing on a rule
+	// that already names what the device IS.
+	pci_vendor: Option<u16>,
+	pci_product: Option<u16>,
 	pci_address: Option<Address>,
 }
 
@@ -1776,7 +1753,19 @@ impl Rule {
 		if self.pci_interface.is_some_and(|interface| info.prog_if != interface) {
 			return false;
 		}
-		if self.device_type.is_some_and(|kind| info.device_type != kind) {
+		// THE TRANSPORT IS ASKED BEFORE THE TYPE, and that ordering is the whole point of the pair:
+		// `virtio_type` is only a virtio number on a function whose transport says so. Without it a
+		// rule for virtio type 2 would match anything this system happens to number 2 next.
+		if self.transport.is_some_and(|transport| info.transport != transport) {
+			return false;
+		}
+		if self.virtio_type.is_some_and(|kind| info.device_type != kind) {
+			return false;
+		}
+		if self.pci_vendor.is_some_and(|vendor| info.vendor != vendor) {
+			return false;
+		}
+		if self.pci_product.is_some_and(|product| info.product != product) {
 			return false;
 		}
 		if let Some(address) = self.pci_address

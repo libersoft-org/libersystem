@@ -186,3 +186,159 @@ impl BindingRecord {
 
 #[cfg(test)]
 mod tests;
+
+// ------------------------------------------------- one ordered queue per device node
+
+// How many events one node may hold before a new one is refused.
+//
+// A node's events are the frames of one handshake plus its terminal ones, so the bound is the
+// protocol's own: at most `MAX_INITIAL_OFFERS` offers, one terminal frame, one exit, one claim
+// answer, and a timeout - and a driver that sends more is a driver whose offers are already being
+// refused past the bound.
+pub const MAX_NODE_EVENTS: usize = driver_protocol::MAX_INITIAL_OFFERS + 4;
+
+// WHAT HAPPENED TO A BINDING, carrying the generation it is about.
+//
+// The generation is ON the event rather than checked where the frame arrived, because an event may
+// be read long after the frame that produced it: the exit of a driver arrives while its binding is
+// being torn down, and the next binding's `READY` arrives on the same device afterwards.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum BindingEvent {
+	// The driver said it is up.
+	Ready { generation: u64 },
+	// It said it failed, and this is what it said.
+	Failed { generation: u64, code: DriverFailureCode },
+	// It offered a provider. The handle itself is held elsewhere, unpublished until the bind commits.
+	Offered { generation: u64 },
+	// Its process ended - however it ended.
+	Exited { generation: u64 },
+	// Its channel closed with nothing terminal on it.
+	Closed { generation: u64 },
+	// This attempt spent its share of the boot window.
+	TimedOut { generation: u64 },
+}
+
+impl BindingEvent {
+	pub fn generation(self) -> u64 {
+		match self {
+			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } => generation,
+		}
+	}
+}
+
+// A DEVICE NODE'S QUEUE, NOT A BINDING'S.
+//
+// A binding is not the thing that outlives its own events. A queue owned by a binding has nowhere
+// to put the events on either side of it, and two consecutive bindings on one device would each
+// hold a queue with the interesting moment falling between them.
+//
+// HERE RATHER THAN IN THE MANAGER, for the reason `BindingState` is here: a ring buffer with a
+// generation filter inside a `no_std` binary is one nobody can drive on a host, and "an exit racing
+// a restart" is exactly the case that has to be driven rather than reasoned about.
+pub struct BindingQueue {
+	events: [Option<BindingEvent>; MAX_NODE_EVENTS],
+	head: usize,
+	count: usize,
+}
+
+impl Default for BindingQueue {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl BindingQueue {
+	pub const fn new() -> Self {
+		Self { events: [None; MAX_NODE_EVENTS], head: 0, count: 0 }
+	}
+
+	pub fn len(&self) -> usize {
+		self.count
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.count == 0
+	}
+
+	// Append one event. A full queue REFUSES the new one rather than dropping the oldest: the oldest
+	// is the one whose ordering matters - an exit before a `READY` is a different story from an exit
+	// after it - and a queue that silently forgets its front is a queue that reorders.
+	pub fn push(&mut self, event: BindingEvent) -> bool {
+		if self.count == MAX_NODE_EVENTS {
+			return false;
+		}
+		let at = (self.head + self.count) % MAX_NODE_EVENTS;
+		self.events[at] = Some(event);
+		self.count += 1;
+		true
+	}
+
+	// Take the oldest event that is about `generation`, dropping anything that is not.
+	//
+	// `generation` of 0 means the node holds no binding, and then nothing in the queue can be about
+	// anything - so the queue drains and answers None. That is the state a node is in between a
+	// teardown and the next attempt, and it is where a dying driver's last events land.
+	//
+	// STALE EVENTS ARE DROPPED HERE AND NOWHERE ELSE, so every reader gets the same answer to "is
+	// this about the binding I am holding".
+	pub fn pop(&mut self, generation: u64) -> Option<BindingEvent> {
+		while self.count > 0 {
+			let event = self.events[self.head].take();
+			self.head = (self.head + 1) % MAX_NODE_EVENTS;
+			self.count -= 1;
+			let event = event?;
+			if generation == 0 || event.generation() != generation {
+				continue;
+			}
+			return Some(event);
+		}
+		None
+	}
+}
+
+// ------------------------------------------------------- what a binding IS about
+
+// A FUNCTION'S CANONICAL IDENTITY, paired with the generation of the binding it names.
+//
+// The BDF is the identity: the ABI has no PCI domain and all three implementations are
+// single-segment, so bus/device/function names a function on this machine and nothing else does.
+//
+// THE ROW NUMBER IS NOT PART OF IT. P02M0098's `ClaimKey { device_index, generation }` addresses the
+// same binding by the kernel's row number, and two identities for one thing with no stated way
+// between them is how a revocation ends up unable to find what it is revoking. The answer is a
+// LOOKUP, not a wider name: a node holds its row number as its own field, absent for a function the
+// kernel's resolver never gave a row. A name that grows a field for every table that wants to find
+// it is not a name.
+//
+// THE GENERATION IS LOAD-BEARING FROM THE FIRST CRASH-RESTART, not from some future hotplug. A node
+// rebound after its driver died keeps its BDF and takes a NEW claim, and P02M0098 gives that claim a
+// new generation - so a message stamped with the previous one is refused by arithmetic rather than
+// by anyone remembering to check.
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+pub struct BindingId {
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+	pub generation: u64,
+}
+
+impl BindingId {
+	pub const fn new(bus: u8, dev: u8, func: u8, generation: u64) -> Self {
+		Self { bus, dev, func, generation }
+	}
+
+	// Whether this names the same FUNCTION as `other`, whatever binding either is about.
+	//
+	// The question a rebind asks: "is this the device I was driving", which is about the location
+	// and not about the binding. `==` answers the other question - "is this the same binding" - and
+	// the two must not be one operator, because a rebind that compared whole identities would
+	// conclude a device it just rebound is a different device.
+	pub fn same_function(self, other: BindingId) -> bool {
+		self.bus == other.bus && self.dev == other.dev && self.func == other.func
+	}
+
+	// The same function, one binding later.
+	pub fn rebound(self, generation: u64) -> Self {
+		Self { generation, ..self }
+	}
+}
