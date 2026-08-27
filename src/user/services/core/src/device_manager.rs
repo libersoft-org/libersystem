@@ -449,6 +449,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64) {
 	unsafe {
 		let count: u64 = device_count();
+		// ONE NODE PER BOOT-CRITICAL DEVICE, and they come up TOGETHER. Four disks used to be bound
+		// one after another, each waiting out its own handshake before the next was started; they
+		// are independent devices and there was never a reason for the fourth to wait on the first.
+		let mut nodes: Vec<Node> = Vec::new();
+		let mut names: Vec<&'static [u8]> = Vec::new();
+		let mut infos: Vec<DeviceInfo> = Vec::new();
 		let mut i: u64 = 0;
 		while i < count {
 			let mut info: DeviceInfo = DeviceInfo::default();
@@ -464,43 +470,59 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 				i += 1;
 				continue;
 			};
-			if !entry.boot_critical {
+			if !entry.boot_critical || nodes.len() >= MAX_NODES_IN_FLIGHT {
 				i += 1;
 				continue;
 			}
-			let driver_name: &[u8] = entry.name;
-			let elf: &[u8] = match package.lookup(entry.artifact) {
-				Some(e) => e,
-				None => {
-					i += 1;
-					continue;
-				}
+			let Some(elf) = package.lookup(entry.artifact) else {
+				i += 1;
+				continue;
 			};
-			let mut offers = Offers::new();
-			let mut dm_chan: u64 = 0;
-			// THE CLAIM STAYS HERE. It is what this service holds the device by: waitable, and the
-			// only thing that can end the binding without the driver's cooperation.
-			let mut claim: u64 = 0;
-			// ONE RECORD PER NODE, carrying where its binding is and why it got there. Nothing reads
-			// it yet beyond the boot log; the milestone that renders it reads THIS rather than
-			// inventing a second vocabulary.
-			let mut record = BindingRecord::new();
-			if launch_one(i, &info, elf, driver_name, 0, power, console_input, device_privilege, buf, &mut offers, &mut dm_chan, &mut claim, &mut record) {
-				// the first virtio-blk disk is the writable system volume; a second is routed
-				// up separately as the read-only FAT media volume, a third as the read-only
-				// ISO9660 volume, a fourth as the read-only UDF volume.
-				let handle: u64 = offers.take(driver_protocol::provider::BLOCK);
-				if *block_client == 0 {
-					*block_client = handle;
-				} else if *block2_client == 0 {
-					*block2_client = handle;
-				} else if *block3_client == 0 {
-					*block3_client = handle;
-				} else if *block4_client == 0 {
-					*block4_client = handle;
-				}
+			let mut node = Node::new(i, alloc::vec![entry]);
+			if begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege) {
+				nodes.push(node);
+				names.push(entry.name);
+				infos.push(info);
 			}
 			i += 1;
+		}
+		// THE CENTRAL WAIT, and every disk answers into it. A driver that never reports in costs
+		// its own share of the boot window and nothing else's.
+		while pump(&mut nodes, buf) {
+			for at in 0..nodes.len() {
+				match advance(&mut nodes[at], names[at]) {
+					Step::Waiting => {}
+					Step::Online => {
+						// the first virtio-blk disk is the writable system volume; a second is
+						// routed up separately as the read-only FAT media volume, a third as the
+						// read-only ISO9660 volume, a fourth as the read-only UDF volume.
+						let handle: u64 = nodes[at].offers.take(driver_protocol::provider::BLOCK);
+						if *block_client == 0 {
+							*block_client = handle;
+						} else if *block2_client == 0 {
+							*block2_client = handle;
+						} else if *block3_client == 0 {
+							*block3_client = handle;
+						} else if *block4_client == 0 {
+							*block4_client = handle;
+						}
+						// ANYTHING STILL HELD IS A PROVIDER NOBODY ROUTES, closed rather than
+						// leaked: a handle this service keeps forever is a channel the driver
+						// waits on forever.
+						nodes[at].offers.close_all();
+					}
+					// A BOOT DRIVER HAS ONE CANDIDATE, so the two rollback answers differ only in
+					// whether another attempt follows. `Again` re-opens the same entry; the rest is
+					// terminal for this device and the boot goes on without that disk.
+					Step::Again => {
+						let entry = nodes[at].candidates[nodes[at].candidate];
+						let Some(elf) = package.lookup(entry.artifact) else { continue };
+						let info = infos[at];
+						begin_bind(&mut nodes[at], &info, elf, entry.name, 0, power, console_input, device_privilege);
+					}
+					Step::NextCandidate | Step::Done => {}
+				}
+			}
 		}
 	}
 }
@@ -525,6 +547,13 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 		// per-device state, sized by what the kernel actually discovered - the bus is
 		// the only bound, never an artificial cap that would silently skip devices.
 		let mut state: Vec<u8> = alloc::vec![STATE_UNKNOWN; count as usize];
+		// ONE NODE PER DEVICE WITH SOMETHING TO TRY, all in flight together.
+		//
+		// This used to be a loop that bound one device at a time, each waiting out its own
+		// handshake. The devices are independent - a sound card has nothing to say about a network
+		// card - and the only thing that made them sequential was where the wait was written.
+		let mut nodes: Vec<Node> = Vec::new();
+		let mut infos: Vec<DeviceInfo> = Vec::new();
 		let mut i: u64 = 0;
 		while i < count {
 			let idx: usize = i as usize;
@@ -548,117 +577,179 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 				i += 1;
 				continue;
 			}
-			// EACH CANDIDATE IN TURN, most specific first, and the next one only after the last is
-			// gone. The ELF is unmapped and its handle closed at the bottom of every attempt
-			// whatever the outcome, so a fallback never runs beside the process it replaces.
-			//
-			// Every rejection is said: which driver, and why. A fallback that quietly succeeds hides
-			// the fact that the preferred driver did not, which is how a machine comes to run on its
-			// second choice for months with nobody aware of it.
-			for entry in candidates {
-				let driver_name: &[u8] = entry.name;
-				state[idx] = STATE_FAILED;
-				// load the driver's ELF off the volume, keep it mapped while we spawn from it.
-				let loaded: Option<(u64, u64, usize)> = read_driver(storage, driver_name);
-				let (file, mapped, size): (u64, u64, usize) = match loaded {
-					Some(t) => t,
-					None => {
-						// The registry names an artifact the volume does not have. That is the image
-						// disagreeing with itself, not a driver that ran and failed, and the two are
-						// worth telling apart: one is a packaging fault and the other is a bug.
-						state[idx] = STATE_DRIVER_MISSING;
+			if nodes.len() >= MAX_NODES_IN_FLIGHT {
+				i += 1;
+				continue;
+			}
+			state[idx] = STATE_FAILED;
+			nodes.push(Node::new(i, candidates));
+			infos.push(info);
+			i += 1;
+		}
+		// Open the first candidate on every node. A device whose first candidate cannot even be
+		// opened falls through to the next one in the loop below, exactly as it did when this was
+		// sequential.
+		for at in 0..nodes.len() {
+			let info = infos[at];
+			start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &mut state);
+		}
+		while pump(&mut nodes, buf) {
+			for at in 0..nodes.len() {
+				let name: &[u8] = nodes[at].candidates[nodes[at].candidate].name;
+				match advance(&mut nodes[at], name) {
+					Step::Waiting => {}
+					Step::Online => {
+						state[nodes[at].index as usize] = STATE_ONLINE;
+						#[cfg(feature = "development")]
+						route_offers(&mut nodes[at], name, storage, console_input, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer, dev);
+						#[cfg(not(feature = "development"))]
+						route_offers(&mut nodes[at], name, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer);
+					}
+					// The same candidate, once more. The window and the attempt budget have already
+					// said there is room for it.
+					Step::Again => {
+						let info = infos[at];
+						start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &mut state);
+					}
+					// EACH CANDIDATE IN TURN, most specific first, and the next one only after the
+					// last is gone - which the rollback has just guaranteed. Every rejection is
+					// said: which driver, and why. A fallback that quietly succeeds hides the fact
+					// that the preferred driver did not, which is how a machine comes to run on its
+					// second choice for months with nobody aware of it.
+					Step::NextCandidate => {
 						print(b"DeviceManager: ");
-						print(driver_name);
-						print(b" is named by the registry and not on the volume; trying the next candidate\n");
-						continue;
-					}
-				};
-				let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
-				let mut offers = Offers::new();
-				let mut dm_chan: u64 = 0;
-				let mut claim: u64 = 0;
-				let mut record = BindingRecord::new();
-				if launch_one(i, &info, elf, driver_name, key_producer, power, console_input, device_privilege, buf, &mut offers, &mut dm_chan, &mut claim, &mut record) {
-					state[idx] = STATE_ONLINE;
-					// ROUTED BY WHAT THE PROVIDER IS, not by which driver sent it and in what order.
-					// Every one of these used to be "the handle that came with the report", with the
-					// xHCI driver's extra two told apart by the literal bytes `USBBUS` and `POINTER`
-					// in the messages that followed - so what a capability was for was decided by
-					// parsing a string the driver chose.
-					if *net_client == 0 {
-						*net_client = offers.take(driver_protocol::provider::NET);
-					}
-					if *gpu_client == 0 {
-						*gpu_client = offers.take(driver_protocol::provider::DISPLAY);
-					}
-					if *snd_client == 0 {
-						*snd_client = offers.take(driver_protocol::provider::AUDIO);
-					}
-					// The development channel driver hands up a raw byte channel, and the agent
-					// that speaks the protocol over it is started here rather than by
-					// ServiceManager. It exists exactly when the device does, it has no other
-					// client, and its whole reason to be a separate process is to keep the
-					// artifact registry out of the address space that holds a device capability -
-					// so it is started where that device is bound, and nowhere else.
-					#[cfg(feature = "development")]
-					let dev_bytes: u64 = offers.take(driver_protocol::provider::CONSOLE_BYTES);
-					#[cfg(feature = "development")]
-					if driver_name == b"dev_channel" && dev_bytes != 0 {
-						// The driver's bootstrap is kept rather than left to leak, because a
-						// replacement agent's wire is handed down over it; and a volume connection of
-						// this program's own is opened, because the one these drivers were read
-						// through is closed as soon as this function returns.
-						dev.driver = dm_chan;
-						dev.storage = service_connect(storage).unwrap_or(0);
-						// INSECURE by name, because that is what this is: an identifier that tells one
-						// boot from another, not a secret. Asking for the secure one would refuse on
-						// every machine with no hardware random source - which is two of the three
-						// architectures - for a number that never needed to be unguessable.
-						random_insecure(&mut dev.nonce);
-						dev.console_input = console_input;
-						dev.bootstrap = start_dev_agent(dev.storage, dev_bytes, console_input, &dev.nonce);
-						if dev.bootstrap == 0 {
-							print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
+						print(name);
+						print(b" did not bind; its resources are released and the next candidate follows\n");
+						nodes[at].candidate += 1;
+						nodes[at].attempt = 0;
+						if nodes[at].candidate < nodes[at].candidates.len() {
+							let info = infos[at];
+							start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &mut state);
 						}
 					}
-					// The pointer flavour of virtio_input offers an INPUT provider; the keyboard
-					// flavour offers none, so an absent one is a state rather than a failure.
-					if *input_client == 0 {
-						*input_client = offers.take(driver_protocol::provider::INPUT);
-					}
-					// The xHCI driver offers up to three: the USB stick's block service (absent
-					// when no mass-storage device is attached), its bus query channel for the
-					// `lsusb` inventory, and a pointer-event channel for a USB pointing device.
-					// All three arrived in ONE handshake and were held unpublished until its
-					// `READY`, so a controller that died between them published nothing.
-					if *usb_client == 0 {
-						*usb_client = offers.take(driver_protocol::provider::BLOCK);
-					}
-					if *usbq_client == 0 {
-						*usbq_client = offers.take(driver_protocol::provider::USB_BUS);
-					}
-					if *usb_pointer == 0 {
-						*usb_pointer = offers.take(driver_protocol::provider::POINTER);
-					}
-					// ANYTHING STILL HELD IS A PROVIDER NOBODY ROUTES, and it is closed rather than
-					// leaked: a handle this service keeps forever is a channel the driver waits on
-					// forever.
-					offers.close_all();
+					Step::Done => {}
 				}
-				unmap_object(file);
-				close(file);
-				// Bound. Nothing below this candidate is tried.
-				if state[idx] == STATE_ONLINE {
-					break;
-				}
-				print(b"DeviceManager: ");
-				print(driver_name);
-				print(b" did not bind; its resources are released and the next candidate follows\n");
 			}
-			i += 1;
 		}
 		close(key_producer);
 		report_state(&state);
+	}
+}
+
+// Read this node's current candidate off the volume and open a bind with it.
+//
+// THE ELF IS UNMAPPED THE MOMENT THE SPAWN IS DONE WITH IT. `sys_process_load` copies the whole
+// image into a kernel buffer before the loader touches it, so the mapping is needed for the
+// duration of one syscall - not, as it was, for the whole handshake. That is what makes a dozen
+// devices coming up at once cost one mapping at a time rather than a dozen.
+#[allow(clippy::too_many_arguments)]
+unsafe fn start_candidate(node: &mut Node, storage: u64, info: &DeviceInfo, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, state: &mut [u8]) {
+	unsafe {
+		loop {
+			if node.candidate >= node.candidates.len() {
+				return;
+			}
+			let entry = node.candidates[node.candidate];
+			let driver_name: &[u8] = entry.name;
+			let Some((file, mapped, size)) = read_driver(storage, driver_name) else {
+				// The registry names an artifact the volume does not have. That is the image
+				// disagreeing with itself, not a driver that ran and failed, and the two are worth
+				// telling apart: one is a packaging fault and the other is a bug.
+				state[node.index as usize] = STATE_DRIVER_MISSING;
+				print(b"DeviceManager: ");
+				print(driver_name);
+				print(b" is named by the registry and not on the volume; trying the next candidate\n");
+				node.candidate += 1;
+				node.attempt = 0;
+				continue;
+			};
+			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
+			let opened: bool = begin_bind(node, info, elf, driver_name, key_producer, power, console_input, device_privilege);
+			unmap_object(file);
+			close(file);
+			if opened {
+				return;
+			}
+			// It could not even be opened - the claim refused, the spawn refused. `begin_bind` has
+			// already put the node where the table says that belongs, so the only question left is
+			// whether there is another candidate to try.
+			node.candidate += 1;
+			node.attempt = 0;
+		}
+	}
+}
+
+// ROUTED BY WHAT THE PROVIDER IS, not by which driver sent it and in what order.
+//
+// Every one of these used to be "the handle that came with the report", with the xHCI driver's
+// extra two told apart by the literal bytes `USBBUS` and `POINTER` in the messages that followed -
+// so what a capability was for was decided by parsing a string the driver chose.
+#[allow(clippy::too_many_arguments)]
+unsafe fn route_offers(node: &mut Node, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+	unsafe {
+		let _ = driver_name;
+		if *net_client == 0 {
+			*net_client = node.offers.take(driver_protocol::provider::NET);
+		}
+		if *gpu_client == 0 {
+			*gpu_client = node.offers.take(driver_protocol::provider::DISPLAY);
+		}
+		if *snd_client == 0 {
+			*snd_client = node.offers.take(driver_protocol::provider::AUDIO);
+		}
+		// The development channel driver hands up a raw byte channel, and the agent that speaks the
+		// protocol over it is started here rather than by ServiceManager. It exists exactly when the
+		// device does, it has no other client, and its whole reason to be a separate process is to
+		// keep the artifact registry out of the address space that holds a device capability - so it
+		// is started where that device is bound, and nowhere else.
+		#[cfg(feature = "development")]
+		{
+			let dev_bytes: u64 = node.offers.take(driver_protocol::provider::CONSOLE_BYTES);
+			if driver_name == b"dev_channel" && dev_bytes != 0 {
+				// The driver's bootstrap is kept rather than left to leak, because a replacement
+				// agent's wire is handed down over it; and a volume connection of this program's own
+				// is opened, because the one these drivers were read through is closed as soon as
+				// the caller returns.
+				if let Some(binding) = &node.binding {
+					dev.driver = binding.channel;
+				}
+				dev.storage = service_connect(storage).unwrap_or(0);
+				// INSECURE by name, because that is what this is: an identifier that tells one boot
+				// from another, not a secret. Asking for the secure one would refuse on every
+				// machine with no hardware random source - which is two of the three architectures -
+				// for a number that never needed to be unguessable.
+				random_insecure(&mut dev.nonce);
+				dev.console_input = console_input;
+				dev.bootstrap = start_dev_agent(dev.storage, dev_bytes, console_input, &dev.nonce);
+				if dev.bootstrap == 0 {
+					print(b"DeviceManager: development agent did not start; the control channel is transport-only\n");
+				}
+			} else if dev_bytes != 0 {
+				close(dev_bytes);
+			}
+		}
+		// The pointer flavour of virtio_input offers an INPUT provider; the keyboard flavour offers
+		// none, so an absent one is a state rather than a failure.
+		if *input_client == 0 {
+			*input_client = node.offers.take(driver_protocol::provider::INPUT);
+		}
+		// The xHCI driver offers up to three: the USB stick's block service (absent when no
+		// mass-storage device is attached), its bus query channel for the `lsusb` inventory, and a
+		// pointer-event channel for a USB pointing device. All three arrived in ONE handshake and
+		// were held unpublished until its `READY`, so a controller that died between them published
+		// nothing.
+		if *usb_client == 0 {
+			*usb_client = node.offers.take(driver_protocol::provider::BLOCK);
+		}
+		if *usbq_client == 0 {
+			*usbq_client = node.offers.take(driver_protocol::provider::USB_BUS);
+		}
+		if *usb_pointer == 0 {
+			*usb_pointer = node.offers.take(driver_protocol::provider::POINTER);
+		}
+		// ANYTHING STILL HELD IS A PROVIDER NOBODY ROUTES, and it is closed rather than leaked: a
+		// handle this service keeps forever is a channel the driver waits on forever.
+		node.offers.close_all();
 	}
 }
 
@@ -807,6 +898,156 @@ unsafe fn read_driver(storage: u64, name: &[u8]) -> Option<(u64, u64, usize)> {
 	}
 }
 
+// ------------------------------------------------- the node, and its ordered queue
+//
+// A BINDING IS NOT THE THING THAT OUTLIVES ITS OWN EVENTS.
+//
+// The exit of a driver arrives while its binding is being torn down, and the next binding's `READY`
+// arrives on the same device afterwards - so a queue owned by a binding has nowhere to put the
+// events on either side of it, and two consecutive bindings would each hold a queue with the
+// interesting moment falling between them. The queue belongs to a DEVICE NODE, which exists from
+// the boot scan onward and holds `Option<Binding>`.
+//
+// The record used to be a local inside the bring-up loop and died with the iteration that made it.
+// Where a device's binding is, and why, is a fact about the device - so it lives here, for the life
+// of this program.
+
+// How many events one node may hold before the oldest is refused.
+//
+// A node's events are the frames of one handshake plus its terminal ones, so the bound is the
+// protocol's own: at most `MAX_INITIAL_OFFERS` offers, one terminal frame, one exit, one claim
+// answer, and a timeout - and a driver that sends more is a driver whose offers are already being
+// refused past the bound.
+const MAX_NODE_EVENTS: usize = driver_protocol::MAX_INITIAL_OFFERS + 4;
+
+// EVERY BINDING EVENT CARRIES THE GENERATION IT IS ABOUT.
+//
+// A process being replaced cannot touch its replacement's state: its `READY` is not this binding's
+// `READY`, and its offer is a capability from a binding that is over. The generation is what tells
+// the two apart, and it is on the event rather than checked at the point of reading, because the
+// event may be read long after the frame that produced it arrived.
+#[derive(Clone, Copy)]
+enum Event {
+	// The driver said it is up.
+	Ready { generation: u64 },
+	// It said it failed, and this is what it said.
+	Failed { generation: u64, code: driver_protocol::DriverFailureCode },
+	// It offered a provider. The handle is held by the node's `Offers` until the binding commits.
+	Offered { generation: u64 },
+	// Its process ended - however it ended.
+	Exited { generation: u64 },
+	// Its channel closed with nothing terminal on it.
+	Closed { generation: u64 },
+	// This attempt spent its share of the boot window.
+	TimedOut { generation: u64 },
+}
+
+impl Event {
+	fn generation(self) -> u64 {
+		match self {
+			Event::Ready { generation } | Event::Failed { generation, .. } | Event::Offered { generation } | Event::Exited { generation } | Event::Closed { generation } | Event::TimedOut { generation } => generation,
+		}
+	}
+}
+
+// What is bound to a node right now: everything the manager holds on the driver's behalf.
+//
+// THE BINDING OWNS THE PROCESS HANDLE. `spawn` used to return it and nothing kept it, so nothing
+// could end a process a failed bind had started - which is what made "a failed bind leaves nothing
+// behind" untrue in the one case it is written for.
+struct Binding {
+	generation: u64,
+	process: u64,
+	channel: u64,
+	claim: u64,
+	key: ClaimKey,
+}
+
+impl Binding {
+	// The same holdings, as the ledger a rollback undoes.
+	//
+	// ONE ROLLBACK IMPLEMENTATION, NOT TWO. A bind that fails before the binding is installed and
+	// one that fails after it hold exactly the same four things, and the order they are given back
+	// in is the property that matters - so a second implementation would be a second order, and the
+	// two would agree until the day somebody changed one of them.
+	fn into_attempt(self) -> Attempt {
+		Attempt { process: self.process, channel: self.channel, claim: self.claim, key: self.key }
+	}
+}
+
+// One device, for the life of this program.
+struct Node {
+	// The device table index. Stable because the scan runs once: nothing rescans, so there is no
+	// removal event and no identity to invalidate.
+	index: u64,
+	// Where this node's binding is and why it got there. Survives every binding on this node.
+	record: BindingRecord,
+	// What is bound now, if anything.
+	binding: Option<Binding>,
+	// The providers the current handshake has offered, held unpublished until it says `READY`.
+	offers: Offers,
+	// The window this bring-up incident may spend, opened when the first attempt begins.
+	incident: Incident,
+	// How many automatic attempts this incident has spent.
+	attempt: u32,
+	// The registry candidates left to try, most specific first, and which one is being tried.
+	candidates: Vec<&'static Entry>,
+	candidate: usize,
+	// One ordered queue. Two nodes are independent; one node never handles two events at once.
+	queue: [Option<Event>; MAX_NODE_EVENTS],
+	head: usize,
+	count: usize,
+}
+
+impl Node {
+	fn new(index: u64, candidates: Vec<&'static Entry>) -> Node {
+		Node { index, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: [None; MAX_NODE_EVENTS], head: 0, count: 0 }
+	}
+
+	// Append one event. A full queue REFUSES the new one rather than dropping the oldest: the
+	// oldest is the one whose ordering matters - an exit before a `READY` is a different story from
+	// an exit after it - and a queue that silently forgets its front is a queue that reorders.
+	fn push(&mut self, event: Event) -> bool {
+		if self.count == MAX_NODE_EVENTS {
+			return false;
+		}
+		let at = (self.head + self.count) % MAX_NODE_EVENTS;
+		self.queue[at] = Some(event);
+		self.count += 1;
+		true
+	}
+
+	// Take the oldest, dropping anything about a binding that is over.
+	//
+	// STALE EVENTS ARE DROPPED HERE AND NOWHERE ELSE, so every reader of this queue gets the same
+	// answer to "is this about the binding I am holding". A duplicate is idempotent because the
+	// state machine that consumes these refuses a transition it has already made.
+	fn pop(&mut self) -> Option<Event> {
+		while self.count > 0 {
+			let event = self.queue[self.head].take();
+			self.head = (self.head + 1) % MAX_NODE_EVENTS;
+			self.count -= 1;
+			let event = event?;
+			let current: u64 = match &self.binding {
+				Some(binding) => binding.generation,
+				// No binding means nothing this event could be about.
+				None => continue,
+			};
+			if event.generation() != current {
+				continue;
+			}
+			return Some(event);
+		}
+		None
+	}
+
+	// Whether this node still has work in flight - a driver that has been sent `BIND` and has not
+	// reached a terminal state.
+	fn in_flight(&self) -> bool {
+		self.binding.is_some() && matches!(self.record.state, BindingState::Binding | BindingState::Stopping)
+	}
+}
+
 // ------------------------------------------------------- one bind, one transaction
 //
 // BIND USED TO BE A SEQUENCE OF STEPS THAT EACH SUCCEEDED SEPARATELY: map the ELF, spawn the
@@ -942,17 +1183,6 @@ impl Offers {
 	}
 }
 
-// How a handshake ended.
-enum HandshakeResult {
-	Ready,
-	Failed(driver_protocol::DriverFailureCode),
-	Closed,
-	// The driver is still there and has not answered. A different fact from `Closed` - which is a
-	// driver that is gone - and it is retryable for a different reason: nothing says the device is
-	// unusable, only that this attempt spent its allowance.
-	TimedOut,
-}
-
 // Send one frame, optionally moving one capability with it under `mask`.
 unsafe fn send_frame(channel: u64, opcode: driver_protocol::Opcode, generation: u64, payload: &[u8], handle: u64, mask: u32) -> bool {
 	unsafe {
@@ -962,77 +1192,6 @@ unsafe fn send_frame(channel: u64, opcode: driver_protocol::Opcode, generation: 
 		frame[driver_protocol::HEADER_LEN..driver_protocol::HEADER_LEN + payload.len()].copy_from_slice(payload);
 		let bytes = &frame[..driver_protocol::HEADER_LEN + payload.len()];
 		if handle == 0 { send_blocking(channel, bytes, 0) } else { send_blocking_attenuated(channel, bytes, handle, mask) }
-	}
-}
-
-// READ UNTIL THE HANDSHAKE ENDS: offers, then exactly one `READY` or one `FAILED`.
-//
-// EVERY REFUSAL CLOSES WHAT ARRIVED WITH IT, and "what arrived" includes the handles this reader
-// never looked at - the capability-aware receive is what makes that possible at all, because the
-// ordinary one takes the first and drops the rest.
-//
-// A FRAME CARRYING A STALE GENERATION IS DROPPED RATHER THAN ACTED ON. A process being replaced
-// cannot touch its replacement's state: its `READY` is not this binding's `READY`, and its offer is
-// a capability from a binding that is over.
-// `deadline` is absolute, in monotonic ticks, and bounds the WHOLE handshake rather than each frame
-// of it: a driver that sends an offer every tick and never sends `READY` would otherwise refresh its
-// own reprieve forever, which is the shape of a hang that looks like progress.
-unsafe fn read_handshake_result(channel: u64, generation: u64, deadline: u64, buf: &mut [u8], offers: &mut Offers) -> HandshakeResult {
-	unsafe {
-		loop {
-			let handshake = recv_caps_deadline(channel, buf, deadline);
-			if matches!(handshake, DeadlineCaps::TimedOut) {
-				offers.close_all();
-				return HandshakeResult::TimedOut;
-			}
-			let DeadlineCaps::Message { len, handles } = handshake else {
-				offers.close_all();
-				return HandshakeResult::Closed;
-			};
-			let refuse = |handles: &wire::Handles| {
-				for &handle in handles.as_slice() {
-					close(handle);
-				}
-			};
-			let Ok(header) = driver_protocol::Header::decode(&buf[..len]) else {
-				refuse(&handles);
-				continue;
-			};
-			if header.check_handles(handles.as_slice().len()).is_err() || header.generation != generation {
-				refuse(&handles);
-				continue;
-			}
-			match header.opcode {
-				driver_protocol::Opcode::Offer => {
-					let Ok(kind) = driver_protocol::decode_offer(header.payload(buf)) else {
-						refuse(&handles);
-						continue;
-					};
-					if !offers.push(kind, handles.as_slice()[0]) {
-						// PAST THE BOUND IS A REFUSAL WITH THE HANDLE CLOSED, not an accumulation.
-						refuse(&handles);
-					}
-				}
-				driver_protocol::Opcode::Ready => {
-					if driver_protocol::decode_ready(header.payload(buf)).is_err() {
-						continue;
-					}
-					return HandshakeResult::Ready;
-				}
-				driver_protocol::Opcode::Failed => {
-					let code = match driver_protocol::decode_failed(header.payload(buf)) {
-						Ok(code) => code,
-						// A `FAILED` whose code is not one of the five is still a failure, and the
-						// least it can be taken for is the one that says nothing about a retry.
-						Err(_) => driver_protocol::DriverFailureCode::InternalError,
-					};
-					offers.close_all();
-					return HandshakeResult::Failed(code);
-				}
-				// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
-				driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource => refuse(&handles),
-			}
-		}
 	}
 }
 
@@ -1105,6 +1264,177 @@ unsafe fn retry_or_quarantine(record: &mut BindingRecord, txn: &mut Attempt, off
 // then re-acquires a fresh capability and respawns it, up to a few times - the
 // driver crash/restart cycle. Drivers do not crash in normal operation, so the
 // restart path is dormant on a healthy boot.
+// ------------------------------------------------------- the one wait
+//
+// SHORT NON-BLOCKING STEPS DRIVEN FROM ONE CENTRAL WAIT.
+//
+// Bring-up used to be a blocking `launch_one` per device: claim, spawn, and then park on the
+// handshake until it answered. One driver that never answered held the manager, and every other
+// device waited behind the bring-up of a device nobody was using. An actor framework is not needed
+// for this and is not wanted - what is needed is that no step blocks.
+//
+// The wait set is two handles per node in flight: its channel, and its process. The second is what
+// makes an exit an EVENT rather than something discovered by a read failing.
+
+// The ceiling on nodes in flight at once, from the kernel's wait-set limit and two handles each.
+const MAX_NODES_IN_FLIGHT: usize = abi::MAX_WAIT_HANDLES / 2;
+
+// Wait for one thing to happen anywhere, and queue it on the node it belongs to.
+//
+// Returns false when there is nothing in flight to wait for, which is the loop's exit condition.
+unsafe fn pump(nodes: &mut [Node], buf: &mut [u8]) -> bool {
+	unsafe {
+		// The wait set, and which node each entry belongs to. Rebuilt every pass because what is in
+		// flight changes every pass.
+		let mut handles: [u64; abi::MAX_WAIT_HANDLES] = [0; abi::MAX_WAIT_HANDLES];
+		let mut owner: [usize; abi::MAX_WAIT_HANDLES] = [0; abi::MAX_WAIT_HANDLES];
+		let mut is_process: [bool; abi::MAX_WAIT_HANDLES] = [false; abi::MAX_WAIT_HANDLES];
+		let mut set: usize = 0;
+		// The earliest deadline anywhere, so the wait ends when the FIRST node runs out rather than
+		// when the last one does.
+		let mut soonest: u64 = 0;
+		for (at, node) in nodes.iter().enumerate() {
+			if !node.in_flight() || set + 2 > abi::MAX_WAIT_HANDLES {
+				continue;
+			}
+			let Some(binding) = &node.binding else { continue };
+			handles[set] = binding.channel;
+			owner[set] = at;
+			is_process[set] = false;
+			set += 1;
+			if binding.process != 0 {
+				handles[set] = binding.process;
+				owner[set] = at;
+				is_process[set] = true;
+				set += 1;
+			}
+			let deadline: u64 = node.incident.attempt_deadline();
+			if soonest == 0 || deadline < soonest {
+				soonest = deadline;
+			}
+		}
+		if set == 0 {
+			return false;
+		}
+		let ready: i64 = wait_any(&handles[..set], soonest);
+		if ready < 0 {
+			// THE DEADLINE, OR A WAIT THAT COULD NOT BE DONE AT ALL. Either way the answer is the
+			// same: give every node whose own deadline has passed its timeout, and let the state
+			// machine decide what that means. Treating an un-performable wait as a spin would burn
+			// the rest of the window on a cooperative scheduler.
+			let now: u64 = clock();
+			let mut timed_out: bool = false;
+			for node in nodes.iter_mut() {
+				if !node.in_flight() {
+					continue;
+				}
+				if node.incident.attempt_deadline() > now {
+					continue;
+				}
+				let Some(binding) = &node.binding else { continue };
+				let generation: u64 = binding.generation;
+				node.push(Event::TimedOut { generation });
+				timed_out = true;
+			}
+			// NOBODY TIMED OUT AND THE WAIT STILL FAILED, which is a wait this program cannot
+			// perform - a handle without the WAIT right, or a set the kernel refused. Reporting no
+			// progress here would spin; the honest answer is to time out everything in flight,
+			// because a manager that cannot wait cannot supervise.
+			if !timed_out {
+				for node in nodes.iter_mut() {
+					if !node.in_flight() {
+						continue;
+					}
+					let Some(binding) = &node.binding else { continue };
+					let generation: u64 = binding.generation;
+					node.push(Event::TimedOut { generation });
+				}
+			}
+			return true;
+		}
+		let at: usize = ready as usize;
+		if at >= set {
+			return true;
+		}
+		let which: usize = owner[at];
+		if is_process[at] {
+			let Some(binding) = &nodes[which].binding else { return true };
+			let generation: u64 = binding.generation;
+			nodes[which].push(Event::Exited { generation });
+			return true;
+		}
+		// A READABLE CHANNEL IS DRAINED, not read once. Several frames can be waiting - a driver
+		// sends its offers and its `READY` back to back - and taking one per wait would cost a
+		// syscall per frame and reorder nothing.
+		drain_channel(&mut nodes[which], buf);
+		true
+	}
+}
+
+// Take every frame waiting on this node's channel and queue what each one means.
+unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
+	unsafe {
+		let Some(binding) = &node.binding else { return };
+		let (channel, generation): (u64, u64) = (binding.channel, binding.generation);
+		loop {
+			let frame = try_recv_caps(channel, buf);
+			let (len, handles) = match frame {
+				PolledCaps::Message { len, handles } => (len, handles),
+				PolledCaps::Empty => return,
+				PolledCaps::Closed => {
+					node.push(Event::Closed { generation });
+					return;
+				}
+			};
+			let refuse = |handles: &wire::Handles| {
+				for &handle in handles.as_slice() {
+					close(handle);
+				}
+			};
+			let Ok(header) = driver_protocol::Header::decode(&buf[..len]) else {
+				refuse(&handles);
+				continue;
+			};
+			// A FRAME CARRYING A STALE GENERATION IS DROPPED RATHER THAN ACTED ON, and its handles
+			// with it: a capability from a binding that is over is not a capability to publish.
+			if header.check_handles(handles.as_slice().len()).is_err() || header.generation != generation {
+				refuse(&handles);
+				continue;
+			}
+			match header.opcode {
+				driver_protocol::Opcode::Offer => {
+					let Ok(kind) = driver_protocol::decode_offer(header.payload(buf)) else {
+						refuse(&handles);
+						continue;
+					};
+					if node.offers.push(kind, handles.as_slice()[0]) {
+						node.push(Event::Offered { generation });
+					} else {
+						// PAST THE BOUND IS A REFUSAL WITH THE HANDLE CLOSED, not an accumulation.
+						refuse(&handles);
+					}
+				}
+				driver_protocol::Opcode::Ready => {
+					if driver_protocol::decode_ready(header.payload(buf)).is_ok() {
+						node.push(Event::Ready { generation });
+					}
+				}
+				driver_protocol::Opcode::Failed => {
+					let code = match driver_protocol::decode_failed(header.payload(buf)) {
+						Ok(code) => code,
+						// A `FAILED` whose code is not one of the five is still a failure, and the
+						// least it can be taken for is the one that says nothing about a retry.
+						Err(_) => driver_protocol::DriverFailureCode::InternalError,
+					};
+					node.push(Event::Failed { generation, code });
+				}
+				// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
+				driver_protocol::Opcode::Bind | driver_protocol::Opcode::Resource => refuse(&handles),
+			}
+		}
+	}
+}
+
 // Whether another automatic attempt is allowed: the attempt budget AND the time budget, which are
 // two different budgets and are spent in different places.
 //
@@ -1137,133 +1467,168 @@ unsafe fn back_off(incident: &Incident, attempt: u32) {
 	}
 }
 
-unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], offers: &mut Offers, control_out: &mut u64, claim_out: &mut u64, record: &mut BindingRecord) -> bool {
+// OPEN THE TRANSACTION AND SEND `BIND`, AND DO NOT WAIT FOR THE ANSWER.
+//
+// Everything this attempt takes is recorded in the transaction as it is taken, so there is no path
+// out that leaves a claim, a process, a handle or a provider behind. What is different from the
+// blocking bring-up this replaces is only where it ENDS: with the frames sent and the node in
+// flight, for the central wait to hear about.
+//
+// Returns false when the attempt could not be opened at all, having already put the node wherever
+// the table says a bind that failed this early belongs.
+#[allow(clippy::too_many_arguments)]
+unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64) -> bool {
 	unsafe {
-		let mut attempt: u32 = 0;
-		// ONE WINDOW FOR THE WHOLE CHAIN OF ATTEMPTS, opened here rather than per attempt. Three
-		// attempts of two seconds plus their backoffs is 6.3 seconds for ONE device, which is
-		// already past the window the kernel's settle ladder gives the whole boot - and a machine
-		// with several unbindable devices multiplies it. So the bound is absolute across every
-		// attempt on this node, not a per-attempt deadline times a count.
-		let incident = Incident::open();
-		loop {
-			// ONE TRANSACTION PER ATTEMPT. Everything taken below is recorded in it as it is taken,
-			// and `give_up` hands all of it back in reverse - so there is no path out of this loop
-			// that leaves a claim, a process, a handle or a provider behind.
-			let mut txn = Attempt::new();
-			*claim_out = 0;
-			if !record.move_to(BindingState::Binding, None) {
-				print(b"DeviceManager: refusing an illegal transition into binding for ");
-				print(driver_name);
-				print(b"\n");
-				return false;
+		if node.attempt == 0 {
+			// ONE WINDOW FOR THE WHOLE CHAIN OF ATTEMPTS, opened on the first and not per attempt.
+			// Three attempts of two seconds plus their backoffs is 6.3 seconds for ONE device,
+			// which is already past the window the kernel's settle ladder gives the whole boot -
+			// and a machine with several unbindable devices multiplies it.
+			node.incident = Incident::open();
+		}
+		let mut txn = Attempt::new();
+		if !node.record.move_to(BindingState::Binding, None) {
+			print(b"DeviceManager: refusing an illegal transition into binding for ");
+			print(driver_name);
+			print(b"\n");
+			return false;
+		}
+		node.record.attempts = node.attempt + 1;
+		let grant: ClaimGrant = match device_claim(node.index, device_privilege) {
+			Ok(grant) => grant,
+			// NOT RETRYABLE, and named as such: the device is held by somebody else and waiting
+			// changes nothing this service controls.
+			Err(_) => return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ClaimRefused, driver_name),
+		};
+		txn.claim = grant.claim;
+		txn.key = grant.key;
+		node.record.generation = grant.key.generation;
+		let (dm_side, driver_side): (u64, u64) = match channel() {
+			Some(pair) => pair,
+			None => return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name),
+		};
+		txn.channel = dm_side;
+		// THE PROCESS HANDLE IS KEPT. It used to be dropped the moment `spawn` returned, so
+		// nothing could end the process a failed bind had started - which is what made "leaves
+		// nothing behind" untrue in the one case it is written for. It is also the handle the
+		// central wait watches, which is what makes an exit an event rather than a read failing.
+		let process: i64 = spawn(elf, driver_side);
+		if process < 0 {
+			return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::SpawnFailed, driver_name);
+		}
+		txn.process = process as u64;
+		// ASSEMBLE THE RESOURCE LIST BEFORE ANNOUNCING ITS LENGTH.
+		//
+		// `BIND` states how many `RESOURCE` frames follow, and that number is this service's own
+		// count of the list it is ABOUT TO SEND - not a number read out of the registry entry,
+		// which has no resource list to read one from. A promise about what is already in hand
+		// is the only kind that can be kept, and the driver's receive loop is bounded by it:
+		// state one too many and the driver waits forever for a frame that is not coming.
+		//
+		// The interrupt-driven drivers (virtio-input, virtio-net, virtio-snd, xhci, virtio-gpu,
+		// dev-channel) each take their own per-device MSI-X vector, edge-triggered with no INTx
+		// sharing. The gpu routes only its CONFIG vector to it and keeps its control queue
+		// polled; the dev channel is idle almost always and must block on its interrupt rather
+		// than poll, because a spinning driver starves the cooperative scheduler for the guest's
+		// whole life. The remaining polling drivers get none, so their device IRQs stay silent.
+		let mut resources: [(u16, u64); 5] = [(0u16, 0u64); 5];
+		let mut resource_count: usize = 0;
+		// The device's own MMIO capability is always first and always present.
+		resources[resource_count] = (driver_protocol::ResourceKind::Device as u16, grant.memory);
+		resource_count += 1;
+		let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel";
+		if use_msix {
+			let irq: i64 = device_msix_acquire(grant.claim);
+			if irq < 0 {
+				return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name);
 			}
-			record.attempts = attempt + 1;
-			let grant: ClaimGrant = match device_claim(i, device_privilege) {
-				Ok(grant) => grant,
-				// NOT RETRYABLE, and named as such: the device is held by somebody else and waiting
-				// changes nothing this service controls.
-				Err(_) => return give_up(record, &mut txn, offers, FailureCause::ClaimRefused, driver_name),
-			};
-			txn.claim = grant.claim;
-			txn.key = grant.key;
-			record.generation = grant.key.generation;
-			let (dm_side, driver_side): (u64, u64) = match channel() {
-				Some(pair) => pair,
-				None => return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name),
-			};
-			txn.channel = dm_side;
-			// THE PROCESS HANDLE IS KEPT. It used to be dropped the moment `spawn` returned, so
-			// nothing could end the process a failed bind had started - which is what made "leaves
-			// nothing behind" untrue in the one case it is written for.
-			let process: i64 = spawn(elf, driver_side);
-			if process < 0 {
-				return give_up(record, &mut txn, offers, FailureCause::SpawnFailed, driver_name);
-			}
-			txn.process = process as u64;
-			// ASSEMBLE THE RESOURCE LIST BEFORE ANNOUNCING ITS LENGTH.
-			//
-			// `BIND` states how many `RESOURCE` frames follow, and that number is this service's own
-			// count of the list it is ABOUT TO SEND - not a number read out of the registry entry,
-			// which has no resource list to read one from. A promise about what is already in hand
-			// is the only kind that can be kept, and the driver's receive loop is bounded by it:
-			// state one too many and the driver waits forever for a frame that is not coming.
-			//
-			// The interrupt-driven drivers (virtio-input, virtio-net, virtio-snd, xhci, virtio-gpu,
-			// dev-channel) each take their own per-device MSI-X vector, edge-triggered with no INTx
-			// sharing. The gpu routes only its CONFIG vector to it and keeps its control queue
-			// polled; the dev channel is idle almost always and must block on its interrupt rather
-			// than poll, because a spinning driver starves the cooperative scheduler for the guest's
-			// whole life. The remaining polling drivers get none, so their device IRQs stay silent.
-			let mut resources: [(u16, u64); 5] = [(0u16, 0u64); 5];
-			let mut resource_count: usize = 0;
-			// The device's own MMIO capability is always first and always present.
-			resources[resource_count] = (driver_protocol::ResourceKind::Device as u16, grant.memory);
+			resources[resource_count] = (driver_protocol::ResourceKind::Irq as u16, irq as u64);
 			resource_count += 1;
-			let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel";
-			if use_msix {
-				let irq: i64 = device_msix_acquire(grant.claim);
-				if irq < 0 {
-					return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name);
+		}
+		if driver_name == b"virtio_input" || driver_name == b"xhci" {
+			let sink: i64 = duplicate(key_producer, RIGHT_SEND | RIGHT_TRANSFER);
+			if sink < 0 {
+				return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name);
+			}
+			resources[resource_count] = (driver_protocol::ResourceKind::Keys as u16, sink as u64);
+			resource_count += 1;
+			// A CONNECTION OF ITS OWN, not a copy of an authority. These two used to be handed a
+			// duplicate of the root-Domain handle - which can kill every process on the machine -
+			// so that the Power key would work. What they get now can ask for a reboot and
+			// nothing else, on a channel nobody else answers on.
+			let Some(connection) = service_connect(power) else { return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name) };
+			resources[resource_count] = (driver_protocol::ResourceKind::SysPower as u16, connection);
+			resource_count += 1;
+			// The capability that lets those keystrokes reach the console at all. A duplicate
+			// per driver, for the same reason as the power connection.
+			if console_input != 0 {
+				let feed: i64 = duplicate(console_input, RIGHT_TRANSFER);
+				if feed < 0 {
+					return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name);
 				}
-				resources[resource_count] = (driver_protocol::ResourceKind::Irq as u16, irq as u64);
+				resources[resource_count] = (driver_protocol::ResourceKind::Console as u16, feed as u64);
 				resource_count += 1;
 			}
-			if driver_name == b"virtio_input" || driver_name == b"xhci" {
-				let sink: i64 = duplicate(key_producer, RIGHT_SEND | RIGHT_TRANSFER);
-				if sink < 0 {
-					return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name);
-				}
-				resources[resource_count] = (driver_protocol::ResourceKind::Keys as u16, sink as u64);
-				resource_count += 1;
-				// A CONNECTION OF ITS OWN, not a copy of an authority. These two used to be handed a
-				// duplicate of the root-Domain handle - which can kill every process on the machine -
-				// so that the Power key would work. What they get now can ask for a reboot and
-				// nothing else, on a channel nobody else answers on.
-				let Some(connection) = service_connect(power) else { return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name) };
-				resources[resource_count] = (driver_protocol::ResourceKind::SysPower as u16, connection);
-				resource_count += 1;
-				// The capability that lets those keystrokes reach the console at all. A duplicate
-				// per driver, for the same reason as the power connection.
-				if console_input != 0 {
-					let feed: i64 = duplicate(console_input, RIGHT_TRANSFER);
-					if feed < 0 {
-						return give_up(record, &mut txn, offers, FailureCause::ResourceExhausted, driver_name);
-					}
-					resources[resource_count] = (driver_protocol::ResourceKind::Console as u16, feed as u64);
-					resource_count += 1;
-				}
+		}
+		// `BIND` - the device, and the count of what follows. No capability travels with it.
+		let mut payload = [0u8; driver_protocol::MAX_PAYLOAD];
+		let payload_len = driver_protocol::encode_bind(info, resource_count as u16, &mut payload);
+		if !send_frame(dm_side, driver_protocol::Opcode::Bind, grant.key.generation, &payload[..payload_len], 0, 0) {
+			return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::DriverExited, driver_name);
+		}
+		for &(kind, handle) in resources[..resource_count].iter() {
+			let mut kind_payload = [0u8; driver_protocol::U16_PAYLOAD_LEN];
+			driver_protocol::encode_u16(kind, &mut kind_payload);
+			// THE DEVICE CAPABILITY ARRIVES WITHOUT RIGHT_TRANSFER, through one attenuating
+			// move. It is minted here WITH it, because this process is the one that hands it
+			// over and cannot do that with a capability it may not move - minting it without
+			// TRANSFER outright would break the boot on the first try, right here. The rule is
+			// about the HOLDER: a driver cannot pass its device on.
+			let mask: u32 = if kind == driver_protocol::ResourceKind::Device as u16 { RIGHT_READ | RIGHT_WRITE | RIGHT_MAP } else { RIGHTS_ALL };
+			if !send_frame(dm_side, driver_protocol::Opcode::Resource, grant.key.generation, &kind_payload, handle, mask) {
+				return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::DriverExited, driver_name);
 			}
-			// `BIND` - the device, and the count of what follows. No capability travels with it.
-			let mut payload = [0u8; driver_protocol::MAX_PAYLOAD];
-			let payload_len = driver_protocol::encode_bind(info, resource_count as u16, &mut payload);
-			if !send_frame(dm_side, driver_protocol::Opcode::Bind, grant.key.generation, &payload[..payload_len], 0, 0) {
-				return give_up(record, &mut txn, offers, FailureCause::DriverExited, driver_name);
-			}
-			for &(kind, handle) in resources[..resource_count].iter() {
-				let mut kind_payload = [0u8; driver_protocol::U16_PAYLOAD_LEN];
-				driver_protocol::encode_u16(kind, &mut kind_payload);
-				// THE DEVICE CAPABILITY ARRIVES WITHOUT RIGHT_TRANSFER, through one attenuating
-				// move. It is minted here WITH it, because this process is the one that hands it
-				// over and cannot do that with a capability it may not move - minting it without
-				// TRANSFER outright would break the boot on the first try, right here. The rule is
-				// about the HOLDER: a driver cannot pass its device on.
-				let mask: u32 = if kind == driver_protocol::ResourceKind::Device as u16 { RIGHT_READ | RIGHT_WRITE | RIGHT_MAP } else { RIGHTS_ALL };
-				if !send_frame(dm_side, driver_protocol::Opcode::Resource, grant.key.generation, &kind_payload, handle, mask) {
-					return give_up(record, &mut txn, offers, FailureCause::DriverExited, driver_name);
+		}
+		// IN FLIGHT. The transaction's holdings become the node's binding, which is what the
+		// central wait watches and what a rollback gives back.
+		node.binding = Some(Binding { generation: grant.key.generation, process: txn.process, channel: txn.channel, claim: txn.claim, key: txn.key });
+		txn.commit();
+		true
+	}
+}
+
+// What one node's state machine decided, for the caller that knows what to do about it.
+enum Step {
+	// Still in flight: nothing terminal has arrived.
+	Waiting,
+	// Committed. Its offers are on the node, and routing them is the caller's - which provider
+	// goes where is a policy this machinery has no business knowing.
+	Online,
+	// Rolled back, and this candidate may be tried again.
+	Again,
+	// Rolled back, and this candidate is spent. The next one, if there is one, follows.
+	NextCandidate,
+	// Terminal: `Failed` or `Quarantined`. Nothing further happens on this node this boot.
+	Done,
+}
+
+// Drain one node's queue and act on what is in it.
+//
+// ONE EVENT AT A TIME AND IN ORDER, which is the whole point of the queue: an exit that arrives
+// during a teardown and a `READY` that arrives on the next binding are two events about two
+// bindings, and the generation on each is what keeps them apart.
+unsafe fn advance(node: &mut Node, driver_name: &[u8]) -> Step {
+	unsafe {
+		while let Some(event) = node.pop() {
+			let cause: FailureCause = match event {
+				// An offer is progress, not an outcome: it is already held on the node, unpublished.
+				Event::Offered { .. } => continue,
+				Event::Ready { .. } => {
+					// THE TRANSACTION COMMITS. What it took stays taken and passes to the caller.
+					node.record.move_to(BindingState::Online, None);
+					return Step::Online;
 				}
-			}
-			match read_handshake_result(dm_side, grant.key.generation, incident.attempt_deadline(), buf, offers) {
-				HandshakeResult::Ready => {
-					// THE TRANSACTION COMMITS. What it took stays taken and passes to the caller:
-					// the claim handle this service holds the device by, and the bootstrap channel.
-					*control_out = dm_side;
-					*claim_out = txn.claim;
-					record.move_to(BindingState::Online, None);
-					txn.commit();
-					return true;
-				}
-				HandshakeResult::Failed(code) => {
+				Event::Failed { code, .. } => {
 					// A DRIVER THAT SAID WHY. Retryability is read off the code rather than decided
 					// again here: `device-not-responding` and `out-of-memory` are the two a second
 					// attempt can change, and the other three describe a driver that has read its
@@ -1271,51 +1636,39 @@ unsafe fn launch_one(i: u64, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], 
 					print(b"DeviceManager: ");
 					print(driver_name);
 					print(if code.retryable() { b" reported a retryable failure\n" } else { b" reported a permanent failure\n" });
-					if !code.retryable() || !may_try_again(&incident, attempt) {
-						return give_up(record, &mut txn, offers, FailureCause::DriverReported(code), driver_name);
-					}
-					attempt += 1;
-					// BACK THROUGH THE TEARDOWN. The device was taken, so the only way to another
-					// attempt is to give it back first - and a release that does not confirm ends
-					// the node here rather than rebinding over a device that may still be live.
-					if !retry_or_quarantine(record, &mut txn, offers, FailureCause::DriverReported(code), driver_name) {
-						return false;
-					}
-					back_off(&incident, attempt);
+					FailureCause::DriverReported(code)
 				}
-				HandshakeResult::Closed => {
-					// the driver crashed before reporting in: restart it a few times.
-					if !may_try_again(&incident, attempt) {
-						return give_up(record, &mut txn, offers, FailureCause::DriverExited, driver_name);
-					}
-					attempt += 1;
-					if !retry_or_quarantine(record, &mut txn, offers, FailureCause::DriverExited, driver_name) {
-						return false;
-					}
-					back_off(&incident, attempt);
-				}
-				HandshakeResult::TimedOut => {
-					// A DRIVER THAT IS STILL THERE AND HAS NOT ANSWERED, which is the case this
-					// whole budget exists for: before it, this wait had no end and one silent
-					// driver held the manager - and therefore the boot - for as long as it liked.
-					//
-					// Retryable, because a timeout says nothing about the device. But the retry is
-					// bounded by the same window that just expired, so in practice the second
-					// attempt happens only when the first one failed early and left time behind.
+				// The process ended, or its channel closed with nothing terminal on it. Both are a
+				// driver that is gone without having said anything.
+				Event::Exited { .. } | Event::Closed { .. } => FailureCause::DriverExited,
+				Event::TimedOut { .. } => {
+					// A DRIVER THAT IS STILL THERE AND HAS NOT ANSWERED, which is the case the
+					// budget exists for: before it, this wait had no end and one silent driver held
+					// the manager - and therefore the boot - for as long as it liked.
 					print(b"DeviceManager: ");
 					print(driver_name);
 					print(b" did not report in inside its share of the boot window\n");
-					if !may_try_again(&incident, attempt) {
-						return give_up(record, &mut txn, offers, FailureCause::HandshakeTimeout, driver_name);
-					}
-					attempt += 1;
-					if !retry_or_quarantine(record, &mut txn, offers, FailureCause::HandshakeTimeout, driver_name) {
-						return false;
-					}
-					back_off(&incident, attempt);
+					FailureCause::HandshakeTimeout
 				}
+			};
+			// ROLL BACK WHAT THIS BINDING HELD, through the one order there is. The binding is
+			// TAKEN out of the node first, so an interrupted rollback cannot be re-entered against
+			// handles it has already given back.
+			let Some(binding) = node.binding.take() else { return Step::Done };
+			let mut txn = binding.into_attempt();
+			let retryable: bool = cause.retryable() && may_try_again(&node.incident, node.attempt);
+			let alive: bool = if retryable { retry_or_quarantine(&mut node.record, &mut txn, &mut node.offers, cause, driver_name) } else { give_up(&mut node.record, &mut txn, &mut node.offers, cause, driver_name) };
+			if !alive {
+				return Step::Done;
 			}
+			if !retryable {
+				return Step::NextCandidate;
+			}
+			node.attempt += 1;
+			back_off(&node.incident, node.attempt);
+			return Step::Again;
 		}
+		Step::Waiting
 	}
 }
 
