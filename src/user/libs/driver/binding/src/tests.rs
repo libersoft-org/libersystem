@@ -342,3 +342,34 @@ fn a_crash_then_a_withdrawal_then_the_backoff_expiry_does_not_bind_on_a_conditio
 	assert!(record.move_to(BindingState::DependencyPending, None));
 	assert!(record.state == BindingState::DependencyPending);
 }
+
+#[test]
+fn withdrawing_one_provider_is_not_the_driver_failing() {
+	// DRIVER READINESS AND PROVIDER READINESS ARE DIFFERENT FACTS, and so are driver failure and
+	// provider failure. A controller whose child goes away withdraws that child's provider; it does
+	// not report itself failed, and nothing about its binding moves.
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Binding, None));
+	assert!(record.move_to(BindingState::Online, None));
+
+	let mut queue = BindingQueue::new();
+	assert!(queue.push(BindingEvent::Withdrawn { generation: 1, token: 2 }));
+	assert!(queue.pop(1) == Some(BindingEvent::Withdrawn { generation: 1, token: 2 }));
+	// The record is untouched: a withdrawal is not a transition, which is why it is not in the
+	// table. A state machine that moved here would tear down a healthy controller because one of
+	// its children left.
+	assert!(record.state == BindingState::Online);
+	assert!(record.failure.is_none());
+}
+
+#[test]
+fn a_provider_offered_after_ready_belongs_to_the_same_binding() {
+	// A controller reports in and THEN enumerates its bus, so its children's providers arrive after
+	// the handshake is over. They carry the same generation, because it is the same binding - which
+	// is what lets the manager publish them without any second handshake.
+	let mut queue = BindingQueue::new();
+	assert!(queue.push(BindingEvent::Ready { generation: 4 }));
+	assert!(queue.push(BindingEvent::Offered { generation: 4 }));
+	assert!(queue.pop(4) == Some(BindingEvent::Ready { generation: 4 }));
+	assert!(queue.pop(4) == Some(BindingEvent::Offered { generation: 4 }), "a late offer is this binding's offer");
+}

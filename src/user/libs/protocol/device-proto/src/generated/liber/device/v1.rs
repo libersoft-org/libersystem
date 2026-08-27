@@ -425,6 +425,321 @@ pub mod device {
 	}
 }
 
+/// What a driver publishes for others to use. The set is closed: a kind this system
+/// does not have is a manifest that fails to parse, not a requirement nothing ever
+/// satisfies.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ProviderKind {
+	Block = 1,
+	Net = 2,
+	Display = 3,
+	Audio = 4,
+	Input = 5,
+	UsbBus = 6,
+	Pointer = 7,
+	ConsoleBytes = 8,
+}
+
+impl ProviderKind {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProviderKind> {
+		let mut r = Reader::new(bytes);
+		let value = ProviderKind::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProviderKind> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProviderKind::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u8(*self as u8)
+	}
+	pub fn read(r: &mut Reader) -> Option<ProviderKind> {
+		match r.u8()? {
+			1 => Some(ProviderKind::Block),
+			2 => Some(ProviderKind::Net),
+			3 => Some(ProviderKind::Display),
+			4 => Some(ProviderKind::Audio),
+			5 => Some(ProviderKind::Input),
+			6 => Some(ProviderKind::UsbBus),
+			7 => Some(ProviderKind::Pointer),
+			8 => Some(ProviderKind::ConsoleBytes),
+			_ => None,
+		}
+	}
+}
+
+/// One published provider, named by the identity DeviceManager assigned it - never by
+/// one a driver chose. The binding is its publisher's: the PCI function's bus/device/
+/// function and the claim generation of the binding that published it, so a provider
+/// from a binding that is over is distinguishable from its replacement. `slot` and
+/// `provider-generation` are the manager's own, and together they make a reused slot
+/// unmistakable for the provider that left it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderInfo {
+	pub kind: ProviderKind,
+	pub bus: u32,
+	pub dev: u32,
+	pub func: u32,
+	pub binding_generation: u64,
+	pub slot: u32,
+	pub provider_generation: u32,
+}
+
+impl ProviderInfo {
+	pub fn encode(&self, out: &mut [u8]) -> Option<usize> {
+		let mut w = SliceWriter::new(out);
+		self.write(&mut w)?;
+		// `finish` refuses while a capability is recorded, because returning the
+		// length alone would drop it.
+		w.finish()
+	}
+	pub fn encode_vec(&self) -> Option<Vec<u8>> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		// `into_inner` refuses while a capability is recorded, because returning
+		// the bytes alone would drop it.
+		w.into_inner()
+	}
+	pub fn encode_message(&self) -> Option<(Vec<u8>, Handles)> {
+		let mut w = VecWriter::new();
+		self.write(&mut w)?;
+		Some(w.into_message())
+	}
+	pub fn decode(bytes: &[u8]) -> Option<ProviderInfo> {
+		let mut r = Reader::new(bytes);
+		let value = ProviderInfo::read(&mut r)?;
+		r.finish()?;
+		Some(value)
+	}
+	pub fn decode_message(bytes: &[u8], handles: &mut Handles) -> Option<ProviderInfo> {
+		let mut r = Reader::with_handles(bytes, handles);
+		let value = ProviderInfo::read(&mut r)?;
+		r.finish()?;
+		// The frame is good, so the capabilities it carried are the value's now. A
+		// refusal above leaves them in the caller's list, which is the half that closes.
+		handles.clear();
+		Some(value)
+	}
+	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		self.kind.write(w)?;
+		w.u32(self.bus)?;
+		w.u32(self.dev)?;
+		w.u32(self.func)?;
+		w.u64(self.binding_generation)?;
+		w.u32(self.slot)?;
+		w.u32(self.provider_generation)?;
+		Some(())
+	}
+	pub fn read(r: &mut Reader) -> Option<ProviderInfo> {
+		let kind = ProviderKind::read(r)?;
+		let bus = r.u32()?;
+		let dev = r.u32()?;
+		let func = r.u32()?;
+		let binding_generation = r.u64()?;
+		let slot = r.u32()?;
+		let provider_generation = r.u32()?;
+		Some(ProviderInfo { kind, bus, dev, func, binding_generation, slot, provider_generation })
+	}
+}
+
+/// The provider catalogue, served by DeviceManager - the only process that holds it.
+///
+/// `subscribe` answers with everything of that kind published RIGHT NOW and continues
+/// as the live stream. One operation, because two would have a window between them:
+/// a provider added after the read and before the registration would be in neither,
+/// and that is the same race as a service started later seeing nothing.
+// interface `provider-catalogue` over a channel: opcodes, a Service trait + dispatch, and a Client.
+pub mod provider_catalogue {
+	use super::*;
+	use crate::codec::{Reader, Sink, SliceWriter, Transport, TransportError, VecWriter};
+	use alloc::vec::Vec;
+
+	pub const OP_SUBSCRIBE: u16 = 1;
+
+	pub trait Service {
+		fn subscribe(&mut self, kind: ProviderKind) -> Vec<ProviderInfo>;
+	}
+
+	pub fn dispatch<S: Service>(_service: &mut S, _request: &[u8], _request_handles: &mut Handles, _out: &mut [u8], _reply_handles: &mut Handles) -> Option<usize> {
+		None
+	}
+
+	pub fn subscribe_open<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles) -> Option<(u32, Vec<ProviderInfo>)> {
+		let mut reader = Reader::with_handle_list(request, request_handles);
+		let r = &mut reader;
+		let _op = r.u16()?;
+		let corr = r.u32()?;
+		let kind = ProviderKind::read(r)?;
+		r.finish()?;
+		request_handles.clear();
+		let items = service.subscribe(kind);
+		Some((corr, items))
+	}
+	pub fn subscribe_frame(seq: u32, item: &ProviderInfo, out: &mut [u8], frame_handles: &mut Handles) -> Option<usize> {
+		let mut writer = SliceWriter::new(out);
+		let encoded: Option<()> = (|| {
+			let w = &mut writer;
+			w.u32(seq)?;
+			item.write(w)?;
+			Some(())
+		})();
+		if encoded.is_none() {
+			if let Some(taken) = Handles::try_from_slice(writer.handles()) {
+				*frame_handles = taken;
+			}
+			return None;
+		}
+		*frame_handles = Handles::try_from_slice(writer.handles())?;
+		Some(writer.pos())
+	}
+	pub fn subscribe_read(msg: &[u8], frame_handles: &mut Handles) -> Option<ProviderInfo> {
+		let mut reader = Reader::with_handles(msg, frame_handles);
+		let r = &mut reader;
+		let _seq = r.u32()?;
+		let value = ProviderInfo::read(r)?;
+		reader.finish()?;
+		frame_handles.clear();
+		Some(value)
+	}
+
+	fn transport_outcome(error: TransportError) -> Error {
+		match error {
+			// The request never left this process, so nothing happened and trying
+			// again is safe - which is what `again` says.
+			TransportError::SendRefused | TransportError::NoRoute => Error::Again,
+			// It went out and no answer came back. The server may have acted before
+			// it died or before the deadline; nobody knows, and `commit-uncertain` is
+			// the answer `base.error` grew so a caller is not forced to guess.
+			// The reply could not be held, or arrived and broke the framing rules. In
+			// both the server ANSWERED, so it acted; this end simply cannot read what
+			// it said, which is the same position as never hearing back.
+			TransportError::PeerClosed | TransportError::ReceiveFailed | TransportError::TimedOut | TransportError::NoMemory | TransportError::Malformed => Error::CommitUncertain,
+		}
+	}
+
+	pub struct Client<T: Transport> {
+		transport: T,
+		corr: u32,
+		deadline: u64,
+		last_error: Option<TransportError>,
+	}
+
+	impl<T: Transport> Client<T> {
+		pub fn new(transport: T) -> Client<T> {
+			Client { transport, corr: 0, deadline: 0, last_error: None }
+		}
+		pub fn with_deadline(transport: T, deadline: u64) -> Client<T> {
+			Client { transport, corr: 0, deadline, last_error: None }
+		}
+		pub fn set_deadline(&mut self, deadline: u64) {
+			self.deadline = deadline;
+		}
+		pub fn last_error(&self) -> Option<TransportError> {
+			self.last_error
+		}
+		pub fn into_transport(self) -> T {
+			self.transport
+		}
+		fn next_corr(&mut self) -> u32 {
+			let c = self.corr;
+			self.corr = self.corr.wrapping_add(1);
+			c
+		}
+		pub fn protocol_info(&mut self) -> Option<(String, u32)> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(PROTOCOL_INFO_OP)?;
+			w.u32(corr)?;
+			// No parameter, so no capability: `into_inner` says so rather than this
+			// line assuming it.
+			let request = writer.into_inner()?;
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, &[], &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			if !reply_handles.is_empty() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr {
+				return None;
+			}
+			let package = r.string_lp()?;
+			let version = r.u32()?;
+			r.finish()?;
+			Some((package, version))
+		}
+		pub fn subscribe(&mut self, kind: &ProviderKind) -> Option<u64> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SUBSCRIBE)?;
+			w.u32(corr)?;
+			kind.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = self
+				.transport
+				.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline)
+				.map_err(|e| {
+					self.last_error = Some(e);
+					e
+				})
+				.ok()?;
+			let mut reader = Reader::new(&reply);
+			let r = &mut reader;
+			if r.u32()? != corr || r.finish().is_none() || reply_handles.len() != 1 {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			Some(reply_handles.first())
+		}
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_provider_catalogue_subscribe")]
+	fn channel_invoke_subscribe(chan: u64, kind: &ProviderKind) -> Option<u64> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.subscribe(kind)
+	}
+}
+
 /// One enumerated USB device, as the xHCI driver addressed it: the root port it hangs
 /// off (a device behind a hub reports the hub's root port), its speed, the vendor and
 /// product ids from its device descriptor, its class code, and the role the driver
@@ -803,6 +1118,143 @@ impl DeviceEntry {
 		self.r#type.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mmio-len");
 		crate::codec::cbor::uint(out, self.mmio_len as u64);
+	}
+}
+
+impl ProviderKind {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		match self {
+			ProviderKind::Block => out.push_str("\"block\""),
+			ProviderKind::Net => out.push_str("\"net\""),
+			ProviderKind::Display => out.push_str("\"display\""),
+			ProviderKind::Audio => out.push_str("\"audio\""),
+			ProviderKind::Input => out.push_str("\"input\""),
+			ProviderKind::UsbBus => out.push_str("\"usb-bus\""),
+			ProviderKind::Pointer => out.push_str("\"pointer\""),
+			ProviderKind::ConsoleBytes => out.push_str("\"console-bytes\""),
+		}
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		match self {
+			ProviderKind::Block => out.push_str("block"),
+			ProviderKind::Net => out.push_str("net"),
+			ProviderKind::Display => out.push_str("display"),
+			ProviderKind::Audio => out.push_str("audio"),
+			ProviderKind::Input => out.push_str("input"),
+			ProviderKind::UsbBus => out.push_str("usb-bus"),
+			ProviderKind::Pointer => out.push_str("pointer"),
+			ProviderKind::ConsoleBytes => out.push_str("console-bytes"),
+		}
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		match self {
+			ProviderKind::Block => crate::codec::cbor::text(out, "block"),
+			ProviderKind::Net => crate::codec::cbor::text(out, "net"),
+			ProviderKind::Display => crate::codec::cbor::text(out, "display"),
+			ProviderKind::Audio => crate::codec::cbor::text(out, "audio"),
+			ProviderKind::Input => crate::codec::cbor::text(out, "input"),
+			ProviderKind::UsbBus => crate::codec::cbor::text(out, "usb-bus"),
+			ProviderKind::Pointer => crate::codec::cbor::text(out, "pointer"),
+			ProviderKind::ConsoleBytes => crate::codec::cbor::text(out, "console-bytes"),
+		}
+	}
+}
+
+impl ProviderInfo {
+	pub fn to_json(&self) -> String {
+		let mut s = String::new();
+		self.to_json_into(&mut s);
+		s
+	}
+	pub fn to_text(&self) -> String {
+		let mut s = String::new();
+		self.to_text_into(&mut s);
+		s
+	}
+	pub fn to_cbor(&self) -> Vec<u8> {
+		let mut v = Vec::new();
+		self.to_cbor_into(&mut v);
+		v
+	}
+	pub(crate) fn to_json_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("\"kind\":");
+		self.kind.to_json_into(out);
+		out.push(',');
+		out.push_str("\"bus\":");
+		let _ = write!(out, "{}", self.bus);
+		out.push(',');
+		out.push_str("\"dev\":");
+		let _ = write!(out, "{}", self.dev);
+		out.push(',');
+		out.push_str("\"func\":");
+		let _ = write!(out, "{}", self.func);
+		out.push(',');
+		out.push_str("\"binding-generation\":");
+		let _ = write!(out, "{}", self.binding_generation);
+		out.push(',');
+		out.push_str("\"slot\":");
+		let _ = write!(out, "{}", self.slot);
+		out.push(',');
+		out.push_str("\"provider-generation\":");
+		let _ = write!(out, "{}", self.provider_generation);
+		out.push('}');
+	}
+	pub(crate) fn to_text_into(&self, out: &mut String) {
+		out.push('{');
+		out.push_str("kind=");
+		self.kind.to_text_into(out);
+		out.push_str(", ");
+		out.push_str("bus=");
+		let _ = write!(out, "{}", self.bus);
+		out.push_str(", ");
+		out.push_str("dev=");
+		let _ = write!(out, "{}", self.dev);
+		out.push_str(", ");
+		out.push_str("func=");
+		let _ = write!(out, "{}", self.func);
+		out.push_str(", ");
+		out.push_str("binding-generation=");
+		let _ = write!(out, "{}", self.binding_generation);
+		out.push_str(", ");
+		out.push_str("slot=");
+		let _ = write!(out, "{}", self.slot);
+		out.push_str(", ");
+		out.push_str("provider-generation=");
+		let _ = write!(out, "{}", self.provider_generation);
+		out.push('}');
+	}
+	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
+		crate::codec::cbor::map(out, 7);
+		crate::codec::cbor::text(out, "kind");
+		self.kind.to_cbor_into(out);
+		crate::codec::cbor::text(out, "bus");
+		crate::codec::cbor::uint(out, self.bus as u64);
+		crate::codec::cbor::text(out, "dev");
+		crate::codec::cbor::uint(out, self.dev as u64);
+		crate::codec::cbor::text(out, "func");
+		crate::codec::cbor::uint(out, self.func as u64);
+		crate::codec::cbor::text(out, "binding-generation");
+		crate::codec::cbor::uint(out, self.binding_generation as u64);
+		crate::codec::cbor::text(out, "slot");
+		crate::codec::cbor::uint(out, self.slot as u64);
+		crate::codec::cbor::text(out, "provider-generation");
+		crate::codec::cbor::uint(out, self.provider_generation as u64);
 	}
 }
 

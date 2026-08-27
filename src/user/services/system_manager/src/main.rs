@@ -107,6 +107,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		_ => (0, 0),
 	};
 
+	// 1f. which volume the loader chose as this boot's system volume. Relayed down to whoever
+	//     mounts one - a format cannot answer it, because two LiberFS volumes differ only by uuid
+	//     and two FAT volumes not even by that.
+	let mut root_selection: [u8; 24] = [0u8; 24];
+	if let Received::Message { len, .. } = unsafe { recv_blocking(bootstrap, &mut buf) }
+		&& len >= 7 + 24
+		&& &buf[..7] == b"ROOTSEL"
+	{
+		root_selection.copy_from_slice(&buf[7..31]);
+	}
+
 	// 2. find ServiceManager in the package and spawn it, handing it one end of a
 	//    fresh control channel as its bootstrap.
 	let archive: &[u8] = unsafe { core::slice::from_raw_parts(pkg_base as *const u8, pkg_len) };
@@ -181,6 +192,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		window_msg[7..15].copy_from_slice(&boot_deadline.to_le_bytes());
 		window_msg[15..].copy_from_slice(&boot_window.to_le_bytes());
 		send_blocking(sm_side, &window_msg, 0);
+		// The loader's choice, last, in the position it arrived in.
+		let mut root_msg: [u8; 7 + 24] = [0u8; 7 + 24];
+		root_msg[..7].copy_from_slice(b"ROOTSEL");
+		root_msg[7..].copy_from_slice(&root_selection);
+		send_blocking(sm_side, &root_msg, 0);
 	}
 
 	// 4. relay every report ServiceManager sends up to the kernel. ServiceManager's

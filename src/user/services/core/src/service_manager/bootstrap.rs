@@ -397,7 +397,23 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				// an extra message instead would shift every read after it - the desyncs that cost
 				// this milestone the most all came from exactly that.
 				if name == b"storage_service" && role.tag == b"BLOCK" {
-					return if live_volume != 0 { Some((b"LIVEVOL".to_vec(), live_volume)) } else { Some((role.tag.to_vec(), block)) };
+					if live_volume != 0 {
+						// The loader's choice was `Embedded`, and there is nothing to check it
+						// against: the image the kernel handed over IS the one the loader verified.
+						return Some((b"LIVEVOL".to_vec(), live_volume));
+					}
+					// WHAT THE LOADER CHOSE, APPENDED TO THE TAG rather than sent after it.
+					//
+					// The comment above says why, and this milestone paid for the lesson twice: a
+					// separate `ROOTSEL` message parked every OTHER instance of this program - seven
+					// run on an ordinary boot and only this one is given the role - and it would
+					// have owed twenty-six test harnesses a message each. The system instance
+					// already reads this message; the identity travels in it.
+					let mut message: alloc::vec::Vec<u8> = role.tag.to_vec();
+					message.extend_from_slice(&super::ROOT_HEAD.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+					message.extend_from_slice(&super::ROOT_UUID_LOW.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+					message.extend_from_slice(&super::ROOT_UUID_HIGH.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+					return Some((message, block));
 				}
 				if name == b"audio_service" && role.tag == b"SND" {
 					return Some((role.tag.to_vec(), snd));

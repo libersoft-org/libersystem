@@ -1893,6 +1893,14 @@ tag = "BOOTWIN"
 kind = "payload"
 provider = "service_manager"
 
+# The channel clients reach the provider catalogue on. LAST, because this bootstrap is read
+# positionally at every hop and anything inserted in the middle shifts every read after it.
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:device@1/provider-catalogue"
+
 [[services]]
 name = "device_service"
 program = "device_service"
@@ -2567,6 +2575,7 @@ tag = "SERVE"
 kind = "serve-root"
 provider = "self"
 interface = "liber:storage@1/volume"
+
 
 [[services]]
 name = "system_graph_service"

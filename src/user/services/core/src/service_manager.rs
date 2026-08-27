@@ -364,6 +364,14 @@ impl Supervised {
 // Only that first bind competes with the boot. A DeviceManager restarted an hour later gets the
 // length and no deadline, because a deadline an hour in the past is not a budget - it is a
 // guarantee that every recovery fails on arithmetic before it reaches a device.
+// WHAT THE LOADER CHOSE AS THIS BOOT'S SYSTEM VOLUME - kind, module and uuid, as three words of the
+// wire form. Kept undecoded, because this supervisor does not act on it: it hands it to the process
+// that mounts volumes, and a value this one interpreted would be a second reader of a decision the
+// loader already made.
+static ROOT_HEAD: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ROOT_UUID_LOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+static ROOT_UUID_HIGH: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 static BOOT_DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 static BOOT_WINDOW: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -463,6 +471,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	};
 	BOOT_DEADLINE.store(boot_deadline, core::sync::atomic::Ordering::Relaxed);
 	BOOT_WINDOW.store(boot_window, core::sync::atomic::Ordering::Relaxed);
+
+	// 1f. which volume the loader chose. Kept for the life of this supervisor and handed to
+	//     StorageService, which is the process that mounts one - and the only one that should,
+	//     because matching a `Block(uuid)` means reading a LiberFS superblock and keeping a
+	//     filesystem out of the process that hands out device authority is worth one hand-off.
+	if let Received::Message { len, .. } = unsafe { recv_blocking(bootstrap, &mut buf) }
+		&& len >= 7 + 24
+		&& &buf[..7] == b"ROOTSEL"
+	{
+		let word = |at: usize| -> u64 { u64::from_le_bytes(buf[at..at + 8].try_into().unwrap_or([0; 8])) };
+		ROOT_HEAD.store(word(7), core::sync::atomic::Ordering::Relaxed);
+		ROOT_UUID_LOW.store(word(15), core::sync::atomic::Ordering::Relaxed);
+		ROOT_UUID_HIGH.store(word(23), core::sync::atomic::Ordering::Relaxed);
+	}
 
 	// 2. bring the services up in dependency order. Each pass starts every pending
 	//    service whose dependencies are all Running; repeat until a pass makes no

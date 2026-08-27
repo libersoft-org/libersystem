@@ -154,6 +154,10 @@ const ISO_SECTORS: u64 = (iso9660::SECTOR_SIZE / SECTOR_SIZE) as u64;
 // block is one read.
 const UDF_SECTORS: u64 = (udf::SECTOR_SIZE / SECTOR_SIZE) as u64;
 
+// `bootproto::ROOT_BLOCK`, spelled here because this is a userspace service and does not link the
+// boot protocol.
+const ROOT_BLOCK: u32 = 1;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
@@ -168,10 +172,38 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			Volume::new(alloc::boxed::Box::new(ArchiveFs { base, len: length }))
 		}
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BLOCK" => match unsafe { mount_system_volume(handle) } {
-			Some(fs) => Volume::new(alloc::boxed::Box::new(DiskFs { fs })),
-			None => exit(),
-		},
+		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BLOCK" => {
+			// WHAT THE LOADER CHOSE, carried in this message rather than after it - `kind`, then
+			// `module`, then the uuid, appended to the tag. A boot that published none leaves the
+			// message at its old length and nothing below fires, which is the same answer as
+			// `ROOT_NONE`: nothing was promoted.
+			let chosen: Option<(u32, [u8; 16])> = if len >= 5 + 24 {
+				let kind = u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]);
+				let mut uuid = [0u8; 16];
+				uuid.copy_from_slice(&buf[13..29]);
+				Some((kind, uuid))
+			} else {
+				None
+			};
+			match unsafe { mount_system_volume(handle) } {
+				Some(fs) => {
+					// THE MOUNT IS REFUSED ON A MISMATCH, and that is the whole point of carrying
+					// the identity this far. Two LiberFS volumes are told apart by uuid and by
+					// nothing else, so an instance that mounted a volume the loader did not choose
+					// has mounted somebody else's system - and would serve it as `vol://system` for
+					// the life of the boot.
+					if let Some((kind, want)) = chosen
+						&& kind == ROOT_BLOCK
+						&& fs.uuid() != want
+					{
+						unsafe { print(b"StorageService: the volume this instance mounted is not the one the loader chose - refusing to serve it as the system volume\n") };
+						exit();
+					}
+					Volume::new(alloc::boxed::Box::new(DiskFs { fs }))
+				}
+				None => exit(),
+			}
+		}
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None })),
 		// NO MOUNT HERE, AND NO `handle != 0` EITHER - the same shape as USBBLOCK below.
 		//

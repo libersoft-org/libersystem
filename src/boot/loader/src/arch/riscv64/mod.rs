@@ -198,7 +198,7 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 			}
 			_ => (0, 0),
 		};
-		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: regions_phys, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit: bootproto::PSCI_NONE, rsdp: 0, smp_trampoline: 0, dtb };
+		*(phys as *mut BootInfo) = BootInfo { magic: bootproto::MAGIC, version: bootproto::VERSION, _pad0: 0, hhdm_offset: 0, memmap: regions_phys, memmap_len: 0, modules, modules_len, framebuffer, fb_present: fb.present as u32, psci_conduit: bootproto::PSCI_NONE, rsdp: 0, smp_trampoline: 0, dtb, root: bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] } };
 	}
 	phys
 }

@@ -4,6 +4,10 @@ record device-entry(index:u32,type:device-type,mmio-len:u64)
 interface device
 method device.list op=1 () -> result<list<device-entry>, liber:base@1::error>
 method device.get op=2 (index:u32:rights=) -> result<device-entry, liber:base@1::error>
+enum provider-kind(block=1,net=2,display=3,audio=4,input=5,usb-bus=6,pointer=7,console-bytes=8)
+record provider-info(kind:provider-kind,bus:u32,dev:u32,func:u32,binding-generation:u64,slot:u32,provider-generation:u32)
+interface provider-catalogue
+method provider-catalogue.subscribe op=1 (kind:provider-kind:rights=) -> stream<provider-info>
 record usb-device(port:u32,speed:string,vendor:u32,product:u32,class:u32,type:string)
 interface usb
 method usb.list op=1 () -> result<list<usb-device>, liber:base@1::error>

@@ -55,8 +55,42 @@ for service in manifest.get("services", []):
 		hint = f" - did you mean {' or '.join(near)}?" if near else ""
 		failures.append(f"services.{service['name']}.roles.{role['tag']}.interface: no such LSIDL interface {name}{hint}")
 
+# THE PROVIDER KINDS ARE ONE SET SPELLED TWICE, and a divergence would lose providers silently.
+#
+# The IDL enum is what clients ask with; `driver_protocol::provider` is what the wire carries. They
+# meet in exactly one `match` in DeviceManager, which a compiler checks for COMPLETENESS and not for
+# the numbers agreeing - so a kind renumbered on one side would compile and then find nothing.
+idl_kinds = {}
+device_idl = os.path.join(root, "idl", "device.lsidl")
+if os.path.isfile(device_idl):
+	text = open(device_idl, encoding="utf-8").read()
+	block = re.search(r"enum\s+provider-kind\s*\{(.*?)\}", text, re.S)
+	if block:
+		for name, value in re.findall(r"([a-z0-9\-]+)\s*=\s*(\d+)", block.group(1)):
+			idl_kinds[name.replace("-", "_").upper()] = int(value)
+
+wire_kinds = {}
+protocol = os.path.join(root, "user", "libs", "driver", "protocol", "src", "lib.rs")
+if os.path.isfile(protocol):
+	text = open(protocol, encoding="utf-8").read()
+	block = re.search(r"pub mod provider \{(.*?)\n\}", text, re.S)
+	if block:
+		for name, value in re.findall(r"pub const ([A-Z_]+): u16 = (\d+);", block.group(1)):
+			wire_kinds[name] = int(value)
+
+if idl_kinds and wire_kinds and idl_kinds != wire_kinds:
+	only_idl = sorted(set(idl_kinds) - set(wire_kinds))
+	only_wire = sorted(set(wire_kinds) - set(idl_kinds))
+	renumbered = sorted(name for name in set(idl_kinds) & set(wire_kinds) if idl_kinds[name] != wire_kinds[name])
+	if only_idl:
+		failures.append(f"provider kinds: {', '.join(only_idl)} are in device.lsidl and not in driver_protocol::provider")
+	if only_wire:
+		failures.append(f"provider kinds: {', '.join(only_wire)} are in driver_protocol::provider and not in device.lsidl")
+	for name in renumbered:
+		failures.append(f"provider kind {name}: device.lsidl says {idl_kinds[name]} and driver_protocol::provider says {wire_kinds[name]}")
+
 for failure in failures:
 	print(f"check-declared-interfaces: {failure}", file=sys.stderr)
 if failures:
 	sys.exit(1)
-print(f"check-declared-interfaces: {len(defined)} interfaces defined, every declared role reference resolves")
+print(f"check-declared-interfaces: {len(defined)} interfaces defined, every declared role reference resolves; {len(idl_kinds)} provider kinds agree between the IDL and the driver wire")

@@ -36,7 +36,46 @@ pub mod compat;
 pub const MAGIC: u64 = 0x4c42_5350_524f_5432;
 
 // Layout revision. Bump on any incompatible change to the structs below.
-pub const VERSION: u32 = 1;
+//
+// 2 since 2026-08-27: `BootInfo` gained `root`, which is what the loader CHOSE as this boot's
+// system volume. This is not a product version - it is the guard that stops a loader and a kernel
+// which disagree about the shape of this struct from running together, and the two are staged
+// SEPARATELY: the loader lives on the ESP and the kernel on the volume, so a mismatched pair is
+// reachable. That mismatch is the one failure that happens before anything can report it, which is
+// why the guard exists and why appending a field is what it is for.
+pub const VERSION: u32 = 2;
+
+// WHAT THE LOADER CHOSE AS THIS BOOT'S SYSTEM VOLUME.
+//
+// It RECORDS A DECISION rather than describing how to make one, and that distinction is the whole
+// point: two of these can be true of one medium at once. A shipping ISO carries `system-volume.img`
+// as a file AND a signed pairing, because the image is staged for exactly the medium that carries
+// the volume - so a reader deciding between them afterwards is re-deriving a choice that was already
+// made, and can decide differently.
+//
+// The loader has already made it, and its order is deliberate: an installed system's own volume wins
+// over an image that happens to be lying on the boot medium beside it.
+//
+// `NONE` means nothing is promoted. That is an ANSWER, not a licence to fall back to the first disk
+// that answered - which is the arrival-order decision this field exists to remove.
+pub const ROOT_NONE: u32 = 0;
+// A paired block volume was found and used. `uuid` is its LiberFS uuid, which the boot medium's
+// signed manifest named and the loader verified.
+pub const ROOT_BLOCK: u32 = 1;
+// The verified module was used. `module` indexes `modules`, and it names `system-volume.img` -
+// never `volume.pkg`, which is the factory archive a test medium carries and is not a volume.
+pub const ROOT_EMBEDDED: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RootSelection {
+	// `ROOT_NONE`, `ROOT_BLOCK` or `ROOT_EMBEDDED`.
+	pub kind: u32,
+	// The module index, for `ROOT_EMBEDDED`. Zero otherwise.
+	pub module: u32,
+	// The volume uuid, for `ROOT_BLOCK`. All zero otherwise.
+	pub uuid: [u8; 16],
+}
 
 // Region kinds reported in `MemRegion::kind`. These mirror the kernel ABI's
 // stable MEMMAP_* codes (abi::MEMMAP_*) so the loader hands the kernel values it
@@ -170,4 +209,10 @@ pub struct BootInfo {
 	// tables, so the kernel maps it through its own direct map), unlike x86 where
 	// `framebuffer.addr` is an HHDM virtual address the loader already mapped.
 	pub dtb: u64,
+
+	// WHAT THE LOADER CHOSE, so nothing downstream has to choose again. See `RootSelection`.
+	//
+	// Appended, which is why `VERSION` is 2: the kernel reads these by offset and there is no size
+	// field, so an old loader's shorter struct would be read past its end.
+	pub root: RootSelection,
 }

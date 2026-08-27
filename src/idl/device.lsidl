@@ -29,6 +29,46 @@ interface device {
 	@op(2) get:  func(index: u32) -> result<device-entry, error>;
 }
 
+/// What a driver publishes for others to use. The set is closed: a kind this system
+/// does not have is a manifest that fails to parse, not a requirement nothing ever
+/// satisfies.
+enum provider-kind {
+	block         = 1,
+	net           = 2,
+	display       = 3,
+	audio         = 4,
+	input         = 5,
+	usb-bus       = 6,
+	pointer       = 7,
+	console-bytes = 8,
+}
+
+/// One published provider, named by the identity DeviceManager assigned it - never by
+/// one a driver chose. The binding is its publisher's: the PCI function's bus/device/
+/// function and the claim generation of the binding that published it, so a provider
+/// from a binding that is over is distinguishable from its replacement. `slot` and
+/// `provider-generation` are the manager's own, and together they make a reused slot
+/// unmistakable for the provider that left it.
+record provider-info {
+	kind:                provider-kind,
+	bus:                 u32,
+	dev:                 u32,
+	func:                u32,
+	binding-generation:  u64,
+	slot:                u32,
+	provider-generation: u32,
+}
+
+/// The provider catalogue, served by DeviceManager - the only process that holds it.
+///
+/// `subscribe` answers with everything of that kind published RIGHT NOW and continues
+/// as the live stream. One operation, because two would have a window between them:
+/// a provider added after the read and before the registration would be in neither,
+/// and that is the same race as a service started later seeing nothing.
+interface provider-catalogue {
+	@op(1) subscribe: func(kind: provider-kind) -> stream<provider-info>;
+}
+
 /// One enumerated USB device, as the xHCI driver addressed it: the root port it hangs
 /// off (a device behind a hub reports the hub's root port), its speed, the vendor and
 /// product ids from its device descriptor, its class code, and the role the driver

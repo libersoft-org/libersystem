@@ -178,6 +178,14 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	let bi = boot_info();
 	assert!(bi.magic == bootproto::MAGIC, "boot protocol magic mismatch: the loader and kernel disagree");
 	assert!(bi.version == bootproto::VERSION, "boot protocol version mismatch: rebuild the loader and kernel together");
+	// WHAT THE LOADER CHOSE, printed once. A boot that promoted nothing looks exactly like one that
+	// promoted the first disk that answered unless somebody says which happened.
+	match bi.root.kind {
+		bootproto::ROOT_BLOCK => serial_println!("loader: this boot's system volume is a paired block volume"),
+		bootproto::ROOT_EMBEDDED => serial_println!("loader: this boot's system volume is the verified image the medium carries"),
+		_ => serial_println!("loader: this boot promotes no system volume"),
+	}
+	ROOT_SELECTION.lock().replace(bi.root);
 	serial_println!("{} kernel is starting ...", product::NAME);
 	arch::init();
 	// Named after `arch::init` rather than before it, because that is where a backend learns
@@ -641,6 +649,27 @@ fn spawn_system_manager(boot_deadline: u64, window_ticks: u64) -> Result<(alloc:
 	// ALLOC-OK: as above
 	window_msg.extend_from_slice(&window_ticks.to_le_bytes());
 	kernel_ep.send(Message::new(window_msg, alloc::vec::Vec::new())).map_err(|_| "failed to hand SystemManager the boot window")?;
+
+	// WHICH VOLUME THE LOADER CHOSE, carried to whoever mounts one.
+	//
+	// A format cannot answer this. Two LiberFS volumes are told apart by uuid and by nothing else,
+	// and two FAT volumes - a removable medium and a USB stick - are indistinguishable from their
+	// BPBs, so a probe by format collapses roles and picks by arrival order again. The loader
+	// verified an identity and this is it, unchanged.
+	//
+	// `ROOTSEL` + kind u32 + module u32 + uuid[16]. Last in the sequence, like every addition.
+	let root = ROOT_SELECTION.lock().unwrap_or(bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] });
+	// ALLOC-OK: boot, the last message of the hand-off, before userspace exists.
+	let mut root_msg = alloc::vec::Vec::with_capacity(7 + 24);
+	// ALLOC-OK: as above
+	root_msg.extend_from_slice(b"ROOTSEL");
+	// ALLOC-OK: as above
+	root_msg.extend_from_slice(&root.kind.to_le_bytes());
+	// ALLOC-OK: as above
+	root_msg.extend_from_slice(&root.module.to_le_bytes());
+	// ALLOC-OK: as above
+	root_msg.extend_from_slice(&root.uuid);
+	kernel_ep.send(Message::new(root_msg, alloc::vec::Vec::new())).map_err(|_| "failed to hand SystemManager the root selection")?;
 	Ok((kernel_ep, process))
 }
 
@@ -854,6 +883,12 @@ fn serial_rx_interrupt(_vector: u32) {
 // are facts about the machine rather than absences of news, and a report that is always there is
 // what makes a later change worth reading. Placed in the shared tail because a report only x86
 // printed would be a report that says nothing about the ports most likely to differ.
+// WHAT THE LOADER CHOSE, kept so the boot chain can hand it to whoever mounts volumes.
+//
+// The loader decided; this is only carrying it. Re-deriving it here from the modules and the medium
+// is exactly what the field exists to stop - two readers of one medium can reach two answers.
+static ROOT_SELECTION: crate::sync::SpinLock<Option<bootproto::RootSelection>> = crate::sync::SpinLock::new(None);
+
 #[cfg(not(test))]
 fn report_machine() {
 	// The cores are bound to their nodes only now, after bring-up has established which of them

@@ -202,6 +202,10 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		(*boot_info).rsdp = rsdp;
 		(*boot_info).smp_trampoline = trampoline;
 		(*boot_info).dtb = 0; // x86 uses ACPI, not a device tree.
+		// WHAT THIS LOADER CHOSE, carried past itself. Without this the decision was made and then
+		// thrown away, and everything downstream re-derived it from what happened to be lying on
+		// the medium - which for a shipping ISO is two answers at once.
+		(*boot_info).root = crate::root_selection();
 	}
 
 	// Snapshot the memory map and exit boot services. GetMemoryMap must be the

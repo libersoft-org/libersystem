@@ -512,6 +512,19 @@ const SOURCE_BOOT_MEDIUM: &str = "the boot medium (the system volume did not ans
 // The uuid of the volume this boot medium is paired with, when it names one.
 static mut PAIRED_UUID: Option<[u8; 16]> = None;
 
+// WHAT THIS LOADER CHOSE AS THE SYSTEM VOLUME, recorded where the choice is made.
+//
+// Set once, by whichever branch actually used a volume, and read at the hand-off. It is not
+// re-derived from what is lying on the medium, because two of the three cases can be true of one
+// medium at once - a shipping ISO carries the image AND a signed pairing - and a reader deciding
+// afterwards can decide differently from the loader that already decided.
+static mut ROOT_SELECTION: bootproto::RootSelection = bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] };
+
+// What the loader chose, for the hand-off.
+pub(crate) fn root_selection() -> bootproto::RootSelection {
+	unsafe { ROOT_SELECTION }
+}
+
 // Which system volume this boot medium is paired with: the uuid in its own signed manifest, and
 // `None` when it names none.
 fn read_pairing(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) -> Option<[u8; 16]> {
@@ -622,6 +635,12 @@ pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) 
 		abi::bootstrap::Selection::Verified(archive) => unsafe {
 			BOOTSTRAP = retain(bs, &archive);
 			BOOTSTRAP_SOURCE = SOURCE_LIVE_IMAGE;
+			// THE IMAGE IS THIS BOOT'S SYSTEM VOLUME, and only because no disk answered first: the
+			// guard at the top of this function is what makes an installed system win over an image
+			// lying on the medium beside it. `uuid` is carried too, so the same identity is on the
+			// wire whichever branch set it - a reader asking "which volume is this" gets one answer
+			// and not one answer per case.
+			ROOT_SELECTION = bootproto::RootSelection { kind: bootproto::ROOT_EMBEDDED, module: 0, uuid: fs.uuid() };
 		},
 		abi::bootstrap::Selection::Invalid(reason) => unsafe { BOOTSTRAP_REFUSED = Some(reason) },
 		abi::bootstrap::Selection::Unavailable => {}
@@ -657,6 +676,15 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 	// when it carries a volume; this refuses to boot one.
 	if want.is_none() && !trust::IS_TEST_TRUST {
 		panic!("loader: a LiberFS volume is in this machine and the boot medium's signed manifest names none - refusing to pick one by firmware enumeration order");
+	}
+	// A DISK VOLUME ANSWERED, so this boot's system volume is that one and nothing downstream has
+	// to work it out again. Recorded HERE, at the branch that used it - `choose_volume` has already
+	// applied the pairing rule, so `fs.uuid()` is the volume this medium names, not the first one
+	// the firmware enumerated.
+	unsafe {
+		if ROOT_SELECTION.kind == bootproto::ROOT_NONE {
+			ROOT_SELECTION = bootproto::RootSelection { kind: bootproto::ROOT_BLOCK, module: 0, uuid: fs.uuid() };
+		}
 	}
 	// The bootstrap set, packed into the archive format the kernel already unpacks. This is
 	// what retires `init.pkg` as an artifact: the same bytes reach the kernel, assembled from

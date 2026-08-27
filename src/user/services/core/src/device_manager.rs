@@ -60,6 +60,11 @@ unsafe fn report_boot_window() {
 	}
 }
 
+// THE BLOCK TAGS THE BOOT HAND-OFF CARRIES, in the order ServiceManager reads them: the system
+// volume, then the read-only FAT media, ISO9660 and UDF volumes. A property of that wire, named
+// here so the number is one list rather than four variables and a `send` each.
+const BOOT_BLOCK_TAGS: [&[u8]; 4] = [b"BLOCK", b"BLOCK2", b"BLOCK3", b"BLOCK4"];
+
 // EVERY NUMBER THAT BOUNDS A BIND, IN ONE PLACE.
 //
 // They were three constants and a `recv_blocking`, which is to say two of them did not exist. A
@@ -363,16 +368,32 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// deadline in the past is not a budget. Two lines that differ is what makes "ServiceManager
 		// kept the length" an observation rather than a claim about a variable nobody can see.
 		report_boot_window();
+		// 1b5. and the channel clients reach the provider catalogue on. Optional: a boot that
+		//      granted none simply has nobody asking, and refusing to start over it would trade a
+		//      missing query interface for a machine with no drivers.
+		let catalogue_service: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or(0);
 
 		// 2. phase 1: launch the bootstrap block driver (virtio_blk) for each disk it backs.
 		//    It hands back a block-read service channel, which we route up to ServiceManager
 		//    (it forwards it to StorageService). The non-bootstrap drivers cannot load yet -
 		//    they live on the system volume, which is only mountable once virtio_blk and
 		//    StorageService are up - so they wait for phase 2 below.
-		let mut block_client: u64 = 0;
-		let mut block2_client: u64 = 0;
-		let mut block3_client: u64 = 0;
-		let mut block4_client: u64 = 0;
+		// ONE CATALOGUE FOR THE LIFE OF THIS PROCESS. It was a local inside each bring-up phase,
+		// which meant it died with the function that filled it - so what a machine has published
+		// could be reported at the end of a phase and asked about never again. It outlives both
+		// phases now, because it is what the provider-catalogue interface is served from.
+		let mut catalogue = Catalogue::new();
+		// THE BOOT WIRE'S SHAPE, NOT THIS PROGRAM'S LIMIT, and the difference is the whole of M7.
+		//
+		// These were four named locals - `block_client`, `block2_client`, `block3_client`,
+		// `block4_client` - each routed by hand, so a second disk had somewhere to go and a fifth
+		// did not, and which volume was which depended on which driver finished first. What is left
+		// is the number of BLOCK tags the hand-off to ServiceManager carries, which is a fact about
+		// that wire: `BLOCK`, `BLOCK2`, `BLOCK3`, `BLOCK4`, feeding the system, media, ISO and UDF
+		// volumes. The CATALOGUE has no such number - it holds `MAX_PROVIDERS` of any kind - so a
+		// fifth disk is published, counted and REPORTED rather than silently dropped into a variable
+		// that does not exist.
+		let mut boot_blocks: [u64; BOOT_BLOCK_TAGS.len()] = [0; BOOT_BLOCK_TAGS.len()];
 		let mut net_client: u64 = 0;
 		let mut gpu_client: u64 = 0;
 		let mut snd_client: u64 = 0;
@@ -386,17 +407,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// program has finished starting drivers - and so its death is noticed and answered.
 		#[cfg(feature = "development")]
 		let mut dev: DevAgent = DevAgent::default();
-		launch_boot_drivers(&package, power, console_input, device_privilege, &mut buf, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client);
+		launch_boot_drivers(&package, &mut catalogue, power, console_input, device_privilege, &mut buf, &mut boot_blocks);
 
 		// 3. report in once the disks are bound, transferring the block service channel up
 		//    the boot chain, then the second/third/fourth block disks' service channels (the
 		//    report itself carries one handle; each `BLOCK2`/`BLOCK3`/`BLOCK4` handle is 0
 		//    when that disk is absent). The net / gpu / snd / input driver channels follow in
 		//    phase 2, once the volume they load from is mounted.
-		send_blocking(bootstrap, b"DeviceManager: online", block_client);
-		send_blocking(bootstrap, b"BLOCK2", block2_client);
-		send_blocking(bootstrap, b"BLOCK3", block3_client);
-		send_blocking(bootstrap, b"BLOCK4", block4_client);
+		send_blocking(bootstrap, b"DeviceManager: online", boot_blocks[0]);
+		for (at, tag) in BOOT_BLOCK_TAGS.iter().enumerate().skip(1) {
+			send_blocking(bootstrap, tag, boot_blocks[at]);
+		}
 
 		// 4. stand until ServiceManager drives phase 2 (a "DRIVERS" message carrying a
 		//    StorageService client, once the volume is up: we load the non-bootstrap drivers
@@ -411,12 +432,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				dev.supervise(&mut buf);
 				continue;
 			}
+			// A CATALOGUE QUERY IS ANSWERED WITHOUT LEAVING THIS LOOP. The wait covers the
+			// supervisor's channel and the catalogue's together, so a client asking what is
+			// published does not have to wait for a supervisor message and cannot delay one.
+			if catalogue_service != 0 && wait_any(&[bootstrap, catalogue_service], 0) == 1 {
+				serve_catalogue_once(catalogue_service, &catalogue, &mut buf);
+				continue;
+			}
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
 					#[cfg(feature = "development")]
-					launch_volume_drivers(handle, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev);
+					launch_volume_drivers(handle, &mut catalogue, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev);
 					#[cfg(not(feature = "development"))]
-					launch_volume_drivers(handle, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys);
+					launch_volume_drivers(handle, &mut catalogue, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys);
 					if handle != 0 {
 						close(handle);
 					}
@@ -468,7 +496,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // device's MMIO capability and info. Each disk's block-read service channel is routed up
 // (system / media / iso / udf, in discovery order). The non-bootstrap drivers are skipped
 // here - they load from the volume in phase 2, once it is mounted.
-unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64) {
+unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], boot_blocks: &mut [u64; BOOT_BLOCK_TAGS.len()]) {
 	unsafe {
 		let count: u64 = device_count();
 		// ONE NODE PER BOOT-CRITICAL DEVICE, and they come up TOGETHER. Four disks used to be bound
@@ -477,7 +505,6 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 		let mut nodes: Vec<Node> = Vec::new();
 		let mut names: Vec<&'static [u8]> = Vec::new();
 		let mut infos: Vec<DeviceInfo> = Vec::new();
-		let mut catalogue = Catalogue::new();
 		let mut i: u64 = 0;
 		while i < count {
 			let mut info: DeviceInfo = DeviceInfo::default();
@@ -506,7 +533,7 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 			// refuses one - but the gate is asked here anyway rather than assumed, because "no
 			// boot driver has requirements today" is a fact about the manifest and not a property
 			// of this code.
-			if gate_on_requirements(&mut node, entry, &catalogue) && begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege) {
+			if gate_on_requirements(&mut node, entry, catalogue) && begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege) {
 				nodes.push(node);
 				names.push(entry.name);
 				infos.push(info);
@@ -517,16 +544,13 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 		// its own share of the boot window and nothing else's.
 		while pump(&mut nodes, buf) {
 			for at in 0..nodes.len() {
-				match advance(&mut nodes[at], names[at], &mut catalogue) {
+				match advance(&mut nodes[at], names[at], catalogue) {
 					Step::Waiting => {}
 					Step::Online => {
 						// PUBLISHED, NOT ROUTED. Everything a committed binding offered goes into
 						// the catalogue with an identity this service minted; who gets which is a
 						// question asked once below, over everything that came up, rather than at
 						// the moment each driver happened to answer.
-						let id = nodes[at].id;
-						let entry = nodes[at].candidates[nodes[at].candidate];
-						catalogue.publish_all(id, entry, &mut nodes[at].offers);
 						nodes[at].offers.close_all();
 					}
 					// A BOOT DRIVER HAS ONE CANDIDATE, so the two rollback answers differ only in
@@ -551,11 +575,19 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 		// changed is that the order is now a decision made in one place over a catalogue, instead
 		// of four named variables filled by whichever driver finished first - which is what has to
 		// be true before a ROLE can replace it.
-		report_catalogue(&catalogue);
-		*block_client = catalogue.take(driver_protocol::provider::BLOCK);
-		*block2_client = catalogue.take(driver_protocol::provider::BLOCK);
-		*block3_client = catalogue.take(driver_protocol::provider::BLOCK);
-		*block4_client = catalogue.take(driver_protocol::provider::BLOCK);
+		report_catalogue(catalogue);
+		// ONE LOOP OVER THE TAGS THE WIRE HAS, taking by lowest bus address. The count comes from
+		// the wire's own list; nothing here decides how many disks a machine may have.
+		for slot in boot_blocks.iter_mut() {
+			*slot = catalogue.take(driver_protocol::provider::BLOCK);
+		}
+		// A DISK THE WIRE HAS NO TAG FOR IS SAID, not dropped. It is published in the catalogue and
+		// answerable through the provider interface; what it does not have is a mount, because the
+		// boot hand-off names four volumes.
+		let left = catalogue.count_of(driver_protocol::provider::BLOCK).saturating_sub(BOOT_BLOCK_TAGS.len());
+		if left > 0 {
+			print(b"DeviceManager: this machine has more block providers than the boot hand-off has volumes for; the extra ones are published and unmounted\n");
+		}
 	}
 }
 
@@ -568,7 +600,7 @@ unsafe fn launch_boot_drivers(package: &Package, power: u64, console_input: u64,
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -586,10 +618,6 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 		// card - and the only thing that made them sequential was where the wait was written.
 		let mut nodes: Vec<Node> = Vec::new();
 		let mut infos: Vec<DeviceInfo> = Vec::new();
-		// ONE CATALOGUE FOR PHASE TWO. Phase one has its own, and the two never overlap: the boot
-		// drivers are done and their block providers routed before a volume exists to load these
-		// from.
-		let mut catalogue = Catalogue::new();
 		let mut i: u64 = 0;
 		while i < count {
 			let idx: usize = i as usize;
@@ -627,25 +655,25 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 		// sequential.
 		for at in 0..nodes.len() {
 			let info = infos[at];
-			start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &catalogue, &mut state);
+			start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 		}
 		while pump(&mut nodes, buf) {
 			for at in 0..nodes.len() {
 				let name: &[u8] = nodes[at].candidates[nodes[at].candidate].name;
-				match advance(&mut nodes[at], name, &mut catalogue) {
+				match advance(&mut nodes[at], name, catalogue) {
 					Step::Waiting => {}
 					Step::Online => {
 						state[nodes[at].index as usize] = STATE_ONLINE;
 						#[cfg(feature = "development")]
-						route_offers(&mut nodes[at], &mut catalogue, name, storage, console_input, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer, dev);
+						route_offers(&mut nodes[at], catalogue, name, storage, console_input, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer, dev);
 						#[cfg(not(feature = "development"))]
-						route_offers(&mut nodes[at], &mut catalogue, name, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer);
+						route_offers(&mut nodes[at], catalogue, name, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer);
 					}
 					// The same candidate, once more. The window and the attempt budget have already
 					// said there is room for it.
 					Step::Again => {
 						let info = infos[at];
-						start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &catalogue, &mut state);
+						start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 					}
 					// EACH CANDIDATE IN TURN, most specific first, and the next one only after the
 					// last is gone - which the rollback has just guaranteed. Every rejection is
@@ -660,7 +688,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 						nodes[at].attempt = 0;
 						if nodes[at].candidate < nodes[at].candidates.len() {
 							let info = infos[at];
-							start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, &catalogue, &mut state);
+							start_candidate(&mut nodes[at], storage, &info, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 						}
 					}
 					Step::Done => {}
@@ -669,7 +697,7 @@ unsafe fn launch_volume_drivers(storage: u64, power: u64, console_input: u64, de
 		}
 		close(key_producer);
 		report_state(&state);
-		report_catalogue(&catalogue);
+		report_catalogue(catalogue);
 	}
 }
 
@@ -735,8 +763,6 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		// an identity this service minted; what follows takes from the catalogue rather than from
 		// the driver's own message, so a provider that nothing routes is still a provider the
 		// machine has - and is withdrawn with its binding rather than leaked.
-		let entry = node.candidates[node.candidate];
-		catalogue.publish_all(node.id, entry, &mut node.offers);
 		if *net_client == 0 {
 			*net_client = catalogue.take(driver_protocol::provider::NET);
 		}
@@ -1272,17 +1298,39 @@ impl Catalogue {
 	// handing one capability to two consumers, which is two consumers competing over one reply queue
 	// and not two connections.
 	fn take(&mut self, kind: u16) -> u64 {
+		// BY THE PUBLISHER'S ADDRESS ON THE BUS, ASCENDING - never by which driver finished first.
+		//
+		// THIS IS THE ORIGIN THE MILESTONE ASKS FOR, and for four identical virtio-blk disks it is
+		// the only thing that separates them: they run the same driver, their formats do not differ,
+		// and a FAT BPB cannot tell a removable medium from a USB stick. What differs is where each
+		// one is plugged in, and the boot scan enumerates the bus ONCE, in bus order - so bus:dev:fn
+		// is stable across boots in a way "whichever answered first" never was.
+		let mut best: Option<usize> = None;
 		for slot in 0..MAX_PROVIDERS {
-			if let Some(provider) = self.entries[slot].as_mut()
-				&& provider.kind == kind
-				&& provider.handle != 0
-			{
-				let handle = provider.handle;
-				provider.handle = 0;
-				return handle;
+			let Some(provider) = self.entries[slot].as_ref() else { continue };
+			if provider.kind != kind || provider.handle == 0 {
+				continue;
+			}
+			let better = match best {
+				None => true,
+				Some(previous) => self.entries[previous].as_ref().is_some_and(|held| address_of(provider) < address_of(held)),
+			};
+			if better {
+				best = Some(slot);
 			}
 		}
-		0
+		let slot = match best {
+			Some(slot) => slot,
+			None => return 0,
+		};
+		match self.entries[slot].as_mut() {
+			Some(provider) => {
+				let handle = provider.handle;
+				provider.handle = 0;
+				handle
+			}
+			None => 0,
+		}
 	}
 
 	// Withdraw one publication of `binding`, named by the token its publisher chose.
@@ -1329,6 +1377,12 @@ impl Catalogue {
 	fn count_of(&self, kind: u16) -> usize {
 		self.entries.iter().filter(|entry| entry.as_ref().is_some_and(|provider| provider.kind == kind)).count()
 	}
+}
+
+// One comparable number for a function's place on the bus, so "lowest address first" is one
+// comparison rather than three.
+fn address_of(provider: &Provider) -> u32 {
+	((provider.id.binding.bus as u32) << 16) | ((provider.id.binding.dev as u32) << 8) | provider.id.binding.func as u32
 }
 
 impl Provider {
@@ -1812,8 +1866,22 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 	unsafe {
 		while let Some(event) = node.pop() {
 			let cause: FailureCause = match event {
-				// An offer is progress, not an outcome: it is already held on the node, unpublished.
-				BindingEvent::Offered { .. } => continue,
+				// AN OFFER BEFORE `READY` IS HELD; AN OFFER AFTER IT IS PUBLISHED AT ONCE.
+				//
+				// Driver readiness and provider readiness are different facts. `READY` means the
+				// process is initialised and supervised; a provider appears when its OWN probe is
+				// complete, and for a controller with children that is later - the xHCI driver
+				// reports in and then enumerates its bus. Holding every offer until the terminal
+				// frame is right for the handshake, where a driver that dies half way through
+				// announcing itself must announce nothing, and wrong afterwards, where there is no
+				// handshake left to be half way through.
+				BindingEvent::Offered { .. } => {
+					if node.record.state == BindingState::Online {
+						let entry = node.candidates[node.candidate];
+						catalogue.publish_all(node.id, entry, &mut node.offers);
+					}
+					continue;
+				}
 				// A LIVE DRIVER RETIRING ONE OF ITS OWN PUBLICATIONS. Not an outcome either: the
 				// driver stays bound and its other providers stay published. Named by the token it
 				// chose, because a driver never sees the identity this service minted.
@@ -1825,10 +1893,21 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					continue;
 				}
 				BindingEvent::Ready { .. } => {
-					// THE TRANSACTION COMMITS. What it took stays taken and passes to the caller.
+					// THE TRANSACTION COMMITS. What it took stays taken, and everything held
+					// unpublished through the handshake enters the catalogue here - in one place,
+					// so a provider offered before `READY` and one offered after it are published
+					// by the same code under the same bound.
 					node.record.move_to(BindingState::Online, None);
+					let entry = node.candidates[node.candidate];
+					catalogue.publish_all(node.id, entry, &mut node.offers);
 					return Step::Online;
 				}
+				// A `FAILED` FRAME IS ABOUT THE DRIVER, NEVER ABOUT ONE OF ITS CHILDREN.
+				//
+				// A controller whose child fails says so by WITHDRAWING that child's provider - the
+				// binding stays `Online` and its siblings stay published. There is no child-failure
+				// frame and there should not be one: the two are different facts and the protocol
+				// already has a word for each.
 				BindingEvent::Failed { code, .. } => {
 					// A DRIVER THAT SAID WHY. Retryability is read off the code rather than decided
 					// again here: `device-not-responding` and `out-of-memory` are the two a second
@@ -1883,6 +1962,56 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			return Step::Again;
 		}
 		Step::Waiting
+	}
+}
+
+// THE PROVIDER CATALOGUE, SERVED.
+//
+// `subscribe` answers with everything of that kind published RIGHT NOW. One operation, because two
+// would have a window between them: a provider added after the read and before the registration
+// would be in neither, which is the same race as a service started later seeing nothing. The
+// generated stream opens FROM the snapshot, so there is no second step to lose anything in.
+struct CatalogueView<'a>(&'a Catalogue);
+
+impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
+	fn subscribe(&mut self, kind: proto::system::ProviderKind) -> Vec<proto::system::ProviderInfo> {
+		let wire: u16 = provider_kind_wire(kind);
+		self.0.entries.iter().filter_map(|entry| entry.as_ref()).filter(|provider| provider.kind == wire).map(|provider| proto::system::ProviderInfo { kind, bus: provider.id.binding.bus as u32, dev: provider.id.binding.dev as u32, func: provider.id.binding.func as u32, binding_generation: provider.id.binding.generation, slot: provider.id.slot as u32, provider_generation: provider.id.generation }).collect()
+	}
+}
+
+// The wire number the driver protocol gives a typed kind. The two sets are the same set spelled
+// twice - once in the IDL for clients and once in `driver_protocol` for the wire - and this is the
+// one place they meet, so a divergence is a compile error here rather than a provider nobody finds.
+fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
+	match kind {
+		proto::system::ProviderKind::Block => driver_protocol::provider::BLOCK,
+		proto::system::ProviderKind::Net => driver_protocol::provider::NET,
+		proto::system::ProviderKind::Display => driver_protocol::provider::DISPLAY,
+		proto::system::ProviderKind::Audio => driver_protocol::provider::AUDIO,
+		proto::system::ProviderKind::Input => driver_protocol::provider::INPUT,
+		proto::system::ProviderKind::UsbBus => driver_protocol::provider::USB_BUS,
+		proto::system::ProviderKind::Pointer => driver_protocol::provider::POINTER,
+		proto::system::ProviderKind::ConsoleBytes => driver_protocol::provider::CONSOLE_BYTES,
+	}
+}
+
+// Answer one catalogue request. Non-blocking by construction: the caller only reaches this when the
+// channel is ready, and one request is one reply.
+unsafe fn serve_catalogue_once(service: u64, catalogue: &Catalogue, buf: &mut [u8]) {
+	unsafe {
+		let ReceivedCaps::Message { len, handles } = recv_caps_blocking(service, buf) else { return };
+		for &handle in handles.as_slice() {
+			close(handle);
+		}
+		let mut view = CatalogueView(catalogue);
+		let mut reply = [0u8; 1024];
+		let mut request_handles = wire::Handles::new();
+		let mut reply_handles = wire::Handles::new();
+		let request: Vec<u8> = buf[..len].to_vec();
+		if let Some(written) = proto::system::provider_catalogue::dispatch(&mut view, &request, &mut request_handles, &mut reply, &mut reply_handles) {
+			send_blocking(service, &reply[..written], 0);
+		}
 	}
 }
 

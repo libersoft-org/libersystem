@@ -18,6 +18,22 @@ fn device_entry_wire_is_stable() {
 	assert_eq!(DeviceEntry::decode(&bytes).unwrap(), sample);
 }
 #[test]
+fn provider_kind_wire_is_stable() {
+	let sample = ProviderKind::Block;
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProviderKind::decode(&bytes).unwrap(), sample);
+}
+#[test]
+fn provider_info_wire_is_stable() {
+	let sample = ProviderInfo { kind: ProviderKind::Block, bus: 7, dev: 7, func: 7, binding_generation: 7, slot: 7, provider_generation: 7 };
+	let bytes = sample.encode_vec().expect("encode");
+	let golden: &[u8] = &[1, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	assert_eq!(bytes, golden);
+	assert_eq!(ProviderInfo::decode(&bytes).unwrap(), sample);
+}
+#[test]
 fn usb_device_wire_is_stable() {
 	let sample = UsbDevice { port: 7, speed: String::from("x"), vendor: 7, product: 7, class: 7, r#type: String::from("x") };
 	let bytes = sample.encode_vec().expect("encode");
