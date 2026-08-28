@@ -172,7 +172,7 @@ or preventing further development of `v1`.
 - [x] [P02M0096 - Image conversion tool (`imgconv`)](P02M0096.md)
 - [x] [P02M0097 - Userspace source and system-volume layout cleanup](P02M0097.md)
 - [x] [P02M0098 - A device claim is a count, so two drivers can own one device](P02M0098.md)
-- [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a cross-phase umbrella of 41 driver candidates plus one prerequisite, not a Phase-2 gate; starting work here means picking one item and writing its requires/owns/gate
+- [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a cross-phase umbrella of 41 driver candidates plus one prerequisite, not a Phase-2 gate; each item now names its specification and a permissive reference, and four turn out to need an AML interpreter rather than hardware
 - [x] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [x] [P02M0101 - Additional system utilities](P02M0101.md)
 - [x] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)
@@ -240,7 +240,7 @@ or preventing further development of `v1`.
 - [x] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
 - [x] [P02M0165 - A driver that stops answering looks exactly like one that is busy](P02M0165.md)
 - [x] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)
-- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - ten rounds of external review; the last three found guards that protect the wrong end - a hash checked only on its result, a lock on a path that can still be replaced
+- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - eleven rounds of external review; implementation-ready, with `verify.sh --jobs` settled as the only scheduler and the flat paths serialised
 - [x] [P02M0168 - The kernel brings up every core the firmware lists and then two tables assume sixty-four](P02M0168.md)
 
 ### Definition of done (phase 2)

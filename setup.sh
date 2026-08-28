@@ -75,6 +75,18 @@ APT_PACKAGES=(
 	# is the failure that milestone exists to prevent.
 	sbsigntool            # sbsign/sbverify: Authenticode-sign the loader and check the signature back
 	python3-virt-firmware # virt-fw-vars: enrol the test PK/KEK/db into a per-run OVMF VARS copy
+
+	# AND THESE TWO ARE NOT BUILD DEPENDENCIES EITHER. They are the host halves of two QEMU devices
+	# whose guest halves are drivers this system is going to grow: `vhost-user-fs-pci` needs a
+	# virtiofs daemon on the host to answer it, and `tpm-tis`/`tpm-crb` need a software TPM behind
+	# them. QEMU exposes both device models without either, and a guest then binds a device nothing
+	# answers - which is a driver looking broken because the HOST is not there.
+	#
+	# Installed here rather than when the first of those drivers is written, because a machine that
+	# cannot exercise a device cannot tell "not implemented" from "not testable", and the point of
+	# this file is that the whole check suite runs on a developer's machine.
+	virtiofsd # the virtio-fs daemon QEMU's vhost-user-fs device talks to
+	swtpm     # software TPM 2.0 behind QEMU's tpm-tis and tpm-crb models
 )
 
 info "Updating apt and installing packages..."
