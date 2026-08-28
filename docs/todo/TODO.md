@@ -240,7 +240,7 @@ or preventing further development of `v1`.
 - [x] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
 - [x] [P02M0165 - A driver that stops answering looks exactly like one that is busy](P02M0165.md)
 - [x] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)
-- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - nine rounds of external review; implementation-ready, and the wrong sweep order turns out to be written in four places rather than one
+- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - ten rounds of external review; the last three found guards that protect the wrong end - a hash checked only on its result, a lock on a path that can still be replaced
 - [x] [P02M0168 - The kernel brings up every core the firmware lists and then two tables assume sixty-four](P02M0168.md)
 
 ### Definition of done (phase 2)
