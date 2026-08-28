@@ -473,7 +473,16 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 			super::imsic::disarm();
 			crate::serial_println!("riscv64: the device tree's IMSIC is not one this kernel addresses - {reason}; no MSI is armed on this machine, and the compiled qemu-virt-aia address is NOT used because this boot has a tree")
 		}
-		None => crate::serial_println!("riscv64: no device tree to read the IMSIC from - using the qemu-virt-aia descriptor, which makes no discovery claim"),
+		// AND A BOOT WITH NO TREE NEEDS AUTHORISING, exactly as it does on aarch64. This took the
+		// compiled descriptor for granted, so `None` - an absent tree, and equally a tree this reader
+		// could not parse - selected QEMU `virt`'s IMSIC addresses on any machine at all.
+		None if super::boot_profile_authorises_no_dt() => {
+			crate::serial_println!("riscv64: no device tree, and this build authorises the named no-DT profile - using the qemu-virt-aia descriptor, which makes no discovery claim")
+		}
+		None => {
+			super::imsic::disarm();
+			crate::serial_println!("riscv64: no device tree to read the IMSIC from, and this build does not authorise the named no-DT profile; no MSI is armed on this machine rather than writing to an address nothing claimed")
+		}
 	}
 	super::imsic::init_hart();
 	// Size the per-CPU id tables and record the boot hart's real id (the SBI boot hart

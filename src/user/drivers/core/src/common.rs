@@ -398,6 +398,15 @@ pub unsafe fn stand(bootstrap: u64, bind: &Bind) -> ! {
 						exit();
 					}
 				}
+				// A STOP IS ANSWERED. `stand` treated every opcode other than `PING` as terminal and
+				// exited, so a driver standing on its channel - `virtio_console` is one - never sent
+				// `STOPPED` at all and the manager waited out its forced-teardown deadline for a
+				// driver that had done exactly what it was asked. It has no work to drain, which is
+				// what makes answering immediately the honest reply rather than a shortcut.
+				proto::Opcode::Stop => {
+					stopped(bootstrap, bind);
+					exit();
+				}
 				// Anything else on this channel ends the stand, which is what dropping the channel
 				// has always meant.
 				_ => exit(),
@@ -426,7 +435,9 @@ pub unsafe fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Op
 			match drain_control(bootstrap, bind) {
 				Control::Continue => {}
 				Control::Stop => {
-					stopped(bootstrap, bind);
+					// LATCHED, NOT ANSWERED - see `finish_stop`. The caller unwinds and answers once
+					// its own work is finished or abandoned, which is what `STOPPED` certifies.
+					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 					return None;
 				}
 				Control::Ended => return None,
@@ -465,7 +476,7 @@ pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool 
 			match drain_control(bootstrap, bind) {
 				Control::Continue => {}
 				Control::Stop => {
-					stopped(bootstrap, bind);
+					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 					return false;
 				}
 				Control::Ended => return false,
@@ -534,7 +545,7 @@ pub unsafe fn answer_ping(bootstrap: u64, bind: &Bind) -> bool {
 		match drain_control(bootstrap, bind) {
 			Control::Continue => true,
 			Control::Stop => {
-				stopped(bootstrap, bind);
+				STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 				false
 			}
 			Control::Ended => false,
@@ -548,6 +559,41 @@ pub unsafe fn answer_ping(bootstrap: u64, bind: &Bind) -> bool {
 // that a PLANNED stop completed, which is what makes it different from a channel that simply closed.
 pub unsafe fn stopped(bootstrap: u64, bind: &Bind) -> bool {
 	unsafe { send_frame(bootstrap, proto::Opcode::Stopped, bind.generation, &[]) }
+}
+
+// A STOP WAS READ AND NOT YET ANSWERED.
+//
+// `STOPPED` is defined as "everything I accepted is finished or abandoned and my device is quiet",
+// and the wait helpers used to send it the instant they READ the stop - before the driver had done
+// any of that, and before the caller had even been told. `virtio_blk` has `flush_request` and never
+// called it on this path; `virtio_snd` exits with a stream still playing; nothing calls
+// `device_quiesced`, which is what lets the kernel release orphaned DMA frames and pending vectors.
+//
+// So the helpers now only LATCH the stop, and `finish_stop` is what answers it - after the driver's
+// own cleanup, which is the only code that knows what "finished or abandoned" means for this device.
+static STOP_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// Whether the manager has asked this driver to stop. `true` means the exit is a PLANNED one and the
+// driver owes a `STOPPED` once it has finished up.
+pub fn stop_requested() -> bool {
+	STOP_PENDING.load(core::sync::atomic::Ordering::Acquire)
+}
+
+// The cleanup is done: answer the stop, and quiesce the device so the kernel may reclaim what it was
+// holding on this driver's behalf. Called on the exit path of every driver the manager can stop.
+//
+// `device_quiesced` is the claim the kernel needs before it will give back a dead driver's DMA frames
+// and masked vectors; it was called only during the INITIAL reset, so a stopped driver left both
+// held. A driver with no device capability passes 0 and only answers the frame.
+pub unsafe fn finish_stop(bootstrap: u64, bind: &Bind, device: u64) {
+	unsafe {
+		if device != 0 {
+			device_quiesced(device);
+		}
+		if STOP_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+			stopped(bootstrap, bind);
+		}
+	}
 }
 
 // "I am here, and this is the number you asked me with."

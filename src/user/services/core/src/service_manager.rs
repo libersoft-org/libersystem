@@ -1005,7 +1005,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		{
 			// A connection of DeviceManager's own, so its writes are its own. Sent whether or not
 			// one could be minted: the read is positional.
-			let config_for_dm: u64 = if config_client != 0 { service_connect(config_client).unwrap_or(0) } else { 0 };
+			// THE OWNER CONNECTION, NOT AN ORDINARY ONE. `service_connect` mints a connection
+			// indistinguishable from every other component's, so ConfigService could not tell whose
+			// request was whose and `set` let any `CAP_CONFIG` holder write under `device.policy.`.
+			// ConfigService mints this pair itself and hands the client end up under `POLICYOWNER`;
+			// routing it here is what makes the namespace DeviceManager's.
+			// TAKEN, not read: it is handed to DeviceManager below, and a handle two places believe
+			// they own is exactly what `take_end_of` exists to prevent.
+			let owner: u64 = kept.take_end_of(b"config_service", b"POLICYOWNER");
+			let config_for_dm: u64 = if owner != 0 {
+				owner
+			} else if config_client != 0 {
+				service_connect(config_client).unwrap_or(0)
+			} else {
+				0
+			};
 			send_blocking(channels[dm], b"POLICYCFG", config_for_dm);
 		}
 	}
@@ -1644,6 +1658,24 @@ unsafe fn supervise(power: u64, state: &mut [State; N], desired: &mut [Desired; 
 									console_report(MANIFEST[idx].name, b"escalated");
 								}
 							} else {
+								// A CRASHED MANAGER'S SUBTREE GOES WITH IT, whatever the restart
+								// policy says about the manager itself.
+								//
+								// The only `domain_kill` for DeviceManager's child Domain lived
+								// inside `restart_service`, which the supervisor calls only for
+								// `Restart::Transparent` - and DeviceManager is declared
+								// `escalate`. So its REAL crash took this branch, recorded `Failed`,
+								// dropped the channel, and left every driver process it had spawned
+								// alive, each still holding a device claim, with nothing left that
+								// could tear them down. That state has to be gone before either
+								// reconstruction or escalation, and killing the Domain is what
+								// removes it: the claims are released as the handle tables close.
+								if MANIFEST[idx].name == b"device_manager" && *device_manager_domain != 0 {
+									domain_kill(*device_manager_domain);
+									close(*device_manager_domain);
+									*device_manager_domain = 0;
+									console_report(MANIFEST[idx].name, b"its driver subtree was killed with it");
+								}
 								broker.lifecycle.record(idx, state[idx], State::Failed, epoch_of(procs[idx]), Reason::Faulted);
 								state[idx] = State::Failed;
 								sup[idx].failure = Failure::Crashed;

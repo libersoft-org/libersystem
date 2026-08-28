@@ -283,6 +283,16 @@ impl FailureCause {
 /// which is a fact about the machine and not an absence.
 #[derive(Clone, Debug, PartialEq)]
 pub struct BindingRecord {
+	/// WHICH ROW OF THE KERNEL DEVICE TABLE THIS BINDING IS ABOUT.
+	///
+	/// The System Graph used to pair a device list with a binding list BY POSITION, and the two are
+	/// not positionally equivalent: DeviceService returns every kernel table row in table order,
+	/// while this list holds only DeviceManager's nodes - boot-critical appended first, other
+	/// candidate-bearing ones second, rows with no candidate omitted. One supported non-boot device
+	/// at a lower table index than a boot disk swapped two records, and an omitted row shifted every
+	/// later one, so the graph reported another device's state, cause and restart count. `device-entry`
+	/// already carries this index; carrying it here too is what lets the two be joined on identity.
+	pub index: u32,
 	pub bus: u32,
 	pub dev: u32,
 	pub func: u32,
@@ -343,6 +353,7 @@ impl BindingRecord {
 		Some(value)
 	}
 	pub fn write<W: Sink>(&self, w: &mut W) -> Option<()> {
+		w.u32(self.index)?;
 		w.u32(self.bus)?;
 		w.u32(self.dev)?;
 		w.u32(self.func)?;
@@ -357,6 +368,7 @@ impl BindingRecord {
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<BindingRecord> {
+		let index = r.u32()?;
 		let bus = r.u32()?;
 		let dev = r.u32()?;
 		let func = r.u32()?;
@@ -368,7 +380,7 @@ impl BindingRecord {
 		let rule = r.u32()?;
 		let providers = r.u32()?;
 		let resources = r.u32()?;
-		Some(BindingRecord { bus, dev, func, generation, state, cause, attempts, artifact, rule, providers, resources })
+		Some(BindingRecord { index, bus, dev, func, generation, state, cause, attempts, artifact, rule, providers, resources })
 	}
 }
 
@@ -2339,6 +2351,9 @@ impl BindingRecord {
 	}
 	pub(crate) fn to_json_into(&self, out: &mut String) {
 		out.push('{');
+		out.push_str("\"index\":");
+		let _ = write!(out, "{}", self.index);
+		out.push(',');
 		out.push_str("\"bus\":");
 		let _ = write!(out, "{}", self.bus);
 		out.push(',');
@@ -2375,6 +2390,9 @@ impl BindingRecord {
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
 		out.push('{');
+		out.push_str("index=");
+		let _ = write!(out, "{}", self.index);
+		out.push_str(", ");
 		out.push_str("bus=");
 		let _ = write!(out, "{}", self.bus);
 		out.push_str(", ");
@@ -2410,7 +2428,9 @@ impl BindingRecord {
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 11);
+		crate::codec::cbor::map(out, 12);
+		crate::codec::cbor::text(out, "index");
+		crate::codec::cbor::uint(out, self.index as u64);
 		crate::codec::cbor::text(out, "bus");
 		crate::codec::cbor::uint(out, self.bus as u64);
 		crate::codec::cbor::text(out, "dev");

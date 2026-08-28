@@ -1726,6 +1726,23 @@ kind = "serve-root"
 provider = "self"
 interface = "liber:config@1/config"
 
+# THE ONE CONNECTION ALLOWED TO WRITE UNDER `device.policy.`.
+#
+# `Config::set` checked nothing, so any component holding `CAP_CONFIG` - and the supervisor grants it
+# to several - could overwrite or delete DeviceManager's persistent device policy. `Config::remove`
+# refused every key outside the prefix and the comment beside the constant claimed `set` did too; it
+# did not. Authority over a namespace has to come from WHICH CONNECTION a request arrived on, and a
+# connection minted on demand from the ordinary root is indistinguishable from any other.
+#
+# So ConfigService mints this pair itself, keeps the server end as a served seed - which is what makes
+# its channel value knowable - and hands the client end up. The supervisor routes it to DeviceManager
+# in place of an ordinary connection.
+[[services.roles]]
+tag = "POLICYOWNER"
+kind = "serve-root"
+provider = "self"
+interface = "liber:config@1/config"
+
 [[services]]
 name = "console_service"
 program = "console_service"

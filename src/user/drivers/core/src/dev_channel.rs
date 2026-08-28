@@ -192,11 +192,24 @@ unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64) -> bool {
 					}
 					if let Ok(header) = driver_protocol::Header::decode(&buf[..len])
 						&& header.generation == bind.generation
-						&& header.opcode == driver_protocol::Opcode::Ping
-						&& let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
-						&& !common::pong(bootstrap, bind, sequence)
 					{
-						return false;
+						match header.opcode {
+							driver_protocol::Opcode::Ping => {
+								if let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
+									&& !common::pong(bootstrap, bind, sequence)
+								{
+									return false;
+								}
+							}
+							// AND A STOP IS ANSWERED. This driver read its bootstrap for pings alone,
+							// so a manager asking it to stop waited out the forced-teardown deadline
+							// for a driver that had nothing to drain.
+							driver_protocol::Opcode::Stop => {
+								common::stopped(bootstrap, bind);
+								return false;
+							}
+							_ => {}
+						}
 					}
 				}
 				Polled::Empty => return true,

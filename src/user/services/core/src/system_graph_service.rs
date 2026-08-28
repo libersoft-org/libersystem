@@ -141,18 +141,22 @@ impl system_graph::Service for GraphService {
 		// to the device record in the IDL and regenerating. Recorded here rather than left as a
 		// comment claiming the index match is sound.
 		let bindings: Vec<BindingRecord> = if self.bindings != 0 { provider_catalogue::Client::new(ChannelTransport { chan: self.bindings }).bindings().unwrap_or_default() } else { Vec::new() };
-		for (at, d) in devices.iter().enumerate() {
+		for d in devices.iter() {
 			// A DEVICE WITH NO BINDING RECORD IS `Unknown`, NOT `Running`. That is the honest answer
 			// for a node DeviceManager has not spoken about, and it is the whole difference from
 			// what this line used to say.
-			let (state, failure) = match bindings.get(at) {
+			// JOINED ON THE KERNEL TABLE INDEX, which both records now carry. `bindings.get(at)` paired
+			// them by POSITION in two vectors that are not positionally equivalent - see the comment
+			// above and `binding-record.index`.
+			let record = bindings.iter().find(|record| record.index == d.index);
+			let (state, failure) = match record {
 				Some(record) => (component_state(record.state), String::from_utf8_lossy(cause_text(record.cause)).into_owned()),
 				// A DEVICE DEVICEMANAGER HAS NOT SPOKEN ABOUT IS `Pending`, NOT `Running`. That is
 				// the honest answer for a node with no record, and it is the whole difference from
 				// what this line used to say.
 				None => (ComponentState::Pending, String::new()),
 			};
-			let restarts: u32 = bindings.get(at).map_or(0, |record| record.attempts);
+			let restarts: u32 = record.map_or(0, |record| record.attempts);
 			components.push(Component { name: device_name(d), r#type: ComponentType::Device, state, deps: alloc::vec![String::from("device_manager")], counters: Counters { messages_sent: 0, messages_received: 0, handles: 0, memory_bytes: 0, restarts, watchdog_trips: 0, last_failure: failure } });
 		}
 

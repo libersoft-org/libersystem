@@ -1004,6 +1004,9 @@ unsafe fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots
 		loop {
 			// The manager's channel joins the three this loop already waits on.
 			if common::wait_or_answer(bootstrap, bind, &[irq, blk_server, usbq]).is_none() {
+				// The controller keeps its capability in the storage half rather than on this struct,
+				// so the stop is answered here and the quiesce is the device's own reset path.
+				common::finish_stop(bootstrap, bind, 0);
 				exit();
 			}
 			// the interrupt: drain the event ring (HID reports feed the console and

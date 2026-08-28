@@ -321,6 +321,20 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, ctl: &Ctl, tx: &mut Tx, rx:
 			// The manager's ping is answered by THIS loop. A driver parked waiting for its next
 			// period is idle, not wedged, and only a combined wait can tell the two apart.
 			if !common::serve_or_answer(bootstrap, bind, service) {
+				// THE STREAMS ARE STOPPED AND RELEASED BEFORE THE STOP IS ANSWERED. This exited with
+				// playback or capture still running - the same cleanup its service-channel-close
+				// branch performs, skipped on the path that promises the work is finished.
+				if common::stop_requested() {
+					if started {
+						ctl.stream_cmd(R_PCM_STOP, stream);
+						ctl.stream_cmd(R_PCM_RELEASE, stream);
+					}
+					if capturing {
+						ctl.stream_cmd(R_PCM_STOP, capture.unwrap_or(0));
+						ctl.stream_cmd(R_PCM_RELEASE, capture.unwrap_or(0));
+					}
+				}
+				common::finish_stop(bootstrap, bind, ctl.q.capability);
 				exit();
 			}
 			// receive straight into the period region of the transmit DMA page.

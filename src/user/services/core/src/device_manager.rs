@@ -431,6 +431,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut usbq_client: u64 = 0;
 		let mut usb_pointer: u64 = 0;
 		let mut raw_keys: u64 = 0;
+		// What a post-`Online` restart needs, filled in by phase two. See `Recovery`.
+		let mut recovery: Recovery = Recovery::none();
 		// What this program holds on behalf of the development agent: its bootstrap, so the
 		// launcher can be handed to it once PermissionManager exists - which is after this
 		// program has finished starting drivers - and so its death is noticed and answered.
@@ -467,11 +469,53 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// is: `advance` reads the event and the transaction rolls back. Anything it leaves
 			// terminal stays terminal - there is no volume to reload a driver from at this point,
 			// so a rebind is P02M0165 M6's subject and not this loop's.
-			let soonest: u64 = tick_heartbeats(&mut nodes, &mut buf);
+			let mut soonest: u64 = tick_heartbeats(&mut nodes, &mut buf);
+			// AND A NODE WAITING OUT ITS BACKOFF IS SOMETHING TO WAKE FOR. The loop skips such a node
+			// rather than sleeping on it, so without this the wait could park past the moment it
+			// became due and the retry would land whenever something unrelated next arrived.
+			for node in nodes.iter() {
+				if node.retry_at != 0 && (soonest == 0 || node.retry_at < soonest) {
+					soonest = node.retry_at;
+				}
+			}
 			for at in 0..nodes.len() {
 				let name: &[u8] = nodes[at].driver_name();
-				let _ = advance(&mut nodes[at], name, &mut catalogue);
+				// A NODE WHOSE BACKOFF HAS COME DUE. `advance` is event-driven and a node parked in
+				// `Backoff` raises none, so without this a deferred attempt - a retryable failure, or
+				// a device that was still being released when this manager looked - would wait for
+				// some unrelated message to arrive before anything tried again.
+				if nodes[at].record.state == BindingState::Backoff && nodes[at].retry_at != 0 && clock() >= nodes[at].retry_at && recovery.armed() {
+					nodes[at].retry_at = 0;
+					start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+				}
+				// AN OPERATOR'S RETRY, PERFORMED. One attempt, from wherever the node was left.
+				if nodes[at].restart_requested && recovery.armed() {
+					nodes[at].restart_requested = false;
+					start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+				}
+				// THE ANSWER IS ACTED ON. This discarded the `Step`, so a driver that crashed after
+				// coming online was moved to `Backoff` and left there for the rest of the boot -
+				// the bring-up loops that handle `Again` had returned long before. Recovery is only
+				// possible once phase two has handed over what a rebind needs.
+				match advance(&mut nodes[at], name, &mut catalogue) {
+					// THE STANDING LOOP DOES NOT WAIT AT ALL. It comes round on its own bounded wait,
+					// so a node whose backoff has not passed is simply skipped this time - which is
+					// what "one node's delay is not every node's" means in the loop that has others.
+					Step::Again if recovery.armed() && clock() >= nodes[at].retry_at => {
+						start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+					}
+					Step::NextCandidate if recovery.armed() => {
+						nodes[at].candidate += 1;
+						nodes[at].attempt = 0;
+						if nodes[at].candidate < nodes[at].candidates.len() {
+							start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+						}
+					}
+					_ => {}
+				}
 			}
+			// AND ANY NEW INCIDENT IS WRITTEN DOWN, so it outlives this program - see `persist_incidents`.
+			persist_incidents(&mut nodes, policy_config);
 			// ONE WAIT, AND ONLY A READY BOOTSTRAP FALLS THROUGH TO THE RECEIVE.
 			//
 			// Anything else goes round: a catalogue query is answered and a DEADLINE means the
@@ -508,7 +552,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				if ready > 0 {
 					let at: usize = ready as usize;
 					if policy_service != 0 && (at == policy_at || (at >= policy_clients_at && at < policy_clients_at + policy_clients.live().len())) {
-						serve_policy_once(waiting[at], at == policy_at, &mut policy_clients, &mut nodes, policy_config, &mut buf);
+						serve_policy_once(waiting[at], at == policy_at, &mut policy_clients, &mut nodes, &mut catalogue, policy_config, &mut buf);
 					} else {
 						let is_root: bool = catalogue_service != 0 && at == 1;
 						serve_catalogue_once(waiting[at], is_root, &mut catalogue_clients, &catalogue, &nodes, &mut buf);
@@ -519,12 +563,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
 					#[cfg(feature = "development")]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut dev);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery, &mut dev);
 					#[cfg(not(feature = "development"))]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys);
-					if handle != 0 {
-						close(handle);
-					}
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery);
+					// NOT CLOSED: `Recovery` holds it, because rebinding a crashed driver means
+					// reading its artifact off the volume again. See `Recovery`.
 					send_blocking(bootstrap, b"NET", net_client);
 					send_blocking(bootstrap, b"GPU", gpu_client);
 					send_blocking(bootstrap, b"SND", snd_client);
@@ -565,6 +608,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				}
 				Received::Message { len, handle } if len >= 9 && &buf[..9] == b"POLICYCFG" => {
 					policy_config = handle;
+					// READ BACK WHAT WAS STORED, now that there is somewhere to read it from.
+					load_stored_policy(&mut nodes, policy_config);
 				}
 				Received::Message { .. } => {
 					// THE DRIVERS GO DOWN BEFORE THIS PROGRAM DOES, and in reverse dependency
@@ -653,6 +698,9 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 					// whether another attempt follows. `Again` re-opens the same entry; the rest is
 					// terminal for this device and the boot goes on without that disk.
 					Step::Again => {
+						// NOT BEFORE ITS BACKOFF HAS PASSED. The delay used to be a sleep inside
+						// `advance`; it is now a deadline, and honouring it is the caller's job.
+						wait_out_backoff(&nodes[at]);
 						let entry = nodes[at].candidates[nodes[at].candidate];
 						let Some(elf) = package.lookup(entry.artifact) else { continue };
 						let info = nodes[at].info;
@@ -696,7 +744,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -765,6 +813,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 					// The same candidate, once more. The window and the attempt budget have already
 					// said there is room for it.
 					Step::Again => {
+						wait_out_backoff(&nodes[at]);
 						start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 					}
 					// EACH CANDIDATE IN TURN, most specific first, and the next one only after the
@@ -786,7 +835,9 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 				}
 			}
 		}
-		close(key_producer);
+		// KEPT, NOT CLOSED - see `Recovery`. A driver that crashes after coming online is rebound by
+		// the standing loop, and an input driver's key sink is minted from this end.
+		*recovery = Recovery { storage, key_producer, state: core::mem::take(&mut state) };
 		report_state(&state);
 		report_catalogue(catalogue, b"after every device");
 	}
@@ -1139,8 +1190,41 @@ impl Binding {
 	// one that fails after it hold exactly the same four things, and the order they are given back
 	// in is the property that matters - so a second implementation would be a second order, and the
 	// two would agree until the day somebody changed one of them.
+	// An INSTALLED binding holds no untransferred resources: everything the bind assembled either
+	// reached the driver or the attempt was rolled back before this existed. So the two fields
+	// `Attempt` grew for the pre-commit paths are empty here, and that is a statement about when this
+	// conversion happens rather than an omission.
 	fn into_attempt(self) -> Attempt {
-		Attempt { domain: self.domain, process: self.process, channel: self.channel, claim: self.claim, key: self.key }
+		Attempt { domain: self.domain, process: self.process, channel: self.channel, claim: self.claim, key: self.key, driver_side: 0, resources: [(0, 0); MAX_BIND_RESOURCES], resource_count: 0 }
+	}
+}
+
+// WHAT A RESTART AFTER `Online` NEEDS, kept for the life of this program.
+//
+// The standing loop calls `advance` and used to DISCARD its `Step`. So a driver that crashed after
+// coming online had its binding removed, its record moved to `Backoff` - and nothing ever called
+// `start_candidate` again, because the bring-up loops that handle `Step::Again` have long returned by
+// then. The node sat in `Backoff` for the rest of the boot. Acting on that answer needs the same
+// three things phase two had and then dropped.
+//
+// THE KEY PRODUCER IS DELIBERATELY NOT CLOSED any more. Phase two closed it after handing each input
+// driver a duplicate; a restarted `virtio_input` or `xhci` needs another, and minting one requires an
+// end this program still holds. The cost is that InputService's consumer no longer sees the channel
+// close when every input driver has died - which was never the signal it acts on, because a dead
+// driver reaches it through this manager rather than through an EOF on the raw stream.
+struct Recovery {
+	storage: u64,
+	key_producer: u64,
+	state: Vec<u8>,
+}
+
+impl Recovery {
+	fn none() -> Self {
+		Self { storage: 0, key_producer: 0, state: Vec::new() }
+	}
+
+	fn armed(&self) -> bool {
+		self.storage != 0
 	}
 }
 
@@ -1188,6 +1272,14 @@ struct Node {
 	// What the last teardown found, if there has been one. Rendered by P02M0166; kept here because
 	// the node outlives the binding it is about, which is the whole reason the node exists.
 	incident_report: Option<Diagnostic>,
+	// WHETHER THAT REPORT HAS BEEN WRITTEN SOMEWHERE THAT OUTLIVES THIS PROGRAM. See
+	// `persist_incidents`: held only here, the snapshot died with the manager that took it.
+	incident_stored: bool,
+	// AN OPERATOR ASKED FOR ONE MORE ATTEMPT. Consumed by the standing loop - see `PolicyVerb::Retry`.
+	restart_requested: bool,
+	// THE TICK THIS NODE MAY TRY AGAIN AT, 0 for "now". Set by `back_off_until` instead of sleeping,
+	// so one node's delay is not every node's - see the comment there.
+	retry_at: u64,
 }
 
 // WHAT WAS TRUE WHEN A BINDING WENT WRONG, taken BEFORE the process is gone.
@@ -1257,7 +1349,7 @@ impl Heartbeat {
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None, incident_stored: false }
 	}
 
 	// Queue one event for this node.
@@ -1320,11 +1412,51 @@ struct Attempt {
 	// own; releasing it explicitly is how the terminal state is LEARNED rather than assumed.
 	claim: u64,
 	key: ClaimKey,
+	// THE DRIVER'S END OF THE BOOTSTRAP CHANNEL, until the spawn consumes it.
+	//
+	// `begin_bind` created the pair and recorded only its OWN end, so a `domain_create` that failed
+	// in between closed `dm_side` and left this one open - and `spawn_prepared_in` documents that a
+	// failed spawn returns with the bootstrap handle still in the caller. Two ordinary failure paths,
+	// each leaking one handle and its accounting, in the function whose whole claim is that it leaves
+	// nothing behind. Zeroed the moment the spawn takes it.
+	driver_side: u64,
+	// THE RESOURCES ASSEMBLED FOR TRANSFER, until each one is sent.
+	//
+	// The MMIO grant, the MSI vector, the key-channel duplicate, the power connection and the console
+	// duplicate lived in a local array. A failure while acquiring a later one - or while sending
+	// `BIND`, or while sending any `RESOURCE` - went to `give_up` with the earlier ones still held
+	// and nothing that could close them. Releasing the claim revokes the capability GENERATION, which
+	// invalidates capabilities without removing their handle-table entries, so it does not refund
+	// those slots. An entry is zeroed as its send transfers it.
+	resources: [(u16, u64); MAX_BIND_RESOURCES],
+	resource_count: usize,
 }
+
+// The most resources one bind sends: the device MMIO, an MSI vector, a key sink, a power connection
+// and a console feed. Named because `Attempt` has to hold them and a bare `5` in two places is two
+// places to get it wrong.
+const MAX_BIND_RESOURCES: usize = 5;
 
 impl Attempt {
 	fn new() -> Self {
-		Self { domain: 0, process: 0, channel: 0, claim: 0, key: ClaimKey::default() }
+		Self { domain: 0, process: 0, channel: 0, claim: 0, key: ClaimKey::default(), driver_side: 0, resources: [(0, 0); MAX_BIND_RESOURCES], resource_count: 0 }
+	}
+
+	// Record a resource this attempt has acquired and not yet handed over.
+	fn holds(&mut self, kind: u16, handle: u64) {
+		if self.resource_count < MAX_BIND_RESOURCES {
+			self.resources[self.resource_count] = (kind, handle);
+			self.resource_count += 1;
+		}
+	}
+
+	// That resource has been transferred: it is the driver's now, and a rollback must not close it.
+	fn handed_over(&mut self, handle: u64) {
+		for entry in self.resources[..self.resource_count].iter_mut() {
+			if entry.1 == handle {
+				entry.1 = 0;
+			}
+		}
 	}
 
 	// THE TRANSACTION COMMITS: what it took stays taken, and passes to whoever asked for the bind.
@@ -1362,6 +1494,20 @@ impl Attempt {
 				self.process = 0;
 			}
 			offers.close_all();
+			// EVERYTHING THIS ATTEMPT ACQUIRED AND DID NOT HAND OVER. Closed after the process is
+			// dead, so a driver cannot be reading one as it goes, and before the claim is released,
+			// because the release is what tears the device down under them.
+			if self.driver_side != 0 {
+				close(self.driver_side);
+				self.driver_side = 0;
+			}
+			for entry in self.resources[..self.resource_count].iter_mut() {
+				if entry.1 != 0 {
+					close(entry.1);
+					entry.1 = 0;
+				}
+			}
+			self.resource_count = 0;
 			if self.channel != 0 {
 				close(self.channel);
 				self.channel = 0;
@@ -1665,8 +1811,16 @@ unsafe fn send_frame(channel: u64, opcode: driver_protocol::Opcode, generation: 
 // `Backoff` when the teardown confirmed and there is something a later attempt could change,
 // `Failed` when there is not, `Quarantined` when the release could not be confirmed - which outranks
 // both, because a device that may still be live is not a device to try again on.
-unsafe fn give_up(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Offers, cause: FailureCause, driver_name: &[u8]) -> bool {
-	unsafe { give_up_with(record, txn, offers, cause, driver_binding::StopIntent::Fault, driver_name) }
+// The same, for a failure that happened BEFORE the binding was installed and may still have attempts.
+//
+// `give_up` hardcoded "no attempts left", on the reasoning that it "is only called once the decision
+// to stop trying has been made". That is true of the post-`Online` paths and false of `begin_bind`,
+// which calls it for `SpawnFailed` and for a `DriverExited` while sending the initial frames - both of
+// which the crate's own `retryable()` classifies as worth another try. So a transient spawn shortage
+// ended the node permanently, and M3's `Stopping -> Backoff` edge was unreachable from the one place
+// that needed it.
+unsafe fn give_up_retryable(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Offers, cause: FailureCause, driver_name: &[u8], attempts_left: bool) -> bool {
+	unsafe { give_up_with_budget(record, txn, offers, cause, driver_binding::StopIntent::Fault, driver_name, attempts_left && cause.retryable()) }
 }
 
 // The same, for a node that was asked to stop rather than one that failed.
@@ -1677,6 +1831,12 @@ unsafe fn give_up(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Of
 // ignores the intent entirely and ends at `Quarantined`, because what is unknown is whether the
 // device is still live and no intent changes that.
 unsafe fn give_up_with(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Offers, cause: FailureCause, intent: driver_binding::StopIntent, driver_name: &[u8]) -> bool {
+	unsafe { give_up_with_budget(record, txn, offers, cause, intent, driver_name, false) }
+}
+
+// `attempts_left` is what the table's confirmed outcome branches on - see `give_up_retryable`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn give_up_with_budget(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Offers, cause: FailureCause, intent: driver_binding::StopIntent, driver_name: &[u8], attempts_left: bool) -> bool {
 	unsafe {
 		// THE PATH THROUGH THE TABLE DEPENDS ON WHETHER A DEVICE WAS TAKEN, and flattening that was
 		// wrong. `Binding -> Failed` is for a transaction that failed BEFORE the claim; once there
@@ -1698,7 +1858,7 @@ unsafe fn give_up_with(record: &mut BindingRecord, txn: &mut Attempt, offers: &m
 			// whatever they say. `Shutdown` answers None: the manager is going away, so there is no
 			// next binding to describe and entering a state nobody will read is a state nobody
 			// wrote down for a reason.
-			intent.confirmed_lands_at(false)
+			intent.confirmed_lands_at(attempts_left)
 		};
 		let state = match landed {
 			Some(landed) if record.move_to(landed, Some(cause)) => landed,
@@ -1968,7 +2128,18 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 					}
 				}
 				driver_protocol::Opcode::Stopped => {
-					node.push(BindingEvent::Stopped { generation });
+					// ONLY WHERE A STOP WAS ACTUALLY ASKED FOR. This queued any generation-matching
+					// STOPPED, so a driver could announce a clean stop nobody requested and the
+					// manager would print that it stopped cleanly and tear the binding down. A
+					// planned stop is a state this manager put the node INTO; an unsolicited frame
+					// claiming one is a driver describing a conversation that did not happen.
+					if node.record.state == BindingState::Stopping && node.stop_intent != driver_binding::StopIntent::Fault {
+						node.push(BindingEvent::Stopped { generation });
+					} else {
+						print(b"DeviceManager: ");
+						print_driver_name(node.driver_name());
+						print(b" said it had stopped and nothing had asked it to; the frame is refused\n");
+					}
 				}
 				// Manager-to-driver opcodes coming the wrong way: refused rather than ignored,
 				// because a driver asking the manager whether IT is alive, or telling it to stop,
@@ -2157,10 +2328,24 @@ unsafe fn may_try_again(incident: &Incident, attempt: u32) -> bool {
 // Sleep the backoff before attempt number `attempt` (1-based: the delay before the second attempt
 // is the first of `BACKOFF_TICKS`).
 //
-// `may_try_again` has already established there is room for it, so this only has to perform it.
-// A parked wait rather than a spin: the scheduler is cooperative and a busy loop here would starve
-// every other driver coming up beside this one.
-unsafe fn back_off(incident: &Incident, attempt: u32) {
+// `may_try_again` has already established there is room for it, so this only has to say WHEN.
+//
+// A DEADLINE, NOT A SLEEP. This called `sleep_until`, which parks the ONE DeviceManager thread - so a
+// node's 100 ms or 200 ms backoff was 100 ms or 200 ms during which no other node's handshake, exit,
+// heartbeat or catalogue query was looked at. M2's node independence is the whole point of the queue
+// and the multiplexed wait above it, and a sleep in the middle of the loop undoes both. The node
+// records when it may try again and the loop's own wait is bounded by the soonest of them.
+// A BRING-UP LOOP HAS NOTHING ELSE TO DO, so it waits the node's backoff out where the standing loop
+// skips and comes back. Both honour the same deadline; they differ in what else they could be doing.
+unsafe fn wait_out_backoff(node: &Node) {
+	unsafe {
+		if node.retry_at > clock() {
+			sleep_until(node.retry_at);
+		}
+	}
+}
+
+unsafe fn back_off_until(incident: &Incident, attempt: u32) -> u64 {
 	unsafe {
 		let index: usize = (attempt as usize).saturating_sub(1).min(BACKOFF_TICKS.len() - 1);
 		let mut until: u64 = clock().saturating_add(BACKOFF_TICKS[index]);
@@ -2172,7 +2357,7 @@ unsafe fn back_off(incident: &Incident, attempt: u32) {
 				until = spendable;
 			}
 		}
-		sleep_until(until);
+		until
 	}
 }
 
@@ -2218,6 +2403,14 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 				return false;
 			}
 		}
+		// WHETHER THIS NODE STILL HAS AN ATTEMPT, computed once and handed to every failure exit below.
+		// A failure here is a failure BEFORE the binding is installed, and `SpawnFailed` and a
+		// `DriverExited` while sending the initial frames are both classified retryable by the crate -
+		// so ending the node permanently on the first transient shortage was the table's
+		// `Stopping -> Backoff` edge being unreachable from the one place that needed it.
+		let attempts_left: bool = may_try_again(&node.incident, node.attempt);
+		// The backoff this attempt was waiting out is spent; nothing should wake for it again.
+		node.retry_at = 0;
 		let mut txn = Attempt::new();
 		if !node.record.move_to(BindingState::Binding, None) {
 			print(b"DeviceManager: refusing an illegal transition into binding for ");
@@ -2241,8 +2434,22 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// passed. "Waits and then binds" is not one of the branches.
 		match observe_claim(node, device_privilege, driver_name) {
 			ClaimReadiness::Bindable => {}
-			ClaimReadiness::WaitAndSeeAgain => return false,
-			ClaimReadiness::Terminal(cause) => return give_up(&mut node.record, &mut txn, &mut node.offers, cause, driver_name),
+			ClaimReadiness::WaitAndSeeAgain => {
+				// COME BACK TO IT, rather than losing it.
+				//
+				// This returned `false`, and both callers read that as "this candidate failed": the
+				// non-boot path moved to the next candidate while the record was still `Binding` - so
+				// no later candidate could enter `Binding` either - and the boot path dropped the
+				// device entirely. A `Releasing` claim is a device somebody else is still giving
+				// back, which is a WAIT and not a failure, and the kernel has already latched the
+				// deadline, so the only thing missing was something to make this manager look again.
+				// `Backoff` is the state for an attempt that has not started, and `retry_at` is what
+				// the standing loop's wait is bounded by.
+				node.record.move_to(BindingState::Backoff, None);
+				node.retry_at = clock().saturating_add(BACKOFF_TICKS[0]);
+				return false;
+			}
+			ClaimReadiness::Terminal(cause) => return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, cause, driver_name, attempts_left),
 		}
 		let grant: ClaimGrant = match device_claim(node.index, device_privilege) {
 			Ok(grant) => grant,
@@ -2252,8 +2459,8 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			// on the explicit condition that the distinguishable kernel path produce it, and nothing
 			// did. Everything else here is "somebody else holds it", which is `claim-refused` and is
 			// not worth waiting on either.
-			Err(errno) if errno == abi::ERR_ACCESS_DENIED => return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::IommuRequired, driver_name),
-			Err(_) => return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ClaimRefused, driver_name),
+			Err(errno) if errno == abi::ERR_ACCESS_DENIED => return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::IommuRequired, driver_name, attempts_left),
+			Err(_) => return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::ClaimRefused, driver_name, attempts_left),
 		};
 		txn.claim = grant.claim;
 		txn.key = grant.key;
@@ -2263,9 +2470,11 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		node.id = node.id.rebound(grant.key.generation);
 		let (dm_side, driver_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
-			None => return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name),
+			None => return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name, attempts_left),
 		};
 		txn.channel = dm_side;
+		// HELD BY THE TRANSACTION until the spawn consumes it - see `Attempt::driver_side`.
+		txn.driver_side = driver_side;
 		// THE PROCESS HANDLE IS KEPT. It used to be dropped the moment `spawn` returned, so
 		// nothing could end the process a failed bind had started - which is what made "leaves
 		// nothing behind" untrue in the one case it is written for. It is also the handle the
@@ -2281,13 +2490,17 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// reports - and a subtree that can be killed as a unit.
 		let domain: i64 = domain_create(u64::MAX, u64::MAX, u64::MAX);
 		if domain < 0 {
-			return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name);
+			return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name, attempts_left);
 		}
 		txn.domain = domain as u64;
 		let process: i64 = spawn_in(elf, driver_side, domain as u64);
 		if process < 0 {
-			return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::SpawnFailed, driver_name);
+			// The spawn did NOT take the bootstrap handle - `spawn_prepared_in` says so - so it is
+			// still the transaction's and the rollback closes it.
+			return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::SpawnFailed, driver_name, attempts_left);
 		}
+		// Taken by the spawn: no longer this transaction's to close.
+		txn.driver_side = 0;
 		txn.process = process as u64;
 		// ASSEMBLE THE RESOURCE LIST BEFORE ANNOUNCING ITS LENGTH.
 		//
@@ -2303,45 +2516,41 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// polled; the dev channel is idle almost always and must block on its interrupt rather
 		// than poll, because a spinning driver starves the cooperative scheduler for the guest's
 		// whole life. The remaining polling drivers get none, so their device IRQs stay silent.
-		let mut resources: [(u16, u64); 5] = [(0u16, 0u64); 5];
-		let mut resource_count: usize = 0;
-		// The device's own MMIO capability is always first and always present.
-		resources[resource_count] = (driver_protocol::ResourceKind::Device as u16, grant.memory);
-		resource_count += 1;
+		// RECORDED ON THE TRANSACTION AS THEY ARE TAKEN. The list used to be a local array, so a
+		// failure while acquiring a later entry - or while sending - reached `give_up` with the
+		// earlier ones held and nothing able to close them.
+		txn.holds(driver_protocol::ResourceKind::Device as u16, grant.memory);
 		let use_msix: bool = driver_name == b"virtio_input" || driver_name == b"virtio_net" || driver_name == b"virtio_snd" || driver_name == b"xhci" || driver_name == b"virtio_gpu" || driver_name == b"dev_channel";
 		if use_msix {
 			let irq: i64 = device_msix_acquire(grant.claim);
 			if irq < 0 {
-				return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name);
+				return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name, attempts_left);
 			}
-			resources[resource_count] = (driver_protocol::ResourceKind::Irq as u16, irq as u64);
-			resource_count += 1;
+			txn.holds(driver_protocol::ResourceKind::Irq as u16, irq as u64);
 		}
 		if driver_name == b"virtio_input" || driver_name == b"xhci" {
 			let sink: i64 = duplicate(key_producer, RIGHT_SEND | RIGHT_TRANSFER);
 			if sink < 0 {
-				return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name);
+				return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name, attempts_left);
 			}
-			resources[resource_count] = (driver_protocol::ResourceKind::Keys as u16, sink as u64);
-			resource_count += 1;
+			txn.holds(driver_protocol::ResourceKind::Keys as u16, sink as u64);
 			// A CONNECTION OF ITS OWN, not a copy of an authority. These two used to be handed a
 			// duplicate of the root-Domain handle - which can kill every process on the machine -
 			// so that the Power key would work. What they get now can ask for a reboot and
 			// nothing else, on a channel nobody else answers on.
-			let Some(connection) = service_connect(power) else { return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name) };
-			resources[resource_count] = (driver_protocol::ResourceKind::SysPower as u16, connection);
-			resource_count += 1;
+			let Some(connection) = service_connect(power) else { return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name, attempts_left) };
+			txn.holds(driver_protocol::ResourceKind::SysPower as u16, connection);
 			// The capability that lets those keystrokes reach the console at all. A duplicate
 			// per driver, for the same reason as the power connection.
 			if console_input != 0 {
 				let feed: i64 = duplicate(console_input, RIGHT_TRANSFER);
 				if feed < 0 {
-					return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name);
+					return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::ResourceExhausted, driver_name, attempts_left);
 				}
-				resources[resource_count] = (driver_protocol::ResourceKind::Console as u16, feed as u64);
-				resource_count += 1;
+				txn.holds(driver_protocol::ResourceKind::Console as u16, feed as u64);
 			}
 		}
+		let resource_count: usize = txn.resource_count;
 		node.granted_resources = resource_count as u32;
 		// WHICH RULE CHOSE THIS DRIVER, recorded where the choice is still in hand. An entry may
 		// declare several and "virtio_console bound it" does not say which applied - the pinned
@@ -2351,9 +2560,10 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		let mut payload = [0u8; driver_protocol::MAX_PAYLOAD];
 		let payload_len = driver_protocol::encode_bind(info, resource_count as u16, &mut payload);
 		if !send_frame(dm_side, driver_protocol::Opcode::Bind, grant.key.generation, &payload[..payload_len], 0, 0) {
-			return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::DriverExited, driver_name);
+			return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::DriverExited, driver_name, attempts_left);
 		}
-		for &(kind, handle) in resources[..resource_count].iter() {
+		for index in 0..resource_count {
+			let (kind, handle) = txn.resources[index];
 			let mut kind_payload = [0u8; driver_protocol::U16_PAYLOAD_LEN];
 			driver_protocol::encode_u16(kind, &mut kind_payload);
 			// THE DEVICE CAPABILITY ARRIVES WITHOUT RIGHT_TRANSFER, through one attenuating
@@ -2363,8 +2573,11 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			// about the HOLDER: a driver cannot pass its device on.
 			let mask: u32 = if kind == driver_protocol::ResourceKind::Device as u16 { RIGHT_READ | RIGHT_WRITE | RIGHT_MAP } else { RIGHTS_ALL };
 			if !send_frame(dm_side, driver_protocol::Opcode::Resource, grant.key.generation, &kind_payload, handle, mask) {
-				return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::DriverExited, driver_name);
+				// The send did not transfer it, so it is still the transaction's - and so is every
+				// entry after it, which is exactly what the rollback now closes.
+				return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, FailureCause::DriverExited, driver_name, attempts_left);
 			}
+			txn.handed_over(handle);
 		}
 		// IN FLIGHT. The transaction's holdings become the node's binding, which is what the
 		// central wait watches and what a rollback gives back.
@@ -2397,6 +2610,9 @@ enum Step {
 unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> Step {
 	unsafe {
 		while let Some(event) = node.pop() {
+			// WHETHER THIS WAS A STOP THAT COMPLETED, so the outcome can be stated once the
+			// teardown has answered rather than before it has run - see the `Stopped` arm.
+			let mut planned_stop = false;
 			let cause: FailureCause = match event {
 				// AN OFFER BEFORE `READY` IS HELD; AN OFFER AFTER IT IS PUBLISHED AT ONCE.
 				//
@@ -2469,6 +2685,15 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 						print(b"DeviceManager: a second terminal frame on a binding that is already past its handshake - refused\n");
 						return Step::Again;
 					}
+					// THE BRING-UP INCIDENT IS SPENT AND A NEW ONE STARTS AT `Online`.
+					//
+					// Neither counter was reset here, so a crash an hour later was judged against the
+					// incident opened for the ORIGINAL bring-up: expired, so recovery was declared
+					// spent before it began - or, if it had not expired, charged with whatever
+					// attempts the bring-up had already used. A driver that came up is a driver whose
+					// bring-up succeeded, and what follows is a different incident.
+					node.attempt = 0;
+					node.incident = Incident::open();
 					let entry = node.candidates[node.candidate];
 					catalogue.publish_all(node.id, entry, &mut node.offers);
 					// SUPERVISION STARTS WHERE THE DRIVER SAYS IT IS UP, not at the bind: before
@@ -2499,11 +2724,16 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// then `Binding`, and an operator's stop that did the same would be a stop that
 				// starts the driver again.
 				BindingEvent::Stopped { .. } => {
-					print(b"DeviceManager: ");
-					print_driver_name(driver_name);
-					print(b" stopped cleanly: ");
-					print(node.stop_intent.name());
-					print(b"\n");
+					// SAID AFTER THE TEARDOWN, NOT BEFORE IT. This printed "stopped cleanly" HERE -
+					// before `roll_back` had called `device_release` and learned whether the device
+					// went quiet - so an unconfirmed teardown could announce a clean flush and then
+					// land in `Quarantined`. The answer is recorded and the line is printed below,
+					// once there is something to base it on.
+					planned_stop = true;
+					// AND IT IS NOT `driver-exited`. That cause renders as "it exited without saying
+					// anything", which is the opposite of what a STOPPED frame is: the driver said
+					// exactly this. A planned stop that completes is not a failure, and the cause
+					// only travels so the shared teardown path has one to carry.
 					FailureCause::DriverExited
 				}
 				// The process ended, or its channel closed with nothing terminal on it. Both are a
@@ -2525,6 +2755,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			let report = capture(node, cause);
 			report_incident(driver_name, &report);
 			node.incident_report = Some(report);
+			node.incident_stored = false;
 			// EVERYTHING THIS BINDING PUBLISHED GOES WITH IT, and the count is SAID.
 			//
 			// A provider outliving the binding that published it is a channel whose server is gone:
@@ -2548,6 +2779,20 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			let planned: bool = node.stop_intent != driver_binding::StopIntent::Fault;
 			let retryable: bool = !planned && cause.retryable() && may_try_again(&node.incident, node.attempt);
 			let alive: bool = if retryable { retry_or_quarantine(&mut node.record, &mut txn, &mut node.offers, cause, driver_name) } else { give_up_with(&mut node.record, &mut txn, &mut node.offers, cause, node.stop_intent, driver_name) };
+			// NOW THE STOP CAN BE DESCRIBED, because the teardown has run and the record says how it
+			// went. A `Quarantined` landing means nothing observed the device go quiet, which is the
+			// one outcome a "stopped cleanly" line must never be printed over.
+			if planned_stop {
+				print(b"DeviceManager: ");
+				print_driver_name(driver_name);
+				if node.record.state == BindingState::Quarantined {
+					print(b" answered the stop, and its teardown did NOT confirm - nothing here says its work was flushed: ");
+				} else {
+					print(b" stopped cleanly: ");
+				}
+				print(node.stop_intent.name());
+				print(b"\n");
+			}
 			if !alive {
 				return Step::Done;
 			}
@@ -2555,7 +2800,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				return Step::NextCandidate;
 			}
 			node.attempt += 1;
-			back_off(&node.incident, node.attempt);
+			node.retry_at = back_off_until(&node.incident, node.attempt);
 			return Step::Again;
 		}
 		Step::Waiting
@@ -2577,6 +2822,9 @@ struct CatalogueView<'a> {
 // PermissionManager mints for the operator path.
 struct PolicyView<'a> {
 	nodes: &'a mut [Node],
+	// A DISABLE ON A RUNNING BINDING HAS TO WITHDRAW WHAT IT PUBLISHED before it asks the driver to
+	// finish, so the verb needs the catalogue - see `apply_policy`.
+	catalogue: &'a mut Catalogue,
 	// This program's OWN ConfigService connection. The bytes live there; the decision lives here.
 	config: u64,
 }
@@ -2611,7 +2859,7 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 			return Ok(PolicyOutcome::NotStored);
 		}
 		// AND NOW THE EFFECT ON THE NODE, which is the half only this program can perform.
-		unsafe { apply_policy(node, verb) };
+		unsafe { apply_policy(node, verb, self.catalogue) };
 		Ok(PolicyOutcome::Accepted)
 	}
 
@@ -2646,9 +2894,35 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 	}
 }
 
+// START THE TEARDOWN AN OPERATOR ASKED FOR, on a binding that is running.
+//
+// The providers go first and the driver is asked second, which is the order `stop_all` uses and for
+// the reason written there: a driver asked to finish while work keeps arriving is a driver that
+// cannot finish. What this does NOT do is wait - the standing loop's own wait already watches this
+// node's channel and its process, and `advance` resolves the `Stopping` against the intent recorded
+// here. A verb that blocked would be the teardown-blocks-every-other-node defect with a nicer name.
+unsafe fn begin_operator_stop(node: &mut Node, catalogue: &mut Catalogue) {
+	unsafe {
+		let Some(binding) = &node.binding else { return };
+		let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
+		catalogue.withdraw_binding(node.id);
+		if !node.record.move_to(BindingState::Stopping, None) {
+			print(b"DeviceManager: the operator's disable could not enter the teardown\n");
+			return;
+		}
+		if !send_frame(channel, driver_protocol::Opcode::Stop, generation, &[], 0, 0) {
+			// Its channel is already gone, so there is nobody to ask: the exit will arrive on its
+			// own and `advance` resolves it against the intent just recorded.
+			print(b"DeviceManager: ");
+			print_driver_name(node.driver_name());
+			print(b" could not be asked to stop; its exit is what will end the binding\n");
+		}
+	}
+}
+
 // What a verb does to the node itself. The write has already happened; this is the half no other
 // component can perform.
-unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb) {
+unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, catalogue: &mut Catalogue) {
 	unsafe {
 		use proto::system::PolicyVerb;
 		match verb {
@@ -2656,6 +2930,18 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb) {
 			// does not rebind; one on a binding that is not running has nothing to give back.
 			PolicyVerb::Disable => {
 				node.stop_intent = driver_binding::StopIntent::OperatorDisable;
+				// A RUNNING BINDING IS STOPPED, NOT RELABELLED.
+				//
+				// This tried `Online -> Disabled` directly. The table refuses that - the path is
+				// `Online -> Stopping -> Disabled`, because `Stopping` is what "there is a teardown
+				// to run" means - and nothing sent `STOP`, withdrew the providers or enqueued
+				// anything. So the refusal was silent, the loop went back to heartbeats, and the
+				// driver an operator had just disabled stayed online. The stop the shutdown path
+				// performs is the same stop this verb needs.
+				if node.record.state == BindingState::Online {
+					begin_operator_stop(node, catalogue);
+					return;
+				}
 				if !node.record.move_to(BindingState::Disabled, None) {
 					print(b"DeviceManager: the operator's disable is queued behind this binding's teardown\n");
 				}
@@ -2664,6 +2950,13 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb) {
 			PolicyVerb::Enable => {
 				node.stop_intent = driver_binding::StopIntent::Fault;
 				node.record.move_to(BindingState::Unbound, None);
+				// AND SOMETHING HAS TO PERFORM THE BIND IT INVITES. `Unbound` is the state that
+				// invites one; nothing in the standing loop starts a candidate for a node just
+				// because it is in that state, so an accepted enable brought nothing back. Same
+				// mechanism the operator retry uses.
+				node.attempt = 0;
+				node.incident = Incident::open();
+				node.restart_requested = true;
 			}
 			// SELECT CHANGES NOTHING NOW. It is stored, and it applies at the next bind.
 			PolicyVerb::Select => {}
@@ -2671,8 +2964,22 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb) {
 			// without that rule the two mechanisms meet in the table with nothing said, and whoever
 			// implements it decides for themselves whether an operator can spend the budget again.
 			PolicyVerb::Retry => {
+				// EXACTLY ONE FURTHER ATTEMPT, AND IT IS ACTUALLY OPENED.
+				//
+				// This subtracted from the counter and replaced the incident, and left the record in
+				// `Failed` - so it granted zero attempts, not one: nothing performed the legal
+				// `Failed -> Binding` transition and nothing called a bind path. The standing loop
+				// starts a candidate for a node it finds in `Backoff`, which is where a retry with a
+				// budget belongs; from there the ordinary machinery runs exactly one attempt, because
+				// the incident is fresh and `Retry` does not reset the automatic budget.
 				node.attempt = node.attempt.saturating_sub(1);
 				node.incident = Incident::open();
+				// ASKED FOR, AND THE LOOP PERFORMS IT. A state change alone would not do: `advance`
+				// is event-driven and a node sitting in `Failed` or `Backoff` raises no event, so
+				// nothing would ever start the attempt. The flag is consumed once by the standing
+				// loop, which calls `start_candidate` - and `Failed -> Binding` is a legal edge, so
+				// the ordinary bind path performs the transition rather than this verb faking it.
+				node.restart_requested = true;
 			}
 		}
 	}
@@ -2686,6 +2993,7 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 		self.nodes
 			.iter()
 			.map(|node| proto::system::BindingRecord {
+				index: node.index as u32,
 				bus: node.id.bus as u32,
 				dev: node.id.dev as u32,
 				func: node.id.func as u32,
@@ -2785,6 +3093,117 @@ fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -
 	}
 }
 
+// EVERY NODE'S STORED POLICY, READ BACK AND APPLIED. Called when the ConfigService connection arrives.
+//
+// The policy was WRITE-ONLY: `PolicyView::apply` wrote `device.policy.<bdf>` and nothing ever read it
+// again - not at startup, not at a reconnect, not at candidate selection - so a disable an operator
+// stored did not survive a reboot and a selected artifact was never preferred. The two stored shapes
+// are the two `decide_policy` writes: `disabled`, and `select=<artifact>`.
+//
+// A STALE CHOICE IS SAID, NOT SILENTLY DROPPED. An artifact this image no longer declares for this
+// device cannot be honoured - policy narrows and never widens - and an operator whose stored
+// preference has stopped applying is exactly who needs to be told.
+unsafe fn load_stored_policy(nodes: &mut [Node], config: u64) {
+	unsafe {
+		if config == 0 {
+			return;
+		}
+		for node in nodes.iter_mut() {
+			let key = policy_key(node.id);
+			let mut client = proto::system::config::Client::new(ChannelTransport { chan: config });
+			let Some(Ok(entry)) = client.get(&key) else { continue };
+			let value = entry.as_bytes();
+			if value == b"disabled" {
+				// A device an operator disabled is not bound at all this boot. `Unbound -> Disabled`
+				// is in the table, which is the edge for a node that has nothing to tear down.
+				if node.record.move_to(BindingState::Disabled, None) {
+					print(b"DeviceManager: ");
+					print_driver_name(node.driver_name());
+					print(b" stays unbound - an operator disabled it and that is stored\n");
+				}
+				continue;
+			}
+			let Some(wanted) = value.strip_prefix(b"select=") else { continue };
+			match node.candidates.iter().position(|entry| entry.name == wanted) {
+				Some(at) => {
+					node.candidate = at;
+					print(b"DeviceManager: ");
+					print_driver_name(wanted);
+					print(b" is the stored choice for this device and is tried first\n");
+				}
+				None => {
+					print(b"DeviceManager: the stored choice ");
+					print_driver_name(wanted);
+					print(b" is not a candidate this image declares for that device any more; it is STALE and the registry order applies\n");
+				}
+			}
+		}
+	}
+}
+
+// WRITE EVERY NEW INCIDENT SOMEWHERE THAT OUTLIVES THIS PROGRAM.
+//
+// The report lived only in `Node::incident_report`, and the endpoint that serves it is this program's
+// - so when DeviceManager died, the endpoint and the sole copy went together and the last thing that
+// went wrong before it died was exactly what nobody could read. M5 asks for the snapshot to remain
+// visible after both the driver AND the manager have died.
+//
+// ConfigService is where it goes, because it is the one component that already outlives this one and
+// already holds this program's per-device records. The value is a compact text row rather than the
+// wire struct: whoever reads it after this program is gone is reading it through an ordinary
+// configuration `get`, not through a typed endpoint that no longer exists.
+fn persist_incidents(nodes: &mut [Node], config: u64) {
+	{
+		if config == 0 {
+			return;
+		}
+		for node in nodes.iter_mut() {
+			if node.incident_stored {
+				continue;
+			}
+			let Some(report) = node.incident_report else { continue };
+			let mut value = alloc::string::String::new();
+			let mut number = [0u8; 20];
+			let mut push_number = |value: &mut alloc::string::String, n: u64| {
+				let written = decimal(n, &mut number);
+				value.push_str(core::str::from_utf8(&number[..written]).unwrap_or("0"));
+			};
+			value.push_str("cause=");
+			value.push_str(core::str::from_utf8(report.cause.name()).unwrap_or("?"));
+			value.push_str(" state=");
+			value.push_str(core::str::from_utf8(report.state.name()).unwrap_or("?"));
+			value.push_str(" gen=");
+			push_number(&mut value, report.binding.generation);
+			value.push_str(" attempts=");
+			push_number(&mut value, report.attempts as u64);
+			value.push_str(" last-opcode=");
+			push_number(&mut value, report.last_opcode as u64);
+			value.push_str(" silent-for=");
+			push_number(&mut value, report.silent_for);
+			let key = incident_key(node.id);
+			let mut client = proto::system::config::Client::new(ChannelTransport { chan: config });
+			if client.set(&proto::system::ConfigEntry { key, value }).is_some() {
+				node.incident_stored = true;
+			}
+		}
+	}
+}
+
+// Where one device's last incident is kept, under the same reserved prefix as its policy so both are
+// the records this program owns.
+fn incident_key(id: BindingId) -> alloc::string::String {
+	let mut key = alloc::string::String::from("device.policy.incident.");
+	let mut number = [0u8; 20];
+	for (at, part) in [id.bus as u64, id.dev as u64, id.func as u64].into_iter().enumerate() {
+		if at > 0 {
+			key.push('.');
+		}
+		let n = decimal(part, &mut number);
+		key.push_str(core::str::from_utf8(&number[..n]).unwrap_or("0"));
+	}
+	key
+}
+
 // The config key one device's policy lives under. The BDF, because that is the device's identity -
 // a row number would name whatever the table happened to hold this boot.
 fn policy_key(id: BindingId) -> alloc::string::String {
@@ -2855,7 +3274,7 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 // channel is ready, and one request is one reply.
 // Answer one operator request. The endpoint is narrow by design and single-client: exactly one
 // connection is minted for the operator path, so there is nothing here to multiplex.
-unsafe fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients, nodes: &mut [Node], config: u64, buf: &mut [u8]) {
+unsafe fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients, nodes: &mut [Node], catalogue: &mut Catalogue, config: u64, buf: &mut [u8]) {
 	unsafe {
 		let ReceivedCaps::Message { len, handles } = recv_caps_blocking(service, buf) else { return };
 		for &handle in handles.as_slice() {
@@ -2883,7 +3302,7 @@ unsafe fn serve_policy_once(service: u64, is_root: bool, clients: &mut Catalogue
 				return;
 			}
 		}
-		let mut view = PolicyView { nodes, config };
+		let mut view = PolicyView { nodes, catalogue, config };
 		let mut reply = [0u8; 1024];
 		let mut request_handles = wire::Handles::new();
 		let mut reply_handles = wire::Handles::new();
@@ -3012,7 +3431,14 @@ unsafe fn observe_claim(node: &mut Node, device_privilege: u64, driver_name: &[u
 				print(b"DeviceManager: ");
 				print_driver_name(driver_name);
 				print(b"'s device is quarantined - nothing observed it go quiet, and it is not claimed again this boot\n");
-				node.record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed));
+				// ADOPTED, AND THE MOVE IS CHECKED. This was `move_to(..)` with the result discarded,
+				// and the edge did not exist - so the refusal was silent and `give_up` then recorded
+				// `Failed` for an attempt that had taken no claim. `Binding -> Quarantined` is now in
+				// the table, and a refusal here would be a bug worth seeing rather than a state
+				// quietly replaced by a worse description of it.
+				if !node.record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed)) {
+					print(b"DeviceManager: the binding record refused to adopt the device's quarantine\n");
+				}
 				ClaimReadiness::Terminal(FailureCause::TeardownUnconfirmed)
 			}
 			// A CORRECT `domain_kill` CANNOT LEAVE IT HERE. Reported as the invariant violation it

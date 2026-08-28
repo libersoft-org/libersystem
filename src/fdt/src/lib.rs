@@ -1148,10 +1148,20 @@ impl Fdt {
 							// GICv2 describes a distributor and a CPU interface, and the two are
 							// driven differently - so which one this is has to come from the
 							// machine rather than from the shape of `reg`.
-							if self.str_eq(pname, "compatible") && self.stringlist_contains(val, len, b"arm,gic-v3") {
-								gic_version = 3;
-							} else if self.str_eq(pname, "compatible") && gic.known {
-								gic_version = 2;
+							//
+							// AND ONLY FOR THE NODE WHOSE ADDRESSES WERE TAKEN. The addresses are
+							// committed once, while `gic_dist == 0`, and this was rewritten for EVERY
+							// recognised GIC node afterwards - so a usable GICv2 followed by a
+							// recognised GICv3 produced the FIRST node's GICv2 cpu-interface address
+							// with version 3, which the kernel then drives as a redistributor region.
+							// A version that describes a different node than the addresses do is worse
+							// than no version at all.
+							if gic_dist == 0 && self.str_eq(pname, "compatible") {
+								if self.stringlist_contains(val, len, b"arm,gic-v3") {
+									gic_version = 3;
+								} else if gic.known {
+									gic_version = 2;
+								}
 							}
 						} else if depth == 1 && d1_chosen && (self.str_eq(pname, "linux,initrd-start") || self.str_eq(pname, "linux,initrd-end")) {
 							// QEMU writes these as one or two cells depending on the machine, so

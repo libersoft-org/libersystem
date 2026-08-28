@@ -328,7 +328,11 @@ fn boot_main() {
 	// system - uppercase, unformatted, and meaningless to them. The trace tool runs the guest with
 	// the development profile named over fw_cfg, which is exactly the condition "a harness is
 	// watching", and the same condition the boot line above uses.
-	if arch::boot_profile().is_some() {
+	// ONLY WHERE A TOOL IS ACTUALLY READING IT. `is_some()` was true for the ordinary development
+	// profile, which is what a PERSON boots for an interactive instance - so the one line in the
+	// report addressed to a program was shown to every operator who ever used that profile,
+	// uppercase and meaningless to them. `perf-trace.py` boots `development-trace`; nothing else does.
+	if arch::boot_profile() == Some("development-trace") {
 		serial_println!("\x1ePERF tsc_hz {}", arch::tsc::hz());
 	}
 	// WHAT IS ACTUALLY TRUE AT THIS POINT. The line said "entering the userspace shell" and was

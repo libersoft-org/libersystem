@@ -683,6 +683,15 @@ pub fn detach_for(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// NOTHING ATTACHED IS NOTHING TO CONFIRM, and that is a success rather than a failure: a device
 	// this controller never translated has no mapping that could outlive its binding.
 	let Some(domain) = domain_of(index as u32) else { return true };
+	// DRAINED BEFORE THE REVOKE, because after it there is nothing left to attribute a fault TO.
+	//
+	// This ran only at the end, and by then the endpoint had been removed from `DOMAINS` and revoked -
+	// so `VirtioIommu::drain_faults` could no longer resolve a queued endpoint to its domain and
+	// reported `DomainId(0)`, with `Generation(0)` behind it. That is the teardown path, which is
+	// exactly where a fault most needs attributing: a device faulting as its binding ends is the case
+	// the containment policy is for. Drained again afterwards, because the revoke itself can produce
+	// one.
+	poll_faults();
 	DOMAINS.lock().retain(|(device, _)| *device != index as u32);
 	let confirmed = match revoke_endpoint(domain, bus, dev, func) {
 		Ok(dma::Release::FramesReusable) => true,
@@ -723,6 +732,13 @@ pub fn poll_faults() {
 			match event.address {
 				Some(address) => crate::serial_println!("iommu: FAULT endpoint {:#x} domain {} {:?} at {:#x}: {:?}", event.endpoint.0, event.domain.0, event.access, address.get(), event.reason),
 				None => crate::serial_println!("iommu: FAULT endpoint {:#x} domain {} {:?} at an address the controller did not report: {:?}", event.endpoint.0, event.domain.0, event.access, event.reason),
+			}
+			// AND THE DEVICE IS TAKEN OFF THE BUS. Reporting a fault and leaving the endpoint
+			// mastering memory is a diagnostic where the milestone asks for containment: a device
+			// resolving addresses its own domain refuses is a device to stop, not to describe.
+			let (bus, dev, func) = ((event.endpoint.0 >> 8) as u8, ((event.endpoint.0 >> 3) & 0x1f) as u8, (event.endpoint.0 & 7) as u8);
+			if let Some(index) = crate::device::contain_faulting_endpoint(bus, dev, func) {
+				crate::serial_println!("iommu:   device {index} at {bus:02x}:{dev:02x}.{func} no longer masters the bus - its binding is contained until whoever holds it tears it down");
 			}
 		}
 		reported += taken;
@@ -786,6 +802,18 @@ pub fn report() {
 	};
 	crate::serial_println!("iommu: virtio-iommu present, enforcing={enforcing}, healthy={healthy}");
 	poll_faults();
+	// THE LEDGER, PRINTED. `live_mappings`, `quarantined_mappings` and the fault total existed and
+	// were read only by the DMA crate's own tests, so M4's "exact post-restart endpoint, mapping and
+	// IOVA baseline" could not be asserted from outside the crate at all. These are that baseline:
+	// a machine that has torn every binding down and is holding nothing reads zero live and zero
+	// quarantined, and a non-zero quarantined count is the deliberate leak this kernel takes when a
+	// teardown could not be confirmed - which is a number an operator should be able to see.
+	if let Some((endpoints, live, quarantined, faults, dropped)) = with(|controller| {
+		let iommu = controller.iommu();
+		(iommu.attached_endpoints(), iommu.live_mappings(), iommu.quarantined_mappings(), iommu.faults().total(), iommu.faults().dropped())
+	}) {
+		crate::serial_println!("iommu: {endpoints} endpoint(s) attached, {live} mapping(s) live, {quarantined} quarantined, {faults} fault(s) reported ({dropped} not kept)");
+	}
 	if !enforcing || !healthy {
 		crate::serial_println!("iommu: WARNING - the controller is not in the state this profile requires");
 	}

@@ -145,12 +145,18 @@ unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq:
 			let ready: i64 = if service_open {
 				match common::wait_or_answer(bootstrap, bind, &[irq, frames]) {
 					Some(at) => at as i64,
-					None => exit(),
+					None => {
+						common::finish_stop(bootstrap, bind, rx.capability);
+						exit()
+					}
 				}
 			} else {
 				match common::wait_or_answer(bootstrap, bind, &[irq]) {
 					Some(_) => 0,
-					None => exit(),
+					None => {
+						common::finish_stop(bootstrap, bind, rx.capability);
+						exit()
+					}
 				}
 			};
 			if ready == 0 {

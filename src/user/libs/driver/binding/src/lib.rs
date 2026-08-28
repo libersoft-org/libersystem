@@ -101,6 +101,16 @@ impl BindingState {
 				| (BindingState::Stopping, BindingState::Backoff)
 				| (BindingState::Stopping, BindingState::Failed)
 				| (BindingState::Stopping, BindingState::Quarantined)
+				// A BIND THAT DISCOVERS THE DEVICE IS ALREADY QUARANTINED ADOPTS THAT, rather than
+				// inventing a failure of its own.
+				//
+				// `observe_claim` reads the kernel's claim snapshot AFTER the node has entered
+				// `Binding`, and `CLAIM_STATE_QUARANTINED` is a terminal fact about the DEVICE - some
+				// earlier holder's teardown was never confirmed and nothing will claim it again this
+				// boot. Without this edge the move was refused in silence and the node then reported
+				// `Failed`/`teardown-unconfirmed`, which says this attempt tore something down badly.
+				// It did not: it took no claim at all. The state a reader needs is the device's.
+				| (BindingState::Binding, BindingState::Quarantined)
 				| (BindingState::Backoff, BindingState::Binding)
 				| (BindingState::Backoff, BindingState::Failed)
 				| (BindingState::Failed, BindingState::Binding)

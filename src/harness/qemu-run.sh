@@ -10,6 +10,10 @@
 #   DEBUG=1   QEMU waits for GDB (-s -S) on port :1234
 #   NOKVM=1   disable KVM (more reliable single-stepping under TCG)
 #   TEST=1    test mode (isa-debug-exit or semihosting, maps exit code to pass/fail)
+#   LIBER_BOOT_PROFILE  which profile name goes over fw_cfg with DEV_PROFILE=1. `development` is the
+#                       interactive instance a PERSON boots; `development-trace` is what
+#                       `perf-trace.py` boots, and it is the only one the kernel emits its raw
+#                       `\x1ePERF` anchor on - a line addressed to a tool, shown only where one is.
 #   DEV_PROFILE=1 development profile: names it over fw_cfg so the guest reports it and
 #             DeviceManager starts a control agent, and attaches the channel the agent
 #             answers on. On x86_64 that is the persistent instance `./dev.sh up` owns; on
@@ -777,6 +781,16 @@ if [[ "${DEV_PROFILE:-0}" == "1" && "${TEST:-0}" == "1" ]]; then
 	echo "qemu-run: DEV_PROFILE and TEST are mutually exclusive" >&2
 	exit 1
 fi
+# A PROFILE NAME THE KERNEL DOES NOT KNOW WOULD BOOT AN ORDINARY GUEST THAT LOOKS LIKE A DEVELOPMENT
+# ONE, which is the failure this block already exists to prevent - so the two the kernel recognises
+# are the two this accepts.
+case "${LIBER_BOOT_PROFILE:-development}" in
+development | development-trace) ;;
+*)
+	echo "qemu-run: LIBER_BOOT_PROFILE must be 'development' or 'development-trace'; the kernel recognises no other name and would boot as though none were named" >&2
+	exit 1
+	;;
+esac
 
 # AND REJECT A DRIVEN GUEST ON A DIRECT BOOT, on the two targets whose direct path can carry only
 # one blob.
@@ -1063,7 +1077,14 @@ qemu_run_x86_64() {
 	local usb_storage_id=""
 	if [[ "${TEST:-0}" == "1" || -z "${USB_HOST:-}" ]]; then
 		usb_storage_id="vusb"
-		qemu_args+=(-drive "file=$USB_DISK,if=none,id=vusb,format=raw")
+		# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
+		#
+		# The other three fixture media are attached `readonly=on` and can be shared; this one is not, so
+		# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
+		# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
+		# system disk already takes, and `scratch_sweep` inside it is the cleanup.
+		usb_run_disk="$(qemu_run_disk "$USB_DISK")" || usb_run_disk="$USB_DISK"
+		qemu_args+=(-drive "file=$usb_run_disk,if=none,id=vusb,format=raw")
 	fi
 	qemu_attach_xhci qemu_args "$usb_storage_id"
 
@@ -1091,7 +1112,7 @@ qemu_run_x86_64() {
 		# The development channel is present in the cold test configuration too: the same
 		# second port on every target is what lets a scenario runner drive a boot over
 		# identical framing, including where the persistent profile does not exist.
-		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-x86_64-test.sock" "$virtio_opts"
+		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-x86_64-test.$$.sock" "$virtio_opts"
 		# A BRIDGE WITH SOMETHING BEHIND IT, so the PCI walk has a second bus to find. The x86
 		# enumeration followed no bridges and the q35 default topology puts everything on bus 0,
 		# so recursive enumeration could be written and never executed - it is the topology, not
@@ -1161,7 +1182,7 @@ qemu_run_x86_64() {
 	# construction, and it adds no device and rewrites no image, so the profile changes
 	# nothing a normal or production boot is built from.
 	if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
-		qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
+		qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
 		qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "$virtio_opts"
 	fi
 
@@ -1240,7 +1261,14 @@ qemu_run_aarch64() {
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
 	qemu_prepare_usb_image "$media_suffix"
-	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$USB_DISK")
+	# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
+	#
+	# The other three fixture media are attached `readonly=on` and can be shared; this one is not, so
+	# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
+	# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
+	# system disk already takes, and `scratch_sweep` inside it is the cleanup.
+	usb_run_disk="$(qemu_run_disk "$USB_DISK")" || usb_run_disk="$USB_DISK"
+	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
 	qemu_attach_xhci qemu_args vusb
 
 	# Test mode: enable Arm semihosting while retaining the selected serial backend.
@@ -1251,7 +1279,7 @@ qemu_run_aarch64() {
 		# Unlike x86, the virt machine has no default VGA device, so test mode supplies
 		# the same discoverable GPU path without enabling the interactive peripherals.
 		qemu_args+=(-device virtio-gpu-pci,disable-legacy=on)
-		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-aarch64-test.sock" "disable-legacy=on"
+		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-aarch64-test.$$.sock" "disable-legacy=on"
 		# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
 		# SOURCE rather than a disabled one: it fills a capture period with silence on the device's
 		# own clock, so the receive queue, the input-stream search and the whole inverted used-ring
@@ -1266,7 +1294,7 @@ qemu_run_aarch64() {
 		# a cold boot of every target, and what that needs is a guest that names the profile
 		# (so DeviceManager starts an agent) and a channel for the agent to answer on.
 		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
-			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
+			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
 			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" "disable-legacy=on"
 			# The same discoverable GPU the test configuration supplies, and for the same
 			# reason: the virt machine has no VGA device, the interactive set offers ramfb
@@ -1446,7 +1474,14 @@ qemu_run_riscv64() {
 
 	# xHCI USB host controller + hub with keyboard, tablet, and storage.
 	qemu_prepare_usb_image "$media_suffix"
-	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$USB_DISK")
+	# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
+	#
+	# The other three fixture media are attached `readonly=on` and can be shared; this one is not, so
+	# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
+	# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
+	# system disk already takes, and `scratch_sweep` inside it is the cleanup.
+	usb_run_disk="$(qemu_run_disk "$USB_DISK")" || usb_run_disk="$USB_DISK"
+	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
 	qemu_attach_xhci qemu_args vusb
 
 	# Test mode: enable RISC-V semihosting while retaining the selected serial backend.
@@ -1456,7 +1491,7 @@ qemu_run_riscv64() {
 		# The RISC-V virt machine has no default VGA device, while the boot-chain test
 		# requires DisplayService and its Console/Shell dependents.
 		qemu_args+=(-device virtio-gpu-pci)
-		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-riscv64-test.sock" ""
+		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-riscv64-test.$$.sock" ""
 		# AND A SOUND DEVICE THE SUITE CAN RECORD FROM. The `none` audio backend is a SYNTHETIC
 		# SOURCE rather than a disabled one: it fills a capture period with silence on the device's
 		# own clock, so the receive queue, the input-stream search and the whole inverted used-ring
@@ -1468,7 +1503,7 @@ qemu_run_riscv64() {
 		# Interactive-only devices: ramfb, virtio-keyboard/tablet, sound, virtconsole.
 		qemu_attach_virt_interactive qemu_args -riscv64 ""
 		if [[ "${DEV_PROFILE:-0}" == "1" ]]; then
-			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=development")
+			qemu_args+=(-fw_cfg "name=opt/org.libersystem/profile,string=${LIBER_BOOT_PROFILE:-development}")
 			qemu_attach_dev_channel qemu_args "$(dev_channel_socket)" ""
 			# The same discoverable GPU the test configuration supplies, and for the same
 			# reason: the virt machine has no VGA device, the interactive set offers ramfb

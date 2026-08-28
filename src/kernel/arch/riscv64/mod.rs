@@ -141,12 +141,36 @@ pub(crate) fn set_fwcfg_base(base: u64) {
 // over fw-cfg, so selecting one changes no byte the guest is built from - the same kernel,
 // loader and system image boot with or without it. That is what lets a scenario runner drive a
 // cold boot of this target: the profile is what makes DeviceManager start a control agent.
+// Whether this boot is the named no-device-tree regression profile.
+//
+// THE SAME RULE aarch64 HAS, AND riscv64 HAD NONE. A boot with no tree fell through to the compiled
+// `qemu-virt-aia` descriptor unconditionally - the hardcoded `0x2800_0000` base with `USABLE = true` -
+// so a machine that published no tree was handed QEMU `virt`'s IMSIC addresses and started writing
+// MSIs into them. That is a static descriptor selected by every absent or unparseable tree, where M4
+// asks for one selected only by a NAMED profile.
+//
+// A boot with no tree has no way to name itself - the machine description IS the tree - so the
+// authorisation is compiled in and the harness that boots the profile is what sets it. The default is
+// NO, which turns a machine this port cannot discover into a named refusal rather than an address
+// nobody claimed.
+pub fn boot_profile_authorises_no_dt() -> bool {
+	option_env!("LIBER_NO_DT_PROFILE").is_some_and(|value| value == "1")
+}
+
 pub fn boot_profile() -> Option<&'static str> {
 	let mut name = [0u8; 32];
 	let base = FWCFG_BASE.load(core::sync::atomic::Ordering::Relaxed);
 	let len = crate::arch::common::fwcfg::read_file(base, b"opt/org.libersystem/profile", &mut name, super::paging::phys_to_virt)?;
 	match &name[..len] {
 		b"development" => Some("development"),
+		// A SECOND PROFILE, SO "A HARNESS IS WATCHING" IS ITS OWN CONDITION.
+		//
+		// `boot_main` emitted the `\x1ePERF` anchor whenever a profile was named, and the profile a
+		// PERSON boots interactively (`DEV_PROFILE=1`) is the same one - so a raw record-separator
+		// line addressed to a program appeared on a human's console. It is a development boot in
+		// every other respect, so everything keyed on `is_some()` still holds; what this adds is a
+		// way for the one line addressed to a tool to know a tool is there.
+		b"development-trace" => Some("development-trace"),
 		_ => None,
 	}
 }

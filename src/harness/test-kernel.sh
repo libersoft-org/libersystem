@@ -282,7 +282,13 @@ set +e
 	# what a selector's answer actually is. Both are `option_env!`, so they are compile-time - the
 	# kernel is rebuilt for a different selection, which is why the runner refuses an unknown ID
 	# rather than skipping it.
-	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" cargo "${TEST_ARGS[@]}"
+	# `LIBER_NO_DT_PROFILE` IS COMPILE-TIME, so it is passed HERE and not to the runner.
+	#
+	# It authorises the named no-device-tree profile on the two device-tree ports: without it a boot
+	# that publishes no tree gets a named refusal instead of QEMU `virt`'s controller addresses. It had
+	# no setter anywhere in the tree - the only occurrence was the consumer - so the authorised profile
+	# was unreachable and the refusal it guards was untestable.
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" cargo "${TEST_ARGS[@]}"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

@@ -974,6 +974,12 @@ impl<B: Backend> Iommu<B> {
 		taken
 	}
 
+	// How many endpoints this controller is translating for. Part of the baseline a restart is
+	// asserted against - see `iommu::report`.
+	pub fn attached_endpoints(&self) -> usize {
+		self.domains.values().map(|state| state.endpoints.len()).sum()
+	}
+
 	pub fn live_mappings(&self) -> usize {
 		self.mappings.values().filter(|m| m.state == MappingState::Live).count()
 	}

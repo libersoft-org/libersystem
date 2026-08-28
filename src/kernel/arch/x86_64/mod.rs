@@ -166,6 +166,14 @@ pub fn boot_profile() -> Option<&'static str> {
 	let len = fwcfg::read_file(b"opt/org.libersystem/profile", &mut name)?;
 	match &name[..len] {
 		b"development" => Some("development"),
+		// A SECOND PROFILE, SO "A HARNESS IS WATCHING" IS ITS OWN CONDITION.
+		//
+		// `boot_main` emitted the `\x1ePERF` anchor whenever a profile was named, and the profile a
+		// PERSON boots interactively (`DEV_PROFILE=1`) is the same one - so a raw record-separator
+		// line addressed to a program appeared on a human's console. It is a development boot in
+		// every other respect, so everything keyed on `is_some()` still holds; what this adds is a
+		// way for the one line addressed to a tool to know a tool is there.
+		b"development-trace" => Some("development-trace"),
 		_ => None,
 	}
 }

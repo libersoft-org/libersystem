@@ -440,13 +440,17 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, device: &Virtio, gpu: &Gpu,
 			let ready: i64 = if irq != 0 {
 				match common::wait_or_answer(bootstrap, bind, &[service, irq]) {
 					Some(at) => at as i64,
-					None => exit(),
+					None => {
+						common::finish_stop(bootstrap, bind, 0);
+						exit()
+					}
 				}
 			} else {
 				wait_any_periodic(&[service, bootstrap], clock() + POLL_TICKS)
 			};
 			if irq == 0 && ready == 1 {
 				if !common::answer_ping(bootstrap, bind) {
+					common::finish_stop(bootstrap, bind, 0);
 					exit();
 				}
 				continue;

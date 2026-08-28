@@ -122,6 +122,23 @@ pub fn init() {
 }
 
 // The number of discovered devices.
+// A DEVICE THAT FAULTED AGAINST ITS OWN TRANSLATION IS TAKEN OFF THE BUS.
+//
+// M0153's M5 asks for a hardware fault to reach the binding lifecycle's containment, and nothing did:
+// `poll_faults` printed a line and the device carried on mastering the bus. This is the narrowest of
+// the three answers the milestone permits - refusal, DISABLED BUS MASTERING, or quarantine - and it
+// is the one that needs no cooperation from a driver that is by definition doing something wrong.
+//
+// The claim is NOT released here. Releasing is the manager's decision and the teardown has to be
+// confirmed; what this does is stop the device before that conversation, which is the point of
+// containment. Answers the index it contained, so the caller can say which device it was.
+pub fn contain_faulting_endpoint(bus: u8, dev: u8, func: u8) -> Option<usize> {
+	let table = DEVICES.lock();
+	let index = table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func)?;
+	bus_master(&table[index], false);
+	Some(index)
+}
+
 pub fn count() -> usize {
 	DEVICES.lock().len()
 }
@@ -413,16 +430,26 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	with(index, |entry| bus_master(entry, false));
 	// 2. Everything the claim minted stops working, without the holder's cooperation.
 	revoke_derived(key);
-	// 3. The vectors. Masked and held rather than reissued: a request to stop is not proof of
-	//    stopping, and `SYS_DEVICE_QUIESCED` is the claim that answers it.
-	let vectors = crate::arch::interrupts::release_msi_for_device(index as u32);
-	if vectors != 0 {
-		crate::serial_println!("device: {index} released - {vectors} MSI vector(s) masked");
-	}
-	// 4. And the translation, which is the only step that can fail to CONFIRM. `detach_for` reports
-	//    a detach it could not confirm and leaves the pages quarantined; the claim goes the same way,
+	// 3. The translation, which is the only step that can fail to CONFIRM. `detach_for` reports a
+	//    detach it could not confirm and leaves the pages quarantined; the claim goes the same way,
 	//    because a device whose mappings may still be live is not a device to hand to anyone else.
 	let confirmed = if crate::iommu::translating() { crate::iommu::detach_for(index, bus, dev, func) } else { true };
+	// 4. AND THE VECTORS LAST, AND ONLY IF THE TEARDOWN CONFIRMED.
+	//
+	// This ran BEFORE the detach. `release_for_device` clears `pending`, clears the owner and marks
+	// the slot UNUSED - which is the slot becoming allocatable again - so an unconfirmed detach left
+	// the claim `Quarantined` while a vector it had held was already back in circulation. The rule
+	// this file states everywhere else is that an unconfirmed teardown keeps its resources charged
+	// and out of circulation, and a vector is one of them: a device that may still be translating
+	// may still be raising interrupts.
+	if confirmed {
+		let vectors = crate::arch::interrupts::release_msi_for_device(index as u32);
+		if vectors != 0 {
+			crate::serial_println!("device: {index} released - {vectors} MSI vector(s) given back");
+		}
+	} else {
+		crate::serial_println!("device: {index} did not confirm its teardown - its MSI vector(s) stay masked and held rather than given back");
+	}
 	// AND THE AUDIT RECORD GOES WITH IT. `admit` wrote the degraded row when this device was asking
 	// to master the bus; it is not mastering it any more, and a list of "devices reaching memory
 	// untranslated" that keeps a device which gave the bus back is a list reporting a machine

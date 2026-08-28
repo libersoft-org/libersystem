@@ -8,7 +8,11 @@
 # and the gpu driver all sit on one timeline. The kernel publishes its calibrated TSC
 # frequency once at boot as "\x1ePERF tsc_hz <hz>", which converts cycles to time.
 #
-# DEV_PROFILE=1 IS REQUIRED, and it is what makes the guest emit that anchor. It used to be printed
+# DEV_PROFILE=1 AND `LIBER_BOOT_PROFILE=development-trace` ARE REQUIRED, and together they are what
+# makes the guest emit that anchor. `development` alone is the interactive instance a person boots and
+# does not carry it: a profile selection is not the same condition as "a tool is reading this".
+#
+# It used to be printed
 # on every boot, which meant every ordinary boot showed one line addressed to this program - so the
 # kernel now emits it only when a profile is named over fw_cfg, which is the condition "a harness is
 # watching".
@@ -24,8 +28,8 @@
 # Typical session (start a guest of your own; do NOT pattern-kill QEMU - this used to say
 # `pkill -9 qemu-system-x86`, which takes down every QEMU the user owns, including ones this has
 # nothing to do with):
-#   DEV_PROFILE=1 SERIAL="unix:/tmp/ls-ser.sock,server,nowait" DISPLAYS=vnc VNC_ADDR=127.0.0.1:9 \
-#     harness/qemu-run.sh x86_64 ../.build/cargo/kernel/x86_64-unknown-none/debug/kernel >/tmp/qemu.log 2>&1 &
+#   DEV_PROFILE=1 LIBER_BOOT_PROFILE=development-trace SERIAL="unix:/tmp/ls-ser.sock,server,nowait" DISPLAYS=vnc VNC_ADDR=127.0.0.1:9 \
+#     DEV_PROFILE=1 LIBER_BOOT_PROFILE=development-trace harness/qemu-run.sh x86_64 ../.build/cargo/kernel/x86_64-unknown-none/debug/kernel >/tmp/qemu.log 2>&1 &
 #   harness/perf-trace.py            # connects, waits for boot, runs `help`, prints the trace
 #
 # WHAT IT REFUSES TO MEASURE. A trace is only a measurement of the command if the guest was up
@@ -161,9 +165,12 @@ def main() -> None:
 		# derived from host wall-clock, and the report looked exactly the same. This tool is the
 		# thing that boots that profile, so this is where the condition has a witness.
 		sys.exit(
-			"perf-trace: the guest published no tsc_hz anchor. The kernel emits it only when a boot\n"
-			"            profile is named over fw_cfg (DEV_PROFILE=1), so either the guest was not\n"
-			"            started that way or that condition has stopped matching. Pass\n"
+			"perf-trace: the guest published no tsc_hz anchor. The kernel emits it only for the\n"
+			"            `development-trace` profile - the one THIS tool boots - so start the guest\n"
+			"            with DEV_PROFILE=1 LIBER_BOOT_PROFILE=development-trace, or that condition\n"
+			"            has stopped matching. The ordinary `development` profile is the interactive\n"
+			"            instance a person boots and deliberately does NOT carry the anchor, because\n"
+			"            it is a raw record-separator line addressed to a program. Pass\n"
 			"            --self-calibrate to measure anyway, from host wall-clock, a few percent out."
 		)
 	else:

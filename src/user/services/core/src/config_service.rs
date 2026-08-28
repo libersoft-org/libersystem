@@ -48,6 +48,10 @@ fn tree_path() -> &'static str {
 struct Config {
 	entries: Vec<ConfigEntry>,
 	volume: u64,
+	// WHETHER THE REQUEST BEING SERVED ARRIVED ON THE OWNER'S CONNECTION. Set per request from the
+	// channel `serve_multi` reports, which is the only identity a server has for its callers - see
+	// the `POLICYOWNER` role and `Config::set`.
+	privileged: bool,
 }
 
 impl Config {
@@ -74,7 +78,7 @@ impl Config {
 		entries.push(ConfigEntry { key: String::from("net.mtu"), value: String::from("1500") });
 		entries.push(ConfigEntry { key: String::from("service.restart-budget"), value: String::from("3") });
 		entries.push(ConfigEntry { key: String::from("service.watchdog-ticks"), value: String::from("100") });
-		Config { entries, volume: 0 }
+		Config { entries, volume: 0, privileged: false }
 	}
 
 	// The durable tree: the seeded defaults overlaid with whatever
@@ -193,6 +197,16 @@ impl Service for Config {
 	}
 
 	fn set(&mut self, entry: ConfigEntry) -> Result<(), Error> {
+		// THE RESERVED NAMESPACE IS DEVICEMANAGER'S, AND `set` NOW CHECKS THAT.
+		//
+		// `remove` refused every key outside this prefix and this checked nothing at all, so any
+		// component holding `CAP_CONFIG` - the supervisor grants it to several - could overwrite or
+		// delete a device's stored policy. Authority over a namespace comes from WHICH CONNECTION the
+		// request arrived on; `privileged` is set per request from the served channel, and only the
+		// seeded `POLICYOWNER` pair carries it.
+		if entry.key.as_bytes().starts_with(DEVICE_POLICY_PREFIX.as_bytes()) && !self.privileged {
+			return Err(Error::Denied);
+		}
 		match self.entries.iter_mut().find(|e| e.key == entry.key) {
 			Some(e) => e.value = entry.value,
 			None => self.entries.push(entry),
@@ -211,6 +225,12 @@ impl Service for Config {
 	// declared.
 	fn remove(&mut self, key: alloc::string::String) -> Result<(), Error> {
 		if !key.starts_with(DEVICE_POLICY_PREFIX) {
+			return Err(Error::Denied);
+		}
+		// AND ONLY THE OWNER MAY REMOVE ONE. Refusing every key outside the prefix bounded WHAT could
+		// be deleted and said nothing about WHO - so an `enable` from any `CAP_CONFIG` holder erased
+		// a disable DeviceManager had stored.
+		if !self.privileged {
 			return Err(Error::Denied);
 		}
 		let before = self.entries.len();
@@ -267,8 +287,24 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut config: Config = Config::load(vol);
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
+	// THE OWNER'S CONNECTION, MINTED HERE SO ITS CHANNEL IS KNOWABLE.
+	//
+	// A connection minted on demand from the ordinary root is indistinguishable from every other, so
+	// no server can tell which of its callers is allowed the reserved namespace. This pair is made by
+	// the server: the client end goes up the bootstrap under `POLICYOWNER` for the supervisor to route
+	// to DeviceManager, and the server end is SEEDED into the serve set, which is what makes its
+	// channel value the one identity this program can compare against.
+	let (owner_server, owner_client): (u64, u64) = unsafe { channel().unwrap_or((0, 0)) };
+	if owner_client != 0 {
+		unsafe { send_blocking(bootstrap, b"POLICYOWNER", owner_client) };
+	}
 	unsafe {
-		serve_multi(service, &mut request, &mut reply, |_chan, req, handle, out, reply_handle| -> Option<usize> { config::dispatch(&mut config, req, handle, out, reply_handle) });
+		let seed: [u64; 1] = [owner_server];
+		let seeded: &[u64] = if owner_server != 0 { &seed } else { &[] };
+		serve_multi_seeded(service, seeded, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
+			config.privileged = owner_server != 0 && chan == owner_server;
+			config::dispatch(&mut config, req, handle, out, reply_handle)
+		});
 	}
 	exit();
 }

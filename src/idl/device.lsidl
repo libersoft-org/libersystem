@@ -59,6 +59,16 @@ enum failure-cause {
 /// The node is stable from the boot scan onward, so a record exists for a device nothing binds -
 /// which is a fact about the machine and not an absence.
 record binding-record {
+	/// WHICH ROW OF THE KERNEL DEVICE TABLE THIS BINDING IS ABOUT.
+	///
+	/// The System Graph used to pair a device list with a binding list BY POSITION, and the two are
+	/// not positionally equivalent: DeviceService returns every kernel table row in table order,
+	/// while this list holds only DeviceManager's nodes - boot-critical appended first, other
+	/// candidate-bearing ones second, rows with no candidate omitted. One supported non-boot device
+	/// at a lower table index than a boot disk swapped two records, and an omitted row shifted every
+	/// later one, so the graph reported another device's state, cause and restart count. `device-entry`
+	/// already carries this index; carrying it here too is what lets the two be joined on identity.
+	index:       u32,
 	bus:         u32,
 	dev:         u32,
 	func:        u32,

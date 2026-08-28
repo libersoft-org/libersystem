@@ -245,6 +245,13 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 			// parked in `recv_blocking` would otherwise look exactly like a wedged one, which is
 			// the distinction the whole mechanism exists to make.
 			if !common::serve_or_answer(bootstrap, bind, blk_server) {
+				// THE FLUSH IS WHAT `STOPPED` CERTIFIES, and this path used to exit without it: the
+				// helper answered the stop the instant it read one, so a disk with writes still in
+				// its device's cache reported that everything it had accepted was finished.
+				if common::stop_requested() && has_flush {
+					flush_request(&queue, virt, phys);
+				}
+				common::finish_stop(bootstrap, bind, queue.capability);
 				exit();
 			}
 			match recv_blocking(blk_server, &mut req) {

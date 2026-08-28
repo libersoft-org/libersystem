@@ -179,6 +179,7 @@ unsafe fn event_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut
 			// whether this driver is still answering. An input device that nobody is typing on is
 			// idle, and idle is not wedged.
 			if common::wait_or_answer(bootstrap, bind, &[irq]).is_none() {
+				common::finish_stop(bootstrap, bind, eventq.capability);
 				exit();
 			}
 			// drain the buffers the device filled, re-posting each as we go.
@@ -222,6 +223,7 @@ unsafe fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &m
 			// The manager's channel joins the interrupt this loop already waits on: a pointer
 			// nobody is moving is idle, and idle is not wedged.
 			if common::wait_or_answer(bootstrap, bind, &[irq]).is_none() {
+				common::finish_stop(bootstrap, bind, eventq.capability);
 				exit();
 			}
 			let mut synced: bool = false;

@@ -192,12 +192,17 @@ require_no_stray_qemu() {
 			# missing once the runner stopped sharing anything writable.
 			#
 			# Every image a guest WRITES is now this run's own copy - the system disk, the ESP, the
-			# console capture - and the fixtures it reads are attached `readonly=on` and keyed by
-			# content, so two guests opening one of them is the arrangement rather than the accident.
-			# Refusing on those would refuse exactly the parallelism the isolation was built for, and
-			# the message would name a file that cannot be the reason.
+			# console capture, and the USB fixture - and the fixtures it reads are attached
+			# `readonly=on` and keyed by content, so two guests opening one of them is the arrangement
+			# rather than the accident. Refusing on those would refuse exactly the parallelism the
+			# isolation was built for, and the message would name a file that cannot be the reason.
+			#
+			# `usb-media*.img` USED TO BE ON THIS LIST AND WAS NOT READ-ONLY. It is attached writable,
+			# so exempting it exempted the one shared file two guests could actually corrupt for each
+			# other. It is now copied per run like the system disk; the exemption below covers the
+			# per-run copies, whose names carry the pid.
 			case "${target##*/}" in
-			iso-media*.iso | fat-media*.img | udf-media*.udf | usb-media*.img | libersystem.iso | libersystem-test.*.iso) continue ;;
+			iso-media*.iso | fat-media*.img | udf-media*.udf | usb-media*.[0-9]*.img | libersystem.iso | libersystem-test.*.iso) continue ;;
 			esac
 			held="$target"
 			break

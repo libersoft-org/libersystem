@@ -18,7 +18,7 @@ const EVERY_STATE: [BindingState; 9] = [
 
 // The table, written out a second time and independently, so this test disagrees with the
 // implementation rather than restating it.
-const LEGAL: [(BindingState, BindingState); 25] = [
+const LEGAL: [(BindingState, BindingState); 26] = [
 	(BindingState::Unbound, BindingState::Binding),
 	(BindingState::Binding, BindingState::Online),
 	(BindingState::Binding, BindingState::Backoff),
@@ -28,6 +28,10 @@ const LEGAL: [(BindingState, BindingState); 25] = [
 	(BindingState::Stopping, BindingState::Backoff),
 	(BindingState::Stopping, BindingState::Failed),
 	(BindingState::Stopping, BindingState::Quarantined),
+	// A bind that READS the device as already quarantined adopts that fact. It took no claim, so
+	// `Failed`/`teardown-unconfirmed` - which is where the refused move used to leave it - describes
+	// an attempt that tore something down badly, and this one tore nothing down at all.
+	(BindingState::Binding, BindingState::Quarantined),
 	(BindingState::Backoff, BindingState::Binding),
 	(BindingState::Backoff, BindingState::Failed),
 	(BindingState::Failed, BindingState::Binding),

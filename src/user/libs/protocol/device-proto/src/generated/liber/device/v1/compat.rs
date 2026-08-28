@@ -35,9 +35,9 @@ fn failure_cause_wire_is_stable() {
 }
 #[test]
 fn binding_record_wire_is_stable() {
-	let sample = BindingRecord { bus: 7, dev: 7, func: 7, generation: 7, state: BindingState::Unbound, cause: FailureCause::None, attempts: 7, artifact: String::from("x"), rule: 7, providers: 7, resources: 7 };
+	let sample = BindingRecord { index: 7, bus: 7, dev: 7, func: 7, generation: 7, state: BindingState::Unbound, cause: FailureCause::None, attempts: 7, artifact: String::from("x"), rule: 7, providers: 7, resources: 7 };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	let golden: &[u8] = &[7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 1, 0, 120, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
 	assert_eq!(bytes, golden);
 	assert_eq!(BindingRecord::decode(&bytes).unwrap(), sample);
 }

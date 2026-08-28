@@ -1431,6 +1431,23 @@ fn the_first_usable_controller_wins() {
 	assert_eq!(at(blob).parse().expect("parses").gic_dist, 0x0800_0000);
 }
 
+// AND THE VERSION BELONGS TO THAT NODE TOO.
+//
+// The addresses were committed once, while `gic_dist == 0`, and `gic_version` was rewritten for every
+// recognised GIC node after it - so this tree returned the FIRST node's GICv2 cpu-interface address
+// with version 3, and the kernel drives a v3 "cpu interface" as a redistributor region. The existing
+// duplicate test uses two same-version nodes and cannot see it.
+#[test]
+fn a_later_controller_does_not_relabel_the_one_whose_addresses_were_taken() {
+	let blob = machine(|builder| {
+		builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000)).end();
+		builder.begin("intc@9000000").prop_str("compatible", "arm,gic-v3").prop("reg", &gic_reg(0x0900_0000, 0x1_0000, 0x0901_0000, 0xf6_0000)).end();
+	});
+	let info = at(blob).parse().expect("parses");
+	assert_eq!(info.gic_dist, 0x0800_0000, "the first usable controller still wins its addresses");
+	assert_eq!(info.gic_version, 2, "and it keeps its own version - a v3 label over v2 addresses is a redistributor region that is really a cpu interface");
+}
+
 #[test]
 fn the_msi_frame_is_read_from_the_controller_s_child() {
 	// The GICv2m frame is a child of the controller node, and a machine without one is a machine
