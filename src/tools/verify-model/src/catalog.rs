@@ -29,6 +29,17 @@ pub enum CheckKind {
 	Conformance,
 	KernelTest,
 	DevCheck,
+	// A guest step chosen by the STATE of a target rather than by what it covers.
+	//
+	// Two of them, and they exist because a booted target with no selected test used to be lowered
+	// into a step carrying NO KEYS - which `record_step` returns on, so the largest item in a driver
+	// plan was invisible to the estimator that ordered it, permanently and by construction. A step
+	// that runs tests and discharges nothing is the one shape this model may not emit.
+	//
+	// `select` never picks these: their reason is "this target is booted and nothing else answers
+	// for it", which is a fact about the plan and not about coverage, so the planner adds them after
+	// the ordinary selection has run.
+	GuestFallback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -100,7 +111,19 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 46] = [
+// GATES THAT READ WHAT A GUEST RUN WROTE, and therefore cannot run before one.
+//
+// `capability-trace` compares the newest x86_64 capability trace against the kernel binary beside
+// it, and the trace is produced by the kernel suite. A full run builds first, which makes every
+// existing trace older than the binary - so ordered before the guest steps this gate cannot pass on
+// a clean tree however fresh the trace was when the run started. Measured twice on 2026-08-28, the
+// second time with a trace confirmed green minutes earlier.
+//
+// A LIST RATHER THAN A GUESS. Nothing in a gate's command line says it consumes a guest's output,
+// and inferring it from "the script mentions a log" would catch the ones that write their own.
+pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
+
+const GATES: [(&str, &str); 57] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -113,6 +136,31 @@ const GATES: [(&str, &str); 46] = [
 	// parked, and retires nothing. Its subject is the kernel, because what it proves is the bring-up
 	// cap and the shootdown that depends on it - and it boots one guest, so it is not a fast gate.
 	("smp-core-cap", "kernel"),
+	// Every gate that boots a guest reads the logs that guest named, rather than the newest file in
+	// a shared directory. Its subject is the harness: the rule is about how a gate finds its
+	// evidence, and it reads source, so it costs milliseconds and every harness change selects it.
+	("gate-result-logs", "harness.tools"),
+	// Every kernel test id a gate names is one the tree still declares. Its subject is the KERNEL,
+	// because a rename in the test suite is what breaks it and a kernel change is what carries one -
+	// the gate scripts themselves rot only when the tests under them move.
+	("gate-oracles", "kernel"),
+	// Every staged driver and service has a test that names it, or a written reason why it has none.
+	// Its subject is the manifest, because what it enumerates is what the manifest stages: adding a
+	// driver there is what makes this ask a new question.
+	("component-oracles", "manifest"),
+	// ONE KEY PER PROFILE. `qemu-arch-profiles` runs all eight in one step, which is one duration
+	// divided eight ways - and `record_step` divides evenly, so every per-profile cost on disk was
+	// an artefact of the batching. These are the same eight profiles as separately schedulable
+	// steps, each with its own measured cost, which is what a cheapest-first order needs before it
+	// can be trusted. The umbrella stays for a person who wants all of them in one command.
+	("arch-profile-aarch64-gicv2-1", "kernel"),
+	("arch-profile-aarch64-gicv2-4", "kernel"),
+	("arch-profile-aarch64-gicv3-1", "kernel"),
+	("arch-profile-aarch64-gicv3-4", "kernel"),
+	("arch-profile-aarch64-gicv3-its-1", "kernel"),
+	("arch-profile-aarch64-gicv3-its-4", "kernel"),
+	("arch-profile-riscv64-aia-1", "kernel"),
+	("arch-profile-riscv64-aia-4", "kernel"),
 	// The staged tree's provider chains, and the eight ways the check that reads them can be given
 	// input it cannot read. Its subject is what the build stages, so a userspace change selects it.
 	("staged-consistency", "userspace.build"),
@@ -363,6 +411,20 @@ impl Catalog {
 			catalog.checks.push(Check { id: test.id.clone(), kind: CheckKind::KernelTest, covers: test.covers.clone(), variants: test.architectures.iter().map(|architecture| Variant { architecture: architecture.clone(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), command: String::from("./test.sh --arch {arch}") });
 		}
 
+		// THE TWO GUEST STEPS THAT ARE NOT A TEST LIST, in the catalog so that each has an id, a
+		// variant per target and somewhere for its measured cost to live.
+		//
+		// `guest.boot-smoke` is for a target that WAS enumerated and selected nothing: the
+		// architecture policy has already decided this target boots, so it boots something named
+		// rather than everything or nothing. `guest.whole-suite` is for a target the model could not
+		// enumerate at all, where booting blind is the safe answer to a model that cannot see.
+		//
+		// Both carry no `covers` on purpose and are skipped by `select`; the planner adds the one the
+		// target's state calls for. Giving them a real `covers` would run them BESIDE the tests they
+		// stand in for, which is the opposite of what they are.
+		catalog.checks.push(Check { id: String::from("guest.boot-smoke"), kind: CheckKind::GuestFallback, covers: Vec::new(), variants: ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), command: String::from("./test.sh --arch {arch} --tags smoke") });
+		catalog.checks.push(Check { id: String::from("guest.whole-suite"), kind: CheckKind::GuestFallback, covers: Vec::new(), variants: ARCHITECTURES.iter().map(|architecture| Variant { architecture: (*architecture).to_string(), environment: Environment::TestGuest, configuration: String::from("test") }).collect(), command: String::from("./test.sh --arch {arch}") });
+
 		// The development guest. qemu-run.sh refuses DEV_PROFILE together with TEST, so these can
 		// never share a boot with the kernel suite - which is why the environment is part of the
 		// key rather than a detail of the runner.
@@ -483,6 +545,12 @@ fn build_covers(part: &str, crates: &[Crate], staged: &BTreeSet<String>) -> Vec<
 // One kernel test, as the compiled binaries report it.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct KernelTest {
+	// The files that declare this test. PLURAL: an arch-gated test is declared once per target under
+	// one id, and keeping one path would keep whichever file was read last.
+	//
+	// This is what makes "a test file reaches the tests in it" answerable. Without it the model knows
+	// only that a file under `src/kernel` changed, which is the whole kernel.
+	pub source_paths: Vec<String>,
 	// The Rust function name, which is what the compiled binary's symbols carry. Used to join the
 	// binary's per-architecture presence to the source declaration, and to say WHERE something is
 	// in a diagnostic - never as the test's identity.

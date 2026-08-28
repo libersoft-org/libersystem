@@ -1059,7 +1059,7 @@ fn a_fan_out_stage_with_an_unwritable_destination_still_carries_the_stream() {
 	assert!(counted.windows(10).any(|window| window == b"2 13 83 83"), "the bytes reached the far end anyway: {:?}", core::str::from_utf8(counted));
 }
 
-tagged_test!(a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline, [Service, Process, PermissionService, Shell], id = "kernel.applications.a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline", covers = ["bin.permission_manager", "kernel", "services"]);
+tagged_test!(a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline, [Service, Process, PermissionService, Shell], id = "kernel.applications.a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline", covers = ["bin.permission_manager", "kernel", "services", "bin.shell"]);
 fn a_typed_line_goes_through_the_real_shell_and_comes_back_as_a_pipeline() {
 	// THE LAYER EVERY OTHER TEST HERE SKIPS. The pipeline tests beside this one are hand-written
 	// requests to PermissionManager, which is the transaction and not the shell: the parse, the

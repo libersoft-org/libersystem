@@ -192,7 +192,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash" | "discard-divided-costs" | "candidate-activate")
 	{
 		command = positional.remove(0);
 	}
@@ -584,7 +584,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds) });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -618,7 +618,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: build_exec, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds) });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: build_exec, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -665,7 +665,7 @@ fn run() -> Result<ExitCode, String> {
 				}
 				let mut log = verify_model::shadow::Log::load(&repo_root);
 				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds) });
+				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) });
 				log.save(&repo_root)?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
@@ -734,7 +734,7 @@ fn run() -> Result<ExitCode, String> {
 			// judged is a record that will be believed about a different system later.
 			let mut log = verify_model::shadow::Log::load(&repo_root);
 			log.schema = 1;
-			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds) });
+			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) });
 			log.save(&repo_root)?;
 			// Only Consistent is green, and the other three are green in different wrong ways.
 			// CandidateMiss is the selector's problem; SelectionFailed is the code's and the sweep
@@ -782,7 +782,7 @@ fn run() -> Result<ExitCode, String> {
 			let mut required: std::collections::BTreeSet<String> = plan.architectures_built.iter().cloned().collect();
 			required.extend(plan.architectures_booted.iter().cloned());
 			let required: Vec<String> = required.into_iter().collect();
-			let scopes: std::collections::BTreeMap<String, verify_model::shadow::Scope> = verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds).into_iter().map(|(component, scope)| (component, scope.with_architectures(required.clone()))).collect();
+			let scopes: std::collections::BTreeMap<String, verify_model::shadow::Scope> = verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry).into_iter().map(|(component, scope)| (component, scope.with_architectures(required.clone()))).collect();
 			let empty = verify_model::shadow::Scope::default();
 			let untrusted: Vec<&String> = plan.changed_components.iter().filter(|component| !store.trusted_everywhere(component, &hash, &verify_model::catalog::judging_universes(&model.catalog, component), scopes.get(component.as_str()).unwrap_or(&empty))).collect();
 			// The age BOUND, which is the part that makes it a bound rather than a report.
@@ -908,6 +908,54 @@ fn run() -> Result<ExitCode, String> {
 			}
 			Ok(ExitCode::SUCCESS)
 		}
+		// ACTIVATE A CANDIDATE NARROWING, or refuse it having written nothing.
+		//
+		// Four steps and every one of them is load-bearing. The base is verified BEFORE the first
+		// write, because comparing only the RESULT says nothing about what was there: an activation
+		// that overwrote a `registry.toml` edited in the meantime would still produce the hash the
+		// candidate predicts, and would certify a model nobody reviewed. The overlay is materialised
+		// into the canonical files. The active model is then re-read from those files with NO overlay
+		// in its path - if the candidate planner and the active planner read the same thing, an
+		// identical hash says the overlay equals itself and proves nothing. Only that hash is
+		// compared, and a mismatch is rolled back byte for byte.
+		"candidate-activate" => {
+			let path = positional.first().ok_or("candidate-activate needs the path of a candidate file")?;
+			let candidate = verify_model::candidate::Candidate::load(std::path::Path::new(path))?;
+			candidate.base_is_unmoved(&repo_root)?;
+			let mut sources: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+			for test in &model.kernel_tests.tests {
+				sources.insert(test.id.clone(), test.source_paths.clone());
+			}
+			let previous = candidate.materialise(&repo_root, &sources)?;
+			let active = match Model::load(&repo_root) {
+				Ok(active) => active,
+				Err(error) => {
+					verify_model::candidate::Candidate::roll_back(&repo_root, &previous)?;
+					return Err(format!("the materialised model does not load ({error}); nothing was kept"));
+				}
+			};
+			let actual = active.model_hash();
+			if actual != candidate.expected_hash {
+				verify_model::candidate::Candidate::roll_back(&repo_root, &previous)?;
+				return Err(format!("the activated model hashes {actual} and this candidate's evidence was gathered under {}, so the two are not the same model - rolled back, nothing kept", candidate.expected_hash));
+			}
+			println!("verify-model: candidate activated - {}", candidate.reason);
+			println!("verify-model: the active model hashes {actual}, which is what its evidence was gathered under");
+			Ok(ExitCode::SUCCESS)
+		}
+		// Throw away every cost that was invented by dividing a merged step's duration.
+		//
+		// Run once, before the first cheapest-first run: ordering on those figures is sorting on how
+		// the gates happened to be batched, and inheriting them would make the first ordered run the
+		// least trustworthy one. Freshness survives where the step PASSED, because a step that
+		// passed really did run every member of itself.
+		"discard-divided-costs" => {
+			let mut history = verify_model::history::History::load(&repo_root)?;
+			let (costs, freshness) = history.discard_divided_costs();
+			history.save(&repo_root)?;
+			println!("verify-model: {costs} invented cost(s) discarded, {freshness} record(s) dropped for a merged step that failed before reaching them");
+			Ok(ExitCode::SUCCESS)
+		}
 		// Record a step's outcome against every key it discharged.
 		"record" => {
 			let keys_file = keys_file.ok_or("record needs --keys-file")?;
@@ -968,8 +1016,49 @@ fn run() -> Result<ExitCode, String> {
 			// are emitted separately rather than crammed into the STEP line because a kernel-suite
 			// step carries two hundred of them, and a line the runner has to split on two different
 			// separators is a line somebody will parse wrong.
-			for (index, step) in verify_model::commands::steps(&plan, &per_target, &model.registry).into_iter().enumerate() {
+			let cost = verify_model::history::CostModel { whole_suite_tests: model.kernel_tests.declared_ids, ..verify_model::history::CostModel::default() };
+			let history = verify_model::history::History::load(&model.repo_root).unwrap_or_default();
+			// CHEAPEST FIRST, AMONG THE STEPS WHOSE PREREQUISITES ARE MET.
+			//
+			// A plan that is going to fail runs its cheapest evidence last, which is minutes of
+			// waiting for news that a two-second host suite already had. Ordering by cost alone
+			// would emit a guest before the build it cannot start without, so the sort is by LAYER
+			// first - how deep in the dependency graph a step sits - and by cost inside a layer.
+			//
+			// The id breaks ties, so the emission is stable: a plan that reorders itself between two
+			// identical runs is one nobody can diff.
+			let mut ordered = verify_model::commands::steps(&plan, &per_target, &model.registry);
+			let mut layers: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+			for _ in 0..ordered.len() {
+				for step in &ordered {
+					let depth = step.requires.iter().map(|id| layers.get(id).copied().map_or(0, |d| d + 1)).max().unwrap_or(0);
+					layers.insert(step.id.clone(), depth);
+				}
+			}
+			ordered.sort_by(|left, right| {
+				let (dl, dr) = (layers.get(&left.id).copied().unwrap_or(0), layers.get(&right.id).copied().unwrap_or(0));
+				let (cl, cr) = (cost.estimate(&history, &left.keys), cost.estimate(&history, &right.keys));
+				dl.cmp(&dr).then(cl.partial_cmp(&cr).unwrap_or(std::cmp::Ordering::Equal)).then(left.id.cmp(&right.id))
+			});
+			for (index, step) in ordered.into_iter().enumerate() {
 				println!("STEP\t{}\t{}\t{}\t{}\t{}", index, step.keys.len(), step.label, step.command, step.note.unwrap_or_default());
+				// ITS OWN LINE, not a seventh field. The runner reads a STEP line into six names and
+				// puts everything after the fifth tab into the last one, so a field appended there
+				// would be glued onto the note. A new marker is skipped by a reader that does not
+				// know it and read by one that does, which is what lets the scheduler arrive later
+				// without a flag day.
+				println!("STEPID\t{index}\t{}", step.id);
+				// WHAT IT CANNOT START BEFORE, and WHAT IT IS EXPECTED TO COST. Both on their own
+				// lines for the reason the id is: a reader that does not know a marker skips it, so
+				// the runner can learn about them without a flag day.
+				//
+				// The cost is an ESTIMATE over the keys this step discharges, which is the only
+				// number available before it has ever run. A budget is a sum of estimates and is not
+				// a timeout: it decides what to START, never what to kill.
+				for required in &step.requires {
+					println!("STEPREQ\t{index}\t{required}");
+				}
+				println!("STEPCOST\t{index}\t{:.0}", cost.estimate(&history, &step.keys));
 				for key in &step.keys {
 					println!("KEY\t{index}\t{}", key.display());
 				}
@@ -1090,6 +1179,34 @@ fn join_or_none(items: &[String]) -> String {
 // and the record could not say which it was.
 fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 	let mut failures = Vec::new();
+
+	// EVERY DECLARED CHANGE GROUP MATCHES SOMETHING, AND EVERY REQUIRED ONE IS DECLARED.
+	//
+	// `risk_class.required_groups` is a bar, and a bar naming a group that matches no path in the
+	// tree is one nobody can meet - the same defect as a check that skips what it cannot read,
+	// reached from the other side. A group whose paths have been renamed away stops matching
+	// silently, and the subsystem it guards then becomes unprovable rather than unproven.
+	let tracked: Vec<String> = verify_model::tracked_files(&model.repo_root).unwrap_or_default();
+	for group in &model.registry.change_groups {
+		let matches = group.paths.iter().any(|declared| tracked.iter().any(|path| path == declared || path.starts_with(&format!("{declared}/"))));
+		if !matches {
+			failures.push(format!("the change group `{}` names {} and no tracked file is under any of them - a group that matches nothing is a bar nobody can meet", group.name, group.paths.join(", ")));
+		}
+	}
+	let declared: std::collections::BTreeSet<&str> = model.registry.change_groups.iter().map(|group| group.name.as_str()).collect();
+	for risk in &model.registry.risk_classes {
+		for required in &risk.required_groups {
+			if !declared.contains(required.as_str()) {
+				failures.push(format!("`{}` requires evidence from the change group `{required}`, which no `[[change_group]]` declares", risk.path));
+			}
+		}
+		// AND THE PROSE AND THE FIELDS AGREE ABOUT THE ABI, which is the one of the four that reads
+		// as a sentence and is checkable. `syscall` says "shadow-clean plus the ABI unchanged"; a
+		// row saying that with `abi_unchanged = false` is two answers to one question.
+		if risk.evidence.contains("ABI unchanged") != risk.abi_unchanged {
+			failures.push(format!("`{}` says `{}` and sets abi_unchanged = {} - the sentence and the field disagree", risk.path, risk.evidence, risk.abi_unchanged));
+		}
+	}
 
 	// EVERY JUDGING UNIVERSE HAS AN EVIDENCE PRODUCER, or the components it judges can never be
 	// trusted whatever they accumulate elsewhere.

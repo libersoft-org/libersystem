@@ -369,7 +369,7 @@ fn a_catalog_naming_an_undefined_configuration_is_refused() {
 	let registry = fixture.load().expect("well formed");
 	let manifest = system_manifest::Manifest::load_workspace(&root.join("src")).expect("manifest");
 	let graph = Graph::build(&crates, &manifest, &registry);
-	let kernel_test = KernelTest { name: String::from("t"), id: String::from("kernel.t"), architectures: vec![String::from("x86_64")], covers: vec![String::from("kernel")] };
+	let kernel_test = KernelTest { source_paths: Vec::new(), name: String::from("t"), id: String::from("kernel.t"), architectures: vec![String::from("x86_64")], covers: vec![String::from("kernel")] };
 	let staged = crate::staged_components(&manifest, &crates, &graph);
 	let mut catalog = Catalog::build(&crates, &registry, &graph, &staged, &kernel_test_slice(&kernel_test));
 	catalog.checks[0].variants[0].configuration = String::from("a-configuration-nobody-defined");
@@ -972,7 +972,10 @@ fn an_unparseable_record_is_an_error_rather_than_a_shrug() {
 // it runs rather than by a fixed prefix - a prefix match silently returned nothing the moment the
 // exact-selection form appeared, and the assertion below then compared two empty sets by accident.
 fn guest_targets(plan: &crate::plan::Plan, per_target: &std::collections::BTreeMap<String, usize>) -> BTreeSet<String> {
-	crate::commands::steps(plan, per_target, &model().registry).iter().filter(|step| step.command.contains("./test.sh --arch ")).filter_map(|step| step.command.rsplit(" --arch ").next().map(str::to_string)).collect()
+	// AND THE TARGET IS THE FIRST WORD AFTER THE FLAG, not everything after it. The boot check runs
+	// `./test.sh --arch x86_64 --tags smoke`, so taking the rest of the line answered
+	// `x86_64 --tags smoke` and compared it against a set of architecture names.
+	crate::commands::steps(plan, per_target, &model().registry).iter().filter(|step| step.command.contains("./test.sh --arch ")).filter_map(|step| step.command.rsplit(" --arch ").next().and_then(|rest| rest.split_whitespace().next()).map(str::to_string)).collect()
 }
 
 #[test]
@@ -1105,7 +1108,7 @@ fn the_scan_finds_the_markers_the_design_names() {
 // over-reaching declaration of mine, which is a fair account of what such a gate is for.
 
 fn kernel_test(name: &str, covers: &[&str]) -> KernelTest {
-	KernelTest { name: name.to_string(), id: format!("kernel.{name}"), architectures: vec![String::from("x86_64")], covers: covers.iter().map(|component| (*component).to_string()).collect() }
+	KernelTest { source_paths: Vec::new(), name: name.to_string(), id: format!("kernel.{name}"), architectures: vec![String::from("x86_64")], covers: covers.iter().map(|component| (*component).to_string()).collect() }
 }
 
 #[test]
@@ -1836,7 +1839,7 @@ const PERMISSION_COVERAGE: [&str; 12] = [
 const PERMISSION_MANAGER_PATH: &str = "src/user/services/core/src/permission_manager.rs";
 
 fn permission_kernel_test(id: &str, covers: &[&str]) -> KernelTest {
-	KernelTest { name: id.rsplit('.').next().expect("an id has a last segment").to_string(), id: id.to_string(), covers: covers.iter().map(|item| (*item).to_string()).collect(), architectures: crate::registry::ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()).collect() }
+	KernelTest { source_paths: Vec::new(), name: id.rsplit('.').next().expect("an id has a last segment").to_string(), id: id.to_string(), covers: covers.iter().map(|item| (*item).to_string()).collect(), architectures: crate::registry::ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()).collect() }
 }
 
 // A model whose kernel suite is exactly what this test writes down.
@@ -1989,4 +1992,147 @@ fn a_marker_with_no_tagged_test_is_a_failure() {
 	let consumers = COHORT_CONSUMERS.replace(r#"tagged_test!(two, [Service], id = "kernel.applications.two", covers = ["bin.permission_manager", "kernel"]);"#, "");
 	let problems = crate::kerneltests::audit_permission_cohort(COHORT_MAP, &consumers);
 	assert!(problems.iter().any(|problem| problem.contains("no tagged_test! carries that id")), "{problems:?}");
+}
+
+// ---------------------------------------------------------------------------------------------
+// A step says what it will run, and runs what it says
+
+// What the COMMAND will execute, read off the command itself rather than off the keys - because the
+// keys are the thing being checked and deriving both from one source would prove nothing.
+//
+// Returns None for a command whose extent cannot be read from the line alone, which today is only
+// the whole-suite form: `./test.sh --arch X` runs everything on X, and "everything" is a fact about
+// the catalog rather than about the string.
+fn what_the_command_runs(command: &str) -> Option<BTreeSet<String>> {
+	if let Some(rest) = command.strip_prefix("./build.sh --arch ") {
+		let mut fields = rest.split(" --part ");
+		let _architecture = fields.next()?;
+		return Some(fields.next()?.split(',').map(|part| format!("build.{part}")).collect());
+	}
+	if let Some(rest) = command.strip_prefix("./check.sh --gate ") {
+		return Some(rest.split(',').map(|name| format!("gate.{name}")).collect());
+	}
+	if let Some(rest) = command.strip_prefix("./check.sh --conformance ") {
+		return Some(rest.split(',').map(|name| format!("conformance.{name}")).collect());
+	}
+	if let Some(rest) = command.strip_prefix("TEST_SELECTION=") {
+		return Some(rest.split(" ./test.sh").next()?.split(',').map(str::to_string).collect());
+	}
+	if command.contains("./test.sh --arch ") && command.contains(" --tags smoke") {
+		return Some(BTreeSet::from([String::from("guest.boot-smoke")]));
+	}
+	None
+}
+
+// THE GATE FOR M0, and it is three assertions rather than one.
+//
+// Every EVIDENCE-PRODUCING step carries at least one key - a step that runs tests and discharges
+// nothing is unmeasurable by construction, because `record_step` returns on an empty key list, which
+// is how the whole-suite fallback could never acquire a cost however many times it ran. The keys a
+// step carries are the keys its command will run - the plan said 195 and the run did 205 while the
+// widening lived in the step builder. And every step has a `StepId`, because a cost has to be keyed
+// on the thing that is actually scheduled rather than on what it happened to discharge.
+#[test]
+fn every_step_carries_the_keys_its_command_will_run() {
+	let model = model();
+	let mut per_target: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+	for test in &model.kernel_tests.tests {
+		for architecture in &test.architectures {
+			*per_target.entry(architecture.clone()).or_default() += 1;
+		}
+	}
+	let cases: Vec<Vec<&str>> = vec![
+		vec!["src/user/drivers/core/src/virtio_input.rs"],
+		vec!["src/user/apps/tools/src/imgconv.rs"],
+		vec!["src/kernel/arch/riscv64/traps/mod.rs"],
+		vec!["src/user/libs/audio/flac/src/lib.rs"],
+		vec!["src/harness/qemu-run.sh"],
+		vec!["src/kernel/mem/tlb.rs"],
+	];
+	for paths in &cases {
+		let plan = plan_for(&model, paths);
+		let steps = crate::commands::steps(&plan, &per_target, &model.registry);
+		let mut ids: BTreeSet<String> = BTreeSet::new();
+		for step in &steps {
+			assert!(!step.id.is_empty(), "{paths:?}: the step {:?} has no id, so nothing can schedule it or price it", step.label);
+			assert!(ids.insert(step.id.clone()), "{paths:?}: two steps share the id {:?}, which would merge two costs into one figure describing neither", step.id);
+			assert!(!step.keys.is_empty(), "{paths:?}: the step {:?} runs and discharges no key, which `record_step` cannot file and the estimator cannot see", step.label);
+			let Some(will_run) = what_the_command_runs(&step.command) else {
+				// The whole-suite form. Either it is that target's entire test list, or it is the
+				// one aggregate key that stands in for a list the model could not read - and it is
+				// never a strict subset, which is the mismatch this test exists to catch.
+				if step.command.contains("./test.sh --arch ") {
+					let architecture = step.command.rsplit(" --arch ").next().and_then(|rest| rest.split_whitespace().next()).unwrap_or_default().to_string();
+					if step.keys.len() == 1 && step.keys[0].check == "guest.whole-suite" {
+						continue;
+					}
+					let total = per_target.get(&architecture).copied().unwrap_or(0);
+					assert_eq!(step.keys.len(), total, "{paths:?}: {:?} runs the whole {architecture} suite and carries {} of its {total} keys, so the difference runs unrecorded", step.label, step.keys.len());
+					continue;
+				}
+				// Everything else is one check per command: a host suite is one crate's `cargo
+				// test`, a dev check is one script. A step of either shape carrying two keys is two
+				// results filed against one run.
+				assert_eq!(step.keys.len(), 1, "{paths:?}: {:?} is one command and carries {} keys", step.label, step.keys.len());
+				continue;
+			};
+			let carried: BTreeSet<String> = step.keys.iter().map(|key| key.check.clone()).collect();
+			assert_eq!(carried, will_run, "{paths:?}: the step {:?} carries keys its command does not run, or runs work it carries no key for", step.label);
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// A candidate narrowing can actually reach the threshold it is graded against
+
+// Five records for one component, all producing the SAME decision and each from a DIFFERENT change.
+//
+// This is the deadlock the milestone was written to break, in one function: a frozen `kernel.mem`
+// candidate selects the same tests, walks the same edges and implies the same targets for every
+// change inside it, so keying distinctness on the DECISION gives one digest however many genuine
+// comparisons were run, and the threshold of five is unreachable by construction.
+fn same_decision_different_change(tree: &str, changed: &str) -> crate::shadow::Record {
+	let mut scope = crate::shadow::Scope::from_kinds(vec![String::from("modified")], vec![String::from("link.static")]);
+	scope.changed_digest = String::from(changed);
+	crate::shadow::Record {
+		universe: crate::shadow::Universe::TestGuest,
+		architecture: String::from("x86_64"),
+		verdict: String::from("Consistent"),
+		reason: String::new(),
+		model_hash: String::from("candidate-hash"),
+		source_digest: tree.to_string(),
+		changed_components: vec![String::from("kernel.mem")],
+		outside_failures: Vec::new(),
+		at: 0,
+		change_kinds: Vec::new(),
+		edge_kinds: Vec::new(),
+		shadow_exec: true,
+		model_self_check: true,
+		// THE SAME DECISION EVERY TIME, which is the whole point of the fixture.
+		component_decisions: vec![String::from("kernel.mem\tone-and-only-decision")],
+		component_scopes: [(String::from("kernel.mem"), scope)].into_iter().collect(),
+	}
+}
+
+#[test]
+fn five_different_changes_are_five_pieces_of_evidence_even_when_the_decision_is_identical() {
+	let mut log = crate::shadow::Log::default();
+	for index in 0..5 {
+		log.records.push(same_decision_different_change(&format!("tree-{index}"), &format!("changed-{index}")));
+	}
+	let distinct = log.distinct_evidence_for_pair("kernel.mem", "candidate-hash", crate::shadow::Universe::TestGuest, None);
+	assert_eq!(distinct, 5, "five different changes producing one decision must count as five pieces of evidence, or a frozen-subsystem candidate can never reach the threshold it is graded against");
+}
+
+#[test]
+fn five_runs_of_one_change_are_still_one_piece_of_evidence() {
+	// AND THE RULE IT REPLACED IS STILL RIGHT ABOUT WHAT IT DEFENDED AGAINST. Re-running one
+	// comparison against one tree is one decision validated five times, and counting those five is
+	// what the old criterion existed to refuse. The change is the KEY, not the counting.
+	let mut log = crate::shadow::Log::default();
+	for _ in 0..5 {
+		log.records.push(same_decision_different_change("one-tree", "one-change"));
+	}
+	let distinct = log.distinct_evidence_for_pair("kernel.mem", "candidate-hash", crate::shadow::Universe::TestGuest, None);
+	assert_eq!(distinct, 1, "five runs over one change are one piece of evidence, however many times the comparison was made");
 }

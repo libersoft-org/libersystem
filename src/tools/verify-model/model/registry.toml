@@ -397,21 +397,37 @@ reason = "stamped into every artifact through cargo:rustc-env"
 path = "src/kernel/mem"
 class = "foundational"
 evidence = "shadow-clean on all three targets for allocator and page-table changes; a missed edge here is a use-after-free that surfaces somewhere else entirely"
+targets = ["x86_64", "aarch64", "riscv64"]
+distinct_changes = 5
+abi_unchanged = false
+required_groups = ["allocator", "page-table"]
 
 [[risk_class]]
 path = "src/kernel/object"
 class = "foundational"
 evidence = "shadow-clean across capability, channel, handle and domain changes; every test in the suite holds handles, so the blast radius is genuinely wide"
+targets = ["x86_64", "aarch64", "riscv64"]
+distinct_changes = 5
+abi_unchanged = false
+required_groups = ["capability", "channel", "handle", "domain"]
 
 [[risk_class]]
 path = "src/kernel/sched"
 class = "foundational"
 evidence = "shadow-clean including SMP and preemption changes; scheduling faults present as unrelated timeouts"
+targets = ["x86_64", "aarch64", "riscv64"]
+distinct_changes = 5
+abi_unchanged = false
+required_groups = ["smp", "preemption"]
 
 [[risk_class]]
 path = "src/kernel/syscall"
 class = "contract"
 evidence = "shadow-clean plus the ABI unchanged; this is the boundary every userspace test crosses"
+targets = ["x86_64", "aarch64", "riscv64"]
+distinct_changes = 5
+abi_unchanged = true
+required_groups = []
 
 [[risk_class]]
 path = "src/kernel/elf.rs"
@@ -667,3 +683,60 @@ boot = ["x86_64", "aarch64", "riscv64"]
 path = ""
 build = ["x86_64", "aarch64", "riscv64"]
 boot = ["x86_64"]
+
+# ---------------------------------------------------------------------------------------------
+# Named kinds of change, and the paths that constitute them
+#
+# `risk_class.required_groups` names these and, before they existed, nothing produced them: a record
+# carries `change_kinds`, but those say how a component was REACHED - what it ships, what its tests
+# are built from - not what the edit was ABOUT. So "shadow-clean for allocator and page-table
+# changes" was a bar no record could answer, and a check built on it would have passed on five edits
+# to one corner of the subsystem.
+#
+# A name and its paths, matched against what a change set touched. Every one of these must match at
+# least one tracked path: a group nobody can produce is a bar nobody can meet.
+
+[[change_group]]
+name = "allocator"
+paths = ["src/kernel/mem/frame"]
+reason = "the buddy allocator and the frame paths - where a missed edge is a use-after-free that surfaces somewhere else entirely"
+
+[[change_group]]
+name = "page-table"
+paths = [
+	"src/kernel/mem/heap",
+	"src/kernel/arch/x86_64/paging.rs",
+	"src/kernel/arch/aarch64/paging.rs",
+	"src/kernel/arch/riscv64/paging.rs",
+]
+reason = "the mapping paths themselves, which is the other half of what `src/kernel/mem` asks to see"
+
+[[change_group]]
+name = "capability"
+paths = ["src/kernel/object/capability_tcb"]
+reason = "one of the four kinds `src/kernel/object` names"
+
+[[change_group]]
+name = "channel"
+paths = ["src/kernel/object/channel"]
+reason = "one of the four kinds `src/kernel/object` names"
+
+[[change_group]]
+name = "handle"
+paths = ["src/kernel/object/handle"]
+reason = "one of the four kinds `src/kernel/object` names"
+
+[[change_group]]
+name = "domain"
+paths = ["src/kernel/object/domain"]
+reason = "one of the four kinds `src/kernel/object` names"
+
+[[change_group]]
+name = "smp"
+paths = ["src/kernel/smp"]
+reason = "core bring-up, which `src/kernel/sched` asks to see because scheduling faults present as unrelated timeouts"
+
+[[change_group]]
+name = "preemption"
+paths = ["src/kernel/sched/mod.rs"]
+reason = "the other half of what `src/kernel/sched` asks to see"

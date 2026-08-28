@@ -130,6 +130,23 @@ declare -A GATES=(
 	["declared-interfaces"]="tools/check-declared-interfaces.py"
 	["no-fixed-provider-slots"]="tools/check-no-fixed-provider-slots.sh"
 	["smp-core-cap"]="tools/check-smp-core-cap.sh"
+	["gate-result-logs"]="tools/check-gate-result-logs.sh"
+	["gate-oracles"]="tools/check-gate-oracles.sh"
+	["component-oracles"]="tools/check-component-oracles.sh"
+	# ONE ENTRY PER PROFILE, and the umbrella above kept for a person who wants all eight.
+	#
+	# Eight profiles inside one step is one duration divided eight ways - and `record_step` divides
+	# evenly, so every per-profile figure on disk was an artefact of the batching rather than a
+	# measurement. An emulated four-core aarch64 profile and a one-core riscv64 one differ by more
+	# than that arithmetic can express, and the scheduler needs to be able to tell them apart.
+	["arch-profile-aarch64-gicv2-1"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv2:1"
+	["arch-profile-aarch64-gicv2-4"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv2:4"
+	["arch-profile-aarch64-gicv3-1"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv3:1"
+	["arch-profile-aarch64-gicv3-4"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv3:4"
+	["arch-profile-aarch64-gicv3-its-1"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv3-its:1"
+	["arch-profile-aarch64-gicv3-its-4"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv3-its:4"
+	["arch-profile-riscv64-aia-1"]="tools/check-qemu-arch-profiles.sh --only riscv64:aia:1"
+	["arch-profile-riscv64-aia-4"]="tools/check-qemu-arch-profiles.sh --only riscv64:aia:4"
 	# A warning answered by switching the lint off rather than by fixing the code. Ninety-one such
 	# attributes had accumulated, hiding a hundred and twenty more warnings than the build printed -
 	# and hiding them UNEVENLY, so the same code was reported on one target and silent on another.

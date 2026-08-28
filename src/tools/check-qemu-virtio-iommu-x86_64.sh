@@ -25,6 +25,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
+# shellcheck source=/dev/null
+source "$HERE/result-logs.sh"
 BUILD=".build/boot"
 OVMF_CODE="${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
 OVMF_VARS="${OVMF_VARS_SRC:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
@@ -62,14 +64,14 @@ QEMU_EXTRA="-device virtio-iommu-pci,boot-bypass=on -device edu -device edu" \
 	exit 1
 }
 
-# The guest log the run just produced. Sorted rather than `ls -t`, and read with `sed -n '$p'` so
-# nothing here is a reader that stops early.
-shopt -s nullglob
-logs=(.build/logs/test/x86_64-*-guest.log)
-shopt -u nullglob
-((${#logs[@]})) || fail "the run produced no guest log"
-readarray -t logs < <(printf '%s\n' "${logs[@]}" | sort)
-log="${logs[-1]}"
+# THE LOGS THE RUN SAID IT WROTE. This was "the newest x86_64 guest log", which is a correct-looking
+# read of ANOTHER guest's result the moment two runs of one architecture overlap - and this gate's
+# whole subject is a security property, so a green taken from somebody else's boot is the worst kind
+# of wrong answer it could give.
+mapfile -t logs < <(result_logs "$work/run.log") || fail "the run did not say which logs it wrote"
+((${#logs[@]})) || fail "the run named no readable log"
+log="$work/run.result"
+cat "${logs[@]}" >"$log"
 
 # 2. THE TRANSITION HAPPENED, and the kernel says it read the bypass byte back rather than assuming
 #    the write took.

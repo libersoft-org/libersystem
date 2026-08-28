@@ -6,6 +6,7 @@
 // consult ONE selector rather than four that drift.
 
 pub mod archrisk;
+pub mod candidate;
 pub mod catalog;
 pub mod changes;
 pub mod commands;

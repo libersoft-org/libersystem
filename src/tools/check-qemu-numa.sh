@@ -18,6 +18,8 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
+# shellcheck source=/dev/null
+source "$HERE/result-logs.sh"
 
 fail() {
 	echo "qemu-numa: $*" >&2
@@ -54,18 +56,17 @@ QEMU_EXTRA="$profile" ./test.sh --arch x86_64 --tags numa --smp 4 >"$work/run.lo
 	exit 1
 }
 
-shopt -s nullglob
-logs=(.build/logs/test/x86_64-*-guest.log)
-shopt -u nullglob
-((${#logs[@]})) || fail "the run produced no guest log"
-readarray -t logs < <(printf '%s\n' "${logs[@]}" | sort)
-log="${logs[-1]}"
+# THE LOGS THIS RUN WROTE, from the run rather than from the newest file of this architecture. Two
+# runs in flight and the glob reads the other one's answer; and it read only the guest log, which on
+# riscv64 below holds U-Boot and the loader and none of the suite's output.
+mapfile -t logs < <(result_logs "$work/run.log") || fail "the x86_64 run did not say which logs it wrote"
+((${#logs[@]})) || fail "the x86_64 run named no readable log"
 
 # 1. THE TOPOLOGY WAS READ, AND READ FROM FIRMWARE. "local/remote default" here would mean the SLIT
 #    was absent or refused, which is a different machine from the one this profile describes.
-grep -aq "numa: 2 node(s), distances from firmware" "$log" || {
+grep -aqh "numa: 2 node(s), distances from firmware" ${logs[@]} || {
 	echo "qemu-numa: the kernel did not read a two-node topology with firmware distances" >&2
-	grep -a -m 10 "numa:" "$log" >&2 || echo "    (the kernel printed nothing about topology)" >&2
+	grep -ah -m 10 "numa:" ${logs[@]} >&2 || echo "    (the kernel printed nothing about topology)" >&2
 	exit 1
 }
 
@@ -73,7 +74,7 @@ grep -aq "numa: 2 node(s), distances from firmware" "$log" || {
 #    reading the proximity domain from the wrong offset - which is exactly what this found once, and
 #    what the boot report showed while the processors looked perfectly correct.
 for node in 0 1; do
-	line="$(grep -a -m 1 "numa:   node $node:" "$log" || true)"
+	line="$(grep -ah -m 1 "numa:   node $node:" ${logs[@]} || true)"
 	[[ -n "$line" ]] || fail "node $node is missing from the report"
 	case "$line" in
 	*" 0 MiB"*) fail "node $node was reported with no memory: $line" ;;
@@ -84,22 +85,22 @@ done
 
 # 3. THE ALLOCATOR WAS PARTITIONED. One pool per memory-bearing node plus the unaffiliated one.
 for node in 0 1; do
-	grep -aq "numa:   pool node $node:" "$log" || fail "node $node has no pool of its own"
+	grep -aqh "numa:   pool node $node:" ${logs[@]} || fail "node $node has no pool of its own"
 done
-grep -aq "numa:   pool unaffiliated:" "$log" || fail "there is no pool for memory no node owns"
-if grep -aq "numa: WARNING" "$log"; then
+grep -aqh "numa:   pool unaffiliated:" ${logs[@]} || fail "there is no pool for memory no node owns"
+if grep -aqh "numa: WARNING" ${logs[@]}; then
 	fail "the pools and the allocator disagree about how many frames are free"
 fi
 
 # 4. AND THE TESTS THAT STEER AN ALLOCATION RAN. On the one-node profile these report themselves
 #    skipped, which is what makes requiring them here meaningful.
 for name in strict_fails_where_preferred_falls_back a_contiguous_span_never_crosses_two_nodes every_frame_returns_to_the_pool_that_owns_its_address; do
-	grep -aq "kernel.mem.numa.$name\.\.\..*\[ok\]" "$log" || fail "kernel.mem.numa.$name did not run or did not pass"
+	grep -aqh "kernel.mem.numa.$name\.\.\..*\[ok\]" ${logs[@]} || fail "kernel.mem.numa.$name did not run or did not pass"
 	echo "qemu-numa:   $name passed"
 done
 # AND THE PLACEMENT HALF: a thread asked for node 1 ran on a core whose normalized node is 1.
 for name in only_cores_that_came_up_are_bound_to_a_node placement_names_a_core_of_the_node_it_was_asked_for a_thread_placed_on_a_node_runs_on_a_core_of_that_node; do
-	grep -aq "kernel.smp.numa.$name\.\.\..*\[ok\]" "$log" || fail "kernel.smp.numa.$name did not run or did not pass"
+	grep -aqh "kernel.smp.numa.$name\.\.\..*\[ok\]" ${logs[@]} || fail "kernel.smp.numa.$name did not run or did not pass"
 	echo "qemu-numa:   $name passed"
 done
 # EVERY WEAKER OUTCOME, NOT ONE SPELLING OF IT.
@@ -114,13 +115,13 @@ done
 # make their full claim - a run where every placement really ran produces none.
 weak_placement() {
 	local where="$1" file="$2"
-	if grep -aq "numa-fixture:" "$file"; then
+	if grep -aqh "numa-fixture:" "$file"; then
 		echo "qemu-numa: a placement test could not make its full claim on the $where profile" >&2
 		grep -a "numa-fixture:" "$file" >&2
 		exit 1
 	fi
 }
-weak_placement "two-node" "$log"
+weak_placement "two-node" ${logs[@]}
 
 # 5. AND THE TWO DEVICE-TREE PORTS, on their DIRECT-BOOT profiles.
 #
@@ -147,23 +148,19 @@ for port in aarch64 riscv64; do
 		tail -20 "$work/$port.log" >&2
 		exit 1
 	}
-	shopt -s nullglob
-	port_logs=(.build/logs/test/$port-*-guest.log)
-	shopt -u nullglob
-	((${#port_logs[@]})) || fail "the $port run produced no guest log"
-	readarray -t port_logs < <(printf '%s\n' "${port_logs[@]}" | sort)
-	port_log="${port_logs[-1]}"
-	grep -aq "numa: 2 node(s), distances from firmware" "$port_log" || {
+	mapfile -t port_logs < <(result_logs "$work/$port.log") || fail "the $port run did not say which logs it wrote"
+	((${#port_logs[@]})) || fail "the $port run named no readable log"
+	grep -aqh "numa: 2 node(s), distances from firmware" ${port_logs[@]} || {
 		echo "qemu-numa: $port did not read a two-node topology with firmware distances" >&2
-		grep -a -m 10 "numa:" "$port_log" >&2 || true
+		grep -ah -m 10 "numa:" ${port_logs[@]} >&2 || true
 		exit 1
 	}
 	for node in 0 1; do
-		grep -aq "numa:   pool node $node:" "$port_log" || fail "$port: node $node has no pool of its own"
+		grep -aqh "numa:   pool node $node:" ${port_logs[@]} || fail "$port: node $node has no pool of its own"
 	done
-	weak_placement "$port" "$port_log"
-	echo "qemu-numa:   $port: $(grep -a -m 1 -o 'numa:   node 0: .*' "$port_log")"
-	echo "qemu-numa:   $port: $(grep -a -m 1 -o 'numa:   node 1: .*' "$port_log")"
+	weak_placement "$port" ${port_logs[@]}
+	echo "qemu-numa:   $port: $(grep -a -m 1 -o 'numa:   node 0: .*' ${port_logs[@]})"
+	echo "qemu-numa:   $port: $(grep -a -m 1 -o 'numa:   node 1: .*' ${port_logs[@]})"
 done
 
 echo "qemu-numa: three profiles - x86_64 ACPI, aarch64 and riscv64 device tree - each read two nodes, partitioned per node, and steered real allocations"

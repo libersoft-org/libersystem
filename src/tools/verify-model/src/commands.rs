@@ -11,13 +11,55 @@ use crate::registry::Configuration;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub struct Step {
+	// WHEN TWO STEPS ARE THE SAME WORK. What schedules this one, what its dependencies are stated
+	// in, and what its cost is keyed on - which is a different question from what it DISCHARGES, and
+	// running the two together is why a merged gate step's per-key costs are an artefact of how the
+	// gates happened to be batched.
+	//
+	// It contains the kind, the architecture or crate, the configuration, and what the step was
+	// ASKED to do - selection ids, tags, or build parts. It contains no run identity: an id that
+	// changed every run would have no history and every step would be priced as unseen.
+	pub id: String,
+	// THE STEPS THIS ONE CANNOT START BEFORE, by their ids.
+	//
+	// `Step` carried no dependencies at all, so "prerequisite-closed branch" was a phrase with
+	// nothing behind it - and the ordering defect it left is not a preference: `capability-trace`
+	// reads a log only a guest run produces, and every full path ran the checks BEFORE the tests, so
+	// the gate could not pass however clean the tree was.
+	//
+	// Ids rather than indexes, because an index is a position in one emission and a dependency has
+	// to survive being reordered - which is the next thing that happens to it.
+	pub requires: Vec<String>,
 	pub label: String,
 	pub command: String,
 	// The keys this one command discharges. Carried rather than counted, because a run has to be
 	// RECORDED against them: the history, the age bound and the cost model all range over
 	// PlanItemKeys, and a step that only knows how many it covered can update none of them.
+	//
+	// EMPTY IS LEGITIMATE FOR A PREREQUISITE AND FOR NOTHING ELSE. A step that runs tests and
+	// discharges nothing is unmeasurable by construction - `record_step` returns on an empty key
+	// list - so the two guest steps that stand in for a target's tests are catalog checks with keys
+	// of their own rather than the keyless step this used to invent.
 	pub keys: Vec<crate::plan::PlanItemKey>,
 	pub note: Option<String>,
+}
+
+// A long list is digested rather than spelled. Two hundred selected ids make a nine-kilobyte name,
+// and an identity has to be stable and distinct, not readable.
+fn scoped_id(kind: &str, scope: &str, parts: &[String]) -> String {
+	if parts.is_empty() {
+		return format!("{kind}:{scope}");
+	}
+	let mut sorted: Vec<&str> = parts.iter().map(String::as_str).collect();
+	sorted.sort_unstable();
+	let joined = sorted.join("+");
+	if joined.len() <= 96 {
+		return format!("{kind}:{scope}:{joined}");
+	}
+	let mut hasher = <sha2::Sha256 as sha2::Digest>::new();
+	sha2::Digest::update(&mut hasher, joined.as_bytes());
+	let digest = sha2::Digest::finalize(hasher);
+	format!("{kind}:{scope}:{}:{:x}", sorted.len(), digest)
 }
 
 // The command that runs one check of `kind` in one configuration. `command` already has `{arch}`
@@ -63,7 +105,7 @@ pub fn lower(kind: CheckKind, command: &str, configuration: &Configuration) -> S
 		// a kernel test is selected by tag rather than by feature. Appending cargo flags to any of
 		// them produces something that is not the command the runner runs - and for the dev check,
 		// something that is not a command at all.
-		CheckKind::Gate | CheckKind::Conformance | CheckKind::Build | CheckKind::DevCheck | CheckKind::KernelTest => command.to_string(),
+		CheckKind::Gate | CheckKind::Conformance | CheckKind::Build | CheckKind::DevCheck | CheckKind::KernelTest | CheckKind::GuestFallback => command.to_string(),
 	}
 }
 
@@ -84,8 +126,13 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 		parts_by_arch.entry(&item.key.architecture).or_default().insert(part);
 		build_keys.entry(&item.key.architecture).or_default().push(item.key.clone());
 	}
+	// Kept so a guest step can name the build it cannot start before. A dependency by id survives
+	// the reordering below; an index would not.
+	let mut build_ids: BTreeMap<String, String> = BTreeMap::new();
 	for (architecture, parts) in &parts_by_arch {
-		steps.push(Step { label: format!("build {architecture}"), command: format!("./build.sh --arch {architecture} --part {}", parts.iter().copied().collect::<Vec<_>>().join(",")), keys: build_keys.get(architecture).cloned().unwrap_or_default(), note: None });
+		let part_names: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
+		build_ids.insert((*architecture).to_string(), scoped_id("build", architecture, &part_names));
+		steps.push(Step { id: scoped_id("build", architecture, &part_names), requires: Vec::new(), label: format!("build {architecture}"), command: format!("./build.sh --arch {architecture} --part {}", parts.iter().copied().collect::<Vec<_>>().join(",")), keys: build_keys.get(architecture).cloned().unwrap_or_default(), note: None });
 	}
 
 	// Host suites, one per crate per configuration. The configuration is in the command because it
@@ -93,19 +140,34 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// the one that never ships, and running only that one is what this model exists to stop.
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::HostSuite) {
 		let crate_name = item.key.check.strip_prefix("host.").unwrap_or(&item.key.check);
-		steps.push(Step { label: format!("host suite {crate_name} ({})", item.key.configuration), command: lower(CheckKind::HostSuite, &item.command, registry.configuration(&item.key.configuration).unwrap_or(&DEFAULT_CONFIGURATION)), keys: vec![item.key.clone()], note: None });
+		steps.push(Step { id: scoped_id("host", crate_name, &[item.key.configuration.clone()]), requires: Vec::new(), label: format!("host suite {crate_name} ({})", item.key.configuration), command: lower(CheckKind::HostSuite, &item.command, registry.configuration(&item.key.configuration).unwrap_or(&DEFAULT_CONFIGURATION)), keys: vec![item.key.clone()], note: None });
 	}
 
 	// Gates and conformance suites each collapse into one call, because check.sh takes a list.
+	// TWO GATE STEPS, NOT ONE, AND THE SPLIT IS A DEPENDENCY RATHER THAN A PREFERENCE.
+	//
+	// `capability-trace` reads a log only a guest run produces and compares it against the kernel
+	// binary the build just refreshed - so in one merged step, ordered before the guests, it cannot
+	// pass on a clean tree. Measured twice on 2026-08-28; the second run had a trace confirmed green
+	// minutes earlier and the gate failed inside the sweep anyway, because the sweep's own build
+	// restaled it. A step whose prerequisite is invalidated by a step that runs before it is not a
+	// scheduling preference, it is the graph missing.
+	//
+	// The rest stay in front, where they are cheap and catch things early.
 	let gate_items: Vec<&crate::plan::PlanItem> = plan.items.iter().filter(|item| item.kind == CheckKind::Gate).collect();
-	if !gate_items.is_empty() {
-		let names: Vec<&str> = gate_items.iter().map(|item| item.key.check.strip_prefix("gate.").unwrap_or(&item.key.check)).collect();
-		steps.push(Step { label: format!("{} gate(s)", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: gate_items.iter().map(|item| item.key.clone()).collect(), note: None });
+	let gate_name = |item: &crate::plan::PlanItem| item.key.check.strip_prefix("gate.").unwrap_or(&item.key.check).to_string();
+	let after_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str())).collect();
+	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str())).collect();
+	if !before_guest.is_empty() {
+		let names: Vec<String> = before_guest.iter().map(|item| gate_name(item)).collect();
+		steps.push(Step { id: scoped_id("gate", "host", &names), requires: Vec::new(), label: format!("{} gate(s)", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: before_guest.iter().map(|item| item.key.clone()).collect(), note: None });
 	}
+	let gates_after_guest: Vec<&crate::plan::PlanItem> = after_guest;
 	let conformance_items: Vec<&crate::plan::PlanItem> = plan.items.iter().filter(|item| item.kind == CheckKind::Conformance).collect();
 	if !conformance_items.is_empty() {
 		let names: Vec<&str> = conformance_items.iter().map(|item| item.key.check.strip_prefix("conformance.").unwrap_or(&item.key.check)).collect();
-		steps.push(Step { label: format!("{} conformance suite(s)", names.len()), command: format!("./check.sh --conformance {}", names.join(",")), keys: conformance_items.iter().map(|item| item.key.clone()).collect(), note: None });
+		let format_names: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
+		steps.push(Step { id: scoped_id("conformance", "host", &format_names), requires: Vec::new(), label: format!("{} conformance suite(s)", names.len()), command: format!("./check.sh --conformance {}", names.join(",")), keys: conformance_items.iter().map(|item| item.key.clone()).collect(), note: None });
 	}
 
 	// One boot per architecture, whatever the selection inside it.
@@ -124,56 +186,55 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 		// A strict subset is handed over EXACTLY, by stable ID. The runner refuses an ID it does not
 		// have, so a selection naming a renamed test fails loudly instead of quietly running less.
 		//
-		// Measured on an idle machine: 2 tests take 9 s, 20 take 12 s, 205 take 108 s - a fixed cost
-		// of about eight seconds and roughly half a second per test. An earlier note put
-		// the fixed cost two orders higher and concluded that selection was the smallest lever this
-		// milestone had; that arithmetic mixed a run made under load 115 with one made idle, and it
-		// was wrong. The nine-run calibration in `CostModel::default` is what the model uses now.
-		// Selecting twenty tests out of two hundred is an 89% saving on the guest run.
-		// Hand over an exact list only when it BUYS something.
+		// AND WHETHER TO SUBSET IS NOT DECIDED HERE ANY MORE. This used to run the WHOLE suite when
+		// the selection was within a fifth of it, while attaching only the SELECTED keys - so the
+		// plan said 195 keys and the run did 205, and ten tests ran unrecorded. That is a widening,
+		// the planner makes widenings, and it makes this one now: what arrives here is either a
+		// subset worth handing over or the whole thing, and this emits what it was given.
 		//
-		// 195 of 205 selected produced a nine-kilobyte command line and saved a few seconds, because
-		// the cost of a guest run is about eight seconds fixed plus half a second per test - the
-		// saving is proportional to the tests dropped, and dropping ten of them is not worth an
-		// environment variable nobody can read in a log. Below the threshold the list is worth it:
-		// twenty tests run in 12 s against 108 s for all of them.
-		let worth_selecting = total > 0 && selected.len() * 5 < total * 4;
-		let (command, note) = if worth_selecting {
+		// Measured on an idle machine: 2 tests take 9 s, 20 take 12 s, 205 take 108 s - a fixed cost
+		// of about eight seconds and roughly half a second per test. The nine-run calibration in
+		// `CostModel::default` is what the model uses.
+		let ids: Vec<String> = selected.iter().map(|key| key.check.clone()).collect();
+		let (id, command, note) = if selected.len() < total {
 			// The check id VERBATIM. It used to be stripped of its `kernel.` prefix, which matched
 			// the guest runner's identity only while that identity was `stringify!($name)`; the
 			// runner now matches the declaration's namespaced `id`, and an id it cannot find is a
 			// hard failure by design. The two strings have to be the same string.
-			let ids: Vec<&str> = selected.iter().map(|key| key.check.as_str()).collect();
-			(format!("TEST_SELECTION={} ./test.sh --arch {architecture}", ids.join(",")), Some(format!("{} of {total} tests, handed over by id", selected.len())))
-		} else if selected.len() < total {
-			(format!("./test.sh --arch {architecture}"), Some(format!("{} of {total} selected, close enough to all of them that handing over a list would cost more than it saves", selected.len())))
+			(scoped_id("guest", architecture, &ids), format!("TEST_SELECTION={} ./test.sh --arch {architecture}", ids.join(",")), Some(format!("{} of {total} tests, handed over by id", selected.len())))
 		} else {
-			(format!("./test.sh --arch {architecture}"), None)
+			(scoped_id("guest", architecture, &[String::from("all")]), format!("./test.sh --arch {architecture}"), None)
 		};
-		steps.push(Step { label: format!("kernel suite {architecture}"), command, keys: selected.clone(), note });
+		steps.push(Step { id, requires: build_ids.get(*architecture).cloned().into_iter().collect(), label: format!("kernel suite {architecture}"), command, keys: selected.clone(), note });
 	}
 
-	// Every booted architecture gets a guest step, whether or not the catalog has tests for it.
+	// The two guest steps that stand in for a target's tests, and they are steps like any other.
 	//
-	// Guest steps were derived purely from the kernel-test items in the plan, and a target whose test
-	// binary could not be enumerated contributes none - so a plan could report
-	// `booted: x86_64, aarch64, riscv64` and emit no aarch64 boot at all. The escalation that fires
-	// on a missing enumeration made the plan FULL without making the step appear, which is a plan
-	// claiming a target and a run silently skipping it. That is the whole failure mode.
-	//
-	// The added step carries no keys: nothing was enumerated, so there is nothing to record against,
-	// and pretending otherwise would file history for tests the model cannot name.
-	for architecture in &plan.architectures_booted {
-		if kernel_by_arch.contains_key(architecture.as_str()) {
-			continue;
-		}
-		steps.push(Step { label: format!("kernel suite {architecture} (unenumerated)"), command: format!("./test.sh --arch {architecture}"), keys: Vec::new(), note: Some(String::from("the model could not enumerate this target's tests, so the whole suite runs and nothing is recorded against individual keys")) });
+	// This was a KEYLESS step invented here, for two different states at once, under a note claiming
+	// the model could not enumerate the target - which was false whenever enumeration had worked and
+	// the selection was merely empty. `record_step` returns on an empty key list, so the largest item
+	// in a driver plan could never acquire a cost however many times it ran. Both states are catalog
+	// checks now, chosen by the planner, so `--plan` shows them, the estimator can price them and the
+	// recorder has a key to file against. What is left here is emitting what the plan decided.
+	for item in plan.items.iter().filter(|item| item.kind == CheckKind::GuestFallback) {
+		let architecture = item.key.architecture.as_str();
+		let (label, note) = if item.key.check == "guest.whole-suite" { (format!("kernel suite {architecture} (unenumerated)"), String::from("the model could not enumerate this target's tests, so the whole suite runs and is recorded against one aggregate key")) } else { (format!("boot check {architecture}"), String::from("this target is booted and no test selected it, so it runs a named boot check rather than everything or nothing")) };
+		steps.push(Step { id: scoped_id("guest", architecture, &[item.key.check.clone()]), requires: build_ids.get(architecture).cloned().into_iter().collect(), label, command: item.command.clone(), keys: vec![item.key.clone()], note: Some(note) });
+	}
+
+	// The gates that read what a guest wrote, after the guests wrote it. Every guest step emitted
+	// above is a prerequisite: which of them produced the log a given gate reads is the gate's own
+	// business, and requiring all of them is the conservative answer rather than a guess.
+	if !gates_after_guest.is_empty() {
+		let names: Vec<String> = gates_after_guest.iter().map(|item| gate_name(item)).collect();
+		let guest_ids: Vec<String> = steps.iter().filter(|step| step.id.starts_with("guest:")).map(|step| step.id.clone()).collect();
+		steps.push(Step { id: scoped_id("gate-after-guest", "host", &names), requires: guest_ids, label: format!("{} gate(s) that read a guest run", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: gates_after_guest.iter().map(|item| item.key.clone()).collect(), note: Some(String::from("these read a log a guest run wrote, so they cannot run before one")) });
 	}
 
 	// The development guest last: it needs an instance `./dev.sh up` left running, and qemu-run.sh
 	// refuses to combine DEV_PROFILE with TEST, so it can never share a boot with the suite above.
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::DevCheck) {
-		steps.push(Step { label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")) });
+		steps.push(Step { id: scoped_id("dev", &item.key.check, &[]), requires: Vec::new(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")) });
 	}
 
 	steps

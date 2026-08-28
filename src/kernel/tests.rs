@@ -2376,6 +2376,26 @@ impl Testable for TaggedTest {
 // `covers` is treated as covering everything and is therefore ALWAYS selected. Annotating a test
 // can only ever make the suite cheaper, never less safe, so this can be done a file at a time
 // instead of as one change to 209 call sites.
+//
+// TAGS AND `covers` ARE DIFFERENT INSTRUMENTS, AND THIS IS WHERE THE DIFFERENCE IS WRITTEN DOWN.
+//
+// `covers` answers WHAT WOULD THIS TEST CATCH. It is the change selector's handle and the only one:
+// `verify-model`'s `select` reads `covers` and never looks at a tag, so retagging a test cannot move
+// a `verify.sh` plan by one key.
+//
+// A TAG answers WHAT GROUP DOES THIS TEST BELONG TO, for a person or a gate asking for one, and it
+// is what `./test.sh --tags` pulls on. Most tags are subjects; some honestly are not - `Smoke`,
+// `Slow`, `Stress` and the `arch-*` tags describe how a test RUNS or where, which is a second
+// legitimate kind of group. The rule is that a tag says something TRUE about the test, not that
+// every tag is a subject. A test may carry several.
+//
+// NEITHER IS AN ASSERTION, and that is the mistake both of them get used for. Writing `covers` on a
+// test that never asserts anything which fails when that component breaks moves the plan and catches
+// nothing. Asking for a whole subject tag when what is wanted is five named tests buys every test
+// that subject will ever acquire - which is how a gate about interrupt controllers came to run a
+// 1149-second image-conversion measurement eight times. A gate that wants N named things asks for
+// those N things: `TEST_SELECTION` takes ids and hard-fails on one it does not have, and
+// `check-gate-oracles.sh` refuses a gate that names an id this tree no longer declares.
 #[macro_export]
 macro_rules! tagged_test {
 	// One internal rule builds the descriptor and the four public shapes feed it, so there is

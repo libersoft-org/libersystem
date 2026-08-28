@@ -376,6 +376,20 @@ if [[ "$status" -eq 0 ]] && ! grep -hEq '^test suite complete: [0-9]+ passed' "$
 	echo "[test-$ARCH] the last line of the guest log names the test it happened in; every test after it never ran" >&2
 	exit 1
 fi
+# WHICH FILES CARRY THIS RUN'S RESULT, SAID BY THE RUN THAT MADE THEM.
+#
+# Every consumer used to find them by globbing `.build/logs/test/<arch>-*-guest.log` and taking the
+# newest, which is a correct-looking read of ANOTHER guest's result the moment two runs of one
+# architecture overlap - and it is wrong on one target of three even when they do not, because on
+# riscv64 the suite's output lands in the RUN log while the guest log holds only U-Boot and the
+# loader.
+#
+# BOTH, NOT ONE. The oracle is in the run log on riscv64 and in the guest log on the other two, and
+# the runner itself already reads both rather than choosing - `result` above greps them together.
+# Publishing one would mean picking, and picking is what put a target's answer in a file nobody read.
+# Printed before the verdict so it is present on a failure too, which is when a consumer most needs
+# to be told which files to look in.
+echo "[test-$ARCH] RESULT-LOGS $RUN_LOG $GUEST_LOG"
 if [[ "$status" -eq 0 ]]; then
 	result="$(grep -hE '^test suite complete: [0-9]+ passed' "$RUN_LOG" "$GUEST_LOG" | tail -1 | tr -d '\r')"
 	echo "[test-$ARCH] PASS: $result (${elapsed}s); logs: $RUN_LOG $GUEST_LOG"

@@ -178,6 +178,10 @@ pub struct Planner<'a> {
 	// Measured per-key durations, for the cost escalation. Empty on a checkout that has run nothing,
 	// which still leaves the fixed per-boot terms - and those are what dominate.
 	pub history: crate::history::History,
+	// How many test ids the source declares, for seeding the whole-suite stand-in - see `CostModel`.
+	pub declared_ids: usize,
+	// The tests and the files that declare them, so a changed test file can reach its own tests.
+	pub kernel_tests: Vec<crate::catalog::KernelTest>,
 }
 
 impl<'a> Planner<'a> {
@@ -188,7 +192,7 @@ impl<'a> Planner<'a> {
 	// has to be passed in because it borrows the model's crates and cannot be created here without
 	// outliving the borrow.
 	pub fn for_model(model: &'a crate::Model, ownership: &'a Ownership<'a>) -> Self {
-		Planner { registry: &model.registry, graph: &model.graph, ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone(), arch_risk: model.arch_risk.clone(), history: crate::history::History::load(&model.repo_root).unwrap_or_default() }
+		Planner { registry: &model.registry, graph: &model.graph, ownership, catalog: &model.catalog, unenumerated_targets: model.kernel_tests.missing_targets.clone(), arch_risk: model.arch_risk.clone(), history: crate::history::History::load(&model.repo_root).unwrap_or_default(), declared_ids: model.kernel_tests.declared_ids, kernel_tests: model.kernel_tests.tests.clone() }
 	}
 
 	pub fn plan(&self, changed: &[String]) -> Plan {
@@ -351,7 +355,7 @@ impl<'a> Planner<'a> {
 		// rule cannot express that: it would answer the riscv64 question by also booting the two
 		// targets nobody asked about.
 		if !full && !items.is_empty() {
-			let cost = crate::history::CostModel::default();
+			let cost = crate::history::CostModel { whole_suite_tests: self.declared_ids, ..crate::history::CostModel::default() };
 			let history = &self.history;
 			let mut pairs: BTreeSet<(String, crate::catalog::Environment)> = BTreeSet::new();
 			for item in &items {
@@ -362,6 +366,13 @@ impl<'a> Planner<'a> {
 				let mine: Vec<PlanItemKey> = items.iter().filter(|item| &item.key.architecture == architecture && &item.key.environment == environment).map(|item| item.key.clone()).collect();
 				let mut whole: Vec<PlanItem> = Vec::new();
 				for check in &self.catalog.checks {
+					// NOT THE STATE-DRIVEN GUEST STEPS. "All the keys of this pair" means all the
+					// checks that answer FOR something in it, and these two answer for a target that
+					// has nothing selected - so taking the whole pair would add both of them beside
+					// the tests they stand in for, which is a target booted three times.
+					if check.kind == CheckKind::GuestFallback {
+						continue;
+					}
 					for variant in &check.variants {
 						if &variant.architecture != architecture || &variant.environment != environment || !self.variant_applies(check, variant, &built, &booted) {
 							continue;
@@ -394,6 +405,114 @@ impl<'a> Planner<'a> {
 			}
 		}
 
+		// THE NEAR-FULL WIDENING IS THE PLANNER'S, AND IT USED TO BE THE STEP BUILDER'S.
+		//
+		// Below a threshold the lowering handed the runner an exact id list; at or above it, it ran
+		// `./test.sh --arch X` - the WHOLE suite - while attaching only the SELECTED keys. So the
+		// plan said 195 keys and the run did 205, and ten tests ran unrecorded. Widening is a
+		// decision, the planner already makes one on cost, and a second one living in the step
+		// builder is a plan that does not describe its own run.
+		//
+		// FOUR FIFTHS, measured: a guest run costs a fixed boot plus about half a second per test, so
+		// the saving is proportional to the tests DROPPED. Dropping ten of two hundred saves a few
+		// seconds and costs a nine-kilobyte command line nobody can read in a log.
+		if !full {
+			let mut selected_by_arch: BTreeMap<String, usize> = BTreeMap::new();
+			for item in items.iter().filter(|item| item.kind == CheckKind::KernelTest) {
+				*selected_by_arch.entry(item.key.architecture.clone()).or_default() += 1;
+			}
+			let mut widened: Vec<PlanItem> = Vec::new();
+			for (architecture, count) in &selected_by_arch {
+				let mut whole: Vec<PlanItem> = Vec::new();
+				for check in self.catalog.checks.iter().filter(|check| check.kind == CheckKind::KernelTest) {
+					for variant in &check.variants {
+						if &variant.architecture != architecture || !self.variant_applies(check, variant, &built, &booted) {
+							continue;
+						}
+						whole.push(PlanItem { key: PlanItemKey { check: check.id.clone(), architecture: variant.architecture.clone(), environment: variant.environment.clone(), configuration: variant.configuration.clone() }, kind: check.kind, command: check.command.replace("{arch}", &variant.architecture), reason: format!("the {architecture} guest selection was within a fifth of all of it, so it runs all of it") });
+					}
+				}
+				let total = whole.len();
+				if total == 0 || *count >= total || count * 5 < total * 4 {
+					continue;
+				}
+				warnings.push(format!("the {architecture} guest selection is {count} of {total}, close enough to all of them that handing over a list would cost more than it saves, so it takes all of them"));
+				widened.extend(whole);
+			}
+			if !widened.is_empty() {
+				let already: BTreeSet<PlanItemKey> = items.iter().map(|item| item.key.clone()).collect();
+				items.extend(widened.into_iter().filter(|item| !already.contains(&item.key)));
+				items.sort_by(|left, right| left.key.cmp(&right.key));
+			}
+		}
+
+		// A TEST FILE REACHES THE TESTS IN IT, which is what `src/kernel/test_suites` has promised in
+		// the registry all along and could not deliver.
+		//
+		// The row says "once `covers` is on every test this is derivable rather than declarable, and
+		// this row disappears". `covers` IS on every test - 370 of 370 - and the row stayed, because
+		// discovery threw the source path away: the model knew only that a file under `src/kernel`
+		// had changed, which is the whole kernel. With `source_paths` the question is answerable.
+		//
+		// IT NARROWS THE TESTS AND NOT THE BUILD. Editing a test file changes the kernel binary, so
+		// the kernel is still rebuilt and every target that boots still boots; what stops being
+		// everything is which tests run inside that boot.
+		if !full {
+			let mut declared_here: BTreeSet<String> = BTreeSet::new();
+			for verdict in &paths {
+				for test in &self.kernel_tests {
+					if test.source_paths.iter().any(|source| source == &verdict.path) {
+						declared_here.insert(test.id.clone());
+					}
+				}
+			}
+			if !declared_here.is_empty() {
+				let already: BTreeSet<PlanItemKey> = items.iter().map(|item| item.key.clone()).collect();
+				let mut extra: Vec<PlanItem> = Vec::new();
+				for check in self.catalog.checks.iter().filter(|check| declared_here.contains(&check.id)) {
+					for variant in &check.variants {
+						if !self.variant_applies(check, variant, &built, &booted) {
+							continue;
+						}
+						let key = PlanItemKey { check: check.id.clone(), architecture: variant.architecture.clone(), environment: variant.environment.clone(), configuration: variant.configuration.clone() };
+						if already.contains(&key) {
+							continue;
+						}
+						extra.push(PlanItem { key, kind: check.kind, command: check.command.replace("{arch}", &variant.architecture), reason: String::from("a changed file declares this test") });
+					}
+				}
+				if !extra.is_empty() {
+					items.extend(extra);
+					items.sort_by(|left, right| left.key.cmp(&right.key));
+				}
+			}
+		}
+
+		// THREE STATES, THREE ANSWERS, AND ALL THREE ARE DECIDED HERE.
+		//
+		// A target the model could not enumerate boots WHOLE - booting blind is the safe answer to a
+		// model that cannot see. A target it enumerated and selected nothing for boots a NAMED SMOKE
+		// CHECK, because the architecture policy has already decided this target boots and "runs
+		// nothing" is not one of the answers available to the lowering. A target that need not be
+		// booted is simply not in `booted` and gets neither.
+		//
+		// Both are catalog checks with keys, so `--plan` shows what the run will do and `record_step`
+		// has something to file against. The lowering used to invent a keyless step for the first two
+		// states at once, under a note that said the model could not enumerate the target - which was
+		// false whenever the enumeration had worked and the selection was merely empty.
+		for architecture in &booted {
+			if items.iter().any(|item| item.kind == CheckKind::KernelTest && &item.key.architecture == architecture) {
+				continue;
+			}
+			let unenumerated = self.unenumerated_targets.contains(architecture);
+			let id = if unenumerated { "guest.whole-suite" } else { "guest.boot-smoke" };
+			let Some(check) = self.catalog.checks.iter().find(|check| check.id == id) else { continue };
+			let Some(variant) = check.variants.iter().find(|variant| &variant.architecture == architecture) else { continue };
+			let reason = if unenumerated { format!("the model could not enumerate {architecture}'s tests, so the whole suite runs there") } else { format!("{architecture} is booted and no test selected it, so it runs a named boot check rather than everything or nothing") };
+			items.push(PlanItem { key: PlanItemKey { check: check.id.clone(), architecture: variant.architecture.clone(), environment: variant.environment.clone(), configuration: variant.configuration.clone() }, kind: check.kind, command: check.command.replace("{arch}", architecture), reason });
+		}
+		items.sort_by(|left, right| left.key.cmp(&right.key));
+
 		// The one outcome that must never happen quietly. Something was changed, it was understood,
 		// and the answer was to run nothing at all - that is a selector fault, not a clean bill.
 		if items.is_empty() && !nothing_to_do && !changed.is_empty() {
@@ -415,6 +534,13 @@ impl<'a> Planner<'a> {
 
 	// Why this check is in the plan, or None for "it is not".
 	fn select(&self, check: &Check, affected: &BTreeSet<String>, reached: &BTreeMap<String, Vec<Edge>>, reach: &BTreeMap<String, crate::graph::Reach>, full: bool) -> Option<String> {
+		// NOT EVEN WHEN THE PLAN IS FULL. A state-driven guest step stands in for a target's tests;
+		// a FULL plan has all of them, so adding it would boot the target twice and record a
+		// whole-suite key beside the individual ones it duplicates. `guest_fallbacks` adds the one a
+		// target's state calls for, after this has run.
+		if check.kind == CheckKind::GuestFallback {
+			return None;
+		}
 		if full {
 			return Some(String::from("the plan is FULL"));
 		}

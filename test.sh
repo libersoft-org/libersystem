@@ -187,10 +187,20 @@ require_no_stray_qemu() {
 		held=""
 		for fd in "/proc/$pid/fd"/*; do
 			target="$(readlink "$fd" 2>/dev/null)" || continue
-			if [[ "$target" == "$build/"* ]]; then
-				held="$target"
-				break
-			fi
+			[[ "$target" == "$build/"* ]] || continue
+			# AND SHARING A READ-ONLY FIXTURE IS NOT A COLLISION, which is the half this check was
+			# missing once the runner stopped sharing anything writable.
+			#
+			# Every image a guest WRITES is now this run's own copy - the system disk, the ESP, the
+			# console capture - and the fixtures it reads are attached `readonly=on` and keyed by
+			# content, so two guests opening one of them is the arrangement rather than the accident.
+			# Refusing on those would refuse exactly the parallelism the isolation was built for, and
+			# the message would name a file that cannot be the reason.
+			case "${target##*/}" in
+			iso-media*.iso | fat-media*.img | udf-media*.udf | usb-media*.img | libersystem.iso | libersystem-test.*.iso) continue ;;
+			esac
+			held="$target"
+			break
 		done
 		[[ -n "$held" ]] && holders+="$pid ($held) "
 	done

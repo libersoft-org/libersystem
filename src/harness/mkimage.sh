@@ -350,11 +350,12 @@ assert_pairing_matches_volume() {
 
 make_iso() {
 	local kernel="$1" test_medium="${2:-0}"
-	local final="$BUILD/$SLUG.iso" out="$BUILD/$SLUG.iso.$$.candidate"
-	if [[ "$test_medium" == "1" ]]; then
-		final="$BUILD/$SLUG-test.iso"
-		out="$BUILD/$SLUG-test.iso.$$.candidate"
-	fi
+	# FROM `$output`, NOT COMPUTED AGAIN. This recomputed the same names a second time, which was
+	# harmless while both derivations agreed and stopped being harmless the moment the test medium's
+	# path started carrying its content key: the cache would have looked at one file and the builder
+	# written another, so every run would have been a miss and every guest would have booted whatever
+	# the fixed name last held.
+	local final="$output" out="$output.$$.candidate"
 	CANDIDATES+=("$out")
 	local iso_root="$BUILD/iso_root"
 	rm -f "$out"
@@ -584,9 +585,6 @@ if [[ "$cmd" != testiso ]]; then
 	done
 fi
 
-key_file="$output.build-key"
-digest_file="$output.build-digest"
-
 # EVERY COPIED BYTE, not the subset that was easy to name.
 #
 # The key hashed the builder, the product configuration, the kernel, the loader, two packages and
@@ -635,6 +633,40 @@ image_input_key() {
 }
 
 key="$(image_input_key | sha256sum | awk '{print $1}')"
+# THE TEST MEDIUM'S PATH CARRIES ITS KEY, and the shipping media's does not.
+#
+# `TEST_SELECTION` and `TEST_TAGS` are compile-time - `option_env!` - so two runs of one architecture
+# with different selections compile to different kernels and therefore to different media. Both used
+# to be written to `$SLUG-test.iso`. The write is a rename, so it was never torn; a rename is atomic
+# and not private, and the second run could replace the medium before the first guest opened it. What
+# booted was then the other run's suite under this run's name - green over somebody else's selection.
+#
+# CONTENT-ADDRESSED RATHER THAN PER-RUN, because per-run would defeat the cache this key exists for:
+# two runs of the SAME selection want the same file and want it built once. Two generations are two
+# files, and replacing one is not something that can happen to the other.
+#
+# The shipping ISO and the raw image keep their plain names: they are what a person installs, one
+# artifact per tree, and nothing races them.
+if [[ "$cmd" == testiso ]]; then
+	output="$BUILD/$SLUG-test.$key.iso"
+fi
+key_file="$output.build-key"
+digest_file="$output.build-digest"
+
+# AND THE OLD GENERATIONS ARE SWEPT, because a content-addressed name grows one file per distinct
+# selection and nothing else would ever remove them. A medium a live guest is reading is never
+# touched: `fuser` answers that question and its absence is answered by keeping the file, which is
+# the safe direction for a sweep. Only the test medium is swept - the shipping media have one name.
+if [[ "$cmd" == testiso ]]; then
+	for stale in "$BUILD/$SLUG-test."*.iso; do
+		[[ -f "$stale" && "$stale" != "$output" ]] || continue
+		[[ -n "$(find "$stale" -mmin +720 -print -quit 2>/dev/null)" ]] || continue
+		if command -v fuser >/dev/null && fuser -s "$stale" 2>/dev/null; then
+			continue
+		fi
+		rm -f "$stale" "$stale.build-key" "$stale.build-digest"
+	done
+fi
 # AND THE OUTPUT IS VERIFIED ON A HIT. A matching key used to return the existing file without
 # looking at it, so a truncated, hand-edited or half-written image was served as current - the key
 # describes the INPUTS and says nothing about the bytes that were produced from them.

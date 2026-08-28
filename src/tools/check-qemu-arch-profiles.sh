@@ -19,7 +19,21 @@
 # separate from `arch-surface` for that reason: that one is a static scan and belongs in every run.
 set -euo pipefail
 
+# shellcheck source=/dev/null
+source "$(dirname "$0")/result-logs.sh"
 cd "$(dirname "$0")/../.."
+# ONE PROFILE PER INVOCATION WHEN ASKED, because eight profiles inside one step is one cost divided
+# eight ways and one thing to schedule where there are eight.
+#
+# `--only <arch>:<label>:<cores>` runs exactly that profile. With no argument every profile runs, in
+# order, which is what a person typing the gate's name expects and what the umbrella entry keeps.
+# The catalog registers the eight individually: a merged step's per-profile figures are an artefact
+# of how they happened to be batched, and an emulated aarch64 profile and a one-core riscv64 one
+# differ by more than that arithmetic can express.
+ONLY=""
+if [[ "${1:-}" == "--only" ]]; then
+	ONLY="${2:?--only needs <arch>:<label>:<cores>}"
+fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -28,15 +42,18 @@ fail() {
 	exit 1
 }
 
-# The newest guest log a run produced, read without a reader that stops early.
-newest_guest_log() {
-	local arch="$1" logs
-	shopt -s nullglob
-	logs=(.build/logs/test/"$arch"-*-guest.log)
-	shopt -u nullglob
+# THE LOGS A RUN SAID IT WROTE, joined into one file this gate reads as one thing.
+#
+# This was "the newest guest log of this architecture", which is another run's answer the moment two
+# are in flight - and only the GUEST log, which on riscv64 holds U-Boot and the loader and none of
+# the suite's output. `test-kernel.sh` names both files it wrote; joining them is what lets every
+# assertion below stay one `grep` over one path.
+run_result_log() {
+	local captured="$1" merged="${1%.log}.result" logs
+	mapfile -t logs < <(result_logs "$captured") || return 1
 	((${#logs[@]})) || return 1
-	readarray -t logs < <(printf '%s\n' "${logs[@]}" | sort)
-	printf '%s\n' "${logs[-1]}"
+	cat "${logs[@]}" >"$merged" || return 1
+	printf '%s\n' "$merged"
 }
 
 # The timer floor, read out of the line rather than matched as text: what matters is the NUMBER.
@@ -89,6 +106,9 @@ MULTI_CORE_ORACLES="kernel.sched.a_remote_spawn_wakes_a_halted_core_without_wait
 
 # One profile: boot it, then ask the boot what machine it was on.
 run_profile() {
+	if [[ -n "$ONLY" && "$ONLY" != "$1:$2:$3" ]]; then
+		return 0
+	fi
 	local arch="$1" label="$2" cores="$3" want="$4"
 	shift 4
 	echo "arch-profiles: $arch $label, $cores core(s)"
@@ -144,7 +164,7 @@ run_profile() {
 		exit 1
 	fi
 	local log
-	log="$(newest_guest_log "$arch")" || fail "$arch $label produced no guest log"
+	log="$(run_result_log "$out")" || fail "$arch $label did not say which logs it wrote"
 	grep -aq "$want" "$log" || {
 		echo "arch-profiles: $arch $label did not report the controller this profile has" >&2
 		echo "arch-profiles:   wanted: $want" >&2
@@ -228,13 +248,17 @@ run_profile aarch64 gicv3-its 4 "GICv3 from the device tree" GIC=3its
 # it could not hand out an MSI". The MSI oracle above is the positive form: on this profile a vector
 # is acquired through the ITS, programmed into a device table, dispatched to a bound Interrupt and
 # released, and the profile passes only if that test ran and passed here.
-its_log="$(newest_guest_log aarch64)" || fail "the ITS profile produced no guest log"
-if grep -aqE "interrupts: (an ITS with no redistributor|the machine describes an ITS but no msi-map)" "$its_log"; then
-	echo "arch-profiles: the ITS profile came up without MSI" >&2
-	grep -a "interrupts:\|its:" "$its_log" >&2
-	exit 1
+# The ITS profile that just ran, by the capture `run_profile` wrote for it - a name this gate chose,
+# not a file it went looking for.
+if [[ -z "$ONLY" || "$ONLY" == "aarch64:gicv3-its:4" ]]; then
+	its_log="$(run_result_log "$work/aarch64-gicv3-its-4.log")" || fail "the ITS profile did not say which logs it wrote"
+	if grep -aqE "interrupts: (an ITS with no redistributor|the machine describes an ITS but no msi-map)" "$its_log"; then
+		echo "arch-profiles: the ITS profile came up without MSI" >&2
+		grep -a "interrupts:\|its:" "$its_log" >&2
+		exit 1
+	fi
+	echo "arch-profiles:   the ITS profile discovered its ITS and delivered a real MSI through it"
 fi
-echo "arch-profiles:   the ITS profile discovered its ITS and delivered a real MSI through it"
 
 # The RISC-V AIA. Nothing to select: this runner's only riscv64 machine is `virt,aia=aplic-imsic`, so
 # the profile is what it boots - and passing a second `-machine` to add the AIA, which the first
@@ -243,4 +267,8 @@ MSI_ORACLE=kernel.arch.riscv64.interrupts.imsic_msi_binds_and_dispatch_signals_t
 run_profile riscv64 aia 1 "IMSIC S-mode files from the device tree"
 run_profile riscv64 aia 4 "IMSIC S-mode files from the device tree"
 
-echo "arch-profiles: every named profile booted, named the controller it has, delivered timer interrupts and brought up every declared core"
+if [[ -n "$ONLY" ]]; then
+	echo "arch-profiles: $ONLY booted, named the controller it has, delivered timer interrupts and brought up every declared core"
+else
+	echo "arch-profiles: every named profile booted, named the controller it has, delivered timer interrupts and brought up every declared core"
+fi

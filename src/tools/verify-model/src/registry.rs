@@ -28,6 +28,8 @@ struct RawRegistry {
 	#[serde(default)]
 	risk_class: Vec<RawRiskClass>,
 	#[serde(default)]
+	change_group: Vec<RawChangeGroup>,
+	#[serde(default)]
 	edge: Vec<RawEdge>,
 	#[serde(default)]
 	architecture: Vec<RawArchitecture>,
@@ -68,6 +70,39 @@ struct RawRiskClass {
 	path: String,
 	class: String,
 	evidence: String,
+	// THE FOUR FIELDS `evidence` DESCRIBES IN PROSE, so a check can hold a narrowing to them.
+	//
+	// `evidence` says things like "shadow-clean on all three targets for allocator and page-table
+	// changes" and "shadow-clean plus the ABI unchanged". A sentence cannot be checked, and three
+	// fields would not have been enough: `mem` names two change groups, `object` names four and
+	// `sched` two, so a bar built on targets, a count and an ABI flag would pass on five edits to one
+	// corner of the subsystem.
+	#[serde(default)]
+	targets: Vec<String>,
+	#[serde(default)]
+	distinct_changes: usize,
+	#[serde(default)]
+	abi_unchanged: bool,
+	#[serde(default)]
+	required_groups: Vec<String>,
+}
+
+// A NAMED KIND OF CHANGE, AND THE PATHS THAT CONSTITUTE IT.
+//
+// `risk_class.required_groups` names them and nothing produced them: `Record` carries
+// `change_kinds`, but those say how a component was REACHED - what it ships, what its tests are
+// built from - not what the edit was ABOUT, so no record could answer "was this an allocator
+// change". Declared here as a name and its paths, matched against what a change set touched, and
+// written into the evidence record beside the rest.
+//
+// A group matching no tracked path is REFUSED rather than left standing: a bar nobody can meet is
+// the same defect as a check that skips itself, reached from the other side.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawChangeGroup {
+	name: String,
+	paths: Vec<String>,
+	reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -172,7 +207,20 @@ pub struct ArchitectureRule {
 pub struct RiskClass {
 	pub path: String,
 	pub class: String,
+	// The prose, kept: it is what a person reads, and the four fields below are what a check reads.
+	// Both, because a field that contradicts its sentence is worse than either alone.
 	pub evidence: String,
+	pub targets: Vec<String>,
+	pub distinct_changes: usize,
+	pub abi_unchanged: bool,
+	pub required_groups: Vec<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ChangeGroup {
+	pub name: String,
+	pub paths: Vec<String>,
+	pub reason: String,
 }
 
 #[derive(Clone, Debug)]
@@ -200,6 +248,7 @@ pub struct Registry {
 	pub non_code: Vec<NonCodeRule>,
 	pub host_tests_unrunnable: Vec<Unrunnable>,
 	pub risk_classes: Vec<RiskClass>,
+	pub change_groups: Vec<ChangeGroup>,
 	pub host_configuration_unrunnable: Vec<ConfigurationUnrunnable>,
 	pub selects_everything: Vec<SelectsEverything>,
 	pub edges: Vec<DeclaredEdge>,
@@ -239,7 +288,7 @@ impl Registry {
 			}
 		}
 
-		let registry = Registry { ownership: raw.ownership.into_iter().map(|rule| OwnershipRule { path: rule.path, component: rule.component }).collect(), non_code: raw.non_code.into_iter().map(|rule| NonCodeRule { path: rule.path, reason: rule.reason }).collect(), risk_classes: raw.risk_class.into_iter().map(|rule| RiskClass { path: rule.path, class: rule.class, evidence: rule.evidence }).collect(), host_tests_unrunnable: raw.host_tests_unrunnable.into_iter().map(|rule| Unrunnable { crate_name: rule.crate_name, reason: rule.reason }).collect(), host_configuration_unrunnable: raw.host_configuration_unrunnable.into_iter().map(|rule| ConfigurationUnrunnable { configuration: rule.configuration, when_static_reach: rule.when_static_reach, reason: rule.reason }).collect(), selects_everything: raw.selects_everything.into_iter().map(|rule| SelectsEverything { component: rule.component, reason: rule.reason }).collect(), edges, architecture: raw.architecture.into_iter().map(|rule| ArchitectureRule { path: rule.path, build: rule.build, boot: rule.boot }).collect(), configurations: raw_configurations.configuration, registry_text, configurations_text };
+		let registry = Registry { ownership: raw.ownership.into_iter().map(|rule| OwnershipRule { path: rule.path, component: rule.component }).collect(), non_code: raw.non_code.into_iter().map(|rule| NonCodeRule { path: rule.path, reason: rule.reason }).collect(), change_groups: raw.change_group.into_iter().map(|rule| ChangeGroup { name: rule.name, paths: rule.paths, reason: rule.reason }).collect(), risk_classes: raw.risk_class.into_iter().map(|rule| RiskClass { path: rule.path, class: rule.class, evidence: rule.evidence, targets: rule.targets, distinct_changes: rule.distinct_changes, abi_unchanged: rule.abi_unchanged, required_groups: rule.required_groups }).collect(), host_tests_unrunnable: raw.host_tests_unrunnable.into_iter().map(|rule| Unrunnable { crate_name: rule.crate_name, reason: rule.reason }).collect(), host_configuration_unrunnable: raw.host_configuration_unrunnable.into_iter().map(|rule| ConfigurationUnrunnable { configuration: rule.configuration, when_static_reach: rule.when_static_reach, reason: rule.reason }).collect(), selects_everything: raw.selects_everything.into_iter().map(|rule| SelectsEverything { component: rule.component, reason: rule.reason }).collect(), edges, architecture: raw.architecture.into_iter().map(|rule| ArchitectureRule { path: rule.path, build: rule.build, boot: rule.boot }).collect(), configurations: raw_configurations.configuration, registry_text, configurations_text };
 		registry.validate()?;
 		Ok(registry)
 	}

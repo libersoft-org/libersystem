@@ -30,6 +30,18 @@ pub struct Record {
 	// different graph does not describe what runs today, which is the same argument that makes
 	// TRUSTED a certificate rather than a property of a name.
 	pub model_hash: String,
+	// WHETHER THIS COST WAS INVENTED BY DIVISION.
+	//
+	// `record_step` takes the fixed term off the top and splits what remains EVENLY over the keys a
+	// step discharged. For a boot that is an approximation which adds up to the truth. For a MERGED
+	// step - fifty-six gates in one `check.sh` call - it is one duration divided fifty-six ways, and
+	// every per-gate figure on disk is an artefact of how the gates happened to be batched. Ordering
+	// on those is sorting on the batching.
+	//
+	// Recorded rather than inferred, because after the fact nothing distinguishes a real measurement
+	// from a divided one, and a migration that has to guess would throw away the good ones too.
+	#[serde(default)]
+	pub cost_was_divided: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -46,7 +58,7 @@ pub struct History {
 }
 
 // The history file's format version. Bumped when a recorded value stops meaning what it meant.
-pub const SCHEMA: u32 = 2;
+pub const SCHEMA: u32 = 3;
 
 impl History {
 	pub fn path(repo_root: &Path) -> PathBuf {
@@ -70,6 +82,20 @@ impl History {
 		// observations.
 		if history.schema < SCHEMA {
 			history.fixed_overshoot.clear();
+			// AND EVERY COST WRITTEN BEFORE THE MARKER EXISTED GOES WITH IT.
+			//
+			// `cost_was_divided` is recorded rather than inferred, because after the fact nothing
+			// distinguishes a real measurement from a merged step's duration divided by how many
+			// things were batched into it. A record written before schema 3 carries no marker
+			// and therefore cannot be told apart - so its COST is dropped once, here, and the run
+			// that measures it again writes a figure that says which kind it is.
+			//
+			// ONLY THE COST. When the key last ran and whether it passed are still true, and
+			// throwing those away would turn a cost migration into a freshness reset - every key
+			// suddenly overdue for a reason that has nothing to do with whether it ran.
+			for entry in history.entries.values_mut() {
+				entry.last_seconds = 0.0;
+			}
 			history.schema = SCHEMA;
 		}
 		Ok(history)
@@ -145,13 +171,24 @@ impl History {
 			}
 		}
 		let share = residual.max(0.0) / keys.len() as f64;
+		// A KEY'S SHARE IS A MEASUREMENT ONLY WHERE THE THING IT NAMES COULD HAVE BEEN SCHEDULED ON
+		// ITS OWN. Two hundred kernel tests inside one boot cannot: their share is an approximation
+		// that adds up to the truth, and it is the best number available. Fifty-six gates inside one
+		// `check.sh` call could each have been a step - `check.sh --gate <one>` is a command - so
+		// their share is one duration divided by how they happened to be batched.
+		let divided = keys.len() > 1 && keys.iter().any(|key| key.environment == crate::catalog::Environment::Host);
 		for key in keys {
-			self.record(&key.display(), passed, share, model_hash);
+			self.record_with(&key.display(), passed, share, model_hash, divided);
 		}
 	}
 
 	pub fn record(&mut self, key: &str, passed: bool, seconds: f64, model_hash: &str) {
+		self.record_with(key, passed, seconds, model_hash, false);
+	}
+
+	pub fn record_with(&mut self, key: &str, passed: bool, seconds: f64, model_hash: &str, cost_was_divided: bool) {
 		let entry = self.entries.entry(key.to_string()).or_default();
+		entry.cost_was_divided = cost_was_divided;
 		entry.last_run = now();
 		entry.last_status = String::from(if passed { "passed" } else { "failed" });
 		entry.runs += 1;
@@ -160,6 +197,39 @@ impl History {
 		}
 		entry.last_seconds = seconds;
 		entry.model_hash = model_hash.to_string();
+	}
+
+	// DISCARD EVERY COST THAT WAS INVENTED BY DIVISION, and the freshness of the ones that never ran.
+	//
+	// Ordering cheapest-first on a divided figure is sorting on how the gates happened to be batched,
+	// so those costs go before the first such run rather than being inherited by it. ONLY THE COSTS
+	// WHERE THE STEP PASSED: a record also carries when a key last ran and whether it did, and
+	// throwing that away for a step that really ran every member would turn a cost migration into a
+	// freshness reset - every key suddenly overdue for a reason that has nothing to do with running.
+	//
+	// A FAILED MERGED STEP IS DIFFERENT AND ITS FRESHNESS GOES TOO. `check.sh` runs its gates in
+	// order and stops at the first failure, and `record_step` stamps every key of the step. Measured
+	// 2026-08-28: `capability-trace` refused, it was the fifth gate of forty-five, and all forty-five
+	// were recorded as having run and failed - forty of them never started. Keeping that freshness
+	// means forty gates that never ran count as recently checked.
+	pub fn discard_divided_costs(&mut self) -> (usize, usize) {
+		let (mut costs, mut freshness) = (0, 0);
+		self.entries.retain(|_, entry| {
+			if !entry.cost_was_divided {
+				return true;
+			}
+			if entry.last_status != "passed" {
+				freshness += 1;
+				return false;
+			}
+			if entry.last_seconds > 0.0 {
+				entry.last_seconds = 0.0;
+				costs += 1;
+			}
+			entry.cost_was_divided = false;
+			true
+		});
+		(costs, freshness)
 	}
 
 	pub fn get(&self, key: &str) -> Option<&Record> {
@@ -224,6 +294,15 @@ pub struct CostModel {
 	pub variable_seconds: BTreeMap<(String, String), f64>,
 	// The fallback for a pair nothing was measured for.
 	pub default_variable: f64,
+	// THE CONSERVATIVE SEED FOR A STEP THAT STANDS IN FOR A WHOLE SUITE, in tests.
+	//
+	// `guest.whole-suite` runs everything on a target the model could not enumerate, and pricing it
+	// as one key - which is what a key with no history gets - makes the most expensive thing in the
+	// plan the cheapest thing in the estimate. The count cannot come from the discovery, because the
+	// discovery is what failed; it is the number of test ids the SOURCE declares, which is an upper
+	// bound and therefore the safe direction. Zero means nobody set it, and the aggregate is then
+	// priced like any other key rather than silently as free.
+	pub whole_suite_tests: usize,
 }
 
 impl Default for CostModel {
@@ -260,7 +339,7 @@ impl Default for CostModel {
 		for (architecture, environment, seconds) in [("x86_64", "test-guest", 0.46), ("aarch64", "test-guest", 7.17), ("riscv64", "test-guest", 9.44)] {
 			variable.insert((architecture.to_string(), environment.to_string()), seconds);
 		}
-		CostModel { fixed_seconds: fixed, variable_seconds: variable, default_variable: 0.5 }
+		CostModel { fixed_seconds: fixed, variable_seconds: variable, default_variable: 0.5, whole_suite_tests: 0 }
 	}
 }
 
@@ -289,10 +368,14 @@ impl CostModel {
 		let mut variable = 0.0;
 		for key in items {
 			pairs.insert((key.architecture.clone(), key.environment.as_str().to_string()));
+			let per_test = self.variable_seconds.get(&(key.architecture.clone(), key.environment.as_str().to_string())).copied().unwrap_or(self.default_variable);
 			variable += match history.get(&key.display()) {
 				Some(record) if record.last_seconds > 0.0 => record.last_seconds,
+				// The aggregate is not one test. Seeded from what the source declares, because the
+				// target it stands for is the one whose tests could not be counted.
+				_ if key.check == "guest.whole-suite" && self.whole_suite_tests > 0 => per_test * self.whole_suite_tests as f64,
 				// The measured per-test cost for THIS target, not one number for all of them.
-				_ => self.variable_seconds.get(&(key.architecture.clone(), key.environment.as_str().to_string())).copied().unwrap_or(self.default_variable),
+				_ => per_test,
 			};
 		}
 		let fixed: f64 = pairs.iter().map(|pair| self.fixed_seconds.get(pair).copied().unwrap_or(0.0)).sum();

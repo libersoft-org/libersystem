@@ -166,6 +166,28 @@ qemu_prepare_system_disk() {
 	return 0
 }
 
+# THE DISK A GUEST IS GIVEN IS THIS RUN'S ALONE, AND IT COMES FROM A TEMPLATE.
+#
+# `qemu_prepare_system_disk` above builds the TEMPLATE - keyed on the volume's content, rebuilt when
+# that changes, and never handed to a guest. Before this, that file WAS the guest's disk: two guests
+# of one architecture in one mode wrote the same image, which is a result that is green and means
+# nothing, and a third run inherited whatever the second had left in it. The content key hid it -
+# the key describes the SOURCE, so a disk the previous guest had scribbled on still matched.
+#
+# Copied rather than shared even when nothing appears to write: a fixture that is only read is a
+# claim about every test in the suite, and this is not the place to make it.
+#
+# `$$` is the run identity here as everywhere in this script, and `scratch_sweep` is the cleanup:
+# the script `exec`s QEMU, so no exit trap can run, and a copy owned by a pid that is gone is a copy
+# nothing will come back for.
+qemu_run_disk() {
+	local template="$1"
+	local run_disk="${template%.img}.$$.img"
+	scratch_sweep "${template%.img}" .img
+	cp --reflink=auto "$template" "$run_disk" || return 1
+	printf '%s\n' "$run_disk"
+}
+
 # THE FIXTURE MEDIA, AND WHY THEY ARE KEYED RATHER THAN MERELY PRESENT.
 #
 # These four images used to be generated only when the output path did not exist. Nothing else was
@@ -416,7 +438,20 @@ qemu_attach_virtio_blk() {
 	local file="$2"
 	local drive_id="$3"
 	local legacy="${4:-}"
-	arr+=(-drive "file=$file,if=none,id=$drive_id,format=raw")
+	# READ-ONLY WHERE THE CALLER SAYS SO, AND THE FIXTURE MEDIA SAY SO.
+	#
+	# The FAT, ISO9660 and UDF fixtures were attached writable to every guest that took them, which
+	# is what made sharing them unsafe rather than merely untidy: two guests of one architecture had
+	# one writable image between them. The system already treats them as read-only volumes - the boot
+	# hand-off routes the second, third and fourth disks up as the read-only media - so this makes
+	# the attachment agree with what the machine above it already believes, and a test that writes to
+	# one now fails loudly instead of leaving the next run a different fixture.
+	local readonly_flag="${5:-}"
+	if [[ "$readonly_flag" == "readonly" ]]; then
+		arr+=(-drive "file=$file,if=none,id=$drive_id,format=raw,readonly=on")
+	else
+		arr+=(-drive "file=$file,if=none,id=$drive_id,format=raw")
+	fi
 	if [[ -n "$legacy" ]]; then
 		arr+=(-device "virtio-blk-pci,drive=$drive_id,$legacy")
 	else
@@ -495,7 +530,12 @@ qemu_attach_virt_interactive() {
 	local -n arr=$1
 	local suffix="$2"
 	local legacy="${3:-}"
-	local vcon_out="$QEMU_BUILD_DIR/virtio-console${suffix}.out"
+	# THE GUEST'S OWN OUTPUT, SO IT IS THIS RUN'S OWN FILE. It was one name per mode, which two
+	# guests of one architecture shared - and a capture two guests write is a capture that describes
+	# neither. Nothing outside this script looks it up by name, so per-run costs nothing; the sweep
+	# below removes the ones whose run is gone.
+	local vcon_out="$QEMU_BUILD_DIR/virtio-console${suffix}.$$.out"
+	scratch_sweep "$QEMU_BUILD_DIR/virtio-console${suffix}" .out
 	arr+=(-device "ramfb")
 	if [[ -n "$legacy" ]]; then
 		arr+=(
@@ -951,7 +991,7 @@ qemu_run_x86_64() {
 	local volume_image="$QEMU_BUILD_DIR/system-volume-x86_64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${artifact_suffix}.img"
 	if qemu_prepare_system_disk "$volume_image" "$virtio_disk"; then
-		qemu_attach_virtio_blk qemu_args "$virtio_disk" vblk "$virtio_opts"
+		qemu_attach_virtio_blk qemu_args "$(qemu_run_disk "$virtio_disk")" vblk "$virtio_opts"
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
@@ -1029,9 +1069,9 @@ qemu_run_x86_64() {
 
 	# Keep media disks after USB in PCI discovery order, matching the historical
 	# runner and the volume/device inventory expected by the boot chain.
-	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "$virtio_opts"
-	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "$virtio_opts"
-	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "$virtio_opts"
+	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "$virtio_opts" readonly
+	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "$virtio_opts" readonly
+	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "$virtio_opts" readonly
 
 	# Display backends: parse DISPLAYS env for vnc/spice.
 	qemu_parse_displays qemu-run
@@ -1186,14 +1226,14 @@ qemu_run_aarch64() {
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-aarch64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
-		qemu_attach_virtio_blk qemu_args "$virtio_disk" vol0 "disable-legacy=on"
+		qemu_attach_virtio_blk qemu_args "$(qemu_run_disk "$virtio_disk")" vol0 "disable-legacy=on"
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
 	qemu_prepare_media_images "$media_suffix" -a64
-	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "disable-legacy=on"
-	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "disable-legacy=on"
-	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 "disable-legacy=on"
+	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "disable-legacy=on" readonly
+	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "disable-legacy=on" readonly
+	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 "disable-legacy=on" readonly
 
 	# Network: user-mode virtio-net.
 	qemu_attach_virtio_net qemu_args vnet0 "" "disable-legacy=on"
@@ -1392,14 +1432,14 @@ qemu_run_riscv64() {
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-riscv64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
-		qemu_attach_virtio_blk qemu_args "$virtio_disk" vol0 ""
+		qemu_attach_virtio_blk qemu_args "$(qemu_run_disk "$virtio_disk")" vol0 ""
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
 	qemu_prepare_media_images "$media_suffix" -rv64
-	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 ""
-	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 ""
-	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 ""
+	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" med0 "" readonly
+	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" iso0 "" readonly
+	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" udf0 "" readonly
 
 	# Network: user-mode virtio-net (no disable-legacy for riscv64).
 	qemu_attach_virtio_net qemu_args vnet0 "" ""

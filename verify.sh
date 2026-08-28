@@ -20,7 +20,7 @@ PLANNER_MANIFEST="$SRC_DIR/tools/verify-model/Cargo.toml"
 help() {
 	usage_and_exit <<EOF
 usage: verify.sh [--for-change | --for PATH[,PATH...] | --for-range A..B | --release | --sweep]
-                 [--plan] [--explain] [--json] [--shadow] [--allow-shadow] [--catalog] [--model-hash] [--age] [--trust]
+                 [--jobs N] [--plan] [--explain] [--json] [--shadow] [--allow-shadow] [--catalog] [--model-hash] [--age] [--trust]
 
 Works out what a change needs verified and runs exactly that. With no arguments: --for-change.
 
@@ -32,6 +32,7 @@ Works out what a change needs verified and runs exactly that. With no arguments:
   --shadow         run the FULL suite and compare it against what this change would have scoped
   --shadow-exec    the same, but RUN the selection first and compare the two runs (one target)
   --allow-shadow   accept a scoped run with no shadow evidence (exit 0 instead of 4); --dev is an alias
+  --jobs N         how many guests may boot at once (default 1; parallelism is opted into)
   --plan           print the plan and run nothing
   --explain        print why every item is in the plan
   --json           the plan as JSON, for anything that is not a person
@@ -56,6 +57,25 @@ EOF
 }
 
 mode=for-change
+# HOW MANY GUESTS MAY RUN AT ONCE, and the default is ONE.
+#
+# Parallelism is opted into, because the failure mode of getting it wrong is a green that means
+# nothing and the failure mode of not using it is a slow run. The machine has a hundred cores and
+# used one; what changed is that asking for more stopped being dangerous - every writable image a
+# guest touches is now this run's own copy, the fixtures it reads are attached read-only, and each
+# consumer reads the logs its own run named.
+#
+# THIS IS THE ONLY SCHEDULER. `--release` and `--sweep` are flat by design - they consult no model
+# and read no plan, because they are what runs when the thing that makes choices is broken - so they
+# take no limiter and run one architecture at a time instead.
+JOBS=1
+# A CEILING ON WHAT THIS RUN MAY START, in ESTIMATED seconds. Zero means no ceiling.
+#
+# Not a timeout: it decides what to start and never kills a step that overran its estimate. What it
+# prices is a whole prerequisite-closed branch, so a budget cannot spend its time building and then
+# decline to test. `--sweep`, `--release` and `--shadow` refuse it outright - each of those means
+# "all of it", and a bounded version of "all of it" is a contradiction with a number attached.
+BUDGET=0
 paths=""
 range=""
 action=run
@@ -105,6 +125,16 @@ while [[ $# -gt 0 ]]; do
 		shadow_exec=1
 		shift
 		;;
+	--budget)
+		BUDGET="${2:?--budget needs a number of seconds}"
+		[[ "$BUDGET" =~ ^[0-9]+$ ]] || die "--budget takes a whole number of seconds, not '$BUDGET'"
+		shift 2
+		;;
+	--jobs)
+		JOBS="${2:?--jobs needs a number}"
+		[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "--jobs takes a positive whole number, not '$JOBS'"
+		shift 2
+		;;
 	--plan)
 		action=plan
 		shift
@@ -146,8 +176,28 @@ done
 run_full() {
 	note "FULL verification"
 	./build.sh --arch all
+	# ONE ARCHITECTURE AT A TIME, and this used to be `--arch all`.
+	#
+	# `test.sh --arch all` runs the three targets CONCURRENTLY and says so in its own comment, so
+	# this flat path was a second scheduler - one that predates `--jobs` and answers a different
+	# number. "How many QEMUs may run" has to have exactly one answer on this machine, and the flat
+	# path cannot be the one that gives it: it consults no model and reads no plan by design, which
+	# is the whole reason it exists, so giving it a limiter to consult would remove that.
+	#
+	# Serial is the right half to choose here. It costs wall-clock on the path that is deliberately
+	# slow and thorough, and it leaves `verify.sh --jobs` as the only thing that decides.
+	local architecture
+	for architecture in x86_64 aarch64 riscv64; do
+		./test.sh --arch "$architecture"
+	done
+	# TESTS BEFORE CHECKS, and this used to be the other way round.
+	#
+	# `capability-trace` is a CHECK that reads a log only a TEST produces, and it compares that log
+	# against the kernel binary's timestamp - which `build.sh` above has just refreshed. So on this
+	# path the gate could not pass however clean the tree was, and no amount of preparing a fresh
+	# trace beforehand survives the build that runs before it. Measured on 2026-08-28, twice, the
+	# second time with a trace confirmed fresh minutes earlier.
 	./check.sh
-	./test.sh --arch all
 }
 
 # Refuse to guess. A planner that cannot answer leaves two honest options - run everything, or stop
@@ -157,9 +207,23 @@ planner_failed() {
 	echo >&2
 	echo "verify.sh: FULL VERIFICATION REQUIRED" >&2
 	echo "verify.sh: the planner could not answer ($reason), and a plan that is missing is not a plan that is empty." >&2
-	echo "verify.sh: run the whole thing yourself:  ./build.sh --arch all && ./check.sh && ./test.sh --arch all" >&2
+	# THE ORDER MATTERS AND THIS PRINTED THE WRONG ONE. `capability-trace` is a check that reads a
+	# log only a test produces, so `check` before `test` fails on a clean tree every time - and this
+	# is the line a person reaches for exactly when the planner cannot be trusted to have got it
+	# right, which makes it the worst of the four places to leave stale.
+	echo "verify.sh: run the whole thing yourself:  ./build.sh --arch all && ./test.sh --arch x86_64 && ./test.sh --arch aarch64 && ./test.sh --arch riscv64 && ./check.sh" >&2
 	exit 3
 }
+
+# THE THREE THAT MEAN "ALL OF IT" REFUSE A BUDGET. `--sweep`, `--release` and `--shadow` each assert
+# that everything ran; a bounded version of that is a contradiction with a number attached, and the
+# refusal is louder than a note nobody reads.
+if ((BUDGET > 0)); then
+	case "$mode" in
+	sweep | release) die "--budget cannot be combined with --$mode: that mode's whole claim is that everything ran" ;;
+	esac
+	[[ "$action" == shadow ]] && die "--budget cannot be combined with --shadow: a shadow compares a scoped run against the FULL suite, and a bounded full suite is not one"
+fi
 
 if [[ "$mode" == release ]]; then
 	# Deliberately outside everything else in this file. TRUSTED evidence, the cost estimator, the
@@ -195,7 +259,12 @@ if [[ "$mode" == sweep ]]; then
 	# shellcheck disable=SC2064
 	trap "git worktree remove --force '$worktree' >/dev/null 2>&1 || true" EXIT
 	status=0
-	(cd "$worktree" && ./build.sh --arch all && ./check.sh && ./test.sh --arch all) || status=$?
+	# Serial for the same reason `run_full` is: this is the other flat path, and a second scheduler
+	# living in it would answer a different number from `--jobs`.
+	# Serial, and the checks after the tests, for the two reasons `run_full` gives: a second
+	# scheduler here would answer a different number from `--jobs`, and `capability-trace` is a check
+	# that reads a log only a test produces.
+	(cd "$worktree" && ./build.sh --arch all && ./test.sh --arch x86_64 && ./test.sh --arch aarch64 && ./test.sh --arch riscv64 && ./check.sh) || status=$?
 	if [[ "$status" -ne 0 ]]; then
 		die "the snapshot sweep of $revision failed (exit $status); the worktree is at $worktree until this shell exits"
 	fi
@@ -521,17 +590,197 @@ count="$(grep -c $'^STEP\t' "$steps_file" || true)"
 ((count > 0)) || planner_failed "a $status plan with no steps"
 note "$count step(s)"
 
+# WHICH STEPS A BUDGET CAN AFFORD, decided before anything starts.
+#
+# `--budget` is in ESTIMATED seconds and is NOT a timeout: it decides what to START, never what to
+# kill, and it never stops a step that overran its estimate. What it costs is a whole
+# PREREQUISITE-CLOSED branch - the step and everything it needs - because putting the builds outside
+# it makes `--budget 10` a run that spends forty minutes building and then declines to test.
+#
+# A prerequisite shared by two branches is counted ONCE: the second branch pays only its own
+# incremental closure. Among affordable branches the cheapest is taken. If the cheapest COMPLETE
+# branch does not fit, nothing is started and the minimum is named - a budget that half-builds has
+# spent the time and bought no evidence.
+budget_select() {
+	local budget="$1" total=0 chosen best best_cost add i j
+	local -A picked=() by_id=() closure=()
+	for i in "${!step_ids[@]}"; do by_id["${step_ids[$i]}"]=$i; done
+	# EACH CLOSURE COMPUTED ONCE. The first version resolved a step's prerequisites inside the
+	# selection loop, which is that walk once per candidate per round - cubic in the number of steps,
+	# and an eighty-seven step plan did not finish inside ten minutes. The graph does not change
+	# while it is being spent, so it is walked once.
+	for i in "${!step_ids[@]}"; do
+		local seen=" $i " queue=("$i") node req
+		while ((${#queue[@]})); do
+			node="${queue[0]}"
+			queue=("${queue[@]:1}")
+			for req in ${step_reqs[$node]}; do
+				j="${by_id[$req]:-}"
+				[[ -z "$j" || " $seen " == *" $j "* ]] && continue
+				seen+="$j "
+				queue+=("$j")
+			done
+		done
+		closure[$i]="$seen"
+	done
+	while :; do
+		best=""
+		best_cost=0
+		for i in "${!step_ids[@]}"; do
+			[[ -n "${picked[$i]:-}" ]] && continue
+			add=0
+			for j in ${closure[$i]}; do
+				[[ -n "${picked[$j]:-}" ]] && continue
+				add=$((add + ${step_costs[$j]}))
+			done
+			if [[ -z "$best" ]] || ((add < best_cost)); then
+				best="$i"
+				best_cost="$add"
+			fi
+		done
+		[[ -z "$best" ]] && break
+		if ((total + best_cost > budget)); then
+			if ((${#picked[@]} == 0)); then
+				note "the cheapest complete branch costs an estimated ${best_cost}s and the budget is ${budget}s, so nothing was started"
+			fi
+			break
+		fi
+		for j in ${closure[$best]}; do picked[$j]=1; done
+		total=$((total + best_cost))
+	done
+	chosen=""
+	for i in "${!step_ids[@]}"; do
+		[[ -n "${picked[$i]:-}" ]] && chosen+=" $i"
+	done
+	# THE TOTAL COMES BACK ON THE SAME LINE. This set a global and the caller read it as empty:
+	# the function runs inside `$(...)`, which is a subshell, so what it assigned died with it. A
+	# budget that reports "starting an estimated 0s" while starting two steps is the kind of wrong
+	# that reads as an accounting bug and hides a selection one.
+	echo "$total$chosen"
+}
+
+# The plan's steps, read once into arrays so a budget can be decided over the whole of it before the
+# first command runs - and so a backgrounded guest never shares the file descriptor the plan is on.
+step_ids=()
+step_reqs=()
+step_costs=()
+while IFS=$'\t' read -r marker index rest; do
+	case "$marker" in
+	STEPID) step_ids[$index]="$rest" ;;
+	STEPREQ) step_reqs[$index]="${step_reqs[$index]:-} $rest" ;;
+	STEPCOST) step_costs[$index]="$rest" ;;
+	esac
+done <"$steps_file"
+for i in "${!step_ids[@]}"; do
+	step_reqs[$i]="${step_reqs[$i]:-}"
+	step_costs[$i]="${step_costs[$i]:-0}"
+done
+
+BUDGET_TOTAL=0
+affordable=""
+if ((BUDGET > 0)); then
+	selection="$(budget_select "$BUDGET")"
+	BUDGET_TOTAL="${selection%% *}"
+	affordable="${selection#* }"
+	[[ "$affordable" == "$selection" ]] && affordable=""
+	note "budget ${BUDGET}s: starting an estimated ${BUDGET_TOTAL}s of work"
+fi
+
 failed=()
+skipped=()
 step=0
+guest_pids=()
+guest_labels=()
+
+# ONE COMMAND, RUN AND RECORDED. Split out of the loop so it can be called in the foreground or in a
+# background job without the two drifting apart.
+#
+# It writes its outcome and duration to a file rather than recording them itself: the history is
+# written by ONE writer, and parallel steps updating it concurrently is a lost-update race in the
+# file the estimator reads.
+run_one_step() {
+	local index="$1" label="$2" command="$3" outfile="$4" started=$SECONDS status=0
+	if ! eval "$command"; then
+		status=1
+	fi
+	printf '%s\t%s\n' "$status" "$((SECONDS - started))" >"$outfile"
+	return 0
+}
+
+# Record what a finished step did, against every PlanItemKey it discharged.
+#
+# Per key rather than per step, because that is what the age bound, the cost model and the shadow
+# record all range over - a step that only knew how many keys it covered could update none of them.
+# Recording is best-effort: losing a history entry costs a wider next sweep, and refusing to report a
+# result the run actually produced would cost more.
+#
+# THE PARENT DOES THIS, ALWAYS. It is the single writer, and it is why `run_one_step` reports through
+# a file instead of recording for itself.
+record_one_step() {
+	local index="$1" label="$2" outfile="$3" status seconds outcome keys_file
+	IFS=$'\t' read -r status seconds <"$outfile"
+	outcome=--passed
+	if [[ "$status" != 0 ]]; then
+		# Every step is run and every failure is reported, rather than stopping at the first.
+		# A run that stops early tells you one thing is broken; a run that finishes tells you
+		# how much is.
+		note "FAILED: $label"
+		failed+=("$label")
+		outcome=--failed
+	fi
+	keys_file="$(mktemp)"
+	awk -v want="$index" -F'\t' '$1 == "KEY" && $2 == want { print $3 }' "$steps_file" >"$keys_file"
+	if [[ -s "$keys_file" ]]; then
+		(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- record --keys-file "$keys_file" "$outcome" --seconds "$seconds") || note "        (the run happened; recording it did not)"
+	fi
+	rm -f "$keys_file" "$outfile"
+}
+
+# Wait for every guest in flight and record each one. A BARRIER, and everything that is not a guest
+# step is behind one: `--jobs` answers "how many QEMUs may run", and the answer has to be the same
+# number wherever it is asked.
+drain_guests() {
+	local i
+	for i in "${!guest_pids[@]}"; do
+		wait "${guest_pids[$i]}" || true
+		record_one_step "${guest_indexes[$i]}" "${guest_labels[$i]}" "${guest_outfiles[$i]}"
+	done
+	guest_pids=()
+	guest_labels=()
+	guest_indexes=()
+	guest_outfiles=()
+}
+guest_indexes=()
+guest_outfiles=()
+
 # The plan is read on fd 3, not on stdin.
 #
 # On stdin the first step that reads anything - and `./test.sh` boots QEMU, which does - swallows
 # the rest of the plan, and the run ends early reporting success over the steps it never took. That
 # is a false green produced by the runner itself, which is the one place this milestone cannot
-# afford one.
+# afford one. A backgrounded guest gets fd 3 CLOSED for the same reason, from the other side.
 while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	[[ "$marker" == STEP ]] || continue
 	step=$((step + 1))
+	# EVERY SKIPPED STEP IS PRINTED. A selector that quietly trims its own scope is the defect
+	# P02M0156 is named after, and a budget is that defect with a flag on it unless it says what it
+	# did not run.
+	if ((BUDGET > 0)) && [[ " $affordable " != *" $index "* ]]; then
+		note "[$step/$count] SKIPPED (budget): $label - $keys key(s)"
+		skipped+=("$label")
+		continue
+	fi
+	# A GUEST STEP IS THE ONLY THING `--jobs` LETS OVERLAP, and only with another guest step.
+	#
+	# The expensive item in any plan is a boot, and two boots of different targets have nothing to
+	# contend over now that every writable image is per-run. Everything else - a gate that boots one
+	# of its own, a conformance suite, a build - runs alone, because "how many QEMUs may run" must
+	# have exactly one answer on this machine and a gate's inner boot is not counted by this loop.
+	is_guest=0
+	[[ "$command" == *"./test.sh --arch "* ]] && is_guest=1
+	if ((is_guest == 0)); then
+		drain_guests
+	fi
 	echo
 	note "[$step/$count] $label - $keys key(s)"
 	[[ -n "$note_text" ]] && note "        $note_text"
@@ -542,29 +791,27 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	else
 		note "        $command"
 	fi
-	started=$SECONDS
-	outcome=--passed
-	if ! eval "$command"; then
-		# Every step is run and every failure is reported, rather than stopping at the first.
-		# A run that stops early tells you one thing is broken; a run that finishes tells you
-		# how much is.
-		note "FAILED: $label"
-		failed+=("$label")
-		outcome=--failed
+	outfile="$(mktemp)"
+	if ((is_guest == 1 && JOBS > 1)); then
+		while ((${#guest_pids[@]} >= JOBS)); do
+			wait "${guest_pids[0]}" || true
+			record_one_step "${guest_indexes[0]}" "${guest_labels[0]}" "${guest_outfiles[0]}"
+			guest_pids=("${guest_pids[@]:1}")
+			guest_labels=("${guest_labels[@]:1}")
+			guest_indexes=("${guest_indexes[@]:1}")
+			guest_outfiles=("${guest_outfiles[@]:1}")
+		done
+		run_one_step "$index" "$label" "$command" "$outfile" 3<&- &
+		guest_pids+=("$!")
+		guest_labels+=("$label")
+		guest_indexes+=("$index")
+		guest_outfiles+=("$outfile")
+	else
+		run_one_step "$index" "$label" "$command" "$outfile"
+		record_one_step "$index" "$label" "$outfile"
 	fi
-	# Record the outcome against every PlanItemKey this one command discharged.
-	#
-	# Per key rather than per step, because that is what the age bound, the cost model and the
-	# shadow record all range over - a step that only knew how many keys it covered could update
-	# none of them. Recording is best-effort: losing a history entry costs a wider next sweep, and
-	# refusing to report a result the run actually produced would cost more.
-	keys_file="$(mktemp)"
-	awk -v want="$index" -F'\t' '$1 == "KEY" && $2 == want { print $3 }' "$steps_file" >"$keys_file"
-	if [[ -s "$keys_file" ]]; then
-		(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- record --keys-file "$keys_file" "$outcome" --seconds "$((SECONDS - started))") || note "        (the run happened; recording it did not)"
-	fi
-	rm -f "$keys_file"
 done 3<"$steps_file"
+drain_guests
 
 # The runner's own arithmetic, checked. A loop that silently took fewer steps than the plan listed
 # would report a pass over work it never did.
@@ -574,7 +821,19 @@ fi
 
 echo
 if ((${#failed[@]} > 0)); then
+	# FAIL OUTRANKS INCOMPLETE. A run that skipped work AND found a defect is a failure, and
+	# reporting the skipping is the smaller half of what happened.
+	if ((${#skipped[@]} > 0)); then
+		note "and ${#skipped[@]} step(s) were skipped for the budget: ${skipped[*]}"
+	fi
 	die "${#failed[@]} of $count step(s) failed: ${failed[*]}"
+fi
+if ((${#skipped[@]} > 0)); then
+	note "${#skipped[@]} of $count step(s) were not started for the budget: ${skipped[*]}"
+	# ITS OWN STATUS, NEVER A GREEN. A caller writing `if ./verify.sh; then publish; fi` must not
+	# read a partial run as a verification, and nothing in exit 0 would say otherwise.
+	note "INCOMPLETE: this run verified part of what the change needs"
+	exit 6
 fi
 note "all $count step(s) passed"
 

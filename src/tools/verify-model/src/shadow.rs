@@ -588,6 +588,35 @@ pub struct Scope {
 	// requirement - the same failing-closed rule `model_self_check` applies to records.
 	#[serde(default)]
 	pub pairs: Vec<String>,
+	// WHAT ACTUALLY CHANGED UNDER THIS COMPONENT, digested - and this is a change of rule, stated.
+	//
+	// The distinctness counter keyed on the per-component DECISION: which keys were selected, which
+	// edges walked, which targets implied. For a frozen `kernel.mem` candidate every change inside
+	// `src/kernel/mem` selects the same tests, walks the same edges and implies the same targets, so
+	// five different edits produce ONE digest and the counter never passes one. The threshold is
+	// unreachable for exactly the shape of candidate the narrowing needs.
+	//
+	// The tree rejected content-based distinctness deliberately - "five edits to audio that each
+	// produce the SAME decision are five different digests and counted five times, which is one
+	// decision validated five times" - and that rule is right about what it defended against and
+	// over-reaches here. A shadow comparison does not test the DECISION; it tests whether the
+	// SELECTION was adequate for THAT CHANGE, and adequacy is a property of the change. Five
+	// different edits are five different full runs and five genuine opportunities to find a miss,
+	// however alike the selection looked each time.
+	//
+	// THE TUPLES, because paths alone are not enough - `src/kernel/elf.rs` is one file, so five edits
+	// to it share one path set - and the global source digest is not enough either, since an
+	// unrelated change elsewhere would buy false distinctness for a component nobody touched. Sorted
+	// `(change kind, path, content before or ABSENT, content after or ABSENT)`, so a deletion is a
+	// real change with a real digest and a rename contributes both of its ends.
+	#[serde(default)]
+	pub changed_digest: String,
+	// WHICH NAMED KINDS OF CHANGE THIS ONE WAS, and the field that was missing when
+	// `risk_class.required_groups` was written. `change_kinds` above says how a component was
+	// REACHED; this says what the edit was ABOUT, which is a different question and the one the bar
+	// asks. Declared in the registry as a name and its paths, matched here against what changed.
+	#[serde(default)]
+	pub groups: Vec<String>,
 	// THE TARGETS THE EVIDENCE CAME FROM, and the ones a change needs.
 	//
 	// `Certificate` has carried `architectures` since it existed and `level` never looked at it: the
@@ -622,7 +651,7 @@ impl Scope {
 				pairs.insert(scope_pair(change, edge));
 			}
 		}
-		Scope { change_kinds, edge_kinds, pairs: pairs.into_iter().collect(), architectures: Vec::new() }
+		Scope { change_kinds, edge_kinds, pairs: pairs.into_iter().collect(), architectures: Vec::new(), changed_digest: String::new(), groups: Vec::new() }
 	}
 
 	pub fn from_pairs(pairs: BTreeSet<String>) -> Scope {
@@ -638,7 +667,7 @@ impl Scope {
 				}
 			}
 		}
-		Scope { change_kinds: change_kinds.into_iter().collect(), edge_kinds: edge_kinds.into_iter().collect(), pairs: pairs.into_iter().collect(), architectures: Vec::new() }
+		Scope { change_kinds: change_kinds.into_iter().collect(), edge_kinds: edge_kinds.into_iter().collect(), pairs: pairs.into_iter().collect(), architectures: Vec::new(), changed_digest: String::new(), groups: Vec::new() }
 	}
 
 	// The same scope with the targets it covers, or asks for, attached.
@@ -694,15 +723,61 @@ fn alloc_empty() -> Vec<&'static str> {
 // One function, used at both ends: when a record is written it says what that comparison covered,
 // and when a certificate is consulted it says what the current change needs. Those two have to be
 // the same computation or the subset test compares different vocabularies.
-pub fn component_scopes(repo_root: &Path, plan: &crate::plan::Plan, explicit: &BTreeMap<String, String>) -> BTreeMap<String, Scope> {
+// WHICH DECLARED GROUPS THESE PATHS FALL INTO.
+//
+// Prefix matching, the same shape ownership and the architecture rules use, so a group naming a
+// directory covers what is under it and one naming a file covers that file. Sorted and deduplicated,
+// because the order paths arrive in is not information.
+fn groups_for(paths: &[String], registry: &crate::registry::Registry) -> Vec<String> {
+	let mut out: BTreeSet<String> = BTreeSet::new();
+	for group in &registry.change_groups {
+		for declared in &group.paths {
+			if paths.iter().any(|path| path == declared || path.starts_with(&format!("{declared}/"))) {
+				out.insert(group.name.clone());
+				break;
+			}
+		}
+	}
+	out.into_iter().collect()
+}
+
+pub fn component_scopes(repo_root: &Path, plan: &crate::plan::Plan, explicit: &BTreeMap<String, String>, registry: &crate::registry::Registry) -> BTreeMap<String, Scope> {
 	let mut out: BTreeMap<String, Scope> = BTreeMap::new();
 	for component in &plan.changed_components {
 		// The paths THIS component owns, which `PathVerdict::outcome` already records - not the
 		// whole change set.
 		let owned: Vec<String> = plan.paths.iter().filter(|verdict| &verdict.outcome == component).map(|verdict| verdict.path.clone()).collect();
-		out.insert(component.clone(), Scope::from_kinds(change_kinds_for(repo_root, &owned, explicit), plan.component_edge_kinds.get(component).cloned().unwrap_or_default()));
+		let mut scope = Scope::from_kinds(change_kinds_for(repo_root, &owned, explicit), plan.component_edge_kinds.get(component).cloned().unwrap_or_default());
+		scope.changed_digest = changed_digest_for(repo_root, &owned, explicit);
+		scope.groups = groups_for(&owned, registry);
+		out.insert(component.clone(), scope);
 	}
 	out
+}
+
+// WHAT THESE PATHS ARE, AND WHAT IS IN THEM, as one digest.
+//
+// Sorted tuples of `(change kind, path, before, after)`, where a side that does not exist is the
+// literal `ABSENT` rather than an empty string - a file that was deleted and one that is empty are
+// different changes and would otherwise digest the same.
+//
+// `before` comes from `git show HEAD:path`, which is the only place it exists once the working tree
+// holds the edit. A path git cannot answer for - untracked, or no repository at all - is ABSENT,
+// which is the truth for an untracked file and the safe answer for the rest: it makes the digest
+// depend on the content that IS readable rather than on a failure.
+fn changed_digest_for(repo_root: &Path, paths: &[String], explicit: &BTreeMap<String, String>) -> String {
+	if paths.is_empty() {
+		return String::new();
+	}
+	let mut rows: Vec<String> = Vec::new();
+	for path in paths {
+		let kind = explicit.get(path).cloned().unwrap_or_else(|| String::from("modified"));
+		let before = std::process::Command::new("git").args(["show", &format!("HEAD:{path}")]).current_dir(repo_root).output().ok().filter(|output| output.status.success()).map(|output| crate::candidate::digest_of(&output.stdout)).unwrap_or_else(|| String::from("ABSENT"));
+		let after = std::fs::read(repo_root.join(path)).map(|bytes| crate::candidate::digest_of(&bytes)).unwrap_or_else(|_| String::from("ABSENT"));
+		rows.push(format!("{kind}\t{path}\t{before}\t{after}"));
+	}
+	rows.sort();
+	crate::candidate::digest_of(rows.join("\n").as_bytes())
 }
 
 // The kinds of change a set of paths represents, read from the working tree.
@@ -817,8 +892,19 @@ impl Log {
 		self.records_for(component, model_hash, universe, pair).any(|record| record.shadow_exec)
 	}
 
+	// WHAT MAKES TWO PIECES OF EVIDENCE DIFFERENT, and the answer changed.
+	//
+	// It was the per-component DECISION - the keys selected, the edges walked, the targets implied -
+	// and for a frozen subsystem candidate every change inside it produces the same decision, so the
+	// counter could never pass one and the threshold was unreachable for the shape of candidate the
+	// narrowing needs. It is now WHAT CHANGED: the paths under this component and their content, as
+	// `Scope::changed_digest`.
+	//
+	// The older keys stay as fallbacks, in that order, for records written before this existed - the
+	// same failing-closed rule the rest of this file applies: an older record answers with the best
+	// thing it carries rather than being discarded or counted twice.
 	pub fn distinct_evidence_for_pair(&self, component: &str, model_hash: &str, universe: Universe, pair: Option<&str>) -> usize {
-		self.records_for(component, model_hash, universe, pair).map(|record| record.component_decisions.iter().find_map(|entry| entry.split_once('\t').filter(|(name, _)| *name == component).map(|(_, digest)| String::from(digest))).unwrap_or_else(|| record.changed_components.join(","))).collect::<BTreeSet<String>>().len()
+		self.records_for(component, model_hash, universe, pair).map(|record| record.component_scopes.get(component).map(|scope| scope.changed_digest.clone()).filter(|digest| !digest.is_empty()).or_else(|| record.component_decisions.iter().find_map(|entry| entry.split_once('\t').filter(|(name, _)| *name == component).map(|(_, digest)| String::from(digest)))).unwrap_or_else(|| record.changed_components.join(","))).collect::<BTreeSet<String>>().len()
 	}
 
 	pub fn clean_architectures_for_pair(&self, component: &str, model_hash: &str, universe: Universe, pair: Option<&str>) -> BTreeSet<String> {

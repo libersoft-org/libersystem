@@ -1,0 +1,43 @@
+# WHY A STAGED DRIVER OR SERVICE HAS NO ORACLE THAT NAMES IT.
+#
+# `component<TAB>reason`. Read by check-component-oracles.sh, which refuses a staged driver or
+# service that has neither a covering test nor a line here.
+#
+# A REASON, NOT A NAME. Two of the four below say "its oracle is somewhere this check cannot see"
+# and two say "there is no oracle" - and the difference is the whole point of writing them down.
+# An exception nobody can enumerate is a gap that reads like a decision; an enumerated one is a gap
+# that reads like a gap, which is what these two are.
+
+dev_channel	its oracle is a DEV-GUEST check, not a kernel test: dev-selftest.py drives publication, refusal and rollback through this driver, and that guest cannot share a boot with the suite - qemu-run.sh refuses DEV_PROFILE together with TEST. Covered, elsewhere.
+dev_agent	the same: dev-selftest.py IS the oracle for this agent and runs on the development guest. The check above ranges over kernel tests and cannot see a dev-guest one.
+session_service	NO ORACLE. Nothing in the suite fails when this service breaks. It is staged, it starts, and no test asserts an effect of it - so a change to it selects builds and nothing that would catch a regression. This line is the record of that, not a decision that it needs none.
+time_service	NO ORACLE. The RTC tests assert what the KERNEL reads off the clock hardware; nothing asserts what this service answers to a client. Same shape as session_service and recorded for the same reason.
+
+# AND FIFTEEN WHOSE ORACLE EXISTS AND WHOSE `covers` CANNOT SAY SO.
+#
+# This is a finding about the MECHANISM, not about these components, and it is worth the space.
+# `verify-model` enforces that `covers X` implies the test's body can REACH X, and reach is the
+# forward closure of what the body was seen to LAUNCH. A test that asserts a driver's effect never
+# launches the driver: DeviceManager binds it during boot, and ServiceManager starts the services.
+# So the annotation is TRUE about failure - break the driver and the test goes red - and refused by
+# the model, correctly, because the model cannot see the path.
+#
+# Each line names the test that DOES fail. That is what makes these different from the two above: an
+# oracle exists and is identified, and what is missing is the selector's ability to be told. Closing
+# it needs the reach relation to include the boot chain - a declared edge from what the manifest
+# stages to what boots it - which is its own piece of work and not an annotation.
+virtio_blk	oracle: kernel.services.kernel_reads_file_through_storage_service - the file is served over this disk. `covers` refused: the test launches no driver, DeviceManager binds it at boot.
+virtio_console	oracle: kernel.services.the_console_answers_a_program_through_its_own_channel - the banner goes out through this driver's transmit queue. Same refusal.
+virtio_gpu	oracle: kernel.services.display_service_restores_the_console_surface. Same refusal.
+virtio_input	oracle: kernel.services.input_service_streams_pointer_events. Same refusal.
+virtio_net	oracle: kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock - a lease is a real round trip through this NIC. Same refusal.
+virtio_snd	oracle: kernel.hardware.virtio_snd_driver_captures_a_period_from_the_device. Same refusal.
+xhci	oracle: kernel.hardware.xhci_driver_enumerates_the_usb_bus. Same refusal.
+audio_service	oracle: kernel.services.audio_service_enforces_scope_and_mixes_streams. Same refusal, from the service side: ServiceManager starts it, the test does not.
+config_service	oracle: kernel.services.config_service_serves_the_tree. Same refusal.
+device_manager	oracle: kernel.hardware.device_manager_reacts_to_a_driver_crash. Same refusal.
+device_service	oracle: kernel.hardware.device_service_lists_devices. Same refusal.
+display_service	oracle: kernel.services.display_service_restores_the_console_surface. Same refusal.
+log_service	oracle: kernel.services.log_service_speaks_generated_bindings. Same refusal.
+process_service	oracle: kernel.services.process_service_lists_every_started_program. Same refusal.
+system_graph_service	oracle: kernel.kernel.system_graph_reflects_live_state. Same refusal.

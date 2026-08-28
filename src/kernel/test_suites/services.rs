@@ -85,7 +85,7 @@ fn log_service_speaks_generated_bindings() {
 	assert!(b.windows(b"device_manager".len()).any(|w: &[u8]| w == b"device_manager"), "second entry present");
 }
 
-tagged_test!(input_service_streams_pointer_events, [Service, Input, Mouse, Console], id = "kernel.services.input_service_streams_pointer_events", covers = ["kernel", "services"]);
+tagged_test!(input_service_streams_pointer_events, [Service, Input, Mouse, Console], id = "kernel.services.input_service_streams_pointer_events", covers = ["kernel", "services", "bin.input_service"]);
 fn input_service_streams_pointer_events() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -592,7 +592,7 @@ fn audio_service_closes_streams_after_driver_failure() {
 	run_audio_service_scenario(AudioServiceScenario::DriverFailure);
 }
 
-tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow], id = "kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock", covers = ["kernel", "services"]);
+tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow], id = "kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock", covers = ["kernel", "services", "bin.network_service"]);
 fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -1636,7 +1636,7 @@ fn pty_hosts_a_program() {
 	assert!(captured.windows(b"pty:hello".len()).any(|w| w == b"pty:hello"), "the slave's reply is forwarded back out the master");
 }
 
-tagged_test!(the_console_answers_a_program_through_its_own_channel, [Service, Console, Display], id = "kernel.services.the_console_answers_a_program_through_its_own_channel", covers = ["kernel", "term"]);
+tagged_test!(the_console_answers_a_program_through_its_own_channel, [Service, Console, Display], id = "kernel.services.the_console_answers_a_program_through_its_own_channel", covers = ["kernel", "term", "bin.console_service"]);
 fn the_console_answers_a_program_through_its_own_channel() {
 	use object::channel::{Channel, Message};
 	use object::dma_buffer::DmaBuffer;
@@ -1865,7 +1865,7 @@ fn storage_serves_volume_file_to_client() {
 	assert_eq!(actual, expected);
 }
 
-tagged_test!(resource_manager_contains_a_domain, [Service, Domain], id = "kernel.services.resource_manager_contains_a_domain", covers = ["kernel", "services"]);
+tagged_test!(resource_manager_contains_a_domain, [Service, Domain], id = "kernel.services.resource_manager_contains_a_domain", covers = ["kernel", "services", "bin.resource_manager"]);
 fn resource_manager_contains_a_domain() {
 	// The ResourceManager creates a bounded sub-Domain, launches resource_probe into it, and
 	// caps the Domain's memory at four one-page objects above the probe's baseline. It drives
@@ -1881,7 +1881,7 @@ fn resource_manager_contains_a_domain() {
 	assert_eq!(summary.as_slice(), b"granted=4 denied=1 regranted=4", "the kernel enforced the Domain's memory budget, contained the over-budget refusal, and honored the runtime raise");
 }
 
-tagged_test!(kernel_reads_file_through_storage_service, [Service, Storage], id = "kernel.services.kernel_reads_file_through_storage_service", covers = ["kernel", "liberfs", "storage"]);
+tagged_test!(kernel_reads_file_through_storage_service, [Service, Storage], id = "kernel.services.kernel_reads_file_through_storage_service", covers = ["kernel", "liberfs", "storage", "bin.storage_service"]);
 fn kernel_reads_file_through_storage_service() {
 	// The kernel drives the StorageService as its own client, sending one open request
 	// and a quit sentinel, then reads the returned shared buffer. The bytes must equal

@@ -35,6 +35,14 @@ pub struct Discovery {
 	// and does not run - the model knows only what was built - so a declaration that stays here
 	// across a rebuild is a test nobody is running.
 	pub declared_not_built: Vec<String>,
+	// HOW MANY TEST IDS THE SOURCE DECLARES, whether or not any binary carries them.
+	//
+	// It is the only count available for a target that could not be enumerated, and that is exactly
+	// the target whose whole-suite step has to be priced: `full_suite_seconds` counts the tests the
+	// model DISCOVERED, and a target with no binary has none - so pricing the stand-in from the
+	// discovery collapses it to the fixed boot term and calls booting-and-running-everything the
+	// cheapest thing in the plan. This is an upper bound, which is the safe direction for a seed.
+	pub declared_ids: usize,
 }
 
 pub fn discover(repo_root: &Path, architectures: &[&str]) -> Result<Discovery, String> {
@@ -89,14 +97,14 @@ pub fn discover(repo_root: &Path, architectures: &[&str]) -> Result<Discovery, S
 		if declaration.covers.is_empty() {
 			unannotated += 1;
 		}
-		tests.push(KernelTest { name, id: declaration.id.clone(), architectures: architectures.into_iter().collect(), covers: declaration.covers.clone() });
+		tests.push(KernelTest { name, id: declaration.id.clone(), architectures: architectures.into_iter().collect(), covers: declaration.covers.clone(), source_paths: declaration.source_paths.clone() });
 	}
 	tests.sort();
 	let built: BTreeSet<&str> = tests.iter().map(|test| test.id.as_str()).collect();
 	let mut declared_not_built: Vec<String> = declarations.values().map(|declaration| declaration.id.clone()).filter(|id| !built.contains(id.as_str())).collect();
 	declared_not_built.sort();
 	declared_not_built.dedup();
-	Ok(Discovery { tests, touches, missing_targets, unannotated, declared_not_built })
+	Ok(Discovery { tests, touches, missing_targets, unannotated, declared_not_built, declared_ids: declarations.len() })
 }
 
 // Every plausible candidate, newest first. The caller takes the first that actually carries test
@@ -191,16 +199,16 @@ fn test_name_from_symbol(symbol: &str) -> Option<String> {
 fn scan_source(repo_root: &Path) -> Result<BTreeMap<String, Declaration>, String> {
 	let mut declarations = BTreeMap::new();
 	let mut seen = BTreeMap::new();
-	scan_dir(&repo_root.join("src/kernel"), &mut declarations, &mut seen)?;
+	scan_dir(&repo_root.join("src/kernel"), &mut declarations, &mut seen, repo_root)?;
 	Ok(declarations)
 }
 
-fn scan_dir(dir: &Path, out: &mut BTreeMap<String, Declaration>, seen: &mut BTreeMap<String, String>) -> Result<(), String> {
+fn scan_dir(dir: &Path, out: &mut BTreeMap<String, Declaration>, seen: &mut BTreeMap<String, String>, root: &Path) -> Result<(), String> {
 	let Ok(entries) = fs::read_dir(dir) else { return Ok(()) };
 	for entry in entries.flatten() {
 		let path = entry.path();
 		if path.is_dir() {
-			scan_dir(&path, out, seen)?;
+			scan_dir(&path, out, seen, root)?;
 		} else if path.extension().is_some_and(|extension| extension == "rs") {
 			let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
 			for (name, id, covers) in parse_declarations(&text) {
@@ -224,7 +232,17 @@ fn scan_dir(dir: &Path, out: &mut BTreeMap<String, Declaration>, seen: &mut BTre
 				{
 					return Err(format!("{}: two tests share the Rust function name `{name}` under different ids (`{first}` and `{id}`), which this model cannot tell apart - rename one function; its `id` may stay as it is", path.display()));
 				}
-				out.insert(name, Declaration { id, covers });
+				let relative = path.strip_prefix(root).unwrap_or(&path).to_string_lossy().to_string();
+				match out.get_mut(&name) {
+					Some(existing) => {
+						if !existing.source_paths.contains(&relative) {
+							existing.source_paths.push(relative);
+						}
+					}
+					None => {
+						out.insert(name, Declaration { id, covers, source_paths: vec![relative] });
+					}
+				}
 			}
 		}
 	}
@@ -235,6 +253,18 @@ fn scan_dir(dir: &Path, out: &mut BTreeMap<String, Declaration>, seen: &mut BTre
 pub struct Declaration {
 	pub id: String,
 	pub covers: Vec<String>,
+	// WHICH FILES DECLARE THIS TEST - plural, and that is not a detail.
+	//
+	// The scanner merges several declarations of one id: the arch-gated shape, where a
+	// `#[cfg(target_arch = "..")]` variant per target implements the same test three ways under one
+	// identity. A single path would silently keep whichever file was read last.
+	//
+	// Kept because the registry promises something that needs it: `src/kernel/test_suites` says
+	// "a test file reaches the tests in it; once `covers` is on every test this is derivable rather
+	// than declarable, and this row disappears". `covers` IS on every test - 370 of 370 - and the row
+	// had not disappeared, because discovery threw the source path away and "the tests in this file"
+	// was not a question the model could be asked.
+	pub source_paths: Vec<String>,
 }
 
 // Where a named CLAUSE starts inside a `tagged_test!` argument list, or None.
