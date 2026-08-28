@@ -129,6 +129,7 @@ declare -A GATES=(
 	# declaration rots: it is read by people, who believe it.
 	["declared-interfaces"]="tools/check-declared-interfaces.py"
 	["no-fixed-provider-slots"]="tools/check-no-fixed-provider-slots.sh"
+	["smp-core-cap"]="tools/check-smp-core-cap.sh"
 	# A warning answered by switching the lint off rather than by fixing the code. Ninety-one such
 	# attributes had accumulated, hiding a hundred and twenty more warnings than the build printed -
 	# and hiding them UNEVENLY, so the same code was reported on one target and silent on another.

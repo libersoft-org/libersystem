@@ -26,6 +26,25 @@ use crate::arch;
 #[cfg(target_arch = "x86_64")]
 use crate::mem;
 
+// HOW MANY CORES THIS KERNEL RUNS ON, asked once and answered here.
+//
+// The number is not a preference: it is the smallest limit among the structures that must hold one
+// entry per core, which portably is the TLB shootdown's generation arrays and the online mask below,
+// both sixty-four. `fdt::MAX_CPUS` states the same rule for the ports whose per-CPU pool is static
+// and smaller, and states the policy this uses - a machine with more cores boots on the first
+// `MAX_CPUS` and SAYS so, because refusing it outright turns a large machine into no machine.
+//
+// IT LIVES HERE BECAUSE THIS IS THE MODULE THAT BRINGS CORES UP. It was declared in `mem::tlb`, next
+// to the arrays that force its value, and the module that decides how many cores to start consulted
+// nothing at all - which is how x86_64 came to wake a hundred cores that the shootdown could reach
+// sixty-four of, and discover it one lost page at a time.
+pub const MAX_CPUS: usize = 64;
+
+// The mask below is one word, so the supported count may never outgrow it. Asserted rather than
+// remembered: the two agreeing by coincidence is how `is_online` came to carry a fallback for a case
+// that could not arise, under a comment claiming `MAX_CPUS` was larger than sixty-four.
+const _: () = assert!(MAX_CPUS <= u64::BITS as usize);
+
 // Total cores we manage (BSP + woken APs).
 static CPU_COUNT: AtomicUsize = AtomicUsize::new(1);
 
@@ -52,18 +71,22 @@ pub fn is_online(cpu: usize) -> bool {
 	if cpu == 0 {
 		return true;
 	}
-	if cpu >= 64 {
-		// Beyond what one word holds. Said rather than answered wrongly: this tree's `MAX_CPUS` is
-		// larger than 64, so a mask this narrow would quietly report the cores above it as offline,
-		// and the tally is the honest fallback for them until the mask is widened.
-		return cpu < online_count();
+	// PAST THE SUPPORTED COUNT IS NOT ONLINE, and that is the answer rather than a fallback. No such
+	// core is ever started - the bring-up parks them and says so - so nothing reported in from one.
+	//
+	// This branch used to answer `cpu < online_count()`, which is a DIFFERENT QUESTION: it says an id
+	// is inside the tally, not that the core behind it ever answered, and the mask exists precisely
+	// because those two had been conflated once already. The comment above it justified the stand-in
+	// by claiming `MAX_CPUS` was larger than one word; it was exactly one word.
+	if cpu >= MAX_CPUS {
+		return false;
 	}
 	ONLINE_MASK.load(Ordering::Acquire) & (1u64 << cpu) != 0
 }
 
 // Called by a core once it holds its own id and its per-CPU state - the same moment it is counted.
 fn mark_in_mask(cpu: usize) {
-	if cpu < 64 {
+	if cpu < MAX_CPUS {
 		ONLINE_MASK.fetch_or(1u64 << cpu, Ordering::AcqRel);
 	}
 }
@@ -205,10 +228,30 @@ pub fn init(boot_info: &BootInfo) {
 	// firmware exposed no RSDP or no MADT (the kernel then runs single-core).
 	let mut lapics = madt_local_apics(boot_info.rsdp);
 	if lapics.is_empty() {
-		// ALLOC-OK: CPU bring-up at boot; bounded by MAX_CPUS.
+		// ALLOC-OK: CPU bring-up at boot; one element.
 		lapics.push(bsp_lapic_id);
 	}
 
+	// PAST WHAT THIS KERNEL HOLDS, PARKED AND SAID. The rule and the wording are `fdt::MAX_CPUS`'s,
+	// and aarch64 and riscv64 have followed them all along - `topology.parked()` and one line naming
+	// both counts. This port followed neither: it took every local APIC the firmware listed, started
+	// all of them, and left the shootdown unable to reach the ones past its arrays. Measured on a
+	// 100-core host: the boot never finished, 3058 pages retired in 100 seconds and userspace never
+	// started, because every free after a page-table teardown was refused and quarantined.
+	//
+	// A core that is never started holds no translation, so a shootdown reaching every core that IS
+	// started is complete. That is the whole argument for capping rather than truncating the
+	// shootdown, and it is why the cap belongs here and not there.
+	if lapics.len() > MAX_CPUS {
+		let parked = lapics.len() - MAX_CPUS;
+		// The boot processor is not optional - it is the core running this code - so it keeps its
+		// place whatever order the MADT listed it in.
+		if let Some(at) = lapics.iter().position(|&id| id == bsp_lapic_id) {
+			lapics.swap(0, at);
+		}
+		lapics.truncate(MAX_CPUS);
+		crate::serial_println!("smp: {parked} declared core(s) past the {MAX_CPUS} this kernel holds stay parked");
+	}
 	// Size every per-CPU table from the enumerated core count before any core - the
 	// BSP included - initializes its slot. Extra slots for any AP that fails to
 	// come online stay unused; ids are handed out contiguously as APs report in.
@@ -263,6 +306,15 @@ pub fn init(boot_info: &BootInfo) {
 		for &lapic in &lapics {
 			if lapic == bsp_lapic_id {
 				continue;
+			}
+			// NEVER AN ID PAST THE SLOTS THAT WERE RESERVED. `online` counts the boot processor from
+			// the start and this loop skips the entry that IS the boot processor - so a MADT that
+			// does not list it leaves nothing skipped, and the last core takes id `total`, one past
+			// what `percpu::allocate(total)` reserved. `this_cpu` reaches that allocation through a
+			// raw pointer with no bound of its own, so that core would write past it.
+			if online >= total {
+				crate::serial_println!("smp: the firmware's core list does not include this boot processor, so the last declared core has no per-CPU slot and stays parked");
+				break;
 			}
 			let cpu_id = online; // contiguous id for the next core to report in
 			let stack = alloc_ap_stack();
@@ -638,7 +690,10 @@ fn parse_madt(hhdm: u64, madt_phys: u64, out: &mut Vec<u32>) {
 			let apic_id = unsafe { *base.add(off + 3) } as u32;
 			let flags = unsafe { core::ptr::read_unaligned(base.add(off + 4) as *const u32) };
 			if flags & 1 != 0 {
-				// ALLOC-OK: CPU bring-up at boot; bounded by MAX_CPUS.
+				// ALLOC-OK: CPU bring-up at boot, one entry per enabled local APIC the firmware
+				// lists. NOT bounded by `MAX_CPUS`, which this said and was not true of anything
+				// here: the table is read whole and the CAP is applied by `init` on what it
+				// returns, where the boot processor can be kept and the parking can be said.
 				out.push(apic_id);
 			}
 		}

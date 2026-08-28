@@ -172,7 +172,7 @@ or preventing further development of `v1`.
 - [x] [P02M0096 - Image conversion tool (`imgconv`)](P02M0096.md)
 - [x] [P02M0097 - Userspace source and system-volume layout cleanup](P02M0097.md)
 - [x] [P02M0098 - A device claim is a count, so two drivers can own one device](P02M0098.md)
-- [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a roadmap of 41 driver candidates plus one prerequisite, not one piece of work; the first driver of a family owns the narrow binder extension it needs
+- [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a cross-phase umbrella of 41 driver candidates plus one prerequisite, not a Phase-2 gate; starting work here means picking one item
 - [x] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [x] [P02M0101 - Additional system utilities](P02M0101.md)
 - [x] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)
@@ -231,7 +231,7 @@ or preventing further development of `v1`.
 - [x] [P02M0155 - The loader searches every disk in the machine for a file that is not there](P02M0155.md)
 - [x] [P02M0156 - A check that skips what it cannot read has already answered yes](P02M0156.md)
 - [x] [P02M0157 - The firmware described something the tables cannot hold, and the kernel used it anyway](P02M0157.md)
-- [ ] [P02M0158 - The boot report names the same device twice and the same component two ways](P02M0158.md)
+- [x] [P02M0158 - The boot report names the same device twice and the same component two ways](P02M0158.md)
 - [x] [P02M0159 - Every boot exercises the degraded DMA path and none exercises the isolated one](P02M0159.md)
 - [x] [P02M0160 - One artifact has two required shapes and one name, so the last build wins](P02M0160.md)
 - [x] [P02M0161 - Every driver family invents its own bring-up wire](P02M0161.md)
@@ -240,8 +240,8 @@ or preventing further development of `v1`.
 - [x] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
 - [x] [P02M0165 - A driver that stops answering looks exactly like one that is busy](P02M0165.md)
 - [x] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)
-- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - six rounds of external review; the sixth found four of the fifth's own new contracts wrong, including an activation hash that compared a model with itself
-- [ ] [P02M0168 - The kernel brings up every core the firmware lists and then two tables assume sixty-four](P02M0168.md) - found by reading a boot report on a 100-core host: the boot never finishes and 3058 pages are lost in 100 s
+- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - seven rounds of external review; the seventh gave the items a dependency order and stopped the definition of done freezing the sweep order the fix has to change
+- [x] [P02M0168 - The kernel brings up every core the firmware lists and then two tables assume sixty-four](P02M0168.md)
 
 ### Definition of done (phase 2)
 

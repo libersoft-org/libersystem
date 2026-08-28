@@ -1309,10 +1309,10 @@ mod inject {
 	// loud flake rather than a quiet pass.
 	#[allow(clippy::declare_interior_mutable_const)]
 	const DISARMED: AtomicUsize = AtomicUsize::new(usize::MAX);
-	static BUDGET: [AtomicUsize; crate::mem::tlb::MAX_CPUS] = [DISARMED; crate::mem::tlb::MAX_CPUS];
+	static BUDGET: [AtomicUsize; crate::smp::MAX_CPUS] = [DISARMED; crate::smp::MAX_CPUS];
 
 	fn me() -> usize {
-		(crate::arch::percpu::this_cpu().cpu_id() as usize).min(crate::mem::tlb::MAX_CPUS - 1)
+		(crate::arch::percpu::this_cpu().cpu_id() as usize).min(crate::smp::MAX_CPUS - 1)
 	}
 
 	// Let `successes` more allocations through on THIS core, then fail every one until
@@ -1352,7 +1352,7 @@ mod inject {
 	// duplicate frames to the scheduler and the drivers for as long as it was armed.
 	#[allow(clippy::declare_interior_mutable_const)]
 	const NOT_DUPLICATING: AtomicBool = AtomicBool::new(false);
-	static DUPLICATE: [AtomicBool; crate::mem::tlb::MAX_CPUS] = [NOT_DUPLICATING; crate::mem::tlb::MAX_CPUS];
+	static DUPLICATE: [AtomicBool; crate::smp::MAX_CPUS] = [NOT_DUPLICATING; crate::smp::MAX_CPUS];
 
 	pub fn duplicate_next() {
 		DUPLICATE[me()].store(true, Ordering::Release);

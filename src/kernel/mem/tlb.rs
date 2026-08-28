@@ -22,8 +22,10 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch;
 
-// The most cores this kernel tracks. Matches the scheduler's own ceiling.
-pub const MAX_CPUS: usize = 64;
+// How many cores this kernel runs on, from the module that brings them up. The generation arrays
+// below are the reason the number is what it is, and they were also where it was DECLARED - so the
+// module deciding how many cores to start had no reason to look at it, and on x86_64 it did not.
+use crate::smp::MAX_CPUS;
 
 // Every request carries a GENERATION, and an acknowledgement names the generation it is for.
 //
@@ -80,6 +82,12 @@ pub fn shootdown() -> bool {
 	//
 	// `false` is the honest answer and the callers already know what to do with it: `frame::retire`
 	// quarantines the span and tries again later.
+	//
+	// AND NO MACHINE THIS KERNEL ACCEPTED REACHES IT ANY MORE. The bring-up caps the core count at
+	// `smp::MAX_CPUS` and parks the rest, so `cpus` is never larger than the arrays - and a core that
+	// was never started holds no translation to flush. The refusal stays because it is what makes
+	// the cap SAFE rather than merely tidy: if the cap is ever wrong, this loses memory instead of
+	// handing back frames a live core can still translate. Reaching it is now a bug in the cap.
 	//
 	// SAID ONCE PER BOOT, NOT ONCE PER SHOOTDOWN, and the comment here already said why before the
 	// code did it: a machine does not grow cores while it runs, so the first line is the whole
