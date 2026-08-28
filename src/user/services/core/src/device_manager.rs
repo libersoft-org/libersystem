@@ -45,6 +45,10 @@ const STATE_DRIVER_MISSING: u8 = 4;
 const MAX_DRIVER_RESTARTS: u32 = 3;
 
 // Say which budget this launch is working to.
+//
+// WITH THE NUMBERS IN IT. This said `boot window and this boot's deadline` - a line that names two
+// quantities and prints neither, so the one thing it exists to answer, what the budget IS, was left
+// for the reader to go and find. Ticks, because that is the unit every deadline in this file is in.
 unsafe fn report_boot_window() {
 	unsafe {
 		let window: u64 = BOOT_WINDOW.load(core::sync::atomic::Ordering::Relaxed);
@@ -52,10 +56,18 @@ unsafe fn report_boot_window() {
 			print(b"DeviceManager: no boot window was published; a bind is bounded by its own deadline alone\n");
 			return;
 		}
-		if BOOT_DEADLINE.load(core::sync::atomic::Ordering::Relaxed) == 0 {
-			print(b"DeviceManager: boot window carried over without the boot's deadline\n");
+		let mut number = [0u8; 20];
+		let deadline: u64 = BOOT_DEADLINE.load(core::sync::atomic::Ordering::Relaxed);
+		print(b"DeviceManager: boot window ");
+		let n = decimal(window, &mut number);
+		print(&number[..n]);
+		if deadline == 0 {
+			print(b" tick(s), carried over without the boot's deadline\n");
 		} else {
-			print(b"DeviceManager: boot window and this boot's deadline\n");
+			print(b" tick(s), this boot's deadline at tick ");
+			let n = decimal(deadline, &mut number);
+			print(&number[..n]);
+			print(b"\n");
 		}
 	}
 }
@@ -652,7 +664,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 		// changed is that the order is now a decision made in one place over a catalogue, instead
 		// of four named variables filled by whichever driver finished first - which is what has to
 		// be true before a ROLE can replace it.
-		report_catalogue(catalogue);
+		report_catalogue(catalogue, b"after the boot devices");
 		// ONE LOOP OVER THE TAGS THE WIRE HAS, taking by lowest bus address. The count comes from
 		// the wire's own list; nothing here decides how many disks a machine may have.
 		for slot in boot_blocks.iter_mut() {
@@ -769,7 +781,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 		}
 		close(key_producer);
 		report_state(&state);
-		report_catalogue(catalogue);
+		report_catalogue(catalogue, b"after every device");
 	}
 }
 
@@ -3044,7 +3056,7 @@ unsafe fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 // The four named locals could report up to four block providers and had no way to say there were
 // five. This counts what the catalogue holds, so a machine with more disks than the old code had
 // variables says so instead of quietly binding the ones that fit.
-unsafe fn report_catalogue(catalogue: &Catalogue) {
+unsafe fn report_catalogue(catalogue: &Catalogue, phase: &[u8]) {
 	unsafe {
 		let mut line = [0u8; 96];
 		let mut at: usize = 0;
@@ -3074,7 +3086,12 @@ unsafe fn report_catalogue(catalogue: &Catalogue) {
 		if at == 0 {
 			return;
 		}
-		print(b"DeviceManager: providers published - ");
+		// WHICH BRING-UP THIS IS. Both phases report, and the line was the same string for both -
+		// so a machine whose second phase publishes nothing new printed one fact twice with nothing
+		// saying they were different moments.
+		print(b"DeviceManager: providers published ");
+		print(phase);
+		print(b" - ");
 		print(&line[..at]);
 		print(b"\n");
 	}

@@ -117,6 +117,16 @@ impl<D: BlockDevice> ReadsFiles for fat::FatFs<D> {
 // The state machine is `abi::bootstrap::assemble`, beside the list parser it uses and the archive
 // writer it ends with, because this is a UEFI binary and nothing inside one can be tested. What
 // stays here is the reading and the reporting.
+// WHICH SOURCE ANSWERED, on the receipt rather than left to the reader. Two sources can each verify
+// a bootstrap set on one boot - the system volume first, the boot medium after it declines - and the
+// receipt was the same string for both, so the log carried it twice with nothing saying they were
+// different disks. An earlier fix stopped the SAME source being asked twice and left this half.
+//
+// The distinguisher is already in hand: `expected` is what says which source this read is against.
+fn source_name(expected: &crate::trust::Expected) -> &'static str {
+	if expected.source_kind == bootproto::manifest::SOURCE_BOOT_MEDIUM { "the boot medium" } else { "the system volume" }
+}
+
 pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F, expected: &crate::trust::Expected) -> abi::bootstrap::Selection {
 	// WHICH MANIFEST, AND THE SIGNED ONE WINS WHEREVER IT EXISTS. A source carrying `boot.manifest2`
 	// is one that was signed, and reading the text manifest beside it instead would be choosing the
@@ -152,7 +162,9 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F, expected: &crate::tr
 			},
 		);
 		if matches!(verdict, abi::bootstrap::Selection::Verified(_)) {
-			crate::arch::serial::write_str("loader: bootstrap set verified against a SIGNED etc/boot.manifest2\n");
+			crate::arch::serial::write_str("loader: bootstrap set verified against a SIGNED etc/boot.manifest2 on ");
+			crate::arch::serial::write_str(source_name(expected));
+			crate::arch::serial::write_str("\n");
 		}
 		return verdict;
 	}
@@ -179,7 +191,9 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F, expected: &crate::tr
 	if matches!(verdict, abi::bootstrap::Selection::Verified(_)) {
 		// SAY THAT IT CHECKED. A check that is silent when it passes cannot be told apart in a boot
 		// log from one that was never wired up, and this one's whole value is that it ran.
-		crate::arch::serial::write_str("loader: bootstrap set verified against etc/boot.manifest\n");
+		crate::arch::serial::write_str("loader: bootstrap set verified against etc/boot.manifest on ");
+		crate::arch::serial::write_str(source_name(expected));
+		crate::arch::serial::write_str("\n");
 	}
 	verdict
 }

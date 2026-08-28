@@ -100,7 +100,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // This list and check.sh's must agree, and `verify-model check` compares them by reading check.sh
 // rather than trusting that they do: a gate added there and not here would never be selected by a
 // change to its subject, which is a false green of exactly the kind this milestone exists to close.
-const GATES: [(&str, &str); 44] = [
+const GATES: [(&str, &str); 45] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -221,6 +221,11 @@ const GATES: [(&str, &str); 44] = [
 	// this list is written in holds one subject per gate. The protocol version is the failure worth
 	// catching early; a dropped KEEP is caught by the same gate on the next change that selects it.
 	("driver-protocol-note", "driver-protocol"),
+	// No numbered per-provider local in DeviceManager. Four `blockN_client` variables were a count
+	// of disks compiled into the manager, so a fifth had nowhere to go and which volume was which
+	// depended on which driver finished first. Its subject is the crate that holds the manager, so a
+	// change to it selects the gate - and it reads source, so it costs milliseconds.
+	("no-fixed-provider-slots", "services"),
 	// Two gates over one subject: generated or compiled artifacts below `src`, in the working tree and anywhere
 	// in reachable history. They were Justfile recipes that nothing called and nothing selected;
 	// moving them into `check.sh` is what makes a change to the tree able to select them, and this

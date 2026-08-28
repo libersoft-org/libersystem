@@ -280,6 +280,21 @@ pub fn describe(out: &mut [u8; 64], name: &[u8], device: &Virtio, detail: &[u8])
 	n
 }
 
+// ONE WRITE, NOT TWO. `print(report); print(b"\n")` is two syscalls with a gap between them, and the
+// kernel writes to the same serial port from its own cores - so a boot report carried
+// `driver.virtio-blk: online (00:02.0)iommu: 00:08.0 attached to domain 4` and then a bare newline,
+// which is two lines a reader cannot read and neither of them the line either component wrote. The
+// gap is what has to go; the terminator belongs to the line.
+unsafe fn print_line(report: &[u8]) {
+	unsafe {
+		let mut out = [0u8; 96];
+		let n = report.len().min(out.len() - 1);
+		out[..n].copy_from_slice(&report[..n]);
+		out[n] = b'\n';
+		print(&out[..n + 1]);
+	}
+}
+
 // Append what fits and drop what does not: a report that runs off the end of its buffer is a report,
 // and a driver that panicked while writing one is a device that never came up.
 fn push(out: &mut [u8; 64], at: &mut usize, bytes: &[u8]) {
@@ -304,8 +319,7 @@ fn hex2(byte: u8) -> [u8; 2] {
 // dies between them announces nothing.
 pub unsafe fn online(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16, u64)]) -> bool {
 	unsafe {
-		print(report);
-		print(b"\n");
+		print_line(report);
 		// THE TOKEN IS THE POSITION IN THIS DRIVER'S OWN OFFER LIST, which is unique within this
 		// driver by construction and costs a driver author no thought at all. The kind would do for
 		// every driver in the tree today, because none publishes two of one kind - and that is
@@ -335,8 +349,7 @@ pub unsafe fn online(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16,
 // a driver that dies between the two announces nothing.
 pub unsafe fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], service: u64, provider_kind: u16) -> ! {
 	unsafe {
-		print(report);
-		print(b"\n");
+		print_line(report);
 		if service != 0 && !offer(bootstrap, bind, provider_kind, 0, service) {
 			exit();
 		}

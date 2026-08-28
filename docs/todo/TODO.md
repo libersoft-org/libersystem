@@ -224,7 +224,7 @@ or preventing further development of `v1`.
 - [x] [P02M0148 - `shutdown` tears the system down and then does not stop the machine](P02M0148.md)
 - [x] [P02M0149 - A provider was rebuilt, its consumer was not, and only the packager noticed](P02M0149.md)
 - [x] [P02M0150 - A digest beside a payload is not a boot trust chain](P02M0150.md)
-- [ ] [P02M0151 - The architecture boundary contains no panic-shaped compatibility contract](P02M0151.md)
+- [x] [P02M0151 - The architecture boundary contains no panic-shaped compatibility contract](P02M0151.md)
 - [x] [P02M0152 - Memory has a topology, not one global distance](P02M0152.md)
 - [x] [P02M0153 - Virtio-IOMMU confines the first x86_64 QEMU endpoints](P02M0153.md)
 - [x] [P02M0154 - The capability transfer rules have a machine-checked bounded model](P02M0154.md)
@@ -240,7 +240,8 @@ or preventing further development of `v1`.
 - [x] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
 - [x] [P02M0165 - A driver that stops answering looks exactly like one that is busy](P02M0165.md)
 - [x] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)
-- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - revised twice on 2026-08-27 after external review: M0 added, every item given a contract
+- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - four rounds of external review; M5 rewritten twice, and its second fix was wrong in the way the first was
+- [ ] [P02M0168 - The kernel brings up every core the firmware lists and then two tables assume sixty-four](P02M0168.md) - found by reading a boot report on a 100-core host: the boot never finishes and 3058 pages are lost in 100 s
 
 ### Definition of done (phase 2)
 

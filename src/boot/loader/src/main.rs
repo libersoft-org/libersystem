@@ -182,7 +182,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 					if !blockio::covered_by(&manifest, bootproto::manifest::KIND_KERNEL, KERNEL_FILE.as_bytes(), &bytes) {
 						panic!("loader: the kernel is not what the system volume's SIGNED manifest records");
 					}
-					announce_release(&manifest);
+					announce_release(&manifest, "the system volume's kernel");
 				}
 				// PRESENT AND UNREADABLE IS BETRAYAL, NOT ABSENCE - which `assemble_bootstrap` has
 				// said for the bootstrap set all along, and this path could not say because every
@@ -565,7 +565,7 @@ fn read_pairing(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) ->
 	};
 	// The release this boot is, latched by the first thing verified - and on a paired machine that
 	// is this manifest, before any volume has been chosen.
-	announce_release(&manifest);
+	announce_release(&manifest, "the boot medium's pairing record");
 	if manifest.volume_uuid == [0u8; 16] { None } else { Some(manifest.volume_uuid) }
 }
 
@@ -792,7 +792,12 @@ pub(crate) fn read_boot_file(bs: *mut BootServices, root: Option<*mut uefi::File
 // re-derive a decision from. What the harness asserts is this line - the release the manifest
 // names, the key that signed it, and the digest of the record itself, which is what makes two
 // boots comparable.
-fn announce_release(manifest: &bootproto::manifest::Manifest<'_>) {
+//
+// AND WHAT IT COVERED. One boot verifies up to three manifests and two of them are the same record
+// read for different questions - the medium's, once to learn which volume it is paired with and
+// again as cover for the kernel read off it - so the receipt was printed twice with matching
+// digests and nothing saying the two lines were different answers.
+fn announce_release(manifest: &bootproto::manifest::Manifest<'_>, subject: &str) {
 	arch::serial::write_str("loader: signed manifest verified - release ");
 	for byte in manifest.release {
 		arch::serial::write_byte(*byte);
@@ -804,7 +809,9 @@ fn announce_release(manifest: &bootproto::manifest::Manifest<'_>) {
 	for byte in &digest[..8] {
 		write_hex8(*byte);
 	}
-	arch::serial::write_str("\n");
+	arch::serial::write_str(" (");
+	arch::serial::write_str(subject);
+	arch::serial::write_str(")\n");
 }
 
 fn write_hex8(byte: u8) {
@@ -856,7 +863,7 @@ fn read_verified_kernel_from_boot_medium(bs: *mut BootServices, root: Option<*mu
 		if !blockio::covered_by(&manifest, bootproto::manifest::KIND_KERNEL, KERNEL_FILE.as_bytes(), bytes) {
 			panic!("loader: the kernel is not what the boot medium's SIGNED manifest records");
 		}
-		announce_release(&manifest);
+		announce_release(&manifest, "the boot medium's kernel");
 		return bytes;
 	}
 	// The third of the same fallback: a signed manifest that is ABSENT, on the medium this loader

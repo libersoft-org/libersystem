@@ -178,12 +178,18 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	let bi = boot_info();
 	assert!(bi.magic == bootproto::MAGIC, "boot protocol magic mismatch: the loader and kernel disagree");
 	assert!(bi.version == bootproto::VERSION, "boot protocol version mismatch: rebuild the loader and kernel together");
-	// WHAT THE LOADER CHOSE, printed once. A boot that promoted nothing looks exactly like one that
-	// promoted the first disk that answered unless somebody says which happened.
+	// WHAT THE LOADER HANDED OVER, printed once, by the receiver. A boot that promoted nothing looks
+	// exactly like one that promoted the first disk that answered unless somebody says which
+	// happened.
+	//
+	// UNDER A PREFIX THIS PROGRAM OWNS. It said `loader:`, and the loader had just written seventeen
+	// lines under that prefix - so grepping it returned two programs' accounts interleaved, and the
+	// one line reporting what arrived over the boot protocol was indistinguishable from the loader's
+	// own account of choosing it. Which program is speaking is the first thing a prefix is for.
 	match bi.root.kind {
-		bootproto::ROOT_BLOCK => serial_println!("loader: this boot's system volume is a paired block volume"),
-		bootproto::ROOT_EMBEDDED => serial_println!("loader: this boot's system volume is the verified image the medium carries"),
-		_ => serial_println!("loader: this boot promotes no system volume"),
+		bootproto::ROOT_BLOCK => serial_println!("boot: the system volume is a paired block volume"),
+		bootproto::ROOT_EMBEDDED => serial_println!("boot: the system volume is the verified image the medium carries"),
+		_ => serial_println!("boot: no system volume was promoted"),
 	}
 	ROOT_SELECTION.lock().replace(bi.root);
 	serial_println!("{} kernel is starting ...", product::NAME);

@@ -54,6 +54,10 @@ static ACK_GENERATION: [AtomicU64; MAX_CPUS] = [ZERO; MAX_CPUS];
 // because it bounds how far the numbers can run ahead of each other and keeps the wait below simple.
 static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
+// Whether this boot has already said that it cannot reach every core. The condition is a property
+// of the machine and cannot change while it runs, so the sentence is worth exactly one line.
+static UNCOVERED_REPORTED: AtomicBool = AtomicBool::new(false);
+
 // Flush every other online core's translations and wait for them to confirm it.
 //
 // Call this after the page-table entries are gone and BEFORE the frames they named are
@@ -75,10 +79,18 @@ pub fn shootdown() -> bool {
 	// answer would be a physical use-after-free on precisely the cores the mechanism forgot.
 	//
 	// `false` is the honest answer and the callers already know what to do with it: `frame::retire`
-	// quarantines the span and tries again later. Said once per shootdown rather than counted,
-	// because a machine does not grow cores while it runs - the first line is the whole story.
+	// quarantines the span and tries again later.
+	//
+	// SAID ONCE PER BOOT, NOT ONCE PER SHOOTDOWN, and the comment here already said why before the
+	// code did it: a machine does not grow cores while it runs, so the first line is the whole
+	// story and every line after it is the same sentence again. Measured on a 100-core host: 3236
+	// copies of it in one boot, half of every line the console printed, with the report they were
+	// buried in being the thing anyone reading a console is there for. The count is not lost -
+	// `frame::retired_pages` counts the consequence and the report prints it.
 	if !covers_every_core(cpus) {
-		crate::serial_println!("tlb: {cpus} cores are online and this tracks {MAX_CPUS} - a shootdown cannot reach them all, so it reports incomplete");
+		if !UNCOVERED_REPORTED.swap(true, Ordering::Relaxed) {
+			crate::serial_println!("tlb: {cpus} cores are online and this tracks {MAX_CPUS} - a shootdown cannot reach them all, so every one of them reports incomplete and every page it was for is retired");
+		}
 		return false;
 	}
 	// One at a time. A second requester waits for the first rather than sharing its
