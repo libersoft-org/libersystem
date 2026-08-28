@@ -240,7 +240,7 @@ or preventing further development of `v1`.
 - [x] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
 - [x] [P02M0165 - A driver that stops answering looks exactly like one that is busy](P02M0165.md)
 - [x] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)
-- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - four rounds of external review; M5 rewritten twice, and its second fix was wrong in the way the first was
+- [ ] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md) - five rounds of external review; the fifth found the suite's own test medium racing at a fixed path and a candidate model that could never hash identically at activation
 - [ ] [P02M0168 - The kernel brings up every core the firmware lists and then two tables assume sixty-four](P02M0168.md) - found by reading a boot report on a 100-core host: the boot never finishes and 3058 pages are lost in 100 s
 
 ### Definition of done (phase 2)
