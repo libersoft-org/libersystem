@@ -769,6 +769,22 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	let cpu = super::percpu::this_cpu();
 	crate::serial_println!("aarch64: per-CPU up (TPIDR_EL1) cpu_id={} mpidr={:#x} of {} CPU(s)", cpu.cpu_id(), cpu.lapic_id() & 0xff_ffff, cpu_count);
 
+	// SIZE THE PORTABLE ID TABLE BEFORE ANY SECONDARY CAN RECORD ITSELF IN IT.
+	//
+	// This used to happen AFTER `bring_up_secondaries`, and every secondary publishes its MPIDR from
+	// `secondary_idle` while bring-up is still running. `set_lapic_id` stores only when the table is
+	// allocated and the id is below `cpu_count`, and neither held yet - so it silently dropped the
+	// store for every secondary, `set_cpu_count` then allocated a ZERO-filled table, and the boot
+	// path filled slot 0 alone. `numa::bind_online` reads this table and joins each online core to
+	// firmware topology BY THAT HARDWARE ID, so every secondary was looked up as affinity 0 and bound
+	// to whichever node owns it, or to none. riscv64 has had the right order all along - size for
+	// every id this boot can hand out, then narrow to what answered - and this is that order.
+	crate::smp::set_cpu_count(topology.slots());
+	// THE BOOT CORE'S OWN AFFINITY, into the portable table the NUMA binding and the wake IPI read.
+	// It used to hold the subscript `0`, which is the right answer only on a machine whose first
+	// core's MPIDR affinity happens to be zero.
+	crate::smp::set_lapic_id(0, mpidr & super::psci::MPIDR_AFFINITY);
+
 	// Wake the secondary cores via PSCI CPU_ON (each brings up its own per-CPU
 	// block + local GIC/timer, then idles).
 	let outcome = super::psci::bring_up_secondaries(topology.secondaries(), arg);
@@ -795,11 +811,9 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// rather than running off the end. The same scheduler the x86_64/riscv64 kernels
 	// use - the aarch64 arch backend (context switch, per-CPU, read/write_cr3, timer)
 	// satisfies its whole contract.
+	// NARROWED TO THE IDS IN USE. The count published before bring-up sized the table; this one is
+	// what the scheduler, the IPI paths and the shootdown read from here on.
 	crate::smp::set_cpu_count(cpu_count as usize);
-	// THE BOOT CORE'S OWN AFFINITY, into the portable table the NUMA binding and the wake IPI read.
-	// It used to hold the subscript `0`, which is the right answer only on a machine whose first
-	// core's MPIDR affinity happens to be zero.
-	crate::smp::set_lapic_id(0, mpidr & super::psci::MPIDR_AFFINITY);
 	// Said out loud here, from the portable counter every port increments as a core reports in.
 	// x86_64 prints the same line from its own prologue; a port that wakes cores and never says how
 	// many answered is one whose secondary bring-up can regress in silence.

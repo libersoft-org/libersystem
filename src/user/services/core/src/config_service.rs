@@ -224,9 +224,18 @@ impl Service for Config {
 	}
 }
 
-// The one prefix `remove` will touch. DeviceManager alone writes under it - the four operator verbs
-// live on its own narrow endpoint, so a component holding `CAP_CONFIG` can neither write a policy
-// record nor delete one.
+// The one prefix `remove` will touch.
+//
+// AND `set` DOES NOT CHECK IT, which is a hole and not a decision. This comment used to claim that
+// "a component holding `CAP_CONFIG` can neither write a policy record nor delete one" - true of
+// `remove`, which refuses every key outside this prefix, and NOT true of `set`, which accepts any
+// key from any client. So an ordinary `CAP_CONFIG` holder - and ServiceManager grants that
+// capability to several components - can overwrite DeviceManager's persistent device policy.
+//
+// It is not fixed here because ConfigService cannot currently tell its callers apart: every
+// connection is dispatched through the same `Config` value and `serve_multi` passes a per-connection
+// channel that is ignored. Making this prefix DeviceManager-only needs that identity first. Recorded
+// as the gap it is rather than left as a claim the code does not support.
 const DEVICE_POLICY_PREFIX: &str = "device.policy.";
 
 #[unsafe(no_mangle)]

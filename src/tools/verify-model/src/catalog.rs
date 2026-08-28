@@ -364,6 +364,21 @@ pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shado
 	seen.into_iter().collect()
 }
 
+// GATES THAT ARE EXACTLY THE UNION OF OTHER GATES, and must therefore never be SELECTED.
+//
+// `check.sh` runs `qemu-arch-profiles` (all eight interrupt profiles, one command) and also runs the
+// eight `arch-profile-*` entries individually, because a person typing one name wants all of them and
+// the scheduler needs eight separately measured costs. Both were in the catalog and both cover
+// `kernel`, so any kernel change selected all nine - and `commands::steps` merges pre-guest gates into
+// one `./check.sh --gate a,b,...`, so the eight expensive emulated profiles ran ONCE EACH under their
+// own keys and then a SECOND time inside the umbrella. Measured in a full sweep: the gate step carried
+// the umbrella key and all eight profile keys.
+//
+// The entry stays in `GATES` so the two lists still agree - check.sh really does run it - and it gets
+// no catalog check, so nothing can select it. Running the union by hand stays a command a person can
+// type; paying for it twice in a sweep does not.
+const UMBRELLA_GATES: [&str; 1] = ["qemu-arch-profiles"];
+
 pub fn catalog_gate_names() -> BTreeSet<String> {
 	GATES.iter().map(|(name, _)| (*name).to_string()).collect()
 }
@@ -398,6 +413,10 @@ impl Catalog {
 		}
 
 		for (gate, subject) in GATES {
+			// The union entries are declared and never selected - see UMBRELLA_GATES.
+			if UMBRELLA_GATES.contains(&gate) {
+				continue;
+			}
 			catalog.checks.push(Check { id: format!("gate.{gate}"), kind: CheckKind::Gate, covers: vec![subject.to_string()], variants: vec![Variant { architecture: String::from("host"), environment: Environment::Host, configuration: String::from("default") }], command: format!("./check.sh --gate {gate}") });
 		}
 

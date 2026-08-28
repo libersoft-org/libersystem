@@ -939,6 +939,12 @@ pub(crate) fn boot_userspace(window_ticks: u64) {
 		fault::clear_crash_notify();
 	} else {
 		fault::clear_crash_notify();
+		// AND THE ISOLATION STATE HERE TOO, because this is the branch where a reader most needs it
+		// and the one where it was never said. The report was on the success path alone, so a boot
+		// that could not stabilize userspace - the case somebody is reading the log to diagnose -
+		// carried no record of which devices had been admitted to master the bus untranslated, even
+		// though every one of them was admitted before this point. Whatever bound, bound.
+		dma_policy::report();
 		serial_println!("recovery: SystemManager could not be stabilized after {} attempts - rebooting", MAX_RESTARTS + 1);
 		arch::reset();
 	}

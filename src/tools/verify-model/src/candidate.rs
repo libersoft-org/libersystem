@@ -68,7 +68,21 @@ impl Candidate {
 	// Answered before anything is written, and answered for ALL of them rather than stopping at the
 	// first mismatch: an operator deciding whether to refreeze wants the whole list, and reporting
 	// one file at a time turns one decision into as many rounds as there are files.
-	pub fn base_is_unmoved(&self, repo_root: &Path) -> Result<(), String> {
+	pub fn base_is_unmoved(&self, repo_root: &Path, sources: &BTreeMap<String, Vec<String>>) -> Result<(), String> {
+		// EVERY FILE THIS WILL OVERWRITE HAS TO BE IN THE BASE. The check ranged over the entries the
+		// candidate CHOSE to list, so a candidate that simply omitted `registry.toml` - or the source
+		// declaring a test whose `covers` it rewrites - passed a check named "the base is unmoved"
+		// while overwriting a file nobody had compared against anything.
+		let mut will_write: Vec<String> = vec![String::from("src/tools/verify-model/model/registry.toml")];
+		for id in self.covers.keys() {
+			if let Some(paths) = sources.get(id) {
+				will_write.extend(paths.iter().cloned());
+			}
+		}
+		let unlisted: Vec<&String> = will_write.iter().filter(|path| !self.base.contains_key(*path)).collect();
+		if !unlisted.is_empty() {
+			return Err(format!("this candidate would overwrite files it does not record a base digest for, so nothing could tell whether they had moved:\n    {}\n  Refreeze the candidate so its `base` covers every file it writes; nothing was written.", unlisted.iter().map(|path| path.as_str()).collect::<Vec<_>>().join("\n    ")));
+		}
 		let mut moved = Vec::new();
 		for (relative, expected) in &self.base {
 			let path = repo_root.join(relative);
@@ -92,7 +106,31 @@ impl Candidate {
 	// Returns what was there before, so a refused activation can put it back byte for byte - which
 	// is the difference between a check that refuses and one that refuses after the damage.
 	pub fn materialise(&self, repo_root: &Path, sources: &BTreeMap<String, Vec<String>>) -> Result<BTreeMap<String, Vec<u8>>, String> {
+		// EVERY ID RESOLVED BEFORE THE FIRST WRITE. The registry was written first and the ids were
+		// resolved inside the loop after it, so a candidate naming a test the tree does not have was
+		// refused with the canonical registry already replaced - and the caller's `?` returned before
+		// it had the `previous` map to put it back with. A refusal that leaves the damage is the one
+		// thing this function's own comment says it is not.
+		for id in self.covers.keys() {
+			if !sources.contains_key(id) {
+				return Err(format!("the candidate gives `{id}` a narrower `covers` and no source declares that id - a candidate naming a test the tree does not have cannot be activated; nothing was written"));
+			}
+		}
+		// AND AN IO ERROR PART-WAY THROUGH UNDOES WHAT THIS CALL WROTE. The ids above are resolved
+		// first, so what is left to fail here is a read or a write - and failing on the third file of
+		// four used to leave two of them replaced with the caller holding no `previous` to undo them.
 		let mut previous: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+		match self.write_overlay(repo_root, sources, &mut previous) {
+			Ok(()) => Ok(previous),
+			Err(error) => match Candidate::roll_back(repo_root, &previous) {
+				Ok(()) => Err(format!("{error}; nothing was kept")),
+				Err(second) => Err(format!("{error}; and putting the files back failed too, so the tree is now part-written and needs a look: {second}")),
+			},
+		}
+	}
+
+	// The writes themselves. Separated so the caller above can undo exactly what this managed to do.
+	fn write_overlay(&self, repo_root: &Path, sources: &BTreeMap<String, Vec<String>>, previous: &mut BTreeMap<String, Vec<u8>>) -> Result<(), String> {
 		let registry = repo_root.join("src/tools/verify-model/model/registry.toml");
 		previous.insert(String::from("src/tools/verify-model/model/registry.toml"), std::fs::read(&registry).map_err(|error| format!("{}: {error}", registry.display()))?);
 		std::fs::write(&registry, self.registry.as_bytes()).map_err(|error| format!("{}: {error}", registry.display()))?;
@@ -105,9 +143,7 @@ impl Candidate {
 		// plural, because an arch-gated test is declared once per target under one id and editing
 		// only the last file read would leave the other two saying something else.
 		for (id, covers) in &self.covers {
-			let Some(paths) = sources.get(id) else {
-				return Err(format!("the candidate gives `{id}` a narrower `covers` and no source declares that id - a candidate naming a test the tree does not have cannot be activated"));
-			};
+			let Some(paths) = sources.get(id) else { unreachable!("every id was resolved before the first write") };
 			let replacement = format!("id = \"{id}\", covers = [{}]", covers.iter().map(|component| format!("\"{component}\"")).collect::<Vec<_>>().join(", "));
 			for relative in paths {
 				let path = repo_root.join(relative);
@@ -122,7 +158,7 @@ impl Candidate {
 				std::fs::write(&path, rewritten.as_bytes()).map_err(|error| format!("{}: {error}", path.display()))?;
 			}
 		}
-		Ok(previous)
+		Ok(())
 	}
 
 	pub fn roll_back(repo_root: &Path, previous: &BTreeMap<String, Vec<u8>>) -> Result<(), String> {

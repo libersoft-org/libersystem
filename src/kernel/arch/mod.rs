@@ -14,20 +14,25 @@
 //                   halt_loop, reset, poweroff, cpu_brand, boot_profile, exit_qemu (cfg(test))
 //       paging:     PRESENT / WRITABLE / USER / NO_CACHE / NO_EXECUTE, map_page, map_page_in,
 //                   try_map_page, try_map_page_in, unmap_page, unmap_page_in, translate,
-//                   new_address_space, free_address_space, user_access, copy_to_user_page,
-//                   remove_bootstrap_identity
+//                   new_address_space, free_address_space, user_access, copy_to_user_page
+//                   (`remove_bootstrap_identity` is x86-only: it undoes the loader hand-off's
+//                   identity map, and the other two ports never make one.)
 //       context:    switch_context, init_thread_stack, read_cr3, write_cr3 (read_cr3/write_cr3
 //                   name the active address-space token - CR3 on x86, TTBR0 on aarch64, SATP on
 //                   riscv64)
 //       percpu:     PerCpu (cpu_id, lapic_id), allocate, init, this_cpu, set_kernel_rsp,
 //                   set_stack_bounds, in_user_syscall
-//       interrupts: IRQ_BASE, HandlerFn, register, bind, unbind, is_bound, is_bindable,
-//                   acquire_msi_unique, bind_msi, eoi, irq_info, irq_info_len
+//       interrupts: bind, unbind, is_bound, is_bindable, acquire_msi_unique, bind_msi, eoi,
+//                   irq_info, irq_info_len
+//                   `IRQ_BASE`, `HandlerFn` and `register` ARE NOT HERE. They are the x86 INTx
+//                   registry and exist only under `x86_64` - part (2) says so and this list said
+//                   the opposite, which put back in the contract exactly the obligation the
+//                   milestone removed from the other two ports.
 //       apic:       local_id, send_wake_ipi, ticks   (the interrupt controller + timer; GIC on
 //                   aarch64, PLIC/CLINT + IMSIC on riscv64 - keeps the `apic` name for now)
 //       tsc:        now, init, hz, cycles_to_ns   (the fine cycle clock)
-//       serial:     SerialWriter, init, enable_rx_irq, enable_async, drain_tx, flush_sync,
-//                   write_bytes, read_byte
+//       serial:     SerialWriter, init, enable_async, drain_tx, flush_sync, write_bytes, read_byte
+//                   (`enable_rx_irq` is x86-only too, for the same reason: it arms an INTx line.)
 //       pci:        PciDevice / VirtioDevice / XhciDevice, scan, scan_virtio, scan_xhci,
 //                   set_intx_disabled, msix_enable
 //       syscall:    invoke (cfg(test))            usermode: enter, exit_to_kernel

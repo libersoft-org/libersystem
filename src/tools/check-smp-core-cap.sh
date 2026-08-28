@@ -63,10 +63,22 @@ if grep -qh "cores are online and this tracks" ${logs[@]}; then
 fi
 echo "smp-core-cap:     no shootdown reported itself unable to reach every core"
 
-# AND NOTHING WAS RETIRED. A page retired for a shootdown that did not complete is the memory this
-# machine loses for good, and it is the consequence the line above only predicts.
-if grep -qh "could not be queued and its shootdown did not complete" ${logs[@]}; then
+# AND NOTHING WAS RETIRED - THE COUNTER, NOT A SENTENCE ABOUT IT.
+#
+# This grepped for one spelling of one warning: `its shootdown did not complete`. `frame::retire`
+# prints `their shootdown did not complete` for the BATCHED case, and the retirement paths in
+# `deallocate` and `note_retired_pages` increment the counter without printing either - so three of
+# the four ways this machine can lose a page passed the check that exists to catch them.
+#
+# `test_runner` now prints the same retirement line the ordinary boot report prints, so the number
+# itself is here to be asserted. Both warning spellings are still refused: they name WHY a page went,
+# which the total cannot, and a run that prints one has already failed by the time the count is read.
+if grep -qhE "could not be queued and (its|their) shootdown did not complete" ${logs[@]}; then
+	grep -m1 -hE "could not be queued and (its|their) shootdown did not complete" ${logs[@]} >&2
 	fail "pages were retired for an incomplete shootdown at $cores cores"
 fi
-echo "smp-core-cap:     no page was retired for an incomplete shootdown"
+retired="$(grep -ho "memory: [0-9]* page(s) retired for good" ${logs[@]} | tail -1 | sed 's/[^0-9]*\([0-9]*\).*/\1/')"
+[[ -n "$retired" ]] || fail "the run printed no retirement count, so 'loses nothing' would be a claim with no evidence - expected a 'memory: N page(s) retired for good' line in ${logs[*]}"
+[[ "$retired" == 0 ]] || fail "$retired page(s) were retired for good at $cores cores - the machine lost them, which is the consequence the cap exists to prevent"
+echo "smp-core-cap:     0 page(s) retired for good, said by the run itself"
 echo "smp-core-cap: a machine past the supported count boots on $supported cores, says so, and loses nothing"

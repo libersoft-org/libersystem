@@ -203,11 +203,17 @@ pub fn lapic_id(cpu: usize) -> u64 {
 pub fn set_lapic_id(cpu: usize, id: u64) {
 	// A core recording its controller id is a core that reached this code, which is what the mask is
 	// about. The two are set together so they cannot disagree.
-	mark_in_mask(cpu);
+	//
+	// THE ID FIRST, AND THE MASK BIT AFTER IT. The mask was set first with a RELAXED id store behind
+	// it, so a topology sweep running concurrently with a late-arriving secondary could see
+	// `is_online(cpu)` and read the zero this slot was initialised to - and `bind_self` does not
+	// repair a slot that is already bound, so that core kept the wrong node for the life of the boot.
+	// The release/acquire pair is what makes the mask bit mean "the id beside it is readable".
 	let base = LAPIC_IDS.load(Ordering::Acquire);
 	if !base.is_null() && cpu < cpu_count() {
-		unsafe { (*base.add(cpu)).store(id, Ordering::Relaxed) };
+		unsafe { (*base.add(cpu)).store(id, Ordering::Release) };
 	}
+	mark_in_mask(cpu);
 }
 
 // Wake every application processor and wait for all cores to report in. Runs on

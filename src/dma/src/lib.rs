@@ -690,6 +690,31 @@ impl<B: Backend> Iommu<B> {
 	// refuses leaves the caller with no mapping, no reserved address and no charge - because a
 	// half-installed mapping is an address the driver may be told about and the hardware does not
 	// honour, or worse, one the hardware honours and the kernel has forgotten.
+	// AN UNCONFIRMED MAP IS NOT A REFUSED ONE, and the difference decides whether an address may be
+	// handed out again.
+	//
+	// `Fault::Unconfirmed` says in its own definition: "the kernel does not know the state of the
+	// hardware, so nothing may be released." Both map paths released the IOVA for EVERY error,
+	// under a comment asserting that nothing was installed - which is true of a refusal and is
+	// exactly what an unconfirmed result does not say. A completion that timed out, named the wrong
+	// descriptor, claimed an invalid length or omitted its status leaves a controller that may well
+	// have installed the translation; giving that address to the next caller hands the device a
+	// second owner's memory.
+	//
+	// So a refusal releases and an unconfirmed result QUARANTINES: the address stays taken for the
+	// life of the domain, and the mapping is recorded so the accounting can see it.
+	fn map_failed(&mut self, domain: DomainId, iova: DmaAddress, physical: u64, len: u64, direction: Direction, generation: Generation, reason: Fault) -> Fault {
+		if reason == Fault::Unconfirmed {
+			let id = MappingId(self.next_mapping);
+			self.next_mapping += 1;
+			self.mappings.insert(id, Mapping { id, domain, iova, physical, len, direction, generation, state: MappingState::Quarantined });
+			return reason;
+		}
+		let state = self.domains.get_mut(&domain).expect("the caller holds this domain");
+		let _ = state.space.release(iova);
+		reason
+	}
+
 	pub fn map(&mut self, domain: DomainId, physical: u64, len: u64, direction: Direction, requirements: &Requirements) -> Result<MappingId, Fault> {
 		if len == 0 {
 			return Err(Fault::Malformed);
@@ -716,13 +741,9 @@ impl<B: Backend> Iommu<B> {
 				self.mappings.insert(id, Mapping { id, domain, iova, physical, len, direction, generation, state: MappingState::Live });
 				Ok(id)
 			}
-			Err(reason) => {
-				// NOTHING INSTALLED, so the address goes straight back: no translation was made, so
-				// there is nothing a device could still resolve.
-				let state = self.domains.get_mut(&domain).expect("checked above");
-				let _ = state.space.release(iova);
-				Err(reason)
-			}
+			// A REFUSAL releases the address - no translation was made, so there is nothing a device
+			// could still resolve. An UNCONFIRMED result quarantines it: see `map_failed`.
+			Err(reason) => Err(self.map_failed(domain, iova, physical, len, direction, generation, reason)),
 		}
 	}
 
@@ -749,11 +770,7 @@ impl<B: Backend> Iommu<B> {
 				self.mappings.insert(id, Mapping { id, domain, iova, physical: address, len, direction, generation, state: MappingState::Live });
 				Ok(id)
 			}
-			Err(reason) => {
-				let state = self.domains.get_mut(&domain).expect("checked above");
-				let _ = state.space.release(iova);
-				Err(reason)
-			}
+			Err(reason) => Err(self.map_failed(domain, iova, address, len, direction, generation, reason)),
 		}
 	}
 

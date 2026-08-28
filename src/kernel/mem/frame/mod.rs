@@ -393,9 +393,18 @@ impl FrameAllocator {
 		let Some(want) = want else { return count };
 		// An insertion sort over at most seventeen entries, which is smaller than the machinery a
 		// general sort would need and allocates nothing.
+		// THE REQUESTED NODE IS FIRST BY CONSTRUCTION, not because its distance happens to be
+		// smallest. The key was `(distance, node id)` and `distance(n, n)` is `LOCAL_DISTANCE` -
+		// which firmware is allowed to declare for an off-diagonal pair too, that being a machine
+		// reporting two nodes equally near, which this kernel accepts rather than refuses. On such a
+		// machine node 0 sorted ahead of a requested node 1 on the tie rule alone, and
+		// `allocate_preferred(1)` reached for node 0's memory while node 1 still had free frames.
+		// "The requested node, then increasing firmware distance" is the contract, and a tie rule is
+		// not allowed to reorder its first word. `Topology::fallback_order` is keyed the same way;
+		// this is the allocator's own copy of that order and it had not been corrected with it.
 		let key = |at: usize| match self.pools[at].node {
-			Some(node) => (crate::mem::topology_distance(want, node) as u32, node.0),
-			None => (u32::MAX, u32::MAX),
+			Some(node) => (node != want, crate::mem::topology_distance(want, node) as u32, node.0),
+			None => (true, u32::MAX, u32::MAX),
 		};
 		for i in 1..count {
 			let mut j = i;

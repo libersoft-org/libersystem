@@ -262,11 +262,23 @@ pub unsafe fn bringup_bound(bootstrap: u64, bind: &Bind, resources: &Resources, 
 // `detail` is whatever else the driver has to say about itself - a role, a self-test result - and is
 // empty for most. The whole line is built in a fixed buffer because a driver has no formatter.
 pub fn describe(out: &mut [u8; 64], name: &[u8], device: &Virtio, detail: &[u8]) -> usize {
+	describe_state(out, name, device, b"online", detail)
+}
+
+// The same line, for a driver that reached its report WITHOUT what it exists to offer.
+//
+// `describe` hardcoded the word `online`, and the two virtio-blk exits that have no request queue and
+// no service channel went through it - so a boot said `driver.virtio-blk: online (00:02.0, no
+// channel)`, a success claim contradicted by its own parenthetical four characters later. The state
+// is what the line is FOR; it cannot be the one part of it that is always the same.
+pub fn describe_state(out: &mut [u8; 64], name: &[u8], device: &Virtio, state: &[u8], detail: &[u8]) -> usize {
 	let (bus, dev, func) = device.address();
 	let mut n = 0usize;
 	push(out, &mut n, b"driver.");
 	push(out, &mut n, name);
-	push(out, &mut n, b": online (");
+	push(out, &mut n, b": ");
+	push(out, &mut n, state);
+	push(out, &mut n, b" (");
 	push(out, &mut n, &hex2(bus));
 	push(out, &mut n, b":");
 	push(out, &mut n, &hex2(dev));
@@ -306,7 +318,7 @@ fn push(out: &mut [u8; 64], at: &mut usize, bytes: &[u8]) {
 	}
 }
 
-fn hex2(byte: u8) -> [u8; 2] {
+pub fn hex2(byte: u8) -> [u8; 2] {
 	const HEX: &[u8; 16] = b"0123456789abcdef";
 	[HEX[(byte >> 4) as usize], HEX[(byte & 0xf) as usize]]
 }

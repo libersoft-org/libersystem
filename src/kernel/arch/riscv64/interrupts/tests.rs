@@ -151,6 +151,16 @@ fn a_machine_whose_imsic_this_kernel_refused_hands_out_no_msi_vector() {
 			b.harts[0] = 9;
 			b
 		}),
+		// AND FILES THE DIRECT MAP DOES NOT REACH. The refusal for this has always been the FIRST one
+		// `configure_layout` makes after the zero-base check, and no case here drove it - the FDT
+		// suite decodes a high address and never passes it through this boundary, so the one shape
+		// whose consequence is a store into whatever `phys_to_virt` arithmetic produced was the one
+		// shape nobody had watched be refused.
+		("interrupt files outside the direct map", {
+			let mut b = accepted;
+			b.base = crate::mem::direct_map_ceiling_for_test().saturating_add(0x1000_0000);
+			b
+		}),
 	] {
 		let refused = crate::arch::imsic::configure_layout(&info);
 		assert!(refused.is_err(), "{what} is a layout this port cannot address, and `configure` must say so rather than compute an address inside it");

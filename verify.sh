@@ -16,6 +16,29 @@ SCRIPT_NAME=verify.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 PLANNER_MANIFEST="$SRC_DIR/tools/verify-model/Cargo.toml"
+# WHICH LOGS A RUN WROTE, SAID BY THE RUN. The shadow comparison below used to find its evidence with
+# `find .build/logs/test -name "<arch>-*-guest.log" | sort -rn | head -1` - the newest-file glob that
+# `result-logs.sh` exists to replace. Two runs of one architecture in flight and it reads the OTHER
+# one's log; and it is wrong on riscv64 even alone, where the suite output lands in the RUN log while
+# the guest log holds only U-Boot and the loader. Every gate was moved off that glob and this producer
+# was missed, because `check-gate-result-logs.sh` scans `check-*.sh` and not this file.
+# shellcheck source=/dev/null
+source "$SRC_DIR/tools/result-logs.sh"
+
+# The one of a run's published logs that carries the suite's own output. The oracle is in the run log
+# on riscv64 and in the guest log on the other two, so this asks the files rather than choosing by
+# target - a rule keyed on the architecture is a rule that is wrong the day a port moves its output.
+suite_result_log() {
+	local captured="$1" path
+	while IFS= read -r path; do
+		if grep -qaE '^(test suite complete|running [0-9]+ (tests|selected tests))' "$path"; then
+			printf '%s\n' "$path"
+			return 0
+		fi
+	done < <(result_logs "$captured")
+	echo "verify.sh: none of the logs that run published carries its suite output" >&2
+	return 1
+}
 
 help() {
 	usage_and_exit <<EOF
@@ -366,16 +389,20 @@ if [[ "$action" == shadow ]]; then
 			selection="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- guest-selection --stdin --arch "$target")" || planner_failed "the planner could not name the guest selection"
 			if [[ -n "$selection" ]]; then
 				note "shadow-exec: running the selection on $target first (${selection//$'\n'/,})"
-				TEST_SELECTION="$(printf '%s' "$selection" | tr '\n' ',')" ./test.sh --arch "$target" || note "the $target scoped run did not pass - the comparison reads its log anyway"
-				scoped_log="$(find "$BUILD_DIR/logs/test" -name "$target-*-guest.log" -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2)"
+				scoped_capture="$(mktemp)"
+				TEST_SELECTION="$(printf '%s' "$selection" | tr '\n' ',')" ./test.sh --arch "$target" 2>&1 | tee "$scoped_capture" || true
+				scoped_log="$(suite_result_log "$scoped_capture")" || die "the $target scoped run did not say which logs it wrote"
+				rm -f "$scoped_capture"
 				[[ -n "$scoped_log" ]] || die "no $target scoped guest log to compare against"
 				scoped_arg=(--scoped-log "../$scoped_log")
 			else
 				note "shadow-exec: the plan selects no guest test on $target, so there is nothing to execute"
 			fi
 		fi
-		./test.sh --arch "$target" || note "the $target sweep did not pass - the comparison below reads its log anyway, which is the point"
-		log="$(find "$BUILD_DIR/logs/test" -name "$target-*-guest.log" -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2)"
+		sweep_capture="$(mktemp)"
+		./test.sh --arch "$target" 2>&1 | tee "$sweep_capture" || true
+		log="$(suite_result_log "$sweep_capture")" || die "the $target sweep did not say which logs it wrote"
+		rm -f "$sweep_capture"
 		[[ -n "$log" ]] || die "no $target guest log to compare against"
 		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --guest-log "../$log" --arch "$target" "${scoped_arg[@]}") || shadow_failed=1
 	done
@@ -688,6 +715,18 @@ fi
 
 failed=()
 skipped=()
+# STEPS WHOSE PREREQUISITE FAILED, and the ids of the steps that failed.
+#
+# `step_reqs` was read only while computing a budget closure; the execution loop never looked at it.
+# So a failed build was followed by its guest, and a failed guest by `capability-trace` - which reads
+# that guest's log - and the dependent's inevitable second failure was reported as a separate defect.
+# One cause, several red lines, and the real one not necessarily first.
+#
+# ONLY PREREQUISITES THAT RAN IN THIS PLAN. A narrowed plan legitimately omits steps that other steps
+# declare a requirement on: nothing changed under them, so they were not selected and their absence is
+# not a failure. A requirement blocks only when it is in this plan AND it failed.
+declare -A failed_ids=()
+blocked=()
 step=0
 guest_pids=()
 guest_labels=()
@@ -726,6 +765,7 @@ record_one_step() {
 		# how much is.
 		note "FAILED: $label"
 		failed+=("$label")
+		failed_ids["${step_ids[$index]:-}"]=1
 		outcome=--failed
 	fi
 	keys_file="$(mktemp)"
@@ -768,6 +808,17 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	if ((BUDGET > 0)) && [[ " $affordable " != *" $index "* ]]; then
 		note "[$step/$count] SKIPPED (budget): $label - $keys key(s)"
 		skipped+=("$label")
+		continue
+	fi
+	# A STEP WHOSE PREREQUISITE FAILED IS NOT RUN. Its result could only be the prerequisite's
+	# failure a second time, in a form that names the wrong thing.
+	blockers=""
+	for req in ${step_reqs[$index]}; do
+		[[ -n "${failed_ids[$req]:-}" ]] && blockers+=" $req"
+	done
+	if [[ -n "$blockers" ]]; then
+		note "[$step/$count] BLOCKED: $label - ${blockers# } failed, and this step reads what it produces"
+		blocked+=("$label")
 		continue
 	fi
 	# A GUEST STEP IS THE ONLY THING `--jobs` LETS OVERLAP, and only with another guest step.
@@ -825,6 +876,9 @@ if ((${#failed[@]} > 0)); then
 	# reporting the skipping is the smaller half of what happened.
 	if ((${#skipped[@]} > 0)); then
 		note "and ${#skipped[@]} step(s) were skipped for the budget: ${skipped[*]}"
+	fi
+	if ((${#blocked[@]} > 0)); then
+		note "and ${#blocked[@]} step(s) were not run because what they read failed: ${blocked[*]}"
 	fi
 	die "${#failed[@]} of $count step(s) failed: ${failed[*]}"
 fi

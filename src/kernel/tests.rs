@@ -2433,6 +2433,20 @@ macro_rules! tagged_test {
 	};
 }
 
+// THE BASELINE A SUITE RUN CANNOT OTHERWISE PUBLISH.
+//
+// `boot_main` prints the retirement and loss counters at the end of an ordinary boot, and it is
+// compiled only under `cfg(not(test))` - so a TEST kernel exits through `test_runner` and the numbers
+// are never said. A gate that boots the test kernel to prove a machine "loses nothing" then had no
+// value to assert and was reduced to grepping for one spelling of one warning, which the batched
+// retirement path does not print and the other retirement paths do not print at all.
+//
+// One line, on every successful suite exit, so a gate asserts a NUMBER rather than the absence of a
+// sentence. Same wording as the boot report, so one grep reads either.
+fn report_retirement() {
+	serial_println!("memory: {} page(s) retired for good, {} page(s) lost in all, {} free(s) refused", crate::mem::frame::retired_pages(), crate::mem::frame::lost_pages(), crate::mem::frame::refused_frees());
+}
+
 pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 	// Exact selection first: a list of stable IDs, which is the machine's execution interface.
 	//
@@ -2465,6 +2479,7 @@ pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 			arch::exit_qemu(false);
 		}
 		serial_println!("test suite complete: {ran} passed");
+		report_retirement();
 		arch::exit_qemu(true);
 	}
 
@@ -2474,6 +2489,7 @@ pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 			test.run();
 		}
 		serial_println!("test suite complete: {} passed", tests.len());
+		report_retirement();
 		arch::exit_qemu(true);
 	};
 
@@ -2522,6 +2538,7 @@ pub(crate) fn test_runner(tests: &[&dyn Testable]) {
 		}
 	}
 	serial_println!("test suite complete: {selected} passed");
+	report_retirement();
 	arch::exit_qemu(true);
 }
 

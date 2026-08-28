@@ -293,6 +293,14 @@ fn a_matrix_that_is_not_a_topology_is_refused() {
 	let table = slit(2, &[11, 20, 20, 10]);
 	assert_eq!(parse_slit(&table, &mut Builder::new()), Err(Error::MalformedMatrix));
 
+	// AND NOTHING IS NEARER THAN LOCAL, refused BY THIS READER. The builder rejects it too, and at
+	// this boundary that is a different outcome: the kernel keeps SRAT affinity when `parse_slit`
+	// refuses and discards the whole topology when `build` does, so leaving this to the builder threw
+	// away every CPU and memory affinity the firmware had reported correctly. The device-tree reader
+	// has always refused the same table; this is the ACPI half of "both readers".
+	let table = slit(2, &[10, 9, 20, 10]);
+	assert_eq!(parse_slit(&table, &mut Builder::new()), Err(Error::MalformedMatrix), "an off-diagonal below the local distance is a false table, and refusing it here is what keeps the affinity");
+
 	// A matrix shorter than its own size claims.
 	let mut short = slit(2, &[10, 20, 20, 10]);
 	short.truncate(short.len() - 2);

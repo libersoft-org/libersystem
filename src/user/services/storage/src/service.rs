@@ -3467,6 +3467,20 @@ impl fat::BlockDevice for FatBlockDevice {
 		unsafe { block_read(self.chan, lba, 1, buf.as_mut_ptr()) }
 	}
 
+	// THE SPAN, IN ONE EXCHANGE - which is the whole point of the reader above it forming runs.
+	//
+	// `FatFs::read_chain` coalesces a file's clusters into contiguous runs and hands each run to
+	// `BlockDevice::read_blocks` as one call. This adapter implemented only `read_block`, so it
+	// inherited the fs-core default, which loops `read_block` once per block - and a FAT block here is
+	// one 512-byte sector. Every contiguous read through `vol://media` and `vol://usb` was therefore
+	// still one StorageService-to-driver round trip per sector, exactly the structural cost the
+	// batching was written to remove, on the two production FAT paths. The loader saw the benefit
+	// because `FirmwareDisk` overrides this, and the request-count test saw it because its fake disk
+	// does too, so nothing in the tree was looking at the adapter that did not.
+	fn read_blocks(&mut self, index: u64, count: u64, buf: &mut [u8]) -> bool {
+		unsafe { read_blocks_chunked(self.chan, 1, index, count, buf, SECTOR_SIZE) }
+	}
+
 	fn write_block(&mut self, lba: u64, buf: &[u8]) -> bool {
 		unsafe { block_write(self.chan, lba, 1, buf.as_ptr()) }
 	}

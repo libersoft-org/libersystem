@@ -921,11 +921,14 @@ fn run() -> Result<ExitCode, String> {
 		"candidate-activate" => {
 			let path = positional.first().ok_or("candidate-activate needs the path of a candidate file")?;
 			let candidate = verify_model::candidate::Candidate::load(std::path::Path::new(path))?;
-			candidate.base_is_unmoved(&repo_root)?;
 			let mut sources: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
 			for test in &model.kernel_tests.tests {
 				sources.insert(test.id.clone(), test.source_paths.clone());
 			}
+			// The base is checked against the files this candidate will WRITE, which is why the
+			// source map is built first: a candidate that omits one of them from its base records no
+			// digest for a file it replaces, and "the base is unmoved" would be true of a smaller set.
+			candidate.base_is_unmoved(&repo_root, &sources)?;
 			let previous = candidate.materialise(&repo_root, &sources)?;
 			let active = match Model::load(&repo_root) {
 				Ok(active) => active,

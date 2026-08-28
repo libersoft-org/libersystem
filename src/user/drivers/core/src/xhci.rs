@@ -438,7 +438,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// bound is checked in one place instead of trusted at every append: an overlong report
 		// is a truncated line, never a dead driver, and the driver's job is the bus.
 		let mut report: Bounded<96> = Bounded::new();
+		// ADDRESSED, like every other driver's report. Two controllers produced two identical online
+		// lines, and xHCI is an ordinary registry driver - a machine may have more than one.
 		report.push(b"driver.xhci: online (");
+		report.push(&common::hex2(bind.info.bus));
+		report.push(b":");
+		report.push(&common::hex2(bind.info.dev));
+		report.push(b".");
+		report.push(&[b'0' + (bind.info.func % 10)]);
+		report.push(b", ");
 		report.decimal(devices as u64);
 		report.push(b" device(s))");
 		if hids.any_keyboard() {

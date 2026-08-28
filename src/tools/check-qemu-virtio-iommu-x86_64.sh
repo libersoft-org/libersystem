@@ -27,7 +27,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 cd "$HERE/../.."
 # shellcheck source=/dev/null
 source "$HERE/result-logs.sh"
-BUILD=".build/boot"
+BUILD_ROOT=".build"
+BUILD="$BUILD_ROOT/boot"
 OVMF_CODE="${OVMF_CODE:-/usr/share/OVMF/OVMF_CODE_4M.fd}"
 OVMF_VARS="${OVMF_VARS_SRC:-/usr/share/OVMF/OVMF_VARS_4M.fd}"
 
@@ -111,8 +112,16 @@ ISO="$BUILD/libersystem.iso"
 # ordinary-traffic phase and the default-machine phase - and this gate would then have proved the
 # default profile of a kernel nobody had just changed. That is the exact class of false green this
 # tree's verification milestone exists to remove, in the gate that proves the isolation default.
-KERNEL_ELF="$BUILD/cargo/kernel/x86_64-unknown-none/debug/kernel"
-if [[ -f "$KERNEL_ELF" && "$KERNEL_ELF" -nt "$ISO" ]]; then
+#
+# THE PATH THE BUILD ACTUALLY WRITES. This read `$BUILD/cargo/...` - `.build/boot/cargo/...` - which
+# no build has ever produced, and the `-f` guard then turned a check that could not find its input
+# into a check that was skipped. The image in this tree was fifteen hours older than the kernel and
+# this gate called it fresh. `$BUILD_ROOT`, not `$BUILD`: the kernel is staged one level up from the
+# boot directory, and a missing kernel is now a REFUSAL - the comparison exists because the answer
+# matters, so being unable to make it cannot be the same as making it and passing.
+KERNEL_ELF="$BUILD_ROOT/cargo/kernel/x86_64-unknown-none/debug/kernel"
+[[ -f "$KERNEL_ELF" ]] || fail "no built kernel at $KERNEL_ELF, so this gate cannot tell whether $ISO carries this tree - build first:  ./build.sh --arch x86_64"
+if [[ "$KERNEL_ELF" -nt "$ISO" ]]; then
 	echo "qemu-virtio-iommu: $ISO is older than the kernel it is supposed to carry" >&2
 	echo "qemu-virtio-iommu:   image:  $(date -r "$ISO" '+%Y-%m-%d %H:%M:%S')" >&2
 	echo "qemu-virtio-iommu:   kernel: $(date -r "$KERNEL_ELF" '+%Y-%m-%d %H:%M:%S')" >&2
@@ -216,6 +225,15 @@ fi
 if [[ "$gpu_lines" -gt 1 ]]; then
 	echo "qemu-virtio-iommu: virtio-gpu reported itself online $gpu_lines times - it is restarting, not running" >&2
 	grep -a "virtio-gpu" "$default_log" >&2 || true
+	exit 1
+fi
+# AND NOBODY RESTARTED IT. Counting the online lines catches a restart that SUCCEEDS; a driver that
+# comes online once, dies, and whose restart attempt fails before it can report again leaves the
+# count at one. DeviceManager says what it is doing on the way in, so the restart itself is the
+# thing to refuse - which is what the definition of done asks for, rather than its usual symptom.
+if grep -aq "DeviceManager: restarting virtio_gpu" "$default_log"; then
+	echo "qemu-virtio-iommu: virtio-gpu was restarted on the default translated machine - it came up and did not stay up" >&2
+	grep -a "virtio-gpu\|DeviceManager: restarting" "$default_log" >&2 || true
 	exit 1
 fi
 echo "qemu-virtio-iommu:   the default machine is translated, nothing is degraded, nothing faulted, and the display driver runs"

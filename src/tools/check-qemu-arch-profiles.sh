@@ -34,6 +34,15 @@ ONLY=""
 if [[ "${1:-}" == "--only" ]]; then
 	ONLY="${2:?--only needs <arch>:<label>:<cores>}"
 fi
+# A SELECTOR THAT NAMES NOTHING IS NOT A RUN OF NOTHING, IT IS A REFUSAL.
+#
+# `--only` took any string, `run_profile` returned success for every profile it did not name, and the
+# success line at the bottom then printed that "$ONLY booted, named the controller it has, delivered
+# timer interrupts and brought up every declared core" - about a profile that had never started. A
+# typo in `check.sh` was a green gate that ran no QEMU. `RAN` counts the profiles this invocation
+# actually booted and the bottom refuses a selector that booted none, so the list lives in one place
+# (the `run_profile` calls) rather than being duplicated here to be validated against.
+RAN=0
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -96,7 +105,12 @@ timer_ticked() {
 # and this profile has no claim on.
 #
 # Measured 2026-08-27, which is why the number above is a number and not "slow".
-TAGS="boot,smp,interrupt,paging,scheduler,drivers"
+#
+# AND THEN THE TAG SET WENT ENTIRELY. The reasoning above is kept because it is the measurement that
+# justified trimming `memory`, and because it explains what this gate is and is not about - but the
+# answer to "which tags does this profile need" turned out to be "none of them". A gate asserting N
+# named things asks for those N things, and `run_profile` now names the ids it will assert on. The
+# tag set was the last place this gate could quietly buy a test family to read four lines out of.
 # MSI acquire, program, bind, dispatch and release - the delivery and the teardown - on whichever MSI
 # controller this machine has. Set per profile, because a GICv3 with its ITS turned OFF has no MSI
 # backend at all: asking it an MSI question proves nothing, and that profile exists for the timer and
@@ -109,6 +123,7 @@ run_profile() {
 	if [[ -n "$ONLY" && "$ONLY" != "$1:$2:$3" ]]; then
 		return 0
 	fi
+	RAN=$((RAN + 1))
 	local arch="$1" label="$2" cores="$3" want="$4"
 	shift 4
 	echo "arch-profiles: $arch $label, $cores core(s)"
@@ -153,12 +168,41 @@ run_profile() {
 	# asserted by this gate directly off the log, and the multi-core oracles arrive through
 	# `scheduler` and `smp`. Only the whole-system boot assertion goes, and only where it is
 	# structurally unsatisfiable.
-	local tags="$TAGS"
-	if [[ -z "$MSI_ORACLE" ]]; then
-		tags="${TAGS//boot,/}"
+	# A GATE ASSERTING N NAMED THINGS ASKS FOR THOSE N THINGS.
+	#
+	# This asked for six subject TAGS and then greped the result for the one MSI test and, on a
+	# multi-core profile, three named SMP tests. So it ran every test carrying any of those six tags -
+	# and every test any of them will ever acquire - to read four lines out of the log. `TEST_SELECTION`
+	# takes ids, hard-fails on an id the kernel does not declare, and is exactly the instrument for
+	# this; asking for a subject tag was buying a family to look at four of its members.
+	#
+	# The ids are the ones the assertions below use, built from the same two variables, so the request
+	# and the assertion cannot drift apart.
+	#
+	# A PROFILE WITH NO ORACLES STILL BOOTS. `aarch64:gicv3:1` has no MSI backend and one core, so it
+	# names no test at all - what it proves is the controller it discovered and its timer ticks, both
+	# read off the boot. An empty selection would fall through to the tag path, so that case asks for
+	# `smoke`: the smallest bounded run that gets the boot to a clean suite exit.
+	local selection=""
+	if [[ -n "$MSI_ORACLE" ]]; then
+		selection="$MSI_ORACLE"
+	else
 		echo "arch-profiles:     no MSI backend on this profile - not requiring a full service bring-up"
 	fi
-	if ! env "$@" ./test.sh --arch "$arch" --tags "$tags" --smp "$cores" >"$out" 2>&1; then
+	if [[ "$cores" -gt 1 ]]; then
+		local want_id
+		for want_id in $MULTI_CORE_ORACLES; do
+			selection="${selection:+$selection,}$want_id"
+		done
+	fi
+	local -a request=()
+	if [[ -n "$selection" ]]; then
+		request=(env "TEST_SELECTION=$selection" "$@" ./test.sh --arch "$arch" --smp "$cores")
+		echo "arch-profiles:     asking for $(tr ',' ' ' <<<"$selection" | wc -w) named test(s)"
+	else
+		request=(env "$@" ./test.sh --arch "$arch" --tags smoke --smp "$cores")
+	fi
+	if ! "${request[@]}" >"$out" 2>&1; then
 		echo "arch-profiles: the integration suite failed on $arch $label at $cores core(s)" >&2
 		tail -20 "$out" >&2
 		exit 1
@@ -202,7 +246,22 @@ run_profile() {
 		for id in $MULTI_CORE_ORACLES; do
 			passed "$id" || fail "$arch $label at $cores core(s): $id did not run and pass, so this profile proves nothing about cross-core work on it"
 		done
-		echo "arch-profiles:     remote wake IPI, TLB shootdown acknowledgement and a thread on a secondary core"
+		# WHAT THE WAKE TEST ACTUALLY MEASURED, RATHER THAN WHAT ITS NAME SUGGESTS.
+		#
+		# `a_remote_spawn_wakes_a_halted_core...` compares a woken run against a deliberately
+		# unwoken one and PASSES on three outcomes: the wake saved time (the measurement), the gap
+		# sat inside this machine's own noise floor (nothing to measure), or - failing - the wake
+		# made it worse. Under emulation the middle one is common, and the line here claimed a
+		# measured remote wake IPI for it. The positive acknowledgement this profile rests on is the
+		# shootdown: every OTHER core must answer it, which is an IPI delivered and acknowledged and
+		# is not a timing comparison. So the shootdown and the secondary-core thread are stated
+		# unconditionally, and the wake is stated as what it was on this run.
+		if grep -aq "there is nothing here to measure" "$log"; then
+			echo "arch-profiles:     TLB shootdown acknowledged by every other core, and a thread on a secondary core"
+			echo "arch-profiles:     (the remote wake could not be measured here - this machine's idle cores do not stay halted long enough)"
+		else
+			echo "arch-profiles:     remote wake IPI, TLB shootdown acknowledgement and a thread on a secondary core"
+		fi
 	fi
 	if [[ "$cores" -gt 1 ]]; then
 		# EVERY DECLARED CORE, not "more than one". A machine that started three of four is a boot
@@ -268,6 +327,7 @@ run_profile riscv64 aia 1 "IMSIC S-mode files from the device tree"
 run_profile riscv64 aia 4 "IMSIC S-mode files from the device tree"
 
 if [[ -n "$ONLY" ]]; then
+	((RAN)) || fail "no profile is named '$ONLY' - this gate ran nothing, and saying it passed is the false green it exists against"
 	echo "arch-profiles: $ONLY booted, named the controller it has, delivered timer interrupts and brought up every declared core"
 else
 	echo "arch-profiles: every named profile booted, named the controller it has, delivered timer interrupts and brought up every declared core"

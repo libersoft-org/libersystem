@@ -139,7 +139,20 @@ fn read() -> Option<Topology> {
 			cpus.push((info.cpu_ids[index], info.cpu_node_ids[index]));
 		}
 	}
-	let distances = &info.numa_distances[..info.numa_distance_count];
+	// A MALFORMED MATRIX IS REFUSED, AND THE AFFINITY IS KEPT.
+	//
+	// The reader used to hand back whatever prefix of a bad matrix it had managed to parse - a partial
+	// triple at the end, more cells than the bound, a distance above 255, a `distance-map` node in a
+	// format this kernel has never read - and a prefix of a false table is not a table. It now says so,
+	// and the split here is the one the ACPI path already makes for a bad SLIT: bad distances say
+	// nothing about which memory is on which node, so the banks and harts keep their nodes and the
+	// distances fall back to the local/remote default.
+	let distances: &[(u32, u32, u8)] = if info.numa_distance_malformed {
+		crate::serial_println!("numa: the device tree's distance map was refused; node affinity is kept and distances are the local/remote default");
+		&[]
+	} else {
+		&info.numa_distances[..info.numa_distance_count]
+	};
 	let described = banks.iter().filter(|(_, _, node)| *node != topology::UNKNOWN_NODE).count();
 	if described == 0 {
 		record(Absence::NoNodeIds);

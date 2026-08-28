@@ -326,6 +326,9 @@ pub enum FrameError {
 	HandleCount { expected: usize, found: usize },
 	// A field inside the payload is not one of its defined values.
 	UnknownValue(u16),
+	// More bytes than the header declares. `payload_len` IS the number of bytes after the header, so
+	// a frame with anything past them is not a frame this protocol defines.
+	TrailingBytes { declared: u32, received: usize },
 }
 
 // One frame's header.
@@ -377,6 +380,14 @@ impl Header {
 		}
 		if bytes.len() < HEADER_LEN + payload_len as usize {
 			return Err(FrameError::TooShort);
+		}
+		// AND NOT MORE THAN IT DECLARES EITHER. This was a lower bound alone, so a `READY` declaring
+		// a zero-byte payload in a message carrying one extra byte decoded cleanly, `payload()`
+		// returned the empty declared prefix and the remainder was silently dropped - a malformed
+		// length accepted, which is the one thing a length field is checked for. Both receive paths
+		// hand this the exact message they received, so the bound is an equality.
+		if bytes.len() > HEADER_LEN + payload_len as usize {
+			return Err(FrameError::TrailingBytes { declared: payload_len, received: bytes.len() - HEADER_LEN });
 		}
 		Ok(Header { version, opcode, generation, payload_len })
 	}

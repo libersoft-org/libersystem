@@ -178,6 +178,20 @@ pub fn parse_slit(bytes: &[u8], into: &mut Builder) -> Result<(), Error> {
 			return Err(Error::MalformedMatrix);
 		}
 	}
+	// AND NOTHING IS NEARER THAN LOCAL, REFUSED HERE RATHER THAN IN THE BUILDER.
+	//
+	// The builder rejects this too, and that is not the same thing at this boundary. The kernel reads
+	// a `parse_slit` error as "the distances are bad, keep the affinity" and a `build` error as "the
+	// topology does not hold together, discard all of it" - so leaving the check to the builder turned
+	// a distance-only defect into the loss of every CPU and memory affinity the SRAT reported
+	// correctly. The two readers are required to refuse the same false table; this is the ACPI half.
+	for from in 0..size {
+		for to in 0..size {
+			if from != to && cells[from * size + to] < LOCAL_DISTANCE {
+				return Err(Error::MalformedMatrix);
+			}
+		}
+	}
 	into.set_matrix(size, cells);
 	Ok(())
 }

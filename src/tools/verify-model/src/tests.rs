@@ -2136,3 +2136,54 @@ fn five_runs_of_one_change_are_still_one_piece_of_evidence() {
 	let distinct = log.distinct_evidence_for_pair("kernel.mem", "candidate-hash", crate::shadow::Universe::TestGuest, None);
 	assert_eq!(distinct, 1, "five runs over one change are one piece of evidence, however many times the comparison was made");
 }
+
+// A CANDIDATE THAT IS REFUSED LEAVES THE TREE AS IT FOUND IT.
+//
+// `materialise` wrote `registry.toml` FIRST and only then resolved the test ids in `covers`, so a
+// candidate naming a test the tree does not have was refused with the canonical registry already
+// replaced - and the caller's `?` returned before it held the `previous` map to put it back with. The
+// function's own comment says a refusal is "the difference between a check that refuses and one that
+// refuses after the damage", and it was the second one.
+#[test]
+fn a_refused_candidate_writes_nothing() {
+	let fixture = Fixture::new("candidate-refused");
+	let model_dir = fixture.dir.join("src/tools/verify-model/model");
+	std::fs::create_dir_all(&model_dir).expect("model directory");
+	let registry_path = model_dir.join("registry.toml");
+	let before = "schema = 1\n# the canonical registry, which a refusal must not touch\n";
+	std::fs::write(&registry_path, before).expect("registry");
+
+	let candidate = crate::candidate::Candidate { reason: String::from("narrow the memory subsystem"), expected_hash: String::from("does-not-matter-here"), base: [(String::from("src/tools/verify-model/model/registry.toml"), crate::candidate::digest_of(before.as_bytes()))].into_iter().collect(), registry: String::from("schema = 1\n# the overlay\n"), covers: [(String::from("kernel.mem.no_such_test"), vec![String::from("kernel")])].into_iter().collect() };
+	// No source declares that id, which is the refusal being provoked.
+	let sources: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+
+	let error = candidate.materialise(&fixture.dir, &sources).expect_err("a candidate naming a test the tree does not have cannot be activated");
+	assert!(error.contains("nothing was written"), "the refusal has to say what it left behind: {error}");
+	let after = std::fs::read_to_string(&registry_path).expect("the registry is still there");
+	assert_eq!(after, before, "a refused candidate replaced the canonical registry and returned an error - the activation contract is byte-for-byte rollback, and this path never had one");
+}
+
+// AND THE BASE HAS TO COVER EVERY FILE THE CANDIDATE WRITES.
+//
+// `base_is_unmoved` ranged over the entries the candidate CHOSE to list. A candidate that simply
+// omitted `registry.toml` therefore passed a check named "the base is unmoved" while overwriting the
+// one file whose previous content nothing had compared against anything.
+#[test]
+fn a_candidate_that_does_not_record_what_it_overwrites_is_refused() {
+	let fixture = Fixture::new("candidate-base-gap");
+	let model_dir = fixture.dir.join("src/tools/verify-model/model");
+	std::fs::create_dir_all(&model_dir).expect("model directory");
+	std::fs::write(model_dir.join("registry.toml"), "schema = 1\n").expect("registry");
+
+	let candidate = crate::candidate::Candidate {
+		reason: String::from("narrow something"),
+		expected_hash: String::from("does-not-matter-here"),
+		// Empty: it records a digest for nothing, and it writes the registry.
+		base: std::collections::BTreeMap::new(),
+		registry: String::from("schema = 1\n# the overlay\n"),
+		covers: std::collections::BTreeMap::new(),
+	};
+	let sources: std::collections::BTreeMap<String, Vec<String>> = std::collections::BTreeMap::new();
+	let error = candidate.base_is_unmoved(&fixture.dir, &sources).expect_err("a candidate that records no base for a file it overwrites cannot be activated");
+	assert!(error.contains("registry.toml"), "the refusal has to name the file whose base is missing: {error}");
+}

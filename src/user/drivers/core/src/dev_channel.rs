@@ -101,7 +101,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(pair) => pair,
 			None => exit(),
 		};
-		common::online(bootstrap, &bind, b"driver.dev-channel: online (transport)", &[(driver_protocol::provider::CONSOLE_BYTES, bytes_far)]);
+		// THE ADDRESS, because the registry binds this driver to a SECOND virtio-console function and
+		// the address is the whole distinguisher. The line said `driver.dev-channel: online (transport)`
+		// - a role where the device type belongs and no address at all - so the two functions of one
+		// type were told apart by nothing. `describe` is what every other driver's report goes through.
+		let mut line = [0u8; 64];
+		let n = common::describe(&mut line, b"dev-channel", &device, b"transport");
+		common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::CONSOLE_BYTES, bytes_far)]);
 		let mut port: Port = Port { device: &device, irq, tx: &mut tx, virt: tx_virt, phys: tx_phys, busy: false };
 		pump(&device, &bind, irq, bootstrap, bytes, &mut rx, &mut port, rx_virt, &rx_phys)
 	}
@@ -169,6 +175,37 @@ impl Port<'_> {
 // after one. Both queues share the device's single MSI-X vector, so the wait inside a
 // transmit drain can consume the very interrupt that announced newly arrived bytes; draining
 // first means the loop never blocks while work is already queued, whichever wait observed it.
+// Answer whatever the manager has said, without blocking. `false` means this driver is finished:
+// its bootstrap closed, which is how the supervisor tells a driver to shut down.
+//
+// A frame that is not a PING for this generation is dropped, and any handle on it closed - the same
+// answer `adopt` gives, because a driver that is serving has nothing to do with a resource it was not
+// expecting.
+unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64) -> bool {
+	unsafe {
+		let mut buf: [u8; 64] = [0u8; 64];
+		loop {
+			match try_recv(bootstrap, &mut buf) {
+				Polled::Message { len, handle } => {
+					if handle != 0 {
+						close(handle);
+					}
+					if let Ok(header) = driver_protocol::Header::decode(&buf[..len])
+						&& header.generation == bind.generation
+						&& header.opcode == driver_protocol::Opcode::Ping
+						&& let Ok(sequence) = driver_protocol::decode_sequence(header.payload(&buf))
+						&& !common::pong(bootstrap, bind, sequence)
+					{
+						return false;
+					}
+				}
+				Polled::Empty => return true,
+				Polled::Closed => return false,
+			}
+		}
+	}
+}
+
 unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, bytes: u64, rx: &mut Queue, port: &mut Port, rx_virt: u64, rx_phys: &[u64]) -> ! {
 	unsafe {
 		let mut outbound: Vec<u8> = alloc::vec![0u8; MAX_FRAME];
@@ -185,7 +222,7 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 					// device down with the process that was using it - the bytes in flight are
 					// lost with the session they belonged to, which is what a disconnect means.
 					if !send_blocking(bytes, chunk, 0) {
-						bytes = adopt(device, irq, bootstrap, bytes, rx, rx_phys);
+						bytes = adopt(device, bind, irq, bootstrap, bytes, rx, rx_phys);
 					}
 					worked = true;
 				}
@@ -208,13 +245,13 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 				match try_recv(bytes, &mut outbound) {
 					Polled::Message { len, .. } => {
 						if !port.write(&outbound[..len]) && !send_blocking(bytes, &[], 0) {
-							bytes = adopt(device, irq, bootstrap, bytes, rx, rx_phys);
+							bytes = adopt(device, bind, irq, bootstrap, bytes, rx, rx_phys);
 						}
 						worked = true;
 					}
 					Polled::Empty => break,
 					Polled::Closed => {
-						bytes = adopt(device, irq, bootstrap, bytes, rx, rx_phys);
+						bytes = adopt(device, bind, irq, bootstrap, bytes, rx, rx_phys);
 						break;
 					}
 				}
@@ -222,9 +259,18 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 			if worked {
 				continue;
 			}
-			// Nothing left either way: block on the device interrupt and the agent's channel
-			// at once, waking on whichever speaks first.
-			let ready: i64 = wait_any(&[irq, bytes], 0);
+			// AND THE MANAGER'S OWN CHANNEL, which this loop did not read at all.
+			//
+			// The heartbeat was handled only in `adopt` - the path taken when the agent above the
+			// driver has gone - so a driver serving normally never answered a PING, and its registry
+			// entry declares a 100ms deadline. The manager would have declared it wedged. Every
+			// serving driver answers in its own loop; this one now does too.
+			if !heartbeat(bind, bootstrap) {
+				exit();
+			}
+			// Nothing left either way: block on the device interrupt, the agent's channel and the
+			// manager's, waking on whichever speaks first.
+			let ready: i64 = wait_any(&[irq, bytes, bootstrap], 0);
 			if ready == 0 {
 				// Read the ISR to deassert the device's level-triggered INTx line before
 				// acking (a harmless zero read on MSI-X, which is edge-triggered).
@@ -246,10 +292,13 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 // the host that reconnects. Turning the ring is right because eight buffers is all the device
 // has: stopping here would leave it with nowhere to put what a host is still writing, and the
 // port would still be stalled once the new agent arrived.
-unsafe fn adopt(device: &Virtio, irq: u64, bootstrap: u64, dead: u64, rx: &mut Queue, rx_phys: &[u64]) -> u64 {
+unsafe fn adopt(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, dead: u64, rx: &mut Queue, rx_phys: &[u64]) -> u64 {
 	unsafe {
 		close(dead);
-		let mut buf: [u8; 16] = [0u8; 16];
+		// BIG ENOUGH FOR THE FRAME IT IS MEANT TO READ. This was 16 bytes - smaller than the 20-byte
+		// header alone, so the PING branch below could never decode one even once `bind` was in
+		// scope. A PING is 24 bytes: the header and a four-byte sequence.
+		let mut buf: [u8; 64] = [0u8; 64];
 		loop {
 			let mut recycled: bool = false;
 			while let Some((id, _)) = rx.take_used() {

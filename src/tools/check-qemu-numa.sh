@@ -113,11 +113,16 @@ done
 #
 # Any `numa-fixture:` line at all is now the refusal. The tests print one only when they could not
 # make their full claim - a run where every placement really ran produces none.
+# EVERY LOG THE RUN NAMED, not the first of them. This took `$2` and greped that one file while both
+# call sites hand it the whole `result_logs` array - run log first, guest log second. The oracle is in
+# the GUEST log on x86_64 and aarch64, so the one check that rejects a weaker placement was reading
+# the file that cannot contain it, and the false green this function exists to stop was still open.
 weak_placement() {
-	local where="$1" file="$2"
-	if grep -aqh "numa-fixture:" "$file"; then
+	local where="$1"
+	shift
+	if grep -aqh "numa-fixture:" "$@"; then
 		echo "qemu-numa: a placement test could not make its full claim on the $where profile" >&2
-		grep -a "numa-fixture:" "$file" >&2
+		grep -ah "numa-fixture:" "$@" >&2
 		exit 1
 	fi
 }

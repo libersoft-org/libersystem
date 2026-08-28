@@ -12,6 +12,7 @@ dev_channel	its oracle is a DEV-GUEST check, not a kernel test: dev-selftest.py 
 dev_agent	the same: dev-selftest.py IS the oracle for this agent and runs on the development guest. The check above ranges over kernel tests and cannot see a dev-guest one.
 session_service	NO ORACLE. Nothing in the suite fails when this service breaks. It is staged, it starts, and no test asserts an effect of it - so a change to it selects builds and nothing that would catch a regression. This line is the record of that, not a decision that it needs none.
 time_service	NO ORACLE. The RTC tests assert what the KERNEL reads off the clock hardware; nothing asserts what this service answers to a client. Same shape as session_service and recorded for the same reason.
+virtio_input	NO ORACLE. This line used to name `kernel.services.input_service_streams_pointer_events`, and that test does not exercise this driver: the pointer device is interactive-only, so the test spawns InputService and - in its own words - "plays the driver itself" by sending raw events on a producer end it keeps. Breaking `virtio_input` cannot make it fail, and nothing else in the suite asserts an effect of it. A change to it selects builds and a smoke boot. Recorded as the gap it is rather than as the coverage it is not.
 
 # AND FIFTEEN WHOSE ORACLE EXISTS AND WHOSE `covers` CANNOT SAY SO.
 #
@@ -29,7 +30,6 @@ time_service	NO ORACLE. The RTC tests assert what the KERNEL reads off the clock
 virtio_blk	oracle: kernel.services.kernel_reads_file_through_storage_service - the file is served over this disk. `covers` refused: the test launches no driver, DeviceManager binds it at boot.
 virtio_console	oracle: kernel.services.the_console_answers_a_program_through_its_own_channel - the banner goes out through this driver's transmit queue. Same refusal.
 virtio_gpu	oracle: kernel.services.display_service_restores_the_console_surface. Same refusal.
-virtio_input	oracle: kernel.services.input_service_streams_pointer_events. Same refusal.
 virtio_net	oracle: kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock - a lease is a real round trip through this NIC. Same refusal.
 virtio_snd	oracle: kernel.hardware.virtio_snd_driver_captures_a_period_from_the_device. Same refusal.
 xhci	oracle: kernel.hardware.xhci_driver_enumerates_the_usb_bus. Same refusal.

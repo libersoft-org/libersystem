@@ -42,7 +42,14 @@ const STATE_DRIVER_MISSING: u8 = 4;
 
 // How many times DeviceManager restarts a driver that crashes during bring-up
 // before giving up on its device.
-const MAX_DRIVER_RESTARTS: u32 = 3;
+// AT MOST THREE AUTOMATIC ATTEMPTS PER NODE PER BOOT, which is two backoffs between them.
+//
+// Named for what it bounds. As `MAX_DRIVER_RESTARTS` it was compared against `node.attempt`, which is
+// ZERO on the first attempt - so 0, 1 and 2 all passed and the node ran a FOURTH attempt before the
+// budget was spent, with a third backoff that re-used the 200ms entry because `BACKOFF_TICKS` is two
+// long and the index was clamped. M5 states the numbers: three attempts, two backoffs, 100ms then
+// 200ms.
+const MAX_AUTOMATIC_ATTEMPTS: u32 = 3;
 
 // Say which budget this launch is working to.
 //
@@ -1883,11 +1890,19 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 					}
 				}
 				driver_protocol::Opcode::Failed => {
-					let code = match driver_protocol::decode_failed(header.payload(buf)) {
-						Ok(code) => code,
-						// A `FAILED` whose code is not one of the five is still a failure, and the
-						// least it can be taken for is the one that says nothing about a retry.
-						Err(_) => driver_protocol::DriverFailureCode::InternalError,
+					// A `FAILED` WHOSE PAYLOAD IS NOT ONE IS REFUSED, not rounded to a code.
+					//
+					// This mapped every decode error to `InternalError` and queued an ordinary
+					// `Failed`, so a malformed frame became the recorded FACT `DriverReported(
+					// InternalError)` - a driver-owned vocabulary entry manufactured from input that
+					// did not contain one, carrying that code's non-retryable policy with it. The
+					// vocabulary is closed precisely so a driver cannot hand the manager a fact it
+					// did not state. A refused frame is dropped like every other malformed one; what
+					// the driver does next - a valid terminal frame, an exit, or nothing until the
+					// deadline - is what the manager concludes from.
+					let Ok(code) = driver_protocol::decode_failed(header.payload(buf)) else {
+						refuse(&handles);
+						continue;
 					};
 					node.push(BindingEvent::Failed { generation, code });
 				}
@@ -2095,7 +2110,9 @@ unsafe fn gate_on_requirements(node: &mut Node, entry: &'static Entry, catalogue
 // Failed` when the time is - and reading only the first is how a node sits in a backoff whose
 // deadline passed while it slept.
 unsafe fn may_try_again(incident: &Incident, attempt: u32) -> bool {
-	unsafe { attempt < MAX_DRIVER_RESTARTS && incident.allows_backoff(BACKOFF_TICKS[(attempt as usize).min(BACKOFF_TICKS.len() - 1)]) }
+	// `attempt` is zero-based, so the number of attempts already made is `attempt + 1` - which is
+	// also what `begin_bind` prints. Another one is allowed only while that count is below the bound.
+	unsafe { attempt + 1 < MAX_AUTOMATIC_ATTEMPTS && incident.allows_backoff(BACKOFF_TICKS[(attempt as usize).min(BACKOFF_TICKS.len() - 1)]) }
 }
 
 // Sleep the backoff before attempt number `attempt` (1-based: the delay before the second attempt
@@ -2373,7 +2390,18 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// unpublished through the handshake enters the catalogue here - in one place,
 					// so a provider offered before `READY` and one offered after it are published
 					// by the same code under the same bound.
-					node.record.move_to(BindingState::Online, None);
+					// EXACTLY ONE TERMINAL FRAME, AND THE STATE TABLE IS WHAT SAYS SO.
+					//
+					// The result of `move_to` was discarded, so a SECOND `READY` on an already-online
+					// binding was acted on in full: the table refused `Online -> Online` silently, and
+					// this went on to publish the offers again, re-arm supervision and report
+					// `Step::Online` a second time. The handshake ends in one `READY` or one `FAILED`;
+					// a driver that sends another is not making a transition, and the refusal the
+					// table already computes is the answer - it just had to be read.
+					if !node.record.move_to(BindingState::Online, None) {
+						print(b"DeviceManager: a second terminal frame on a binding that is already past its handshake - refused\n");
+						return Step::Again;
+					}
 					let entry = node.candidates[node.candidate];
 					catalogue.publish_all(node.id, entry, &mut node.offers);
 					// SUPERVISION STARTS WHERE THE DRIVER SAYS IT IS UP, not at the bind: before

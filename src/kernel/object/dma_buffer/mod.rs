@@ -230,6 +230,23 @@ impl DmaBuffer {
 			Some(index) => match crate::iommu::map_device_buffer(index, base, (pages * PAGE_SIZE as usize) as u64) {
 				Ok(Some(mapped)) => Some(mapped),
 				Ok(None) => None,
+				// AN UNCONFIRMED MAP DOES NOT SAY THE FRAMES ARE FREE.
+				//
+				// Every mapping error took this branch, which hands the frames straight back to the
+				// allocator and refunds the charge - correct for a REFUSAL, and a physical
+				// use-after-free for `Fault::Unconfirmed`, whose own definition says the kernel does
+				// not know the state of the hardware. A controller that installed the translation and
+				// then lost or malformed its reply still resolves these addresses, and the next owner
+				// of the frame gets a device writing into it.
+				//
+				// So an unconfirmed result LEAKS them deliberately - the same answer this kernel
+				// already gives a dead driver's frames whose device was never confirmed stopped - and
+				// the charge stays, because the memory is still gone.
+				Err(dma::Fault::Unconfirmed) => {
+					crate::serial_println!("dma: WARNING: a mapping for device {} did not confirm - {} frame(s) at {:#x} are LEAKED rather than returned, because the controller may still translate them", device.unwrap_or(u32::MAX), pages, base);
+					frame::note_lost_pages(pages as u64);
+					return Err(MemoryError::OutOfMemory);
+				}
 				Err(_) => {
 					for i in 0..pages as u64 {
 						// NEVER-MAPPED: allocated in this call and refused before any mapping was

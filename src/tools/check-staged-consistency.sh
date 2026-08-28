@@ -22,7 +22,22 @@ fail() {
 	exit 1
 }
 
-[[ -d "$LIB" ]] || fail "no staged tree at $LIB - run ./build.sh --arch ${TARGET%%-*} first"
+# THE PUBLIC ARCHITECTURE NAME, THROUGH THE ONE MAPPING THAT KNOWS IT. `${TARGET%%-*}` is right for
+# two targets of three and prints `--arch riscv64gc` for the third - the exact nonexistent command
+# this milestone removed from the other diagnostic, reintroduced by the gate added to prove it gone.
+# Asked of `build-shared.sh` rather than copied here: a second copy of a mapping is the thing that
+# rots, and the point is that both messages come from one answer.
+public_arch() { "$VERIFY" --public-arch "$1"; }
+
+# ALL THREE MAPPINGS, ASSERTED. M3 asks for the mapping to be covered by a test, and its only other
+# caller is a diagnostic that never runs on a healthy build - so nothing would have noticed it rot.
+for pair in x86_64-unknown-none:x86_64 aarch64-unknown-none:aarch64 riscv64gc-unknown-none-elf:riscv64; do
+	got="$(public_arch "${pair%%:*}")"
+	[[ "$got" == "${pair##*:}" ]] || fail "public_arch ${pair%%:*} said '$got' and the public name is '${pair##*:}' - a build command printed to somebody whose build just failed has to name one that exists"
+done
+echo "staged-consistency: the three target triples map to the three public --arch names"
+
+[[ -d "$LIB" ]] || fail "no staged tree at $LIB - run ./build.sh --arch $(public_arch "$TARGET") first"
 command -v llvm-objcopy >/dev/null || fail "llvm-objcopy is required by this gate"
 
 work="$(mktemp -d)"

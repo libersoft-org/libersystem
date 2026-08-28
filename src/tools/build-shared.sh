@@ -39,6 +39,17 @@ if [[ "${1:-}" == "--verify-staged" ]]; then
 	shift 2
 	set -- "$verify_staged_only"
 fi
+# `--public-arch <target>`: answer the triple-to-public-name mapping and nothing else, so the gate
+# that asserts all three mappings asks THIS function rather than keeping a second copy of it.
+if [[ "${1:-}" == "--public-arch" ]]; then
+	public_arch_only="${2:-}"
+	if [[ -z "$public_arch_only" ]]; then
+		echo "usage: $0 --public-arch <target>" >&2
+		exit 2
+	fi
+	shift 2
+	set -- "$public_arch_only"
+fi
 if [[ "${1:-}" == "--artifact" ]]; then
 	selected_artifact="${2:-}"
 	if [[ -z "$selected_artifact" ]]; then
@@ -57,9 +68,9 @@ if [[ "${1:-}" == "--artifact" ]]; then
 		;;
 	esac
 fi
-# `--verify-staged` names a target and no crates: it compiles nothing, so a crate list would be a
-# list of things it does not read.
-if [[ -z "${verify_staged_only:-}" ]] && { [[ -z "$selected_artifact" && $# -lt 2 ]] || [[ -n "$selected_artifact" && $# -lt 1 ]]; }; then
+# `--verify-staged` and `--public-arch` name a target and no crates: they compile nothing, so a crate
+# list would be a list of things they do not read.
+if [[ -z "${verify_staged_only:-}" && -z "${public_arch_only:-}" ]] && { [[ -z "$selected_artifact" && $# -lt 2 ]] || [[ -n "$selected_artifact" && $# -lt 1 ]]; }; then
 	echo "usage: $0 [--verbose] [--explain] [--rebuild] [--artifact <artifact>] <target> <crate>..." >&2
 	exit 2
 fi
@@ -293,6 +304,20 @@ verify_staged_provider_chains() {
 	local note file artifact provider recorded expected inconsistent=0
 	local -A staged_digests=()
 	local -A recorded_providers=()
+	# AND THE FOURTH ONE, WHICH WAS THE WHOLE INPUT. Both loops below read from
+	# `find "$provider_output_dir/lib" ... 2>/dev/null`, so a staged tree that is absent or unreadable
+	# ran neither loop, left `inconsistent` at zero, and `--verify-staged` printed that every staged
+	# library names the providers staged beside it. A check that cannot read its input has not
+	# checked it, and the three refusals below exist to say exactly that about smaller cases.
+	if [[ ! -d "$provider_output_dir/lib" ]]; then
+		echo "build-shared: no staged tree at $provider_output_dir/lib - there is nothing to check, which is not the same as everything being consistent" >&2
+		echo "build-shared: build it first:  ./build.sh --arch $(public_arch "$target")" >&2
+		return 1
+	fi
+	if ! find "$provider_output_dir/lib" -name '*.lslib' -type f >/dev/null; then
+		echo "build-shared: the staged tree at $provider_output_dir/lib cannot be read, so nothing about it has been checked" >&2
+		return 1
+	fi
 	note="$(mktemp "$build_scratch/staged-identity.XXXXXX")"
 	while IFS= read -r file; do
 		artifact="$(basename "$file" .lslib)"
@@ -301,7 +326,7 @@ verify_staged_provider_chains() {
 			inconsistent=1
 			continue
 		fi
-	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f 2>/dev/null | sort)
+	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f | sort)
 	while IFS= read -r file; do
 		artifact="$(basename "$file" .lslib)"
 		if ! llvm-objcopy --dump-section .note.liber.identity="$note" "$file" /dev/null 2>/dev/null; then
@@ -341,7 +366,7 @@ verify_staged_provider_chains() {
 				inconsistent=1
 			fi
 		done < <(grep -a -o 'provider=[a-z0-9_-]*:[0-9a-f]\{64\}' "$note" || true)
-	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f 2>/dev/null | sort)
+	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f | sort)
 	rm -f "$note"
 	if ((inconsistent)); then
 		echo "build-shared: the staged tree for $target is inconsistent - a provider was replaced and a library that records it was not rebuilt" >&2
@@ -349,6 +374,14 @@ verify_staged_provider_chains() {
 		return 1
 	fi
 }
+# THE MAPPING, ASKABLE. `check-staged-consistency.sh` asserts all three triples through this, so the
+# public name printed by a failed build's advice and the one the gate checks are the same answer
+# rather than two copies of it.
+if [[ -n "${public_arch_only:-}" ]]; then
+	public_arch "$target"
+	exit 0
+fi
+
 if [[ -n "${verify_staged_only:-}" ]]; then
 	mkdir -p "$build_scratch"
 	verify_staged_provider_chains || exit 1

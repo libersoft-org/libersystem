@@ -89,6 +89,21 @@ fn a_length_the_buffer_does_not_hold_is_refused() {
 	assert_eq!(Header::decode(&bytes), Err(FrameError::TooShort), "the payload it declares is not in the buffer");
 }
 
+// AND THE OTHER DIRECTION OF THE SAME LIE.
+//
+// The bound was `bytes.len() < HEADER_LEN + payload_len` alone, so a frame declaring FEWER bytes than
+// it carries decoded cleanly and `payload()` handed back the declared prefix while the rest was
+// silently dropped. A `READY` declaring nothing, in a message carrying one byte, was queued as an
+// ordinary `Ready`. `payload_len` is defined as the bytes after the header, so this is a malformed
+// length and both receive paths hand the decoder the exact message they received.
+#[test]
+fn a_frame_carrying_more_than_it_declares_is_refused() {
+	let mut bytes = [0u8; HEADER_LEN + 1];
+	bytes[..HEADER_LEN].copy_from_slice(&header(Opcode::Ready, 1, 0).encode());
+	bytes[HEADER_LEN] = 0xff;
+	assert_eq!(Header::decode(&bytes), Err(FrameError::TrailingBytes { declared: 0, received: 1 }), "a byte the header does not declare is not a byte this protocol carries");
+}
+
 #[test]
 fn each_opcode_declares_exactly_how_many_handles_it_carries() {
 	// EXACTLY, NOT AT MOST. The channel does not enforce one handle per frame - this protocol

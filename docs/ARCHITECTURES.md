@@ -9,7 +9,7 @@ much code it shares, and not a claim about hardware nobody has run it on.
 | --- | --- | --- | --- |
 | Entry path | UEFI loader | UEFI loader, and direct `-kernel` | UEFI loader, and direct `-kernel` |
 | Machine description | ACPI (RSDP, MADT, SRAT/SLIT) | device tree, or a named no-DT profile | device tree |
-| Interrupt controller | APIC / IO-APIC, MSI-X | GICv2, GICv2m, GICv3, GICv3+ITS | PLIC, and AIA/IMSIC for MSI |
+| Interrupt controller | APIC / IO-APIC, MSI-X | GICv2, GICv2m, GICv3, GICv3+ITS | AIA/IMSIC. The PLIC is READ FROM THE TREE AND DISCARDED - `boot.rs` prints its address and then drops it, and the only external-interrupt handler dispatches IMSIC EIDs. A machine with no IMSIC has no external interrupts here. |
 | Timer | local APIC, TSC-calibrated | CNTP (generic timer) | SBI timer |
 | SMP bring-up | ACPI MADT + INIT-SIPI-SIPI | PSCI `CPU_ON` | SBI HSM |
 | DMA isolation | virtio-iommu, on by default | none yet | none yet |

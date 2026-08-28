@@ -66,6 +66,15 @@ pub struct BootInfo {
 	// numbering. Empty on a machine with one node or none.
 	pub numa_distances: [(u32, u32, u8); MAX_NUMA_CELLS],
 	pub numa_distance_count: usize,
+	// THE MATRIX WAS NOT ONE, and the reader could not say so.
+	//
+	// The triple loop stopped at the first incomplete triple, stopped at `MAX_NUMA_CELLS`, and
+	// `continue`d past a distance above 255 - all three silently, and the comment beside the last one
+	// claimed it was "refused rather than truncated". So a malformed or oversized matrix arrived as a
+	// SHORTER VALID ONE, and a machine describing itself wrongly was read as a machine describing
+	// itself partially. A prefix of a false table is not a table. Set here and refused above; the
+	// affinity is kept, which is the same split the ACPI reader makes for a bad SLIT.
+	pub numa_distance_malformed: bool,
 	pub cpu_nodes: u32,
 	// PCIe ECAM config-space base (0 if the tree has no pcie node).
 	pub pcie_ecam: u64,
@@ -667,6 +676,10 @@ impl Fdt {
 			// The distance map, which is a node of its own rather than a property of the others.
 			let mut numa_distances = [(0u32, 0u32, 0u8); MAX_NUMA_CELLS];
 			let mut numa_distance_count = 0usize;
+			let mut numa_distance_malformed = false;
+			// The versioned binding, which this reader never checked: entering distance-map mode on
+			// the node NAME alone accepts any future or foreign map as if it were this one.
+			let mut distance_map_versioned = false;
 			let mut in_distance_map = false;
 			let mut cpu_count: u32 = 0;
 			let mut cpu_ids = [0u64; MAX_CPUS];
@@ -747,6 +760,9 @@ impl Fdt {
 							// property of anything. QEMU emits it as `/distance-map` when the
 							// machine was given distances.
 							in_distance_map = self.str_eq(name, "distance-map");
+							if in_distance_map {
+								distance_map_versioned = false;
+							}
 							d1_cpus = self.str_eq(name, "cpus");
 							d1_chosen = self.str_eq(name, "chosen");
 						} else if depth == 2 && d1_cpus && self.str_starts(name, "cpu@") {
@@ -1045,19 +1061,39 @@ impl Fdt {
 							d1_memory_node = self.be32(val);
 						} else if depth == 2 && in_cpu && len == 4 && self.str_eq(pname, "numa-node-id") {
 							cpu_node_id = self.be32(val);
+						} else if in_distance_map && self.str_eq(pname, "compatible") {
+							// THE VERSIONED BINDING. `numa-distance-map-v1` is what this reader
+							// implements; a node named `distance-map` carrying something else is a
+							// map in a format nobody here has read, and entering distance-map mode on
+							// the NAME alone accepted it as if it were this one.
+							distance_map_versioned = self.str_eq(val, "numa-distance-map-v1");
 						} else if in_distance_map && self.str_eq(pname, "distance-matrix") {
 							// TRIPLES OF CELLS: from, to, distance. The distance is a u32 in the
 							// tree and a byte here, because a distance above 255 is not a distance
 							// any of this reasons about - it is refused rather than truncated.
 							let mut q = val;
 							let end = val + len as u64;
-							while q + 12 <= end && numa_distance_count < MAX_NUMA_CELLS {
+							// A LENGTH THAT IS NOT A WHOLE NUMBER OF TRIPLES is a malformed matrix,
+							// not a matrix with something after it.
+							if len % 12 != 0 {
+								numa_distance_malformed = true;
+							}
+							while q + 12 <= end {
 								let from = self.be32(q);
 								let to = self.be32(q + 4);
 								let distance = self.be32(q + 8);
 								q += 12;
 								if distance > u8::MAX as u32 {
-									continue;
+									// Refused, which is what the comment always said and what the
+									// `continue` never did.
+									numa_distance_malformed = true;
+									break;
+								}
+								if numa_distance_count >= MAX_NUMA_CELLS {
+									// More cells than this kernel bounds at. Truncating leaves a
+									// square that is not the machine's.
+									numa_distance_malformed = true;
+									break;
 								}
 								numa_distances[numa_distance_count] = (from, to, distance as u8);
 								numa_distance_count += 1;
@@ -1241,7 +1277,12 @@ impl Fdt {
 					off += 8;
 				}
 			}
-			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, ram_region_nodes, cpu_count: cpu_count.max(1), cpu_ids, cpu_node_ids, numa_distances, numa_distance_count, cpu_nodes, pcie_ecam, plic_base, gic_dist, gic_dist_size, gic_cpu, gic_cpu_size, gic_version, gic_msi, gic_msi_size, gic_its, gic_its_size, pci_msi_rid_base, pci_msi_devid_base, pci_msi_length, imsic_base, imsic_size, imsic_guest_index_bits, imsic_group_index_bits, imsic_num_ids, imsic_harts, imsic_hart_count, fwcfg_base, modules_start, modules_end })
+			// A MATRIX WITHOUT ITS VERSION IS NOT THIS FORMAT. Checked here rather than at the node,
+			// because `compatible` and `distance-matrix` may appear in either order.
+			if numa_distance_count > 0 && !distance_map_versioned {
+				numa_distance_malformed = true;
+			}
+			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, ram_region_nodes, cpu_count: cpu_count.max(1), cpu_ids, cpu_node_ids, numa_distances, numa_distance_count, numa_distance_malformed, cpu_nodes, pcie_ecam, plic_base, gic_dist, gic_dist_size, gic_cpu, gic_cpu_size, gic_version, gic_msi, gic_msi_size, gic_its, gic_its_size, pci_msi_rid_base, pci_msi_devid_base, pci_msi_length, imsic_base, imsic_size, imsic_guest_index_bits, imsic_group_index_bits, imsic_num_ids, imsic_harts, imsic_hart_count, fwcfg_base, modules_start, modules_end })
 		}
 	}
 }

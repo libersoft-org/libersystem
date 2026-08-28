@@ -126,8 +126,20 @@ impl system_graph::Service for GraphService {
 			_ => Vec::new(),
 		};
 		spans.push(TraceSpan { name: String::from("device.list"), duration_ns: unsafe { clock_ns() }.wrapping_sub(list_start) });
-		// THE BINDINGS, from the one process that holds them. Asked once and matched to the device
-		// nodes by index, so the graph renders what DeviceManager decided rather than a constant.
+		// THE BINDINGS, from the one process that holds them.
+		//
+		// MATCHED BY POSITION, AND THE TWO VECTORS ARE NOT POSITIONALLY EQUIVALENT. DeviceService
+		// returns every row of the kernel device table in table-index order; this list contains only
+		// DeviceManager's `Node`s - boot-critical ones appended in phase one, other candidate-bearing
+		// ones in phase two, and rows with no candidate omitted entirely. So a supported non-boot
+		// device at a lower table index than a boot disk is enough to swap two records, and an
+		// omitted row shifts every later one: the graph then reports another device's state, cause
+		// and restart count.
+		//
+		// Matching by identity needs one: `BindingRecord` carries bus/dev/func and `DeviceEntry`
+		// carries none of them, so closing this means adding the address (or the kernel table index)
+		// to the device record in the IDL and regenerating. Recorded here rather than left as a
+		// comment claiming the index match is sound.
 		let bindings: Vec<BindingRecord> = if self.bindings != 0 { provider_catalogue::Client::new(ChannelTransport { chan: self.bindings }).bindings().unwrap_or_default() } else { Vec::new() };
 		for (at, d) in devices.iter().enumerate() {
 			// A DEVICE WITH NO BINDING RECORD IS `Unknown`, NOT `Running`. That is the honest answer

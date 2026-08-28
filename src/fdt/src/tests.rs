@@ -1718,6 +1718,67 @@ fn two_node_machine(distances: bool) -> &'static [u8] {
 	builder.finish()
 }
 
+// A machine whose distance map is wrong in one of the four ways this reader can be given one.
+fn machine_with_distance_map(compatible: &str, matrix: &[u8]) -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x1000_0000).prop_u32("numa-node-id", 0).end();
+	builder.begin("memory@50000000").prop("device_type", b"memory\0").prop_reg64(0x5000_0000, 0x1000_0000).prop_u32("numa-node-id", 1).end();
+	builder.begin("distance-map").prop_str("compatible", compatible).prop("distance-matrix", matrix).end();
+	builder.end();
+	builder.finish()
+}
+
+fn triples(cells: &[(u32, u32, u32)]) -> Vec<u8> {
+	let mut out: Vec<u8> = Vec::new();
+	for (from, to, distance) in cells {
+		out.extend_from_slice(&from.to_be_bytes());
+		out.extend_from_slice(&to.to_be_bytes());
+		out.extend_from_slice(&distance.to_be_bytes());
+	}
+	out
+}
+
+// A PREFIX OF A FALSE TABLE IS NOT A TABLE.
+//
+// The triple loop stopped at the first incomplete triple, stopped at `MAX_NUMA_CELLS` and skipped a
+// distance above 255 - all silently, and the comment beside the last one claimed it refused rather
+// than truncated. So each of these arrived as a SHORTER VALID matrix, and the machine that described
+// itself wrongly was read as one that described itself partially. The affinity is kept in every case;
+// it is the distances that are refused.
+#[test]
+fn a_distance_map_that_is_not_one_is_refused_rather_than_truncated() {
+	// The good one, so the four below are a change and not the only thing this fixture can produce.
+	let good = at(machine_with_distance_map("numa-distance-map-v1", &triples(&[(0, 0, 10), (0, 1, 21), (1, 0, 21), (1, 1, 10)]))).parse().expect("a valid map parses");
+	assert!(!good.numa_distance_malformed, "a well-formed versioned map is not malformed");
+	assert_eq!(good.numa_distance_count, 4);
+	assert_eq!(good.ram_region_count, 2, "and the affinity is read either way");
+
+	// A length that is not a whole number of triples.
+	let mut ragged = triples(&[(0, 0, 10), (0, 1, 21)]);
+	ragged.extend_from_slice(&[0, 0, 0, 7]);
+	let info = at(machine_with_distance_map("numa-distance-map-v1", &ragged)).parse().expect("it still parses");
+	assert!(info.numa_distance_malformed, "bytes after the last whole triple are a malformed matrix, not a matrix with something after it");
+	assert_eq!(info.ram_region_count, 2, "the affinity survives a bad distance map");
+
+	// A distance a byte cannot hold. The reader's own comment always said this was refused.
+	let info = at(machine_with_distance_map("numa-distance-map-v1", &triples(&[(0, 0, 10), (0, 1, 256)]))).parse().expect("it still parses");
+	assert!(info.numa_distance_malformed, "a distance above 255 is refused, which is what the comment beside the `continue` always claimed");
+
+	// More cells than this kernel bounds at.
+	let mut many: Vec<(u32, u32, u32)> = Vec::new();
+	for index in 0..(super::MAX_NUMA_CELLS + 1) {
+		many.push((index as u32, index as u32, 10));
+	}
+	let info = at(machine_with_distance_map("numa-distance-map-v1", &triples(&many))).parse().expect("it still parses");
+	assert!(info.numa_distance_malformed, "truncating at the bound leaves a square that is not the machine's");
+
+	// A `distance-map` node in a format this reader has never implemented.
+	let info = at(machine_with_distance_map("numa-distance-map-v2", &triples(&[(0, 0, 10), (0, 1, 21)]))).parse().expect("it still parses");
+	assert!(info.numa_distance_malformed, "entering distance-map mode on the node name alone accepts any format as if it were this one");
+}
+
 #[test]
 fn every_bank_and_every_hart_carries_the_node_the_tree_gave_it() {
 	let info = at(two_node_machine(true)).parse().expect("a two-node tree parses");

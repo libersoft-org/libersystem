@@ -370,7 +370,17 @@ impl CostModel {
 			pairs.insert((key.architecture.clone(), key.environment.as_str().to_string()));
 			let per_test = self.variable_seconds.get(&(key.architecture.clone(), key.environment.as_str().to_string())).copied().unwrap_or(self.default_variable);
 			variable += match history.get(&key.display()) {
-				Some(record) if record.last_seconds > 0.0 => record.last_seconds,
+				// A MEASURED COST, AND NOT ONE THAT WAS INVENTED BY DIVIDING.
+				//
+				// `record_step` splits a merged step's wall clock evenly across every key it
+				// discharged, and marks each entry `cost_was_divided` for exactly this reason - but
+				// the estimator read `last_seconds` without looking at the marker, so an eight-way
+				// split of one gate step came back as eight per-key measurements and the
+				// cheapest-first order sorted on how the steps had happened to be batched. The
+				// marker is only worth recording if something reads it. A divided entry falls back
+				// to the measured per-test cost for its own target, which is a worse estimate of one
+				// key and a much better one than a number that describes a batch.
+				Some(record) if record.last_seconds > 0.0 && !record.cost_was_divided => record.last_seconds,
 				// The aggregate is not one test. Seeded from what the source declares, because the
 				// target it stands for is the one whose tests could not be counted.
 				_ if key.check == "guest.whole-suite" && self.whole_suite_tests > 0 => per_test * self.whole_suite_tests as f64,

@@ -72,7 +72,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(q) => q,
 			None => {
 				let mut line = [0u8; 64];
-				let n = common::describe(&mut line, b"virtio-blk", &device, b"no request queue");
+				let n = common::describe_state(&mut line, b"virtio-blk", &device, b"DEGRADED", b"no request queue");
 				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0)
 			}
 		};
@@ -88,7 +88,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// word was "online" for a driver with no service channel to be online on.
 			None => {
 				let mut line = [0u8; 64];
-				let n = common::describe(&mut line, b"virtio-blk", &device, b"no channel");
+				let n = common::describe_state(&mut line, b"virtio-blk", &device, b"DEGRADED", b"no channel");
 				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0)
 			}
 		};

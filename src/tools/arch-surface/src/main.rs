@@ -359,29 +359,16 @@ fn predicate_is_test(tokens: &[Token], open: usize) -> bool {
 	if inner >= close {
 		return false;
 	}
-	match tokens[inner].kind {
-		Tok::Word if tokens[inner].text == "test" && inner + 1 == close => true,
-		Tok::Word if matches!(tokens[inner].text.as_str(), "not" | "all" | "any") && tokens.get(inner + 1).is_some_and(|t| t.kind == Tok::OpenParen) => {
-			let group = inner + 1;
-			let args = arguments(tokens, group);
-			match tokens[inner].text.as_str() {
-				// A negation is never a test gate. `not(test)` is the PRODUCTION half of a split,
-				// which is the case that sent this scanner past whole production functions, and
-				// `not(unix)` is not about tests at all. `not(not(test))` would be, and answering
-				// `false` for it scans an item that could have been skipped - which is the safe
-				// direction for a gate whose failure mode is skipping.
-				"not" => false,
-				// `all(test, unix)` needs `test` to hold, so it cannot be compiled without it: ONE
-				// test arm makes the whole conjunction test-only.
-				"all" => args.iter().any(|&a| term_is_test(tokens, a)),
-				// `any(test, unix)` compiles wherever EITHER holds, so it is production code on
-				// unix. Every arm has to be a test arm for the item to be absent from a production
-				// build.
-				_ => !args.is_empty() && args.iter().all(|&a| term_is_test(tokens, a)),
-			}
-		}
-		_ => false,
+	// ONE PLACE READS AN OPERATOR, AND IT IS `term_is_test`. This arm used to read `not`/`all`/`any`
+	// itself and `term_is_test` delegated a NESTED one back here by pointing at its opening
+	// parenthesis - which starts the walk INSIDE the group, where the operator is no longer visible.
+	// `all(not(test), target_arch = "x86_64")` was therefore read as `all(test, ...)`: a test-only
+	// arm, the whole item skipped, and a production panic-only body reported clean. That shape is in
+	// this tree three times over, `src/kernel/main.rs` among them.
+	if tokens[inner].kind == Tok::Word && tokens[inner].text == "test" {
+		return inner + 1 == close;
 	}
+	term_is_test(tokens, inner)
 }
 
 // One argument of an `all`/`any`/`not` list: either the bare word `test`, or a nested predicate.
@@ -390,9 +377,23 @@ fn term_is_test(tokens: &[Token], at: usize) -> bool {
 		return !tokens.get(at + 1).is_some_and(|t| t.kind == Tok::OpenParen);
 	}
 	if tokens[at].kind == Tok::Word && matches!(tokens[at].text.as_str(), "not" | "all" | "any") && tokens.get(at + 1).is_some_and(|t| t.kind == Tok::OpenParen) {
-		// `predicate_is_test` reads the operator from the token before the parenthesis, which is
-		// exactly what `at` is, so the same walk answers a nested list.
-		return predicate_is_test(tokens, at + 1);
+		// THE OPERATOR IS AT `at`, so it is read here rather than handed to a walk that starts past
+		// it. Nested and top-level lists take the same path, which is what makes them agree.
+		let args = arguments(tokens, at + 1);
+		return match tokens[at].text.as_str() {
+			// A negation is never a test gate. `not(test)` is the PRODUCTION half of a split, which
+			// is the case that sent this scanner past whole production functions, and `not(unix)` is
+			// not about tests at all. `not(not(test))` would be, and answering `false` for it scans
+			// an item that could have been skipped - the safe direction for a gate whose failure
+			// mode is skipping.
+			"not" => false,
+			// `all(test, unix)` needs `test` to hold, so it cannot be compiled without it: ONE test
+			// arm makes the whole conjunction test-only.
+			"all" => args.iter().any(|&a| term_is_test(tokens, a)),
+			// `any(test, unix)` compiles wherever EITHER holds, so it is production code on unix.
+			// Every arm has to be a test arm for the item to be absent from a production build.
+			_ => !args.is_empty() && args.iter().all(|&a| term_is_test(tokens, a)),
+		};
 	}
 	false
 }
@@ -573,6 +574,10 @@ fn run_self_test() -> Result<(), String> {
 		("a placeholder under cfg(not(test)), which is the production half of a split", "#[cfg(not(test))]\nfn entry() { todo!() }\n"),
 		("a placeholder under cfg(any(test, target_arch)), which compiles on that target", "#[cfg(any(test, target_arch = \"x86_64\"))]\nfn entry() { todo!() }\n"),
 		("a placeholder under cfg_attr(test, ..), which gates an attribute and not the item", "#[cfg_attr(test, doc = \"under test\")]\nfn entry() { todo!() }\n"),
+		// A NESTED `not(test)`, which is the shape the tree actually uses to split a port's
+		// production half from its test half - and the one the parser answered backwards.
+		("a placeholder under cfg(all(not(test), target_arch)), which is production on that target", "#[cfg(all(not(test), target_arch = \"x86_64\"))]\nfn entry() { panic!(\"no entry\") }\n"),
+		("a placeholder under cfg(any(not(test), unix)), where no arm needs test", "#[cfg(any(not(test), unix))]\nfn entry() { todo!() }\n"),
 	];
 	let must_accept: &[(&str, &str)] = &[
 		("a panic after a check, which is a refusal and not a stub", "fn entry(n: u64) -> u64 {\n\tif n == 0 {\n\t\tpanic!(\"the firmware published no interrupt files\");\n\t}\n\tn\n}\n"),
