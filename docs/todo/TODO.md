@@ -172,7 +172,7 @@ or preventing further development of `v1`.
 - [x] [P02M0096 - Image conversion tool (`imgconv`)](P02M0096.md)
 - [x] [P02M0097 - Userspace source and system-volume layout cleanup](P02M0097.md)
 - [x] [P02M0098 - A device claim is a count, so two drivers can own one device](P02M0098.md)
-- [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md)
+- [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a roadmap of 41 items, not one piece of work; the first driver of a family owns the narrow binder extension it needs
 - [x] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [x] [P02M0101 - Additional system utilities](P02M0101.md)
 - [x] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)
