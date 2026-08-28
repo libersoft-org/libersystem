@@ -356,7 +356,7 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	// THE TOPOLOGY BEFORE THE PARTITION, and after the heap - the same order x86's `mem::init` uses
 	// and for the same two reasons: the reader allocates, and the frame allocator cannot be divided
 	// into node pools once it has started handing frames out. See `mem::numa`.
-	crate::mem::numa::discover();
+	crate::mem::numa::discover(&regions[..region_count]);
 	crate::mem::frame::upgrade_to_heap();
 	// Reserve every top-level entry the kernel's two growing windows can ever need, while the
 	// kernel's is still the only address space in existence. This is what `mem::init` does on

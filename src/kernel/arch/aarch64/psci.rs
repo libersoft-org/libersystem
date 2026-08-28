@@ -358,7 +358,7 @@ extern "C" fn aarch64_secondary_main(cpu_id: u64) -> ! {
 	//
 	// The stack is never freed, so the handle is forgotten deliberately rather than leaked by
 	// accident: an idle context lives as long as its core does.
-	if let Some(stack) = crate::object::thread::KernelStack::allocate() {
+	if let Some(stack) = crate::object::thread::KernelStack::allocate_on(None) {
 		let top = stack.top();
 		super::percpu::record_idle_stack(stack.usable_base(), stack.capacity());
 		core::mem::forget(stack);

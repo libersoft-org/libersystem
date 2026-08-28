@@ -77,7 +77,16 @@ fn a_thread_placed_on_a_node_runs_on_a_core_of_that_node() {
 
 	RAN_ON.store(usize::MAX, AtomicOrdering::SeqCst);
 	let event = crate::object::event::Event::create().expect("a test event");
-	let thread = crate::sched::prepare_with_object(body, event, crate::object::rights::Rights::ALL);
+	// THE CORE IS NAMED AT CREATION, which is where the kernel stack is allocated. Naming it only at
+	// `start_thread_on` - which is what this test used to do - leaves the stack in the CREATING core's
+	// node, so a thread placed on node 1 ran there with every kernel entry reaching node 0's memory.
+	// M3's third bullet is about that allocation, not about the queueing.
+	let thread = crate::sched::prepare_with_object_for(body, event, crate::object::rights::Rights::ALL, Some(wanted));
+	// AND THE STACK IS WHERE THE THREAD IS. The frames were taken preferring `node`; on a machine
+	// whose other nodes are exhausted the preference falls back, which is deliberate - a thread that
+	// cannot be created is worse than one whose stack is remote - so this asserts the node it got
+	// only when the requested node still had memory, which `place_on` succeeding above implies it did.
+	assert_eq!(thread.stack_node(), topology::Affinity::Node(node), "a kernel stack created for a core of node {} came from that node's memory", node.0);
 	assert!(crate::sched::start_thread_on(wanted, &thread), "the thread was queued on the core that was named");
 	crate::sched::run_until_idle();
 	// AND THEN WAIT FOR THE OTHER CORE, bounded. `run_until_idle` drains this core's queue; the

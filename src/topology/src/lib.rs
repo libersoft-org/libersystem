@@ -333,6 +333,9 @@ pub struct Builder {
 	matrix_size: usize,
 	// Which node each row and column of `matrix` belongs to, in order.
 	matrix_ids: Vec<NodeId>,
+	// The spans this machine seeds its allocator with - see `restrict_to_seedable`. Empty means the
+	// caller did not say, and affinity ranges are then kept whole.
+	seedable: Vec<(u64, u64)>,
 }
 
 impl Builder {
@@ -346,6 +349,24 @@ impl Builder {
 		if !self.nodes.contains(&node) {
 			self.nodes.push(node);
 		}
+	}
+
+	// THE MEMORY THIS MACHINE ACTUALLY SEEDS ITS ALLOCATOR WITH.
+	//
+	// Firmware affinity ranges describe the machine, not the pool: an SRAT range legitimately covers
+	// reserved, firmware-owned and hotplug memory, and the range is not malformed for doing so. The
+	// builder used to keep those bytes, so the normalized topology - and the boot report built from
+	// it - stated per-node totals that included memory this kernel will never hand out. The allocator
+	// was never endangered, because `partition` ranges only over the runs it seeded; what was wrong
+	// was the number everyone reads.
+	//
+	// Given a list of seedable spans, `build` INTERSECTS every affinity range with it rather than
+	// rejecting a range for describing more than the free pool. An empty list means nothing was
+	// supplied and the ranges are kept whole, which is what the host fixtures want.
+	pub fn restrict_to_seedable(&mut self, spans: &[(u64, u64)]) {
+		self.seedable.clear();
+		self.seedable.extend_from_slice(spans);
+		self.seedable.sort_by_key(|(base, _)| *base);
 	}
 
 	pub fn add_memory(&mut self, base: u64, len: u64, node: NodeId) {
@@ -397,6 +418,27 @@ impl Builder {
 		for range in &self.memory {
 			if range.len == 0 || range.base.checked_add(range.len).is_none() {
 				return Err(Error::MalformedRange);
+			}
+		}
+		// INTERSECTED WITH WHAT SEEDS THE POOL, if the caller said what that is. A range may survive
+		// as several pieces - one affinity range can straddle two usable regions with a reserved hole
+		// between them - and a range with no overlap at all drops out: it described memory this
+		// machine does not allocate from, which is a true statement about the firmware and not a
+		// fact about the pool.
+		if !self.seedable.is_empty() {
+			let mut kept: Vec<Range> = Vec::new();
+			for range in self.memory.drain(..) {
+				for (base, len) in &self.seedable {
+					let low = range.base.max(*base);
+					let high = range.end().min(base.saturating_add(*len));
+					if high > low {
+						kept.push(Range { base: low, len: high - low, node: range.node });
+					}
+				}
+			}
+			self.memory = kept;
+			if self.memory.len() > MAX_RANGES {
+				return Err(Error::TooManyRanges);
 			}
 		}
 		self.memory.sort_by_key(|range| (range.base, range.len));

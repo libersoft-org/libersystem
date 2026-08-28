@@ -2187,3 +2187,35 @@ fn a_candidate_that_does_not_record_what_it_overwrites_is_refused() {
 	let error = candidate.base_is_unmoved(&fixture.dir, &sources).expect_err("a candidate that records no base for a file it overwrites cannot be activated");
 	assert!(error.contains("registry.toml"), "the refusal has to name the file whose base is missing: {error}");
 }
+
+// A STEP'S COST IS THE STEP'S, NOT ITS KEYS' SHARE OF IT.
+//
+// `STEPCOST` was `estimate(history, step.keys)` - a sum of per-key numbers, and for a merged step
+// every one of those was that step's own duration divided by how many keys it happened to discharge.
+// Ordering on them is ordering on the batching. A step has ONE duration and it is measurable, so
+// once it has been measured under this model that is the number, and the estimate is only the seed
+// for a step nobody has timed.
+#[test]
+fn a_measured_step_cost_replaces_the_estimate_and_a_stale_one_does_not() {
+	let mut history = crate::history::History::default();
+	let cost = crate::history::CostModel::default();
+	let keys = alloc_keys();
+
+	// Nothing measured: the estimate is all there is.
+	assert_eq!(history.step_seconds("guest:x86_64", "hash-a"), None, "a step nobody has run has no measurement");
+
+	history.record_step_id(Some("guest:x86_64"), &keys, true, 187.0, "hash-a", &cost);
+	assert_eq!(history.step_seconds("guest:x86_64", "hash-a"), Some(187.0), "the whole step's duration, against the step");
+
+	// A measurement taken under a DIFFERENT model is not a measurement for this plan - the same rule
+	// a key's record follows, and for the same reason.
+	assert_eq!(history.step_seconds("guest:x86_64", "hash-b"), None, "a duration measured over another model is not a duration for this one");
+
+	// And the per-key records are still written, because the age bound and the shadow both range
+	// over keys rather than steps.
+	assert!(history.get(&keys[0].display()).is_some(), "recording a step still records its keys");
+}
+
+fn alloc_keys() -> Vec<crate::plan::PlanItemKey> {
+	vec![crate::plan::PlanItemKey { check: String::from("kernel.mem.frame.frame_alloc_distinct"), architecture: String::from("x86_64"), environment: crate::catalog::Environment::TestGuest, configuration: String::from("test") }]
+}

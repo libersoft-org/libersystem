@@ -231,7 +231,7 @@ fi
 # comes online once, dies, and whose restart attempt fails before it can report again leaves the
 # count at one. DeviceManager says what it is doing on the way in, so the restart itself is the
 # thing to refuse - which is what the definition of done asks for, rather than its usual symptom.
-if grep -aq "DeviceManager: restarting virtio_gpu" "$default_log"; then
+if grep -aq "DeviceManager: restarting virtio-gpu" "$default_log"; then
 	echo "qemu-virtio-iommu: virtio-gpu was restarted on the default translated machine - it came up and did not stay up" >&2
 	grep -a "virtio-gpu\|DeviceManager: restarting" "$default_log" >&2 || true
 	exit 1

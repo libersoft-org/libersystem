@@ -459,9 +459,20 @@ pub fn spawn_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject
 // drift in how a thread is constructed.
 #[cfg(test)]
 pub fn prepare_with_object(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights) -> Arc<Thread> {
+	prepare_with_object_for(entry, object, rights, None)
+}
+
+// The same, for a thread that is going to be started on a NAMED cpu.
+//
+// The cpu is given HERE rather than at `start_thread_on`, because the kernel stack is allocated while
+// the thread is built - so a caller that names the core afterwards has already put the stack in the
+// creating core's node. That is the defect M3's third bullet describes, and this is the seam that
+// closes it: the placement decision reaches the allocation that depends on it.
+#[cfg(test)]
+pub fn prepare_with_object_for(entry: extern "C" fn(u64), object: Arc<dyn KernelObject>, rights: Rights, cpu: Option<usize>) -> Arc<Thread> {
 	let process = Process::new(kernel_as(), root_domain()).expect("out of memory for a kernel thread's process");
 	let arg = process.install(object, rights).expect("out of memory for a kernel thread's bootstrap handle");
-	Thread::new(entry, arg, process).expect("out of memory for a kernel thread stack")
+	Thread::new_for_cpu(entry, arg, process, cpu).expect("out of memory for a kernel thread stack")
 }
 
 // A process of its own, and every thread put into it shares one handle table.

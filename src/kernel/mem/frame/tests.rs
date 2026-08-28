@@ -17,6 +17,26 @@ fn frame_alloc_distinct() {
 	}
 }
 
+// A FRAME TAKEN BEFORE THE TOPOLOGY WAS KNOWN IS STILL A FRAME THIS POOL OWNS.
+//
+// `heap::init` runs before `frame::upgrade_to_heap` and consumes frames from the HEAD of the run
+// table. The buddy used to be sized from the first and last free runs REMAINING at upgrade time, so
+// its base sat above every frame the heap had taken: freeing one later found no covering pool,
+// `free_span` refused an address below its base, and the allocator recorded the frame as lost and
+// RETIRED IT FOR EVER. The milestone's promise is that those frames return to their physical node if
+// they are ever freed, and the extent is what decides whether they can.
+//
+// Asserted at the pool's first seeded address, which is the one furthest below the remaining free
+// runs and therefore the first to fall outside a wrongly-sized extent.
+crate::tagged_test!(a_frame_taken_before_the_buddy_existed_is_inside_the_pool_that_would_take_it_back, [Frame, Memory], id = "kernel.mem.frame.a_frame_taken_before_the_buddy_existed_is_inside_the_pool_that_would_take_it_back", covers = ["kernel"]);
+fn a_frame_taken_before_the_buddy_existed_is_inside_the_pool_that_would_take_it_back() {
+	let Some(covered) = super::seeded_base_is_covered() else {
+		crate::serial_println!("    frame-fixture: this build runs on the fallback run table, so there is no buddy extent to check");
+		return;
+	};
+	assert!(covered, "the pool's first seeded frame is outside every installed extent - a free of it would find no pool, be refused as below the base, and retire the page instead of returning it");
+}
+
 crate::tagged_test!(the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free, [Frame, Memory], id = "kernel.mem.frame.the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free", covers = ["kernel"]);
 fn the_frame_pool_grows_past_the_boot_table_and_refuses_a_double_free() {
 	// NOTHING here reads the global free count, and that is the point.

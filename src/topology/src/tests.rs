@@ -676,3 +676,30 @@ fn a_known_srat_record_whose_length_contradicts_its_type_is_truncated() {
 	assert!(parse_srat(&srat(&[unknown, srat_cpu(1, 4, 1)]), &mut builder).is_ok());
 	assert_eq!(builder.build().expect("a topology").cpus().len(), 1, "and the record behind it was still read");
 }
+
+// AN AFFINITY RANGE IS A STATEMENT ABOUT THE MACHINE, NOT ABOUT THE POOL.
+//
+// Firmware legitimately reports affinity for reserved, firmware-owned and hotplug memory, and the
+// builder kept every byte of it - so the normalized topology, and the boot report built from it,
+// stated per-node totals covering memory this kernel will never hand out. M1 asks for the ranges to
+// be INTERSECTED with what seeds the allocator rather than for a range to be refused for describing
+// more than the free pool.
+#[test]
+fn an_affinity_range_is_intersected_with_the_memory_that_seeds_the_pool() {
+	// Node 0's range covers a usable region AND a reserved hole after it; node 1's lies entirely in
+	// memory nothing seeds, which is a true firmware statement and not a pool this kernel has.
+	let mut builder = Builder::new();
+	builder.add_memory(0x1000, 0x3000, NodeId(0));
+	builder.add_memory(0x8000, 0x1000, NodeId(1));
+	builder.restrict_to_seedable(&[(0x1000, 0x1000), (0x3000, 0x1000)]);
+	let topology = builder.build().expect("valid");
+	assert_eq!(topology.memory_of(NodeId(0)), 0x2000, "node 0 keeps the two seedable pieces of its range and not the reserved hole between them");
+	assert_eq!(topology.memory_of(NodeId(1)), 0, "a range describing memory nothing seeds contributes nothing to the pool it does not belong to");
+
+	// AND SAYING NOTHING KEEPS THEM WHOLE, so a caller that has no memory map - every host fixture -
+	// is unaffected.
+	let mut builder = Builder::new();
+	builder.add_memory(0x1000, 0x3000, NodeId(0));
+	let topology = builder.build().expect("valid");
+	assert_eq!(topology.memory_of(NodeId(0)), 0x3000, "no seedable list supplied means the ranges are the firmware's own");
+}

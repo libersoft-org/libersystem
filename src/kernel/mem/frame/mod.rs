@@ -125,6 +125,17 @@ struct FrameAllocator {
 	#[cfg(debug_assertions)]
 	owned: Option<Vec<u64>>,
 	#[cfg(debug_assertions)]
+	// THE EXTENT THE POOL WAS SEEDED WITH, in every build.
+	//
+	// Not the same thing as the remaining free runs, and the difference is a guarantee: `heap::init`
+	// consumes frames from the HEAD of the run table before the buddy is built, so a buddy sized from
+	// what is left starts above them. Those frames are legitimately held and outside every extent, so
+	// a later `deallocate` finds no covering pool, `free_span` refuses an address below its base, and
+	// the frame is recorded as lost and retired for ever - instead of being returned to its node. The
+	// buddy is sized from THIS, and seeded from the runs that are actually free, so the early frames
+	// are covered without being handed out twice.
+	seeded_base: u64,
+	seeded_pages: u64,
 	owned_base: u64,
 	#[cfg(debug_assertions)]
 	owned_frames: u64,
@@ -160,6 +171,8 @@ impl FrameAllocator {
 			#[cfg(debug_assertions)]
 			owned: None,
 			#[cfg(debug_assertions)]
+			seeded_base: 0,
+			seeded_pages: 0,
 			owned_base: 0,
 			#[cfg(debug_assertions)]
 			owned_frames: 0,
@@ -792,14 +805,16 @@ pub fn init(regions: &[MemRegion]) {
 	allocator.total_count = allocator.free_count;
 	// And fix the pool's ADDRESS extent here too, while the free runs still are the whole
 	// pool. After the first allocation they are not, so this is the only moment the span
-	// the ownership record has to cover can be read off the table.
-	#[cfg(debug_assertions)]
-	{
-		let extent = {
-			let runs = allocator.runs();
-			runs.first().zip(runs.last()).map(|(first, last)| (first.base, last.base + last.pages * PAGE_SIZE))
-		};
-		if let Some((low, high)) = extent {
+	// the ownership record and the buddy have to cover can be read off the table.
+	let extent = {
+		let runs = allocator.runs();
+		runs.first().zip(runs.last()).map(|(first, last)| (first.base, last.base + last.pages * PAGE_SIZE))
+	};
+	if let Some((low, high)) = extent {
+		allocator.seeded_base = low;
+		allocator.seeded_pages = (high - low) / PAGE_SIZE;
+		#[cfg(debug_assertions)]
+		{
 			allocator.owned_base = low;
 			allocator.owned_frames = (high - low) / PAGE_SIZE;
 		}
@@ -834,8 +849,13 @@ pub fn upgrade_to_heap() {
 	// under the lock below.
 	let (extent, total, owned_words, owned_frames) = {
 		let allocator = ALLOCATOR.lock();
-		let runs = allocator.runs();
-		let extent = runs.first().zip(runs.last()).map(|(first, last)| (first.base, (last.base + last.pages * PAGE_SIZE - first.base) / PAGE_SIZE));
+		// THE SEEDED EXTENT, NOT THE REMAINING ONE. This read the first and last FREE runs, and by
+		// now `heap::init` has taken frames off the front - so every frame it took was below the
+		// buddy's base and could never be freed back into it. `seeded_base`/`seeded_pages` were
+		// fixed while the free runs still were the whole pool, which is the span a free has to be
+		// able to land in. The buddy is SEEDED from the free runs below, so the frames the heap
+		// holds are covered by the extent and absent from the free lists, which is exactly right.
+		let extent = (allocator.seeded_pages > 0).then_some((allocator.seeded_base, allocator.seeded_pages));
 		#[cfg(debug_assertions)]
 		let words = (allocator.owned_frames as usize).div_ceil(64);
 		#[cfg(not(debug_assertions))]
@@ -1118,6 +1138,26 @@ pub fn report_pools() {
 	if summed as usize != allocator.free_count {
 		crate::serial_println!("numa: WARNING - the pools hold {summed} free frames and the allocator counts {}; a free has gone somewhere unrecorded", allocator.free_count);
 	}
+}
+
+// THE FIRST FRAME THE POOL WAS SEEDED WITH, and whether any installed pool covers it.
+//
+// The property this exists to assert: a frame consumed during the topology-neutral phase - which is
+// every frame `heap::init` took off the head of the run table before the buddy was built - is inside
+// the extent it would be freed into. Sized from the REMAINING free runs, the buddy started above all
+// of them, so `pool_of` found nothing, `free_span` refused an address below its base, and the frame
+// was retired for ever instead of returning to its node.
+#[cfg(test)]
+pub fn seeded_base_is_covered() -> Option<bool> {
+	let allocator = ALLOCATOR.lock();
+	if allocator.pools.is_empty() || allocator.seeded_pages == 0 {
+		return None;
+	}
+	let base = allocator.seeded_base;
+	Some(allocator.pools.iter().any(|pool| {
+		let (low, pages) = pool.buddy.extent();
+		base >= low && base < low + pages * PAGE_SIZE
+	}))
 }
 
 // How many pools serve allocations. One on every machine with no topology.
@@ -1436,7 +1476,10 @@ pub fn allocate_strict(node: NodeId) -> Option<u64> {
 
 // A frame from this node if there is one, then from the nearest node that has one, then from memory
 // no node owns. One deterministic order, and it is `preference`'s.
-#[cfg(test)]
+//
+// NOT TEST-ONLY ANY MORE: `KernelStack::allocate_on` uses it, so a thread created for a selected CPU
+// gets its kernel stack from that CPU's node - which is what M0152's M3 asks for and what nothing in
+// a production build could express while this was behind `cfg(test)`.
 pub fn allocate_preferred(node: NodeId) -> Option<u64> {
 	if injected_failure() {
 		return None;

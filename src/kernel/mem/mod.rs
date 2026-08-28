@@ -235,7 +235,7 @@ pub fn init(regions: &[MemRegion], hhdm: u64) {
 	// lines above. It cannot be later: `upgrade_to_heap` is where the free pool is divided into node
 	// pools, and dividing an allocator that has already handed frames out means partitioning a state
 	// nobody recorded. The heap has to exist first because the parsers allocate.
-	numa::discover();
+	numa::discover(regions);
 	// The heap is up now: the frame allocator's run table moves onto it (so
 	// fragmentation is bounded by memory, not a fixed table), and the memory map
 	// can be retained (Vec) for runtime inspection.

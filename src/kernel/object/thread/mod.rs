@@ -129,7 +129,21 @@ impl KernelStack {
 	// userspace call into a kernel panic. The Domain thread quota does not help: it bounds how
 	// many threads ONE process may have, not whether there is memory for the next one, and the
 	// pressure can come from anywhere in the system.
-	pub(crate) fn allocate() -> Option<Self> {
+	// The stack, optionally PREFERRING a node - the node of the CPU this thread is being created for.
+	//
+	// - the node of the CPU this thread is being created for. `None` is the ordinary spawn, which keeps
+	// its previous behaviour exactly.
+	//
+	// M3 asks that a kernel stack created for a selected CPU prefer that CPU's node, and this used the
+	// plain `frame::allocate()`, which prefers the node of the core doing the CREATING. On a
+	// two-node machine a thread placed on node 1 by a creator running on node 0 therefore ran on node
+	// 1 with its kernel stack in node 0's memory - every entry into the kernel a remote access, for
+	// the life of the thread, and nothing in the placement path had said otherwise.
+	//
+	// PREFERRED, NEVER STRICT. A stack that cannot be allocated is a thread that cannot be created,
+	// and refusing to create one because the requested node is full would turn a locality hint into
+	// an allocation policy. `allocate_preferred` falls back through increasing firmware distance.
+	pub(crate) fn allocate_on(node: Option<topology::NodeId>) -> Option<Self> {
 		let pages = KERNEL_STACK_SIZE.div_ceil(crate::mem::frame::PAGE_SIZE as usize);
 		let len = (pages as u64 + 1) * crate::mem::frame::PAGE_SIZE;
 		let base = crate::syscall::alloc_kernel_vrange(len);
@@ -150,7 +164,10 @@ impl KernelStack {
 			// `rollback` frees what is MAPPED, so nothing knew about it. That is the single frame
 			// `a_load_that_runs_out_of_frames_anywhere_gives_back_everything` reports as kept when
 			// a budget lands on the mapper's own allocation.
-			let allocated = crate::mem::frame::allocate();
+			let allocated = match node {
+				Some(node) => crate::mem::frame::allocate_preferred(node),
+				None => crate::mem::frame::allocate(),
+			};
 			let mapped = match allocated {
 				Some(frame) if arch::paging::try_map_page(at, frame, flags).is_ok() => Some(frame),
 				Some(frame) => {
@@ -214,6 +231,18 @@ impl KernelStack {
 		self.base + crate::mem::frame::PAGE_SIZE
 	}
 
+	// Which node this stack's first mapped frame came from.
+	//
+	// The evidence for M3's third bullet: a kernel stack created for a selected CPU has to come from
+	// that CPU's node, and only the PHYSICAL frame behind the stack can say whether it did.
+	#[cfg(test)]
+	pub fn node(&self) -> topology::Affinity {
+		match arch::paging::translate(self.usable_base()) {
+			Some(physical) => crate::mem::topology_node_of(physical),
+			None => topology::Affinity::Unknown,
+		}
+	}
+
 	// One past the highest mapped byte - what a stack pointer starts at.
 	// The aarch64 secondary-core bring-up parks its idle stack by top.
 	#[cfg(target_arch = "aarch64")]
@@ -260,9 +289,32 @@ impl Thread {
 	// charging one thread slot to the process's Domain unconditionally (the
 	// infallible path used for the unlimited root Domain).
 	// None if the kernel stack cannot be allocated, with the thread charge refunded.
+	// Which node this thread's kernel stack came from. See `KernelStack::node`.
+	#[cfg(test)]
+	pub fn stack_node(&self) -> topology::Affinity {
+		self.stack.node()
+	}
+
 	pub fn new(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Option<Arc<Self>> {
+		Self::new_for_cpu(entry, arg, process, None)
+	}
+
+	// The same, for a thread being created to run on a NAMED cpu: its kernel stack is allocated
+	// preferring that cpu's node.
+	//
+	// This is the production half of M0152's M3. The placement API named a core only AFTER the thread
+	// existed - `prepare_with_object` built it, `start_thread_on` chose the core - so the stack was
+	// already in the creating core's node and stayed there for the life of the thread. The node has to
+	// be known where the frames are taken, which is here.
+	pub fn new_for_cpu(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>, cpu: Option<usize>) -> Option<Arc<Self>> {
+		let node = match cpu.map(crate::smp::numa::cpu_node) {
+			Some(topology::Affinity::Node(node)) => Some(node),
+			// An unbound cpu, or a machine with no topology: there is no node to prefer, and the
+			// ordinary allocation is the honest answer rather than a guess.
+			_ => None,
+		};
 		process.domain().charge_thread();
-		let thread = Self::build(entry, arg, process.clone());
+		let thread = Self::build_on(entry, arg, process.clone(), node);
 		if thread.is_none() {
 			process.domain().uncharge_thread();
 		}
@@ -284,7 +336,13 @@ impl Thread {
 
 	// Shared constructor tail: fabricate the initial stack and assemble the Thread.
 	fn build(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Option<Arc<Self>> {
-		let mut stack = KernelStack::allocate()?;
+		Self::build_on(entry, arg, process, None)
+	}
+
+	// The same, for a thread being created FOR a particular CPU: its kernel stack prefers that CPU's
+	// node. See `KernelStack::allocate_on` for why this exists and why it is a preference.
+	fn build_on(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>, node: Option<topology::NodeId>) -> Option<Arc<Self>> {
+		let mut stack = KernelStack::allocate_on(node)?;
 		let sp = arch::context::init_thread_stack(stack.as_mut_slice(), entry, arg);
 		// FALLIBLY: `SYS_THREAD_CREATE` reaches this, and `build` already answers `Option`.
 		let thread = crate::mem::heap::try_arc(Self {

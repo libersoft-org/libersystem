@@ -64,8 +64,24 @@ fn absence_clause() -> &'static str {
 //
 // Returns whether a topology was published. The caller reports it; nothing else changes behaviour
 // on the answer, because the allocator asks `mem::with_topology` when it partitions.
-pub fn discover() -> bool {
-	let Some(found) = read() else {
+// `regions` is the boot memory map, so both readers can intersect the firmware's affinity ranges with
+// the memory this machine actually seeds its allocator from - see `Builder::restrict_to_seedable`.
+// The spans this machine seeds its frame allocator with, from the loader's own map. One list, used
+// by both readers, so the ACPI and device-tree paths intersect against the same thing the allocator
+// was actually given.
+fn seedable_spans(regions: &[bootproto::MemRegion]) -> alloc::vec::Vec<(u64, u64)> {
+	let mut spans: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+	for region in regions {
+		if crate::mem::frame::seeds_the_pool(region.kind) && region.length > 0 {
+			// ALLOC-OK: read once at boot, bounded by the memory map's region count.
+			spans.push((region.base, region.length));
+		}
+	}
+	spans
+}
+
+pub fn discover(regions: &[bootproto::MemRegion]) -> bool {
+	let Some(found) = read(regions) else {
 		return false;
 	};
 	if found.is_empty() {
@@ -81,9 +97,10 @@ pub fn discover() -> bool {
 // nodes and no measured distances, and the documented local/remote default is what it gets - not a
 // fabricated matrix, and not a refusal to use the affinity it did report.
 #[cfg(target_arch = "x86_64")]
-fn read() -> Option<Topology> {
+fn read(regions: &[bootproto::MemRegion]) -> Option<Topology> {
 	let rsdp = crate::boot_info().rsdp;
 	let mut builder = topology::Builder::new();
+	builder.restrict_to_seedable(&seedable_spans(regions));
 	let Some(srat) = crate::smp::acpi_table(rsdp, b"SRAT") else {
 		// SAID, RATHER THAN SILENT. "No SRAT" and "an SRAT this kernel could not read" are different
 		// facts about a machine, and a boot report that showed neither would make the two look the
@@ -117,7 +134,7 @@ fn read() -> Option<Topology> {
 
 // The device-tree ports: `numa-node-id` on banks and harts, and `/distance-map`.
 #[cfg(not(target_arch = "x86_64"))]
-fn read() -> Option<Topology> {
+fn read(regions: &[bootproto::MemRegion]) -> Option<Topology> {
 	let Some(info) = crate::arch::device_tree_boot_info() else {
 		// WHICH OF THE TWO SILENCES THIS IS. "No tree was kept" and "the tree said nothing about
 		// nodes" are different facts about a boot, and a reader that showed neither could not tell a
@@ -153,6 +170,24 @@ fn read() -> Option<Topology> {
 	} else {
 		&info.numa_distances[..info.numa_distance_count]
 	};
+	// THE SAME INTERSECTION THE ACPI READER MAKES. A device tree's `/memory` banks are the machine's,
+	// and what this kernel seeds is the loader's map - on a direct boot they are close and on a UEFI
+	// boot they are not, so the banks are clipped rather than assumed.
+	let seedable = seedable_spans(regions);
+	if !seedable.is_empty() {
+		let mut clipped: alloc::vec::Vec<(u64, u64, u32)> = alloc::vec::Vec::new();
+		for (base, len, node) in &banks {
+			for (span_base, span_len) in &seedable {
+				let low = (*base).max(*span_base);
+				let high = (base + len).min(span_base + span_len);
+				if high > low {
+					// ALLOC-OK: read once at boot, bounded by the map's region count.
+					clipped.push((low, high - low, *node));
+				}
+			}
+		}
+		banks = clipped;
+	}
 	let described = banks.iter().filter(|(_, _, node)| *node != topology::UNKNOWN_NODE).count();
 	if described == 0 {
 		record(Absence::NoNodeIds);

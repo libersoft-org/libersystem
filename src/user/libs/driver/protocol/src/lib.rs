@@ -107,6 +107,33 @@ pub fn declared_version() -> u16 {
 	u16::from_le_bytes([PROTOCOL_NOTE[28], PROTOCOL_NOTE[29]])
 }
 
+// THE VERSION A STAGED ARTIFACT DECLARES, read out of its bytes before it is launched.
+//
+// `declared_version` above answers for the RUNNING binary, which is why it could never be the
+// pre-claim check the note exists for: `common::handshake` calls it after the process has already
+// been spawned and the device already claimed. This reads an arbitrary ELF slice - the one
+// DeviceManager is about to launch - so the refusal can happen while refusing still costs nothing.
+//
+// LOCATED BY THE NOTE'S OWN FIXED PREFIX rather than by walking sections. The first 28 bytes are
+// constant for every driver this build produces - namesz, descsz, type, the name and the magic - and
+// the magic is in the note precisely to make it findable. A section walk would be a second ELF parser
+// on a hostile input path to answer a question a memchr already answers.
+//
+// `None` means no note: an artifact this build did not produce, or one whose note was stripped. That
+// is not the same as a version mismatch and the caller says so.
+pub fn declared_version_in(elf: &[u8]) -> Option<u16> {
+	let prefix = &PROTOCOL_NOTE[..28];
+	if elf.len() < NOTE_LEN {
+		return None;
+	}
+	for at in 0..=elf.len() - NOTE_LEN {
+		if &elf[at..at + 28] == prefix {
+			return Some(u16::from_le_bytes([elf[at + 28], elf[at + 29]]));
+		}
+	}
+	None
+}
+
 // What one side is saying. Five, and each has ONE direction.
 //
 // `RESOURCE` and `OFFER` cannot be one opcode however similar they look: they travel in opposite

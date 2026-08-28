@@ -498,8 +498,25 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 			reserved.push(dma::Reserved { base: region.base, len: region.len });
 		}
 		let domain = iommu.create_domain(config.input_start, config.input_len(), reserved, Generation(generation))?;
-		iommu.attach(domain, endpoint)?;
-		install_doorbell(iommu, domain, endpoint, &regions);
+		// A FAILED ATTACH TAKES ITS DOMAIN WITH IT. This returned on the `?` with the domain created,
+		// so every refused bind left one behind and consumed an id - and `next_domain` only advances.
+		if let Err(reason) = iommu.attach(domain, endpoint) {
+			let _ = iommu.destroy_domain(domain);
+			return Err(reason);
+		}
+		// AND AN ENDPOINT WHOSE DOORBELL COULD NOT BE MAPPED IS NOT ATTACHED EITHER.
+		//
+		// This logged the failure and reported success, so `device::claim` went on to enable bus
+		// mastering for a binding already known not to receive interrupts. The milestone's own rule
+		// is that a map failure ends in refusal, disabled bus mastering or quarantine; publishing it
+		// is none of the three. Rolled back the way the attach above is, so the refusal leaves nothing
+		// - which is what makes it a refusal rather than a half-built domain.
+		if let Err(reason) = install_doorbell(iommu, domain, endpoint, &regions) {
+			crate::serial_println!("iommu: endpoint {:#x} is not attached - its interrupts could not be routed through its domain", endpoint.0);
+			let _ = iommu.revoke_endpoint(domain, endpoint);
+			let _ = iommu.destroy_domain(domain);
+			return Err(reason);
+		}
 		Ok(domain)
 	})
 	.unwrap_or(Err(Fault::Unconfirmed))
@@ -520,10 +537,16 @@ static DOORBELL_REPORTED: AtomicBool = AtomicBool::new(false);
 // transmitted, the host answered, and the guest never saw a packet. QEMU's own trace showed one
 // unmatched translation in the whole boot - `addr=0xfee00000`, the x86 MSI doorbell.
 //
-// A FAILURE HERE IS NOT FATAL AND IS NOT SILENT. The endpoint is attached and translating either
-// way; what it loses is interrupt delivery, which is a driver that does not work rather than a
-// driver that reaches memory it should not. So it is named and the boot goes on.
-fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::DomainId, endpoint: dma::EndpointId, regions: &[dma::ProbedRegion]) {
+// A FAILURE HERE IS A REFUSAL, and it did not used to be.
+//
+// The comment here said the failure "is not fatal and is not silent": the endpoint was attached and
+// translating, and what it lost was interrupt delivery - "a driver that does not work rather than a
+// driver that reaches memory it should not". That reasoning is about MEMORY SAFETY and the rule it
+// was measured against is about BINDINGS: a map failure ends in refusal, disabled bus mastering or
+// quarantine. Reporting success meant `device::claim` went on to enable bus mastering for a binding
+// already known not to receive interrupts - a device that can write to memory and cannot tell anyone
+// it did. The caller now rolls the domain back and the claim fails, which is the first of the three.
+fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::DomainId, endpoint: dma::EndpointId, regions: &[dma::ProbedRegion]) -> Result<(), Fault> {
 	let mut mapped = false;
 	for region in regions.iter().filter(|r| r.kind == dma::RegionKind::MsiDoorbell) {
 		// THE DEVICE WRITES ITS DOORBELL. `ToDevice` is the direction that reads, and mapping it
@@ -542,7 +565,10 @@ fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::Doma
 					crate::serial_println!("iommu: every domain carries the MSI doorbell at {:#x}+{:#x}, mapped one to one - a device's interrupt is a memory write and goes through its own domain", region.base, region.len);
 				}
 			}
-			Err(reason) => crate::serial_println!("iommu: domain {} could not map its MSI doorbell at {:#x}+{:#x} ({reason:?}) - this endpoint's interrupts will not be delivered", domain.0, region.base, region.len),
+			Err(reason) => {
+				crate::serial_println!("iommu: domain {} could not map its MSI doorbell at {:#x}+{:#x} ({reason:?}) - this endpoint's interrupts could not be delivered", domain.0, region.base, region.len);
+				return Err(reason);
+			}
 		}
 	}
 	// AN ENDPOINT THAT REPORTED NO DOORBELL STILL HAS ONE.
@@ -553,8 +579,11 @@ fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::Doma
 	// doorbell is the fallback, and it is mapped the same way: one to one, written by the device.
 	if !mapped {
 		let Some((base, len)) = crate::arch::pci::msi_doorbell() else {
-			crate::serial_println!("iommu: endpoint {:#x} reported no MSI doorbell and this port names none - its interrupts will not be delivered", endpoint.0);
-			return;
+			// NOTHING TO MAP AND NOTHING TO REFUSE. A port that names no doorbell is one where an
+			// interrupt is not a memory write at all, so there is no translation this endpoint is
+			// missing - unlike the branches above, where one was needed and could not be made.
+			crate::serial_println!("iommu: endpoint {:#x} reported no MSI doorbell and this port names none", endpoint.0);
+			return Ok(());
 		};
 		match iommu.map_identity(domain, base, len, dma::Direction::FromDevice) {
 			Ok(_) => {
@@ -562,9 +591,13 @@ fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::Doma
 					crate::serial_println!("iommu: every domain carries this port's MSI doorbell at {base:#x}+{len:#x}, mapped one to one - the endpoint reported none of its own");
 				}
 			}
-			Err(reason) => crate::serial_println!("iommu: domain {} could not map this port's MSI doorbell at {base:#x}+{len:#x} ({reason:?}) - this endpoint's interrupts will not be delivered", domain.0),
+			Err(reason) => {
+				crate::serial_println!("iommu: domain {} could not map this port's MSI doorbell at {base:#x}+{len:#x} ({reason:?}) - this endpoint's interrupts could not be delivered", domain.0);
+				return Err(reason);
+			}
 		}
 	}
+	Ok(())
 }
 
 // Install one translation for a device that is behind the IOMMU, and hand back the address the

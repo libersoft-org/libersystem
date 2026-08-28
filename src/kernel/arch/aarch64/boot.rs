@@ -625,7 +625,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// THE TOPOLOGY BEFORE THE PARTITION, and after the heap - the same order x86's `mem::init` uses
 	// and for the same two reasons: the reader allocates, and the frame allocator cannot be divided
 	// into node pools once it has started handing frames out. See `mem::numa`.
-	crate::mem::numa::discover();
+	crate::mem::numa::discover(&regions[..region_count]);
 	crate::mem::frame::upgrade_to_heap();
 
 	// The MSI controller, now that its tables can be allocated: a GICv2m frame's SPI range, or a

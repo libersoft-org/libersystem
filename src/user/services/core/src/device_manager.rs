@@ -792,6 +792,24 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 	}
 }
 
+// A DRIVER'S NAME AS THE REPORT NAMES IT, not as the manifest keys it.
+//
+// The registry identifier is `virtio_blk`; every driver's own line, the kernel's device inventory and
+// `lsdev` all say `virtio-blk`. DeviceManager printed the raw identifier in its failure, restart and
+// give-up lines, so one boot could name one driver two ways - a driver that fails once and later
+// binds appeared under both spellings, and a reader matching them up has to know that the two are one
+// thing. One report, one name.
+unsafe fn print_driver_name(name: &[u8]) {
+	unsafe {
+		let mut out = [0u8; 64];
+		let n = name.len().min(out.len());
+		for (at, byte) in name[..n].iter().enumerate() {
+			out[at] = if *byte == b'_' { b'-' } else { *byte };
+		}
+		print(&out[..n]);
+	}
+}
+
 // Read this node's current candidate off the volume and open a bind with it.
 //
 // THE ELF IS UNMAPPED THE MOMENT THE SPAWN IS DONE WITH IT. `sys_process_load` copies the whole
@@ -801,8 +819,22 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 #[allow(clippy::too_many_arguments)]
 unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &Catalogue, state: &mut [u8]) {
 	unsafe {
+		// WHETHER THE LAST THING THAT WENT WRONG WAS A MISSING ARTIFACT, so exhaustion can say which
+		// of the two failures it was. See the block at the top of the loop.
+		let mut missing = false;
 		loop {
 			if node.candidate >= node.candidates.len() {
+				// CANDIDATES EXHAUSTED IS A TERMINAL STATE, AND IT WAS NOT BEING RECORDED.
+				//
+				// A `read_driver` failure updated only the old byte-state array and moved on, so a
+				// node whose every candidate was absent from the volume stayed `Unbound` with no
+				// cause on the externally served record - and `driver-missing` is a cause M1 names
+				// precisely so an operator can tell a packaging fault from a driver that ran and
+				// failed. Recorded here rather than at each miss, because "this one is not there" is
+				// only a failure of the NODE once there is nothing else to try.
+				if missing && node.record.state == BindingState::Unbound {
+					node.record.move_to(BindingState::Failed, Some(FailureCause::DriverMissing));
+				}
 				return;
 			}
 			let entry = node.candidates[node.candidate];
@@ -818,8 +850,9 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 				// disagreeing with itself, not a driver that ran and failed, and the two are worth
 				// telling apart: one is a packaging fault and the other is a bug.
 				state[node.index as usize] = STATE_DRIVER_MISSING;
+				missing = true;
 				print(b"DeviceManager: ");
-				print(driver_name);
+				print_driver_name(driver_name);
 				print(b" is named by the registry and not on the volume; trying the next candidate\n");
 				node.candidate += 1;
 				node.attempt = 0;
@@ -1244,8 +1277,14 @@ impl Node {
 	}
 
 	// The driver this node is currently trying, or an empty name for a node with none left.
+	// THE ARTIFACT THIS NODE IS ON, or the LAST one it tried.
+	//
+	// Both exhaustion paths increment `candidate` past the final entry, so a record that has failed
+	// every candidate read its artifact out of bounds and served an EMPTY name - on exactly the
+	// failure an operator is trying to diagnose, and on a node where registry entries had matched and
+	// been attempted. The last candidate is the one the failure is about.
 	fn driver_name(&self) -> &'static [u8] {
-		match self.candidates.get(self.candidate) {
+		match self.candidates.get(self.candidate).or_else(|| self.candidates.last()) {
 			Some(entry) => entry.name,
 			None => b"",
 		}
@@ -1666,7 +1705,7 @@ unsafe fn give_up_with(record: &mut BindingRecord, txn: &mut Attempt, offers: &m
 			_ => record.state,
 		};
 		print(b"DeviceManager: ");
-		print(driver_name);
+		print_driver_name(driver_name);
 		if intent == driver_binding::StopIntent::Fault {
 			print(b" did not bind (");
 			print(cause.name());
@@ -1695,13 +1734,13 @@ unsafe fn retry_or_quarantine(record: &mut BindingRecord, txn: &mut Attempt, off
 		if after == BindingState::Quarantined {
 			record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed));
 			print(b"DeviceManager: ");
-			print(driver_name);
+			print_driver_name(driver_name);
 			print(b" - the teardown did not confirm, so this device is quarantined for the boot\n");
 			return false;
 		}
 		record.move_to(BindingState::Backoff, Some(cause));
 		print(b"DeviceManager: restarting ");
-		print(driver_name);
+		print_driver_name(driver_name);
 		print(b"\n");
 		// The next pass reopens the transaction from `Backoff`, which the table allows.
 		true
@@ -1976,7 +2015,7 @@ unsafe fn report_incident(driver_name: &[u8], report: &Diagnostic) {
 	unsafe {
 		let mut number = [0u8; 20];
 		print(b"DeviceManager: incident ");
-		print(driver_name);
+		print_driver_name(driver_name);
 		print(b" at ");
 		let n = decimal(report.binding.bus as u64, &mut number);
 		print(&number[..n]);
@@ -2156,10 +2195,33 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			// and a machine with several unbindable devices multiplies it.
 			node.incident = Incident::open();
 		}
+		// WHAT THIS ARTIFACT SAYS IT SPEAKS, BEFORE THE DEVICE IS GIVEN TO IT.
+		//
+		// The note exists for exactly this moment - its own definition says so: "refusing a driver
+		// AFTER the claim would mean taking a device back from something that should never have held
+		// it." Nothing read it. `driver_protocol::declared_version` answers for the RUNNING binary
+		// and `common::handshake` calls it once the process is already spawned and the device already
+		// claimed, so an artifact declaring a version this build does not implement was claimed,
+		// started, and only then failed on the frame exchange.
+		//
+		// NO NOTE IS NOT A MISMATCH. An artifact without one is not an artifact this build produced,
+		// and that is a packaging fault rather than a version disagreement - but it is equally not
+		// something to hand a device to, and `protocol-mismatch` is the cause for both. It is the
+		// variant M0161 defined for this and the reason it had no producer.
+		match driver_protocol::declared_version_in(elf) {
+			Some(version) if version == driver_protocol::VERSION => {}
+			_ => {
+				print(b"DeviceManager: ");
+				print_driver_name(driver_name);
+				print(b" does not declare this build's driver protocol; refusing before the claim\n");
+				node.record.move_to(BindingState::Failed, Some(FailureCause::ProtocolMismatch));
+				return false;
+			}
+		}
 		let mut txn = Attempt::new();
 		if !node.record.move_to(BindingState::Binding, None) {
 			print(b"DeviceManager: refusing an illegal transition into binding for ");
-			print(driver_name);
+			print_driver_name(driver_name);
 			print(b"\n");
 			return false;
 		}
@@ -2184,8 +2246,13 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		}
 		let grant: ClaimGrant = match device_claim(node.index, device_privilege) {
 			Ok(grant) => grant,
-			// NOT RETRYABLE, and named as such: the device is held by somebody else and waiting
-			// changes nothing this service controls.
+			// WHICH REFUSAL IT WAS. The kernel keeps two apart and this collapsed them into one:
+			// `ERR_ACCESS_DENIED` is the DMA policy declining to admit the device on a machine that is
+			// not enforcing translation, which is `iommu-required` - a cause M3 kept in the vocabulary
+			// on the explicit condition that the distinguishable kernel path produce it, and nothing
+			// did. Everything else here is "somebody else holds it", which is `claim-refused` and is
+			// not worth waiting on either.
+			Err(errno) if errno == abi::ERR_ACCESS_DENIED => return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::IommuRequired, driver_name),
 			Err(_) => return give_up(&mut node.record, &mut txn, &mut node.offers, FailureCause::ClaimRefused, driver_name),
 		};
 		txn.claim = grant.claim;
@@ -2362,7 +2429,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// NOT reset the watchdog, and this is where that is said out loud.
 				BindingEvent::Ponged { .. } => {
 					print(b"DeviceManager: ");
-					print(driver_name);
+					print_driver_name(driver_name);
 					print(b" answered a ping nobody asked; the watchdog is not reset by it\n");
 					continue;
 				}
@@ -2371,7 +2438,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// for starting it, which is what the record carries.
 				BindingEvent::Wedged { .. } => {
 					print(b"DeviceManager: ");
-					print(driver_name);
+					print_driver_name(driver_name);
 					print(b" stopped answering its control path inside the deadline its registry entry declares\n");
 					// `hung`, NOT `handshake-timeout`. A driver that came up and then went quiet is
 					// a different fact from one that never answered at all, and a reader cannot act
@@ -2381,7 +2448,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				BindingEvent::Withdrawn { token, .. } => {
 					let withdrawn = catalogue.withdraw(node.id, token);
 					print(b"DeviceManager: ");
-					print(driver_name);
+					print_driver_name(driver_name);
 					print(if withdrawn.is_some() { b" withdrew a provider it had published\n" } else { b" withdrew a provider that was not published under that token\n" });
 					continue;
 				}
@@ -2422,7 +2489,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// attempt can change, and the other three describe a driver that has read its
 					// device and will not drive it however many times it is asked.
 					print(b"DeviceManager: ");
-					print(driver_name);
+					print_driver_name(driver_name);
 					print(if code.retryable() { b" reported a retryable failure\n" } else { b" reported a permanent failure\n" });
 					FailureCause::DriverReported(code)
 				}
@@ -2433,7 +2500,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// starts the driver again.
 				BindingEvent::Stopped { .. } => {
 					print(b"DeviceManager: ");
-					print(driver_name);
+					print_driver_name(driver_name);
 					print(b" stopped cleanly: ");
 					print(node.stop_intent.name());
 					print(b"\n");
@@ -2447,7 +2514,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// budget exists for: before it, this wait had no end and one silent driver held
 					// the manager - and therefore the boot - for as long as it liked.
 					print(b"DeviceManager: ");
-					print(driver_name);
+					print_driver_name(driver_name);
 					print(b" did not report in inside its share of the boot window\n");
 					FailureCause::HandshakeTimeout
 				}
@@ -2468,7 +2535,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			let published = catalogue.withdraw_binding(node.id);
 			if published > 0 {
 				print(b"DeviceManager: ");
-				print(driver_name);
+				print_driver_name(driver_name);
 				print(b" went away holding published providers; they are withdrawn and whatever was in flight on them is NOT confirmed\n");
 			}
 			// ROLL BACK WHAT THIS BINDING HELD, through the one order there is. The binding is
@@ -2937,13 +3004,13 @@ unsafe fn observe_claim(node: &mut Node, device_privilege: u64, driver_name: &[u
 				// that comes back here still has time left, and one that ran out came back
 				// `Quarantined` instead. There is no arithmetic to repeat and no second authority.
 				print(b"DeviceManager: ");
-				print(driver_name);
+				print_driver_name(driver_name);
 				print(b"'s device is still being torn down by whoever held it last; not acquiring it yet\n");
 				ClaimReadiness::WaitAndSeeAgain
 			}
 			CLAIM_STATE_QUARANTINED => {
 				print(b"DeviceManager: ");
-				print(driver_name);
+				print_driver_name(driver_name);
 				print(b"'s device is quarantined - nothing observed it go quiet, and it is not claimed again this boot\n");
 				node.record.move_to(BindingState::Quarantined, Some(FailureCause::TeardownUnconfirmed));
 				ClaimReadiness::Terminal(FailureCause::TeardownUnconfirmed)
@@ -2953,7 +3020,7 @@ unsafe fn observe_claim(node: &mut Node, device_privilege: u64, driver_name: &[u
 			// device somebody still holds.
 			_ => {
 				print(b"DeviceManager: ");
-				print(driver_name);
+				print_driver_name(driver_name);
 				print(b"'s device reads as CLAIMED and this manager holds no claim on it - that is an invariant violation, not a device to rebind over\n");
 				ClaimReadiness::Terminal(FailureCause::ClaimRefused)
 			}
@@ -2972,15 +3039,54 @@ unsafe fn observe_claim(node: &mut Node, device_privilege: u64, driver_name: &[u
 // goes away are a shutdown and a teardown, and both are asked for from inside.
 unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver_binding::StopIntent, buf: &mut [u8]) {
 	unsafe {
-		// The order, by how many OTHER nodes' published kinds a node requires. A node requiring
-		// something is a dependent and goes first; one requiring nothing is a leaf provider and
-		// goes last. A cycle cannot appear here - `system-manifest` refuses one at registry-build
-		// time - so a single ordering pass is enough and there is no fixed point to chase.
+		// REVERSE DEPENDENCY ORDER, WHICH IS DEPTH AND NOT A COUNT.
+		//
+		// This sorted by how many direct requirements a node declares, on the reasoning that "a node
+		// requiring something is a dependent and goes first". That holds only for chains one deep. In
+		// A requires a kind B provides, and B requires a kind C provides, A and B BOTH declare one
+		// requirement: their tie falls to enumeration order and B can be stopped before its own
+		// dependent A. The manifest validator accepts such chains - it refuses cycles and orphans -
+		// so this is an ordinary supported registry, not an exotic one.
+		//
+		// Depth is what the order needs: how far a node is from a leaf provider, following the kinds
+		// it requires to the nodes that publish them. A cycle cannot appear (refused at registry-build
+		// time), so the relaxation below terminates; `nodes.len()` passes is the worst case for a
+		// chain that happens to be enumerated backwards, and every pass is over a handful of entries.
+		let mut depth: Vec<usize> = alloc::vec![0; nodes.len()];
+		for _ in 0..nodes.len() {
+			let mut moved = false;
+			for at in 0..nodes.len() {
+				let Some(entry) = nodes[at].candidates.get(nodes[at].candidate) else { continue };
+				let mut want = 0usize;
+				for kind in entry.requires {
+					// Whoever publishes that kind: this node stands one level above the deepest of
+					// them. A requirement nothing in this image provides cannot occur - the manifest
+					// validator refuses it - and if it somehow did, it contributes nothing, which
+					// leaves the node a leaf rather than inventing a level for it.
+					for other in 0..nodes.len() {
+						if other == at {
+							continue;
+						}
+						let Some(provider) = nodes[other].candidates.get(nodes[other].candidate) else { continue };
+						if provider.provides.iter().any(|(declared, _)| declared == kind) {
+							want = want.max(depth[other] + 1);
+						}
+					}
+				}
+				if want != depth[at] {
+					depth[at] = want;
+					moved = true;
+				}
+			}
+			if !moved {
+				break;
+			}
+		}
 		let mut order: Vec<usize> = (0..nodes.len()).collect();
-		order.sort_by_key(|&at| {
-			let entry = nodes[at].candidates.get(nodes[at].candidate);
-			core::cmp::Reverse(entry.map_or(0, |entry| entry.requires.len()))
-		});
+		// Deepest first: a dependent is stopped before what it depends on. The index breaks ties so
+		// two unrelated nodes at one level stop in a stable order rather than in whatever order the
+		// sort happened to leave them.
+		order.sort_by_key(|&at| (core::cmp::Reverse(depth[at]), at));
 		for at in order {
 			if nodes[at].record.state != BindingState::Online {
 				continue;

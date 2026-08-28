@@ -324,3 +324,29 @@ fn the_cadence_comes_out_of_the_deadline_and_is_never_zero() {
 		previous = period;
 	}
 }
+
+// THE PRE-CLAIM CHECK CAN ACTUALLY READ A NOTE OUT OF AN ARTIFACT.
+//
+// `declared_version` answers for the RUNNING binary, so it could never be the check the note exists
+// for - DeviceManager has to answer about an artifact it has not launched. This is that reader, and
+// the three cases are: a note present, a note absent, and a note declaring something else.
+#[test]
+fn a_staged_artifact_declares_its_protocol_version_before_it_is_launched() {
+	// A slice with the note somewhere inside it, the way a real artifact carries it in `.rodata`.
+	let mut artifact = [0u8; 256];
+	artifact[100..100 + NOTE_LEN].copy_from_slice(&PROTOCOL_NOTE);
+	assert_eq!(declared_version_in(&artifact), Some(VERSION), "the note this build emits is the note this reader finds");
+
+	// No note at all: an artifact this build did not produce, or one whose note was stripped.
+	assert_eq!(declared_version_in(&[0u8; 256]), None, "no note is not a version, and it is not version zero either");
+
+	// A note declaring a version this build does not implement - the case the check is FOR.
+	let mut other = artifact;
+	let wrong = VERSION.wrapping_add(1).to_le_bytes();
+	other[100 + 28] = wrong[0];
+	other[100 + 29] = wrong[1];
+	assert_eq!(declared_version_in(&other), Some(VERSION + 1), "the reader reports what the artifact says, and the caller decides whether it is acceptable");
+
+	// Shorter than a note cannot contain one, and must not index out of bounds looking.
+	assert_eq!(declared_version_in(&[0u8; 4]), None);
+}

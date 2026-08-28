@@ -55,6 +55,30 @@ pub struct History {
 	// `#[serde(default)]` so the histories already on disk load and read as "never overshot".
 	#[serde(default)]
 	pub fixed_overshoot: BTreeMap<String, f64>,
+	// WHAT A WHOLE STEP MEASURED, KEYED BY ITS `StepId`.
+	//
+	// The distinction this milestone is named for. `entries` is per KEY, and a step's duration
+	// divided among its keys is an estimate however it is dressed up - for a merged step it is an
+	// artefact of the batching. A step has ONE duration and it is measurable, so it is measured, and
+	// the scheduler orders on it. Keyed by `StepId` because that is what a step is: `scoped_id`
+	// derives it from the kind, the scope and the parts, so the same step in two runs is the same id
+	// and a step that changed what it does is a different one.
+	//
+	// `#[serde(default)]` so the histories on disk load and read as "nothing measured yet".
+	#[serde(default)]
+	pub steps: BTreeMap<String, StepRecord>,
+}
+
+// One step's own measurement. Deliberately smaller than `Record`: pass/fail already lives per key,
+// and what this table exists to answer is "how long does this step take".
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct StepRecord {
+	pub last_run: u64,
+	pub last_seconds: f64,
+	pub runs: u64,
+	// The model this was measured under, for the same reason `Record` carries one: a duration
+	// measured over a different plan is not a duration for this one.
+	pub model_hash: String,
 }
 
 // The history file's format version. Bumped when a recorded value stops meaning what it meant.
@@ -68,13 +92,13 @@ impl History {
 	pub fn load(repo_root: &Path) -> Result<Self, String> {
 		let path = Self::path(repo_root);
 		if !path.is_file() {
-			return Ok(History { schema: SCHEMA, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new() });
+			return Ok(History { schema: SCHEMA, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new(), steps: BTreeMap::new() });
 		}
 		let text = fs::read_to_string(&path).map_err(|error| format!("{}: {error}", path.display()))?;
 		// A history that cannot be read is an empty history, not a failure. It records what has run;
 		// losing it costs a wider next sweep, which is the safe direction, and refusing to plan
 		// because a cache is corrupt would be the unsafe one.
-		let mut history: History = serde_json::from_str(&text).unwrap_or(History { schema: SCHEMA, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new() });
+		let mut history: History = serde_json::from_str(&text).unwrap_or(History { schema: SCHEMA, entries: BTreeMap::new(), fixed_overshoot: BTreeMap::new(), steps: BTreeMap::new() });
 		// EVIDENCE RECORDED UNDER A RULE THAT WAS WRONG IS NOT EVIDENCE. Schema 1 recorded an
 		// overshoot for any step that came in under its fixed term, including steps that did not run
 		// at all - see `record_step`. The per-key records are unaffected and are kept; the overshoot
@@ -120,6 +144,19 @@ impl History {
 	// do not cost the same - but it is an approximation that adds up to the truth, which the
 	// alternative did not.
 	pub fn record_step(&mut self, keys: &[PlanItemKey], passed: bool, step_seconds: f64, model_hash: &str, cost: &CostModel) {
+		self.record_step_id(None, keys, passed, step_seconds, model_hash, cost);
+	}
+
+	// The same, told WHICH step it was. `step_id` is `None` only for a caller that has no id to give,
+	// which after this milestone is none of them - see `StepRecord`.
+	pub fn record_step_id(&mut self, step_id: Option<&str>, keys: &[PlanItemKey], passed: bool, step_seconds: f64, model_hash: &str, cost: &CostModel) {
+		if let Some(id) = step_id.filter(|id| !id.is_empty()) {
+			let entry = self.steps.entry(id.to_string()).or_default();
+			entry.last_run = now();
+			entry.last_seconds = step_seconds;
+			entry.runs += 1;
+			entry.model_hash = model_hash.to_string();
+		}
 		if keys.is_empty() {
 			return;
 		}
@@ -340,6 +377,16 @@ impl Default for CostModel {
 			variable.insert((architecture.to_string(), environment.to_string()), seconds);
 		}
 		CostModel { fixed_seconds: fixed, variable_seconds: variable, default_variable: 0.5, whole_suite_tests: 0 }
+	}
+}
+
+impl History {
+	// What this step measured last time, if it was measured under THIS model.
+	//
+	// A duration from another model is not a duration for this plan - the same argument that makes a
+	// key's record carry a hash - so a stale one is ignored rather than trusted for being a number.
+	pub fn step_seconds(&self, step_id: &str, model_hash: &str) -> Option<f64> {
+		self.steps.get(step_id).filter(|record| record.model_hash == model_hash && record.last_seconds > 0.0).map(|record| record.last_seconds)
 	}
 }
 

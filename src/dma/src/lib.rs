@@ -853,6 +853,33 @@ impl<B: Backend> Iommu<B> {
 	// marked `Released` with their addresses handed back while the device had never been told to
 	// drop a single translation - the frames were declared reusable on the strength of a detach
 	// alone, which is the one thing this crate exists to refuse.
+	// RETIRE A DOMAIN, so a failed bind and a rebind cycle do not accumulate them.
+	//
+	// `Backend::domain_destroy` existed and nothing called it: `revoke_endpoint` left `DomainState`
+	// and every terminal `Mapping` in their maps, and `next_domain` only ever advances - so repeated
+	// failed binds consumed domain ids and grew two maps that nothing ever shrank. M3/M4's exact
+	// post-restart baseline cannot hold while that is true.
+	//
+	// A DOMAIN HOLDING A QUARANTINED MAPPING IS NOT RETIRED, and that is the whole care this needs.
+	// A quarantined mapping is one nobody knows the device has stopped resolving; forgetting it would
+	// hand its address space back for reuse on exactly the evidence that says not to. Those domains
+	// stay, which is a bounded leak with a reason, and `quarantined_mappings` counts them.
+	pub fn destroy_domain(&mut self, domain: DomainId) -> Result<Confirmed, Fault> {
+		let Some(state) = self.domains.get(&domain) else { return Err(Fault::UnknownEndpoint) };
+		if !state.endpoints.is_empty() {
+			// Something is still attached: destroying now would be a domain believed gone with an
+			// endpoint still translating through it.
+			return Err(Fault::Unconfirmed);
+		}
+		if self.mappings.values().any(|m| m.domain == domain && m.state == MappingState::Quarantined) {
+			return Err(Fault::Unconfirmed);
+		}
+		let confirmed = self.backend.domain_destroy(domain)?;
+		self.mappings.retain(|_, m| m.domain != domain);
+		self.domains.remove(&domain);
+		Ok(confirmed)
+	}
+
 	pub fn revoke_endpoint(&mut self, domain: DomainId, endpoint: EndpointId) -> Result<Release, Fault> {
 		let live: Vec<MappingId> = self.mappings.values().filter(|m| m.domain == domain && matches!(m.state, MappingState::Live | MappingState::Closing)).map(|m| m.id).collect();
 		// Each one on its own, because one translation the device refuses to drop must not condemn

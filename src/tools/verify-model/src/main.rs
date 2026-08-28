@@ -66,6 +66,9 @@ fn run() -> Result<ExitCode, String> {
 	let mut quiet = false;
 	let mut from_stdin = false;
 	let mut keys_file: Option<String> = None;
+	// Which STEP a `record` is about, so its whole duration can be stored against it rather than
+	// only divided among the keys it discharged. See `History::steps`.
+	let mut step_id: Option<String> = None;
 	let mut scoped_log: Option<String> = None;
 	// The SCOPED run's log for the keyed universes - the selection executed on its own, before the
 	// sweep, so the comparison can ask whether it is executable at all rather than only whether the
@@ -168,6 +171,10 @@ fn run() -> Result<ExitCode, String> {
 			"--grant" => {
 				index += 1;
 				grant = Some(arguments.get(index).ok_or("--grant needs a component")?.clone());
+			}
+			"--step-id" => {
+				index += 1;
+				step_id = Some(arguments.get(index).ok_or("--step-id needs a StepId")?.clone());
 			}
 			"--keys-file" => {
 				index += 1;
@@ -979,7 +986,7 @@ fn run() -> Result<ExitCode, String> {
 					None => unknown += 1,
 				}
 			}
-			history.record_step(&keys, passed, seconds, &hash, &verify_model::history::CostModel::default());
+			history.record_step_id(step_id.as_deref(), &keys, passed, seconds, &hash, &verify_model::history::CostModel::default());
 			history.save(&repo_root)?;
 			eprintln!("verify-model: recorded {} key(s) as {}{}", keys.len(), if passed { "passed" } else { "failed" }, if unknown > 0 { format!(", {unknown} not in the catalog") } else { String::new() });
 			Ok(ExitCode::SUCCESS)
@@ -1021,6 +1028,7 @@ fn run() -> Result<ExitCode, String> {
 			// separators is a line somebody will parse wrong.
 			let cost = verify_model::history::CostModel { whole_suite_tests: model.kernel_tests.declared_ids, ..verify_model::history::CostModel::default() };
 			let history = verify_model::history::History::load(&model.repo_root).unwrap_or_default();
+			let model_hash = model.model_hash();
 			// CHEAPEST FIRST, AMONG THE STEPS WHOSE PREREQUISITES ARE MET.
 			//
 			// A plan that is going to fail runs its cheapest evidence last, which is minutes of
@@ -1040,7 +1048,9 @@ fn run() -> Result<ExitCode, String> {
 			}
 			ordered.sort_by(|left, right| {
 				let (dl, dr) = (layers.get(&left.id).copied().unwrap_or(0), layers.get(&right.id).copied().unwrap_or(0));
-				let (cl, cr) = (cost.estimate(&history, &left.keys), cost.estimate(&history, &right.keys));
+				// The same number the STEPCOST line will carry: measured where it has been measured.
+				let cl = history.step_seconds(&left.id, &model_hash).unwrap_or_else(|| cost.estimate(&history, &left.keys));
+				let cr = history.step_seconds(&right.id, &model_hash).unwrap_or_else(|| cost.estimate(&history, &right.keys));
 				dl.cmp(&dr).then(cl.partial_cmp(&cr).unwrap_or(std::cmp::Ordering::Equal)).then(left.id.cmp(&right.id))
 			});
 			for (index, step) in ordered.into_iter().enumerate() {
@@ -1061,7 +1071,14 @@ fn run() -> Result<ExitCode, String> {
 				for required in &step.requires {
 					println!("STEPREQ\t{index}\t{required}");
 				}
-				println!("STEPCOST\t{index}\t{:.0}", cost.estimate(&history, &step.keys));
+				// MEASURED IF IT HAS BEEN, ESTIMATED IF IT HAS NOT.
+				//
+				// `estimate` sums per-key costs, which for a merged step is the batching's own
+				// arithmetic handed back as a prediction. A step has one duration; once it has been
+				// run under this model, that duration is the answer and the estimate is only the
+				// seed for a step nobody has timed yet.
+				let measured = history.step_seconds(&step.id, &model_hash);
+				println!("STEPCOST\t{index}\t{:.0}", measured.unwrap_or_else(|| cost.estimate(&history, &step.keys)));
 				for key in &step.keys {
 					println!("KEY\t{index}\t{}", key.display());
 				}
