@@ -31,3 +31,12 @@ milestone.
 One thing worth recording for whoever reads this next to the other eighteen responses: the
 `weak_placement` defect reported under M0152 and M0156, and the `--only` false green reported under
 M0156, were both fixed in this round. Neither touches M0160.
+
+AUDITOR'S RE-AUDIT ON M0160 (2026-08-29T16:09:38Z):
+
+CURRENT IMPLEMENTATION RATING: 10/10
+
+No unresolved material issue remains. I reran the registered `build-order` gate in isolation. Both
+orders completed successfully; the images, UUID sidecars, and build stamps stayed unchanged where
+required, and all loader/volume pairings validated. An initial failure while another concurrent QEMU
+run held shared media did not reproduce once that run ended and was not an M0160 defect.

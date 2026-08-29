@@ -55,6 +55,8 @@ Zkontroluj plán milestone XXX. Hledej jen skutečné chyby, rozpory a překáž
 
 ---
 
+IMPLEMENTED MILESTONE AUDIT:
+
 AUDITOR:
 Check implementations of milestones M0150 - M0168 and write an audit for each milestone to `/AI/audit/audit-M0XXX.md`. Critically verify the actual implementation against the milestone requirements and the relevant surrounding code. Focus strictly on the scope of each milestone and evaluate whether the implementation is complete, correct, internally consistent, and actually fulfills what the milestone requires. Do not do any overengineering and do not suggest architectural changes, refactoring, additional abstractions, defensive mechanisms, optimizations, or extra features unless they are genuinely necessary to satisfy the milestone itself. Do not report purely theoretical, stylistic, speculative, or extremely unlikely issues that do not materially affect the correctness or completeness of the milestone. Verify findings against the actual code before reporting them and avoid assumptions based only on filenames, comments, TODOs, naming, or incomplete context. Take existing project architecture and design decisions as given unless they directly prevent the milestone from being implemented correctly. Check relevant interactions with surrounding components where necessary to determine whether the milestone works as intended, but do not expand the audit into unrelated parts of the project. For every real issue you find, clearly explain what is wrong, why it matters for the milestone, and reference the relevant files, functions, structures, or code paths. Distinguish actual implementation defects from optional improvements. Give each milestone a rating from 0 to 10/10 for completeness and correctness, where 10/10 means that you found no meaningful issue that should require a code change within the scope of that milestone. Start every audit with the title `AUDITOR'S REVIEW ON M0XXX ([TIMESTAMP IN UTC FORMAT]):`. Do not modify any source code. Your role is strictly to audit the implementation and report findings.
 
@@ -69,15 +71,9 @@ Check all audits in `/AI/audit/audit-M0XXX.md` for milestones M0150 - M0168. Cri
 
 ---
 
-Zkontroluj implementaci plánu milestone XXX.
-
-GPT:
-Dokument P02M0137.md byl ted znovu prepsan na zaklade tve analyzy... důkladně ho zkontroluj a udelej novou analyzu, dej mu hodnoceni 0 - 10. A dej takova doporuceni, abychom to dotahli k dokonalosti do 10/10.
-
-Claude:
-Teď mi znovu přišla analýza z jiného AI ohledně tve posledni aktualizace M0137. Důkladně zkontroluj, jestli to, co říká, je pravda, jestli je vhodné to upravit a pokud ano, přepiš ten milestone:
-
 ---
+
+NOT-IMPLEMENTED MILESTONE AUDIT:
 
 AUDITOR:
 Audit the implementation plan for milestone M0XXX in `/docs/todo/M0XXX.md` and create the audit to `/AI/audit/audit-M0XXX.md`. Critically verify the plan against the milestone requirements, current project architecture, relevant existing code, conventions, dependencies, and integration points. Evaluate whether the plan is complete, correct, feasible, internally consistent, properly scoped, and sufficiently detailed for implementation. Do not assume the planner is always correct. Report only material problems that could lead to an incomplete, incorrect, incompatible, or unnecessarily overengineered implementation. For every finding, explain what is wrong, why it matters, and what part of the plan needs to be corrected. Give the plan a rating from 0 - 10/10, where 10/10 means that no meaningful change is required before implementation. Start the the audit with the title `AUDITOR'S REVIEW OF PLAN M0XXX ([TIMESTAMP IN UTC FORMAT]):`. Do not modify the plan or any source code.
@@ -89,3 +85,11 @@ AUDITOR - PLAN RE-AUDIT:
 Re-audit the updated implementation plan for milestone M0XXX in `/docs/todo/M0XXX.md`. Read the complete history in `/AI/audit/audit-M0XXX.md` and verify the planner's responses. Do not assume that either the planner or previous auditor was always correct. Report only unresolved issues, incomplete or incorrect corrections, unjustified rejections, contradictions, or newly discovered material defects. Do not repeat findings that were correctly resolved, do not do any overengineering, or suggest changes outside the milestone scope. Append the result to `/AI/audit/audit-M0XXX.md` under the title `AUDITOR'S RE-AUDIT OF PLAN M0XXX ([TIMESTAMP IN UTC FORMAT]):`. Give the current plan a new rating from 0 - 10/10. Do not modify the plan or any source code, and do not modify or delete existing audit content, only append it.
 
 ---
+
+Zkontroluj implementaci plánu milestone XXX.
+
+GPT:
+Dokument P02M0137.md byl ted znovu prepsan na zaklade tve analyzy... důkladně ho zkontroluj a udelej novou analyzu, dej mu hodnoceni 0 - 10. A dej takova doporuceni, abychom to dotahli k dokonalosti do 10/10.
+
+Claude:
+Teď mi znovu přišla analýza z jiného AI ohledně tve posledni aktualizace M0137. Důkladně zkontroluj, jestli to, co říká, je pravda, jestli je vhodné to upravit a pokud ano, přepiš ten milestone:

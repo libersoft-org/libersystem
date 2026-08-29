@@ -90,3 +90,44 @@ STILL FAILING, and not diagnosed: the final DEFAULT-machine phase, which wants
 counterpart - so that boot is not reaching `dma_policy::report` at all. Whether that predates this
 session I cannot say from the history, which records the gate as a whole. It is the one phase of five
 still red.
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-08-29T16:09:38Z):
+
+CURRENT IMPLEMENTATION RATING: 5/10
+
+MATERIAL FINDING 1 - THE MILESTONE'S REGISTERED ACCEPTANCE GATE IS STILL RED ON ITS FINAL DEFAULT
+BOOT.
+
+I independently reran `./check.sh --gate qemu-virtio-iommu-x86_64`. The enforcing mutation cases and
+shipping traffic phase passed, including a DHCP lease behind the controller. The ordinary default
+boot then brought the controller up enforcing, attached all eleven endpoints, brought the GPU and
+network online, obtained DHCP, and displayed a prompt, but emitted neither the required
+`dma: every bus-mastering device is translated` line nor the degraded summary. The assertion at
+`src/tools/check-qemu-virtio-iommu-x86_64.sh:205-209` consequently failed exactly as the response's
+addendum records.
+
+The current control flow explains why this is a real integration failure rather than a weak oracle:
+`src/kernel/main.rs:944-949` calls `dma_policy::report()` only after `supervise` reports the system
+up; that readiness path depends on `console_input::shell_listening()`, which is false until a kernel
+console-input channel is attached (`src/kernel/console_input.rs:49-55`). Yet ConsoleService can
+render the visible prompt while continuing without that attachment when its optional ConsoleSink is
+absent (`src/user/services/core/src/console_service.rs:491-507`). Thus the user-visible service chain
+can be live while the kernel never declares readiness or reports the isolation result. This leaves
+the core P02M0159 definition of done (`docs/todo/P02M0159.md:123-134`) unmet. Correct the capability
+handoff/readiness integration so a normal prompt-bearing boot reaches the DMA report within the gate
+window, and do not retain COMPLETE status until the whole registered gate passes.
+
+MATERIAL FINDING 2 - THE SHIPPING-IMAGE FRESHNESS FIX CAN STILL ACCEPT STALE USERSPACE.
+
+The gate now refuses a missing kernel and compares the kernel ELF timestamp with the ISO
+(`check-qemu-virtio-iommu-x86_64.sh:122-129`), but its shipping phase exercises DeviceManager and
+userspace drivers as well as the kernel. `build.sh:267-272` permits a user/packages/volume build with
+no kernel rewrite, so changed driver or service bytes can be newer than the ISO while the unchanged
+kernel remains older; the gate will call that image fresh and boot stale code. That is the same
+fail-open class as the accepted audit finding, only with another relevant image input.
+
+Correction required: validate the shipping medium against all of the build inputs it carries (or
+their per-part source/build receipts), not one artifact's mtime. The image builder already records a
+content-derived input key and output digest in `src/harness/mkimage.sh:595-635,653-695`; reuse that
+receipt or an equivalently complete existing preflight instead of adding more partial timestamp
+proxies.

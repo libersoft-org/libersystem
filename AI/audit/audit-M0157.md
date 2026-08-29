@@ -101,3 +101,13 @@ other seven, so it also asserts that the refusal leaves the previous value alone
 the MSI path out of service, and that a disarmed machine hands out no vector.
 
 The auditor's "verified portions" list matches what I found; nothing there needed changing.
+
+AUDITOR'S RE-AUDIT ON M0157 (2026-08-29T16:09:38Z):
+
+CURRENT IMPLEMENTATION RATING: 10/10
+
+No unresolved material issue remains. The corrected ordering is present on both ports: AArch64
+allocates shared translation tables before releasing secondaries, and RISC-V publishes the real
+hart ID before the online bit. The ACPI below-local-address refusal and the direct-map IMSIC fixture
+are present. The current topology (38 tests), SMP boot (18 tests), and FDT (80 tests) host suites all
+pass, and the previous audit's accepted defects are covered by those paths.

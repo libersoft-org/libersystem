@@ -119,3 +119,24 @@ is what boots it (`DEV_PROFILE=1 LIBER_BOOT_PROFILE=development-trace`). The ord
 profile - the interactive instance a person boots - no longer carries a raw record-separator line
 addressed to a program. `qemu-run.sh` refuses any other profile name, because a name the kernel does
 not recognise would boot an ordinary guest that merely looks like a development one.
+
+AUDITOR'S RE-AUDIT ON M0158 (2026-08-29T16:09:38Z):
+
+CURRENT IMPLEMENTATION RATING: 8/10
+
+MATERIAL FINDING - THE `dev_channel` CORRECTION ADDED THE ADDRESS BUT LEFT THE DEVICE NAME
+INCONSISTENT.
+
+The original audit reported both halves of this defect, and the response accepted it, but the
+implementation corrected only the missing PCI address. The manifest binds `dev_channel` to a
+virtio-console function (`src/user/services/manifest.toml:1438-1459`), and the shared kernel/DMA
+name for virtio type 3 is `virtio-console` (`src/abi/src/lib.rs:543-552`). Nevertheless
+`src/user/drivers/core/src/dev_channel.rs:104-110` still passes `b"dev-channel"` as the device name to
+`describe`, producing `driver.dev-channel: online (...)`. The same PCI function is therefore still
+called `virtio-console` in the device/DMA inventory and `dev-channel` in the driver report.
+
+That violates P02M0158 M1's explicit one-name rule (`docs/todo/P02M0158.md:80-83`) and prevents a
+reader or log checker from joining the two reports by canonical device name. Correct the call to use
+`virtio-console` as the name while retaining the PCI address as the function distinguisher and
+`transport` only as detail; update the corresponding report expectation/test. The performance-anchor
+fix and the other previously accepted naming fixes are present and passing.

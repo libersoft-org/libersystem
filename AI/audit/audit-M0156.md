@@ -143,3 +143,31 @@ own comment records two earlier attempts at a stable threshold. It is the third 
 "nothing to measure" one the auditor names - that is unreliable under TCG. I have left it alone
 because it is outside this audit's scope and outside M0156, but it belongs in whatever milestone next
 touches that test.
+
+AUDITOR'S RE-AUDIT ON M0156 (2026-08-29T16:09:38Z):
+
+CURRENT IMPLEMENTATION RATING: 7/10
+
+MATERIAL FINDING - THE STAGED VERIFIER STILL ACCEPTS AN EMPTY OR MANIFEST-INCOMPLETE TREE.
+
+The response fixed the narrower unreadable/missing-directory false green, but not M1's requirement
+to check every expected library and compare each provider set with the manifest. In
+`src/tools/build-shared.sh:303-376`, `verify_staged_provider_chains` checks that `lib/` is a directory
+and that `find` itself succeeds, then iterates only over the `.lslib` files which happen to be there.
+It never requires at least one artifact, never compares the artifact-name set with
+`.libraries | keys`, and never compares a consumer's recorded provider names with that library's
+manifest `providers`. I independently pointed `--verify-staged` at a readable, empty `lib/`
+directory: it exited zero and printed that every staged library named the providers beside it. A
+missing expected library which no remaining consumer mentions can therefore pass in the same way.
+
+This is not an optional second oracle: the script already loads the canonical manifest into
+`manifest_json` at line 127 and uses its library/provider graph elsewhere. The omission directly
+contradicts P02M0156 M1 (`docs/todo/P02M0156.md:69-75`) and its definition of done
+(`:120-125`); the milestone's own result acknowledges that the manifest-set comparison was left out
+at `:447-450` while still marking M1 complete. It leaves the central fail-closed claim false.
+
+Correction required: derive the expected library names and each expected provider-name set from the
+already-loaded manifest; refuse an empty tree, any missing or unexpected staged library, and any
+missing or unexpected provider edge before comparing digests. Add mutations for an empty tree, a
+missing expected but otherwise unreferenced library, and a recorded provider set that differs from
+the manifest.

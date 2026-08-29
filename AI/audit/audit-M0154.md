@@ -196,16 +196,15 @@ it is recorded rather than avoided.
 
 ---
 
-AUDITOR'S RE-AUDIT ON M0154 (2026-08-29T16:01:42Z):
+AUDITOR'S RE-AUDIT ON M0154 (2026-08-29T16:15:24Z):
 
-Current implementation rating: 9/10
+Current implementation rating: 10/10
 
-## Unresolved material completion evidence
+No material unresolved issue remains within M0154's scope after verifying the original findings and
+the implementer's responses against the current implementation.
 
-1. **The source/model fixes are present, but the milestone's required live conformance gate still fails for the current kernel.** The accepted fixes were independently verified: batch actions are whole-lock operations, receiver state and the trace checker are actor-local, `lastBatch` ties covers to their transition, endpoint depth includes in-flight delivery, and the concrete allocation-refusal/generation-ceiling tests exist. The trace checker's committed reference replays and all 14 deliberate defects are refused. However, the completion profile deliberately requires a live trace (`docs/todo/P02M0154.md:560-582,803-808`; `check.sh:55`), and `src/tools/check-capability-trace.sh --require-live` currently exits 1 because the newest trace-bearing x86_64 guest log predates `.build/cargo/kernel/x86_64-unknown-none/debug/kernel`. This is the same fresh runtime proof the original response acknowledged was still owed; the later source/model addendum did not produce current live evidence.
+Verification against the current x86_64 kernel is also complete. With no x86_64 QEMU already active, the focused post-preflight suite
 
-   No further source change is indicated by this result. Run the focused x86_64 QEMU conformance fixture against the current kernel, retain its trace-bearing log/artifact, and rerun the exact required gate successfully before retaining `Status: COMPLETE` for the current implementation.
+`TEST_SELECTION=kernel.object.capability_tcb_conformance_trace,kernel.object.capability_tcb_seeded_schedules src/harness/test-kernel.sh x86_64`
 
-## Verification
-
-The lenient `src/tools/check-capability-trace.sh` passed the reference and mutation suite and correctly reported the stale live artifact. The required `--require-live` invocation failed solely on freshness; no unresolved defect was found in the five previously accepted source/model fixes.
+passed both trace producers (2 passed in 18 seconds). `src/tools/check-capability-trace.sh --require-live` then passed: the checker refused all 14 deliberate defects, the fresh live trace matched the committed reference, and all 315 steps across nine runs replayed as enabled model actions. The earlier stale-trace result was a transient artifact of a newer shared kernel build, not an implementation or completion defect.

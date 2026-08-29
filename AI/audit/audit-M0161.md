@@ -141,3 +141,29 @@ of a staged artifact by its fixed 28-byte prefix, and `begin_bind` refuses befor
 refused too. Covered by `a_staged_artifact_declares_its_protocol_version_before_it_is_launched`.
 
 All four accepted findings are now fixed; Finding 2 remains rejected. P02M0161 stays COMPLETE.
+
+AUDITOR'S RE-AUDIT ON M0161 (2026-08-29T16:09:38Z):
+
+CURRENT IMPLEMENTATION RATING: 7/10
+
+MATERIAL FINDING - THE REJECTION OF THE PROTOCOL-VERSION DEFECT IS NOT JUSTIFIED.
+
+The source still declares `VERSION = 1` while its own adjacent contract says that adding an opcode
+or changing a payload bumps it (`src/user/libs/driver/protocol/src/lib.rs:21-26`). The current wire
+format includes new opcodes 6 through 11 (`:162-222`) and a four-byte kind-plus-token OFFER payload
+(`:554-577`), whereas the original M0161 protocol used only opcodes 1 through 5 and a two-byte OFFER.
+P02M0161 states the same versioning rule at `docs/todo/P02M0161.md:110-113`.
+
+The response's rationale that one current build has 21 mutually agreeing artifacts does not make the
+formats compatible. It only proves that today's artifacts agree with one another. An earlier
+version-1 artifact is now semantically incompatible yet still advertises the version the manager
+accepts; it can pass the new pre-claim note check and fail only after claiming the device. Distinguishing
+an artifact built at another time is precisely why M3 added the pre-claim note
+(`docs/todo/P02M0161.md:149-180`). Incrementing this internal `u16` wire revision also does not consume
+or close the product's release-level v1.
+
+Correct the accumulated incompatible change by bumping the one shared wire `VERSION` for manager,
+drivers, headers, and notes together, then add a regression showing that an artifact/note carrying
+the historical revision is refused before claim. The four previously accepted findings are fixed,
+and the driver-protocol host suites and packaged-note gate pass; they do not resolve this remaining
+compatibility hole.
