@@ -69,6 +69,8 @@ fn run() -> Result<ExitCode, String> {
 	// Which STEP a `record` is about, so its whole duration can be stored against it rather than
 	// only divided among the keys it discharged. See `History::steps`.
 	let mut step_id: Option<String> = None;
+	// A frozen narrowing to plan against, instead of the canonical model. See `Model::load_with_candidate`.
+	let mut candidate_path: Option<String> = None;
 	let mut scoped_log: Option<String> = None;
 	// The SCOPED run's log for the keyed universes - the selection executed on its own, before the
 	// sweep, so the comparison can ask whether it is executable at all rather than only whether the
@@ -172,6 +174,10 @@ fn run() -> Result<ExitCode, String> {
 				index += 1;
 				grant = Some(arguments.get(index).ok_or("--grant needs a component")?.clone());
 			}
+			"--candidate" => {
+				index += 1;
+				candidate_path = Some(arguments.get(index).ok_or("--candidate needs the path of a candidate file")?.clone());
+			}
 			"--step-id" => {
 				index += 1;
 				step_id = Some(arguments.get(index).ok_or("--step-id needs a StepId")?.clone());
@@ -230,7 +236,29 @@ fn run() -> Result<ExitCode, String> {
 	}
 
 	let repo_root = find_repo_root()?;
-	let model = Model::load(&repo_root)?;
+	// THE MODEL EVERY COMMAND WORKS AGAINST, and `--candidate` is what makes a NARROWER one available
+	// without installing it.
+	//
+	// M5's shape is evidence first, split second: the authoritative run stays FULL while the narrower
+	// selection is computed beside it, and the comparison is recorded under the candidate's own hash.
+	// Before this the only candidate command was `candidate-activate`, which WRITES the overlay - so
+	// the only way to plan against a candidate was to activate it, and activation is what the evidence
+	// is for. `--candidate` is refused for `candidate-activate` itself, which must read the canonical
+	// files with no overlay in its path or the hash it compares would be the overlay agreeing with
+	// itself.
+	let candidate_overlay: Option<verify_model::candidate::Candidate> = match &candidate_path {
+		Some(path) if command == "candidate-activate" => return Err(format!("--candidate is not for `candidate-activate`: it reads the canonical files with no overlay in its path, which is what makes the hash it compares mean anything ({path})")),
+		Some(path) => Some(verify_model::candidate::Candidate::load(std::path::Path::new(path))?),
+		None => None,
+	};
+	let model = Model::load_with_candidate(&repo_root, candidate_overlay.as_ref())?;
+	if let Some(candidate) = &candidate_overlay {
+		let planned = model.model_hash();
+		if planned != candidate.expected_hash {
+			return Err(format!("this candidate plans as model {planned} and says its evidence is gathered under {}, so a record written now would be filed against a model this overlay does not produce - refreeze it", candidate.expected_hash));
+		}
+		eprintln!("verify-model: planning against candidate {planned} - {}", candidate.reason);
+	}
 
 	match command.as_str() {
 		// The digest a shadow comparison is pinned to: HEAD plus the bytes of every dirty file.
@@ -936,6 +964,37 @@ fn run() -> Result<ExitCode, String> {
 			// source map is built first: a candidate that omits one of them from its base records no
 			// digest for a file it replaces, and "the base is unmoved" would be true of a smaller set.
 			candidate.base_is_unmoved(&repo_root, &sources)?;
+			// AND THE EVIDENCE BAR, WHICH NOTHING WAS ASKING FOR.
+			//
+			// Activation checked the base digests and the resulting model hash and never called the
+			// trust evaluation at all - so a candidate could activate a narrowing with NO qualifying
+			// evidence behind it, which is the one thing M5's contract is for. A narrowing takes
+			// coverage AWAY from components: for every component a test stops covering under this
+			// candidate, the shadow log has to have earned that component a certificate UNDER THIS
+			// CANDIDATE'S OWN HASH. Evidence gathered under the current model says nothing about the
+			// narrower one, which is the same argument that makes `expected_hash` load-bearing.
+			{
+				let log = verify_model::shadow::Log::load(&repo_root);
+				let store = verify_model::trust::Store::load(&repo_root);
+				let mut short: Vec<String> = Vec::new();
+				for (id, narrowed) in &candidate.covers {
+					let Some(check) = model.catalog.checks.iter().find(|check| &check.id == id) else { continue };
+					for lost in check.covers.iter().filter(|component| !narrowed.contains(component)) {
+						if short.iter().any(|line| line.starts_with(&format!("{lost}:"))) {
+							continue;
+						}
+						// The universe a kernel test is judged in. A narrowing of a guest test is
+						// answered by guest evidence; asking for host evidence about it would be a
+						// bar nothing could ever meet.
+						if let Err(why) = store.evaluate(lost, &candidate.expected_hash, verify_model::shadow::Universe::TestGuest, &log) {
+							short.push(format!("{lost}: {why}"));
+						}
+					}
+				}
+				if !short.is_empty() {
+					return Err(format!("this candidate narrows coverage of component(s) that have not earned it under its own model hash, so activating it would take away checking nothing has shown to be spare:\n    {}\n  Gather the evidence under {} first; nothing was written.", short.join("\n    "), candidate.expected_hash));
+				}
+			}
 			let previous = candidate.materialise(&repo_root, &sources)?;
 			let active = match Model::load(&repo_root) {
 				Ok(active) => active,

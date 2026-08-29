@@ -77,12 +77,34 @@ pub struct Model {
 
 impl Model {
 	pub fn load(repo_root: &Path) -> Result<Self, String> {
-		let registry = Registry::load(&repo_root.join("src/tools/verify-model/model"))?;
+		Model::load_with_candidate(repo_root, None)
+	}
+
+	// THE MODEL A CANDIDATE WOULD INSTALL, BUILT WITHOUT INSTALLING IT.
+	//
+	// M5's whole shape is evidence first, split second: the authoritative run stays FULL while the
+	// narrower selection is computed beside it and the comparison is recorded under the CANDIDATE's
+	// hash. That needs the narrowed model to exist in memory, and it did not - the only candidate
+	// command was `candidate-activate`, which writes the overlay into the tree. So the only way to
+	// plan against a candidate was to activate it, and activation is the thing the evidence is FOR.
+	//
+	// Both narrowing inputs are overlaid: the registry's text, and the `covers` a test declares -
+	// which reach `model_hash` through the catalog, so a model built from one of them could never
+	// hash to what the evidence was gathered under.
+	pub fn load_with_candidate(repo_root: &Path, candidate: Option<&crate::candidate::Candidate>) -> Result<Self, String> {
+		let registry = Registry::load_with(&repo_root.join("src/tools/verify-model/model"), candidate.map(|c| c.registry.as_str()))?;
 		let crates = crates::discover(repo_root)?;
 		let manifest = system_manifest::Manifest::load_workspace(&repo_root.join("src")).map_err(|error| format!("services/manifest.toml: {error}"))?;
 		let graph = Graph::build(&crates, &manifest, &registry);
 		graph.validate(&crates, &registry)?;
-		let kernel_tests = kerneltests::discover(repo_root, &registry::ARCHITECTURES)?;
+		let mut kernel_tests = kerneltests::discover(repo_root, &registry::ARCHITECTURES)?;
+		if let Some(candidate) = candidate {
+			for test in kernel_tests.tests.iter_mut() {
+				if let Some(narrowed) = candidate.covers.get(&test.id) {
+					test.covers = narrowed.clone();
+				}
+			}
+		}
 		let staged = staged_components(&manifest, &crates, &graph);
 		let catalog = Catalog::build(&crates, &registry, &graph, &staged, &kernel_tests.tests);
 		catalog.validate(&registry)?;

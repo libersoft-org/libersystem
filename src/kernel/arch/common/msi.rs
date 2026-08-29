@@ -244,6 +244,19 @@ impl<const N: usize> MsiRegistry<N> {
 	// Free every slot pending for `device`, and answer how many. Reached from
 	// `SYS_DEVICE_QUIESCED`, which is the holder of the device's own DeviceMemory saying the
 	// hardware is stopped - the same claim, from the same capability, that releases its DMA frames.
+	// HOW MANY SLOTS THIS DEVICE STILL HOLDS - bound or masked-and-pending. Read by the claim
+	// snapshot, so a manager that did not make the binding can reconstruct what it is charged with.
+	pub fn held_by_device(&self, device: u32) -> usize {
+		let mut held = 0;
+		for slot in 0..N {
+			let _bound = self.bound[slot].lock();
+			if self.owner[slot].load(Ordering::Acquire) == device && (self.used[slot].load(Ordering::Acquire) || self.pending[slot].load(Ordering::Acquire)) {
+				held += 1;
+			}
+		}
+		held
+	}
+
 	pub fn release_for_device(&self, device: u32) -> usize {
 		let mut released = 0;
 		for slot in 0..N {

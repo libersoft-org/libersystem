@@ -411,7 +411,7 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// selected only when there is NO tree, never beside one, and it says so in the boot log.
 	let controller = if controller.usable() {
 		controller
-	} else if tree.is_none() {
+	} else if tree.is_none() && matches!(unsafe { super::dtb::absence(dtb) }, super::dtb::TreeAbsence::NoTree) {
 		// A NAMED PROFILE AUTHORISES THIS, NOT THE ABSENCE OF A TREE.
 		//
 		// The AAVMF/U-Boot path hands the kernel no device tree, and it works only because these
@@ -432,13 +432,34 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 		// rather than at the first MMIO write. Without a GIC there is no timer interrupt, and a
 		// kernel without one cannot claim a working scheduler even on a single core - so guessing an
 		// address would be claiming a machine rather than reading one.
-		panic!("aarch64: the device tree describes no usable interrupt controller (distributor {:#x}, cpu interface {:#x}, version {})", controller.dist, controller.cpu, controller.version);
+		// AND A TREE THIS READER COULD NOT USE IS NOT THE NO-DT PROFILE EITHER. Both used to answer
+		// `None` from `parse`, so a build that authorised the profile authorised the corrupt-tree case
+		// with it - a static descriptor selected by a boot that HAS a tree, which is what M4 forbids.
+		panic!("aarch64: the device tree describes no usable interrupt controller (distributor {:#x}, cpu interface {:#x}, version {}) - a tree this kernel cannot use is not the named no-DT profile", controller.dist, controller.cpu, controller.version);
 	};
 	crate::serial_println!("aarch64: GICv{} from {} - distributor {:#x}+{:#x}, {} {:#x}+{:#x}", controller.version, controller.name, controller.dist, controller.dist_size, if controller.version >= 3 { "redistributors" } else { "cpu interface" }, controller.cpu, controller.cpu_size);
 
 	// Bring up the GIC + the generic timer, enable interrupts, and confirm the
 	// timer IRQ fires by watching the tick counter advance (each tick arrives
 	// through the IRQ vector -> gic::handle_irq -> eret).
+	// THE TIMER'S INTERRUPT, FROM THE SAME TREE THE CONTROLLER CAME FROM.
+	//
+	// The backend held a compiled `30` with a comment naming QEMU `virt`, and nothing read the timer
+	// node - so a machine naming another PPI had 30 armed anyway, which is an interrupt it never
+	// described, and a machine naming none had it armed too. A missing or undecodable timer path is
+	// FATAL for the same reason a missing controller is: without a timer interrupt there is no
+	// scheduler tick, and arming a number the machine did not name is claiming a machine rather than
+	// reading one.
+	//
+	// The authorised no-DT profile keeps QEMU virt's PPI 14, which is the descriptor it exists to be.
+	let timer_intid: u32 = match tree.as_ref().map(|bi| bi.timer_intid) {
+		Some(0) | None if super::boot_profile_authorises_no_dt() => 30,
+		Some(0) => panic!("aarch64: the device tree describes no timer interrupt this kernel can decode - without one there is no scheduler tick, and arming an interrupt the machine did not name is not a boot this kernel will make"),
+		None => panic!("aarch64: no device tree and no authorised profile, so nothing named the timer interrupt"),
+		Some(intid) => intid,
+	};
+	crate::serial_println!("aarch64: the timer is INTID {timer_intid}, from the machine description");
+	super::gic::set_timer_intid(timer_intid);
 	super::gic::init(controller.version, controller.dist, controller.cpu, controller.cpu_size);
 	crate::serial_println!("aarch64: GIC + generic timer up ({} Hz counter)", super::gic::timer_hz());
 	// The MSI controller is brought up after the frame allocator, further down: a v2m frame is one
@@ -787,7 +808,15 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 
 	// Wake the secondary cores via PSCI CPU_ON (each brings up its own per-CPU
 	// block + local GIC/timer, then idles).
-	let outcome = super::psci::bring_up_secondaries(topology.secondaries(), arg);
+	// THE CONDUIT COMES FROM WHERE THE TREE IS, not from the register it was announced in.
+	//
+	// The direct path enters with `x0 = 0` and this runner loads the tree at a fixed address, so
+	// `conduit(arg)` was asked about zero and answered `PSCI_NONE` - and `bring_up_secondaries` then
+	// returned the one-core result on a machine whose own tree states `method`. That is why the
+	// interrupt-profile gate stopped using `UEFI=0`: a four-core DIRECT profile came up on one core.
+	// The tree is right there, and `dtb::located` is what knows.
+	let psci_arg: u64 = if arg != 0 { arg } else { unsafe { super::dtb::tree_address(0) }.unwrap_or(0) };
+	let outcome = super::psci::bring_up_secondaries(topology.secondaries(), psci_arg);
 	// THE IDS IN USE, NOT THE CORES ONLINE. An attempt that timed out keeps its id for the life of
 	// the boot, so a core that came up after one holds an id above the online count - and this is
 	// what the run queues and the controller-id map are indexed by.

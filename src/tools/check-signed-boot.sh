@@ -108,7 +108,20 @@ echo "signed-boot: the loader refused an altered signed manifest and loaded no k
 # the image is read; what matters is that it is refused rather than mounted.
 cp "$esp" "$efi"
 mcopy -i "$efi" ::/system-volume.img "$work/volume.img" || fail "the medium carries no system volume image"
-printf '\x01' | dd of="$work/volume.img" bs=1 seek=$((1024 * 1024)) count=1 conv=notrunc status=none
+# A BYTE THAT IS DIFFERENT FROM THE ONE THAT IS THERE, and the proof that it is.
+#
+# This wrote `\x01` at a fixed offset and never looked. Today's volume image happens to hold `\x01`
+# at exactly that offset, so the "alteration" wrote the byte that was already there, the loader
+# correctly accepted an image nobody had altered, and the gate reported the trust chain broken. The
+# same silence is worse the other way round: on every build where the byte differed by luck this case
+# was testing something, and nothing said which of the two had happened. The manifest case three
+# blocks up compares the digest before and after for exactly this reason; this one now does too.
+volume_before="$(sha256sum "$work/volume.img" | cut -d' ' -f1)"
+at=$((1024 * 1024))
+was="$(dd if="$work/volume.img" bs=1 skip="$at" count=1 status=none | od -An -tu1 | tr -d ' ')"
+printf "$(printf '\\%03o' $(((was + 1) % 256)))" | dd of="$work/volume.img" bs=1 seek="$at" count=1 conv=notrunc status=none
+volume_after="$(sha256sum "$work/volume.img" | cut -d' ' -f1)"
+[[ "$volume_before" != "$volume_after" ]] || fail "the system volume image did not change - this case would prove nothing"
 mcopy -o -i "$efi" "$work/volume.img" ::/system-volume.img
 payload_log="$work/payload.log"
 boot_medium "$efi" "$payload_log"
@@ -232,6 +245,17 @@ resign_with() {
 	local kernel="$work/kernel.bin"
 	extract_from_esp "/kernel" "$kernel" || return 1
 	rows+=(--row "kernel:kernel=$kernel")
+	# AND THE LIVE VOLUME, WHEN THE MEDIUM CARRIES ONE.
+	#
+	# The loader refuses to mount or publish `system-volume.img` unless the medium's manifest vouches
+	# for the whole of it, and that check comes BEFORE the volume's own manifest is verified. A
+	# re-signed manifest without this row therefore stopped the boot at "the live system volume is not
+	# what the boot medium's signed manifest records" - which is a real refusal for a different
+	# reason, and would have answered the volume-identity case below with the wrong evidence.
+	local live="$work/live-volume.img"
+	if extract_from_esp "/system-volume.img" "$live"; then
+		rows+=(--row "system-volume:system-volume.img=$live")
+	fi
 	(cd "$signer" && cargo run --quiet -- --profile test-trust --product LiberSystem \
 		--arch x86_64 --source boot-medium --release 0.0.1 \
 		--volume-uuid 00000000000000000000000000000000 "$@" "${rows[@]}" --out "$out") >/dev/null 2>&1
@@ -262,12 +286,63 @@ wrong_context() {
 	echo "signed-boot: a manifest signed for $what is refused"
 }
 
+# THE PAIRING ITSELF, WHICH THE FOUR CASES ABOVE CANNOT REACH.
+#
+# The "different volume" case used to be `wrong_context "a different volume" --source system-volume
+# --volume-uuid ...` - it overrode the SOURCE KIND as well as the uuid, and `verify_for` checks the
+# kind third and the uuid fourth, so it always refused at the third with the same message as the case
+# before it. Worse, the medium being booted is a boot medium, so its `Expected` carries
+# `VolumeIdentity::NotAVolume`, whose branch compares nothing at all. Deleting the
+# `VolumeIdentity::Exactly` arm entirely would have left that case green: it was evidence for the
+# check above it, twice.
+#
+# WHERE THE COMPARISON ACTUALLY LIVES. `Expected::volume(PAIRED_UUID)` is built for a source that IS
+# a volume, and the live system volume image on this ESP is one of those - mounted straight out of a
+# file, with no disk scan and no pairing-by-enumeration in the way. So: re-sign the medium's manifest
+# with a pairing naming a volume that is not the one staged beside it, and every other field left
+# exactly as it was. The image's own manifest is untouched and still validly signed; the two now
+# disagree about which volume this is, and the fourth check is the only one that can say so.
+wrong_volume() {
+	local manifest="$work/wrong-volume.manifest2"
+	# A uuid that is not the staged image's, whatever the staged image's happens to be.
+	if ! resign_with "$manifest" --volume-uuid 0123456789abcdef0123456789abcdef; then
+		echo "signed-boot: could not sign the different-volume case" >&2
+		return 1
+	fi
+	cp "$esp" "$efi"
+	mcopy -o -i "$efi" "$manifest" ::/etc/boot.manifest2
+	local log="$work/wrong-volume.log"
+	boot_medium "$efi" "$log"
+	# THE MESSAGE, because this case exists to prove WHICH check fired. Any of the three before it
+	# refusing would stop the boot just as dead and prove nothing about the pairing.
+	if ! grep -aq "signed for a different volume than the one this medium is paired with" "$log"; then
+		echo "signed-boot: a manifest paired with another volume was not refused for that reason" >&2
+		grep -a -m 8 "loader:" "$log" >&2
+		return 1
+	fi
+	# AND THE BOOT STOPPED. The refusal is LATCHED rather than raised where it is detected - the
+	# kernel has already been read by then - so a gate that only read the message would pass on a
+	# loader that printed it and handed off anyway. Two halves: the loader said it was refusing to
+	# hand off, and no kernel ever started.
+	if ! grep -aq "refusing to hand off" "$log"; then
+		echo "signed-boot: the pairing was refused and the loader did not say it was refusing to hand off" >&2
+		grep -a -m 8 "loader" "$log" >&2
+		return 1
+	fi
+	if grep -aq "LiberSystem kernel is starting" "$log"; then
+		echo "signed-boot: the pairing was refused and a kernel started anyway" >&2
+		grep -a -m 10 "loader\|kernel" "$log" >&2
+		return 1
+	fi
+	echo "signed-boot: a validly signed volume manifest paired with a different volume is refused, and the boot stops"
+}
+
 if [[ -n "$(command -v mcopy)" ]]; then
 	status=0
 	wrong_context "another product" --product NotLiberSystem || status=1
 	wrong_context "another architecture" --arch aarch64 || status=1
 	wrong_context "another kind of source" --source system-volume || status=1
-	wrong_context "a different volume" --source system-volume --volume-uuid 0123456789abcdef0123456789abcdef || status=1
+	wrong_volume || status=1
 	((status == 0)) || exit 1
 fi
 

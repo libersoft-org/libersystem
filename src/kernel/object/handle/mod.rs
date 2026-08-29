@@ -10,6 +10,8 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+#[cfg(test)]
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use super::domain::Domain;
 use super::rights::Rights;
@@ -195,6 +197,32 @@ pub struct HandleTable {
 //
 // A slot at the end of its generations is simply not reused. One slot of a table is a
 // negligible loss; a handle coming back from the dead is not.
+// AN ALLOCATION THAT FAILS AT THE RECEIVE'S RESERVATION PHASE, ARMED ON PURPOSE.
+//
+// `reserve` is the answer to the hole its own comment describes: a receive dequeues a message on the
+// strength of this returning true, so the slot memory has to be there BEFORE the quota is spent. The
+// failing branch is the one a short heap takes and no test could reach it - reaching it for real
+// means exhausting the machine's heap, after which nothing can be asserted about what the refusal
+// left behind. Armed here, in the test configuration only, so the refusal can be examined: the
+// message must still be queued, the quota unspent and no booking left.
+#[cfg(test)]
+static REFUSE_RESERVATION_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn refuse_next_reservation_allocations(count: usize) {
+	REFUSE_RESERVATION_ALLOCATIONS.store(count, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn reservation_allocation_refused() -> bool {
+	REFUSE_RESERVATION_ALLOCATIONS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok()
+}
+
+#[cfg(not(test))]
+fn reservation_allocation_refused() -> bool {
+	false
+}
+
 fn retire_or_recycle(slot: &mut Slot, free: &mut Vec<u32>, index: usize) {
 	match slot.generation.checked_add(1) {
 		Some(next) => {
@@ -216,6 +244,43 @@ impl HandleTable {
 	#[cfg(test)]
 	pub fn set_trace_id(&mut self, id: u16) {
 		self.trace_id = id;
+	}
+
+	// The same number, for a caller that has to announce WHOSE step a channel action is.
+	pub fn trace_id(&self) -> u16 {
+		self.trace_id
+	}
+
+	// PUT A SLOT AT THE GENERATION CEILING, so `retire_or_recycle` can be driven through the arm it
+	// exists for. Reaching `u32::MAX` by churning handles is four billion close-and-open cycles; the
+	// model reaches the ceiling by declaring `MaxGen` to be three, and the CONCRETE seam - the arm
+	// that stops incrementing and refuses to hand the index back - had nothing driving it at all.
+	//
+	// Answers whether the slot was there to age, so a test cannot silently age nothing.
+	#[cfg(test)]
+	pub fn age_slot_to_ceiling(&mut self, handle: Handle) -> bool {
+		let index = handle.index() as usize;
+		match self.slots.get_mut(index) {
+			Some(slot) => {
+				slot.generation = u32::MAX;
+				true
+			}
+			None => false,
+		}
+	}
+
+	// What generation a slot stands at, for a test that has to say the ceiling was reached and then
+	// not passed.
+	#[cfg(test)]
+	pub fn slot_generation(&self, index: usize) -> Option<u32> {
+		self.slots.get(index).map(|slot| slot.generation)
+	}
+
+	// How many slots exist, so a test can say a retired one was not handed out again by watching the
+	// table grow instead of reusing it.
+	#[cfg(test)]
+	pub fn slot_count(&self) -> usize {
+		self.slots.len()
 	}
 
 	// One line at each boundary. In a production build `handle_event` reaches an empty `record`, so
@@ -349,7 +414,8 @@ impl HandleTable {
 	// that already exist, so only the shortfall needs allocating; `try_reserve` may over-allocate,
 	// which is fine - it never under-allocates, and that is the direction that matters here.
 	pub fn reserve(&mut self, count: usize) -> bool {
-		if self.booked.try_reserve(count).is_err() {
+		// See `refuse_next_reservation_allocations`: the same branch a short heap takes, armed.
+		if reservation_allocation_refused() || self.booked.try_reserve(count).is_err() {
 			return false;
 		}
 		let before = self.booked.len();

@@ -2219,3 +2219,24 @@ fn a_measured_step_cost_replaces_the_estimate_and_a_stale_one_does_not() {
 fn alloc_keys() -> Vec<crate::plan::PlanItemKey> {
 	vec![crate::plan::PlanItemKey { check: String::from("kernel.mem.frame.frame_alloc_distinct"), architecture: String::from("x86_64"), environment: crate::catalog::Environment::TestGuest, configuration: String::from("test") }]
 }
+
+// A CANDIDATE WITH NO QUALIFYING EVIDENCE DOES NOT ACTIVATE.
+//
+// `candidate-activate` checked the base digests and the resulting model hash and never called the
+// trust evaluation, so a narrowing could be activated with nothing behind it - which is the one thing
+// M5's contract exists to prevent. The bar is per COMPONENT LOST: a narrowing takes coverage away, and
+// what has to be earned is that the component it stops covering is trusted under the CANDIDATE'S own
+// hash. Evidence gathered under the current model says nothing about the narrower one, which is the
+// same argument that makes `expected_hash` load-bearing in the first place.
+#[test]
+fn evidence_under_another_model_does_not_qualify_a_candidate() {
+	let mut log = crate::shadow::Log { schema: 1, records: Vec::new() };
+	let store = crate::trust::Store { schema: 1, certificates: Vec::new() };
+	// Enough distinct clean decisions on enough targets to earn a certificate - but recorded under
+	// the CURRENT model, which is not the model the candidate would install.
+	for tree in 0..crate::trust::REQUIRED_CLEAN_RUNS {
+		log.records.push(evidence(crate::shadow::Universe::TestGuest, "x86_64", true, &format!("tree-{tree}")));
+		log.records.push(evidence(crate::shadow::Universe::TestGuest, "riscv64", true, &format!("tree-{tree}")));
+	}
+	assert!(store.evaluate("audio", "candidate-hash", crate::shadow::Universe::TestGuest, &log).is_err(), "evidence gathered under one model hash is not evidence about a different one - a candidate cannot borrow the current model's record to justify narrowing away from it");
+}

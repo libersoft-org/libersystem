@@ -1061,16 +1061,24 @@ fn capability_tcb_seeded_schedules() {
 			table
 		};
 		let mut sender = table_of();
-		let mut receiver = table_of();
+		// TWO RECEIVERS ON ONE ENDPOINT, which is what makes the identity rule mean anything.
+		//
+		// The schedule had one, so every PEEK on this endpoint was that receiver's: a checker could
+		// keep a single inspected identity per endpoint and never be wrong, and the trace could not
+		// distinguish `recv_identified` from `recv whatever is at the head`. The race the syscall
+		// exists for needs a second receiver peeking over the top of the first, and the first's take
+		// then refusing because the message it inspected is not the head any more.
+		let mut receivers = [table_of(), table_of()];
 		let (a, b) = Channel::try_create_with_depth(2).expect("a two-deep pair");
 
 		// What the schedule is holding between steps. Each is the half-finished state of one of the
 		// protocol's two-phase operations, which is where every interesting interleaving lives.
 		let mut live: alloc::vec::Vec<super::handle::Handle> = alloc::vec::Vec::new();
 		let mut taken: Option<(super::handle::Handle, Capability)> = None;
-		let mut peeked: Option<(u64, usize)> = None;
-		let mut in_hand: Option<Message> = None;
-		let mut booked = 0usize;
+		// PER RECEIVER, like the state the syscall keeps on its own stack.
+		let mut peeked: [Option<(u64, usize)>; 2] = [None, None];
+		let mut in_hand: [Option<Message>; 2] = [None, None];
+		let mut booked = [0usize; 2];
 		let mut next_value = seed * 1000;
 
 		trace::start();
@@ -1115,24 +1123,32 @@ fn capability_tcb_seeded_schedules() {
 						sender.abandon_taken(handle);
 					}
 				}
-				// Look at what is queued.
+				// Look at what is queued. WHICHEVER RECEIVER THE SCHEDULE PICKS - two of them look
+				// at one endpoint, which is the state the identity rule is about.
 				4 => {
-					if in_hand.is_none() {
+					let who = (roll() as usize) % 2;
+					if in_hand[who].is_none() {
+						trace::set_actor(receivers[who].trace_id());
 						if let Ok((id, _bytes, caps)) = b.peek_identified() {
-							peeked = Some((id, caps));
+							peeked[who] = Some((id, caps));
 						}
 					}
 				}
 				// Take it, having booked the room for what it carries.
 				5 => {
-					if let Some((id, caps)) = peeked.take() {
-						if in_hand.is_none() && receiver.reserve(caps.max(1)) {
-							booked = caps.max(1);
+					let who = (roll() as usize) % 2;
+					if let Some((id, caps)) = peeked[who].take() {
+						if in_hand[who].is_none() && receivers[who].reserve(caps.max(1)) {
+							booked[who] = caps.max(1);
+							trace::set_actor(receivers[who].trace_id());
 							match b.recv_identified(id, 64, caps) {
-								Ok(message) => in_hand = Some(message),
+								Ok(message) => in_hand[who] = Some(message),
+								// SUPERSEDED, which is the outcome the second receiver creates: the
+								// message this one inspected was taken while it was deciding, so the
+								// take refuses and the booking goes back whole.
 								Err(_) => {
-									receiver.release_reservation(booked);
-									booked = 0;
+									receivers[who].release_reservation(booked[who]);
+									booked[who] = 0;
 								}
 							}
 						}
@@ -1140,23 +1156,27 @@ fn capability_tcb_seeded_schedules() {
 				}
 				// Finish the delivery, installing what it carried.
 				6 => {
-					if let Some(mut message) = in_hand.take() {
+					let who = (roll() as usize) % 2;
+					if let Some(mut message) = in_hand[who].take() {
+						trace::set_actor(receivers[who].trace_id());
 						b.commit_delivery(&mut message);
 						for cap in message.caps.drain(..) {
-							let handle = receiver.insert_reserved(cap);
+							let handle = receivers[who].insert_reserved(cap);
 							if handle.raw() != 0 {
-								booked = booked.saturating_sub(1);
+								booked[who] = booked[who].saturating_sub(1);
 							}
 						}
-						receiver.release_reservation(booked);
-						booked = 0;
+						receivers[who].release_reservation(booked[who]);
+						booked[who] = 0;
 					}
 				}
 				// Or fail before the commit, which puts the message back at the head still charged.
 				7 => {
-					if let Some(message) = in_hand.take() {
-						receiver.release_reservation(booked);
-						booked = 0;
+					let who = (roll() as usize) % 2;
+					if let Some(message) = in_hand[who].take() {
+						receivers[who].release_reservation(booked[who]);
+						booked[who] = 0;
+						trace::set_actor(receivers[who].trace_id());
 						b.return_to_head(message);
 					}
 				}
@@ -1197,12 +1217,15 @@ fn capability_tcb_seeded_schedules() {
 		if let Some((handle, cap)) = taken.take() {
 			sender.restore_taken(handle, cap);
 		}
-		if let Some(mut message) = in_hand.take() {
-			b.commit_delivery(&mut message);
-			message.caps.clear();
-		}
-		if booked > 0 {
-			receiver.release_reservation(booked);
+		for who in 0..2 {
+			if let Some(mut message) = in_hand[who].take() {
+				trace::set_actor(receivers[who].trace_id());
+				b.commit_delivery(&mut message);
+				message.caps.clear();
+			}
+			if booked[who] > 0 {
+				receivers[who].release_reservation(booked[who]);
+			}
 		}
 		trace::stop();
 

@@ -131,9 +131,62 @@ struct Model {
 #[derive(Default)]
 struct Queue {
 	pending: VecDeque<u64>,
+	// PER RECEIVER, NOT PER ENDPOINT. These were three scalars, so a second receiver's peek
+	// overwrote the first's and a second dequeue overwrote what the first was holding - which means
+	// the identity rule this checker names (`a dequeue of a message this receiver never inspected`)
+	// was comparing a receiver's take against whatever anybody had looked at last. `recv_identified`
+	// is exactly the syscall that stops one receiver from acting on another's inspection, and the
+	// adapter could not tell it from a receive of whatever is at the head. The actor is the trace's
+	// `slot` field on a channel action.
+	receivers: std::collections::BTreeMap<u16, Receiver>,
+	// THE DEPTH THIS ENDPOINT WAS CONFIGURED WITH, learned from the first event that names it. The
+	// bound was `CHANNEL_QUEUE_MAX` - the largest depth ANY channel may be given - so a second
+	// pending message on a one-deep endpoint was accepted, and the model's `QueueBounded` was
+	// replayed against a limit four thousand times looser than the one the run actually had.
+	limit: Option<usize>,
+}
+
+#[derive(Default, Clone)]
+struct Receiver {
 	held: Option<u64>,
 	committed: bool,
 	peeked: Option<u64>,
+}
+
+impl Queue {
+	// Messages taken and not yet committed - the other half of the model's `Depth`, which is queued
+	// PLUS in flight. Counting only `pending` let a trace put `limit` messages in the queue while
+	// another was in a receiver's hand, and the endpoint really was one past its depth.
+	fn in_flight(&self) -> usize {
+		self.receivers.values().filter(|r| r.held.is_some() && !r.committed).count()
+	}
+
+	fn receiver(&mut self, actor: u16) -> &mut Receiver {
+		self.receivers.entry(actor).or_default()
+	}
+
+	// The depth an event says this endpoint has, remembered the first time and required to agree
+	// afterwards. An endpoint's depth is fixed at creation, so two events disagreeing about it means
+	// the trace is describing two channels under one identity - and every queue check after that
+	// would be against the wrong bound.
+	fn note_depth(&mut self, declared: usize) -> Result<(), String> {
+		if declared == 0 {
+			return Ok(());
+		}
+		match self.limit {
+			None => {
+				self.limit = Some(declared);
+				Ok(())
+			}
+			Some(known) if known == declared => Ok(()),
+			Some(known) => Err(format!("an endpoint whose depth was {known} now says it is {declared} - one identity naming two channels")),
+		}
+	}
+
+	// Whoever is holding this message, if anybody is.
+	fn holder_of(&self, message: u64) -> Option<u16> {
+		self.receivers.iter().find(|(_, r)| r.held == Some(message)).map(|(id, _)| *id)
+	}
 }
 
 // What each fault and rollback class needs at least one of. A trace that never reaches one is a
@@ -340,58 +393,78 @@ impl Model {
 			// The ceiling here is the largest a channel can be configured to, not the default: a
 			// trace comes from a running system whose endpoints may have been given any of them.
 			ENQUEUE => {
+				let declared = event.rights as usize;
 				let queue = self.queue(event.party);
-				if queue.pending.len() >= CHANNEL_QUEUE_MAX {
-					return Err(format!("a message queued onto an endpoint already holding {} - past what any channel may hold", queue.pending.len()));
+				queue.note_depth(declared)?;
+				// `QueueBounded`, AS THE MODEL STATES IT: queued PLUS in flight, against the depth
+				// this endpoint was actually configured with.
+				let depth = queue.pending.len() + queue.in_flight();
+				let bound = queue.limit.unwrap_or(CHANNEL_QUEUE_MAX).min(CHANNEL_QUEUE_MAX);
+				if depth >= bound {
+					return Err(format!("a message queued onto an endpoint already at depth {depth} of {bound} - queued plus in flight, which is what the depth bounds"));
 				}
 				queue.pending.push_back(event.message);
 			}
 			PEEK => {
+				let declared = event.rights as usize;
+				let actor = event.slot;
 				let queue = self.queue(event.party);
+				queue.note_depth(declared)?;
 				let Some(front) = queue.pending.front() else {
 					return Err(String::from("a peek at an empty queue"));
 				};
 				if *front != event.message {
 					return Err(String::from("a peek that named a message which is not at the head"));
 				}
-				queue.peeked = Some(event.message);
+				queue.receiver(actor).peeked = Some(event.message);
 			}
 			DEQUEUE => {
+				let declared = event.rights as usize;
+				let actor = event.slot;
 				let queue = self.queue(event.party);
+				queue.note_depth(declared)?;
 				let Some(front) = queue.pending.front().copied() else {
 					return Err(String::from("a dequeue from an empty queue"));
 				};
 				if front != event.message {
 					return Err(String::from("a dequeue of a message that is not at the head"));
 				}
-				// `MessageIdentityStable`: a receive acts on the message it looked at, or the
-				// shape it sized its buffers from belongs to something else.
-				if queue.peeked != Some(event.message) {
+				// `MessageIdentityStable`: a receive acts on the message THIS receiver looked at, or
+				// the shape it sized its buffers from belongs to something else.
+				if queue.receiver(actor).peeked != Some(event.message) {
 					return Err(String::from("a dequeue of a message this receiver never inspected"));
 				}
+				if queue.receiver(actor).held.is_some() {
+					return Err(String::from("a dequeue by a receiver that is already holding a message"));
+				}
 				queue.pending.pop_front();
-				queue.held = Some(event.message);
-				queue.committed = false;
+				let receiver = queue.receiver(actor);
+				receiver.held = Some(event.message);
+				receiver.committed = false;
 			}
 			RETURN_TO_HEAD => {
+				let actor = event.slot;
 				let queue = self.queue(event.party);
-				if queue.held != Some(event.message) {
+				// WHOEVER IS HOLDING IT MUST BE THE ONE PUTTING IT BACK, which is a statement the
+				// single global `held` could not make.
+				if queue.holder_of(event.message) != Some(actor) {
 					return Err(String::from("a message returned that was not the one in hand"));
 				}
 				// `PostCommitCopyoutIsTerminal`: past the commit the message cannot go back.
-				if queue.committed {
+				if queue.receiver(actor).committed {
 					return Err(String::from("a message returned to the queue AFTER its delivery committed"));
 				}
 				queue.pending.push_front(event.message);
-				queue.held = None;
+				queue.receiver(actor).held = None;
 				covers.return_to_head += 1;
 			}
 			COMMIT_DELIVERY => {
+				let actor = event.slot;
 				let queue = self.queue(event.party);
-				if queue.held != Some(event.message) {
+				if queue.holder_of(event.message) != Some(actor) {
 					return Err(String::from("a delivery committed for a message that is not in hand"));
 				}
-				queue.committed = true;
+				queue.receiver(actor).committed = true;
 				covers.commit_delivery += 1;
 			}
 			other => return Err(format!("event {index} names action {other}, which this checker does not know")),
@@ -702,6 +775,42 @@ fn self_test(reference: &[Event]) {
 			forged.slot = 9;
 			forged.generation = 1;
 			out.insert(at + 1, forged);
+			out
+		}),
+		// THE TWO RULES THE MODEL NAMES THAT THIS CHECKER USED TO STATE AND NOT ENFORCE.
+		//
+		// Both were written as comments and neither was reachable: the depth check compared only
+		// pending messages against the largest depth ANY channel may have, and the identity check
+		// compared a receiver's take against whatever anybody had inspected last. A mutation that
+		// the checker accepts is a rule the trace is not carrying, whatever the comment beside it
+		// says - which is why these are here rather than in a paragraph.
+		("an enqueue past the endpoint's own depth", "which is what the depth bounds", |events, nth| {
+			let mut out = events.to_vec();
+			// EVERY ENDPOINT DECLARED ONE DEEP. The same trace against a one-deep channel is a trace
+			// that overran its bound the moment it queued a second message or queued one while
+			// another was in a receiver's hand - which is what "queued plus in flight" means, and
+			// what comparing against the largest depth ANY channel may have could never notice.
+			//
+			// Shrinking the declared depth by one was the first form and it proved nothing: the
+			// fixture's endpoints are declared 64 and 2 deep and never hold more than two, so 63 and
+			// 1 are still roomy. A mutation has to reach the rule.
+			let _ = nth(events, ENQUEUE, 0);
+			for event in out.iter_mut() {
+				// QUEUE ACTIONS ONLY: on a handle action `rights` is the rights the action asked
+				// for, and rewriting those makes a different mutation - which is what happened, and
+				// the self-test caught it by requiring the refusal to name the rule it was made for.
+				if matches!(event.action, ENQUEUE | PEEK | DEQUEUE | RETURN_TO_HEAD | COMMIT_DELIVERY) {
+					event.rights = 1;
+				}
+			}
+			out
+		}),
+		("a dequeue by a receiver that inspected nothing", "never inspected", |events, nth| {
+			let mut out = events.to_vec();
+			// The peek stays, and it belongs to somebody else: the message really was inspected,
+			// and not by the receiver that takes it. Against one global `peeked` this was accepted.
+			let at = nth(events, PEEK, 0);
+			out[at].slot = out[at].slot.wrapping_add(1);
 			out
 		}),
 		("a trace that never reaches a rollback", "never reached", |events, nth| {

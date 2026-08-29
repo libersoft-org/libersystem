@@ -78,11 +78,30 @@ fn panic(info: &core::panic::PanicInfo<'_>) -> ! {
 		}
 	}
 	arch::serial::write_str(": ");
-	if let Some(msg) = info.message().as_str() {
-		arch::serial::write_str(msg);
-	}
+	// THE MESSAGE, INCLUDING THE ONES THAT SAY ANYTHING.
+	//
+	// This was `info.message().as_str()`, which answers `Some` only for a panic whose message is a
+	// bare literal - so every `panic!` in this file carrying a value said NOTHING. The refusals that
+	// most need explaining are exactly the ones that name what they refused: "a boot source was
+	// selected and failed its manifest ({reason:?})" reached the serial port as an empty string
+	// after the colon, and a fail-closed loader whose last word is a line number is one nobody can
+	// diagnose from a serial log.
+	let mut out = SerialWriter;
+	let _ = core::fmt::Write::write_fmt(&mut out, format_args!("{}", info.message()));
 	arch::serial::write_str("\n");
 	arch::halt()
+}
+
+// `core::fmt` over the serial port, which is all the panic handler needs and is why it is here
+// rather than anywhere a caller might reach for it. No buffer: a panic that ran out of one would be
+// a panic reporting its own reporting.
+struct SerialWriter;
+
+impl core::fmt::Write for SerialWriter {
+	fn write_str(&mut self, s: &str) -> core::fmt::Result {
+		arch::serial::write_str(s);
+		Ok(())
+	}
 }
 
 // The firmware entry point. The `*-unknown-uefi` targets link this symbol as the PE
@@ -229,7 +248,7 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 		// read of its kernel failed. Continuing to the boot medium here is how a machine whose disk
 		// is going bad silently boots an older kernel off its ESP.
 		VolumeRead::Unreadable => {
-			panic!("loader: the system volume was selected and its kernel could not be read - refusing to boot something else instead");
+			panic!("loader: the system volume was selected and did not answer - it would not mount, or its kernel is missing or unreadable - refusing to boot something else instead");
 		}
 		VolumeRead::NotOnVolume => {
 			arch::serial::write_str("loader: system volume found but it has no kernel; using the boot volume\n");
@@ -612,6 +631,17 @@ pub(crate) fn read_verified_package(bs: *mut BootServices, root: Option<*mut uef
 // The live medium's system volume, read once. It is needed twice - to assemble the bootstrap set
 // from and to hand to the kernel as a module - and it is the largest thing this loader reads, so
 // reading it per use would cost another copy of it in firmware pages.
+// WHICH MODULE THE EMBEDDED SELECTION NAMES, recorded by the architecture that builds the module
+// array. A no-op unless the live image is this boot's system volume: an `Embedded` selection is what
+// gives the index a meaning, and writing one over a `Block` selection would rename a disk.
+pub(crate) fn record_embedded_root(module: u32) {
+	unsafe {
+		if ROOT_SELECTION.kind == bootproto::ROOT_EMBEDDED {
+			ROOT_SELECTION.module = module;
+		}
+	}
+}
+
 pub(crate) static mut LIVE_VOLUME: Option<&'static [u8]> = None;
 pub(crate) const LIVE_VOLUME_FILE: &str = "system-volume.img";
 
@@ -637,10 +667,16 @@ pub(crate) fn bootstrap_from_image(bs: *mut BootServices, bytes: &'static [u8]) 
 			BOOTSTRAP_SOURCE = SOURCE_LIVE_IMAGE;
 			// THE IMAGE IS THIS BOOT'S SYSTEM VOLUME, and only because no disk answered first: the
 			// guard at the top of this function is what makes an installed system win over an image
-			// lying on the medium beside it. `uuid` is carried too, so the same identity is on the
-			// wire whichever branch set it - a reader asking "which volume is this" gets one answer
-			// and not one answer per case.
-			ROOT_SELECTION = bootproto::RootSelection { kind: bootproto::ROOT_EMBEDDED, module: 0, uuid: fs.uuid() };
+			// lying on the medium beside it.
+			//
+			// `module` AND `uuid` ARE WHAT THE PROTOCOL SAYS THEY ARE. This wrote `module: 0` and the
+			// image's filesystem uuid; `RootSelection` defines this case as the INDEX of
+			// `system-volume.img` with a ZERO uuid, and on the shipping x86_64 path module zero is
+			// `init.pkg` - so the one field that names which module was chosen named a different
+			// one, and every reader sidestepped it by looking the module up by filename instead.
+			// The index is not knowable here: it is decided where the module array is built, and
+			// `record_embedded_root` is called from there.
+			ROOT_SELECTION = bootproto::RootSelection { kind: bootproto::ROOT_EMBEDDED, module: 0, uuid: [0u8; 16] };
 		},
 		abi::bootstrap::Selection::Invalid(reason) => unsafe { BOOTSTRAP_REFUSED = Some(reason) },
 		abi::bootstrap::Selection::Unavailable => {}
@@ -657,14 +693,27 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 	// A LiberFS volume that is not the one this medium is paired with is somebody else's system.
 	// Keep looking; on a machine with one volume there is nothing to skip.
 	let want = unsafe { PAIRED_UUID };
-	let Some(mut fs) = (unsafe {
-		uefi::disk::choose_volume(bs, want, |disk| {
-			let fs = liberfs::LiberFs::mount(disk).ok()?;
-			let uuid = fs.uuid();
-			Some((uuid, fs))
+	// EVERY MOUNT ERROR USED TO BE `.ok()?` - one character that turned a corrupt superblock, a
+	// device that did not answer, and a volume written by a newer build into "not a LiberFS disk",
+	// which is the one answer that lets this boot go on to the medium's own kernel. Corrupting one
+	// superblock reached the signed fallback as though the disk had been pulled out of the machine.
+	//
+	// `Unformatted` is the only error that means what the old code said: no superblock, so a blank
+	// disk or somebody else's. The other five say the disk is OURS AND BROKEN, and a broken system
+	// volume stops the boot rather than handing it to whatever else is bootable.
+	let mut fs = match unsafe {
+		uefi::disk::choose_volume(bs, want, |disk| match liberfs::LiberFs::mount(disk) {
+			Ok(fs) => {
+				let uuid = fs.uuid();
+				Ok(Some((uuid, fs)))
+			}
+			Err(liberfs::MountError::Unformatted) => Ok(None),
+			Err(_) => Err(()),
 		})
-	}) else {
-		return VolumeRead::NoVolume;
+	} {
+		uefi::disk::VolumeChoice::Chosen(fs) => fs,
+		uefi::disk::VolumeChoice::NotHere => return VolumeRead::NoVolume,
+		uefi::disk::VolumeChoice::Failed => return VolumeRead::Unreadable,
 	};
 	// A VOLUME WAS FOUND AND NOTHING NAMED IT.
 	//
@@ -718,10 +767,21 @@ pub(crate) fn read_from_system_volume(bs: *mut BootServices, path: &[u8]) -> Vol
 			// is a failure of the read rather than an absence.
 			None => VolumeRead::Unreadable,
 		},
-		// A NAME THAT IS NOT ON THE VOLUME IS THE ONE ABSENCE. Everything else the filesystem
-		// answers with - a bad extent, a short read, a disk returning an error - is the selected
-		// source failing, and the difference is what decides whether this boot may look elsewhere.
-		Err(liberfs::FsError::NotFound) => VolumeRead::NotOnVolume,
+		// A NAME THAT IS NOT ON THE VOLUME IS THE ONE ABSENCE - ON A VOLUME NOTHING SELECTED.
+		// Everything else the filesystem answers with - a bad extent, a short read, a disk returning
+		// an error - is the selected source failing, and the difference is what decides whether this
+		// boot may look elsewhere.
+		//
+		// AND A PAIRING SELECTS. When the medium's signed manifest NAMES this volume, the volume is
+		// the chosen source and M4's rule applies to it: a missing named file is `Invalid`, not
+		// absence. Without this, an attacker who could not forge a signature did not need to - leave
+		// the volume's signed manifest exactly where it is, delete the kernel from the mutable
+		// filesystem, and the loader announced "the system volume has no kernel" and booted the
+		// medium's own. The unpaired case is unchanged: a rescue stick paired with nothing, or a
+		// machine with a single volume and no pairing, may still fall back, because nothing named
+		// that volume as the source.
+		Err(liberfs::FsError::NotFound) if want.is_none() => VolumeRead::NotOnVolume,
+		Err(liberfs::FsError::NotFound) => VolumeRead::Unreadable,
 		Err(_) => VolumeRead::Unreadable,
 	}
 }

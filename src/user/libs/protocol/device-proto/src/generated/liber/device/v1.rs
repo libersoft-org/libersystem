@@ -864,6 +864,13 @@ pub struct ProviderInfo {
 	pub binding_generation: u64,
 	pub slot: u32,
 	pub provider_generation: u32,
+	/// WHETHER THIS PROVIDER IS STILL THERE. A subscription is a live stream, and a withdrawal has
+	/// to travel on it: without this the only frame the stream could carry was "here is another
+	/// one", so a consumer learned about every provider that appeared and about none that left -
+	/// and a channel whose server is gone looks exactly like one that is idle. `false` names the
+	/// publication that is going away; `slot` and `provider-generation` are what identify it, which
+	/// is why a withdrawal can be described at all after its handle has been closed.
+	pub live: bool,
 }
 
 impl ProviderInfo {
@@ -909,6 +916,7 @@ impl ProviderInfo {
 		w.u64(self.binding_generation)?;
 		w.u32(self.slot)?;
 		w.u32(self.provider_generation)?;
+		w.boolean(self.live)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<ProviderInfo> {
@@ -919,7 +927,8 @@ impl ProviderInfo {
 		let binding_generation = r.u64()?;
 		let slot = r.u32()?;
 		let provider_generation = r.u32()?;
-		Some(ProviderInfo { kind, bus, dev, func, binding_generation, slot, provider_generation })
+		let live = r.boolean()?;
+		Some(ProviderInfo { kind, bus, dev, func, binding_generation, slot, provider_generation, live })
 	}
 }
 
@@ -2548,6 +2557,13 @@ impl ProviderInfo {
 		out.push(',');
 		out.push_str("\"provider-generation\":");
 		let _ = write!(out, "{}", self.provider_generation);
+		out.push(',');
+		out.push_str("\"live\":");
+		if self.live {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -2572,10 +2588,17 @@ impl ProviderInfo {
 		out.push_str(", ");
 		out.push_str("provider-generation=");
 		let _ = write!(out, "{}", self.provider_generation);
+		out.push_str(", ");
+		out.push_str("live=");
+		if self.live {
+			out.push_str("true");
+		} else {
+			out.push_str("false");
+		}
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 7);
+		crate::codec::cbor::map(out, 8);
 		crate::codec::cbor::text(out, "kind");
 		self.kind.to_cbor_into(out);
 		crate::codec::cbor::text(out, "bus");
@@ -2590,6 +2613,8 @@ impl ProviderInfo {
 		crate::codec::cbor::uint(out, self.slot as u64);
 		crate::codec::cbor::text(out, "provider-generation");
 		crate::codec::cbor::uint(out, self.provider_generation as u64);
+		crate::codec::cbor::text(out, "live");
+		crate::codec::cbor::boolean(out, self.live);
 	}
 }
 

@@ -7,11 +7,11 @@ Error: Invariant AuthorityNeverWidens is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ outcome = "none"
+/\ lastBatch = 0
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -49,23 +49,24 @@ State 1: <Initial predicate>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 2: <Duplicate line 387, col 5 to line 398, col 162 of module Transfer>
+State 2: <Duplicate line 483, col 5 to line 494, col 165 of module Transfer>
 /\ outcome = "none"
+/\ lastBatch = 0
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 2 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -103,23 +104,24 @@ State 2: <Duplicate line 387, col 5 to line 398, col 162 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 3: <Close line 437, col 5 to line 441, col 162 of module Transfer>
+State 3: <Close line 533, col 5 to line 537, col 165 of module Transfer>
 /\ outcome = "none"
+/\ lastBatch = 0
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -157,23 +159,24 @@ State 3: <Close line 437, col 5 to line 441, col 162 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 4: <Duplicate line 387, col 5 to line 398, col 162 of module Transfer>
+State 4: <Duplicate line 483, col 5 to line 494, col 165 of module Transfer>
 /\ outcome = "none"
+/\ lastBatch = 0
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 2 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -211,14 +214,15 @@ State 4: <Duplicate line 387, col 5 to line 398, col 162 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-324 states generated, 164 distinct states found, 120 states left on queue.
+324 states generated, 165 distinct states found, 121 states left on queue.

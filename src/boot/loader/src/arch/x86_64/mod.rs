@@ -123,6 +123,15 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 		}
 		if let Some(volume) = live_volume {
 			serial::write_str("loader: live system volume handed over\n");
+			// THE INDEX THE SELECTION NAMES, RECORDED WHERE IT IS DECIDED.
+			//
+			// `RootSelection` defines `Embedded(module)` as the index of `system-volume.img` in this
+			// array, and `bootstrap_from_image` wrote `module: 0` - the index of `init.pkg` on the
+			// shipping x86_64 path - together with the image's filesystem uuid, which that case
+			// defines as zero. So the one field naming which module was chosen named a different
+			// module, and downstream code sidestepped it by looking the module up by filename. The
+			// index is not knowable where the bootstrap set is assembled; it is knowable here.
+			crate::record_embedded_root(module_count as u32);
 			*modules.add(module_count) = crate::make_module(volume, crate::LIVE_VOLUME_FILE, HHDM_OFFSET);
 			module_count += 1;
 		}

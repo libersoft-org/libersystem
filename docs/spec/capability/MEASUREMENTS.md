@@ -23,11 +23,11 @@ takes.
 | TLC | 2.19 of 08 August 2024 (rev 5a47802), from the JAR pinned in `toolchain.lock` |
 | Java | OpenJDK 25.0.4.1 (the pin's floor is 11) |
 | Result | model checking completed, no error |
-| Distinct states | 45092 |
-| Search depth | 27 |
-| Wall clock | 2 s at four workers |
-| Peak resident | 650 MiB (the JVM's default heap on this machine, not a measured requirement) |
-| `Transfer.tla` | `aeb29adfeddf0ac8…` |
+| Distinct states | 68244 |
+| Search depth | 28 |
+| Wall clock | 4 s at four workers |
+| Peak resident | 1.5 GiB (the JVM's heap on this machine, not a measured requirement) |
+| `Transfer.tla` | `f88300aea6231123…` |
 | `Capability.tla` | `3c9cd782da8819a0…` |
 | `spike.cfg` | `826bd323a669ac51…` |
 
@@ -66,10 +66,10 @@ one type to ask for.
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| Distinct states | 607859 |
+| Distinct states | 1185349 |
 | Search depth | 30 |
-| Wall clock | 17 s at four workers |
-| Peak resident | 2.1 GiB |
+| Wall clock | 38 s at four workers |
+| Peak resident | 10.4 GiB |
 | `handles.cfg` | `217315560a0f7b8a…` |
 
 `TransferIsLinear` is NOT checked here, and that is the point of the split: it counts one authority
@@ -98,10 +98,10 @@ the spike's state count is identical with and without the constant, which is how
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| Distinct states | 25320 |
+| Distinct states | 39272 |
 | Search depth | 26 |
-| Wall clock | 2 s at four workers |
-| Peak resident | 1.0 GiB |
+| Wall clock | 3 s at four workers |
+| Peak resident | 1.4 GiB |
 | `revoke-test-only.cfg` | `193ee13587a2172b…` |
 
 ### Watched to fail
@@ -121,10 +121,10 @@ cannot show an all-or-nothing rule - and it is what `FailedSendRestores` is chec
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| Distinct states | 13356126 |
-| Search depth | 36 |
-| Wall clock | not captured in the run that produced these counts |
-| Peak resident | not captured in the run that produced these counts |
+| Distinct states | 11974842 |
+| Search depth | 31 |
+| Wall clock | 6 min 20 s at four workers |
+| Peak resident | 10.5 GiB |
 | `transactions-batch.cfg` | `f33ce6d32989fd86…` |
 
 ### What the batch cost to model, and what that cost bought
@@ -153,7 +153,7 @@ This is the same defect the send side had before 2026-08-25 - `BatchMax = 2` wit
 capability - found in the half nobody looked at when that one was fixed. `Book` is now bounded by
 `BatchMax`, and six covers say the states are reached rather than merely permitted:
 `NoTwoBookings`, `NoTwoCapMessageDequeued`, `NoTwoCapsInstalled`, `NoTwoCapsPublished`,
-`NoTwoCapPayloadFailure` and `NoCloseBetweenTwoInstalls`. Each is refuted by
+`NoTwoCapPayloadFailure` and `NoBatchOfTwoDroppedIntoClosed`. Each is refuted by
 `check-model-mutations.sh`, and that refutation is the evidence.
 
 The state count rose by a factor of ten and the depth by eight, which is the shape of the answer: a
@@ -179,10 +179,10 @@ be interrupted at is what this configuration is for.
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| Distinct states | 6728673 |
-| Search depth | 37 |
-| Wall clock | 2 min 56 s at four workers |
-| Peak resident | 1.2 GiB |
+| Distinct states | 24752058 |
+| Search depth | 43 |
+| Wall clock | 13 min 30 s at four workers |
+| Peak resident | 13.2 GiB |
 | `transactions-single.cfg` | `af0f65b81bb6ecd0…` |
 
 ## `propagation.cfg`
@@ -195,10 +195,10 @@ verb. `TransferIsLinear` is not checked here for the same reason as in `handles.
 | | |
 | --- | --- |
 | Result | model checking completed, no error |
-| Distinct states | 2998061 |
+| Distinct states | 6343160 |
 | Search depth | 35 |
-| Wall clock | 1 min 24 s at four workers |
-| Peak resident | 2.4 GiB |
+| Wall clock | 3 min 44 s at four workers |
+| Peak resident | 10.7 GiB |
 | `propagation.cfg` | `dc50be81c8c75893…` |
 
 THE MOST EXPENSIVE CONFIGURATION BY AN ORDER OF MAGNITUDE, and it is the third process that costs

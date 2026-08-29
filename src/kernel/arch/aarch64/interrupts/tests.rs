@@ -1,4 +1,4 @@
-use super::{acquire_msi, bind_msi, dispatch_msi, irq_info, irq_info_len, is_bound, unbind};
+use super::{acquire_msi, bind_msi, dispatch_msi, irq_info, irq_info_len, is_bound, release_msi_for_device, unbind};
 use crate::mem::frame;
 use crate::object::interrupt::Interrupt;
 
@@ -35,9 +35,21 @@ fn gicv2m_msi_binds_and_dispatch_signals_the_driver() {
 	assert!(interrupt.is_pending(), "dispatch signalled the bound Interrupt");
 	// An INTID below the frame's SPI range (the SGI / PPI space) is not an MSI vector.
 	assert!(!dispatch_msi(0), "INTID 0 is not one of the frame's MSI SPIs");
-	// Unbinding frees the slot for re-use.
+	// UNBIND IS NOT THE TEARDOWN, and this test used to end here calling it one.
+	//
+	// `unbind` RETIRES the slot pending a later device-quiesced release: it drops the binding and the
+	// vector stays masked and held, which is deliberate - a request to stop is not proof of stopping.
+	// So "unbind, therefore the vector is released" was the gate's claim and not the code's, and M3's
+	// teardown checkpoint went unproved while the profile printed that it was satisfied.
 	unbind(vector);
 	assert!(!is_bound(vector), "unbind drops the binding");
+	// THE RELEASE IS WHAT RETURNS IT, and the proof is that the slot can be acquired again.
+	let released = release_msi_for_device(3);
+	assert!(released >= 1, "the device's retired vector is given back by the release, which is the step `unbind` deliberately does not perform");
+	let again = acquire_msi(table, 0, 3).expect("the released slot is handed out again");
+	assert_eq!(again, vector, "the SAME vector comes back - a release that hands out a different one has not returned this one");
+	unbind(again);
+	let _ = release_msi_for_device(3);
 	unsafe { frame::deallocate(table) };
 }
 

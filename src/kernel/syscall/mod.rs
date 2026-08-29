@@ -1438,6 +1438,17 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 	}
 	let key = claim.key();
 	let index = key.device_index as u64;
+	// AND A VECTOR NOTHING CAN DELIVER IS NOT HANDED OUT.
+	//
+	// A translated endpoint writes its interrupt through its own domain, so a domain with no mapping
+	// for the doorbell drops it: nothing faults, nothing is logged, and the driver waits for an
+	// interrupt that was never delivered. `attach_endpoint` records such a domain rather than refusing
+	// the attach - most drivers here poll and are unaffected - and this is the point where the
+	// difference matters, because this is where a driver asks for the interrupt.
+	if !crate::iommu::msi_deliverable(index as u32) {
+		crate::serial_println!("device: {index} is translated and its domain carries no MSI doorbell mapping - refusing to hand out a vector that could not be delivered");
+		return ERR_UNSUPPORTED;
+	}
 	let (cap, table_phys, bus, dev, func) = match device::with(index as usize, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)) {
 		Some((cap, table_phys, bus, dev, func)) if cap != 0 => (cap, table_phys, bus, dev, func),
 		_ => return ERR_INVALID,
@@ -2737,6 +2748,10 @@ fn receive_transactionally(thread: &crate::object::thread::Thread, channel: &Cha
 	// anyway: a caller told to try again can, and a loop with no ceiling inside a syscall is a
 	// place a contended endpoint could hold a core.
 	const ATTEMPTS: usize = 8;
+	// WHOSE RECEIVE THIS IS, for the conformance trace. The channel's own methods know the endpoint
+	// and not the caller, and a trace that does not say which receiver peeked cannot say that the
+	// take used the identity that receiver inspected.
+	crate::object::trace::set_actor(thread.handles().lock().trace_id());
 	for _ in 0..ATTEMPTS {
 		let (id, bytes, caps) = match channel.peek_identified() {
 			Ok(shape) => shape,

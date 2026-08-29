@@ -245,19 +245,55 @@ pub unsafe fn each_disk(bs: *mut BootServices, mut visit: impl FnMut(FirmwareDis
 // # Safety
 // `bs` must be the live `BootServices` table, before `ExitBootServices` - the same contract
 // `each_disk` below it carries, and it was safe here while being unsafe there.
-pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mut open: impl FnMut(FirmwareDisk) -> Option<([u8; 16], T)>) -> Option<T> {
+// WHY NO VOLUME WAS CHOSEN, WHICH IS TWO DIFFERENT FACTS.
+//
+// This answered `Option`, so a disk whose superblock is CORRUPT, whose read FAILED, or whose UUID was
+// altered was skipped exactly like a disk that is not a LiberFS volume at all - and exhaustion then
+// read as "the paired volume is not in this machine", which is the one answer that lets policy fall
+// back to a signed medium. So corrupting one superblock reached the fallback as though the disk were
+// absent. LiberFS distinguishes six mount errors and all of them were erased here.
+pub enum VolumeChoice<T> {
+	Chosen(T),
+	// Every disk was looked at and none carried the volume wanted. Absence.
+	NotHere,
+	// A disk answered as a LiberFS volume and FAILED - a corrupt superblock, an I/O error, or a
+	// volume whose identity did not match after it had been opened. Present and broken.
+	Failed,
+}
+
+// `open` answers `Err(())` for a disk that is a LiberFS volume and could not be used, `Ok(None)` for
+// a disk that is not one, and `Ok(Some(..))` for a volume it opened.
+pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mut open: impl FnMut(FirmwareDisk) -> Result<Option<([u8; 16], T)>, ()>) -> VolumeChoice<T> {
 	let mut chosen: Option<T> = None;
+	let mut failed = false;
 	unsafe {
 		each_disk(bs, |device| {
-			let Some((uuid, value)) = open(device) else { return false };
-			if want.is_some_and(|want| want != uuid) {
-				return false;
+			match open(device) {
+				Err(()) => {
+					// A VOLUME THAT IS HERE AND BROKEN IS REMEMBERED. The walk goes on - another disk
+					// may carry the one wanted - and if none does, the answer is `Failed` rather than
+					// `NotHere`, because something WAS there.
+					failed = true;
+					false
+				}
+				Ok(None) => false,
+				Ok(Some((uuid, value))) => {
+					if want.is_some_and(|want| want != uuid) {
+						// A volume that opened cleanly and is not the one the pairing names is not a
+						// failure: it is somebody else's disk, which is an ordinary thing to find.
+						return false;
+					}
+					chosen = Some(value);
+					true
+				}
 			}
-			chosen = Some(value);
-			true
 		})
 	};
-	chosen
+	match chosen {
+		Some(value) => VolumeChoice::Chosen(value),
+		None if failed => VolumeChoice::Failed,
+		None => VolumeChoice::NotHere,
+	}
 }
 
 // The identity a boot medium's sidecar names, parsed from its hex text.

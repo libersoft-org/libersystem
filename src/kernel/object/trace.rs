@@ -57,8 +57,21 @@ pub struct Event {
 	// model's `queue` is one channel's and a checker sharing one across channels would be checking
 	// an order that never existed. Channel identities carry the high bit so the two never collide.
 	pub party: u16,
+	// FOR A HANDLE ACTION, the slot it touched. FOR A CHANNEL ACTION, WHO TOOK THE STEP - the trace
+	// id of the handle table on whose behalf the receive is running, 0 for a send-side action that
+	// belongs to no receiver.
+	//
+	// A channel action named the endpoint and not the actor, so a checker replaying it could keep
+	// only one `peeked` and one `held` per endpoint: a second receiver's peek overwrote the first's,
+	// and the trace could no longer say that a syscall took the message THAT receiver inspected -
+	// which is the whole of `recv_identified`. The field was written as zero on every channel
+	// action, so carrying the actor in it costs no wire format.
 	pub slot: u16,
 	pub generation: u32,
+	// FOR A HANDLE ACTION, the rights the action asked for. FOR A QUEUE ACTION, THE ENDPOINT'S
+	// CONFIGURED DEPTH - `Channel::limit`, the bound the queue relation is actually against. A
+	// checker without it can only compare against the largest depth any channel may be configured
+	// with, which accepts a second pending message on a one-deep endpoint.
 	pub rights: u32,
 	// The message identity a channel action names, 0 when the action names none.
 	pub message: u64,
@@ -145,9 +158,45 @@ pub fn handle_event(action: u8, table: u16, slot: u16, generation: u32, rights: 
 	record(Event { action, outcome, party: table, slot, generation, rights, message: 0 });
 }
 
-pub fn channel_event(action: u8, endpoint: u16, message: u64, outcome: u8) {
-	record(Event { action, outcome, party: endpoint, slot: 0, generation: 0, rights: 0, message });
+// `actor` is the handle table the receive is running for, 0 for a send-side action; `depth` is the
+// endpoint's configured queue depth.
+pub fn channel_event(action: u8, endpoint: u16, message: u64, actor: u16, depth: u32, outcome: u8) {
+	record(Event { action, outcome, party: endpoint, slot: actor, generation: 0, rights: depth, message });
 }
 
 // The high bit that keeps channel identities out of the handle tables' numbering.
 pub const CHANNEL_PARTY: u16 = 0x8000;
+
+// WHICH TABLE THE RECEIVE RUNNING ON THIS CORE BELONGS TO.
+//
+// The channel methods are reached from a syscall that knows its caller and from the conformance
+// fixture that drives them directly, and neither identity is on the path: `Channel` holds an inbox
+// and a limit and has never needed to know who is asking. Rather than thread a receiver through the
+// four receive-side methods and their fifty-odd call sites - most of them tests where the receiver
+// is the only one there - the actor is announced around the receive.
+//
+// ONE GLOBAL, AND THAT IS SOUND HERE BECAUSE OF WHAT RECORDS. Recording exists only in the test
+// configuration and is switched on only around the two conformance schedules, both of which are
+// single-threaded deterministic interleavings driven from one core - which is what makes a trace
+// something a checker can replay as a sequence at all. A concurrent recording would need this
+// per-core; a concurrent recording would also not be a replayable trace.
+#[cfg(test)]
+static ACTOR: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(not(test))]
+pub fn set_actor(_id: u16) {}
+
+#[cfg(test)]
+pub fn set_actor(id: u16) {
+	ACTOR.store(id as usize, Ordering::Release);
+}
+
+#[cfg(not(test))]
+pub fn actor() -> u16 {
+	0
+}
+
+#[cfg(test)]
+pub fn actor() -> u16 {
+	ACTOR.load(Ordering::Acquire) as u16
+}

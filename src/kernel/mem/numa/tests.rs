@@ -118,3 +118,82 @@ fn a_contiguous_span_never_crosses_two_nodes() {
 	}
 	assert!(crate::mem::frame::pools_agree_with_total(), "and the span went back to the pool it came from");
 }
+
+// THE MODEL AND THE ALLOCATOR ANSWER THE SAME TRACE THE SAME WAY.
+//
+// M4 asks for a multi-node reference model driven by long deterministic traces with EVERY TOTAL
+// compared against the implementation. `topology::pools::Pools` existed and was graded only against
+// its own invariants: nothing ever fed the same operations to the kernel allocator, so the model
+// could be right about a system nobody had checked it described. A model nothing is compared with is
+// a second implementation of the same guess.
+//
+// WHAT IS COMPARED IS THE DECISION, NOT THE ADDRESS. The model owns a synthetic frame list and the
+// allocator owns the machine's, so "which frame" is meaningless across them; what has to agree is
+// which NODE a preferred allocation was served from, whether a strict one succeeded, and that the
+// counts move by exactly one each time. That is the property M4 is about - the allocator's placement
+// decisions are the model's - and it is checkable on any machine with a topology.
+crate::tagged_test!(the_reference_model_and_the_allocator_agree_over_a_trace, [Numa, Memory, Kernel], id = "kernel.mem.numa.the_reference_model_and_the_allocator_agree_over_a_trace", covers = ["kernel", "topology"]);
+fn the_reference_model_and_the_allocator_agree_over_a_trace() {
+	let Some((nodes, distances)) = crate::mem::with_topology(|found| (found.nodes().to_vec(), found.clone())) else {
+		crate::serial_println!("numa-fixture: skipped - this machine reported no topology, so there are no per-node decisions to compare");
+		return;
+	};
+	if nodes.len() < 2 {
+		crate::serial_println!("numa-fixture: skipped - one node, so every allocation is local and the model cannot disagree");
+		return;
+	}
+	// The model over a synthetic pool with the SAME topology: eight frames per node, addressed inside
+	// each node's own range so `owner_of` routes them the way the allocator's `pool_of` does.
+	let mut frames: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	for node in &nodes {
+		let base = distances.ranges().iter().find(|range| range.node == *node).map(|range| range.base).unwrap_or(0);
+		for index in 0..8u64 {
+			frames.push(base + index * crate::mem::frame::PAGE_SIZE);
+		}
+	}
+	let mut model = topology::pools::Pools::new(distances.clone(), &frames);
+
+	// A DETERMINISTIC TRACE, walked by both. Sixteen rounds over the node list: a strict allocation, a
+	// preferred one, and a free of what the preferred one returned.
+	let mut held: alloc::vec::Vec<(u64, topology::NodeId)> = alloc::vec::Vec::new();
+	for round in 0..16usize {
+		let want = nodes[round % nodes.len()];
+		// STRICT: both sides must agree on whether the requested node could serve it.
+		let real_strict = crate::mem::frame::allocate_strict(want);
+		let model_strict = model.alloc_strict(want);
+		assert_eq!(real_strict.is_some(), model_strict.is_some(), "round {round}: the allocator and the model disagree about whether node {} can serve a strict allocation", want.0);
+		if let Some(frame) = real_strict {
+			assert_eq!(crate::mem::topology_node_of(frame), topology::Affinity::Node(want), "round {round}: a STRICT allocation came from a node other than the one asked for, which is the one thing strict means");
+			// SAFETY: allocated by this call and never mapped.
+			unsafe { crate::mem::frame::deallocate(frame) };
+		}
+		if let Some(frame) = model_strict {
+			model.free(frame, Some(want));
+		}
+
+		// PREFERRED: both must land on the same NODE - the requested one while it has memory, which
+		// `alloc_strict` succeeding above has just established.
+		let Some(real) = crate::mem::frame::allocate_preferred(want) else {
+			crate::serial_println!("numa-fixture: the allocator ran out during the trace at round {round}");
+			break;
+		};
+		let Some(modelled) = model.alloc_preferred(want) else {
+			panic!("round {round}: the allocator served a preferred allocation and the model refused one - the model describes a machine with less memory than this trace uses");
+		};
+		let real_node = crate::mem::topology_node_of(real);
+		let model_node = model.owner_of(modelled).map(topology::Affinity::Node).unwrap_or(topology::Affinity::Unknown);
+		assert_eq!(real_node, model_node, "round {round}: a preferred allocation for node {} came from {real_node:?} in the allocator and {model_node:?} in the model", want.0);
+		held.push((real, want));
+		model.free(modelled, Some(want));
+		assert!(model.consistent(), "round {round}: the model's own totals stopped adding up");
+	}
+
+	// AND EVERY FRAME GOES BACK, to the pool that owns its address.
+	let retired_before = crate::mem::frame::retired_pages();
+	for (frame, _) in held {
+		// SAFETY: each was allocated by this test and never mapped.
+		unsafe { crate::mem::frame::deallocate(frame) };
+	}
+	assert_eq!(crate::mem::frame::retired_pages(), retired_before, "a frame this trace allocated could not be returned and was retired - the trace lost memory the model says it still has");
+	crate::serial_println!("    the model and the allocator agreed on every placement decision in the trace");
+}

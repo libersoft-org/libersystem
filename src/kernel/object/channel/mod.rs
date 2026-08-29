@@ -260,6 +260,7 @@ impl Channel {
 	}
 
 	fn send_inner(&self, mut msg: Message, sender: Option<&Arc<Domain>>) -> Result<(), (ChannelError, Vec<Capability>)> {
+		// See `refuse_next_enqueue_allocations`.
 		let Some(peer) = self.peer() else {
 			return Err((ChannelError::PeerClosed, msg.caps));
 		};
@@ -277,7 +278,7 @@ impl Channel {
 			//
 			// Reserved first so the failure costs nothing: a charge taken and then given back is
 			// two more places for the accounting to be wrong.
-			if inbox.try_reserve(1).is_err() {
+			if enqueue_allocation_refused() || inbox.try_reserve(1).is_err() {
 				return Err((ChannelError::Full, msg.caps));
 			}
 			// Charge only once space is assured, so a refused message charges nothing.
@@ -286,7 +287,7 @@ impl Channel {
 					return Err((ChannelError::Full, msg.caps));
 				}
 			}
-			super::trace::channel_event(super::trace::ENQUEUE, peer.trace_id, msg.id, super::trace::OK);
+			super::trace::channel_event(super::trace::ENQUEUE, peer.trace_id, msg.id, 0, peer.limit as u32, super::trace::OK);
 			inbox.push_back(msg);
 		}
 		// The peer endpoint is now readable: wake any thread blocked waiting on it.
@@ -401,7 +402,7 @@ impl Channel {
 	// longer refunded on the way out of the queue, so a message returned here was never unaccounted
 	// and the domain's `ipc_queue` figure never understated what is outstanding.
 	pub fn return_to_head(&self, mut message: Message) {
-		super::trace::channel_event(super::trace::RETURN_TO_HEAD, self.trace_id, message.id, super::trace::OK);
+		super::trace::channel_event(super::trace::RETURN_TO_HEAD, self.trace_id, message.id, super::trace::actor(), self.limit as u32, super::trace::OK);
 		{
 			let mut inbox = self.inbox.lock();
 			// Back into the slot it never gave up: the reservation becomes a queued message again,
@@ -422,7 +423,7 @@ impl Channel {
 	// well before the caller knows whether it can take it. Past here the message cannot go back, so
 	// this is the only place besides `return_to_head` where a receive ends.
 	pub fn commit_delivery(&self, message: &mut Message) {
-		super::trace::channel_event(super::trace::COMMIT_DELIVERY, self.trace_id, message.id, super::trace::OK);
+		super::trace::channel_event(super::trace::COMMIT_DELIVERY, self.trace_id, message.id, super::trace::actor(), self.limit as u32, super::trace::OK);
 		message.release_queue_charge();
 		let freed = {
 			let inbox = self.inbox.lock();
@@ -462,7 +463,7 @@ impl Channel {
 			}
 		};
 		if let Some(msg) = popped {
-			super::trace::channel_event(super::trace::DEQUEUE, self.trace_id, msg.id, super::trace::OK);
+			super::trace::channel_event(super::trace::DEQUEUE, self.trace_id, msg.id, super::trace::actor(), self.limit as u32, super::trace::OK);
 			// As above: the charge travels with the message and is released when delivery commits.
 			return Ok(msg);
 		}
@@ -489,7 +490,7 @@ impl Channel {
 	// The same, plus the identity that lets a caller act on the message it just looked at.
 	pub fn peek_identified(&self) -> Result<(u64, usize, usize), ChannelError> {
 		if let Some(msg) = self.inbox.lock().front() {
-			super::trace::channel_event(super::trace::PEEK, self.trace_id, msg.id, super::trace::OK);
+			super::trace::channel_event(super::trace::PEEK, self.trace_id, msg.id, super::trace::actor(), self.limit as u32, super::trace::OK);
 			return Ok((msg.id, msg.bytes.len(), msg.caps.len()));
 		}
 		if self.is_peer_closed() { Err(ChannelError::PeerClosed) } else { Err(ChannelError::Empty) }
@@ -538,3 +539,32 @@ impl Drop for Channel {
 
 #[cfg(test)]
 mod tests;
+
+// AN ALLOCATION THAT FAILS AT THE PHASE IT REALLY FAILS AT, ARMED ON PURPOSE.
+//
+// `inbox.try_reserve(1)` in `send_inner` is this kernel's answer to a short heap on the busiest
+// syscall path there is, and nothing could reach it: seeing the branch means exhausting the
+// machine's heap, and a test that has exhausted the heap cannot then assert anything about what the
+// refusal left behind - which is the half that matters, because a send that fails here has already
+// taken every capability out of the caller's table.
+//
+// So the branch is ARMED rather than simulated. It is the same branch and the same return; what the
+// switch decides is whether it is taken. Present only in the test configuration, and the production
+// build compiles the constant-false arm away.
+#[cfg(test)]
+static REFUSE_ENQUEUE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn refuse_next_enqueue_allocations(count: usize) {
+	REFUSE_ENQUEUE_ALLOCATIONS.store(count, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+fn enqueue_allocation_refused() -> bool {
+	REFUSE_ENQUEUE_ALLOCATIONS.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| left.checked_sub(1)).is_ok()
+}
+
+#[cfg(not(test))]
+fn enqueue_allocation_refused() -> bool {
+	false
+}

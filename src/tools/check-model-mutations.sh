@@ -134,18 +134,16 @@ run_mutation closed-table-restores spike ClosedProcessCannotResurrect \
 
 # 5. A receive takes whatever is at the head rather than the message it inspected.
 run_mutation dequeue-by-position transactions-single MessageIdentityStable \
-	'    /\ peeked = Head(queue).id' \
+	'    /\ peeked[p] = Head(queue).id' \
 	'    /\ TRUE' || status=1
 
 # 6. An install does not consume the booking it used, so one booking installs twice - and the index
 #    it named is Live and booked at once, which is what `SlotOwnershipUnique` is for.
 run_mutation install-keeps-booking spike SlotOwnershipUnique \
-	"       /\\ table' = [table EXCEPT ![p][i] = [state |-> \"Live\", cap |-> Head(held.caps), gen |-> table[p][i].gen]]
-       /\\ booked' = [booked EXCEPT ![p] = Tail(booked[p])]
-       /\\ installed' = Append(installed, i)" \
-	"       /\\ table' = [table EXCEPT ![p][i] = [state |-> \"Live\", cap |-> Head(held.caps), gen |-> table[p][i].gen]]
-       /\\ UNCHANGED booked
-       /\\ installed' = Append(installed, i)" || status=1
+	"          /\\ booked' = [booked EXCEPT ![p] = SubSeq(booked[p], n + 1, Len(booked[p]))]
+          /\\ installed' = [installed EXCEPT ![p] = installed[p] \\o at]" \
+	"          /\\ UNCHANGED booked
+          /\\ installed' = [installed EXCEPT ![p] = installed[p] \\o at]" || status=1
 
 # THE COVER PROPERTIES, EACH ONE REQUIRED TO BE REFUTED. An invariant that passes because its
 # dangerous action is never enabled is a failed gate, and a passing run does not say which of the two
@@ -196,7 +194,7 @@ done
 # receiver at one booking while `Dequeue` demands one per capability, so a two-capability message
 # could be built and never taken. Every rule about installing two, publishing two, rolling two back
 # and closing between the two was checked over a batch of one.
-for name in NoTwoBookings NoTwoCapMessageDequeued NoTwoCapsInstalled NoTwoCapsPublished NoTwoCapPayloadFailure NoCloseBetweenTwoInstalls; do
+for name in NoTwoBookings NoTwoCapMessageDequeued NoTwoCapsInstalled NoTwoCapsPublished NoTwoCapPayloadFailure NoBatchOfTwoDroppedIntoClosed; do
 	cover "$name" transactions-batch || status=1
 done
 # And the queue really holds more than one message where the configuration says it does - which is

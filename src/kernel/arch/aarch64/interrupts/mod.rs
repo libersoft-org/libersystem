@@ -111,10 +111,24 @@ fn device_itt(devid: u32) -> Option<u64> {
 				return None;
 			};
 			unsafe { core::ptr::write_bytes(super::paging::phys_to_virt(frame) as *mut u8, 0, 4096) };
-			ITT_FRAME[slot].store(frame, Ordering::Release);
+			// MAPPED FIRST, PUBLISHED SECOND.
+			//
+			// This stored the frame and THEN issued MAPD, and left both published when MAPD failed -
+			// so a later acquisition for the same DeviceID took that frame straight out of the cache
+			// at the top of this function and went on to MAPTI as though MAPD had been confirmed. An
+			// unconfirmed controller operation reused as a confirmed one is precisely what M3 forbids,
+			// and it applies to a bounded command failure and to an explicit MAPD refusal alike.
+			//
+			// A FAILED MAPD GIVES EVERYTHING BACK: the slot is released so the id can be tried again,
+			// and the frame goes back to the allocator, because nothing was ever told about it.
 			if !super::its::map_device(devid, MAX_MSI as u32, frame) {
+				held.store(u32::MAX, Ordering::Release);
+				// SAFETY: allocated by this call, never mapped into any address space, and the ITS
+				// was not told about it - the MAPD is what failed.
+				unsafe { crate::mem::frame::deallocate(frame) };
 				return None;
 			}
+			ITT_FRAME[slot].store(frame, Ordering::Release);
 			return Some(frame);
 		}
 	}
@@ -253,8 +267,20 @@ fn program_acquired(slot: usize, table_phys: u64, owner: u32) -> Option<u32> {
 		// the order is: give the device an ITT, map its event to this LPI, and only then write the
 		// MSI-X entry that lets it write at all.
 		let lpi = super::its::LPI_BASE + slot as u32;
-		let devid = its_devid(owner)?;
-		let itt = device_itt(devid)?;
+		// A REFUSAL GIVES THE SLOT BACK. These two exits used `?` on a slot `REGISTRY.acquire*` had
+		// already marked USED, so a requester outside `msi-map`, an exhausted ITT table, a failed
+		// allocation or a refused MAPD each consumed one of the sixty-four MSI slots and returned
+		// `None`. Repeated SAFE refusals - the ones a hostile or misconfigured device produces on
+		// purpose - exhausted the controller. `map_event` below already frees on failure; these did
+		// not, and the difference was invisible because both answer the caller the same way.
+		let Some(devid) = its_devid(owner) else {
+			REGISTRY.free(slot);
+			return None;
+		};
+		let Some(itt) = device_itt(devid) else {
+			REGISTRY.free(slot);
+			return None;
+		};
 		let _ = itt;
 		if !super::its::map_event(devid, slot as u32, lpi) {
 			ITS_STALLED.store(true, Ordering::Release);
@@ -340,14 +366,21 @@ pub fn dispatch_msi(intid: u32) -> bool {
 // window (each a device's per-device SPI) follows.
 // Free every MSI vector that is masked and waiting for `device` to be confirmed stopped, and answer
 // how many. Reached from `SYS_DEVICE_QUIESCED`.
+// How many MSI slots this device still holds. See `MsiRegistry::held_by_device`.
+pub fn msi_held_by_device(device: u32) -> usize {
+	REGISTRY.held_by_device(device)
+}
+
 pub fn release_msi_for_device(device: u32) -> usize {
 	REGISTRY.release_for_device(device)
 }
 
 pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
-	const TIMER_INTID: u32 = 30; // mirrors gic::TIMER_INTID (the EL1 physical-timer PPI)
+	// FROM THE MACHINE, like the controller's addresses. This mirrored a compiled constant, so the
+	// inventory reported an interrupt the tree may never have named.
+	let timer_intid: u32 = super::gic::timer_intid_for_report();
 	if index == 0 {
-		return Some(abi::IrqInfo { vector: TIMER_INTID, kind: abi::IRQ_KIND_FIXED, bound: 1, device: abi::IRQ_NO_DEVICE });
+		return Some(abi::IrqInfo { vector: timer_intid, kind: abi::IRQ_KIND_FIXED, bound: 1, device: abi::IRQ_NO_DEVICE });
 	}
 	let slot = index - 1;
 	let len = MSI_LEN.load(Ordering::Relaxed);

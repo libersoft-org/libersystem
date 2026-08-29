@@ -39,6 +39,25 @@ if ! printf '%s\n' "$code" | grep -q 'MAX_PROVIDERS'; then
 	echo "provider-slots: DeviceManager no longer names MAX_PROVIDERS - the catalogue is what bounds providers" >&2
 	fail=1
 fi
+# AND THE NUMBER IS THE REGISTRY'S, NOT THIS FILE'S.
+#
+# Requiring the symbol was all this checked, so `const MAX_PROVIDERS: usize = 32;` written here
+# satisfied it - which is the same fixed-slot defect the numbered locals were, with a larger
+# constant, and the definition of done says the count is bounded by what drivers DECLARE and by
+# nothing compiled into DeviceManager. A definition in this file is that constant coming back.
+if offenders="$(printf '%s\n' "$code" | grep -nE '^[[:space:]]*const[[:space:]]+MAX_PROVIDERS')"; then
+	echo "provider-slots: DeviceManager DEFINES MAX_PROVIDERS:" >&2
+	printf '%s\n' "$offenders" >&2
+	echo "    The bound is the sum of every 'provides' declaration in the registry, emitted by" >&2
+	echo "    build.rs beside the registry itself. A number written here is one the manifest cannot" >&2
+	echo "    move: an image declaring more loses a publication, one declaring fewer carries slots" >&2
+	echo "    it can never fill, and neither is something a reader of the manifest would expect." >&2
+	fail=1
+fi
+if ! grep -q 'MAX_PROVIDERS' "$(dirname "$0")/../user/services/core/build.rs"; then
+	echo "provider-slots: build.rs no longer emits MAX_PROVIDERS - nothing derives the bound from the registry" >&2
+	fail=1
+fi
 if ! printf '%s\n' "$code" | grep -q 'BOOT_BLOCK_TAGS'; then
 	echo "provider-slots: the boot hand-off's block tags are no longer one named list" >&2
 	fail=1

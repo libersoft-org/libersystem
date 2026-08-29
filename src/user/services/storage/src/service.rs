@@ -185,6 +185,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			} else {
 				None
 			};
+			// NOTHING CHOSEN PROMOTES NOTHING, and that is a rule about the KIND before it is one
+			// about the uuid.
+			//
+			// The comparison below was reached only when the kind was already `ROOT_BLOCK`, so a
+			// boot whose loader chose NO volume - `ROOT_NONE`, the answer on a machine whose medium
+			// names no system volume - fell past it and this instance mounted and served whatever
+			// block device it had been handed as `vol://system` for the life of the boot. That is
+			// the opposite of what the selection is for: a promotion the loader declined, performed
+			// by the service that was told about the declining.
+			if let Some((kind, _)) = chosen
+				&& kind != ROOT_BLOCK
+			{
+				unsafe { print(b"StorageService: the loader promoted no block volume for this boot - refusing to serve one as the system volume\n") };
+				exit();
+			}
 			match unsafe { mount_system_volume(handle) } {
 				Some(fs) => {
 					// THE MOUNT IS REFUSED ON A MISMATCH, and that is the whole point of carrying
@@ -192,8 +207,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// nothing else, so an instance that mounted a volume the loader did not choose
 					// has mounted somebody else's system - and would serve it as `vol://system` for
 					// the life of the boot.
-					if let Some((kind, want)) = chosen
-						&& kind == ROOT_BLOCK
+					if let Some((_, want)) = chosen
 						&& fs.uuid() != want
 					{
 						unsafe { print(b"StorageService: the volume this instance mounted is not the one the loader chose - refusing to serve it as the system volume\n") };

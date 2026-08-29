@@ -149,9 +149,20 @@ grep -aq "iommu: .* attached to domain" "$traffic" || {
 	grep -a -m 10 "iommu:" "$traffic" >&2 || true
 	exit 1
 }
-grep -aq "NetworkService: online" "$traffic" || {
+# THE DRIVER'S OWN LINE, WHICH IS THE ONE THAT REACHES THIS CONSOLE.
+#
+# This asked for `NetworkService: online`, and that string never appears on the serial console at all:
+# a service reports in by SENDING that text to its supervisor, `ServiceManager` relays it to
+# SystemManager over a channel, and SystemManager does not print it. So the assertion could not pass on
+# any boot - and the recorded history for this gate is three runs and three failures, which is what
+# that looks like from outside.
+#
+# `driver.virtio-net: online (bb:dd.f)` is the driver's own report, written to the console by the
+# driver, and it says the thing this phase is about: the NIC bound and came up while its endpoint was
+# behind the enforcing controller. The DHCP assertion below is what proves packets then crossed.
+grep -aq "driver.virtio-net: online (" "$traffic" || {
 	echo "qemu-virtio-iommu: virtio-net did not come up behind the enforcing controller" >&2
-	grep -a -m 10 "virtio_net\|devmgr\|iommu:" "$traffic" >&2 || true
+	grep -a -m 10 "virtio.net\|DeviceManager:\|iommu:" "$traffic" >&2 || true
 	exit 1
 }
 # AND PACKETS ACTUALLY CROSSED, which "the service is online" does not say. This used to end at the

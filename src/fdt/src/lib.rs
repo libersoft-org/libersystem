@@ -90,6 +90,18 @@ pub struct BootInfo {
 	// no GIC and cannot claim a timer interrupt, which is a refusal rather than a default.
 	pub gic_dist: u64,
 	pub gic_dist_size: u64,
+	// THE TIMER'S OWN INTERRUPT, READ FROM THE TREE RATHER THAN COMPILED IN.
+	//
+	// The backend held `const TIMER_INTID: u32 = 30` with a comment naming QEMU `virt`, and nothing
+	// decoded the ARM timer node at all - so a tree naming another PPI, or omitting the interrupt
+	// this kernel uses, was ACCEPTED and the kernel enabled 30 regardless. `/timer` carries four
+	// triples (secure, non-secure EL1 physical, virtual, hypervisor); this reader takes the SECOND,
+	// which is the EL1 physical timer the kernel programs.
+	//
+	// Zero means the tree named no timer interrupt this reader could decode, which is a refusal for
+	// the caller to make rather than a number to default.
+	pub timer_intid: u32,
+	pub _pad_timer: u32,
 	pub gic_cpu: u64,
 	pub gic_cpu_size: u64,
 	// 2 for a GICv2 (`arm,cortex-a15-gic` / `arm,gic-400`), 3 for a GICv3, 0 for neither. The
@@ -677,6 +689,9 @@ impl Fdt {
 			let mut numa_distances = [(0u32, 0u32, 0u8); MAX_NUMA_CELLS];
 			let mut numa_distance_count = 0usize;
 			let mut numa_distance_malformed = false;
+			let mut in_timer = false;
+			let mut timer_intid: u32 = 0;
+			let mut timer_compatible = false;
 			// The versioned binding, which this reader never checked: entering distance-map mode on
 			// the node NAME alone accepts any future or foreign map as if it were this one.
 			let mut distance_map_versioned = false;
@@ -760,6 +775,8 @@ impl Fdt {
 							// property of anything. QEMU emits it as `/distance-map` when the
 							// machine was given distances.
 							in_distance_map = self.str_eq(name, "distance-map");
+							// The ARM generic timer, a root child on every machine that has one.
+							in_timer = self.str_eq(name, "timer");
 							if in_distance_map {
 								distance_map_versioned = false;
 							}
@@ -941,6 +958,16 @@ impl Fdt {
 								// distributor would write the CPU interface. Checked here, where
 								// both are known, rather than at the first MMIO write.
 								&& !ranges_overlap(dist_phys, dist_size, cpu_phys, cpu_size)
+								// AND BIG ENOUGH TO HOLD THE REGISTERS THE DRIVER WRITES.
+								//
+								// Non-zero was the whole size check, so a ONE-BYTE distributor was
+								// accepted - and the driver then writes `GICD_IROUTER` at offset
+								// 0x6000 and the GICv2 CPU interface at 0x10, far outside the window
+								// the machine declared. A range that cannot hold the registers is a
+								// machine description that is wrong, and the first MMIO write is a
+								// bad place to find that out.
+								&& dist_size >= MIN_GIC_DIST_SIZE
+								&& cpu_size >= MIN_GIC_CPU_SIZE
 							{
 								gic_dist = dist_phys;
 								gic_dist_size = dist_size;
@@ -1061,6 +1088,20 @@ impl Fdt {
 							d1_memory_node = self.be32(val);
 						} else if depth == 2 && in_cpu && len == 4 && self.str_eq(pname, "numa-node-id") {
 							cpu_node_id = self.be32(val);
+						} else if in_timer && self.str_eq(pname, "compatible") {
+							// `arm,armv8-timer` (or the v7 name) is the node this reader decodes.
+							timer_compatible = self.stringlist_contains(val, len, b"arm,armv8-timer") || self.stringlist_contains(val, len, b"arm,armv7-timer");
+						} else if in_timer && self.str_eq(pname, "interrupts") && len >= 24 {
+							// FOUR TRIPLES: secure EL1, NON-SECURE EL1, virtual, hypervisor. Each is
+							// (kind, number, flags) with kind 1 = PPI, and a PPI's INTID is its number
+							// plus 16. The kernel programs the non-secure EL1 PHYSICAL timer, which is
+							// the second triple - taking the first would arm the secure one, which is
+							// not this kernel's to arm.
+							let kind = self.be32(val + 12);
+							let number = self.be32(val + 16);
+							if kind == 1 {
+								timer_intid = number + 16;
+							}
 						} else if in_distance_map && self.str_eq(pname, "compatible") {
 							// THE VERSIONED BINDING. `numa-distance-map-v1` is what this reader
 							// implements; a node named `distance-map` carrying something else is a
@@ -1292,7 +1333,12 @@ impl Fdt {
 			if numa_distance_count > 0 && !distance_map_versioned {
 				numa_distance_malformed = true;
 			}
-			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, ram_region_nodes, cpu_count: cpu_count.max(1), cpu_ids, cpu_node_ids, numa_distances, numa_distance_count, numa_distance_malformed, cpu_nodes, pcie_ecam, plic_base, gic_dist, gic_dist_size, gic_cpu, gic_cpu_size, gic_version, gic_msi, gic_msi_size, gic_its, gic_its_size, pci_msi_rid_base, pci_msi_devid_base, pci_msi_length, imsic_base, imsic_size, imsic_guest_index_bits, imsic_group_index_bits, imsic_num_ids, imsic_harts, imsic_hart_count, fwcfg_base, modules_start, modules_end })
+			// A TIMER NODE THIS READER DID NOT RECOGNISE NAMES NO INTERRUPT. Zero is "the tree said
+			// nothing I could decode", which the caller refuses on rather than defaulting.
+			if !timer_compatible {
+				timer_intid = 0;
+			}
+			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, ram_region_nodes, cpu_count: cpu_count.max(1), cpu_ids, cpu_node_ids, numa_distances, numa_distance_count, numa_distance_malformed, timer_intid, _pad_timer: 0, cpu_nodes, pcie_ecam, plic_base, gic_dist, gic_dist_size, gic_cpu, gic_cpu_size, gic_version, gic_msi, gic_msi_size, gic_its, gic_its_size, pci_msi_rid_base, pci_msi_devid_base, pci_msi_length, imsic_base, imsic_size, imsic_guest_index_bits, imsic_group_index_bits, imsic_num_ids, imsic_harts, imsic_hart_count, fwcfg_base, modules_start, modules_end })
 		}
 	}
 }
@@ -1378,6 +1424,16 @@ struct Bus {
 // Do two physical ranges share a byte? Written as one function because two callers - the
 // controller's own pair, and a caller checking a frame against them - must answer it the same way,
 // and because an end computed with `+` wraps where this cannot.
+// THE SMALLEST WINDOWS THE DRIVERS ACTUALLY REACH INTO.
+//
+// Taken from the offsets the aarch64 backend writes, not from the specification's maximum: a machine
+// may legitimately declare a smaller distributor than the architecture allows, and refusing that would
+// refuse a real controller. What cannot be legitimate is a window smaller than the registers this
+// kernel writes into it - `GICD_IROUTER` sits at 0x6000, and a GICv2 CPU interface's `GICC_EOIR` at
+// 0x10 - because those are stores outside the range the machine declared.
+const MIN_GIC_DIST_SIZE: u64 = 0x7000;
+const MIN_GIC_CPU_SIZE: u64 = 0x1000;
+
 fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
 	let (a_end, b_end) = match (a.checked_add(a_len), b.checked_add(b_len)) {
 		(Some(x), Some(y)) => (x, y),

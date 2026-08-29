@@ -29,6 +29,16 @@ fn imsic_msi_binds_and_dispatch_signals_the_driver() {
 	// Unbinding frees the slot for re-use.
 	unbind(vector);
 	assert!(!is_bound(vector), "unbind drops the binding");
+	// UNBIND IS NOT THE TEARDOWN. It RETIRES the slot pending a later device-quiesced release - the
+	// vector stays masked and held, because a request to stop is not proof of stopping. So a test
+	// that ends at `unbind` proves the binding was dropped and says nothing about the vector being
+	// returned, which is the checkpoint the profile gate prints as satisfied.
+	let released = super::release_msi_for_device(3);
+	assert!(released >= 1, "the device's retired vector is given back by the release, which is the step `unbind` deliberately does not perform");
+	let again = acquire_msi(table, 0, 3).expect("the released slot is handed out again");
+	assert_eq!(again, vector, "the SAME vector comes back - a release that hands out a different one has not returned this one");
+	unbind(again);
+	let _ = super::release_msi_for_device(3);
 	unsafe { frame::deallocate(table) };
 }
 
@@ -169,18 +179,18 @@ fn a_machine_whose_imsic_this_kernel_refused_hands_out_no_msi_vector() {
 		assert!(crate::arch::imsic::usable(), "a refusal on its own does not disarm - the boot path does, and that is what the next line drives");
 		crate::arch::imsic::disarm();
 		assert!(!crate::arch::imsic::usable(), "the boot's answer to a refusal is to take the MSI path out of service");
-		assert!(acquire_msi(table, 0, 21).is_none(), "and a disarmed machine hands out no vector rather than programming the address it refused: {what}");
+		assert!(acquire_msi(table, 0, 3).is_none(), "and a disarmed machine hands out no vector rather than programming the address it refused: {what}");
 		crate::arch::imsic::set_usable_for_test(true);
 		crate::arch::imsic::configure_layout(&accepted).expect("the machine this test runs on is still the one it started on");
 	}
 
 	crate::arch::imsic::set_usable_for_test(false);
-	assert!(acquire_msi(table, 0, 21).is_none(), "a refused machine hands out no vector rather than programming the address it refused");
+	assert!(acquire_msi(table, 0, 3).is_none(), "a refused machine hands out no vector rather than programming the address it refused");
 
 	// AND THE REGISTRY IS NOT LEFT HOLDING THE SLOT. A refusal that consumed an EID would run the
 	// machine out of vectors on a path that never delivers one.
 	crate::arch::imsic::set_usable_for_test(true);
-	let vector = acquire_msi(table, 0, 21).expect("and the same acquire works once the machine is usable again");
+	let vector = acquire_msi(table, 0, 3).expect("and the same acquire works once the machine is usable again");
 	release_msi_for_device(21);
 	assert!(!is_bound(vector));
 

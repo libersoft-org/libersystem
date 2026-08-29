@@ -150,3 +150,52 @@ fn closing_a_handle_never_needs_an_allocation() {
 	table.close_all();
 	assert!(table.free_capacity_for_test() >= table.slot_count_for_test(), "close_all rebuilt the free list within the reserved capacity");
 }
+
+crate::tagged_test!(a_slot_at_the_generation_ceiling_is_retired_and_never_handed_out_again, [Handle, Object, Kernel], id = "kernel.object.handle.a_slot_at_the_generation_ceiling_is_retired_and_never_handed_out_again", covers = ["kernel"]);
+fn a_slot_at_the_generation_ceiling_is_retired_and_never_handed_out_again() {
+	// THE GENERATION CEILING, THROUGH THE CONCRETE SEAM RATHER THAN THE MODEL'S.
+	//
+	// `StaleHandlesStayDead` is checked in TLC against a `MaxGen` of three, and nothing here drove
+	// `retire_or_recycle`'s other arm: reaching `u32::MAX` by churning handles is four billion
+	// close-and-open cycles, so the branch that STOPS incrementing - and refuses to put the index
+	// back on the free list - had no test at all. What it prevents is a raw handle coming back
+	// round: the index reused at a generation a previously-closed handle already carries, so a
+	// value userspace still holds would name a capability it was never given.
+	let mut table = HandleTable::new();
+
+	let doomed = table.insert_object(TestObject::new(1), Rights::ALL);
+	let index = doomed.index() as usize;
+	assert!(table.age_slot_to_ceiling(doomed), "the slot is there to age");
+	assert_eq!(table.slot_generation(index), Some(u32::MAX), "and it stands at the ceiling");
+	let slots_before = table.slot_count();
+
+	// A handle naming the ceiling generation is an ordinary live handle: it is the RECYCLE that is
+	// refused, not the use.
+	let at_ceiling = Handle::from_raw(((u32::MAX as u64) << 32) | index as u64);
+	assert!(table.lookup(at_ceiling, Rights::READ).is_ok(), "a slot at the ceiling is still usable while it holds something");
+
+	table.close(at_ceiling).expect("a live handle closes");
+
+	// THE INDEX IS GONE. Every insert from here appends rather than reusing it, and the retired
+	// slot's generation never moves - it cannot, because there is nothing above `u32::MAX` and
+	// wrapping is precisely the failure.
+	for n in 2..=8u64 {
+		let handle = table.insert_object(TestObject::new(n), Rights::ALL);
+		assert_ne!(handle.index() as usize, index, "the retired slot was handed out again at insert {n}");
+	}
+	assert_eq!(table.slot_generation(index), Some(u32::MAX), "the retired slot's generation never moved");
+	assert!(table.slot_count() > slots_before, "the table grew rather than reusing the retired index");
+
+	// AND THE OLD VALUE NAMES NOTHING. The handle userspace was holding is refused rather than
+	// resolving to whatever the index now carries.
+	assert!(matches!(table.lookup(at_ceiling, Rights::READ), Err(HandleError::BadHandle)), "the closed ceiling handle names nothing");
+
+	// A slot BELOW the ceiling is recycled, which is what says the refusal above is the ceiling and
+	// not a table that stopped recycling altogether.
+	let ordinary = table.insert_object(TestObject::new(9), Rights::ALL);
+	let ordinary_index = ordinary.index() as usize;
+	table.close(ordinary).expect("close");
+	let reused = table.insert_object(TestObject::new(10), Rights::ALL);
+	assert_eq!(reused.index() as usize, ordinary_index, "an ordinary slot comes back round");
+	assert_ne!(reused.raw(), ordinary.raw(), "under a new handle value, because its generation moved");
+}

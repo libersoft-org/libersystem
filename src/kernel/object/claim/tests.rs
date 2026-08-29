@@ -126,6 +126,41 @@ fn ending_a_claim_takes_the_mapping_and_not_just_the_handle() {
 	assert_eq!(device::derived_rows(), rows, "a released claim leaves nothing behind in the registry");
 }
 
+// A CLAIM'S SNAPSHOT SAYS WHAT IT STILL HOLDS, so a manager that did not make the binding can
+// reconstruct the charge instead of starting it at zero.
+//
+// `DeviceClaimSnapshot` carried the state, the generation and the release deadline and nothing else,
+// while `granted_resources` - DeviceManager's own count - counts the RESOURCE frames IT sent during
+// the CURRENT bind. A reconstructed node has sent none, so it reported a binding charged with nothing
+// while the kernel held its MMIO window. M0165's M5 asks for the device-specific holdings to be
+// reconstructable from this snapshot, and this is the fixture for it.
+crate::tagged_test!(a_claims_snapshot_names_what_it_still_holds, [Object, Kernel, Pci], id = "kernel.object.claim.a_claims_snapshot_names_what_it_still_holds", covers = ["kernel"]);
+fn a_claims_snapshot_names_what_it_still_holds() {
+	use crate::object::KernelObject;
+	use crate::object::device_memory::DeviceMemory;
+	let index = device::add_synthetic_device();
+
+	// NOTHING HELD BEFORE ANYBODY CLAIMS IT, which is the baseline a restart is compared against.
+	let free = device::snapshot(index).expect("a slot exists for a device the table has");
+	assert_eq!(free.mmio_windows, 0, "an unclaimed device holds no window");
+	assert_eq!(free.irq_vectors, 0, "an unclaimed device holds no vector");
+	assert_eq!(free.iommu_grants, 0, "an unclaimed device holds no grant");
+
+	let key = device::claim(index).expect("claimed");
+	let memory = DeviceMemory::for_claim(key, 0xfeed_2000, 0x1000).expect("a device memory");
+	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>))), "recorded as derived");
+
+	// AND NOW IT NAMES THE WINDOW. Counted from the kernel's own record of what was minted under this
+	// key, rather than from a number somebody remembered to keep in step.
+	let held = device::snapshot(index).expect("the slot is still there");
+	assert_eq!(held.mmio_windows, 1, "the claim derived one MMIO window and its snapshot has to say so - this is what a new manager reconstructs from");
+	assert_eq!(held.generation, key.generation, "and the snapshot is about THIS binding");
+
+	device::release_claim(key).expect("released");
+	let after = device::snapshot(index).expect("the slot outlives the claim");
+	assert_eq!(after.mmio_windows, 0, "a released claim holds no window - the post-restart baseline is zero, which is the whole point of being able to read it");
+}
+
 crate::tagged_test!(a_capability_from_a_previous_binding_cannot_speak_for_this_one, [Object, Kernel, Pci, Dma], id = "kernel.object.claim.a_capability_from_a_previous_binding_cannot_speak_for_this_one", covers = ["kernel"]);
 fn a_capability_from_a_previous_binding_cannot_speak_for_this_one() {
 	// `SYS_DEVICE_QUIESCED`'s whole authority is "the holder of this capability has just reset the

@@ -705,3 +705,290 @@ fn a_boot_that_published_no_window_bounds_nothing_by_it() {
 	assert!(IncidentWindow::deadline(0, 3, 500, 10) == 0);
 	assert!(IncidentWindow::deadline(300, 0, 500, 10) == 0);
 }
+
+// ------------------------------------------------------------- M7's resource-invariant fault cases
+//
+// EVERY ONE OF THESE IS A BIND THAT FAILED, AND WHAT IT MAY NOT COST.
+//
+// The fault cases here used to walk a `BindingRecord` through abstract states: they never
+// instantiated the transaction, never failed it at a step, and never asked what was still held - so
+// two handles that a real rollback leaked (the driver's end of the bootstrap channel, and every
+// resource acquired and not yet sent) were invisible to a suite that passed. The ledger is testable
+// now, and a `Closes` that RECORDS rather than acts is what makes "closed exactly once, in this
+// order, and nothing left" a thing a machine checks rather than a sentence in a comment.
+
+use super::{Closes, Holdings, Settled};
+
+// What a rollback did, in the order it did it. FIXED ARRAYS, because this crate is `no_std` and a
+// test that needed a heap would be a test that could not run where the code does.
+const LEDGER_MAX: usize = 16;
+
+struct Ledger {
+	killed: [u64; LEDGER_MAX],
+	killed_n: usize,
+	closed: [u64; LEDGER_MAX],
+	closed_n: usize,
+	released: [u64; LEDGER_MAX],
+	released_n: usize,
+	domains: [u64; LEDGER_MAX],
+	domains_n: usize,
+	// What the release answers. `None` is a release still running - the answer arrives on the claim
+	// handle - which is the case the deadline exists for.
+	release_answer: Option<u32>,
+}
+
+impl Ledger {
+	fn new(release_answer: Option<u32>) -> Self {
+		Self { killed: [0; LEDGER_MAX], killed_n: 0, closed: [0; LEDGER_MAX], closed_n: 0, released: [0; LEDGER_MAX], released_n: 0, domains: [0; LEDGER_MAX], domains_n: 0, release_answer }
+	}
+	fn closed_once(&self, handle: u64) -> bool {
+		self.closed[..self.closed_n].iter().filter(|&&h| h == handle).count() == 1
+	}
+	fn closed_any(&self, handle: u64) -> bool {
+		self.closed[..self.closed_n].contains(&handle)
+	}
+	// WHERE IN THE SEQUENCE a handle was closed, so ORDER can be asserted and not just membership.
+	fn closed_at(&self, handle: u64) -> Option<usize> {
+		self.closed[..self.closed_n].iter().position(|&h| h == handle)
+	}
+}
+
+impl Closes for Ledger {
+	fn kill(&mut self, process: u64) {
+		self.killed[self.killed_n] = process;
+		self.killed_n += 1;
+	}
+	fn close(&mut self, handle: u64) {
+		self.closed[self.closed_n] = handle;
+		self.closed_n += 1;
+	}
+	fn release(&mut self, claim: u64) -> Option<u32> {
+		self.released[self.released_n] = claim;
+		self.released_n += 1;
+		self.release_answer
+	}
+	fn kill_domain(&mut self, domain: u64) {
+		self.domains[self.domains_n] = domain;
+		self.domains_n += 1;
+	}
+}
+
+fn free_ledger() -> Ledger {
+	Ledger::new(Some(super::CLAIM_FREE))
+}
+
+#[test]
+fn a_bind_that_fails_before_the_claim_leaves_nothing_and_takes_no_device() {
+	// THE CLAIM STEP. Nothing has been taken, so nothing is released and nothing is quarantined -
+	// but a Domain may already exist, and a Domain nobody kills is a subtree charged to this manager
+	// for ever.
+	let mut held = Holdings::new();
+	held.domain = 0x10;
+	held.channel = 0x11;
+	held.driver_side = 0x12;
+	let mut ledger = free_ledger();
+	let mut pending = held.begin_teardown(&mut ledger);
+	assert_eq!(ledger.released_n, 0, "a transaction that took no device releases none");
+	assert!(ledger.closed_once(0x11) && ledger.closed_once(0x12), "both ends of the bootstrap channel are given back");
+	let settled = pending.settle(&mut ledger, 0, 100);
+	assert_eq!(settled, Some(Settled::Free), "with no process and no claim there is nothing to wait for");
+	assert_eq!(&ledger.domains[..ledger.domains_n], &[0x10], "and the Domain is killed exactly once");
+}
+
+#[test]
+fn a_spawn_that_fails_gives_back_the_bootstrap_handle_it_was_holding() {
+	// THE SPAWN STEP, AND THE HANDLE THE AUDIT FOUND. `spawn_prepared_in` returns with the driver's
+	// end of the bootstrap channel still in the caller when it fails, and the rollback had no field
+	// by which to close it: one leaked handle and its accounting on an ordinary failure path.
+	let mut held = Holdings::new();
+	held.domain = 0x20;
+	held.channel = 0x21;
+	held.driver_side = 0x22;
+	held.claim = 0x23;
+	let mut ledger = free_ledger();
+	let mut pending = held.begin_teardown(&mut ledger);
+	assert!(ledger.closed_once(0x22), "the driver's end of the bootstrap channel is closed exactly once");
+	assert_eq!(&ledger.released[..ledger.released_n], &[0x23], "and the device is given back");
+	assert_eq!(pending.settle(&mut ledger, 0, 100), Some(Settled::Free), "a confirmed release with no process to wait for settles at once");
+	assert_eq!(held.driver_side, 0, "and the ledger no longer names it, so a second rollback closes nothing twice");
+}
+
+#[test]
+fn a_bind_that_fails_between_resources_closes_every_one_it_had_not_sent() {
+	// THE RESOURCE STEP. The MMIO grant, the MSI vector, the key sink, the power connection and the
+	// console feed are acquired one at a time and sent one at a time, and a failure anywhere in
+	// between leaves some acquired and some already the driver's. A rollback that closed all of them
+	// would close what it had given away; one that closed none leaked what it still held.
+	let mut held = Holdings::new();
+	held.domain = 0x30;
+	held.process = 0x31;
+	held.channel = 0x32;
+	held.claim = 0x33;
+	assert!(held.hold(1, 0x40) && held.hold(2, 0x41) && held.hold(3, 0x42));
+	held.handed_over(0x40);
+	let mut ledger = free_ledger();
+	let mut pending = held.begin_teardown(&mut ledger);
+	assert!(!ledger.closed_any(0x40), "a resource the driver already has is NOT closed by the sender");
+	assert!(ledger.closed_once(0x41) && ledger.closed_once(0x42), "and every one still held is closed exactly once");
+	assert_eq!(&ledger.killed[..ledger.killed_n], &[0x31], "the process is killed, and killed once");
+	// AND THE ORDER: the manager's own handles go back after the kill and before the release, which
+	// is what stops a driver reading one as it dies and what stops the release running under them.
+	assert!(ledger.closed_at(0x41) < ledger.closed_at(0x32), "the resources are closed before the channel");
+	assert!(pending.process != 0, "and its handle is KEPT - the exit is what confirms it, not the kill");
+	assert_eq!(ledger.domains_n, 0, "the Domain is not killed before the confirmations");
+	assert_eq!(pending.settle(&mut ledger, 0, 100), None, "and nothing settles while the exit has not arrived");
+}
+
+#[test]
+fn a_teardown_leaves_the_node_stopping_until_both_confirmations_arrive() {
+	// THE HANDSHAKE STEP, AND THE TWO CONFIRMATIONS. A release that is still running answers no
+	// terminal state, so BOTH halves are outstanding; the node may not leave `Stopping` on either
+	// one alone.
+	let mut held = Holdings::new();
+	held.domain = 0x50;
+	held.process = 0x51;
+	held.channel = 0x52;
+	held.claim = 0x53;
+	let mut ledger = Ledger::new(None);
+	let mut pending = held.begin_teardown(&mut ledger);
+	assert_eq!(pending.claim, 0x53, "a release that has not answered keeps the claim handle to wait on");
+	assert_eq!(pending.settle(&mut ledger, 0, 100), None, "neither confirmation has arrived");
+	pending.note(super::BindingEvent::Exited { generation: 1 });
+	assert_eq!(pending.settle(&mut ledger, 0, 100), None, "the exit alone is not a teardown");
+	pending.note(super::BindingEvent::ClaimSettled { generation: 1, state: super::CLAIM_FREE });
+	assert_eq!(pending.settle(&mut ledger, 0, 100), Some(Settled::Free), "both, and the device is back");
+	assert!(ledger.closed_once(0x51) && ledger.closed_once(0x53), "and the two handles are closed exactly once, here and not before");
+	assert_eq!(&ledger.domains[..ledger.domains_n], &[0x50], "the Domain last of all");
+}
+
+#[test]
+fn a_confirmation_that_never_comes_ends_at_the_deadline_and_quarantines() {
+	// A CHILD THAT IGNORES ITS DEATH. The teardown slice M5 reserves is what this is for: the node
+	// does not hold open for ever, and the device does not go back into circulation on the strength
+	// of a confirmation nobody received.
+	let mut held = Holdings::new();
+	held.domain = 0x60;
+	held.process = 0x61;
+	held.claim = 0x62;
+	let mut ledger = Ledger::new(None);
+	let mut pending = held.begin_teardown(&mut ledger);
+	pending.note(super::BindingEvent::ClaimSettled { generation: 1, state: super::CLAIM_FREE });
+	assert_eq!(pending.settle(&mut ledger, 99, 100), None, "before the deadline it is still waiting");
+	assert_eq!(pending.settle(&mut ledger, 100, 100), Some(Settled::Unconfirmed), "at it, the teardown is unconfirmed");
+	assert!(ledger.closed_once(0x61), "the handles are given back even so - what is quarantined is the DEVICE");
+	assert_eq!(&ledger.domains[..ledger.domains_n], &[0x60]);
+}
+
+#[test]
+fn a_release_that_does_not_reach_free_is_unconfirmed_however_promptly_it_answers() {
+	// PROMPT IS NOT THE SAME AS CONFIRMED. A release that answers at once with a state that is not
+	// `Free` is a device that is not back, and the node is quarantined for it - which is the rule a
+	// teardown that read only "did the syscall return" could not state.
+	let mut held = Holdings::new();
+	held.claim = 0x70;
+	held.domain = 0x71;
+	let mut ledger = Ledger::new(Some(3));
+	let mut pending = held.begin_teardown(&mut ledger);
+	assert_eq!(pending.settle(&mut ledger, 0, 100), Some(Settled::Unconfirmed), "a terminal state that is not Free is not a device given back");
+}
+
+// ------------------------------------------------------- M7's heartbeat refusals, actually refused
+//
+// THE THREE REFUSAL TESTS COMPARED ENUM VARIANTS. `assert_ne!(Opcode::Pong, Opcode::Ping)` and
+// `assert_ne!(1, 2)` are true of any program, so they would have passed against a supervisor that
+// reset its watchdog on ANY frame with ANY sequence - which is exactly what `rt::heartbeat` did and
+// what this milestone exists to have stopped. The decisions are drivable now, so the refusals are
+// asserted against the thing that makes them.
+
+use super::{Beat, Heartbeat};
+
+// The cadence the entry's deadline implies. Passed in rather than computed here so the arithmetic
+// stays in `driver-protocol`, where it is tested against the deadline bounds.
+const PERIOD: u32 = 5;
+const DEADLINE: u32 = 10;
+
+fn armed(now: u64) -> Heartbeat {
+	let mut beat = Heartbeat::default();
+	beat.arm(Some(DEADLINE), now, PERIOD);
+	beat
+}
+
+#[test]
+fn a_pong_carrying_a_sequence_nobody_asked_with_does_not_reset_the_watchdog() {
+	let mut beat = armed(0);
+	assert_eq!(beat.tick(4), Beat::Idle, "nothing is due before the period is up");
+	assert_eq!(beat.tick(5), Beat::Ask(1), "and then one ping goes out");
+	beat.asked(5);
+
+	// EVERY WAY OF ANSWERING WRONG, and none of them counts.
+	assert!(!beat.answered(2, 6, PERIOD), "a sequence that was never asked with");
+	assert!(!beat.answered(0, 6, PERIOD), "the sequence before any ping");
+	assert!(!beat.answered(1 + 1, 6, PERIOD), "the sequence of the ping that has not been sent yet");
+	assert!(beat.awaiting(), "and the ping is still outstanding after every one of them");
+
+	// The right one, once.
+	assert!(beat.answered(1, 6, PERIOD), "the number it was asked with");
+	assert!(!beat.awaiting(), "which clears it");
+	// AND A DUPLICATE OF THE RIGHT ONE IS STILL WRONG. Nothing is outstanding, so there is nothing
+	// for it to answer - a driver echoing its last pong for ever must not look supervised.
+	assert!(!beat.answered(1, 7, PERIOD), "a duplicate answers a ping that is no longer outstanding");
+}
+
+#[test]
+fn a_ping_that_is_not_answered_inside_its_deadline_wedges_once_and_not_repeatedly() {
+	let mut beat = armed(0);
+	assert_eq!(beat.tick(5), Beat::Ask(1));
+	beat.asked(5);
+	assert_eq!(beat.tick(14), Beat::Idle, "inside the deadline there is nothing to say");
+	assert_eq!(beat.tick(15), Beat::Wedged, "at it, the driver is wedged");
+	// ONCE. A node stays wedged for as long as its teardown takes, and a supervisor that queued the
+	// verdict on every pass would queue one per tick of that teardown.
+	assert_eq!(beat.tick(16), Beat::Idle, "and it is not re-declared on the next pass");
+	// NOR IS IT ASKED AGAIN. Clearing only the outstanding flag left the next ping already due, so
+	// the pass after the verdict sent one to a binding that was being torn down.
+	assert_eq!(beat.tick(99), Beat::Idle, "a spent watchdog asks nothing more");
+	assert_eq!(beat.wake_at(), 0, "and the wait has nothing to come back for");
+	// The NEXT binding on this node arms it again, and the schedule starts over.
+	beat.arm(Some(DEADLINE), 100, PERIOD);
+	assert_eq!(beat.tick(105), Beat::Ask(1), "a fresh binding starts at the first sequence again");
+}
+
+#[test]
+fn a_driver_whose_entry_declares_no_deadline_is_never_asked_and_never_wedged() {
+	// AN ABSENT DEADLINE IS NOT A ZERO ONE. A supervisor that treated it as zero would declare every
+	// unsupervised driver wedged immediately, which is the failure the `supervised` guard prevents.
+	let mut beat = Heartbeat::default();
+	beat.arm(None, 0, PERIOD);
+	assert!(!beat.supervised());
+	assert_eq!(beat.wake_at(), 0, "there is nothing to wake for");
+	assert_eq!(beat.tick(u64::MAX), Beat::Idle, "and nothing to say, ever");
+	assert!(!beat.answered(0, 0, PERIOD), "an answer to a question nobody asked counts for nothing");
+
+	// A deadline of zero is the same thing said the other way, and the manifest refuses it anyway.
+	let mut zero = Heartbeat::default();
+	zero.arm(Some(0), 0, PERIOD);
+	assert!(!zero.supervised());
+}
+
+#[test]
+fn a_ping_that_could_not_be_sent_is_neither_an_answer_nor_a_wedge() {
+	// The channel has gone, which is a driver that ENDED rather than one that is slow: the exit
+	// event arrives on its own, and the watchdog must not race it to a verdict of its own.
+	let mut beat = armed(0);
+	assert_eq!(beat.tick(5), Beat::Ask(1));
+	beat.unsendable(5);
+	assert!(!beat.awaiting(), "nothing is outstanding, so nothing can expire");
+	assert_eq!(beat.tick(6), Beat::Idle);
+	assert_eq!(beat.wake_at(), 15, "and the next look is a whole deadline away");
+}
+
+#[test]
+fn the_wait_comes_back_for_whichever_of_the_two_deadlines_is_next() {
+	// `wake_at` is what the manager's central wait is bounded by, so getting it wrong is a watchdog
+	// that fires late or a loop that spins.
+	let mut beat = armed(100);
+	assert_eq!(beat.wake_at(), 105, "with nothing outstanding, the next ping is what to wake for");
+	assert_eq!(beat.tick(105), Beat::Ask(1));
+	beat.asked(105);
+	assert_eq!(beat.wake_at(), 115, "with one outstanding, its expiry is");
+}

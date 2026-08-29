@@ -273,9 +273,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    the supervisor drops the bootstrap channel first (no clients this boot), we
 	//    are done.
 	let mut vol: u64 = 0;
+	// THE OWNER'S SERVE ROOT, minted by the supervisor like every other. It arrives BEFORE `SERVE`,
+	// because the loop below ends on `SERVE` - see the role's comment in the manifest.
+	let mut owner_server: u64 = 0;
 	let service: u64 = loop {
 		match unsafe { recv_blocking(bootstrap, &mut buf) } {
 			Received::Message { len, handle } if len >= 7 && &buf[..7] == b"STORAGE" => vol = handle,
+			Received::Message { len, handle } if len >= 11 && &buf[..11] == b"POLICYOWNER" => owner_server = handle,
 			Received::Message { len, handle } if len >= 5 && &buf[..5] == b"SERVE" && handle != 0 => break handle,
 			Received::Message { .. } => {}
 			Received::Closed => exit(),
@@ -287,17 +291,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut config: Config = Config::load(vol);
 	let mut request: [u8; 512] = [0u8; 512];
 	let mut reply: [u8; 4096] = [0u8; 4096];
-	// THE OWNER'S CONNECTION, MINTED HERE SO ITS CHANNEL IS KNOWABLE.
+	// THE OWNER'S CONNECTION, SEEDED SO ITS CHANNEL IS KNOWABLE.
 	//
 	// A connection minted on demand from the ordinary root is indistinguishable from every other, so
-	// no server can tell which of its callers is allowed the reserved namespace. This pair is made by
-	// the server: the client end goes up the bootstrap under `POLICYOWNER` for the supervisor to route
-	// to DeviceManager, and the server end is SEEDED into the serve set, which is what makes its
-	// channel value the one identity this program can compare against.
-	let (owner_server, owner_client): (u64, u64) = unsafe { channel().unwrap_or((0, 0)) };
-	if owner_client != 0 {
-		unsafe { send_blocking(bootstrap, b"POLICYOWNER", owner_client) };
-	}
+	// no server can tell which of its callers is allowed the reserved namespace. This one is a serve
+	// root of its own: the supervisor minted the pair and gave this end to this program, and seeding
+	// it into the serve set is what makes its channel value the identity `Config::set` compares
+	// against. The supervisor keeps the client end and hands it to DeviceManager.
 	unsafe {
 		let seed: [u64; 1] = [owner_server];
 		let seeded: &[u64] = if owner_server != 0 { &seed } else { &[] };

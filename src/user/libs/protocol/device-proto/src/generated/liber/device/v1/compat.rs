@@ -51,9 +51,9 @@ fn provider_kind_wire_is_stable() {
 }
 #[test]
 fn provider_info_wire_is_stable() {
-	let sample = ProviderInfo { kind: ProviderKind::Block, bus: 7, dev: 7, func: 7, binding_generation: 7, slot: 7, provider_generation: 7 };
+	let sample = ProviderInfo { kind: ProviderKind::Block, bus: 7, dev: 7, func: 7, binding_generation: 7, slot: 7, provider_generation: 7, live: true };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[1, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
+	let golden: &[u8] = &[1, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 1];
 	assert_eq!(bytes, golden);
 	assert_eq!(ProviderInfo::decode(&bytes).unwrap(), sample);
 }

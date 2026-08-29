@@ -528,6 +528,12 @@ pub const TRANSPORT_VIRTIO_PCI: u8 = 1;
 // are below 0x40), so one `device_type` field classifies every discovered device.
 pub const DEVICE_TYPE_XHCI: u32 = 0x100;
 
+// A FUNCTION THIS KERNEL RESOLVED NO PROFILE FOR, and that is a device type of its own rather than an
+// absence. Every PCI function is in the inventory; the ones outside the two resolvers carry their
+// standards identity - vendor, product, the class triple, the address - and no resources, so a rule
+// can match one and nothing can claim what it does not have.
+pub const DEVICE_TYPE_UNKNOWN: u32 = 0x101;
+
 // The name for a device-type code, beside the codes it names.
 //
 // It lived in `lsirq` and nowhere else, so every other reporter of a device printed the raw number:
@@ -544,6 +550,7 @@ pub fn device_type_name(device_type: u32) -> &'static str {
 		VIRTIO_TYPE_INPUT => "virtio-input",
 		VIRTIO_TYPE_SOUND => "virtio-snd",
 		DEVICE_TYPE_XHCI => "xhci",
+		DEVICE_TYPE_UNKNOWN => "unresolved-pci-function",
 		// A code this build does not classify. The NUMBER is kept, because a reader chasing an
 		// unrecognised device needs it and "unknown" alone sends them back to the source.
 		_ => "unknown",
@@ -899,6 +906,18 @@ pub struct DeviceClaimSnapshot {
 	pub generation: u64,
 	// Absolute tick by which a teardown under way must confirm, or 0.
 	pub release_deadline: u64,
+	// WHAT THIS CLAIM STILL HOLDS, so a manager that did not make the binding can reconstruct the
+	// charge rather than start it at zero.
+	//
+	// M0165's M5 asks for the device-specific holdings - MMIO windows, IRQ vectors, IOMMU grants -
+	// to be reconstructable from this snapshot, and it carried only the state, the generation and the
+	// deadline. DeviceManager's own `granted_resources` is a count of RESOURCE frames sent during the
+	// CURRENT bind, which is zero for a reconstructed node and says nothing about a claim somebody
+	// else made. These are counted from the kernel's own records at the moment of the read.
+	pub mmio_windows: u32,
+	pub irq_vectors: u32,
+	pub iommu_grants: u32,
+	pub _pad1: u32,
 }
 
 // The four states a device-table slot can be in. THE SAME FOUR everywhere - two lists is how a state

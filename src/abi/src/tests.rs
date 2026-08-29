@@ -729,7 +729,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	// Read by device INDEX rather than through a claim handle, so it carries no key: a caller that
 	// had one would not need this call.
 	assert_layout!(
-		covered, DeviceClaimSnapshot, 24, 8,
+		covered, DeviceClaimSnapshot, 40, 8,
 		state => 0,
 		// Explicit, for the reason every other `_pad` in this file is: the struct is copied to
 		// userspace with `size_of::<T>()` from a value built on the kernel stack.
@@ -737,6 +737,13 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		generation => 8,
 		// The claim's OWN deadline, minted at the release. Zero unless a teardown is under way.
 		release_deadline => 16,
+		// WHAT THE CLAIM STILL HOLDS - added 2026-08-29, deliberately, so a manager that did not make
+		// the binding can reconstruct the charge instead of starting it at zero. This freeze catching
+		// the widening is the freeze working; the change is intended and pre-release.
+		mmio_windows => 24,
+		irq_vectors => 28,
+		iommu_grants => 32,
+		_pad1 => 36,
 	);
 	assert_layout!(
 		covered, ClaimGrant, 32, 8,
@@ -1078,8 +1085,20 @@ impl FakeSource {
 }
 
 impl FakeSource {
-	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
-		self.files.iter().find(|(p, _)| *p == path).map(|(_, bytes)| bytes.clone())
+	fn read(&mut self, path: &[u8]) -> crate::bootstrap::Read {
+		match self.files.iter().find(|(p, _)| *p == path) {
+			Some((_, bytes)) => crate::bootstrap::Read::Bytes(bytes.clone()),
+			None => crate::bootstrap::Read::Absent,
+		}
+	}
+
+	// The path is here and the medium cannot answer for it - which is a different fact from absence
+	// and is the one this source used to be unable to express.
+	fn read_damaged(&mut self, path: &[u8], damaged: &[u8]) -> crate::bootstrap::Read {
+		if path == damaged {
+			return crate::bootstrap::Read::Unreadable;
+		}
+		self.read(path)
 	}
 }
 
@@ -1174,4 +1193,30 @@ fn an_invalid_source_is_invalid_whichever_order_the_sources_are_tried_in() {
 		assert!(verdicts.iter().any(|v| matches!(v, Selection::Invalid(Refusal::MissingProgram))), "the bad source refuses either way");
 		assert!(verdicts.iter().any(|v| matches!(v, Selection::Verified(_))), "and the good one verifies either way");
 	}
+}
+
+// A SOURCE THAT IS HERE AND DAMAGED IS NOT A SOURCE THAT IS ABSENT.
+//
+// `assemble` took `Option<Vec<u8>>`, so "no bootstrap list here" and "the list is here and could not
+// be read" were one value - and the first invites policy to try another disk while the second is a
+// source that was SELECTED and failed. Deleting or damaging a signed manifest's named list therefore
+// produced a kernel from one source and a bootstrap set from another: a downgrade performed by
+// corrupting a file rather than by forging one, which is exactly what the signature cannot prevent.
+#[test]
+fn a_list_that_is_present_and_unreadable_stops_the_boot_rather_than_falling_through() {
+	use crate::bootstrap::{Refusal, Selection, assemble};
+	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"bin/init", b"i"), (b"bin/svc", b"s")]);
+	let outcome = assemble(|path| fs.read_damaged(path, b"etc/bootstrap.list"), vouching(MANIFEST));
+	assert!(matches!(outcome, Selection::Invalid(Refusal::ListUnreadable)), "a damaged list is a refusal, not an absence that lets the next source answer");
+
+	// AND THE SAME FOR A PROGRAM. Missing and unreadable are both fatal here - the source is already
+	// chosen - and they are named apart so a reader knows whether the file is gone or the medium is.
+	let mut fs = FakeSource::new(&[(b"etc/bootstrap.list", LIST), (b"bin/init", b"i"), (b"bin/svc", b"s")]);
+	let outcome = assemble(|path| fs.read_damaged(path, b"bin/svc"), vouching(MANIFEST));
+	assert!(matches!(outcome, Selection::Invalid(Refusal::ProgramUnreadable)), "a program that is there and unreadable is not a program that is missing");
+
+	// A source with no list at all is still `Unavailable`, which is what keeps ordinary fallback
+	// working: this must refuse damage, not refuse every disk that is not a boot source.
+	let mut fs = FakeSource::new(&[(b"etc/other", b"x")]);
+	assert!(matches!(assemble(|path| fs.read(path), vouching(MANIFEST)), Selection::Unavailable), "a disk that is not a boot source is still not one");
 }

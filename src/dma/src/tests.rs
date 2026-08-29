@@ -497,3 +497,62 @@ fn an_identity_mapping_lands_on_the_address_it_was_asked_for() {
 	// And a range outside the negotiated input range is refused rather than mapped somewhere else.
 	assert_eq!(iommu.map_identity(domain, 0xF000_0000, 0x1000, Direction::FromDevice).err(), Some(Fault::OutOfRange));
 }
+
+// THE BOUNCE DECISION NOW HAS A CONSUMER, and the sync points happen whether or not a copy does.
+//
+// `Plan::Bounce` existed and nothing built one, `Requirements::coherent` was recorded and never read,
+// and there were no `sync_for_device`/`sync_for_cpu` operations - so a driver on an address-limited or
+// non-coherent device was handed a decision it could not act on. M0's portable contract is these two
+// moments and who performs the maintenance at them.
+#[test]
+fn a_staged_buffer_copies_at_the_sync_points_and_tells_the_caches() {
+	use core::cell::RefCell;
+
+	// A cache that records what it was asked to do, so the ORDER and the SPANS are checkable rather
+	// than assumed.
+	struct Recorder {
+		events: RefCell<Vec<(&'static str, u64, u64)>>,
+	}
+	impl crate::CacheMaintenance for Recorder {
+		fn clean_for_device(&self, physical: u64, len: u64) {
+			self.events.borrow_mut().push(("clean", physical, len));
+		}
+		fn invalidate_for_cpu(&self, physical: u64, len: u64) {
+			self.events.borrow_mut().push(("invalidate", physical, len));
+		}
+	}
+	let cache = Recorder { events: RefCell::new(Vec::new()) };
+
+	// A NON-COHERENT device that can address the low 32 bits.
+	let requirements = crate::Requirements::new(32, 0x1000, 1, false).expect("a legal requirement");
+	let mut bounce = crate::Bounce::new(0x1000, 64, &requirements).expect("a staging buffer the device can reach");
+	assert_eq!(bounce.len(), 64);
+
+	bounce.for_device(&[0xab; 16], &cache).expect("staged");
+	assert_eq!(cache.events.borrow().last().copied(), Some(("clean", 0x1000, 16)), "the CPU wrote and the device is about to read, so the writes are pushed out first");
+
+	let mut back = [0u8; 16];
+	bounce.for_cpu(&mut back, &cache).expect("read back");
+	assert_eq!(back, [0xab; 16], "the bytes survive the round trip through the staging buffer");
+	assert_eq!(cache.events.borrow().last().copied(), Some(("invalidate", 0x1000, 16)), "the device wrote and the CPU is about to read, so stale lines go first");
+
+	// A DIRECT plan on the same machine still has sync points - nothing is copied because the data is
+	// already where the device looks, and the caches still have to be told. A bounce-shaped API that
+	// made the COPY the trigger would silently skip this, which is the case worth having a name for.
+	let segments = [crate::Segment { physical: 0x8000, len: 0x1000 }];
+	let before = cache.events.borrow().len();
+	crate::Bounce::sync_direct_for_device(&segments, &requirements, &cache);
+	assert_eq!(cache.events.borrow().len(), before + 1, "a direct plan on a non-coherent machine still cleans before the device reads");
+
+	// AND A COHERENT MACHINE PAYS NOTHING, which is what makes writing a driver against this contract
+	// free on the ports that do not need it.
+	let coherent = crate::Requirements::new(64, 0x1000, 1, true).expect("a legal requirement");
+	let mut plain = crate::Bounce::new(0x1000, 16, &coherent).expect("a staging buffer");
+	let quiet = cache.events.borrow().len();
+	plain.for_device(&[1u8; 8], &cache).expect("staged");
+	crate::Bounce::sync_direct_for_device(&segments, &coherent, &cache);
+	assert_eq!(cache.events.borrow().len(), quiet, "a coherent machine asks the caches for nothing at either point");
+
+	// A staging buffer the device cannot address is not one.
+	assert!(matches!(crate::Bounce::new(0x1_0000_0000, 16, &requirements), Err(crate::Fault::OutOfRange)), "a 32-bit device cannot be staged above its ceiling");
+}

@@ -198,8 +198,13 @@ pub enum Refusal {
 	ListMismatch,
 	// The list is not a list this loader understands.
 	MalformedList,
+	// The list is here and could not be read. A source that is PRESENT and damaged, which is not the
+	// same as one that has no list - see `Read`.
+	ListUnreadable,
 	// A program the list names is not on the source.
 	MissingProgram,
+	// A program is here and could not be read.
+	ProgramUnreadable,
 	// A program is not what the manifest says.
 	ProgramMismatch,
 	// The set is verified and could not be packed - an allocation failure, not a trust failure,
@@ -233,10 +238,35 @@ pub enum Selection {
 // `bootproto`, the policy lives here, and neither has to know the other's crate. They are closures
 // rather than traits because the loader's filesystems are types it does not own, and the orphan
 // rule does not let it implement somebody else's trait for them.
-pub fn assemble(mut read: impl FnMut(&[u8]) -> Option<Vec<u8>>, verify: impl Fn(&[u8], &[u8]) -> bool) -> Selection {
-	let Some(list) = read(b"etc/bootstrap.list") else {
-		return Selection::Unavailable;
+// WHAT A SOURCE ANSWERED, IN THREE STATES.
+//
+// `assemble` took `Option<Vec<u8>>`, so "this source has no bootstrap list" and "this source HAS one
+// and it could not be read" were the same value - and the first is `Unavailable`, which invites policy
+// to try another source, while the second is a source that was SELECTED and failed. Deleting a signed
+// manifest's named list, or damaging it, therefore produced a kernel from one source and a bootstrap
+// set from another: a downgrade performed by corrupting a file rather than forging one.
+//
+// The loader already distinguished the two at the filesystem (`FileRead`) and threw the distinction
+// away at this boundary.
+pub enum Read {
+	Bytes(Vec<u8>),
+	// The path names nothing on this source.
+	Absent,
+	// Something is there and the reader could not use it.
+	Unreadable,
+}
+
+pub fn assemble(mut read: impl FnMut(&[u8]) -> Read, verify: impl Fn(&[u8], &[u8]) -> bool) -> Selection {
+	let list = match read(b"etc/bootstrap.list") {
+		Read::Bytes(bytes) => bytes,
+		// NOT A LIBERSYSTEM SOURCE. Policy may consider another.
+		Read::Absent => return Selection::Unavailable,
+		// A SOURCE THAT IS HERE AND DAMAGED. The boot stops rather than looking elsewhere: the
+		// alternative is that destroying one file downgrades the machine to whatever the next source
+		// offers, which is the whole reason this outcome exists.
+		Read::Unreadable => return Selection::Invalid(Refusal::ListUnreadable),
 	};
+	{};
 	let Some(rows) = parse_list(&list) else {
 		return Selection::Invalid(Refusal::MalformedList);
 	};
@@ -257,8 +287,12 @@ pub fn assemble(mut read: impl FnMut(&[u8]) -> Option<Vec<u8>>, verify: impl Fn(
 		// is exactly the programs the system needs before its volume is readable, so a missing one
 		// produces a machine that dies later and further away, with nothing to say which program it
 		// was.
-		let Some(blob) = read(row.path) else {
-			return Selection::Invalid(Refusal::MissingProgram);
+		// Both failures are fatal HERE - the source was already chosen - and they are named apart so
+		// a reader knows whether the program is missing or the medium is failing.
+		let blob = match read(row.path) {
+			Read::Bytes(bytes) => bytes,
+			Read::Absent => return Selection::Invalid(Refusal::MissingProgram),
+			Read::Unreadable => return Selection::Invalid(Refusal::ProgramUnreadable),
 		};
 		if !verify(row.path, &blob) {
 			return Selection::Invalid(Refusal::ProgramMismatch);

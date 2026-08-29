@@ -16,6 +16,8 @@ SCRIPT_NAME=verify.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 PLANNER_MANIFEST="$SRC_DIR/tools/verify-model/Cargo.toml"
+# The candidate overlay to plan against, if one was named. Empty for an ordinary run.
+candidate_arg=()
 # WHICH LOGS A RUN WROTE, SAID BY THE RUN. The shadow comparison below used to find its evidence with
 # `find .build/logs/test -name "<arch>-*-guest.log" | sort -rn | head -1` - the newest-file glob that
 # `result-logs.sh` exists to replace. Two runs of one architecture in flight and it reads the OTHER
@@ -43,7 +45,8 @@ suite_result_log() {
 help() {
 	usage_and_exit <<EOF
 usage: verify.sh [--for-change | --for PATH[,PATH...] | --for-range A..B | --release | --sweep]
-                 [--jobs N] [--plan] [--explain] [--json] [--shadow] [--allow-shadow] [--catalog] [--model-hash] [--age] [--trust]
+                 [--jobs N] [--plan] [--explain] [--json] [--shadow] [--allow-shadow] [--candidate FILE]
+                 [--catalog] [--model-hash] [--age] [--trust]
 
 Works out what a change needs verified and runs exactly that. With no arguments: --for-change.
 
@@ -55,6 +58,10 @@ Works out what a change needs verified and runs exactly that. With no arguments:
   --shadow         run the FULL suite and compare it against what this change would have scoped
   --shadow-exec    the same, but RUN the selection first and compare the two runs (one target)
   --allow-shadow   accept a scoped run with no shadow evidence (exit 0 instead of 4); --dev is an alias
+  --candidate FILE plan the shadow comparison against a FROZEN narrowing and record it under that
+                   candidate's model hash. The run that happens is unchanged and still full; what
+                   the candidate changes is which selection the comparison is graded against, which
+                   is how a narrowing earns the evidence its activation demands.
   --jobs N         how many guests may boot at once (default 1; parallelism is opted into)
   --plan           print the plan and run nothing
   --explain        print why every item is in the plan
@@ -133,6 +140,16 @@ while [[ $# -gt 0 ]]; do
 		;;
 	# Accept a scoped run that has no shadow evidence behind it. The default refuses, because a
 	# machine reading an exit status cannot read the note that says what the green is worth.
+	# A FROZEN NARROWING TO PLAN AGAINST, so evidence can be gathered UNDER it while the run that
+	# actually happens stays full. That is M5's shape - evidence first, split second - and without
+	# this the only way to plan against a candidate was to activate it, which is the thing the
+	# evidence is for.
+	--candidate)
+		[[ $# -ge 2 ]] || die "--candidate needs the path of a candidate file"
+		candidate_arg=(--candidate "$2")
+		shift 2
+		continue
+		;;
 	--allow-shadow | --dev)
 		allow_shadow=1
 		shift
@@ -404,7 +421,7 @@ if [[ "$action" == shadow ]]; then
 		log="$(suite_result_log "$sweep_capture")" || die "the $target sweep did not say which logs it wrote"
 		rm -f "$sweep_capture"
 		[[ -n "$log" ]] || die "no $target guest log to compare against"
-		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --guest-log "../$log" --arch "$target" "${scoped_arg[@]}") || shadow_failed=1
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --guest-log "../$log" --arch "$target" "${scoped_arg[@]}") || shadow_failed=1
 	done
 	# The HOST universe, from the same sweep.
 	#
@@ -458,7 +475,7 @@ if [[ "$action" == shadow ]]; then
 		printf 'total %s\n' "$host_scoped_total" >>"$host_scoped_log"
 		host_scoped_arg=(--host-scoped-log "../$host_scoped_log")
 	fi
-	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --host-log "../$host_log" "${host_scoped_arg[@]}") || shadow_failed=1
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --host-log "../$host_log" "${host_scoped_arg[@]}") || shadow_failed=1
 
 	# The DEV GUEST universe, the third and last producer.
 	#
@@ -499,7 +516,7 @@ if [[ "$action" == shadow ]]; then
 		printf 'total %s\n' "$dev_scoped_total" >>"$dev_scoped_log"
 		dev_scoped_arg=(--dev-scoped-log "../$dev_scoped_log")
 	fi
-	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --dev-log "../$dev_log" "${dev_scoped_arg[@]}") || shadow_failed=1
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --dev-log "../$dev_log" "${dev_scoped_arg[@]}") || shadow_failed=1
 
 	# The BUILD universe, and it costs the sweep nothing it was not already paying.
 	#
@@ -567,7 +584,7 @@ if [[ "$action" == shadow ]]; then
 				note "shadow-exec (build, $build_arch): the grouped step built exactly what the selection named"
 			done <<<"$build_steps"
 		fi
-		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- shadow --stdin --build-log "../$build_log" --build-arch "$build_arch" --build-exec "$build_exec") || shadow_failed=1
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --build-log "../$build_log" --build-arch "$build_arch" --build-exec "$build_exec") || shadow_failed=1
 	done
 
 	source_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)"

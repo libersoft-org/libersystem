@@ -1720,12 +1720,6 @@ provider = "storage_service"
 source = "ADMIN"
 interface = "liber:storage@1/volume"
 
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:config@1/config"
-
 # THE ONE CONNECTION ALLOWED TO WRITE UNDER `device.policy.`.
 #
 # `Config::set` checked nothing, so any component holding `CAP_CONFIG` - and the supervisor grants it
@@ -1734,11 +1728,20 @@ interface = "liber:config@1/config"
 # did not. Authority over a namespace has to come from WHICH CONNECTION a request arrived on, and a
 # connection minted on demand from the ordinary root is indistinguishable from any other.
 #
-# So ConfigService mints this pair itself, keeps the server end as a served seed - which is what makes
-# its channel value knowable - and hands the client end up. The supervisor routes it to DeviceManager
-# in place of an ordinary connection.
+# So this is a serve root of its own: the supervisor mints the pair, ConfigService serves the server
+# end as a seeded client - which is what makes its channel value knowable - and the supervisor hands
+# the client end to DeviceManager in place of an ordinary connection.
+#
+# BEFORE `SERVE`, because ConfigService's bootstrap loop breaks on `SERVE` and would never read a
+# message that came after it.
 [[services.roles]]
 tag = "POLICYOWNER"
+kind = "serve-root"
+provider = "self"
+interface = "liber:config@1/config"
+
+[[services.roles]]
+tag = "SERVE"
 kind = "serve-root"
 provider = "self"
 interface = "liber:config@1/config"

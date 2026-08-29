@@ -130,6 +130,9 @@ declare -A GATES=(
 	["declared-interfaces"]="tools/check-declared-interfaces.py"
 	["no-fixed-provider-slots"]="tools/check-no-fixed-provider-slots.sh"
 	["smp-core-cap"]="tools/check-smp-core-cap.sh"
+	# The line addressed to a tool appears only where a tool is reading it. Two boots, and the
+	# ABSENCE on an interactive profile is half of what it proves.
+	["perf-anchor"]="tools/check-perf-anchor.sh"
 	["gate-result-logs"]="tools/check-gate-result-logs.sh"
 	["gate-oracles"]="tools/check-gate-oracles.sh"
 	["component-oracles"]="tools/check-component-oracles.sh"

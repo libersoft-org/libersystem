@@ -126,8 +126,15 @@ pub fn declared_version_in(elf: &[u8]) -> Option<u16> {
 	if elf.len() < NOTE_LEN {
 		return None;
 	}
+	// A CHEAP FIRST BYTE, THEN THE COMPARISON. A 28-byte slice compare at every offset of a driver
+	// image is a call per byte of the artifact, and DeviceManager runs this before the claim on the
+	// boot path: measured on the shipping image it cost enough of the bind window that the driver's
+	// `READY` arrived after the manager had stopped waiting, and a working driver was reported as a
+	// handshake timeout. The note's first byte is `namesz` - 12 - so most offsets are rejected by one
+	// comparison.
+	let first = prefix[0];
 	for at in 0..=elf.len() - NOTE_LEN {
-		if &elf[at..at + 28] == prefix {
+		if elf[at] == first && &elf[at..at + 28] == prefix {
 			return Some(u16::from_le_bytes([elf[at + 28], elf[at + 29]]));
 		}
 	}

@@ -9,7 +9,7 @@ method device.list op=1 () -> result<list<device-entry>, liber:base@1::error>
 method device.get op=2 (index:u32:rights=) -> result<device-entry, liber:base@1::error>
 method device.bindings op=3 () -> result<list<binding-record>, liber:base@1::error>
 enum provider-kind(block=1,net=2,display=3,audio=4,input=5,usb-bus=6,pointer=7,console-bytes=8)
-record provider-info(kind:provider-kind,bus:u32,dev:u32,func:u32,binding-generation:u64,slot:u32,provider-generation:u32)
+record provider-info(kind:provider-kind,bus:u32,dev:u32,func:u32,binding-generation:u64,slot:u32,provider-generation:u32,live:bool)
 enum policy-verb(disable=0,enable=1,select=2,retry=3)
 enum policy-outcome(accepted=0,no-such-device=1,not-a-candidate=2,quarantined=3,busy=4,refused=5,not-stored=6)
 record incident-report(present:bool,bus:u32,dev:u32,func:u32,generation:u64,state:binding-state,cause:failure-cause,last-opcode:u32,silent-for:u64,attempts:u32,domain-known:bool,memory-used:u64,memory-peak:u64,handles-used:u64,threads-used:u64,dma-used:u64)

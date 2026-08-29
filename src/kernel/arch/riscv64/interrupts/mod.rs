@@ -176,6 +176,11 @@ pub fn dispatch_msi(eid: u32) -> bool {
 // EID) follows.
 // Free every MSI vector that is masked and waiting for `device` to be confirmed stopped, and answer
 // how many. Reached from `SYS_DEVICE_QUIESCED`.
+// How many MSI slots this device still holds. See `MsiRegistry::held_by_device`.
+pub fn msi_held_by_device(device: u32) -> usize {
+	REGISTRY.held_by_device(device)
+}
+
 pub fn release_msi_for_device(device: u32) -> usize {
 	REGISTRY.release_for_device(device)
 }

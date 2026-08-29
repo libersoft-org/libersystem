@@ -339,12 +339,21 @@ pub enum BindingEvent {
 	// It answered a `STOP`: everything it accepted is finished or abandoned and its device is quiet.
 	// A PLANNED stop completing, which is a different fact from a channel that simply closed.
 	Stopped { generation: u64 },
+	// THE CLAIM REACHED A TERMINAL STATE, which is the OTHER half of a teardown.
+	//
+	// A rollback used to be one call that killed the process, released the device and answered where
+	// the node had landed - so `Stopping` was a label the record passed through rather than a state
+	// the node was ever IN, the teardown deadline had nothing to apply to, and the manager was inside
+	// the release syscall for its whole duration while every other node waited behind it. M4 says the
+	// exit and the claim reaching `Free` ARRIVE, separately, on this node's queue: `state` is one of
+	// `abi::CLAIM_STATE_*`, and anything that is not `Free` is a device that is not back.
+	ClaimSettled { generation: u64, state: u32 },
 }
 
 impl BindingEvent {
 	pub fn generation(self) -> u64 {
 		match self {
-			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } | BindingEvent::Ponged { generation, .. } | BindingEvent::Wedged { generation } | BindingEvent::Stopped { generation } => generation,
+			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } | BindingEvent::Ponged { generation, .. } | BindingEvent::Wedged { generation } | BindingEvent::Stopped { generation } | BindingEvent::ClaimSettled { generation, .. } => generation,
 		}
 	}
 }
@@ -520,5 +529,313 @@ impl IncidentWindow {
 		// recovery a deadline ALREADY IN THE PAST, which is a budget spent before the work it
 		// bounds was asked for.
 		if boot_deadline > now && boot_deadline < own { boot_deadline } else { own }
+	}
+}
+
+// ------------------------------------------------------------------ what one bind holds
+//
+// THE TRANSACTION'S LEDGER, IN THE CRATE WHERE IT CAN BE DRIVEN.
+//
+// It lived in DeviceManager, which is a `no_std` binary nothing can run on a host - so the one
+// property the whole milestone rests on, that a bind either completes or leaves nothing behind, was
+// asserted by reading the code. The fault cases M7 names could not be written: no test could
+// instantiate the transaction, fail it at the claim, the resource, the spawn or the handshake, and
+// then ask what was still held. The audit that found two leaked handles found them by reading too.
+//
+// So the ledger and the ORDER it gives things back in are here, over a `Closes` the caller supplies.
+// DeviceManager's implementation calls the syscalls; the tests' implementation records what was done
+// and in what order, which is what makes "closed exactly once, in this order, and nothing left" a
+// thing a machine checks.
+
+// The most resources one bind hands over: the device MMIO, an MSI vector, a key sink, a power
+// connection and a console feed.
+pub const MAX_BIND_RESOURCES: usize = 5;
+
+// What a rollback does to the world. Separated from the ledger so the ledger can be driven.
+//
+// `kill` does NOT close the process handle: M4 keeps it until the exit event arrives, which is the
+// difference between observing a child die and assuming it did.
+pub trait Closes {
+	fn kill(&mut self, process: u64);
+	fn close(&mut self, handle: u64);
+	// The claim's terminal state, or `None` where the release is still running and the answer will
+	// arrive on the claim handle.
+	fn release(&mut self, claim: u64) -> Option<u32>;
+	fn kill_domain(&mut self, domain: u64);
+}
+
+// Everything one bind transaction has acquired and not yet handed over.
+#[derive(Clone, Copy, Default)]
+pub struct Holdings {
+	pub domain: u64,
+	pub process: u64,
+	// The manager's end of the bootstrap channel.
+	pub channel: u64,
+	pub claim: u64,
+	// The DRIVER's end, until the spawn consumes it. Zero afterwards.
+	pub driver_side: u64,
+	resources: [(u16, u64); MAX_BIND_RESOURCES],
+	count: usize,
+}
+
+impl Holdings {
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	// The four an INSTALLED binding holds. A binding that reached `Online` has no untransferred
+	// resources and no driver-side channel end - everything the bind assembled either reached the
+	// driver or the attempt was rolled back before the binding existed - so those are empty by
+	// construction rather than by omission.
+	pub fn installed(domain: u64, process: u64, channel: u64, claim: u64) -> Self {
+		Self { domain, process, channel, claim, ..Self::default() }
+	}
+
+	// Record a resource this attempt has acquired and not yet handed over. Answers false when the
+	// ledger is full, which is a bind asking for more than the format carries.
+	pub fn hold(&mut self, kind: u16, handle: u64) -> bool {
+		if self.count >= MAX_BIND_RESOURCES {
+			return false;
+		}
+		self.resources[self.count] = (kind, handle);
+		self.count += 1;
+		true
+	}
+
+	// That resource has been transferred: it is the driver's now, and a rollback must not close it.
+	pub fn handed_over(&mut self, handle: u64) {
+		for entry in self.resources[..self.count].iter_mut() {
+			if entry.1 == handle {
+				entry.1 = 0;
+			}
+		}
+	}
+
+	pub fn resources(&self) -> &[(u16, u64)] {
+		&self.resources[..self.count]
+	}
+
+	// M4'S STEPS 1 TO 3, IN THE ONE ORDER THERE IS.
+	//
+	// 1. `SIG_KILL` the process, keeping its handle - the exit is what confirms it, not the kill.
+	// 2. Close the manager's own handles: everything acquired and not handed over, then the channel.
+	//    AFTER the kill, so a driver cannot be reading one as it goes, and BEFORE the release,
+	//    because the release is what tears the device down under them.
+	// 3. Release the claim, which STARTS the teardown rather than finishing it.
+	//
+	// The Domain is not touched here: killing it before the exit and the release would take the
+	// process out from under a teardown still reading its handles. That is step 4's, in `settle`.
+	pub fn begin_teardown<C: Closes>(&mut self, closes: &mut C) -> Pending {
+		if self.process != 0 {
+			closes.kill(self.process);
+		}
+		if self.driver_side != 0 {
+			closes.close(self.driver_side);
+			self.driver_side = 0;
+		}
+		for entry in self.resources[..self.count].iter_mut() {
+			if entry.1 != 0 {
+				closes.close(entry.1);
+				entry.1 = 0;
+			}
+		}
+		self.count = 0;
+		if self.channel != 0 {
+			closes.close(self.channel);
+			self.channel = 0;
+		}
+		// A transaction that took no device has nothing to release and nothing to confirm. That is
+		// not the same as a claim that reached `Free`, and it is not a quarantine either.
+		let state: Option<u32> = if self.claim == 0 { Some(CLAIM_FREE) } else { closes.release(self.claim) };
+		let claim = if state.is_some() {
+			if self.claim != 0 {
+				closes.close(self.claim);
+			}
+			0
+		} else {
+			self.claim
+		};
+		let pending = Pending { process: self.process, claim, domain: self.domain, exited: self.process == 0, state };
+		// Handed to the teardown; a second call finds nothing to do.
+		self.process = 0;
+		self.claim = 0;
+		self.domain = 0;
+		pending
+	}
+}
+
+// `abi::CLAIM_STATE_FREE`, named here so this crate does not depend on `abi` for one number. The
+// value is the wire's and changing it in one place without the other is what the test below is for.
+pub const CLAIM_FREE: u32 = 0;
+
+// A teardown that has been started and not yet confirmed.
+#[derive(Clone, Copy)]
+pub struct Pending {
+	pub process: u64,
+	pub claim: u64,
+	pub domain: u64,
+	pub exited: bool,
+	pub state: Option<u32>,
+}
+
+// Where a settled teardown leaves the device.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Settled {
+	// Both confirmations arrived and the claim reached `Free`: the device is back.
+	Free,
+	// Something did not confirm, or confirmed as something other than `Free`. Its frames, vectors
+	// and grants stay charged and out of circulation.
+	Unconfirmed,
+}
+
+impl Pending {
+	// What the node's queue delivered. Anything else a dying binding emits is about a binding that
+	// is already over.
+	pub fn note(&mut self, event: BindingEvent) {
+		match event {
+			BindingEvent::Exited { .. } => self.exited = true,
+			BindingEvent::ClaimSettled { state, .. } => self.state = Some(state),
+			_ => {}
+		}
+	}
+
+	// M4'S STEP 4. `Some` once both confirmations are in or the deadline has passed, and only then
+	// are the two handles closed and the Domain killed.
+	pub fn settle<C: Closes>(&mut self, closes: &mut C, now: u64, deadline: u64) -> Option<Settled> {
+		let confirmed: bool = self.exited && self.state.is_some();
+		if !confirmed && now < deadline {
+			return None;
+		}
+		let free: bool = confirmed && self.state == Some(CLAIM_FREE);
+		if self.process != 0 {
+			closes.close(self.process);
+			self.process = 0;
+		}
+		if self.claim != 0 {
+			closes.close(self.claim);
+			self.claim = 0;
+		}
+		if self.domain != 0 {
+			closes.kill_domain(self.domain);
+			closes.close(self.domain);
+			self.domain = 0;
+		}
+		Some(if free { Settled::Free } else { Settled::Unconfirmed })
+	}
+}
+
+// ------------------------------------------------------------------------ the watchdog's decisions
+//
+// WHEN TO ASK, WHEN TO GIVE UP, AND WHAT COUNTS AS AN ANSWER - in the crate where a test can drive
+// them. The state and its three decisions lived in DeviceManager, and the refusal tests M7 names
+// could therefore only compare enum variants and integers: they would have passed against a
+// supervisor that reset its watchdog on any frame, any generation and any sequence, which is exactly
+// what `rt::heartbeat` used to do and what the milestone exists to have stopped doing.
+#[derive(Clone, Copy, Default)]
+pub struct Heartbeat {
+	// The entry's declared deadline in ticks, or 0 for a driver that is not supervised this way.
+	deadline: u32,
+	// The sequence the outstanding `PING` was sent with, and whether one is outstanding.
+	sequence: u32,
+	awaiting: bool,
+	// When the next `PING` is due, and when an outstanding one stops being answerable.
+	due: u64,
+	expires: u64,
+	// THE VERDICT HAS BEEN GIVEN. A wedged binding is being torn down; asking it again would queue a
+	// second verdict on every pass of the loop until that finishes, and the schedule this watchdog
+	// was keeping belongs to a binding that is over. Cleared by `arm`, which is what the NEXT
+	// binding on this node calls.
+	spent: bool,
+}
+
+// What the watchdog wants done this tick.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Beat {
+	// Nothing is due.
+	Idle,
+	// Send a `PING` carrying this sequence.
+	Ask(u32),
+	// The outstanding one was not answered inside the deadline the entry declared.
+	Wedged,
+}
+
+impl Heartbeat {
+	// Arm from the entry's declared deadline. The cadence is `heartbeat_period` and not a second
+	// number: a driver always gets one whole period to answer inside the deadline it declared.
+	pub fn arm(&mut self, deadline: Option<u32>, now: u64, period: u32) {
+		match deadline {
+			Some(deadline) if deadline != 0 => *self = Heartbeat { deadline, sequence: 0, awaiting: false, due: now.saturating_add(period as u64), expires: 0, spent: false },
+			_ => *self = Heartbeat::default(),
+		}
+	}
+
+	pub fn supervised(&self) -> bool {
+		self.deadline != 0
+	}
+
+	pub fn deadline(&self) -> u32 {
+		self.deadline
+	}
+
+	pub fn awaiting(&self) -> bool {
+		self.awaiting
+	}
+
+	// The soonest tick this node needs the wait to come back at, or 0 for "nothing to wake for".
+	pub fn wake_at(&self) -> u64 {
+		if !self.supervised() || self.spent {
+			return 0;
+		}
+		if self.awaiting { self.expires } else { self.due }
+	}
+
+	// AN ANSWER THAT ECHOES THE NUMBER IT WAS ASKED WITH, AND NOTHING ELSE COUNTS.
+	//
+	// A pong with a sequence nobody is waiting for - a duplicate, one from an earlier round, one
+	// invented - does NOT reset the watchdog. Answers whether it counted, so a caller can say so.
+	pub fn answered(&mut self, sequence: u32, now: u64, period: u32) -> bool {
+		if self.spent || !self.awaiting || sequence != self.sequence {
+			return false;
+		}
+		self.awaiting = false;
+		self.due = now.saturating_add(period as u64);
+		true
+	}
+
+	// What to do at `now`. `Ask` hands out the next sequence and starts the deadline; the caller
+	// reports whether the send happened, because a channel that has gone is a driver that ended
+	// rather than one that is slow.
+	pub fn tick(&mut self, now: u64) -> Beat {
+		if !self.supervised() || self.spent {
+			return Beat::Idle;
+		}
+		if self.awaiting {
+			if now < self.expires {
+				return Beat::Idle;
+			}
+			// ONCE, AND THEN NOTHING. Clearing `awaiting` alone left `due` in the past, so the very
+			// next pass sent another `PING` to a binding that was being torn down - and a supervisor
+			// that keeps asking after its own verdict is one whose verdict meant nothing.
+			self.awaiting = false;
+			self.spent = true;
+			return Beat::Wedged;
+		}
+		if now < self.due {
+			return Beat::Idle;
+		}
+		self.sequence = self.sequence.wrapping_add(1);
+		Beat::Ask(self.sequence)
+	}
+
+	// The `PING` went out: the deadline for answering it starts now.
+	pub fn asked(&mut self, now: u64) {
+		self.awaiting = true;
+		self.expires = now.saturating_add(self.deadline as u64);
+	}
+
+	// The `PING` could not be sent. Not an answer and not a wedge - stop asking until the next
+	// period, and let the exit event arrive on its own.
+	pub fn unsendable(&mut self, now: u64) {
+		self.due = now.saturating_add(self.deadline as u64);
 	}
 }

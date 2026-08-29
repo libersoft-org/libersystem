@@ -263,9 +263,23 @@ pub struct Registry {
 
 impl Registry {
 	pub fn load(model_dir: &Path) -> Result<Self, String> {
+		Registry::load_with(model_dir, None)
+	}
+
+	// The same, with the registry TEXT supplied instead of read.
+	//
+	// What a candidate overlay needs: the narrowing lives in `registry.toml`'s bytes, and the model
+	// hash is taken over that text - so planning against a candidate means building a registry from
+	// the candidate's text WITHOUT writing it anywhere. Writing it first and reading it back is what
+	// the activation contract does, and doing that to gather evidence would mean the tree carrying a
+	// narrowing nobody had earned yet.
+	pub fn load_with(model_dir: &Path, registry_override: Option<&str>) -> Result<Self, String> {
 		let registry_path = model_dir.join("registry.toml");
 		let configurations_path = model_dir.join("configurations.toml");
-		let registry_text = fs::read_to_string(&registry_path).map_err(|error| format!("{}: {error}", registry_path.display()))?;
+		let registry_text = match registry_override {
+			Some(text) => text.to_string(),
+			None => fs::read_to_string(&registry_path).map_err(|error| format!("{}: {error}", registry_path.display()))?,
+		};
 		let configurations_text = fs::read_to_string(&configurations_path).map_err(|error| format!("{}: {error}", configurations_path.display()))?;
 		let raw: RawRegistry = toml::from_str(&registry_text).map_err(|error| format!("{}: {error}", registry_path.display()))?;
 		let raw_configurations: RawConfigurations = toml::from_str(&configurations_text).map_err(|error| format!("{}: {error}", configurations_path.display()))?;

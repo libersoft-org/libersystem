@@ -1,7 +1,7 @@
 use crate::arch::syscall::invoke;
 use crate::object::channel::Channel;
 use crate::object::rights::Rights;
-use crate::syscall::{ERR_WOULD_BLOCK, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND_CAPS, SYS_EVENT_CREATE, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_YIELD, sys_is_err};
+use crate::syscall::{ERR_WOULD_BLOCK, SYS_CHANNEL_PEEK, SYS_CHANNEL_RECV_CAPS, SYS_CHANNEL_SEND_CAPS, SYS_EVENT_CREATE, SYS_EVENT_POLL, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_TIMER_CREATE, SYS_TIMER_POLL, SYS_YIELD, sys_is_err};
 use core::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 
 // `invoke` answers in the raw register width; every comparison against an error is against the
@@ -819,4 +819,135 @@ fn capability_tcb_termination_at_each_transfer_phase() {
 	// THE LEDGER IS THE POINT. Four terminations at four phases, and not one unit of handle quota
 	// is missing or double-counted afterwards.
 	assert_eq!(domain.account().handles().used(), charged_before, "every phase gave back exactly what it took");
+}
+
+// AN ALLOCATION THAT FAILS INSIDE A TRANSFER, AT BOTH PHASES THAT CAN REFUSE FOR MEMORY.
+//
+// The quota fixture above says in as many words that it is NOT an out-of-memory injection, and that
+// was the whole of the gap: `try_reserve` in `send_inner` and in `HandleTable::reserve` are this
+// kernel's answers to a short heap on the two busiest paths there are, and neither branch had
+// anything driving it. Reaching them for real means exhausting the machine's heap - after which
+// nothing can be asserted about what the refusal LEFT BEHIND, which is the half that matters,
+// because a send that fails at the enqueue has already emptied every one of the caller's handles.
+//
+// So the two branches are armed (see `channel::refuse_next_enqueue_allocations` and
+// `handle::refuse_next_reservation_allocations`) and driven through the real syscalls.
+//
+// THE ORDER IS THE ASSERTION, not merely the count. The send path restores with
+// `taken.into_iter().zip(caps)`, so a batch put back in the wrong order would leave both handles
+// live, both capabilities reachable and the quota exactly right - every count intact and the
+// caller's two handles swapped. Two objects of DIFFERENT TYPES is what makes that observable: after
+// the refusal the event handle must still poll as an event and the timer handle as a timer, and
+// nothing about the numbers would have said so.
+static ALLOC_SEND: AtomicU64 = AtomicU64::new(0);
+static ALLOC_RECV: AtomicU64 = AtomicU64::new(0);
+static ALLOC_REPORT: AtomicI64 = AtomicI64::new(-1);
+static ALLOC_REFUSED_SEND: AtomicI64 = AtomicI64::new(0);
+static ALLOC_REFUSED_RECV: AtomicI64 = AtomicI64::new(0);
+static ALLOC_STILL_QUEUED: AtomicI64 = AtomicI64::new(0);
+static ALLOC_ENTRIES_BEFORE: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_ENTRIES_AFTER: AtomicUsize = AtomicUsize::new(0);
+
+// The live entries of the calling thread's own table, counted from inside so the count is taken
+// while the thread is still there to have one.
+fn live_entries() -> usize {
+	crate::sched::current_thread().map(|thread| thread.handles().lock().entries().len()).unwrap_or(0)
+}
+
+extern "C" fn alloc_thread(_argument: u64) {
+	let send_handle = ALLOC_SEND.load(Ordering::SeqCst);
+	let recv_handle = ALLOC_RECV.load(Ordering::SeqCst);
+	let body = [3u8; 8];
+
+	let event = unsafe { invoke(SYS_EVENT_CREATE, 0, 0, 0, 0) };
+	let timer = unsafe { invoke(SYS_TIMER_CREATE, 0, 0, 0, 0) };
+	if sys_is_err(event) || sys_is_err(timer) {
+		ALLOC_REPORT.store(1, Ordering::SeqCst);
+		return;
+	}
+	let caps = [2u64, event, timer];
+
+	ALLOC_ENTRIES_BEFORE.store(live_entries(), Ordering::SeqCst);
+	// THE ENQUEUE'S ALLOCATION FAILS. Both capabilities are already out of the table by then.
+	crate::object::channel::refuse_next_enqueue_allocations(1);
+	let refused = unsafe { invoke(SYS_CHANNEL_SEND_CAPS, send_handle, body.as_ptr() as u64, body.len() as u64, caps.as_ptr() as u64) };
+	ALLOC_REFUSED_SEND.store(signed(refused), Ordering::SeqCst);
+	ALLOC_ENTRIES_AFTER.store(live_entries(), Ordering::SeqCst);
+
+	// EACH CAPABILITY BACK UNDER ITS OWN HANDLE. Poll each one as the type it is and as the type the
+	// other one is: a swapped restoration passes the first two and fails the second two.
+	if sys_is_err(unsafe { invoke(SYS_EVENT_POLL, event, 0, 0, 0) }) {
+		ALLOC_REPORT.store(2, Ordering::SeqCst);
+		return;
+	}
+	if !sys_is_err(unsafe { invoke(SYS_TIMER_POLL, event, 0, 0, 0) }) {
+		ALLOC_REPORT.store(3, Ordering::SeqCst);
+		return;
+	}
+	if sys_is_err(unsafe { invoke(SYS_TIMER_POLL, timer, 0, 0, 0) }) {
+		ALLOC_REPORT.store(4, Ordering::SeqCst);
+		return;
+	}
+	if !sys_is_err(unsafe { invoke(SYS_EVENT_POLL, timer, 0, 0, 0) }) {
+		ALLOC_REPORT.store(5, Ordering::SeqCst);
+		return;
+	}
+
+	// AND THE SAME SEND SUCCEEDS with nothing armed, which is what says the refusal was the
+	// allocation and not anything about the message or the handles.
+	let sent = unsafe { invoke(SYS_CHANNEL_SEND_CAPS, send_handle, body.as_ptr() as u64, body.len() as u64, caps.as_ptr() as u64) };
+	if sys_is_err(sent) {
+		ALLOC_REPORT.store(6, Ordering::SeqCst);
+		return;
+	}
+
+	// THE RECEIVE'S RESERVATION FAILS. The message must stay queued: `reserve` returning false is
+	// the whole reason the dequeue happens after it and not before.
+	let mut caps_out = [0u64; CAPS + 1];
+	let mut bytes_out = [0u8; 16];
+	crate::object::handle::refuse_next_reservation_allocations(1);
+	let no_room = unsafe { invoke(SYS_CHANNEL_RECV_CAPS, recv_handle, bytes_out.as_mut_ptr() as u64, bytes_out.len() as u64, caps_out.as_mut_ptr() as u64) };
+	ALLOC_REFUSED_RECV.store(signed(no_room), Ordering::SeqCst);
+	ALLOC_STILL_QUEUED.store(signed(unsafe { invoke(SYS_CHANNEL_PEEK, recv_handle, 0, 0, 0) }), Ordering::SeqCst);
+
+	// And the same receive, unarmed, takes it whole.
+	let now = unsafe { invoke(SYS_CHANNEL_RECV_CAPS, recv_handle, bytes_out.as_mut_ptr() as u64, bytes_out.len() as u64, caps_out.as_mut_ptr() as u64) };
+	if sys_is_err(now) || caps_out[0] != 2 {
+		ALLOC_REPORT.store(7, Ordering::SeqCst);
+		return;
+	}
+	for raw in caps_out.iter().take(2 + 1).skip(1) {
+		if sys_is_err(unsafe { invoke(SYS_HANDLE_CLOSE, *raw, 0, 0, 0) }) {
+			ALLOC_REPORT.store(8, Ordering::SeqCst);
+			return;
+		}
+	}
+	ALLOC_REPORT.store(0, Ordering::SeqCst);
+}
+
+crate::tagged_test!(capability_tcb_an_allocation_that_fails_mid_transfer_costs_the_caller_nothing, [CapabilityTcb, Object, Handle, Channel, Domain, Kernel, Syscall, Memory], id = "kernel.object.capability_tcb_an_allocation_that_fails_mid_transfer_costs_the_caller_nothing", covers = ["kernel"]);
+fn capability_tcb_an_allocation_that_fails_mid_transfer_costs_the_caller_nothing() {
+	ALLOC_REPORT.store(-1, Ordering::SeqCst);
+
+	let (a, b) = Channel::create();
+	let (process, send_handle) = crate::sched::prepare_shared_process(a.clone(), Rights::ALL);
+	let recv_handle = process.install(b.clone(), Rights::ALL).expect("a second endpoint in the same table");
+	ALLOC_SEND.store(send_handle, Ordering::SeqCst);
+	ALLOC_RECV.store(recv_handle, Ordering::SeqCst);
+
+	let driver = crate::sched::prepare_in_process(alloc_thread, 0, &process);
+	crate::sched::start_thread(&driver);
+	crate::sched::run_until_idle();
+
+	// NOTHING ARMED IS LEFT ARMED. A counter that survived this test would refuse an allocation in
+	// whatever ran next, which is a failure nobody would look for here.
+	crate::object::channel::refuse_next_enqueue_allocations(0);
+	crate::object::handle::refuse_next_reservation_allocations(0);
+
+	let report = ALLOC_REPORT.load(Ordering::SeqCst);
+	assert_eq!(report, 0, "the allocation fixture stopped at step {report} (see `alloc_thread`)");
+	assert!(ALLOC_REFUSED_SEND.load(Ordering::SeqCst) < 0, "a send whose enqueue cannot allocate is refused rather than aborting the kernel");
+	assert_eq!(ALLOC_ENTRIES_BEFORE.load(Ordering::SeqCst), ALLOC_ENTRIES_AFTER.load(Ordering::SeqCst), "a refused send leaves the caller's table exactly as it found it - every capability back under the handle it came from");
+	assert_eq!(ALLOC_REFUSED_RECV.load(Ordering::SeqCst), crate::syscall::ERR_RESOURCE_EXHAUSTED, "a receive whose reservation cannot allocate is refused");
+	assert!(ALLOC_STILL_QUEUED.load(Ordering::SeqCst) >= 0, "and the message it could not book for is still queued for a receiver that can");
 }

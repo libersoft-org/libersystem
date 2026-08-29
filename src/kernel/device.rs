@@ -114,6 +114,34 @@ pub fn init() {
 		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
 		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_XHCI as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: x.pci.vendor, product: x.pci.device_id, bar_phys: x.bar_phys, bar_len: x.bar_len, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: x.msix_cap, msix_table_phys: x.msix_table_phys, bus: x.pci.bus, dev: x.pci.dev, func: x.pci.func, class: x.pci.class, subclass: x.pci.subclass, prog_if: x.pci.prog_if, on_bus: true });
 	}
+	// AND EVERY OTHER FUNCTION ON THE BUS, so the inventory is the machine rather than the two
+	// families this kernel happens to resolve.
+	//
+	// `PCI_FUNCTIONS` held the full scan and its only reader was `SYS_PCI_INFO`, for `lspci`. The
+	// table below - which answers `SYS_DEVICE_COUNT`, supplies identity to the binder, and owns the
+	// claim slots - was filled by `scan_virtio()` and `scan_xhci()` alone. So a function outside those
+	// two resolvers had no identity row anywhere the registry, a stable node, the binding catalogue or
+	// DeviceService look: it was visible through one diagnostic syscall and nowhere else.
+	//
+	// A ROW WITH NO RESOURCE PROFILE IS THE POINT, not a gap in one. These carry the standards
+	// identity the scan resolved - vendor, product, the class triple, the address - and no BAR, no
+	// MSI-X and no virtio structure offsets, because this kernel did not resolve any for them. That is
+	// what "discoverable and capability-free" means: a rule can match one, nothing can claim resources
+	// it has none of, and a device nothing binds is still a device this machine reports having.
+	//
+	// APPENDED, so the indices the two resolvers produced keep the values they had.
+	for p in crate::arch::pci::scan() {
+		// Bridges are not endpoints: they forward for what is behind them and there is nothing to
+		// bind to one. `header_type & 0x7F == 0` is the same test `init` uses above.
+		if p.header_type & 0x7F != 0 {
+			continue;
+		}
+		if table.iter().any(|entry| entry.bus == p.bus && entry.dev == p.dev && entry.func == p.func) {
+			continue;
+		}
+		// ALLOC-OK: the device inventory is built once at boot from what the bus reports.
+		table.push(DeviceEntry { device_type: abi::DEVICE_TYPE_UNKNOWN as u16, transport: abi::TRANSPORT_PLAIN_PCI, vendor: p.vendor, product: p.device_id, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: p.bus, dev: p.dev, func: p.func, class: p.class, subclass: p.subclass, prog_if: p.prog_if, on_bus: true });
+	}
 	// One claim slot per device, all `Free`: nothing is driving anything yet, and enumeration left
 	// every device with bus mastering off.
 	let len = table.len();
@@ -400,7 +428,15 @@ pub fn snapshot(index: usize) -> Option<abi::DeviceClaimSnapshot> {
 		slot.state = ClaimState::Quarantined;
 		crate::serial_println!("device: {index} did not confirm its teardown inside the deadline - quarantined, and nothing it held is reused");
 	}
-	Some(abi::DeviceClaimSnapshot { state: slot.state as u32, _pad0: 0, generation: slot.generation, release_deadline: slot.release_deadline })
+	// WHAT THE CLAIM STILL HOLDS, counted from the kernel's own records rather than from a number
+	// somebody remembered to keep. `DERIVED` is every capability minted under this key - the MMIO
+	// window a driver maps is one - the MSI registry knows which slots this device owns, and the
+	// IOMMU knows what its domain still has mapped. See `DeviceClaimSnapshot`.
+	let key = abi::ClaimKey { device_index: index as u32, _pad: 0, generation: slot.generation };
+	let mmio_windows = DERIVED.lock().iter().filter(|row| row.key == key && row.object.strong_count() > 0).count() as u32;
+	let irq_vectors = crate::arch::interrupts::msi_held_by_device(index as u32) as u32;
+	let iommu_grants = crate::iommu::grants_for(index as u32) as u32;
+	Some(abi::DeviceClaimSnapshot { state: slot.state as u32, _pad0: 0, generation: slot.generation, release_deadline: slot.release_deadline, mmio_windows, irq_vectors, iommu_grants, _pad1: 0 })
 }
 
 // RELEASE THE DEVICE, and prove it is quiet before anything it held is reused.

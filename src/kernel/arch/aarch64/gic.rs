@@ -72,8 +72,30 @@ const GICC_PMR: usize = 0x004; // priority mask
 const GICC_IAR: usize = 0x00c; // interrupt acknowledge (read the pending INTID)
 const GICC_EOIR: usize = 0x010; // end of interrupt
 
-// The EL1 physical timer interrupt on QEMU virt (PPI 14 -> INTID 30).
-const TIMER_INTID: u32 = 30;
+// THE EL1 PHYSICAL TIMER'S INTID, READ FROM THE MACHINE.
+//
+// This was `const TIMER_INTID: u32 = 30` with a comment naming QEMU `virt` - a claim about one
+// machine, enabled on every machine, on a port whose whole discovery story is that addresses come
+// from the tree. A machine naming another PPI had 30 armed anyway, which is an interrupt it never
+// described; a machine naming none had 30 armed too.
+//
+// Published by the boot path from `BootInfo::timer_intid` before the controller is brought up. Zero
+// means the tree named none, and `init` refuses rather than defaulting - see `set_timer_intid`.
+static TIMER_INTID_CELL: AtomicU32 = AtomicU32::new(0);
+
+// Record what the tree said the timer's interrupt is. Called once, before `init`.
+pub fn set_timer_intid(intid: u32) {
+	TIMER_INTID_CELL.store(intid, Ordering::Release);
+}
+
+// The same, for the IRQ inventory, which reports what this machine's timer is rather than a constant.
+pub fn timer_intid_for_report() -> u32 {
+	timer_intid()
+}
+
+fn timer_intid() -> u32 {
+	TIMER_INTID_CELL.load(Ordering::Acquire)
+}
 
 // 100 Hz tick (the shared scheduler-tick policy).
 use crate::arch::common::time::TICK_HZ;
@@ -223,8 +245,8 @@ fn init_cpu_local() {
 			// (SGI 0) is delivered and bounces this core out of WFI.
 			core::ptr::write_volatile(gicd(GICD_ISENABLER), 0x0000_ffff);
 			// Unmask the timer PPI (INTID 30 -> ISENABLER0 bit 30; banked per core).
-			let reg = gicd(GICD_ISENABLER + (TIMER_INTID as usize / 32) * 4);
-			core::ptr::write_volatile(reg, 1 << (TIMER_INTID % 32));
+			let reg = gicd(GICD_ISENABLER + (timer_intid() as usize / 32) * 4);
+			core::ptr::write_volatile(reg, 1 << (timer_intid() % 32));
 		}
 	}
 	arm_local_timer();
@@ -259,7 +281,7 @@ fn init_cpu_local_v3() {
 			core::ptr::write_volatile(gicr(frame, GICR_IPRIORITYR + intid) as *mut u8, 0xa0);
 		}
 		// The 16 SGIs (the wake IPI is SGI 0) and the timer PPI.
-		core::ptr::write_volatile(gicr(frame, GICR_ISENABLER0), 0x0000_ffff | (1 << TIMER_INTID));
+		core::ptr::write_volatile(gicr(frame, GICR_ISENABLER0), 0x0000_ffff | (1 << timer_intid()));
 
 		// THE CPU INTERFACE IS SYSTEM REGISTERS, AND SRE ENABLES THEM. Written by encoding rather
 		// than by name so this assembles without depending on the toolchain's register-name table.
@@ -304,7 +326,7 @@ pub fn handle_irq(from_user: bool) {
 	if intid == 0 {
 		crate::mem::tlb::service_pending();
 	}
-	if intid == TIMER_INTID {
+	if intid == timer_intid() {
 		// Re-arm for the next tick (clears the timer's level-asserted condition). EVERY core does
 		// this - it is what drives preemption on that core - and only the shared clock below is
 		// gated, so the rate is the machine's and not the core count's.
@@ -333,7 +355,7 @@ pub fn handle_irq(from_user: bool) {
 	// The periodic timer tick drives preemption: rotate to the next ready thread on
 	// this core (a no-op until the scheduler is up and only if another is ready).
 	// EOI is already sent above, matching the x86 timer-ISR order.
-	if intid == TIMER_INTID {
+	if intid == timer_intid() {
 		crate::sched::on_timer_preempt(from_user);
 	}
 }

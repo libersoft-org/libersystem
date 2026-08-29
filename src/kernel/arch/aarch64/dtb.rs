@@ -74,6 +74,48 @@ pub unsafe fn parse(hint: u64) -> Option<BootInfo> {
 	unsafe { at(locate(hint)?).parse() }
 }
 
+// WHY THERE IS NO TREE, WHICH IS TWO DIFFERENT FACTS.
+//
+// `parse` answers `None` for a machine that published no tree AND for one that published a tree this
+// reader could not use - and the caller then treats `None` as the no-DT case, so a build that
+// authorises the named no-DT profile authorises the CORRUPT-tree case with it. M4 asks for the static
+// descriptor to be selected only by a named profile; a corrupt tree is not that profile.
+pub enum TreeAbsence {
+	// The boot path published no pointer and no tree was found where this port looks.
+	NoTree,
+	// Something was published or found and this reader could not use it. Never the no-DT profile.
+	Unusable,
+}
+
+// WHERE THE TREE ACTUALLY IS, which is not always where the boot path said.
+//
+// This runner's DIRECT path enters with `x0 = 0` and loads the tree at a fixed address, so a caller
+// that asks the boot argument gets zero and concludes there is no tree - which is how `psci::conduit`
+// came to answer `PSCI_NONE` on a machine whose own tree states `method`, and why a four-core direct
+// profile came up on one core. `locate` already knows the answer; nothing outside this file could ask.
+//
+// # Safety
+// `hint` must be 0 or the device-tree pointer the boot path was given.
+pub unsafe fn tree_address(hint: u64) -> Option<u64> {
+	unsafe { locate(hint) }
+}
+
+// # Safety
+// `hint` must be 0 or the device-tree pointer the boot path was given.
+pub unsafe fn absence(hint: u64) -> TreeAbsence {
+	// A pointer that was given and is not an FDT is an error, and `locate` says so; reaching here
+	// with a hint at all means something was published.
+	if hint != 0 {
+		return TreeAbsence::Unusable;
+	}
+	match unsafe { locate(hint) } {
+		// A tree was FOUND and `parse` still refused it: the blob is there and this reader cannot
+		// use it, which is the case that must not select a static descriptor.
+		Some(_) => TreeAbsence::Unusable,
+		None => TreeAbsence::NoTree,
+	}
+}
+
 // The tree itself, at wherever it was actually found.
 //
 // `parse` locates the blob and throws the location away, so a caller that needs the FDT for anything

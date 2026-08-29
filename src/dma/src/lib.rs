@@ -516,6 +516,120 @@ pub enum Plan {
 	Bounce { len: u64 },
 }
 
+// WHAT A NON-COHERENT MACHINE HAS TO DO AT THE SYNC POINTS, and the reason this is a trait rather
+// than a function.
+//
+// This crate is portable and holds no architecture: cleaning a cache line is an instruction that
+// differs per port, and `Requirements::coherent` was recorded and never read because there was nowhere
+// for the answer to go. The kernel supplies the maintenance; the crate supplies WHEN it happens, which
+// is the half a driver cannot get right on its own.
+pub trait CacheMaintenance {
+	// The CPU has written; the device is about to read. Push the writes out to where it will look.
+	fn clean_for_device(&self, physical: u64, len: u64);
+	// The device has written; the CPU is about to read. Drop anything stale the CPU still holds.
+	fn invalidate_for_cpu(&self, physical: u64, len: u64);
+}
+
+// A COHERENT MACHINE, where both sync points are nothing. The honest implementation for x86_64 and for
+// any port whose devices snoop - and the reason a driver written against this contract costs nothing
+// on the machines that do not need it.
+pub struct Coherent;
+
+impl CacheMaintenance for Coherent {
+	fn clean_for_device(&self, _physical: u64, _len: u64) {}
+	fn invalidate_for_cpu(&self, _physical: u64, _len: u64) {}
+}
+
+// A STAGED BUFFER, for a device that cannot reach the pages where the data is.
+//
+// `Plan::Bounce` said this was needed and nothing built one, so the planner's answer had no consumer:
+// a driver on an address-limited or non-coherent device got a decision it could not act on. The two
+// sync points are the whole contract - `for_device` before the device is told to go, `for_cpu` after
+// it says it is done - and they are where the cache maintenance happens whether or not a copy does.
+pub struct Bounce {
+	staging: Vec<u8>,
+	// Where the staging buffer is, in the addresses the DEVICE will use.
+	physical: u64,
+	coherent: bool,
+}
+
+impl Bounce {
+	// `physical` is the address of a buffer the device CAN reach - the caller allocated it under the
+	// same `Requirements` that produced the bounce decision.
+	pub fn new(physical: u64, len: u64, requirements: &Requirements) -> Result<Bounce, Fault> {
+		if len == 0 {
+			return Err(Fault::Malformed);
+		}
+		if !requirements.permits(physical, len) {
+			// A staging buffer the device cannot address is not a staging buffer.
+			return Err(Fault::OutOfRange);
+		}
+		let mut staging = Vec::new();
+		if staging.try_reserve(len as usize).is_err() {
+			return Err(Fault::NoSpace);
+		}
+		staging.resize(len as usize, 0);
+		Ok(Bounce { staging, physical, coherent: requirements.coherent() })
+	}
+
+	pub fn physical(&self) -> u64 {
+		self.physical
+	}
+
+	pub fn len(&self) -> u64 {
+		self.staging.len() as u64
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.staging.is_empty()
+	}
+
+	// The CPU's bytes, staged where the device can reach them, and the caches told about it.
+	pub fn for_device(&mut self, source: &[u8], cache: &dyn CacheMaintenance) -> Result<(), Fault> {
+		if source.len() > self.staging.len() {
+			return Err(Fault::OutOfRange);
+		}
+		self.staging[..source.len()].copy_from_slice(source);
+		if !self.coherent {
+			cache.clean_for_device(self.physical, source.len() as u64);
+		}
+		Ok(())
+	}
+
+	// The device's bytes, read back after it says it is done - stale lines dropped first.
+	pub fn for_cpu(&self, destination: &mut [u8], cache: &dyn CacheMaintenance) -> Result<(), Fault> {
+		if destination.len() > self.staging.len() {
+			return Err(Fault::OutOfRange);
+		}
+		if !self.coherent {
+			cache.invalidate_for_cpu(self.physical, destination.len() as u64);
+		}
+		destination.copy_from_slice(&self.staging[..destination.len()]);
+		Ok(())
+	}
+
+	// A DIRECT plan still has sync points on a non-coherent machine. The data is where the device will
+	// look, so nothing is copied - and the caches still have to be told, which is exactly the case a
+	// bounce-shaped API would hide by making the copy the trigger.
+	pub fn sync_direct_for_device(segments: &[Segment], requirements: &Requirements, cache: &dyn CacheMaintenance) {
+		if requirements.coherent() {
+			return;
+		}
+		for segment in segments {
+			cache.clean_for_device(segment.physical, segment.len);
+		}
+	}
+
+	pub fn sync_direct_for_cpu(segments: &[Segment], requirements: &Requirements, cache: &dyn CacheMaintenance) {
+		if requirements.coherent() {
+			return;
+		}
+		for segment in segments {
+			cache.invalidate_for_cpu(segment.physical, segment.len);
+		}
+	}
+}
+
 // Decide how a device with these requirements reaches these pages.
 //
 // The two failure directions are different and both matter: too many segments for the descriptor
@@ -976,6 +1090,11 @@ impl<B: Backend> Iommu<B> {
 
 	// How many endpoints this controller is translating for. Part of the baseline a restart is
 	// asserted against - see `iommu::report`.
+	// Every mapping this domain still holds, live or quarantined. See `iommu::grants_for`.
+	pub fn mappings_in(&self, domain: DomainId) -> usize {
+		self.mappings.values().filter(|m| m.domain == domain && m.state != MappingState::Released).count()
+	}
+
 	pub fn attached_endpoints(&self) -> usize {
 		self.domains.values().map(|state| state.endpoints.len()).sum()
 	}

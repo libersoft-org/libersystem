@@ -195,12 +195,19 @@ run_profile() {
 			selection="${selection:+$selection,}$want_id"
 		done
 	fi
+	# DIRECT BOOT, WHICH IS WHAT M6 ASKS FOR AND WHAT THIS GATE COULD NOT DO.
+	#
+	# It forced `UEFI=1` because the direct path came up on ONE core: QEMU enters with `x0 = 0` and
+	# this runner loads the tree at a fixed address, so `psci::conduit` was asked about zero, answered
+	# `PSCI_NONE`, and no secondary ever started. That is fixed - the conduit is read from where the
+	# tree IS - and a four-core direct profile now brings up four cores, so the profiles boot the way
+	# the milestone names: the controller AND the bring-up read from the tree in front of them.
 	local -a request=()
 	if [[ -n "$selection" ]]; then
-		request=(env "TEST_SELECTION=$selection" "$@" ./test.sh --arch "$arch" --smp "$cores")
+		request=(env UEFI=0 "TEST_SELECTION=$selection" "$@" ./test.sh --arch "$arch" --smp "$cores")
 		echo "arch-profiles:     asking for $(tr ',' ' ' <<<"$selection" | wc -w) named test(s)"
 	else
-		request=(env "$@" ./test.sh --arch "$arch" --tags smoke --smp "$cores")
+		request=(env UEFI=0 "$@" ./test.sh --arch "$arch" --tags smoke --smp "$cores")
 	fi
 	if ! "${request[@]}" >"$out" 2>&1; then
 		echo "arch-profiles: the integration suite failed on $arch $label at $cores core(s)" >&2

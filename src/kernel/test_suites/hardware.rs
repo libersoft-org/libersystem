@@ -388,6 +388,61 @@ fn dma_buffer_maps_and_reports_phys() {
 	assert_eq!(READBACK.load(Ordering::SeqCst), MARK, "the bytes written through the mapping must be visible at the physical base");
 }
 
+// A PCI FUNCTION NOTHING BINDS IS STILL IN THE INVENTORY, AND HAS NO RESOURCES.
+//
+// M1 says every PCI function is inventoried and the definition of done says a function nothing binds
+// stays discoverable and capability-free. It was neither: `device::init` filled `PCI_FUNCTIONS` from
+// the full scan for `lspci` alone, and filled the table that answers `SYS_DEVICE_COUNT`, supplies
+// identity to the binder and owns the claim slots from `scan_virtio()` and `scan_xhci()` only. A
+// function outside those two resolvers existed in one diagnostic syscall and nowhere else - and M4's
+// missing fixture for exactly this case is why nobody noticed.
+//
+// THE MACHINE SUPPLIES THE CASE. q35 carries an ISA bridge, a SATA controller and an SMBus function
+// beside the virtio devices, so this asserts against real rows rather than an injected one.
+crate::tagged_test!(a_pci_function_nothing_binds_is_still_inventoried_and_holds_nothing, [Drivers, Kernel], id = "kernel.hardware.a_pci_function_nothing_binds_is_still_inventoried_and_holds_nothing", covers = ["kernel"]);
+fn a_pci_function_nothing_binds_is_still_inventoried_and_holds_nothing() {
+	let count = crate::device::count();
+	let mut unresolved = 0usize;
+	for index in 0..count {
+		let Some(entry) = crate::device::with(index, |d| (d.device_type, d.transport, d.bar_phys, d.bar_len, d.msix_cap, d.vendor, d.bus, d.dev, d.func)) else {
+			panic!("device {index} is counted and cannot be read - the count and the table disagree");
+		};
+		let (device_type, transport, bar_phys, bar_len, msix_cap, vendor, bus, dev, func) = entry;
+		if device_type != abi::DEVICE_TYPE_UNKNOWN as u16 {
+			continue;
+		}
+		unresolved += 1;
+		// CAPABILITY-FREE. This kernel resolved no BAR and no MSI-X for it, so there is nothing a
+		// claim could hand a driver - which is what makes an unbound function safe to inventory.
+		assert_eq!(bar_phys, 0, "an unresolved function at {bus:02x}:{dev:02x}.{func} carries a BAR address this kernel never resolved");
+		assert_eq!(bar_len, 0, "an unresolved function at {bus:02x}:{dev:02x}.{func} carries a BAR length this kernel never resolved");
+		assert_eq!(msix_cap, 0, "an unresolved function at {bus:02x}:{dev:02x}.{func} carries an MSI-X capability this kernel never resolved");
+		// AND IT KEPT ITS IDENTITY, which is the half that makes it matchable by a registry rule.
+		assert_eq!(transport, abi::TRANSPORT_PLAIN_PCI, "an unresolved function speaks plain PCI - it is not a virtio transport this kernel decoded");
+		assert_ne!(vendor, 0, "an unresolved function at {bus:02x}:{dev:02x}.{func} lost the vendor id the scan read");
+	}
+	assert!(unresolved > 0, "this machine's bus carries functions outside the virtio and xHCI resolvers, and none of them reached the inventory - which is the defect, not the fixture");
+
+	// AND TWO CONTROLLERS OF ONE KIND DO NOT COLLIDE, which is M4's other named case. This machine
+	// presents several virtio-blk functions; each is its own row with its own address and its own
+	// claim slot, so "the same driver bound both" is two independent bindings rather than one row
+	// two things share.
+	let mut same_kind: alloc::vec::Vec<(u16, u8, u8, u8)> = alloc::vec::Vec::new();
+	for index in 0..count {
+		if let Some(row) = crate::device::with(index, |d| (d.device_type, d.bus, d.dev, d.func)) {
+			same_kind.push(row);
+		}
+	}
+	for (at, left) in same_kind.iter().enumerate() {
+		for right in same_kind.iter().skip(at + 1) {
+			assert_ne!((left.1, left.2, left.3), (right.1, right.2, right.3), "two inventory rows name one PCI address, so a claim on either is a claim on both");
+		}
+	}
+	let blocks = same_kind.iter().filter(|row| row.0 == abi::VIRTIO_TYPE_BLOCK as u16).count();
+	assert!(blocks > 1, "this machine presents several virtio-blk functions and the inventory holds {blocks} - the same-kind case cannot be asserted against one row");
+	crate::serial_println!("    {unresolved} PCI function(s) nothing binds are inventoried, identified and hold nothing; {blocks} controllers of one kind hold {blocks} rows");
+}
+
 tagged_test!(device_service_lists_devices, [Service, Drivers], id = "kernel.hardware.device_service_lists_devices", covers = ["kernel"]);
 fn device_service_lists_devices() {
 	use object::channel::Message;

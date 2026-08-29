@@ -1437,6 +1437,32 @@ fn the_first_usable_controller_wins() {
 // recognised GIC node after it - so this tree returned the FIRST node's GICv2 cpu-interface address
 // with version 3, and the kernel drives a v3 "cpu interface" as a redistributor region. The existing
 // duplicate test uses two same-version nodes and cannot see it.
+// A WINDOW TOO SMALL FOR THE REGISTERS THE DRIVER WRITES IS NOT A CONTROLLER.
+//
+// Non-zero was the whole size check, so a one-byte distributor was accepted - and the backend then
+// writes `GICD_IROUTER` at offset 0x6000 and a GICv2 CPU interface at 0x10, outside the window the
+// machine declared. Those are stores into whatever the arithmetic produced, found at the first MMIO
+// write rather than where both numbers are known.
+#[test]
+fn a_controller_window_too_small_for_its_registers_is_not_taken() {
+	let undersized_dist = machine(|builder| {
+		builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop("reg", &gic_reg(0x0800_0000, 0x10, 0x0801_0000, 0x1_0000)).end();
+	});
+	assert_eq!(at(undersized_dist).parse().expect("parses").gic_dist, 0, "a distributor that cannot hold GICD_IROUTER is not the distributor this kernel drives");
+
+	let undersized_cpu = machine(|builder| {
+		builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x8)).end();
+	});
+	assert_eq!(at(undersized_cpu).parse().expect("parses").gic_dist, 0, "a CPU interface smaller than its own EOIR register is not one");
+
+	// AND THE ORDINARY MACHINE IS UNAFFECTED, which is what stops this from being a rule that refuses
+	// real controllers.
+	let ok = machine(|builder| {
+		builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000)).end();
+	});
+	assert_eq!(at(ok).parse().expect("parses").gic_dist, 0x0800_0000, "QEMU virt's own GICv2 still resolves");
+}
+
 #[test]
 fn a_later_controller_does_not_relabel_the_one_whose_addresses_were_taken() {
 	let blob = machine(|builder| {
@@ -1838,4 +1864,49 @@ fn a_two_node_tree_without_a_distance_map_still_places_its_memory() {
 	assert_eq!(info.ram_region_nodes[0], 0);
 	assert_eq!(info.ram_region_nodes[1], 1);
 	assert_eq!(info.numa_distance_count, 0);
+}
+
+// THE TIMER'S INTERRUPT COMES FROM THE TREE.
+//
+// The backend held `const TIMER_INTID: u32 = 30` with a comment naming QEMU `virt`, and nothing
+// decoded the timer node at all - so a machine naming another PPI was ACCEPTED and the kernel enabled
+// 30 anyway, and a machine naming none was accepted too. M2 wants a missing or contradictory timer
+// path to be a named refusal, and a refusal needs something to refuse ON.
+#[test]
+fn the_timer_interrupt_is_read_from_the_tree_and_not_assumed() {
+	// FOUR TRIPLES, the binding's own shape: secure EL1, non-secure EL1 physical, virtual,
+	// hypervisor. Kind 1 is a PPI and a PPI's INTID is its number plus 16, so QEMU virt's
+	// non-secure EL1 physical timer at PPI 14 is INTID 30.
+	let interrupts = |a: u32, b: u32, c: u32, d: u32| -> Vec<u8> {
+		let mut out = Vec::new();
+		for number in [a, b, c, d] {
+			out.extend_from_slice(&1u32.to_be_bytes());
+			out.extend_from_slice(&number.to_be_bytes());
+			out.extend_from_slice(&0xf08u32.to_be_bytes());
+		}
+		out
+	};
+	let virt = machine(|builder| {
+		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &interrupts(13, 14, 11, 10)).end();
+	});
+	assert_eq!(at(virt).parse().expect("parses").timer_intid, 30, "QEMU virt's non-secure EL1 physical timer is PPI 14, which is INTID 30 - the number the backend had compiled in");
+
+	// A MACHINE THAT NAMES ANOTHER PPI IS READ, not overridden. This is the case the compiled
+	// constant was silently wrong about.
+	let other = machine(|builder| {
+		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &interrupts(13, 20, 11, 10)).end();
+	});
+	assert_eq!(at(other).parse().expect("parses").timer_intid, 36, "a tree naming PPI 20 means INTID 36, and reading 30 there arms an interrupt the machine did not describe");
+
+	// AND A MACHINE WITH NO TIMER NODE NAMES NOTHING, which is what the caller refuses on.
+	let none = machine(|builder| {
+		builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000)).end();
+	});
+	assert_eq!(at(none).parse().expect("parses").timer_intid, 0, "no timer node is no timer interrupt - zero is 'the tree said nothing', not a default");
+
+	// A node named `timer` that is not the ARM generic timer is not one either.
+	let foreign = machine(|builder| {
+		builder.begin("timer").prop_str("compatible", "some,other-timer").prop("interrupts", &interrupts(13, 14, 11, 10)).end();
+	});
+	assert_eq!(at(foreign).parse().expect("parses").timer_intid, 0, "a timer this reader does not implement names no interrupt it can arm");
 }

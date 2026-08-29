@@ -7,11 +7,11 @@ Error: Action property GenerationsOnlyAdvance is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ outcome = "none"
+/\ lastBatch = 0
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -49,18 +49,20 @@ State 1: <Initial predicate>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 2: <Take line 119, col 5 to line 138, col 154 of module Transfer>
+State 2: <Take line 135, col 5 to line 154, col 157 of module Transfer>
 /\ outcome = "none"
+/\ lastBatch = 0
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = ( p1 :>
@@ -71,7 +73,6 @@ State 2: <Take line 119, col 5 to line 138, col 154 of module Transfer>
            from |-> {"USE", "TRANSFER"} ] >> @@
   p2 :> <<>> )
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<1>> @@ p2 :> <<>>)
@@ -109,23 +110,24 @@ State 2: <Take line 119, col 5 to line 138, col 154 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 3: <Enqueue line 194, col 5 to line 206, col 140 of module Transfer>
+State 3: <Enqueue line 212, col 5 to line 225, col 132 of module Transfer>
 /\ outcome = "sent"
+/\ lastBatch = 1
 /\ nextId = 2
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<1>> @@ p2 :> <<>>)
@@ -163,7 +165,7 @@ State 3: <Enqueue line 194, col 5 to line 206, col 140 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = << [ id |-> 1,
      caps |->
          << [ objgen |-> 1,
@@ -172,21 +174,22 @@ State 3: <Enqueue line 194, col 5 to line 206, col 140 of module Transfer>
               rights |-> {"USE", "TRANSFER"},
               from |-> {"USE", "TRANSFER"} ] >>,
      slotHeld |-> FALSE ] >>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 1
 /\ objgen = 1
 
-State 4: <CommitTake line 149, col 5 to line 155, col 152 of module Transfer>
+State 4: <CommitTake line 165, col 5 to line 171, col 155 of module Transfer>
 /\ outcome = "sent"
+/\ lastBatch = 1
 /\ nextId = 2
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 0 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -224,7 +227,7 @@ State 4: <CommitTake line 149, col 5 to line 155, col 152 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = << [ id |-> 1,
      caps |->
          << [ objgen |-> 1,
@@ -233,21 +236,22 @@ State 4: <CommitTake line 149, col 5 to line 155, col 152 of module Transfer>
               rights |-> {"USE", "TRANSFER"},
               from |-> {"USE", "TRANSFER"} ] >>,
      slotHeld |-> FALSE ] >>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 1
 /\ objgen = 1
 
-State 5: <Book line 223, col 5 to line 230, col 154 of module Transfer>
+State 5: <Book line 252, col 5 to line 264, col 157 of module Transfer>
 /\ outcome = "sent"
+/\ lastBatch = 1
 /\ nextId = 2
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -285,7 +289,7 @@ State 5: <Book line 223, col 5 to line 230, col 154 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = << [ id |-> 1,
      caps |->
          << [ objgen |-> 1,
@@ -294,21 +298,22 @@ State 5: <Book line 223, col 5 to line 230, col 154 of module Transfer>
               rights |-> {"USE", "TRANSFER"},
               from |-> {"USE", "TRANSFER"} ] >>,
      slotHeld |-> FALSE ] >>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<1>> @@ p2 :> <<>>)
 /\ bytes = 1
 /\ objgen = 1
 
-State 6: <Peek line 249, col 5 to line 252, col 169 of module Transfer>
+State 6: <Peek line 297, col 5 to line 300, col 172 of module Transfer>
 /\ outcome = "sent"
+/\ lastBatch = 1
 /\ nextId = 2
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -346,7 +351,7 @@ State 6: <Peek line 249, col 5 to line 252, col 169 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 1
+/\ peeked = (p1 :> 1 @@ p2 :> 0)
 /\ queue = << [ id |-> 1,
      caps |->
          << [ objgen |-> 1,
@@ -355,21 +360,22 @@ State 6: <Peek line 249, col 5 to line 252, col 169 of module Transfer>
               rights |-> {"USE", "TRANSFER"},
               from |-> {"USE", "TRANSFER"} ] >>,
      slotHeld |-> FALSE ] >>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<1>> @@ p2 :> <<>>)
 /\ bytes = 1
 /\ objgen = 1
 
-State 7: <Dequeue line 257, col 5 to line 269, col 135 of module Transfer>
+State 7: <Dequeue line 310, col 5 to line 329, col 138 of module Transfer>
 /\ outcome = "sent"
+/\ lastBatch = 1
 /\ nextId = 2
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = p1
 /\ inflight = 1
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -407,30 +413,32 @@ State 7: <Dequeue line 257, col 5 to line 269, col 135 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 1
+/\ peeked = (p1 :> 1 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [ id |-> 1,
-  caps |->
-      << [ objgen |-> 1,
-           obj |-> o1,
-           type |-> t1,
-           rights |-> {"USE", "TRANSFER"},
-           from |-> {"USE", "TRANSFER"} ] >>,
-  slotHeld |-> TRUE ]
+/\ held = ( p1 :>
+      [ id |-> 1,
+        caps |->
+            << [ objgen |-> 1,
+                 obj |-> o1,
+                 type |-> t1,
+                 rights |-> {"USE", "TRANSFER"},
+                 from |-> {"USE", "TRANSFER"} ] >>,
+        slotHeld |-> TRUE ] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<1>> @@ p2 :> <<>>)
 /\ bytes = 1
 /\ objgen = 1
 
-State 8: <CommitDelivery line 294, col 5 to line 301, col 143 of module Transfer>
+State 8: <CommitDelivery line 363, col 5 to line 369, col 146 of module Transfer>
 /\ outcome = "sent"
+/\ lastBatch = 1
 /\ nextId = 2
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = p1
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -468,30 +476,32 @@ State 8: <CommitDelivery line 294, col 5 to line 301, col 143 of module Transfer
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 1
+/\ peeked = (p1 :> 1 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = TRUE
-/\ installed = <<>>
+/\ committed = (p1 :> TRUE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [ id |-> 1,
-  caps |->
-      << [ objgen |-> 1,
-           obj |-> o1,
-           type |-> t1,
-           rights |-> {"USE", "TRANSFER"},
-           from |-> {"USE", "TRANSFER"} ] >>,
-  slotHeld |-> FALSE ]
+/\ held = ( p1 :>
+      [ id |-> 1,
+        caps |->
+            << [ objgen |-> 1,
+                 obj |-> o1,
+                 type |-> t1,
+                 rights |-> {"USE", "TRANSFER"},
+                 from |-> {"USE", "TRANSFER"} ] >>,
+        slotHeld |-> FALSE ] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<1>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 9: <Install line 305, col 5 to line 315, col 145 of module Transfer>
+State 9: <Install line 380, col 5 to line 397, col 148 of module Transfer>
 /\ outcome = "sent"
+/\ lastBatch = 1
 /\ nextId = 2
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = p1
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -529,23 +539,24 @@ State 9: <Install line 305, col 5 to line 315, col 145 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 1
+/\ peeked = (p1 :> 1 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = TRUE
-/\ installed = <<1>>
+/\ committed = (p1 :> TRUE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<1>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 1, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 1, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 10: <Close line 437, col 5 to line 441, col 162 of module Transfer>
+State 10: <Close line 533, col 5 to line 537, col 165 of module Transfer>
 /\ outcome = "sent"
+/\ lastBatch = 1
 /\ nextId = 2
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 0 @@ p2 :> 0)
-/\ holder = p1
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -583,14 +594,15 @@ State 10: <Close line 437, col 5 to line 441, col 162 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 1
+/\ peeked = (p1 :> 1 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = TRUE
-/\ installed = <<1>>
+/\ committed = (p1 :> TRUE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<1>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 1, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 1, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-3345 states generated, 844 distinct states found, 174 states left on queue.
+4339 states generated, 1072 distinct states found, 238 states left on queue.

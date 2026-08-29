@@ -53,7 +53,7 @@ mod firmware {
 	pub fn each_disk(bs: *mut BootServices, visit: impl FnMut(disk::FirmwareDisk) -> bool) {
 		unsafe { disk::each_disk(bs, visit) }
 	}
-	pub fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, open: impl FnMut(disk::FirmwareDisk) -> Option<([u8; 16], T)>) -> Option<T> {
+	pub fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, open: impl FnMut(disk::FirmwareDisk) -> Result<Option<([u8; 16], T)>, ()>) -> disk::VolumeChoice<T> {
 		unsafe { disk::choose_volume(bs, want, open) }
 	}
 	pub fn locate_framebuffer(bs: *mut BootServices) -> gop::GopFb {
@@ -181,18 +181,28 @@ fn the_enumeration_reports_every_disk_in_the_firmware_order() {
 // A volume's identity, read the way the loader reads it: mount, ask, keep. Here the identity is the
 // first sixteen bytes of the disk, which stands in for the superblock UUID a LiberFS mount answers
 // with - the pairing rule is what is under test, not LiberFS.
-fn read_uuid(mut device: disk::FirmwareDisk) -> Option<([u8; 16], [u8; 16])> {
+fn read_uuid(mut device: disk::FirmwareDisk) -> Result<Option<([u8; 16], [u8; 16])>, ()> {
 	let mut header = vec![0u8; 512];
 	if !fscore::BlockDevice::read_block(&mut device, 0, &mut header) {
-		return None;
+		// The device did not answer. A real mount reports `MountError::Io` here and the loader
+		// stops; this fixture keeps the same shape.
+		return Err(());
 	}
 	if header[..16] == [0u8; 16] {
 		// Nothing mounted here: not a volume of ours.
-		return None;
+		return Ok(None);
 	}
 	let mut uuid = [0u8; 16];
 	uuid.copy_from_slice(&header[..16]);
-	Some((uuid, uuid))
+	Ok(Some((uuid, uuid)))
+}
+
+// What a choice was, spelled for `assert_eq!`.
+fn chosen_uuid(choice: disk::VolumeChoice<[u8; 16]>) -> Option<[u8; 16]> {
+	match choice {
+		disk::VolumeChoice::Chosen(uuid) => Some(uuid),
+		_ => None,
+	}
 }
 
 // TWO LIBERSYSTEM VOLUMES IN ONE MACHINE, in either handle order.
@@ -221,7 +231,7 @@ fn the_paired_volume_is_chosen_whichever_order_the_firmware_reports_it_in() {
 		add_disk(512, 0, first);
 		add_disk(512, 0, second);
 		let chosen = firmware::choose_volume(mock::boot_services(), Some([0xd4; 16]), read_uuid);
-		assert_eq!(chosen, Some([0xd4; 16]), "{label}: the paired volume is the one chosen");
+		assert_eq!(chosen_uuid(chosen), Some([0xd4; 16]), "{label}: the paired volume is the one chosen");
 	}
 
 	// With no pairing there is nothing to choose by, and the first volume wins - which is the
@@ -231,12 +241,52 @@ fn the_paired_volume_is_chosen_whichever_order_the_firmware_reports_it_in() {
 	add_disk(512, 0, theirs.clone());
 	add_disk(512, 0, ours.clone());
 	let chosen = firmware::choose_volume(mock::boot_services(), None, read_uuid);
-	assert_eq!(chosen, Some([0x77; 16]), "with no pairing the first volume that opens wins");
+	assert_eq!(chosen_uuid(chosen), Some([0x77; 16]), "with no pairing the first volume that opens wins");
 
 	// And a pairing that names a volume this machine does not have finds NOTHING rather than
 	// falling back to somebody else's system.
 	let chosen = firmware::choose_volume(mock::boot_services(), Some([0x5e; 16]), read_uuid);
-	assert_eq!(chosen, None, "a volume that is not here is not substituted for");
+	assert!(matches!(chosen, disk::VolumeChoice::NotHere), "a volume that is not here is not substituted for");
+}
+
+// A DISK THAT IS OURS AND BROKEN IS NOT A DISK THAT IS ABSENT.
+//
+// The two used to be one answer. `choose_volume` took an `Option` opener, so a corrupt superblock,
+// an unreadable device and a volume written by a newer build were all "not one of ours" - and the
+// loader read exhaustion as "the paired volume is not in this machine", which is the single answer
+// that permits a fallback to the boot medium's own kernel. Corrupting one superblock was therefore
+// enough to reach the signed fallback without touching a signature.
+//
+// Both directions are asserted, because only the pair is the property: a disk that FAILED makes the
+// exhausted walk answer `Failed`, and a disk that is merely not a volume of ours still leaves it
+// `NotHere`.
+#[test]
+fn a_volume_that_is_here_and_broken_is_not_reported_as_a_volume_that_is_absent() {
+	let _guard = guard();
+	// One disk that is not ours at all, and one that is ours and will not open.
+	add_disk(512, 0, vec![0x00; 2048]);
+	state().disks.clear();
+	add_disk(512, 0, vec![0x00; 2048]);
+	let chosen = firmware::choose_volume(mock::boot_services(), Some([0x5e; 16]), read_uuid);
+	assert!(matches!(chosen, disk::VolumeChoice::NotHere), "a disk that is not one of ours is absence");
+
+	// The same walk, with one disk whose read fails. Nothing else about the machine changes.
+	state().disks.clear();
+	add_disk(512, 0, vec![0x00; 2048]);
+	add_disk(512, 0, vec![]); // ours in shape, and it does not answer
+	let chosen = firmware::choose_volume(mock::boot_services(), Some([0x5e; 16]), read_uuid);
+	assert!(matches!(chosen, disk::VolumeChoice::Failed), "a disk that failed to open is not absence");
+
+	// AND A FAILURE DOES NOT END THE WALK. The volume wanted may be on a later disk, and a machine
+	// with one bad disk still boots off the good one - what it may not do is call the good one's
+	// absence a failure or the bad one's failure an absence.
+	state().disks.clear();
+	add_disk(512, 0, vec![]); // fails
+	let mut wanted = vec![0u8; 2048];
+	wanted[..16].copy_from_slice(&[0x5e; 16]);
+	add_disk(512, 0, wanted);
+	let chosen = firmware::choose_volume(mock::boot_services(), Some([0x5e; 16]), read_uuid);
+	assert_eq!(chosen_uuid(chosen), Some([0x5e; 16]), "a broken disk before the wanted one does not hide it");
 }
 
 // Two FAT volumes, and a disk that is not a volume at all.
@@ -258,7 +308,7 @@ fn a_disk_that_does_not_open_does_not_end_the_search() {
 		opened += 1;
 		read_uuid(device)
 	});
-	assert_eq!(chosen, Some([0x9c; 16]), "the third disk is found");
+	assert_eq!(chosen_uuid(chosen), Some([0x9c; 16]), "the third disk is found");
 	assert_eq!(opened, 3, "and every disk before it was tried");
 }
 

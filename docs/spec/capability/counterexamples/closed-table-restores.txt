@@ -7,11 +7,11 @@ Error: Invariant ClosedProcessCannotResurrect is violated.
 Error: The behavior up to this point is:
 State 1: <Initial predicate>
 /\ outcome = "none"
+/\ lastBatch = 0
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -49,18 +49,20 @@ State 1: <Initial predicate>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 2: <Take line 119, col 5 to line 138, col 154 of module Transfer>
+State 2: <Take line 135, col 5 to line 154, col 157 of module Transfer>
 /\ outcome = "none"
+/\ lastBatch = 0
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = ( p1 :>
@@ -71,7 +73,6 @@ State 2: <Take line 119, col 5 to line 138, col 154 of module Transfer>
            from |-> {"USE", "TRANSFER"} ] >> @@
   p2 :> <<>> )
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<1>> @@ p2 :> <<>>)
@@ -109,18 +110,20 @@ State 2: <Take line 119, col 5 to line 138, col 154 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> FALSE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 3: <Terminate line 455, col 5 to line 463, col 154 of module Transfer>
+State 3: <Terminate line 551, col 5 to line 564, col 149 of module Transfer>
 /\ outcome = "none"
+/\ lastBatch = 0
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = ( p1 :>
@@ -131,7 +134,6 @@ State 3: <Terminate line 455, col 5 to line 463, col 154 of module Transfer>
            from |-> {"USE", "TRANSFER"} ] >> @@
   p2 :> <<>> )
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<1>> @@ p2 :> <<>>)
@@ -169,23 +171,24 @@ State 3: <Terminate line 455, col 5 to line 463, col 154 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> TRUE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-State 4: <RestoreTake line 162, col 5 to line 177, col 137 of module Transfer>
+State 4: <RestoreTake line 178, col 5 to line 194, col 129 of module Transfer>
 /\ outcome = "restored"
+/\ lastBatch = 1
 /\ nextId = 1
 /\ lastAsk = "none"
 /\ xfer = (p1 :> <<>> @@ p2 :> <<>>)
 /\ charge = (p1 :> 1 @@ p2 :> 0)
-/\ holder = "none"
 /\ inflight = 0
 /\ lastUse = [objgen |-> 0, obj |-> "none", type |-> "none", rights |-> {}, from |-> {}]
 /\ xferSlot = (p1 :> <<>> @@ p2 :> <<>>)
@@ -223,14 +226,15 @@ State 4: <RestoreTake line 162, col 5 to line 177, col 137 of module Transfer>
                  rights |-> {},
                  from |-> {} ],
            gen |-> 1 ] >> )
-/\ peeked = 0
+/\ peeked = (p1 :> 0 @@ p2 :> 0)
 /\ queue = <<>>
-/\ committed = FALSE
-/\ installed = <<>>
+/\ committed = (p1 :> FALSE @@ p2 :> FALSE)
+/\ installed = (p1 :> <<>> @@ p2 :> <<>>)
 /\ closed = (p1 :> TRUE @@ p2 :> FALSE)
-/\ held = [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE]
+/\ held = ( p1 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] @@
+  p2 :> [id |-> 0, caps |-> <<>>, slotHeld |-> FALSE] )
 /\ booked = (p1 :> <<>> @@ p2 :> <<>>)
 /\ bytes = 0
 /\ objgen = 1
 
-106 states generated, 68 distinct states found, 51 states left on queue.
+106 states generated, 69 distinct states found, 52 states left on queue.

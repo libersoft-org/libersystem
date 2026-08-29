@@ -123,7 +123,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 57] = [
+const GATES: [(&str, &str); 58] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -136,6 +136,10 @@ const GATES: [(&str, &str); 57] = [
 	// parked, and retires nothing. Its subject is the kernel, because what it proves is the bring-up
 	// cap and the shootdown that depends on it - and it boots one guest, so it is not a fast gate.
 	("smp-core-cap", "kernel"),
+	// The harness anchor is published to the harness and to nobody else. Its subject is the kernel:
+	// the emission is in `boot_main` and the condition is an arch `boot_profile`, so a kernel change
+	// is what can break it - and it boots two guests, so it is not a fast gate.
+	("perf-anchor", "kernel"),
 	// Every gate that boots a guest reads the logs that guest named, rather than the newest file in
 	// a shared directory. Its subject is the harness: the rule is about how a gate finds its
 	// evidence, and it reads source, so it costs milliseconds and every harness change selects it.

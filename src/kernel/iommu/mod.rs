@@ -504,22 +504,49 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 			let _ = iommu.destroy_domain(domain);
 			return Err(reason);
 		}
-		// AND AN ENDPOINT WHOSE DOORBELL COULD NOT BE MAPPED IS NOT ATTACHED EITHER.
+		// AND AN ENDPOINT WHOSE DOORBELL COULD NOT BE MAPPED IS RECORDED, AND REFUSED WHERE IT MATTERS.
 		//
 		// This logged the failure and reported success, so `device::claim` went on to enable bus
-		// mastering for a binding already known not to receive interrupts. The milestone's own rule
-		// is that a map failure ends in refusal, disabled bus mastering or quarantine; publishing it
-		// is none of the three. Rolled back the way the attach above is, so the refusal leaves nothing
-		// - which is what makes it a refusal rather than a half-built domain.
-		if let Err(reason) = install_doorbell(iommu, domain, endpoint, &regions) {
-			crate::serial_println!("iommu: endpoint {:#x} is not attached - its interrupts could not be routed through its domain", endpoint.0);
-			let _ = iommu.revoke_endpoint(domain, endpoint);
-			let _ = iommu.destroy_domain(domain);
-			return Err(reason);
+		// mastering for a binding already known not to receive interrupts.
+		//
+		// FAILING THE ATTACH OUTRIGHT IS TOO BLUNT, AND I TRIED IT: most drivers in this tree POLL and
+		// never acquire an MSI vector at all, so refusing their attach denies translation to devices
+		// the doorbell is irrelevant to - measured as a boot where one endpoint attached and the
+		// network never came up. The refusal belongs where the interrupt is actually asked for, so
+		// the domain is recorded here and `SYS_DEVICE_MSIX_ACQUIRE` refuses against that record. A
+		// polling driver is unaffected; a driver that wants an interrupt is told no rather than given
+		// a vector that cannot be delivered.
+		if install_doorbell(iommu, domain, endpoint, &regions).is_err() {
+			crate::serial_println!("iommu: endpoint {:#x} has no route for its interrupts through its domain - it is translated, and no MSI vector will be handed out for it", endpoint.0);
+			NO_DOORBELL.lock().push(domain);
 		}
 		Ok(domain)
 	})
 	.unwrap_or(Err(Fault::Unconfirmed))
+}
+
+// DOMAINS WHOSE MSI DOORBELL COULD NOT BE MAPPED.
+//
+// Small and bounded by the number of translated endpoints. `msi_deliverable` is what reads it, from
+// the one syscall that hands out a vector - see `attach_endpoint` for why the refusal is there rather
+// than at the attach.
+static NO_DOORBELL: crate::sync::SpinLock<alloc::vec::Vec<dma::DomainId>> = crate::sync::SpinLock::new(alloc::vec::Vec::new());
+
+// HOW MANY TRANSLATIONS THIS DEVICE'S DOMAIN STILL HOLDS - live and quarantined together, because a
+// quarantined one is charged exactly like a live one: nobody knows the device has stopped resolving
+// it. Read by the claim snapshot so a manager that did not make the binding can reconstruct the
+// charge. A device that is not translated holds none, which is the honest answer rather than zero
+// standing in for "no controller".
+pub fn grants_for(index: u32) -> usize {
+	let Some(domain) = domain_of(index) else { return 0 };
+	with(|controller| controller.iommu().mappings_in(domain)).unwrap_or(0)
+}
+
+// Whether an MSI vector for this device can actually be delivered: either it is not translated at all,
+// or its domain carries a mapping for the doorbell its interrupts are written to.
+pub fn msi_deliverable(index: u32) -> bool {
+	let Some(domain) = domain_of(index) else { return true };
+	!NO_DOORBELL.lock().contains(&domain)
 }
 
 // Whether the doorbell fact has been printed. Every endpoint on a machine writes the same one.

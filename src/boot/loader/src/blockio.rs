@@ -74,12 +74,16 @@ pub(crate) enum FileRead {
 pub(crate) trait ReadsFiles {
 	fn read_file(&mut self, path: &[u8]) -> FileRead;
 
-	// For the walk, which treats both failures alike: a program that is missing and one that cannot
-	// be read are both a source that cannot supply its bootstrap set.
-	fn read(&mut self, path: &[u8]) -> Option<alloc::vec::Vec<u8>> {
+	// FOR THE WALK, WHICH NOW WANTS ALL THREE. This collapsed `Absent` and `Unreadable` into `None`,
+	// and `assemble` read `None` for the bootstrap list as "not a boot source, try another" - so
+	// damaging the list a signed manifest names dropped this source out of consideration entirely and
+	// the loader took the next one's bootstrap set beside this one's kernel. The distinction existed
+	// three lines up and was thrown away here.
+	fn read(&mut self, path: &[u8]) -> abi::bootstrap::Read {
 		match self.read_file(path) {
-			FileRead::Bytes(bytes) => Some(bytes),
-			_ => None,
+			FileRead::Bytes(bytes) => abi::bootstrap::Read::Bytes(bytes),
+			FileRead::Absent => abi::bootstrap::Read::Absent,
+			FileRead::Unreadable => abi::bootstrap::Read::Unreadable,
 		}
 	}
 }
@@ -182,7 +186,7 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F, expected: &crate::tr
 		crate::arch::serial::write_str("loader: this source carries no SIGNED manifest, and this build authenticates what it boots - refusing rather than falling back to the text one\n");
 		return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::NoManifest);
 	}
-	let Some(manifest) = fs.read(b"etc/boot.manifest") else {
+	let abi::bootstrap::Read::Bytes(manifest) = fs.read(b"etc/boot.manifest") else {
 		crate::arch::serial::write_str("loader: this source has no manifest of either kind - refusing to boot from it\n");
 		return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::NoManifest);
 	};
