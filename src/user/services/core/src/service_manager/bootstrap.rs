@@ -85,7 +85,7 @@ impl Kept {
 // locals - a block device's channel, the console-input privilege, the bytes a memory volume is
 // sized with. Threading fifty named variables through here would be the ladder again with one more
 // level of indirection.
-pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, external: &mut dyn FnMut(&Role) -> Option<(alloc::vec::Vec<u8>, u64)>) -> bool {
+pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, external: &mut dyn FnMut(&Role) -> Option<(alloc::vec::Vec<u8>, u64)>, follow: &mut dyn FnMut(&Role) -> [u64; 4]) -> bool {
 	unsafe {
 		for (slot, role) in ROLES[index].iter().enumerate() {
 			// THE CALLER GETS FIRST REFUSAL ON EVERY ROLE, not only the kinds the plan cannot
@@ -99,6 +99,15 @@ pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut K
 			if let Some((bytes, handle)) = external(role) {
 				if !send_blocking(manager_side, &bytes, handle) {
 					return false;
+				}
+				// AS MANY AS THAT MESSAGE SAID. Every other role answers with none.
+				for probe in follow(role) {
+					if probe == 0 {
+						continue;
+					}
+					if !send_blocking(manager_side, b"PROBE", probe) {
+						return false;
+					}
 				}
 				continue;
 			}
@@ -266,7 +275,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
+pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut [u64; 4], policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, gpu_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, snd_client: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -352,6 +361,10 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			// serve roots it creates, and a closure holding a reference alongside would be two
 			// borrows of one table.
 			let session_root: u64 = kept.end_of(b"session_service", CAP_SERVE);
+			// Read BEFORE either closure borrows the array: one wants the count, the other takes the
+			// handles, and a closure holding a reference alongside would be two borrows of one thing.
+			let probe_handles: [u64; 4] = core::mem::take(probe_blocks);
+			let probe_count: u8 = probe_handles.iter().filter(|handle| **handle != 0).count() as u8;
 			let (fat, iso, udf, usb): (u64, u64, u64, u64) = (*block2_client, *block3_client, *block4_client, *block5_client);
 			let (block, snd, frames, gpu): (u64, u64, u64, u64) = (*block_client, *snd_client, *net_frames, *gpu_client);
 			let (pointer, pointer2, keys): (u64, u64, u64) = (*input_raw, *usb_pointer, *raw_keys);
@@ -429,6 +442,12 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 					message.extend_from_slice(&super::ROOT_HEAD.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
 					message.extend_from_slice(&super::ROOT_UUID_LOW.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
 					message.extend_from_slice(&super::ROOT_UUID_HIGH.load(core::sync::atomic::Ordering::Relaxed).to_le_bytes());
+					// AND HOW MANY PROBE CONNECTIONS FOLLOW, so the instance reads exactly that many
+					// and never one more. A count in the message the reader is already reading, not
+					// a sentinel after the last one: a reader looking for a terminator CONSUMES
+					// whatever comes next, and the kernel's own fixtures send `BLOCK` and then
+					// `SERVE` with no probes at all.
+					message.push(probe_count);
 					return Some((message, block));
 				}
 				if name == b"audio_service" && role.tag == b"SND" {
@@ -553,7 +572,16 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				}
 				None
 			};
-			if !deliver_roles(manager_side, index, kept, &mut external) {
+			// THE PROBE CONNECTIONS, for the one instance whose job is to choose among the disks.
+			// Every other role answers with none. TAKEN, not duplicated: these were minted for this
+			// consumer and nobody else holds them.
+			let mut follow = |role: &Role| -> [u64; 4] {
+				if name != b"storage_service" || role.tag != b"BLOCK" {
+					return [0; 4];
+				}
+				probe_handles
+			};
+			if !deliver_roles(manager_side, index, kept, &mut external, &mut follow) {
 				return (State::Failed, Reason::BootstrapRefused);
 			}
 			// THE ENDS THIS SUPERVISOR KEEPS, copied out of the plan's own table into the names the
@@ -661,6 +689,14 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 					}
 					if let Received::Message { handle: block4, .. } = recv_blocking(manager_side, buf) {
 						*block4_client = block4;
+					}
+					// AND ONE PROBE CONNECTION PER BLOCK PROVIDER, in the same order. These are
+					// minted connections rather than the roles' own channels, so the instance that
+					// probes them competes with nobody for a reply.
+					for slot in probe_blocks.iter_mut() {
+						if let Received::Message { handle: probe, .. } = recv_blocking(manager_side, buf) {
+							*slot = probe;
+						}
 					}
 				}
 				// PermissionManager follows its "online" report with the sandbox proof: the

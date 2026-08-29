@@ -185,6 +185,33 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			} else {
 				None
 			};
+			// A CONNECTION TO EVERY BLOCK DEVICE THIS MACHINE HAS, so this instance can CHOOSE.
+			//
+			// The system volume was whichever block provider came first by bus address: a paired
+			// volume at a later address was never considered, and a machine whose first disk is not
+			// the system one had no system volume at all. The probe belongs here because this is
+			// what parses a LiberFS superblock - keeping a filesystem out of the process that hands
+			// out device authority is worth the one hand-off it costs.
+			//
+			// HOW MANY FOLLOW IS IN THIS MESSAGE, one byte after the selection. A producer that
+			// carries no count sends no probes, and reading ahead for a sentinel would eat the role
+			// after it - the kernel's own fixtures send `BLOCK` and then `SERVE`.
+			let mut probes: [u64; 4] = [0; 4];
+			let mut probe_count: usize = 0;
+			let expected: usize = if len >= 5 + 24 + 1 { (buf[5 + 24] as usize).min(probes.len()) } else { 0 };
+			while probe_count < expected {
+				let Received::Message { len, handle } = (unsafe { recv_blocking(bootstrap, &mut buf) }) else { break };
+				if len < 5 || &buf[..5] != b"PROBE" {
+					if handle != 0 {
+						unsafe { close(handle) };
+					}
+					break;
+				}
+				if handle != 0 {
+					probes[probe_count] = handle;
+					probe_count += 1;
+				}
+			}
 			// NOTHING CHOSEN PROMOTES NOTHING, and that is a rule about the KIND before it is one
 			// about the uuid.
 			//
@@ -200,7 +227,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				unsafe { print(b"StorageService: the loader promoted no block volume for this boot - refusing to serve one as the system volume\n") };
 				exit();
 			}
-			match unsafe { mount_system_volume(handle) } {
+			// THE ONE THE LOADER CHOSE, wherever it is on the bus. The handle this instance was
+			// given is tried first, so a machine whose first disk IS the system volume behaves
+			// exactly as it did; a probe is only reached when it is not.
+			let mounted = unsafe { mount_by_uuid(handle, &probes[..probe_count], chosen.map(|(_, want)| want)) };
+			for probe in probes[..probe_count].iter() {
+				unsafe { close(*probe) };
+			}
+			match mounted {
 				Some(fs) => {
 					// THE MOUNT IS REFUSED ON A MISMATCH, and that is the whole point of carrying
 					// the identity this far. Two LiberFS volumes are told apart by uuid and by
@@ -3599,6 +3633,35 @@ unsafe fn read_blocks_chunked(chan: u64, sectors_per_block: u64, index: u64, cou
 // filesystem over a disk is a decision a person makes with the disk in front of them; a service
 // deciding it at boot, from a sample of sectors, is how somebody else's data gets destroyed by a
 // machine that was only supposed to start up.
+// THE VOLUME THE LOADER CHOSE, MOUNTED, wherever on the bus it turned out to be.
+//
+// The primary is tried first and kept when it matches, which is every ordinary machine. A probe is
+// reached only when it does not - and a probe that matches is a connection minted for THIS consumer,
+// so mounting it competes with nobody. Answers the primary's mount when nothing matches, and the
+// uuid check at the call site then refuses it: a machine whose paired volume is not present says so
+// rather than serving somebody else's system.
+unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Option<LiberFs<ChannelBlockDevice>> {
+	unsafe {
+		let first = mount_system_volume(primary);
+		let Some(want) = want else { return first };
+		if first.as_ref().is_some_and(|fs| fs.uuid() == want) {
+			return first;
+		}
+		for &probe in probes {
+			if probe == 0 {
+				continue;
+			}
+			if let Some(fs) = mount_system_volume(probe)
+				&& fs.uuid() == want
+			{
+				print(b"StorageService: the volume the loader chose is not the first block device; serving the one that matches\n");
+				return Some(fs);
+			}
+		}
+		first
+	}
+}
+
 unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {
 	// What the disk IS, before deciding what may be written to it. Exactly two answers lead
 	// anywhere near a format, and the difference between them and the rest is the difference
