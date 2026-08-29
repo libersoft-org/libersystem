@@ -501,7 +501,19 @@ extern "C" fn aarch64_main(arg: u64) -> ! {
 	// evidence of it was a number nobody was reading.
 	let delivered = super::gic::ticks() - start;
 	if delivered == 0 {
-		crate::serial_println!("aarch64: NO TIMER IRQ WAS DELIVERED in {spins} spins - the interrupt path is not carrying the generic timer, and everything timed on this machine is on a clock that does not tick");
+		// AND IT IS FATAL, which is what M2 says and what printing it was not.
+		//
+		// The line was written and the boot went on - so a machine whose scheduler tick never
+		// arrives brought up userspace and measured every timeout, every preemption and every sleep
+		// against a clock that does not move. There is no degraded mode here to fall back to: a
+		// kernel that cannot be interrupted by its own timer cannot schedule, and continuing is a
+		// system that will hang somewhere further away from the cause.
+		//
+		// The panic handler writes to serial and stops, which is what fail-closed looks like on a
+		// machine with no operator - and the line above it says which of the two things went wrong,
+		// because a timer specifier this reader refused leaves `timer_intid` at zero and a delivered
+		// count of zero on a valid one is a different fault in the same place.
+		panic!("aarch64: NO TIMER IRQ WAS DELIVERED in {spins} spins - the interrupt path is not carrying the generic timer, and everything timed on this machine would be on a clock that does not tick");
 	} else if delivered < 5 {
 		crate::serial_println!("aarch64: timer IRQs delivered - {delivered} ticks, fewer than the 5 this waited for; the timer is running and the path is slower than this expects");
 	} else {
@@ -1045,5 +1057,10 @@ fn run_system_manager() {
 	// at a prompt that would never appear, and one lost afterwards left an ownerless control plane
 	// nothing watched. Four hundred rounds is the budget this machine needs; the rest is policy and
 	// lives in one place.
-	crate::boot_userspace(400);
+	// TEN TIMES WHAT IT WAS, for the reason x86_64's call site records: the window was never
+	// exercised, because the settle drain never returned to consult it. The ratio to x86_64 is
+	// unchanged - this target has always been given a third more than that one - so what moved is
+	// the one number that was measured. Emulated boots on this port are slower than that ratio
+	// suggests and this budget is not measured; it is the old calibration carried across.
+	crate::boot_userspace(4000);
 }

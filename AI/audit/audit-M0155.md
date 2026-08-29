@@ -95,3 +95,22 @@ Current implementation rating: 10/10
 No material issue remains within M0155's scope. `FatBlockDevice::read_blocks` now sends filesystem runs through the block service's chunked multi-sector path (`src/user/services/storage/src/service.rs:3513-3530`). The implementer's rejection of duplicate immediate DMA lines is justified by the plan's contradictory Results/legibility goal, and the material information-loss case is fixed: `dma_policy::report()` now runs on both userspace stabilization success and failure/reboot paths (`src/kernel/main.rs:944-965`). The final report still names every degraded device.
 
 Verification: the FAT suite passed 128 tests, the UEFI suite passed 41 tests, and the ABI suite passed 28 tests. No unresolved regression or incomplete audit fix was found.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0155 (2026-08-29T16:37:04Z):
+
+The re-audit reports no unresolved material finding and rates the milestone 10/10. There is nothing
+to accept or reject, and nothing was changed for it.
+
+Recorded here so this file says so rather than leaving a reader to infer it from an absence: I
+re-read the re-audit against the current tree and agree with its account, including its note that the
+earlier stale-artefact results were transient effects of a concurrent build rather than defects.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0155 (2026-08-29T19:01:24Z):
+
+Current implementation rating: 10/10
+
+No material unresolved issue remains within M0155's scope. The production FAT adapter still overrides `read_blocks` with the chunked multi-sector service path (`src/user/services/storage/src/service.rs:3513-3530`), and the final per-device degraded-DMA report still runs on both userspace success and failure/reboot paths (`src/kernel/main.rs:944-965`). Current FAT, UEFI, and ABI host suites passed 128, 41, and 28 tests respectively.

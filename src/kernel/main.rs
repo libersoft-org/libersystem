@@ -346,9 +346,18 @@ fn boot_main() {
 	arch::interrupts::register(arch::interrupts::IRQ_BASE as u32 + 4, serial_rx_interrupt);
 	arch::ioapic::route(4, arch::interrupts::IRQ_BASE + 4, smp::lapic_id(0));
 	arch::serial::enable_rx_irq();
-	// THREE HUNDRED ROUNDS, which is what `console_shell_loop` used to wait on this port before the
-	// wait moved inside the supervised attempt.
-	boot_userspace(300);
+	// THREE THOUSAND TICKS - THIRTY SECONDS - AND THE NUMBER IS A MEASUREMENT.
+	//
+	// It was 300, inherited from what `console_shell_loop` used to wait on this port before the wait
+	// moved inside the supervised attempt, and it had never been exercised: the settle drain never
+	// returned, so no boot ever reached the readiness check and no window was ever consulted. With
+	// the drain bounded and readiness polled, the default machine - virtio-blk x4, net, console,
+	// input x2, gpu, sound, xhci, behind an enforcing virtio-iommu - SETTLES IN 1085 TICKS on
+	// x86_64 under KVM, measured 2026-08-29. The old budget was a third of what this machine needs.
+	//
+	// 3000 is that measurement with room for a host under load; it is also DeviceManager's bind
+	// budget, which is the same window seen from userspace, and which was equally short.
+	boot_userspace(3000);
 	serial_println!("halting");
 }
 
@@ -406,12 +415,35 @@ pub(crate) fn console_shell_loop() {
 	// path live while no one is typing on the wire.
 	// AND THE HINT, WHERE THE SHELL ACTUALLY IS. It used to ride on the kernel's `boot OK` line,
 	// thirty lines and a whole userspace bring-up before anything could read a command.
-	serial_println!("shell attached - type 'help', or 'exit' to halt");
-	console_input::feed_serial(b'\n');
-	while console_input::shell_listening() {
-		if let Some(byte) = arch::serial::read_byte() {
-			if !console_input::feed_serial(byte) {
-				break;
+	// A SHELL THAT HAS NOT ATTACHED YET IS NOT A SHELL THAT EXITED.
+	//
+	// This was `while shell_listening()`, which could not be reached with nothing attached because
+	// `supervise` only ever returned true once a shell was listening. It can be now: a window that
+	// closes over a LIVE control plane is a boot that is up, and on a slow machine the console
+	// attaches after it. With the old condition that machine printed "shell attached", found
+	// nothing, returned, and the kernel halted a system that was still bringing itself up -
+	// stopping the boot at the window instead of merely declining to call it settled.
+	//
+	// So the loop ends on a shell that ATTACHED AND THEN WENT AWAY, which is what "the user typed
+	// exit" means. Until one attaches it keeps the machine running, and picks it up when it does.
+	let mut ever_attached = false;
+	loop {
+		let listening = console_input::shell_listening();
+		if listening && !ever_attached {
+			ever_attached = true;
+			// AND THE HINT WHEN THERE IS SOMETHING TO HINT AT, with the nudge that makes the shell
+			// print its first prompt.
+			serial_println!("shell attached - type 'help', or 'exit' to halt");
+			console_input::feed_serial(b'\n');
+		}
+		if !listening && ever_attached {
+			break;
+		}
+		if listening {
+			if let Some(byte) = arch::serial::read_byte() {
+				if !console_input::feed_serial(byte) {
+					break;
+				}
 			}
 		}
 		sched::run_until_idle();
@@ -678,6 +710,18 @@ fn spawn_system_manager(boot_deadline: u64, window_ticks: u64) -> Result<(alloc:
 	Ok((kernel_ep, process))
 }
 
+// How long one drain of the settle loop may run before readiness is asked again.
+//
+// Small enough that "is a shell listening" is a poll rather than a single question at the end of the
+// window, large enough that the answer is not being asked more often than the chain can change it.
+// One tick is 10 ms on every target this kernel runs on.
+const SETTLE_SLICE: u64 = 10;
+
+// The end of the next slice, never past the window's own deadline.
+fn settle_slice(deadline: u64) -> u64 {
+	core::cmp::min(deadline, arch::apic::ticks().saturating_add(SETTLE_SLICE))
+}
+
 // Drain the crash-notify channel and report whether the process `koid` faulted.
 // Each record fault::notify_crash sends is [koid u64 LE][kind u64 LE].
 fn crash_seen(crash_rx: &object::channel::Channel, koid: u64) -> bool {
@@ -785,7 +829,28 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 			continue;
 		};
 		let koid = process.header().koid();
-		sched::run_until_idle();
+		// BOUNDED BY THIS ATTEMPT'S WINDOW, like the wait below - and this is where the boot was
+		// being lost.
+		//
+		// `run_until_idle` returns only when nothing is runnable AND nothing is waiting on a
+		// deadline. The service set never reaches that state: virtio-gpu polls its display size on
+		// a short repeating timer, which is stated twelve lines into `boot_userspace` and was not
+		// carried here. So this drain never returned, on any default boot. The whole system ran
+		// INSIDE it - drivers bound, DHCP completed, the shell printed its prompt - while the loop
+		// below, which asks whether a shell is listening and decides the boot has settled, was
+		// never reached at all. Nothing after it ran either: no readiness, no `SYSTEM_IS_UP`, and no
+		// `dma_policy::report`, which is the isolation summary M0159's gate requires of an ordinary
+		// boot and the reason it could not find one.
+		//
+		// A machine that works is not the same as a boot that settled, and this is the difference.
+		//
+		// AND A SLICE, NOT THE WHOLE WINDOW. Bounding it by `deadline` fixes the hang and replaces
+		// it with a second one exactly as fatal: this drain returns only when the deadline has
+		// passed, and the wait below is `while ticks < deadline`, so the readiness check would never
+		// be reached either - the boot would end having never once asked whether a shell was
+		// listening. The drain is asked for a slice; the loop below asks for the rest, a slice at a
+		// time, and looks in between.
+		sched::run_until_idle_until(settle_slice(deadline));
 		if crash_seen(crash_rx, koid) {
 			serial_println!("recovery: SystemManager (koid {}) faulted - starting a recovery SystemManager (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
 			continue;
@@ -806,11 +871,20 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		// it - so this is the boot log and the backpressure relief in one loop.
 		let mut listening = false;
 		let mut gone = false;
-		while arch::apic::ticks() < deadline {
-			// BOUNDED, not merely called. A thread that yields and requeues itself keeps this core's
-			// run queue non-empty for as long as it likes, and the unbounded form would never come
-			// back to look at the deadline - which is the shape of a boot that is failing to settle.
-			sched::run_until_idle_until(deadline);
+		loop {
+			// BOUNDED, and bounded by a SLICE rather than by the window.
+			//
+			// A thread that yields and requeues itself keeps this core's run queue non-empty for as
+			// long as it likes, so the unbounded form never comes back to look at the deadline -
+			// which is the shape of a boot that is failing to settle. But `run_until_idle_until`
+			// returns only when its bound has PASSED, so handing it the window's own deadline means
+			// exactly one look, taken after the window is over. Every service in this chain parks on
+			// a timer, so that is what happens on every real boot: the drain consumed the whole
+			// budget and the question below was asked once, too late to answer yes.
+			//
+			// A slice is what makes this a poll. It costs one extra look every `SETTLE_SLICE` ticks
+			// and it is the difference between a readiness check and a formality.
+			sched::run_until_idle_until(settle_slice(deadline));
 			while let Ok(message) = reports.recv() {
 				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
 			}
@@ -823,6 +897,9 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 			// the end of the budget is a retry that waited for nothing.
 			if crash_seen(crash_rx, koid) || process.is_terminated() {
 				gone = true;
+				break;
+			}
+			if arch::apic::ticks() >= deadline {
 				break;
 			}
 			arch::idle_halt();
@@ -839,9 +916,28 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		}
 		if gone {
 			serial_println!("recovery: SystemManager (koid {}) is gone while the chain was coming up (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
-		} else {
-			serial_println!("recovery: no interactive shell within this target's boot window of {} tick(s) (attempt {} of {})", window_ticks, attempt + 1, max_restarts + 1);
+			continue;
 		}
+		serial_println!("recovery: no interactive shell within this target's boot window of {} tick(s)", window_ticks);
+		// A LIVE CONTROL PLANE IS NOT A FAILED BOOT, and treating it as one reboots a working
+		// machine.
+		//
+		// The window closing without a shell means one of two things, and only one of them is a
+		// failure. If SystemManager faulted or ended, the branch above has it. If it is still
+		// running - which is what the retry ladder itself discovers one line later, when the next
+		// attempt refuses to start a second manager beside the branch that is already there - then
+		// the system came up and the console has not attached YET: a machine whose volume is a
+		// CD-ROM, an emulated target, a host under load. Retrying that spawns nothing, exhausts the
+		// ladder, and calls `arch::reset()` on a system that was working.
+		//
+		// So the boot is up, said as the weaker claim it is. The isolation report and the resident-
+		// manager watch belong to a machine that is running, and a shell that attaches after this
+		// point still works - `console_shell_loop` is what feeds it.
+		if !process.is_terminated() && !crash_seen(crash_rx, koid) {
+			serial_println!("recovery: SystemManager (koid {}) is running, so the system is up without an attached shell", koid);
+			return true;
+		}
+		serial_println!("recovery: and SystemManager is gone with it (attempt {} of {})", attempt + 1, max_restarts + 1);
 	}
 	false
 }

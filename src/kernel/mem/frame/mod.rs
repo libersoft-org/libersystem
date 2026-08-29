@@ -623,6 +623,9 @@ impl FrameAllocator {
 	// One frame from `want`'s pool and nowhere else.
 	#[cfg(test)]
 	fn take_one_strict(&mut self, want: NodeId) -> Option<u64> {
+		if node_is_pretend_empty(want) {
+			return None;
+		}
 		let at = self.pools.iter().position(|pool| pool.node == Some(want))?;
 		let base = self.pools[at].buddy.alloc(0)?;
 		// The same checks the neutral path makes, in the same order. A strict allocation is not a
@@ -647,6 +650,12 @@ impl FrameAllocator {
 			let count = self.preference(want, &mut order);
 			let mut chosen = None;
 			for at in order.iter().take(count).copied() {
+				// A NODE THIS BUILD PRETENDS IS EMPTY IS SKIPPED, which is what makes the fallback
+				// half of the matrix drivable: the preference order is unchanged, so what is
+				// exercised is the ordering itself rather than a shortcut around it.
+				if self.pools[at].node.is_some_and(node_is_pretend_empty) {
+					continue;
+				}
 				if let Some(base) = self.pools[at].buddy.alloc(0) {
 					chosen = Some((at, base));
 					break;
@@ -716,6 +725,10 @@ impl FrameAllocator {
 			let count = self.preference(want, &mut order);
 			let mut chosen = None;
 			for at in order.iter().take(count).copied() {
+				// The same skip the single-frame path makes - see `node_is_pretend_empty`.
+				if self.pools[at].node.is_some_and(node_is_pretend_empty) {
+					continue;
+				}
 				if let Some(base) = self.pools[at].buddy.alloc_contiguous(pages) {
 					chosen = Some((at, base));
 					break;
@@ -1181,6 +1194,17 @@ pub fn pools_agree_with_total() -> bool {
 	summed as usize == allocator.free_count
 }
 
+// THE ONE POOL'S FREE COUNT, exactly. `pools_agree_with_total` says the sum is right, which a
+// matrix that moved a frame from node 0 to node 1 and back would also satisfy; this is what lets a
+// test name the per-node figure M0152's M5 asks to be restored. `None` is the unaffiliated pool, and
+// a node with no pool answers `None` rather than zero - "this node has nothing free" and "this node
+// has no memory at all" are different states and the caller has to be able to tell them apart.
+#[cfg(test)]
+pub fn free_in_node(node: Option<NodeId>) -> Option<usize> {
+	let allocator = ALLOCATOR.lock();
+	allocator.pools.iter().find(|pool| pool.node == node).map(|pool| pool.buddy.free_pages() as usize)
+}
+
 // How many runs the live table can hold, and whether it is the heap-backed one. For the test that
 // pins the worst-case sizing; nothing else needs to know.
 #[cfg(test)]
@@ -1454,6 +1478,33 @@ fn injected_failure() -> bool {
 #[cfg(test)]
 fn injected_failure() -> bool {
 	inject::should_fail()
+}
+
+// A NODE THIS BUILD PRETENDS IS EMPTY, so the failure half of the placement matrix can be driven.
+//
+// M5 asks for deterministic exhaustion of a node, a strict refusal on it, and a fallback to a NAMED
+// other node - and the only honest way to reach that on a real machine is to take every frame the
+// node has, which is millions of them and an allocation pattern no test can hold. What the matrix
+// actually needs is the STATE "this node can serve nothing", not the work of getting there, so it is
+// injected: the pool stays exactly as it is and the two node-aware paths refuse to draw from it.
+//
+// Test configuration only, and it is one comparison on a path that already makes several.
+#[cfg(test)]
+static EMPTY_NODE: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+#[cfg(test)]
+pub fn pretend_node_is_empty(node: Option<NodeId>) {
+	EMPTY_NODE.store(node.map_or(u32::MAX, |node| node.0 as u32), core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(test)]
+fn node_is_pretend_empty(node: NodeId) -> bool {
+	EMPTY_NODE.load(core::sync::atomic::Ordering::Acquire) == node.0 as u32
+}
+
+#[cfg(not(test))]
+fn node_is_pretend_empty(_node: NodeId) -> bool {
+	false
 }
 
 // Allocate one physical frame, returning its physical address.

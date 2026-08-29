@@ -217,6 +217,74 @@ else
 	exit 1
 fi
 
+# A CHOSEN SOURCE WITH ITS BOOTSTRAP LIST DELETED.
+#
+# The other half of M4's rule, and the half a damaged file cannot test: a source that is present,
+# correctly signed, and simply does not have the file. That is what an attacker produces by deleting
+# one name from a mutable filesystem - no signature broken, no key needed - and the loader used to
+# read it as "not a LiberSystem source", go on to the live image and the boot medium, and boot the
+# paired volume's KERNEL with somebody else's bootstrap set.
+#
+# BUILT RATHER THAN CORRUPTED. Removing a file from a LiberFS image after the fact means writing the
+# format from the host, and flipping a byte in its directory breaks the block checksum - which tests
+# the UNREADABLE branch, not this one. `mkpackages` omits the list under
+# `LIBER_OMIT_BOOTSTRAP_LIST`, and the manifest is built over what is actually staged, so the volume
+# this produces is internally consistent and correctly signed and has no list.
+absent_list_case() {
+	local volume="$BUILD/system-volume-bootable-x86_64.img"
+	[[ -f "$volume" ]] || {
+		echo "signed-boot: no bootable system volume, so the absent-list case is not run" >&2
+		return 0
+	}
+	local saved="$work/volume-with-list.img"
+	cp "$volume" "$saved"
+	if ! LIBER_OMIT_BOOTSTRAP_LIST=1 ./build.sh --arch x86_64 --kernel-on-volume --part volume >"$work/omit.log" 2>&1; then
+		cp "$saved" "$volume"
+		echo "signed-boot: could not build a volume without its bootstrap list" >&2
+		return 1
+	fi
+	cp "$volume" "$work/volume-no-list.img"
+	# THE TREE IS PUT BACK BEFORE THE BOOT, so a failure here cannot leave a listless volume behind
+	# for whatever runs next.
+	cp "$saved" "$volume"
+
+	# AND THE MEDIUM IS PAIRED WITH THE VOLUME THAT IS ACTUALLY ATTACHED.
+	#
+	# A volume's uuid is taken over its PAYLOAD, so omitting the list changes it - and the shipping
+	# medium names the volume built WITH one. Attached unchanged, the loader would decline this disk
+	# as unpaired and never reach its manifest at all, which is a true refusal for the wrong reason.
+	# Re-signed with the new uuid, the pairing SELECTS it, and what is being tested is what happens
+	# to a chosen source whose list is gone.
+	cp "$esp" "$efi"
+	local paired="$work/paired-no-list.manifest2"
+	if ! resign_with "$paired" --volume-uuid "$(volume_superblock_uuid "$work/volume-no-list.img")"; then
+		echo "signed-boot: could not pair a medium with the listless volume" >&2
+		return 1
+	fi
+	mcopy -o -i "$efi" "$paired" ::/etc/boot.manifest2
+	local log="$work/absent-list.log" vars="$work/vars.absent.fd"
+	cp "$OVMF_VARS" "$vars"
+	timeout 120 qemu-system-x86_64 \
+		-machine q35 -m 2G -display none -no-reboot \
+		-drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
+		-drive "if=pflash,format=raw,file=$vars" \
+		-drive "format=raw,file=$efi" \
+		-drive "format=raw,file=$work/volume-no-list.img,if=none,id=vol1" \
+		-device virtio-blk-pci,drive=vol1 \
+		-serial "file:$log" >/dev/null 2>&1 || true
+	rm -f "$vars"
+	if ! grep -aq "this source was chosen and its bootstrap list is not on it" "$log"; then
+		echo "signed-boot: a chosen volume with no bootstrap list did not stop the boot for that reason" >&2
+		grep -a -m 10 "loader" "$log" >&2
+		return 1
+	fi
+	if grep -aq "LiberSystem kernel is starting" "$log"; then
+		echo "signed-boot: the missing list was refused and a kernel started anyway" >&2
+		return 1
+	fi
+	echo "signed-boot: a chosen volume whose bootstrap list was deleted stops the boot instead of taking one from elsewhere"
+}
+
 # THE CONTEXT THE SIGNATURE COVERS, AND WHAT HAPPENS WHEN IT DOES NOT DESCRIBE THIS MACHINE.
 #
 # The manifest format signs the product, the architecture, the kind of source and the volume's
@@ -343,6 +411,7 @@ if [[ -n "$(command -v mcopy)" ]]; then
 	wrong_context "another architecture" --arch aarch64 || status=1
 	wrong_context "another kind of source" --source system-volume || status=1
 	wrong_volume || status=1
+	absent_list_case || status=1
 	((status == 0)) || exit 1
 fi
 

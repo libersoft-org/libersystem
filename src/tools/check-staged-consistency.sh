@@ -76,11 +76,20 @@ echo "staged-consistency: $(basename "$consumer" .lslib) records $provider"
 "$VERIFY" --verify-staged "$TARGET" >/dev/null 2>&1 || fail "the unmutated staged tree does not verify - every case below would be meaningless"
 echo "staged-consistency: the unmutated tree verifies"
 
+# `$2`, WHERE IT MATTERS, IS THE REASON. A mutation refused for a DIFFERENT reason than the one it
+# was made for is a case that has stopped testing its own subject - which is how a gate keeps passing
+# while the rule it names quietly stops being checked.
 refuses() {
-	local what="$1"
+	local what="$1" because="${2:-}"
 	if "$VERIFY" --verify-staged "$TARGET" >"$work/out" 2>&1; then
 		echo "staged-consistency: $what was ACCEPTED" >&2
 		sed -n '1,10p' "$work/out" >&2
+		exit 1
+	fi
+	if [[ -n "$because" ]] && ! grep -aq "$because" "$work/out"; then
+		echo "staged-consistency: $what was refused, but not for the reason it was made for" >&2
+		echo "staged-consistency:   wanted: $because" >&2
+		sed -n '1,6p' "$work/out" >&2
 		exit 1
 	fi
 	echo "staged-consistency:   refused: $what"
@@ -180,7 +189,83 @@ llvm-objcopy --update-section .note.liber.identity="$work/note" "$consumer" 2>/d
 refuses "an identity note recording one provider twice"
 undo
 
+# 9. AN EMPTY STAGED TREE. Every case above mutates something that is THERE, and the check used to
+#    iterate over whatever `.lslib` files it happened to find - so a readable but empty `lib/` ran
+#    both loops zero times and reported that every staged library named the providers beside it. A
+#    check entirely relative to its own input cannot say anything is missing.
+# THE WHOLE DIRECTORY ASIDE, not a glob: the libraries live in per-owner subdirectories, so
+# `$LIB/*.lslib` names nothing and a mutation that moves nothing tests nothing.
+holding="$work/held"
+rm -rf "$holding"
+mv "$LIB" "$holding" || fail "could not move the staged tree aside"
+mkdir -p "$LIB"
+refuses "a readable but empty staged tree" "an empty tree is not a consistent one"
+rmdir "$LIB" && mv "$holding" "$LIB" || fail "could not restore the staged tree"
+
+# 10. ONE EXPECTED LIBRARY MISSING, AND NOTHING RECORDING IT. Case 1 removes a provider some consumer
+#     names, so the consumer's own note reports it. This removes a library whose absence no remaining
+#     note mentions - which the manifest is the only thing that can notice.
+unreferenced=""
+while IFS= read -r candidate; do
+	name="$(basename "$candidate" .lslib)"
+	if ! grep -aqr "provider=$name:" "$LIB" 2>/dev/null; then
+		unreferenced="$candidate"
+		break
+	fi
+done < <(find "$LIB" -name '*.lslib' -type f | sort)
+if [[ -n "$unreferenced" ]]; then
+	# BY ITS OWN PATH, because it lives in a per-owner subdirectory and putting it back at the top
+	# would leave the tree consistent-looking and wrong.
+	mv "$unreferenced" "$work/unreferenced.lslib" || fail "could not move the unreferenced library aside"
+	refuses "an expected library missing from the staged tree that no remaining note names" "and it is not staged"
+	mv "$work/unreferenced.lslib" "$unreferenced" || fail "could not restore it"
+else
+	echo "staged-consistency:   every staged library is named by some note, so the unreferenced case has no subject in this image"
+fi
+
+# 11. A PROVIDER SET THAT IS NOT THE MANIFEST'S. Case 7 replaces a provider's BYTES so the digests
+#     disagree; this records an edge the manifest does not declare at all, which every digest
+#     comparison passes because the edge names a library that really is staged with that digest.
+mutate "$consumer"
+llvm-objcopy --dump-section .note.liber.identity="$work/note" "$consumer" /dev/null 2>/dev/null || fail "could not read the consumer's note"
+foreign=""
+while IFS= read -r candidate; do
+	name="$(basename "$candidate" .lslib)"
+	if [[ "$name" != "$provider" ]] && ! grep -aq "provider=$name:" "$work/note"; then
+		foreign="$name"
+		break
+	fi
+done < <(find "$LIB" -name '*.lslib' -type f | sort)
+if [[ -n "$foreign" ]]; then
+	# THE DIGEST THE BUILD RECORDED FOR IT, taken from a note that already names it.
+	#
+	# A library's own identity digest is a hash of its note's descriptor bytes, not a string inside
+	# the note - so it cannot be grepped out of the file. Some other consumer records this provider
+	# with that digest, and reading it from there is the same number by construction. It has to be
+	# the RIGHT one: with a wrong digest the older recorded-versus-staged check fires first and this
+	# case would pass for a reason that is not the one it is named for.
+	#
+	# `|| true` ON EVERY STAGE. Under `set -euo pipefail` a `grep` that matches nothing ends the
+	# script, and a gate that dies where a case has no subject reports a failure it did not find.
+	foreign_digest="$(grep -a -h -o "provider=$foreign:[0-9a-f]\{64\}" -r "$LIB" 2>/dev/null | sed -n '1s/.*://p' || true)"
+	if [[ -n "$foreign_digest" ]]; then
+		printf 'provider=%s:%s\n' "$foreign" "$foreign_digest" >>"$work/note"
+		while (($(stat -c %s "$work/note") % 4 != 0)); do
+			printf '\0' >>"$work/note"
+		done
+		true
+		llvm-objcopy --update-section .note.liber.identity="$work/note" "$consumer" 2>/dev/null || fail "could not write the mutated note back"
+		refuses "an identity note recording an edge the manifest does not declare" "the manifest declares no such dependency"
+	else
+		echo "staged-consistency:   no readable foreign digest, so the undeclared-edge case has no subject"
+	fi
+	undo
+else
+	echo "staged-consistency:   the consumer already records every staged library, so the undeclared-edge case has no subject"
+	undo
+fi
+
 # AND THE TREE IS AS IT WAS. Said rather than assumed: the restore above is what every case depends
 # on, and a gate that left the tree mutated would break the next build with no explanation.
 "$VERIFY" --verify-staged "$TARGET" >/dev/null 2>&1 || fail "the staged tree does not verify after this gate restored it"
-echo "staged-consistency: eight mutations refused, and the tree verifies again afterwards"
+echo "staged-consistency: eleven mutations refused, and the tree verifies again afterwards"

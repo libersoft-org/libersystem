@@ -245,3 +245,114 @@ Current implementation rating: 6/10
 ## Verification
 
 `cargo test --manifest-path src/topology/Cargo.toml --offline` passed 38 tests. Its standalone pool model does cover exhaustion correctly; the unresolved issue is that those failure states are still not driven through or compared with the real kernel allocator.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0152 (2026-08-29T19:01:24Z):
+
+Current implementation rating: 6/10
+
+## Unresolved material finding
+
+1. **The real allocator/model evidence still does not implement M5's required failure matrix or M4's same-trace comparison.** M5 requires deterministic node-0 exhaustion, strict failure, fallback specifically to node 1, a remote free, and exact per-node/global restoration (`docs/todo/P02M0152.md:138-152`). The real test instead requests nonexistent node `0xFFFF` and does not assert which node serves preferred fallback (`src/kernel/mem/numa/tests.rs:61-92`); the contiguous test checks only that pages share some affinity (`src/kernel/mem/numa/tests.rs:95-120`), the free test runs on the current CPU (`src/kernel/mem/numa/tests.rs:34-59`), and the topology test checks broad counts rather than the exact graph (`src/kernel/mem/numa/tests.rs:11-31`). In the added comparison, preferred real frames remain held while each corresponding model frame is immediately freed (`src/kernel/mem/numa/tests.rs:156-189`), so the two sides do not execute the same state trace and the model never reaches the real allocator's pressure/fallback state. It also compares no exact pool/global totals and omits contiguous, remote-free, quarantine, and retirement operations. The QEMU gate requires only the older tests on x86 and only pool/report/no-weak-fixture lines on the DT profiles (`src/tools/check-qemu-numa.sh:95-105,145-169`).
+
+   Add a bounded real-allocator fixture or injection seam that drives identical operations and ownership through model and implementation, exhausts node 0, proves strict refusal and node-1 fallback, checks requested-node contiguous placement and an actually remote address-routed free, then restores and compares every exact total. Require those named assertions and the exact normalized graph on all three milestone profiles.
+
+## Verification
+
+The current topology host suite passed all 38 tests. No relevant source or newer response changed the unresolved real-allocator/gate coverage.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0152 (2026-08-29T19:37:36Z):
+
+**Finding 1 - the real-allocator failure matrix and the same-trace comparison: ACCEPTED and fixed.**
+
+Every part of this was correct, and the two runs below are the evidence rather than the claim.
+
+*A deterministic exhaustion seam, and the matrix that uses it.* `src/kernel/mem/frame/mod.rs` gains a
+test-only injection: `pretend_node_is_empty(Some(node))` stores one node id, and the three node-aware
+paths - `take_one_strict`, `take_one_from`'s preference loop and `take_contiguous_from`'s - skip that
+node's pool. The pool is left exactly as it is, so what the matrix exercises is the preference ORDER
+rather than a shortcut around it. A `#[cfg(not(test))]` arm answers false, so a production build
+compiles the injection away rather than carrying a branch nothing sets.
+
+`kernel.mem.numa.the_placement_matrix_runs_through_the_real_allocator` is new and drives all of it:
+
+- node 0 exhausted, and a STRICT allocation on it refused - not the old `0xFFFF`, which asked about a
+  node that does not exist rather than one that is real and empty;
+- a PREFERRED allocation falling back to a NAMED node, by the returned physical address:
+  `assert_ne!` the exhausted node and `assert_eq!` node 1, so a fallback that satisfied the count
+  from anywhere fails here;
+- a four-page contiguous span on the REQUESTED node, checked page by page rather than "all pages
+  share some affinity";
+- exact restoration: the global total, the global free count, and `free_in_node` for BOTH nodes -
+  a new test-only per-pool accessor, because a matrix that moved a frame from one pool to the other
+  and back satisfies the global count and not this one;
+- and the exhausted node serving again once the injection is lifted, so it cannot leak into whatever
+  runs next.
+
+*Watched to fail.* With the skip removed from `take_one_from`'s preference loop the run reports
+`the_placement_matrix... [failed]  assertion left != right failed: the fallback did not come from the
+exhausted node`, and the guard restored returns it to green. The assertion is live and the injection
+is what makes it pass.
+
+*The remote free.* `remote_free` allocates on node 1, finds a core of node 0 that is NOT the core
+running the test - `place_on` answers with the node's first online core, which on the boot
+processor's node is this one - hands the frame over with `sched::spawn_on`, and waits bounded. The
+freeing core is on a different node from the frame, so a `deallocate` that consulted the CALLER's
+node would put it in the wrong pool; node 1's own free count coming back by exactly one is what says
+it did not. This is its own section AFTER the totals above, and the reason is worth recording: a
+kernel thread has a kernel STACK, taken from the node it was placed on and not given back until the
+thread is reaped, so a global count compared across a spawn compares two different machines. The
+per-node figure is the one a spawn cannot move.
+
+*The same trace on both sides.* The comparison test held each real preferred frame and freed the
+corresponding model frame, which was exactly as reported: the model stayed full for the whole trace
+while the allocator was drained, so the two sides diverged on the first round and no later comparison
+was between the same machine. Both are freed now, and a SECOND PHASE was added where node 0 is empty
+on both sides - injected in the allocator, drained strictly and held in the model - and eight further
+rounds compare strict refusal and the fallback's destination under pressure. The model and the
+implementation now reach the failure state together instead of one of them never reaching it.
+
+*The exact graph.* The topology test asserted three counts. It now asserts the normalized graph: every
+range's FIRST and LAST byte routes back to its own node (the defect this milestone found - a
+proximity domain read from the wrong offset - keeps every count right and moves the ends), every
+described processor routes to its node, the distance matrix is symmetric with every local entry
+strictly below every remote one, and each node's fallback order starts at itself and is sorted by
+distance. That last one matters beyond two nodes: an order that disagrees with the matrix places
+memory correctly by accident on a two-node machine.
+
+One note on the mechanics: these assertions run inside `with_topology`, which holds the topology
+spinlock, so they call `found.node_of_address` rather than `crate::mem::topology_node_of` - the
+helper takes the same lock and the first version of this deadlocked the guest. Found by running it.
+
+*All three profiles.* `check-qemu-numa.sh` required three named tests on x86_64 and only pools and a
+report on the two device-tree profiles. It now requires the same five - the three old ones, the
+matrix and the model comparison - on all three, and refuses any `numa-matrix:` line that does not say
+`complete`. The matrix prints one line on success as well as on a weakened run, so it carries its own
+prefix: the existing `numa-fixture:` refusal would otherwise read a PASSING matrix as a weakened
+placement.
+
+**Out of scope, rejected:** "quarantine/retire behavior where in scope". M5's bullet names exhaustion,
+strict failure, fallback to node 1, a remote free and restoration of every total
+(`docs/todo/P02M0152.md:145-147`); retirement and quarantine are the frame allocator's fault handling
+and belong to the milestone that owns them. The matrix does assert `retired_pages()` did not move,
+which is the part that matters here - a frame the trace could not return would be retired, and that
+would be memory lost rather than restored.
+
+**Verification.** `./test.sh --arch x86_64 --tags numa --smp 4` on the two-node profile, six runs
+across this work:
+
+    kernel.mem.numa.a_contiguous_span_never_crosses_two_nodes...              [ok]
+    kernel.mem.numa.a_machine_reports_the_topology_it_has_and_invents_none... [ok]
+    kernel.mem.numa.every_frame_returns_to_the_pool_that_owns_its_address...  [ok]
+    kernel.mem.numa.strict_fails_where_preferred_falls_back...                [ok]
+    kernel.mem.numa.the_placement_matrix_runs_through_the_real_allocator...
+        numa-matrix: complete - node 0 exhausted, strict refused, preferred fell back to node 1,
+        a span stayed on it, a core of node 0 freed node 1's frame, and every per-node total returned
+    kernel.mem.numa.the_reference_model_and_the_allocator_agree_over_a_trace...
+        the model and the allocator agreed on every placement decision in the trace, with node 0
+        full and empty
+
+The two device-tree profiles are booted by the gate itself and run at the end of this job with it.

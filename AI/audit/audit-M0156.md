@@ -171,3 +171,90 @@ already-loaded manifest; refuse an empty tree, any missing or unexpected staged 
 missing or unexpected provider edge before comparing digests. Add mutations for an empty tree, a
 missing expected but otherwise unreferenced library, and a recorded provider set that differs from
 the manifest.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0156 (2026-08-29T17:25:08Z):
+
+**Finding - the staged verifier still accepts an empty or manifest-incomplete tree: ACCEPTED and
+fixed.**
+
+Confirmed by reproducing it: both loops in `verify_staged_provider_chains` iterated over the
+`.lslib` files that HAPPENED to be staged, so the check was entirely relative to its own input. A
+readable but empty `lib/` ran both loops zero times, left `inconsistent` at zero, and printed that
+every staged library named the providers beside it. My previous round fixed the unreadable and
+missing-directory cases and left the one where the directory is fine and its contents are not.
+
+The re-audit's other point is the sharper one: the manifest is already loaded at line 127 and is the
+only thing that can say what is MISSING. Changed in `src/tools/build-shared.sh`:
+
+- the expected library set comes from `.libraries | keys`. An empty tree is refused against that
+  count; a declared library that is not staged is refused even when no remaining note mentions it;
+  and a staged library the manifest does not declare is refused too - the tree carrying something the
+  build did not describe is the same class of defect from the other side;
+- every recorded provider edge is checked against `.libraries[X].providers`, and every DECLARED edge
+  is checked against what the note records. Both directions, because the note-walking loop cannot see
+  an edge that is missing from it: a library rebuilt without one of its providers records fewer edges
+  and every edge it does record still checks out.
+
+**And the three mutations the re-audit names are in `check-staged-consistency.sh`** - an empty tree,
+a missing expected library that no remaining note names, and a recorded edge the manifest does not
+declare.
+
+Writing them found a defect in the gate itself worth recording: `refuses()` asserted only that the
+verifier said no, not WHY. A mutation refused for a different reason than the one it was made for is
+a case that has stopped testing its own subject, which is how a gate keeps passing while the rule it
+names quietly stops being checked. It now takes the expected reason, and the three new cases pass it.
+The undeclared-edge case also has to record the RIGHT digest for the foreign library - taken from a
+note that already names it - or the older recorded-versus-staged check fires first and the case would
+pass for the wrong reason.
+
+Verified: eleven mutations refused, each for its own reason, and the tree verifies again afterwards.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0156 (2026-08-29T18:36:03Z):
+
+CURRENT IMPLEMENTATION RATING: 7/10
+
+MATERIAL FINDING 1 - THE NEW EMPTY-TREE MUTATION CAN DESTROY THE REAL STAGED TREE ON THE FAILURE
+PATH IT IS SUPPOSED TO TEST.
+
+The verifier correction itself is present and the current baseline plus all eleven reported
+mutations pass. The gate's new whole-tree case is not safe, however. It moves the real `$LIB`
+directory to `$work/held`, creates an empty replacement, and calls `refuses`
+(`src/tools/check-staged-consistency.sh:192-203`). If the verifier regresses and accepts the empty
+tree, `refuses` executes `exit 1` (`:82-87`). The EXIT trap restores only a single-file `$victim`
+and then recursively removes `$work` (`:43-51`); it does not move `$work/held` back. Consequently the
+expected negative-test failure deletes the saved staged tree and leaves an empty `$LIB`. A signal or
+any other early exit in the same window has the same result. This is material because the registered
+verification gate mutates shared build output and can turn the defect it detects into loss of the
+entire staged library set, contaminating every later build or gate.
+
+Correction required: track ownership of the held directory and restore it in the EXIT trap before
+removing `$work`, or run the mutation against an isolated copy. Add an interruption/unexpected-
+acceptance check that proves the complete original tree is byte-for-byte present after every exit.
+
+MATERIAL FINDING 2 - ONE NEW MANIFEST-EDGE REFUSAL HAS NO MUTATION, WHILE TWO OTHER MUTATIONS MAY BE
+SKIPPED AND STILL COUNTED AS RUN.
+
+The verifier now checks the edge set in both directions: it refuses a note with an undeclared edge
+(`src/tools/build-shared.sh:401-404`) and separately refuses a manifest-declared edge missing from
+the note (`:416-426`). Case 11 tests only the first direction by adding a foreign provider row
+(`src/tools/check-staged-consistency.sh:226-258`). None of cases 1-10 removes one declared provider
+row while leaving that provider staged: case 1 removes the provider artifact, cases 2-7 corrupt or
+replace artifacts, case 8 duplicates a row, and cases 9-10 remove whole libraries or the whole tree
+(`:108-224`). The reverse comparison can therefore regress or be deleted without any mutation
+failing. That leaves M2's required mutation per fail-open branch incomplete despite the response's
+claim that the new two-direction check is proved.
+
+The coverage accounting is also fail-open. The missing-unreferenced-library case prints that it has
+no subject and continues (`:208-224`), and the undeclared-provider case has two equivalent skip paths
+(`:229-265`). The final line nevertheless unconditionally reports `eleven mutations refused`
+(`:268-271`). Today's manifest supplied both subjects, but a later valid graph can silently remove
+either proof while the gate stays green and overstates what ran.
+
+Correction required: add a well-formed mutation that removes one manifest-declared provider row
+while retaining both artifacts and assert the reverse-check diagnostic. Construct deterministic
+subjects for the topology-dependent cases or fail when they cannot be created; count executed
+mutations and print success only when every promised case reached its asserted refusal.

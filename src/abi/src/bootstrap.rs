@@ -210,6 +210,15 @@ pub enum Refusal {
 	// The set is verified and could not be packed - an allocation failure, not a trust failure,
 	// and still not a source to boot from.
 	OutOfMemory,
+	// THE LIST IS ABSENT FROM A SOURCE THAT WAS ALREADY CHOSEN.
+	//
+	// Not the same refusal as `ListUnreadable` and not the same answer as `Unavailable`. A source
+	// nothing selected and which has no list is simply not a LiberSystem source, and policy may look
+	// at another; a source a signed pairing NAMED, or one whose own verified manifest says the list
+	// is there, is a source that was chosen - and a named file missing from a chosen source is M4's
+	// `Invalid`, not an absence. Deleting one file from a paired volume otherwise combines that
+	// volume's kernel with another source's bootstrap set, with no signature forged.
+	ListAbsentOnSelectedSource,
 }
 
 // WHAT A SOURCE IS, once it has been looked at.

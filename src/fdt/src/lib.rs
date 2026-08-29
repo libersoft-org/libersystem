@@ -928,8 +928,20 @@ impl Fdt {
 								&& let Some((child, size)) = self.read_reg_range(val, len, parent_addr, parent_size, 0)
 								&& let Some(physical) = self.translate_to_root(&buses, depth as usize - 1, child)
 							{
-								gic_msi = physical;
-								gic_msi_size = size;
+								// BIG ENOUGH FOR THE REGISTERS ITS DRIVER WRITES. The frame was
+								// committed with no minimum at all, so a one-byte window reached
+								// MMIO - and the v2m backend writes `MSI_TYPER` at 0x008 and
+								// `MSI_SETSPI_NS` at 0x040, which are stores outside the range the
+								// machine declared.
+								//
+								// WHETHER IT ALIASES THE CONTROLLER IS ASKED LATER, not here: this
+								// node is the GIC's CHILD, so it ends BEFORE its parent and the core
+								// ranges are still zero at this point. Comparing them here compares
+								// against nothing, which is a check that passes for the wrong reason.
+								if size >= MIN_GIC_V2M_SIZE {
+									gic_msi = physical;
+									gic_msi_size = size;
+								}
 							}
 							v2m.leave();
 						}
@@ -967,7 +979,17 @@ impl Fdt {
 								// machine description that is wrong, and the first MMIO write is a
 								// bad place to find that out.
 								&& dist_size >= MIN_GIC_DIST_SIZE
-								&& cpu_size >= MIN_GIC_CPU_SIZE
+								// AND THE SECOND RANGE IS MEASURED AGAINST WHAT IT IS.
+								//
+								// One 0x1000 was applied to both a GICv2 CPU interface and a GICv3
+								// REDISTRIBUTOR range, and those are not the same object: a
+								// redistributor frame is 0x20000, and `this_redistributor` cannot
+								// inspect even one unless a whole stride fits. An undersized v3
+								// range was accepted as a main controller and the backend then
+								// logged that this core had no redistributor and carried on with no
+								// interrupts at all. The version is known here - it is taken from
+								// the same node's `compatible`, before this point.
+								&& cpu_size >= if gic_version == 3 { MIN_GICR_STRIDE } else { MIN_GIC_CPU_SIZE }
 							{
 								gic_dist = dist_phys;
 								gic_dist_size = dist_size;
@@ -1099,8 +1121,20 @@ impl Fdt {
 							// not this kernel's to arm.
 							let kind = self.be32(val + 12);
 							let number = self.be32(val + 16);
-							if kind == 1 {
-								timer_intid = number + 16;
+							// A PPI, AND A PPI NUMBER. `kind == 1` says the cell is tagged a PPI; it
+							// does not say the NUMBER is one. The architecture gives PPIs sixteen of
+							// them, 0..15, which occupy INTIDs 16..31 - and nothing checked that, so
+							// a tree naming PPI 20 was published as INTID 36. GICv3 then shifts a
+							// 32-bit enable word by that, and GICv2 reads it as a distributor SPI;
+							// neither is the timer, and both are a machine whose scheduler tick goes
+							// somewhere else.
+							//
+							// A specifier outside the range is one this reader cannot decode, and
+							// leaving `timer_intid` unset is what lets the caller refuse - see the
+							// aarch64 backend, where a boot with no timer is now fatal rather than
+							// reported.
+							if kind == PPI_KIND && number < PPI_COUNT {
+								timer_intid = number + PPI_INTID_BASE;
 							}
 						} else if in_distance_map && self.str_eq(pname, "compatible") {
 							// THE VERSIONED BINDING. `numa-distance-map-v1` is what this reader
@@ -1338,6 +1372,24 @@ impl Fdt {
 			if !timer_compatible {
 				timer_intid = 0;
 			}
+			// AND NO CHILD REGION MAY SHARE BYTES WITH THE CONTROLLER OR WITH THE OTHER CHILD.
+			//
+			// Asked HERE, where every range is known. The v2m frame and the ITS are the GIC node's
+			// children, so each ends before its parent does - at the moment one is committed the
+			// core addresses are still zero, and a comparison there compares against nothing.
+			//
+			// A frame that overlaps the distributor sends its MSI writes into the controller's own
+			// registers; an ITS that overlaps either sends its commands there. Dropped rather than
+			// refused whole: a machine with a bad child frame still has a working controller, and
+			// the backend already treats a zero MSI base as "no message-signalled interrupts".
+			if gic_msi != 0 && (ranges_overlap(gic_msi, gic_msi_size, gic_dist, gic_dist_size) || ranges_overlap(gic_msi, gic_msi_size, gic_cpu, gic_cpu_size)) {
+				gic_msi = 0;
+				gic_msi_size = 0;
+			}
+			if gic_its != 0 && (ranges_overlap(gic_its, gic_its_size, gic_dist, gic_dist_size) || ranges_overlap(gic_its, gic_its_size, gic_cpu, gic_cpu_size) || (gic_msi != 0 && ranges_overlap(gic_its, gic_its_size, gic_msi, gic_msi_size))) {
+				gic_its = 0;
+				gic_its_size = 0;
+			}
 			Some(BootInfo { ram_base, ram_size, ram_regions, ram_region_count, ram_region_nodes, cpu_count: cpu_count.max(1), cpu_ids, cpu_node_ids, numa_distances, numa_distance_count, numa_distance_malformed, timer_intid, _pad_timer: 0, cpu_nodes, pcie_ecam, plic_base, gic_dist, gic_dist_size, gic_cpu, gic_cpu_size, gic_version, gic_msi, gic_msi_size, gic_its, gic_its_size, pci_msi_rid_base, pci_msi_devid_base, pci_msi_length, imsic_base, imsic_size, imsic_guest_index_bits, imsic_group_index_bits, imsic_num_ids, imsic_harts, imsic_hart_count, fwcfg_base, modules_start, modules_end })
 		}
 	}
@@ -1433,6 +1485,25 @@ struct Bus {
 // 0x10 - because those are stores outside the range the machine declared.
 const MIN_GIC_DIST_SIZE: u64 = 0x7000;
 const MIN_GIC_CPU_SIZE: u64 = 0x1000;
+
+// AND A GICv3 REDISTRIBUTOR IS NOT A GICv2 CPU INTERFACE, however alike the two look in the tree.
+//
+// One `MIN_GIC_CPU_SIZE` of 0x1000 was applied to both, and a v3 redistributor FRAME is 0x20000 -
+// two 64 KiB pages, RD_base and SGI_base. `this_redistributor` cannot inspect even one unless the
+// declared size covers a whole stride, so an undersized v3 range was accepted as a main controller
+// and the backend then logged that the core had no redistributor and carried on with no interrupts.
+// One stride is the floor because a machine may declare exactly one core's worth.
+const MIN_GICR_STRIDE: u64 = 0x20000;
+
+// The registers the v2m frame's driver writes: `MSI_TYPER` at 0x008 and `MSI_SETSPI_NS` at 0x040. A
+// frame smaller than that is one whose declared window does not contain the stores this kernel makes
+// into it - the same rule the distributor minimum is derived from, applied to the child.
+const MIN_GIC_V2M_SIZE: u64 = 0x1000;
+
+// A PRIVATE PERIPHERAL INTERRUPT, as the device tree's `interrupts` cells encode one.
+const PPI_KIND: u32 = 1;
+const PPI_COUNT: u32 = 16;
+const PPI_INTID_BASE: u32 = 16;
 
 fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
 	let (a_end, b_end) = match (a.checked_add(a_len), b.checked_add(b_len)) {

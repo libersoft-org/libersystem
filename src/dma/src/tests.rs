@@ -525,15 +525,31 @@ fn a_staged_buffer_copies_at_the_sync_points_and_tells_the_caches() {
 
 	// A NON-COHERENT device that can address the low 32 bits.
 	let requirements = crate::Requirements::new(32, 0x1000, 1, false).expect("a legal requirement");
-	let mut bounce = crate::Bounce::new(0x1000, 64, &requirements).expect("a staging buffer the device can reach");
-	assert_eq!(bounce.len(), 64);
+	// THE BUFFER THE DEVICE WILL USE, and the CPU's mapping of it are ONE THING. This test used to
+	// call both methods on a vector the `Bounce` had allocated for itself, with the physical address
+	// stored beside it as a number nothing referred to - so it proved the two methods agreed with
+	// each other and nothing about the address the device was given.
+	let mut mapped = [0u8; 64];
+	{
+		let mut bounce = crate::Bounce::new(&mut mapped, 0x1000, &requirements).expect("a staging buffer the device can reach");
+		assert_eq!(bounce.len(), 64);
+		bounce.for_device(&[0xab; 16], &cache).expect("staged");
+		assert_eq!(cache.events.borrow().last().copied(), Some(("clean", 0x1000, 16)), "the CPU wrote and the device is about to read, so the writes are pushed out first");
+	}
+	// THE BYTES ARE AT THE ADDRESS THE DEVICE WAS GIVEN. Asserted against the mapping itself rather
+	// than by reading them back through the same object that wrote them.
+	assert_eq!(&mapped[..16], &[0xab; 16], "what was staged is in the buffer the device will read");
 
-	bounce.for_device(&[0xab; 16], &cache).expect("staged");
-	assert_eq!(cache.events.borrow().last().copied(), Some(("clean", 0x1000, 16)), "the CPU wrote and the device is about to read, so the writes are pushed out first");
-
+	// AND THE DEVICE WRITES THERE. Simulated by writing through the mapping, which is what "the CPU
+	// view of `physical()`" means - and is exactly what the old shape could not express, because the
+	// device's buffer and the staging vector were different memory.
+	mapped[..16].copy_from_slice(&[0x5c; 16]);
 	let mut back = [0u8; 16];
-	bounce.for_cpu(&mut back, &cache).expect("read back");
-	assert_eq!(back, [0xab; 16], "the bytes survive the round trip through the staging buffer");
+	{
+		let bounce = crate::Bounce::new(&mut mapped, 0x1000, &requirements).expect("the same buffer");
+		bounce.for_cpu(&mut back, &cache).expect("read back");
+	}
+	assert_eq!(back, [0x5c; 16], "the CPU reads what the DEVICE wrote, not what the CPU staged");
 	assert_eq!(cache.events.borrow().last().copied(), Some(("invalidate", 0x1000, 16)), "the device wrote and the CPU is about to read, so stale lines go first");
 
 	// A DIRECT plan on the same machine still has sync points - nothing is copied because the data is
@@ -547,12 +563,20 @@ fn a_staged_buffer_copies_at_the_sync_points_and_tells_the_caches() {
 	// AND A COHERENT MACHINE PAYS NOTHING, which is what makes writing a driver against this contract
 	// free on the ports that do not need it.
 	let coherent = crate::Requirements::new(64, 0x1000, 1, true).expect("a legal requirement");
-	let mut plain = crate::Bounce::new(0x1000, 16, &coherent).expect("a staging buffer");
+	let mut quiet_map = [0u8; 16];
 	let quiet = cache.events.borrow().len();
-	plain.for_device(&[1u8; 8], &cache).expect("staged");
+	{
+		let mut plain = crate::Bounce::new(&mut quiet_map, 0x1000, &coherent).expect("a staging buffer");
+		plain.for_device(&[1u8; 8], &cache).expect("staged");
+	}
 	crate::Bounce::sync_direct_for_device(&segments, &coherent, &cache);
 	assert_eq!(cache.events.borrow().len(), quiet, "a coherent machine asks the caches for nothing at either point");
+	assert_eq!(&quiet_map[..8], &[1u8; 8], "and the bytes are still where the device will look for them");
 
 	// A staging buffer the device cannot address is not one.
-	assert!(matches!(crate::Bounce::new(0x1_0000_0000, 16, &requirements), Err(crate::Fault::OutOfRange)), "a 32-bit device cannot be staged above its ceiling");
+	let mut unreachable = [0u8; 16];
+	assert!(matches!(crate::Bounce::new(&mut unreachable, 0x1_0000_0000, &requirements), Err(crate::Fault::OutOfRange)), "a 32-bit device cannot be staged above its ceiling");
+	// And a zero-length mapping is not a buffer.
+	let mut nothing: [u8; 0] = [];
+	assert!(matches!(crate::Bounce::new(&mut nothing, 0x1000, &requirements), Err(crate::Fault::Malformed)));
 }

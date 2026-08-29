@@ -201,6 +201,17 @@ impl Expected {
 		Expected::source(bootproto::manifest::SOURCE_SYSTEM_VOLUME, identity)
 	}
 
+	// WHETHER THIS SOURCE WAS CHOSEN, which decides what a missing named file on it means.
+	//
+	// Two ways to be chosen, and both are statements somebody signed. The medium's manifest NAMED
+	// this volume, so the pairing selected it; or this source's own verified manifest has a row for
+	// `etc/bootstrap.list`, which is the manifest saying the file is there. A source that is neither
+	// - a volume nothing named, whose manifest does not mention a list - is one this boot may leave
+	// for another, and that is the only case an absence is an absence.
+	pub(crate) fn selects_its_source(&self, manifest: &bootproto::manifest::Manifest<'_>) -> bool {
+		matches!(self.volume_uuid, VolumeIdentity::Exactly(_)) || manifest.find(bootproto::manifest::KIND_BOOTSTRAP_LIST, b"etc/bootstrap.list").is_some()
+	}
+
 	// The medium this loader itself came off. Not a volume.
 	pub(crate) fn medium() -> Expected {
 		Expected::source(bootproto::manifest::SOURCE_BOOT_MEDIUM, VolumeIdentity::NotAVolume)

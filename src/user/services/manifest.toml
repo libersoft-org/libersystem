@@ -735,7 +735,7 @@ role = "tool"
 linkage = "dynamic"
 stage = "volume"
 destination = "bin/lsdev.lsexe"
-providers = ["base-proto", "device-client", "device-proto", "wire", "lsrt"]
+providers = ["base-proto", "config-client", "device-client", "device-proto", "wire", "lsrt"]
 
 [[programs]]
 name = "lsirq"

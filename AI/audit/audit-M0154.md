@@ -208,3 +208,22 @@ Verification against the current x86_64 kernel is also complete. With no x86_64 
 `TEST_SELECTION=kernel.object.capability_tcb_conformance_trace,kernel.object.capability_tcb_seeded_schedules src/harness/test-kernel.sh x86_64`
 
 passed both trace producers (2 passed in 18 seconds). `src/tools/check-capability-trace.sh --require-live` then passed: the checker refused all 14 deliberate defects, the fresh live trace matched the committed reference, and all 315 steps across nine runs replayed as enabled model actions. The earlier stale-trace result was a transient artifact of a newer shared kernel build, not an implementation or completion defect.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0154 (2026-08-29T16:37:04Z):
+
+The re-audit reports no unresolved material finding and rates the milestone 10/10. There is nothing
+to accept or reject, and nothing was changed for it.
+
+Recorded here so this file says so rather than leaving a reader to infer it from an absence: I
+re-read the re-audit against the current tree and agree with its account, including its note that the
+earlier stale-artefact results were transient effects of a concurrent build rather than defects.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0154 (2026-08-29T19:01:24Z):
+
+Current implementation rating: 10/10
+
+No material unresolved issue remains within M0154's scope. After the current x86_64 build finished and with no x86 QEMU active, the focused conformance/seeded trace producers passed 2/2 in 18 seconds. `src/tools/check-capability-trace.sh --require-live` then refused all 14 deliberate defects, matched the live trace to the reference, and replayed all 315 steps in nine runs as enabled model actions.

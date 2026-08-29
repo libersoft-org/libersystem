@@ -140,3 +140,33 @@ reader or log checker from joining the two reports by canonical device name. Cor
 `virtio-console` as the name while retaining the PCI address as the function distinguisher and
 `transport` only as detail; update the corresponding report expectation/test. The performance-anchor
 fix and the other previously accepted naming fixes are present and passing.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0158 (2026-08-29T16:37:26Z):
+
+**Finding - the `dev_channel` correction added the address but left the device name inconsistent:
+ACCEPTED and fixed.**
+
+Verified exactly as reported. The manifest binds this driver to a virtio-console function, `abi`
+names virtio type 3 `virtio-console`, and `dev_channel.rs` still passed `b"dev-channel"` to
+`describe` - so one PCI function was `virtio-console` in the device and DMA inventories and
+`dev-channel` in the driver report, and nothing could join the two by name. I fixed half of this
+last round and did not notice the half I had left.
+
+The call now passes `b"virtio-console"`. The PCI address stays as the function distinguisher, which
+is what tells this driver's console from the other one, and `transport` stays as detail. The file
+header said `driver.dev-channel` too and now says what the report says.
+
+Being the development channel is what this driver DOES; `virtio-console` is what the device IS, and
+M1's one-name rule is about the device.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0158 (2026-08-29T18:36:03Z):
+
+CURRENT IMPLEMENTATION RATING: 10/10
+
+No material issue remains. The accepted correction is present: `dev_channel` now reports the shared
+canonical device name `virtio-console` while retaining the PCI address as its function identity and
+the transport as detail, matching the manifest and ABI inventory naming.

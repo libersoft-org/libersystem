@@ -23,7 +23,20 @@ pub const MAGIC: u32 = 0x5744_5250;
 // It appears in the frame header AND in the ELF note every driver carries, and both come from here.
 // Two numbers that could disagree would make "the handshake confirms what the note claimed" a check
 // of nothing. Adding an opcode, or changing any payload below, bumps this.
-pub const VERSION: u16 = 1;
+//
+// 2 SINCE THE WIRE STOPPED BEING WHAT REVISION 1 DESCRIBED. Revision 1 had opcodes 1..5 and a
+// two-byte `OFFER` payload. This one has 1..11 - `WITHDRAW`, `PING`, `PONG`, `STOP`, `STOPPED` and
+// `CONNECT` - and a four-byte `OFFER` carrying a kind and a publisher-local token.
+//
+// THAT EVERY ARTIFACT IN ONE BUILD AGREES IS NOT COMPATIBILITY. It only says today's artifacts agree
+// with one another. An artifact built before those changes still declares 1 in its note, and 1 was
+// what the manager accepted - so it passed the pre-claim note check, was handed a device, and failed
+// on the first frame it could not decode. Telling an artifact from another time apart BEFORE the
+// claim is the entire reason that note is read, and a version that never moves cannot do it.
+//
+// This is the internal wire revision and nothing else. It is not the product's release version,
+// which is 1 and stays 1 until the first final release.
+pub const VERSION: u16 = 2;
 
 // magic(4) + version(2) + opcode(2) + generation(8) + payload_len(4).
 pub const HEADER_LEN: usize = 20;
@@ -139,6 +152,21 @@ pub fn declared_version_in(elf: &[u8]) -> Option<u16> {
 		}
 	}
 	None
+}
+
+// WHETHER AN ARTIFACT MAY BE HANDED A DEVICE, asked of its bytes before the claim.
+//
+// The version comparison and the missing-note case in ONE answer, here rather than at the caller.
+// `declared_version_in` reports what an artifact SAYS; this reports whether that is speakable, and
+// the two are different questions - a caller that only had the first had to remember that `None` and
+// a stale number lead to the same refusal, and remembering is what a shared predicate is for.
+//
+// A HISTORICAL REVISION IS THE CASE THIS EXISTS FOR. An artifact built when the wire was revision 1
+// declares 1 in its note; while `VERSION` stayed 1 it passed this check, took a device, and failed
+// on the first frame it could not decode. That is precisely what reading the note before the claim
+// is supposed to prevent.
+pub fn speaks_this_version(elf: &[u8]) -> bool {
+	declared_version_in(elf) == Some(VERSION)
 }
 
 // What one side is saying. Five, and each has ONE direction.

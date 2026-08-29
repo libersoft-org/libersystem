@@ -207,7 +207,17 @@ fn assemble_system_volume(conf: &[(String, String)], files: &[(String, Vec<u8>)]
 			}
 		}
 	}
-	staged.push((String::from("etc/bootstrap.list"), bootstrap.clone().into_bytes()));
+	// A VOLUME BUILT WITHOUT ITS LIST, FOR THE GATE THAT PROVES THE LOADER REFUSES ONE.
+	//
+	// The signed manifest below is built over what is actually staged, so omitting the list here
+	// produces a volume that is internally consistent and correctly signed and has no bootstrap
+	// list - which is exactly the artefact an attacker produces by deleting one file from a mutable
+	// filesystem, and the only way to produce it without a host-side LiberFS writer. Nothing in a
+	// shipping build sets this; `check-signed-boot.sh` does, for one boot.
+	let omit_list: bool = env::var_os("LIBER_OMIT_BOOTSTRAP_LIST").is_some();
+	if !omit_list {
+		staged.push((String::from("etc/bootstrap.list"), bootstrap.clone().into_bytes()));
+	}
 	// THE DIGESTS OF THE BYTES THE LOADER READS, beside the list it already reads.
 	//
 	// It covers the kernel, `etc/bootstrap.list` and every program that list names - the final bytes

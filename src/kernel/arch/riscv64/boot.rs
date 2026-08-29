@@ -728,5 +728,8 @@ fn run_system_manager() {
 	// THE SHARED BOOT TAIL - see the note in the aarch64 port. Four thousand rounds because this
 	// machine settles an order of magnitude more slowly under TCG than the other two, which is a
 	// number this caller passes rather than a reason for a third copy of the policy.
-	crate::boot_userspace(4000);
+	// TEN TIMES WHAT IT WAS, for the reason x86_64's call site records - and this port keeps its
+	// own ratio to that one, which has always been the largest of the three. Not measured here:
+	// what was measured is the x86_64 settle, and this is the old calibration carried across it.
+	crate::boot_userspace(40000);
 }

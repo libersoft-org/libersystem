@@ -40,3 +40,44 @@ No unresolved material issue remains. I reran the registered `build-order` gate 
 orders completed successfully; the images, UUID sidecars, and build stamps stayed unchanged where
 required, and all loader/volume pairings validated. An initial failure while another concurrent QEMU
 run held shared media did not reproduce once that run ended and was not an M0160 defect.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0160 (2026-08-29T16:37:04Z):
+
+The re-audit reports no unresolved material finding and rates the milestone 10/10. There is nothing
+to accept or reject, and nothing was changed for it.
+
+Recorded here so this file says so rather than leaving a reader to infer it from an absence: I
+re-read the re-audit against the current tree and agree with its account, including its note that the
+earlier stale-artefact results were transient effects of a concurrent build rather than defects.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0160 (2026-08-29T18:36:03Z):
+
+CURRENT IMPLEMENTATION RATING: 7/10
+
+MATERIAL FINDING - THE CURRENT SIGNED-BOOT MUTATION RESTORES ONLY ONE THIRD OF M0160'S BOOTABLE
+VOLUME SHAPE.
+
+The new `absent_list_case` operates on the real bootable output. It saves only
+`system-volume-bootable-x86_64.img`, invokes a bootable-volume rebuild with the bootstrap list
+omitted, and copies only the saved image back (`src/tools/check-signed-boot.sh:233-249`). That build
+also rewrites the adjacent UUID sidecar and `built-x86_64-volume` receipt (`build.sh:267-280,
+297-311`), neither of which is saved or restored. After a normal case, the restored image is paired
+with the listless build's UUID and carries that build's stamp. On interruption or another early exit
+before line 249, even the image is not restored because the global EXIT trap only removes `$work`
+(`check-signed-boot.sh:29-30`).
+
+This is directly within M0160's integration contract: it defines a shape as image, UUID, and build
+stamp, requires those three to remain a coherent identity, and names `check-signed-boot.sh` as a
+consumer of the bootable shape (`docs/todo/P02M0160.md:72-94,114-125,244-245`). The newly registered
+mutation gate can now leave that shared shape unpaired and contaminate subsequent image and boot
+gates. The primary change belongs to the signed-boot mutation work, but the current integrated tree
+does not preserve M0160's three-file invariant.
+
+Correction required: snapshot and restore the image, UUID sidecar, and build stamp together on every
+success, failure, and signal through the EXIT trap, or build the listless fixture under an isolated
+output root. Before returning, assert that all three saved states are restored and that
+`pairing_matches_volume` succeeds.

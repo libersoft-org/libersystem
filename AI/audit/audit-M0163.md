@@ -152,3 +152,59 @@ AUDITOR'S RE-AUDIT ON M0163 (2026-08-29T16:05:00Z):
 Rating: 8/10
 
 1. **The milestone's decisive negative matching case still does not test the runtime matcher.** The production predicate remains the private `device_manager::Rule::matches(DeviceInfo)` (`src/user/services/core/src/device_manager.rs:4299-4351`). The host-tested manifest predicate is a separate operation, `system_manifest::MatchRule::overlaps` (`src/tools/system-manifest/src/lib.rs:498-547`), and the current guest test only proves unresolved PCI functions enter inventory without resources (`src/kernel/test_suites/hardware.rs:402-424`). None of those tests drives the production conjunction or proves that transport is checked before virtio type. Deleting the runtime transport check would therefore leave the named M4 tests green while allowing an ordinary PCI function with the same numeric type to be offered to a virtio driver, exactly the regression P02M0163 M4 requires the negative case to prevent (`docs/todo/P02M0163.md:128-145`). Extract the runtime match decision into a host-testable shared seam, or add a guest integration fixture that drives DeviceManager selection itself, and assert the ordinary class-02/non-virtio refusal plus the full conjunction there.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0163 (2026-08-29T18:29:58Z):
+
+Rating: 8/10
+
+1. **M4's required ordinary-Ethernet-versus-virtio-net negative case still exercises a different predicate from production.** The current runtime decision remains the private `device_manager::Rule::matches(DeviceInfo)` (`src/user/services/core/src/device_manager.rs:4323`), whereas the passing host test calls the independently implemented `system_manifest::MatchRule::overlaps` (`src/tools/system-manifest/src/lib.rs:535`). The guest inventory test establishes visibility/resources but never drives DeviceManager's matcher. Thus removing the runtime transport conjunct would still leave all 15 `system-manifest` tests green while violating the exact regression M4 and the Definition of Done name (`docs/todo/P02M0163.md:128-145`). Put the runtime decision behind the tested shared seam, or add a production integration test that actually attempts this match and observes refusal.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0163 (2026-08-29T18:45:32Z):
+
+**Finding - the milestone's decisive negative matching case still does not test the runtime matcher:
+ACCEPTED and fixed.**
+
+Verified, including the part that makes it a real gap rather than a coverage complaint: the
+host-tested `system_manifest::MatchRule::overlaps` answers a DIFFERENT question - whether two rules
+could both match something - while the production predicate was `device_manager::Rule::matches`,
+private to a binary nothing runs on a host. So M4's named case was checked against neither, and the
+re-audit's test of the claim is exact: deleting the runtime transport check would have left every
+named test green while an ordinary PCI function whose number collides with a virtio type was offered
+to a virtio driver.
+
+Changed:
+
+- `driver_binding::Match` and `driver_binding::Discovered` carry the decision, in the crate that
+  already owns where a binding is and why. It matches on integers, so this needs no dependency on
+  the ABI;
+- `device_manager::Rule::matches` is now the conversion from the generated registry's shape to that
+  and nothing else. A second copy of the predicate would be a second thing to keep in step, and the
+  one that is not tested is the one that drifts.
+
+Three host cases, in `driver-binding`:
+
+- **the milestone's own negative case**: a plain-PCI mass-storage controller whose device type this
+  system happens to number 2 is NOT matched by a virtio-blk rule - and the same function on the
+  virtio transport IS, so the refusal is about the transport and not about the fixture;
+- **the full conjunction**, one predicate at a time: transport, virtio type, class, subclass,
+  prog_if, vendor, product and address each asserted by making the function differ in that field
+  ALONE;
+- **`None` is "do not ask"**, not "must be absent" - a generic rule matching on the standards
+  identity alone matches a function that also carries a vendor and a product, or no generic rule
+  ever binds.
+
+Watched to fail: disabling the transport check fails exactly the two cases that are about it - "a
+plain PCI function is not a virtio device however its type is numbered" and the conjunction's
+`transport` line - and nothing else. 57 host tests pass in the crate and the x86_64 build is clean.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0163 (2026-08-29T18:57:11Z):
+
+Rating: 10/10
+
+No material issue remains. The production `Rule::matches` now converts into and delegates to the host-testable `driver_binding::Match` predicate, whose tests cover the transport/type negative case and every conjunct independently. All 57 `driver-binding` tests pass on the current tree, so the earlier runtime-versus-build-time matcher gap is resolved.

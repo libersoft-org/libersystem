@@ -839,3 +839,81 @@ impl Heartbeat {
 		self.due = now.saturating_add(self.deadline as u64);
 	}
 }
+
+// ------------------------------------------------------------------ which driver a function gets
+//
+// THE RUNTIME MATCH DECISION, IN THE CRATE WHERE A TEST CAN DRIVE IT.
+//
+// It was `device_manager::Rule::matches`, private to a binary nothing runs on a host, and the
+// host-tested predicate beside it - `system_manifest::MatchRule::overlaps` - is a DIFFERENT
+// operation: that one asks whether two rules could both match something, this one asks whether one
+// rule matches one function. So the milestone's decisive negative case was checked against neither.
+// Deleting the transport check here would have left every named test green while an ordinary PCI
+// function whose class byte happens to equal a virtio type was offered to a virtio driver.
+
+// What a discovered function IS, as the matcher reads it. The fields the kernel's inventory carries,
+// named here so this crate does not depend on the ABI for a match it performs on integers.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Discovered {
+	pub transport: u8,
+	pub virtio_type: u32,
+	pub class: u8,
+	pub subclass: u8,
+	pub prog_if: u8,
+	pub vendor: u16,
+	pub product: u16,
+	pub bus: u8,
+	pub dev: u8,
+	pub func: u8,
+}
+
+// One registry rule. Every predicate that is PRESENT must hold; `None` is "do not ask", which is not
+// the same as "must be absent".
+#[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
+pub struct Match {
+	pub transport: Option<u8>,
+	pub virtio_type: Option<u32>,
+	pub class: Option<u8>,
+	pub subclass: Option<u8>,
+	pub prog_if: Option<u8>,
+	pub vendor: Option<u16>,
+	pub product: Option<u16>,
+	// bus, dev, func - a rule pinning one function by where it is plugged in.
+	pub address: Option<(u8, u8, u8)>,
+}
+
+impl Match {
+	pub fn matches(self, found: &Discovered) -> bool {
+		if self.class.is_some_and(|class| found.class != class) {
+			return false;
+		}
+		if self.subclass.is_some_and(|subclass| found.subclass != subclass) {
+			return false;
+		}
+		if self.prog_if.is_some_and(|interface| found.prog_if != interface) {
+			return false;
+		}
+		// THE TRANSPORT IS ASKED BEFORE THE TYPE, and that ordering is the whole point of the pair:
+		// `virtio_type` is only a virtio number on a function whose transport says so. Without it a
+		// rule for virtio type 2 matches anything this system happens to number 2 next - an ordinary
+		// PCI function offered to a virtio driver, which is the case M4 exists to prevent.
+		if self.transport.is_some_and(|transport| found.transport != transport) {
+			return false;
+		}
+		if self.virtio_type.is_some_and(|kind| found.virtio_type != kind) {
+			return false;
+		}
+		if self.vendor.is_some_and(|vendor| found.vendor != vendor) {
+			return false;
+		}
+		if self.product.is_some_and(|product| found.product != product) {
+			return false;
+		}
+		if let Some((bus, dev, func)) = self.address
+			&& (found.bus != bus || found.dev != dev || found.func != func)
+		{
+			return false;
+		}
+		true
+	}
+}

@@ -170,6 +170,25 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F, expected: &crate::tr
 			crate::arch::serial::write_str(source_name(expected));
 			crate::arch::serial::write_str("\n");
 		}
+		// AN ABSENT LIST ON A SOURCE THAT WAS ALREADY CHOSEN IS A REFUSAL, NOT AN ABSENCE.
+		//
+		// `assemble` cannot tell the two apart: it is handed a reader and a verifier and knows
+		// nothing about how this source came to be the one being read. Here both facts are in hand.
+		//
+		// A source is CHOSEN when the medium's signed manifest named this volume - `VolumeIdentity
+		// ::Exactly` - or when this source's own verified manifest has a row for the list, which is
+		// the manifest saying the file is there. Either way the file is missing from something that
+		// was selected, which M4 calls `Invalid`; only a source nothing named and whose manifest
+		// does not mention a list is genuinely not a LiberSystem source, and policy may look at
+		// another.
+		//
+		// Without this, deleting `etc/bootstrap.list` from a paired volume left the kernel coming
+		// from that volume and the bootstrap set from somewhere else - the two-halves-of-two-systems
+		// outcome this whole path exists to prevent - with nothing forged.
+		if matches!(verdict, abi::bootstrap::Selection::Unavailable) && expected.selects_its_source(&manifest) {
+			crate::arch::serial::write_str("loader: this source was chosen and its bootstrap list is not on it - refusing to take one from somewhere else\n");
+			return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::ListAbsentOnSelectedSource);
+		}
 		return verdict;
 	}
 	// A SOURCE WITH NO SIGNED MANIFEST IS A DOWNGRADE, AND WHETHER THIS BUILD TAKES ONE IS A PROFILE.

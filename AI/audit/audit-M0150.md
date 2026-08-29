@@ -195,3 +195,67 @@ Current implementation rating: 7/10
 ## Verification
 
 `cargo test --manifest-path src/abi/Cargo.toml --offline` passed 28 tests and `cargo test --manifest-path src/boot/uefi/Cargo.toml --offline` passed 41 tests. Those suites do not exercise the missing selected-plus-absent state above.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0150 (2026-08-29T16:44:31Z):
+
+**Finding - the selected-source fix still treats a missing bootstrap list as permission to use
+another source: ACCEPTED and fixed.**
+
+Verified exactly as reported, and the re-audit is right about why my previous round missed it: the
+three-state read fixed the UNREADABLE branch and left the ABSENT one, so deleting
+`etc/bootstrap.list` from a paired volume still combined that volume's kernel with another source's
+bootstrap set - no signature forged. The host test I pointed at confirmed absence was unconditional
+rather than proving it should be.
+
+The re-audit's own sharpening is the part worth taking: a source is chosen either because a signed
+pairing NAMED it, or because its own verified manifest says the list is there. Both are statements
+somebody signed, and only a source that is neither is genuinely one this boot may leave for another.
+
+Changed:
+
+- `abi::bootstrap::Refusal::ListAbsentOnSelectedSource`, distinct from `ListUnreadable` and from
+  `Selection::Unavailable` - three different facts about a missing list;
+- `trust::Expected::selects_its_source(manifest)` answers whether this source was chosen:
+  `VolumeIdentity::Exactly`, or a `KIND_BOOTSTRAP_LIST` row for `etc/bootstrap.list` in the verified
+  manifest;
+- `blockio::assemble_bootstrap` upgrades `Unavailable` to that refusal when it is. `assemble` itself
+  is unchanged and still answers `Unavailable`, which is the honest answer THERE: it is handed a
+  reader and a verifier and knows nothing about how this source came to be read. Both facts are in
+  hand one level up, so that is where the decision belongs;
+- `a_source_with_no_bootstrap_list_is_not_a_source` keeps its assertion and now says which half of
+  the rule it is about, so the next reader does not take it for the whole one.
+
+**And the signed-boot deletion case the re-audit asks for is in the gate.** Corrupting a LiberFS
+image from the host cannot produce this state - flipping a byte in a directory breaks the block
+checksum, which is the UNREADABLE branch - so `mkpackages` omits the list under
+`LIBER_OMIT_BOOTSTRAP_LIST` and the manifest is built over what is actually staged. The volume that
+produces is internally consistent, correctly signed, and has no list: exactly what deleting one name
+from a mutable filesystem leaves behind. `absent_list_case` boots it attached and requires the
+refusal by name and no kernel started. The tree is put back before the boot, so a failure cannot
+leave a listless volume for whatever runs next.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0150 (2026-08-29T19:01:24Z):
+
+Current implementation rating: 6/10
+
+## Unresolved material findings
+
+1. **The selected-source correction is applied only to signed-v2 manifests; the supported legacy/test-trust path still falls through.** The plan explicitly retains v1 as a development migration reader and says that once a manifest or paired volume selects a source, a missing named file is terminal (`docs/todo/P02M0150.md:84-85,123-138`). The signed branch now upgrades `Selection::Unavailable` when `Expected::selects_its_source` is true (`src/boot/loader/src/blockio.rs:188-192`), but the no-v2/test-trust branch reads `etc/boot.manifest`, calls the same assembler, and returns its verdict unchanged (`src/boot/loader/src/blockio.rs:194-221`). The assembler maps an absent list to `Unavailable` before consulting the v1 manifest (`src/abi/src/bootstrap.rs:268-276`); on a paired system volume the caller ignores that answer (`src/boot/loader/src/main.rs:750-758`) and proceeds to the live image and boot medium (`src/boot/loader/src/main.rs:440-457`). Thus a volume selected by the signed medium's UUID can still supply the kernel while a different source supplies bootstrap whenever the supported migration path is used. The new deletion case builds a signed-v2 volume and does not exercise this branch.
+
+   Apply the selected-source decision to the legacy branch as well: pairing alone selects an `Exactly` volume, and a valid v1 manifest row naming the list selects an unpaired legacy source. Add a test-trust paired-volume/list-absent case so the downgrade profile cannot reintroduce source mixing.
+
+2. **The new deletion case corrupts the canonical bootable-volume identity while claiming to restore it.** `absent_list_case` saves and restores only `system-volume-bootable-x86_64.img` around a build using `LIBER_OMIT_BOOTSTRAP_LIST` (`src/tools/check-signed-boot.sh:233-249`). That build also writes the image's UUID sidecar (`src/tools/mkpackages/src/main.rs:328-350`) and the bootable-volume build receipt (`build.sh:281-313`), neither of which is saved or restored, and the script's exit trap only removes its temporary directory. The defect reproduced in this audit: after the case ran, the canonical sidecar was `72d2aa11e9720d2ec298655852d9e6c2`, matching the temporary listless volume, while the restored canonical image's superblock was `736357727191dcfd234add54a0eeb35e`; `pairing_matches_volume` returned `MISMATCH`, and `built-x86_64-volume` had just been refreshed as though the canonical shape were consistent/current. An interruption before line 249 can additionally leave the listless image itself behind.
+
+   Build the mutation into isolated output, or snapshot and restore the complete three-file shape (image, UUID, and stamp) from an interruption-safe cleanup trap. Require the gate's postcondition to prove both pairing consistency and unchanged artifact/receipt state.
+
+3. **The three-port signed-boot gate can pass on stale aarch64/riscv64 loaders.** M5/M6 require the current shared verifier and mutations through both non-x86 loader paths (`docs/todo/P02M0150.md:154-166`). The gate checks only that each port's kernel exists, then invokes `run.sh` (`src/tools/check-signed-boot.sh:517-550`); neither it nor `run.sh` compares the loader build receipt with current sources. During this audit the current `source_digest boot/loader` was `6f07cb...fab0`, while both `built-aarch64-loader` and `built-riscv64-loader` contained `74991b...5639`; the EFI binaries predated the changed shared `blockio.rs` (12:23/12:27 versus 18:38). The gate nevertheless began reporting its cross-port results from those old binaries. It therefore cannot prove that the current fix compiles or is exercised on either path.
+
+   Preflight each architecture's loader receipt against the current loader-source digest (or explicitly build the loader before the run) and fail on stale evidence, as the live capability-trace gate already does for its kernel/trace relationship.
+
+## Verification
+
+Current ABI, FDT, topology, DMA, FAT, and UEFI host suites passed (28, 80, 38, 54, 128, and 41 tests). The signed-boot run passed every x86_64 case through and including the new selected-volume/list-absent refusal. Its cross-port phase was not counted because the gate itself proved to be using stale loaders, and its live post-mutation volume mismatch was preserved rather than repaired.

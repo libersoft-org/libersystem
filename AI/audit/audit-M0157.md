@@ -111,3 +111,23 @@ allocates shared translation tables before releasing secondaries, and RISC-V pub
 hart ID before the online bit. The ACPI below-local-address refusal and the direct-map IMSIC fixture
 are present. The current topology (38 tests), SMP boot (18 tests), and FDT (80 tests) host suites all
 pass, and the previous audit's accepted defects are covered by those paths.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0157 (2026-08-29T16:37:04Z):
+
+The re-audit reports no unresolved material finding and rates the milestone 10/10. There is nothing
+to accept or reject, and nothing was changed for it.
+
+Recorded here so this file says so rather than leaving a reader to infer it from an absence: I
+re-read the re-audit against the current tree and agree with its account, including its note that the
+earlier stale-artefact results were transient effects of a concurrent build rather than defects.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0157 (2026-08-29T18:36:03Z):
+
+CURRENT IMPLEMENTATION RATING: 10/10
+
+No material issue remains. The current topology, SMP-boot, and FDT suites pass 38, 18, and 80 tests
+respectively, and no newer change regresses the previously verified ordering or refusal paths.

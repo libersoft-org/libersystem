@@ -215,3 +215,69 @@ Current implementation rating: 7/10
 ## Verification
 
 `cargo test --manifest-path src/dma/Cargo.toml --offline` passed all 54 tests. The current bounce test proves method ordering and cache callback spans, but not that the bytes reside at the address given to the device.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-08-29T18:41:17Z):
+
+**Finding - `Bounce` copies into unrelated heap storage, not into the physical buffer the device is
+told to DMA: ACCEPTED and fixed.**
+
+The re-audit is right and the diagnosis is exact. `Bounce::new` took a `physical` address, allocated
+its OWN `Vec<u8>`, and stored both with nothing tying them together. `for_device` copied into the
+vector and cleaned caches at the address; `for_cpu` invalidated the address and read the vector back.
+A device operating on `physical()` read none of the staged bytes and wrote none of the bytes returned
+to the CPU. This was not a missing adoption - the type could not have worked for any driver that
+adopted it, which is worse than not having it.
+
+And the reason my own test did not say so is the one the re-audit names: it called both methods on
+the same vector, so it proved the two methods agreed WITH EACH OTHER and nothing about the address
+the device was given.
+
+Changed in `src/dma/src/lib.rs`:
+
+- `Bounce<'a>` holds `staging: &'a mut [u8]` - the CPU's view OF the buffer at `physical`, one
+  buffer seen two ways, which is what a driver gets from `dma_buffer_map` and `dma_buffer_phys` on
+  one DMA buffer. There is no second allocation and no `Vec`, so the only way to construct one is to
+  hand it the mapping. The length comes from the slice rather than being a separate argument that
+  could disagree with it.
+
+The one thing this cannot check is that the slice really IS the mapping of that address; the
+correspondence is established where the buffer is allocated, and the signature is what forces the
+caller to have one at all.
+
+Changed in `src/dma/src/tests.rs` - and this is the half that makes the fix an assertion rather than
+a claim:
+
+- what was staged is checked AGAINST THE MAPPING, not by reading it back through the object that
+  wrote it;
+- the device's write is simulated by writing through the mapping - which is what "the CPU view of
+  `physical()`" means, and is exactly what the old shape could not express because the device's
+  buffer and the staging vector were different memory - and `for_cpu` must return THOSE bytes;
+- the coherent case asserts the bytes are where the device will look even though no cache call was
+  made, and a zero-length mapping is refused.
+
+Watched to fail: making `for_cpu` fill the destination from anywhere but the mapping fails with "the
+CPU reads what the DEVICE wrote, not what the CPU staged" and nothing else. 54 host tests pass.
+
+**On the second half of the finding - connect the plan/sync result to the kernel DMA-buffer path:**
+that is adoption by a driver, and no driver has a bounce plan today (the only production
+`Requirements` is a coherent 64-bit IOMMU one, as the re-audit notes). What was wrong was that the
+contract could not have worked; it can now, and the signature is what will force the first adopter to
+pass a real mapping rather than discovering this the way the audit did.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-08-29T19:01:24Z):
+
+Current implementation rating: 8/10
+
+## Unresolved material finding
+
+1. **The internal second allocation is gone, but the safe public API still does not establish the mapping/address invariant it promises.** The new `Bounce<'a>` correctly borrows caller storage instead of allocating an unrelated `Vec`, resolving the prior concrete byte-path defect. However, `Bounce::new` is a safe function accepting any `&mut [u8]` and any numerically permitted `physical` value (`src/dma/src/lib.rs:549-580`). Nothing ties that slice to the pinned DMA allocation at that address, so entirely safe code can still pair an ordinary heap slice with an unrelated permitted address and recreate the same device/CPU split; the comment itself concedes that correspondence cannot be checked. The updated test follows the intended precondition by convention, drops the object before mutating the array, and constructs a new one (`src/dma/src/tests.rs:528-552`), so it neither enforces the relationship nor models memory changed asynchronously by a device while the DMA object remains live. This matters for a portable contract: a long-lived exclusive Rust slice also tells the optimizer that ordinary Rust owns the bytes, while hardware mutation needs an explicit unsafe/interior-mutability or volatile synchronization boundary.
+
+   Accept a typed pinned DMA allocation that exposes its CPU mapping and device address together, or make construction an explicit `unsafe` boundary with documented pinning, address-correspondence, lifetime, and external-mutation requirements and use an appropriate raw/`UnsafeCell`/volatile representation at the sync points. Test a fake mapped allocation whose device view mutates the same live backing. The implementer's decision not to force production adoption yet is otherwise justified because no current device requests a bounce plan.
+
+## Verification
+
+The revised DMA suite passed all 54 tests. The original unrelated-`Vec` finding is resolved; only the still-unenforced safe mapping/address contract above remains.

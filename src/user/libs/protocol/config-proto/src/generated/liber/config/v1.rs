@@ -79,6 +79,7 @@ pub mod config {
 	pub const OP_LIST: u16 = 2;
 	pub const OP_SET: u16 = 3;
 	pub const OP_REMOVE: u16 = 4;
+	pub const OP_SEAL: u16 = 5;
 
 	pub trait Service {
 		fn get(&mut self, key: String) -> Result<String, Error>;
@@ -92,6 +93,14 @@ pub mod config {
 		/// Not a general delete, and not a rule that `set ""` means absent - which is how an empty
 		/// string becomes a third state nobody declared.
 		fn remove(&mut self, key: String) -> Result<(), Error>;
+		/// SEAL THIS CONNECTION: from here on it may read and may not write. Irreversible - there is no
+		/// unseal - and it applies to the CONNECTION rather than to the caller, so a component granted a
+		/// read-only configuration client cannot obtain a writable one by asking again.
+		///
+		/// It exists so a status tool can be given the configuration READ it needs without being given
+		/// authority over unrelated system configuration. The granting authority seals the connection
+		/// before handing it over, so this is not a promise the holder makes about itself.
+		fn seal(&mut self) -> Result<(), Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -265,6 +274,41 @@ pub mod config {
 					Error::Again.write(w)?;
 				}
 			}
+			OP_SEAL => {
+				r.finish()?;
+				request_handles.clear();
+				let result = service.seal();
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v9) => {
+							w.u8(1)?;
+						}
+						Err(v10) => {
+							w.u8(0)?;
+							v10.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
+				}
+			}
 			_ => return None,
 		}
 		match Handles::try_from_slice(writer.handles()) {
@@ -406,13 +450,13 @@ pub mod config {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v9 = r.u16()? as usize;
-						let mut v10 = Vec::new();
-						v10.try_reserve_exact(v9).ok()?;
-						for _ in 0..v9 {
-							v10.push(ConfigEntry::read(r)?);
+						let v11 = r.u16()? as usize;
+						let mut v12 = Vec::new();
+						v12.try_reserve_exact(v11).ok()?;
+						for _ in 0..v11 {
+							v12.push(ConfigEntry::read(r)?);
 						}
-						v10
+						v12
 					})
 				} else {
 					Err(Error::read(r)?)
@@ -492,6 +536,38 @@ pub mod config {
 			}
 			decoded
 		}
+		pub fn seal(&mut self) -> Option<Result<(), Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_SEAL)?;
+			w.u32(corr)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? { Ok(()) } else { Err(Error::read(r)?) };
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
 	}
 
 	#[cfg(feature = "channel-client-impl")]
@@ -524,6 +600,14 @@ pub mod config {
 	fn channel_invoke_remove(chan: u64, key: &str) -> Option<Result<(), Error>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.remove(key)
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_config_config_seal")]
+	fn channel_invoke_seal(chan: u64) -> Option<Result<(), Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.seal()
 	}
 }
 
@@ -634,13 +718,13 @@ pub mod picker {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v11) => {
+						Ok(v13) => {
 							w.u8(1)?;
-							v11.write(w)?;
+							v13.write(w)?;
 						}
-						Err(v12) => {
+						Err(v14) => {
 							w.u8(0)?;
-							v12.write(w)?;
+							v14.write(w)?;
 						}
 					}
 					Some(())

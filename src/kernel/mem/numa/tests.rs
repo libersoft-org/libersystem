@@ -29,6 +29,48 @@ fn a_machine_reports_the_topology_it_has_and_invents_none() {
 	if with_memory >= 2 {
 		assert!(crate::mem::frame::pool_count() >= with_memory, "each memory-bearing node has a pool of its own");
 	}
+
+	// AND THE GRAPH EXACTLY, not three counts that a table half-read would also satisfy.
+	//
+	// Counting nodes says nothing about which memory and which processors are on them, and the
+	// defect this milestone actually found - a proximity domain read from the wrong offset - kept
+	// every count right. What follows asserts the normalized graph itself: each range routes to its
+	// own node at BOTH ends, each described processor routes to its node, and the distance matrix is
+	// symmetric with every local entry strictly below every remote one.
+	crate::mem::with_topology(|found| {
+		let named = found.nodes();
+		assert!(!found.ranges().is_empty(), "a topology with nodes describes memory somewhere");
+		for range in found.ranges() {
+			assert!(named.contains(&range.node), "a memory range is on node {} which the node list does not name", range.node.0);
+			assert!(range.end() > range.base, "a range with no bytes in it is a table read wrong, not a node with no memory");
+			// `found.node_of_address`, NOT `crate::mem::topology_node_of`: this closure runs under
+			// the topology lock and that helper takes it again, which on a spinlock is the machine
+			// stopping. The routing being asserted is the same function either way.
+			assert_eq!(found.node_of_address(range.base), topology::Affinity::Node(range.node), "the first byte of a range routes to another node");
+			assert_eq!(found.node_of_address(range.end() - 1), topology::Affinity::Node(range.node), "the last byte of a range routes to another node - the range is being read as shorter or longer than it is");
+		}
+		for &(hardware_id, node) in found.cpus() {
+			assert!(named.contains(&node), "processor {hardware_id} is on node {} which the node list does not name", node.0);
+			assert_eq!(found.node_of_cpu(hardware_id), topology::Affinity::Node(node), "a described processor does not route back to its own node");
+		}
+		for &from in named {
+			let local = found.distance(from, from);
+			for &to in named {
+				assert_eq!(found.distance(from, to), found.distance(to, from), "the distance matrix is not symmetric between nodes {} and {}", from.0, to.0);
+				if to != from {
+					assert!(found.distance(from, to) > local, "node {} is described as no further from node {} than from itself", to.0, from.0);
+				}
+			}
+			// AND THE FALLBACK ORDER IS THE DISTANCES, STARTING AT HOME. This is the order every
+			// preferred allocation walks, so an order that disagreed with the matrix would place
+			// memory correctly by accident on a two-node machine and wrongly on any larger one.
+			let order = found.fallback_order(from);
+			assert_eq!(order.first().copied(), Some(from), "the fallback order for node {} does not start with itself", from.0);
+			for pair in order.windows(2) {
+				assert!(found.distance(from, pair[0]) <= found.distance(from, pair[1]), "the fallback order for node {} is not sorted by distance", from.0);
+			}
+		}
+	});
 }
 
 crate::tagged_test!(every_frame_returns_to_the_pool_that_owns_its_address, [Numa, Memory, Kernel], id = "kernel.mem.numa.every_frame_returns_to_the_pool_that_owns_its_address", covers = ["kernel"]);
@@ -183,6 +225,13 @@ fn the_reference_model_and_the_allocator_agree_over_a_trace() {
 		let real_node = crate::mem::topology_node_of(real);
 		let model_node = model.owner_of(modelled).map(topology::Affinity::Node).unwrap_or(topology::Affinity::Unknown);
 		assert_eq!(real_node, model_node, "round {round}: a preferred allocation for node {} came from {real_node:?} in the allocator and {model_node:?} in the model", want.0);
+		// THE SAME OWNERSHIP ON BOTH SIDES, WHICH IS WHAT MAKES IT ONE TRACE.
+		//
+		// This held the real frame and freed the model's. The two states then diverged on the first
+		// round and stayed diverged: the model was full for the whole trace while the allocator was
+		// being drained, so every later comparison was between two different machines and the model
+		// could never have reached a fallback the allocator reached. Both are freed here, and the
+		// pressure the matrix below needs is INJECTED into both rather than accumulated in one.
 		held.push((real, want));
 		model.free(modelled, Some(want));
 		assert!(model.consistent(), "round {round}: the model's own totals stopped adding up");
@@ -190,10 +239,215 @@ fn the_reference_model_and_the_allocator_agree_over_a_trace() {
 
 	// AND EVERY FRAME GOES BACK, to the pool that owns its address.
 	let retired_before = crate::mem::frame::retired_pages();
-	for (frame, _) in held {
+	for (frame, _) in held.drain(..) {
 		// SAFETY: each was allocated by this test and never mapped.
 		unsafe { crate::mem::frame::deallocate(frame) };
 	}
 	assert_eq!(crate::mem::frame::retired_pages(), retired_before, "a frame this trace allocated could not be returned and was retired - the trace lost memory the model says it still has");
-	crate::serial_println!("    the model and the allocator agreed on every placement decision in the trace");
+
+	// PHASE TWO: THE SAME TRACE WITH NODE 0 EMPTY ON BOTH SIDES.
+	//
+	// Above, neither side is under pressure, so the trace compares the easy half of the contract -
+	// where a preferred allocation lands when the node it asked for can serve it. What M5 asks about
+	// is the other half, and neither the model nor the allocator reached it. The exhaustion is made
+	// the same way on both: the allocator is told to pretend the node is empty, and the model's
+	// frames for that node are taken out strictly and held, which for a pool model IS empty.
+	let first = nodes[0];
+	let mut drained: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+	while let Some(frame) = model.alloc_strict(first) {
+		drained.push(frame);
+	}
+	assert!(!drained.is_empty(), "the model had nothing on node {} to begin with", first.0);
+	assert_eq!(model.free_in(Some(first)), 0, "the model's node {} is empty", first.0);
+	crate::mem::frame::pretend_node_is_empty(Some(first));
+
+	for round in 0..8usize {
+		// STRICT ON THE EMPTY NODE: both refuse, and neither answers with somebody else's memory.
+		assert!(model.alloc_strict(first).is_none(), "round {round}: the model served a strict allocation from an empty node");
+		assert!(crate::mem::frame::allocate_strict(first).is_none(), "round {round}: the allocator served a strict allocation from an empty node while the model refused");
+
+		// PREFERRED ON THE EMPTY NODE: both fall back, and to the SAME node.
+		let Some(modelled) = model.alloc_preferred(first) else {
+			panic!("round {round}: the model has no memory left anywhere, so this trace cannot compare a fallback");
+		};
+		let Some(real) = crate::mem::frame::allocate_preferred(first) else {
+			panic!("round {round}: the allocator refused a preferred allocation the model served");
+		};
+		let model_node = model.owner_of(modelled).map(topology::Affinity::Node).unwrap_or(topology::Affinity::Unknown);
+		assert_eq!(crate::mem::topology_node_of(real), model_node, "round {round}: the fallback from an empty node {} went to different nodes in the model and the allocator", first.0);
+		assert_ne!(model_node, topology::Affinity::Node(first), "round {round}: the fallback stayed on the node that has nothing");
+		// SAFETY: allocated by this call and never mapped.
+		unsafe { crate::mem::frame::deallocate(real) };
+		model.free(modelled, None);
+		assert!(model.consistent(), "round {round}: the model's totals stopped adding up under pressure");
+	}
+
+	crate::mem::frame::pretend_node_is_empty(None);
+	for frame in drained {
+		model.free(frame, Some(first));
+	}
+	assert!(model.consistent(), "the model is back where it started");
+	crate::serial_println!("    the model and the allocator agreed on every placement decision in the trace, with node {} full and empty", first.0);
+}
+
+crate::tagged_test!(the_placement_matrix_runs_through_the_real_allocator, [Numa, Memory, Kernel], id = "kernel.mem.numa.the_placement_matrix_runs_through_the_real_allocator", covers = ["kernel"]);
+fn the_placement_matrix_runs_through_the_real_allocator() {
+	// M5'S FAILURE MATRIX, DRIVEN THROUGH THE ALLOCATOR THIS KERNEL USES.
+	//
+	// What was here asked for a node that does not exist (`0xFFFF`) and accepted a preferred success
+	// without checking WHICH node served it - so the fallback was proved to happen and never proved
+	// to go anywhere in particular, and the exhaustion case was a node with no pool rather than a
+	// pool with no memory. Those are different states: one exercises "there is nothing to ask", the
+	// other "the node is real and has nothing left", and only the second is the one a machine
+	// reaches.
+	//
+	// EXHAUSTION IS INJECTED, NOT PERFORMED. Emptying a real node means taking every frame it has -
+	// millions, on any machine worth testing - and the matrix needs the STATE rather than the work.
+	// `pretend_node_is_empty` leaves the pool exactly as it is and makes the two node-aware paths
+	// skip it, so what is exercised is the preference ORDER rather than a shortcut around it.
+	let Some(nodes) = crate::mem::with_topology(|found| found.memory_bearing_nodes()) else {
+		crate::serial_println!("numa-matrix: skipped - this machine reported no topology");
+		return;
+	};
+	if nodes.len() < 2 {
+		crate::serial_println!("numa-matrix: skipped - one memory-bearing node, so there is nowhere to fall back to");
+		return;
+	}
+	let (first, second) = (nodes[0], nodes[1]);
+	let (total_before, free_before) = crate::mem::frame::totals();
+	// THE EXACT PER-NODE FIGURES, which is what M5 asks to be restored. The global count returning to
+	// where it started is also what a matrix that moved a frame from one pool to the other and back
+	// would produce.
+	let (in_first, in_second) = (crate::mem::frame::free_in_node(Some(first)), crate::mem::frame::free_in_node(Some(second)));
+	assert!(in_first.is_some() && in_second.is_some(), "both memory-bearing nodes have a pool of their own");
+
+	crate::mem::frame::pretend_node_is_empty(Some(first));
+
+	// 1. STRICT REFUSES. The node is real, has a pool, and can serve nothing.
+	assert!(crate::mem::frame::allocate_strict(first).is_none(), "a strict allocation on an exhausted node is a refusal, not a frame from somewhere else");
+
+	// 2. PREFERRED FALLS BACK, AND TO A NAMED NODE. The address is the evidence: a fallback that
+	//    satisfied the count and came from anywhere would be exactly the defect.
+	let Some(fallback) = crate::mem::frame::allocate_preferred(first) else {
+		panic!("a preferred allocation must fall back while another pool has memory");
+	};
+	let served = crate::mem::topology_node_of(fallback);
+	assert_ne!(served, topology::Affinity::Node(first), "the fallback did not come from the exhausted node");
+	assert_eq!(served, topology::Affinity::Node(second), "and it came from the next node in the preference order, not from whichever pool answered first");
+
+	// 3. A CONTIGUOUS SPAN GOES TO THE NODE THAT WAS ASKED FOR, and every page of it. Asking for the
+	//    second node while the first is exhausted also proves the span did not silently move.
+	let pages = 4usize;
+	let Some(span) = crate::mem::frame::allocate_contiguous_preferred(pages, second) else {
+		panic!("a four-page span could not be served from a node with memory");
+	};
+	for page in 0..pages as u64 {
+		assert_eq!(crate::mem::topology_node_of(span + page * 4096), topology::Affinity::Node(second), "page {page} of a contiguous span left the node it was placed on");
+	}
+
+	// 4. EVERYTHING GOES BACK, ROUTED BY ADDRESS.
+	// SAFETY / NEVER-MAPPED: allocated here, never entered a page table, freed once.
+	unsafe {
+		crate::mem::frame::deallocate(fallback);
+		for page in 0..pages as u64 {
+			crate::mem::frame::deallocate(span + page * 4096);
+		}
+	}
+
+	crate::mem::frame::pretend_node_is_empty(None);
+
+	// 5. AND THE TOTALS ARE EXACTLY WHAT THEY WERE - per pool and overall. A matrix that ended with
+	//    the right answers and the wrong accounting has moved memory between pools.
+	assert!(crate::mem::frame::pools_agree_with_total(), "every frame went back to the pool it came from");
+	let (total_after, free_after) = crate::mem::frame::totals();
+	assert_eq!(total_after, total_before, "no frame appeared or vanished");
+	assert_eq!(free_after, free_before, "and the free count is where it started");
+	assert_eq!(crate::mem::frame::free_in_node(Some(first)), in_first, "node {}'s own free count is not what it was before the matrix ran", first.0);
+	assert_eq!(crate::mem::frame::free_in_node(Some(second)), in_second, "node {}'s own free count is not what it was before the matrix ran", second.0);
+
+	// 6. THE EXHAUSTED NODE SERVES AGAIN once it is not pretending. Without this the injection could
+	//    leak into whatever runs next and every later allocation would be testing a lie.
+	let Some(back) = crate::mem::frame::allocate_strict(first) else {
+		panic!("the node refuses strict allocations after the injection was lifted");
+	};
+	assert_eq!(crate::mem::topology_node_of(back), topology::Affinity::Node(first));
+	// SAFETY / NEVER-MAPPED: as above.
+	unsafe { crate::mem::frame::deallocate(back) };
+
+	// 7. AND A FRAME OF ONE NODE IS GIVEN BACK BY A CORE OF ANOTHER.
+	//
+	//    `deallocate` finds the pool from the frame rather than from whoever is freeing it, which is
+	//    the property that makes a cross-node free correct; freeing on the core that allocated
+	//    proves nothing about it, because that core's pool is the right one either way. So a frame of
+	//    node `second` is handed to a core of node `first` - a `deallocate` that consulted the
+	//    CALLER's node would put it in the wrong pool, and node `second`'s own count would not come
+	//    back.
+	//
+	//    ITS OWN SECTION, AFTER THE TOTALS ABOVE, because a kernel thread has a kernel STACK: those
+	//    frames are taken from the node the thread was placed on and are not given back until it is
+	//    reaped, so a global count compared across a spawn is comparing two different machines. The
+	//    per-node figure this section does assert is the one the spawn cannot move - the stack is
+	//    charged to node `first` and the frame under test belongs to node `second`.
+	let Some(travelling) = crate::mem::frame::allocate_strict(second) else {
+		crate::serial_println!("numa-matrix: incomplete - node {} could not serve the frame for the cross-node free", second.0);
+		return;
+	};
+	let owner_before = crate::mem::frame::free_in_node(Some(second));
+	if !remote_free(first, travelling) {
+		// SAFETY / NEVER-MAPPED: still this test's frame, never mapped, freed exactly once here
+		// because no other core took it.
+		unsafe { crate::mem::frame::deallocate(travelling) };
+		crate::serial_println!("numa-matrix: incomplete - no core of node {} other than this one took the cross-node free, so it was made locally", first.0);
+		return;
+	}
+	assert_eq!(crate::mem::frame::free_in_node(Some(second)), owner_before.map(|count| count + 1), "a frame of node {} freed by a core of node {} did not go back to node {}'s pool", second.0, first.0, second.0);
+	assert!(crate::mem::frame::pools_agree_with_total(), "and the pools still add up after a core of another node gave a frame back");
+	crate::serial_println!("numa-matrix: complete - node {} exhausted, strict refused, preferred fell back to node {}, a span stayed on it, a core of node {} freed node {}'s frame, and every per-node total returned", first.0, second.0, first.0, second.0);
+}
+
+// FREE ONE FRAME FROM A CORE OF `node`, and say whether that core actually took it.
+//
+// The frame is handed over through a static because a kernel thread body is an `extern "C" fn(u64)`
+// and the argument is the frame itself; the flag is what tells the caller whether the free happened
+// there or has still to be made here. Bounded, like every other cross-core wait in this suite: a
+// core that is busy or asleep must weaken the claim rather than hang the run.
+fn remote_free(node: topology::NodeId, frame: u64) -> bool {
+	use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+	static FREED: AtomicBool = AtomicBool::new(false);
+	extern "C" fn body(frame: u64) {
+		// SAFETY: the caller allocated this frame, never mapped it, and does not free it itself once
+		// this thread has been started - `FREED` is what tells it so.
+		// NEVER-MAPPED: allocated by the matrix above and freed without entering a page table.
+		unsafe { crate::mem::frame::deallocate(frame) };
+		FREED.store(true, AtomicOrdering::SeqCst);
+	}
+
+	crate::smp::numa::bind_online();
+	// A CORE OF THIS NODE THAT IS NOT THE ONE ASKING.
+	//
+	// `place_on` answers with the node's first online core, which on the boot processor's node is
+	// the core running this test - and a free made there proves exactly what freeing inline proves.
+	// The profile this matters on gives each node two cores for this reason.
+	let here = crate::sched::current_cpu_id();
+	let mut chosen = None;
+	for cpu in 0..crate::smp::cpu_count() {
+		if cpu != here && crate::smp::numa::cpu_node(cpu) == topology::Affinity::Node(node) {
+			chosen = Some(cpu);
+			break;
+		}
+	}
+	let Some(cpu) = chosen else { return false };
+	FREED.store(false, AtomicOrdering::SeqCst);
+	// THE FRAME IS THE ARGUMENT, and `spawn_on` is what carries one to a named core - the
+	// `prepare_*` forms take an object rather than a value and would need the frame in a static
+	// beside the flag. A remote core is kicked with a wake IPI here, so it does not wait for its
+	// next timer tick to notice.
+	crate::sched::spawn_on(cpu, body, frame);
+	for _ in 0..2_000_000u64 {
+		if FREED.load(AtomicOrdering::SeqCst) {
+			return true;
+		}
+		core::hint::spin_loop();
+	}
+	false
 }

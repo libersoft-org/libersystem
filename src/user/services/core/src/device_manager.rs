@@ -524,10 +524,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					nodes[at].retry_at = 0;
 					start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
 				}
-				// AN OPERATOR'S RETRY, PERFORMED. One attempt, from wherever the node was left.
+				// AN OPERATOR'S RETRY, PERFORMED. One attempt, from wherever the node was left -
+				// but never on a node that still HAS a binding.
+				//
+				// `Retry` legitimately asks for one from `Failed` and from `Backoff`, so the seam
+				// cannot require `Unbound`; what it must refuse is a node whose driver is still
+				// running. `Online -> Binding` is not an edge, so every attempt failed and
+				// `start_candidate` advanced the cursor for it, walking the list to exhaustion on a
+				// device that was working the whole time.
 				if nodes[at].restart_requested && recovery.armed() {
 					nodes[at].restart_requested = false;
-					start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+					if nodes[at].binding.is_none() && nodes[at].teardown.is_none() {
+						start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+					}
 				}
 				// THE ANSWER IS ACTED ON. This discarded the `Step`, so a driver that crashed after
 				// coming online was moved to `Backoff` and left there for the rest of the boot -
@@ -985,6 +994,21 @@ unsafe fn print_driver_name(name: &[u8]) {
 #[allow(clippy::too_many_arguments)]
 unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, power: u64, console_input: u64, device_privilege: u64, catalogue: &Catalogue, state: &mut [u8]) {
 	unsafe {
+		// A STORED DISABLE PARKS THE NODE; IT DOES NOT SPEND A CANDIDATE.
+		//
+		// The refusal used to be made inside `begin_bind`, which answers `false` for it - the same
+		// answer a claim that was refused and a spawn that failed give. The caller reads that as
+		// "this candidate did not work" and moves to the next one, so one policy-disabled recovery
+		// walked the whole candidate list and left `node.candidate` past its end. A later enable then
+		// reached `Unbound` with nothing left to launch: the persistence fix would have made the
+		// device unrecoverable.
+		//
+		// A policy disable is a property of the NODE, not of any one candidate, so it is answered
+		// here - before the list is consulted at all - and the cursor is untouched.
+		if node.disabled_by_policy {
+			node.record.move_to(BindingState::Disabled, None);
+			return;
+		}
 		// WHETHER THE LAST THING THAT WENT WRONG WAS A MISSING ARTIFACT, so exhaustion can say which
 		// of the two failures it was. See the block at the top of the loop.
 		let mut missing = false;
@@ -1401,6 +1425,19 @@ struct Node {
 	retry_at: u64,
 	// A TEARDOWN WAITING FOR ITS CONFIRMATIONS. See `Teardown`.
 	teardown: Option<Teardown>,
+	// AN OPERATOR DISABLED THIS DEVICE, AND THAT IS A DESIRE RATHER THAN A STATE.
+	//
+	// The stored record used to be applied by attempting `move_to(Disabled)` and ignoring the
+	// refusal - and the table deliberately has no `Online -> Disabled` edge, so for every eligible
+	// driver already bound by the time ConfigService became available the record was read and
+	// silently forgotten. The device stayed online and a later crash bound it again, against a
+	// policy that was still on disk.
+	//
+	// Kept apart from `record.state` because the two answer different questions: the state is where
+	// this binding IS, and this is what the operator asked for. An already-online device stays live
+	// until its next bind - taking it down under a running system is not what a stored record asks -
+	// and that next bind is refused.
+	disabled_by_policy: bool,
 }
 
 // A TEARDOWN THAT HAS BEEN STARTED AND NOT YET CONFIRMED.
@@ -1469,7 +1506,7 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None, incident_stored: false, teardown: None }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None, incident_stored: false, teardown: None, disabled_by_policy: false }
 	}
 
 	// Queue one event for this node.
@@ -2688,6 +2725,21 @@ unsafe fn back_off_until(incident: &Incident, attempt: u32) -> u64 {
 #[allow(clippy::too_many_arguments)]
 unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64) -> bool {
 	unsafe {
+		// A STORED DISABLE IS CONSULTED BEFORE EVERY BIND, not applied once when it was read.
+		//
+		// This is the other half of `load_stored_policy`: the record is a desire that outlives any
+		// one binding, so the question "may this device be bound" has to be asked HERE, where a bind
+		// starts, rather than answered once against whatever state the node happened to be in when
+		// ConfigService first answered. Without it a driver that was online when the policy arrived
+		// stayed online - correctly - and then bound again on its next crash, against a record that
+		// was still on disk.
+		if node.disabled_by_policy {
+			node.record.move_to(BindingState::Disabled, None);
+			print(b"DeviceManager: ");
+			print_driver_name(driver_name);
+			print(b" is disabled in stored policy; this bind does not start\n");
+			return false;
+		}
 		if node.attempt == 0 {
 			// ONE WINDOW FOR THE WHOLE CHAIN OF ATTEMPTS, opened on the first and not per attempt.
 			// Three attempts of two seconds plus their backoffs is 6.3 seconds for ONE device,
@@ -2712,9 +2764,12 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// and that is a packaging fault rather than a version disagreement - but it is equally not
 		// something to hand a device to, and `protocol-mismatch` is the cause for both. It is the
 		// variant M0161 defined for this and the reason it had no producer.
-		match driver_protocol::declared_version_in(elf) {
-			Some(version) if version == driver_protocol::VERSION => {}
-			_ => {
+		// THE ONE PREDICATE, in the crate that owns the note - see `speaks_this_version`. A caller
+		// comparing the number itself has to remember that a missing note and a stale one lead to
+		// the same refusal, and remembering is what a shared predicate is for.
+		match driver_protocol::speaks_this_version(elf) {
+			true => {}
+			false => {
 				print(b"DeviceManager: ");
 				print_driver_name(driver_name);
 				print(b" does not declare this build's driver protocol; refusing before the claim\n");
@@ -3361,6 +3416,10 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, catalog
 			// A DISABLE ON A RUNNING BINDING GOES THROUGH THE TEARDOWN, carrying the intent so it
 			// does not rebind; one on a binding that is not running has nothing to give back.
 			PolicyVerb::Disable => {
+				// THE DESIRE, beside the stop. What follows takes the binding down; this is what
+				// stops the next one starting, and it is what a stored record restores on the next
+				// boot - see `load_stored_policy` and the check in `begin_bind`.
+				node.disabled_by_policy = true;
 				node.stop_intent = driver_binding::StopIntent::OperatorDisable;
 				// A RUNNING BINDING IS STOPPED, NOT RELABELLED.
 				//
@@ -3380,15 +3439,30 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, catalog
 			}
 			// ENABLE GOES TO `Unbound`, which is what INVITES the bind an enable is asking for.
 			PolicyVerb::Enable => {
+				// AND ENABLE IS WHAT LIFTS IT. An enable that moved the record and left the desire
+				// would be a node that binds once and is refused for ever after.
+				node.disabled_by_policy = false;
 				node.stop_intent = driver_binding::StopIntent::Fault;
-				node.record.move_to(BindingState::Unbound, None);
-				// AND SOMETHING HAS TO PERFORM THE BIND IT INVITES. `Unbound` is the state that
-				// invites one; nothing in the standing loop starts a candidate for a node just
-				// because it is in that state, so an accepted enable brought nothing back. Same
-				// mechanism the operator retry uses.
-				node.attempt = 0;
-				node.incident = Incident::open();
-				node.restart_requested = true;
+				// AND SOMETHING HAS TO PERFORM THE BIND IT INVITES - WHEN THERE IS ONE TO PERFORM.
+				//
+				// `Unbound` is the state that invites a bind; nothing in the standing loop starts a
+				// candidate for a node just because it is in that state, so an accepted enable
+				// brought nothing back. Same mechanism the operator retry uses.
+				//
+				// THE MOVE'S ANSWER IS READ, WHICH IT WAS NOT. Enabling a node that is still ONLINE
+				// - the ordinary case for a disable that was stored while the driver was running -
+				// has no `Online -> Unbound` edge, so the record stayed where it was and the restart
+				// was requested anyway. There is nothing to restart on a device that is already
+				// running, and asking for one spent its candidates against a state no bind can start
+				// from. The desire is lifted either way; only a node that actually reached `Unbound`
+				// gets an attempt.
+				if node.record.move_to(BindingState::Unbound, None) {
+					node.attempt = 0;
+					node.incident = Incident::open();
+					node.restart_requested = true;
+				} else {
+					print(b"DeviceManager: the stored disable is lifted; this device is not stopped, so nothing is restarted\n");
+				}
 			}
 			// SELECT CHANGES NOTHING NOW. It is stored, and it applies at the next bind.
 			PolicyVerb::Select => {}
@@ -3597,12 +3671,21 @@ unsafe fn load_stored_policy(nodes: &mut [Node], config: u64) {
 			let Some(Ok(entry)) = client.get(&key) else { continue };
 			let value = entry.as_bytes();
 			if value == b"disabled" {
-				// A device an operator disabled is not bound at all this boot. `Unbound -> Disabled`
-				// is in the table, which is the edge for a node that has nothing to tear down.
+				// THE DESIRE IS RECORDED WHETHER OR NOT IT CAN BE APPLIED NOW. This was the move
+				// alone, with its refusal ignored - and a node already `Online` cannot move to
+				// `Disabled`, so every driver bound before ConfigService answered kept its record
+				// read and forgotten.
+				node.disabled_by_policy = true;
+				// A device that has nothing bound is disabled immediately: `Unbound -> Disabled` is
+				// in the table, which is the edge for a node with nothing to tear down.
 				if node.record.move_to(BindingState::Disabled, None) {
 					print(b"DeviceManager: ");
 					print_driver_name(node.driver_name());
 					print(b" stays unbound - an operator disabled it and that is stored\n");
+				} else {
+					print(b"DeviceManager: ");
+					print_driver_name(node.driver_name());
+					print(b" is disabled in stored policy and is already bound; it stays up and will not bind again\n");
 				}
 				continue;
 			}
@@ -3663,6 +3746,45 @@ fn persist_incidents(nodes: &mut [Node], config: u64) {
 			push_number(&mut value, report.last_opcode as u64);
 			value.push_str(" silent-for=");
 			push_number(&mut value, report.silent_for);
+			// AND THE WHOLE TYPED RECORD, not the half of it that fitted a summary line.
+			//
+			// This wrote cause, state, generation, attempts, opcode and silence and dropped the
+			// device's address and every Domain counter - so the persisted copy could not answer
+			// what the live endpoint answers, and "the snapshot outlives the manager" was true of a
+			// summary rather than of the report. A reader that finds fewer fields than the schema
+			// has cannot tell a record written before this from one whose driver had no Domain.
+			// AND THE ROW NUMBER THIS BOOT GAVE IT, which is what `lsdev --incident N` asks by.
+			//
+			// The KEY is the device's address, because that is the record's identity and a row
+			// number names whatever the table happened to hold. But the operator's question is asked
+			// by index, and with no index in the record a reader could only answer it by listing
+			// every stored incident - which is what it did, printing unrelated devices and unable to
+			// say whether N had one at all.
+			value.push_str(" index=");
+			push_number(&mut value, node.index as u64);
+			value.push_str(" at=");
+			push_number(&mut value, report.binding.bus as u64);
+			value.push(':');
+			push_number(&mut value, report.binding.dev as u64);
+			value.push('.');
+			push_number(&mut value, report.binding.func as u64);
+			// `domain=` is absent when the Domain was already gone or never made, which is itself
+			// worth recording rather than reporting zeros - the same distinction the live report
+			// carries as `domain_known`.
+			if let Some(domain) = report.domain {
+				value.push_str(" domain=1 memory=");
+				push_number(&mut value, domain.memory_used);
+				value.push_str(" peak=");
+				push_number(&mut value, domain.memory_peak);
+				value.push_str(" handles=");
+				push_number(&mut value, domain.handles_used);
+				value.push_str(" threads=");
+				push_number(&mut value, domain.threads_used);
+				value.push_str(" dma=");
+				push_number(&mut value, domain.dma_used);
+			} else {
+				value.push_str(" domain=0");
+			}
 			let key = incident_key(node.id);
 			let mut client = proto::system::config::Client::new(ChannelTransport { chan: config });
 			if client.set(&proto::system::ConfigEntry { key, value }).is_some() {
@@ -4317,37 +4439,16 @@ struct Rule {
 }
 
 impl Rule {
+	// THE DECISION ITSELF IS `driver_binding::Match`, which is host-tested. This is the conversion
+	// from the generated registry's shape to it and nothing more: a second copy of the predicate
+	// here would be a second thing to keep in step, and the one that is not tested is the one that
+	// drifts. See the note beside `Match` for why the conjunction could not be checked before.
 	fn matches(self, info: &DeviceInfo) -> bool {
-		if self.pci_class.is_some_and(|class| info.class != class) {
-			return false;
-		}
-		if self.pci_subclass.is_some_and(|subclass| info.subclass != subclass) {
-			return false;
-		}
-		if self.pci_interface.is_some_and(|interface| info.prog_if != interface) {
-			return false;
-		}
-		// THE TRANSPORT IS ASKED BEFORE THE TYPE, and that ordering is the whole point of the pair:
-		// `virtio_type` is only a virtio number on a function whose transport says so. Without it a
-		// rule for virtio type 2 would match anything this system happens to number 2 next.
-		if self.transport.is_some_and(|transport| info.transport != transport) {
-			return false;
-		}
-		if self.virtio_type.is_some_and(|kind| info.device_type != kind) {
-			return false;
-		}
-		if self.pci_vendor.is_some_and(|vendor| info.vendor != vendor) {
-			return false;
-		}
-		if self.pci_product.is_some_and(|product| info.product != product) {
-			return false;
-		}
-		if let Some(address) = self.pci_address
-			&& (info.bus != address.bus || info.dev != address.dev || info.func != address.func)
-		{
-			return false;
-		}
-		true
+		self.as_match().matches(&driver_binding::Discovered { transport: info.transport, virtio_type: info.device_type, class: info.class, subclass: info.subclass, prog_if: info.prog_if, vendor: info.vendor, product: info.product, bus: info.bus, dev: info.dev, func: info.func })
+	}
+
+	fn as_match(self) -> driver_binding::Match {
+		driver_binding::Match { transport: self.transport, virtio_type: self.virtio_type, class: self.pci_class, subclass: self.pci_subclass, prog_if: self.pci_interface, vendor: self.pci_vendor, product: self.pci_product, address: self.pci_address.map(|address| (address.bus, address.dev, address.func)) }
 	}
 }
 

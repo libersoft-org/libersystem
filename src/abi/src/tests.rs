@@ -1125,6 +1125,14 @@ const MANIFEST_PARTIAL: &[u8] = b"etc/bootstrap.list\nbin/init";
 
 #[test]
 fn a_source_with_no_bootstrap_list_is_not_a_source() {
+	// AND THAT IS ONLY TRUE OF A SOURCE NOTHING CHOSE.
+	//
+	// `assemble` is handed a reader and a verifier and knows nothing about how this source came to
+	// be the one being read, so `Unavailable` is the honest answer HERE. Whether it stays that
+	// answer is the caller's - `blockio::assemble_bootstrap` upgrades it to
+	// `ListAbsentOnSelectedSource` when the medium's manifest named this volume, or when this
+	// source's own verified manifest has a row for the list. This test is about the first half and
+	// the loader is where the second lives.
 	use crate::bootstrap::{Selection, assemble};
 	let mut fs = FakeSource::new(&[(b"etc/other", b"x")]);
 	assert!(matches!(assemble(|path| fs.read(path), vouching(MANIFEST)), Selection::Unavailable));

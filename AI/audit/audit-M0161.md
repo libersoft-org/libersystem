@@ -167,3 +167,67 @@ drivers, headers, and notes together, then add a regression showing that an arti
 the historical revision is refused before claim. The four previously accepted findings are fixed,
 and the driver-protocol host suites and packaged-note gate pass; they do not resolve this remaining
 compatibility hole.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0161 (2026-08-29T16:37:26Z):
+
+**Finding - the rejection of the protocol-version defect is not justified: ACCEPTED. My rejection was
+wrong and the reasoning behind it does not survive being written out.**
+
+I argued that one build's twenty-one artefacts agree with each other. The re-audit's answer is the
+correct one: that says today's artefacts agree with one another and nothing about an artefact from
+another time. An artefact built when the wire had opcodes 1..5 and a two-byte `OFFER` still declares
+1 in its note - and while `VERSION` stayed 1, that note PASSED the pre-claim check, the artefact was
+handed a device, and it failed on the first frame it could not decode. Telling an artefact from
+another revision apart before the claim is the entire reason M3 added that note; a version that never
+moves cannot do it.
+
+Changed:
+
+- `driver_protocol::VERSION` is 2, with the reason in the comment beside it: the wire now carries
+  opcodes 1..11 - `WITHDRAW`, `PING`, `PONG`, `STOP`, `STOPPED`, `CONNECT` - and a four-byte
+  `OFFER` payload. It is the internal wire revision and is explicitly not the product's release
+  version, which stays 1 until the first final release;
+- `speaks_this_version(elf)` in the same crate answers whether an artefact may be handed a device -
+  the version comparison and the missing-note case in one place. DeviceManager's pre-claim check
+  calls it instead of comparing the number itself, so "a missing note and a stale one refuse the
+  same way" is a property of the predicate rather than something a caller remembers;
+- `an_artifact_declaring_a_historical_revision_is_refused_before_the_claim` builds a note carrying
+  revision 1 at an offset inside a synthetic image, asserts the finder reads it, and asserts it is
+  refused - then asserts this build's own revision is accepted, so the refusal is about the revision
+  and not about the synthetic note. A missing note is refused too, and is still a different fact.
+
+26 host tests pass in the protocol crate and the x86_64 build is clean.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0161 (2026-08-29T18:36:03Z):
+
+CURRENT IMPLEMENTATION RATING: 8/10
+
+MATERIAL FINDING - THE PACKAGED-NOTE GATE SILENTLY SKIPS MISSING ARCHITECTURES DESPITE THE MILESTONE'S
+EXPLICIT THREE-ARCHITECTURE CLAIM.
+
+The version correction itself is sound: the shared revision is now 2, DeviceManager applies
+`speaks_this_version` before Binding, the historical-revision regression is present, and the protocol
+and binding host suites pass 26 and 54 tests. The build dependency is also intact: every driver has a
+path dependency on `driver-protocol`, and an ordinary complete user/packages/volume build invalidates
+and restages the affected artifacts without requiring `--rebuild`. After that normal build, the
+current packaged-note gate passes all 21 artifacts across all three architectures. The initially
+stale AArch64 bootstrap was therefore workspace state, not a source implementation defect.
+
+The registered proof is nevertheless fail-open. `check-driver-protocol-note.sh` loops over x86_64,
+AArch64, and RISC-V but executes `continue` whenever either that architecture's bootstrap directory
+or volume package is absent (`src/tools/check-driver-protocol-note.sh:86-92`). Its final guard rejects
+only `archs_seen == 0` (`:142-146`), so one built architecture is enough for success. I reproduced
+this against an isolated build root containing only the current x86_64 bootstrap and volume: the
+gate exited zero and reported `7 driver artifacts across 1 architecture(s)`. That contradicts the
+milestone's explicit closure claim that all 21 packaged driver artifacts across all three
+architectures carry the note (`docs/todo/P02M0161.md:13-21,149-180`). A missing architecture is
+precisely where a linker-script or packaging regression on that port disappears from this gate.
+
+Correction required: require all three named artifact pairs to exist, fail with the missing
+architecture and its normal build command when one does not, and reach the success line only after
+all three per-architecture scans pass. Keep the per-architecture manifest-derived driver floors so
+the total remains derived rather than hard-coded.

@@ -592,6 +592,22 @@ fi
 # `bootstrap.list` and `libexec/` files this copies onto the ESP, nor the volume UUID sidecar. So a
 # destination could move, the fallback set could change, or the pairing file could be corrected, and
 # the key stayed equal: a cache HIT returning an image that does not implement the current manifest.
+# WHAT A FILE IS, NOT WHERE IT WAS REACHED FROM.
+#
+# `sha256sum` prints the file NAME beside the digest, so the identical tree hashed through a
+# different spelling of the same path - `harness/mkimage.sh` with `src` as the working directory, or
+# `src/tools/../harness/mkimage.sh` from the repository root - produced a DIFFERENT key. Two
+# consequences, and the second is why this is here: the cache missed on nothing whenever a caller
+# invoked this script differently, and no checker could recompute a published image's key to ask
+# whether that image implements the current tree. The basename is kept because it names which input
+# a line is about; the prefix is a property of the caller.
+hash_inputs() {
+	local file
+	for file in "$@"; do
+		printf 'input=%s digest=%s\n' "$(basename "$file")" "$(sha256sum "$file" | awk '{print $1}')"
+	done
+}
+
 image_input_key() {
 	printf 'format=liber-boot-image-input-v3\n'
 	printf 'mode=%s\n' "$mode_input"
@@ -606,7 +622,9 @@ image_input_key() {
 	# in no key at all.
 	local bootstrap_root="$BUILD/bootstrap-x86_64"
 	if [[ -d "$bootstrap_root" ]]; then
-		find "$bootstrap_root" -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum
+		# RELATIVE TO THAT ROOT, for the reason `hash_inputs` gives: the absolute prefix is a
+		# property of who invoked this script, not of what the medium carries.
+		(cd "$bootstrap_root" && find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum)
 	else
 		printf 'bootstrap=absent\n'
 	fi
@@ -618,21 +636,36 @@ image_input_key() {
 	# collide with the other. What the old rule did instead was make `testiso` - which carries the
 	# factory archive and no volume at all - depend on the bootable volume: on a clean tree that is
 	# `sha256sum` failing on a missing file, before the preflight that would have explained it.
-	sha256sum "$0" "$REPO_ROOT/src/tools/stage-kernel.sh" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg"
+	hash_inputs "$0" "$REPO_ROOT/src/tools/stage-kernel.sh" "$REPO_ROOT/product.conf" "$kernel" "$LOADER_EFI" "$BUILD/init-x86_64.pkg"
 	case "$cmd" in
 	testiso)
 		# The archive it stages, and nothing about a volume it does not carry.
-		sha256sum "$BUILD/volume-x86_64.pkg"
+		hash_inputs "$BUILD/volume-x86_64.pkg"
 		;;
 	*)
 		# The bootable volume and the pairing sidecar that says which volume this medium declares
 		# itself paired with. Both are required before the key is computed - see the check above.
-		sha256sum "$BUILD/system-volume-bootable-x86_64.img" "$BUILD/system-volume-bootable-x86_64.uuid"
+		hash_inputs "$BUILD/system-volume-bootable-x86_64.img" "$BUILD/system-volume-bootable-x86_64.uuid"
 		;;
 	esac
 }
 
 key="$(image_input_key | sha256sum | awk '{print $1}')"
+# THE KEY ON ITS OWN, for a checker that only wants to know whether a published medium is current.
+#
+# `<image>.build-key` records the key the published image was built from. Asking whether that image
+# implements THIS tree means computing today's key, and the only place that knows what goes into one
+# is the function above - kernel, loader, init package, the bootable volume and its pairing sidecar,
+# the service manifest and its normalized layout, the fallback bootstrap set, `product.conf` and the
+# builders themselves. Comparing an image's mtime against one artifact answers a smaller question,
+# and several of these artifacts have their timestamps pinned for reproducibility, so for them it
+# answers none at all.
+#
+# An environment variable rather than a flag, because `img` already takes a positional size.
+if [[ "${LIBER_IMAGE_PRINT_KEY:-0}" == 1 ]]; then
+	printf '%s\n' "$key"
+	exit 0
+fi
 # THE TEST MEDIUM'S PATH CARRIES ITS KEY, and the shipping media's does not.
 #
 # `TEST_SELECTION` and `TEST_TAGS` are compile-time - `option_env!` - so two runs of one architecture

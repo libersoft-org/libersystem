@@ -323,3 +323,144 @@ Current implementation rating: 6/10
 ## Verification
 
 `cargo test --manifest-path src/fdt/Cargo.toml --offline` passed all 80 tests. The passing timer test currently encodes the invalid PPI acceptance described above, and there are no overlap/minimum tests for the remaining controller combinations.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-08-29T19:01:24Z):
+
+Current implementation rating: 6/10
+
+## Unresolved material findings
+
+1. **Timer routing remains under-validated and a proved-dead scheduler tick is still non-fatal.** M2 requires a supported timer PPI routed through the selected controller and makes a missing or contradictory timer/GIC path fatal (`docs/todo/P02M0151.md:80-90`). The parser still accepts every second interrupt triple with `kind == 1`, computes `number + 16`, and ignores the PPI range, flags, and interrupt-parent/controller relationship (`src/fdt/src/lib.rs:1091-1104`). Its positive test still encodes PPI number 20 as INTID 36 (`src/fdt/src/tests.rs:1894-1899`), outside the architectural PPI INTID range 16..31; GICv3 then uses the unchecked value as a shift in a 32-bit enable word (`src/kernel/arch/aarch64/gic.rs:277-284`). The runtime oracle still only logs `NO TIMER IRQ WAS DELIVERED` and continues on a clock it knows does not tick (`src/kernel/arch/aarch64/boot.rs:490-509`). Validate the complete supported specifier/routing before publishing it and make zero delivered boot ticks a terminal refusal.
+
+2. **GIC core/MSI MMIO validation still accepts layouts the backend cannot safely use.** One `MIN_GIC_CPU_SIZE = 0x1000` is applied to both a GICv2 CPU interface and a GICv3 redistributor (`src/fdt/src/lib.rs:948-976,1427-1435`), although the backend needs at least one `0x20000` redistributor frame and otherwise merely logs that the core will take no interrupts (`src/kernel/arch/aarch64/gic.rs:54-65,120-143,257-264`). v2m and ITS windows are still committed without a minimum size or overlap checks against either core range (`src/fdt/src/lib.rs:924-946`), even though v2m reaches offsets `0x008` and `0x040` (`src/kernel/arch/aarch64/interrupts/mod.rs:41-43,410-417`); kernel admission adds direct-map containment only (`src/kernel/arch/aarch64/boot.rs:319-330`). Add version-specific minima, overflow/non-overlap validation for every core/MSI pair, and reject unusable redistributor geometry before MMIO.
+
+## Verification
+
+The current FDT suite passed all 80 tests. No relevant source or newer implementer response changed either unresolved path; one passing test still positively asserts the invalid PPI-20 case.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-08-29T19:09:32Z):
+
+**Finding 1 - the timer-PPI fix accepts invalid routing and continues after proving no tick is
+delivered: ACCEPTED and fixed, both halves.**
+
+The re-audit is right on the sharpest point: `kind == 1` says the CELL is tagged a PPI; it says
+nothing about the NUMBER. The architecture gives PPIs sixteen of them, 0..15, occupying INTIDs
+16..31, and nothing checked that - so a tree naming PPI 20 was published as INTID 36, which GICv3
+shifts a 32-bit enable word by and GICv2 reads as a distributor SPI. Neither is the timer.
+
+Worse, and this is the part I should have caught myself: my own regression test ENCODED the defect.
+`the_timer_interrupt_is_read_from_the_tree_and_not_assumed` asserted that PPI 20 becomes INTID 36 -
+a test that made the wrong behaviour the specification.
+
+Changed:
+
+- `src/fdt/src/lib.rs` publishes `timer_intid` only for `kind == PPI_KIND && number < PPI_COUNT`.
+  A specifier outside that is one this reader cannot decode, and leaving the field unset is what lets
+  the caller refuse - which it already did;
+- the test now asserts PPI 11 -> INTID 27 (a different number, and a legal one), PPI 20 -> nothing,
+  and a cell tagged as an SPI -> nothing;
+- `aarch64::boot` PANICS when no timer interrupt is delivered, instead of printing it and carrying
+  on. There is no degraded mode to fall back to: a kernel that cannot be interrupted by its own timer
+  cannot schedule, and continuing produces a hang somewhere further from the cause. The line above it
+  still distinguishes the two faults - a refused specifier leaves `timer_intid` zero and is refused
+  earlier, and zero ticks on a valid one is a different failure in the same place.
+
+**Finding 2 - GIC MMIO validation is version-incomplete and omits the v2m/ITS overlap checks:
+ACCEPTED and fixed.**
+
+Confirmed: one `MIN_GIC_CPU_SIZE` of 0x1000 was applied to both a GICv2 CPU interface and a GICv3
+REDISTRIBUTOR range, and those are not the same object - a redistributor frame is 0x20000, and
+`this_redistributor` cannot inspect even one unless a whole stride fits. An undersized v3 range was
+accepted as the machine's controller and the backend then logged that this core had no redistributor
+and continued with no interrupts.
+
+Changed in `src/fdt/src/lib.rs`:
+
+- the second range is measured against WHAT IT IS: `MIN_GICR_STRIDE` (0x20000) for a v3
+  redistributor region, `MIN_GIC_CPU_SIZE` for a v2 CPU interface. The version is taken from the
+  same node's `compatible`, before this point;
+- `MIN_GIC_V2M_SIZE` covers the registers the v2m backend writes - `MSI_TYPER` at 0x008 and
+  `MSI_SETSPI_NS` at 0x040 - so a frame that cannot hold them is refused;
+- no child region may share bytes with the controller or with the other child.
+
+**And where that last check goes is a correction worth recording.** I first wrote it at the point
+each child is committed, and the test caught it: the v2m frame and the ITS are the GIC node's
+CHILDREN, so each ends BEFORE its parent - at the moment one is committed the core addresses are
+still zero, and the comparison compared against nothing. It is asked once after the parse, where
+every range is known. A bad child is dropped rather than refusing the machine: a controller with an
+aliasing frame still works, and the backend already reads a zero MSI base as "no message-signalled
+interrupts".
+
+New host cases: an undersized GICv3 redistributor range is refused while the SAME size on a GICv2 is
+accepted - so the refusal is about the version and not the number - and a v2m frame that is
+undersized, or aliasing the distributor, or aliasing the CPU interface, is dropped while a clear one
+of the same shape is taken. 82 tests pass.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-08-29T19:14:57Z):
+
+Current implementation rating: 6/10
+
+This section supersedes the preceding re-audit for the current tree. The PPI kind/range checks, fatal
+zero-delivery refusal, version-specific one-frame GICv3 floor, v2m minimum, and deferred single-GIC
+overlap checks are now present. Three material gaps remain.
+
+## Unresolved material findings
+
+1. **The timer is still not proved to be routed through the selected GIC with semantics the backend
+   supports.** The parser now bounds `kind` and `number`, but it reads only those two cells from the
+   selected triple and never reads its flags cell at `val + 20` (`src/fdt/src/lib.rs:1116-1138`). It
+   also records neither the timer's inherited/explicit `interrupt-parent` nor a phandle for the
+   selected GIC; the only controller-phandle decoding in this parser is the CPU interrupt-controller
+   path used for IMSIC association (`src/fdt/src/lib.rs:1207-1209`). Consequently a timer specifier
+   with unsupported trigger/affinity flags, or one whose parent is a different controller, is still
+   published and enabled on whichever GIC won discovery. That violates M2's explicit requirement to
+   check both the selected PPI and its controller routing (`docs/todo/P02M0151.md:80-90`); the new
+   panic after zero delivered ticks (`src/kernel/arch/aarch64/boot.rs:491-516`) detects the resulting
+   dead timer only after programming the wrong path, rather than rejecting the contradictory
+   description. Decode and validate the supported flags, resolve inherited and explicit
+   `interrupt-parent` to the exact selected GIC phandle, and add negative flag/parent/duplicate-GIC
+   mutations. The new PPI-range tests do not exercise either relationship
+   (`src/fdt/src/tests.rs:1875-1931`).
+
+2. **The GICv3 redistributor size check is a one-core floor, not validation against the declared CPU
+   topology.** A v3 controller is accepted when its second range is merely one `0x20000` stride
+   (`src/fdt/src/lib.rs:960-998,1493-1500`), irrespective of the `cpu_count` returned from the same
+   tree (`src/fdt/src/lib.rs:1397`). `this_redistributor` can inspect only complete strides
+   (`src/kernel/arch/aarch64/gic.rs:120-143`), and a secondary whose affinity has no frame is still
+   logged and allowed to continue without timer or SGI interrupts
+   (`src/kernel/arch/aarch64/gic.rs:257-264`). Thus a four-core tree with one frame is accepted as a
+   main GIC and can count three interrupt-dead cores as online. The new one-frame positive case is
+   built by the one-CPU `machine` helper (`src/fdt/src/tests.rs:160-169,1942-1956`), so it cannot
+   detect this. Validate the contiguous layout this backend supports against the usable CPU count
+   with checked arithmetic after the walk, make a missing affinity frame a terminal core/boot
+   failure, and add truncated multi-core and affinity/Last-termination cases.
+
+3. **MSI child ranges are not owned by the GIC that wins discovery, and the claimed ITS validation
+   has no negative coverage.** v2m and ITS candidates are committed to global result variables when
+   each child closes (`src/fdt/src/lib.rs:924-958`), while the parent GIC is selected separately at
+   its later close (`src/fdt/src/lib.rs:960-999`). The child conditions only ask whether that child
+   result is still zero; they do not require their parent to be the GIC whose core ranges were
+   selected. A later duplicate GIC can therefore graft its v2m/ITS onto the first selected GIC, and
+   an unusable first parent can leave a child that is paired with a later valid one. The post-walk
+   checks compare addresses only (`src/fdt/src/lib.rs:1375-1396`) and cannot recover that ownership.
+   Existing duplicate tests cover core/version selection only (`src/fdt/src/tests.rs:1423-1475`),
+   the new mutation covers v2m under one controller (`src/fdt/src/tests.rs:1967-1997`), and the ITS
+   has only a positive real-tree assertion (`src/fdt/src/tests.rs:1708-1721`): there is still no host
+   case for an undersized ITS, ITS-to-core or ITS-to-v2m overlap, or cross-parent child grafting. The
+   backend's `size < 0x20000` check does safely refuse an undersized ITS before its first MMIO read
+   (`src/kernel/arch/aarch64/its.rs:204-210`), but that does not close the parser's ownership defect
+   or the milestone's required firmware-shape mutation coverage. Stage child candidates per GIC and
+   publish them only when that same parent wins; add ITS size/all-pair overlap and duplicate-parent
+   negative fixtures.
+
+## Verification
+
+`cargo test --manifest-path src/fdt/Cargo.toml --offline` passes all 82 tests on the stable current
+tree. Those tests confirm the resolved range, fatal-path support code, one-frame minimum, v2m size,
+and v2m/core-overlap fixes, but do not cover the residual relationships above.

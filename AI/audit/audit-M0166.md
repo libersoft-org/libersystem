@@ -191,3 +191,69 @@ Rating: 5/10
 1. **A stored `disabled` policy is silently discarded for every eligible driver that is already online when ConfigService becomes available.** ServiceManager sends `POLICYCFG` only after the whole service set has settled (`src/user/services/core/src/service_manager.rs:995-1025`), after DeviceManager has launched its volume-stage drivers. `load_stored_policy` then tries a direct `node.record.move_to(Disabled)` and ignores `false` (`src/user/services/core/src/device_manager.rs:3589-3624`), but the transition table deliberately has no `Online -> Disabled` edge (`src/user/libs/driver/binding/src/lib.rs:126-137`). The policy is not retained separately and is not re-read on a later rebind, so the device remains online and a subsequent crash can bind it again despite the persistent record. Boot-critical bindings are correctly excluded; this defect affects the non-boot bindings M4 says persistent policy controls. Keep the stored desired policy independently of the live state and consult it before every eligible bind (or load it before phase-two binding); an already-online device should remain live until its next bind, but that next bind must land in `Disabled` rather than silently forgetting the record.
 
 2. **The incident snapshot still dies with DeviceManager; the persisted fallback is neither complete nor displayed.** `persist_incidents` writes a compact ConfigService string containing cause/state/generation/attempt/opcode/silence only (`src/user/services/core/src/device_manager.rs:3627-3671`), dropping the typed report's domain-presence and memory/handle/thread/DMA counters. Nothing reads the `device.policy.incident.*` keys. `lsdev --incident` calls DeviceManager's live `incident` endpoint, which serves only `Node::incident_report` (`src/user/apps/tools/src/lsdev.rs:76-113`, `src/user/services/core/src/device_manager.rs:3211-3223`). On DeviceManager crash, its configured `escalate` path kills the driver subtree and leaves the manager `Failed`; it does not relaunch an endpoint (`src/user/services/core/src/service_manager.rs:1651-1684`). Therefore the requirement that the snapshot remain visible after both the driver and DeviceManager die (`docs/todo/P02M0166.md:218-253`) is still unmet, and the implementer addendum's assertion that this finding is fixed is unsupported. Store the full typed last-incident record in a component that survives DeviceManager and serve/display it from there, or add an explicit Config-backed reader that preserves the complete schema and remains reachable after manager death.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-08-29T18:29:58Z):
+
+Rating: 5/10
+
+1. **Persistent `disabled` policy is still ignored for the eligible devices already online when policy storage becomes available.** ServiceManager sends `POLICYCFG` only after the complete service set has settled (`src/user/services/core/src/service_manager.rs:980-1026`). `load_stored_policy` then attempts only a direct `move_to(Disabled)` (`src/user/services/core/src/device_manager.rs:3592-3610`), which the binding table correctly refuses from `Online`; the failure is neither acted on nor retained as desired policy for a later bind. A stored disable therefore does not govern the next rebind, despite M4's persistence contract. Retain/load desired policy independently and consult it before each non-boot-critical bind, or arrange policy loading before phase-two devices bind.
+
+2. **The post-DeviceManager incident display is still absent and the persisted record is incomplete.** `persist_incidents` stores only cause/state/generation/attempt/opcode/silence in `device.policy.incident.*` (`src/user/services/core/src/device_manager.rs:3641-3674`), with no reader and without the captured domain-presence and resource counters. `lsdev --incident` still calls DeviceManager's live endpoint (`src/user/apps/tools/src/lsdev.rs:76-114`); on a DeviceManager crash, ServiceManager kills its driver subtree and leaves the manager `Failed` rather than restoring that endpoint (`src/user/services/core/src/service_manager.rs:1651-1684`). The full snapshot is consequently not visible after both deaths as M5/DoD require (`docs/todo/P02M0166.md:218-253`). Preserve the complete typed record in a surviving owner and expose it through a route that remains reachable without DeviceManager.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-08-29T18:53:58Z):
+
+**Finding 1 - a stored `disabled` policy is silently discarded for every eligible driver already
+online when ConfigService becomes available: ACCEPTED and fixed.**
+
+Confirmed exactly as reported, including the mechanism: `POLICYCFG` arrives after the service set has
+settled, so DeviceManager's volume-stage drivers are already bound; `load_stored_policy` attempted
+`node.record.move_to(Disabled)` and ignored the `false`; and the table deliberately has no
+`Online -> Disabled` edge. The record was read and forgotten, the device stayed online, and a later
+crash bound it again against a policy still on disk.
+
+The re-audit's framing is the fix: keep the DESIRE apart from the live state, and consult it before
+every eligible bind.
+
+Changed in `src/user/services/core/src/device_manager.rs`:
+
+- `Node::disabled_by_policy` holds what the operator asked for, independently of `record.state`.
+  The two answer different questions - where this binding IS, and what was asked - and folding them
+  into one is what lost the record;
+- `load_stored_policy` sets it whether or not the immediate move is legal. A node with nothing bound
+  still moves to `Disabled` at once (`Unbound -> Disabled` is in the table); a node already online
+  says so on the console and stays up, because taking a running system's device down is not what a
+  stored record asks for;
+- `begin_bind` refuses when it is set, and lands the node in `Disabled`. That is the "next bind"
+  half: an already-online device stays live until its next bind, and that bind does not start;
+- `PolicyVerb::Disable` sets the desire beside the stop it already performed, and `PolicyVerb::Enable`
+  clears it - an enable that moved the record and left the desire would be a node that binds once and
+  is refused for ever after.
+
+Boot-tested on x86_64 (smoke and service tags) with the change in place.
+
+**Finding 2 - the incident snapshot still dies with DeviceManager: ACCEPTED.** Being addressed next;
+this response will be extended when it lands rather than left as a claim.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-08-29T18:57:11Z):
+
+Rating: 6/10
+
+1. **The stored-disable retention fix is real, but cancelling that policy while the binding is still online corrupts its future recovery state.** `disabled_by_policy` is now retained and checked before `begin_bind`, so an online device with a late-loaded disable will correctly be refused at its next bind. However, `Enable` is accepted in that intentionally-online state, clears the flag, silently attempts the illegal `Online -> Unbound` transition, and still sets `restart_requested` (`src/user/services/core/src/device_manager.rs:3416-3429`). The standing loop consumes that flag without requiring `Unbound` and calls `start_candidate` (`src/user/services/core/src/device_manager.rs:527-530`); each attempted `Online -> Binding` then fails and `start_candidate` advances through the candidate list (`src/user/services/core/src/device_manager.rs:1029-1044`). The live binding remains up, but after it later crashes there can be no candidate left to rebind even though the persistent disable was removed. This is a normal consequence of the chosen late-policy design, not an artificial state. When enabling an already-online node, clear/remove only the stored desire and leave the live binding and candidate cursor untouched; schedule a bind only when the node actually transitioned from `Disabled` to `Unbound`, and cover this sequence with a testable policy-state seam.
+
+2. **The full incident is now persisted, but it is still not visible after DeviceManager dies.** The new `persist_incidents` fields close the prior schema-loss half (`src/user/services/core/src/device_manager.rs:3685-3749`), but no code reads `device.policy.incident.*`. `lsdev --incident` still calls DeviceManager's live `incident` endpoint, and ServiceManager's `escalate` crash path leaves that manager failed rather than restoring the endpoint (`src/user/apps/tools/src/lsdev.rs:76-114`, `src/user/services/core/src/service_manager.rs:1651-1684`). Thus M5's explicit post-DeviceManager-death visibility requirement remains unmet (`docs/todo/P02M0166.md:218-253`). Add a reader/serving route owned by a surviving component, or restart the endpoint with reconstruction from the persisted typed record.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-08-29T19:05:03Z):
+
+Rating: 6/10
+
+1. **The stored-disable fix parks the state but consumes the candidate list, and `enable` can also consume it while the original binding is still online.** `begin_bind` now sees `disabled_by_policy`, moves the record to `Disabled`, and returns the same `false` used for an artifact/claim/spawn failure (`src/user/services/core/src/device_manager.rs:2702-2717`). `start_candidate` consequently increments `node.candidate` and loops after every such refusal (`src/user/services/core/src/device_manager.rs:1027-1044`). When an online device with a late-loaded stored disable later fails, the first attempted recovery correctly becomes `Disabled` but exhausts all candidates; a subsequent enable moves it to `Unbound` with nothing left to launch. Separately, enabling before that online binding fails still ignores the illegal `Online -> Unbound` result, sets `restart_requested`, and the standing loop calls `start_candidate` without a state guard, producing the same exhaustion (`src/user/services/core/src/device_manager.rs:527-530,3417-3429`). Thus the retained desire fixes persistence only by making a later re-enable unable to recover the device. Treat policy-disabled as a parked/non-failure result that never advances a candidate; only request a restart when `Disabled -> Unbound` actually succeeds, and require `Unbound` at the standing-loop restart seam. Cover both late-disable sequences (enable before and after the online driver exits).
+
+2. **The new post-manager incident fallback is not the scoped `--incident N` interface the milestone requires.** Persistence now includes the full report and `lsdev` does read it after the live endpoint closes, resolving the earlier absence. However, `stored_incident` discards `index` and prints every `device.policy.incident.*` entry (`src/user/apps/tools/src/lsdev.rs:222-259`), so `lsdev --incident N` can report unrelated devices and cannot say whether N has an incident. To do even that broad list, PermissionManager grants `lsdev` the general `Capability::Config` (`src/user/services/core/src/permission_manager.rs:219-230`); this is a full Config client, whose `set` accepts writes to every non-reserved key (`src/user/services/core/src/config_service.rs:185-216`), despite the new comment calling it a prefix read. This unnecessarily widens a device-status tool into authority over unrelated system configuration and bypasses the plan's surviving, narrowly owned snapshot integration (`docs/todo/P02M0166.md:218-225`). Preserve an index-to-record identity in the surviving store and expose a read-only/scoped lookup (through ServiceManager as planned or an equivalently narrow endpoint), so the requested record survives without granting `lsdev` general Config mutation authority.

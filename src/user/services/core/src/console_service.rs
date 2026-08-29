@@ -504,6 +504,23 @@ unsafe fn run(console: &mut Console) -> ! {
 		if sink != 0 && sys_is_err(syscall(SYS_CONSOLE_ATTACH, feed, sink, 0, 0)) {
 			exit();
 		}
+		// AND THE CONSOLE SAYS WHICH OF THE TWO IT IS.
+		//
+		// The attach is what the kernel reads as "a shell is listening", and it is what ends the
+		// supervised boot window. A console rendering without it is a working screen on a machine
+		// the kernel will never call up - so the degradation has to be visible in the boot log
+		// rather than inferred from a missing line somewhere else.
+		if sink == 0 {
+			print(
+				b"ConsoleService: no ConsoleSink capability - rendering without keyboard input
+",
+			);
+		} else {
+			print(
+				b"ConsoleService: attached to the kernel console input
+",
+			);
+		}
 		console.input = input;
 		let mut keys: [u8; 64] = [0u8; 64];
 		// The per-message output buffer: sized to the transport ceiling (4096, the same

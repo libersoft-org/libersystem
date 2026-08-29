@@ -350,3 +350,39 @@ fn a_staged_artifact_declares_its_protocol_version_before_it_is_launched() {
 	// Shorter than a note cannot contain one, and must not index out of bounds looking.
 	assert_eq!(declared_version_in(&[0u8; 4]), None);
 }
+
+#[test]
+fn an_artifact_declaring_a_historical_revision_is_refused_before_the_claim() {
+	// THE CASE THE NOTE EXISTS FOR, and the one a version that never moved could not catch.
+	//
+	// Revision 1 had opcodes 1..5 and a two-byte `OFFER`; this wire has 1..11 and a four-byte one.
+	// An artifact built then still declares 1, and while `VERSION` was also 1 it passed this check,
+	// was handed a device, and failed on the first frame it could not decode - after the claim,
+	// which is the one place the whole pre-claim note was added to avoid.
+	// FIXED ARRAYS, because this crate is `no_std` and a test that needed a heap could not run
+	// where the code does.
+	const AT: usize = 130;
+	let mut image = [0u8; 512];
+	image[AT..AT + NOTE_LEN].copy_from_slice(&note_bytes_for(1));
+	assert_eq!(declared_version_in(&image), Some(1), "the note is found and read");
+	assert!(!speaks_this_version(&image), "and an artifact from another revision is refused");
+
+	// The current one is accepted, so the refusal above is about the REVISION and not about this
+	// test's synthetic note.
+	let mut current = [0u8; 512];
+	current[AT..AT + NOTE_LEN].copy_from_slice(&note_bytes_for(VERSION));
+	assert!(speaks_this_version(&current), "this build's own revision is what is accepted");
+
+	// AND NO NOTE IS NOT A MISMATCH, but it is equally not something to hand a device to.
+	let blank = [0u8; 512];
+	assert_eq!(declared_version_in(&blank), None);
+	assert!(!speaks_this_version(&blank));
+}
+
+// A note carrying an arbitrary revision, built from the same fixed prefix a driver emits so the
+// finder locates it exactly as it locates a real one.
+fn note_bytes_for(version: u16) -> [u8; NOTE_LEN] {
+	let mut note = PROTOCOL_NOTE;
+	note[28..30].copy_from_slice(&version.to_le_bytes());
+	note
+}

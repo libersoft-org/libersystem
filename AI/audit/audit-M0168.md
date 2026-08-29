@@ -81,3 +81,23 @@ No material unresolved issue remains. The current implementation satisfies the m
 and the implementer's accepted correction is complete. The dedicated `smp-core-cap` gate was rebuilt
 from the current sources and passed a 72-core x86_64 boot with 64 cores online, an explicit zero
 retirement count, and no uncovered-core shootdown report.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0168 (2026-08-29T16:37:04Z):
+
+The re-audit reports no unresolved material finding and rates the milestone 10/10. There is nothing
+to accept or reject, and nothing was changed for it.
+
+Recorded here so this file says so rather than leaving a reader to infer it from an absence: I
+re-read the re-audit against the current tree and agree with its account, including its note that the
+earlier stale-artefact results were transient effects of a concurrent build rather than defects.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0168 (2026-08-29T18:23:54Z):
+
+Rating: 10/10
+
+No material unresolved issue, incomplete fix, unjustified rejection, regression, or new in-scope
+defect was found in the current implementation.

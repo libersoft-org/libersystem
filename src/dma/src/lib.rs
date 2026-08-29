@@ -546,29 +546,37 @@ impl CacheMaintenance for Coherent {
 // a driver on an address-limited or non-coherent device got a decision it could not act on. The two
 // sync points are the whole contract - `for_device` before the device is told to go, `for_cpu` after
 // it says it is done - and they are where the cache maintenance happens whether or not a copy does.
-pub struct Bounce {
-	staging: Vec<u8>,
-	// Where the staging buffer is, in the addresses the DEVICE will use.
+pub struct Bounce<'a> {
+	// THE CPU'S VIEW OF THE BUFFER THE DEVICE WILL USE. Not a second allocation beside it.
+	//
+	// This was an independently allocated `Vec<u8>` with `physical` stored next to it as a bare
+	// number, and nothing tied the two together. `for_device` copied into the vector and cleaned
+	// caches at the address; `for_cpu` invalidated the address and read the vector back. A device
+	// operating on `physical()` therefore read none of the staged bytes and wrote none of the bytes
+	// returned to the CPU - the type could not work for any driver that adopted it, and the test
+	// missed it by calling both methods on the same vector and never simulating a device write.
+	//
+	// A borrow makes that unrepresentable: the only way to construct one is to hand it the mapping.
+	staging: &'a mut [u8],
+	// Where those same bytes are, in the addresses the DEVICE will use.
 	physical: u64,
 	coherent: bool,
 }
 
-impl Bounce {
-	// `physical` is the address of a buffer the device CAN reach - the caller allocated it under the
-	// same `Requirements` that produced the bounce decision.
-	pub fn new(physical: u64, len: u64, requirements: &Requirements) -> Result<Bounce, Fault> {
-		if len == 0 {
+impl<'a> Bounce<'a> {
+	// `staging` is the CPU mapping OF the buffer at `physical` - one buffer seen two ways, which is
+	// what a driver gets from `dma_buffer_map` and `dma_buffer_phys` on one DMA buffer. Passing a
+	// slice that is not that mapping is the defect this signature exists to prevent, and it is the
+	// one thing this cannot check: the caller allocated it under the same `Requirements` that
+	// produced the bounce decision, and that is where the correspondence is established.
+	pub fn new(staging: &'a mut [u8], physical: u64, requirements: &Requirements) -> Result<Bounce<'a>, Fault> {
+		if staging.is_empty() {
 			return Err(Fault::Malformed);
 		}
-		if !requirements.permits(physical, len) {
+		if !requirements.permits(physical, staging.len() as u64) {
 			// A staging buffer the device cannot address is not a staging buffer.
 			return Err(Fault::OutOfRange);
 		}
-		let mut staging = Vec::new();
-		if staging.try_reserve(len as usize).is_err() {
-			return Err(Fault::NoSpace);
-		}
-		staging.resize(len as usize, 0);
 		Ok(Bounce { staging, physical, coherent: requirements.coherent() })
 	}
 

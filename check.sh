@@ -150,6 +150,16 @@ declare -A GATES=(
 	["arch-profile-aarch64-gicv3-its-4"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv3-its:4"
 	["arch-profile-riscv64-aia-1"]="tools/check-qemu-arch-profiles.sh --only riscv64:aia:1"
 	["arch-profile-riscv64-aia-4"]="tools/check-qemu-arch-profiles.sh --only riscv64:aia:4"
+	# THE THREE NUMA PROFILES, ONE STEP EACH, for the reason directly above.
+	#
+	# `qemu-numa` boots x86_64 under KVM and then aarch64 and riscv64 under emulation, and as one
+	# step the scheduler could neither run them against each other nor measure them apart: one
+	# duration divided three ways, with the KVM boot and the two emulated ones averaged together.
+	# It is now the union of these three, and like `qemu-arch-profiles` it stays runnable by name
+	# and is never selected.
+	["numa-profile-x86_64"]="tools/check-qemu-numa.sh --only x86_64"
+	["numa-profile-aarch64"]="tools/check-qemu-numa.sh --only aarch64"
+	["numa-profile-riscv64"]="tools/check-qemu-numa.sh --only riscv64"
 	# A warning answered by switching the lint off rather than by fixing the code. Ninety-one such
 	# attributes had accumulated, hiding a hundred and twenty more warnings than the build printed -
 	# and hiding them UNEVENLY, so the same code was reported on one target and silent on another.

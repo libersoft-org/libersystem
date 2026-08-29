@@ -52,6 +52,18 @@ struct Config {
 	// channel `serve_multi` reports, which is the only identity a server has for its callers - see
 	// the `POLICYOWNER` role and `Config::set`.
 	privileged: bool,
+	// THE CONNECTION THE REQUEST BEING SERVED ARRIVED ON, and the ones that have been sealed.
+	//
+	// A sealed connection may read and may not write. It is the same per-request channel identity
+	// `privileged` uses, pointed the other way: that one names the ONE caller allowed more than the
+	// rest, this one names the callers allowed less. Both exist because authority here comes from
+	// WHICH CONNECTION a request arrived on and from nothing else.
+	//
+	// Sealing is done by whoever GRANTS the connection - PermissionManager seals the client it mints
+	// for a status tool before handing it over - so it is not a promise the holder makes about
+	// itself, and there is no unseal.
+	current: u64,
+	sealed: Vec<u64>,
 }
 
 impl Config {
@@ -78,7 +90,7 @@ impl Config {
 		entries.push(ConfigEntry { key: String::from("net.mtu"), value: String::from("1500") });
 		entries.push(ConfigEntry { key: String::from("service.restart-budget"), value: String::from("3") });
 		entries.push(ConfigEntry { key: String::from("service.watchdog-ticks"), value: String::from("100") });
-		Config { entries, volume: 0, privileged: false }
+		Config { entries, volume: 0, privileged: false, current: 0, sealed: Vec::new() }
 	}
 
 	// The durable tree: the seeded defaults overlaid with whatever
@@ -182,6 +194,13 @@ fn read_lp(bytes: &[u8], at: usize) -> Option<(String, usize)> {
 	Some((String::from(core::str::from_utf8(&bytes[at + 2..end]).ok()?), end))
 }
 
+impl Config {
+	// Whether the connection this request arrived on has been sealed.
+	fn is_sealed(&self) -> bool {
+		self.current != 0 && self.sealed.contains(&self.current)
+	}
+}
+
 impl Service for Config {
 	fn get(&mut self, key: String) -> Result<String, Error> {
 		for e in &self.entries {
@@ -207,6 +226,13 @@ impl Service for Config {
 		if entry.key.as_bytes().starts_with(DEVICE_POLICY_PREFIX.as_bytes()) && !self.privileged {
 			return Err(Error::Denied);
 		}
+		// AND A SEALED CONNECTION WRITES NOTHING AT ALL. The prefix rule above bounds what an
+		// ordinary client may overwrite to "everything outside the reserved namespace", which is
+		// still authority over unrelated system configuration - too much for a component that was
+		// granted a configuration client only to READ one record.
+		if self.is_sealed() {
+			return Err(Error::Denied);
+		}
 		match self.entries.iter_mut().find(|e| e.key == entry.key) {
 			Some(e) => e.value = entry.value,
 			None => self.entries.push(entry),
@@ -230,7 +256,7 @@ impl Service for Config {
 		// AND ONLY THE OWNER MAY REMOVE ONE. Refusing every key outside the prefix bounded WHAT could
 		// be deleted and said nothing about WHO - so an `enable` from any `CAP_CONFIG` holder erased
 		// a disable DeviceManager had stored.
-		if !self.privileged {
+		if !self.privileged || self.is_sealed() {
 			return Err(Error::Denied);
 		}
 		let before = self.entries.len();
@@ -239,6 +265,18 @@ impl Service for Config {
 		// succeed: the caller is asking for a state, and the state is already what they asked for.
 		if self.entries.len() != before {
 			self.persist();
+		}
+		Ok(())
+	}
+
+	// SEAL THE CONNECTION THIS ARRIVED ON. Idempotent, and there is no way back: a connection that
+	// could be unsealed by its holder would be a promise rather than a restriction.
+	fn seal(&mut self) -> Result<(), Error> {
+		if self.current == 0 {
+			return Err(Error::Denied);
+		}
+		if !self.sealed.contains(&self.current) {
+			self.sealed.push(self.current);
 		}
 		Ok(())
 	}
@@ -303,6 +341,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let seeded: &[u64] = if owner_server != 0 { &seed } else { &[] };
 		serve_multi_seeded(service, seeded, &mut request, &mut reply, |chan, req, handle, out, reply_handle| -> Option<usize> {
 			config.privileged = owner_server != 0 && chan == owner_server;
+			config.current = chan;
 			config::dispatch(&mut config, req, handle, out, reply_handle)
 		});
 	}

@@ -51,6 +51,43 @@ for device in virtio-iommu-pci edu; do
 	esac
 done
 
+# THE SHIPPING MEDIUM IS THIS TREE'S - CHECKED FIRST, AND OVER EVERY INPUT IT CARRIES.
+#
+# FIRST, because the phases below build and boot test media, and a test build rewrites staged
+# artifacts the shipping image is keyed on. A freshness question asked after them is asked about a
+# tree the gate itself has moved; asked here it is about the tree the operator left.
+#
+# AND OVER EVERY INPUT: this compared the kernel ELF's mtime with the image's. The phases below
+# exercise DeviceManager, the userspace drivers and the services on the system volume as much as
+# they exercise the kernel, and `build.sh` rebuilds any of those - and the volume - without
+# rewriting the kernel, so changed driver bytes could be newer than the ISO while the untouched
+# kernel stayed older and this preflight would call the image fresh. Worse for a timestamp check
+# still: several staged artifacts have their mtimes PINNED to `SOURCE_DATE_EPOCH` so images build
+# reproducibly, so for those an mtime comparison can never answer anything at all.
+#
+# `mkimage.sh` computes a content-derived key over all of it - kernel, loader, init package, the
+# bootable volume and its pairing sidecar, the service manifest and its normalized layout, the
+# fallback bootstrap set, `product.conf` and the builders - and records the key each published image
+# was built from beside it. This asks the builder for today's key and compares the two.
+ISO="$BUILD/libersystem.iso"
+[[ -f "$ISO" ]] || fail "no $ISO - run ./image.sh --format iso, which is what the ordinary-traffic half boots"
+[[ -f "$ISO.build-key" ]] || fail "$ISO carries no build receipt, so nothing about it can be checked - rebuild it:  ./image.sh --format iso"
+KERNEL_ELF="$BUILD_ROOT/cargo/kernel/x86_64-unknown-none/debug/kernel"
+[[ -f "$KERNEL_ELF" ]] || fail "no built kernel at $KERNEL_ELF, so this gate cannot tell whether $ISO carries this tree - build first:  ./build.sh --arch x86_64"
+# `$HERE`, not `dirname "$0"`: this script has already `cd`-ed to the repository root. stderr is kept
+# because a builder that cannot answer has a reason, and swallowing it turns a diagnosable refusal
+# into a blank one.
+current_key="$(LIBER_IMAGE_PRINT_KEY=1 "$HERE/../harness/mkimage.sh" iso "$KERNEL_ELF" || true)"
+[[ -n "$current_key" ]] || fail "the image builder could not compute this tree's image key - build first:  ./build.sh --arch x86_64"
+if [[ "$current_key" != "$(<"$ISO.build-key")" ]]; then
+	echo "qemu-virtio-iommu: $ISO was not built from this tree" >&2
+	echo "qemu-virtio-iommu:   the image was built from $(<"$ISO.build-key")" >&2
+	echo "qemu-virtio-iommu:   this tree computes     $current_key" >&2
+	echo "qemu-virtio-iommu:   rebuild the image from this tree:  ./image.sh --format iso" >&2
+	exit 1
+fi
+echo "qemu-virtio-iommu: the shipping image was built from this tree ($current_key)"
+
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 
@@ -104,30 +141,7 @@ fi
 
 # 5. AND ORDINARY TRAFFIC STILL WORKS. A kernel whose DMA was broken altogether would refuse
 #    everything, including what should work, and satisfy every check above.
-ISO="$BUILD/libersystem.iso"
-[[ -f "$ISO" ]] || fail "no $ISO - run ./image.sh --format iso, which is what the ordinary-traffic half boots"
-# AND IT IS THIS BUILD'S IMAGE, not whichever one is lying about.
-#
-# Existence was the whole test, so an image built before the change under test satisfied both the
-# ordinary-traffic phase and the default-machine phase - and this gate would then have proved the
-# default profile of a kernel nobody had just changed. That is the exact class of false green this
-# tree's verification milestone exists to remove, in the gate that proves the isolation default.
-#
-# THE PATH THE BUILD ACTUALLY WRITES. This read `$BUILD/cargo/...` - `.build/boot/cargo/...` - which
-# no build has ever produced, and the `-f` guard then turned a check that could not find its input
-# into a check that was skipped. The image in this tree was fifteen hours older than the kernel and
-# this gate called it fresh. `$BUILD_ROOT`, not `$BUILD`: the kernel is staged one level up from the
-# boot directory, and a missing kernel is now a REFUSAL - the comparison exists because the answer
-# matters, so being unable to make it cannot be the same as making it and passing.
-KERNEL_ELF="$BUILD_ROOT/cargo/kernel/x86_64-unknown-none/debug/kernel"
-[[ -f "$KERNEL_ELF" ]] || fail "no built kernel at $KERNEL_ELF, so this gate cannot tell whether $ISO carries this tree - build first:  ./build.sh --arch x86_64"
-if [[ "$KERNEL_ELF" -nt "$ISO" ]]; then
-	echo "qemu-virtio-iommu: $ISO is older than the kernel it is supposed to carry" >&2
-	echo "qemu-virtio-iommu:   image:  $(date -r "$ISO" '+%Y-%m-%d %H:%M:%S')" >&2
-	echo "qemu-virtio-iommu:   kernel: $(date -r "$KERNEL_ELF" '+%Y-%m-%d %H:%M:%S')" >&2
-	echo "qemu-virtio-iommu:   rebuild the image from this tree:  ./image.sh --format iso" >&2
-	exit 1
-fi
+# The image and the kernel were checked at the top of this gate, before any phase could move them.
 [[ -f "$OVMF_CODE" ]] || fail "no OVMF firmware at $OVMF_CODE"
 echo "qemu-virtio-iommu: booting the shipping image with an ordinary virtio-net endpoint behind the controller"
 traffic="$work/traffic.log"

@@ -123,7 +123,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 58] = [
+const GATES: [(&str, &str); 61] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -179,7 +179,15 @@ const GATES: [(&str, &str); 58] = [
 	("capability-model", "kernel"),
 	("capability-trace", "kernel"),
 	("virtio-iommu-protocol", "dma"),
+	// THE NUMA UMBRELLA AND ITS THREE PROFILES, exactly as `qemu-arch-profiles` above: the umbrella
+	// stays runnable by name and is never selected, and the three profiles carry the keys.
+	//
+	// One step meant one duration divided three ways, with an x86_64 KVM boot and two emulated ones
+	// averaged together, and the outer `--jobs` could not schedule them against each other at all.
 	("qemu-numa", "kernel"),
+	("numa-profile-x86_64", "kernel"),
+	("numa-profile-aarch64", "kernel"),
+	("numa-profile-riscv64", "kernel"),
 	("qemu-virtio-iommu-x86_64", "kernel"),
 	("implementation-mutations", "kernel"),
 	// The model's invariants proved capable of failing. Same subject as the model
@@ -381,7 +389,7 @@ pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shado
 // The entry stays in `GATES` so the two lists still agree - check.sh really does run it - and it gets
 // no catalog check, so nothing can select it. Running the union by hand stays a command a person can
 // type; paying for it twice in a sweep does not.
-const UMBRELLA_GATES: [&str; 1] = ["qemu-arch-profiles"];
+const UMBRELLA_GATES: [&str; 2] = ["qemu-arch-profiles", "qemu-numa"];
 
 pub fn catalog_gate_names() -> BTreeSet<String> {
 	GATES.iter().map(|(name, _)| (*name).to_string()).collect()

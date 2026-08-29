@@ -1892,11 +1892,31 @@ fn the_timer_interrupt_is_read_from_the_tree_and_not_assumed() {
 	assert_eq!(at(virt).parse().expect("parses").timer_intid, 30, "QEMU virt's non-secure EL1 physical timer is PPI 14, which is INTID 30 - the number the backend had compiled in");
 
 	// A MACHINE THAT NAMES ANOTHER PPI IS READ, not overridden. This is the case the compiled
-	// constant was silently wrong about.
+	// constant was silently wrong about. PPI 11 is INTID 27 - a different number, and a legal one.
 	let other = machine(|builder| {
+		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &interrupts(13, 11, 11, 10)).end();
+	});
+	assert_eq!(at(other).parse().expect("parses").timer_intid, 27, "a tree naming PPI 11 means INTID 27, and reading 30 there arms an interrupt the machine did not describe");
+
+	// AND A NUMBER THAT IS NOT A PPI IS NOT READ AT ALL.
+	//
+	// This test used to assert that PPI 20 becomes INTID 36, which encoded the defect: the tag says
+	// the cell is a PPI and the architecture gives PPIs 0..15, so 20 is not one however it is
+	// tagged. Published, it becomes INTID 36 - which GICv3 shifts a 32-bit enable word by and GICv2
+	// reads as a distributor SPI, neither of which is the timer. Unset is what lets the caller
+	// refuse a machine it cannot drive.
+	let past_the_range = machine(|builder| {
 		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &interrupts(13, 20, 11, 10)).end();
 	});
-	assert_eq!(at(other).parse().expect("parses").timer_intid, 36, "a tree naming PPI 20 means INTID 36, and reading 30 there arms an interrupt the machine did not describe");
+	assert_eq!(at(past_the_range).parse().expect("parses").timer_intid, 0, "PPI 20 is not a PPI - sixteen of them exist, and a number past that is a specifier this reader cannot decode");
+
+	// NOR IS A CELL TAGGED AS SOMETHING ELSE. Kind 0 is an SPI; a timer is not on the distributor.
+	let not_a_ppi = machine(|builder| {
+		let mut cells = interrupts(13, 14, 11, 10);
+		cells[12..16].copy_from_slice(&0u32.to_be_bytes());
+		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &cells).end();
+	});
+	assert_eq!(at(not_a_ppi).parse().expect("parses").timer_intid, 0, "a specifier that is not tagged a PPI is not one");
 
 	// AND A MACHINE WITH NO TIMER NODE NAMES NOTHING, which is what the caller refuses on.
 	let none = machine(|builder| {
@@ -1909,4 +1929,64 @@ fn the_timer_interrupt_is_read_from_the_tree_and_not_assumed() {
 		builder.begin("timer").prop_str("compatible", "some,other-timer").prop("interrupts", &interrupts(13, 14, 11, 10)).end();
 	});
 	assert_eq!(at(foreign).parse().expect("parses").timer_intid, 0, "a timer this reader does not implement names no interrupt it can arm");
+}
+
+// A GICv3 REDISTRIBUTOR REGION TOO SMALL TO HOLD ONE FRAME IS NOT A MAIN CONTROLLER.
+//
+// One 0x1000 minimum was applied to both a GICv2 CPU interface and a v3 redistributor range, and
+// those are not the same object: a redistributor frame is 0x20000 - RD_base and SGI_base - and
+// `this_redistributor` cannot inspect even one unless a whole stride fits. An undersized v3 range
+// was accepted as the machine's controller, and the backend then logged that this core had no
+// redistributor and carried on with no interrupts at all.
+#[test]
+fn an_undersized_gicv3_redistributor_range_is_not_accepted_as_the_controller() {
+	let one_frame = with_gic(&gic_reg(0x0800_0000, 0x1_0000, 0x080a_0000, 0x20000), "arm,gic-v3");
+	let info = at(one_frame).parse().expect("parses");
+	assert_eq!(info.gic_dist, 0x0800_0000, "one whole stride is a controller that can serve one core");
+	assert_eq!(info.gic_cpu_size, 0x20000);
+
+	// A byte short of one frame. A GICv2 CPU interface of this size would be legal, which is the
+	// whole reason the minimum cannot be one number.
+	let short = with_gic(&gic_reg(0x0800_0000, 0x1_0000, 0x080a_0000, 0x1_0000), "arm,gic-v3");
+	assert_eq!(at(short).parse().expect("parses").gic_dist, 0, "a v3 range smaller than one redistributor frame describes no controller this kernel can drive");
+
+	// AND THE SAME SIZE ON A GICv2 IS FINE, so the refusal above is about the version rather than
+	// about the number.
+	let v2 = with_gic(&gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000), "arm,cortex-a15-gic");
+	assert_eq!(at(v2).parse().expect("parses").gic_dist, 0x0800_0000, "a v2 cpu interface of one page is a whole cpu interface");
+}
+
+// A CHILD FRAME THAT IS TOO SMALL, OR THAT SITS ON TOP OF THE CONTROLLER IT BELONGS TO.
+//
+// The v2m and ITS regions were committed with no minimum and no comparison against anything: a
+// one-byte frame reached MMIO, and so did one aliasing the distributor. The v2m backend writes
+// `MSI_TYPER` at 0x008 and `MSI_SETSPI_NS` at 0x040, so an MSI write into an aliased window lands in
+// the controller's own registers - which is a machine description that is wrong, and the first store
+// is a bad place to find that out.
+#[test]
+fn a_v2m_frame_that_is_undersized_or_aliases_the_controller_is_refused() {
+	// One helper, three trees: the frame's address and size are the only things that move.
+	let tree = |frame: u64, size: u64| -> &'static [u8] {
+		let mut builder = Builder::new();
+		builder.begin("");
+		builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+		builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+		builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+		builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop("ranges", b"").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000));
+		builder.begin("v2m@8020000").prop_str("compatible", "arm,gic-v2m-frame").prop_reg64(frame, size).end();
+		builder.end().end();
+		builder.finish()
+	};
+
+	// THE BASELINE, so the two refusals below are about what they say and not about the fixture.
+	assert_eq!(at(tree(0x0802_0000, 0x1000)).parse().expect("parses").gic_msi, 0x0802_0000, "a frame clear of the controller and big enough is taken");
+
+	// One byte short of the registers its driver writes.
+	assert_eq!(at(tree(0x0802_0000, 0x40)).parse().expect("parses").gic_msi, 0, "a frame that cannot hold MSI_SETSPI_NS is not a frame");
+
+	// AND ONE ON TOP OF THE DISTRIBUTOR. Every byte of it is the controller's.
+	assert_eq!(at(tree(0x0800_0000, 0x1000)).parse().expect("parses").gic_msi, 0, "a frame aliasing the distributor would send its MSI writes into the controller");
+
+	// The same for the CPU interface, which is the other range the controller declared.
+	assert_eq!(at(tree(0x0801_0800, 0x1000)).parse().expect("parses").gic_msi, 0, "nor may it overlap the cpu interface");
 }

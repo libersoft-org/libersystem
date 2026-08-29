@@ -52,7 +52,7 @@ use proto::system::display_admin;
 use proto::system::input_admin;
 use proto::system::network;
 use proto::system::permission::{self, Service};
-use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, SelectedFile, StartResult, process, volume, volume_admin};
+use proto::system::{AuditEntry, Capability, EnvVar, Error, LaunchContext, Manifest, PipelineResult, PipelineStage, SelectedFile, StartResult, config, process, volume, volume_admin};
 use rt::*;
 use services::executable;
 
@@ -219,7 +219,13 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// THE DEVICE OPERATOR COMMAND holds both halves: the READ that renders the list, and the
 		// WRITE that changes a binding. They are separate capabilities because nothing else in the
 		// system needs the second - a tool that renders devices gets `device` and gets no closer.
-		b"lsdev" => Some(granted("lsdev", alloc::vec![Capability::Device, Capability::DevicePolicy])),
+		// AND `Config`, FOR THE INCIDENT THAT OUTLIVES ITS MANAGER. `--incident` reads DeviceManager's
+		// live endpoint, and the report it serves dies with the process that holds it - which is the
+		// one moment an operator most needs it, because DeviceManager dying is what killed the
+		// driver subtree. The persisted copy is in ConfigService, which survives, and reading it is
+		// what makes the snapshot visible after both deaths. A read of one key prefix rather than a
+		// second write authority: `lsdev` already holds `DevicePolicy` for its four verbs.
+		b"lsdev" => Some(granted("lsdev", alloc::vec![Capability::Device, Capability::DevicePolicy, Capability::Config])),
 		b"config" => Some(granted("config", alloc::vec![Capability::Config])),
 		b"set" => Some(granted("set", alloc::vec![Capability::Config])),
 		b"beep" => Some(granted("beep", alloc::vec![Capability::Audio])),
@@ -503,6 +509,16 @@ unsafe fn grant_for_task(clients: &mut Clients, cap: Capability, task: u64, comp
 // A FUNCTION AND NOT A MANIFEST FIELD. A path beside the grant would be a place to write the wrong
 // one, and "which files may this program read" is not something a policy table should be able to
 // get subtly wrong - it should be answerable from the program's identity alone.
+// Which components get a configuration client that may only READ.
+//
+// A FUNCTION AND NOT A MANIFEST FIELD, for the reason `asset_bundle` gives directly below: the
+// manifest says whether a capability is granted at all, and how much of it a particular program
+// should have is answerable from the program's identity. A status tool reads; it does not configure
+// the system.
+fn config_is_read_only(component: &str) -> bool {
+	matches!(component, "lsdev")
+}
+
 fn asset_bundle(component: &str) -> &str {
 	match component {
 		"lico" | "licoedit" | "licoview" => "lico",
@@ -565,6 +581,21 @@ unsafe fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) 
 			Some(m) => m,
 			None => return 0,
 		};
+		// AND A READ-ONLY CONFIGURATION GRANT IS SEALED BEFORE IT IS HANDED OVER.
+		//
+		// `lsdev` needs to read one persisted record - a device's last incident, under the reserved
+		// prefix - after DeviceManager has died. Granting it `Capability::Config` for that gave it a
+		// full configuration client, whose `set` accepts any key outside the reserved namespace:
+		// authority over unrelated system configuration, granted to a status tool, to answer a
+		// question about a device.
+		//
+		// The connection is sealed HERE, by the authority that mints it, so what the tool receives
+		// can only read. Sealing is irreversible and belongs to the connection, so asking again
+		// produces another sealed one.
+		if cap == Capability::Config && config_is_read_only(component) && config::Client::new(ChannelTransport { chan: minted }).seal().is_none_or(|answer| answer.is_err()) {
+			close(minted);
+			return 0;
+		}
 		// Narrow the minted connection to a client's rights, like every other grant.
 		let dup: i64 = duplicate(minted, GRANT_RIGHTS);
 		close(minted);

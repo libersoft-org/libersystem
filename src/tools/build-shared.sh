@@ -318,6 +318,49 @@ verify_staged_provider_chains() {
 		echo "build-shared: the staged tree at $provider_output_dir/lib cannot be read, so nothing about it has been checked" >&2
 		return 1
 	fi
+	# WHAT THE MANIFEST SAYS SHOULD BE THERE, before anything is compared with anything else.
+	#
+	# Both loops below iterate over the `.lslib` files that HAPPEN to be staged, so the check was
+	# entirely relative to its own input: a readable but EMPTY `lib/` ran both loops zero times, left
+	# `inconsistent` at zero, and printed that every staged library named the providers beside it. A
+	# missing library that no remaining consumer mentions passed the same way. The manifest is
+	# already loaded, and it is the only thing that can say what is missing.
+	local -A expected_libraries=()
+	while IFS= read -r artifact; do
+		[[ -n "$artifact" ]] || continue
+		expected_libraries[$artifact]=1
+	done < <(jq -r '.libraries | keys[]' <<<"$manifest_json")
+	if ((${#expected_libraries[@]} == 0)); then
+		echo "build-shared: the manifest declares no shared library at all, so this check has no subject" >&2
+		return 1
+	fi
+	local -A staged_present=()
+	while IFS= read -r file; do
+		staged_present["$(basename "$file" .lslib)"]=1
+	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f)
+	if ((${#staged_present[@]} == 0)); then
+		echo "build-shared: the staged tree at $provider_output_dir/lib holds no library, and the manifest declares ${#expected_libraries[@]} - an empty tree is not a consistent one" >&2
+		return 1
+	fi
+	for artifact in "${!expected_libraries[@]}"; do
+		if [[ -z "${staged_present[$artifact]:-}" ]]; then
+			echo "build-shared: the manifest declares $artifact and it is not staged - a library nothing remaining consumes is still one this image should carry" >&2
+			inconsistent=1
+		fi
+	done
+	for artifact in "${!staged_present[@]}"; do
+		if [[ -z "${expected_libraries[$artifact]:-}" ]]; then
+			echo "build-shared: $artifact is staged and the manifest declares no such library - the tree carries something this build did not describe" >&2
+			inconsistent=1
+		fi
+	done
+	# EVERY DEPENDENCY THE MANIFEST DECLARES, as a set of `library:provider` pairs. Read once rather
+	# than queried per edge: this loop runs over every staged library and every edge each one records.
+	local -A manifest_providers=()
+	while IFS= read -r edge; do
+		[[ -n "$edge" ]] || continue
+		manifest_providers[$edge]=1
+	done < <(jq -r '.libraries | to_entries[] | .key as $lib | (.value.providers[]? | "\($lib):\(.)")' <<<"$manifest_json")
 	note="$(mktemp "$build_scratch/staged-identity.XXXXXX")"
 	while IFS= read -r file; do
 		artifact="$(basename "$file" .lslib)"
@@ -355,6 +398,10 @@ verify_staged_provider_chains() {
 				inconsistent=1
 			fi
 			recorded_providers[$provider]="$recorded"
+			if [[ -z "${manifest_providers[$artifact:$provider]:-}" ]]; then
+				echo "build-shared: $artifact records an edge to $provider and the manifest declares no such dependency - the note is not the graph this build was described by" >&2
+				inconsistent=1
+			fi
 			expected="${staged_digests[$provider]:-}"
 			if [[ -z "$expected" ]]; then
 				echo "build-shared: $artifact was built against $provider, and no readable $provider is staged beside it" >&2
@@ -366,6 +413,17 @@ verify_staged_provider_chains() {
 				inconsistent=1
 			fi
 		done < <(grep -a -o 'provider=[a-z0-9_-]*:[0-9a-f]\{64\}' "$note" || true)
+		# AND THE EDGES THE MANIFEST DECLARES AND THE NOTE DOES NOT. The loop above walks what the
+		# note records, so an edge the manifest declares and the artifact was NOT built against is
+		# invisible to it - a library rebuilt without one of its providers records fewer edges and
+		# every edge it does record still checks out.
+		while IFS= read -r provider; do
+			[[ -n "$provider" ]] || continue
+			if [[ -z "${recorded_providers[$provider]:-}" ]]; then
+				echo "build-shared: the manifest says $artifact is built against $provider and its identity note records no such edge" >&2
+				inconsistent=1
+			fi
+		done < <(jq -r --arg artifact "$artifact" '.libraries[$artifact].providers[]? // empty' <<<"$manifest_json")
 	done < <(find "$provider_output_dir/lib" -name '*.lslib' -type f | sort)
 	rm -f "$note"
 	if ((inconsistent)); then

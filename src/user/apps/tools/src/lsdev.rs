@@ -15,6 +15,7 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use config_client::ConfigClient;
 use device_client::DeviceClient;
 use device_client::DevicePolicyClient;
 use proto::codec::JsonMode;
@@ -40,10 +41,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    a device list needs the second, and holding the first gets a component no closer to it.
 		let devsvc: u64 = recv_tagged(bootstrap, &mut buf, b"DEVICE").unwrap_or_else(|| exit());
 		let policy: u64 = recv_tagged(bootstrap, &mut buf, b"DEVPOLICY").unwrap_or(0);
+		// AND THE READ THAT OUTLIVES THE MANAGER. Not a third authority over devices: a client of
+		// ConfigService, where DeviceManager persists each incident, for the case where the endpoint
+		// above cannot answer because the process holding it is gone.
+		let config: u64 = recv_tagged(bootstrap, &mut buf, b"CONFIG").unwrap_or(0);
 		// A verb, or the listing. `lsdev` with no verb reads and changes nothing, which is what a
 		// command called `ls` had better do.
 		if let Some(request) = parse_verb(&args) {
-			apply_verb(policy, request);
+			apply_verb(policy, config, request);
 			exit();
 		}
 		query_devices(devsvc, JsonMode::parse(&args));
@@ -91,7 +96,7 @@ fn parse_verb(args: &[u8]) -> Option<VerbRequest> {
 }
 
 // Apply one verb and say what happened, in the words the outcome carries.
-unsafe fn apply_verb(policy: u64, request: VerbRequest) {
+unsafe fn apply_verb(policy: u64, config: u64, request: VerbRequest) {
 	unsafe {
 		if policy == 0 {
 			eprint(b"lsdev: this boot granted no device-policy authority\n");
@@ -110,7 +115,13 @@ unsafe fn apply_verb(policy: u64, request: VerbRequest) {
 					print(b"\n");
 				}
 				Some(Err(_)) => eprint(b"lsdev: no device has that index\n"),
-				None => eprint(b"lsdev: the device policy endpoint did not answer\n"),
+				// THE MANAGER IS GONE, WHICH IS WHEN THIS QUESTION MATTERS MOST.
+				//
+				// The live report is held by DeviceManager and dies with it - and DeviceManager
+				// dying is what killed the driver subtree, so an operator asking what happened is
+				// asking a process that is no longer there. The persisted copy is in ConfigService,
+				// which survives, and it carries the whole record rather than a summary of it.
+				None => stored_incident(config, request.index),
 			}
 			return;
 		}
@@ -195,5 +206,73 @@ unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 			Some(Err(_)) => eprint(b"lsdev: query error\n"),
 			None => eprint(b"lsdev: service unavailable\n"),
 		}
+	}
+}
+
+// THE INCIDENT AS CONFIGSERVICE HOLDS IT, for when the manager that served the live one is gone.
+//
+// DeviceManager writes each incident under `device.policy.incident.<bus>.<dev>.<func>` with the
+// whole record - cause, state, generation, attempts, last opcode, silence, the device's address and
+// the Domain's counters. It used to write a summary of that, so the persisted copy could not answer
+// what the live endpoint answered and "the snapshot outlives the manager" was true of a summary.
+//
+// KEYED BY ADDRESS, NOT BY INDEX, because the index is the kernel's row number for this boot and the
+// address is what the record is about. So the address is asked of DeviceService first - and when
+// that is gone too, the operator is told the shape of the key rather than nothing.
+unsafe fn stored_incident(config: u64, index: u32) {
+	unsafe {
+		if config == 0 {
+			eprint(b"lsdev: the device policy endpoint did not answer, and this boot granted no configuration read to look for the stored copy\n");
+			return;
+		}
+		let mut client = ConfigClient::new(config);
+		// THE RECORD FOR THE DEVICE THAT WAS ASKED ABOUT, and not every stored incident.
+		//
+		// This discarded `index` and printed the whole prefix, so `lsdev --incident 3` reported
+		// unrelated devices and could not say whether device 3 had an incident at all - a listing
+		// where a lookup was asked for. The record is KEYED by the device's address, because that is
+		// its identity across boots, and it now CARRIES the row number this boot gave it, which is
+		// what the operator's question is asked by. So the lookup is: read the prefix, match
+		// `index=N`.
+		let mut wanted = String::from(" index=");
+		let mut number: [u8; 20] = [0u8; 20];
+		let written = decimal(index as u64, &mut number);
+		wanted.push_str(core::str::from_utf8(&number[..written]).unwrap_or("?"));
+		let mut found = false;
+		match client.list() {
+			Some(Ok(entries)) => {
+				for entry in entries.iter() {
+					// FILTERED HERE, because `list` answers with the whole tree and the incidents
+					// are one prefix of it. An operator asking what went wrong is not asking for
+					// every configuration value this system holds.
+					if !entry.key.starts_with("device.policy.incident.") {
+						continue;
+					}
+					// The record's own index, followed by a space or the end of the value, so
+					// `index=1` does not match `index=12`.
+					let Some(at) = entry.value.find(wanted.as_str()) else { continue };
+					let rest = &entry.value[at + wanted.len()..];
+					if !rest.is_empty() && !rest.starts_with(' ') {
+						continue;
+					}
+					found = true;
+					print(entry.key.as_bytes());
+					print(b"  ");
+					print(entry.value.as_bytes());
+					print(b"\n");
+				}
+			}
+			_ => {
+				eprint(b"lsdev: the device policy endpoint did not answer and the stored copy could not be read either\n");
+				return;
+			}
+		}
+		if !found {
+			eprint(b"lsdev: the device policy endpoint did not answer, and no incident is stored for device ");
+			eprint(&number[..written]);
+			eprint(b"\n");
+			return;
+		}
+		eprint(b"lsdev: DeviceManager did not answer - the record above is the persisted copy, keyed by the device's address\n");
 	}
 }

@@ -1068,3 +1068,65 @@ fn the_wait_comes_back_for_whichever_of_the_two_deadlines_is_next() {
 	beat.asked(105);
 	assert_eq!(beat.wake_at(), 115, "with one outstanding, its expiry is");
 }
+
+// ------------------------------------------------------- M4's decisive negative case, actually run
+//
+// THE ORDINARY PCI FUNCTION THAT IS NOT A VIRTIO DEVICE. This is the case the milestone names and
+// the one no test drove: the production predicate was private to a binary nothing runs on a host,
+// and the host-tested `system_manifest::MatchRule::overlaps` beside it answers a different question
+// - whether two RULES could both match something, not whether one rule matches one function.
+
+use super::{Discovered, Match};
+
+// A virtio-blk rule as the registry writes one: virtio-pci transport, virtio type 2.
+const VIRTIO_PCI: u8 = 1;
+const PLAIN_PCI: u8 = 0;
+
+fn virtio_blk_rule() -> Match {
+	Match { transport: Some(VIRTIO_PCI), virtio_type: Some(2), ..Match::default() }
+}
+
+#[test]
+fn an_ordinary_pci_function_is_not_offered_to_a_virtio_driver_because_of_its_number() {
+	// A mass-storage controller that is NOT virtio. Class 0x01, and whatever this system happens to
+	// have numbered 2 in its own device-type space - which is the collision the transport check is
+	// for. Without that check a rule for "virtio type 2" matches this.
+	let ordinary = Discovered { transport: PLAIN_PCI, virtio_type: 2, class: 0x01, subclass: 0x08, vendor: 0x8086, product: 0x0953, bus: 0, dev: 5, func: 0, ..Discovered::default() };
+	assert!(!virtio_blk_rule().matches(&ordinary), "a plain PCI function is not a virtio device however its type is numbered");
+
+	// The same function on the virtio transport IS the one the rule is for, so the refusal above is
+	// about the transport and not about anything else in this fixture.
+	let virtio = Discovered { transport: VIRTIO_PCI, ..ordinary };
+	assert!(virtio_blk_rule().matches(&virtio), "and the virtio one matches");
+}
+
+#[test]
+fn every_predicate_a_rule_states_has_to_hold() {
+	// THE CONJUNCTION, one predicate at a time. A matcher that stopped checking any one of these
+	// would bind a driver to a function it was not written for, and each is asserted by making the
+	// function differ in that field ALONE.
+	let rule = Match { transport: Some(VIRTIO_PCI), virtio_type: Some(2), class: Some(0x01), subclass: Some(0x08), prog_if: Some(0x02), vendor: Some(0x1af4), product: Some(0x1042), address: Some((0, 4, 0)) };
+	let exact = Discovered { transport: VIRTIO_PCI, virtio_type: 2, class: 0x01, subclass: 0x08, prog_if: 0x02, vendor: 0x1af4, product: 0x1042, bus: 0, dev: 4, func: 0 };
+	assert!(rule.matches(&exact), "the function the rule describes matches it");
+
+	assert!(!rule.matches(&Discovered { transport: PLAIN_PCI, ..exact }), "transport");
+	assert!(!rule.matches(&Discovered { virtio_type: 3, ..exact }), "virtio type");
+	assert!(!rule.matches(&Discovered { class: 0x02, ..exact }), "class");
+	assert!(!rule.matches(&Discovered { subclass: 0x00, ..exact }), "subclass");
+	assert!(!rule.matches(&Discovered { prog_if: 0x00, ..exact }), "prog_if");
+	assert!(!rule.matches(&Discovered { vendor: 0x8086, ..exact }), "vendor");
+	assert!(!rule.matches(&Discovered { product: 0x1000, ..exact }), "product");
+	assert!(!rule.matches(&Discovered { dev: 9, ..exact }), "address");
+}
+
+#[test]
+fn a_predicate_a_rule_does_not_state_is_not_asked() {
+	// `None` is "do not ask", not "must be absent" - a generic rule matching on class alone has to
+	// match a function that also carries a vendor and a product, or no generic rule ever binds.
+	let generic = Match { class: Some(0x0c), subclass: Some(0x03), prog_if: Some(0x30), ..Match::default() };
+	let xhci = Discovered { transport: PLAIN_PCI, virtio_type: 0, class: 0x0c, subclass: 0x03, prog_if: 0x30, vendor: 0x8086, product: 0x1e31, bus: 0, dev: 20, func: 0 };
+	assert!(generic.matches(&xhci), "a rule that names only the standards identity matches by it");
+
+	// And a rule that states NOTHING matches everything, which is why `system-manifest` refuses one.
+	assert!(Match::default().matches(&xhci));
+}

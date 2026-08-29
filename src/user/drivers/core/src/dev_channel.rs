@@ -1,4 +1,6 @@
-// driver.dev-channel - the development channel port.
+// The development channel port. Its report names the DEVICE - `virtio-console`, with the PCI address
+// that tells it from the other one - because being the development channel is what this driver does
+// and not what the device is. See the `describe` call below.
 //
 // The host attaches a SECOND single-port virtio-serial device, pinned to a fixed PCI
 // address, and DeviceManager binds this program to it instead of the console driver. That
@@ -101,12 +103,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			Some(pair) => pair,
 			None => exit(),
 		};
-		// THE ADDRESS, because the registry binds this driver to a SECOND virtio-console function and
-		// the address is the whole distinguisher. The line said `driver.dev-channel: online (transport)`
-		// - a role where the device type belongs and no address at all - so the two functions of one
-		// type were told apart by nothing. `describe` is what every other driver's report goes through.
+		// ONE NAME FOR ONE DEVICE, AND THE ADDRESS IS WHAT TELLS TWO OF THEM APART.
+		//
+		// The line said `driver.dev-channel: online (transport)` - a ROLE where the device type
+		// belongs, and no address at all - so the two virtio-console functions of one machine were
+		// told apart by nothing, and the same PCI function was called `virtio-console` in the device
+		// and DMA inventories and `dev-channel` in the driver report. A reader joining the two by
+		// name could not. The address was added first and the name was left, which fixed half of it.
+		//
+		// The registry binds this driver to a SECOND virtio-console function; being the development
+		// channel is what this driver DOES, not what the device IS, and the address is the
+		// distinguisher the report already carries.
 		let mut line = [0u8; 64];
-		let n = common::describe(&mut line, b"dev-channel", &device, b"transport");
+		let n = common::describe(&mut line, b"virtio-console", &device, b"transport");
 		common::online(bootstrap, &bind, &line[..n], &[(driver_protocol::provider::CONSOLE_BYTES, bytes_far)]);
 		let mut port: Port = Port { device: &device, irq, tx: &mut tx, virt: tx_virt, phys: tx_phys, busy: false };
 		pump(&device, &bind, irq, bootstrap, bytes, &mut rx, &mut port, rx_virt, &rx_phys)

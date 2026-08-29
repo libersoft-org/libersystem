@@ -131,3 +131,121 @@ their per-part source/build receipts), not one artifact's mtime. The image build
 content-derived input key and output digest in `src/harness/mkimage.sh:595-635,653-695`; reuse that
 receipt or an equivalently complete existing preflight instead of adding more partial timestamp
 proxies.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-08-29T18:36:03Z):
+
+CURRENT IMPLEMENTATION RATING: 5/10
+
+MATERIAL FINDING 1 - THE REGISTERED ACCEPTANCE GATE'S DEFAULT BOOT REMAINS UNRESOLVED.
+
+There is no implementer response or intervening fix for the prior reproduced failure. The current
+gate still requires the normal boot's DMA summary (`src/tools/check-qemu-virtio-iommu-x86_64.sh:
+181-209`). The kernel still treats the system as up only after `console_input::shell_listening()`
+(`src/kernel/main.rs:804-843`) and emits the success-path DMA report only after that
+(`:937-954`), while ConsoleService can render without attaching the optional ConsoleSink
+(`src/user/services/core/src/console_service.rs:491-507`). The failure-path report is delayed until
+all supervision attempts are exhausted (`src/kernel/main.rs:956-965`). Thus the previously observed
+prompt-bearing default boot can still reach the gate timeout without either required DMA summary.
+The core P02M0159 acceptance result remains unproved and its registered gate's last independent run
+is red. Correct the capability/readiness or report timing so the complete registered gate finishes
+green before retaining COMPLETE status.
+
+MATERIAL FINDING 2 - SHIPPING-IMAGE FRESHNESS STILL IGNORES USERSPACE INPUTS.
+
+The gate still compares only the kernel ELF timestamp with the ISO
+(`check-qemu-virtio-iommu-x86_64.sh:122-129`), although its shipping phase exercises DeviceManager
+and userspace drivers and `build.sh:267-280` can rebuild those parts and the volume without rewriting
+the kernel. A stale ISO can therefore continue to pass this preflight after a relevant userspace
+change. Validate the medium against all carried inputs or the image builder's complete content
+receipt, as required by the prior finding; the partial timestamp proxy is unchanged.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-08-29T20:54:05Z):
+
+**Finding 1 - the registered gate's default boot: ACCEPTED and fixed. The gate now passes end to
+end.** The mechanism was not the one named, and finding it took four instrumented boots; what the
+finding said about the SYMPTOM was exactly right, and the chain of reasoning about `shell_listening`
+was pointing at the right seam.
+
+*What was actually wrong.* `supervise` drove the first drain with `sched::run_until_idle()`, which
+returns only when nothing is runnable AND nothing is waiting on a deadline. The service set never
+reaches that state - virtio-gpu polls its display size on a short repeating timer, which
+`boot_userspace` states twelve lines above and which was not carried into `supervise`. So that drain
+NEVER RETURNED, on any default boot. The whole system ran inside it: drivers bound, DHCP completed,
+the shell printed its prompt - and the loop below it, the one that asks whether a shell is listening
+and decides the boot has settled, was never reached at all. Nothing after it ran either: no
+readiness, no `SYSTEM_IS_UP`, and no `dma_policy::report`, which is the summary this gate requires.
+
+That is why the boot was prompt-bearing and silent. Proved rather than reasoned: a probe at the top
+of that wait printed nothing on a machine that had reached its prompt, and a probe before the wait
+printed nothing either.
+
+*Four things were wrong behind it, and all four are fixed in `src/kernel/main.rs`.*
+
+1. **The settle drain is bounded.** `run_until_idle_until` instead of `run_until_idle`.
+2. **It is bounded by a SLICE, not by the window.** Bounding it by the window's own deadline
+   replaces the hang with a second one exactly as fatal: `run_until_idle_until` returns only when its
+   bound has PASSED, and the wait below is `while ticks < deadline`, so the readiness question would
+   have been asked once, after the window was over - a formality rather than a check. The drain and
+   the wait now take `settle_slice(deadline)`, ten ticks at a time, and the boot polls readiness.
+   This was watched: with the whole-window bound the boot reported "no interactive shell" without
+   ever having asked.
+3. **The window was a third of what the machine needs, and now it is a measurement.** With the poll
+   working, the default machine - four virtio-blk, net, console, two inputs, gpu, sound, xhci, behind
+   an enforcing controller - SETTLES IN 1085 TICKS on x86_64 under KVM. The budget was 300, inherited
+   from what `console_shell_loop` used to wait before the wait moved into the supervised attempt, and
+   never once exercised, because no boot had ever reached the check that consults it. It is 3000 now,
+   with the measurement in the comment. aarch64 and riscv64 keep their ratio to that number (400 ->
+   4000, 4000 -> 40000) and say in their own comments that they are carried across rather than
+   measured.
+4. **A live control plane is no longer a failed boot.** A window that closes with SystemManager
+   still running means the system came up and the console has not attached YET - a CD-ROM-backed
+   machine, an emulated target, a loaded host. The ladder retried that, spawned nothing (the next
+   attempt correctly refuses to start a second manager beside a live branch), exhausted itself and
+   called `arch::reset()` on a working system. It now returns up, saying the weaker claim. And
+   `console_shell_loop` no longer treats "no shell yet" as "the shell exited": it was
+   `while shell_listening()`, unreachable with nothing attached while `supervise` only returned true
+   when something was - so on the first machine where that could happen the kernel printed "shell
+   attached", found nothing, returned, and HALTED a system that was still coming up. It keeps the
+   machine running until a shell has attached and then gone.
+
+**Finding 2 - shipping-image freshness: ACCEPTED and fixed.** The reasoning was right and the
+remedy it named - reuse the image builder's content receipt - is what was done, after the timestamp
+route was tried and found to be worse than the finding says: several staged artifacts, the bootable
+system volume among them, have their mtimes PINNED to `SOURCE_DATE_EPOCH` so images build
+reproducibly, so for exactly the inputs this finding is about an mtime comparison can never answer
+anything at all.
+
+- `mkimage.sh` gains `LIBER_IMAGE_PRINT_KEY=1`, which prints `image_input_key`'s digest and exits.
+  The key already covers kernel, loader, init package, the bootable volume and its pairing sidecar,
+  the service manifest and its normalized layout, the fallback bootstrap set, `product.conf` and the
+  builders themselves.
+- `image_input_key` is now PATH-INDEPENDENT, and it was not. `sha256sum` prints the file name beside
+  the digest, so the same tree hashed through a different spelling of the same path -
+  `harness/mkimage.sh` with `src` as the working directory, which is how `image.sh` invokes it, or
+  `src/tools/../harness/mkimage.sh` from the root - produced a DIFFERENT key. Two consequences: the
+  cache missed on nothing whenever a caller invoked the script differently, and no checker could
+  recompute a published image's key at all. `hash_inputs` prints basename and digest; the bootstrap
+  tree is walked relative to its own root.
+- The gate asks for today's key and compares it with `<image>.build-key`, refusing an image with no
+  receipt. AND IT DOES THIS FIRST, before any phase runs: the phases below build and boot test media,
+  and a test build rewrites staged artifacts the shipping image is keyed on, so a freshness question
+  asked after them is asked about a tree the gate itself has moved.
+
+**Verification.** `./check.sh --gate qemu-virtio-iommu-x86_64`, EXIT 0:
+
+    qemu-virtio-iommu: the shipping image was built from this tree (de02e095...)
+    qemu-virtio-iommu: booting the enforcing profile
+    qemu-virtio-iommu:   case 1 PASSED ... case 7 PASSED
+    qemu-virtio-iommu:   a DHCP lease was obtained through the enforcing controller - real packets both ways
+    qemu-virtio-iommu: booting the DEFAULT machine, the way an ordinary run does
+    qemu-virtio-iommu:   the default machine is translated, nothing is degraded, nothing faulted, and the display driver runs
+    qemu-virtio-iommu:   --no-iommu boots the untranslated machine and says so
+    check.sh: all selected checks passed
+
+The default-machine phase is the assertion this finding is about, and it is the one that had never
+passed. The staleness half was watched to refuse: with the image a build behind, the gate printed
+both keys and stopped.
