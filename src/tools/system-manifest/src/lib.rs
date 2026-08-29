@@ -145,6 +145,15 @@ struct RawProvides {
 	// At most this many of that kind. `most = 0` would be a declaration that publishes nothing,
 	// which is what leaving the row out already says.
 	most: u16,
+	// HOW MANY CONSUMERS ONE OF THEM ADMITS, and one is the answer for nearly everything.
+	//
+	// A kind that admits only one consumer SAYS SO HERE rather than discovering it at the second
+	// subscriber: a consumer that asked for a connection and was quietly handed one nobody serves
+	// waits for ever, where one that is refused knows immediately. Absent is one, because that is
+	// what every driver in this tree was built assuming and a manifest should not have to restate
+	// the ordinary case.
+	#[serde(default)]
+	consumers: Option<u16>,
 }
 
 // A match rule, as a CLOSED tagged set rather than free-form key/value pairs.
@@ -479,6 +488,8 @@ pub const MAX_HEARTBEAT_DEADLINE: u32 = 100;
 pub struct Provides {
 	pub kind: ProviderKindName,
 	pub most: u16,
+	// See `RawProvides::consumers`. Resolved here so no reader has to know that absent means one.
+	pub consumers: u16,
 }
 
 // A match rule the generated registry can evaluate against a discovered node: every predicate that
@@ -867,7 +878,7 @@ impl Manifest {
 				lifecycle: raw.lifecycle,
 				priority: raw.priority,
 				requires: raw.requires.clone(),
-				provides: raw.provides.iter().map(|entry| Provides { kind: entry.kind, most: entry.most }).collect(),
+				provides: raw.provides.iter().map(|entry| Provides { kind: entry.kind, most: entry.most, consumers: entry.consumers.unwrap_or(1).max(1) }).collect(),
 				heartbeat_deadline: raw.heartbeat_deadline,
 				rules: raw
 					.rules

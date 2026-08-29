@@ -186,12 +186,7 @@ unsafe extern "C" fn kmain(boot_info_ptr: *const BootInfo) -> ! {
 	// lines under that prefix - so grepping it returned two programs' accounts interleaved, and the
 	// one line reporting what arrived over the boot protocol was indistinguishable from the loader's
 	// own account of choosing it. Which program is speaking is the first thing a prefix is for.
-	match bi.root.kind {
-		bootproto::ROOT_BLOCK => serial_println!("boot: the system volume is a paired block volume"),
-		bootproto::ROOT_EMBEDDED => serial_println!("boot: the system volume is the verified image the medium carries"),
-		_ => serial_println!("boot: no system volume was promoted"),
-	}
-	ROOT_SELECTION.lock().replace(bi.root);
+	adopt_root_selection(bi.root);
 	serial_println!("{} kernel is starting ...", product::NAME);
 	arch::init();
 	// Named after `arch::init` rather than before it, because that is where a backend learns
@@ -898,6 +893,23 @@ fn serial_rx_interrupt(_vector: u32) {
 // The loader decided; this is only carrying it. Re-deriving it here from the modules and the medium
 // is exactly what the field exists to stop - two readers of one medium can reach two answers.
 static ROOT_SELECTION: crate::sync::SpinLock<Option<bootproto::RootSelection>> = crate::sync::SpinLock::new(None);
+
+// ADOPT WHAT THE LOADER DECIDED, AND SAY WHICH IT WAS - from whichever prologue this port enters by.
+//
+// `kmain` is x86_64's alone; aarch64 and riscv64 enter `arch::boot::*_main` and neither read the
+// field. So on two of three ports the loader computed a selection, put it in `BootInfo`, handed it
+// over - and nothing ever looked. `ROOT_SELECTION` stayed `None`, the boot chain told StorageService
+// that nothing had been promoted, and the only reason no port noticed is that StorageService used to
+// mount the first block device whatever it was told. That is the fallback P02M0164's M2 exists to
+// remove, so removing it is what made the gap visible.
+pub(crate) fn adopt_root_selection(root: bootproto::RootSelection) {
+	match root.kind {
+		bootproto::ROOT_BLOCK => serial_println!("boot: the system volume is a paired block volume"),
+		bootproto::ROOT_EMBEDDED => serial_println!("boot: the system volume is the verified image the medium carries"),
+		_ => serial_println!("boot: no system volume was promoted"),
+	}
+	ROOT_SELECTION.lock().replace(root);
+}
 
 #[cfg(not(test))]
 fn report_machine() {

@@ -179,6 +179,21 @@ pub enum Opcode {
 	// driver -> manager, terminal for the binding: everything it accepted is finished or abandoned
 	// and its device is quiet.
 	Stopped = 10,
+	// manager -> driver, after the handshake. ONE CAPABILITY: a server endpoint for the provider
+	// this driver published under the token in the payload, minted by the MANAGER and handed over
+	// for the driver to serve.
+	//
+	// A CONNECTION PER CONSUMER, WHICH IS WHY THIS EXISTS. A provider was one channel, transferred
+	// once, and `Catalogue::take` moved it to the first consumer that asked - so a second subscriber
+	// could see the provider as metadata and had no way to reach it, and handing it the SAME channel
+	// would be two consumers competing over one reply queue rather than two connections.
+	//
+	// THE MANAGER MINTS THE PAIR, not the driver, and that is the whole reason this needs no reply.
+	// A driver answering with a handle would be a second round trip and a second thing to fail
+	// half-way; the manager already transfers capabilities TO drivers for every resource a bind
+	// hands over, so this is that mechanism and not a new one. The driver adds the endpoint to what
+	// it serves; the manager keeps the client end for whoever asked.
+	Connect = 11,
 	// driver -> manager, the answer, echoing the sequence it was asked with.
 	//
 	// THE SEQUENCE IS WHY THIS IS NOT `rt::heartbeat`. That one counts ANY message as a pong -
@@ -203,6 +218,7 @@ impl Opcode {
 			8 => Some(Opcode::Pong),
 			9 => Some(Opcode::Stop),
 			10 => Some(Opcode::Stopped),
+			11 => Some(Opcode::Connect),
 			_ => None,
 		}
 	}
@@ -217,7 +233,7 @@ impl Opcode {
 	pub fn handle_count(self) -> usize {
 		match self {
 			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped => 0,
-			Opcode::Resource | Opcode::Offer => 1,
+			Opcode::Resource | Opcode::Offer | Opcode::Connect => 1,
 		}
 	}
 

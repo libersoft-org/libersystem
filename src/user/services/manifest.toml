@@ -1417,7 +1417,7 @@ providers = []
 [programs.driver]
 lifecycle = "boot-critical"
 match = [{ transport = "virtio-pci", virtio-type = 2 }]
-provides = [{ kind = "block", most = 1 }]
+provides = [{ kind = "block", most = 1, consumers = 4 }]
 heartbeat-deadline = 100
 
 [[programs]]

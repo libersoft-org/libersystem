@@ -515,6 +515,11 @@ fn a_ready_that_arrives_after_the_deadline_does_not_undo_the_timeout() {
 	// same rule every other illegal transition is - not by a special case somebody remembered.
 	assert!(!record.move_to(BindingState::Online, None), "a late READY is late, and late is not up");
 	assert!(record.state == BindingState::Backoff);
+	// AND WHAT THE TIMED-OUT ATTEMPT HELD IS GONE, which is the half a state comparison cannot make.
+	// The table refusing the late `READY` says nothing about the device, the child or the handles -
+	// and "at most one claim owner, no leaked process, handle or counter" is what M7 asks after each
+	// race. Driven through the same ledger the fault cases use, so this is the real teardown.
+	assert_baseline_after_teardown(&mut attempt_that_reached(0x1000), "a READY after its deadline");
 }
 
 #[test]
@@ -532,6 +537,10 @@ fn a_crash_between_publish_and_subscribe_withdraws_what_was_published() {
 	let after_rebind = ProviderId::new(BindingId::new(0, 3, 0, 2), 0, 2);
 	assert!(published != after_rebind);
 	assert!(published.binding.same_function(after_rebind.binding));
+	// AND THE BINDING THAT PUBLISHED IT LEAVES NOTHING BEHIND. A stale provider is one half of what
+	// M7 asks after this race; the other half is the transaction, and comparing two identities said
+	// nothing about it.
+	assert_baseline_after_teardown(&mut attempt_that_reached(0x2000), "a crash between publish and subscribe");
 }
 
 #[test]
@@ -552,6 +561,18 @@ fn a_watchdog_expiry_racing_a_clean_exit_reaches_one_verdict_and_not_two() {
 	// the table, so it changes nothing and the verdict stays the one that was reached first.
 	assert!(!record.move_to(BindingState::Stopping, Some(FailureCause::DriverExited)));
 	assert!(record.failure == Some(FailureCause::HandshakeTimeout), "the first verdict stands");
+	// ONE VERDICT IS ALSO ONE TEARDOWN. Two events about one binding must not run two rollbacks -
+	// the second would close handles the first already gave back and release a claim twice.
+	let mut held = attempt_that_reached(0x3000);
+	assert_baseline_after_teardown(&mut held, "a watchdog expiry racing a clean exit");
+	// The second event arrives and finds a ledger with nothing in it: the rollback is idempotent
+	// because it is empty, not because somebody remembered a flag.
+	let mut ledger = free_ledger();
+	let mut again = held.begin_teardown(&mut ledger);
+	assert_eq!(ledger.closed_n, 0, "a second teardown of the same attempt closes nothing");
+	assert_eq!(ledger.released_n, 0, "and releases nothing");
+	assert_eq!(again.settle(&mut ledger, 0, 100), Some(Settled::Free));
+	assert_eq!(ledger.domains_n, 0, "and kills no Domain a second time");
 }
 
 #[test]
@@ -565,6 +586,10 @@ fn a_manager_restart_with_drivers_still_live_cannot_mistake_them_for_a_fresh_bin
 	// A node with no binding - which is what a fresh manager's node looks like - drains them all.
 	assert!(queue.pop(0).is_none());
 	assert!(queue.is_empty(), "nothing from the previous manager's binding survives to be acted on");
+	// AND THE OLD BINDING'S RESOURCES ARE GIVEN BACK BY WHOEVER TEARS IT DOWN. Draining the events
+	// is what stops a new manager ACTING on them; it is not what returns the device, and a test that
+	// stopped at the drain would have said the race was safe while a claim was still held.
+	assert_baseline_after_teardown(&mut attempt_that_reached(0x4000), "a manager restart with drivers still live");
 }
 
 #[test]
@@ -583,6 +608,57 @@ fn a_stopped_that_arrives_after_the_deadline_does_not_turn_a_forced_teardown_bac
 	assert!(!record.move_to(BindingState::Backoff, Some(FailureCause::DriverExited)));
 	assert!(!record.move_to(BindingState::Failed, Some(FailureCause::DriverExited)));
 	assert!(record.failure == Some(FailureCause::TeardownUnconfirmed), "the report still says the teardown was not confirmed");
+	// AND AN UNCONFIRMED TEARDOWN STILL GIVES BACK EVERY HANDLE - what it does NOT give back is the
+	// DEVICE. That distinction is the whole of `Quarantined`: the frames, vectors and grants stay
+	// charged because something may still be writing to them, and the manager's own handles are not
+	// among them. A test that only read the record could not tell the two apart.
+	let mut held = attempt_that_reached(0x5000);
+	let mut ledger = Ledger::new(None);
+	let mut pending = held.begin_teardown(&mut ledger);
+	assert_eq!(pending.settle(&mut ledger, 100, 100), Some(Settled::Unconfirmed), "the deadline passed with no confirmation");
+	assert!(ledger.closed_once(0x5000 + 1), "the process handle is closed even so");
+	assert!(ledger.closed_once(0x5000 + 2), "and the manager's end of the bootstrap channel");
+	assert_eq!(&ledger.domains[..ledger.domains_n], &[0x5000], "and the Domain is killed exactly once");
+}
+
+// ONE ATTEMPT THAT REACHED THE FAR SIDE OF A BIND, for a race test to tear down. The numbers are a
+// base plus an offset so a failure names which handle was left behind rather than "a handle".
+fn attempt_that_reached(base: u64) -> Holdings {
+	let mut held = Holdings::new();
+	held.domain = base;
+	held.process = base + 1;
+	held.channel = base + 2;
+	held.claim = base + 3;
+	held
+}
+
+// M7'S POST-RACE BASELINE, asked of the ledger rather than of a state name: at most one claim owner
+// (the release happens exactly once), no leaked process, handle or counter (every handle closed
+// exactly once), and the Domain killed once, last.
+fn assert_baseline_after_teardown(held: &mut Holdings, race: &str) {
+	let mut ledger = free_ledger();
+	let mut pending = held.begin_teardown(&mut ledger);
+	// NOTHING SETTLES ON THE KILL ALONE. The claim answered terminally, so the half that is still
+	// outstanding is the child - and that it has to ARRIVE is the property, not a formality: without
+	// this line the assertion below fails, which is the teardown refusing to call itself done.
+	assert_eq!(pending.settle(&mut ledger, 0, 100), None, "{race}: the exit has not arrived yet");
+	pending.note(super::BindingEvent::Exited { generation: 1 });
+	assert_eq!(pending.settle(&mut ledger, 0, 100), Some(Settled::Free), "{race}: the device comes back");
+	assert_eq!(ledger.released_n, 1, "{race}: the claim is released exactly once - one owner, one release");
+	assert!(ledger.closed_once(ledger.released[0]), "{race}: and its handle is closed exactly once");
+	assert_eq!(&ledger.killed[..ledger.killed_n], &[held_process(ledger.released[0])], "{race}: the child is signalled once");
+	assert_eq!(ledger.domains_n, 1, "{race}: the Domain is killed exactly once");
+	// NOTHING IS LEFT NAMED. A ledger that still names a handle is one a second rollback would close
+	// twice, and one that named a claim would be a second owner of a device already given back.
+	assert_eq!(held.process, 0, "{race}: no process left in the ledger");
+	assert_eq!(held.claim, 0, "{race}: no claim left in the ledger");
+	assert_eq!(held.domain, 0, "{race}: no Domain left in the ledger");
+	assert_eq!(held.resources().len(), 0, "{race}: no resource left in the ledger");
+}
+
+// The process handle that goes with a claim handle in `attempt_that_reached`.
+fn held_process(claim: u64) -> u64 {
+	claim - 2
 }
 
 // ------------------------------------------------------- the operator's four verbs

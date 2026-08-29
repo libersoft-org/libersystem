@@ -248,6 +248,17 @@ interface provider-catalogue {
 	/// than each deriving a state - the log is not a third rendering to compare against, because it
 	/// is a history of transitions and this is a moment.
 	@op(2) bindings:  func() -> list<binding-record>;
+	/// A CONNECTION TO ONE PROVIDER, MINTED FOR THIS CONSUMER.
+	///
+	/// `subscribe` says what is there; this is how a consumer reaches it. A provider was one channel
+	/// the driver transferred once, so the first consumer to ask took it and a second could see the
+	/// provider and had no way to connect - and handing over the same channel would be two consumers
+	/// competing over one reply queue rather than two connections.
+	///
+	/// The manager mints the pair, sends the server end to the driver and answers with the client
+	/// end. A kind that admits only one consumer says so in its registry declaration, so a second
+	/// ask is REFUSED here rather than answered with an endpoint nobody serves.
+	@op(3) open: func(provider: provider-info) -> result<handle<channel>, error>;
 }
 
 /// One enumerated USB device, as the xHCI driver addressed it: the root port it hangs

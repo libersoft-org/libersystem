@@ -383,15 +383,32 @@ pub unsafe fn stand(bootstrap: u64, bind: &Bind) -> ! {
 	unsafe {
 		let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
 		loop {
-			let Received::Message { len, .. } = recv_blocking(bootstrap, &mut buf) else { exit() };
-			let Ok(header) = proto::Header::decode(&buf[..len]) else { continue };
+			let Received::Message { len, handle } = recv_blocking(bootstrap, &mut buf) else { exit() };
+			let Ok(header) = proto::Header::decode(&buf[..len]) else {
+				if handle != 0 {
+					close(handle);
+				}
+				continue;
+			};
 			// A FRAME FROM A BINDING THAT IS OVER IS NOT THIS BINDING'S. Dropped rather than
 			// answered: answering it would tell the manager a generation it has moved on from is
 			// alive.
 			if header.generation != bind.generation {
+				if handle != 0 {
+					close(handle);
+				}
 				continue;
 			}
 			match header.opcode {
+				// A DRIVER THAT STANDS SERVES NOTHING, so there is nowhere to put a second consumer
+				// and the endpoint goes back. Closed rather than dropped: a consumer whose endpoint
+				// is closed learns its connection ended, where one whose endpoint is merely never
+				// read waits for ever.
+				proto::Opcode::Connect => {
+					if handle != 0 {
+						close(handle);
+					}
+				}
 				proto::Opcode::Ping => {
 					let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
 					if !pong(bootstrap, bind, sequence) {
@@ -466,6 +483,19 @@ pub unsafe fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Op
 // which ends the driver the way it always has.
 pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool {
 	unsafe {
+		let mut one = Serving::new(server);
+		serve_any_or_answer(bootstrap, bind, &mut one).is_some()
+	}
+}
+
+// THE SAME, OVER EVERY CONSUMER THIS PROVIDER HAS. Answers WHICH endpoint has work, or `None` when
+// the driver is finished.
+//
+// `serve_or_answer` is this with a set of one, kept for the loops that serve something which is not
+// a provider - a driver's own control path - and so a caller that will never see a `CONNECT` does
+// not have to hold a set to say so.
+pub unsafe fn serve_any_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving) -> Option<usize> {
+	unsafe {
 		loop {
 			// THE MANAGER'S CHANNEL IS DRAINED FIRST, EVERY PASS, and that is not a nicety.
 			//
@@ -473,22 +503,84 @@ pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool 
 			// it starves everything after it in the set - and a busy driver would never see a ping,
 			// which is precisely the driver a watchdog must not kill. Measured: every virtio-blk in
 			// the machine was declared wedged while serving StorageService as fast as it could.
-			match drain_control(bootstrap, bind) {
+			match drain_control_into(bootstrap, bind, Some(serving)) {
 				Control::Continue => {}
 				Control::Stop => {
 					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
-					return false;
+					return None;
 				}
-				Control::Ended => return false,
+				Control::Ended => return None,
 			}
-			if poll_ready(server) {
-				return true;
+			// THE FIRST WITH WORK, and a set that grew while this was parked is waited on next pass.
+			for index in 0..serving.as_slice().len() {
+				if poll_ready(serving.at(index)) {
+					return Some(index);
+				}
 			}
-			// Nothing on either: park until one of them speaks.
-			if wait_any(&[server, bootstrap], 0) < 0 {
-				return false;
+			// Nothing on any of them: park until one speaks. The manager's channel goes LAST so a
+			// consumer with work waiting does not starve it - see the note above about the reverse.
+			let mut set: [u64; MAX_PROVIDER_CLIENTS + 1] = [0; MAX_PROVIDER_CLIENTS + 1];
+			let live = serving.as_slice();
+			set[..live.len()].copy_from_slice(live);
+			set[live.len()] = bootstrap;
+			if wait_any(&set[..live.len() + 1], 0) < 0 {
+				return None;
 			}
 		}
+	}
+}
+
+// THE ENDPOINTS THIS DRIVER SERVES ONE PROVIDER ON.
+//
+// A provider used to be one channel: the driver made a pair, offered the client end, and served the
+// server end until that client closed. So the SECOND consumer of a disk or a NIC had nowhere to go -
+// the catalogue could show it the provider and had nothing to give it, and handing over the same
+// channel would be two consumers competing over one reply queue rather than two connections.
+//
+// The manager mints each new pair and sends the server end in a `CONNECT` frame; this is where they
+// accumulate. A bound, because a driver cannot grow an unbounded set of clients from frames a
+// manager sends - and one that is full refuses the endpoint by closing it, which the consumer reads
+// as a connection that ended rather than one that never answers.
+pub const MAX_PROVIDER_CLIENTS: usize = 8;
+
+pub struct Serving {
+	ends: [u64; MAX_PROVIDER_CLIENTS],
+	count: usize,
+}
+
+impl Serving {
+	// The first one, which the driver made itself and offered to the manager.
+	pub fn new(first: u64) -> Self {
+		let mut ends = [0u64; MAX_PROVIDER_CLIENTS];
+		ends[0] = first;
+		Self { ends, count: 1 }
+	}
+
+	pub fn as_slice(&self) -> &[u64] {
+		&self.ends[..self.count]
+	}
+
+	pub fn at(&self, index: usize) -> u64 {
+		self.ends[index]
+	}
+
+	// A consumer's endpoint has closed: drop it and keep the rest. The order of the others does not
+	// matter, so the last one fills the hole rather than everything shifting.
+	pub fn close_at(&mut self, index: usize) {
+		unsafe { close(self.ends[index]) };
+		self.count -= 1;
+		self.ends[index] = self.ends[self.count];
+		self.ends[self.count] = 0;
+	}
+
+	// One more, from a `CONNECT`. False when this driver is already serving as many as it will.
+	fn accept(&mut self, end: u64) -> bool {
+		if self.count >= MAX_PROVIDER_CLIENTS {
+			return false;
+		}
+		self.ends[self.count] = end;
+		self.count += 1;
+		true
 	}
 }
 
@@ -504,15 +596,27 @@ enum Control {
 
 // Answer every `PING` waiting on `bootstrap` right now, without blocking.
 unsafe fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
+	unsafe { drain_control_into(bootstrap, bind, None) }
+}
+
+// The same, for a loop that serves a provider: a `CONNECT` carries an endpoint and there has to be
+// somewhere to put it. `None` is a caller that serves none, and one arriving there is refused with
+// its handle closed rather than silently dropped.
+unsafe fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&mut Serving>) -> Control {
 	unsafe {
 		let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
 		loop {
-			let (len, _handle) = match try_recv(bootstrap, &mut buf) {
+			let (len, handle) = match try_recv(bootstrap, &mut buf) {
 				Polled::Message { len, handle } => (len, handle),
 				Polled::Empty => return Control::Continue,
 				Polled::Closed => return Control::Ended,
 			};
-			let Ok(header) = proto::Header::decode(&buf[..len]) else { continue };
+			let Ok(header) = proto::Header::decode(&buf[..len]) else {
+				if handle != 0 {
+					close(handle);
+				}
+				continue;
+			};
 			// A frame from a binding that is over is not this binding's: dropped rather than
 			// answered, because answering it would tell the manager a generation it has moved on
 			// from is alive.
@@ -520,6 +624,17 @@ unsafe fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
 				continue;
 			}
 			match header.opcode {
+				// ONE MORE CONSUMER. The manager made the pair and kept the client end; this is the
+				// server end, and serving it is the whole of what a driver has to do about it.
+				proto::Opcode::Connect => {
+					let accepted = handle != 0 && serving.as_deref_mut().is_some_and(|serving| serving.accept(handle));
+					if !accepted && handle != 0 {
+						// Full, or a loop that serves no provider. Closed rather than kept, so the
+						// consumer learns its connection ended instead of waiting on a server that
+						// will never read it.
+						close(handle);
+					}
+				}
 				proto::Opcode::Ping => {
 					let Ok(sequence) = proto::decode_sequence(header.payload(&buf)) else { continue };
 					if !pong(bootstrap, bind, sequence) {
@@ -531,7 +646,12 @@ unsafe fn drain_control(bootstrap: u64, bind: &Bind) -> Control {
 				// what it owes is the answer and then its own exit. A driver with something to
 				// drain overrides `Control::Stop` rather than letting this decide for it.
 				proto::Opcode::Stop => return Control::Stop,
-				_ => return Control::Ended,
+				_ => {
+					if handle != 0 {
+						close(handle);
+					}
+					return Control::Ended;
+				}
 			}
 		}
 	}

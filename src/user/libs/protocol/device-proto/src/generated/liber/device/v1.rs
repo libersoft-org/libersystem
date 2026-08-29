@@ -1575,6 +1575,7 @@ pub mod provider_catalogue {
 
 	pub const OP_SUBSCRIBE: u16 = 1;
 	pub const OP_BINDINGS: u16 = 2;
+	pub const OP_OPEN: u16 = 3;
 
 	pub trait Service {
 		fn subscribe(&mut self, kind: ProviderKind) -> Vec<ProviderInfo>;
@@ -1582,6 +1583,17 @@ pub mod provider_catalogue {
 		/// than each deriving a state - the log is not a third rendering to compare against, because it
 		/// is a history of transitions and this is a moment.
 		fn bindings(&mut self) -> Vec<BindingRecord>;
+		/// A CONNECTION TO ONE PROVIDER, MINTED FOR THIS CONSUMER.
+		///
+		/// `subscribe` says what is there; this is how a consumer reaches it. A provider was one channel
+		/// the driver transferred once, so the first consumer to ask took it and a second could see the
+		/// provider and had no way to connect - and handing over the same channel would be two consumers
+		/// competing over one reply queue rather than two connections.
+		///
+		/// The manager mints the pair, sends the server end to the driver and answers with the client
+		/// end. A kind that admits only one consumer says so in its registry declaration, so a second
+		/// ask is REFUSED here rather than answered with an endpoint nobody serves.
+		fn open(&mut self, provider: ProviderInfo) -> Result<u64, Error>;
 	}
 
 	pub fn dispatch<S: Service>(service: &mut S, request: &[u8], request_handles: &mut Handles, out: &mut [u8], reply_handles: &mut Handles) -> Option<usize> {
@@ -1628,6 +1640,44 @@ pub mod provider_catalogue {
 						}
 					}
 					return None;
+				}
+			}
+			OP_OPEN => {
+				let provider = ProviderInfo::read(r)?;
+				r.finish()?;
+				request_handles.clear();
+				let result = service.open(provider);
+				let encoded: Option<()> = (|| {
+					let w = &mut writer;
+					w.u32(corr)?;
+					match &result {
+						Ok(v19) => {
+							w.u8(1)?;
+							w.set_handle(*v19)?;
+							w.u32(0)?;
+						}
+						Err(v20) => {
+							w.u8(0)?;
+							v20.write(w)?;
+						}
+					}
+					Some(())
+				})();
+				if encoded.is_none() {
+					if writer.has_handle() {
+						match Handles::try_from_slice(writer.handles()) {
+							Some(taken) => *reply_handles = taken,
+							None => {}
+						}
+						return None;
+					}
+					// the reply outgrew the caller's buffer: replace it with a typed
+					// error, so the client sees a failure instead of hanging.
+					writer.reset();
+					let w = &mut writer;
+					w.u32(corr)?;
+					w.u8(0)?;
+					Error::Again.write(w)?;
 				}
 			}
 			_ => return None,
@@ -1802,13 +1852,53 @@ pub mod provider_catalogue {
 					return None;
 				}
 				let value = {
-					let v19 = r.u16()? as usize;
-					let mut v20 = Vec::new();
-					v20.try_reserve_exact(v19).ok()?;
-					for _ in 0..v19 {
-						v20.push(BindingRecord::read(r)?);
+					let v21 = r.u16()? as usize;
+					let mut v22 = Vec::new();
+					v22.try_reserve_exact(v21).ok()?;
+					for _ in 0..v21 {
+						v22.push(BindingRecord::read(r)?);
 					}
-					v20
+					v22
+				};
+				r.finish()?;
+				Some(value)
+			})();
+			if decoded.is_none() {
+				self.transport.discard_handles(reply_handles.as_slice());
+				return None;
+			}
+			decoded
+		}
+		pub fn open(&mut self, provider: &ProviderInfo) -> Option<Result<u64, Error>> {
+			let corr = self.next_corr();
+			let mut writer = VecWriter::new();
+			let w = &mut writer;
+			w.u16(OP_OPEN)?;
+			w.u32(corr)?;
+			provider.write(w)?;
+			// One call for both halves: the bytes cannot be taken without them.
+			let (request, request_handles) = writer.into_message();
+			let mut reply_handles = Handles::new();
+			let reply = match self.transport.call(&request, request_handles.as_slice(), &mut reply_handles, self.deadline) {
+				Ok(reply) => reply,
+				Err(e) => {
+					self.last_error = Some(e);
+					return Some(Err(transport_outcome(e)));
+				}
+			};
+			let mut reader = Reader::with_handle_list(&reply, &reply_handles);
+			let decoded = (|| {
+				let r = &mut reader;
+				if r.u32()? != corr {
+					return None;
+				}
+				let value = if r.tag()? {
+					Ok({
+						let _ = r.u32()?;
+						r.take_handle()?
+					})
+				} else {
+					Err(Error::read(r)?)
 				};
 				r.finish()?;
 				Some(value)
@@ -1835,6 +1925,14 @@ pub mod provider_catalogue {
 	fn channel_invoke_bindings(chan: u64) -> Option<Vec<BindingRecord>> {
 		let mut client = Client::new(ipc_client::ChannelTransport { chan });
 		client.bindings()
+	}
+
+	#[cfg(feature = "channel-client-impl")]
+	#[inline(never)]
+	#[unsafe(export_name = "liber_channel_impl_liber_device_provider_catalogue_open")]
+	fn channel_invoke_open(chan: u64, provider: &ProviderInfo) -> Option<Result<u64, Error>> {
+		let mut client = Client::new(ipc_client::ChannelTransport { chan });
+		client.open(provider)
 	}
 }
 
@@ -1950,19 +2048,19 @@ pub mod usb {
 					let w = &mut writer;
 					w.u32(corr)?;
 					match &result {
-						Ok(v21) => {
+						Ok(v23) => {
 							w.u8(1)?;
-							if v21.len() > u16::MAX as usize {
+							if v23.len() > u16::MAX as usize {
 								return None;
 							}
-							w.u16(v21.len() as u16)?;
-							for v23 in v21.iter() {
-								v23.write(w)?;
+							w.u16(v23.len() as u16)?;
+							for v25 in v23.iter() {
+								v25.write(w)?;
 							}
 						}
-						Err(v22) => {
+						Err(v24) => {
 							w.u8(0)?;
-							v22.write(w)?;
+							v24.write(w)?;
 						}
 					}
 					Some(())
@@ -2092,13 +2190,13 @@ pub mod usb {
 				}
 				let value = if r.tag()? {
 					Ok({
-						let v24 = r.u16()? as usize;
-						let mut v25 = Vec::new();
-						v25.try_reserve_exact(v24).ok()?;
-						for _ in 0..v24 {
-							v25.push(UsbDevice::read(r)?);
+						let v26 = r.u16()? as usize;
+						let mut v27 = Vec::new();
+						v27.try_reserve_exact(v26).ok()?;
+						for _ in 0..v26 {
+							v27.push(UsbDevice::read(r)?);
 						}
-						v25
+						v27
 					})
 				} else {
 					Err(Error::read(r)?)

@@ -20,6 +20,7 @@ method device-policy-admin.incident op=3 (index:u32:rights=) -> result<incident-
 interface provider-catalogue
 method provider-catalogue.subscribe op=1 (kind:provider-kind:rights=) -> stream<provider-info>
 method provider-catalogue.bindings op=2 () -> list<binding-record>
+method provider-catalogue.open op=3 (provider:provider-info:rights=) -> result<handle<channel>, liber:base@1::error>
 record usb-device(port:u32,speed:string,vendor:u32,product:u32,class:u32,type:string)
 interface usb
 method usb.list op=1 () -> result<list<usb-device>, liber:base@1::error>

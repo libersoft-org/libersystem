@@ -62,8 +62,8 @@ fn a_version_this_build_does_not_implement_is_refused_and_named() {
 fn an_unknown_opcode_is_refused_rather_than_accepted_as_some_message_arriving() {
 	// Which is the whole of what happens today: `launch_one` treats any message as success.
 	let mut bytes = header(Opcode::Ready, 1, 0).encode();
-	// 1 through 10 are allocated; 11 is the next one that is not.
-	for raw in [0u16, 11, 12, 0xffff] {
+	// 1 through 11 are allocated; 12 is the next one that is not.
+	for raw in [0u16, 12, 13, 0xffff] {
 		bytes[6..8].copy_from_slice(&raw.to_le_bytes());
 		assert_eq!(Header::decode(&bytes), Err(FrameError::UnknownOpcode(raw)), "opcode {raw}");
 	}

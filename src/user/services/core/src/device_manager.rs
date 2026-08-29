@@ -439,6 +439,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// fifth disk is published, counted and REPORTED rather than silently dropped into a variable
 		// that does not exist.
 		let mut boot_blocks: [u64; BOOT_BLOCK_TAGS.len()] = [0; BOOT_BLOCK_TAGS.len()];
+		// A connection to each block provider for whoever has to CHOOSE among them - see
+		// `mint_connection` and the `PROBE` tags below.
+		let mut probe_blocks: [u64; BOOT_BLOCK_TAGS.len()] = [0; BOOT_BLOCK_TAGS.len()];
 		let mut net_client: u64 = 0;
 		let mut gpu_client: u64 = 0;
 		let mut snd_client: u64 = 0;
@@ -454,7 +457,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// program has finished starting drivers - and so its death is noticed and answered.
 		#[cfg(feature = "development")]
 		let mut dev: DevAgent = DevAgent::default();
-		launch_boot_drivers(&package, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut boot_blocks);
+		launch_boot_drivers(&package, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut boot_blocks, &mut probe_blocks);
 
 		// 3. report in once the disks are bound, transferring the block service channel up
 		//    the boot chain, then the second/third/fourth block disks' service channels (the
@@ -464,6 +467,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		send_blocking(bootstrap, b"DeviceManager: online", boot_blocks[0]);
 		for (at, tag) in BOOT_BLOCK_TAGS.iter().enumerate().skip(1) {
 			send_blocking(bootstrap, tag, boot_blocks[at]);
+		}
+		// AND THE PROBE CONNECTIONS, in the same order and under their own tags. A zero handle is a
+		// disk this machine does not have, and the tag travels anyway so the reader's positions do
+		// not shift - the same rule every other hand-off in this chain follows.
+		for probe in probe_blocks {
+			send_blocking(bootstrap, b"PROBE", probe);
 		}
 
 		// 4. stand until ServiceManager drives phase 2 (a "DRIVERS" message carrying a
@@ -703,7 +712,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // device's MMIO capability and info. Each disk's block-read service channel is routed up
 // (system / media / iso / udf, in discovery order). The non-bootstrap drivers are skipped
 // here - they load from the volume in phase 2, once it is mounted.
-unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], boot_blocks: &mut [u64; BOOT_BLOCK_TAGS.len()]) {
+unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], boot_blocks: &mut [u64; BOOT_BLOCK_TAGS.len()], probe_blocks: &mut [u64; BOOT_BLOCK_TAGS.len()]) {
 	unsafe {
 		let count: u64 = device_count();
 		// ONE NODE PER BOOT-CRITICAL DEVICE, and they come up TOGETHER. Four disks used to be bound
@@ -801,6 +810,23 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 		report_catalogue(catalogue, b"after the boot devices");
 		// ONE LOOP OVER THE TAGS THE WIRE HAS, taking by lowest bus address. The count comes from
 		// the wire's own list; nothing here decides how many disks a machine may have.
+		// ONE PROBE CONNECTION PER BLOCK PROVIDER, MINTED BEFORE THE ROLES TAKE THEIRS.
+		//
+		// The system volume was whichever block provider came first by bus address: a paired volume
+		// at a later address was never considered, and a machine whose first disk is not the system
+		// one had no system volume at all. The PROBE belongs to StorageService - it is what parses a
+		// LiberFS superblock - and what it was missing is anything to probe.
+		//
+		// MINTED, NOT DUPLICATED. A duplicate of a role's channel shares that role's reply queue,
+		// which is the failure the whole per-consumer factory exists to prevent; these are fresh
+		// connections through `CONNECT`, so the instance that probes them competes with nobody.
+		// Taken first because `take` moves the offered channel and this asks the same binding.
+		for (at, slot) in probe_blocks.iter_mut().enumerate() {
+			let Some(found) = catalogue.entries.iter().enumerate().filter(|(_, entry)| entry.as_ref().is_some_and(|held| held.kind == driver_protocol::provider::BLOCK)).map(|(index, _)| index).nth(at) else {
+				break;
+			};
+			*slot = mint_connection(catalogue, nodes, found);
+		}
 		for slot in boot_blocks.iter_mut() {
 			*slot = catalogue.take(driver_protocol::provider::BLOCK);
 		}
@@ -1655,6 +1681,36 @@ struct Provider {
 	token: u16,
 	// The channel the driver serves it on. Zero for a free slot.
 	handle: u64,
+	// HOW MANY CONSUMERS HAVE BEEN GIVEN A CONNECTION TO IT, the first offer included. Bounded by
+	// what the driver's registry entry declares for the kind - see `Entry::provides` - so a kind
+	// that admits one refuses the second ask instead of answering with an endpoint nobody serves.
+	consumers: u16,
+}
+
+// ONE MORE CONNECTION TO THE PROVIDER IN `slot`, minted through the same `CONNECT` the served
+// `open` uses. Zero when there is no live binding to ask, or when the ask failed.
+//
+// NOT A DUPLICATE OF THE CHANNEL THE PROVIDER WAS OFFERED ON. A duplicate shares the reply queue
+// with whoever holds the original, which is the "two consumers competing over one reply queue" the
+// whole per-consumer factory exists to prevent - and a change meant to honour that rule committed
+// exactly it once, so it is written here where the next caller will read it.
+unsafe fn mint_connection(catalogue: &Catalogue, nodes: &[Node], slot: usize) -> u64 {
+	unsafe {
+		let Some(provider) = catalogue.entries[slot].as_ref() else { return 0 };
+		let binding = provider.id.binding;
+		let Some((control, generation)) = nodes.iter().find(|node| node.id.same_function(binding) && node.id.generation == binding.generation).and_then(|node| node.binding.as_ref().map(|live| (live.channel, node.id.generation))) else {
+			return 0;
+		};
+		let Some((server, client)) = channel() else { return 0 };
+		let mut payload = [0u8; driver_protocol::OFFER_PAYLOAD_LEN];
+		payload[..2].copy_from_slice(&provider.token.to_le_bytes());
+		if !send_frame(control, driver_protocol::Opcode::Connect, generation, &payload[..2], server, u32::MAX) {
+			close(server);
+			close(client);
+			return 0;
+		}
+		client
+	}
 }
 
 // One provider, as the wire describes it. `live` is what tells a publication from a withdrawal.
@@ -1806,7 +1862,7 @@ impl Catalogue {
 				// the half no build-time check can do. A compromised driver advertising itself as a
 				// disk is refused here, with its handle closed rather than kept.
 				let kind = offers.kinds[index];
-				let Some(&(_, most)) = entry.provides.iter().find(|&&(declared, _)| declared == kind) else {
+				let Some(&(_, most, _)) = entry.provides.iter().find(|&&(declared, _, _)| declared == kind) else {
 					print(b"DeviceManager: ");
 					print(entry.name);
 					print(b" offered a provider kind it does not declare in `provides`; refused\n");
@@ -1826,7 +1882,7 @@ impl Catalogue {
 					continue;
 				};
 				self.generation = self.generation.wrapping_add(1);
-				let provider = Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle };
+				let provider = Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle, consumers: 0 };
 				// AND EVERYONE WATCHING THAT KIND IS TOLD, which is the live half of a subscription:
 				// a consumer that subscribed before this driver bound sees it appear.
 				self.announce(&provider, true);
@@ -2325,6 +2381,13 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 			node.last_opcode = header.opcode as u16;
 			node.last_frame_at = clock();
 			match header.opcode {
+				// A DRIVER SENDING `CONNECT` IS SENDING THE MANAGER'S OWN FRAME BACK. This is
+				// manager-to-driver and nothing else; a frame arriving here under it is refused with
+				// its handle closed, like every other opcode this direction does not carry.
+				driver_protocol::Opcode::Connect => {
+					refuse(&handles);
+					continue;
+				}
 				driver_protocol::Opcode::Offer => {
 					let Ok((kind, token)) = driver_protocol::decode_offer(header.payload(buf)) else {
 						refuse(&handles);
@@ -3096,7 +3159,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 // would be in neither, which is the same race as a service started later seeing nothing. The
 // generated stream opens FROM the snapshot, so there is no second step to lose anything in.
 struct CatalogueView<'a> {
-	catalogue: &'a Catalogue,
+	catalogue: &'a mut Catalogue,
 	nodes: &'a [Node],
 }
 
@@ -3378,6 +3441,57 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 				resources: node.granted_resources,
 			})
 			.collect()
+	}
+
+	// A CONNECTION TO ONE PROVIDER, MINTED FOR THIS CONSUMER.
+	//
+	// The manager makes the pair, hands the SERVER end to the driver in a `CONNECT` frame and
+	// answers with the client end. That direction is the whole reason this needs no reply from the
+	// driver: capabilities already travel manager-to-driver for every resource a bind hands over, so
+	// this is that mechanism rather than a new round trip with its own half-way failure.
+	fn open(&mut self, provider: proto::system::ProviderInfo) -> Result<u64, proto::system::Error> {
+		unsafe {
+			let wire: u16 = provider_kind_wire(provider.kind);
+			// THE PROVIDER THIS NAMES, by the identity the manager minted - not by kind and not by
+			// position. A consumer holding a stale `provider-info` names a slot that has been reused
+			// and its generation is what says so.
+			let Some(slot) = self.catalogue.entries.iter().position(|entry| entry.as_ref().is_some_and(|held| held.kind == wire && held.id.slot as u32 == provider.slot && held.id.generation == provider.provider_generation && held.id.binding.generation == provider.binding_generation)) else {
+				return Err(proto::system::Error::NotFound);
+			};
+			// WHAT ITS DRIVER DECLARED. A kind that admits one consumer is refused here, at the ask,
+			// which is the difference between a consumer that knows and one that waits for ever.
+			let (token, admits) = {
+				let held = self.catalogue.entries[slot].as_ref().expect("the slot was just found");
+				let admits = self.nodes.iter().find(|node| node.id.same_function(held.id.binding) && node.id.generation == held.id.binding.generation).and_then(|node| node.candidates.get(node.candidate)).and_then(|entry| entry.provides.iter().find(|&&(kind, _, _)| kind == held.kind)).map_or(1, |&(_, _, consumers)| consumers);
+				(held.token, admits)
+			};
+			if self.catalogue.entries[slot].as_ref().is_some_and(|held| held.consumers >= admits) {
+				print(b"DeviceManager: a provider was asked for one more consumer than its driver declares it admits; refused\n");
+				return Err(proto::system::Error::Denied);
+			}
+			// THE BINDING THAT PUBLISHED IT has to still be the one that is bound: a `CONNECT` sent
+			// on a channel whose generation has moved on is a frame the driver drops, and answering
+			// with a client end nobody will ever serve is the failure this refuses instead.
+			let binding = self.catalogue.entries[slot].as_ref().map(|held| held.id.binding).expect("the slot was just found");
+			let Some((control, generation)) = self.nodes.iter().find(|node| node.id.same_function(binding) && node.id.generation == binding.generation).and_then(|node| node.binding.as_ref().map(|live| (live.channel, node.id.generation))) else {
+				return Err(proto::system::Error::NotFound);
+			};
+			// NOT `channel` - that is the driver's control channel, shadowed just above. The pair.
+			let Some((server, client)) = channel() else { return Err(proto::system::Error::Exhausted) };
+			let mut payload = [0u8; driver_protocol::OFFER_PAYLOAD_LEN];
+			payload[..2].copy_from_slice(&token.to_le_bytes());
+			// THE WHOLE ENDPOINT, unattenuated: a server end with rights taken off it is one the
+			// driver cannot answer on, which is the same as not sending it.
+			if !send_frame(control, driver_protocol::Opcode::Connect, generation, &payload[..2], server, u32::MAX) {
+				close(server);
+				close(client);
+				return Err(proto::system::Error::Closed);
+			}
+			if let Some(held) = self.catalogue.entries[slot].as_mut() {
+				held.consumers += 1;
+			}
+			Ok(client)
+		}
 	}
 
 	fn subscribe(&mut self, kind: proto::system::ProviderKind) -> Vec<proto::system::ProviderInfo> {
@@ -3939,7 +4053,7 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 							continue;
 						}
 						let Some(provider) = nodes[other].candidates.get(nodes[other].candidate) else { continue };
-						if provider.provides.iter().any(|(declared, _)| declared == kind) {
+						if provider.provides.iter().any(|(declared, _, _)| declared == kind) {
 							want = want.max(depth[other] + 1);
 						}
 					}
@@ -4255,7 +4369,10 @@ struct Entry {
 	// Which kinds it may publish and at most how many. A BOUND, so a driver cannot publish a kind
 	// it never declared: a compromised one advertising itself as a disk is what this closes.
 	// `system-manifest` refuses a requirement nothing produces and a cycle, at registry-build time.
-	provides: &'static [(u16, u16)],
+	// Kind, at most how many of them, and HOW MANY CONSUMERS ONE ADMITS. The third is what a
+	// per-consumer connection needs: a kind that admits one says so here, and the second `open` is
+	// refused rather than handed an endpoint nobody serves.
+	provides: &'static [(u16, u16, u16)],
 	// How long this driver may take to answer a `PING`, in ticks. `None` is "not heartbeat-
 	// supervised", which is the honest state for a driver that stands on its channel and does
 	// nothing else - and the registry refuses 0, because `wait_any` reads that as no timeout at all.

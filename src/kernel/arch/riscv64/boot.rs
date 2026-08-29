@@ -116,6 +116,20 @@ _start:
 // neither now: one kernel binary, whatever userspace is handed to it.
 static BOOT_MODULES: crate::sync::SpinLock<Option<&'static [u8]>> = crate::sync::SpinLock::new(None);
 
+// The selection the loader put in `BootInfo`, read the same way the modules are: physically, before
+// this kernel publishes anything, and only when the boot argument really is a `BootInfo`.
+fn loader_root_selection(arg: u64) -> Option<bootproto::RootSelection> {
+	if arg == 0 {
+		return None;
+	}
+	let magic = unsafe { core::ptr::read_volatile(super::paging::phys_to_virt(arg) as *const u64) };
+	if magic != bootproto::MAGIC {
+		return None;
+	}
+	let bi = super::paging::phys_to_virt(arg) as *const bootproto::BootInfo;
+	Some(unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*bi).root)) })
+}
+
 // The boot argument, kept so a module can be looked up after the early boot has moved on.
 static BOOT_ARG: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
@@ -182,6 +196,11 @@ extern "C" fn riscv64_main(hartid: u64, arg: u64) -> ! {
 	if let Some(archive) = loader_archive(arg) {
 		*BOOT_MODULES.lock() = Some(archive);
 		crate::serial_println!("riscv64: boot packages handed over by the loader ({} bytes)", archive.len());
+	}
+	// AND WHAT THE LOADER PROMOTED, which this port handed over and never read. See
+	// `crate::adopt_root_selection`.
+	if let Some(root) = loader_root_selection(arg) {
+		crate::adopt_root_selection(root);
 	}
 
 	// Prove the higher half is live: read back the VA this function is linked at.

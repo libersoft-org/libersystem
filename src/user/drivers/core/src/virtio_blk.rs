@@ -240,11 +240,15 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 		let mut span: Span = Span { handle: 0, virt: 0, phys: 0, bytes: 0, capability: queue.capability };
 		let max_sectors: u64 = (size_max / SECTOR as u64).max(1);
 		let mut req: [u8; 16] = [0u8; 16];
+		// EVERY CONSUMER OF THIS DISK, not the one that asked first. A second subscriber gets its
+		// own endpoint from the manager and it arrives here as a `CONNECT`; this is the set they
+		// accumulate in, and the loop below serves whichever has work.
+		let mut serving = common::Serving::new(blk_server);
 		loop {
 			// THE MANAGER'S PING IS ANSWERED BY THIS LOOP, not by a second one. An idle driver
 			// parked in `recv_blocking` would otherwise look exactly like a wedged one, which is
 			// the distinction the whole mechanism exists to make.
-			if !common::serve_or_answer(bootstrap, bind, blk_server) {
+			let Some(at) = common::serve_any_or_answer(bootstrap, bind, &mut serving) else {
 				// THE FLUSH IS WHAT `STOPPED` CERTIFIES, and this path used to exit without it: the
 				// helper answered the stop the instant it read one, so a disk with writes still in
 				// its device's cache reported that everything it had accepted was finished.
@@ -253,7 +257,10 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 				}
 				common::finish_stop(bootstrap, bind, queue.capability);
 				exit();
-			}
+			};
+			// THE ENDPOINT THAT HAS WORK, and every reply goes back on it. It was one fixed handle,
+			// which is the same assumption "one consumer per provider" was everywhere else.
+			let blk_server: u64 = serving.at(at);
 			match recv_blocking(blk_server, &mut req) {
 				Received::Message { len, handle } if len >= 16 => {
 					let op: u32 = u32::from_le_bytes([req[0], req[1], req[2], req[3]]);
@@ -275,7 +282,11 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 						}
 					}
 				}
-				_ => exit(),
+				// THIS CONSUMER IS GONE, AND THE DISK IS NOT. Closing one endpoint used to end the
+				// driver, because there was only ever one; with several, a consumer that closes is
+				// one client leaving and the rest keep their disk. The last one leaving is not an
+				// exit either - the manager decides when a binding ends, not the last reader.
+				_ => serving.close_at(at),
 			}
 		}
 	}

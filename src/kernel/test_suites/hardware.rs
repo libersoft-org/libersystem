@@ -430,7 +430,15 @@ fn a_pci_function_nothing_binds_is_still_inventoried_and_holds_nothing() {
 	let mut same_kind: alloc::vec::Vec<(u16, u8, u8, u8)> = alloc::vec::Vec::new();
 	for index in 0..count {
 		if let Some(row) = crate::device::with(index, |d| (d.device_type, d.bus, d.dev, d.func)) {
-			same_kind.push(row);
+			// SYNTHETIC ROWS ARE NOT BUS FUNCTIONS, and this is about bus functions. `add_synthetic_device`
+			// appends a table entry with `device_type: u16::MAX` at the non-address `ff:1f.7` so a
+			// test can drive claim mechanics without a device; several tests in this suite make one,
+			// and in a whole-suite run there is more than one - which is two rows carrying the same
+			// non-address, not two rows naming one PCI function. Asserted per tag ran, and this only
+			// showed up on the full suite.
+			if row.0 != u16::MAX {
+				same_kind.push(row);
+			}
 		}
 	}
 	for (at, left) in same_kind.iter().enumerate() {

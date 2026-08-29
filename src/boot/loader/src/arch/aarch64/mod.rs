@@ -276,7 +276,7 @@ fn build_boot_info(bs: *mut BootServices, dtb: u64, init_pkg: Option<&'static [u
 				if let Some(volume) = live_volume {
 					serial::write_str("loader: live system volume handed over\n");
 					// The index the `Embedded` selection names - see `record_embedded_root`.
-					crate::record_embedded_root(count);
+					crate::record_embedded_root(count as u32);
 					*entries.add(count as usize) = crate::make_module(volume, crate::LIVE_VOLUME_FILE, 0);
 					count += 1;
 				}
