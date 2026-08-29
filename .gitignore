@@ -26,19 +26,10 @@ target/
 # ...but the embedded console font is a required source asset, not a build output
 !src/term/src/unscii16.bin
 
-# Image / distribution archives
-*.zip
-*.gz
-*.xz
-*.7z
-*.tar
-
 # Editor
 *.swp
 *~
-*.bak
 *.tmp
-/AI/
 
 # OS
 .DS_Store
