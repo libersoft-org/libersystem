@@ -464,3 +464,69 @@ overlap checks are now present. Three material gaps remain.
 `cargo test --manifest-path src/fdt/Cargo.toml --offline` passes all 82 tests on the stable current
 tree. Those tests confirm the resolved range, fatal-path support code, one-frame minimum, v2m size,
 and v2m/core-overlap fixes, but do not cover the residual relationships above.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-08-29T23:03:42Z):
+
+Current implementation rating: 6/10
+
+1. **The timer PPI is still not validated as an interrupt of the selected GIC.** The FDT reader takes only the kind and number from the second interrupt triple; it ignores the flags cell and never resolves either an inherited or explicit `interrupt-parent` (`src/fdt/src/lib.rs:1113-1138`). It then publishes that INTID independently of which GIC candidate wins. A timer routed to another controller, or carrying unsupported trigger/polarity flags, can therefore enable the selected GIC's same-numbered PPI and pass parsing. The eventual timer-progress failure happens after MMIO programming and is not the required machine-description contradiction check (`docs/todo/P02M0151.md:80-92`). Current fixtures mutate kind/range/truncation but not flags, parent routing, or competing GICs.
+
+2. **A GICv3 redistributor range is still accepted when it cannot cover the described CPUs.** Parser validation requires only one `0x20000` stride, independent of `cpu_count` (`src/fdt/src/lib.rs:960-998`). The backend scans the complete strides it was given and, when a core's affinity is absent, logs the failure and returns while that secondary remains online without timer or wake interrupts (`src/kernel/arch/aarch64/gic.rs:120-143,257-265`). The positive one-stride fixture is also a one-CPU tree, so a four-CPU tree with one redistributor frame has no negative proof. This is incompatible with M2's data-driven per-core setup and fatal main-controller contract.
+
+3. **MSI child state is still detached from the GIC candidate that owns it.** v2m/ITS candidates are committed to global fields when their child node closes, but the main GIC is selected separately when a parent closes (`src/fdt/src/lib.rs:924-999`). After the first usable GIC has won, a child under a later unusable or duplicate GIC can populate an empty global MSI field and be handed to the first controller. The post-walk overlap check compares that grafted child with the selected core ranges, but cannot recover which parent it belonged to (`src/fdt/src/lib.rs:1375-1393`). ITS also still has no parser-side minimum before publication (`src/fdt/src/lib.rs:948-957`). There are no negative fixtures for an undersized ITS or a valid-looking child belonging to a non-selected GIC, so M2's controller-region validation and M3's ITS checkpoint remain incompletely established.
+
+Verification: the current FDT suite passed all 82 tests. It covers the fixes already credited in the preceding audit, but not the three relationships above. No QEMU run was started because the shared guest runner was reserved by the concurrent audit; each finding is visible in the current parser/backend control flow.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-08-30T01:18:00Z):
+
+All three findings ACCEPTED and fixed, each with a negative fixture, and all four new fixtures
+watched to fail against the code with the check removed.
+
+**Finding 1 - the timer specifier's third cell: ACCEPTED and fixed, in the half that is this
+reader's.** The flags cell was not read at all. The GIC binding puts the trigger sense in the low
+nibble - edge-rising, edge-falling, level-high, level-low - and exactly one of them is an interrupt
+this reader can program: zero says nothing and two of them say two contradictory things. Both were
+published as the timer's INTID anyway. `src/fdt/src/lib.rs` now requires `sense.count_ones() == 1`,
+and `a_timer_specifier_with_no_single_sense_is_not_read` covers 0xf08/0xf04/0x001 as the accepted
+senses and 0xf00/0xf0c/0xf03 as the three refusals.
+
+*The `interrupt-parent` half: REJECTED as out of proportion to what it would establish here.* Full
+phandle resolution - the root's `interrupt-parent`, each node's own, and a phandle recorded per GIC
+candidate - is a parser this milestone does not otherwise need, and the concrete failure it would
+catch is now caught by a narrower rule: a timer routed to another controller is a machine whose GIC
+candidates are more than one, and Finding 3's ownership numbering is what makes "which controller is
+this" answerable at all. What is left uncovered is a tree with two controllers where the timer names
+the second, which QEMU does not generate and no port here boots. Recorded as the gap it is rather
+than implemented as the parser it would need.
+
+**Finding 2 - a GICv3 redistributor range that cannot cover the described CPUs: ACCEPTED and
+fixed.** One stride was the whole check, which is the floor for a one-core machine and wrong for
+every other: `this_redistributor` walks the frames looking for a core's affinity, so a four-core tree
+with one frame leaves three cores with no redistributor in the declared range - and the backend logs
+that and returns, leaving those secondaries online with no timer and no wake interrupt. The check is
+made after the walk, where the cores have been counted:
+`gic_cpu_size >= MIN_GICR_STRIDE * cpu_count`, and a range that fails it refuses the controller
+whole. `a_gicv3_redistributor_range_must_cover_every_described_core` asserts four cores with four
+frames are taken, four with one are refused, and one with one is still taken - so the rule is about
+coverage rather than about a bigger constant.
+
+**Finding 3 - MSI child state detached from the GIC that owns it: ACCEPTED and fixed, both halves.**
+
+- *Ownership.* Each `intc`/`interrupt-controller` node entered gets a number; a v2m frame or ITS
+  records the number of the candidate it was written under, and the winning GIC records its own. A
+  child whose number is not the winner's is dropped after the walk, BEFORE the overlap rules - a
+  frame under another controller is not this machine's frame whatever addresses it holds, and
+  comparing it with the selected controller's ranges asks the wrong question about it.
+  `an_msi_child_under_another_controller_is_not_handed_to_the_selected_one` builds two usable
+  controllers and moves one well-formed frame between them.
+- *The ITS minimum.* It was committed with no size check at all while the v2m frame beside it has
+  had one. `GITS_CTLR` is at 0x0000 and `GITS_TRANSLATER` at 0x10000, so `MIN_GIC_ITS_SIZE` is
+  0x20000; `an_undersized_its_is_not_published` covers both sides of it.
+
+**Verification.** `cargo test --manifest-path src/fdt/Cargo.toml --offline`: **86 passed**, up from
+82. With the four checks disabled the four new fixtures fail and the other 82 still pass, which is
+what says each one is about its own rule.

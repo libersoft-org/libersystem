@@ -146,7 +146,7 @@ unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq:
 				match common::wait_or_answer(bootstrap, bind, &[irq, frames]) {
 					Some(at) => at as i64,
 					None => {
-						common::finish_stop(bootstrap, bind, rx.capability);
+						common::finish_stop(bootstrap, bind, rx.capability, device.quiesce());
 						exit()
 					}
 				}
@@ -154,7 +154,7 @@ unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq:
 				match common::wait_or_answer(bootstrap, bind, &[irq]) {
 					Some(_) => 0,
 					None => {
-						common::finish_stop(bootstrap, bind, rx.capability);
+						common::finish_stop(bootstrap, bind, rx.capability, device.quiesce());
 						exit()
 					}
 				}

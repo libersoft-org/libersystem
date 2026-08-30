@@ -114,3 +114,11 @@ AUDITOR'S RE-AUDIT ON M0155 (2026-08-29T19:01:24Z):
 Current implementation rating: 10/10
 
 No material unresolved issue remains within M0155's scope. The production FAT adapter still overrides `read_blocks` with the chunked multi-sector service path (`src/user/services/storage/src/service.rs:3513-3530`), and the final per-device degraded-DMA report still runs on both userspace success and failure/reboot paths (`src/kernel/main.rs:944-965`). Current FAT, UEFI, and ABI host suites passed 128, 41, and 28 tests respectively.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0155 (2026-08-29T23:04:15Z):
+
+Current implementation rating: 10/10
+
+No material unresolved issue remains within M0155's scope. The production FAT adapter still batches contiguous reads through the block service, the loader still distinguishes absent firmware files from unreadable volumes while latching read-only mounts, and the final named DMA report remains present on both userspace outcomes. Current FAT, UEFI, and ABI host suites passed 128, 41, and 28 tests respectively.

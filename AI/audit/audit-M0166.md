@@ -257,3 +257,74 @@ Rating: 6/10
 1. **The stored-disable fix parks the state but consumes the candidate list, and `enable` can also consume it while the original binding is still online.** `begin_bind` now sees `disabled_by_policy`, moves the record to `Disabled`, and returns the same `false` used for an artifact/claim/spawn failure (`src/user/services/core/src/device_manager.rs:2702-2717`). `start_candidate` consequently increments `node.candidate` and loops after every such refusal (`src/user/services/core/src/device_manager.rs:1027-1044`). When an online device with a late-loaded stored disable later fails, the first attempted recovery correctly becomes `Disabled` but exhausts all candidates; a subsequent enable moves it to `Unbound` with nothing left to launch. Separately, enabling before that online binding fails still ignores the illegal `Online -> Unbound` result, sets `restart_requested`, and the standing loop calls `start_candidate` without a state guard, producing the same exhaustion (`src/user/services/core/src/device_manager.rs:527-530,3417-3429`). Thus the retained desire fixes persistence only by making a later re-enable unable to recover the device. Treat policy-disabled as a parked/non-failure result that never advances a candidate; only request a restart when `Disabled -> Unbound` actually succeeds, and require `Unbound` at the standing-loop restart seam. Cover both late-disable sequences (enable before and after the online driver exits).
 
 2. **The new post-manager incident fallback is not the scoped `--incident N` interface the milestone requires.** Persistence now includes the full report and `lsdev` does read it after the live endpoint closes, resolving the earlier absence. However, `stored_incident` discards `index` and prints every `device.policy.incident.*` entry (`src/user/apps/tools/src/lsdev.rs:222-259`), so `lsdev --incident N` can report unrelated devices and cannot say whether N has an incident. To do even that broad list, PermissionManager grants `lsdev` the general `Capability::Config` (`src/user/services/core/src/permission_manager.rs:219-230`); this is a full Config client, whose `set` accepts writes to every non-reserved key (`src/user/services/core/src/config_service.rs:185-216`), despite the new comment calling it a prefix read. This unnecessarily widens a device-status tool into authority over unrelated system configuration and bypasses the plan's surviving, narrowly owned snapshot integration (`docs/todo/P02M0166.md:218-225`). Preserve an index-to-record identity in the surviving store and expose a read-only/scoped lookup (through ServiceManager as planned or an equivalently narrow endpoint), so the requested record survives without granting `lsdev` general Config mutation authority.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-08-29T23:02:31Z):
+
+Current implementation rating: 6/10
+
+1. **An accepted operator `retry` can still grant zero attempts after ordinary candidate exhaustion.** Both phase-two and standing-loop `Step::NextCandidate` handling increment `node.candidate`, including past the last entry (`src/user/services/core/src/device_manager.rs:552-557,948-956`). `PolicyVerb::Retry` reduces only the automatic-attempt counter, opens a new incident, and sets `restart_requested`; it never restores a candidate to retry (`device_manager.rs:3469-3488`). The standing loop consumes the flag and calls `start_candidate`, which immediately returns when `candidate >= candidates.len()` before re-evaluating `requires` or opening a bind (`device_manager.rs:527-539,995-1028`). A normally exhausted `Failed` node therefore reports `Accepted` but performs no attempt and cannot reach `DependencyPending` when its requirement remains absent. This violates the explicit one-extra-attempt and requirement-re-evaluation contract (`docs/todo/P02M0166.md:76-77,241-248`).
+
+2. **The post-manager `--incident N` fallback can return a stale record for a different device from an earlier boot.** DeviceManager stores incident rows durably under stable BDF keys, embeds the current boot's transient row `index`, and never removes old incident keys (`src/user/services/core/src/device_manager.rs:3721-3809`; `src/user/services/core/src/config_service.rs:96-143`). The comment says the requested index is resolved to an address through DeviceService, but `apply_verb` is passed only the policy and Config handles; on live-endpoint failure `stored_incident` instead calls the general Config `list` and prints every incident value containing the literal ` index=N` (`src/user/apps/tools/src/lsdev.rs:29-50,102-125,222-276`). If inventory membership or order changes, an old BDF can retain the same row number now assigned to another device, so the lookup can print the wrong snapshot or multiple snapshots. That is not the requested binding's last incident and also turns the explicitly non-historical snapshot into retained history (`docs/todo/P02M0166.md:253,267-268`).
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-08-30T01:01:21Z):
+
+**Finding 1 - policy-disabled consumes the candidate list, and `enable` consumes it while the binding
+is still online: ACCEPTED and fixed.** Both halves were exactly as reported, and the second one is
+the worse of the two: the retention fix would have made a later re-enable unable to recover the
+device, which is a defect the fix introduced rather than one it left.
+
+Three changes in `src/user/services/core/src/device_manager.rs`:
+
+- **A stored disable parks the node before any candidate is spent.** The refusal was made inside
+  `begin_bind`, which answers `false` for it - the same answer a refused claim and a failed spawn
+  give - so `start_candidate` read it as "this candidate did not work" and walked the whole list. A
+  policy disable is a property of the NODE, not of any one candidate, so it is answered at the top of
+  `start_candidate`, before the list is consulted at all, and the cursor is untouched.
+- **`PolicyVerb::Enable` reads the answer of its own transition.** It attempted `Online -> Unbound`,
+  ignored the `false`, and requested a restart anyway. There is nothing to restart on a device that
+  is already running, and asking for one spent its candidates against a state no bind can start
+  from. The desire is lifted either way; only a node that actually reached `Unbound` gets an attempt,
+  and the console says so when it does not.
+- **The standing loop's restart seam refuses a node that still HAS a binding.** It cannot require
+  `Unbound` - `Retry` legitimately asks for an attempt from `Failed` and from `Backoff` - so what it
+  refuses is `binding.is_some() || teardown.is_some()`, which is the state where `Online -> Binding`
+  is not an edge and every attempt would fail while advancing the cursor.
+
+**Finding 2 - the incident interface: ACCEPTED, both halves, and fixed.**
+
+*The index.* `stored_incident` discarded it and printed the whole prefix, so `lsdev --incident 3`
+reported unrelated devices and could not say whether device 3 had an incident at all - a listing
+where a lookup was asked for. The record stays KEYED by the device's address, because that is its
+identity across boots and a row number names whatever the table happened to hold; what it now also
+CARRIES is `index=N`, the row number this boot gave it, which is what the operator's question is
+asked by. `lsdev` matches on that, with the space-or-end check that keeps `index=1` from matching
+`index=12`, and says "no incident is stored for device N" rather than "for any device".
+
+*The authority.* The observation is right and it was the part of the earlier fix I was least happy
+with: `Capability::Config` is a full configuration client, and `set` accepts any key outside the
+reserved namespace, so a status tool was given authority over unrelated system configuration to
+answer a question about a device.
+
+A connection can now be SEALED, and the granting authority is what seals it:
+
+- `src/idl/config.lsidl` gains `@op(5) seal: func() -> result<unit, error>`, regenerated through
+  `./gen.sh`.
+- `ConfigService` keeps the channel each request arrived on and the set of sealed ones - the same
+  per-connection identity `privileged` already uses, pointed the other way: that one names the single
+  caller allowed MORE than the rest, this one names callers allowed less. `set` and `remove` refuse
+  on a sealed connection. There is no unseal.
+- `PermissionManager` seals the connection it mints for a component listed in `config_is_read_only`,
+  before duplicating it out. `lsdev` is that list. A function rather than a manifest field, for the
+  reason `asset_bundle` beside it gives: the manifest says whether a capability is granted at all,
+  and how much of it a particular program should have is answerable from the program's identity.
+
+So what `lsdev` receives can only read, and asking again produces another sealed connection rather
+than a writable one. This is not a promise the holder makes about itself, which is what a
+voluntary drop would have been.
+
+**Verification.** `./build.sh --arch x86_64` clean. The device-manager and config changes are
+exercised by the service suite in the final run at the end of this job.

@@ -230,23 +230,56 @@ fi
 # the UNREADABLE branch, not this one. `mkpackages` omits the list under
 # `LIBER_OMIT_BOOTSTRAP_LIST`, and the manifest is built over what is actually staged, so the volume
 # this produces is internally consistent and correctly signed and has no list.
+# THE BOOTABLE SHAPE IS THREE FILES, AND ALL THREE ARE PUT BACK.
+#
+# The shape is the image, the uuid sidecar beside it and the build stamp that says which sources
+# produced them - one identity, and every consumer reads it as one. This case rebuilds the volume in
+# place to omit its bootstrap list, and the rebuild rewrites ALL THREE. Saving the image alone left
+# the restored image paired with the listless build's uuid and carrying that build's stamp: a shape
+# assembled from two different builds, which the next image or boot gate would then read as current.
+#
+# Restored through the EXIT trap rather than at the end of the function, because an interruption or
+# an early return is exactly when a half-restored shape gets left behind.
+BOOTABLE_SHAPE=("$BUILD/system-volume-bootable-x86_64.img" "$BUILD/system-volume-bootable-x86_64.uuid" ".build/state/built-x86_64-volume")
+restore_bootable_shape() {
+	local at=0 file saved
+	for file in "${BOOTABLE_SHAPE[@]}"; do
+		saved="$work/shape.$at"
+		((at += 1))
+		[[ -f "$saved" ]] || continue
+		cp "$saved" "$file"
+	done
+}
+
 absent_list_case() {
-	local volume="$BUILD/system-volume-bootable-x86_64.img"
+	local volume="${BOOTABLE_SHAPE[0]}"
 	[[ -f "$volume" ]] || {
 		echo "signed-boot: no bootable system volume, so the absent-list case is not run" >&2
 		return 0
 	}
-	local saved="$work/volume-with-list.img"
-	cp "$volume" "$saved"
+	# SAVED FIRST AND ARMED FIRST. The trap is set before the rebuild, so every path out of this
+	# function - success, failure, interruption - puts the shape back.
+	local at=0 file
+	for file in "${BOOTABLE_SHAPE[@]}"; do
+		[[ -f "$file" ]] && cp "$file" "$work/shape.$at"
+		((at += 1))
+	done
+	trap 'restore_bootable_shape; rm -rf "$work"' EXIT
 	if ! LIBER_OMIT_BOOTSTRAP_LIST=1 ./build.sh --arch x86_64 --kernel-on-volume --part volume >"$work/omit.log" 2>&1; then
-		cp "$saved" "$volume"
+		restore_bootable_shape
 		echo "signed-boot: could not build a volume without its bootstrap list" >&2
 		return 1
 	fi
 	cp "$volume" "$work/volume-no-list.img"
 	# THE TREE IS PUT BACK BEFORE THE BOOT, so a failure here cannot leave a listless volume behind
-	# for whatever runs next.
-	cp "$saved" "$volume"
+	# for whatever runs next - and put back WHOLE, sidecar and stamp with the image.
+	restore_bootable_shape
+	# AND THE RESTORED SHAPE IS COHERENT, asserted rather than assumed: the sidecar beside the image
+	# must name the image that is actually there.
+	if ! pairing_matches_volume "$(<"${BOOTABLE_SHAPE[1]}")" "$volume"; then
+		echo "signed-boot: the bootable volume shape was not restored - its sidecar does not name the image beside it" >&2
+		return 1
+	fi
 
 	# AND THE MEDIUM IS PAIRED WITH THE VOLUME THAT IS ACTUALLY ATTACHED.
 	#
@@ -515,10 +548,28 @@ echo "signed-boot: and a release build refuses it, naming the missing signed man
 # These have no shipping ISO: their medium is the ESP the runner assembles, so the tamper happens
 # there. Emulated, so this is minutes rather than seconds - and it is the reason this phase is last.
 if [[ "${SIGNED_BOOT_PORTS:-1}" == "1" ]]; then
+	# THE LOADER THESE PORTS BOOT MUST BE THE ONE THIS TREE DESCRIBES.
+	#
+	# The phase checked for a kernel and booted. The thing under test here is the LOADER's verifier -
+	# shared source, three ports - and nothing asked whether each port's loader had been built from
+	# it. A green riscv64 run could therefore exercise a binary from an older tree and prove nothing
+	# about the code that was changed, which is the fail-open shape this gate exists to remove.
+	#
+	# The receipt and the comparison are the ones `test.sh` already makes for exactly this reason,
+	# through `lib.sh`'s `source_digest` - one authority over "is this built from these sources"
+	# rather than a second opinion here.
+	# shellcheck source=/dev/null
+	source ./lib.sh
 	for port in aarch64 riscv64; do
 		kernel=".build/cargo/kernel/$(case $port in aarch64) echo aarch64-unknown-none ;; riscv64) echo riscv64gc-unknown-none-elf ;; esac)/debug/kernel"
 		if [[ ! -f "$kernel" ]]; then
 			echo "signed-boot: no $port kernel - run ./build.sh --arch $port" >&2
+			exit 1
+		fi
+		loader_stamp=".build/state/built-$port-loader"
+		if [[ ! -f "$loader_stamp" || "$(<"$loader_stamp")" != "$(source_digest boot/loader)" ]]; then
+			echo "signed-boot: the $port loader was not built from this tree, so a refusal it makes says nothing about this verifier" >&2
+			echo "signed-boot:   run:  ./build.sh --arch $port --part loader" >&2
 			exit 1
 		fi
 		clean_log="$work/$port-clean.log"

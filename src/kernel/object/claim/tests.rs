@@ -302,3 +302,99 @@ fn a_teardown_that_runs_out_of_time_is_latched_terminal_and_a_late_finish_releas
 	assert_eq!(device::claim_state(index), Some(device::ClaimState::Quarantined));
 	assert_eq!(device::claim(index), Err(ClaimError::Quarantined), "and it is not claimed again this boot");
 }
+
+crate::tagged_test!(a_forced_release_takes_a_live_interrupt_away, [Object, Kernel, Pci, Interrupt], id = "kernel.object.claim.a_forced_release_takes_a_live_interrupt_away", covers = ["kernel"]);
+fn a_forced_release_takes_a_live_interrupt_away() {
+	// THE VECTOR, NOT ONLY THE CAPABILITY.
+	//
+	// Revoking an interrupt's header makes every HANDLE to it fail lookup and does nothing to the
+	// hardware binding: the unbind lived in `Interrupt::drop`, which a forced release cannot reach,
+	// because the holder is still running by definition and a wait in progress keeps the object
+	// alive as long as it likes. So a released device kept a bound, deliverable vector aimed at the
+	// old driver - and the next claimant could not be given that slot either, because it was still
+	// owned.
+	//
+	// This holds the `Arc` across the release, which is the hostile case: nothing here lets the
+	// object drop, so anything the release does it has to do itself.
+	use crate::object::KernelObject;
+	use crate::object::interrupt::Interrupt;
+	let index = device::add_synthetic_device();
+	let key = device::claim(index).expect("claimed");
+	let interrupt = Interrupt::new(0x71).expect("an interrupt object");
+	interrupt.mark_bound();
+	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(interrupt.clone() as alloc::sync::Arc<dyn KernelObject>))), "recorded as derived");
+	interrupt.signal();
+	assert!(interrupt.is_pending(), "a live interrupt that fired is pending");
+
+	assert_eq!(device::release_claim(key), Ok(ClaimState::Free), "the teardown confirmed");
+
+	assert!(interrupt.is_revoked(), "the release revoked the interrupt itself, not only every handle to it");
+	assert!(!interrupt.is_pending(), "and what it had already delivered does not survive the release");
+	// AND IT CANNOT BE SIGNALLED AGAIN. The dispatch table holds this weakly and can still upgrade
+	// it for a message that was already in flight; what must not happen is that message reaching the
+	// old holder.
+	interrupt.signal();
+	assert!(!interrupt.is_pending(), "a revoked interrupt is not signalled");
+}
+
+crate::tagged_test!(closing_the_last_claim_handle_releases_while_another_reference_is_alive, [Object, Kernel, Pci, Handle], id = "kernel.object.claim.closing_the_last_claim_handle_releases_while_another_reference_is_alive", covers = ["kernel"]);
+fn closing_the_last_claim_handle_releases_while_another_reference_is_alive() {
+	// THE LAST HANDLE, NOT THE LAST `Arc` - and the difference is a whole class of stuck device.
+	//
+	// The release used to be `Claim::drop`. That is the last strong reference, which equals the last
+	// handle only in a single-threaded process: a thread parked in `SYS_WAIT` on the claim holds an
+	// `Arc` until the claim settles, so a second thread closing the process's only claim handle
+	// dropped no object, started no release, and left the first thread waiting for a settlement
+	// nothing would ever produce. An in-flight syscall holding the object does the same for a
+	// shorter time.
+	//
+	// The retained `Arc` here is that waiter. Nothing drops it, and the close must release anyway.
+	use crate::object::handle::{Capability, HandleTable};
+	use crate::object::rights::Rights;
+	let index = device::add_synthetic_device();
+	let key = device::claim(index).expect("claimed");
+	let claim = Claim::create(key).expect("a claim object");
+	let mut table = HandleTable::new();
+	let handle = table.insert(Capability::new(claim.clone() as alloc::sync::Arc<dyn crate::object::KernelObject>, Rights::WAIT | Rights::MANAGE));
+	assert_eq!(device::claim_state(index), Some(ClaimState::Claimed), "held while the handle is open");
+	assert!(!claim.is_settled(), "and the claim has not settled");
+
+	table.close(handle).expect("closed");
+
+	assert!(claim.is_settled(), "closing the last handle settled the claim, with this reference still alive");
+	assert_eq!(claim.outcome(), Some(abi::CLAIM_STATE_FREE), "and it settled FREE, which is what a confirmed teardown reports");
+	assert_eq!(device::claim_state(index), Some(ClaimState::Free), "the device is claimable again");
+	// The reference outlived the release, which is the point: dropping it now must not tear
+	// anything down a second time.
+	drop(claim);
+	assert_eq!(device::claim_state(index), Some(ClaimState::Free));
+}
+
+crate::tagged_test!(a_release_in_progress_refuses_a_late_derivation, [Object, Kernel, Pci], id = "kernel.object.claim.a_release_in_progress_refuses_a_late_derivation", covers = ["kernel"]);
+fn a_release_in_progress_refuses_a_late_derivation() {
+	// THE ONE-TIME SWEEP IS NOT A BARRIER BY ITSELF.
+	//
+	// `begin_release` moves the slot to `Releasing` under the claims lock and the sweep then drains
+	// the derived table under a different one. A syscall that had already passed capability lookup
+	// could therefore register its object AFTER the sweep had run, and hand out a capability nothing
+	// would ever revoke - against a device already being given away, or against the next binding's
+	// domain. Registration now asks whether the key is still the live claim, under the release's own
+	// lock.
+	use crate::object::KernelObject;
+	use crate::object::device_memory::DeviceMemory;
+	let index = device::add_synthetic_device();
+	let key = device::claim(index).expect("claimed");
+	let memory = DeviceMemory::for_claim(key, 0xfeed_1000, 0x1000).expect("a device memory");
+	let weak = alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>));
+	assert!(device::register_derived(key, weak.clone()), "a live claim derives capabilities");
+
+	device::begin_release_for_test(key).expect("the release starts");
+	assert!(!device::register_derived(key, weak.clone()), "a claim that is being released derives nothing further");
+	device::finish_release_for_test(index, true);
+
+	// AND A STALE KEY IS REFUSED AFTER THE RELEASE HAS FINISHED, which is the same rule one step
+	// later: the generation has moved on and the row would belong to nobody.
+	assert!(!device::register_derived(key, weak), "a key whose claim has ended derives nothing at all");
+	let next = device::claim(index).expect("claimable again");
+	device::release_claim(next).expect("released");
+}

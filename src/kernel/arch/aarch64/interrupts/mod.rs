@@ -168,11 +168,16 @@ pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
 // The SPI is retired rather than freed, for the reason the x86 backend spells out: the device's
 // MSI-X entry was programmed to write the GICv2m frame, and nothing here can prove a write already
 // on its way will not land. The SPI waits for `SYS_DEVICE_QUIESCED`.
-pub fn unbind(vector: u32) {
+// Returns whether the teardown CONFIRMED - always, on this port: releasing the ITS translation and
+// retiring the slot are local operations with no remote agreement to wait for. The signature is
+// shared with riscv64, where the answer can be false, so a caller can fold it into a claim's
+// terminal state without asking which architecture it is on.
+pub fn unbind(vector: u32) -> bool {
 	if let Some(slot) = spi_slot(vector) {
 		release_translation(slot, vector);
 		REGISTRY.retire(slot);
 	}
+	true
 }
 
 // Allocate a free MSI SPI and program a device's MSI-X table entry 0 so the device

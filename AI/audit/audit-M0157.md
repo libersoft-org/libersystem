@@ -131,3 +131,11 @@ CURRENT IMPLEMENTATION RATING: 10/10
 
 No material issue remains. The current topology, SMP-boot, and FDT suites pass 38, 18, and 80 tests
 respectively, and no newer change regresses the previously verified ordering or refusal paths.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0157 (2026-08-29T23:04:15Z):
+
+Current implementation rating: 10/10
+
+No material unresolved issue remains within M0157's scope. The corrected secondary-release/publication ordering, below-local ACPI-distance refusal, and outside-direct-map IMSIC refusal fixture are all still present. Current topology, SMP-boot, and FDT suites passed 38, 18, and 82 tests respectively.

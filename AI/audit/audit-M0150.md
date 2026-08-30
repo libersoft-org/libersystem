@@ -259,3 +259,61 @@ Current implementation rating: 6/10
 ## Verification
 
 Current ABI, FDT, topology, DMA, FAT, and UEFI host suites passed (28, 80, 38, 54, 128, and 41 tests). The signed-boot run passed every x86_64 case through and including the new selected-volume/list-absent refusal. Its cross-port phase was not counted because the gate itself proved to be using stale loaders, and its live post-mutation volume mismatch was preserved rather than repaired.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0150 (2026-08-29T23:03:42Z):
+
+Current implementation rating: 6/10
+
+1. **The selected-source fix still permits two source-mixing paths.** In the development-only v1 branch, `assemble_bootstrap` returns `Selection::Unavailable` unchanged when `etc/bootstrap.list` is absent (`src/boot/loader/src/blockio.rs:194-221`). That remains true even when `Expected::volume(Exactly(...))` says the signed boot medium paired with and selected this volume, so a test-trust boot can take its kernel and later take another source's bootstrap. The signed v2 path has a separate unpaired variant: `Expected::selects_its_source` recognizes only exact pairing or a bootstrap-list row (`src/boot/loader/src/trust.rs:204-213`). In test-trust, an unpaired volume may therefore provide a signed, verified `KIND_KERNEL` row and kernel while omitting the list; bootstrap assembly returns `Unavailable`, and later sources may supply the bootstrap (`src/boot/loader/src/main.rs:183-235,686-758`). Selecting and executing that manifest's kernel already selected its source. Treating its missing list as absence violates M3's same signed release/source requirement and M4's rule that a manifest-selected source fails terminally (`docs/todo/P02M0150.md:109-138`).
+
+2. **The list-absence gate still mutates canonical build state incompletely.** `absent_list_case` saves and restores only `.build/boot/system-volume-bootable-x86_64.img` (`src/tools/check-signed-boot.sh:233-250`). Its nested `build.sh --part volume` also rewrites the volume UUID sidecar and `.build/state/built-x86_64-volume`, neither of which is restored, and there is no trap protecting the image on interruption. A successful gate can leave the build receipt and UUID describing the temporary listless image while the restored image contains the list, or interruption can leave the temporary image itself. A later build happened to make the currently present image and sidecar consistent; it does not repair the gate's unsafe state transition.
+
+3. **The cross-port signed-boot gate still accepts stale loader binaries.** The aarch64/riscv64 phase checks for a kernel and invokes `run.sh`, but never compares each loader receipt with `source_digest boot/loader` or rebuilds it (`src/tools/check-signed-boot.sh:511-551`). At this re-audit the current loader digest was `6f07cb214e...fab0`, while `built-riscv64-loader` still recorded `74991b907...5639`. Thus a green riscv64 mutation run can still exercise an older verifier and cannot establish that the current shared loader source compiles or rejects the mutation on that port. The currently matching aarch64 receipt does not close this fail-open gate design.
+
+Verification: the current ABI, UEFI, boot-protocol, boot-signature, and sign-manifest suites passed 28, 41, 54, 4, and 8 tests respectively, and the signed-boot script passes shell syntax checking. These host checks do not execute the source-selection branches or prove loader freshness. QEMU was not run in this re-audit because the shared guest runner was reserved by the concurrent audit.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0150 (2026-08-30T01:18:00Z):
+
+**Finding 1 - two remaining source-mixing paths: ACCEPTED and fixed, both.**
+
+*The development v1 branch.* The rule that a CHOSEN source with no bootstrap list is a refusal - not
+an absence another source may fill - was enforced only in the signed branch. `assemble_bootstrap`'s
+`etc/boot.manifest` path returned `Unavailable` unchanged, and that is the `test-trust` profile,
+where a mixed boot is easiest to arrange: the rule held exactly where it was least needed. There is
+no signed manifest there to ask about rows, so the pairing is the whole question, and
+`Expected::pairs_with_this_source` is that half of `selects_its_source` on its own.
+
+*The unpaired signed volume.* Also right, and the reasoning is the part worth keeping: a manifest
+carrying a `KIND_KERNEL` row is the one the running kernel came from, and a boot that has EXECUTED a
+source's kernel has selected that source whatever named it. `selects_its_source` now answers true for
+pairing, for a bootstrap-list row, or for a kernel row. Without the third, an unpaired volume could
+hand over a signed, verified kernel, omit its list, and have the absence read as "not a LiberSystem
+source" - kernel from here, bootstrap set from somewhere else, with nothing forged.
+
+**Finding 2 - the list-absence gate mutates canonical build state incompletely: ACCEPTED and fixed.**
+The same defect the M0160 re-audit reports, and fixed once: `BOOTABLE_SHAPE` names the image, the
+uuid sidecar and the build stamp; all three are saved before the rebuild; the EXIT trap is armed at
+that moment so an interruption restores them too; and `pairing_matches_volume` asserts the restored
+shape is coherent before the case goes on. See the M0160 response for the detail.
+
+**Finding 3 - the cross-port phase accepts stale loader binaries: ACCEPTED and fixed.** The phase
+checked for a kernel and booted. The subject under test is the LOADER's verifier - shared source,
+three ports - and nothing asked whether each port's loader had been built from it, so a green riscv64
+run could exercise a binary from an older tree and prove nothing about the code that changed.
+
+The check is the one `test.sh` already makes for exactly this reason, through `lib.sh`'s
+`source_digest`: `built-$port-loader` must equal `source_digest boot/loader`, and a mismatch is a
+refusal naming the build command. One authority over "is this built from these sources" rather than a
+second opinion in this gate.
+
+And the finding's measurement reproduces: `source_digest boot/loader` is `6f07cb214e...fab0` in this
+tree, `built-aarch64-loader` matches it, and `built-riscv64-loader` still records `74991b907...5639`.
+So the gate now refuses that port until it is rebuilt, which is the whole point - the riscv64 loader
+rebuild is part of the final verification run at the end of this job.
+
+**Verification.** `./build.sh --arch x86_64 --part loader` clean. The signed-boot gate itself runs in
+the final verification.

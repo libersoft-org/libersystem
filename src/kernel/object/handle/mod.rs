@@ -809,10 +809,34 @@ impl HandleTable {
 		if slot.cap.is_none() || slot.generation != handle.generation() {
 			return Err(HandleError::BadHandle);
 		}
-		slot.cap = None;
+		// THE LAST CLOSE OF A CLAIM HANDLE STARTS THE RELEASE, HERE, at the close.
+		//
+		// It was `Claim::drop`, which is the last strong `Arc` and not the last HANDLE. Those are
+		// the same thing only in a single-threaded process: a thread parked in `SYS_WAIT` on the
+		// claim holds an `Arc` until the claim settles, so a second thread closing the process's
+		// only claim handle dropped no object, started no release, and left the first thread waiting
+		// for a settlement nothing would ever produce. An in-flight syscall holding the object for
+		// the length of its own work does the same thing for a shorter time.
+		//
+		// Taken out of the slot first and released after the table's own bookkeeping, because the
+		// release reaches the device layer and this runs under the table's lock.
+		let closing = slot.cap.take();
 		retire_or_recycle(slot, &mut self.free, index);
 		if let Some(domain) = &self.domain {
 			domain.uncharge_handles(1);
+		}
+		if let Some(cap) = closing {
+			let object = cap.object();
+			let is_claim = cap.object_type() == ObjectType::Claim;
+			drop(cap);
+			// LAST IN THIS TABLE, which is what "the process closed its claim" means. Another
+			// process holding a transferred handle is a different holder, and its close is its own.
+			if is_claim
+				&& !self.slots.iter().any(|slot| slot.cap.as_ref().is_some_and(|other| Arc::ptr_eq(&other.object(), &object)))
+				&& let Some(claim) = object.as_any().downcast_ref::<super::claim::Claim>()
+			{
+				claim.release();
+			}
 		}
 		Ok(())
 	}

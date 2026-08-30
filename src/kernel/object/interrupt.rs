@@ -27,12 +27,15 @@ pub struct Interrupt {
 	// Set once this Interrupt actually owns its vector's binding, so only the owner
 	// unbinds on drop (a refused bind's Interrupt leaves the live binding alone).
 	bound: AtomicBool,
+	// REVOKED: the claim this was derived from has been released, and this object's authority ended
+	// with it. Set by `revoke`, never cleared - a revoked interrupt does not come back.
+	revoked: AtomicBool,
 }
 
 impl Interrupt {
 	// FALLIBLY: `SYS_IRQ_BIND` and `SYS_DEVICE_MSIX_ACQUIRE` reach this.
 	pub fn new(vector: u32) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), vector, pending: AtomicBool::new(false), bound: AtomicBool::new(false) })
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), vector, pending: AtomicBool::new(false), bound: AtomicBool::new(false), revoked: AtomicBool::new(false) })
 	}
 
 	pub fn vector(&self) -> u32 {
@@ -47,6 +50,14 @@ impl Interrupt {
 	// Mark the interrupt pending and wake any thread blocked waiting on it. Called
 	// from the interrupt-dispatch path when the bound vector fires.
 	pub fn signal(&self) {
+		// A REVOKED INTERRUPT IS NOT SIGNALLED. The dispatch table holds this weakly and a driver
+		// that is still running - or a wait that already resolved the object - holds it strongly, so
+		// revoking the capability alone left a live path from a released device's vector into the
+		// old holder. The vector is unbound by `revoke` as well; this is the second half, for a
+		// message already in flight when that happened.
+		if self.revoked.load(Ordering::Acquire) {
+			return;
+		}
 		self.pending.store(true, Ordering::Release);
 		sched::wake_object(self.header.koid());
 	}
@@ -57,8 +68,40 @@ impl Interrupt {
 	}
 
 	// Whether the IRQ has fired and not yet been cleared (the wait readiness).
+	//
+	// A REVOKED INTERRUPT IS NEVER PENDING, so a wait that resolved this object before the release
+	// and is testing readiness afterwards does not act on authority that has ended.
 	pub fn is_pending(&self) -> bool {
-		self.pending.load(Ordering::Acquire)
+		!self.revoked.load(Ordering::Acquire) && self.pending.load(Ordering::Acquire)
+	}
+
+	// Whether this interrupt's authority has been revoked with its claim.
+	//
+	// THE CFG IS ITS CALLER'S. The production paths do not ask - `signal` and `is_pending` consult
+	// the flag themselves, which is where it has to be enforced - so the only reader is the test
+	// that proves a forced release takes a live vector away. This tree denies dead code rather than
+	// suppressing the warning, so the cfg names the build where a caller exists.
+	#[cfg(test)]
+	pub fn is_revoked(&self) -> bool {
+		self.revoked.load(Ordering::Acquire)
+	}
+
+	// TAKE THE VECTOR AWAY NOW, rather than when the last reference happens to go.
+	//
+	// Unbinding lived in `Drop`, which is the wrong moment for a FORCED release: the holder is still
+	// running, and a wait in progress or any transient `Arc` defers that drop for as long as it
+	// likes. So a released device kept a live, bound, deliverable vector - and the next claimant
+	// could not have it either, because the slot was still owned.
+	//
+	// Returns whether the architecture CONFIRMED the teardown. On riscv64 a hart that does not
+	// answer leaves the slot armed and quarantined, and the claim's terminal state has to say so
+	// rather than reading `Free` from the IOMMU alone.
+	pub fn revoke(&self) -> bool {
+		self.revoked.store(true, Ordering::Release);
+		self.pending.store(false, Ordering::Release);
+		// `swap`, so the unbind happens exactly once however many callers race here - and so `Drop`
+		// does not repeat it against a slot another device may by then own.
+		if self.bound.swap(false, Ordering::AcqRel) { crate::arch::interrupts::unbind(self.vector) } else { true }
 	}
 }
 
@@ -69,7 +112,9 @@ impl Drop for Interrupt {
 		// The driver let go of this interrupt (closed the handle, or died): stop
 		// delivering its vector. Only the binding's owner unbinds, so a refused bind's
 		// Interrupt does not clear the live binding.
-		if self.bound.load(Ordering::Acquire) {
+		// `swap` for the same reason `revoke` uses one: a forced release may already have unbound
+		// this vector, and repeating it would tear down whatever owns the slot by now.
+		if self.bound.swap(false, Ordering::AcqRel) {
 			crate::arch::interrupts::unbind(self.vector);
 		}
 	}

@@ -1990,3 +1990,144 @@ fn a_v2m_frame_that_is_undersized_or_aliases_the_controller_is_refused() {
 	// The same for the CPU interface, which is the other range the controller declared.
 	assert_eq!(at(tree(0x0801_0800, 0x1000)).parse().expect("parses").gic_msi, 0, "nor may it overlap the cpu interface");
 }
+
+// A TIMER SPECIFIER WHOSE THIRD CELL DOES NOT NAME ONE SENSE.
+//
+// The reader took the kind and the number and skipped the flags entirely, so a tree carrying an
+// unsupported or self-contradictory trigger published its number as the timer's INTID anyway. The
+// GIC binding puts the sense in the low nibble - edge-rising, edge-falling, level-high, level-low -
+// and exactly one of them is an interrupt this reader can program. Zero says nothing; two say two
+// contradictory things; both are a machine description that has to be refused rather than half-read.
+#[test]
+fn a_timer_specifier_with_no_single_sense_is_not_read() {
+	let with_flags = |flags: u32| -> &'static [u8] {
+		machine(move |builder| {
+			let mut cells = Vec::new();
+			for number in [13u32, 14, 11, 10] {
+				cells.extend_from_slice(&1u32.to_be_bytes());
+				cells.extend_from_slice(&number.to_be_bytes());
+				cells.extend_from_slice(&flags.to_be_bytes());
+			}
+			builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &cells).end();
+		})
+	};
+
+	// THE BASELINE. 0xf08 is level-low with the PPI cpu mask above it, which is what every tree this
+	// system meets writes - so the refusals below are about the flags and not about the fixture.
+	assert_eq!(at(with_flags(0xf08)).parse().expect("parses").timer_intid, 30, "level-low is a sense, and the cpu mask above the nibble is not this reader's business");
+	assert_eq!(at(with_flags(0xf04)).parse().expect("parses").timer_intid, 30, "so is level-high");
+	assert_eq!(at(with_flags(0x001)).parse().expect("parses").timer_intid, 30, "and edge-rising");
+
+	assert_eq!(at(with_flags(0xf00)).parse().expect("parses").timer_intid, 0, "a specifier naming no sense at all describes no interrupt this reader can program");
+	assert_eq!(at(with_flags(0xf0c)).parse().expect("parses").timer_intid, 0, "and one naming level-high AND level-low describes two, which is a tree contradicting itself");
+	assert_eq!(at(with_flags(0xf03)).parse().expect("parses").timer_intid, 0, "the same for both edges at once");
+}
+
+// A GICv3 REDISTRIBUTOR RANGE THAT CANNOT COVER THE CORES THE TREE DESCRIBES.
+//
+// One stride was the floor and the only check, which is right for a one-core machine and wrong for
+// every other: `this_redistributor` walks the frames looking for a core's affinity, so a four-core
+// tree with one frame leaves three cores whose redistributor is not in the range at all. The backend
+// logs that and returns, and those secondaries come up with no timer and no wake interrupt - a boot
+// that looks like it worked and has three cores that cannot be scheduled onto.
+#[test]
+fn a_gicv3_redistributor_range_must_cover_every_described_core() {
+	let cores = |count: u32, cpu_size: u64| -> &'static [u8] {
+		let reg = gic_reg(0x0800_0000, 0x1_0000, 0x080a_0000, cpu_size);
+		let mut builder = Builder::new();
+		builder.begin("");
+		builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+		builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+		builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0);
+		for id in 0..count {
+			// The names only have to differ; `cpu@N` for a single digit is what every fixture here
+			// writes and four is as many as this test needs.
+			let name = ["cpu@0", "cpu@1", "cpu@2", "cpu@3"][id as usize % 4];
+			builder.begin(name).prop_u32("reg", id).end();
+		}
+		builder.end();
+		builder.begin("intc@8000000").prop_str("compatible", "arm,gic-v3").prop("reg", &reg).end();
+		builder.end();
+		builder.finish()
+	};
+
+	// FOUR CORES AND FOUR FRAMES IS THE MACHINE QEMU DESCRIBES, and it is taken.
+	let whole = at(cores(4, 0x20000 * 4)).parse().expect("parses");
+	assert_eq!(whole.cpu_count, 4);
+	assert_eq!(whole.gic_dist, 0x0800_0000, "a range that holds one frame per core is a controller this kernel can drive");
+
+	// FOUR CORES AND ONE FRAME IS NOT. Three of them have no redistributor in the declared range.
+	let short = at(cores(4, 0x20000)).parse().expect("parses");
+	assert_eq!(short.cpu_count, 4, "the cores are still described");
+	assert_eq!(short.gic_dist, 0, "and the controller is not, because its redistributor range covers one of them");
+
+	// ONE CORE AND ONE FRAME IS STILL FINE, so the rule is about coverage rather than about a bigger
+	// constant.
+	assert_eq!(at(cores(1, 0x20000)).parse().expect("parses").gic_dist, 0x0800_0000, "one core needs one frame");
+}
+
+// AN MSI CHILD BELONGS TO THE CONTROLLER IT WAS WRITTEN UNDER.
+//
+// The v2m frame and the ITS are committed when THEIR node closes, and the main GIC is chosen when
+// ITS node closes - which is later. Only the first usable GIC wins, but a child under a LATER
+// candidate still found the global MSI field empty and filled it, so the machine was handed a frame
+// belonging to a controller it is not running. The addresses may be perfectly legal; they are simply
+// not this controller's.
+#[test]
+fn an_msi_child_under_another_controller_is_not_handed_to_the_selected_one() {
+	let two_controllers = |child_under_second: bool| -> &'static [u8] {
+		let mut builder = Builder::new();
+		builder.begin("");
+		builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+		builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+		builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+		// THE ONE THAT WINS: first, usable, and it declares no child of its own.
+		builder.begin("intc@8000000").prop_str("compatible", "arm,cortex-a15-gic").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop("ranges", b"").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000));
+		if !child_under_second {
+			builder.begin("v2m@8020000").prop_str("compatible", "arm,gic-v2m-frame").prop_reg64(0x0802_0000, 0x1000).end();
+		}
+		builder.end();
+		// A SECOND CONTROLLER NOBODY IS RUNNING, with a child under it. Its frame is well formed and
+		// clear of every range - the only thing wrong with it is whose it is.
+		builder.begin("intc@9000000").prop_str("compatible", "arm,cortex-a15-gic").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop("ranges", b"").prop("reg", &gic_reg(0x0900_0000, 0x1_0000, 0x0901_0000, 0x1_0000));
+		if child_under_second {
+			builder.begin("v2m@9020000").prop_str("compatible", "arm,gic-v2m-frame").prop_reg64(0x0902_0000, 0x1000).end();
+		}
+		builder.end();
+		builder.end();
+		builder.finish()
+	};
+
+	// THE BASELINE: the child under the winning controller is taken.
+	let own = at(two_controllers(false)).parse().expect("parses");
+	assert_eq!(own.gic_dist, 0x0800_0000, "the first usable controller wins");
+	assert_eq!(own.gic_msi, 0x0802_0000, "and its own frame is its own");
+
+	// AND THE CHILD OF THE OTHER ONE IS NOT.
+	let foreign = at(two_controllers(true)).parse().expect("parses");
+	assert_eq!(foreign.gic_dist, 0x0800_0000, "the same controller still wins");
+	assert_eq!(foreign.gic_msi, 0, "a frame declared under a controller this machine is not running is not this controller's frame");
+}
+
+// AN ITS TOO SMALL TO HOLD THE REGISTERS ITS DEVICES WRITE.
+//
+// It was committed with no size check at all, while the v2m frame beside it has had one. `GITS_CTLR`
+// is at 0x0000 and `GITS_TRANSLATER` - the register a device writes to raise an interrupt - is at
+// 0x10000, so a window short of 0x20000 does not contain the stores this machine makes into it.
+#[test]
+fn an_undersized_its_is_not_published() {
+	let with_its = |size: u64| -> &'static [u8] {
+		let mut builder = Builder::new();
+		builder.begin("");
+		builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+		builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+		builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+		builder.begin("intc@8000000").prop_str("compatible", "arm,gic-v3").prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop("ranges", b"").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x080a_0000, 0x20000));
+		builder.begin("its@8080000").prop_str("compatible", "arm,gic-v3-its").prop_reg64(0x0808_0000, size).end();
+		builder.end().end();
+		builder.finish()
+	};
+
+	assert_eq!(at(with_its(0x20000)).parse().expect("parses").gic_its, 0x0808_0000, "a whole ITS window is taken");
+	assert_eq!(at(with_its(0x1000)).parse().expect("parses").gic_its, 0, "and one that does not reach GITS_TRANSLATER is not an ITS this kernel can command");
+}

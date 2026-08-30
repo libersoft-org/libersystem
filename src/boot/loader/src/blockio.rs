@@ -211,6 +211,18 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F, expected: &crate::tr
 	};
 	crate::arch::serial::write_str("loader: THIS SOURCE IS NOT AUTHENTICATED - it carries no signed manifest, and this build accepts the checksum one\n");
 	let verdict = abi::bootstrap::assemble(|path| fs.read(path), |path, bytes| digests_ok(&manifest, path, bytes));
+	// THE SAME RULE HERE, and it was only in the signed branch above.
+	//
+	// A missing list on a source the medium's manifest NAMED is a refusal, not an absence: the
+	// kernel came from this volume and taking the bootstrap set from another is the two-halves-of-
+	// two-systems outcome. That was enforced for the signed path and not for this one - and this is
+	// the development profile, where a mixed boot is easiest to arrange, so leaving it out made the
+	// rule hold exactly where it was least needed. There is no signed manifest to ask about rows
+	// here, so the pairing is the whole question.
+	if matches!(verdict, abi::bootstrap::Selection::Unavailable) && expected.pairs_with_this_source() {
+		crate::arch::serial::write_str("loader: this source was chosen and its bootstrap list is not on it - refusing to take one from somewhere else\n");
+		return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::ListAbsentOnSelectedSource);
+	}
 	if matches!(verdict, abi::bootstrap::Selection::Verified(_)) {
 		// SAY THAT IT CHECKED. A check that is silent when it passes cannot be told apart in a boot
 		// log from one that was never wired up, and this one's whole value is that it ran.

@@ -641,6 +641,14 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	// cannot grow is a refusal rather than a buffer nothing can revoke.
 	if let Some(key) = claim {
 		if !device::register_derived(key, alloc::sync::Arc::downgrade(&(object.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+			// AND THE BUFFER IS HELD RATHER THAN GIVEN BACK. The registration refuses for two
+			// reasons: a table that cannot grow, and a claim that is no longer the live one -
+			// which is a release that started while this call was creating and mapping the
+			// buffer. In the second case the sweep has already run, so nothing else will ever
+			// revoke these frames, and a device that was never reset may have their physical
+			// addresses in a live descriptor. Orphaned is what every other forced-release path
+			// does with exactly that state.
+			object.mark_orphaned();
 			return ERR_RESOURCE_EXHAUSTED;
 		}
 	}

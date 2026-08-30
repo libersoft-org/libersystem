@@ -258,3 +258,54 @@ Correction required: add a well-formed mutation that removes one manifest-declar
 while retaining both artifacts and assert the reverse-check diagnostic. Construct deterministic
 subjects for the topology-dependent cases or fail when they cannot be created; count executed
 mutations and print success only when every promised case reached its asserted refusal.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0156 (2026-08-29T23:04:15Z):
+
+Current implementation rating: 7/10
+
+1. The staged-consistency gate still cannot restore all mutations on failure or interruption. Its EXIT handler restores only the single-file `victim` and then deletes `$work` (`src/tools/check-staged-consistency.sh:43-51`). Case 9 moves the complete real `$LIB` tree into `$work/held` without registering it with that handler (`:192-203`), so an unexpected acceptance, signal, or other early exit deletes the saved tree and leaves the empty replacement. Case 10 has the same defect at file scale: it moves an unreferenced real library to `$work/unreferenced.lslib` and calls `refuses` without setting trap state (`:208-221`), so the failure path deletes that library. This remains a material shared-build-output corruption risk in the registered gate.
+
+2. The verifier's reverse manifest-edge check is present, but its required negative proof is still absent. Case 11 adds an undeclared edge; no case removes a manifest-declared provider row while keeping both artifacts staged (`check-staged-consistency.sh:226-265`). Cases 10 and 11 may also skip for lack of a topology-dependent subject, while the final line unconditionally claims that eleven mutations were refused (`:268-271`). The reverse branch can therefore regress, or either conditional proof can stop running, without invalidating the gate's success claim.
+
+Verification: `arch-surface` passed over 61 files; the verify-model suite passed 108 tests; missing staged input and an unknown architecture-profile selector were both refused; relevant shell syntax checks passed. The destructive staged-tree gate was deliberately not run against shared output because the unresolved restoration paths above are reached precisely on failure.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0156 (2026-08-30T01:18:00Z):
+
+**Finding 1 - the gate cannot restore all its mutations on failure or interruption: ACCEPTED and
+fixed.** Correct, and it matters for the reason the finding gives: the unrestored paths are reached
+precisely on FAILURE, because `refuses` exits non-zero when a mutation is accepted - which is the
+case this gate exists to catch. Case 9 moved the whole staged tree and case 10 an unreferenced
+library, and neither told the EXIT handler, so a signal or an early exit ran `rm -rf "$work"` over
+the only copy and left the tree empty or the library gone. That is shared build output.
+
+`src/tools/check-staged-consistency.sh` gains `moved_aside`/`moved_back`: a list of
+`source<TAB>destination` pairs replayed in reverse, registered BEFORE the mutation is tested and
+replayed by `restore`, which the EXIT trap already ran. Both cases now register, and both call
+`moved_back` on their success path so the ordinary flow is the same one the trap would take.
+
+**Finding 2 - the reverse edge has no negative proof, and the closing claim is unconditional:
+ACCEPTED and fixed, both halves.**
+
+- **Case 12** removes a `provider=` row the MANIFEST declares from the consumer's identity note while
+  both artifacts stay staged - which is what a library rebuilt without one of its providers looks
+  like: fewer edges recorded, and every edge it does record still checks out. Only the manifest can
+  notice, and only in that direction, so without this case the verifier's reverse branch could be
+  deleted and the gate would stay green. The row is replaced by NUL padding of its own length rather
+  than deleted, because a shorter section is refused for being malformed - a different case with a
+  different name.
+- **The claim is counted.** `refuses` increments `refused_count` and the closing line reports it. It
+  said "eleven mutations refused" unconditionally while three cases have a subject only on some
+  images, so a case that stopped running would never have been noticed.
+
+**Verification.** `./check.sh --gate staged-consistency`, EXIT 0:
+
+    staged-consistency:   refused: an identity note recording an edge the manifest does not declare
+    staged-consistency:   refused: an identity note that does not record an edge the manifest declares
+    staged-consistency: 12 mutation(s) refused, and the tree verifies again afterwards
+
+The count is the evidence for the second half: eleven before, twelve now, printed rather than
+asserted.

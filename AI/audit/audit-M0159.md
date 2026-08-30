@@ -249,3 +249,13 @@ anything at all.
 The default-machine phase is the assertion this finding is about, and it is the one that had never
 passed. The staleness half was watched to refuse: with the image a build behind, the gate printed
 both keys and stopped.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-08-29T23:04:15Z):
+
+Current implementation rating: 7/10
+
+1. The bounded supervision fix introduces a false-success path that can publish M0159's final DMA claim before boot has established it. `supervise` documents success as reaching a listening shell and distinguishes an expired window as a failed round (`src/kernel/main.rs:766-779`), but after the window expires it returns `true` solely because the SystemManager process is still alive (`:921-938`). Process liveness does not establish that DeviceManager finished binding the service set or even processed every endpoint. `boot_userspace` immediately calls `dma_policy::report()` and sets `SYSTEM_IS_UP` on that answer (`:1040-1050`), so a slow or stalled chain can print `dma: every bus-mastering device is translated` before later devices bind. The default-machine gate requires only that summary plus an eventual single GPU-online line and does not require the shell/readiness boundary (`src/tools/check-qemu-virtio-iommu-x86_64.sh:195-264`), so it can accept the premature claim. A live manager needs a positive service-chain readiness signal before the final isolation report; mere survival to a deadline is not that signal.
+
+2. The milestone's required integration evidence is currently red. `./check.sh --gate qemu-virtio-iommu-x86_64` exited 1 at the freshness preflight before launching QEMU: the ISO records build key `de02e0950912adead0dd8555d84a828b7e824f361ec0f77551bf497177e0c0f5`, while the current tree computes `646516d7e22984108e27e614473929d6e076755a803d580f29e67379c0c7e96b`. This correctly demonstrates that the freshness fix is present and fail-closed, but it also means the hostile-DMA, traffic, default, and `--no-iommu` phases have not verified the current implementation. The current image must be rebuilt and the complete required gate pass before this milestone can claim current end-to-end evidence.

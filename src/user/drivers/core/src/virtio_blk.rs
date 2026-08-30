@@ -255,7 +255,7 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 				if common::stop_requested() && has_flush {
 					flush_request(&queue, virt, phys);
 				}
-				common::finish_stop(bootstrap, bind, queue.capability);
+				common::finish_stop(bootstrap, bind, queue.capability, device.quiesce());
 				exit();
 			};
 			// THE ENDPOINT THAT HAS WORK, and every reply goes back on it. It was one fixed handle,

@@ -118,7 +118,12 @@ pub fn bind(vector: u32, intr: &Arc<Interrupt>) -> bool {
 }
 
 // Remove any binding for `vector` (called from an Interrupt's Drop).
-pub fn unbind(vector: u32) {
+// Returns whether the teardown CONFIRMED, which on this port it always does: masking an MSI-X table
+// entry and freeing the slot are local writes with no remote agreement to wait for. riscv64 is the
+// port where it can fail - see its `unbind`, which asks the owning hart to disable the EID - and the
+// signature is shared so a caller can fold the answer into a claim's terminal state without asking
+// which architecture it is on.
+pub fn unbind(vector: u32) -> bool {
 	if is_msi(vector) {
 		// MASK the device's table entry, then unmap its page, and only then free the vector.
 		//
@@ -135,12 +140,13 @@ pub fn unbind(vector: u32) {
 		// hardware. It waits for `SYS_DEVICE_QUIESCED` - the device's own capability holder saying
 		// the device stopped - exactly as that driver's DMA frames do.
 		REGISTRY.retire(slot);
-		return;
+		return true;
 	}
 	let index = vector.wrapping_sub(IRQ_BASE as u32) as usize;
 	if index < IRQ_COUNT {
 		*BOUND[index].lock() = None;
 	}
+	true
 }
 
 // Give back a vector whose Interrupt NEVER REACHED ITS OWNER: mask the entry, unmap the table page

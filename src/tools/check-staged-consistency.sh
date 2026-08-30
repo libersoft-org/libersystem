@@ -42,10 +42,37 @@ command -v llvm-objcopy >/dev/null || fail "llvm-objcopy is required by this gat
 
 work="$(mktemp -d)"
 victim=""
+# EVERY MUTATION THIS GATE MAKES IS REGISTERED HERE, not only the single-file one.
+#
+# `victim` covers the cases that overwrite one artifact and put the original back. Two later cases
+# MOVE things - the whole staged tree, and one unreferenced library - and neither told this handler,
+# so an unexpected acceptance, a signal or any other early exit ran `rm -rf "$work"` over the only
+# copy and left the staged tree empty or a library gone. That is shared build output, and the failure
+# path is exactly where it happens: `refuses` exits non-zero when a mutation is ACCEPTED, which is
+# the case this gate exists to catch.
+#
+# `moved` is a list of `source<TAB>destination` pairs, replayed in reverse.
+moved=()
+moved_aside() {
+	moved+=("$1	$2")
+}
+moved_back() {
+	local at pair from to
+	for ((at = ${#moved[@]} - 1; at >= 0; at--)); do
+		pair="${moved[at]}"
+		from="${pair%%	*}"
+		to="${pair##*	}"
+		[[ -e "$from" ]] || continue
+		rm -rf "$to"
+		mv "$from" "$to" 2>/dev/null || true
+	done
+	moved=()
+}
 restore() {
 	if [[ -n "$victim" && -f "$work/original" ]]; then
 		cp "$work/original" "$victim"
 	fi
+	moved_back
 	rm -rf "$work"
 }
 trap restore EXIT
@@ -79,6 +106,13 @@ echo "staged-consistency: the unmutated tree verifies"
 # `$2`, WHERE IT MATTERS, IS THE REASON. A mutation refused for a DIFFERENT reason than the one it
 # was made for is a case that has stopped testing its own subject - which is how a gate keeps passing
 # while the rule it names quietly stops being checked.
+# HOW MANY MUTATIONS ACTUALLY RAN, so the closing line reports a number it counted.
+#
+# It said "eleven mutations refused" unconditionally, and three of the cases have a subject only on
+# some images - a consumer that already records every staged library, a tree with no unreferenced
+# one. On such an image the gate skipped them, said eleven anyway, and a case that stopped running
+# altogether would never be noticed.
+refused_count=0
 refuses() {
 	local what="$1" because="${2:-}"
 	if "$VERIFY" --verify-staged "$TARGET" >"$work/out" 2>&1; then
@@ -92,6 +126,7 @@ refuses() {
 		sed -n '1,6p' "$work/out" >&2
 		exit 1
 	fi
+	refused_count=$((refused_count + 1))
 	echo "staged-consistency:   refused: $what"
 }
 
@@ -198,9 +233,11 @@ undo
 holding="$work/held"
 rm -rf "$holding"
 mv "$LIB" "$holding" || fail "could not move the staged tree aside"
+# REGISTERED BEFORE THE MUTATION IS TESTED, so every way out of the line below puts the tree back.
+moved_aside "$holding" "$LIB"
 mkdir -p "$LIB"
 refuses "a readable but empty staged tree" "an empty tree is not a consistent one"
-rmdir "$LIB" && mv "$holding" "$LIB" || fail "could not restore the staged tree"
+moved_back
 
 # 10. ONE EXPECTED LIBRARY MISSING, AND NOTHING RECORDING IT. Case 1 removes a provider some consumer
 #     names, so the consumer's own note reports it. This removes a library whose absence no remaining
@@ -217,8 +254,9 @@ if [[ -n "$unreferenced" ]]; then
 	# BY ITS OWN PATH, because it lives in a per-owner subdirectory and putting it back at the top
 	# would leave the tree consistent-looking and wrong.
 	mv "$unreferenced" "$work/unreferenced.lslib" || fail "could not move the unreferenced library aside"
+	moved_aside "$work/unreferenced.lslib" "$unreferenced"
 	refuses "an expected library missing from the staged tree that no remaining note names" "and it is not staged"
-	mv "$work/unreferenced.lslib" "$unreferenced" || fail "could not restore it"
+	moved_back
 else
 	echo "staged-consistency:   every staged library is named by some note, so the unreferenced case has no subject in this image"
 fi
@@ -265,7 +303,45 @@ else
 	undo
 fi
 
+# 12. AN EDGE THE MANIFEST DECLARES AND THE NOTE DOES NOT RECORD - the other direction of case 11,
+#     and the one the verifier's reverse check exists for.
+#
+#     Case 11 adds an edge nothing declared. This REMOVES a declared one from the consumer's note
+#     while both artifacts stay staged, which is what a library rebuilt without one of its providers
+#     looks like: it records fewer edges, and every edge it does record still checks out. Only the
+#     manifest can notice, and only in this direction - so without this case the reverse branch could
+#     be deleted and the gate would stay green.
+declared="$(src/tools/system-manifest.sh export-json 2>/dev/null | jq -r --arg artifact "$(basename "$consumer" .lslib)" '.libraries[$artifact].providers[]? // empty' 2>/dev/null | head -1 || true)"
+if [[ -n "$declared" ]]; then
+	mutate "$consumer"
+	llvm-objcopy --dump-section .note.liber.identity="$work/note" "$consumer" /dev/null 2>/dev/null || fail "could not read the consumer's note"
+	# THE ROW OUT, AND THE NOTE STILL WELL FORMED. The descriptor is a sequence of NUL-padded rows,
+	# so the row is replaced by padding of its own length rather than deleted - a shorter section
+	# would be refused for being malformed, which is a different case with a different name.
+	# NO NESTED BLOCK IN THE PYTHON. `<<-` strips leading TABS so this can sit at the shell's own
+	# indentation, and it strips Python's with them - an `if:` body written here loses the
+	# indentation that makes it a body. A conditional EXPRESSION needs none.
+	python3 - "$work/note" "$declared" <<-'PYEOF'
+		import re, sys
+		path, provider = sys.argv[1], sys.argv[2]
+		data = open(path, 'rb').read()
+		row = re.search(rb'provider=' + re.escape(provider.encode()) + rb':[0-9a-f]{64}', data)
+		sys.exit(3) if row is None else open(path, 'wb').write(data[: row.start()] + b'\0' * (row.end() - row.start()) + data[row.end() :])
+	PYEOF
+	case $? in
+	0)
+		llvm-objcopy --update-section .note.liber.identity="$work/note" "$consumer" 2>/dev/null || fail "could not write the mutated note back"
+		refuses "an identity note that does not record an edge the manifest declares" "records no such edge"
+		;;
+	3) echo "staged-consistency:   the consumer's note does not record its declared provider, so the missing-edge case has no subject" ;;
+	*) fail "could not remove a declared edge from the note" ;;
+	esac
+	undo
+else
+	echo "staged-consistency:   the manifest declares no provider for this consumer, so the missing-edge case has no subject"
+fi
+
 # AND THE TREE IS AS IT WAS. Said rather than assumed: the restore above is what every case depends
 # on, and a gate that left the tree mutated would break the next build with no explanation.
 "$VERIFY" --verify-staged "$TARGET" >/dev/null 2>&1 || fail "the staged tree does not verify after this gate restored it"
-echo "staged-consistency: eleven mutations refused, and the tree verifies again afterwards"
+echo "staged-consistency: $refused_count mutation(s) refused, and the tree verifies again afterwards"

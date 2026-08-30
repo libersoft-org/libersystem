@@ -312,6 +312,29 @@ impl Virtio {
 		}
 	}
 
+	// STOP THE DEVICE, AND WAIT FOR IT TO SAY IT HAS STOPPED.
+	//
+	// A virtio device reset: status 0, then the device reads back 0 when it has finished. That is
+	// the transport's own "I am not using the queues any more", and it is what a driver owes before
+	// it acknowledges a planned stop - `STOPPED` certifies that the hardware is quiet, and the
+	// kernel cannot verify the claim, so it has to be true when it is made.
+	//
+	// Returns whether the device confirmed. A device that does not is one whose descriptors may
+	// still be live, so its driver must NOT report a clean stop - see `common::finish_stop`.
+	pub unsafe fn quiesce(&self) -> bool {
+		unsafe {
+			w8(self.common + CFG_DEVICE_STATUS, 0);
+			let mut spins: u32 = 0;
+			while r8(self.common + CFG_DEVICE_STATUS) != 0 {
+				spins += 1;
+				if spins > 100_000 {
+					return false;
+				}
+			}
+			true
+		}
+	}
+
 	// Read the ISR-status register: returns the pending-interrupt reason bits and, on a
 	// level-triggered INTx line (the riscv PLIC path), deasserts the device's interrupt
 	// so the kernel can complete the source. An interrupt-driven driver reads it once per

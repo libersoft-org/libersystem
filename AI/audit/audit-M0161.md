@@ -231,3 +231,15 @@ Correction required: require all three named artifact pairs to exist, fail with 
 architecture and its normal build command when one does not, and reach the success line only after
 all three per-architecture scans pass. Keep the per-architecture manifest-derived driver floors so
 the total remains derived rather than hard-coded.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0161 (2026-08-29T23:04:15Z):
+
+Current implementation rating: 7/10
+
+1. The packaged-note gate remains fail-open across architectures. It skips any architecture missing either its bootstrap directory or volume package and rejects only when all three are absent (`src/tools/check-driver-protocol-note.sh:86-92,142-146`). The complete current tree passed with 21 artifacts across three architectures, but an isolated build root containing only x86_64 also exited zero and reported `7 driver artifacts across 1 architecture(s)`. M0161 explicitly requires packaged-note evidence on all three ports, so this still permits a missing or regressed architecture to disappear from the proof.
+
+2. The implementer's partial rejection of the original terminal-frame finding is unjustified and the fix remains incomplete. A second `READY` is now refused by checking the `Online` transition, but `drain_channel` still queues every valid, current-generation `FAILED` (`src/user/services/core/src/device_manager.rs:2440-2461`), and `advance` handles it as a driver failure without requiring the binding to remain in its handshake state (`:3091-3106`). Thus `READY` followed by `FAILED` for the same generation tears down an already-online binding instead of refusing the second terminal frame. M0161 requires exactly one `READY` or `FAILED` and expressly refuses a second terminal frame (`docs/todo/P02M0161.md:123-145,202-203`). M0165 defines post-ready lifecycle with process exit, `PING`/`PONG`, and `STOP`/`STOPPED`; it does not supersede that rule or assign post-ready meaning to `FAILED`.
+
+Verification: the driver-protocol and binding suites passed 26 and 57 tests, and the full packaged-note scan passed for the artifacts currently present. No test covers the still-accepted `READY`-then-`FAILED` sequence.

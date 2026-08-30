@@ -714,6 +714,19 @@ impl Fdt {
 			let mut gic_cpu: u64 = 0;
 			let mut gic_cpu_size: u64 = 0;
 			let mut gic_version: u8 = 0;
+			// WHICH GIC CANDIDATE A CHILD BELONGED TO, and which one won.
+			//
+			// The v2m frame and the ITS are children of a GIC node and are committed when THEIR node
+			// closes; the main controller is chosen when ITS node closes, which is later. Only the
+			// first usable GIC wins, but a child under a LATER candidate - an unusable one, a
+			// duplicate - still found the global MSI field empty and filled it, and the machine was
+			// then handed a frame belonging to a controller it is not running. Counting the
+			// candidates makes the question answerable: a child records the number of the node it
+			// was under, and anything not matching the winner is dropped after the walk.
+			let mut gic_seen: u32 = 0;
+			let mut selected_gic: u32 = 0;
+			let mut msi_owner: u32 = 0;
+			let mut its_owner: u32 = 0;
 			let mut gic_msi: u64 = 0;
 			let mut gic_msi_size: u64 = 0;
 			let mut imsic_base: u64 = 0;
@@ -800,6 +813,9 @@ impl Fdt {
 						// to look.
 						if gic.depth < 0 && (self.str_starts(name, "intc") || self.str_starts(name, "interrupt-controller")) {
 							gic.enter(depth);
+							// EACH CANDIDATE GETS A NUMBER, so a child can say which one it was
+							// under - see `msi_owner`.
+							gic_seen += 1;
 						}
 						if gic.depth >= 0 && v2m.depth < 0 && self.str_starts(name, "v2m") {
 							v2m.enter(depth);
@@ -941,6 +957,8 @@ impl Fdt {
 								if size >= MIN_GIC_V2M_SIZE {
 									gic_msi = physical;
 									gic_msi_size = size;
+									// WHICH GIC THIS CHILD WAS UNDER - see `msi_owner`.
+									msi_owner = gic_seen;
 								}
 							}
 							v2m.leave();
@@ -951,9 +969,15 @@ impl Fdt {
 								&& let (parent_addr, parent_size) = cells_at[depth as usize - 1]
 								&& let Some((child, size)) = self.read_reg_range(val, len, parent_addr, parent_size, 0)
 								&& let Some(physical) = self.translate_to_root(&buses, depth as usize - 1, child)
+								// BIG ENOUGH FOR THE REGISTERS ITS DRIVER AND ITS DEVICES WRITE, which
+								// the v2m frame beside it has always been checked for and this was
+								// not. See `MIN_GIC_ITS_SIZE`.
+								&& size >= MIN_GIC_ITS_SIZE
 							{
 								gic_its = physical;
 								gic_its_size = size;
+								// WHICH GIC THIS CHILD WAS UNDER - see `msi_owner`.
+								its_owner = gic_seen;
 							}
 							its.leave();
 						}
@@ -995,6 +1019,9 @@ impl Fdt {
 								gic_dist_size = dist_size;
 								gic_cpu = cpu_phys;
 								gic_cpu_size = cpu_size;
+								// AND WHICH CANDIDATE WON, so a child committed under another one
+								// cannot be handed to it - see `msi_owner`.
+								selected_gic = gic_seen;
 							}
 							gic.leave();
 						}
@@ -1133,7 +1160,17 @@ impl Fdt {
 							// leaving `timer_intid` unset is what lets the caller refuse - see the
 							// aarch64 backend, where a boot with no timer is now fatal rather than
 							// reported.
-							if kind == PPI_KIND && number < PPI_COUNT {
+							// AND THE THIRD CELL IS READ, which it was not.
+							//
+							// The specifier is (kind, number, flags) and the flags say what SENSE the
+							// interrupt has: exactly one of edge-rising, edge-falling, level-high,
+							// level-low. Zero says nothing and two of them say two contradictory
+							// things, and neither is an interrupt this reader can program - but the
+							// cell was skipped entirely, so a tree carrying either published its
+							// number as the timer's INTID and the machine armed a timer whose own
+							// description did not agree on how it fires.
+							let sense = self.be32(val + 20) & IRQ_SENSE_MASK;
+							if kind == PPI_KIND && number < PPI_COUNT && sense.count_ones() == 1 {
 								timer_intid = number + PPI_INTID_BASE;
 							}
 						} else if in_distance_map && self.str_eq(pname, "compatible") {
@@ -1382,6 +1419,38 @@ impl Fdt {
 			// registers; an ITS that overlaps either sends its commands there. Dropped rather than
 			// refused whole: a machine with a bad child frame still has a working controller, and
 			// the backend already treats a zero MSI base as "no message-signalled interrupts".
+			// AND A CHILD BELONGING TO ANOTHER CANDIDATE IS NOT THIS CONTROLLER'S.
+			//
+			// Checked before the overlap rules below, because a frame under a different GIC is not
+			// this machine's MSI frame whatever addresses it happens to hold - and comparing it with
+			// the selected controller's ranges would be asking the wrong question about it.
+			if gic_msi != 0 && msi_owner != selected_gic {
+				gic_msi = 0;
+				gic_msi_size = 0;
+			}
+			if gic_its != 0 && its_owner != selected_gic {
+				gic_its = 0;
+				gic_its_size = 0;
+			}
+			// AND A GICv3 REDISTRIBUTOR RANGE HAS TO COVER THE CORES THIS TREE DESCRIBES.
+			//
+			// One stride was the whole check, and it is only the floor for a one-core machine.
+			// `this_redistributor` walks the frames looking for a core's affinity, so a four-core
+			// tree with one frame leaves three cores whose redistributor is not in the range: the
+			// backend logs that and returns, and those secondaries come up with no timer and no
+			// wake interrupt at all. A range that cannot hold one frame per described core is a
+			// machine description that contradicts itself, and this is where that is visible - the
+			// cores are counted by the time the walk is over.
+			if gic_version == 3 && gic_cpu != 0 && (cpu_count as u64) > 1 && gic_cpu_size < MIN_GICR_STRIDE * cpu_count as u64 {
+				gic_dist = 0;
+				gic_dist_size = 0;
+				gic_cpu = 0;
+				gic_cpu_size = 0;
+				gic_msi = 0;
+				gic_msi_size = 0;
+				gic_its = 0;
+				gic_its_size = 0;
+			}
 			if gic_msi != 0 && (ranges_overlap(gic_msi, gic_msi_size, gic_dist, gic_dist_size) || ranges_overlap(gic_msi, gic_msi_size, gic_cpu, gic_cpu_size)) {
 				gic_msi = 0;
 				gic_msi_size = 0;
@@ -1500,10 +1569,29 @@ const MIN_GICR_STRIDE: u64 = 0x20000;
 // into it - the same rule the distributor minimum is derived from, applied to the child.
 const MIN_GIC_V2M_SIZE: u64 = 0x1000;
 
+// AN ITS IS A 128 KiB WINDOW, and it had no minimum at all.
+//
+// `GITS_CTLR` is at 0x0000 and `GITS_TRANSLATER` - the register a device writes to raise an
+// interrupt - is at 0x10000, so a window that does not reach 0x20000 does not contain the registers
+// this kernel and its devices write. Committed with no size check, a one-byte ITS was published and
+// the first command wrote outside the range the machine declared. The same rule the distributor and
+// the v2m frame already carry, applied to the third child.
+const MIN_GIC_ITS_SIZE: u64 = 0x20000;
+
 // A PRIVATE PERIPHERAL INTERRUPT, as the device tree's `interrupts` cells encode one.
 const PPI_KIND: u32 = 1;
 const PPI_COUNT: u32 = 16;
 const PPI_INTID_BASE: u32 = 16;
+
+// THE SENSE BITS OF AN INTERRUPT SPECIFIER'S THIRD CELL, and the four values that name one.
+//
+// The GIC binding puts the trigger type in the low nibble: 1 edge-rising, 2 edge-falling, 4
+// level-high, 8 level-low. Exactly one of them is a sense; zero is a specifier that says nothing,
+// and two of them is a specifier that says two contradictory things. Neither is an interrupt this
+// reader can program, and the flags cell was not being looked at at all - so a tree carrying an
+// unsupported or contradictory trigger published its number as the timer's INTID and the machine
+// then armed a timer whose sense the description did not agree on.
+const IRQ_SENSE_MASK: u32 = 0xf;
 
 fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
 	let (a_end, b_end) = match (a.checked_add(a_len), b.checked_add(b_len)) {

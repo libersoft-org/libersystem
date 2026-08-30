@@ -464,21 +464,34 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	};
 	// 1. BUS MASTERING FIRST. Everything below assumes the device is not starting new transactions.
 	with(index, |entry| bus_master(entry, false));
-	// 2. Everything the claim minted stops working, without the holder's cooperation.
-	revoke_derived(key);
-	// 3. The translation, which is the only step that can fail to CONFIRM. `detach_for` reports a
+	// 2. Everything the claim minted stops working, without the holder's cooperation - and every
+	//    interrupt it derived is unbound HERE rather than whenever its last reference goes.
+	let interrupts_quiet = revoke_derived(key);
+	// 3. The translation, which is the other step that can fail to CONFIRM. `detach_for` reports a
 	//    detach it could not confirm and leaves the pages quarantined; the claim goes the same way,
 	//    because a device whose mappings may still be live is not a device to hand to anyone else.
-	let confirmed = if crate::iommu::translating() { crate::iommu::detach_for(index, bus, dev, func) } else { true };
-	// 4. AND THE VECTORS LAST, AND ONLY IF THE TEARDOWN CONFIRMED.
+	let translation_quiet = if crate::iommu::translating() { crate::iommu::detach_for(index, bus, dev, func) } else { true };
+	// EVERY RESOURCE, NOT ONE OF THEM. The terminal state was derived from the IOMMU alone, so a
+	// vector whose unbind could not be confirmed - a riscv64 hart that did not answer, which
+	// quarantines the still-armed slot - was charged to a claim this then published as `Free`.
+	let confirmed = translation_quiet && interrupts_quiet;
+	if !interrupts_quiet {
+		crate::serial_println!("device: {index} could not confirm that every interrupt it derived was unbound - the claim is not free");
+	}
+	// 4. THE TERMINAL STATE, AND ONLY THEN THE VECTORS.
 	//
-	// This ran BEFORE the detach. `release_for_device` clears `pending`, clears the owner and marks
-	// the slot UNUSED - which is the slot becoming allocatable again - so an unconfirmed detach left
-	// the claim `Quarantined` while a vector it had held was already back in circulation. The rule
-	// this file states everywhere else is that an unconfirmed teardown keeps its resources charged
-	// and out of circulation, and a vector is one of them: a device that may still be translating
-	// may still be raising interrupts.
-	if confirmed {
+	// The vectors used to be released before this, on the strength of `confirmed` alone. But
+	// `finish_release` is where the DEADLINE LATCH is observed - `snapshot` can quarantine a claim
+	// from another core while this teardown is still waiting for the IOMMU - so a release that took
+	// too long could put its vectors back into circulation and then be told it was quarantined. The
+	// state decides, and it is decided first.
+	//
+	// `release_for_device` clears `pending`, clears the owner and marks the slot UNUSED, which is
+	// the slot becoming allocatable again. The rule this file states everywhere else is that an
+	// unconfirmed teardown keeps its resources charged and out of circulation, and a vector is one
+	// of them: a device that may still be translating may still be raising interrupts.
+	let state = finish_release(index, confirmed);
+	if state == ClaimState::Free {
 		let vectors = crate::arch::interrupts::release_msi_for_device(index as u32);
 		if vectors != 0 {
 			crate::serial_println!("device: {index} released - {vectors} MSI vector(s) given back");
@@ -491,7 +504,6 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	// untranslated" that keeps a device which gave the bus back is a list reporting a machine
 	// nobody is running.
 	crate::dma_policy::forget_degraded(bus, dev, func);
-	let state = finish_release(index, confirmed);
 	if state == ClaimState::Quarantined {
 		crate::serial_println!("device: {:02x}:{:02x}.{} was NOT confirmed torn down - device {index} is quarantined for this boot and nothing it held is reused", bus, dev, func);
 	}
@@ -609,6 +621,21 @@ static DERIVED: SpinLock<Vec<Derived>> = SpinLock::new(Vec::new());
 // must treat as a failed mint: a capability the revocation cannot reach is exactly what this
 // milestone exists to make impossible, so it must not be handed out.
 pub fn register_derived(key: abi::ClaimKey, object: alloc::sync::Weak<dyn crate::object::KernelObject>) -> bool {
+	// THE KEY HAS TO STILL BE THE LIVE CLAIM, AND THE CHECK HOLDS THE RELEASE'S OWN LOCK.
+	//
+	// This pushed a row for any key at all. `begin_release` moves the slot to `Releasing` under
+	// `CLAIMS` and the sweep then drains `DERIVED` under a different lock, so a syscall that had
+	// already passed capability lookup could register AFTER the sweep and hand out a capability the
+	// revocation would never reach - which is exactly what this table exists to prevent.
+	//
+	// `CLAIMS` is taken first and held across the push, so a release cannot begin between the check
+	// and the row landing. That is the same order `snapshot` takes them in, and the only order in
+	// this file.
+	let claims = CLAIMS.lock();
+	let Some(slot) = claims.get(key.device_index as usize) else { return false };
+	if slot.generation != key.generation || slot.state != ClaimState::Claimed {
+		return false;
+	}
 	let mut derived = DERIVED.lock();
 	// ALLOC-OK: one row per capability a binding derives, checked before it is taken.
 	if derived.try_reserve(1).is_err() {
@@ -626,7 +653,8 @@ pub fn register_derived(key: abi::ClaimKey, object: alloc::sync::Weak<dyn crate:
 // handle half, and it is O(1). And a `DeviceMemory` that was already mapped has its mapping torn
 // out of the address space it was mapped in, which is the half the driver notices: the raw virtual
 // address it has been using faults instead of reaching the BAR.
-fn revoke_derived(key: abi::ClaimKey) {
+// Returns whether every interrupt this key derived CONFIRMED its teardown. See `revoke_effects_of`.
+fn revoke_derived(key: abi::ClaimKey) -> bool {
 	// TAKEN OUT UNDER THE LOCK AND RELEASED BEFORE THE WORK, because tearing a mapping down takes
 	// the address space's own locks and calling into them from under this one would be a lock order
 	// nothing else in the kernel uses.
@@ -639,16 +667,17 @@ fn revoke_derived(key: abi::ClaimKey) {
 			// A SWEEP THAT CANNOT ALLOCATE STILL REVOKES. Falling back to the slower shape - one
 			// pass, in place - costs time on a path that runs once per binding and keeps the
 			// property, which is the thing that must not depend on a heap.
+			let mut quiet = true;
 			for row in derived.iter() {
 				if row.key == key {
 					if let Some(object) = row.object.upgrade() {
 						object.header().revoke();
-						revoke_effects_of(&object);
+						quiet &= revoke_effects_of(&object);
 					}
 				}
 			}
 			derived.retain(|row| row.key != key);
-			return;
+			return quiet;
 		}
 		for row in derived.drain(..) {
 			if row.key == key {
@@ -659,12 +688,14 @@ fn revoke_derived(key: abi::ClaimKey) {
 		}
 		*derived = kept;
 	}
+	let mut quiet = true;
 	for weak in taken {
 		if let Some(object) = weak.upgrade() {
 			object.header().revoke();
-			revoke_effects_of(&object);
+			quiet &= revoke_effects_of(&object);
 		}
 	}
+	quiet
 }
 
 // The type-specific half of revocation.
@@ -679,15 +710,29 @@ fn revoke_derived(key: abi::ClaimKey) {
 // was handed may still be sitting in a live descriptor. `SYS_DEVICE_QUIESCED` is the one claim that
 // can say otherwise, and it comes from a driver that has just reset the hardware.
 //
-// An `Interrupt` needs nothing here: the release masks and holds its vector by the same argument,
-// through `release_msi_for_device`, in the order the release states.
-fn revoke_effects_of(object: &alloc::sync::Arc<dyn crate::object::KernelObject>) {
+// An `Interrupt` LOSES ITS VECTOR HERE, and this said it needed nothing.
+//
+// The argument was that `release_msi_for_device` masks and holds the vector. It does that for a slot
+// already marked pending, and does nothing at all to an ordinary live binding - and the actual
+// unbind sat in `Interrupt::drop`, which a forced release cannot reach: the holder is still running
+// by definition, and a wait in progress keeps the object alive as long as it likes. So a released
+// device kept a bound, deliverable vector aimed at the old driver, and the next claimant could not
+// be given that slot either.
+//
+// Returns whether the teardown CONFIRMED, which only an interrupt can answer no to - see
+// `Interrupt::revoke` and riscv64's `unbind`. Everything else here is a local operation that cannot
+// fail, so `true` is a statement rather than an assumption.
+fn revoke_effects_of(object: &alloc::sync::Arc<dyn crate::object::KernelObject>) -> bool {
 	if let Some(memory) = object.as_any().downcast_ref::<crate::object::device_memory::DeviceMemory>() {
 		memory.teardown_mapping();
 	}
 	if let Some(buffer) = object.as_any().downcast_ref::<crate::object::dma_buffer::DmaBuffer>() {
 		buffer.mark_orphaned();
 	}
+	if let Some(interrupt) = object.as_any().downcast_ref::<crate::object::interrupt::Interrupt>() {
+		return interrupt.revoke();
+	}
+	true
 }
 
 // Forget every row belonging to an object that is gone, for the tests that ask how big this gets.

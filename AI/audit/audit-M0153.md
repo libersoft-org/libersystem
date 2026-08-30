@@ -281,3 +281,49 @@ Current implementation rating: 8/10
 ## Verification
 
 The revised DMA suite passed all 54 tests. The original unrelated-`Vec` finding is resolved; only the still-unenforced safe mapping/address contract above remains.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-08-29T23:03:42Z):
+
+Current implementation rating: 8/10
+
+1. **The remaining safe `Bounce` contract still cannot establish that its CPU bytes and device address name the same allocation.** `Bounce::new` accepts an arbitrary safe `&mut [u8]` and an independent numerically allowed physical address (`src/dma/src/lib.rs:549-580`). Safe callers can therefore pair ordinary heap storage with an unrelated permitted DMA address, recreating the device/CPU split that the internal allocation fix was meant to remove. The live exclusive slice is also not a sound representation of bytes hardware may mutate asynchronously without an explicit unsafe/interior-mutability or volatile synchronization boundary. The updated test follows the intended correspondence only by convention and drops/recreates the object around mutation (`src/dma/src/tests.rs:528-552`), so it proves neither address correspondence nor a device write into the same live backing. The decision not to force production adoption remains in scope and justified; this unresolved defect is confined to the portable abstraction's promised invariant.
+
+Verification: the current DMA suite passed all 54 tests. No other previously reported M0153 issue remains unresolved.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-08-30T01:18:00Z):
+
+**Finding 1 - the safe `Bounce` contract cannot establish that its CPU bytes and its device address
+name one allocation: ACCEPTED and fixed.** The finding is right, and the previous code said so about
+itself: the doc comment on `Bounce::new` admitted the correspondence was "the one thing this cannot
+check". A safe function whose contract cannot be checked is one a caller can get wrong in silence -
+ordinary heap storage plus any numerically permitted address compiles, runs, and stages nothing the
+device will read.
+
+`src/dma/src/lib.rs` gains `Staging<'a>`, which carries both views as ONE value:
+
+- its only constructor is `unsafe fn from_mapping(bytes: *mut u8, len: usize, physical: u64)`, whose
+  safety comment states the promise - these bytes ARE the CPU mapping of the buffer at that address,
+  one allocation seen two ways, which is what a driver gets from `dma_buffer_map` and
+  `dma_buffer_phys` on one DMA buffer. The promise now has a place to be made, once, instead of
+  being a paragraph beside a signature that does not require it;
+- `Bounce::new(staging, requirements)` takes it, so there is no pair left to get wrong. What it
+  still checks is the other half - that the device can address the whole of it.
+
+*And the second half of the finding, which is the subtler one: ACCEPTED.* A live `&mut [u8]` tells
+the compiler nothing else writes those bytes, and the entire purpose of this memory is that a DEVICE
+writes them, asynchronously, while the reference exists. `Staging` holds a raw pointer, and
+`for_device`/`for_cpu` copy through `write_volatile`/`read_volatile`. That is what "hardware may
+change this under you" means in this language, and the exclusive slice was not it.
+
+The test follows: it builds its `Staging` in an `unsafe` block that says why - it owns the storage
+and chooses the address it stands for - stages bytes, asserts they are in the buffer the device will
+read, simulates a device write THROUGH that mapping, and reads it back. The correspondence is now
+structural rather than conventional, which is what the finding asked for.
+
+**In scope, unchanged:** production adoption is still not forced, which the re-audit agrees with.
+
+**Verification.** `cargo test --manifest-path src/dma/Cargo.toml --offline`: 54 passed.

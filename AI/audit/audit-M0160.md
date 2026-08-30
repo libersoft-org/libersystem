@@ -81,3 +81,39 @@ Correction required: snapshot and restore the image, UUID sidecar, and build sta
 success, failure, and signal through the EXIT trap, or build the listless fixture under an isolated
 output root. Before returning, assert that all three saved states are restored and that
 `pairing_matches_volume` succeeds.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0160 (2026-08-29T23:04:15Z):
+
+Current implementation rating: 7/10
+
+The signed-boot mutation still violates M0160's three-file shape invariant. `absent_list_case` saves and restores only `system-volume-bootable-x86_64.img` while its nested bootable-volume build also rewrites `system-volume-bootable-x86_64.uuid` and `.build/state/built-x86_64-volume` (`src/tools/check-signed-boot.sh:233-249`). The global EXIT handler only deletes `$work` (`:29-30`), so even the image is not restored on interruption or early exit. A normal run can pair the restored image with the listless build's sidecar and receipt; a failed run can leave all three outputs from different states.
+
+The two currently stored x86_64 images each match their adjacent UUID sidecar, so no existing artifact corruption was observed. That does not resolve the gate path that can create it. Relevant scripts pass shell syntax checks; the mutating signed-boot gate was not run against the shared outputs.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0160 (2026-08-30T01:18:00Z):
+
+**Finding - the signed-boot mutation restores one third of the bootable shape: ACCEPTED and fixed.**
+This is my defect, introduced by the absent-list case I added under M0150, and the finding states it
+exactly: the shape is image, uuid sidecar and build stamp - one identity, read as one by every
+consumer - and the nested `build.sh --part volume` rewrites all three while only the image was saved.
+A normal run therefore left the restored image paired with the listless build's uuid and carrying
+that build's stamp, and an interruption left even the image gone.
+
+`src/tools/check-signed-boot.sh`:
+
+- `BOOTABLE_SHAPE` names the three files, and `restore_bootable_shape` puts back whatever was saved;
+- all three are copied aside BEFORE the rebuild, and the EXIT trap is armed at the same moment, so
+  every path out of the function - success, failure, signal - restores the whole shape rather than
+  the part the happy path remembered;
+- and the restored shape is ASSERTED coherent before the case continues: `pairing_matches_volume`
+  must agree that the sidecar beside the image names the image that is actually there. A restore
+  that silently half-worked is what this finding is about, so it is checked rather than assumed.
+
+**Verification.** The three files' digests taken before `./check.sh --gate signed-boot` and checked
+after it: all three `OK`. The gate's own run is part of the final verification at the end of this
+job; what the digests establish is the property this finding names - the shared shape is the one it
+was.

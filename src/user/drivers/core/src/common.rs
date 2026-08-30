@@ -705,8 +705,24 @@ pub fn stop_requested() -> bool {
 // `device_quiesced` is the claim the kernel needs before it will give back a dead driver's DMA frames
 // and masked vectors; it was called only during the INITIAL reset, so a stopped driver left both
 // held. A driver with no device capability passes 0 and only answers the frame.
-pub unsafe fn finish_stop(bootstrap: u64, bind: &Bind, device: u64) {
+// `quiet` is the DRIVER'S OWN ANSWER about its hardware, and it is what this will not invent.
+//
+// `STOPPED` is a certificate that the device is quiet, and `device_quiesced` is the claim on which
+// the kernel gives back orphaned DMA frames and masked vectors. The kernel explicitly cannot check
+// either - it relies on the caller having just stopped the device - so a driver that could not
+// confirm the hardware stopped must not make the claim. It says so and answers nothing, and the
+// manager's deadline then takes the forced path: the claim is quarantined and what it held stays out
+// of circulation, which is the correct outcome for a device that may still be mastering the bus.
+//
+// This used to take no such argument, and every caller was therefore certifying quiescence it had
+// not established.
+pub unsafe fn finish_stop(bootstrap: u64, bind: &Bind, device: u64, quiet: bool) {
 	unsafe {
+		if !quiet {
+			print(b"driver: the device did not confirm it stopped - no clean stop is acknowledged for it\n");
+			STOP_PENDING.store(false, core::sync::atomic::Ordering::Release);
+			return;
+		}
 		if device != 0 {
 			device_quiesced(device);
 		}

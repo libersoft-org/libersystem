@@ -546,8 +546,54 @@ impl CacheMaintenance for Coherent {
 // a driver on an address-limited or non-coherent device got a decision it could not act on. The two
 // sync points are the whole contract - `for_device` before the device is told to go, `for_cpu` after
 // it says it is done - and they are where the cache maintenance happens whether or not a copy does.
+// ONE BUFFER, SEEN TWO WAYS, AND THE PAIRING IS THE UNSAFE PART.
+//
+// `Bounce::new` used to take a safe `&mut [u8]` and a physical address beside it, and the doc
+// comment admitted the correspondence between them was "the one thing this cannot check". A safe
+// function whose contract cannot be checked is a safe function a caller can get wrong in silence:
+// ordinary heap storage plus any numerically permitted address compiles, runs, and stages nothing
+// the device will read. The promise now has a place to be made - here, once, in `unsafe` - instead
+// of being a paragraph beside a signature that does not require it.
+//
+// AND A POINTER RATHER THAN A SLICE, which is the second half of the same problem. `&mut [u8]` tells
+// the compiler nothing else writes these bytes, and the whole purpose of this memory is that a
+// DEVICE writes them, asynchronously, while the reference exists. The bytes are therefore held as a
+// raw pointer and copied volatile, which is what "hardware may change this under you" means in this
+// language.
+pub struct Staging<'a> {
+	bytes: *mut u8,
+	len: usize,
+	physical: u64,
+	held: core::marker::PhantomData<&'a mut [u8]>,
+}
+
+impl<'a> Staging<'a> {
+	// SAFETY: `bytes[..len]` must BE the CPU mapping of the buffer at `physical` - one allocation
+	// seen two ways, which is what a driver gets from `dma_buffer_map` and `dma_buffer_phys` on one
+	// DMA buffer. It must be valid for reads and writes for `'a`, and no Rust reference to it may
+	// exist while this does. A device may write it at any time.
+	pub unsafe fn from_mapping(bytes: *mut u8, len: usize, physical: u64) -> Staging<'a> {
+		Staging { bytes, len, physical, held: core::marker::PhantomData }
+	}
+
+	// The device address of these same bytes.
+	pub fn physical(&self) -> u64 {
+		self.physical
+	}
+
+	pub fn len(&self) -> usize {
+		self.len
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.len == 0
+	}
+}
+
+// A STAGED BUFFER, for a device that cannot reach the pages where the data is.
 pub struct Bounce<'a> {
-	// THE CPU'S VIEW OF THE BUFFER THE DEVICE WILL USE. Not a second allocation beside it.
+	// THE CPU'S VIEW OF THE BUFFER THE DEVICE WILL USE, and the device's address for it, as ONE
+	// value that cannot be assembled from two unrelated ones. See `Staging`.
 	//
 	// This was an independently allocated `Vec<u8>` with `physical` stored next to it as a bare
 	// number, and nothing tied the two together. `for_device` copied into the vector and cleaned
@@ -555,33 +601,26 @@ pub struct Bounce<'a> {
 	// operating on `physical()` therefore read none of the staged bytes and wrote none of the bytes
 	// returned to the CPU - the type could not work for any driver that adopted it, and the test
 	// missed it by calling both methods on the same vector and never simulating a device write.
-	//
-	// A borrow makes that unrepresentable: the only way to construct one is to hand it the mapping.
-	staging: &'a mut [u8],
-	// Where those same bytes are, in the addresses the DEVICE will use.
-	physical: u64,
+	staging: Staging<'a>,
 	coherent: bool,
 }
 
 impl<'a> Bounce<'a> {
-	// `staging` is the CPU mapping OF the buffer at `physical` - one buffer seen two ways, which is
-	// what a driver gets from `dma_buffer_map` and `dma_buffer_phys` on one DMA buffer. Passing a
-	// slice that is not that mapping is the defect this signature exists to prevent, and it is the
-	// one thing this cannot check: the caller allocated it under the same `Requirements` that
-	// produced the bounce decision, and that is where the correspondence is established.
-	pub fn new(staging: &'a mut [u8], physical: u64, requirements: &Requirements) -> Result<Bounce<'a>, Fault> {
+	// The staging buffer is one value carrying both views, so there is no pair to get wrong here.
+	// What this checks is the other half: that the device can address the whole of it.
+	pub fn new(staging: Staging<'a>, requirements: &Requirements) -> Result<Bounce<'a>, Fault> {
 		if staging.is_empty() {
 			return Err(Fault::Malformed);
 		}
-		if !requirements.permits(physical, staging.len() as u64) {
+		if !requirements.permits(staging.physical(), staging.len() as u64) {
 			// A staging buffer the device cannot address is not a staging buffer.
 			return Err(Fault::OutOfRange);
 		}
-		Ok(Bounce { staging, physical, coherent: requirements.coherent() })
+		Ok(Bounce { staging, coherent: requirements.coherent() })
 	}
 
 	pub fn physical(&self) -> u64 {
-		self.physical
+		self.staging.physical()
 	}
 
 	pub fn len(&self) -> u64 {
@@ -597,9 +636,17 @@ impl<'a> Bounce<'a> {
 		if source.len() > self.staging.len() {
 			return Err(Fault::OutOfRange);
 		}
-		self.staging[..source.len()].copy_from_slice(source);
+		// VOLATILE, because the device may be reading or writing these bytes and the compiler must
+		// not assume otherwise - see `Staging`.
+		// SAFETY: `from_mapping`'s caller promised this is a valid mapping of `len` bytes, and the
+		// length was checked against it directly above.
+		unsafe {
+			for (at, byte) in source.iter().enumerate() {
+				self.staging.bytes.add(at).write_volatile(*byte);
+			}
+		}
 		if !self.coherent {
-			cache.clean_for_device(self.physical, source.len() as u64);
+			cache.clean_for_device(self.staging.physical(), source.len() as u64);
 		}
 		Ok(())
 	}
@@ -610,9 +657,14 @@ impl<'a> Bounce<'a> {
 			return Err(Fault::OutOfRange);
 		}
 		if !self.coherent {
-			cache.invalidate_for_cpu(self.physical, destination.len() as u64);
+			cache.invalidate_for_cpu(self.staging.physical(), destination.len() as u64);
 		}
-		destination.copy_from_slice(&self.staging[..destination.len()]);
+		// SAFETY: as in `for_device` - a valid mapping of `len` bytes, and the length checked above.
+		unsafe {
+			for (at, byte) in destination.iter_mut().enumerate() {
+				*byte = self.staging.bytes.add(at).read_volatile();
+			}
+		}
 		Ok(())
 	}
 

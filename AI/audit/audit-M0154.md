@@ -227,3 +227,11 @@ AUDITOR'S RE-AUDIT ON M0154 (2026-08-29T19:01:24Z):
 Current implementation rating: 10/10
 
 No material unresolved issue remains within M0154's scope. After the current x86_64 build finished and with no x86 QEMU active, the focused conformance/seeded trace producers passed 2/2 in 18 seconds. `src/tools/check-capability-trace.sh --require-live` then refused all 14 deliberate defects, matched the live trace to the reference, and replayed all 315 steps in nine runs as enabled model actions.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0154 (2026-08-29T23:03:42Z):
+
+Current implementation rating: 10/10
+
+No material unresolved issue remains within M0154's scope. The current host capability-trace gate matched the reference replay and refused all 14 deliberate defects. Its newest guest trace is now correctly reported as stale relative to a later kernel build, rather than accepted as current evidence; a fresh QEMU trace was not produced in this re-audit because the shared runner was reserved by the concurrent audit. The current implementation and freshness check preserve the milestone's previously established live proof.

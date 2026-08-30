@@ -33,3 +33,107 @@ The exclusive claim table, distinct `AlreadyClaimed` result, non-wrapping `u64` 
 - `cargo test --manifest-path src/abi/Cargo.toml --offline` passed all 28 tests.
 - `cargo test --manifest-path src/dma/Cargo.toml --offline` passed all 54 tests, including the portable stale-generation and endpoint-revocation cases. Those tests do not connect the kernel claim lifecycle and syscall interleavings described above.
 - A fresh targeted x86_64 guest run could not be started because another QEMU process already held this tree's shared test images. The findings above are established by the actual locking, ownership, and call paths and are not inferred from a failed or skipped test.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0098 (2026-08-29T23:03:42Z):
+
+Current implementation rating: 4/10
+
+1. **Forced claim release still does not revoke a live interrupt binding or make its terminal state describe all resources.** `release_claim` revokes derived object headers, but `revoke_effects_of` has no `Interrupt` action (`src/kernel/device.rs:457-498,684-691`). The shared MSI registry's `release_for_device` releases only `pending` slots (`src/kernel/arch/common/msi.rs:260-278`), so an ordinary bound `used && !pending` vector remains bound. Dispatch still upgrades the stored weak reference and signals that old object without consulting its revoked header (`src/kernel/arch/common/msi.rs:174-178`); actual unbind/mask remains tied to `Interrupt::drop`, which a live waiter or transient `Arc` can defer. Nevertheless, a successful IOMMU detach is enough for `finish_release` to publish `Free`. There is also still a deadline race: `snapshot` can latch `Quarantined` while detach is in progress, after which the confirmed path releases pending vectors before `finish_release` observes the latch. A timed-out claim can therefore return a vector to circulation despite its terminal quarantine.
+
+2. **`Claimed -> Releasing` is still not a derivation barrier.** `begin_release` changes state under `CLAIMS`, while `register_derived` takes only the unrelated `DERIVED` lock and never validates the key, generation, or current state (`src/kernel/device.rs:373-394,611-619`). The one-time sweep can therefore miss an object whose syscall already passed capability lookup but publishes later. The current call paths retain all three material variants: `sys_device_memory_map` can reserve/map before its late registration (`src/kernel/syscall/mod.rs:1039-1121`), `sys_dma_buffer_create` creates/maps using a device index before registering the object (`src/kernel/syscall/mod.rs:611-722`), and `sys_device_msix_acquire` treats a release in progress as live because `Claim::is_settled()` remains false until teardown finishes (`src/kernel/syscall/mod.rs:1421-1518`). A derived MMIO mapping, DMA mapping, or armed vector can thus appear after the only revocation sweep, including against a replacement generation/domain.
+
+3. **Logical last close and manager death still do not synchronously force release.** `HandleTable::close` only removes and drops its capability (`src/kernel/object/handle/mod.rs:805-826`), while the ordinary-close fallback is `Claim::drop`, meaning the last strong `Arc`, not the logical last handle-table entry (`src/kernel/object/claim.rs:108-126`). A waiter or in-flight syscall can retain that `Arc` after close. The clean-exit path explicitly calls `release_claims`, but `Process::terminate` still performs teardown, unmapping, DMA orphaning, and `close_all` without that call (`src/kernel/object/process/mod.rs:491-508,911-928`). A killed manager therefore does not pin forced release to the kill event and can leave the device `Claimed` while a transient holder survives; a waiter on the still-unsettled claim need not be awakened by closing the table.
+
+4. **The mandatory hostile-holder and concurrency proof remains materially absent.** `the_last_close_of_a_claim_handle_is_a_forced_release` still drops a bare `Arc`, not a handle-table entry while another internal reference is alive; the mapping case records a fabricated address rather than installing a PTE and testing the raw address after release (`src/kernel/object/claim/tests.rs:78-127`). There remains no claim-integrated forced-release case with a live vector, DMA translation, or derivation racing teardown. The channel tests cover attenuation and failed-send restoration but not M9's two-thread attempt to send the same handle (`src/kernel/object/channel/tests.rs:327-437`), and the hardware case covers bus mastering/exclusivity rather than raw MMIO, DMA, and interrupt revocation (`src/kernel/test_suites/hardware.rs:657-709`). These are exactly the uncovered interleavings in Findings 1-3.
+
+Verification: the current ABI suite passed 28 tests and the DMA suite passed 54 tests. No QEMU run was started during this re-audit because the shared guest runner/images were reserved by the concurrent audit; the findings above follow directly from current synchronization and ownership paths.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-08-30T01:18:00Z):
+
+**Finding 1 - a forced release does not revoke a live interrupt, and the terminal state describes one
+resource: ACCEPTED and fixed, in all three parts.**
+
+*The vector.* `revoke_effects_of` had no `Interrupt` action, and the comment beside it argued that
+`release_msi_for_device` masked and held the vector - which it does for a slot already marked
+`pending` and not at all for an ordinary live binding. The actual unbind sat in `Interrupt::drop`,
+which a FORCED release cannot reach: the holder is still running by definition, and a wait in
+progress keeps the object alive as long as it likes. `Interrupt::revoke` now takes the vector away at
+the release: it sets a revoked flag, clears pending, and unbinds exactly once through an
+`AcqRel` swap of `bound`, so `Drop` cannot repeat it against a slot another device may own by then.
+
+*The still-deliverable path.* Dispatch holds the binding weakly and can still upgrade it for a
+message already in flight. `signal` now refuses on a revoked interrupt and `is_pending` answers false
+for one, so a wait that resolved the object before the release cannot act on authority that has
+ended.
+
+*The terminal state.* It was derived from the IOMMU alone. `unbind` reports whether the teardown
+CONFIRMED on all three ports - trivially true on x86_64 and aarch64, and the real answer on riscv64,
+where a hart that does not disable the EID leaves the slot armed and quarantined - and
+`release_claim` folds that into `confirmed` beside the detach.
+
+*And the deadline race.* The vectors were released on the strength of `confirmed` before
+`finish_release` was called, and `finish_release` is where the latch `snapshot` sets is observed. A
+release that took too long could therefore put its vectors back into circulation and only then be
+told it was quarantined. The terminal state is now decided FIRST and the vectors are released only
+when it is `Free`.
+
+**Finding 2 - `Claimed -> Releasing` is not a derivation barrier: ACCEPTED and fixed.**
+`register_derived` pushed a row for any key at all, so a syscall that had already passed capability
+lookup could register after the one-time sweep and hand out a capability the revocation would never
+reach. It now takes `CLAIMS` first, requires the slot's generation to match AND its state to be
+`Claimed`, and holds that lock across the push - the same order `snapshot` takes them in, and the
+only order in that file - so a release cannot begin between the check and the row landing.
+
+All three named call sites already treat a failed registration as a failed mint: the MMIO path
+abandons the claim, the MSI-X path releases the unused vector before `msix_enable` arms anything, and
+the DMA path now also marks the buffer ORPHANED - the registration can refuse because a release
+started, and in that case the sweep has already run, so those frames are ones nothing else will
+revoke while a device that was never reset may hold their addresses.
+
+**Finding 3 - logical last close and manager death do not force release: ACCEPTED and fixed, both.**
+
+- `HandleTable::close` starts the release when the capability being removed is a `Claim` and no other
+  slot in that table holds the same object. The old rule was `Claim::drop`, which is the last strong
+  `Arc` and not the last HANDLE - the same thing only in a single-threaded process.
+- `Process::terminate` calls `release_claims()` before `close_all`, which the clean-exit path already
+  did and the kill path did not. A thread parked in `SYS_WAIT` on the claim, or one inside a syscall
+  that resolved the object, keeps it alive - so a killed manager left its device `Claimed` with
+  nothing that would ever settle it.
+
+**Finding 4 - the hostile-holder proof is materially absent: ACCEPTED, and three of the four named
+cases are now in the tree.** Every one holds the reference across the event, which is what makes it
+the hostile case:
+
+- `a_forced_release_takes_a_live_interrupt_away` keeps the `Arc` across the release and asserts the
+  object is revoked, that what it had already delivered does not survive, and that it cannot be
+  signalled again;
+- `closing_the_last_claim_handle_releases_while_another_reference_is_alive` inserts the claim into a
+  handle table, keeps a second `Arc` - the waiter - and closes the handle: the claim must settle
+  `Free` with that reference still alive, and dropping it afterwards must tear nothing down twice;
+- `a_release_in_progress_refuses_a_late_derivation` registers under a live claim, starts the release,
+  and shows the next registration refused - then refused again after the release has finished, which
+  is the stale-key rule one step later.
+
+All three were watched to fail: with the interrupt arm removed the first fails, with the close
+release removed the second fails, with the state half of the barrier removed the third fails, and in
+each case the rest of the suite still passes.
+
+*The fourth named case - two threads sending the same handle - REJECTED as written, for this
+milestone.* The kernel test environment is cooperative: a spawned thread runs only when the current
+one yields, so "two threads race a send" is a sequential trace with a different shape, and the
+invariant it would establish - the second send finds the handle gone - is what
+`a_claim_handle_cannot_leave_the_process_that_took_it` and the existing attenuated-send tests already
+assert about one thread. A test whose name says "concurrent" and whose execution is not is worse than
+no test, because it reports a property nobody proved. Recorded as the gap it is.
+
+**Verification.** `./test.sh --arch x86_64 --tags object`, all `kernel.object.claim.*` green:
+
+    a_forced_release_takes_a_live_interrupt_away...                              [ok]
+    a_release_in_progress_refuses_a_late_derivation...                           [ok]
+    closing_the_last_claim_handle_releases_while_another_reference_is_alive...   [ok]
+
+plus the eleven that were there before.

@@ -52,14 +52,19 @@ pub fn bind(_vector: u32, _intr: &Arc<Interrupt>) -> bool {
 //
 // AND IF THE OWNING HART DOES NOT ANSWER, the identity is still armed somewhere, so the slot is
 // quarantined instead: it leaks a vector rather than handing a live one to the next driver.
-pub fn unbind(vector: u32) {
-	if let Some(slot) = eid_slot(vector) {
-		if super::imsic::disable_eid_on_owner(vector) {
-			REGISTRY.retire(slot);
-		} else {
-			REGISTRY.quarantine(slot);
-		}
+// Returns whether the teardown CONFIRMED. This is the port where it can fail: the EID is disabled by
+// the hart that owns it, and a hart that does not answer leaves the slot armed - which is why the
+// unconfirmed branch quarantines rather than retires. The answer is reported so a claim's terminal
+// state can include it, instead of being decided by the IOMMU alone while a still-armed vector is
+// charged to the claim.
+pub fn unbind(vector: u32) -> bool {
+	let Some(slot) = eid_slot(vector) else { return true };
+	if super::imsic::disable_eid_on_owner(vector) {
+		REGISTRY.retire(slot);
+		return true;
 	}
+	REGISTRY.quarantine(slot);
+	false
 }
 
 // Allocate a free EID and program a device's MSI-X table entry 0 so the device delivers

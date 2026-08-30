@@ -356,3 +356,17 @@ across this work:
         full and empty
 
 The two device-tree profiles are booted by the gate itself and run at the end of this job with it.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0152 (2026-08-29T23:03:42Z):
+
+Current implementation rating: 6/10
+
+1. **The claimed same-trace model proof is still not a same-state trace, and rejecting lifecycle coverage as out of scope is unjustified.** In phase one, the real preferred frame is retained in `held` while the model frame is immediately freed (`src/kernel/mem/numa/tests.rs:198-238`). The comment says both sides are freed, but the code drains the real allocator for 16 rounds while leaving the model full, then returns the real frames only after the loop. Phase two compares only strict/preferred allocation with immediate free (`src/kernel/mem/numa/tests.rs:248-290`); it does not compare the complete allocation/free/contiguous/retirement/quarantine sequence or exact per-node and global totals after each operation that the original M4 required. The response's scope rejection also conflicts with the still-current Goal, M2, and definition of done: freeing, retirement, quarantine, and delayed reclamation must route by the frame's physical owner (`docs/todo/P02M0152.md:23-28,90-119,191-200`). Current tests separately exercise a generic retired-page counter and generic quarantine flow, but no NUMA ownership test retires or quarantines a frame and later reclaims it on another CPU. M4 and the lifecycle part of M2 therefore remain unproved.
+
+2. **The remote-free proof can free the same frame twice after its bounded wait expires.** `remote_free` queues an uncancelled `spawn_on`, spins, and returns `false` on timeout (`src/kernel/mem/numa/tests.rs:414-452`). Its caller then deallocates `travelling` locally (`src/kernel/mem/numa/tests.rs:391-401`). The queued remote body can run later and deallocate it again; there is also a direct race where the remote body has deallocated at line 421 but has not yet stored `FREED` at line 422 when the caller times out. The allocator's double-free guard may refuse the second operation, but that means the required gate itself can inject an ownership violation and contaminate subsequent accounting. The comment that a false result means no other core took the frame is not established by the code.
+
+3. **The purported exact-profile graph assertion checks only self-consistency of the graph the parser produced.** For each recorded range it asks the same graph to route the range's endpoints, and for each recorded `(hardware_id, node)` pair it asks the same graph to route that CPU; it then checks symmetric ordering properties (`src/kernel/mem/numa/tests.rs:33-73`). It never compares the normalized ranges or hardware CPU-to-node assignments with the profile's explicit expected graph. The gate itself requires two nodes, nonzero memory/processors, pools, and passing generic tests (`src/tools/check-qemu-numa.sh:131-170,209-224`). A consistently swapped or otherwise misassigned two-node graph can satisfy all of those checks, especially on the symmetric 2+2 equal-memory profiles. M5 explicitly requires the exact normalized node/CPU/range graph (`docs/todo/P02M0152.md:138-153`).
+
+Verification: the current topology and FDT host suites passed 38 and 82 tests, and the NUMA gate passes shell syntax checking. Those checks do not close the live proof gaps above. QEMU was not run here because the shared runner/images were reserved by the concurrent audit.

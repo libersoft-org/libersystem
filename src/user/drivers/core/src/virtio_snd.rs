@@ -334,7 +334,7 @@ unsafe fn serve(bootstrap: u64, bind: &common::Bind, ctl: &Ctl, tx: &mut Tx, rx:
 						ctl.stream_cmd(R_PCM_RELEASE, capture.unwrap_or(0));
 					}
 				}
-				common::finish_stop(bootstrap, bind, ctl.q.capability);
+				common::finish_stop(bootstrap, bind, ctl.q.capability, device.quiesce());
 				exit();
 			}
 			// receive straight into the period region of the transmit DMA page.

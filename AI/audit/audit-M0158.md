@@ -170,3 +170,11 @@ CURRENT IMPLEMENTATION RATING: 10/10
 No material issue remains. The accepted correction is present: `dev_channel` now reports the shared
 canonical device name `virtio-console` while retaining the PCI address as its function identity and
 the transport as detail, matching the manifest and ABI inventory naming.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0158 (2026-08-29T23:04:15Z):
+
+Current implementation rating: 10/10
+
+No material unresolved issue remains within M0158's scope. `PERF tsc_hz` remains restricted to the dedicated `development-trace` profile and its gate retains both positive and ordinary-interactive negative boots. The previously inconsistent driver paths still use canonical device names and hardware addresses, and failed virtio-blk bindings report `DEGRADED` rather than `online`. Relevant gate and harness scripts pass shell syntax checks.

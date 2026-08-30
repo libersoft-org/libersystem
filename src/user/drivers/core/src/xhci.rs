@@ -542,6 +542,23 @@ unsafe fn bring_up(base: u64) -> Option<Xhci> {
 }
 
 // Spin until the masked bits at `addr` are all set. None on budget exhaustion.
+impl Xhci {
+	// STOP THE CONTROLLER AND WAIT FOR IT TO SAY SO.
+	//
+	// Clear Run/Stop and wait for USBSTS.HCHalted: the specification's own handshake, and the same
+	// pair `reset` performs before it resets. A halted controller has stopped fetching from the
+	// command, event and transfer rings, which is what a planned stop has to establish before it can
+	// be acknowledged as clean. Returns whether the controller confirmed within the spin budget - a
+	// controller that does not is one whose rings may still be live, and its driver must not report a
+	// clean stop.
+	unsafe fn halt(&self) -> bool {
+		unsafe {
+			w32(self.op + OP_USBCMD, r32(self.op + OP_USBCMD) & !CMD_RUN);
+			wait_set(self.op + OP_USBSTS, STS_HCHALTED).is_some()
+		}
+	}
+}
+
 unsafe fn wait_set(addr: u64, mask: u32) -> Option<()> {
 	unsafe {
 		let mut spins: u32 = 0;
@@ -1004,9 +1021,14 @@ unsafe fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots
 		loop {
 			// The manager's channel joins the three this loop already waits on.
 			if common::wait_or_answer(bootstrap, bind, &[irq, blk_server, usbq]).is_none() {
-				// The controller keeps its capability in the storage half rather than on this struct,
-				// so the stop is answered here and the quiesce is the device's own reset path.
-				common::finish_stop(bootstrap, bind, 0);
+				// AND THE CONTROLLER IS HALTED FIRST, which this did not do.
+				//
+				// The comment here said "the quiesce is the device's own reset path", and that reset
+				// happens at BRING-UP. On a planned stop the controller was left RUNNING - command
+				// ring, event ring and every transfer ring live, all of them DMA - and `STOPPED` was
+				// sent anyway, which certifies the opposite. `halt` clears R/S and waits for HCHalted,
+				// which is the controller's own statement that it has stopped touching memory.
+				common::finish_stop(bootstrap, bind, 0, hc.halt());
 				exit();
 			}
 			// the interrupt: drain the event ring (HID reports feed the console and

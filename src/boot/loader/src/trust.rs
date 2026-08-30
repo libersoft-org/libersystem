@@ -209,7 +209,25 @@ impl Expected {
 	// - a volume nothing named, whose manifest does not mention a list - is one this boot may leave
 	// for another, and that is the only case an absence is an absence.
 	pub(crate) fn selects_its_source(&self, manifest: &bootproto::manifest::Manifest<'_>) -> bool {
-		matches!(self.volume_uuid, VolumeIdentity::Exactly(_)) || manifest.find(bootproto::manifest::KIND_BOOTSTRAP_LIST, b"etc/bootstrap.list").is_some()
+		// AND A MANIFEST THAT SUPPLIED THE KERNEL HAS ALREADY CHOSEN ITS SOURCE.
+		//
+		// The two above are the ways this source was NAMED. This is the way it was USED: a manifest
+		// carrying a `KIND_KERNEL` row is the one the running kernel came from, and a boot that has
+		// executed a source's kernel has selected that source whatever named it. Without this an
+		// unpaired volume could hand over a signed, verified kernel, omit its bootstrap list, and
+		// have the absence read as "not a LiberSystem source" - so the kernel came from here and the
+		// bootstrap set from somewhere else, which is the outcome this whole path exists to prevent.
+		self.pairs_with_this_source() || manifest.find(bootproto::manifest::KIND_BOOTSTRAP_LIST, b"etc/bootstrap.list").is_some() || manifest.find(bootproto::manifest::KIND_KERNEL, b"boot/kernel").is_some()
+	}
+
+	// The pairing half of `selects_its_source`, on its own.
+	//
+	// The development `etc/boot.manifest` path has no signed manifest to ask about rows, and the
+	// question "did the medium name this volume" is answerable without one - so the rule that a
+	// chosen source's missing list is a REFUSAL applies there too. It did not, and the profile that
+	// takes an unsigned manifest is exactly the one where a mixed boot is easiest to arrange.
+	pub(crate) fn pairs_with_this_source(&self) -> bool {
+		matches!(self.volume_uuid, VolumeIdentity::Exactly(_))
 	}
 
 	// The medium this loader itself came off. Not a volume.

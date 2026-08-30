@@ -919,6 +919,16 @@ impl Process {
 		self.begin_teardown();
 		self.unmap_objects();
 		self.orphan_dma_buffers();
+		// AND THE CLAIMS, BEFORE THE HANDLES GO - which the clean-exit path already does and this
+		// one did not.
+		//
+		// `close_all` drops the table's capabilities, and for a claim that is a release only if the
+		// table held the LAST strong reference. A killed manager is exactly the case where it does
+		// not: a thread parked in `SYS_WAIT` on its claim, or one inside a syscall that resolved the
+		// object, keeps it alive - so the manager died and its device stayed `Claimed`, with no
+		// event ever settling it. `release_claims` starts the release from the kill itself, which is
+		// what M6's synchronous killed-holder rule asks for.
+		self.release_claims();
 		self.handles.lock().close_all();
 		self.killed.store(true, Ordering::Release);
 		self.record_in_groups();

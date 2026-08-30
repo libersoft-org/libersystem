@@ -219,6 +219,28 @@ unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 // KEYED BY ADDRESS, NOT BY INDEX, because the index is the kernel's row number for this boot and the
 // address is what the record is about. So the address is asked of DeviceService first - and when
 // that is gone too, the operator is told the shape of the key rather than nothing.
+// One unsigned number as decimal digits, into a caller's buffer. Twenty digits is the widest a u64
+// can be, so the buffer cannot be short. `alloc::format!` would do it in one line and pull a
+// formatting machine into a tool whose whole output is bytes.
+fn decimal(value: u64, out: &mut [u8; 20]) -> usize {
+	if value == 0 {
+		out[0] = b'0';
+		return 1;
+	}
+	let mut digits: [u8; 20] = [0u8; 20];
+	let mut left = value;
+	let mut count = 0usize;
+	while left > 0 {
+		digits[count] = b'0' + (left % 10) as u8;
+		left /= 10;
+		count += 1;
+	}
+	for at in 0..count {
+		out[at] = digits[count - 1 - at];
+	}
+	count
+}
+
 unsafe fn stored_incident(config: u64, index: u32) {
 	unsafe {
 		if config == 0 {
