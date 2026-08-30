@@ -12,6 +12,13 @@ crate::tagged_test!(a_machine_reports_the_topology_it_has_and_invents_none, [Num
 fn a_machine_reports_the_topology_it_has_and_invents_none() {
 	// The report is called here because a test build has no `boot_main` to call it, and a reporting
 	// path nothing exercises is a reporting path that stops working.
+	//
+	// AND THE CORES ARE BOUND FIRST, in the order a boot performs it. `report_machine` calls
+	// `bind_online` and THEN reports, because firmware describes processors it believes exist and
+	// binding is what establishes which of them answered - so a report taken before it describes a
+	// machine no boot ever produces, with every node showing zero online cores. Exercising the
+	// reporting path against a state that cannot occur is not exercising it.
+	crate::smp::numa::bind_online();
 	report();
 
 	let described = crate::mem::with_topology(|found| (found.nodes().len(), found.memory_bearing_nodes().len()));

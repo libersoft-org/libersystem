@@ -32,6 +32,23 @@ pub enum Verdict {
 	Mismatch,
 }
 
+// Whether `manifest` has a row for `path` at all, without checking any content against it.
+//
+// The loader needs this to answer a different question from `verify`'s: not "is this file the one
+// the manifest records" but "did this manifest SUPPLY this file". A source whose manifest names
+// `boot/kernel` is the source the running kernel came from, and a boot that has executed a source's
+// kernel has selected that source - which decides whether a missing bootstrap list on it is an
+// absence or a refusal. The signed manifest answers the same question with `find(KIND_KERNEL, ..)`;
+// this is the v1 equivalent, and its absence is why the rule held on one path only.
+pub fn names(manifest: &[u8], path: &[u8]) -> bool {
+	let mut lines = manifest.split(|byte| *byte == b'\n');
+	match lines.next() {
+		Some(first) if first == MAGIC => {}
+		_ => return false,
+	}
+	lines.any(|line| line.len() >= 66 && &line[64..66] == b"  " && &line[66..] == path)
+}
+
 // Check `bytes` against the row for `path` in `manifest`.
 pub fn verify(manifest: &[u8], path: &[u8], bytes: &[u8]) -> Verdict {
 	let mut lines = manifest.split(|byte| *byte == b'\n');

@@ -3496,6 +3496,25 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, catalog
 				// the incident is fresh and `Retry` does not reset the automatic budget.
 				node.attempt = node.attempt.saturating_sub(1);
 				node.incident = Incident::open();
+				// AND THE CURSOR IS REWOUND WHEN THERE IS NOTHING LEFT TO TRY, which is the case this
+				// granted zero attempts in.
+				//
+				// `Step::NextCandidate` advances `node.candidate` past the final entry, and that is
+				// how a node records "every candidate has been tried". `start_candidate` returns
+				// immediately for a cursor in that state - correctly, since it is the terminal
+				// condition - so a retry that only opened an incident and asked the loop to start a
+				// candidate asked it to start nothing. An operator saw `Accepted` and nothing
+				// happened, which is the one outcome a policy verb may not produce.
+				//
+				// Rewound to the REGISTRY ORDER rather than to the last entry tried: a retry is a
+				// request to bind the device again, and the stored `select=` preference is expressed
+				// as this same cursor, so an operator who chose an artifact gets it re-applied by
+				// `load_stored_policy` on the next start rather than by this verb second-guessing
+				// which entry was meant. The `requires` re-evaluation the milestone asks for then
+				// happens where it always does, inside `start_candidate`.
+				if node.candidate >= node.candidates.len() {
+					node.candidate = 0;
+				}
 				// ASKED FOR, AND THE LOOP PERFORMS IT. A state change alone would not do: `advance`
 				// is event-driven and a node sitting in `Failed` or `Backoff` raises no event, so
 				// nothing would ever start the attempt. The flag is consumed once by the standing
@@ -3769,15 +3788,19 @@ fn persist_incidents(nodes: &mut [Node], config: u64) {
 			// what the live endpoint answers, and "the snapshot outlives the manager" was true of a
 			// summary rather than of the report. A reader that finds fewer fields than the schema
 			// has cannot tell a record written before this from one whose driver had no Domain.
-			// AND THE ROW NUMBER THIS BOOT GAVE IT, which is what `lsdev --incident N` asks by.
+			// THE ROW NUMBER IS NOT RECORDED, AND WAS (corrected 2026-08-30).
 			//
-			// The KEY is the device's address, because that is the record's identity and a row
-			// number names whatever the table happened to hold. But the operator's question is asked
-			// by index, and with no index in the record a reader could only answer it by listing
-			// every stored incident - which is what it did, printing unrelated devices and unable to
-			// say whether N had one at all.
-			value.push_str(" index=");
-			push_number(&mut value, node.index as u64);
+			// It was added so `lsdev --incident N` could find one record rather than list them all,
+			// and it made the record wrong in a way listing never was. The key is the device's
+			// ADDRESS because that is what identifies it across boots; `node.index` is this boot's
+			// position in an inventory whose order and membership can change. A record written when
+			// device 3 was the NIC, read in a boot where row 3 is the audio controller, matched -
+			// and several old records could match one row. A field that is only correct until the
+			// next boot is worse in a record whose whole purpose is to outlive the manager.
+			//
+			// The address below is what a reader matches on now, and `lsdev` asks by address on the
+			// path where the manager is gone. Where the manager is alive it answers by index itself,
+			// from the live inventory that gives the number meaning.
 			value.push_str(" at=");
 			push_number(&mut value, report.binding.bus as u64);
 			value.push(':');

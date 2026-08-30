@@ -104,7 +104,11 @@ pub fn cpu_node(cpu: usize) -> Affinity {
 // The per-node mask, in the one form anything in this kernel needs: a count. A bitmask would be an
 // interface for a scheduler policy this tree explicitly does not add, and adding one to make a
 // test easier is how a milestone grows an API nobody asked for.
-#[cfg(test)]
+//
+// NO LONGER TEST-ONLY: the boot report is a production caller. It printed the count of FIRMWARE
+// RECORDS per node, so a core that timed out or never came up was still reported under its node -
+// and M1 says an absent or timed-out CPU creates no logical affinity. The two counts are different
+// facts and the report now prints both.
 pub fn online_on(node: NodeId) -> usize {
 	let bindings = BINDINGS.lock();
 	bindings.iter().filter(|slot| slot.load(Ordering::Acquire) == node.0).count()

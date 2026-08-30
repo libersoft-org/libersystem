@@ -90,14 +90,29 @@ impl DeviceMemory {
 		(self.page_offset() as usize + self.len).div_ceil(PAGE_SIZE as usize).max(1)
 	}
 
-	// The sentinel a claim holds between `claim_mapping` and `set_mapped_in`.
+	// The sentinel a claim holds between `claim_mapping` and `commit_mapping`.
 	const RESERVED: u64 = 1;
+
+	// THE TOMBSTONE A TEARDOWN LEAVES, and it is what makes the commit below claim-current.
+	//
+	// The sweep and the map syscall could both run and neither could see the other. `claim_mapping`
+	// takes `RESERVED`, the syscall then allocates a range and installs PTEs, and only afterwards
+	// records where it mapped. A release landing in that window found `RESERVED`, read it as "not
+	// mapped yet", and returned having unmapped nothing - and the syscall then published a live
+	// mapping of device registers AFTER the only sweep the claim will ever run. The holder kept raw
+	// BAR access with the claim already `Free`, which is the property this milestone exists to
+	// deny.
+	//
+	// A value no mapping can have, like `RESERVED`, and one that is TERMINAL: once a teardown has
+	// swapped it in, `claim_mapping` can never take the object again and the in-flight commit
+	// cannot publish. The mapping is one-shot by design, so there is nothing to reset it for.
+	const REVOKED: u64 = 2;
 
 	// Claim the right to map this region, once.
 	//
-	// `mapped_at() != 0` was tested at the top of the map syscall and `set_mapped_in` ran
+	// `mapped_at() != 0` was tested at the top of the map syscall and the record was written
 	// twenty-five lines later, so two threads could both find it unmapped and both build an MMIO
-	// mapping - and the second `set_mapped_in` overwrote the record of the first. `Drop` then
+	// mapping - and the second write overwrote the record of the first. `Drop` then
 	// removed one of them, and the other outlived the capability that authorised it: a mapping of
 	// device registers left in a process with no handle to the device.
 	//
@@ -108,16 +123,29 @@ impl DeviceMemory {
 		self.mapped_at.compare_exchange(0, Self::RESERVED, Ordering::AcqRel, Ordering::Acquire).is_ok()
 	}
 
+	// COMMIT THE MAPPING, OR REFUSE IT BECAUSE THE CLAIM ENDED WHILE IT WAS BEING BUILT.
+	//
+	// The record used to be stored unconditionally, so a teardown that ran between `claim_mapping`
+	// and the store was overwritten by it. This is the same reserve-then-commit the claim uses, closed at
+	// the other end: the commit is a CAS off `RESERVED`, so a `REVOKED` tombstone left by a sweep
+	// makes it fail and the caller unmaps what it had installed.
+	//
+	// `false` means the mapping must be torn down by its builder, because nothing else will: the
+	// sweep that set the tombstone had nothing to find.
+	pub fn commit_mapping(&self, virt: u64, space: Arc<AddressSpace>) -> bool {
+		*self.mapped_in.lock() = Some(space);
+		if self.mapped_at.compare_exchange(Self::RESERVED, virt, Ordering::AcqRel, Ordering::Acquire).is_err() {
+			// The space record is dropped with it, so a later teardown cannot reach into an address
+			// space for a mapping this call is about to remove itself.
+			*self.mapped_in.lock() = None;
+			return false;
+		}
+		true
+	}
+
 	// Give the claim back, for a map that could not be completed.
 	pub fn release_claim(&self) {
 		let _ = self.mapped_at.compare_exchange(Self::RESERVED, 0, Ordering::AcqRel, Ordering::Acquire);
-	}
-
-	// Record where this region is mapped AND in which address space, so the teardown can
-	// reach the same one rather than whichever is active when the last reference dies.
-	pub fn set_mapped_in(&self, virt: u64, space: Arc<AddressSpace>) {
-		*self.mapped_in.lock() = Some(space);
-		self.mapped_at.store(virt, Ordering::Release);
 	}
 
 	// Where this region is mapped, for the test that asks whether a revocation reached the address
@@ -154,8 +182,15 @@ impl DeviceMemory {
 	// evidence that a MAPPING is gone: the driver has a raw virtual address it has been using for as
 	// long as it has been running, and revoking the capability does not touch it. This does.
 	pub fn teardown_mapping(&self) {
-		let base = self.mapped_at.swap(0, Ordering::AcqRel);
-		if base == 0 || base == Self::RESERVED {
+		// SWAPPED TO THE TOMBSTONE, NOT TO ZERO. Zero is the state a fresh object is in, so a sweep
+		// that wrote it left the object mappable again - and, worse, indistinguishable from one that
+		// had never been mapped, which is how an in-flight commit could publish past the sweep. The
+		// tombstone is terminal and says which of the two happened.
+		let base = self.mapped_at.swap(Self::REVOKED, Ordering::AcqRel);
+		if base == 0 || base == Self::RESERVED || base == Self::REVOKED {
+			// NOTHING TO UNMAP HERE, AND THAT IS NOT THE SAME AS NOTHING TO DO. `RESERVED` means a
+			// map syscall is between its claim and its commit: the tombstone this just wrote is what
+			// makes that commit fail, and the syscall unmaps its own work.
 			return;
 		}
 		let space = self.mapped_in.lock().take();

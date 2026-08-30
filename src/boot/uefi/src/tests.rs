@@ -243,10 +243,17 @@ fn the_paired_volume_is_chosen_whichever_order_the_firmware_reports_it_in() {
 	let chosen = firmware::choose_volume(mock::boot_services(), None, read_uuid);
 	assert_eq!(chosen_uuid(chosen), Some([0x77; 16]), "with no pairing the first volume that opens wins");
 
-	// And a pairing that names a volume this machine does not have finds NOTHING rather than
-	// falling back to somebody else's system.
+	// AND A PAIRING THAT NAMES A VOLUME THIS MACHINE DOES NOT HAVE, WITH LIBERFS VOLUMES PRESENT, IS
+	// A FAILURE RATHER THAN AN ABSENCE.
+	//
+	// This asserted `NotHere` and codified the defect: the walk found LiberFS volumes, none of them
+	// was the one the pairing names, and answering "not here" is the answer a machine with no LiberFS
+	// volume gives - which the loader may follow with a fallback to the signed boot medium. Changing
+	// a superblock UUID and recomputing the unauthenticated filesystem checksum would then turn a
+	// present source whose identity is wrong into an absence with a fallback behind it. Exhaustion
+	// with a candidate present is terminal.
 	let chosen = firmware::choose_volume(mock::boot_services(), Some([0x5e; 16]), read_uuid);
-	assert!(matches!(chosen, disk::VolumeChoice::NotHere), "a volume that is not here is not substituted for");
+	assert!(matches!(chosen, disk::VolumeChoice::Failed), "LiberFS volumes were here and none was the one named - a present source with the wrong identity is not an absence");
 }
 
 // A DISK THAT IS OURS AND BROKEN IS NOT A DISK THAT IS ABSENT.

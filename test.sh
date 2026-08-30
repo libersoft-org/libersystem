@@ -253,7 +253,9 @@ require_built() {
 		local efi="$BUILD_DIR/cargo/loader/$(loader_triple "$arch")/debug/libersystem-loader.efi"
 		[[ -f "$efi" ]] || die "no loader for $arch - run: ./build.sh --arch $arch --part loader"
 		local loader_stamp="$BUILD_DIR/state/built-$arch-loader"
-		if [[ ! -f "$loader_stamp" || "$(cat "$loader_stamp")" != "$(source_digest boot/loader)" ]]; then
+		# `LOADER_SOURCES`, not `boot/loader`: the same identity the build writes and the signed-boot
+		# gate compares, so all three agree on what a stale loader is.
+		if [[ ! -f "$loader_stamp" || "$(cat "$loader_stamp")" != "$(source_digest "${LOADER_SOURCES[@]}")" ]]; then
 			die "the $arch loader does not match its sources
     Run:  ./build.sh --arch $arch --part loader"
 		fi

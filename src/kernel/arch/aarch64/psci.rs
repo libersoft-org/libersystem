@@ -382,7 +382,17 @@ extern "C" fn secondary_idle(cpu_id: u64) -> ! {
 	unsafe {
 		core::arch::asm!("mrs {}, mpidr_el1", out(reg) mpidr, options(nomem, nostack, preserves_flags));
 	}
-	super::gic::init_secondary();
+	// A CORE THAT CANNOT TAKE INTERRUPTS DOES NOT JOIN THE ONLINE SET.
+	//
+	// `init_secondary` answers whether this core's interrupt state could be established at all - on
+	// GICv3 it cannot when the redistributor region does not describe a frame for it. Such a core
+	// used to print a line and carry on into the online count, where the scheduler placed threads on
+	// it that were never preempted and never woken by an IPI. Parking it is what makes the described
+	// and online counts differ, which is a fact the boot report now prints and a gate can read.
+	if !super::gic::init_secondary() {
+		crate::serial_println!("psci: core {cpu_id} is not brought online - its interrupt state could not be established");
+		super::halt_loop();
+	}
 	SEC_MPIDR[cpu_id as usize].store(mpidr, Ordering::Relaxed);
 	SMP_ONLINE.fetch_add(1, Ordering::Release);
 	// AND INTO THE PORTABLE TABLE TOO, before the core counts as online. The affinity lived only in

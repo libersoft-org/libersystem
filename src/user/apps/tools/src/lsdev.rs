@@ -216,30 +216,11 @@ unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 // the Domain's counters. It used to write a summary of that, so the persisted copy could not answer
 // what the live endpoint answered and "the snapshot outlives the manager" was true of a summary.
 //
-// KEYED BY ADDRESS, NOT BY INDEX, because the index is the kernel's row number for this boot and the
-// address is what the record is about. So the address is asked of DeviceService first - and when
-// that is gone too, the operator is told the shape of the key rather than nothing.
-// One unsigned number as decimal digits, into a caller's buffer. Twenty digits is the widest a u64
-// can be, so the buffer cannot be short. `alloc::format!` would do it in one line and pull a
-// formatting machine into a tool whose whole output is bytes.
-fn decimal(value: u64, out: &mut [u8; 20]) -> usize {
-	if value == 0 {
-		out[0] = b'0';
-		return 1;
-	}
-	let mut digits: [u8; 20] = [0u8; 20];
-	let mut left = value;
-	let mut count = 0usize;
-	while left > 0 {
-		digits[count] = b'0' + (left % 10) as u8;
-		left /= 10;
-		count += 1;
-	}
-	for at in 0..count {
-		out[at] = digits[count - 1 - at];
-	}
-	count
-}
+// KEYED BY ADDRESS, NOT BY INDEX, because the index is the kernel's row number for THIS boot and the
+// address is what the record is about. That is why this path cannot answer a question asked by row
+// number: the inventory that gives a row its meaning is DeviceManager's, and reaching this code
+// means DeviceManager is gone. It says so rather than matching a number that named a different
+// device in the boot that wrote it.
 
 unsafe fn stored_incident(config: u64, index: u32) {
 	unsafe {
@@ -248,18 +229,26 @@ unsafe fn stored_incident(config: u64, index: u32) {
 			return;
 		}
 		let mut client = ConfigClient::new(config);
-		// THE RECORD FOR THE DEVICE THAT WAS ASKED ABOUT, and not every stored incident.
+		// A ROW NUMBER CANNOT BE RESOLVED WITHOUT THE MANAGER, AND THIS PRETENDED IT COULD
+		// (corrected 2026-08-30).
 		//
-		// This discarded `index` and printed the whole prefix, so `lsdev --incident 3` reported
-		// unrelated devices and could not say whether device 3 had an incident at all - a listing
-		// where a lookup was asked for. The record is KEYED by the device's address, because that is
-		// its identity across boots, and it now CARRIES the row number this boot gave it, which is
-		// what the operator's question is asked by. So the lookup is: read the prefix, match
-		// `index=N`.
-		let mut wanted = String::from(" index=");
-		let mut number: [u8; 20] = [0u8; 20];
-		let written = decimal(index as u64, &mut number);
-		wanted.push_str(core::str::from_utf8(&number[..written]).unwrap_or("?"));
+		// The record is KEYED by the device's address, which is its identity across boots. It also
+		// carried the row number of the boot that wrote it, and this matched on that - so a record
+		// written when row 3 was the NIC answered a question about row 3 in a boot where that row is
+		// the audio controller, and several old records could match one row. The index is gone from
+		// the record for that reason.
+		//
+		// What is left is honest: this path runs only when DeviceManager is gone, and the row number
+		// is a position in the inventory DeviceManager serves. So the number cannot be turned into a
+		// device here, and rather than guess, this says so and prints every stored incident BY ITS
+		// ADDRESS - which is the durable name the operator can match against `lspci`. Where the
+		// manager is alive the question is answered by index, from the live inventory that gives the
+		// number meaning, and this path is not reached.
+		eprint(
+			b"lsdev: DeviceManager is gone, so a row number cannot be resolved to a device - the stored incidents are listed by the address that identifies them across boots
+",
+		);
+		let _ = index;
 		let mut found = false;
 		match client.list() {
 			Some(Ok(entries)) => {
@@ -268,13 +257,6 @@ unsafe fn stored_incident(config: u64, index: u32) {
 					// are one prefix of it. An operator asking what went wrong is not asking for
 					// every configuration value this system holds.
 					if !entry.key.starts_with("device.policy.incident.") {
-						continue;
-					}
-					// The record's own index, followed by a space or the end of the value, so
-					// `index=1` does not match `index=12`.
-					let Some(at) = entry.value.find(wanted.as_str()) else { continue };
-					let rest = &entry.value[at + wanted.len()..];
-					if !rest.is_empty() && !rest.starts_with(' ') {
 						continue;
 					}
 					found = true;
@@ -290,11 +272,9 @@ unsafe fn stored_incident(config: u64, index: u32) {
 			}
 		}
 		if !found {
-			eprint(b"lsdev: the device policy endpoint did not answer, and no incident is stored for device ");
-			eprint(&number[..written]);
-			eprint(b"\n");
+			eprint(b"lsdev: the device policy endpoint did not answer, and no incident is stored for any device\n");
 			return;
 		}
-		eprint(b"lsdev: DeviceManager did not answer - the record above is the persisted copy, keyed by the device's address\n");
+		eprint(b"lsdev: DeviceManager did not answer - the records above are the persisted copies, each keyed by the address of the device it belongs to\n");
 	}
 }

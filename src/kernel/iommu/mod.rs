@@ -504,33 +504,28 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 			let _ = iommu.destroy_domain(domain);
 			return Err(reason);
 		}
-		// AND AN ENDPOINT WHOSE DOORBELL COULD NOT BE MAPPED IS RECORDED, AND REFUSED WHERE IT MATTERS.
+		// THE DOORBELL IS NOT MAPPED HERE, AND THAT IS THE FIX RATHER THAN THE OMISSION.
 		//
-		// This logged the failure and reported success, so `device::claim` went on to enable bus
-		// mastering for a binding already known not to receive interrupts.
+		// Three shapes were tried. Mapping it here and IGNORING a failure enabled bus mastering for a
+		// binding already known not to receive interrupts - silently. Mapping it here and FAILING THE
+		// ATTACH is too blunt, and was measured to be: most drivers in this tree POLL and never
+		// acquire an MSI vector at all, so refusing their attach denies translation to devices the
+		// doorbell is irrelevant to, and the boot came up with one endpoint attached and no network.
+		// Mapping it here and RECORDING the failure for a later refusal - what this did - fixes the
+		// silence and leaves a map failure ending in a published binding, which the milestone rule
+		// does not allow.
 		//
-		// FAILING THE ATTACH OUTRIGHT IS TOO BLUNT, AND I TRIED IT: most drivers in this tree POLL and
-		// never acquire an MSI vector at all, so refusing their attach denies translation to devices
-		// the doorbell is irrelevant to - measured as a boot where one endpoint attached and the
-		// network never came up. The refusal belongs where the interrupt is actually asked for, so
-		// the domain is recorded here and `SYS_DEVICE_MSIX_ACQUIRE` refuses against that record. A
-		// polling driver is unaffected; a driver that wants an interrupt is told no rather than given
-		// a vector that cannot be delivered.
-		if install_doorbell(iommu, domain, endpoint, &regions).is_err() {
-			crate::serial_println!("iommu: endpoint {:#x} has no route for its interrupts through its domain - it is translated, and no MSI vector will be handed out for it", endpoint.0);
-			NO_DOORBELL.lock().push(domain);
-		}
+		// The dilemma is created by mapping it EAGERLY for an endpoint that may never want one. So it
+		// is mapped LAZILY, by `SYS_DEVICE_MSIX_ACQUIRE`, at the moment an interrupt is actually
+		// asked for and before MSI-X is enabled on the device. A polling driver asks for no doorbell
+		// and no map can fail; a driver that wants an interrupt gets the map or gets a refusal, and a
+		// refusal there IS a refused binding - it is handed no vector and the device is never allowed
+		// to raise one. Nothing is published on a failed map, and no endpoint is left translated with
+		// a route nobody checked.
 		Ok(domain)
 	})
 	.unwrap_or(Err(Fault::Unconfirmed))
 }
-
-// DOMAINS WHOSE MSI DOORBELL COULD NOT BE MAPPED.
-//
-// Small and bounded by the number of translated endpoints. `msi_deliverable` is what reads it, from
-// the one syscall that hands out a vector - see `attach_endpoint` for why the refusal is there rather
-// than at the attach.
-static NO_DOORBELL: crate::sync::SpinLock<alloc::vec::Vec<dma::DomainId>> = crate::sync::SpinLock::new(alloc::vec::Vec::new());
 
 // HOW MANY TRANSLATIONS THIS DEVICE'S DOMAIN STILL HOLDS - live and quarantined together, because a
 // quarantined one is charged exactly like a live one: nobody knows the device has stopped resolving
@@ -544,9 +539,29 @@ pub fn grants_for(index: u32) -> usize {
 
 // Whether an MSI vector for this device can actually be delivered: either it is not translated at all,
 // or its domain carries a mapping for the doorbell its interrupts are written to.
-pub fn msi_deliverable(index: u32) -> bool {
+// MAP THE DOORBELL FOR THIS DEVICE, NOW THAT AN INTERRUPT IS BEING ASKED FOR.
+//
+// `true` for an endpoint this controller does not translate: its interrupts do not pass through a
+// domain, so there is nothing to map and nothing that could fail. Otherwise the doorbell region is
+// mapped into the endpoint's domain and the answer is whether it is now reachable.
+//
+// IDEMPOTENT, because a driver may acquire, release and acquire again across one binding: mapping a
+// region that is already mapped answers `AlreadyMapped`, which is the same success as mapping it.
+pub fn msi_deliverable(index: u32, bus: u8, dev: u8, func: u8) -> bool {
 	let Some(domain) = domain_of(index) else { return true };
-	!NO_DOORBELL.lock().contains(&domain)
+	let endpoint = requester_of(bus, dev, func);
+	let installed = with(|controller| {
+		let iommu = controller.iommu();
+		let regions = iommu.probe(endpoint).map_err(|_| ())?;
+		install_doorbell(iommu, domain, endpoint, &regions).map_err(|_| ())
+	});
+	match installed {
+		Some(Ok(())) => true,
+		_ => {
+			crate::serial_println!("iommu: domain {} has no route for its interrupts - no MSI vector is handed out for it", domain.0);
+			false
+		}
+	}
 }
 
 // Whether the doorbell fact has been printed. Every endpoint on a machine writes the same one.
@@ -684,7 +699,15 @@ pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8, generation: u64) -> 
 			if domains.try_reserve(1).is_err() {
 				drop(domains);
 				let endpoint = requester_of(bus, dev, func);
-				let undone = with(|controller| controller.iommu().revoke_endpoint(domain, endpoint)).is_some();
+				let undone = matches!(with(|controller| controller.iommu().revoke_endpoint(domain, endpoint)), Some(Ok(dma::Release::FramesReusable)));
+				// AND THE DOMAIN GOES WITH IT, on the same rule as the ordinary detach: a rollback
+				// that revoked the endpoint cleanly has nothing left to keep the domain for, and one
+				// that did not leaves it standing. Without this the failed attach left a domain
+				// behind exactly as the normal path did - and this is the path taken when memory is
+				// already short, which is the worst moment to start leaking domain IDs.
+				if undone {
+					let _ = with(|controller| controller.iommu().destroy_domain(domain));
+				}
 				crate::serial_println!("iommu: {:02x}:{:02x}.{} attached and its row could not be recorded - the attach was {}", bus, dev, func, if undone { "undone" } else { "NOT undone, and this endpoint is translating under a domain nothing tracks" });
 				return false;
 			}
@@ -714,7 +737,17 @@ pub fn detach_for(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// control plane for the boot-time budget. The budget is restored before returning, on every
 	// path, because the boot's own attaches must keep the longer one.
 	let previous_budget = virtqueue::set_spin_budget(virtqueue::TEARDOWN_SPINS);
+	// AND A WALL-CLOCK BOUND WITH IT, which the spin count is not.
+	//
+	// A million iterations is a duration only on a machine whose speed you already know; on an
+	// emulated target under load it is an unstated one. The manager's loop is what waits behind this,
+	// so the bound it needs is in the units it budgets in - ticks. Whichever expires first ends the
+	// wait, and either expiry is `Unconfirmed`, which quarantines the claim rather than freeing
+	// anything. Restored on every path, like the budget, because the boot's own attaches must not
+	// inherit a deadline that has already passed.
+	let previous_deadline = virtqueue::set_deadline(crate::arch::apic::ticks().saturating_add(virtqueue::TEARDOWN_TICKS));
 	let confirmed = detach_for_inner(index, bus, dev, func);
+	virtqueue::set_deadline(previous_deadline);
 	virtqueue::set_spin_budget(previous_budget);
 	confirmed
 }
@@ -740,6 +773,26 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 			false
 		}
 	};
+	// AND A CONFIRMED REVOKE DESTROYS THE DOMAIN, which nothing did.
+	//
+	// The public row was removed and the endpoint revoked, and the `DomainState` behind them stayed:
+	// its terminal mapping rows, its entry in the controller's map, and its domain ID. A machine that
+	// binds and unbinds a device - a driver restart, an operator stop, a rebind after a crash - grew
+	// one dead domain per cycle and never gave a domain ID back, which is the lifecycle leak M4's
+	// restart baseline cannot hold across.
+	//
+	// UNCONFIRMED IS THE CASE THAT MUST NOT, and `destroy_domain` already refuses it rather than
+	// trusting this caller: it returns `Unconfirmed` while any endpoint is still attached or any
+	// mapping of the domain is quarantined, because forgetting a quarantined mapping would hand its
+	// address space back for reuse on exactly the evidence that says not to. So the rule is stated
+	// here and enforced there.
+	if confirmed {
+		match with(|controller| controller.iommu().destroy_domain(domain)) {
+			Some(Ok(_)) => {}
+			Some(Err(fault)) => crate::serial_println!("iommu: domain {} outlived the endpoint that used it ({fault:?}) - it is retained rather than reused", domain.0),
+			None => {}
+		}
+	}
 	// A BINDING CHANGE IS WHEN THE FAULTS ARE COLLECTED. Bounded, and said plainly: this kernel
 	// polls the event queue at binding transitions and at boot rather than on an interrupt, so a
 	// fault raised between two of those moments is reported late. It is never LOST - the device

@@ -228,15 +228,18 @@ fn init_distributor_v3() {
 // Bring up a secondary core's CPU interface + timer (the distributor is already on). The CPU
 // interface, the redistributor frame and the SGI/PPI enable bits are all per core, so each core must
 // run this itself.
-pub fn init_secondary() {
-	init_cpu_local();
+//
+// ANSWERS WHETHER THIS CORE CAN TAKE INTERRUPTS AT ALL, so its caller can refuse to count it online.
+pub fn init_secondary() -> bool {
+	init_cpu_local()
 }
 
 // Per-core setup: the CPU interface on, the timer PPI and the SGIs unmasked, CNTP armed.
-fn init_cpu_local() {
+fn init_cpu_local() -> bool {
 	if v3() {
-		init_cpu_local_v3();
-	} else {
+		return init_cpu_local_v3();
+	}
+	{
 		unsafe {
 			// Allow all priorities through (PMR high) and enable the CPU interface.
 			core::ptr::write_volatile(gicc(GICC_PMR), 0xf0);
@@ -250,18 +253,29 @@ fn init_cpu_local() {
 		}
 	}
 	arm_local_timer();
+	// GICv2's per-core state is banked registers on a fixed CPU interface: there is no per-core
+	// frame that can be absent, so this path cannot fail the way v3's can.
+	true
 }
 
 // The GICv3 per-core half: wake this core's redistributor, put its SGIs and PPIs in group 1, enable
 // them, and turn on the system-register CPU interface.
-fn init_cpu_local_v3() {
+fn init_cpu_local_v3() -> bool {
 	let Some(frame) = this_redistributor() else {
 		// A core whose redistributor the region does not describe cannot be given interrupts at
-		// all - not the timer that drives its preemption, not the SGI that wakes it. Saying so is
-		// the whole of what can be done here; the core still runs, and the boot core's line about
-		// the controller is where a reader looks.
-		crate::serial_println!("gic: this core has no redistributor frame in the region the machine described - it takes no interrupts");
-		return;
+		// all - not the timer that drives its preemption, not the SGI that wakes it.
+		//
+		// SAYING SO WAS THE WHOLE OF WHAT THIS DID, AND IT LET THE CORE RUN. It then joined the
+		// online set, the scheduler placed threads on it, and those threads were never preempted and
+		// never woken by an IPI - a core that is counted as usable and takes no interrupts is worse
+		// than one that is absent, because nothing downstream can tell. The size check on the GICR
+		// region proves there are enough BYTES for the described cores; it cannot prove the runtime
+		// `GICR_TYPER` affinity chain reaches each of them, and this is where that contradiction
+		// shows up.
+		//
+		// `false` here is what keeps the core out of the online count. It parks instead.
+		crate::serial_println!("gic: this core has no redistributor frame in the region the machine described - it takes no interrupts and is not brought online");
+		return false;
 	};
 	unsafe {
 		// OUT OF SLEEP FIRST. A redistributor resets asleep and forwards nothing while it is;
@@ -295,6 +309,7 @@ fn init_cpu_local_v3() {
 		// ICC_IGRPEN1_EL1 (S3_0_C12_C12_7): group 1 delivery on.
 		core::arch::asm!("msr S3_0_C12_C12_7, {}", "isb", in(reg) 1u64, options(nomem, nostack, preserves_flags));
 	}
+	true
 }
 
 // Arm CNTP for a TICK_HZ tick on this core and enable it (ENABLE=1, IMASK=0).

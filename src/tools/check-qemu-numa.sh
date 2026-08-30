@@ -149,7 +149,13 @@ if wanted x86_64; then
 		[[ -n "$line" ]] || fail "node $node is missing from the report"
 		case "$line" in
 		*" 0 MiB"*) fail "node $node was reported with no memory: $line" ;;
-		*"0 processor(s)"*) fail "node $node was reported with no processors: $line" ;;
+		*"0 processor(s) described"*) fail "node $node was reported with no processors: $line" ;;
+		esac
+		# AND THE ONES THAT CAME UP, WHICH IS THE NUMBER THE SCHEDULER PLACES AGAINST. The report now
+		# prints both because they are different facts; a node with two described cores and none
+		# online is a node no thread can be placed on, and the count on its own hid that.
+		case "$line" in
+		*", 0 online"*) fail "node $node described processors and none of them came online: $line" ;;
 		esac
 		echo "qemu-numa:   ${line#*numa:   }"
 	done
@@ -247,13 +253,40 @@ for port in aarch64 riscv64; do
 		grep -aqh "numa:   pool node $node:" ${port_logs[@]} || fail "$port: node $node has no pool of its own"
 	done
 	# THE SAME GRAPH COMPARISON AS x86_64 - the distances, which the device tree declares the same
-	# way. The CPU IDS are not compared here: a hart id and an MPIDR are the machine's own numbering
-	# and the profile names logical cpus, so the two need not be the same integers.
+	# way.
 	for triple in "0 0 10" "0 1 21" "1 0 21" "1 1 10"; do
 		set -- $triple
 		grep -aqhE "numa:   distance $1 -> $2: $3[[:space:]]*$" ${port_logs[@]} || fail "$port: the profile declares distance $1 -> $2 as $3 and the kernel read something else"
 	done
+	# AND THE CPU ASSIGNMENTS, BY THEIR SHAPE RATHER THAN BY THEIR INTEGERS.
+	#
+	# The x86 phase greps for `node 0 cpu 0` and the three lines beside it, and that cannot be done
+	# here: a hart id and an MPIDR are the machine's own numbering while the profile names LOGICAL
+	# cpus, so requiring them to be the same integers would be asserting a coincidence of QEMU's
+	# mapping rather than a property of the kernel.
+	#
+	# But omitting the comparison entirely - which is what this did - accepts the one graph the whole
+	# exact-graph work exists to reject: these profiles are symmetric 2+2 with near-equal memory, so a
+	# SWAPPED assignment satisfies every count, every pool and every distance above. What is
+	# numbering-independent is the SHAPE, and it is enough: this profile puts the first two cpus on
+	# node 0 and the last two on node 1, so however the machine numbers them, node 0's identifiers
+	# are two, node 1's are two, and every one of node 0's is below every one of node 1's. A swap
+	# fails on the last of those.
+	node0_cpus="$(grep -ahoE "numa:     node 0 cpu [0-9]+" ${port_logs[@]} | awk '{print $NF}' | sort -n -u)"
+	node1_cpus="$(grep -ahoE "numa:     node 1 cpu [0-9]+" ${port_logs[@]} | awk '{print $NF}' | sort -n -u)"
+	[[ "$(wc -l <<<"$node0_cpus")" == 2 && "$(wc -l <<<"$node1_cpus")" == 2 ]] || fail "$port: the profile gives each node two processors and the kernel reported node 0: $(tr '\n' ' ' <<<"$node0_cpus"), node 1: $(tr '\n' ' ' <<<"$node1_cpus")"
+	if [[ "$(tail -n 1 <<<"$node0_cpus")" -ge "$(head -n 1 <<<"$node1_cpus")" ]]; then
+		fail "$port: this profile puts the FIRST two processors on node 0 and the last two on node 1, and the kernel reported node 0: $(tr '\n' ' ' <<<"$node0_cpus"), node 1: $(tr '\n' ' ' <<<"$node1_cpus") - the assignments are swapped or interleaved"
+	fi
+	echo "qemu-numa:   $port: node 0 holds the first two processors and node 1 the last two, so the assignment is not swapped"
 	weak_placement "$port" ${port_logs[@]}
+	# AND THE PLACEMENT HALF, WHICH ONLY x86_64 WAS ASKED FOR. M5 wants node-placement execution on
+	# all three named profiles, and a tag or selection regression that stopped running these on the
+	# device-tree ports would have been invisible: the phase asserted pools, a report and the memory
+	# tests, none of which needs a core to have been bound to a node at all.
+	for name in only_cores_that_came_up_are_bound_to_a_node placement_names_a_core_of_the_node_it_was_asked_for a_thread_placed_on_a_node_runs_on_a_core_of_that_node; do
+		grep -aqh "kernel.smp.numa.$name\.\.\..*\[ok\]" ${port_logs[@]} || fail "$port: kernel.smp.numa.$name did not run or did not pass"
+	done
 	# THE SAME NAMED TESTS AS x86_64, on the profiles that used to be checked for pools and a report
 	# and nothing else. Three profiles were the milestone's evidence and only one of them was asked
 	# whether an allocation had been steered.

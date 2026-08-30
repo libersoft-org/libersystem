@@ -86,6 +86,22 @@ impl Interrupt {
 		self.revoked.load(Ordering::Acquire)
 	}
 
+	// GIVE UP OWNERSHIP OF THE SLOT WITHOUT TOUCHING IT, for a caller that is about to free the slot
+	// itself.
+	//
+	// `sys_device_msix_acquire` binds the vector and can then still fail - the derived-capability
+	// registry may refuse the registration - and its rollback calls `release_unused_msi`, which frees
+	// the registry slot outright. That left this object still believing it owned the binding, so its
+	// `Drop` called the architectural `unbind` afterwards: mask the entry, unmap the table page and
+	// RETIRE the slot. By then another core may have acquired the freed slot and bound its own
+	// interrupt, and the stale rollback tore down the replacement's binding instead of its own.
+	//
+	// `swap`, so the disarm happens exactly once and a caller cannot disarm a slot twice. Call it
+	// BEFORE making the slot reusable: the order is what closes the window rather than narrowing it.
+	pub fn disown(&self) {
+		self.bound.store(false, Ordering::Release);
+	}
+
 	// TAKE THE VECTOR AWAY NOW, rather than when the last reference happens to go.
 	//
 	// Unbinding lived in `Drop`, which is the wrong moment for a FORCED release: the holder is still

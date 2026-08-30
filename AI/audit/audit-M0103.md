@@ -300,3 +300,94 @@ restart work, the self-thread runtime, the one-shot completion object, and the S
 would make its public claim true - and two of those are explicitly shared with other milestones so
 they are decided once. What remains genuinely open is listed by name under pass 10 and blocks `s`,
 which is the honest state: `s` is not finished, and no part below it may start until it is.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-08-30T09:46:14Z):
+
+Rating: 3/10
+
+1. **Pass 10 remains an unresolved second specification, and its `DrawList` correction is incorrectly marked resolved.**
+
+   The plan claims every pass-10 entry is either resolved in the authoritative sections or explicitly
+   listed as blocking (`docs/todo/P02M0103.md:1742-1754`). In fact, only two of its twenty-three entries
+   are checked; twenty-one remain unchecked. The six-item blocker summary omits material unresolved
+   contracts including split specification-freeze gates, complete filter coverage, the Render3D versus
+   Scene3D registry split, CPU-view versus backend-access spans, cache ordering, zeroing and padding
+   security, atomic surface configuration, YUV layout, prepared-list invalidation, dynamic parameters,
+   backend-neutral submission, and profile hashing (`:1768-1933`).
+
+   Even the entry marked resolved for `DrawList` is not resolved. Backend-free tests still require a
+   “display-list serialisation round-trip” (`:1008-1013`), and part `b` still completes only when the
+   list “round-trips through its transportable form” (`:1685-1687`), despite the authoritative decision
+   that Profile 1 is in-process and cross-process transport is deferred (`:852-903`). This leaves
+   conflicting acceptance criteria and materially understates the blockers to freezing `s`. Integrate
+   every surviving correction into its owning section, list every unresolved contract as a blocker,
+   and remove the two remaining transport requirements or explicitly define a process-local encoding
+   that is not a wire ABI.
+
+2. **The accepted scope and ordering correction is contradicted by the actual part boundaries, mandatory Definition of Done, and roadmap entry.**
+
+   The new header says the compositor-facing 2D foundation is delivered first and WSI/presentation
+   follows it (`docs/todo/P02M0103.md:37-44`). WSI, surfaces, presentation, lifecycle, and accounting
+   nevertheless remain inside part `a` (`:572-795`), while `b` cannot start until all of `a` is complete
+   (`:797-800`). The stated order is therefore impossible: the 2D renderer remains blocked on WSI,
+   P02M0141, and the undecided completion primitive. The rejection of a further split is unjustified
+   because the current parts do not express the newly claimed implementation seams.
+
+   The same header moves scene-engine features to optional later profiles (`:39-44`), but part `f`
+   still mandates `Scene3D Core Profile 1`, PBR, animation, skinning, morphing, shadows, HDR, and
+   postprocessing (`:1367-1457`), and the per-part and overall 3D completion gates still require them
+   (`:1697-1716`). It also says the title was narrowed (`:45-48`), but the title is unchanged at `:1`,
+   and M0103 remains an ordinary unchecked item in the Phase-2 list (`docs/todo/TODO.md:179`) rather
+   than a future-vision index. Split common graphics from WSI or change the declared order, remove
+   optional scene work from mandatory Profile 1/Done conditions, and propagate the scope correction to
+   the title and roadmap.
+
+3. **The prerequisite matrix declares lifecycle and evidence foundations satisfied from status labels rather than their current implementations.**
+
+   M0103 says P02M0164-P02M0167 are complete and that only P02M0141 still blocks WSI lifecycle
+   (`docs/todo/P02M0103.md:93-113`). The production display-provider path still cannot perform the
+   backing reacquisition M0103 requires at `:745-754`: DeviceManager retains fixed `gpu_client`
+   routing and sends one `GPU` bootstrap handle
+   (`src/user/services/core/src/device_manager.rs:441-448,656-659,1078-1093`), while DisplayService
+   still receives that fixed role (`src/user/services/manifest.toml:1961-1972`). No production
+   driver-provider consumer subscribes to the catalogue, so a replacement display provider can be
+   published without DisplayService discovering it.
+
+   P02M0167's evidence isolation is also incomplete: the selection-specific preliminary build is
+   locked, but the second `cargo test` uses the same target directory after the lock is released
+   (`src/harness/test-kernel.sh:303-341`). M0103 therefore cannot yet rely on the promised concurrent
+   tri-architecture evidence. Mark prerequisites according to their unmet contracts, not only their
+   `COMPLETE` status lines.
+
+4. **The completion and self-thread fixes still leave mutually exclusive implementation choices with no owning milestone.**
+
+   The WSI contract mandates a paired one-shot `Event` with WAIT/SIGNAL authority
+   (`docs/todo/P02M0103.md:701-720`), then tells the implementer to choose either a new kernel object or
+   channel endpoints (`:722-743`). Those alternatives require different kernel, ABI, IDL, ownership,
+   and failure contracts, yet the header says the mechanism has no owner or milestone (`:115-119`).
+   The current Event remains an unpaired boolean latch with idempotent signalling and no terminal
+   failure (`src/kernel/object/event/mod.rs:16-42`). `WSI_PROFILE_1.md` therefore cannot freeze this
+   contract, and the backend submission item has no settled primitive to share.
+
+   Likewise, the plan says the self-thread runtime is unowned and permits removing multithreading from
+   Profile 1 if it is not approved (`docs/todo/P02M0103.md:1098-1117`), while the authoritative `c` and
+   `g` completion gates still require multithreading (`:1688-1690`, `:1701-1702`). Choose and own the
+   completion design; identify and number the shared self-thread prerequisite or remove
+   multithreading from the mandatory Done conditions now.
+
+5. **The client-Domain accounting correction does not define an implementable surface-image ownership protocol.**
+
+   The plan selects client-created/imported MemoryObjects in prose (`docs/todo/P02M0103.md:766-777`),
+   but the present-queue API still describes a service-negotiated pool whose `acquire_next` returns
+   service-managed images (`:607-628`). It does not say how the client supplies negotiated image
+   handles, which rights move, what happens on generation changes and resize, or when DisplayService
+   releases retained imports. DisplayService currently creates, maps, retains, and exports each
+   MemoryObject itself (`src/user/services/core/src/display_service.rs:101-145`), while the kernel
+   charges creation to the syscall caller's Domain (`src/kernel/syscall/mod.rs:585-595`). Without the
+   missing import lifecycle, implementing the written API naturally preserves the accounting defect.
+
+   The item also still says either extend ResourceManager for graphics classifications or drop the
+   promise, without choosing (`docs/todo/P02M0103.md:778-781`), and leaves surface-delegation policy to
+   be stated later (`:782-788`). ResourceManager currently exposes only its six kernel resource types
+   (`src/idl/resources.lsidl:7-48`). Specify the import/resize/reclamation protocol and decide the
+   graphics-policy and delegation contracts before part `a` is implementable.

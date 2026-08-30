@@ -1929,6 +1929,26 @@ fn the_timer_interrupt_is_read_from_the_tree_and_not_assumed() {
 		builder.begin("timer").prop_str("compatible", "some,other-timer").prop("interrupts", &interrupts(13, 14, 11, 10)).end();
 	});
 	assert_eq!(at(foreign).parse().expect("parses").timer_intid, 0, "a timer this reader does not implement names no interrupt it can arm");
+
+	// AND A TIMER ROUTED TO ANOTHER CONTROLLER NAMES NO INTERRUPT THIS KERNEL MAY PROGRAM.
+	//
+	// The kind, number and sense were all checked and the ROUTING was not, so a PPI belonging to a
+	// different interrupt controller was published and enabled on the GIC this reader selected. The
+	// tree below states a parent that is not the GIC's phandle, which is the one form of the mistake
+	// that is decidable without implementing `interrupt-parent` inheritance.
+	let elsewhere = machine(|builder| {
+		builder.begin("intc@8000000").prop_str("compatible", "arm,gic-v3").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x080a_0000, 0xf6_0000)).prop_u32("phandle", 1).end();
+		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop_u32("interrupt-parent", 7).prop("interrupts", &interrupts(13, 14, 11, 10)).end();
+	});
+	assert_eq!(at(elsewhere).parse().expect("parses").timer_intid, 0, "a timer whose interrupt-parent is not the selected GIC describes a PPI on another controller, and arming its INTID here would program an interrupt the tree does not put on this one");
+
+	// AND THE SAME TREE WITH THE ROUTING AGREEING IS ACCEPTED, so the check above is a routing check
+	// rather than a refusal of every tree that states a parent at all.
+	let routed_here = machine(|builder| {
+		builder.begin("intc@8000000").prop_str("compatible", "arm,gic-v3").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x080a_0000, 0xf6_0000)).prop_u32("phandle", 1).end();
+		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop_u32("interrupt-parent", 1).prop("interrupts", &interrupts(13, 14, 11, 10)).end();
+	});
+	assert_eq!(at(routed_here).parse().expect("parses").timer_intid, 30, "a timer that names the selected GIC is the ordinary case and is read");
 }
 
 // A GICv3 REDISTRIBUTOR REGION TOO SMALL TO HOLD ONE FRAME IS NOT A MAIN CONTROLLER.

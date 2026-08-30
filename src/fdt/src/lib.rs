@@ -690,6 +690,21 @@ impl Fdt {
 			let mut numa_distance_count = 0usize;
 			let mut numa_distance_malformed = false;
 			let mut in_timer = false;
+			// THE SELECTED MAIN GIC'S OWN PHANDLE, AND WHAT THE TIMER SAYS IT IS ROUTED TO.
+			//
+			// The timer PPI's kind, number and sense were all checked and its ROUTING was not, so a
+			// timer whose `interrupt-parent` names a different controller was accepted and its INTID
+			// enabled on the selected GIC - a PPI programmed on a controller the tree does not say it
+			// belongs to. M2 asks for the routing to be checked; these two numbers are what the check
+			// compares.
+			//
+			// Zero means "not stated", and for the timer that is the ordinary case: `interrupt-parent`
+			// is INHERITED, and on both machines this reader boots the root node carries it and the
+			// timer does not repeat it. So an unstated parent is accepted and a STATED one that
+			// disagrees is refused - which is the only form of the check that does not require this
+			// reader to implement inheritance for one property.
+			let mut gic_phandle: u32 = 0;
+			let mut timer_parent: u32 = 0;
 			let mut timer_intid: u32 = 0;
 			let mut timer_compatible = false;
 			// The versioned binding, which this reader never checked: entering distance-map mode on
@@ -1140,6 +1155,8 @@ impl Fdt {
 						} else if in_timer && self.str_eq(pname, "compatible") {
 							// `arm,armv8-timer` (or the v7 name) is the node this reader decodes.
 							timer_compatible = self.stringlist_contains(val, len, b"arm,armv8-timer") || self.stringlist_contains(val, len, b"arm,armv7-timer");
+						} else if in_timer && self.str_eq(pname, "interrupt-parent") && len == 4 {
+							timer_parent = self.be32(val);
 						} else if in_timer && self.str_eq(pname, "interrupts") && len >= 24 {
 							// FOUR TRIPLES: secure EL1, NON-SECURE EL1, virtual, hypervisor. Each is
 							// (kind, number, flags) with kind 1 = PPI, and a PPI's INTID is its number
@@ -1254,6 +1271,14 @@ impl Fdt {
 							pci_msi_length = self.be32(val + 12);
 						} else if v2m.depth == depth && self.record_device(&mut v2m, pname, val, len, &["arm,gic-v2m-frame"]) {
 						} else if imsic.depth == depth && self.record_device(&mut imsic, pname, val, len, &["riscv,imsics"]) {
+						} else if gic.depth == depth && gic_dist == 0 && self.str_eq(pname, "phandle") && len == 4 {
+							// THE SELECTED GIC'S OWN PHANDLE, taken from the same node its addresses
+							// are, so the timer's routing is compared against the controller this
+							// reader actually selected rather than against whichever GIC node came
+							// last. Its own branch because `record_device` handles `reg`, `status`
+							// and `compatible` and refuses everything else - a `phandle` handed to it
+							// falls through the chain and is never seen.
+							gic_phandle = self.be32(val);
 						} else if gic.depth == depth && self.record_device(&mut gic, pname, val, len, &["arm,cortex-a15-gic", "arm,gic-400", "arm,arm11mp-gic", "arm,gic-v3"]) {
 							// The version, from the same `compatible` the reader just matched. A
 							// GICv3 describes a distributor and a REDISTRIBUTOR region where a
@@ -1407,6 +1432,22 @@ impl Fdt {
 			// A TIMER NODE THIS READER DID NOT RECOGNISE NAMES NO INTERRUPT. Zero is "the tree said
 			// nothing I could decode", which the caller refuses on rather than defaulting.
 			if !timer_compatible {
+				timer_intid = 0;
+			}
+			// AND A TIMER ROUTED SOMEWHERE ELSE NAMES NO INTERRUPT THIS KERNEL MAY PROGRAM.
+			//
+			// The PPI's kind, number and sense were checked and its ROUTING was not. A timer node
+			// whose `interrupt-parent` names a controller other than the main GIC this reader
+			// selected describes a PPI on THAT controller - and enabling its INTID on the selected
+			// GIC arms a per-core interrupt the tree does not say belongs there.
+			//
+			// STATED AND DIFFERENT is the only refusal. `interrupt-parent` is inherited, so a timer
+			// that states nothing is routed by its ancestors - the ordinary shape on both machines
+			// this boots - and refusing that would refuse every real tree. A stated parent that
+			// matches, or a tree in which the GIC declares no phandle to compare against, is
+			// accepted. Zeroing rather than flagging, because the caller already refuses a boot with
+			// no timer: this is the same absence, arrived at for a stated reason.
+			if timer_parent != 0 && gic_phandle != 0 && timer_parent != gic_phandle {
 				timer_intid = 0;
 			}
 			// AND NO CHILD REGION MAY SHARE BYTES WITH THE CONTROLLER OR WITH THE OTHER CHILD.

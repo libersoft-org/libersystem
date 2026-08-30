@@ -1028,7 +1028,15 @@ unsafe fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots
 				// ring, event ring and every transfer ring live, all of them DMA - and `STOPPED` was
 				// sent anyway, which certifies the opposite. `halt` clears R/S and waits for HCHalted,
 				// which is the controller's own statement that it has stopped touching memory.
-				common::finish_stop(bootstrap, bind, 0, hc.halt());
+				// AND THE KERNEL IS TOLD, which passing zero skipped.
+				//
+				// `finish_stop` calls `device_quiesced` only for a caller that has the device's own
+				// capability, and this driver has held it in `DEVICE` since bind - so passing zero
+				// certified the controller quiet to the MANAGER and never made the claim the KERNEL
+				// acts on. The DMA frames and the masked MSI-X vector this controller held stayed
+				// out of circulation for the rest of the boot, which is the state a driver that
+				// could NOT confirm its hardware is supposed to produce, reached by one that did.
+				common::finish_stop(bootstrap, bind, device(), hc.halt());
 				exit();
 			}
 			// the interrupt: drain the event ring (HID reports feed the console and

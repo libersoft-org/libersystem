@@ -213,7 +213,16 @@ pub fn report() {
 		for node in found.nodes() {
 			let memory = found.memory_of(*node);
 			let cpus = found.cpus().iter().filter(|(_, owner)| owner == node).count();
-			crate::serial_println!("numa:   node {}: {} MiB, {} processor(s)", node.0, memory / (1024 * 1024), cpus);
+			// DESCRIBED AND ONLINE ARE TWO NUMBERS, and printing only the first was wrong.
+			//
+			// `found.cpus()` is what the firmware DESCRIBED. A core that timed out during bring-up,
+			// or that never answered at all, is still in that list - so a node whose second core
+			// never came up reported two processors and had one, and M1's rule that an absent or
+			// timed-out CPU creates no logical affinity was invisible in the one place a reader
+			// looks. The confirmed bindings are `smp::numa::online_on`, which is what the scheduler
+			// actually places against.
+			let online = crate::smp::numa::online_on(*node);
+			crate::serial_println!("numa:   node {}: {} MiB, {} processor(s) described, {} online", node.0, memory / (1024 * 1024), cpus, online);
 			// WHICH PROCESSORS, AND WHERE THE MEMORY IS - not just how many and how much.
 			//
 			// A gate can compare a COUNT with the profile it launched and still accept a graph whose
@@ -240,6 +249,12 @@ pub fn report() {
 				crate::serial_println!("numa:   distance {} -> {}: {}", from.0, to.0, found.distance(*from, *to));
 			}
 		}
+		// AND THE RULE THOSE DISTANCES ARE USED BY, said once rather than left to be inferred.
+		//
+		// M6 asks for the fallback policy in the report and the report carried only its INPUT. A
+		// reader given a distance matrix and no rule cannot tell a machine that prefers the nearest
+		// node from one that round-robins, and both would print exactly these lines.
+		crate::serial_println!("numa:   fallback: the requested node first, then the rest by ascending distance, ties by ascending node id; unaffiliated memory last");
 	}) else {
 		crate::serial_println!("numa: no memory topology - one pool, no locality{}", absence_clause());
 		return;

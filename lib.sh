@@ -212,6 +212,21 @@ WAVE_TAGS[6]='service,process,storage,permission-service'
 # could see.
 VOLUME_SOURCES=(abi boot fs idl proto sdk term tools user volume wasm wire)
 
+# WHAT THE LOADER IS BUILT FROM, which is not `boot/loader`.
+#
+# Its receipt hashed the loader directory alone, and `source_digest` hashes exactly the paths it is
+# given - so a change in the crates the loader LINKS left the receipt unchanged. Those crates are
+# where its verifier actually lives: `boot/signature` is the Ed25519 verification, `boot/protocol`
+# the manifest format, `boot/uefi` the firmware-facing algorithms, and the filesystem crates read the
+# volume the manifest describes. A cross-port freshness check comparing that receipt would have
+# accepted a stale aarch64 or riscv64 binary across every one of those edits, and the whole point of
+# the check is that the port's loader is the one this tree describes.
+#
+# The local path dependencies of `src/boot/loader/Cargo.toml`, plus the loader itself. Kept beside
+# `VOLUME_SOURCES` because it is the same kind of list and drifts the same way: a `path = "..."`
+# added there needs a directory added here.
+LOADER_SOURCES=(boot/loader boot/protocol boot/signature boot/uefi fdt fs abi)
+
 # A digest of every source file a build reads, so "has it changed" is answered by CONTENT.
 #
 # Modification times cannot answer it. `mkpackages` skips a write whose bytes are unchanged, so an

@@ -228,6 +228,19 @@ if grep -aq "dma: DEGRADED ISOLATION" "$default_log"; then
 	grep -a "dma:" "$default_log" >&2
 	exit 1
 fi
+# AND A SUMMARY THAT WAS RETRACTED IS NOT A CLEAN SUMMARY.
+#
+# The isolation summary is printed when the supervisor decides the system is up, and a device that
+# binds afterwards can still be admitted untranslated - so `dma_policy` retracts the claim at the
+# moment that happens. This gate asked only for the clean line and only rejected `DEGRADED
+# ISOLATION`, so a boot could print the clean summary, explicitly say it was no longer true, and
+# still be accepted. The retraction is a REJECTION here: it names a device mastering the bus
+# untranslated on the machine this phase is about.
+if grep -aq "dma: ADMITTED UNTRANSLATED AFTER THE ISOLATION SUMMARY" "$default_log"; then
+	echo "qemu-virtio-iommu: the default run retracted its own isolation summary - a device was admitted untranslated after it was printed" >&2
+	grep -a "dma:" "$default_log" >&2
+	exit 1
+fi
 if grep -aq "iommu: FAULT" "$default_log"; then
 	echo "qemu-virtio-iommu: a device faulted on the default machine" >&2
 	grep -a "iommu: FAULT" "$default_log" >&2

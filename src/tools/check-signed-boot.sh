@@ -241,13 +241,27 @@ fi
 # Restored through the EXIT trap rather than at the end of the function, because an interruption or
 # an early return is exactly when a half-restored shape gets left behind.
 BOOTABLE_SHAPE=("$BUILD/system-volume-bootable-x86_64.img" "$BUILD/system-volume-bootable-x86_64.uuid" ".build/state/built-x86_64-volume")
+# AND THE RECEIPT IS RESTORED WITH ITS MODIFICATION TIME, because that is what it is compared by.
+#
+# Both volume shapes are built from the same sources, so both receipts hold IDENTICAL BYTES - which
+# is exactly why `check-build-order.sh` compares the stamp by mtime and the image and pairing by
+# content. A plain `cp` puts the bytes back and gives the file a new timestamp, so this gate's own
+# restoration performed the one mutation the milestone requires not to occur, and a digest comparison
+# could never see it. `cp -p` preserves it.
+#
+# AND A MEMBER THAT WAS NOT THERE BEFORE IS REMOVED RATHER THAN LEFT. The saver recorded only files
+# that existed, so a member the nested build CREATED survived restoration - a shape assembled from
+# two builds, which is the same failure from the other direction.
 restore_bootable_shape() {
 	local at=0 file saved
 	for file in "${BOOTABLE_SHAPE[@]}"; do
 		saved="$work/shape.$at"
+		if [[ -f "$work/absent.$at" ]]; then
+			rm -f "$file"
+		elif [[ -f "$saved" ]]; then
+			cp -p "$saved" "$file"
+		fi
 		((at += 1))
-		[[ -f "$saved" ]] || continue
-		cp "$saved" "$file"
 	done
 }
 
@@ -261,7 +275,12 @@ absent_list_case() {
 	# function - success, failure, interruption - puts the shape back.
 	local at=0 file
 	for file in "${BOOTABLE_SHAPE[@]}"; do
-		[[ -f "$file" ]] && cp "$file" "$work/shape.$at"
+		if [[ -f "$file" ]]; then
+			cp -p "$file" "$work/shape.$at"
+		else
+			# ABSENCE IS STATE TOO, and it is recorded so restoration can reproduce it.
+			: >"$work/absent.$at"
+		fi
 		((at += 1))
 	done
 	trap 'restore_bootable_shape; rm -rf "$work"' EXIT
@@ -280,6 +299,37 @@ absent_list_case() {
 		echo "signed-boot: the bootable volume shape was not restored - its sidecar does not name the image beside it" >&2
 		return 1
 	fi
+	# AND THE SHAPE IS THE ONE THAT WAS HERE, member for member, receipt timestamp included.
+	#
+	# The pairing check above proves the image and its sidecar agree with EACH OTHER; it says nothing
+	# about whether this gate put back what it found. Three members, each either present with the
+	# bytes and mtime it had, or absent because it was absent.
+	local at=0 file saved
+	for file in "${BOOTABLE_SHAPE[@]}"; do
+		saved="$work/shape.$at"
+		if [[ -f "$work/absent.$at" ]]; then
+			[[ -e "$file" ]] && {
+				echo "signed-boot: $file did not exist before this case and does now - the nested build left a member behind" >&2
+				return 1
+			}
+		else
+			[[ -f "$file" ]] || {
+				echo "signed-boot: $file was here before this case and is gone - the shape was not restored" >&2
+				return 1
+			}
+			cmp -s "$saved" "$file" || {
+				echo "signed-boot: $file was not restored to the bytes it had" >&2
+				return 1
+			}
+			# THE STAMP BY ITS TIMESTAMP, which is how its own gate reads it: identical bytes are what
+			# a rewritten receipt looks like, so content proves nothing about this member.
+			if [[ "$(stat -c %Y.%y "$saved")" != "$(stat -c %Y.%y "$file")" ]]; then
+				echo "signed-boot: $file was restored with a new modification time - the build stamp is compared by WHEN it was written, so this is the mutation the shape rule forbids" >&2
+				return 1
+			fi
+		fi
+		((at += 1))
+	done
 
 	# AND THE MEDIUM IS PAIRED WITH THE VOLUME THAT IS ACTUALLY ATTACHED.
 	#
@@ -567,7 +617,11 @@ if [[ "${SIGNED_BOOT_PORTS:-1}" == "1" ]]; then
 			exit 1
 		fi
 		loader_stamp=".build/state/built-$port-loader"
-		if [[ ! -f "$loader_stamp" || "$(<"$loader_stamp")" != "$(source_digest boot/loader)" ]]; then
+		# THE SAME LIST THE BUILD WROTE, which is the loader's TRANSITIVE local sources rather than its
+		# own directory. Both sides read `LOADER_SOURCES`, so the identity cannot be widened on one
+		# side and compared narrowly on the other - which is how a receipt stays valid across a change
+		# to the verifier it is supposed to be an identity for.
+		if [[ ! -f "$loader_stamp" || "$(<"$loader_stamp")" != "$(source_digest "${LOADER_SOURCES[@]}")" ]]; then
 			echo "signed-boot: the $port loader was not built from this tree, so a refusal it makes says nothing about this verifier" >&2
 			echo "signed-boot:   run:  ./build.sh --arch $port --part loader" >&2
 			exit 1

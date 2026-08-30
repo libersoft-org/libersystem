@@ -266,6 +266,16 @@ pub enum VolumeChoice<T> {
 pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mut open: impl FnMut(FirmwareDisk) -> Result<Option<([u8; 16], T)>, ()>) -> VolumeChoice<T> {
 	let mut chosen: Option<T> = None;
 	let mut failed = false;
+	// WHETHER ANY LIBERFS VOLUME WAS HERE AT ALL, which decides what exhaustion MEANS.
+	//
+	// A volume that opens cleanly under a different identity used to be dismissed as somebody else's
+	// disk and forgotten - so a walk that found LiberFS volumes and no match answered `NotHere`, the
+	// same answer as a machine with no LiberFS volume on it, and the loader may fall back to the
+	// signed boot medium from there. That turns "the selected volume's identity is wrong" into "the
+	// selected volume is absent", which is exactly the substitution the exact-pairing rule exists to
+	// refuse: change a superblock UUID, recompute the unauthenticated filesystem checksum, and a
+	// present-invalid source becomes an absence with a fallback behind it.
+	let mut saw_liberfs = false;
 	unsafe {
 		each_disk(bs, |device| {
 			match open(device) {
@@ -278,9 +288,13 @@ pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mu
 				}
 				Ok(None) => false,
 				Ok(Some((uuid, value))) => {
+					saw_liberfs = true;
 					if want.is_some_and(|want| want != uuid) {
 						// A volume that opened cleanly and is not the one the pairing names is not a
-						// failure: it is somebody else's disk, which is an ordinary thing to find.
+						// failure ON ITS OWN: it is somebody else's disk, which is an ordinary thing
+						// to find, and a later disk may still carry the one wanted. The walk goes on;
+						// what changes is what happens when it ends without a match - see
+						// `saw_liberfs` above.
 						return false;
 					}
 					chosen = Some(value);
@@ -292,6 +306,11 @@ pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mu
 	match chosen {
 		Some(value) => VolumeChoice::Chosen(value),
 		None if failed => VolumeChoice::Failed,
+		// EXHAUSTION WITH A CANDIDATE PRESENT IS A FAILURE, NOT AN ABSENCE. Every disk was walked,
+		// LiberFS volumes were found, and none of them is the one the pairing names. That is a
+		// present source whose identity is wrong, which this milestone requires to end terminally
+		// rather than in a fallback.
+		None if saw_liberfs && want.is_some() => VolumeChoice::Failed,
 		None => VolumeChoice::NotHere,
 	}
 }

@@ -206,3 +206,38 @@ pipeline has one normative order with retained intermediates, the limits bound w
 caches, and the Done condition names gates that can be run. Three dependencies it cannot satisfy
 alone are stated as blocking rather than assumed - `P02M0103`'s `DrawList` decision, the
 `P02M0097`-compatible font package role and catalogue owner, and `P02M0105` for any default language.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-08-30T09:46:14Z):
+
+Rating: 7/10
+
+1. **The plan incorrectly declares the `DrawList` precondition resolved.**
+
+   M0136 says the decision is now final and builds its typed process-local font-resource seam on it
+   (`docs/todo/P02M0136.md:16-25`). P02M0103's authoritative item does choose an immutable in-process
+   list and defer cross-process transport (`docs/todo/P02M0103.md:852-903`), but its backend-free tests
+   still require a “display-list serialisation round-trip” (`:1008-1013`) and part `b` still completes
+   only when the list “round-trips through its transportable form” (`:1685-1687`). Those are the same
+   requirements P0103's checked correction at `:1774-1781` says were removed.
+
+   The planner was right about which model M0136 should use, but wrong that the conflicting normative
+   and completion text was gone. Until P0103 removes it or explicitly defines a process-local encoding
+   that is not a wire ABI, the font resource's transport, lifetime, and validation boundary remain
+   contradictory. Keep this precondition open rather than marking it met.
+
+2. **The font-package and catalogue finding was externalized, not resolved or given an implementable owner.**
+
+   The corrected plan accurately enumerates what is missing, but assigns it only to a “separately
+   approved P02M0097-compatible addition” with no milestone, owner, ordering, or gate
+   (`docs/todo/P02M0136.md:158-169`, `:223-225`). P02M0097 still has no font destination, and the
+   current manifest validator still refuses factory source data outside its narrow allowlist
+   (`src/tools/system-manifest/src/lib.rs:1391-1411`). Thus no planned deliverable can stage the required
+   last-resort face or conformance corpus, expose a bounded installed-face catalogue, or make the guest
+   gate at `P02M0136.md:206-212` runnable.
+
+   The response also claims the catalogue/cache architecture was decided in-process, while the actual
+   plan says “IN-PROCESS IS THE ANSWER unless the catalogue forces otherwise” (`:170-174`). Because the
+   catalogue itself is unowned, that clause reopens the service-versus-process accounting and quota
+   decision. Create and name the prerequisite addition, choose its architecture, and make M0136 depend
+   on its concrete staging, capability, identity, update, and invalidation contract before treating
+   this correction as complete.

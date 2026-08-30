@@ -36,6 +36,29 @@ pub fn set_spin_budget(spins: u64) -> u64 {
 // freeing anything, so a short wait can only be more conservative.
 pub const TEARDOWN_SPINS: u64 = 1_000_000;
 
+// AND WHAT IT MAY SPEND IN TIME, WHICH IS THE BOUND THAT MEANS ANYTHING TO THE MANAGER.
+//
+// A spin count is not a duration. The same million iterations are a millisecond on one machine and
+// far longer on an emulated target under load, so "a tenth of the boot's budget" stated a ratio and
+// bounded nothing a caller could reason about - and the caller here is DeviceManager's SOLE event
+// loop, where every other device's supervision waits behind this. A release that occupies it for an
+// unstated length of time is the blocking the binding milestone forbids, whatever the iteration
+// count.
+//
+// TICKS, because that is what the rest of this kernel bounds waits with and what the manager's own
+// budgets are expressed in. The wait ends at whichever comes first, the spins or the deadline; an
+// expiry is `Unconfirmed` either way, which quarantines the claim rather than freeing anything, so
+// cutting it short can only be more conservative.
+pub const TEARDOWN_TICKS: u64 = 20;
+
+// The deadline a bounded wait must not pass, or zero for "spins only" - which is what the ordinary
+// boot path uses, since no manager is waiting behind it there.
+static DEADLINE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+pub fn set_deadline(deadline: u64) -> u64 {
+	DEADLINE.swap(deadline, core::sync::atomic::Ordering::Relaxed)
+}
+
 // The rings, at the offsets the specification lays them out at within their own frames. Each ring
 // gets a frame of its own rather than being packed: a frame is the unit the allocator hands out, and
 // three of them is a negligible cost next to arithmetic that has to be right.
@@ -181,7 +204,15 @@ impl VirtQueue {
 		// A shorter budget is not a weaker check: an expiry is `Fault::Unconfirmed`, the detach is
 		// not confirmed, and the claim is QUARANTINED - which keeps its frames and vectors out of
 		// circulation. Cutting the wait short can only make the release more conservative.
-		for _ in 0..spin_budget() {
+		// CHECKED EVERY `CLOCK_EVERY` SPINS, not every spin: reading the timer is a device access on
+		// two of the three ports and doing it per iteration would make the wait it bounds slower than
+		// the wait itself.
+		const CLOCK_EVERY: u64 = 1024;
+		let deadline = DEADLINE.load(core::sync::atomic::Ordering::Relaxed);
+		for spin in 0..spin_budget() {
+			if deadline != 0 && spin % CLOCK_EVERY == 0 && crate::arch::apic::ticks() >= deadline {
+				return None;
+			}
 			// SAFETY: the used ring's index field, in this queue's own frame.
 			let used = unsafe { read16(self.used + 2) };
 			if used != self.used_seen {

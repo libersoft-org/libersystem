@@ -323,7 +323,15 @@ if [[ -z "$ONLY" || "$ONLY" == "aarch64:gicv3-its:4" ]]; then
 		grep -a "interrupts:\|its:" "$its_log" >&2
 		exit 1
 	fi
-	echo "arch-profiles:   the ITS profile discovered its ITS and delivered a real MSI through it"
+	# AND THE CLAIM IS THE ONE THE ORACLE MAKES (corrected 2026-08-30). This said "delivered a REAL
+	# MSI", and the oracle behind it allocates an ordinary RAM frame as a stand-in MSI-X table and
+	# calls `dispatch_msi` by hand - the controller path is exercised end to end, the DEVICE path is
+	# not. A device-to-ITS write is what the ITS profile would have to see to say "real", and no test
+	# on this profile produces one: the virtio-snd hardware test stops at stream acknowledgement and
+	# releases neither the claim nor the vector. Saying what was proved is the fix available here;
+	# proving the device path needs a device on this profile, which is its own item.
+	echo "arch-profiles:   the ITS profile discovered its ITS, and a vector was acquired through it, programmed into a device table, dispatched to a bound Interrupt and released - by the kernel's own oracle rather than by a device"
+	echo "arch-profiles:   (a device-originated MSI through the ITS is NOT proved here - no device on this profile raises one)"
 fi
 
 # The RISC-V AIA. Nothing to select: this runner's only riscv64 machine is `virt,aia=aplic-imsic`, so

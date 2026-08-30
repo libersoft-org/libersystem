@@ -219,7 +219,19 @@ pub(crate) fn assemble_bootstrap<F: ReadsFiles>(fs: &mut F, expected: &crate::tr
 	// the development profile, where a mixed boot is easiest to arrange, so leaving it out made the
 	// rule hold exactly where it was least needed. There is no signed manifest to ask about rows
 	// here, so the pairing is the whole question.
-	if matches!(verdict, abi::bootstrap::Selection::Unavailable) && expected.pairs_with_this_source() {
+	// AND A v1 MANIFEST THAT SUPPLIED THE KERNEL HAS SELECTED ITS SOURCE, exactly as a signed one
+	// does (corrected 2026-08-30).
+	//
+	// `pairs_with_this_source` alone asks only whether the medium NAMED this volume. The signed
+	// branch also asks whether the manifest was USED - a `KIND_KERNEL` row means the running kernel
+	// came from here - and that half was missing here. So an UNPAIRED test-trust volume could supply
+	// `boot/kernel`, have it verified by its v1 manifest and executed, then answer `Unavailable` for
+	// the missing list and leave later bootstrap sources eligible: the kernel from this volume and
+	// the bootstrap set from another, which is the two-halves-of-two-systems outcome this whole path
+	// exists to prevent. Executing a v1 manifest's kernel selects its source just as executing a v2
+	// `KIND_KERNEL` row does.
+	let supplied_kernel = bootproto::boot_manifest::names(&manifest, b"boot/kernel");
+	if matches!(verdict, abi::bootstrap::Selection::Unavailable) && (expected.pairs_with_this_source() || supplied_kernel) {
 		crate::arch::serial::write_str("loader: this source was chosen and its bootstrap list is not on it - refusing to take one from somewhere else\n");
 		return abi::bootstrap::Selection::Invalid(abi::bootstrap::Refusal::ListAbsentOnSelectedSource);
 	}

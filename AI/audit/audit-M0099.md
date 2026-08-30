@@ -329,3 +329,94 @@ discriminated device-node identity, the AML interpreter and namespace, and the I
 and two mechanisms it does own are now items rather than sentences: the declared DMA policy and the
 host-test seam. Its phase claims match the architecture document, its licence rule matches its own
 table, and its integration gates name observable effects rather than describing them.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-08-30T09:46:14Z):
+
+Rating: 4/10
+
+1. **The non-completable-index correction is still contradicted by the controlling roadmap records.**
+
+   The update declares M0099 a non-completable index that never appears in phase-completion reporting
+   (`docs/todo/P02M0099.md:783-799`), but the status still calls it a milestone behind one global hard
+   gate (`:3-4`), the introduction still says “the milestone closes when its items do” (`:70-73`), and
+   the Phase-2 roadmap still carries it as an ordinary unchecked milestone (`docs/todo/TODO.md:175`).
+   The inventory is not even counted consistently: the plan says it contains forty-two checkboxes
+   (`P02M0099.md:42-45`), while `virtio-iommu` remains syntactically checked despite declaring itself
+   “NOT a checkbox” (`:219-229`) and the correction added a separate DMA-policy prerequisite.
+
+   This leaves both Phase-2 completion and M0099 closure ambiguous. Represent M0099 consistently as an
+   index outside the phase checklist, remove milestone-closure language, and track executable child
+   items separately.
+
+2. **The prerequisite matrix is neither type-correct nor current.**
+
+   Its `every item` row requires P02M0098/P02M0161/P02M0162 (`docs/todo/P02M0099.md:61`), contradicting
+   the plan's own rule that shared libraries and architectural decisions have no claim or bind
+   (`:75-88`, `:800-805`). Its statement that the supporting milestones “have since been closed”
+   (`:56-59`) also substitutes status labels for the contracts in the current implementation. Normal
+   release still enters `device_release` synchronously from DeviceManager's sole loop
+   (`src/user/libs/driver/binding/src/lib.rs:702-747`;
+   `src/user/services/core/src/device_manager.rs:1614-1631`); normal IOMMU detach removes the public
+   domain row but never destroys the confirmed domain (`src/kernel/iommu/mod.rs:722-749`); and the
+   supposedly isolated verification path releases its build lock before a second selection-dependent
+   Cargo invocation (`src/harness/test-kernel.sh:303-341`).
+
+   Scope the three-slice floor to actual driver items and mark each applicable dependency unsatisfied
+   until its current requirements are reclosed. Otherwise non-driver items inherit impossible gates
+   while driver items may begin on foundations whose required behavior is still absent.
+
+3. **Several accepted split and ownership corrections exist only in explanatory prose; the actionable items still say the opposite.**
+
+   The ACPI power-button/battery/thermal work remains one checkbox that tells its implementer to split
+   it later (`docs/todo/P02M0099.md:369-380`), despite the response claiming it was split. HID-over-I2C
+   still unconditionally owns the I2C contract and leaves its bind half hardware-deferred (`:479-491`),
+   while later text classifies the parser/contract as a shared-library item, blocks binding on a
+   controller fixture (`:592-598`), and assigns the I2C contract to the first implemented consumer
+   (`:720-727`). Likewise, the virtio-SCSI item still says it owns the common SCSI layer (`:247-256`)
+   while the common rule permits UAS to own it first.
+
+   Split and classify the actual items and remove the conflicting fixed-owner statements. In the
+   current form, two item plans can correctly follow different portions of M0099 and produce duplicate
+   or incompatible shared contracts.
+
+4. **The provider-migration correction has no owner for several existing destination services.**
+
+   No production driver-provider consumer subscribes to the catalogue. DeviceService and
+   SystemGraphService only request binding snapshots (`src/user/services/core/src/device_service.rs:34-42`;
+   `src/user/services/core/src/system_graph_service.rs:143`), while DeviceManager still consumes
+   providers through fixed net/display/audio/input/USB locals and bootstrap handoffs
+   (`src/user/services/core/src/device_manager.rs:441-475,656-665,1072-1146`). The revised plan assigns
+   migration only to the first non-virtio audio or network slice (`docs/todo/P02M0099.md:729-740`). It
+   assigns no equivalent owner for block, display, input, pointer, or USB consumers, although many
+   listed drivers must prove effects through those services.
+
+   Name the production subscription and attach/detach migration required by each affected destination
+   and make it a prerequisite or an owned part of the first relevant item. Merely publishing a
+   provider cannot satisfy the listed integration gates while the destination remains bound to its
+   bootstrap-time provider.
+
+5. **The declared Phase-2 subset is still an unbounded group assignment based on a false architecture premise.**
+
+   The plan puts every group-1 item into Phase 2 because they are supposedly what the reference VM
+   “actually runs” (`docs/todo/P02M0099.md:19-25,199-203`). The harness actually configures the
+   existing virtio-blk/net/input/console/sound profile and xHCI
+   (`src/harness/qemu-run.sh:467-589`); it does not run the proposed RNG, vsock, SCSI, crypto,
+   balloon/mem, or virtio-fs items. The group also includes unowned kernel/ResourceManager mechanisms
+   (`P02M0099.md:272-279`) and a development-only, acknowledged month-scale filesystem backend
+   (`:280-287`, `:674-677`). That conflicts with the architecture's deliberately small Phase-2 set,
+   selected by appliance value and bounded cost (`docs/CONCEPT_EN.md:989-998`).
+
+   Select the bounded Phase-2 candidates individually and leave the remaining virtio entries in the
+   phased backlog. A whole-group assignment makes unrelated future work part of the current phase gate.
+
+6. **The proposed DMA declaration cannot represent a driver that performs no DMA.**
+
+   The new infrastructure item requires every driver row to choose only `iommu-required` or
+   trusted-untranslated (`docs/todo/P02M0099.md:205-217`). Those are two policies for bus-mastering
+   drivers, yet this roadmap also contains non-DMA devices and helpers. Current claim admission enables
+   bus mastering for every claimed PCI function (`src/kernel/device.rs:335-363`), so labelling a
+   non-DMA driver “trusted untranslated” preserves unnecessary authority and prevents the registry
+   from distinguishing “audited DMA without translation” from “must never DMA.”
+
+   Add an explicit no-DMA declaration, or require the field only when an independently validated
+   resource declaration says DMA is used, and make claim admission honor that distinction.

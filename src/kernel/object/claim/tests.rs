@@ -111,16 +111,29 @@ fn ending_a_claim_takes_the_mapping_and_not_just_the_handle() {
 	let rows = device::derived_rows();
 	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>))), "recorded as derived");
 	assert_eq!(device::derived_rows(), rows + 1, "the registry grew by the one capability this binding derived");
-	// A mapping the revocation has to find. The address space is this thread's, which is the one a
-	// driver's mapping would be in.
-	// THE KERNEL'S OWN ADDRESS SPACE, because this test does not run on a thread: the runner's
-	// context has no current thread, and reaching for one here died on the `expect` rather than on
-	// the property being checked. Which space it is does not matter - what matters is that the
-	// revocation reaches the one that was RECORDED, rather than whichever happens to be active.
-	memory.set_mapped_in(0x4444_0000, crate::sched::kernel_as());
+	// A REAL MAPPING, THROUGH THE REAL SEAM, WITH REAL PAGE TABLE ENTRIES.
+	//
+	// This used to hand the object a fabricated address and never install a PTE, so it asserted that
+	// a NUMBER had been cleared - which a revocation that left the page tables untouched passes just
+	// as well as one that does not. The address space is the kernel's because the runner's context
+	// has no current thread; which space it is does not matter, only that the revocation reaches the
+	// one that was RECORDED.
+	//
+	// The sequence is the map syscall's own: claim the reservation, install the entries, commit.
+	let space = crate::sched::kernel_as();
+	let base = space.alloc_vrange(crate::mem::frame::PAGE_SIZE);
+	assert_ne!(base, 0, "a virtual range for the mapping");
+	assert!(memory.claim_mapping(), "the reservation is free");
+	let flags = crate::arch::paging::PRESENT | crate::arch::paging::WRITABLE | crate::arch::paging::NO_CACHE | crate::arch::paging::NO_EXECUTE;
+	space.map(base, memory.aligned_phys_base(), flags);
+	assert!(crate::arch::paging::translate(base).is_some(), "the entry is installed before the release, or the assertion below proves nothing");
+	assert!(memory.commit_mapping(base, space.clone()), "the claim is live, so the commit stands");
 	device::release_claim(key).expect("released");
 	assert_ne!(memory.header().generation(), before, "every capability to it is invalid now");
-	assert_eq!(memory.mapped_at_for_test(), 0, "and the mapping it had is gone, not merely unreachable");
+	assert_ne!(memory.mapped_at_for_test(), base, "and the mapping it had is gone, not merely unreachable");
+	// THE PAGE TABLE, ASKED DIRECTLY. The record being cleared is the bookkeeping; this is the
+	// property - a driver holding the raw address finds nothing there.
+	assert!(crate::arch::paging::translate(base).is_none(), "the revocation reached the address space, not only the record");
 	// AND THE REGISTRY GAVE THE ROW BACK. It is swept on every release, so a claim that ends takes
 	// its own rows out - otherwise a boot that binds and unbinds would grow this table forever.
 	assert_eq!(device::derived_rows(), rows, "a released claim leaves nothing behind in the registry");
@@ -397,4 +410,101 @@ fn a_release_in_progress_refuses_a_late_derivation() {
 	assert!(!device::register_derived(key, weak), "a key whose claim has ended derives nothing at all");
 	let next = device::claim(index).expect("claimable again");
 	device::release_claim(next).expect("released");
+}
+
+crate::tagged_test!(a_release_that_lands_mid_map_leaves_no_mapping_behind, [Object, Kernel, Pci, Paging], id = "kernel.object.claim.a_release_that_lands_mid_map_leaves_no_mapping_behind", covers = ["kernel"]);
+fn a_release_that_lands_mid_map_leaves_no_mapping_behind() {
+	// THE WINDOW BETWEEN RESERVING A MAPPING AND PUBLISHING IT, which is where a claim release could
+	// pass through and find nothing to do.
+	//
+	// `SYS_DEVICE_MEMORY_MAP` reserves the object, allocates a range, installs the page table
+	// entries and only then records where it mapped. A release landing inside that sequence swept a
+	// reservation sentinel, read it as "not mapped yet", and unmapped nothing - and the syscall then
+	// published a live mapping of device registers AFTER the only sweep the claim will ever run. The
+	// holder kept raw BAR access with the claim already `Free`.
+	//
+	// The window is reproduced exactly rather than raced for: reserve, release, then attempt the
+	// commit the syscall would attempt.
+	use crate::object::KernelObject;
+	use crate::object::device_memory::DeviceMemory;
+	let index = device::add_synthetic_device();
+	let key = device::claim(index).expect("claimed");
+	let memory = DeviceMemory::for_claim(key, 0xfeed_1000, 0x1000).expect("a device memory");
+	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>))), "recorded as derived");
+
+	let space = crate::sched::kernel_as();
+	let base = space.alloc_vrange(crate::mem::frame::PAGE_SIZE);
+	assert_ne!(base, 0, "a virtual range for the mapping");
+	// The syscall's first step.
+	assert!(memory.claim_mapping(), "the reservation is taken, and the object now looks unmapped to a sweep");
+	let flags = crate::arch::paging::PRESENT | crate::arch::paging::WRITABLE | crate::arch::paging::NO_CACHE | crate::arch::paging::NO_EXECUTE;
+	space.map(base, memory.aligned_phys_base(), flags);
+	assert!(crate::arch::paging::translate(base).is_some(), "the entries are installed, which is the state the release has to survive");
+
+	// THE RELEASE ARRIVES HERE, one instruction before the commit.
+	device::release_claim(key).expect("released");
+
+	// AND THE COMMIT IS REFUSED, which is the fix. Publishing here would leave a mapping no sweep
+	// will ever visit.
+	assert!(!memory.commit_mapping(base, space.clone()), "a claim that ended while the mapping was being built does not get to publish it");
+	// The builder takes its own work down, because nothing else can: the sweep had nothing to find.
+	space.unmap(base);
+	space.free_vrange(base, crate::mem::frame::PAGE_SIZE);
+	assert!(crate::arch::paging::translate(base).is_none(), "and no mapping of device registers is left behind");
+	// AND THE OBJECT IS TERMINAL: a second attempt cannot reserve it again, so a holder cannot simply
+	// call map once more after the claim is gone.
+	assert!(!memory.claim_mapping(), "a revoked device memory is never mappable again");
+}
+
+crate::tagged_test!(a_rolled_back_msi_acquire_does_not_unbind_the_slots_next_owner, [Object, Kernel, Interrupt], id = "kernel.object.claim.a_rolled_back_msi_acquire_does_not_unbind_the_slots_next_owner", covers = ["kernel"]);
+fn a_rolled_back_msi_acquire_does_not_unbind_the_slots_next_owner() {
+	// A ROLLBACK THAT RUNS AFTER THE SLOT HAS BEEN GIVEN AWAY, which is what the acquire path could
+	// do.
+	//
+	// `sys_device_msix_acquire` binds the vector and can still fail afterwards - the derived
+	// registry may refuse the registration - and its rollback frees the registry slot. The bound
+	// `Interrupt` was left still believing it owned the binding, so its `Drop` called the
+	// architectural `unbind` after another core could already have taken the freed slot: mask,
+	// unmap and RETIRE, against a replacement's binding.
+	//
+	// Reproduced without racing: bind, disown as the rollback now does, then bind a REPLACEMENT to
+	// the same vector and drop the first. The replacement must still be bound.
+	use crate::arch::interrupts::{acquire_msi, bind_msi, is_bound, release_msi_for_device, release_unused_msi, unbind};
+	use crate::mem::frame;
+	use crate::object::interrupt::Interrupt;
+	// A frame standing in for a device's MSI-X table, the same fixture the ports' own interrupt
+	// suites use: `acquire_msi` programs entry 0 into it.
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	let owner: u32 = 41;
+	let Some(vector) = acquire_msi(table, 0, owner) else {
+		crate::serial_println!("    no MSI vector free on this machine - the rollback case is not exercised");
+		// SAFETY: allocated by this call and never mapped.
+		unsafe { frame::deallocate(table) };
+		return;
+	};
+	let first = Interrupt::new(vector).expect("an interrupt object");
+	assert!(bind_msi(vector, &first), "the first binder takes the slot");
+	assert!(is_bound(vector), "and the slot says so");
+
+	// THE ROLLBACK, IN THE ORDER THE SYSCALL NOW PERFORMS IT: disown, then free. Reversing these two
+	// lines is the defect - the slot becomes reusable while this object still claims it.
+	first.disown();
+	release_unused_msi(vector);
+	assert!(!is_bound(vector), "the rollback gave the binding back");
+
+	// THE NEXT OWNER, which the stale drop below must not touch. The slot was FREED rather than
+	// retired, so it is handed straight out again.
+	let again = acquire_msi(table, 0, owner).expect("the freed slot is handed out again");
+	assert_eq!(again, vector, "the same slot, which is what makes the collision below possible at all");
+	let replacement = Interrupt::new(vector).expect("a second interrupt object");
+	assert!(bind_msi(vector, &replacement), "the replacement takes the slot the rollback gave back");
+	drop(first);
+	assert!(is_bound(vector), "the rolled-back acquire's drop did not tear down the slot's new owner");
+
+	// And the replacement gives it back the ordinary way, so the vector is not leaked to the rest of
+	// the suite.
+	unbind(vector);
+	let _ = release_msi_for_device(owner);
+	// SAFETY: allocated by this call and never mapped.
+	unsafe { frame::deallocate(table) };
 }

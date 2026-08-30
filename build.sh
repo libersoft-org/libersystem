@@ -306,7 +306,7 @@ for arch in "${archs[@]}"; do
 	[[ "$kernel_on_volume" == "1" ]] || volume_stamp="volume-test"
 	for part in "${parts[@]}"; do
 		case "$part" in
-		loader) printf '%s\n' "$(source_digest boot/loader)" >"$BUILD_DIR/state/built-$arch-$part" ;;
+		loader) printf '%s\n' "$(source_digest "${LOADER_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$part" ;;
 		volume) printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$volume_stamp" ;;
 		*) printf '%s\n' "$(source_digest "${VOLUME_SOURCES[@]}")" >"$BUILD_DIR/state/built-$arch-$part" ;;
 		esac

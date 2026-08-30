@@ -1078,7 +1078,21 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 		device.release_claim();
 		return ERR_NO_MEMORY;
 	}
-	device.set_mapped_in(base, space);
+	// AND THE COMMIT IS WHERE THE CLAIM IS CHECKED AGAIN, because everything above it takes time.
+	//
+	// The PTEs are installed by this point. If the claim was released while they were being
+	// installed, its sweep found the reservation sentinel and had nothing to unmap - so publishing
+	// here would leave a live mapping of device registers behind a claim that is already `Free`,
+	// which no later sweep will ever visit. `commit_mapping` refuses in exactly that case, and this
+	// takes its own work back down: the builder of a mapping nothing else can see is the only thing
+	// that can remove it.
+	if !device.commit_mapping(base, space.clone()) {
+		for i in 0..pages {
+			space.unmap(base + i as u64 * PAGE_SIZE);
+		}
+		free_vrange(Some(&space), base, len);
+		return ERR_INVALID;
+	}
 	(base + device.page_offset()) as i64
 }
 
@@ -1448,19 +1462,24 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 	let index = key.device_index as u64;
 	// AND A VECTOR NOTHING CAN DELIVER IS NOT HANDED OUT.
 	//
-	// A translated endpoint writes its interrupt through its own domain, so a domain with no mapping
-	// for the doorbell drops it: nothing faults, nothing is logged, and the driver waits for an
-	// interrupt that was never delivered. `attach_endpoint` records such a domain rather than refusing
-	// the attach - most drivers here poll and are unaffected - and this is the point where the
-	// difference matters, because this is where a driver asks for the interrupt.
-	if !crate::iommu::msi_deliverable(index as u32) {
-		crate::serial_println!("device: {index} is translated and its domain carries no MSI doorbell mapping - refusing to hand out a vector that could not be delivered");
-		return ERR_UNSUPPORTED;
-	}
 	let (cap, table_phys, bus, dev, func) = match device::with(index as usize, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)) {
 		Some((cap, table_phys, bus, dev, func)) if cap != 0 => (cap, table_phys, bus, dev, func),
 		_ => return ERR_INVALID,
 	};
+	// AND THE DOORBELL IS MAPPED HERE, WHICH IS THE MOMENT IT IS ASKED FOR.
+	//
+	// A translated endpoint writes its interrupt through its own domain, so a domain with no mapping
+	// for the doorbell drops it: nothing faults, nothing is logged, and the driver waits for an
+	// interrupt that was never delivered. The map used to be installed EAGERLY at attach for every
+	// endpoint, including the many drivers here that poll and never ask for a vector - so its failure
+	// could not refuse the attach without denying translation to devices the doorbell is irrelevant
+	// to, and it was recorded for a later refusal instead. Installing it HERE removes that dilemma:
+	// the only endpoints that need one are the ones that reach this line, and a failure refuses
+	// before a vector exists and before MSI-X is enabled on the device.
+	if !crate::iommu::msi_deliverable(index as u32, bus, dev, func) {
+		crate::serial_println!("device: {index} is translated and its domain has no route for an MSI doorbell - refusing to hand out a vector that could not be delivered");
+		return ERR_UNSUPPORTED;
+	}
 	// Our MSI message address encodes an 8-bit xAPIC destination. If the running
 	// core's LAPIC id does not fit (a >255-core machine), steer the vector to the
 	// first core with an addressable id instead of truncating silently; x2APIC
@@ -1538,6 +1557,17 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 	// property this milestone is about; a table that cannot grow gives the vector back rather than
 	// arming one nothing can take away.
 	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(interrupt.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+		// DISOWNED BEFORE THE SLOT IS MADE REUSABLE, and the order is the whole of it.
+		//
+		// This is the one rollback that runs with the vector already BOUND to `interrupt`. Freeing
+		// the slot first left this object still claiming the binding, and its `Drop` then called the
+		// architectural `unbind` - masking the entry, unmapping the table page and retiring the slot
+		// - after another core could already have acquired that slot and bound its own interrupt.
+		// The rollback would have torn down the replacement.
+		//
+		// Disowning first makes the `Drop` a no-op, so exactly one path gives the slot back and it
+		// is this one.
+		interrupt.disown();
 		arch::interrupts::release_unused_msi(vector);
 		thread.handles().lock().release_reservation(1);
 		return ERR_RESOURCE_EXHAUSTED;

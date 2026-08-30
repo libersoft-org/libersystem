@@ -1,4 +1,4 @@
-use super::{Verdict, verify};
+use super::{Verdict, names, verify};
 use std::format;
 use std::string::String;
 use std::vec::Vec;
@@ -56,4 +56,30 @@ fn a_manifest_that_is_corrupt_or_absent_is_refused() {
 	let mut broken = String::from("liberboot-manifest 1\n");
 	broken.push_str(&format!("{}  kernel\n", "z".repeat(64)));
 	assert_eq!(verify(broken.as_bytes(), b"kernel", kernel), Verdict::Mismatch, "a row that is not a digest cannot match");
+}
+
+#[test]
+fn a_manifest_says_which_files_it_supplied_without_being_handed_them() {
+	// "DID THIS MANIFEST SUPPLY THE KERNEL" IS A DIFFERENT QUESTION FROM "IS THIS THE KERNEL IT
+	// RECORDS", and the loader needs the first to decide whether a source was SELECTED.
+	//
+	// A source whose manifest names `boot/kernel` is the source the running kernel came from, so a
+	// missing bootstrap list on it is a refusal rather than an absence. `verify` cannot answer that:
+	// it needs the bytes, and the question is asked about a file the caller is not holding.
+	let mut manifest = String::from("liberboot-manifest 1\n");
+	manifest.push_str(&format!("{}  boot/kernel\n", "ab".repeat(32)));
+	manifest.push_str(&format!("{}  etc/bootstrap.list\n", "cd".repeat(32)));
+	assert!(names(manifest.as_bytes(), b"boot/kernel"), "the manifest names the kernel it supplied");
+	assert!(names(manifest.as_bytes(), b"etc/bootstrap.list"));
+	assert!(!names(manifest.as_bytes(), b"boot/kernel2"), "a longer path is not the one named");
+	assert!(!names(manifest.as_bytes(), b"kernel"), "and neither is a shorter one");
+	// A file that is not recorded, and a manifest that is not one.
+	assert!(!names(manifest.as_bytes(), b"etc/motd"));
+	assert!(!names(b"", b"boot/kernel"), "an empty file names nothing");
+	assert!(!names(b"garbage\nrows\n", b"boot/kernel"), "and neither does something that is not a manifest");
+	// A row whose digest is unreadable still NAMES the path: the question is which files this
+	// manifest is about, and a corrupt digest is `verify`'s to refuse.
+	let mut broken = String::from("liberboot-manifest 1\n");
+	broken.push_str(&format!("{}  boot/kernel\n", "z".repeat(64)));
+	assert!(names(broken.as_bytes(), b"boot/kernel"));
 }

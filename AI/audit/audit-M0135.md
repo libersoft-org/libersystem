@@ -224,3 +224,117 @@ anything is asked to stage one, discovery has a mechanism before it has a schema
 the Done section names an executable gate. The one dependency it cannot satisfy alone is the
 self-thread runtime, which is stated as a blocking prerequisite with no milestone number yet rather
 than assumed - and which `P02M0103` must share.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-08-30T09:46:14Z):
+
+Rating: 5/10
+
+1. **The claimed “named, pinned” reference configuration is still neither named nor pinned.**
+
+   The plan says its completion claim is scoped to one named configuration
+   (`docs/todo/P02M0135.md:25-30`), but the first relevant item still tells the implementer to choose
+   Mesa or a Vulkan loader and later record its version, digest, options, patches, and toolchain
+   (`:46-57`). No project, version, configuration, lockfile, or digest is selected now. Consequently
+   the thread decision (`:98-100`), C++ policy (`:102-116`), TLS branch (`:118-147`), and discovery
+   architecture (`:176-204`) remain scope-defining choices rather than an auditable implementation
+   plan. The response's claim that the new item “pins ONE named configuration” is inaccurate; it only
+   requires someone to select one later.
+
+   Mesa and a Vulkan loader have materially different build systems, headers, runtime surfaces,
+   threading/TLS behavior, licensing closures, and discovery models. Put the selected profile, exact
+   source and patch digests, complete options, three target files, and toolchain/runtime lock into the
+   plan before implementation approval, then resolve the dependent branches against it. The licensing
+   item that says it precedes pinning should also precede the pinning item instead of appearing at
+   `:206-214`.
+
+2. **There is no C/C++ target header or minimal sysroot surface from which the required upstream builds can compile.**
+
+   Pinning compilers, cross files, and flags (`docs/todo/P02M0135.md:46-56`) does not provide the
+   target declarations and ABI used by C/C++ sources. The plan later says identity will bind “the
+   target and sysroot” (`:163-167`) but never creates, selects, versions, or licenses that sysroot, nor
+   defines the headers, target triples/data models, layouts, constants, prototypes, and compiler
+   builtins corresponding to the facilities promised at `:71-77`. The current tree has no project
+   C/C++ target sysroot; the architecture separately describes compiler targets, a sysroot, ABI/IDL
+   bindings, and linker support as future native-SDK work (`docs/CONCEPT_EN.md:1643`).
+
+   The three-target compile gate at `docs/todo/P02M0135.md:221-224` is therefore impossible without
+   silently using a host libc/sysroot, which would derive the wrong ABI and usually import the general
+   POSIX surface this milestone forbids. Own or name a minimal profile-specific cross sysroot/header
+   set, and bind it into the lock, inventory, cache identity, licensing closure, and compile evidence.
+
+3. **The rejection of any upstream link is unjustified, and the object-only inventory is not the external closure claimed by the plan.**
+
+   The plan says the upstream is never linked and calls a final-link check circular
+   (`docs/todo/P02M0135.md:32-42`, `:56-57`, `:261-263`). Its inventory records every undefined symbol
+   in every object (`:59-69`) and later equates that set with the required substrate surface
+   (`:225-226`). Per-object undefined symbols include references satisfied by other upstream objects;
+   archive selection, weak/COMDAT/version/visibility resolution, generated members, and
+   compiler-runtime selection occur at link time. Object-only inspection also cannot supply the final
+   `PT_TLS` proof promised at `:62`. Variant B nevertheless requires a final linked and staged ELF
+   (`:137-144`, `:227-228`) although the reference upstream is forbidden from producing one.
+
+   The gate can demand internal symbols that need no substrate, miss link-selected requirements, and
+   pass while the named configuration still cannot link. Use object analysis for an initial candidate
+   surface, then perform a non-staged audit link against the resulting substrate on all three targets
+   and inspect its link map and final ELF. That is not an image import and is not circular. If it
+   remains deferred, narrow the milestone's claim to object-level scaffolding.
+
+4. **The mandatory thread dependency was externalized to a milestone that still does not exist.**
+
+   The original correction required a named prerequisite or an owned subpart. The update describes the
+   contract, but explicitly says its owner is “not yet created or numbered”
+   (`docs/todo/P02M0135.md:79-100`, `:264-266`), and the Done gate is merely conditional on that unknown
+   prerequisite (`:249-250`). The response's “named prerequisite” is therefore a named concept without
+   an approved plan, ordering, owner, or evidence contract.
+
+   Any selected profile using threads, and every TLS Variant A profile, remains unschedulable. Create
+   and number the shared self-thread-runtime prerequisite before approving M0135, or pin a profile whose
+   inventory proves both threading and TLS support unnecessary.
+
+5. **The discovery correction still leaves the architecture undecided and permits branches incompatible with the milestone's scope.**
+
+   The plan still says “Pick one” among pre-launch injection, eagerly loading every candidate, and an
+   out-of-process provider (`docs/todo/P02M0135.md:176-204`); a recommendation is not a decision. The
+   current loader admits one eager verified global provider closure and rejects duplicate providers
+   (`docs/DYNAMIC_LINKING.md:138-151`, `:179-187`). Eagerly loading real ICD candidates therefore
+   needs a symbol-namespace/collision solution, while an out-of-process ICD requires a graphics-call
+   channel protocol even though all GL/Vulkan ABIs are deferred and “No GL or Vulkan ABI is exported”
+   (`docs/todo/P02M0135.md:203-204`, `:256-260`). Discovery is also an unconditional guest gate
+   (`:245-246`), although an allowed Mesa profile may derive no loader/ICD lookup requirement,
+   contradicting “nothing beyond the inventory” at `:71-77`.
+
+   Select the discovery/loading model after pinning the actual profile, define its owner and capability
+   flow, and make its gate conditional on the profile requiring it. Remove alternatives that require
+   explicitly deferred API or protocol work.
+
+6. **The new identity version has no migration or mixed-closure compatibility policy.**
+
+   The plan requires “a new version” of image identity and names broad components to change
+   (`docs/todo/P02M0135.md:149-174`) but never decides whether all Rust artifacts migrate, whether v1
+   and v2 may coexist in one provider closure, or how live publication works across formats.
+   ProcessService currently parses only v1 and Rust-specific fields
+   (`src/user/services/core/src/process_service.rs:139-165`), packaging does the same
+   (`src/tools/mkpackages/src/main.rs:771-786`), and the shared compatibility path requires those
+   fields and rejects every format other than v1 (`src/boot/protocol/src/compat.rs:45-51,232-245`).
+   Device publication independently enforces that format
+   (`src/user/services/core/src/dev_protocol.rs:1203-1209`).
+
+   A foreign v2 artifact is rejected by every current route, while a partial migration can break mixed
+   Rust/foreign closures or hot publication. State whether v2 replaces v1 image-wide or is
+   version-dispatched alongside it; define common and language-specific fields, mixed provider-digest
+   rules, and the publication compatibility or explicit cold-transition rule. Include the shared
+   compatibility and device-publication paths in the migration gates.
+
+7. **Supported C++ ABI mechanisms still lack evidence for the lifecycle semantics the plan promises.**
+
+   The updated item requires init/fini order, partial-initialization failure, normal exit versus crash
+   behavior, and runtime ownership for supported C++ features (`docs/todo/P02M0135.md:102-116`). The
+   Done section only mutation-tests mechanisms declared forbidden (`:229-230`). Its generic instruction
+   to “use each admitted ABI facility” (`:241-244`) does not establish provider-DAG
+   constructor/destructor order, rollback after a failing constructor, `atexit` behavior, or crash
+   semantics.
+
+   If the selected profile admits any of these mechanisms, the milestone can close with its hardest
+   lifecycle contracts documented but untested. Add focused positive guest gates for every supported
+   C++ mechanism, including ordering and partial-failure/exit/crash cases; retain watched-fail artifact
+   mutations for forbidden mechanisms.
