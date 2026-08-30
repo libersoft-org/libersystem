@@ -409,3 +409,11 @@ not boot.
 The manifest edit I had begun was reverted, so the tree carries no half-seam. What it carries is this
 record of exactly what the seam costs and why it was deferred - which is the state the DoD is in, and
 saying otherwise would be the thing this audit is about.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0164 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 5/10
+
+1. **The provider catalogue is still not the production discovery path.** No driver-provider consumer service subscribes to it; the service-side catalogue users only request binding snapshots. DeviceManager still takes providers into fixed `net_client`, `gpu_client`, `snd_client`, `input_client`, and USB locals, then sends fixed `NET`/`GPU`/`SND`/`INPUT`/`USB` handoffs to ServiceManager (`src/user/services/core/src/device_manager.rs:441-475,656-665,1072-1143`). Block discovery likewise remains the four-entry `BOOT_BLOCK_TAGS`/probe bootstrap route. Consequently an additional or late provider may be recorded in the catalogue but cannot be discovered by a real consumer. This remains the expressly scoped seam change and late-subscriber behavior required by the milestone (`docs/todo/P02M0164.md:288-320`); the latest implementer response correctly acknowledges it as not fixed.

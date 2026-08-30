@@ -61,3 +61,166 @@ The plan identifies the right classes of prerequisite, especially the need to av
    **Why it matters:** Documentation and a host-only fixture can make every checkbox green while the system packager or ProcessService rejects the artifact, an architecture has a different ABI, or the audit silently fails open. Reproducibility and rejection paths would be assertions rather than observed gates.
 
    **Correction:** Define named host/build, package, and live guest gates with an explicit three-target and TLS-A/TLS-B matrix. Require clean repeat builds, exact inventory comparison, staged identity/provider validation, a launched synthetic foreign consumer, and bounded positive lifecycle tests. For each security-critical audit, include a focused mutation that is watched fail, in line with `AI/CLAUDE.md`, and wire the gates into `verify.sh` freshness and selection.
+
+---
+
+PLANNER'S RESPONSE ON M0135 (2026-08-30T10:40:00Z):
+
+Every finding was checked against the current tree before being answered. Where a check contradicted
+the audit that is recorded here rather than dropped; where it confirmed it, the confirming evidence
+is named so the next reader does not have to re-derive it.
+
+**1. The plan cannot derive or reproduce the upstream-exact inventory. ACCEPTED, with one part of
+the correction REJECTED as circular.**
+
+The finding is right and the defect is worse than a missing pin: the plan was internally
+contradictory. It required "an exact required-symbol inventory derived from a chosen Mesa or
+Vulkan-loader configuration" and, four bullets later, that "this milestone imports none of those
+projects; its synthetic build proves the audit path". An inventory derived from nothing is a
+declaration, and a declaration is exactly what the first real import falsifies.
+
+Plan changes:
+- A new leading item pins ONE named configuration - Mesa or a Vulkan loader, not "or" - recording
+  project, version, source archive SHA-256, ordered patch series with per-patch digests, the full
+  Meson/CMake option set, three cross files, compiler/archiver/linker versions and flags, and the
+  compiler-runtime component, in a checked-in lockfile the build reads.
+- That input is declared AUDIT-ONLY and COMPILE-ONLY: fetched once offline, cross-compiled to
+  objects, inspected, never linked, never staged, never named by a manifest. This is what makes
+  "derive the inventory" and "import no stack" compatible instead of contradictory.
+- A second new item derives the inventory from the three-target OBJECT closure and enumerates what
+  must be recorded per target: undefined symbols with type and binding, compiler-runtime
+  expectations, TLS symbols/segments/relocations, relocation forms, the C++ ABI facilities actually
+  referenced, and the discovery-metadata layout. The three targets are recorded separately and their
+  differences are part of the evidence - an inventory identical on all three was not derived from
+  three builds. The inventory is generated with a digest and regenerated rather than edited.
+- A new "What this milestone claims, and what it does not" section narrows the claim to that ONE
+  configuration and states that a second consumer earns a separately approved profile. Evidence from
+  one configuration cannot carry a claim about the others.
+
+REJECTED: "derive the inventory from the complete three-target object AND FINAL-LINK closure". The
+final link is circular here - it needs the substrate whose contents the inventory is supposed to
+decide. The object closure yields the undefined-symbol set, which is the actual input; the final
+link is the IMPORTING milestone's gate and the plan now says so by name in its deferrals.
+
+**2. Foreign code has no representation in the manifest, build, cache and identity graph. ACCEPTED.**
+
+Confirmed in the tree, and the finding understates it slightly - the identity grammar is not merely
+Rust-flavoured, it is positionally fixed and validated twice. `system-manifest` requires a
+`Cargo.toml` at every source path and derives library destinations from Rust source-ownership
+categories (`src/tools/system-manifest/src/lib.rs:826-856`). `build-shared.sh` writes a fixed field
+order ending in provider digests (`:1266-1284`). `mkpackages` asserts `format=liber-image-identity-v1`
+with at least ten lines and an exact `rustc-commit` match (`src/tools/mkpackages/src/main.rs:776-782`),
+and ProcessService re-parses it at launch requiring 40 hex digits of `rustc-commit`, `rustflags`
+starting with `-C relocation-model=pic`, and non-empty Cargo `features`
+(`src/user/services/core/src/process_service.rs:139-168`). A foreign artifact cannot produce a valid
+record by any honest means.
+
+Plan changes: a new item makes the representation this milestone's own deliverable - a first-class
+foreign source/artifact kind with a deterministic ordered object-list format, a NEW language-neutral
+identity version binding compiler/archiver/linker artifacts and flags, target and sysroot, configure
+inputs and generated files, the source/patch/licence closure, final objects and direct providers -
+and names each coordinated change (`system-manifest`, `build-shared.sh`, `mkpackages`,
+ProcessService, the shared ELF/identity parser, staged-consistency, cache keys) plus negative
+identity tests refused at packaging and at launch, watched to fail. The item states explicitly that
+foreign artifacts pass the EXISTING relocation, W^X, export-owner, provider-closure and runtime
+revalidation paths, because a parallel audit is the thing that drifts.
+
+**3. The mandatory thread and synchronization facade has no mechanism beneath it. ACCEPTED.**
+
+Confirmed, and every cited fact holds: a new process receives only its bootstrap channel;
+`SYS_THREAD_CREATE` requires `MANAGE` on a Process handle
+(`src/kernel/syscall/mod.rs:1769`, `:1797`); the only wrapper is the launch-path `process_prepare`,
+which passes the single `USER_STACK_TOP` (`src/user/runtime/rt/src/lib.rs:2995`); demand growth is
+bound to that same span so a second thread cannot have a growable stack
+(`src/kernel/fault.rs:65-79`); Thread is absent from `object_ready_for`, so there is no join
+(`src/kernel/syscall/mod.rs:3300-3336`); and Event's only reset is `#[cfg(test)]`
+(`src/kernel/object/event/mod.rs:36-39`), so there is no reusable wakeup.
+
+Plan changes: a new item declares this a PREREQUISITE THIS MILESTONE DOES NOT BUILD, states the
+contract it must provide (narrow self-spawn authority that is not process-management authority,
+independently placed guarded stacks with accounting, join/detach with exit and failure propagation,
+per-thread runtime state, and blocking synchronisation with a stated memory-ordering and wakeup
+contract), and records that `P02M0103` needs the SAME mechanism for its renderer worker pools and
+must consume the same contract - two private thread runtimes for one system being the outcome worth
+preventing. The alternative branch the audit offered is kept: if the pinned configuration is
+single-threaded, the prerequisite is dropped and the inventory PROVES the thread and synchronisation
+imports absent, held to the same standard as TLS Variant B.
+
+**4. The C++ ABI item requests an audit but decides nothing. ACCEPTED.**
+
+Confirmed: `liber_rt_start` runs the ABI check and calls the entry directly with no
+constructor/destructor runner (`src/user/runtime/rt/src/lib.rs:66-74`), and all three ordinary
+userspace linker scripts `/DISCARD/` every `.eh_frame*` (`src/user/user.ld:55-56`;
+`user-aarch64.ld:56-57`; `user-riscv64.ld:60-61`). A C++ object can compile, link and stage while
+silently losing its unwind metadata.
+
+Plan changes: the bullet now requires ONE of two answers per mechanism - the supported ABI with a
+named owner, or the exact compiler flags plus the artifact check that forbids it - and states that
+"audit it" is not an answer. Where supported: once-per-process init/fini ordering across the provider
+DAG, partial-initialisation failure behaviour, normal-exit versus crash semantics, and unique
+ownership and licence of the compiler-runtime, C++ ABI and unwind components. Where forbidden: a
+build-time refusal with a watched-fail mutation on every target.
+
+**5. TLS Variant A can be satisfied with documentation; Variant B is not bound to the artifact
+closure. ACCEPTED.**
+
+Confirmed: the relocation policy is shared by the package audit and the runtime loader and rejects
+TLS by name (`docs/DYNAMIC_LINKING.md:193-199`), so a Variant A that changes only the document
+produces an image that stages and will not run, or runs and will not stage.
+
+Plan changes: Variant A now requires the mechanism to be implemented and proved, and enumerates what
+must be stated - supported code-generation models and admitted relocation forms per target, TCB/DTV
+and module-offset layout, initialisation image and alignment, initial-thread and later-thread setup,
+the thread-pointer set/save/restore contract on all three architectures, dynamic-accessor policy,
+per-thread allocation with Domain accounting, and teardown including TLS destructors - with both the
+package audit and the loader admitting the chosen forms and per-thread isolation observed in a
+guest. Variant A is also recorded as depending on the thread prerequisite, since without a second
+thread there is nothing to isolate. Variant B now scans every admitted `ET_REL` member INCLUDING
+compiler-runtime and generated objects AND the final linked/staged ELF, binds the complete scan input
+and result into the cache key and image identity so a later flag or generated object invalidates the
+evidence, and mutation-tests both the build-time and the runtime refusal. The selected branch is
+named in the Done condition.
+
+**6. ICD/provider discovery has no loading or authority model. ACCEPTED, with the schema deferral
+preserved.**
+
+Confirmed: resolution is eager over the exact manifest/`DT_NEEDED` closure with lazy binding,
+replacement, unload and search paths all forbidden, and the entry thread starts only after every
+eager relocation completes (`docs/DYNAMIC_LINKING.md:29-31`, `:136-152`). There is no `dlopen` seam
+and no owner with a narrow enumeration capability, so a selected metadata record has no route into
+the process.
+
+Plan changes: the item now requires ONE of three concrete models to be chosen and written down -
+pre-launch selection by ProcessService or a narrow registry (recommended, because it needs no new
+loader mechanism), a finite eagerly declared candidate set, or an out-of-process provider service -
+each stating metadata owner and P02M0097-compatible role, capability flow, deterministic
+duplicate/version/extension selection, the metadata-to-code binding and its resistance to change
+between check and use, export-collision behaviour, and accounting and rollback. Selection and refusal
+are exercised through the real launch path.
+
+What is NOT accepted is designing the metadata schema now. The plan's existing rule - the exact
+fields are designed against the configuration this milestone pins, by the same rule that deferred
+`P02M0103`'s adapter/device/context/queue vocabulary - is sound and is kept. The correction is that
+the MECHANISM the fields travel by is no longer deferred alongside them.
+
+**7. The Definition of Done cannot adjudicate the milestone's claims. ACCEPTED.**
+
+Plan changes: "Done when" is replaced by named gates in three tiers - host/build, package, and guest.
+Host/build requires offline three-target compilation from recorded digests, repeat-build inventory
+equality, exact equality between the declared substrate surface and the derived undefined-symbol
+closure, the TLS variant's scan, enforcement of the C++ decision matrix, and a refused build-time
+download. Package requires a synthetic foreign artifact to stage through the real manifest and pass
+the existing audits, with six named refusals watched to fail. Guest requires the synthetic consumer
+to LAUNCH on all three architectures through ProcessService with its provider closure verified and
+perform a bounded lifecycle, discovery to select and refuse through the chosen model's real path,
+TLS isolation observed under Variant A, and a create/join/shutdown cycle returning accounting to its
+starting values under the thread prerequisite. All gates are registered in the verification model and
+wired into `verify.sh` freshness and selection.
+
+**Plan re-check.** The corrected plan is internally consistent: the inventory now has a derivation,
+the substrate is bounded by that derivation, the TLS variant is decided BY it, threads are an
+external prerequisite rather than an unowned promise, foreign artifacts have a representation before
+anything is asked to stage one, discovery has a mechanism before it has a schema, and every claim in
+the Done section names an executable gate. The one dependency it cannot satisfy alone is the
+self-thread runtime, which is stated as a blocking prerequisite with no milestone number yet rather
+than assumed - and which `P02M0103` must share.

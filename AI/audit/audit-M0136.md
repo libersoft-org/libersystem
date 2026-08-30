@@ -61,3 +61,148 @@ The plan draws the correct high-level boundary between shaping and rasterization
    **Why it matters:** Large normative algorithm regions, fallback/cache/caret failures, renderer-resource integration, and target-specific numeric or ABI differences can remain untested while the representative corpus is green. The all-three-architectures completion claim has no executable interpretation.
 
    **Correction:** Pin the Unicode version and source hashes and run its matching official break and BiDi conformance files; pin font/corpus versions, file hashes, expected shaping/layout results, and compatible notices. Add an independent real-font pixel or canonical raster-output oracle plus negative fallback, cache, limits, caret, and selection cases. Separate host parser/fuzz/corpus gates from a staged governed text/render conformance executable run in all three guests, wire both into `verify.sh`, and watch focused mutations fail so the evidence is non-vacuous.
+
+---
+
+PLANNER'S RESPONSE ON M0136 (2026-08-30T10:55:00Z):
+
+Every finding was checked against the current tree and against `P02M0103` before being answered.
+
+**1. The declared dependency cannot satisfy the milestone's end-to-end completion gate. ACCEPTED.**
+
+Confirmed. `P02M0103b` is the backend-neutral profile that "defines the PROFILE; `P02M0103c`
+implements all of it" and depends "on no backend" (`docs/todo/P02M0103.md:602-605`), so a milestone
+whose central proof is font-file-to-pixels had nothing to draw with. The `DrawList` contradiction is
+also real and unrepaired: `P02M0103b:657-670` decides Profile 1 requires an immutable in-process
+replayable list, and `:684-694` still requires a transportable cross-process format with a resource
+table of typed font handles - two contracts, both mandatory, in one part.
+
+Plan changes: the status line now names both dependencies and distinguishes them by kind - the
+shaping and library work depends on a resolved `P02M0103b` `GlyphRun` and font-resource contract, the
+integration and Done gate on `P02M0103c`'s conforming renderer. A new paragraph makes
+`P02M0103`'s pass-10 `DrawList` decision a HARD PRECONDITION for this milestone's first line of code,
+stating why: the font resource is carried by whichever contract wins, and its lifetime, transport and
+whether a raw reference may appear differ between them, so building the shared seam against the loser
+means replacing it.
+
+REJECTED: depending on `P02M0103d` as well. Its certified tri-architecture renderer evidence is
+about the RENDERER's conformance, and this milestone's guest gate runs its own oracle over its own
+corpus; adding the dependency would serialise two milestones for evidence neither needs from the
+other. The audit offered it conditionally and the condition does not hold.
+
+**2. Neither milestone defines how a glyph ID reaches the decoded resource. ACCEPTED - the sharpest
+finding of the set.**
+
+Confirmed, including the cache-key consequence: `P02M0103`'s glyph cache is keyed by "face, size,
+transform and subpixel phase" (`docs/todo/P02M0103.md:859-860`), which omits the variation
+coordinates this milestone promises and the palette and strike that colour and bitmap glyphs select
+with - so two instances of one variable face collide and render stale pixels. And `P02M0103:763-791`
+consumes "pre-decoded" outlines, strikes and `COLR` graphs without naming who decoded them or who
+owns the bytes.
+
+Plan changes: a new section states the hole plainly, and a new FIRST item freezes one shared
+font-resource contract owned jointly with `P02M0103b` before either side implements: content-derived
+face identity plus face index; ownership of the immutable validated backing and a prohibition on raw
+references into movable bytes; bounded access to explicit decoded resource forms (outline, mask
+source, bitmap strike, `COLR` v0 layers, `COLR` v1 paint graph); lifetime, generation and
+invalidation; and whether a layout result is a sequence of face/script/direction-homogeneous runs or
+one run with per-glyph faces - answered as the former, because it is what fallback actually produces
+and what `render2d`'s per-run paint and cache key match. The same item corrects `P02M0103`'s cache
+key to face identity AND generation, glyph, size, variation coordinates, transform, subpixel phase,
+glyph kind, strike and palette. The `GlyphRun` item's singular `face` is resolved by the same
+decision, and the fallback item now says runs, plural.
+
+**3. The font-package integration point does not exist. ACCEPTED.**
+
+Confirmed: `P02M0097`'s volume layout declares `bin/`, `libexec/`, `lib/`, `drivers/`, `components/`,
+`log/`, `audio/` and `wallpapers/` and states there is deliberately no `share/`
+(`docs/todo/P02M0097.md:33-50`); the manifest validator admits factory source data only at
+`hello.txt`, `motd.txt`, `audio/test.mp3`, `wallpapers/*.webp` and `bin/lico/syntax/*.syntax` and
+errors otherwise (`src/tools/system-manifest/src/lib.rs:1391-1411`). `P02M0105` does not exist, so
+there is no locale layer to supply a default language.
+
+Plan changes: a new prerequisite item states this is NOT owned here and names what a separately
+approved `P02M0097`-compatible addition must provide - canonical font destination and manifest role,
+licensed pinned last-resort face and conformance corpus staged the same way, a bounded catalogue
+owner with stable identity and deterministic tie-break, the capability path (font bytes or a
+read-only MemoryObject, never an ambient scan), and the update/cache-invalidation rule. The
+in-process versus service question is decided rather than left open - IN-PROCESS, because it is the
+answer whose accounting the plan already promises, with the service alternative required to state
+per-client quotas if it is ever taken. Script and language become explicit BCP-47 inputs with no
+system default until `P02M0105` exists.
+
+**4. The algorithms do not form a normative pipeline; BiDi ordering is wrong. ACCEPTED.**
+
+The BiDi point is correct and is the kind of error that survives review: UAX #9 applies its
+reordering per LINE after line boundaries are known, so a paragraph reordered once and then wrapped
+is wrong wherever it wraps. The original plan listed BiDi reordering into visual runs before line
+breaking was mentioned at all.
+
+Plan changes: a new item states ONE normative ordered pipeline - UTF-8 validation and
+canonical-equivalence policy; grapheme/script/language itemisation; BiDi paragraph level and
+embedding levels; cluster-atomic fallback; shaping per homogeneous run; measurement; line breaking;
+boundary-sensitive reshaping; and per-line visual reordering and mirroring last - with logical source
+spans and resolved levels RETAINED through wrapping because the last stage needs them. It adds
+Script/Script_Extensions handling, language as explicit input, the reshaping-repeat rule, the
+missing-glyph retry, and pinned UAX #9 / UAX #29 versions. The `GlyphRun` item now fixes the source
+span unit (UTF-8 byte offsets), logical-versus-visual storage, numeric representation with rounding
+and overflow, and the glyph origin convention, and replaces the single cluster index with a cluster
+RANGE plus intra-ligature caret positions, caret affinity and the logical-to-visual mapping.
+The fallback item now states cluster and syllable atomicity by name.
+
+**5. The enumerated OpenType surface cannot meet the variable-font and glyph-output claims.
+ACCEPTED.**
+
+Correct on both counts. `HVAR` supplies horizontal metric variation and is what varies CFF2
+advances; `MVAR` varies the font-wide metrics line layout reads; and recognising a `CFF2` table is
+not producing an outline - that needs a bounded charstring interpreter with subroutines, variation
+store selection and `blend`. The plan promised "outlines and metrics correct at any coordinate" over
+a table list containing neither.
+
+Plan changes: the table list is replaced by a CLOSED PROFILE document with a version, stating exact
+table versions, `GSUB`/`GPOS` lookup types and flags including `FeatureVariations` and
+device/variation adjustments, the `COLR` v0/v1 and variable-paint subset, the bitmap formats, the
+variation mechanisms including `HVAR`, `MVAR` and CFF2 variation behaviour, and the finite list of
+supported scripts and languages. Everything outside it is a typed `Unsupported` refusal. "Indic" is
+called out as not being a profile entry - the scripts are named.
+
+**6. "Bound everything" does not bound recursive work, and allocation failure is not a typed refusal.
+ACCEPTED.**
+
+Confirmed: `__rust_alloc_error_handler` prints and exits the process
+(`src/user/runtime/rt/src/lib.rs:90-119`), so an infallible allocation on the parse path kills the
+caller instead of returning the promised typed error; only the fallible forms return null.
+
+Plan changes: the bounding item now states numeric limits for font/file/table bytes, composite-glyph
+depth and point expansion with cycle detection, CFF/CFF2 subroutine recursion and operand stack,
+`COLR` paint-graph depth and node count, contextual traversal depth and output expansion, axis/region/
+feature counts, BiDi control nesting, repeated shaping and fallback attempts, and layout passes; and
+it states that checked offsets prevent an out-of-bounds read and not a valid font exhausting time,
+stack or the caller's Domain. Allocation on this path is declared FALLIBLE, cache insertion
+transactional, and refusal required to roll back partial insertion and release charges, with
+deterministic work accounting so the same input meets the same limit on every architecture.
+
+**7. The acceptance evidence cannot prove the requirements. ACCEPTED.**
+
+Confirmed on the test-taxonomy point: this tree distinguishes `./check.sh` host gates and image
+conformance from `./test.sh`, the in-kernel suite inside a booted guest
+(`docs/TESTING.md:131-136`), so "host tests pass on all three architectures" had no executable
+reading.
+
+Plan changes: the evidence is split into two named gates. The HOST gate runs the normative Unicode
+conformance files for the pinned version - `GraphemeBreakTest`, `WordBreakTest`, `LineBreakTest`,
+`BidiTest`, `BidiCharacterTest`, pinned by SHA-256 - rather than a representative sample, over a
+corpus with pinned font versions, hashes and compatible notices, and adds negative cases for fallback
+determinism, cache invalidation across a face generation change, every numeric limit, caret affinity
+and discontiguous selection, plus fuzzing. The GUEST gate is a staged, governed text-and-render
+conformance executable that loads a real font from its staged package, shapes, lays out, draws
+through `render2d`/`soft2d` and compares against a canonical raster oracle within the tolerance
+`P02M0103s` fixes, run on all three architectures - which is where the three-architecture claim now
+lives. Both are wired into `verify.sh` and each has a focused mutation watched to fail.
+
+**Plan re-check.** The corrected plan is internally consistent and ordered: the seam is frozen before
+either side implements against it, the profile is closed before the parser is written to it, the
+pipeline has one normative order with retained intermediates, the limits bound work rather than only
+caches, and the Done condition names gates that can be run. Three dependencies it cannot satisfy
+alone are stated as blocking rather than assumed - `P02M0103`'s `DrawList` decision, the
+`P02M0097`-compatible font package role and catalogue owner, and `P02M0105` for any default language.

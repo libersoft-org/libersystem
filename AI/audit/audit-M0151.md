@@ -530,3 +530,17 @@ coverage rather than about a bigger constant.
 **Verification.** `cargo test --manifest-path src/fdt/Cargo.toml --offline`: **86 passed**, up from
 82. With the four checks disabled the four new fixtures fail and the other 82 still pass, which is
 what says each one is about its own rule.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-08-30T08:43:38Z):
+
+Current implementation rating: 6/10
+
+1. **The timer PPI's interrupt-controller routing is still not validated.** The FDT reader retains the timer interrupt kind, number, and sense but no timer `interrupt-parent` or selected-main-GIC phandle (`src/fdt/src/lib.rs:1140-1175`). A timer routed to a different controller can therefore be accepted and enabled on the selected GIC. M2 explicitly requires the PPI's interrupt-controller routing to be checked and host mutations to cover it (`docs/todo/P02M0151.md:86-92`). The implementer's rejection on proportionality/QEMU-generation grounds contradicts that checked requirement; this needs the bounded phandle relationship check, not a broader firmware framework.
+
+2. **Redistributor validation still proves only byte capacity, not that every described core has a frame.** The parser accepts a GICR range whenever `gic_cpu_size >= 0x20000 * cpu_count` (`src/fdt/src/lib.rs:1435-1448`). If the runtime `GICR_TYPER` affinity/`Last` layout omits a described core despite sufficient bytes, `this_redistributor` returns `None` and `init_cpu_local_v3` only logs and returns, leaving that online core without timer/SGI setup (`src/kernel/arch/aarch64/gic.rs:120-143,257-264`). M2 requires a missing/contradictory main GIC to be fatal and per-core discovery to be data-driven (`docs/todo/P02M0151.md:83-90`). The latest size check closes bounds validation but not the accepted runtime contradiction.
+
+3. **The claimed real-device MSI checkpoint remains synthetic.** The selected oracle allocates ordinary RAM as a fake MSI-X table and manually invokes `dispatch_msi`, then performs synthetic release/reacquire (`src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The profile gate nevertheless reports that it “delivered a real MSI” (`src/tools/check-qemu-arch-profiles.sh:308-326`). The actual virtio-snd hardware test stops after stream acknowledgement and does not release/reacquire the claim or vector (`src/kernel/test_suites/hardware.rs:745-805`). M3/M6 require the final ITS profile to deliver and tear down a real device MSI (`docs/todo/P02M0151.md:94-103,143-154`); the current oracle cannot detect a broken device-to-ITS path or real teardown.
+
+4. **The required UEFI/no-DT regression profiles remain absent from automation.** The architecture gate registers only eight direct-boot invocations with `UEFI=0` (`src/tools/check-qemu-arch-profiles.sh:198-211,296-334`), and no repository caller actually selects `LIBER_NO_DT_PROFILE=1`; `test-kernel.sh` only passes it through when supplied (`src/harness/test-kernel.sh:312,332`). M6 requires separate, labelled aarch64 and riscv64 UEFI/no-DT profiles and the Definition of Done requires them green (`docs/todo/P02M0151.md:143-147,464-472`). A dormant fallback selected by no gate is not regression coverage.

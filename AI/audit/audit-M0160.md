@@ -117,3 +117,11 @@ that build's stamp, and an interruption left even the image gone.
 after it: all three `OK`. The gate's own run is part of the final verification at the end of this
 job; what the digests establish is the property this finding names - the shared shape is the one it
 was.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0160 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 8/10
+
+1. **The restoration fix preserves bytes but not the full pre-run artifact state.** The gate restores the image, sidecar, and receipt with ordinary `cp` (`src/tools/check-signed-boot.sh:243-251,263-279`), which gives the receipt a new modification time. M0160 explicitly makes the receipt mtime the “untouched” invariant because its contents are normally identical (`docs/todo/P02M0160.md:72-94`); digest-only verification therefore misses a mutation the milestone requires not to occur. The saver also records only files that initially exist, so restoration never removes a member that was absent before the test but created by the nested build. Preserve the saved metadata, record initial absence, remove newly created members on restoration, and assert both the receipt timestamp and the three-member presence shape.

@@ -317,3 +317,15 @@ rebuild is part of the final verification run at the end of this job.
 
 **Verification.** `./build.sh --arch x86_64 --part loader` clean. The signed-boot gate itself runs in
 the final verification.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0150 (2026-08-30T08:43:38Z):
+
+Current implementation rating: 6/10
+
+1. **Exact paired-volume selection still fails open when a present LiberFS volume has the wrong identity.** `choose_volume` treats every valid LiberFS volume whose UUID differs from `want` as an ordinary unrelated disk and does not remember that any candidate was present (`src/boot/uefi/src/disk.rs:266-296`). If no exact match follows, it returns `NotHere`; the loader maps that to `NoVolume` and may fall back to the signed boot medium (`src/boot/loader/src/main.rs:241-244,704-716`). An attacker or corruption that changes the selected volume's superblock UUID and recomputes the unauthenticated filesystem checksum therefore turns a present-invalid selected source into absence. The host test codifies this as `NotHere`, while the signed gate's `wrong_volume` case uses an embedded image and never exercises disk selection (`src/boot/uefi/src/tests.rs:246-249`; `src/tools/check-signed-boot.sh:400-405`). M4 requires a present but invalid selected source to fail terminally rather than fall back (`docs/todo/P02M0150.md:23-29,123-138,414-416`). Continue searching for a later exact match, but if only nonmatching LiberFS candidates were found, exhaustion must be a named failure.
+
+2. **The unpaired legacy/test-trust source can still mix its kernel with another source's bootstrap set.** The supported v1 branch upgrades an absent `etc/bootstrap.list` to terminal only when `Expected::pairs_with_this_source()` is true (`src/boot/loader/src/blockio.rs:208-233`; `src/boot/loader/src/trust.rs:223-230`). An unpaired test-trust volume can therefore supply `boot/kernel`, have it verified by its v1 manifest and executed, yet return `Selection::Unavailable` for the missing list; later bootstrap sources remain eligible (`src/boot/loader/src/main.rs:183-231,440-457`). Executing the v1 manifest's kernel selected that source just as executing a v2 `KIND_KERNEL` row does. The latest fix added that rule only to the signed-v2 branch. Carry actual v1 kernel-source selection into bootstrap assembly and add the corresponding unpaired-v1 missing-list regression.
+
+3. **Cross-port loader freshness still omits the verifier's transitive source dependencies.** The gate compares each loader receipt to `source_digest boot/loader` (`src/tools/check-signed-boot.sh:550-574`), and the build writes the same loader-directory-only digest (`build.sh:305-312`). `source_digest` hashes only the literal paths passed to it (`lib.sh:224-229`), while the loader depends on `boot/protocol`, `boot/signature`, `boot/uefi`, `abi`, `fdt`, and filesystem/parser crates (`src/boot/loader/Cargo.toml:12-36`). A change in those shared verification inputs leaves the receipt unchanged, allowing stale aarch64/riscv64 binaries to make M5/M6 appear green. The freshness identity must cover the loader's transitive local build inputs, or the gate must rebuild the subject it executes.

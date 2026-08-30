@@ -328,3 +328,13 @@ voluntary drop would have been.
 
 **Verification.** `./build.sh --arch x86_64` clean. The device-manager and config changes are
 exercised by the service suite in the final run at the end of this job.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 6/10
+
+1. **An accepted `retry` still performs no attempt after ordinary candidate exhaustion.** Both phase-two and standing-loop `Step::NextCandidate` paths advance `node.candidate` past the final entry (`src/user/services/core/src/device_manager.rs:552-557,948-956`). `PolicyVerb::Retry` opens an incident and sets `restart_requested` but never restores a candidate (`device_manager.rs:3485-3504`); the standing loop then calls `start_candidate`, which returns immediately when the cursor is at `candidates.len()` (`device_manager.rs:535-539,1015-1029`). It therefore neither re-evaluates the selected entry's `requires` nor grants the promised one attempt, contrary to M1/DoD (`docs/todo/P02M0166.md:76-77,241-248`). The latest response fixed policy-disable cursor consumption, not this separate exhausted-retry path.
+
+2. **The persisted incident fallback can still select a stale record for a different device.** Incident keys are durable BDFs and are never removed, but each value embeds the transient table index from the boot in which that incident occurred (`src/user/services/core/src/device_manager.rs:3790-3825`). After the live DeviceManager endpoint is gone, `lsdev --incident N` lists all persisted incidents and selects solely by that embedded `index=N` text (`src/user/apps/tools/src/lsdev.rs:244-285`); it does not resolve N's current BDF. If inventory order or membership changes, an old record can match the row now assigned to another device, and multiple old rows can match. This still violates the requested binding's surviving last-snapshot behavior and the explicit refusal of persistent history (`docs/todo/P02M0166.md:253,267-268`). Matching the old index more carefully did not address its cross-boot instability.

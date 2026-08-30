@@ -327,3 +327,15 @@ structural rather than conventional, which is what the finding asked for.
 **In scope, unchanged:** production adoption is still not forced, which the re-audit agrees with.
 
 **Verification.** `cargo test --manifest-path src/dma/Cargo.toml --offline`: 54 passed.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 5/10
+
+1. **IOMMU domains are still not destroyed on the normal or row-allocation rollback paths.** `Iommu::destroy_domain` exists (`src/dma/src/lib.rs:1041-1055`), but the only production call is the immediate `iommu.attach` failure path (`src/kernel/iommu/mod.rs:503-505`). Normal `detach_for_inner` removes the public `DOMAINS` entry and calls only `revoke_endpoint`, and the rollback after failing to record that entry does the same (`src/kernel/iommu/mod.rs:684-689,725-749`). A clean detach/restart therefore retains the underlying `DomainState`, including terminal mapping rows, and consumes domain IDs. This is the lifecycle leak the previous response claimed to fix. A confirmed revoke must destroy the domain; an unconfirmed/quarantined teardown must retain it. The failed-row rollback needs the same distinction.
+
+2. **A failed doorbell mapping once again permits the binding to continue.** `attach_endpoint` now records the domain in `NO_DOORBELL` and returns `Ok(domain)` when `install_doorbell` fails (`src/kernel/iommu/mod.rs:519-523`), allowing the claim to proceed to bus mastering. Refusing a later MSI allocation is narrower than M0153's explicit rule that a mapping failure end in refused binding, disabled bus mastering, or quarantine (`docs/todo/P02M0153.md:34-35`), and contradicts the implementer's statement that this failure rolls the domain back. A polling-only binding should not request an unnecessary doorbell map; an interrupt-capable binding must not be published after the required map failed.
+
+3. **The required production accounting remains incomplete.** The device snapshot exposes only total `iommu_grants`, while the boot report prints global endpoint/live/quarantined-mapping/fault totals (`src/kernel/iommu/mod.rs:535-543,838-856`). Live and quarantined IOVA counters remain test-only (`src/dma/src/lib.rs:1170-1176`), and endpoint/fault holdings are not integrated into binding or Domain accounting. M4 requires mapping, IOVA, endpoint, and fault accounting plus an exact restart baseline (`docs/todo/P02M0153.md:194-195,259-260`); the passing DMA unit tests do not exercise that production lifecycle integration.

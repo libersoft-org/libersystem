@@ -432,3 +432,13 @@ of what this test covers.
 
 **Verification.** `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline`:
 57 passed. `./build.sh --arch x86_64` clean with every driver's stop path rebuilt.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0165 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 7/10
+
+1. **The xHCI planned-stop fix still omits the required quiescence notification.** `Xhci::halt` now correctly clears Run/Stop and waits for `HCHalted`, but the stop path then calls `finish_stop(..., 0, ...)` (`src/user/drivers/core/src/xhci.rs:545-559,1018-1032`). This driver does have the controller's DeviceMemory capability in `DEVICE`, stored at bind time (`xhci.rs:196-206,373-378`). Passing zero skips `device_quiesced` (`src/user/drivers/core/src/common.rs:735-765`), so the kernel is not told to release DMA frames or masked MSI vectors held for this device (`src/kernel/syscall/mod.rs:1292-1331`). M3 explicitly requires the driver to halt/drain, call the existing `device_quiesced`, and only then answer `STOPPED` (`docs/todo/P02M0165.md:128-147`). The hardware-halt half is fixed, but this cleanup half is not.
+
+2. **The publish/crash/subscribe test still does not execute the production catalogue path.** `Publications` is a second slot array with its own `publish`, withdrawal loop, and reachability lookup (`src/user/libs/driver/binding/src/lib.rs:528-579`); DeviceManager's real `Catalogue::withdraw_binding` still has a separate loop, handle close, and subscriber announcement (`src/user/services/core/src/device_manager.rs:1998-2015`). The two implementations share only the leaf `ProviderId::belongs_to` predicate. The named test drives the model (`src/user/libs/driver/binding/src/tests.rs:525-566`), so it would still pass if crash handling stopped calling the production withdrawal, failed to close the provider, or failed to notify a late subscriber. The latest response's claim that the production path “shares rather than mirrors” the tested decision is therefore incomplete, and M7's required no-stale-provider production race remains unproved (`docs/todo/P02M0165.md:280-307`).

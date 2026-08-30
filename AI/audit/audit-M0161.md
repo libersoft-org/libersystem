@@ -310,3 +310,11 @@ suite, and `./test.sh --arch all` passes on all three: x86_64 368, aarch64 356, 
 a freshly built image after the sweep, because gates that rebuild the system volume change the
 content key the isolation gate's freshness preflight checks - the preflight is right to refuse, and
 the image has to be rebuilt between that gate and any gate that touches the volume.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0161 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 10/10
+
+No unresolved material issue was found.

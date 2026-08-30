@@ -92,3 +92,211 @@ The plan contains substantial design work, but it is not implementation-ready. I
    **Why it matters:** Implementing the described API either fails to compile, moves validation into ad hoc free functions/extension traits, or lets unchecked wire values flow into rendering and allocation code. It also couples the in-process API layout to the wire schema the plan otherwise wants versioned independently.
 
    **Correction:** Keep generated wire DTOs in `graphics-proto` and define validated `graphics-core` newtypes with mandatory `TryFrom` conversions at every trust boundary, or generate the checked implementation in the owning protocol crate. Specify which representation is canonical for hashing and ensure renderers accept only the validated core form.
+
+---
+
+PLANNER'S RESPONSE ON M0103 (2026-08-30T11:50:00Z):
+
+Every finding was checked against the tree and against the cited milestones as they stand on
+2026-08-30. This audit is dated 2026-08-28T21:36:03Z, and six of the milestones finding 4 relies on
+were closed on 2026-08-29; where a premise is stale it is rejected as such and the correction is
+re-examined on its own merits.
+
+**1. The plan knowingly contains two competing specifications. ACCEPTED.**
+
+Confirmed, and the file said so itself: the introduction states "this document now answers it both
+ways, in three places" and, five lines later, "Everything in this file is what to build". The
+`DrawList` pair is real - `:657-670` decides Profile 1 requires an immutable in-process replayable
+list, `:684-694` still requires a transportable cross-process format with a typed resource table -
+and both are mandatory items in one part. The coverage contradiction is real too and in two places:
+the bit-exact list included the unqualified word "coverage" directly beneath the paragraph
+establishing that 2D coverage is tolerance-based, and the `soft2d` differential-testing rule repeated
+it as "coverage and geometry classification" must match exactly.
+
+Plan changes:
+- The `DrawList` question is DECIDED in the authoritative section, not in the review. The
+  transportable item is rewritten into the in-process contract, listing what Profile 1 keeps from the
+  transportable form (versioned schema, typed resource TABLE, lifetime and immutability,
+  deduplication, bounded bytes and nesting, validation boundary, thread-safe replay and cancellation)
+  and what it drops (byte order, per-resource rights, cross-process snapshot semantics, the
+  validating parser as a security surface), with the reason a typed handle into a process-local table
+  is not a raw Rust reference and therefore leaves `render2d-wire` addable later as an extension.
+  The "decide it" item and the pass-10 entry are both ticked and dated.
+- The coverage contradiction is fixed at both sites: the bit-exact list now says "3D coverage
+  (sample-point classification)" and states that 2D coverage is not in it, and the `soft2d` rule now
+  distinguishes the scalar reference agreeing bit-exactly with its own parallel paths - one
+  algorithm - from a conformance tolerance against another backend.
+- Pass 10 is demoted from a second roadmap to a REVIEW RECORD: each entry is resolved in the
+  authoritative section and ticked, or it names itself as still open and BLOCKING. Six are listed by
+  name as still open and blocking - invalid image-semantic combinations and unowned formats, the
+  2D/3D conversion claims, pre-compositor multi-surface behaviour, strict-position semantics,
+  conformance tolerances, and the 2D performance floor - and `s` is declared not done while any of
+  them stands. `s`'s Definition of Done is adopted from the review verbatim with that addition.
+
+**2. The status line is not a real phase or activation gate. ACCEPTED.**
+
+Confirmed: both named prerequisites are complete, so the line authorised immediate work, while
+`docs/todo/TODO.md:256-260` records desktop as vision rather than an active product milestone and
+`docs/CONCEPT_EN.md` orders server before desktop and places the desktop platform in Phase 4.
+
+Plan changes: the status line becomes "PHASE-4 FUTURE VISION, activated only after the server phase
+and by explicit project-owner approval, part by part", and names the three genuine cross-phase
+foundations that may be approved earlier - `s`, `a`, and `b`+`c` - stating that everything from `e`
+onward is Phase 4 and is not authorised by approving the 2D foundation.
+
+**3. The scope is inverted and prematurely freezes speculative engine design. ACCEPTED.**
+
+Confirmed against `docs/CONCEPT_EN.md:1664-1675` and this file's own deferral list: it defers the
+compositor, multi-application presentation, the widget and accessibility stack, every
+Mesa/OpenGL/Vulkan path, virgl/Venus and virtio-gpu 3D execution - which is what Phase 4 asks for -
+and makes a vector-effects engine, a shader IR, a full software 3D pipeline and an engine-class scene
+layer mandatory instead, with no mandatory profile feature permitted to return `Unsupported`. The
+self-violation the audit spotted is real: this file's rule is that a shape with fewer than two real
+consumers is a guess, and `render3d` has exactly one.
+
+Plan changes: a scope paragraph in the header fixes the ORDER without renumbering the parts - the
+compositor-facing 2D foundation is delivered and exercised first, WSI and compositor integration
+follow it; the 3D API is EXPERIMENTAL and may not be declared stable until co-designed with a
+concrete accelerated backend or validated by a second implementation; scene-engine features move to
+optional later profiles driven by a real consumer rather than into Profile 1's mandatory set. The
+title's claim is narrowed in the same paragraph to the graphics RENDERING FOUNDATION, since text,
+pointer, touch, compositor and application platform are all elsewhere.
+
+REJECTED: splitting the file into eight separately approved milestones now. The parts already are
+the split, they already declare their dependencies, and renumbering them into separate files would
+move the same content without changing a decision - the same reasoning that produced the
+`P02M0135` split. What was missing was the ACTIVATION and ORDER, and those are now stated.
+
+**4. The prerequisite graph omits broken lifecycle, provider, coherency and verification
+foundations. ACCEPTED IN PART; MOST PREMISES REJECTED AS RESOLVED.**
+
+REJECTED as stale: P02M0162, P02M0164, P02M0165, P02M0166, P02M0167 and P02M0153 were all closed on
+2026-08-29. The specific defects cited - leaked partial-bind resources, no per-consumer connection
+factory, false STOP completion, SystemGraph attributing state to the wrong device, shared writable
+run artifacts - are no longer the state of the tree.
+
+ACCEPTED, and it is the one that still holds: **P02M0141 is NOT complete.** Its status line says
+PLANNED and its Definition of Done says no previously non-restartable service can currently be
+restarted safely, while `docs/todo/TODO.md:217` ticks it - a discrepancy this file must not rely on
+in either direction - and DisplayService is still `restart = "escalate"`, which records a failure
+rather than transparently reconnecting clients. ACCEPTED also: the WSI cache and coherency question
+needed an answer rather than an admission.
+
+Plan changes: a per-part prerequisite matrix is added to the header, with the 2026-08-30 status of
+each milestone recorded beside it, the WSI's restart and rebind semantics marked BLOCKED on P02M0141
+actually closing, and the coherency question decided the way the audit's second alternative proposed
+- Profile 1 is limited to coherent CPU MemoryObjects and cache maintenance is assigned by name to the
+GPU-import milestone, rather than depending on P02M0153's synchronisation contract for v1.
+
+**5. The required completion object does not exist in the kernel or ABI. ACCEPTED.**
+
+Confirmed in full. `Event` is one unpaired `AtomicBool` whose `signal()` stores `true` idempotently,
+with no peer, no failure state, no terminal outcome and a reset that is `#[cfg(test)]`
+(`src/kernel/object/event/mod.rs:16-42`). The authority split cannot even be expressed: the rights
+vocabulary is `read, write, execute, map, send, receive, duplicate, transfer, revoke, get-info,
+manage, wait` (`src/tools/lsidl-gen/src/validate.rs:30`) and contains no `signal`, so "DisplayService
+receives WAIT only and the producer holds SIGNAL only" is not an attenuation anyone can perform.
+
+Plan changes: the completion item now states plainly that the object does not exist, enumerates each
+guarantee the current `Event` fails, and requires ONE of two named prerequisites to be chosen before
+any WSI work - a paired one-shot completion object across kernel, ABI, runtime and LSIDL rights
+validation with distinct authority, refusal of a second signal, retrievable terminal outcome,
+cancellation, peer-death-to-failure and its own accounting; or completion through channel endpoints
+using their existing peer-close semantics, which needs no new kernel object and is the cheaper answer
+if the WSI is the only consumer. Pass 10's asynchronous submission model is bound to the same choice,
+so it is made once. The file is forbidden from describing the current `Event` as sufficient.
+
+**6. Client-Domain accounting and process-death cleanup are incompatible with the current model.
+ACCEPTED.**
+
+Confirmed: `sys_memory_object_create` charges `thread.domain()` - the syscall caller
+(`src/kernel/syscall/mod.rs:588-589`) - and DisplayService creates and retains every surface
+MemoryObject itself, so the bytes are charged to the service. ResourceManager exposes only the six
+fixed kernel resource types with no graphics classification. DisplayService's wait set is built from
+the GPU handle, the kill control, the admin channel and client CHANNELS, never client processes
+(`src/user/services/core/src/display_service.rs:556-565`).
+
+Plan changes: the ResourceManager item now requires the attribution design to be chosen and written -
+client-created-and-imported with strict validation and stated retention rules, or a
+capability-authorised allocate-in/charge-transfer that is itself a kernel prerequisite - with the
+first named as the answer because it needs nothing new. It requires the ResourceManager schema
+extension to be named if graphics classifications and reservations are genuinely wanted, and to be
+dropped from the promise if they are not. And it makes DisplayService's waitable task identity, a
+bounded per-task wait set, an explicit rule on whether surface delegation is legal and how
+attribution follows it, and cleanup proved independently of channel peer lifetime and driver
+progress, part of the item rather than assumed properties of it.
+
+**7. The mandatory multithreaded renderers have no thread mechanism. ACCEPTED.**
+
+Confirmed, and identically to `P02M0135`'s finding 3 - which is the important part of the answer.
+
+Plan changes: the `soft2d` worker-pool item now states the mechanism gap with its five specifics
+(`MANAGE` on a self-Process the application does not hold, the launch-path-only wrapper, the single
+`USER_STACK_TOP` that demand growth is bound to, Thread not being waitable, Event having no
+production reset) and names the three forbidden workarounds. The SELF-THREAD RUNTIME becomes a named
+prerequisite of `c` and `g`, explicitly the SAME contract `P02M0135` requires, with no milestone yet
+and approval required before either consumer starts. The audit's alternative is kept as a real
+option: if it is not approved, multithreading leaves Profile 1's completion set and becomes a later
+performance milestone, because a correct single-threaded rasteriser is a conforming one.
+
+**8. The WSI execution model assumes machinery the plan does not provide. ACCEPTED.**
+
+Confirmed: DisplayService dispatches the GPU, kill control, admin and every client from ONE
+`wait_any` loop, so blocking inside an acquire handler stops the only loop that could deliver the
+release or resize that would unblock it. And the virtio-gpu path acknowledges `TRANSFER_TO_HOST_2D`
+and `RESOURCE_FLUSH` and nothing else, so a flush reply cannot carry a presentation timestamp.
+
+Plan changes: `acquire_next` is made NONBLOCKING in v1 - `Again` when no image is available,
+`NotVisible` when occluded or backgrounded, with the client waiting on an image-available event
+rather than inside the call - and deferred replies with a bounded pending-call table and an
+independent progress pump are named as an extension with their own async-dispatch design rather than
+something an implementer may infer from the word "block". The single word "Displayed" is split into
+three named facts - ACCEPTED, DRIVER-COMPLETED, PHYSICALLY DISPLAYED - with the current backend
+reporting `Displayed` as driver-completed and its presentation timestamp as unavailable or explicitly
+estimated. The timing contract's fields become typed as `Unavailable`/`Estimated(t)`/`Measured(t)`
+rather than a bare timestamp, so a client that needs a real measurement refuses instead of pacing
+against a fabricated number; a genuine vblank/timing capability on the typed display-device contract
+is named as a later item.
+
+**9. The public API has no external consumer contract and no composition owner. ACCEPTED.**
+
+Confirmed: the project's application ABI is WebAssembly components while `.lslib` is explicitly an
+image-internal build optimisation and not a cross-release third-party ABI, and this file supplies
+neither a native SDK boundary nor a Wasm adapter - so "written by other people" had no route. It also
+defers the device/factory vocabulary while forbidding applications to name `soft2d`, leaving nothing
+that instantiates a backend.
+
+Plan changes: a new header section answers both. These are INTERNAL SAME-IMAGE RUST APIs in v1 -
+"public" means public within the image, versioned with it - and a native SDK boundary or Wasm-host
+graphics adapter is a separately approved milestone that is the only thing making the third-party
+claim true; until one exists the file does not make that claim. Backend instantiation is answered by
+permitting COMPILE-TIME SELECTION in v1 through one small composition crate that owns the choice and
+is the single place `soft2d` is named, with a runtime device/factory vocabulary arriving with the
+first second backend - the milestone that can actually test it. And Profile 1 may not be declared
+stable until validated against a concrete second backend, by this file's own two-consumers rule.
+
+**10. The proposed IDL/Rust type ownership cannot support the API. ACCEPTED.**
+
+Correct and unambiguous: Rust does not permit an inherent `impl` for a type another crate owns, and
+re-exporting does not transfer ownership, so "`graphics-core` re-exports those and adds checked
+constructors" does not compile. The second half of the finding is the more important one - treating
+the unvalidated wire DTO as the public core type deletes the boundary that proves a hostile
+descriptor was checked.
+
+Plan changes: the item now states two representations and one conversion. `graphics-proto` owns the
+generated wire DTOs; `graphics-core` owns VALIDATED NEWTYPES carrying the checked constructors,
+`required_bytes()`, slice views and the conversion/sampling/compositing routines; every trust
+boundary crosses by a mandatory `TryFrom` whose error is the typed refusal; renderers accept only the
+validated form. The canonical representation for hashing and for the semantic registries is named as
+the wire DTO, because that is the one a version is declared against.
+
+**Plan re-check.** The file now has one answer per contract where it had two: the `DrawList` is
+in-process with the wire form an extension, 2D coverage is tolerance-based in all three places it is
+mentioned, and pass 10 is a review record whose entries are either resolved in place or named as
+blocking. Its activation is a phase gate rather than a satisfied dependency, its order puts the
+compositor-facing 2D foundation first, and its 3D surface is experimental until a second consumer
+exists. Four things it does not own are stated as prerequisites rather than assumed - P02M0141's
+restart work, the self-thread runtime, the one-shot completion object, and the SDK/Wasm boundary that
+would make its public claim true - and two of those are explicitly shared with other milestones so
+they are decided once. What remains genuinely open is listed by name under pass 10 and blocks `s`,
+which is the honest state: `s` is not finished, and no part below it may start until it is.

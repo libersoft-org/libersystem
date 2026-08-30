@@ -137,3 +137,15 @@ no test, because it reports a property nobody proved. Recorded as the gap it is.
     closing_the_last_claim_handle_releases_while_another_reference_is_alive...   [ok]
 
 plus the eleven that were there before.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0098 (2026-08-30T08:43:38Z):
+
+Current implementation rating: 5/10
+
+1. **The accepted derivation-barrier fix does not stop an already-derived MMIO object from publishing a raw mapping after release.** The DeviceMemory is registered when the claim is created (`src/kernel/syscall/mod.rs:1153-1160`), but its later mapping syscall reserves the object, installs PTEs, and unconditionally publishes the mapping (`src/kernel/syscall/mod.rs:1047-1082`). If claim release sweeps the object while the reservation sentinel is set, `teardown_mapping` swaps the sentinel to zero and returns without unmapping (`src/kernel/object/device_memory.rs:156-160`); the mapping syscall then stores the live address after the only sweep. The new late-`register_derived` barrier (`src/kernel/device.rs:623-645`) cannot protect work on an object registered earlier. A hostile holder can therefore retain raw BAR access after the claim reaches `Free`, violating M3/M5 and the hostile-holder Definition of Done (`docs/todo/P02M0098.md:81-83,235-250`). Mapping commit itself must be claim-current and serialized against the release sweep, with the installed PTEs rolled back when release wins.
+
+2. **The MSI late-registration rollback can tear down a replacement vector owner.** `sys_device_msix_acquire` allocates and binds an `Interrupt`, then on a losing `register_derived` calls `release_unused_msi` (`src/kernel/syscall/mod.rs:1515-1543`). That frees the registry slot without clearing the local object's `bound` flag (`src/kernel/arch/x86_64/interrupts/mod.rs:152-168`, with the same ownership split on the other ports). When the local `Arc` subsequently drops, `Interrupt::drop` still sees `bound == true` and calls architectural `unbind` (`src/kernel/object/interrupt.rs:110-119`). Another core may have reacquired the freed slot in between, so the stale rollback can mask/retire the replacement binding. The failed-registration path must disarm the object's ownership exactly once before making the slot reusable.
+
+3. **The required hostile-holder proof remains materially absent, so rejecting the missing cases is unjustified.** The MMIO test injects a fake `mapped_at` value and never installs or accesses a PTE; the interrupt test calls `mark_bound` on an arbitrary vector without the MSI registry/hardware path; and the derivation test calls `register_derived` directly (`src/kernel/object/claim/tests.rs:97-127,306-338,373-399`). There is still no claim-integrated DMA revocation case or two-thread same-handle attenuating-send case; the channel tests exercise only single-thread transfers and failed-send restoration (`src/kernel/object/channel/tests.rs:327-437`). M9 and the Definition of Done explicitly require raw-address, DMA, live-vector, and concurrent same-handle proofs (`docs/todo/P02M0098.md:193-204,241-252`). These are not redundant tests: the synthetic seams miss the two surviving lifecycle defects above.

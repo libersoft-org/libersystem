@@ -392,3 +392,11 @@ their own commands and their own measured costs:
 passed. `./check.sh --gate component-oracles`: all 26 staged drivers and services have an oracle
 naming them or a written reason. `./check.sh --gate test-tags`: 385 kernel tests. `./test.sh --arch
 x86_64 --tags smoke`: 7 passed, over the content-addressed fixtures and the new build lock.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0167 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 7/10
+
+1. **The selection-specific kernel is still neither immutable nor isolated once the build lock is released.** `test-kernel.sh` serializes a preliminary `cargo build --tests` in the shared target, releases the lock, and then invokes a second `cargo test` against that same target without the lock (`src/harness/test-kernel.sh:295-333`). If another same-architecture run builds a different compile-time `TEST_SELECTION` or `TEST_TAGS` between those calls, the second command must rebuild; two runners can then compile concurrently outside the lock or consume a binary while the other selection replaces it. The content-addressed ISO does not close the earlier shared-kernel race, because its key and payload are derived from whichever shared executable is visible while the runner assembles it (`src/harness/mkimage.sh:669-726`). The implementer also explicitly did not create the required per-run staged kernel. M3 requires the locked build to produce and stage the selection-specific kernel and medium as an immutable prerequisite before parallel guests start, and the DoD requires two concurrent same-architecture suites with different selections/tags to prove it (`docs/todo/P02M0167.md:290-313,658-673`). The current lock placement does not satisfy either requirement.

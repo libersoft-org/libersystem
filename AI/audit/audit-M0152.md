@@ -514,3 +514,13 @@ suite, and `./test.sh --arch all` passes on all three: x86_64 368, aarch64 356, 
 a freshly built image after the sweep, because gates that rebuild the system volume change the
 content key the isolation gate's freshness preflight checks - the preflight is right to refuse, and
 the image has to be rebuilt between that gate and any gate that touches the volume.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0152 (2026-08-30T08:43:38Z):
+
+Current implementation rating: 8/10
+
+1. **The topology report still counts firmware-described CPUs rather than confirmed online CPUs, and it omits the fallback policy.** `report_machine` binds online CPUs and then emits only one aggregate, while the per-node report counts and prints `Topology::cpus()` firmware records (`src/kernel/main.rs:1018-1026`; `src/kernel/mem/numa/mod.rs:210-225`). A timed-out or offline CPU consequently remains reported under its node. The report prints distances and pool totals but never states the requested-first/nearest/tie fallback rule (`src/kernel/mem/numa/mod.rs:237-247`; `src/kernel/mem/frame/mod.rs:1136-1153`). M1 says an absent/timed-out CPU creates no logical affinity, and M6 explicitly requires online CPUs plus distance/fallback policy in bounded output (`docs/todo/P02M0152.md:77-81,192-194`). Report the confirmed logical bindings per node and the actual fallback rule, keeping firmware descriptions separate if they are diagnostically useful.
+
+2. **The exact-graph/placement gate remains incomplete on both device-tree profiles.** `check-qemu-numa.sh` deliberately omits CPU-assignment comparisons on aarch64/riscv64 and does not require the three `kernel.smp.numa.*` placement identities there; those identities are pinned only in the x86 phase, while the DT phase pins memory/model tests (`src/tools/check-qemu-numa.sh:199-203,249-265`). The guest graph test checks the parser against its own resulting topology (`src/kernel/mem/numa/tests.rs:40-73`), so a consistently swapped CPU-to-node map can pass, and a tag/selection regression can silently omit the placement tests on DT. M5 requires the exact normalized node/CPU/range graph plus node-placement execution for all three named profiles (`docs/todo/P02M0152.md:138-164`). Compare the DT profile's declared hardware CPU assignments to the normalized logical bindings and require the placement test identities in each profile's result log.

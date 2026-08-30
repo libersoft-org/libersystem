@@ -351,3 +351,11 @@ suite, and `./test.sh --arch all` passes on all three: x86_64 368, aarch64 356, 
 a freshly built image after the sweep, because gates that rebuild the system volume change the
 content key the isolation gate's freshness preflight checks - the preflight is right to refuse, and
 the image has to be rebuilt between that gate and any gate that touches the volume.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 7/10
+
+1. **A late untranslated admission can retract the clean isolation summary without failing the acceptance gate.** After the summary has been emitted, `record_degraded` prints `dma: ADMITTED UNTRANSLATED AFTER THE ISOLATION SUMMARY ...` when a later device is admitted degraded (`src/kernel/dma_policy/mod.rs:151-180`). The default-profile gate rejects only `dma: DEGRADED ISOLATION` (`src/tools/check-qemu-virtio-iommu-x86_64.sh:219-230`). A boot can therefore print the early clean summary, explicitly retract it later, and still reach the gate's “nothing is degraded” success. The acceptance oracle must reject the retraction line as well, or base success on an authoritative final-state check, and the late-admission mutation must be covered.

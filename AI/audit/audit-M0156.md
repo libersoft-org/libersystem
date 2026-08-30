@@ -309,3 +309,13 @@ ACCEPTED and fixed, both halves.**
 
 The count is the evidence for the second half: eleven before, twelve now, printed rather than
 asserted.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0156 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 7/10
+
+1. **The mutation harness can still delete the only saved copy of files it promises to restore.** Cases 9 and 10 perform the destructive `mv` before registering the move for cleanup (`src/tools/check-staged-consistency.sh:235-237,256-257`), leaving a signal window in which the EXIT handler knows nothing about the displaced file and removes the temporary tree containing it. In addition, `moved_back` suppresses a failed restore with `|| true`, clears the ledger, and lets `restore` delete the recovery directory (`check-staged-consistency.sh:59-76`). Register recovery before the destructive move, and retain/report the recovery copy unless restoration succeeds and is verified.
+
+2. **The promised mutation set is still fail-open.** Topology-dependent cases explicitly skip when a suitable subject is absent (`src/tools/check-staged-consistency.sh:253-262,277-303,319-346`), while the closing path merely prints the number refused and exits successfully (`check-staged-consistency.sh:348-351`). Replacing the former hard-coded message with a measured count does not prove that all twelve required branches ran. The gate must construct deterministic subjects or fail unless the complete named case set was actually exercised and refused.

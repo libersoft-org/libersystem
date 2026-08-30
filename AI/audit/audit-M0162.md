@@ -356,3 +356,11 @@ made the forced release MORE thorough - every interrupt derived from the claim i
 whether that confirmed. That is more work on the synchronous path, not less. It is also the work that
 makes a release actually release, so the two findings pull in opposite directions and the ordering
 matters: the release has to be correct before it can be made asynchronous.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0162 (2026-08-30T08:40:38Z):
+
+Current implementation rating: 7/10
+
+1. **Normal claim teardown still blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` invokes `Closes::release` inline (`src/user/libs/driver/binding/src/lib.rs:702-747`), and the production implementation immediately calls `device_release` (`src/user/services/core/src/device_manager.rs:1614-1631`). The syscall still runs bus-master disable, derived-capability revocation, and IOMMU detach synchronously before returning (`src/kernel/device.rs:457-510`). Reducing the virtqueue poll from 10,000,000 to 1,000,000 iterations (`src/kernel/iommu/mod.rs:709-719`; `src/kernel/iommu/virtqueue.rs:17-37,174-184`) reduces one stall but neither makes the transition nonblocking nor provides a wall-clock bound. On the normal path the retained claim handle is closed with the terminal result only after that work has already occupied the manager, rather than producing the later `ClaimSettled` event M4 specifies. The implementer's rejection is therefore unjustified: short nonblocking transitions and release-starts/`Free`-arrives-as-an-event are explicit milestone requirements (`docs/todo/P02M0162.md:163-186`), not an out-of-scope enhancement.

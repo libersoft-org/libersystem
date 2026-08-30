@@ -101,3 +101,231 @@ The document is useful as a catalogue of possible driver work, but it is not saf
    **Why it matters:** An implementer following the table's stated policy could copy or derive code under an incorrect compatibility assumption, creating avoidable licensing and provenance risk.
 
    **Correction:** Replace those entries with genuinely permissive references, or label them as observational/non-copy references under a documented clean-implementation boundary, just as the plan already does for GPL Linux sources.
+
+---
+
+PLANNER'S RESPONSE ON M0099 (2026-08-30T11:20:00Z):
+
+Every finding was checked against the tree as it stands on 2026-08-30. This audit is dated
+2026-08-28T21:20:14Z and several of its premises were true then and are not now: P02M0153, P02M0162,
+P02M0163, P02M0164, P02M0165, P02M0166 and P02M0167 were all closed on 2026-08-29. Where a finding
+rests on one of those being reopened, the finding's PREMISE is rejected and its CORRECTION is
+re-examined on its own merits, because a stale premise does not automatically make a correction
+wrong - and in three cases it did not.
+
+**1. The per-item plans are deliberately omitted. ACCEPTED IN PART.**
+
+REJECTED: writing forty-one `requires`/`owns`/gate triples now. The plan's own reasoning is right and
+the audit's correction concedes the alternative - inventing prerequisites for drivers nobody has
+started is how a roadmap acquires answers before it has questions.
+
+ACCEPTED, and it is the real defect underneath: the file said it was a roadmap and then carried
+"Done when: every item in the three groups above ..." in the one place a reader looks for the answer,
+and applied ONE DRIVER-SHAPED GATE to a parser, to kernel infrastructure and to an undecided
+architecture question alike.
+
+Plan changes:
+- The completion line is replaced. The milestone is declared a NON-COMPLETABLE INDEX that is never
+  ticked and never appears in a phase's completion report; what closes is an item, and the former
+  "Done when" is restated as the per-item standard.
+- A classification table is added to the head - driver, shared library, kernel/bus infrastructure,
+  destination service, architectural prerequisite - and the closing standard now names a different
+  gate per class: a shared library closes on host tests and hostile fixtures with no bind, a
+  prerequisite closes on the decision being recorded and the mechanism existing, and so on.
+- A new item requires an executable per-item plan BEFORE any code on that item, naming its class,
+  its prerequisites from the new matrix, owned contracts and files, exclusions, device model or
+  fixture, observable-effect oracle, measurable limits, and the Done for its class. The distinction
+  is when, not whether: the triples are written when an item is picked up, and not before.
+
+**2. The hard gate is factually stale. PREMISE REJECTED, CORRECTION ACCEPTED.**
+
+The specific claim - "P02M0162 is REOPENED with five outstanding items", plus six reopened supporting
+milestones - is no longer true; all seven are COMPLETE as of 2026-08-29. But the audit is right that
+a single global three-item gate is the wrong shape, and the file demonstrated it by going stale in
+BOTH directions: it asserted "the hard gate is complete with two verifications outstanding" while
+citing a milestone that had since been reopened and re-closed.
+
+Plan changes: the paragraph is replaced by a PER-ITEM PREREQUISITE MATRIX - the three-slice floor for
+every item, P02M0153 for any DMA-capable driver, P02M0163 plus the identity prerequisite for
+plain-PCI and firmware-bound items, P02M0164 for anything publishing or consuming a provider,
+P02M0165/P02M0166 for stop, removal and operator state, P02M0167 for tri-architecture acceptance -
+with the statement that each item names what it touches and inherits nothing else. A matrix cannot go
+stale the way a global gate did, because each line names its own subject.
+
+**3. The provider catalogue cannot subscribe or connect. MOSTLY REJECTED AS RESOLVED; RESIDUE
+ACCEPTED.**
+
+Checked in the tree, and P02M0164 closed nearly all of it: `provider-catalogue` now has
+`@op(1) subscribe` as a served stream, `@op(2) bindings`, and `@op(3) open` - a per-consumer
+connection factory that verifies slot, provider generation and binding generation, refuses a consumer
+beyond the number the driver's registry entry declares it admits, mints a fresh channel pair and
+sends the server end to the driver (`src/idl/device.lsidl:246-261`;
+`src/user/services/core/src/device_manager.rs:3542-3575`). `provider-info` carries a `live` flag so a
+withdrawal travels on the same stream (`src/idl/device.lsidl:137-143`). A `requires` edge WAKES a
+`DependencyPending` node when its provider appears and STOPS an online one when its provider is
+withdrawn (`device_manager.rs:3349-3371`). Late and multiple consumers are no longer stranded.
+
+ACCEPTED residue, and it is the half the audit was right about for a different reason than it gave:
+no driver SENDS a withdrawal - xHCI creates its block channel unconditionally and leaves the
+publication standing on detach - and the existing services still arrive by the positional bootstrap
+handshake, one singleton each for NET, GPU, SND and the input channels. That is the private handoff
+this milestone's head forbids new drivers from adding, while every current service depends on it.
+
+Plan changes: the "nobody is told" paragraph is rewritten to record what P02M0164 delivered, so the
+first implementer does not rebuild it, and to state the two things actually missing. The migration of
+the singleton audio and network handoffs is assigned, with the versioned device-side PCM and
+frame-plus-link contracts and the service-side attach/detach/reconnect, to THE FIRST NON-VIRTIO AUDIO
+OR NETWORK SLICE.
+
+**4. Plain-PCI and firmware identity are cross-cutting, not narrow rows. ACCEPTED, with one premise
+corrected.**
+
+The premise "DeviceManager does not consume the full PCI scan" is stale: `device.rs` now pushes a
+`DeviceEntry` for every remaining function under `TRANSPORT_PLAIN_PCI` carrying the class triple and
+address (`src/kernel/device.rs:143`). What those entries carry is `bar_phys: 0, bar_len: 0,
+msix_cap: 0` - claimable, unresourced. The plan's own text said NVMe and AHCI "have no entry", which
+is now wrong in a way that would send an implementer to build the wrong thing.
+
+The rest of the finding is correct and is the more important half. `BindingId` is BDF plus
+generation, provider origin is bus/device/function, the manifest's transports are exactly
+`virtio-pci` and `plain-pci` with every other predicate a PCI field, and the kernel's claim addresses
+a PCI function. A PL011, a firmware-described 16550, an ACPI node, an I2C child, a USB interface and
+an NVMe namespace are not a row - they are a discriminated identity, and changing the identity type
+reaches matching, claim/release, binding ids, provider origins, policy keys, diagnostics, revocation
+and generation at once. Owning that inside whichever driver lands first bakes one driver's shape into
+a system-wide name.
+
+Plan changes: the stale entry claim is corrected to say what is actually missing (the resource
+profile, not the entry). A new paragraph carves the identity discriminant OUT of the
+first-driver-owns-it rule and states it as an ARCHITECTURAL PREREQUISITE with no milestone yet,
+spelling out what it must carry. NVMe's ownership is narrowed to the plain-PCI RESOURCE PROFILE and
+explicitly not to a new identity, with the reason - a plain-PCI function is already expressible,
+which is exactly what makes that one narrow and the firmware node not.
+
+**5. The "cheap" legacy 16550 slice lacks authority and a safe handoff. ACCEPTED.**
+
+Confirmed. The public driver resource vocabulary is device MMIO, one IRQ, keys, system power and
+console - there is no port-I/O object or syscall at any range scope - and the x86 kernel programs
+COM1 directly, owns IRQ4 and the receive path and polls it from the idle hook after userspace starts,
+with ownership that is monotonic and has no transfer step.
+
+Plan changes: the "cheapest of the three" paragraph is rewritten to say the opposite and why, naming
+the three missing mechanisms - a range-scoped revocable port-I/O authority, legacy fixed-IRQ routing
+and revocation, and an atomic kernel-to-userspace handoff - plus the panic-only fallback and
+reacquisition rule. The alternative the audit offered is kept: scope the first item to
+firmware-described MMIO UARTs, which needs the identity prerequisite instead. The 16550 checkbox is
+marked BLOCKED on whichever route is taken.
+
+**6. The per-driver DMA policy does not exist. ACCEPTED.**
+
+Confirmed and unchanged by P02M0153's closure: `system-manifest` has no policy field, and
+`IOMMU_REQUIRED_TYPES` is `&[abi::VIRTIO_TYPE_NET as u16]` with everything else defaulting to
+`TrustedUntranslated` (`src/kernel/dma_policy/mod.rs:111`, `:128`). So protecting a new DMA driver
+requires editing that list - the "source `match` arm" this milestone's own head forbids.
+
+Plan changes: a new kernel/bus-infrastructure item owns a REQUIRED DMA policy field on every driver
+row, its validation, its propagation to kernel claim admission, and refusal of both a row that
+declares none and a bind whose declared isolation cannot be satisfied - rather than a silent default.
+Every DMA-capable item is marked blocked on it. The shared-contract bullet is amended to say the
+policy is declared through that field rather than through a kernel list.
+The `virtio-iommu` checkbox is REMOVED from the completion set, as the audit's first alternative
+proposed: its per-driver attachment moves into the driver items via the new field, and the remaining
+architecture work (VT-d, AMD-Vi, SMMU) is Phase 5, one approved backend at a time. What stays is the
+ordering statement, which nobody closes.
+
+**7. The native-storage gate can pass while NVMe cannot host the system volume. ACCEPTED.**
+
+Confirmed: the bootstrap block driver is pinned and boot-critical, DeviceManager cannot load
+volume-stage drivers until it has mounted the volume, and the manifest refuses a boot-critical driver
+stored on the volume it must make accessible (`src/tools/system-manifest/src/lib.rs:1290`).
+
+Plan changes: the integration-gate bullet now states that for every controller eligible to host
+`vol://system` - NVMe and AHCI - the shared storage gate is insufficient, and requires pinned and
+boot-critical staging, deterministic boot-volume selection, fallback behaviour, and an END-TO-END
+BOOT whose system volume is on that controller. The secondary-disk test is kept as coverage and
+demoted from being the proof.
+
+**8. Four ACPI items and HID-over-I2C have no attainable prerequisite path. ACCEPTED.**
+
+Confirmed: the file said the interpreter is a separate milestone and not this one, and no such
+milestone exists anywhere in the roadmap - so four checkboxes had no event that could close them
+while the Definition of Done demanded they close.
+
+Plan changes: the AML paragraph now states that the interpreter and namespace are an ARCHITECTURAL
+PREREQUISITE with no milestone yet, requiring separate approval with its own security scope - what a
+control method may touch, how an operation region is bounded, what an untrusted caller may never
+cause to run - and its own conformance evidence; and that until it exists the four AML items are NOT
+in this roadmap's completion set. The fixed-hardware power button is split out by name, since a PM1a
+event named by the FADT needs none of it. HID-over-I2C is split the same way: the parser and contract
+half is a shared-library item that closes on host tests, the binding half is blocked on an approved
+I2C controller item with a fixture. The same split is stated as the general rule for parser-only
+candidates.
+
+**9. Shared contracts and destination-service ownership are incomplete and inconsistent. ACCEPTED.**
+
+The two ownership contradictions are checkable in the file and real: common SCSI is assigned to
+virtio-SCSI alone while independently ordered UAS needs the same layer, and the I2C contract is
+assigned to HID-over-I2C while the earlier IPMI SSIF transport consumes the same bus class. The
+destination-service half is also right - AudioService receives one static `SND` channel and
+NetworkService one bootstrap `FRAMES` handle with no typed link-state, detach or reconnect path - and
+several named destinations (Bluetooth, smart-card, modem, camera, printer, media import, DFU/admin)
+have no owned service or IDL milestone at all.
+
+Plan changes: the shared-contract bullet now resolves both conflicts by the rule this file already
+uses everywhere else - the FIRST IMPLEMENTED CONSUMER owns the contract, and a fixed owner
+contradicted by a non-gating order is not an owner. It adds the destination-service paragraph:
+migration of the two singleton handoffs assigned to the first non-virtio audio or network slice
+together with the versioned device-side contracts and service-side attach/detach/reconnect, and every
+item whose destination service does not exist marked BLOCKED until one is approved rather than
+inventing a private endpoint.
+
+**10. The verification section is not executable per item and the host tests do not run. ACCEPTED.**
+
+Reproduced exactly: `cargo test --manifest-path src/user/drivers/core/Cargo.toml --lib` fails with
+`error[E0152]: duplicate lang item in crate 'std': 'panic_impl'`, first defined in `rt`, before a
+single test runs. The mandatory host-test strategy is not merely unwritten - it is unavailable.
+The P02M0167 half of the finding is stale (closed 2026-08-29) and its premise is rejected; the
+prerequisite matrix in the head keeps P02M0167 named for tri-architecture acceptance anyway.
+
+Plan changes: a new bullet states the host-test blocker with its exact error and assigns the seam to
+the first item that needs a host test - a pure protocol/parser crate that links no runtime, or a
+host-test feature that drops the runtime entry, panic handler and allocator hooks, plus a
+fake-controller seam - so it is discovered in this file rather than in a build error. The per-item
+bullet now requires the gate to be named CONCRETELY: exact host test ids, QEMU model and arguments or
+physical fixture, target and resource matrix, the OBSERVABLE effect in the destination service (this
+tree's component-oracle convention rejects "reached `Online`"), two-instance topology, teardown
+assertion, numeric limits, oracle registered in the verification model and any new QEMU device wired
+into the harness in the same change.
+
+**11. Phase assignments contradict the architecture document. ACCEPTED.**
+
+Confirmed: `docs/CONCEPT_EN.md:1664-1675` makes Phase 4 the desktop platform on the reference virtual
+machine and says real GPUs and real-hardware audio follow in Phase 5; `:1680-1688` puts
+device- and board-specific drivers, specific machines and SBCs, bare-metal ARM64/RISC-V and
+per-deployment power management in Phase 5.
+
+Plan changes: the head records the correction and its reason, and all eight "remains Phase 4"
+handoffs in the body are changed to Phase 5, as are the native VT-d/AMD-Vi/SMMU backends and the
+concept footer. The head also names the PHASE-2 SUBSET explicitly - group 1's virtio items plus the
+DMA-policy and host-test-seam prerequisites - and states that everything in groups 2 and 3 is phased
+backlog counted in no Phase-2 completion report.
+
+**12. The reference table misclassifies copyleft as permissive. ACCEPTED.**
+
+Confirmed: the framing sentence says the table "names permissively licensed references" while three
+rows are LGPL (pcsc-lite CCID, `libmbim`, `libgphoto2`).
+
+Plan changes: the sentence is corrected and given a per-row rule - a permissive reference may be read
+AND adapted with attribution; an LGPL or GPL reference is OBSERVATIONAL ONLY, read to learn what the
+hardware does, never copied or derived from, implemented clean under the boundary this file already
+applies to Linux. The three rows are marked `OBSERVATIONAL ONLY` in the table itself so the row and
+the rule cannot drift apart.
+
+**Plan re-check.** The corrected file is now internally consistent about what it is: a
+non-completable index whose items close individually against per-class gates, with a prerequisite
+matrix that names milestones per item rather than one global gate that goes stale. Three things it
+cannot supply are stated as blocking prerequisites with no milestone rather than assumed - the
+discriminated device-node identity, the AML interpreter and namespace, and the I2C controller item -
+and two mechanisms it does own are now items rather than sentences: the declared DMA policy and the
+host-test seam. Its phase claims match the architecture document, its licence rule matches its own
+table, and its integration gates name observable effects rather than describing them.
