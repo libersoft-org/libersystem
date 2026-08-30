@@ -78,3 +78,171 @@ The plan recognizes most of the visible dual-stack surfaces, but it assumes tran
 
    **Correction:** Specify separate grammars: RFC 5952 canonical address rendering; bounded RFC 4007/RFC 9844 UI zone input mapped to a stable interface identity; bracketed RFC 3986 URL literals without a zone. Reject scoped URL authorities unless the project deliberately defines and confines a local-only nonstandard extension.
 
+
+PLANNER'S RESPONSE ON M0175 (2026-08-30T19:36:07Z):
+
+All nine findings are accepted. Two of them were scope decisions the plan had left open; both are now
+decided in the plan rather than described. One citation is accepted on substance with its RFC number
+deliberately not carried into the plan, and that is explained under finding 9.
+
+**1. M2 assumes a transmit-side TCP implementation that does not exist - ACCEPTED.**
+
+Confirmed, and it is the finding that resizes the milestone. `TcpConn` (`net.rs:371-400`) holds
+`snd_una`, `snd_nxt`, `rcv_nxt`, a receive `Vec` and `rx_len` - no unacknowledged payload, no
+peer MSS, no send window. `tcp_build_data` (:1008-1014) advances `snd_nxt` past a one-shot frame
+and retains nothing. `socket.send` (`network_service.rs:856-878`) truncates to
+`min(data.len, tx.len() - TCP_SEGMENT_OVERHEAD)`, transmits once, closes the caller's buffer and
+returns `Ok(n)`. Only SYN has a retransmission loop. So "after a validated Packet Too Big
+resegments/retransmits outstanding data" is not an addition to existing code - there is no
+outstanding data, and M5's reduced-MTU gate as written was impossible.
+
+The silent truncation is worth calling out separately: today a caller that sends more than one
+segment loses the remainder and is told the send succeeded.
+
+Plan change: **M2** is now "TCP acquires a bounded transmit side" and is stated as new implementation
+that everything else mentioning retransmission depends on: an owned unacknowledged-byte queue with
+per-flow and aggregate budgets, peer MSS and effective MSS from interface and path MTU, a tracked
+send window, segmentation with partial-write backpressure and a defined accepted-versus-acknowledged
+contract for `send`, ACK retirement with wraparound, an RTO for data and FIN, a retry limit that
+closes rather than retries forever, and PTB resegmentation. Its tests name partial ACK, loss,
+wraparound, PTB, close with data in flight and budget refusal.
+
+**2. DNS omits both response correlation and required TCP fallback - ACCEPTED.**
+
+Confirmed and worse than "omits". `on_udp` (`net.rs:670-678`) hands ANY datagram whose SOURCE
+port is 53 to `parse_dns_response`. The destination port, the server address, the UDP length and
+the checksum are unchecked; the parser ignores the transaction ID, QR, opcode, rcode, the question
+section, the answer owner and the CNAME chain, and returns the first A record. `do_dns` accepts the
+first such event, and `resolve` collapses every failure into `NotFound`. A spoofed or cross-query
+answer is indistinguishable from the real one.
+
+The TCP-fallback half is accepted with the ordering the audit itself points out: RFC 7766 section 5
+requires a general-purpose stub resolver to support TCP, truncated answers are exactly the AAAA and
+CNAME sets this milestone adds, and it depends on finding 1's work.
+
+Plan change: **M6** requires UDP framing, length and checksum validation and correlation by family,
+scoped server, local and destination port, transaction ID, normalized qname, qtype and qclass;
+validation of QR, opcode, rcode and section counts, the answer owner, the CNAME chain, bounded
+compression traversal with loop rejection, and TTLs; preserved distinct timeout, malformed, no-record
+and transport errors; and bounded length-framed DNS/TCP on truncation, explicitly ordered after M2.
+Spoofed, cross-query and TCP-retry tests are named.
+
+**3. Source and destination selection are reduced to an undefined preference - ACCEPTED.**
+
+Confirmed as a genuine gap: the plan said "source-address selection" and "a deterministic
+preference/fallback policy", and P02M0174 can produce multiple global and scoped addresses, prefixes,
+routes and routers. "IPv6 first" is not an algorithm and does not survive a candidate with no usable
+route, a deprecated source, or two prefixes - it produces long deterministic failures before a
+working candidate, and two clients of one API can implement different orders.
+
+Plan change: a new **M5** pins the applicable RFC 6724 profile for BOTH default source-address
+selection and destination-address ordering, including the policy table, this appliance's tie-breaks,
+and any RFC 8028 route/interface update it adopts. It requires candidate filtering, scoped-zone
+handling, explicit caller overrides, failure and fallback TIMING, and behaviour after invalidation,
+and names the test cases: mixed A/AAAA, multiple prefixes and routers, deprecated and tentative
+addresses, link-local scope, and a candidate with no route.
+
+**4. The public IDL migration does not define records or operations - ACCEPTED.**
+
+Confirmed. `network.lsidl:18-21` is `endpoint { addr: ipv4-addr, port: u16 }`; `net-info`
+carries one address and one gateway with an unbounded neighbour list; `@op(7) listen: func(port:
+u16)` takes a bare port. A port alone cannot express IPv4-only, IPv6-only and dual wildcard
+listeners, which are three of the cases M5's tests are supposed to distinguish, and there is no
+interface identity, address status, bind request or accepted-socket identity anywhere.
+
+Plan change: **M1** now requires the exact records, variants and operation signatures to be
+enumerated BEFORE implementation, with the reason stated - a list of record names is not a wire
+contract and two reasonable implementers will produce incompatible ones. It names each one that must
+be decided: stable interface identity with a generation, valid and invalid scope combinations,
+address state with prefixes and lifetimes, route/router/DNS-server entries as plural records, a
+listener bind mode with conflict and reuse rules, and local plus remote endpoints on accepted and
+live sockets. The fixed 16-octet positional record and the atomic first-party migration are kept.
+
+**5. "Bounded" has no numeric LSIDL or service-buffer contract - ACCEPTED.**
+
+Confirmed by count: `network.lsidl` contains ZERO `@bound` annotations, while MAC, neighbour,
+name, TCP request, socket, fetch and chunk lists and strings are all variable. `network_service.rs`
+uses a 1024-byte request buffer and a 4096-byte fixed reply buffer. So the wire currently advertises
+requests the service cannot receive, and a u16 list length is not a resource budget - which leaves
+the bounded-resources Definition of done untestable, exactly as the audit says.
+
+Plan change: M1 requires an explicit `@bound(n)` on every variable-length occurrence the migration
+touches, maximum request and reply sizes DERIVED from those bounds and reconciled against the framing
+buffers, per-client and per-flow aggregate budgets, typed overflow versus deterministic truncation
+with an explicit truncation signal where truncation is allowed, fallible allocation, and exact-bound
+and over-bound encoding tests with rollback and accounting.
+
+**6. Hostile inbound TCP state bypasses the P02M0080 handle ceiling - ACCEPTED.**
+
+Confirmed, and the pool is not merely uncapped in principle. `tcp_alloc` (`net.rs:902-918`) scans
+for a free slot and otherwise does `self.conns.push(fresh); Some(len - 1)` unconditionally - it
+never returns `None`, so `passive_open`'s own comment "No reply if the pool is full" describes a
+state that cannot occur. Every fresh `TcpConn::closed()` allocates `vec![0; 65535]` and
+`passive_open` resizes it to `65535 << 2` = 262,140 bytes when the peer offers window scaling -
+all of it before any socket channel exists. P02M0080 states the domain handle budget is the true
+ceiling, and a half-open TCB consumes no handle, so that statement does not hold for this path.
+
+Plan change: a new **M4** requires hard half-open, established-unaccepted, total-TCB and aggregate
+RX/TX byte budgets; SYN-ACK retransmission with expiry; an accept-backlog policy; an admission or
+eviction rule at the budget; allocation charged BEFORE state is published; and capacity and drop
+reporting through the existing operation. It requires P02M0080's ceiling statement to be corrected in
+the same change, with the reason recorded - that statement is why nobody looked. M9 floods with SYNs
+and with completed-but-unaccepted connections in both families.
+
+**7. Independent family readiness and invalidation require a runtime redesign the plan does not own -
+ACCEPTED.**
+
+Confirmed. `network_service.rs:31-37` and :108-163 block on DHCP before the serve loop and then
+install a hard-coded Slirp IPv4 fallback; the loop schedules only the lease deadline; the synchronous
+helpers pump and discard unrelated events. So an IPv6-only profile would still wait for DHCPv4 and
+silently acquire v4 state, and ND/DAD/RA/PMTU/TCP deadlines can be starved during any RPC.
+
+Plan change: a new **M7** requires immediate event-driven startup, explicit per-family enable and
+readiness criteria, one aggregate deadline scheduler over DHCP/ND/DAD/RA/PMTU/TCP, and a bounded
+durable event and pending-operation store keyed by flow. It states that this milestone CONSUMES
+P02M0174's frozen L3 notification and ingress/egress contract and does not extend it, which is the
+boundary that keeps the two milestones from each waiting for the other. Pure decisions go to
+`service-logic` for the reason the audit gives.
+
+**8. The UDP deliverable is internally ambiguous - ACCEPTED, and decided.**
+
+Confirmed: the goal, M2 and M5 all said UDP, while the public IDL has no datagram socket and UDP
+exists only internally for DHCP, DNS and SNTP. The audit is right that this is a scope decision and
+not an implementation detail.
+
+DECIDED, and written into the Goal as its own paragraph: UDP in this milestone means the named
+INTERNAL operations plus their IPv6 equivalents and test peers, and there is NO public datagram API.
+The reason is stated - it would be a second unplanned public contract stacked on a transmit-side TCP
+implementation this milestone already has to build from nothing, and none of the tools being migrated
+need it. If an application ever needs datagrams it is its own reviewed requirement with scoped
+endpoints, conflict rules and queue budgets. "What this milestone refuses" carries the same line.
+
+**9. UI zone syntax and URL authority syntax are incorrectly left as one parser decision - ACCEPTED
+on substance.**
+
+The substance is correct and independent of any particular document: a zone identifier is
+link-local UI scope under RFC 4007, it is not part of an HTTP origin, RFC 3986's host syntax does not
+admit it, and round-tripping a UI-scoped literal into an authority produces non-standard URLs, origin
+ambiguity and leakage of local interface names. Grouping all three under "one unambiguous
+interface-zone syntax", as the plan did, invites exactly the `%25` handling that should not be
+implemented.
+
+One qualification, stated because it affects what went into the plan: the audit cites RFC 9844 as
+obsoleting RFC 6874. I could not verify that number offline, and the correction does not depend on
+it, so the plan does not carry it. M8 instead cites RFC 5952 for canonical rendering, RFC 4007 for
+the UI zone convention and RFC 3986 for URL authority, and says that RFC 6874's zone-in-URI extension
+is deprecated and is not implemented. That reaches the same behaviour without staking a plan on a
+citation I have not confirmed.
+
+Plan change: M8 defines the THREE grammars separately, requires round-tripping within each, rejects
+scoped URL authorities, and states that a zone is never transmitted. "What this milestone refuses"
+now names zone identifiers in URLs or any transmitted authority.
+
+**Plan re-check.** Nine items where there were five. The growth is the honest cost of findings 1, 3,
+4, 6 and 7, each of which was work hiding inside an adjective. Ordering is implementable and stated
+by the dependencies between items: M1 (contract and bounds) -> M2 (transmit side) -> M3 (family
+invariants) and M4 (inbound budgets) -> M5 (selection) -> M6 (DNS, after M2 for the TCP retry) ->
+M7 (event-driven service) -> M8 (clients and text) -> M9 (matrix). A "What is there now, and what it
+forces" section records the six tree facts an implementer would otherwise rediscover. The Definition
+of done gained clauses for the transmit side, DNS correlation and the inbound budgets so each is
+falsifiable on its own. No source code was modified.

@@ -38,3 +38,95 @@ The required closed DMA-policy field, removal of the permissive device-type fall
 
    **Correction:** Freeze the authority boundary. Preferably state that privileged DeviceManager's selected matching entry is authoritative and the kernel validates generated membership plus device, profile, policy, and generation; otherwise carry a kernel-verifiable selection authorization. Include an operator-selected lower-priority candidate and real fallback attempt in the positive/negative matrix.
 
+
+PLANNER'S RESPONSE ON M0172 (2026-08-30T19:36:07Z):
+
+All four findings are accepted. Two of them were ambiguities rather than errors, and the plan now
+DECIDES them instead of restating the options - which is what an implementation plan is for.
+
+**1. The proposed DMA boot-profile scalar conflicts with the development-profile channel -
+ACCEPTED.**
+
+Confirmed on every architecture. `arch/x86_64/mod.rs:164-179` (and the AArch64 and RISC-V twins)
+reads `opt/org.libersystem/profile` from fw_cfg and recognizes exactly `development` and
+`development-trace`, with an unrecognized name reading as no profile - and the function's own
+comment says the value is ADVISORY. Those exact strings gate security-sensitive userspace behavior in
+`dev_protocol.rs`, the harness injects the file only on that branch, and test mode deliberately
+carries no profile metadata at all. Putting `enforcing-required`/`no-iommu` into that scalar
+either breaks development semantics or makes every current test, direct and non-x86 boot fail closed
+because nobody taught it to answer.
+
+Plan change: a new "Two boundaries this plan fixes before implementation" section states the decision
+- the DMA mode is a SEPARATE typed field and the advisory scalar stays advisory - and M2 was rewritten
+to own it. M2 now requires the value/producer/missing-value behaviour to be written as a TABLE over
+architecture x boot path x run mode rather than as prose, and requires every producer and consumer to
+be migrated BEFORE admission is made fail-closed. M8 adds an assertion that no producer named in that
+table is missing a value.
+
+**2. The authenticated loader-to-kernel handoff is absent and the dependency graph permits
+incompatible format changes - ACCEPTED.**
+
+Confirmed. `BootInfo` is at `VERSION = 2` and its documented v2 addition is `root` - the
+loader's chosen system volume. There is no authenticated policy field, and P02M0150 deliberately did
+not extend `BootInfo` because its trust decision stayed inside the loader. This decision is
+kernel-owned, so the handoff has to be built rather than assumed. Confirmed also that the old
+dependency list named P02M0153, P02M0161-P02M0166 and P02M0099 and named neither P02M0150 nor
+P02M0171, while P02M0171 independently adds a signed generation to the same manifest.
+
+Plan change: a new **M3** owns the handoff and names its three parts - the signed manifest field and
+exactly what the loader validates, a versioned `BootInfo` extension carrying the value AND its
+PROVENANCE (so the kernel can distinguish a loader-authenticated value from a harness-trusted one),
+and the trusted direct-boot equivalent for profiles with no loader. It states that a
+boot-media-controlled value may never present itself as authenticated policy. Dependencies now name
+P02M0150 and P02M0171, with the composition rule written out: if both are in flight the manifest
+evolves ONCE and one compatibility matrix covers both fields, and neither may land a second
+incompatible format change. M8 adds a mutation that must fail when a DMA mode whose provenance says
+it came from replaceable media is accepted.
+
+**3. A new "stable ID" is not reconciled with the identity already persisted and reported -
+ACCEPTED, and decided.**
+
+Confirmed. Generated entries are identified by `name` (`device_manager.rs:4526`), operator policy
+persists `select=<name>` (:3703-3706), and P02M0166 already calls that the registry entry ID. The
+claim boundary carries device index and privilege, and `ClaimKey` carries device index, padding and
+generation - no entry identity anywhere. So the old M2's "give each generated registry entry a stable
+ID" would have created a second name for one thing.
+
+DECIDED rather than left open: the canonical identity is the validated program NAME, which already
+exists, is already unique, is already persisted and is already reported. Inventing a new manifest ID
+field would orphan every stored operator preference and give reporting, userspace selection and
+kernel admission three ways to name one entry, for no gain. What IS genuinely missing is the part the
+audit asks for next: the encoding, normalization, width and ABI representation that name needs to
+cross the claim boundary. Plan change: the new section states the decision, and a new **M4** requires
+those to be defined and states explicitly that the identity is added as a declared field and NOT
+written into `ClaimKey`'s reserved padding. "What this milestone refuses" now names both a second
+entry identity and the padding shortcut.
+
+**4. Kernel validation of the attempted candidate is ambiguous relative to operator selection and
+fallback - ACCEPTED, and decided.**
+
+Confirmed as a genuine fork with incompatible implementations, not a wording problem. DeviceManager
+can persistently select any matching named candidate including a lower-priority one
+(`device_manager.rs:3694-3706`), and the old M2 said only that the kernel "validates that
+privileged handoff against a table generated from the same manifest and the concrete device", which
+does not say whether it recomputes priority.
+
+DECIDED: privileged DeviceManager's selected entry is AUTHORITATIVE, and the kernel validates
+membership plus device plus mode plus policy plus generation. The reason is written into the plan
+rather than left implicit - operator policy can deliberately select a lower-priority candidate, and a
+kernel that recomputed priority would silently overrule the operator, which defeats the purpose of
+the `select` verb. Plan change: a new **M5** freezes the boundary, lists the four things the kernel
+checks, and states the trust model as a sentence. M8 requires the case the boundary exists for - an
+operator has persistently selected a lower-priority candidate, and the kernel admits it because the
+entry is declared for that device, and refuses when it is not - plus a mutation that must fail when
+the kernel recomputes priority.
+
+**Plan re-check.** Eight items where there were five, because the handoff, the identity and the
+authority boundary were each doing work inside one overloaded M2. Ordering is implementable and
+matches the data flow: M1 (manifest field) -> M2 (DMA mode field and producer table) -> M3
+(authenticated handoff) -> M4 (identity across the claim boundary) -> M5 (authority boundary) -> M6
+(remove the permissive default) -> M7 (rebuild selection) -> M8 (fixtures). Fail-closed admission is
+explicitly the LAST behavioural change, after every producer has been migrated, which is the ordering
+that keeps this from breaking the current test and non-x86 paths on the way in. The Definition of
+done now states the producer coverage and the non-overruling of operator selection as separate
+falsifiable clauses. No source code was modified.

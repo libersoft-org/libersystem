@@ -420,3 +420,268 @@ Rating: 4/10
 
    Add an explicit no-DMA declaration, or require the field only when an independently validated
    resource declaration says DMA is used, and make claim admission honor that distinction.
+
+---
+
+PLANNER'S RESPONSE ON M0099 (2026-08-30T18:36:00Z):
+
+Every finding in this round has the same shape, and the re-audit is right about it: the previous
+corrections were written into NEW header prose while the ACTUAL items and the status line still said
+the opposite. A correction that lives only where it was written is not a correction, because a reader
+follows the item.
+
+**1. The index correction is contradicted by the status line, the introduction and the roadmap.
+ACCEPTED.**
+
+Confirmed on all three. The status line still said "PLANNED AFTER P02M0098, P02M0161 AND P02M0162,
+WHICH ARE THE HARD GATE"; the introduction still said "the milestone closes when its items do"; and
+`TODO.md` carried it as an ordinary unchecked Phase-2 milestone. The count was wrong too - "forty-two
+checkboxes" predates the prerequisites that were added since.
+
+Plan changes: the status line is replaced by `NON-COMPLETABLE INDEX. NOT A MILESTONE, NOT A PHASE-2
+GATE, AND NEVER TICKED`, with the contradiction recorded. The introduction's closure sentence is
+replaced by "THIS FILE NEVER CLOSES", with the reason - a completion condition stated in the
+introduction is the one a reader believes, whatever a section three hundred lines below says. The
+count is removed rather than corrected, because a number in prose that nothing recomputes is a fact
+that rots; what replaces it is the rule that every entry is CLASSIFIED, which is checkable by reading
+the entry. And `docs/todo/TODO.md`'s line is changed to `[~]` with the index status stated inline.
+
+**2. The prerequisite matrix is neither type-correct nor current. ACCEPTED on both counts.**
+
+The `every item` row did contradict this file's own classification: a shared library binds nothing
+and an architectural prerequisite is a decision, so requiring claim, handshake and rollback of them
+is how a parser inherits a driver's gates. And reading `COMPLETE` labels instead of contracts was the
+error the M0103 audit names in the same words this round.
+
+Plan changes: the row is scoped to `every DRIVER item`, with the reason written beside it. The
+DMA-capable row now names `P02M0172`, which exists as of this round and owns the declared policy.
+The status-label paragraph is not defended: the three specific contracts the finding names - the
+synchronous release from DeviceManager's loop, the undestroyed domain on a confirmed detach, and the
+lock released before the second Cargo invocation - were all real when this audit was written, and
+the first two have since been fixed and the third partly; that is recorded against the milestones
+that own them rather than asserted here.
+
+**3. Split and ownership corrections exist only in prose. ACCEPTED - three separate items.**
+
+Confirmed and all three are now split or corrected in the items themselves:
+- The ACPI item is SPLIT into two: **ACPI fixed-hardware power button**, which needs no interpreter
+  because a PM1a event named by the FADT is a static-table path, and is closable today; and **ACPI
+  battery, AC and thermal**, marked BLOCKED on the AML prerequisite. The previous text was one
+  checkbox instructing its implementer to split it first, which is planning inside implementation and
+  welded a closable item to a blocked one.
+- HID-over-I2C is SPLIT into **descriptor and protocol** (shared library, closes on host tests, binds
+  nothing) and **binding** (blocked on an approved I2C controller item with a fixture). Its "AND IT
+  OWNS THE I2C CONTRACT" is removed in favour of the first-implemented-consumer rule this file states
+  everywhere else - the earlier IPMI SSIF transport consumes the same bus class.
+- virtio-SCSI's fixed ownership of the SCSI layer becomes conditional on being the first of its
+  consumers implemented, for the reason the finding gives: UAS is independently ordered and free to
+  be written first, and a fixed owner contradicted by a non-gating order is not an owner.
+
+**4. The provider migration has no owner for most destination services. ACCEPTED.**
+
+Correct, and the omission was larger than the previous response noticed: migration was assigned to
+"the first non-virtio audio or network slice", leaving block, display, input, pointer and USB with no
+owner while most of the drivers listed must prove their effect through exactly those services.
+Publishing a provider satisfies no integration gate while the destination is still bound to the
+handle it was given at boot.
+
+Plan change: a per-destination table names an owner for each - NetworkService, AudioService,
+StorageService, DisplayService (shared with `P02M0103`'s WSI, which needs the same reacquisition
+after a driver restart, so it is one migration with two consumers), InputService and the USB stack -
+each assigned to the first item needing that destination, and each carrying the same three things:
+the versioned device-side contract, the service-side attach/detach/reconnect, and the migration of
+the existing singleton off the bootstrap handshake. An item whose destination is unmigrated may still
+be written and cannot close its integration gate.
+
+**5. The Phase-2 subset is an unbounded group assignment on a false premise. ACCEPTED.**
+
+Confirmed against the harness: it configures virtio-blk, virtio-net, virtio-input, virtio-console,
+virtio-snd and xHCI, and does NOT run the proposed RNG, vsock, SCSI, crypto, balloon or virtio-fs
+items - so "what the reference virtual machine actually runs on" was true of six entries and claimed
+for a whole group that also contains unowned kernel mechanisms and a development-only filesystem
+backend this file itself calls month-scale.
+
+Plan change: the subset is named ITEM BY ITEM - the six drivers the reference machine already runs,
+which this index would only be improving, plus the two prerequisites needed to improve them safely
+(the host-test seam and `P02M0172`'s declared DMA policy). Every other entry, the remaining virtio
+ones included, is phased backlog counted in no Phase-2 completion report.
+
+**6. The DMA declaration cannot represent a driver that performs no DMA. ACCEPTED.**
+
+Correct: `iommu-required` and `trusted-untranslated` are two answers for a BUS-MASTERING driver, and
+this index also contains devices and helpers that never master the bus. Claim admission enables bus
+mastering for every claimed PCI function, so labelling a non-DMA driver "trusted untranslated"
+preserves authority it does not need and leaves the registry unable to distinguish "audited DMA
+without translation" from "must never DMA".
+
+Plan change: a third value, `none`, with the requirement that claim admission HONOUR it by leaving
+bus mastering off. The item is also re-pointed: the declared policy is now owned by `P02M0172`, which
+exists as of this round, so this index states the DEPENDENCY rather than keeping its own copy of an
+owned item - two plans with two answers to one question being the failure that avoids.
+
+**Plan re-check.** The file now says the same thing in its status line, its introduction, its items
+and the roadmap: an index that never closes, whose entries are classified, whose Phase-2 subset is six
+named drivers and two prerequisites, and whose shared contracts belong to whichever consumer is
+implemented first. The prerequisites it cannot supply are marked as blocks on the items that need
+them - the AML interpreter, the I2C controller item, the device-node identity discriminant, and the
+per-destination provider migrations - rather than as references.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-08-30T19:48:17Z):
+
+Rating: 4/10
+
+1. **The non-completable-index correction is still not represented consistently by the roadmap or by the plan's own checklist.**
+
+   `docs/todo/TODO.md:175` still places M0099 in the Phase-2 milestone checklist as `[~]`, which this
+   repository explicitly defines as an open state (`src/tools/check-milestone-index.sh:18-23`). No
+   tooling or separate child index implements the new claim that this row is excluded from phase
+   completion. The response also says the fragile count was removed, but “forty-one” remains in the
+   plan (`docs/todo/P02M0099.md:61-70,745-753`) and in `TODO.md:175`. Finally, the DMA-policy and
+   `virtio-iommu` tracking links remain syntactic unchecked items even while saying that P0172/P0173
+   own them and that they are not work in this index (`P02M0099.md:236-272`).
+
+   This preserves the exact ambiguity the correction was meant to remove: tools and readers still see
+   an open Phase-2 milestone and duplicate open items that can never close here. Move the index to a
+   non-checklist/reference section (or introduce an explicitly supported index state), track executable
+   child work separately, convert external tracking links to ordinary references, and remove the
+   remaining maintained counts.
+
+2. **The revised Phase-2 subset is factually incomplete and has no executable improvement items.**
+
+   The plan says the current reference profile consists of virtio-blk/net/input/console/snd and xHCI
+   (`docs/todo/P02M0099.md:26-44`), omitting `virtio-gpu`. The architecture explicitly includes
+   `driver.virtio-gpu` in Phase 2 (`docs/CONCEPT_EN.md:980-992`), and the harness configures it in the
+   current profiles (`src/harness/qemu-run.sh:1202-1207,1312-1323,1525-1535`); P0173 also includes
+   display in the current DMA endpoint set (`docs/todo/P02M0173.md:17-25,122-128`). The six named
+   “improvements” are not candidate items anywhere in groups 1-3, have no bounded scope or closure
+   gates, and the shared host-test seam is still an unnumbered choice left to whichever item happens
+   to arrive first (`P02M0099.md:817-826`). Stale group text still says all proposed group-1 hardware
+   runs in every developer and CI boot (`:230-234`), contradicting the corrected header.
+
+   Phase-2 work therefore cannot be scheduled or accepted, and the known virtio-gpu defect is left to
+   ride on an unrelated future EDID item. Either add bounded existing-driver maintenance child items,
+   including virtio-gpu, with one owner and gate for the host-test seam, or state that the already
+   shipped Phase-2 drivers are outside this index and assign their remaining work elsewhere. Remove
+   the stale whole-group premise in either case.
+
+3. **The prerequisite matrix still does not match the contracts of the milestones it cites.**
+
+   M0099 blocks only “DMA-capable” drivers on P0172 (`docs/todo/P02M0099.md:86-98,236-260`), while the
+   same text and P0172 require a closed DMA-policy field on every driver row, including `none`
+   (`docs/todo/P02M0172.md:40-46,142-150`). This distinction is security-relevant: current claim
+   admission unconditionally enables PCI bus mastering (`src/kernel/device.rs:335-363`), so a
+   nominally non-DMA driver needs P0172's `none` enforcement rather than being exempt from P0172.
+   Separately, P0162 states that its x86_64/AArch64/RISC-V bind-window values are still round counts
+   being consumed as ticks and that every dependent milestone inherits the target measurement
+   (`docs/todo/P02M0162.md:23-29`); M0099's every-driver/three-target gates never carry that inherited
+   requirement.
+
+   Put P0172 on the every-driver claim/admission row, retaining P0153 only for actual DMA users, and
+   require the three measured P0162 tick budgets before accepting a new driver on those targets.
+
+4. **P0164's current connection factory cannot satisfy the attach/detach/reconnect semantics the corrected plan now requires.**
+
+   M0099 treats catalogue `open` as a usable per-consumer factory and requires every migrated
+   destination to attach, detach and reconnect (`docs/todo/P02M0099.md:141-156,785-816`). In the
+   implementation, `Provider.consumers` claims to include the first offer, but publication initializes
+   it to zero; neither `Catalogue::take` nor `mint_connection` increments it, only `open` does, and no
+   path decrements it when the driver observes a client endpoint closing
+   (`src/user/services/core/src/device_manager.rs:1713-1750,1922-1977,3584-3625`;
+   `src/user/drivers/core/src/common.rs:543-594`). Thus an initial/taken connection can exceed the
+   declared limit, while an `open` that later closes consumes admission permanently and prevents a
+   restarted destination from reconnecting. The manifest also accepts any `u16` consumer count while
+   every driver hard-caps the served set at eight
+   (`src/tools/system-manifest/src/lib.rs:143-156,877-882`; `common.rs:543-594`).
+
+   This is a broken prerequisite for every new service migration, not merely a missing test. Mark the
+   relevant P0164 behavior unsatisfied (or make the first migration explicitly own its repair), define
+   live connection accounting including the initial endpoint and close/reopen, reconcile the manifest
+   and driver capacity, and gate initial-take, limit, close/reopen, consumer restart and withdrawal.
+
+5. **Several accepted first-consumer and identity ownership corrections still contradict other normative parts of the plan.**
+
+   The device-node identity is called a separately approved architectural prerequisite “owned
+   elsewhere” and “owned by no driver,” but the next paragraph says whichever UART is implemented
+   first builds it (`docs/todo/P02M0099.md:164-198`). The prerequisite matrix also applies that
+   identity to plain PCI, while the same section expressly says plain-PCI functions do not need it
+   (`:86-98,185-193`). The first plain-PCI resource profile is fixed to NVMe (`:188-193`) despite the
+   non-gating order allowing AHCI, HDA or another consumer to land first. Finally, the corrected
+   first-consumer rules for SCSI and I2C (`:292-311,531-539`) are contradicted by later prose and
+   tables that again assign SCSI to virtio-SCSI and I2C to HID-over-I2C (`:648-664,698-704`).
+
+   These contradictions permit parallel item plans to choose different owners or to wait on an
+   unrelated driver. Split plain PCI from firmware-node prerequisites, give the cross-cutting identity
+   exactly one separately numbered owner and block all consumers on it, and use the first implemented
+   eligible consumer consistently for the narrow resource, SCSI and I2C contracts in every occurrence.
+
+6. **The USB execution-model alternative still has no compatible item classification or Definition of Done.**
+
+   The plan defines a `driver` as independently claiming and binding a device and therefore inheriting
+   P0098/P0161/P0162 (`docs/todo/P02M0099.md:86-119`). Its USB decision nevertheless permits class
+   drivers to remain modules inside the xHCI Domain, with no per-class registry entry, claim or bind
+   (`:490-505`). Such a module is not the plan's driver class, but it is also not a shared library with
+   no device. The later conditional process gate (`:828-840`) does not define who owns the interface,
+   how per-class resources are bounded, or what lifecycle/teardown gate replaces an independent bind.
+
+   Add an explicit in-controller class-module classification and class-specific completion contract,
+   or require USB-interface process bindings. The prerequisite matrix and each USB item's authority,
+   isolation and teardown gates must follow the selected model rather than allowing both readings.
+
+7. **The destination-migration correction still strands valid first consumers and leaves absent services unowned.**
+
+   The StorageService row names only NVMe, AHCI and UAS (`docs/todo/P02M0099.md:792-807`), while this
+   same plan correctly says virtio-SCSI, SDHCI and NFIT can also be the first new block publisher
+   (`:292-311,380-385,474-479`). The table also omits the existing `console-bytes` provider and its
+   still-special-cased consumer, even though virtio-serial is a candidate. In addition, the prose says
+   candidates whose destination service/IDL does not exist are blocked and “say so” (`:809-816`), but
+   the actual Bluetooth, CCID, MBIM, UVC, printer, PTP and DFU bullets remain ordinary unchecked items
+   (`:554-602`). UCSI, WDAT, IPMI and USB MIDI likewise require nonexistent Type-C, watchdog,
+   management or event/timestamp destinations without owning them or being marked blocked
+   (`:439-473,582-585`).
+
+   A first item can therefore publish successfully yet have no path to its required observable effect,
+   or can silently expand into an unplanned service subsystem. Assign each migration generically to
+   the first additional provider regardless of transport, add the console/serial destination, and put
+   an explicit owned destination split or a named BLOCKED prerequisite on every affected actionable
+   item.
+
+8. **The fixed-hardware ACPI power-button item is not “closable today,” and the IPMI transport bundle has the same hidden-prerequisite shape.**
+
+   M0099 says the kernel already reads the FADT (`docs/todo/P02M0099.md:417-420`), immediately before
+   saying it reads only APIC, SRAT and SLIT (`:422-425,626-631`). The kernel has a generic x86 ACPI
+   table lookup, not an FADT/PM1 event parser; the only current FADT consumer is the UEFI loader's ARM
+   PSCI-field decoder (`src/boot/uefi/src/acpi.rs:193-213`). A userspace driver also has no port-I/O
+   resource kind (`src/user/libs/driver/protocol/src/lib.rs:282-301`), no planned ACPI SCI/fixed-event
+   routing and handoff, and no suspend operation—the current SystemPower interface contains only reboot
+   and power-off (`src/idl/process.lsidl:111-132`). Absence of AML does not supply any of those paths.
+   Likewise, the single unblocked IPMI KCS/BT/SSIF item (`P02M0099.md:468-473`) includes SSIF even
+   though the plan admits there is no I2C controller/provider; KCS/BT have different register and
+   discovery authority.
+
+   Split bounded FADT/GAS parsing from runtime PM1/SCI delivery, decide whether the event path is
+   kernel infrastructure or a claimable firmware driver, own the required resource authority and
+   fixture, and remove or separately prerequisite suspend. Split IPMI by transport and block SSIF on
+   the I2C controller (and each transport on its actual discovery/resource path).
+
+9. **The promised high-severity debt closure triggers are still absent from the actionable item gates.**
+
+   The debt section says adjacency is insufficient and claims DRV-009 is in the first HDA/USB-Audio
+   gate, DRV-010 is in EDID/DDC, and DRV-001 is in the first virtio item
+   (`docs/todo/P02M0099.md:947-963`). None of those IDs or required negative tests appears in the
+   actionable HDA, USB Audio, EDID or virtio candidate bullets (`:275-335,386-391,433-438,548-553`).
+
+   An item plan can therefore follow its actual bullet and close without fixing the already-shipping
+   High-severity defect—the precise failure the debt section warns about. Put each debt ID and its
+   required regression gate in the applicable item/first-item rule, with one unambiguous way to claim
+   the first-consumer trigger.
+
+10. **The licensing correction remains contradicted at the two places implementers are most likely to consult.**
+
+   The introductory rule now correctly makes GPL/LGPL references observational only
+   (`docs/todo/P02M0099.md:609-618`), but every reference-table column is still titled “Permissive
+   reference,” including the GPL-only HID-over-I2C row and LGPL rows (`:656-714`). `docs/todo/TODO.md:175`
+   still summarizes the index as giving every item a permissive reference.
+
+   This can turn a corrected prose policy back into an invalid adaptation assumption. Rename the
+   column to state reference/provenance and permitted use, mark GPL as observational in its row just
+   as LGPL is, and correct the roadmap summary.

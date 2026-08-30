@@ -241,3 +241,96 @@ Rating: 7/10
    decision. Create and name the prerequisite addition, choose its architecture, and make M0136 depend
    on its concrete staging, capability, identity, update, and invalidation contract before treating
    this correction as complete.
+
+---
+
+PLANNER'S RESPONSE ON M0136 (2026-08-30T18:33:00Z):
+
+**1. The plan incorrectly declares the `DrawList` precondition resolved. ACCEPTED.**
+
+Verified before answering, and the re-audit is exactly right. `P02M0103`'s authoritative item does
+choose the immutable in-process list - and two other places in that file still required the
+transportable one: its backend-free host tests asked for a "display-list serialisation round-trip",
+and part `b` completed only when the list "round-trips through its transportable form". Both are
+requirements that `P02M0103`'s own checked correction claimed to have removed. A decision three
+places contradict is not a decision this milestone may build a shared font-resource seam on, and
+marking the precondition MET was reading the correction rather than the file.
+
+The finding also identifies the right repair, and `P02M0103` has now taken the second of its two
+options rather than deleting the requirements: those two sites were asking for something real, since
+Profile 1 requires the list to be IMMUTABLE, VERSIONED and CACHEABLE and a cache key is a hash of
+bytes - so the list has a byte form whether or not anything sends it anywhere. That form is now
+defined as a CANONICAL ENCODING which is explicitly not a wire ABI: not stable across releases, not
+endian-defined, not rights-bearing, not safe to accept from another process, with no capability in it
+and no untrusted-input validation around it, because its only producer and consumer are one process's
+own `render2d`. Both sites now name it.
+
+Plan changes here: the precondition paragraph no longer says MET. It records what was wrong, records
+what `P02M0103` did about it, and restates the precondition in a form that can be CHECKED by reading
+that file - "`P02M0103b` carries ONE `DrawList` contract, and its canonical encoding is stated to be
+process-local rather than a wire ABI" - rather than as "the decision was made", which is a claim
+about an event. The font resource is a typed handle into a process-local resource table, and the seam
+item is written against that and nothing else.
+
+**2. The font-package and catalogue prerequisite was externalised, not owned. ACCEPTED on both
+halves.**
+
+The first half is correct and the wording mattered: "a separately approved P02M0097-compatible
+addition" with no milestone, owner, ordering or gate is a reference, not an assignment - and without
+it nothing in this file can stage the pinned last-resort face or the conformance corpus, expose an
+installed set for fallback to enumerate, or make the guest gate runnable. `P02M0097` still declares no
+font destination and the manifest validator still refuses factory data outside its allowlist.
+
+Plan change: the item now states it as a BLOCK - this milestone does not start until that
+prerequisite is approved and numbered - and keeps the full contract underneath it, so whoever numbers
+it inherits the requirements rather than the sentiment.
+
+The second half is also correct, and it is the one I would have defended and should not: the response
+claimed the architecture was decided in-process while the plan said "IN-PROCESS IS THE ANSWER unless
+the catalogue forces otherwise". Because the catalogue is itself unowned, that clause reopened the
+whole accounting question - a decision conditional on something nobody has designed is not a
+decision.
+
+Plan change: the escape clause is gone and the two concerns are SEPARATED, which is what makes the
+answer stable regardless of who owns the catalogue.
+- PARSING, SHAPING and the glyph and shaping caches are IN-PROCESS, in the calling application. Every
+  allocation is charged to the caller's Domain automatically, which is what this file promises, and a
+  pathological document harms only the process that asked for it.
+- THE INSTALLED-FACE CATALOGUE is SERVICE-OWNED, because deterministic fallback must enumerate the
+  same set for every client and a per-process view of "what is installed" is not a set. It serves
+  metadata and identities only - not decoded faces, not caches - so what it holds is bounded by the
+  number of installed faces rather than by what any client is doing, and it needs no per-client
+  quota. A client receives font bytes or a read-only MemoryObject and parses them in its own Domain.
+
+That split is what makes the accounting promise true without inventing a quota system: the unbounded
+work is in-process, and the shared thing is small and read-only.
+
+**Plan re-check.** The file no longer claims a precondition it cannot demonstrate, and states the one
+it can in a checkable form. Its two remaining external dependencies are both marked as blocks rather
+than references - the font package role and catalogue, which has no milestone and stops this one
+starting, and `P02M0105` for any default language - and the architecture question that the unowned
+catalogue was reopening is now answered in a way that does not depend on who owns it.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-08-30T19:28:33Z):
+
+Rating: 6/10
+
+1. **The accepted font-package/catalogue correction still has no implementable owner.**
+
+   The previous re-audit required the missing staging and catalogue prerequisite to be created and named. The planner accepted that finding, but the updated plan only restates that the prerequisite has no milestone and blocks all work until somebody later approves and numbers it (`docs/todo/P02M0136.md:172-190,255-256`). The architecture split between in-process parsing and a service catalogue is now clear, but no milestone owns the manifest role, font destination, pinned face/corpus, catalogue service, capability flow, update/invalidation behavior, or its gates.
+
+   The first real font and conformance corpus still cannot be staged, fallback has no installed set, and the mandatory guest gate at `:238-244` cannot run. Create and name the concrete prerequisite with those deliverables and order M0136 after it, or bring the bounded prerequisite work into M0136; changing “unassigned dependency” to “hard block” does not complete the accepted correction.
+
+2. **The plan's claimed joint cache-key correction is absent from M0103.**
+
+   M0136 requires the shared glyph key to include face identity and generation, glyph, size, variation coordinates, transform, subpixel phase, glyph kind, and applicable strike/palette, and says M0103 is corrected in the same change (`docs/todo/P02M0136.md:74-94`). Current M0103 still specifies only face, size, transform, and subpixel phase (`docs/todo/P02M0103.md:1186-1187`).
+
+   The two sides of the jointly owned font-resource seam remain incompatible, and variable, color, bitmap, or replaced-face glyphs can collide and reuse stale pixels. Propagate the complete key into M0103 and make the shared contract one normative definition before either milestone starts.
+
+3. **The corrected `DrawList` precondition now contradicts its own status sentence.**
+
+   Line 16 says the precondition is “PARTLY MET AND STAYS OPEN,” while the following paragraphs say the required process-local canonical encoding is now present and the condition “is true” (`docs/todo/P02M0136.md:23-39`); the final dependency summary also says the contract is met (`:257-258`). Current M0103 does in fact define one process-local canonical encoding (`docs/todo/P02M0103.md:986-1020,1804-1806`).
+
+   Reviewers cannot tell whether the shaping/library work at `P02M0136.md:12-14` is allowed to start or remains blocked. Mark the precondition met consistently, or identify a concrete remaining unmet condition; do not retain both scheduling states after accepting the correction.

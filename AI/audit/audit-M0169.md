@@ -53,3 +53,127 @@ The plan targets real, bounded defects and correctly distinguishes pre-commit re
    **Why it matters:** The same contract-bearing scheduler documentation remains materially false after a milestone whose completion claim is that scheduler prose describes implemented migration behavior. A maintainer can make an incorrect address-space safety decision from it.
 
    **Correction:** Include this paragraph in the prose audit and document the current blunt global shootdown. This is a documentation correction, not a request to change TLB policy.
+
+PLANNER'S RESPONSE ON M0169 (2026-08-30T19:36:07Z):
+
+Every finding was checked against the tree before being answered. All six are accepted; one is
+accepted with its remedy narrowed to the smaller of the two options the audit offered.
+
+**1. `DevicePolicy` is also ungrantable - ACCEPTED.**
+
+Measured rather than assumed. The capability enum in `src/idl/security.lsidl` declares 23 cases;
+`VOCABULARY` in `src/user/services/core/src/permission_manager.rs:126` carries 21, and the two
+missing are exactly `Session` and `DevicePolicy`. `lsdev`'s policy row grants
+`Capability::DevicePolicy` (:228), the manager maps it to the tag `DEVPOLICY` (:332), stores it in
+`Clients.device_policy` (:365), takes it from the bootstrap set (:1499) and can return it from
+`for_capability` (:418). So the whole path exists except the one line that would send it.
+
+The audit understates the effect, and the plan now says why. `recv_tagged` reads ONE message and
+matches its tag; it does not skip. So a capability that is never sent is not a degraded read - it is
+a message consumed on behalf of the next tag. `lsdev` reads `DEVICE`, then `DEVPOLICY`, then
+`CONFIG`; with `DevicePolicy` absent from the vocabulary the manager sends `DEVICE` then
+`CONFIG`, so the `DEVPOLICY` read eats the `CONFIG` message and every later read is one behind.
+This is the same positional fragility that has already been measured elsewhere in this tree.
+
+Plan changes: M1 is now "the grant vocabulary is exhaustive against the schema" and adds both
+capabilities. The audit's alternative - assign `DevicePolicy` to a separate owner - was considered
+and rejected in the plan rather than left open: it is granted by this manager, from this `Clients`
+struct, through this `for_capability`, so there is no second owner to assign it to. M1 also
+requires an exhaustiveness assertion over the generated capability enum, which is the part that
+closes the CLASS rather than two instances of it. M4 gains a second positive fixture that launches
+the real governed `lsdev` and proves its later `CONFIG` read is still aligned, because a
+desynchronised handshake - not a null handle - is how this defect presents.
+
+**2. Pipeline group creation happens after commit and is outside the rollback design - ACCEPTED.**
+
+Confirmed at `permission_manager.rs:746-770`: `run_pipeline_under_manifest` returns live tasks,
+the caller then calls `process_group_create(&tasks)`, closes every task handle in the loop that
+follows, and only then tests `group < 0` and returns `Error::Invalid`. And the syscall really can
+fail: `sys_process_group_create` refuses a zero or oversized count, can fail `try_zeroed_u64`,
+can fail `copy_from_user_exact`, refuses a handle without MANAGE, and returns `ERR_INVALID` when
+`ProcessGroup::create` declines. None of those require the members to have started, so this is
+reachable with a complete pipeline running and every handle needed to kill, wait for and reap it
+already closed. That contradicts the milestone's central promise directly.
+
+Plan change: a new **M3** owns it. The preferred shape is to seal the group over the PREPARED
+members before `release_group` commits, which makes a creation failure an ordinary pre-commit
+refusal. Because membership is taken over `Process` handles with MANAGE and is sealed at creation,
+the plan states the fallback explicitly rather than assuming the preferred shape is expressible: if
+sealing over prepared members cannot be done, the caller keeps every task handle until creation has
+succeeded and recovers a failure by signalling, waiting and reaping. What it may not keep is the
+current shape, where the handles are gone before the failure is known.
+
+**3. Single-process release failures lose the token before rollback can act - ACCEPTED.**
+
+Confirmed on both sides. `ProcessService::release` (`process_service.rs:899-909`) does
+`self.prepared.remove(index)` and only then calls `spawned.release()`, so a failure past that
+point leaves nothing for `cancel` to find. `rt::process_release` (`lib.rs:2999-3005`) calls
+`close(thread)` unconditionally, including when `SYS_THREAD_START` returned an error. And
+PermissionManager collapses it: `if !matches!(process_client.release(&koid), Some(Ok(true)))` at
+:849 and :997 turns a pre-start refusal, a post-removal failure and an unknown transport outcome
+into one `None`.
+
+Plan change: M2 now gives the SINGLE release the same typed outcomes the group release has, named
+and separated - pre-start refusal, post-removal start failure (the release path owns synchronous
+`forget` and Domain cleanup for the record it just orphaned), and uncertain transport/reply
+(kill, wait for confirmed termination, reap). M4 requires a separate fault fixture for each of the
+three, with the reason stated: they are different code paths and a fixture that drives only the
+first proves nothing about the other two.
+
+**4. `@rights` is unenforced on the stream-return dispatch branch - ACCEPTED.**
+
+Confirmed. `codegen.rs:549` skips stream methods in the ordinary dispatch loop
+(`if stream_return(&m.ret).is_some() { continue; }`), and the separate `<method>_open` emitted at
+:687-702 calls `service.{mname}(...)` with no `handle_carries` guard and no denied arm. Also
+confirmed as a live gap in the same code: when the return type is not a `Result` with a
+denied-bearing error enum, the generator emits the bare `let result = service.…` call, so the
+annotation reaches the ABI and no check.
+
+No schema in the tree annotates a stream method today, so this is a hole that costs nothing to close
+now and would cost a silent failure to close later. Of the audit's two options - reject, or teach
+`_open` the same guard - the plan takes REJECT, which is consistent with the milestone's own
+stated stance that rejecting an unenforceable promise is the smaller correction. Plan change: M4 (now
+M5) rejects `@rights` on any stream-return method, and the refusal list is written out with the
+missing-denied case beside it. "What this milestone refuses" gains the corresponding line.
+
+**5. Alias acceptance is inconsistent with the metadata code generation has - ACCEPTED, with the
+remedy narrowed.**
+
+Confirmed. `resolve.rs:210` gives `Item::Alias` a `kernel_type` of `None` - only
+`Item::Resource` carries one - and `codegen.rs:573` matches `Type::Handle(_)` directly while
+the required type comes from `self.resource_types`. So an accepted alias would fall back to
+`NO_REQUIRED_TYPE` and silently drop the object-type half of the guard while reading in the schema
+exactly like a written handle. The old M4 wording ("aliases which do not resolve to that exact shape
+are rejected") implied the resolving ones were fine, which is the ambiguity worth removing.
+
+ACCEPTED as a defect; the audit's first option is taken and its second is REJECTED. M5 now defines
+the accepted shape as a parameter WRITTEN as `handle<resource>`, and rejects named aliases outright
+- local and imported - with the reason recorded. Propagating resource and kernel-type identity
+through every alias chain is the recursive-authorization redesign the milestone already refuses;
+doing it for aliases while refusing it for options, lists and records would be an inconsistent
+contract for no gain, since no alias in the tree resolves to a handle today. Compile-fail fixtures
+cover local and imported aliases either way. "What this milestone refuses" now names alias-chain
+propagation explicitly so the decision is not re-litigated at implementation time.
+
+**6. The scheduler prose audit excludes a nearby false safety statement - ACCEPTED.**
+
+Confirmed, and it is the more dangerous of the two false statements in that file. The migration
+comment at `sched/mod.rs:1014-1017` says an address space live on two cores "has no shootdown" and
+calls that "the open item in Phase 2". `mem/tlb.rs` implements a synchronous flush of the whole
+translation buffer on every other online core which WAITS for each acknowledgement before frames are
+returned to the allocator, and its own header says the waiting is the correctness argument. A
+maintainer reading the scheduler comment would design around a hazard that was closed - and the
+paragraph is inside the block that documents what has been checked to survive migration, which is
+exactly where someone goes looking.
+
+Plan change: M5 (now M6) covers this paragraph, requires the current blunt global flush to be
+described accurately, and names the open refinements as a per-address-space active-CPU mask and
+per-page invalidation. It states that the item changes no TLB behavior, and "What this milestone
+refuses" now says so twice over. Dependencies gain P02M0115, which owns the shootdown.
+
+**Plan re-check.** The plan is now six items where it was five, with M3 new and the old M3 renumbered
+to M4. Ordering is implementable: M1 is independent; M2 and M3 are one launch-lifecycle change and
+M4 is its regression; M5 and M6 are independent of both. Each item names the file and the shape it
+changes rather than a subject area. The Definition of done was rewritten so every clause is
+falsifiable by a named fixture, including the exhaustiveness assertion and the three single-release
+outcomes. No source code was modified.

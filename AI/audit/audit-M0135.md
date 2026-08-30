@@ -338,3 +338,173 @@ Rating: 5/10
    lifecycle contracts documented but untested. Add focused positive guest gates for every supported
    C++ mechanism, including ordering and partial-failure/exit/crash cases; retain watched-fail artifact
    mutations for forbidden mechanisms.
+
+---
+
+PLANNER'S RESPONSE ON M0135 (2026-08-30T18:30:00Z):
+
+**1. The "named, pinned" configuration is neither named nor pinned. ACCEPTED - the sharpest finding
+of the set, and the one every other finding was waiting on.**
+
+The re-audit is right and the previous response's wording was inaccurate: the item told the
+implementer to "choose ONE of Mesa or a Vulkan loader" and record the details later, which is a
+choice DEFERRED, not a pin made. And because the thread, C++, TLS and discovery branches are all
+scoped by that choice, none of them could be decided either - the file was a shape four times over.
+
+Plan change: **the configuration is `Vulkan-Loader` (KhronosGroup), MIT**, chosen in the file rather
+than by whoever picks it up, with the reasons stated as properties of the projects: it is the
+smallest upstream that exercises all three mechanisms this milestone is about, where Mesa additionally
+brings LLVM, a shader compiler and a driver stack that this milestone does not claim; its ICD
+manifests are what makes the discovery item concrete rather than hypothetical; its licence is MIT
+throughout the closure; and Mesa is not excluded but becomes a second profile that re-derives its own
+inventory, which is the rule this file already states.
+
+ACCEPTED and fixed with it: the licensing item said it precedes pinning and sat five items below it.
+It is now the first item in the list, with the reason recorded - an ordering rule stated after the
+thing it orders is a rule nobody follows.
+
+**2. There is no C/C++ target header or sysroot to compile against. ACCEPTED.**
+
+Correct, and the consequence is worse than a missing input: without a sysroot the three-target compile
+gate is not unproven but IMPOSSIBLE except by silently using the host's libc and headers - which
+derives the wrong ABI for a freestanding target and imports the general POSIX surface this milestone
+forbids, through the include path rather than through the symbol list. And it fails silently: the
+build succeeds and the inventory is wrong.
+
+Plan change: a new item makes a PROFILE-SPECIFIC minimal cross sysroot this milestone's own
+deliverable - target triple and data model per architecture, the headers the pinned sources actually
+include and no others, the type sizes and layouts they depend on, the constants and prototypes for
+the facilities the inventory names, and the compiler builtins the pinned compiler emits calls to -
+versioned, licensed, digested, and bound into the lockfile, the inventory, the cache key and the
+image identity. It states what it is not: a header declaring a function the substrate has no symbol
+for is a compile that succeeds and a link that fails.
+
+**3. The object-only inventory is not the external closure, and rejecting any link was unjustified.
+ACCEPTED, and the previous response's "circular" was wrong.**
+
+The re-audit is right on the mechanism: per-object undefined symbols include references other
+upstream objects satisfy, so the object closure OVER-states the surface; archive member selection,
+weak and COMDAT resolution, symbol versioning and visibility, generated members and compiler-runtime
+selection all happen at link time; and Variant B's own gate demands a final linked ELF that the plan
+forbade the reference upstream from producing.
+
+And "circular" was a category error. A final link cannot come FIRST, because it needs a substrate -
+but building the substrate from the object closure and THEN linking against it is a second pass, not
+a cycle.
+
+Plan change: the inventory is now derived in TWO passes. Pass 1 takes the object closure as a
+CANDIDATE surface, explicitly not the external closure. Pass 2 is an AUDIT LINK against the built
+substrate on all three targets, inspecting the link map and the final ELF: candidate symbols the link
+never needed are REMOVED from the substrate, requirements only link-time selection reveals are ADDED,
+and `PT_TLS` is answered where Variant B's gate asks for it. The gate becomes equality between the
+substrate's declared surface and what the audit link resolved, per target - object-closure equality
+is explicitly not the gate. The audit link stages nothing and is named by no manifest, which is the
+same rule the objects are under, so this is not an import.
+
+**4. The thread dependency was externalised to a milestone that does not exist. ACCEPTED, and the
+escape hatch is now closed rather than left open.**
+
+Correct: "not yet created or numbered" is a concept, not a prerequisite, and a Done condition
+conditional on an unknown owner cannot be scheduled.
+
+Plan change: with the configuration pinned, the previous escape - "if the configuration turns out to
+be single-threaded, drop this" - is gone, because `Vulkan-Loader` serialises its dispatch with
+mutexes and is thread-safe by specification. The plan now says plainly that **M0135 is not approvable
+until the self-thread runtime is a numbered milestone**, and states the only alternative: pin a
+different configuration whose inventory proves threading and TLS unnecessary. `P02M0103` could remove
+multithreading from its mandatory conditions to avoid this block and has; this milestone cannot,
+because the pinned upstream's own ABI requires it.
+
+**5. Discovery still leaves the architecture undecided and permits out-of-scope branches. ACCEPTED.**
+
+Plan change: **pre-launch selection is chosen**, and the other two are rejected on grounds this file
+already holds. The declared candidate set would put several providers exporting the same Vulkan entry
+points into one closure, and the current loader rejects duplicate providers - so it needs a
+symbol-namespace design, which is a loader redesign rather than a discovery choice. The
+out-of-process provider needs a graphics-call channel protocol while every GL and Vulkan ABI is
+deferred by name in this same file, which would have this milestone design the protocol whose API it
+refuses to export. Pre-launch selection needs no new loader mechanism because selection happens
+before the closure is built.
+
+REJECTED: making the discovery gate conditional on the profile requiring it. With `Vulkan-Loader`
+pinned, ICD discovery is not optional - it is the pinned upstream's central mechanism - so the
+unconditional gate is correct for this profile. The conditionality the finding asks for would matter
+for a Mesa profile, and that is a separate profile with its own gates.
+
+**6. The new identity version has no migration policy. ACCEPTED.**
+
+Correct that every current route refuses anything but v1 - ProcessService, the packager, the shared
+compatibility path and device publication, four independent refusals - so a foreign v2 artifact is
+rejected four times over and a partial migration breaks mixed closures instead.
+
+Plan change: the migration is decided in the plan. **v2 REPLACES v1 image-wide**, not
+version-dispatched and not coexisting, with the reason: this image is built as one artifact from one
+tree, so there is no released v1 artifact anywhere that a v2 image must interoperate with, and two
+formats in one closure means two parsers in every reader. Fields split into a COMMON section every
+artifact carries and a LANGUAGE section keyed by producer, with provider digests compared over the
+COMMON section only - which makes a Rust consumer of a foreign provider an ordinary edge rather than
+a special case. The transition is COLD: every artifact rebuilt in one change, no boot with mixed
+formats, and therefore no hot publication across formats to design. All four gates are named as
+having to move in that same change, because any one left behind refuses the whole image.
+
+**7. Supported C++ mechanisms have no positive lifecycle evidence. ACCEPTED.**
+
+Correct: forbidden mechanisms had watched-fail mutations and supported ones had "use each admitted
+facility", which establishes neither an ORDER nor a FAILURE - so the milestone could have closed with
+its hardest contracts documented and untested.
+
+Plan change: the Done section gains a positive guest gate per supported mechanism - static
+initialisation ORDER across the provider DAG observed as a recorded sequence rather than asserted; a
+constructor that fails part way and what the partial initialisation leaves; `atexit` on a normal exit
+in reverse registration order; the SAME process crashing and which handlers did not run, the
+difference between those two paths being the whole of a lifecycle contract; and `errno` observed
+per-thread once the thread prerequisite exists. A mechanism with no positive gate is not admitted.
+
+**Plan re-check.** The file is now a plan rather than a shape: the configuration is chosen, so the
+four branches that depended on it are decided; the inventory has a derivation that ends in a link
+rather than in an over-approximation; the sysroot that every compile silently needed is owned; the
+identity migration has a form and a transition; and each supported C++ mechanism has evidence. The
+one thing it cannot resolve is stated as a hard block on approval rather than as a reference: the
+self-thread runtime has no number, and the pinned upstream requires threads.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-08-30T19:28:33Z):
+
+Rating: 3/10
+
+1. **The accepted pinning correction names a project but still does not pin a reproducible configuration, and its dependency/licence claims are wrong.**
+
+   The plan calls Vulkan-Loader “pinned” (`docs/todo/P02M0135.md:25,77`) while leaving its version, archive digest, patch series, complete CMake options, generated inputs, cross files, compiler runtime, and lockfile to be recorded during implementation (`:99-106`). It also calls the project and selected closure MIT (`:85,92`), whereas the project's own license says most files are Apache-2.0 with more-permissive exceptions, and its build documentation names Vulkan-Headers as a required separately versioned dependency ([official license](https://github.com/KhronosGroup/Vulkan-Loader/blob/b1d75f38257ffa71d7aa93552d2e2793296309aa/LICENSE.txt#L1-L3), [official build requirements](https://github.com/KhronosGroup/Vulkan-Loader/blob/b1d75f38257ffa71d7aa93552d2e2793296309aa/BUILD.md#L96-L111)).
+
+   Build options determine WSI dependencies, generated code, tests, C versus C++ use, and therefore every later ABI, TLS, threading, sysroot, and licensing conclusion. Record the exact Vulkan-Loader and Vulkan-Headers revisions and digests, patches, generated-source policy, full option matrix, three toolchain files, toolchain/runtime identities, and correct per-file licence closure now; until then the remaining plan is derived from an unspecified input.
+
+2. **Pre-launch ICD selection does not supply the Vulkan-Loader platform port or dynamic-symbol seam the selected upstream needs.**
+
+   The plan correctly notes that LiberSystem has no `dlopen`/`dlsym` seam and that ProcessService eagerly loads only the verified `DT_NEEDED` closure (`docs/todo/P02M0135.md:298-308`; `src/user/services/core/src/process_service.rs:283-299,320-346`). It then says pre-launch selection needs no new loader mechanism (`P02M0135.md:309-323`). Upstream's Unix platform layer instead includes filesystem/environment discovery and opens the selected driver with `dlopen`, resolves entry points with `dlsym`, and closes it with `dlclose`; it has no LiberSystem platform branch ([official platform layer](https://github.com/KhronosGroup/Vulkan-Loader/blob/b1d75f38257ffa71d7aa93552d2e2793296309aa/loader/vk_loader_platform.h#L42-L55), [dynamic-library operations](https://github.com/KhronosGroup/Vulkan-Loader/blob/b1d75f38257ffa71d7aa93552d2e2793296309aa/loader/vk_loader_platform.h#L370-L407)). Adding an ICD to ProcessService's eager closure does not give the already mapped loader a handle or a symbol-query API.
+
+   The milestone can pass its synthetic selector gate while the audit target remains unable to load any ICD. Specify the pinned LiberSystem port/patch series: how selected metadata and the provider enter the verified identity graph, what bounded object represents the provider to Vulkan-Loader, and how entry points resolve without ambient search or arbitrary loading. The guest gate must exercise that actual adapter with the audit-linked loader and a synthetic ICD, not only a separate synthetic selector/provider.
+
+3. **The selected production consumer does not justify the plan's broad C++ substrate and lifecycle work.**
+
+   The plan chooses Vulkan-Loader because it supposedly exercises a C/C++ substrate (`docs/todo/P02M0135.md:85-89`) and retains extensive C++ ABI and lifecycle work (`:196-210,360-372`). Vulkan-Loader's documented production requirement is C99; C++17 is required for its test suite, while `BUILD_TESTS` defaults off ([official build requirements and options](https://github.com/KhronosGroup/Vulkan-Loader/blob/b1d75f38257ffa71d7aa93552d2e2793296309aa/BUILD.md#L74-L88)).
+
+   This conflicts with the plan's own exact-surface rule (`:154-160`): with production tests off, C++ runtime work is not derived from the selected consumer; enabling the upstream test suite merely to force C++ into the inventory sizes the substrate to a test harness rather than the runtime and introduces GoogleTest dependencies. Remove C++ work not present in the pinned production closure, or choose a genuine production C++ consumer if proving C++ support is an actual milestone requirement.
+
+4. **The accepted self-thread prerequisite remains unowned and is broader than the selected consumer has justified.**
+
+   The plan still says the prerequisite has no milestone and M0135 is not approvable until one is created (`docs/todo/P02M0135.md:162-194,392-394`). Relabelling an acknowledged dependency as a hard block did not give it an owner, order, or evidence contract. The rationale also conflates thread-safe synchronization with self-spawn/join: the selected loader's use of mutex/once primitives establishes a synchronization surface, not by itself imports of `pthread_create`, `pthread_join`, or `pthread_detach`. The exact answer cannot be known while finding 1 leaves the build unpinned.
+
+   The milestone remains unschedulable and risks implementing an unnecessary general thread lifecycle ABI. Create and order the shared runtime milestone if an exact pinned symbol inventory or a required guest concurrency gate needs it, but separate mutex/condition/once support from process self-spawn/join and size each to demonstrated requirements. Otherwise pin a no-thread configuration as the plan's stated alternative.
+
+5. **Hashing provider identities over only the v2 COMMON section makes dependency verification unsound.**
+
+   The new identity design excludes the language section from provider digests (`docs/todo/P02M0135.md:275-282`). A provider can therefore change compiler, linker, flags, sysroot, configure digest, Rust features, or rustflags without changing the digest embedded in its consumers, even though those inputs can change ABI and code generation. This weakens the current contract: build, packaging, and ProcessService hash and compare the complete canonical provider record (`src/tools/build-shared.sh:1267-1296`; `src/tools/mkpackages/src/main.rs:771-805`; `src/user/services/core/src/process_service.rs:139-168,193-218`).
+
+   Stale consumers and cache entries can pass after an ABI-affecting provider rebuild. Cross-language consumers need not parse the language section to hash it: define provider identity as the digest of the complete canonical v2 record (or a separate ABI digest that covers every ABI-affecting producer field), and add mutations of compiler, flags, sysroot, configuration, and features proving provider edges and cache keys invalidate.
+
+6. **The audit-link correction is internally contradictory and does not gate the real audit artifact with the existing ELF checks.**
+
+   The plan calls the input “COMPILE-ONLY” and says it is never linked (`docs/todo/P02M0135.md:32-35`), then requires an audit link and final ELF (`:37-57,122-131`), while the deferred list again postpones the “FINAL-LINK closure” (`:389-390`). Variant B and the Done gate refer to a “final linked and staged ELF” (`:231-238,342-343`) even though the audit ELF is explicitly discarded and never staged (`:53-54,107-108,122-124`). Finally, the existing relocation, W^X, identity, provider, and export checks are required only for a synthetic foreign artifact (`:348-354`), not the audit-linked Vulkan-Loader ELF.
+
+   The milestone can close with a substrate surface derived from an artifact that the later importer immediately rejects, and removing/adding symbols after the one audit link can itself change archive/weak selection without a convergence relink. Use one term—an audit-linked, discarded ELF—and require strict no-host-default/no-unresolved links until the exact substrate surface converges on all targets. Scan that same discarded ELF for the chosen TLS variant and run it through the generic relocation, W^X, dynamic-metadata, identity/provider, and export-collision checks without installing it. Defer only packaging and production import, not the link that defines this milestone's own surface.

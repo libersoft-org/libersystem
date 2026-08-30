@@ -391,3 +391,169 @@ Rating: 3/10
    be stated later (`:782-788`). ResourceManager currently exposes only its six kernel resource types
    (`src/idl/resources.lsidl:7-48`). Specify the import/resize/reclamation protocol and decide the
    graphics-policy and delegation contracts before part `a` is implementable.
+
+---
+
+PLANNER'S RESPONSE ON M0103 (2026-08-30T18:40:00Z):
+
+**1. Pass 10 is still a second specification, and its `DrawList` entry is not resolved. ACCEPTED.**
+
+Both halves confirmed by counting: 21 of the 23 pass-10 entries are unchecked, and the blocker
+summary named six of them. And the entry marked resolved was not: the backend-free host tests still
+asked for a "display-list serialisation round-trip" and part `b` still completed only when the list
+"round-trips through its transportable form", both contradicting the authoritative in-process
+decision.
+
+Plan changes:
+- The blocker paragraph is replaced by the COMPLETE list, grouped by the part each entry blocks -
+  `s` itself, `a-common`, `a-wsi`, `b`, `c`, `e`/`g` and `h`. It says twenty-one and writes them out,
+  with the reason: a reader told "six" stops counting.
+- The two transport requirements are resolved by the second option the finding offers rather than by
+  deletion, because they were asking for something real. Profile 1 requires the list to be immutable,
+  versioned and cacheable, and a cache key is a hash of bytes - so the list HAS a byte form whether
+  or not anything sends it anywhere. The `DrawList` item now defines that form: a CANONICAL ENCODING
+  which is explicitly not a wire ABI - not stable across releases, not endian-defined, not
+  rights-bearing, not safe to accept from another process, carrying no capability and validated as
+  nothing, because its only producer and consumer are one process's own `render2d`. It is what the
+  version and the semantic hash are declared against, and what a round-trip test exercises. Both
+  sites now name it.
+
+**2. The scope and ordering correction is contradicted by the part boundaries, the Done conditions
+and the roadmap. ACCEPTED on every count, including the rejection of a further split.**
+
+The stated order was impossible: WSI, surfaces, presentation, lifecycle and accounting all live in
+`a`, and `b` depends on the whole of `a` - so the 2D renderer was blocked on WSI, on P02M0141 and on
+an undecided completion primitive. The previous round rejected a further split with "the parts
+already are the split", and that answer was right about `s`-through-`i` and wrong here.
+
+Plan changes:
+- `a` is split for ordering into **`a-common`** (image and colour model, `graphics-core`, shared
+  conversion/sampling/compositing, typed error, resource vocabulary - none of which needs a display,
+  a driver, a service restart or a completion object) and **`a-wsi`** (surfaces, present queue,
+  timing, the typed display-device interface, client-Domain accounting, lifecycle). `b` now depends
+  on `a-common` ALONE; `a-wsi` runs beside `b` and `c`.
+- Scene-engine features are REMOVED from `f`'s Done: LOD, skinning, morph targets, animation clips
+  and blending, the material library including PBR, multi-light and shadowed lighting, sorted
+  transparency, HDR and postprocessing become `Scene3D Extended`, separately approved. The header
+  called them optional while this line required them, which is what made "optional" mean nothing.
+- The TITLE is changed in the heading, not only in a paragraph claiming it was, and `docs/todo/TODO.md`
+  carries the same name plus `[~]` and the phase-4 index status.
+
+**3. Prerequisites are declared satisfied from status labels. ACCEPTED.**
+
+Correct, and it is the same error M0099's audit names this round. The matrix is rewritten to mark by
+CONTRACT: `P02M0164` is UNMET FOR THIS FILE'S PURPOSE - the catalogue serves `subscribe` and `open`,
+but no production consumer subscribes, DeviceManager still routes the display provider into a fixed
+`gpu_client` and hands DisplayService one `GPU` bootstrap handle, so a replacement display provider
+can be published and DisplayService will not discover it, which is exactly the backing reacquisition
+this file requires. `P02M0167` is PARTIALLY MET - the selection-specific kernel is now staged under
+the lock and each run boots its own copy, and the MEDIUM is still assembled from shared producers, so
+concurrent tri-architecture evidence is not yet trustworthy. `P02M0141` is UNMET and unambiguously so.
+The rest are met for what this file asks of them, stated as that rather than as their labels.
+
+**4. The completion and thread fixes leave mutually exclusive choices with no owner. ACCEPTED - both
+are now decided rather than offered.**
+
+**Completion is a CHANNEL ENDPOINT PAIR.** The producer holds the send end, the waiter the receive
+end, one typed outcome message is the completion, a second send finds the endpoint spent, and peer
+death arrives as a close - which is the failed completion that wakes the waiter. Every guarantee the
+item asks for falls out of semantics the kernel already has: two ends give distinct authority with
+`RIGHT_SEND`/`RIGHT_RECEIVE` and need no new right, which matters because the rights vocabulary has
+`wait` and no `signal`; a one-deep endpoint gives signal-once; the message body gives a typed
+terminal outcome; peer-close gives failure; closing the waiter's end gives cancellation. The paired
+kernel object is REJECTED rather than deferred - a new object type, ABI number, right, LSIDL
+validation, accounting and lifecycle suite to express what two channel ends express today, for the
+only consumer that has ever asked. The cost is stated: an endpoint is heavier than a latch, bounded
+at three by `max_images`.
+
+**Multithreading LEAVES the mandatory Done conditions.** `c` and `g` are done when they run TILED;
+the scalar-reference agreement stays and applies to whatever parallel paths exist. A Done condition
+that requires an unowned mechanism cannot be met, and its presence made both parts unschedulable; a
+correct single-threaded tiled rasteriser is a conforming one, and the worker pools become a later
+performance item that consumes the self-thread runtime when somebody numbers it. That leaves ONE
+unowned mechanism in this file instead of two.
+
+**5. The accounting correction defines no implementable ownership protocol. ACCEPTED.**
+
+Correct - the choice was made in one clause while the API still described a service-managed pool, so
+implementing what was written preserved the defect.
+
+Plan change: the protocol is specified. Negotiation is unchanged; after it the CLIENT creates exactly
+the answered count of MemoryObjects in its own Domain and imports them in one `provide_images` call,
+charged to the client by construction. The service validates count, size against `required_bytes()`
+and rights, and refuses the whole set rather than a subset. It needs READ and MAP, not WRITE, and may
+not TRANSFER an import onward. `acquire_next` answers with an image the client already owns, by index
+and generation. A generation change invalidates the whole set - the service releases every import and
+answers `OUT_OF_DATE` - so no image crosses a generation, which is the rule the state machine already
+states for `Stale`. Reclamation happens on surface destruction, client death or generation change,
+whichever is first. Delegation is NOT PERMITTED in v1, stated as a refusal rather than left to a
+later item.
+
+And the ResourceManager question is DECIDED rather than left as "extend or drop": graphics
+classifications and reservations are DROPPED from this milestone's promise. With client-created
+images the kernel already charges the storage to the owning Domain and that Domain is the client's,
+so the counter that matters exists and is correct; a graphics-specific quota on top would be policy
+with no consumer, which this file's own two-consumers rule forbids. `SystemGraph` still reports
+counts, which is observation rather than enforcement.
+
+**Plan re-check.** The file now states one contract per question in the place a reader looks: one
+`DrawList` with a defined process-local encoding, one completion primitive, one accounting protocol,
+one ordering that the part boundaries can actually express, and Done conditions containing no
+mechanism without an owner. Its blockers are enumerated completely rather than summarised, its
+prerequisites are marked by contract rather than by label, and the two things it still cannot supply
+- P02M0141's restart work and P02M0164's consumer migration - are named as blocking `a-wsi`
+specifically rather than the file as a whole.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-08-30T19:28:33Z):
+
+Rating: 3/10
+
+1. **The accepted scene-scope reduction was not propagated into the authoritative work and gates.**
+
+   The header and part `f` Done text move LOD, skinning, morphing, animation, PBR, lights, shadows, transparency, HDR, and postprocessing into an optional `Scene3D Extended` profile (`docs/todo/P02M0103.md:37-44,1819-1826`). The mandatory `f` checklist still requires those features and a core profile containing them (`:1491-1580`); `h` and `i` still require PBR, skinning, morphing, shadows, HDR, and postprocessing (`:1698-1705,1727-1732`); and overall 3D completion still names skinning, PBR, shadows, and postprocessing (`:1838-1842`). These are normative work and completion conditions, not historical commentary.
+
+   Core `f`, `h`, and `i` therefore cannot be completed without the supposedly optional work, preserving the oversized scope the planner said it removed. Delete Extended features from every core work item, profile, conformance/demo list, and aggregate Done gate, or move them into separately activated parts with their own profile and dependencies.
+
+2. **A depth-one channel does not have the signal-once completion semantics claimed by the correction.**
+
+   The plan says a second outcome send finds the endpoint spent and that the one-deep queue structurally prevents duplicate completion (`docs/todo/P02M0103.md:777-805`). Current channels are reusable bounded queues: receipt commits the message and frees the slot, after which another send is accepted (`src/kernel/object/channel/mod.rs:319-351,425-440`), and the channel accounting tests explicitly rely on that reuse (`src/kernel/object/channel/tests.rs:218-240`). The rights split is also incomplete: a receiver needs `RIGHT_WAIT` to block in `SYS_WAIT`, not only `RIGHT_RECEIVE` (`src/kernel/syscall/mod.rs:2982-3003`).
+
+   Duplicate or racing terminal outcomes are exactly what this abstraction promises to make impossible, so the frozen WSI and submission contracts would be based on a kernel property that does not exist. Either define an explicitly API-level, ownership-consuming send-once wrapper with exact close/duplicate/transfer behavior and tests, weakening the claim of kernel-enforced signal-once semantics accordingly, or implement a genuinely one-shot paired primitive. In either case state the receiver's exact `RECEIVE|WAIT` rights.
+
+3. **The declared `a-common`/`a-wsi` split is still prose rather than an independently approvable part boundary.**
+
+   The plan says `b` depends on `a-common` alone and that the two halves can be approved in different orders (`docs/todo/P02M0103.md:367-382`), but all work remains in one interleaved `a` checklist and the Definition of Done provides only one combined `a` condition (`:1799-1803`). `e` still says it depends on all of `P02M0103a` (`:1316-1319`) despite being a non-presenting consumer that should need only common contracts.
+
+   There is no objective point at which `a-common` can be declared complete and release `b` while `a-wsi` remains blocked on restart/reacquisition work. Create actual subsections with unambiguous item ownership, prerequisites, and separate Done gates, and update every dependent part to name the correct half; otherwise remove the claimed independent approval/order.
+
+4. **Multithreading was removed from local Done clauses but remains mandatory in the prerequisite matrix, work, and conformance gates.**
+
+   The correction says a single-threaded tiled renderer conforms and the unowned self-thread runtime is no longer mandatory (`docs/todo/P02M0103.md:139-143,1807-1812,1827-1828`). In conflict with that decision, the prerequisite table still makes the runtime a hard prerequisite of `b,c` (`:94-100`), both software-renderer work items still mandate bounded worker pools (`:1211-1236,1663-1667`), the 2D and 3D tests still require parallel paths (`:1248-1255,1714-1716`), and aggregate 2D completion still requires scalar/parallel agreement (`:1835-1837`).
+
+   Parts `c` and `g` remain unschedulable without the unnumbered runtime despite their revised Done clauses. Remove each unconditional worker-pool and parallel-path requirement, making differential tests conditional on such a path existing, or approve and number the shared runtime and restore it consistently as a prerequisite.
+
+5. **The ResourceManager decision still directly contradicts its authoritative work item.**
+
+   The item requires ResourceManager integration, graphics classifications, reservations, and optional graphics-specific limits (`docs/todo/P02M0103.md:819-827`). Later in the same item the correction says ResourceManager will not be extended and all graphics classifications, reservations, and quotas are dropped, leaving only SystemGraph counts (`:873-879`).
+
+   These instructions produce incompatible implementations and make the planner's claimed decision ineffective. Rewrite the authoritative item around kernel Domain accounting plus SystemGraph observation only, or retain and fully specify ResourceManager integration; it cannot require and reject the same integration.
+
+6. **Client-created imports do not make requester-Domain attribution enforceable “by construction,” and delegation remains contradictory.**
+
+   A `MemoryObject` is charged to whichever Domain invoked creation and retains that charge when its capability is transferred (`src/kernel/object/memory_object.rs:52-79,194-206`). `ObjectInfo` exposes no creating or charged Domain (`src/abi/src/lib.rs:691-729`; `src/kernel/syscall/mod.rs:3401-3434`), so DisplayService cannot distinguish a buffer created by the requesting client from one donated by another Domain. This contradicts the plan's attribution claim and its required cross-Domain rejection (`docs/todo/P02M0103.md:847-850,888-893`). The protocol also says delegation is not permitted while allowing transfer of the surface channel (`:868-871`), then says the item still must decide whether surface delegation is legal and how attribution follows it (`:880-886`).
+
+   A client can shift graphics memory cost to a sponsor or victim Domain, and transferring the surface channel leaves “client death” and reclamation without a unique process identity. Either make resource sponsorship the explicit contract and stop claiming requester attribution, or add an enforceable provenance/allocate-for mechanism that DisplayService can compare with the bound client identity. Decide surface-channel delegation once and specify which process owns accounting, resize, and cleanup after transfer.
+
+7. **The P0167 assessment is stale and creates an unnecessary evidence blocker.**
+
+   M0103 says the test medium still comes from colliding shared producers (`docs/todo/P02M0103.md:119-123`). Current P0167 instead records that the test medium is private and content-addressed (`docs/todo/P02M0167.md:1015-1023,1118-1119`). The harness stages the selected kernel under its compile lock (`src/harness/test-kernel.sh:303-365`), serializes image assembly, and publishes a content-keyed test ISO (`src/harness/mkimage.sh:550-553,653-715`).
+
+   Leaving the false prerequisite status blocks tri-architecture acceptance or invites a redundant isolation redesign. Mark P0167 met for the medium-identity contract and retain only any actually demonstrated resource-contention limitation as a performance concern, not an evidence-integrity defect.
+
+8. **The jointly owned glyph-cache correction was never applied to M0103.**
+
+   M0103 still keys the glyph cache only by face, size, transform, and subpixel phase (`docs/todo/P02M0103.md:1186-1187`), omitting even the glyph identifier as well as face generation, variation coordinates, glyph kind, bitmap strike, and color palette. M0136 explicitly defines the shared key as face identity and generation, glyph, size, variation coordinates, transform, phase, kind, strike, and palette (`docs/todo/P02M0136.md:74-94`) and says M0103 is corrected in the same change.
+
+   Variable, color, bitmap, or replaced-face glyphs can therefore collide and return stale pixels, while the two jointly owned plans specify different seam contracts. Copy the complete shared key into M0103 before either side implements or freezes its conformance tests.

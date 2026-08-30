@@ -38,3 +38,98 @@ The audit-only boundary is appropriate, and the plan correctly avoids treating `
 
    **Correction:** Use P02M0099 attachment only for safe-encapsulation opportunities or necessary boundaries that genuinely belong to planned family work. Give every confirmed current-product unsoundness or material defect its own bounded corrective item, severity, owner, and disposition identifier, while keeping M0176 itself audit-only.
 
+
+PLANNER'S RESPONSE ON M0176 (2026-08-30T19:36:07Z):
+
+All four findings are accepted. Every configuration claim was checked against the build scripts and
+the canonical manifest rather than against the label.
+
+**1. The named configuration matrix does not identify the artifact configurations the project ships
+- ACCEPTED.**
+
+Confirmed, and the "release kernel" reading would have been wrong in the direction that OMITS
+shipped code. `build.sh:step_kernel` runs `cargo build $flag` with NO `--release`, and
+`step_volume` stages from `.build/cargo/kernel/<triple>/debug/kernel`. So the shipping kernel is
+Cargo's dev profile, and `#[cfg(debug_assertions)]` code IS in it - `kernel/mem/frame/mod.rs`
+alone has five such sites in the allocator. `step_user` is likewise `cargo build $flag
+$(dev_features)` with no `--release`. Shared images are a materially different configuration:
+`build-shared.sh` uses `--release`, `--no-default-features --features shared-image`, a custom
+target with `-Z build-std=core,alloc,compiler_builtins`, its own RUSTFLAGS and a separate linking
+pipeline, which selects different runtime linkage, allocation, raw-memory and assembly boundaries in
+the same source.
+
+Plan change: a new section, "The configuration matrix is derived, not named", records each of those
+facts with its source, and M1 now DERIVES the matrix from the build scripts, Cargo metadata and the
+canonical manifest rather than naming it - per row: shipped artifact roots, target triple or spec,
+Cargo profile, exact default and explicit features, build-std and Rust flags, relevant environment
+and the pinned compiler. The kernel is named accurately as the shipping non-test dev-profile
+configuration, and shipping, development-only and test-only closures stay separate. "What this
+milestone refuses" gained a line saying the matrix records what ships and does not propose changing a
+build profile to make itself tidier.
+
+**2. The shipped WebAssembly component is missing from production userspace - ACCEPTED.**
+
+Confirmed as a real third shipped executable shape, not a variant of the other two.
+`build.sh:step_sdk` builds `--release --target wasm32-unknown-unknown --workspace` with default
+features and calls that "THE SHIPPING BUILD, and the one the image stages"; the canonical manifest
+stages it at `components/liber_component/app.wasm` (`manifest.toml:1606`). The separate
+`dev-diagnostics` build goes to its own target directory and is a different row. Its closure carries
+unsafe host imports and linkage attributes, so the audit could have satisfied its literal static and
+shared matrix while missing a shipped unsafe boundary and still claiming complete production
+coverage.
+
+Plan change: M1's coverage list now includes the shipping WASM component and its in-tree SDK closure
+as their own matrix row, with `dev-diagnostics` classified as development evidence. M3's cohort
+list gained the SDK/component cohort and requires the boundary to be audited on BOTH sides - the
+guest's host imports and linkage attributes, and the interpreter's side of the same contract - since
+one side alone does not establish the invariant. The Definition of done names the component
+explicitly.
+
+**3. "Syntax-aware inventory" is not a reproducible completeness mechanism - ACCEPTED.**
+
+Confirmed, including the two mechanisms that make it hard here: services and DeviceManager pull in
+generated code through `include!(concat!(env!("OUT_DIR"), ...))` - ten such sites in the services
+crate alone - and architecture-selected macros emit `global_asm!`. A source parser counts disabled
+branches and macro definitions and cannot decide artifact reachability; expanded output loses source
+provenance. And M4 gave the companion inventory no path, format, schema, stable identifier or
+regeneration command, which is what made "every discovered site is represented" circular rather than
+a completeness test.
+
+Plan change: M1 now specifies the MECHANISM - a toolchain-pinned pipeline starting from the artifact
+matrix, capturing build-script output and macro- and cfg-expanded code, reconciling it back to
+source-level sites, and recording the commands, tool versions and digests it used - with the two
+in-tree mechanisms named as the reason that reconciliation is required. M4 requires the inventory to
+be a machine-readable file at a fixed path with a fixed schema and regeneration command: stable site
+and group IDs, source or generator provenance, artifact and configuration reachability, boundary
+category, owner and disposition. It adds completeness fixtures for a cfg-only, macro-produced,
+generated, in-tree dependency and test-only site, so a missing CLASS of site is mechanically
+detectable rather than a matter of care.
+
+**4. Routing driver findings to P02M0099 contradicts the requirement for bounded owners - ACCEPTED.**
+
+Confirmed against P02M0099's own text: "THIS DEBT BELONGS TO THE FAMILIES IT TOUCHES, NOT TO THE
+MILESTONE AS A WHOLE. It is not in the ordering above and it is not in the Definition of done", and
+each finding "is closed when that family's next item is". That deferral is correct for what it was
+written about - sixteen driver findings should not gate forty new driver items - but it means a
+CONFIRMED soundness defect in currently shipped code, routed there, is deferred indefinitely while
+this audit still reports it as owned. That is a disposition wearing the word "owned", and it
+contradicts M4's own requirement for narrowly scoped corrective milestones.
+
+Plan change: M4 now routes by SEVERITY rather than by subject area. A safe-encapsulation opportunity
+or a boundary that genuinely belongs to planned family work may be attached to its P02M0099 family
+item; a confirmed unsoundness or material defect in shipped code may not, and the reason - quoted
+from P02M0099 - is written into the plan so the next reader does not have to go and find it. Every
+such finding gets its own narrowly scoped corrective item with a severity, an owner and a disposition
+identifier. The audit-only boundary is preserved: this milestone still edits no production code.
+"Dependencies and ordering" now says P02M0099 receives only the dispositions M4 permits it to
+receive, and the Definition of done states that nothing material is parked on an umbrella that defers
+it indefinitely.
+
+**Plan re-check.** The item count is unchanged at four - all four corrections belong inside existing
+items - and the audit-only scope is untouched. The plan is longer in one place only: the derived
+matrix section, which exists because the enumeration is the completeness claim and getting it from a
+label rather than from the build scripts is how this audit would have been wrong without anyone being
+able to tell. Ordering is unchanged: M1 (matrix and inventory mechanism) -> M2 and M3 (the two
+audits, independent of each other) -> M4 (publication and routing). The Definition of done was
+rewritten so each clause names something falsifiable: the derived matrix including the three shipped
+shapes, the completeness fixtures, and the severity-based routing. No source code was modified.

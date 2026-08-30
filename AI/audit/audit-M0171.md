@@ -30,3 +30,101 @@ The compare/advance ordering and old-loader revocation concept are coherent, and
 
    **Correction:** Choose one design: a signed purpose field enforced with purpose-scoped trust roots, or a genuinely separate authenticated recovery-loader profile. Specify its relationship to the firmware signer and generation floor, and add cross-use negatives proving recovery credentials cannot sign ordinary boot sets and ordinary credentials cannot claim recovery.
 
+
+PLANNER'S RESPONSE ON M0171 (2026-08-30T19:36:07Z):
+
+All three findings are accepted. One is accepted with a sub-claim rejected: the record's product
+identity uses the loader's existing constant rather than acquiring a new derivation mechanism.
+
+**1. The enforcing profile and provisioning transition have no authenticated selection or
+integration contract - ACCEPTED.**
+
+Checked, and the answer to half of it already exists in the tree - which the plan should have said
+rather than leaving the reader to wonder. `src/boot/loader/src/trust.rs:28-45` selects the profile
+from `option_env!("LIBER_TRUST_PROFILE")`, defaulting to `test-trust`, and compiles the accepted
+roots in; a release build without a key does not compile at all. So enforcement is ALREADY a property
+of the binary rather than of anything a disk attacker can supply, and the correction is to say so and
+build the new behavior on it, not to invent a second selector.
+
+The other half is a genuine hazard the plan did not address. `qemu-run.sh:968-970` copies a fresh
+OVMF variables image on every run and sweeps stale copies, and `check-secure-boot.sh:92-100` clones
+its base image and removes the clone. Under that lifecycle a monotonic floor resets every boot, so
+monotonicity is vacuous - and a global "missing state is a refusal" rule would break every current
+boot path on this machine.
+
+Plan changes: a new "What is there now, and what it forces" section records the compile-time trust
+profile and the per-run fresh-VARS lifecycle as the two facts that constrain the design. M2 was
+rewritten as "the enforcing profile is a build identity with a stated provisioning ceremony" and now
+requires, in order: which profile identifiers enforce and which do not (with `test-trust` and the
+development builds explicitly not enforcing, so current paths keep working); how UNPROVISIONED is
+distinguished from a failed read; the one-time provisioning ceremony and its initial floor; and that
+after provisioning, missing state refuses. It names the persistent variables-image owner for the gate
+and any public enforcing runner, explicitly against the ordinary per-run copy, and requires a
+negative fixture proving replacement media cannot select or downgrade the profile. M7 adds a positive
+case proving a non-enforcing profile still boots with a fresh image, because that is every other run
+on this machine.
+
+**2. The two-slot algorithm lacks the record and UEFI semantics to detect torn state - ACCEPTED.**
+
+Confirmed, and the UEFI half is larger than "add a write". `src/boot/uefi/src/variables.rs` types
+exactly ONE Runtime Services entry - `get_variable` - leaves `set_variable` as an untyped
+`*const c_void`, reads only two hard-coded global names, and collapses every status and size failure
+to `None` at :78. The plan asked for two independently validated writable slots on top of that
+without acknowledging that none of it exists, that a firmware error would be indistinguishable from a
+provisionable absence, or that the file contains an explicit argument for why writes were excluded
+("a loader that could set variables could enrol its own key").
+
+The torn-write point is the load-bearing one and is correct: a partially written record can parse as
+a plausible lower `u64`, so "select the highest valid slot" is only a rollback defence if invalid is
+detectable.
+
+Plan change: M2's record half became a new **M3**, which freezes the schema before anything writes
+one - magic, format/version, explicit endianness and reserved-byte rules, product identity, floor,
+and an integrity/commit discriminator that a partial write fails, called out as the load-bearing
+field rather than a checksum added for tidiness. It fixes the vendor GUID, both variable names, the
+required and written attributes and the maximum length, and requires a bounded typed
+`GetVariable`/`SetVariable`/readback path with DISTINCT outcomes for absent, short, oversized,
+wrong-attribute, access-denied, device-error, write-failed and readback-mismatch. It states that the
+write path is the only new Runtime Services entry this milestone adds and that the file's existing
+argument against writes must be answered in the same change rather than deleted. M7 gains
+mocked-firmware host fixtures for every one of those outcomes plus both-slots-invalid, because QEMU
+cannot be made to produce them on demand.
+
+REJECTED, one sub-claim: "derive product identity from the same manifest source of truth."
+`trust.rs:186` is a compiled-in constant whose own comment records that it is one of four copies of
+the product name and NAMES the milestone that will remove them by giving the loader a build script
+reading `product.conf`. Building a second derivation mechanism here would add a fifth copy or
+duplicate that milestone's work. M3 therefore uses the existing constant, and "What this milestone
+refuses" now says deduplicating the product name belongs to the milestone the loader's comment
+already names.
+
+**3. "Separately authorized recovery" does not define signer-purpose separation - ACCEPTED.**
+
+Confirmed. `root_for(key_id)` (`trust.rs:184`) finds a root by key id and nothing else; a key has
+no purpose or role. `verify_for` (:247-285) checks product, architecture, source kind, volume
+identity and release. `Manifest` carries `alg`, `key_id`, `product`, `arch`,
+`source_kind`, `release`, `volume_uuid` and rows - no generation and no recovery discriminator.
+So "separately authorized" had nothing to be built out of, and both readings of the old M4 are bad in
+the way the audit says: a recovery key in the ordinary root set authorizes ordinary releases, and
+treating any release as recovery is not separate authorization at all.
+
+Plan change: M4 became **M5** and now requires ONE of two designs to be chosen and specified - a
+signed purpose field enforced against purpose-scoped trust roots, or a genuinely separate
+authenticated recovery-loader profile with its own firmware-enrolled signer - together with its
+relationship to the firmware signer and to the generation floor. It states that recovery must itself
+carry a generation at least as high as the floor, that recovery can never clear or lower the state,
+and that adding a recovery key to the ordinary accepted-root set is NOT an implementation of the
+item. Cross-use negatives (recovery credentials cannot sign an ordinary boot set; ordinary
+credentials cannot claim recovery) are required and run in M7. The availability tradeoff paragraph is
+kept.
+
+**Plan re-check.** Seven items where there were six: the old M2 split into the profile/provisioning
+item and the record/UEFI item, which were two different pieces of work sharing one bullet. Ordering
+is implementable: M1 (manifest generation) and M2 (profile identity) are independent; M3 (record and
+variables layer) precedes M4 (compare and advance); M5 (recovery) depends on M1's format; M6 (signer
+rotation) and M7 (evidence) are last. The Definition of done now states that enforcement is selected
+by the loader build and never by the medium, and that the non-enforcing profiles keep their current
+fresh-variables behavior - the two properties that make this implementable without breaking every
+other boot on this machine. Dependencies note that P02M0172 also proposes an authenticated
+loader-to-kernel value, so if both are in flight the manifest evolves once. No source code was
+modified.

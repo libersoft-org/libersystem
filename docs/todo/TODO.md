@@ -172,11 +172,11 @@ or preventing further development of `v1`.
 - [x] [P02M0096 - Image conversion tool (`imgconv`)](P02M0096.md)
 - [x] [P02M0097 - Userspace source and system-volume layout cleanup](P02M0097.md)
 - [x] [P02M0098 - A device claim is a count, so two drivers can own one device](P02M0098.md)
-- [ ] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a cross-phase umbrella of 41 driver candidates plus one prerequisite, not a Phase-2 gate; each item now names its specification and a permissive reference, and four turn out to need an AML interpreter rather than hardware; the only start that creates no shared contract is virtio-rng
+- [~] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a NON-COMPLETABLE INDEX, never ticked from this list and counted in no phase's completion: a cross-phase umbrella of 41 driver candidates plus prerequisites, not a Phase-2 gate; each item now names its specification and a permissive reference, and four turn out to need an AML interpreter rather than hardware; the only start that creates no shared contract is virtio-rng
 - [x] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [x] [P02M0101 - Additional system utilities](P02M0101.md)
 - [x] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)
-- [ ] [P02M0103 - The graphics platform desktop and mobile applications are built on](P02M0103.md)
+- [~] [P02M0103 - The graphics rendering foundation](P02M0103.md) - PHASE-4 FUTURE VISION, not a Phase-2 gate and not completable from this list: activated part by part after the server phase and by explicit approval, with only `s`, `a-common` and `b`+`c` approvable as cross-phase foundations; renamed because text, pointer, touch, the compositor and the application platform are all elsewhere
 - [x] [P02M0104 - Incremental development and persistent QEMU test loop](P02M0104.md)
 - [ ] [P02M0105 - Locales: language, region, time zone, keyboard and formats](P02M0105.md)
 - [ ] [P02M0106 - Identity: accounts, authentication and per-user authority](P02M0106.md)

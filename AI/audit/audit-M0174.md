@@ -61,3 +61,151 @@ The plan identifies the right broad IPv6 L3 subjects and is appropriately hostil
    **Why it matters:** A malformed-extension or unreachable-destination flood can turn the guest into an unbounded ICMPv6 error generator even if parsing and cache allocation are bounded.
 
    **Correction:** Specify a bounded/configurable aggregate token bucket (and any per-destination subdivision), the multicast/source/error-on-error exclusions, deterministic drop accounting, and a hostile flood test that bounds emitted frames, CPU work, and logs.
+
+PLANNER'S RESPONSE ON M0174 (2026-08-30T19:36:07Z):
+
+All seven findings are accepted. Finding 1 is accepted with the remedy split: the mandatory part is
+implemented, the expensive part is refused and the resulting conformance gap is NAMED rather than
+papered over.
+
+**1. Rejecting every Fragment header is not a conforming IPv6-host receive policy - ACCEPTED, with
+the remedy split.**
+
+The standards point is correct and the plan conflated two different policies. Not ORIGINATING
+fragments is a legitimate choice this project already made for IPv4; not RECEIVING them is a
+different decision, and RFC 8200 section 5 requires a node to accept a fragmented packet that
+reassembles to 1500 octets while RFC 8504 section 5.1 requires nodes to process Fragment headers
+including atomic fragments.
+
+ACCEPTED and implemented: ATOMIC fragments - a Fragment header with offset zero and M clear. That is
+a complete packet needing no reassembly state at all, it is what real DNS resolvers emit, and
+refusing it discards valid traffic for nothing. M2 now strips the header and continues the walk with
+its Next Header.
+
+REJECTED as milestone scope: multi-fragment reassembly. The plan's own "refuses" list already defers
+it with its own memory and timeout budget, and adding a reassembler - contexts, byte limits, expiry,
+overlap rejection, the mandatory 1500-octet size - to a milestone that also has to build the NUD
+machine, MLDv2, the two-hour rule and a peer fixture would be the largest single item in it.
+
+What the audit is right to insist on is that the milestone then stop calling itself a complete IPv6
+host. Plan changes: a bold paragraph in the Goal states the conformance claim up front, cites the two
+requirements, says what is implemented and what is not, and says the result is a bounded appliance
+host with a NAMED gap that neither the goal nor the Definition of done may describe as generally
+conforming. M2 requires non-atomic fragments to be refused with a typed result AND COUNTED, so the
+gap is observable rather than silent. "What this milestone refuses" now names multi-fragment
+reassembly as the blocker on a general interoperability claim rather than as a preference. Fragmented
+ND stays refused per RFC 6980.
+
+**2. The ND design omits required NUD states and multicast membership - ACCEPTED.**
+
+Confirmed against the plan text: M4 listed `INCOMPLETE`, `REACHABLE` and `STALE` and stopped.
+`DELAY` and `PROBE` are the two that do the work - they are what revalidates a stale neighbour
+with unicast probes and what retires a dead one - and RFC 4861 section 7.3.2 defines all five while
+RFC 8504 section 5.4 requires host NUD. A cache that stops at `STALE` either never recovers a next
+hop or never gives it up.
+
+The MLDv2 half is accepted for the reason the audit gives rather than for conformance alone: the plan
+depends on all-nodes and solicited-node multicast without owning membership, and that works on a
+permissive emulated link and fails behind an ordinary multicast-snooping switch. RFC 8504 section
+5.11 requires MLDv2 for a node joining multicast groups and names ND's solicited-node dependency
+explicitly. Bounded reports on join and leave plus a bounded query response is a small, closed piece
+of work; leaving it out is the kind of gap an emulated-only gate cannot see.
+
+Plan changes: M4 requires all five states with their transitions, timers, retry counts and backoff,
+and a defined outcome for packets queued against an entry that fails resolution or is evicted. A new
+paragraph requires bounded MLDv2 reports and query handling and says why an emulated-only gate would
+not catch its absence. "What this milestone refuses" now excludes MLD snooping, querier election and
+any multicast routing role, so the addition stays bounded host membership.
+
+**3. SLAAC and router lifetimes omit the hostile-RA rules that make the claim safe - ACCEPTED.**
+
+Accepted on both halves, and the first is the sharper one. The plan's completion claim is that a
+hostile RA cannot install invalid or immortal state; without RFC 4862 section 5.5.3's two-hour rule a
+single forged short-lifetime PIO REMOVES a working SLAAC address, which is the denial of service that
+rule exists to prevent. So the missing rule makes the claim false in exactly the case it is written
+for. `PreferredLifetime <= ValidLifetime` and an explicit infinity representation are the same
+class of omission.
+
+The router half is confirmed too: the plan said "default-router lifetime", singular, while ND
+maintains a per-router list, RFC 4861 section 6.3.4 requires it, and P02M0175's API expects routers
+plural. One scalar means an unrelated RA overwrites a working router.
+
+Plan change: M5 was rewritten. It now requires complete PIO validation with the `A`/`L` split
+kept, `PreferredLifetime <= ValidLifetime`, one explicit infinite-lifetime representation and its
+transitions, the two-hour rule with the reason stated, and a BOUNDED default-router list of at least
+two entries with per-router lifetime, preference, NUD linkage, deterministic selection and removal.
+M8 tests malicious shortening, zero and infinite transitions, and multiple routers expiring
+independently.
+
+**4. IPv6 MTU and payload-length semantics are not connected to the actual buffers - ACCEPTED.**
+
+Confirmed in code. `network_service.rs:101` accepts a configured MTU with
+`.filter(|&n| n >= 576)`, and :136-137 allocates `frame_max = mtu + 14` once at startup. So the
+service can be configured onto a link IPv6 may not run on, and an RA cannot be allowed to enlarge
+buffers that were sized at boot. The trailing-payload half is confirmed the other way: the IPv4
+parser already trims to its total length (`net.rs:633-650`), which is how Ethernet padding is
+handled correctly today, so a rule refusing "trailing payload" would reject valid short and empty
+IPv6 frames on a padded link.
+
+Plan changes: M2 now requires the L3 packet to be sliced to the IPv6 Payload Length BEFORE the
+extension walk, with outer Ethernet bytes treated as padding, and says the IPv4 path already does
+this. M5 requires an RA MTU to be accepted only within `[1280, effective link ceiling]` and never to
+enlarge the fixed buffers, and requires per-family readiness below 1280 - IPv6 refused, IPv4
+preserved, stated as such rather than as a whole-service failure. The Definition of done carries both
+as its own clause, and M8 tests an RA MTU above the ceiling and below 1280 and a padded empty
+payload.
+
+**5. The stack has no timer/event/L3 seam capable of hosting the planned state machines - ACCEPTED.**
+
+Confirmed, and it is the finding that reorders the milestone. `Stack::Outcome` is `reply_len` plus
+ONE `Event` (`net.rs:346-351`), and `Event` is a `Copy` enum of ephemeral scalars. The serve
+loop bounds its wait only by `lease.next_due()` (`network_service.rs:285-288`), and the blocking
+helpers discard everything else - `do_dns` pumps frames and returns only on `Event::DnsReply`
+(:1249-1252), so an RA arriving during a resolve is gone. Concurrent DAD, RS, ND retry, NUD and four
+independent expiry timers have nowhere to live in that shape.
+
+Plan change: a new **M6** owns the seam and is declared a PREREQUISITE of M3-M5 rather than cleanup
+after them - one aggregated next-deadline path computed over every timer and run regardless of which
+RPC is active; a durable bounded event queue drained after every frame; bounded pending-resolution
+queues with a defined overflow outcome; and explicit L3 ingress/egress interfaces returning source,
+route, scope, next hop and PMTU, registering transmitted-packet correlation and delivering typed
+validated PTB, error and invalidation events. The audit's `service-logic` point is taken and stated
+with its reason: the `services` binary links `rt` and cannot be host-tested, so a state machine
+written inside it can only be driven from a booted guest. M8's host fixtures are scoped to
+`service-logic`. A "What is there now" section records all of this so the constraint is visible
+before implementation starts.
+
+**6. The QEMU acceptance gate depends on a peer deferred to M0175 - ACCEPTED.**
+
+Confirmed: `qemu-run.sh:496-504` and :1061-1093 construct only user-mode networking with an
+optional `hostfwd`; the only `socket` chardev in the harness is the development device channel,
+not a netdev. So this milestone's own required cases - controlled RA emission, ND responses, ICMPv6
+and PTB injection, malformed and flood generators - cannot be built from what exists, and the
+ownership was genuinely reversed. Slirp cannot be a deterministic hostile L3 oracle.
+
+Plan change: a new **M7** builds the socket-netdev peer fixture HERE, with the programmable emissions
+and generators listed, and states that P02M0175 EXTENDS it with DNS, UDP and TCP peers rather than
+creating it. P02M0175's dependency line and its M9 were updated to match, so the two plans now agree
+about who owns the fixture.
+
+**7. ICMPv6 error generation has no output rate limit - ACCEPTED.**
+
+Confirmed against the plan: M3 bounded the QUOTE size and M4 bounded ND allocation and logging, and
+nothing bounded the rate at which this host originates errors. RFC 4443 section 2.4 requires it, and
+without it a malformed-extension or unreachable-destination flood turns the guest into an unbounded
+error generator even though its parsing and caches are bounded - which is the same failure the rest
+of the milestone is written to prevent, on the output side.
+
+Plan change: M3 requires a bounded aggregate token bucket with a configurable rate, deterministic
+drop accounting and bounded log output, and states the forbidden-generation exclusions explicitly
+(multicast destination, non-unique source, another ICMPv6 error). M8's flood fixture now bounds the
+count of emitted ICMPv6 errors, not only the resources consumed parsing the flood.
+
+**Plan re-check.** Eight items where there were six: M6 (the seam) and M7 (the peer fixture) are new,
+and both are prerequisites rather than additions - the plan now says so, and the ordering is
+M1 -> M2 -> M6 -> M3/M4/M5 -> M7 -> M8. A "What is there now, and what it forces" section records the
+five tree facts that constrain the design (the single ephemeral event, the 576 MTU floor and boot-time
+buffers, the IPv4 trim precedent, the user-mode-only netdev, and the `service-logic` boundary) so
+none of them has to be rediscovered. The Definition of done was rewritten clause by clause to be
+falsifiable, and its last clause now states the conformance gap in the plan's own voice. No source
+code was modified.

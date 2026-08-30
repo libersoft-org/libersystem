@@ -61,3 +61,127 @@ The intended revision-bound release dossier is valuable, but the plan does not y
    **Why it matters:** A successful or failed release's evidence can disappear with the snapshot, or concurrent runs can overwrite a shared output. A report that cannot be retained independently is not a release dossier.
 
    **Correction:** Designate a durable output root outside the disposable worktree, publish into a run-ID directory atomically, keep incomplete/failure evidence with an explicit state, and make finalization immutable. Record both the audited snapshot identity and the publisher version.
+
+PLANNER'S RESPONSE ON M0170 (2026-08-30T19:36:07Z):
+
+All seven findings are accepted. One is accepted in part: its staging half is already implemented and
+its locking half is rejected as over-serialization that protects nothing.
+
+**1. M1 is stale and proposes a broader lock boundary than the fix requires - ACCEPTED IN PART.**
+
+The audit is right about the staging half. `src/harness/test-kernel.sh:317-360` already takes the
+same-architecture build lock, compiles with `--message-format=json`, reads the exact executable
+Cargo named for the `kernel` target, copies it to `kernel-test-$ARCH.$$.elf` while the lock is
+still held, and then invokes `qemu-run.sh` directly on that copy rather than letting `cargo test`
+re-resolve the shared target directory. Re-specifying that is duplication.
+
+REJECTED: the requirement to build the medium under the same lock. The ELF is already run-private
+once it is copied, and the medium is content-addressed from its complete inputs - so nothing between
+the lock and the boot can change what the medium is keyed on. Holding the global Cargo lock across
+media construction would serialize the slowest part of the run for no property.
+
+ACCEPTED and kept: what the current code does NOT do. The copy is an ordinary writable file, its
+digest is never computed, and nothing downstream is bound to it. Plan changes: a new "What is there
+now" section records the implemented staging so no future reader re-specifies it; M1 is reduced to
+the three things still missing - atomic publication, immutability, and a digest computed under the
+lock and named by every downstream step - and says explicitly not to extend the lock over media
+construction. M2 keeps the concurrency proof and its mutations are now aimed at the real bindings:
+remove staging, make the copy writable and replace it mid-run, drop the digest binding.
+
+**2. A clean release run has no step that builds the images its gates consume - ACCEPTED.**
+
+Confirmed. `verify.sh:run_full` is `./build.sh --arch all`, three `./test.sh` runs and
+`./check.sh`; nothing on that path runs `image.sh`. `check-secure-boot.sh:107` fails without
+`$BUILD/libersystem.iso`, and `check-qemu-virtio-iommu-x86_64.sh:71-88` requires the ISO AND a
+`.build-key` receipt that matches a key recomputed from this tree. So a genuinely fresh snapshot
+cannot run its own mandatory gates. The asymmetry the audit points out is real and worse than it
+sounds: the virtio-IOMMU gate catches a stale image by content, while the Secure Boot gate only
+checks that the file exists, so in a reused workspace it can pass against media built from another
+tree.
+
+Plan change: a new **M5** puts every shipping-image construction into the catalog as producer rows
+with their own keys, expresses the prerequisite edges from the gates that read them, and requires
+the run to pass run-private immutable paths and digests to those gates. A gate whose named input was
+not produced by this run is a failure, not a skip. M9 binds the digests into the dossier.
+
+**3. The catalog cannot express or independently protect the release set - ACCEPTED.**
+
+Confirmed. `catalog.rs:84-98`: a `Check` is `id`, `kind`, `covers`, `variants`,
+`command`, and nothing else. `UMBRELLA_GATES` are deliberately kept OUT of the catalog (:392) so
+nothing can select them, and the two `GuestFallback` rows carry no `covers` and are skipped by
+`select` (:456-457) because they stand in for tests rather than joining them. So deriving "every
+release obligation" from this catalog is not expressible today, and there is no data by which a
+required concrete profile differs from an umbrella or a fallback.
+
+Plan change: a new **M4** adds the fields and, more importantly, the independent invariants - a
+stable fully qualified key, a closed class, a release-required bit set from a declared class rather
+than per row, prerequisites, producers, artifact inputs and an evidence contract; validated against
+per-architecture and per-class cardinality checks that do not come from the catalog itself, so the
+same mutation cannot both shrink the work and shrink the expectation. A deleted or reclassified
+mandatory row must fail before execution.
+
+**4. No producer/collector protocol can create the promised dossier - ACCEPTED.**
+
+Confirmed, and the failure-erases-evidence half is the sharpest part. `check-qemu-arch-profiles.sh`
+does `work="$(mktemp -d)"; trap 'rm -rf "$work"' EXIT` and writes each profile's log inside it, so
+a gate that fails deletes the record of which phase failed. `verify.sh:run_one_step` writes status
+and duration only, and `record_one_step` records per-key outcome and seconds through the model -
+no artifact digests, no result paths, no run identity.
+
+Plan change: a new **M7** defines the envelope (run ID, exact key, identity block, every input
+artifact path and digest, outcome, duration, result paths and digests), requires each producer to
+publish it BEFORE its cleanup runs, and requires the collector to reject duplicate, unknown,
+missing, cross-run and stale envelopes. It also distinguishes two failures that must not read the
+same: a required key with no envelope, and an envelope recording a failure.
+
+**5. The required development row has no runnable lifecycle - ACCEPTED.**
+
+Confirmed. The three development checks are catalogued with commands that invoke `dev-selftest.py`,
+`proto-test.py` and `perf-gate.py` (`catalog.rs:481`), `commands.rs:237` gives them
+`requires: Vec::new()` and a note saying they need `./dev.sh up`, and nothing on the release path
+starts one. `check-development-build.sh` says in its own header that it does not boot the guest.
+So the row either depends on a guest someone left running - which is bound to no revision,
+configuration or artifact - or cannot execute.
+
+Plan change: a new **M6** requires explicit setup, build, immutable-image, boot, readiness, test and
+teardown steps (or one self-contained gate) with run-private sockets, disks, state and logs and
+guaranteed teardown, declares them as the three checks' prerequisites, and records the boot artifact
+digest in every development result. It keeps `check-development-build.sh` as the compile-only gate
+it is and says it is not evidence that the configuration boots.
+
+**6. Source, tool, firmware and configuration identity are labels - ACCEPTED.**
+
+Confirmed that the two existing helpers answer different questions. `lib.sh:239-245` hashes a
+`find` over selected directories filtered to `.rs`, `.toml` and `.lsidl`.
+`shadow.rs:967-1000` hashes HEAD plus the working tree's changed paths, rename origins, change
+kinds and bytes. Two materially different trees can agree under one and differ under the other.
+Confirmed too that QEMU and OVMF are host-selected and environment-overridable
+(`qemu-run.sh:962-963`, `OVMF_CODE`/`OVMF_VARS_SRC`), and that a version string does not
+identify the executed binary.
+
+Plan change: a new **M8** defines ONE source identity used in both places - NUL-safe over tracked
+path, mode and bytes plus submodules, lockfiles and declared generated inputs, or explicitly the Git
+tree identity for a clean snapshot, labelled as such - and a closed influencing-input manifest with
+resolved tool paths and hashes, lock identity, firmware image hashes rather than package names,
+target/feature/profile flags and the permitted environment variables. Undeclared overrides are
+refused, and the source identity is verified before and after the run.
+
+**7. The dossier has no durable publication owner - ACCEPTED.**
+
+Confirmed. The detached sweep creates its worktree and installs
+`trap "git worktree remove --force …" EXIT` (`verify.sh:299-300`); the failure path prints that
+the worktree survives until the shell exits, and then the trap removes it. Nothing names an output
+root, a run-ID directory, atomic finalization or failed-run retention.
+
+Plan change: M9 requires a durable output root OUTSIDE the disposable worktree, a collision-free
+run-ID directory, atomic and immutable finalization, retention of incomplete and failed evidence
+with an explicit state, and a record of both the audited snapshot identity and the publisher version.
+
+**Plan re-check.** The plan went from five items to ten, which is the honest count once the catalog,
+the envelope, the image producers, the development lifecycle and the identity contract are separate
+work rather than adjectives in M4. Ordering is implementable and stated: M4 (catalog model) precedes
+M5 (producers) and M7 (envelope schema) and M9 (dossier); M8 supplies the identity block M7 embeds;
+M1-M3 are independent of all of them. A "What this milestone refuses" line was added saying this is
+not a general CI system - the envelope, the class model and the identity manifest exist to make one
+release run's claim checkable, and nothing more. Dependencies now name P02M0173, whose five profile
+rows M4's class model has to accept whichever milestone lands first. No source code was modified.

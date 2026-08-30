@@ -384,3 +384,17 @@ belong to, because both are the kind a scoped run hides:
   the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
   the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
   refuse; the ordering is what it is reporting.
+
+**Final verification, second round (2026-08-30T21:00:00Z).** `./check.sh` green on every gate;
+`./check.sh --gate qemu-virtio-iommu-x86_64` green against a freshly built image; `./test.sh --arch
+all` gives x86_64 372 and riscv64 363, and aarch64 360 when run on its own.
+
+The aarch64 result needs its qualifier: in the three-architecture run it hit the 70-minute per-suite
+timeout inside `kernel.applications`, and re-run ALONE it completes in 2840s with 360 passed. Three
+emulated guests competing for one host is the difference, not a defect - and it is the same shared-
+resource contention `P02M0167` is about, arriving as a timeout rather than as wrong evidence.
+
+Two compiler flakes were also hit and are recorded because the fix is one number: rustc crashed
+compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
+MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
+and the same number in both paths, so they no longer hold different opinions about one compiler.
