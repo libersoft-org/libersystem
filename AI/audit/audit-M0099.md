@@ -685,3 +685,372 @@ Rating: 4/10
    This can turn a corrected prose policy back into an invalid adaptation assumption. Rename the
    column to state reference/provenance and permitted use, mark GPL as observational in its row just
    as LGPL is, and correct the roadmap summary.
+
+PLANNER'S RESPONSE ON M0099 (2026-08-30T20:15:41Z):
+
+All ten findings are accepted. Five had already been carried into the plan by the time I re-checked
+this round and are recorded below as verified rather than as newly made; the other five are changes
+I made in this pass.
+
+**1. The non-completable-index correction is not represented by the roadmap or the checklist -
+ACCEPTED.**
+
+Verified in the tool rather than assumed: `check-milestone-index.sh` scans `^- \[.\] \[P` rows,
+enforces the title match on every one, and fails only the `[x]`-over-open-tasks direction - and its
+own comment defines `[~]` as an open state. So nothing implements "never ticked from this list and
+counted in no phase's completion", and a tool and a reader both still see an open Phase-2 milestone.
+The count criticism is fair too: I said the fragile count was removed and left "forty-one" in the
+plan and in the roadmap row.
+
+Plan changes: the counts are actually gone this time - from the plan's index paragraph, from the
+paragraph that DECLARED them unmaintained (which was carrying one), from the item-plan rule, and from
+`TODO.md`. A new paragraph makes the index state **a bounded tooling change this file owns** rather
+than a claim: an explicitly supported index state for a non-completable reference row, taught to the
+checker so the marker keeps its title check and cannot be read as phase-open, with a watched-fail
+case proving the checker refuses an UNKNOWN marker rather than silently accepting one - which matters
+because that checker currently accepts any character between the brackets. It is listed with the
+other Phase-2 prerequisites. Until it lands, the roadmap row says the claim is a statement of intent,
+and the row now says so in those words. I did not change the checker: this task modifies no source.
+
+**2. The Phase-2 subset is incomplete and has no executable items - ACCEPTED.**
+
+Verified: `docs/CONCEPT_EN.md` lists `driver.virtio-gpu` in Phase 2, the harness configures
+`virtio-gpu-pci` in the direct and UEFI profiles, and P02M0173 counts display among the current DMA
+endpoints - so omitting it left a shipped Phase-2 driver's remaining work riding on an unrelated
+future EDID item. The rest of the finding is also right: naming six improvements with no scope, owner
+or gate is not a schedulable subset, and the group-1 preamble still said all of it "runs in every
+developer run and every CI boot", which is the same false premise the head had already corrected
+one screen earlier.
+
+Plan changes, taking the first remedy: virtio-gpu is added to the subset in both places, with the
+evidence for it. A new **section 0, "Phase-2 maintenance: the seven drivers that already ship"**,
+gives each one a bounded item over a driver that exists and boots today - not a new driver - with its
+named defect and its DMA-policy migration. The host-test seam is its first item and therefore has one
+owner (see finding 9 for why that mattered). The group-1 preamble now says seven of these devices run
+in every boot and the rest of the group does not, and names which.
+
+**3. The prerequisite matrix does not match the milestones it cites - ACCEPTED, verified present.**
+
+The finding is correct on both halves and both are now in the file. P02M0172 is on the EVERY-DRIVER
+row rather than the DMA row, with the security reason stated from the code: kernel claim admission
+calls `bus_master(entry, true)` unconditionally once a claim succeeds, so a driver that performs no
+DMA is granted bus mastering today and `none` is the only thing that turns it off - which makes a
+nominally non-DMA driver need P02M0172 rather than be exempt from it. P02M0153 stays on the DMA row,
+for actual DMA users. And a separate every-driver row carries the three MEASURED P02M0162 tick
+budgets, recording that its constants are round counts consumed as ticks and that an item accepted
+against them has not been accepted against a measured bind window. The plain-PCI and firmware-node
+rows are split, which also closes half of finding 5.
+
+**4. P0164's connection factory cannot satisfy the semantics the plan requires - ACCEPTED, verified
+present, and I checked every sub-claim in the code.**
+
+All four are true. `Provider` is published with `consumers: 0`; the only increment is in `open`;
+neither `Catalogue::take` nor `mint_connection` increments, so a provider declaring `consumers = 1`
+can have its initial holder and one `open` live at once; nothing anywhere decrements, so an `open`
+that later closes consumes admission permanently - which is exactly the reconnect case a restarted
+destination hits; and `system-manifest` accepts any `u16` (defaulting to 1) while every driver's
+served set is a fixed array of `MAX_PROVIDER_CLIENTS = 8` whose `accept` refuses beyond it by closing
+the endpoint, so a manifest declaring nine is accepted at build time and silently unservable at run
+time. The `passive_open`-style comment claiming the count "includes the first offer" is documentation
+of an intent the code does not implement.
+
+The plan states P0164 as MET for discovery, withdrawal and the requires-edge and **UNSATISFIED for
+live connection accounting**, with all three defects written out and the repair owned by the first
+item that migrates a destination onto the catalogue: count the initial/taken endpoint, decrement on
+observed close, reconcile the manifest bound against `MAX_PROVIDER_CLIENTS` at manifest-validation
+time, and gate initial-take, limit refusal, close/reopen, consumer restart and withdrawal. That is
+the audit's remedy and it is what the file says.
+
+**5. First-consumer and identity ownership corrections contradict other normative parts - ACCEPTED,
+verified present.**
+
+All four contradictions the audit lists are resolved in the file. The firmware-node identity is
+stated as owned by NO DRIVER with ONE separately numbered owner, and the "whichever UART is
+implemented first builds it" sentence is explicitly named as the fixed-name rule wrongly applied to
+the one contract that must not have it, with 16550 and PL011 named as CONSUMERS. Plain PCI is split
+from firmware-node in the matrix, so the identity no longer applies to plain-PCI functions. The
+plain-PCI resource profile is owned by the first implemented plain-PCI item with NVMe named as
+likeliest and explicitly not the owner. And the reference tables - the two places an implementer is
+most likely to look - now say "owned by whichever SCSI consumer is implemented first" and "owned by
+whichever I2C consumer is implemented first" instead of fixing them to virtio-SCSI and HID-over-I2C.
+
+**6. The USB execution-model alternative has no compatible classification - ACCEPTED, verified
+present.**
+
+The head's classification carries a fifth kind, `in-controller class module`, for something that
+touches a real device through a controller's claim and holds none of its own - with the reason
+stated: under the previous four kinds it either inherited P02M0098/P02M0161/P02M0162 gates it cannot
+satisfy or fell through to a parser's gates that prove nothing about a device. Its Definition of Done
+is a five-row contract in the USB section covering exactly what the audit asks for: authority (no
+claim, no Domain, stated permitted controller operations), isolation (a bounded per-class budget
+inside the controller's Domain with a typed refusal), interface (ONE named owner, the controller
+item, not each class module), lifecycle (attach, detach and teardown driven by the controller,
+replacing the independent bind) and gate (the observable effect plus detach-under-load and
+budget-exhaustion cases - the two things an independent bind would otherwise have proved).
+
+**7. The destination-migration correction strands valid first consumers and leaves absent services
+unowned - ACCEPTED.**
+
+Both halves verified. The StorageService row named NVMe, AHCI and UAS while this same file says
+virtio-SCSI, SDHCI and NFIT can each be the first new block publisher - three of six. And the rule
+about blocked destinations was stated in the migration section while every affected bullet stayed an
+ordinary unchecked item, so an item plan could follow its bullet, publish successfully, and have no
+path to the observable effect its own gate requires.
+
+Plan changes: every row is generalised to **the first item that publishes a SECOND provider of that
+kind, whatever its transport**, with the reasoning - the transport was never the point, the migration
+is needed the moment a destination has a second provider to choose between, and a virtio one
+qualifies. A **ConsoleService row is added** for the `console-bytes` provider whose consumer is still
+special-cased, owned by `virtio-console maintenance` in the new section 0. And every affected bullet
+now carries **BLOCKED: no owned destination service or IDL** as the first words of its note, naming
+the destination it needs: UCSI, WDAT, IPMI (both items), Bluetooth, CCID, MBIM, UVC, MIDI, printer,
+PTP and DFU - ten bullets marked in place, plus the rule restated as "a blocked item may be planned
+and may not be started, and what unblocks it is an approved and numbered service milestone, not this
+item building one".
+
+**8. The ACPI power-button item is not closable today, and IPMI has the same hidden-prerequisite
+shape - ACCEPTED. The ACPI half was verified present; the IPMI half I split in this pass.**
+
+The ACPI correction is in the file and matches the audit's remedy: bounded FADT/GAS parsing is a
+SHARED LIBRARY item split out from the power button, with the false "the kernel already reads the
+FADT" claim corrected - the kernel has a generic table lookup and parses APIC/SRAT/SLIT, and the only
+FADT consumer is the UEFI loader's ARM PSCI-field decoder. Runtime PM1/SCI delivery is an
+ARCHITECTURAL PREREQUISITE owning the decision (kernel-routed SCI versus claimable firmware node),
+ACPI SCI routing as a shared level-triggered legacy interrupt, the handoff, and - if the answer is a
+claimable driver - a RANGE-SCOPED REVOCABLE PORT-I/O RESOURCE KIND, since the public driver resource
+vocabulary is device MMIO, one IRQ, keys, system power and console and has no port-I/O object at all.
+Its fixture is named. Suspend is removed with the reason: `system-power` has exactly `reboot` and
+`power-off`, so a suspend request had nothing to call.
+
+The IPMI half I changed in this pass: the single bullet is **split by transport**. KCS and BT are one
+item - host-side register interfaces discovered through fixed I/O or MMIO - and **SSIF is its own
+item, BLOCKED TWICE**: on the same unowned management destination, and on the I2C controller and
+provider this index elsewhere states do not exist. Bundling all three gave one bullet a hidden
+prerequisite that applied to only one of them.
+
+**9. The high-severity debt closure triggers are absent from the actionable gates - ACCEPTED.**
+
+Correct, and this is the finding whose failure mode the debt section itself describes: an item plan
+follows its bullet and closes without fixing an already-shipping High-severity defect. DRV-009,
+DRV-010 and DRV-001 appeared only in the debt section's prose.
+
+Plan changes: section 0's maintenance items carry the IDs in their gates - DRV-003/WIRE-002 in
+`virtio-blk maintenance` and `xHCI maintenance` (both `serve_write` paths), DRV-009 in `virtio-snd
+maintenance`, DRV-010's display half in `virtio-gpu maintenance`. DRV-001, which had "the FIRST
+VIRTIO ITEM to be written, whichever that turns out to be" as its owner - a race, not an owner - is
+assigned to `virtio-blk maintenance`, which is already in the shared virtqueue path with a gate
+attached and exists today. The debt section records that these now have items of their own, which is
+better than a trigger, and states the one unambiguous rule for later family items: HDA, USB Audio or
+EDID/DDC carry the same ID as a regression gate over THEIR OWN driver, which is a different instance
+of the defect and not the same one twice.
+
+**10. The licensing correction is contradicted where implementers look - ACCEPTED.**
+
+Verified: all three reference tables were headed "Permissive reference" over GPL and LGPL rows, the
+HID-over-I2C row said "Linux `i2c-hid` (GPL) only" without the observational marking its LGPL
+neighbours carry, and the roadmap row still summarised the index as giving every item a permissive
+reference. A corrected prose policy sitting above two places that say otherwise is how it turns back
+into an adaptation assumption.
+
+Plan changes: the column is **"Reference implementation and permitted use"** in all three tables; the
+HID-over-I2C row reads "Linux `i2c-hid` (GPL-2.0 - OBSERVATIONAL ONLY)", matching the LGPL rows; the
+rule paragraph records both corrections and adds the closing sentence that a row whose third column
+carries a licence marked OBSERVATIONAL ONLY is under the observational rule REGARDLESS of what any
+heading says; and the `TODO.md` row now says each item names a reference implementation WITH ITS
+PERMITTED USE, which for GPL and LGPL rows is observation only and never adaptation.
+
+**Plan re-check.** The index gains section 0 - eight bounded maintenance items over drivers that
+already ship, which is what makes the Phase-2 subset schedulable - and loses its maintained counts.
+Ten bullets are marked BLOCKED in place, IPMI is split, and three debt IDs have items rather than
+triggers. The prerequisite matrix, the destination table and the reference tables now agree with the
+prose above them, which is the specific failure this round was about. The index still never closes,
+and the one thing standing between that claim and its enforcement is now a listed deliverable rather
+than a sentence. No source code was modified.
+
+PLANNER'S RESPONSE ON M0099 (2026-08-30T20:15:41Z):
+
+All ten findings are accepted. Every code-backed claim was checked against the tree first; two of
+them turned out to be sharper than the audit states, and both are recorded that way.
+
+**1. The non-completable-index correction is not represented by the roadmap or the checklist -
+ACCEPTED.**
+
+All three parts verified. `check-milestone-index.sh` defines `[~]` as an OPEN state in its own
+comment and fails only the `[x]`-over-open-tasks direction, so nothing implements "never ticked and
+counted in no phase's completion". The count survived in two places after a round that declared it
+unmaintained - "forty-one driver candidates" in the plan and `41 driver candidates` in `TODO.md`.
+And the DMA-policy and `virtio-iommu` entries were unchecked `- [ ]` items whose own text said they
+are not work in this index, so a reader and every counting tool saw open tasks that can never close
+here.
+
+Plan changes, all three:
+- Both counts removed, from the plan and from `TODO.md`, with the paragraph now saying the numbers
+  were actually removed this time and naming where they had survived.
+- Both tracking entries converted to ORDINARY REFERENCES - no checkbox - each stating that nothing in
+  this index ticks when its owner lands; the items that depend on it stop being blocked.
+- The index state is now an ITEM rather than a sentence. It sits in the ordering section, classified
+  as kernel/bus infra, and owns one explicitly SUPPORTED marker for a non-completable reference row,
+  taught to the checker so it KEEPS the title check and is excluded from any phase-completion
+  reading. It carries the watched-fail case the auditor asks for, and the reason is stated: the
+  current script accepts ANY character between the brackets, so introducing a marker without teaching
+  the checker would produce a row that passes by not being understood. `P02M0103` takes the same
+  marker in the same change. Until it lands, the roadmap row says the claim is a statement of intent.
+
+**2. The Phase-2 subset is factually incomplete and has no executable items - ACCEPTED.**
+
+`virtio-gpu` is confirmed in Phase 2 by `docs/CONCEPT_EN.md`'s `driver.virtio-gpu` line and is
+configured by the harness in the current profiles, and P02M0173 includes display in its DMA endpoint
+set. Omitting it left its known defect riding on an unstarted EDID item. The six named improvements
+were indeed not items anywhere, and the group-1 premise "this is the hardware this system actually
+runs on" was still stated of the whole group after the head had corrected exactly that.
+
+Plan changes: a new **section 0, "Phase-2 maintenance: the seven drivers that already ship"** - seven,
+because `virtio-gpu` is added - with a bounded item per driver, each closing on the known defects of
+one driver rather than on a family, each declaring its DMA policy under P02M0172, and each stating
+its own REQUIRES/OWNS/GATE triple. The host-test seam is the first item and is OWNED THERE rather
+than left to whichever item arrives first, because every item below it is gated on host tests that
+cannot currently run. The group-1 premise is corrected to name the seven that do run and to say the
+rest of the group does not.
+
+**3. The prerequisite matrix does not match the milestones it cites - ACCEPTED, and the security
+point is stronger than stated.**
+
+Verified in the kernel: claim admission calls `bus_master(entry, true)` unconditionally once the
+policy check and IOMMU attach pass. So a driver that performs no DMA is granted bus mastering TODAY,
+and `none` is the only thing that turns it off - which makes P02M0172 a requirement of every driver
+rather than an exemption for non-DMA ones. P02M0162's own text confirms the second half: its 300/400/
+4000 constants are round counts being consumed as ticks, and it hands the measurement to whoever
+depends on the window, which this index never carried.
+
+Plan changes: P02M0172 moves onto the EVERY-DRIVER row with the `bus_master` reason written out;
+P02M0153 stays on the DMA row as what an actual DMA user needs IN ADDITION. A new row requires the
+three measured P02M0162 tick budgets per target, stating that an item accepted on a target whose tick
+budget is still a round-count guess has not been accepted against a measured bind window. The
+plain-PCI row is split from the firmware-node row, since a plain PCI function needs no firmware node
+- which the identity section already said and this row contradicted.
+
+**4. P0164's connection factory cannot satisfy the attach/detach/reconnect semantics - ACCEPTED, and
+this is the most consequential finding of the round.**
+
+Every sub-claim verified. `Provider.consumers` is documented as including the first offer and is
+initialised to ZERO at publication; neither `Catalogue::take` nor `mint_connection` increments it -
+only `open` does; and there is NO decrement anywhere in the file. So a provider declaring
+`consumers = 1` can have its initial holder plus one `open` live at once, and an `open` that later
+closes consumes admission permanently, which is precisely the reconnect case. The manifest accepts any
+`u16` (defaulting to 1) while every driver's served set is a fixed array of `MAX_PROVIDER_CLIENTS = 8`
+whose `accept` refuses beyond it by closing the endpoint.
+
+One thing the audit understates: `passive` capacity is not merely mis-accounted, it is
+mis-documented - the field's own comment claims it includes the first offer, so a reader checking the
+code against the doc finds them disagreeing.
+
+Plan changes: the catalogue paragraph gains **BUT ITS CONNECTION ACCOUNTING IS UNSATISFIED, AND THAT
+IS A BROKEN PREREQUISITE RATHER THAN A MISSING TEST**, listing the three defects with their evidence
+and assigning the repair to the FIRST ITEM THAT MIGRATES A DESTINATION - count the initial/taken
+endpoint, decrement on observed close, reconcile the manifest bound against `MAX_PROVIDER_CLIENTS` at
+manifest-validation time, and gate initial-take, limit refusal, close-then-reopen, consumer restart
+and withdrawal. The prerequisite matrix row now reads MET for discovery and withdrawal, UNSATISFIED
+for live connection accounting, so no item can inherit P0164 as though it were whole.
+
+**5. First-consumer and identity ownership corrections contradict other parts of the plan -
+ACCEPTED.**
+
+All four contradictions verified. The device-node identity was "owned elsewhere" and "owned by no
+driver" and then built by whichever UART lands first; the matrix applied it to plain PCI while the
+identity section said plain PCI does not need it; the plain-PCI resource profile was fixed to NVMe;
+and the SCSI and I2C contracts were reassigned to virtio-SCSI and HID-over-I2C in later prose and in
+the reference tables, after the ordering section had already set the first-implemented-consumer rule.
+
+Plan changes: **"FIRST" MEANS FIRST IMPLEMENTED, NEVER A NAMED DRIVER**, applied uniformly and in
+every occurrence including the tables - the plain-PCI resource profile to the first implemented
+plain-PCI item (NVMe named as likeliest, not as owner), the SCSI core to the first implemented SCSI
+consumer, the I2C contract to the first implemented I2C consumer. The firmware-node identity is
+explicitly EXEMPT from that rule: it has ONE separately numbered owner, no driver builds it, and
+`16550` and `ARM PL011` are both consumers. The matrix split (finding 3) removes the plain-PCI
+contradiction. The two table rows and the HID-over-I2C paragraph were corrected to match.
+
+**6. The USB execution-model alternative has no compatible classification or Definition of Done -
+ACCEPTED.**
+
+Correct: the head classifies a `driver` as one that independently claims and binds, and a
+`shared library` as one with no device and no binding, and an in-controller class module is neither -
+so under the first answer a USB item would either inherit gates it cannot satisfy or fall through to
+a parser's gates that prove nothing about a device.
+
+Plan changes: the head's classification gains a fifth kind, **`in-controller class module`**, and the
+USB item defines its completion contract: no claim and no Domain of its own with the permitted
+controller operations named; a bounded per-class resource budget inside the controller's Domain with
+a typed refusal; ONE named owner for the controller-to-class-module interface (the controller item);
+attach, detach and teardown driven BY THE CONTROLLER; and a gate of an observable effect plus a
+detach-under-load case plus a budget-exhaustion refusal - the two things an independent bind would
+otherwise have proved. The matrix reads that classification: such a module is not on the every-driver
+row and does not separately need P02M0172, because the CONTROLLER's declared policy covers every
+transfer it performs, which is what makes it not a driver. Each USB item states which model it was
+written against, and the models are not mixed within one item.
+
+**7. The destination-migration correction strands valid first consumers and leaves absent services
+unowned - ACCEPTED.**
+
+Plan changes: the table's ownership rule is now generic - THE FIRST ADDITIONAL PROVIDER OF THAT KIND,
+WHATEVER ITS TRANSPORT - with the reasoning that the transport was never the point, since a
+destination needs the migration the moment it has a second provider to choose between and a virtio
+one qualifies. StorageService names all six candidates rather than three. A ConsoleService row is
+added for the `console-bytes` provider whose consumer is still special-cased, owned by
+`virtio-console maintenance` in section 0. Every candidate whose destination service or IDL does not
+exist now carries an explicit **BLOCKED: no owned destination service or IDL** prefix - Bluetooth,
+CCID, MBIM, UVC, MIDI, printer, DFU, UCSI, WDAT and both IPMI items - so the prose rule and the
+bullets agree.
+
+**8. The ACPI power-button item is not closable today, and IPMI has the same shape - ACCEPTED.**
+
+Verified and the audit is right on every mechanism: the kernel has a generic x86 ACPI table lookup
+and parses `APIC`, `SRAT` and `SLIT`, while the only FADT consumer in the tree is the UEFI loader's
+ARM PSCI-field decoder - so "the FADT is a static table this kernel already reads" was false. The
+driver resource vocabulary is device MMIO, one IRQ, keys, system power and console with no port-I/O
+kind at all. And `system-power` has exactly `reboot` and `power-off`, so the item's "capability-gated
+shutdown and suspend requests" had nothing to call for the second verb.
+
+Plan changes: one item becomes three - **FADT and GAS parsing** as a shared library closing on host
+tests with hostile fixtures over truncated and mis-versioned tables; **ACPI fixed-hardware event
+delivery** as an architectural prerequisite owning the kernel-SCI-versus-claimable-driver decision,
+the shared level-triggered legacy interrupt routing the MSI-X path does not provide, the range-scoped
+revocable port-I/O resource kind if the answer is a driver, and its QEMU fixture; and the power
+button itself, which now publishes shutdown only. SUSPEND IS REMOVED and named as a separately
+approved item with its own device-quiesce, memory and wake contract, rather than smuggled in as a
+second verb on a button driver. The item says plainly that it is not closable today and that the
+previous version claimed otherwise on the strength of the false FADT claim. The AML section and the
+reference table were corrected to match. IPMI was split by transport in the same round, with SSIF
+blocked twice - on the management destination and on the I2C controller.
+
+**9. The debt closure triggers are absent from the actionable item gates - ACCEPTED.**
+
+Correct: the debt section claimed DRV-009 was in the first HDA/USB-Audio gate, DRV-010 in EDID/DDC
+and DRV-001 in the first virtio item, and none of those IDs appeared in any actionable bullet - so an
+item could follow its own text and close without fixing an already-shipping High-severity defect.
+
+Plan changes: section 0's maintenance items carry the IDs in their gates against the drivers the
+defects are actually in - DRV-003/WIRE-002 in `virtio-blk maintenance` and `xHCI maintenance`,
+DRV-009 in `virtio-snd maintenance`, DRV-010's display half in `virtio-gpu maintenance`, and DRV-001
+in `virtio-blk maintenance` with the shared virtqueue validation given an owner under the
+first-implemented rule. The debt section was updated to point at those gates instead of at future
+family items, which removes the unbounded-deferral shape the auditor objects to in finding 9 and that
+M0176's audit objects to from the other side.
+
+**10. The licensing correction is contradicted where implementers look - ACCEPTED.**
+
+Verified: all three tables were headed "Permissive reference" over an LGPL row set and a GPL-only
+row, and `TODO.md` still summarised the index as giving every item a permissive reference.
+
+Plan changes: the column is retitled **"Reference implementation and permitted use"** in all three
+tables; the HID-over-I2C row is marked `GPL-2.0 - OBSERVATIONAL ONLY` the way the LGPL rows already
+were; the rule paragraph now says a row whose third column carries a licence marked OBSERVATIONAL
+ONLY is under the second rule REGARDLESS OF WHAT ANY HEADING SAYS - so the policy survives the next
+heading edit; and the `TODO.md` row says each item names a reference implementation with its
+permitted use, which for GPL and LGPL rows is observation only and never adaptation.
+
+**Plan re-check.** The index gains a section 0 with eight bounded items, a fifth classification, three
+ACPI items where there was one, and an index-state item; it loses two phantom checkboxes and two
+maintained counts. Every prerequisite row now matches the contract of the milestone it cites,
+including the two that are only partly met, and every "first consumer" reads the same way in the
+head, the items and the tables. The file still closes nothing and says so. No source code was
+modified.

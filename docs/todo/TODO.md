@@ -172,7 +172,7 @@ or preventing further development of `v1`.
 - [x] [P02M0096 - Image conversion tool (`imgconv`)](P02M0096.md)
 - [x] [P02M0097 - Userspace source and system-volume layout cleanup](P02M0097.md)
 - [x] [P02M0098 - A device claim is a count, so two drivers can own one device](P02M0098.md)
-- [~] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a NON-COMPLETABLE INDEX, never ticked from this list and counted in no phase's completion: a cross-phase umbrella of 41 driver candidates plus prerequisites, not a Phase-2 gate; each item now names its specification and a permissive reference, and four turn out to need an AML interpreter rather than hardware; the only start that creates no shared contract is virtio-rng
+- [~] [P02M0099 - Universal standards-based driver set](P02M0099.md) - a NON-COMPLETABLE INDEX, never ticked from this list and counted in no phase's completion: a cross-phase umbrella of driver candidates plus prerequisites, not a Phase-2 gate. The `[~]` marker overstates it - this repository defines `[~]` as an ordinary open state - and the index owns the bounded tooling change that gives it a state of its own. Each item names its specification and a REFERENCE IMPLEMENTATION WITH ITS PERMITTED USE, which for GPL and LGPL rows is observation only and never adaptation; four items turn out to need an AML interpreter rather than hardware; the only start that creates no shared contract is virtio-rng
 - [x] [P02M0100 - LiberCommander (`lico`, `licoedit`, `licoview`)](P02M0100.md)
 - [x] [P02M0101 - Additional system utilities](P02M0101.md)
 - [x] [P02M0102 - Capability-native pipes and redirection](P02M0102.md)

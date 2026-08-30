@@ -557,3 +557,333 @@ Rating: 3/10
    M0103 still keys the glyph cache only by face, size, transform, and subpixel phase (`docs/todo/P02M0103.md:1186-1187`), omitting even the glyph identifier as well as face generation, variation coordinates, glyph kind, bitmap strike, and color palette. M0136 explicitly defines the shared key as face identity and generation, glyph, size, variation coordinates, transform, phase, kind, strike, and palette (`docs/todo/P02M0136.md:74-94`) and says M0103 is corrected in the same change.
 
    Variable, color, bitmap, or replaced-face glyphs can therefore collide and return stale pixels, while the two jointly owned plans specify different seam contracts. Copy the complete shared key into M0103 before either side implements or freezes its conformance tests.
+
+PLANNER'S RESPONSE ON M0103 (2026-08-30T20:15:41Z):
+
+All eight findings are accepted. Six of them are one defect repeated: a correction was written into a
+header or a Done clause and left contradicted by the normative items that actually govern the work.
+That criticism is fair and the fix this round is structural rather than another sentence.
+
+**1. The scene-scope reduction was not propagated into the authoritative work and gates - ACCEPTED.**
+
+Verified everywhere the audit names. The header and the `f` Done clause moved LOD, skinning,
+morphing, animation, PBR, lights, shadows, transparency, HDR and postprocessing to an optional
+profile, while the mandatory `f` checklist still required scene3d to IMPLEMENT them "not admits", the
+conformance list in `h` and the demo scene in `i` still required PBR, shadows, skinning, morph
+targets, HDR, postprocessing and sorted transparency, and the aggregate 3D completion clause named
+skinning, PBR, shadows and postprocessing. Optional in three sentences and required in ten items is
+not optional.
+
+Of the two remedies, the plan takes the second - **separately activated parts** - because deleting
+would throw away real specification: the GGX/Smith/Schlick material equations, the shadow bias and
+PCF parameters, the animation model. Plan changes: a new part **`P02M0103f-ext` - Scene3D Extended**
+carries LOD/skinning/morph, PbrMetallicRoughness and its equation set, environment maps and shadow
+maps with their parameters, the animation system, the sorted transparent queue, HDR and
+postprocessing, and the Scene3DLimits fields those need. It has its own closed `Scene3D Extended
+Profile 1` in the machine-readable registry - so a build claims it entirely or not at all - its own
+host tests, and its own conformance and demo phases which explicitly do NOT extend `h`'s or `i`'s
+lists. Core `f` keeps hierarchy, cameras, unshadowed multi-light lighting, materials up to
+BlinnPhong, queues, culling, instancing, picking and limits. `h`'s scene list, `i`'s demo scene and
+QEMU pixel checks, and both aggregate completion clauses were stripped of Extended features, each
+with the removal stated. The header paragraph that still described the scene layer as mandatory-with-
+animation was corrected too.
+
+**2. A depth-one channel does not have signal-once semantics - ACCEPTED, and it is the finding that
+would have frozen a false contract.**
+
+Verified against the kernel: a channel is a REUSABLE bounded queue. `Channel::recv` treats the
+dequeue as the commit, releases the queue charge and explicitly wakes a sender blocked on a full
+queue so the slot can be reused - the accounting tests depend on that reuse. So "a second send finds
+the endpoint spent" is false, and the plan was about to freeze the WSI and submission contracts on a
+kernel property that does not exist. The rights point is correct as well: `SYS_WAIT` looks the handle
+up with `Rights::WAIT` and answers ACCESS_DENIED without it, so a receive-only end cannot block on
+its own completion.
+
+Of the two remedies the plan takes the first, and states the weakened claim honestly rather than
+building a one-shot kernel object this file is the only consumer of. Plan changes: the completion is
+an **ownership-consuming wrapper** over the send end. It OWNS the send handle and consumes itself on
+signal, closing the handle as it sends, so a second signal is unrepresentable rather than refused -
+a type-system guarantee in the producer's process, and the plan says so in those words. The wrapper
+is the only movable thing; a raw send handle is never handed out beside it, because two holders of
+one send end is the duplicate-completion case. Drop-without-signal closes the handle, which the
+waiter observes as peer-close, so forgetting to signal is a defined failure rather than a hang. The
+receiver's rights are stated exactly as `RIGHT_RECEIVE | RIGHT_WAIT` with the syscall reason. Its
+tests are named: signal-then-drop, drop-without-signal, transfer-then-signal, a RECEIVE-without-WAIT
+end refused at the syscall, and a compile-fail fixture proving a second signal does not compile. The
+requirement paragraph above it now says where each guarantee is enforced instead of assuming kernel.
+
+**3. The a-common/a-wsi split is prose rather than an approvable boundary - ACCEPTED.**
+
+Correct: I wrote "the split is a dependency statement" and "the items below are not renumbered",
+which gave no objective point at which `a-common` could be declared complete and release `b`. An
+ordering that cannot be declared is not an ordering.
+
+Plan changes: `a` now has two real subsections - `### P02M0103a-common` and `### P02M0103a-wsi` -
+each with its own intro naming its dependencies, and every item belongs to exactly one. The surface
+output-colour item was MOVED into `a-wsi`, since it is about the surface. The Definition of Done
+carries a separate condition for each half: `a-common` closes on the image/colour/format model,
+views, owned images, multi-plane, the typed error and the migrated `pix`, with the explicit statement
+that nothing in it needs a display, driver, restart or completion object; `a-wsi` closes on surfaces,
+the present queue, timing, damage, the completion wrapper and the typed display-device interface, and
+additionally requires P02M0141/P02M0164/P02M0165/P02M0166. Part `e` is corrected to depend on
+`a-common` and NOT `a-wsi`, with the reason - it is a non-presenting consumer that renders into
+targets and returns. The cross-phase table and two other references were updated to name the correct
+half.
+
+**4. Multithreading was removed from Done clauses but remains mandatory elsewhere - ACCEPTED.**
+
+Verified in all five places: the prerequisite matrix still made the runtime a hard prerequisite of
+`b,c`; both software-renderer items still mandated a bounded worker pool; the 2D and 3D test items
+required parallel paths; and aggregate 2D completion required scalar/parallel agreement. So `c` and
+`g` remained unschedulable in every place that governs the work, despite their Done clauses.
+
+Plan changes, taking the first remedy: the matrix row reads "NOT the self-thread runtime: a
+single-threaded tiled rasteriser conforms, and the worker pool is a later performance item". Both
+renderer items now own tiling, binning, SIMD and cancellation and explicitly not a pool. Every
+differential test became CONDITIONAL - "every parallel or SIMD path THAT EXISTS is
+differential-tested against it, unconditional once one exists, and not a requirement that one be
+created" - in the 2D item, the 2D host tests, the 3D item, the 3D tri-architecture run and the
+aggregate 2D clause. The prerequisite paragraph now says the runtime is a prerequisite OF THE LATER
+PERFORMANCE ITEM and of nothing in `c` or `g`, and lists the five places that had been left
+inconsistent so the next reader can see the correction was applied rather than described. M0135 has
+pinned a configuration that creates no threads, so neither file is blocked on an unnumbered runtime.
+
+**5. The ResourceManager decision contradicts its authoritative work item - ACCEPTED.**
+
+Verified: the item required ResourceManager integration, graphics classifications, reservations and
+optional graphics-specific limits, and a later paragraph in the same item said ResourceManager will
+not be extended and all of those are dropped. One item instructing two incompatible implementations.
+
+Plan changes, taking the first remedy: the authoritative item is REWRITTEN around kernel Domain
+accounting plus SystemGraph observation, rather than requiring an integration a later paragraph
+rejects. It now owns four specified things - SystemGraph reports bounded counts and reset/fault state
+as observation and never enforcement; every DisplayService-side structure that is NOT a MemoryObject
+(present queue, damage lists, waiter records) gets a stated per-connection bound, because those are
+not charged by the kernel and are what an adversarial client multiplies; exhaustion returns a typed
+error and releases the partial transaction; and reclamation is specified in the client-death item
+rather than asserted here. The later paragraph shrank to one sentence recording that the item is now
+written that way.
+
+**6. Client-created imports do not make requester attribution enforceable, and delegation remains
+contradictory - ACCEPTED.**
+
+Verified: a MemoryObject is charged to the Domain that created it and keeps that charge when the
+capability is transferred, and ObjectInfo carries koid, type, rights, generation and size and no
+charged Domain - so DisplayService cannot distinguish a client-created buffer from a donated one. My
+"charged to the client by construction" was untrue and the required cross-Domain rejection was
+unimplementable. And delegation had three answers: not permitted in v1, the surface channel may be
+transferred, and the item must still decide whether delegation is legal.
+
+Plan changes, taking the first remedy: **sponsorship is the contract and requester attribution is
+not claimed.** The protocol row now states what IS guaranteed - DisplayService no longer pays for its
+clients' images, and no Domain pays for memory it did not itself allocate - and what is not: the
+paying Domain need not be the requesting one, a third Domain sponsoring a client is possible, and
+that is a capability-system consequence rather than a hole, since it requires that Domain to allocate
+and transfer deliberately. Both withdrawn claims are named as withdrawn. A kernel provenance field on
+ObjectInfo is recorded as the thing that WOULD make attribution checkable and as a separate proposal
+against a shared ABI this milestone does not own.
+Delegation is decided once and closed: **the surface channel is not transferable either**, and the
+service refuses a surface whose channel has moved process. One process identity owns a surface's
+images, resize authority and cleanup, and a movable channel would leave "client death" with no unique
+process to name. A client wanting another process to draw gives it the images through its own
+protocol. The later paragraph no longer reopens the question and instead explains that the waitable
+task identity is what makes the closure enforceable. The hostile test list lost "cross-Domain
+handles" - unimplementable - and gained "a surface channel offered from a second process".
+
+**7. The P0167 assessment is stale and creates an unnecessary blocker - ACCEPTED.**
+
+Verified against both the milestone and the harness: P0167 records that the suite's medium carries
+its own content key so two selections are two files, image assembly is serialised under its own lock,
+and a cache hit is verified against a recorded digest rather than trusted. My "the MEDIUM is still
+assembled from shared producers" was written before that landed and is simply out of date.
+
+Plan changes: the row reads MET for the medium-identity contract, with the withdrawal stated. What is
+retained is the audit's own qualifier and nothing more: three emulated guests in flight contend, and
+an aarch64 suite that finishes on its own can hit a per-suite timeout in a three-guest run - recorded
+as a PERFORMANCE limit that bounds how this milestone schedules its tri-architecture gates, not as an
+evidence-integrity defect that makes their results untrustworthy.
+
+**8. The jointly owned glyph-cache correction was never applied - ACCEPTED.**
+
+Verified, and the audit is right that it was worse than M0136 described: the key omitted the GLYPH
+INDEX itself as well as face generation, variation coordinates, kind, strike and palette. M0136 said
+M0103 "is corrected in the same change" and the change was never made.
+
+Plan changes: M0103's renderer item now carries the complete key as a table, verbatim rather than
+summarised - face identity and generation, glyph, size, variation coordinates, transform, subpixel
+phase, glyph kind, and strike and palette where the kind uses them - and states that the key is
+jointly owned, that neither side may restate it in its own words, that a change to it is a change to
+both files in the same edit, and that each side has a negative test proving two entries differing
+only in variation coordinates, generation, kind, strike or palette do not collide. M0136's side was
+updated in the same pass.
+
+**Plan re-check.** The file gains one part (`f-ext`) and two subsections (`a-common`, `a-wsi`), and
+the Definition of Done gains three conditions and loses the Extended features from two. The
+approvable-early set in the header is now `s`, `a-common`, `a-wsi` and `b`+`c`, which matches the
+part boundaries rather than describing an order they contradict. Nothing mandatory in this file now
+depends on an unowned mechanism: the self-thread runtime is out of every core condition, the
+completion object is a wrapper over primitives that exist, and P0167 is met. No source code was
+modified.
+
+PLANNER'S RESPONSE ON M0103 (2026-08-30T20:15:41Z):
+
+All eight findings are accepted. Six of them are the same defect in different sections: a correction
+made in a header or a Done clause while the authoritative work items went on requiring the opposite.
+That is the pattern this round fixes at the level that governs the work, not at the level that
+describes it.
+
+**1. The scene-scope reduction was not propagated into the work and gates - ACCEPTED.**
+
+Verified in every place cited. The header and the `f` Done clause moved LOD, skinning, morphing,
+animation, PBR, lights, shadows, transparency, HDR and postprocessing into an optional profile, while
+`f`'s checklist still said `scene3d` IMPLEMENTS - "not admits" - the whole list; `h`'s conformance
+scene list required PBR with normal mapping, shadows, skinning, morph targets, postprocessing, HDR
+and sorted transparency; `i`'s demo scene required a PBR sphere and a cast shadow with a pixel check
+for the shadow; and the aggregate "3D is complete" clause named skinning, PBR, shadows and
+postprocessing. A feature optional in three sentences and required in ten items is not optional.
+
+Of the two remedies I take the SECOND - separately activated parts - rather than deletion, because
+these items carry real specification (the GGX/Smith/Schlick choices, the shadow bias and PCF kernel,
+the clip data model) and deleting them would throw that away to fix a scoping error.
+
+Plan changes: a new part **`P02M0103f-ext` - Scene3D Extended** with its own closed
+`Scene3D Extended Profile 1` in the same machine-readable registry, its own gates and its own
+dependency on `f` and `g`, activated by explicit approval like every other optional part here. Core
+`f` keeps hierarchy, cameras, lights, mesh instances, render queues, bounds, frustum culling,
+instancing, visibility masks, offscreen targets, the pass graph, picking, the
+`Unlit`/`VertexColor`/`Lambert`/`BlinnPhong` material set, unshadowed multi-light lighting, an opaque
+and alpha-mask queue, and `Scene3DLimits` - and `f-ext` takes LOD, skinning, morph targets, PBR,
+environment maps and IBL, shadow maps, animation clips, the sorted transparent queue, HDR and
+postprocessing, plus the limit fields those need. `h`'s scene list, `i`'s demo scene, `i`'s QEMU pixel
+checks and the aggregate 3D clause were each stripped, with `f-ext` given its own conformance and
+demo coverage in its own executables or clearly separated phases so it cannot creep back into a core
+gate. The profile registry treats Extended as all-or-nothing, so "optional" is a profile a build
+claims entirely or not at all rather than a set of half-present features.
+
+**2. A depth-one channel does not have signal-once semantics - ACCEPTED.**
+
+Verified against the kernel and the plan was wrong. `Channel::recv` treats the dequeue as the commit:
+it releases the queue charge and WAKES a sender blocked on a full queue, explicitly so the slot is
+reusable. So "a second send finds the endpoint spent" is false, and freezing the WSI and submission
+contracts on it would have based them on a kernel property that does not exist. The rights point is
+correct too - `sys_wait` looks the handle up with `Rights::WAIT` and answers `ACCESS_DENIED` without
+it, so a receive-only end cannot block on its own completion.
+
+I take the auditor's first option: an explicitly API-level, ownership-consuming wrapper, with the
+kernel claim withdrawn. The paired kernel object stays rejected for the reasons already recorded.
+
+Plan changes: **SIGNAL-ONCE IS AN API-LEVEL PROPERTY, NOT A KERNEL ONE**, with the channel's actual
+reuse semantics quoted as the reason. The completion becomes an ownership-consuming wrapper over the
+send end that CONSUMES ITSELF on signal and closes the handle as it sends - so a second signal is not
+a runtime refusal but unrepresentable, which is a type-system guarantee in the producer's process and
+is stated as one. The table now also fixes transfer (the wrapper is the only movable thing; a raw
+send handle is never handed out beside it), drop-without-signal (closes the handle, which the waiter
+observes as peer-close - a defined failure rather than a hang), and the waiter's exact rights as
+`RIGHT_RECEIVE | RIGHT_WAIT` with the syscall reason. Its tests are named: signal-then-drop,
+drop-without-signal, transfer-then-signal, a `RECEIVE`-without-`WAIT` end refused at the syscall, and
+a compile-fail fixture proving a second signal does not compile. The requirement paragraph above it
+now says where each guarantee is ENFORCED rather than assuming.
+
+**3. The `a-common`/`a-wsi` split is prose rather than a part boundary - ACCEPTED.**
+
+Correct: the split was called "a dependency statement", all work stayed in one interleaved checklist,
+the Definition of Done had one combined `a` condition, and `e` still depended on all of `a`. So there
+was no objective point at which `a-common` could be declared complete and release `b`.
+
+Plan changes: two real subsections, **`### P02M0103a-common`** (the image, colour and conversion
+model; depends on `s-common`; needs no display, driver, service restart or completion object) and
+**`### P02M0103a-wsi`** (surfaces, presentation and the display-device interface; depends on
+`a-common` plus P02M0141/P02M0164/P02M0165/P02M0166 and the completion object). Every item now sits
+under exactly one - including the surface output-colour-metadata item, which was physically among the
+image-model items and belongs to WSI, and was moved. The Definition of Done carries a separate,
+fully enumerated condition for each half. `e` now depends on `a-common` and NOT `a-wsi`, with the
+reason stated: `render3d` is a non-presenting consumer that renders into targets and returns. The
+cross-phase table at the head of the file lists the two halves separately, and the header's ordering
+sentence names `a-common` rather than `a`.
+
+**4. Multithreading is removed from Done clauses but mandatory everywhere else - ACCEPTED.**
+
+Verified in all five places: the prerequisite matrix made the runtime a hard prerequisite of `b, c`;
+both software-renderer items mandated a bounded worker pool; the 2D and 3D test items required
+parallel paths; and aggregate 2D completion required scalar/parallel agreement. So `c` and `g`
+remained unschedulable in every place that governs the work.
+
+Plan changes: the matrix row now reads "NOT the self-thread runtime: a single-threaded tiled
+rasteriser conforms, and the worker pool is a later performance item". `soft2d` and `soft3d` own
+tiling, binning, SIMD and cancellation and explicitly NOT a pool. Every differential test is
+conditional on a parallel or SIMD path EXISTING - unconditional once one does, and not a requirement
+that one be created - in the 2D rule, the 2D host tests, the 3D item, `h`'s tri-architecture run and
+the aggregate 2D clause. The prerequisite paragraph is retitled so the runtime is a prerequisite OF
+THE LATER PERFORMANCE ITEM and of nothing in `c` or `g`, and it now records that a previous round
+removed it from the Done clauses alone and left it mandatory in five other places. It also notes that
+`P02M0135` has pinned a configuration that does not create threads, so neither file is blocked on an
+unnumbered runtime.
+
+**5. The ResourceManager decision contradicts its authoritative work item - ACCEPTED.**
+
+Verified: the item required ResourceManager integration, graphics classifications, reservations and
+"optional graphics-specific limits", and a later paragraph in the SAME item said ResourceManager is
+not extended and all of those are dropped. One item instructing two incompatible implementations.
+
+Plan changes: I take the auditor's first option and rewrite the authoritative item around the
+decision. It is now **Account through the KERNEL's Domain counters and OBSERVE through SystemGraph.
+ResourceManager is not extended**, and it owns four specified things instead of a contradiction:
+SystemGraph reports bounded counts and reset/fault state as observation never enforcement; every
+DisplayService-side structure that is NOT a MemoryObject (present queue, damage lists, waiter records)
+gets a stated per-connection bound, because those are not charged by the kernel and are what an
+adversarial client multiplies; exhaustion returns a typed error and releases the partial transaction;
+and reclamation is specified in the item that owns it. The later paragraph is reduced to one sentence
+recording that the item is now written that way.
+
+**6. Client-created imports do not make requester attribution enforceable, and delegation is
+contradictory - ACCEPTED.**
+
+Verified: `MemoryObject::create_in` charges the Domain that invoked creation and holds that charge
+until drop, and `ObjectInfo` exposes koid, type, rights, generation and size and NO charged Domain -
+so DisplayService cannot distinguish a client-created buffer from a donated one, and the required
+cross-Domain rejection was unimplementable. Delegation had three answers in one item: not permitted,
+the channel may be transferred, and the item must still decide.
+
+I take the auditor's first option - make sponsorship explicit - because the alternative is a kernel
+provenance field on a shared ABI struct this milestone does not own.
+
+Plan changes: a `who pays` row stating **SPONSORSHIP IS THE CONTRACT, AND REQUESTER ATTRIBUTION IS NOT
+CLAIMED**. It says what the design DOES guarantee - DisplayService no longer pays for its clients'
+images, and no Domain pays for memory it did not itself allocate - and what it does not: that the
+paying Domain is the requesting one. It records that a third Domain sponsoring a client is possible
+and is a capability-system consequence rather than a hole, since it requires that Domain to allocate
+and transfer deliberately. Both the "by construction" claim and the cross-Domain rejection gate are
+withdrawn rather than left as a test nobody can build, and the kernel provenance field is named as a
+separate proposal. Delegation is DECIDED ONCE: in v1 the surface channel is NOT transferable either,
+so one process identity owns a surface's images, resize authority and cleanup - which is what makes
+"client death" name a unique process. The later paragraph no longer reopens it, and the hostile-test
+list drops "cross-Domain handles" for "a surface channel offered from a second process".
+
+**7. The P0167 assessment is stale - ACCEPTED.**
+
+Verified against both P0167 and the harness. P0167's M3 records that the suite's medium carries its
+content key so two selections are two files, `mkimage.sh` serialises assembly under its own lock and
+verifies a cache hit against a recorded digest, and `test-kernel.sh` stages the selected kernel under
+the build lock. My "the MEDIUM is still assembled from shared producers" was written before that
+landed. Leaving it would have blocked tri-architecture acceptance or invited a redundant redesign.
+
+Plan changes: the row now reads MET for the medium-identity contract, with the withdrawn sentence
+named as withdrawn. What is retained is the auditor's own distinction: a PERFORMANCE limit, not an
+evidence-integrity one - three emulated guests contend, and an aarch64 suite that finishes on its own
+can hit a per-suite timeout in a three-guest run, which bounds how this milestone SCHEDULES its
+tri-architecture gates without making their results untrustworthy.
+
+**8. The joint glyph-cache correction was never applied to M0103 - ACCEPTED.**
+
+Verified, and worse than reported: the key omitted the glyph index itself, so it did not identify a
+glyph at all. Answered jointly with M0136 finding 2 - `P02M0103`'s glyph-rendering item now carries
+the complete key verbatim as a labelled table, with the statement that it is one normative definition
+owned jointly, that neither side may restate it in its own words, and that a change to it is a change
+to both files in the same edit. Both sides carry the same negative test.
+
+**Plan re-check.** The file gains one part (`f-ext`) and two subsections (`a-common`, `a-wsi`), and
+its Definition of Done gains three conditions and loses none. Every part now has a Done gate that can
+be met with the mechanisms that exist: `a-common` needs no display, `b` needs only `a-common`, `c` and
+`g` need no thread runtime, `f` needs no Extended feature, and the completion object's guarantee is
+enforced where the plan says it is. Ordering is `s-common` -> `a-common` -> `s-2d` -> `b` -> `c`, with
+`a-wsi` beside them and `e`-onward Phase 4. No source code was modified.

@@ -508,3 +508,319 @@ Rating: 3/10
    The plan calls the input “COMPILE-ONLY” and says it is never linked (`docs/todo/P02M0135.md:32-35`), then requires an audit link and final ELF (`:37-57,122-131`), while the deferred list again postpones the “FINAL-LINK closure” (`:389-390`). Variant B and the Done gate refer to a “final linked and staged ELF” (`:231-238,342-343`) even though the audit ELF is explicitly discarded and never staged (`:53-54,107-108,122-124`). Finally, the existing relocation, W^X, identity, provider, and export checks are required only for a synthetic foreign artifact (`:348-354`), not the audit-linked Vulkan-Loader ELF.
 
    The milestone can close with a substrate surface derived from an artifact that the later importer immediately rejects, and removing/adding symbols after the one audit link can itself change archive/weak selection without a convergence relink. Use one term—an audit-linked, discarded ELF—and require strict no-host-default/no-unresolved links until the exact substrate surface converges on all targets. Scan that same discarded ELF for the chosen TLS variant and run it through the generic relocation, W^X, dynamic-metadata, identity/provider, and export-collision checks without installing it. Defer only packaging and production import, not the link that defines this milestone's own surface.
+
+PLANNER'S RESPONSE ON M0135 (2026-08-30T20:15:41Z):
+
+All six findings are accepted. One is accepted with an obligation I cannot discharge offline, and I
+say so rather than inventing the values it asks for.
+
+**1. The pinning correction names a project but does not pin a configuration, and its licence and
+dependency claims are wrong - ACCEPTED.**
+
+Both factual corrections are taken. The licence claim was wrong: I wrote MIT, and Vulkan-Loader's
+own LICENSE.txt is Apache-2.0 with more-permissive per-file exceptions. It is not a fatal difference
+- Apache-2.0 is permissive and this is an audit-only input - but a wrong licence inside an item whose
+whole purpose is "a check rather than an analysis" turns the check into a rubber stamp. And
+Vulkan-Headers was missing entirely: it is a separately versioned repository and a required build
+dependency, so a pin naming only the loader does not identify a buildable configuration.
+
+The structural half is the more serious one and is also accepted. Listing what to record and then
+leaving it to be recorded "during implementation" is not a pin. Build options decide the WSI
+dependencies, the generated sources, whether C++ is compiled at all, the TLS model and the sysroot
+surface - so every later conclusion in the file is derived from an input that does not exist yet.
+
+Plan changes: the licence is corrected to Apache-2.0 in both places it appeared, with the
+per-file closure explicitly determined by the licensing item rather than asserted in the pin.
+Vulkan-Headers is co-pinned, with the statement that the loader revision must build against the
+named header revision. The lockfile becomes **this milestone's first deliverable and a gate on every
+other item** - no other item may start until it is committed and reviewed, and the first host gate
+checks exactly that and that the build takes these values from nowhere else. Its fields are
+enumerated rather than summarised, and the OPTIONS THAT CHANGE THE INVENTORY are named individually
+so none stays implicit: BUILD_TESTS (off), each BUILD_WSI_*_SUPPORT (off, since LiberSystem is none
+of those window systems and they are what pull in X11/Wayland/XCB), the assembly/dispatch option, the
+loader-layer and debug options, the install and shared/static choice - plus a generated-source policy
+with digests, because generated code that is not pinned makes the inventory unreproducible.
+
+WHAT I COULD NOT DO, stated plainly: I cannot supply the revisions and SHA-256 digests. This session
+has no network access, and a fabricated digest in a lockfile is worse than an unfilled obligation -
+it would be a false fact that every later gate compares against. The plan therefore specifies the
+lockfile's exact contents and makes committing it the milestone's first gate, which is the strongest
+form the pin can take from here. The remaining audit finding on this point is discharged when the
+file is written, and the gate is what proves it was.
+
+**2. Pre-launch ICD selection does not supply the platform port or dynamic-symbol seam - ACCEPTED,
+and it is the most valuable finding in this round.**
+
+The plan said "(a) needs no new loader mechanism, because selection happens before the closure is
+built". I meant THIS system's loader; the sentence reads as though the pinned upstream needed nothing
+either, and that is false. Upstream's platform layer discovers drivers through the filesystem and the
+environment and then opens the selected one with dlopen, resolves entry points with dlsym and
+releases it with dlclose - with no LiberSystem branch. Adding an ICD to ProcessService's eager
+closure gives the already-mapped loader neither a handle nor a symbol-query API. So pre-launch
+selection answers DISCOVERY and says nothing about LOADING, and the milestone could have passed its
+synthetic selector gate with the audit target still unable to load anything.
+
+Plan changes: the sentence is narrowed to "needs no new PROCESSSERVICE mechanism", and a new block
+makes **the LiberSystem platform port a named deliverable**, pinned in the lockfile's patch series
+like every other modification. It states four things: how the selected metadata and provider enter
+the verified identity graph; what bounded object represents the provider in place of a dlopen handle
+- a reference to something already in the verified closure, never a capability to open something new,
+so dlopen/dlclose become "look up the pre-verified provider" and "drop the reference"; how entry
+points resolve in place of dlsym, as a bounded query against that provider's exports with no ambient
+search; and what each replaced call does on failure, since the upstream error paths assume a
+filesystem. The guest gate now requires the AUDIT-LINKED LOADER ITSELF to reach a synthetic ICD's
+entry points through that path, because a selector gate that never runs the thing being ported proves
+the wrong half.
+
+**3. The selected consumer does not justify the broad C++ substrate work - ACCEPTED.**
+
+Correct, and it contradicts this file's own exact-surface rule, which is what makes it a real
+inconsistency rather than a preference. Vulkan-Loader's production requirement is C99; C++17 is
+required for its TEST SUITE, and BUILD_TESTS defaults off and is now pinned off. So the extensive C++
+ABI and lifecycle work was not derived from the selected consumer at all. The audit is also right
+that enabling the upstream test suite to force C++ into the inventory would size the substrate to a
+test harness and drag in GoogleTest.
+
+Plan changes: the "C/C++ substrate" phrasing in the selection rationale is corrected to "foreign ABI
+substrate" with a note that this consumer is C99 in production. The C++ item keeps its decision
+structure - each mechanism gets the supported answer or the forbidden answer, never "audit it" - and
+is scoped by measurement: where the inventory names nothing, the answer is FORBIDDEN and the
+deliverable is the compiler flags plus a build-time artifact check with a watched-fail mutation on
+every target, which is cheap and worth having and is the whole of the C++ work under this pin. The
+positive per-mechanism guest gates now say the expected set is EMPTY under this pin, and that an
+empty set means those gates are not written rather than waived. A later profile wanting to prove C++
+support pins a genuine production C++ consumer, which is the same rule this file already applies to
+Mesa.
+
+**4. The self-thread prerequisite remains unowned and is broader than the consumer justifies -
+ACCEPTED, and the block is removed rather than re-labelled.**
+
+The audit is right on both halves. Relabelling an acknowledged dependency as a hard block gave it no
+owner, order or evidence contract - the same criticism M0136 received, and it is fair in both places.
+And the rationale did conflate two things: thread SAFETY (the loader serialises its dispatch so a
+multi-threaded caller is safe) establishes a synchronisation surface; it does not imply imports of
+pthread_create, pthread_join or pthread_detach. I inferred creation from safety.
+
+Plan changes: the item is rewritten as **THE PINNED CONFIGURATION CREATES NO THREADS, AND THAT IS
+WHAT THE INVENTORY MUST SHOW**, separating synchronisation from self-spawn in a table. Mutex,
+condition and once primitives are supplied under a DOCUMENTED SINGLE-THREADED CONTRACT - in a process
+that creates no threads an uncontended lock is a counter - and are stated as such in the ABI notes so
+nobody later mistakes them for a concurrency implementation. Self-spawn and join are out of scope.
+The audit's own alternative is taken: pin the no-thread configuration, and let measurement decide -
+**if pass 1's inventory names any thread-creation symbol on any target, the milestone STOPS and the
+runtime becomes a numbered prerequisite before it resumes.** That is a gate on a derived fact rather
+than an assumption, and it is the honest form of a question nobody can answer before the
+configuration is built. A gate was added that must fail when an injected thread-creation symbol is
+present. The contract such a runtime would own is retained as a record for whoever numbers it.
+
+Consequences elsewhere in the file: TLS Variant A depended on that runtime, so it is marked
+unprovable under this pin with a TLS requirement named as the file's second measured stop condition;
+errno is process-wide, which is what the pin makes correct; the "Required and NOT owned here" line
+becomes "NOT required by this milestone as pinned"; and the completion section now says the milestone
+IS APPROVABLE, with two measured stop conditions replacing one unowned block. M0103 has removed the
+same mechanism from everything mandatory, so no milestone is currently blocked on it.
+
+**5. Hashing provider identities over only the COMMON section makes verification unsound -
+ACCEPTED.**
+
+This is the most serious finding of the six, because it WEAKENED an existing contract rather than
+leaving a gap. Build, packaging and ProcessService all hash and compare the complete canonical
+provider record today; my v2 design would have let a provider change compiler, linker, flags,
+sysroot, configure-input digest, rustflags or features - every one able to change ABI and code
+generation - without changing the digest its consumers embed, so a stale consumer or cache entry
+would pass after an ABI-affecting rebuild.
+
+And the concern it was solving does not require it, which is the part I got wrong: a cross-language
+consumer HASHES the language section, it does not PARSE it, and hashing bytes needs no knowledge of
+their producer. Plan changes: provider digests are over the COMPLETE canonical v2 record, with that
+reasoning written down and the common/language split redefined as governing who must UNDERSTAND
+which fields rather than what identity covers. A separate ABI digest is named as the correct shape
+IF a future need arises to compare only ABI-affecting inputs - a digest that omits fields because
+one reader finds them opaque is not that. Mutation tests were added, watched to fail: a provider
+rebuilt with a different compiler, flag set, sysroot digest, configure-input digest, rustflags or
+feature set must each change the digest, invalidate every consumer edge and invalidate the cache key.
+
+**6. The audit-link correction is internally contradictory and does not gate the real artifact -
+ACCEPTED.**
+
+Verified in every place the audit names. The input was called "COMPILE-ONLY" and "never linked into
+anything" while pass 2 links; the TLS gate and Variant B referred to "the final staged ELF" although
+the audit ELF is discarded and never staged; the deferred list postponed "the FINAL-LINK closure"
+that pass 2 performs; and the relocation, W^X, identity, provider and export checks were required
+only of a synthetic foreign artifact, never of the audit-linked loader whose measurement is this
+milestone's entire claim.
+
+Plan changes, one term throughout: **AUDIT-LINKED AND DISCARDED**. The distinction is stated as
+IMPORT versus LINK - linking to measure is how the inventory is settled, importing is what this
+milestone refuses - and the deferred list now defers import and explicitly says the link is not
+deferred. Every "staged ELF" reference became "audit-linked ELF". A package gate was added putting
+that same discarded ELF through the generic relocation, W^X, dynamic-metadata, identity/provider and
+export-collision checks per target without installing it, with the synthetic artifact retained for
+the PACKAGING path and neither substituting for the other. And the audit's convergence point is
+taken: the link is strict - no host default library paths, no default libraries, no unresolved
+symbols, because a link that silently pulls a host libc measures the host - and it is REPEATED until
+it reaches a fixed point, since removing or adding substrate symbols after one link can itself change
+archive-member and weak selection. The gate is two consecutive links producing the same resolved set
+on all three targets, not the first link's output.
+
+**Plan re-check.** The milestone is now schedulable and its first item is the lockfile. Ordering:
+lockfile -> pass 1 objects -> substrate -> pass 2 audit link to a fixed point -> gates. The two
+measured stop conditions (a thread-creation symbol, a TLS requirement) are the only things that can
+halt it, and both are decided by evidence rather than by an unowned dependency. The C++ work is sized
+to the pinned closure, the provider identity no longer weakens the existing contract, and the loader
+port is named as the largest piece of work the pin implies rather than being absent. The one
+obligation I could not discharge - the actual revisions and digests - is specified precisely and
+gated, not faked. No source code was modified.
+
+PLANNER'S RESPONSE ON M0135 (2026-08-30T20:15:41Z):
+
+All six findings are accepted. Two of them removed a block rather than adding one, and one is
+accepted with an honest limitation stated rather than papered over.
+
+**1. The pinning correction names a project but does not pin a configuration, and its licence and
+dependency claims are wrong - ACCEPTED.**
+
+The licence claim was wrong and I wrote it. `Vulkan-Loader`'s own `LICENSE.txt` is Apache-2.0 with
+more-permissive per-file exceptions; the plan said MIT, and it said so in the sentence arguing that
+the licensing item would be "a check rather than an analysis" - which is exactly the sentence a wrong
+licence turns into a rubber stamp. `Vulkan-Headers` is a separately versioned repository and a
+required build dependency, and the plan did not mention it at all, so what was called a pin did not
+identify a buildable configuration.
+
+The deferral is the more serious half and the auditor states the mechanism correctly: build options
+decide the WSI dependencies, the generated sources, whether C++ is compiled, the TLS model and the
+sysroot surface, so a plan that leaves them to be "recorded during implementation" derives every
+later conclusion from an unspecified input.
+
+**A limitation I will not paper over:** I cannot supply the revisions and SHA-256 digests here. This
+session has no network, and a fabricated digest in a lockfile is worse than a stated obligation -
+it would be a fact nobody could check that looks like one anybody could. So the correction makes the
+lockfile the milestone's FIRST DELIVERABLE and a GATE ON EVERY OTHER ITEM, rather than pretending to
+fill it in.
+
+Plan changes: the licence is corrected to Apache-2.0 with the per-file closure left to the licensing
+item to determine rather than asserted; `Vulkan-Headers` is added as a co-pinned project with the
+loader/header compatibility recorded; and the recording paragraph is rewritten as **THE LOCKFILE IS
+THIS MILESTONE'S FIRST DELIVERABLE AND A GATE ON EVERY OTHER ITEM**, enumerating both projects with
+digests, the patch series INCLUDING the platform port from finding 2, the CMake option set in full
+with the inventory-changing options named explicitly (`BUILD_TESTS` OFF, each `BUILD_WSI_*_SUPPORT`
+OFF, assembly/dispatch, loader-layer and debug, shared/static), the generated-source policy and
+digests, the three toolchain files, the tool identities and the sysroot digest. A new host gate makes
+the lockfile the build's ONLY source for those values and fails a build that takes any of them from
+anywhere else, or a lockfile missing any field.
+
+**2. Pre-launch ICD selection supplies no platform port or dynamic-symbol seam - ACCEPTED.**
+
+This is the finding that would have let the milestone close while failing at its own purpose. The
+plan's sentence was "(a) needs no new loader mechanism" - I meant THIS system's loader, and the
+sentence reads as though the upstream needed nothing either. It does: upstream's Unix platform layer
+discovers drivers through the filesystem and the environment, opens the selected one with `dlopen`,
+resolves entry points with `dlsym` and releases it with `dlclose`, and has no LiberSystem branch.
+Adding an ICD to ProcessService's eager closure gives the already-mapped loader neither a handle nor
+a symbol-query API. Pre-launch selection answers DISCOVERY and says nothing about LOADING.
+
+Plan changes: the sentence is narrowed to "needs no new PROCESSSERVICE mechanism" and followed by
+**BUT IT DOES NEED A LOADER PORT, AND THAT IS A DELIVERABLE OF THIS MILESTONE**, pinned in the
+lockfile's patch series and specifying four things: how the selected metadata and provider enter the
+verified identity graph; what bounded object represents the provider in place of a `dlopen` handle
+(a reference to something already in the verified closure, never a capability to open something new);
+how entry points resolve in place of `dlsym` (a bounded query against that provider's exports, no
+ambient search); and what each replaced call does on failure, since the upstream error paths assume a
+filesystem. The plan calls it the largest single piece of work the pin implies. The guest gate is
+changed with it: the audit-linked loader itself must run against a synthetic ICD and reach its entry
+points through the replaced path - a selector gate that never runs the thing being ported proves the
+wrong half.
+
+**3. The selected consumer does not justify the broad C++ substrate work - ACCEPTED.**
+
+Correct, and it contradicts the plan's own exact-surface rule ("a facility the derived inventory does
+not name is not built"). `Vulkan-Loader`'s documented production requirement is C99; C++17 is
+required for its TEST SUITE, and `BUILD_TESTS` defaults off. So the extensive C++ ABI and lifecycle
+work was not derived from the selected consumer. The auditor's observation that enabling the test
+suite to force C++ into the inventory would size the substrate to a test harness - and drag in
+GoogleTest - is right and is now written into the plan as a refusal.
+
+Plan changes: the item is retitled "and under this pin the expected answer is FORBIDDEN" and scoped -
+each mechanism is decided by what passes 1 and 2 actually name, and where the inventory names
+nothing the answer is FORBIDDEN with compiler flags plus a build-time artifact check and a
+watched-fail mutation on every target. That check is cheap and worth having, so the work is scoped
+rather than deleted. The guest-gate section now says the expected supported set is EMPTY under this
+pin, and that an empty set means those gates are not written rather than waived. The "smallest
+upstream that exercises a C/C++ substrate" bullet is corrected to "a foreign ABI substrate", since
+the C++ half was the overstatement. Proving C++ support is explicitly reassigned to a later profile
+with a genuine production C++ consumer.
+
+**4. The self-thread prerequisite remains unowned and is broader than justified - ACCEPTED, and the
+block is removed.**
+
+The auditor's technical point is the one that resolves it: thread SAFETY is not thread CREATION. The
+plan inferred the second from the first - "`Vulkan-Loader` serialises its dispatch with mutexes and
+is thread-safe by specification, so the substrate needs real mutual exclusion" is true and does not
+imply `pthread_create`. And a milestone declared "not approvable" until someone numbers a milestone
+nobody has proposed is unschedulable by construction.
+
+Plan changes: the item becomes **THE PINNED CONFIGURATION CREATES NO THREADS, AND THAT IS WHAT THE
+INVENTORY MUST SHOW**, separating SYNCHRONISATION (mutex, condition, once - satisfiable in a
+single-threaded process without any kernel mechanism, supplied under a documented single-threaded
+contract stated in the ABI notes) from SELF-SPAWN AND JOIN (the facility that needs a runtime that
+does not exist). The configuration is pinned without thread creation, and the exact-surface rule
+decides the rest by measurement: if pass 1 names any thread-creation symbol on any target, the
+milestone STOPS and the runtime becomes a numbered prerequisite. That is a gate on a derived fact
+rather than an assumption, which is the honest form of a question that cannot be answered until the
+configuration is built. A new host gate proves it: a fixture injecting a thread-creation symbol into
+the recorded inventory must make the gate refuse.
+
+The runtime's contract is retained for whoever numbers it, and the TLS section, the `errno` gate and
+the dependency summary were all corrected to match - `errno` is now PROCESS-WIDE, which is what the
+pin makes correct. The completion section states the milestone is APPROVABLE as it stands, with two
+measured STOP CONDITIONS (a thread-creation symbol, or a TLS requirement) replacing the block.
+`P02M0103` made the same correction in the same round, so neither file is now blocked on an
+unnumbered runtime.
+
+**5. Hashing provider identities over only the COMMON section is unsound - ACCEPTED.**
+
+Verified against the tree: build, packaging and ProcessService all hash and compare the COMPLETE
+canonical provider record today, so the plan's v2 design was a WEAKENING of a working contract, not a
+new rule. And the failure mode is exactly as described - compiler, linker, flags, sysroot,
+configure-input digest, rustflags and features are all ABI-affecting and all sit in the language
+section, so a provider could change any of them without changing the digest its consumers embed.
+
+The auditor also dissolves the concern the split was solving: a cross-language consumer HASHES the
+language section, it does not PARSE it, and hashing bytes needs no knowledge of their producer. That
+is right and it is now the plan's reasoning.
+
+Plan changes: provider digests are taken over the complete canonical v2 record, common AND language
+sections, with the common/language split reduced to what it should always have been - a statement
+about who must UNDERSTAND which fields, not about what identity covers. A separate ABI digest is
+named as the correct answer if comparing only ABI-affecting inputs is ever wanted. Mutation tests are
+added and watched to fail: a provider rebuilt with a different compiler, flag set, sysroot digest,
+configure-input digest, rustflags or feature set must each change the digest, invalidate every
+consumer edge and invalidate the cache key.
+
+**6. The audit-link correction is internally contradictory and does not gate the real artifact -
+ACCEPTED.**
+
+Every contradiction listed is real and every one is mine: "COMPILE-ONLY" and "never linked into
+anything" against a pass 2 that links; "final linked and staged ELF" in two places against an ELF
+that is explicitly discarded; and the deferred list still deferring "the FINAL-LINK closure" that the
+plan performs. The substantive half is the last one - the existing relocation, W^X, identity,
+provider and export checks applied only to a synthetic foreign artifact, so the milestone could close
+with its surface derived from an artifact the later importer immediately rejects.
+
+Plan changes: one term throughout - **AUDIT-LINKED AND DISCARDED** - with the distinction stated as
+IMPORT rather than link ("linking to measure is how the inventory is settled; importing is what this
+milestone refuses"). Every "staged ELF" is corrected to the audit-linked one. The deferred list now
+defers IMPORT by name and says the LINK is not deferred, with the reason. The package gates gain a
+first entry running the audit-linked ELF itself through the generic relocation, W^X, dynamic-metadata,
+identity/provider and export-collision checks per target without installing it, and the synthetic
+artifact is explicitly described as proving the PACKAGING path while the audit-linked ELF proves the
+SURFACE - neither substituting for the other. The auditor's convergence point is taken too: the link
+is strict (no host default library paths, no default libraries, no unresolved symbols) and is
+REPEATED until it reaches a fixed point, because adjusting the substrate after one link can itself
+change archive-member and weak selection.
+
+**Plan re-check.** The item count is unchanged; the plan is longer where it now states obligations it
+had deferred. Ordering is explicit and gated: the lockfile first and blocking everything, then pass 1,
+then the substrate, then the converging audit link, with the platform port pinned into the patch
+series the lockfile records. Two measured stop conditions replace one unowned block, and the
+completion section says the milestone is approvable. No source code was modified.

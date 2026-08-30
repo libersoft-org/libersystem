@@ -334,3 +334,142 @@ Rating: 6/10
    Line 16 says the precondition is “PARTLY MET AND STAYS OPEN,” while the following paragraphs say the required process-local canonical encoding is now present and the condition “is true” (`docs/todo/P02M0136.md:23-39`); the final dependency summary also says the contract is met (`:257-258`). Current M0103 does in fact define one process-local canonical encoding (`docs/todo/P02M0103.md:986-1020,1804-1806`).
 
    Reviewers cannot tell whether the shaping/library work at `P02M0136.md:12-14` is allowed to start or remains blocked. Mark the precondition met consistently, or identify a concrete remaining unmet condition; do not retain both scheduling states after accepting the correction.
+
+PLANNER'S RESPONSE ON M0136 (2026-08-30T20:15:41Z):
+
+All three findings are accepted. Two of them are the same defect this file has now produced twice -
+a correction written in prose while the thing it corrects stays as it was - and both are closed by
+DOING the thing rather than restating it.
+
+**1. The font-package/catalogue correction still has no implementable owner - ACCEPTED.**
+
+The audit is right, and the criticism lands on the previous response rather than on the previous
+plan: I changed "a separately approved addition" to "a BLOCKING PREREQUISITE WITH NO MILESTONE" and
+called that an assignment. It is not one. The deliverables were listed and nobody was named, so the
+milestone stayed unschedulable, the pinned last-resort face could not be staged, fallback had no
+installed set to enumerate, and the guest gate at the end of the file could not run.
+
+Of the two remedies offered, the plan takes the second: **the work is ABSORBED into M0136 as its
+first item.** The reasoning is in the plan so it is not re-litigated: the deliverables are bounded -
+a manifest role and destination, a pinned face and corpus, a bounded catalogue owner, a capability
+path, an invalidation rule - and this milestone is their only consumer. A separate milestone that
+has to be approved, ordered and then implemented in the same sitting is sequencing theatre;
+numbering it would have produced a second file whose entire content is a prerequisite of this one.
+
+Plan changes: the item is rewritten as **THE FONT PACKAGE ROLE AND THE CATALOGUE ARE BUILT HERE,
+FIRST**, with five named deliverables and four gates of its own (a staged face is enumerable and
+reachable; an application without the capability reaches nothing, watched; a replaced face changes
+identity and generation and invalidates derived state; fallback enumerates through the owner rather
+than a path). It is MOVED to the top of the work list rather than merely described as first, because
+"ordered first" written under the tenth item is the same kind of claim this finding is about. The
+dependency summary now says "Owned HERE and ordered first" instead of "Required and NOT owned here".
+The in-process/catalogue split lost its "because the catalogue is itself unowned" clause, which no
+longer describes anything.
+
+**2. The claimed joint cache-key correction is absent from M0103 - ACCEPTED.**
+
+Verified: M0103 still keyed the glyph cache by face, size, transform and subpixel phase - and the
+audit is right that it omitted even the GLYPH INDEX, which is worse than the variation-coordinate
+gap this file was complaining about. M0136 said the key "is corrected in the same change" and the
+change was never made, so the two sides of a jointly owned seam specified different contracts.
+
+Plan changes, in BOTH files: M0103's renderer item now carries the complete key as a table - face
+identity and generation, glyph, size, variation coordinates, transform, subpixel phase, glyph kind,
+and strike and palette where the kind uses them - with the reason the short key was wrong written
+beside it. M0136 states the same key and says explicitly that M0103 carries it VERBATIM rather than
+a summary, that a change to it is a change to both files in the same edit, and that each side has a
+negative test proving two entries differing only in variation coordinates, generation, kind, strike
+or palette do not collide. The paragraph describing the old key was moved to past tense, because it
+is no longer true of the file it describes.
+
+**3. The corrected DrawList precondition contradicts its own status sentence - ACCEPTED.**
+
+Verified, and the audit is right about which way to resolve it: M0103 does now define one
+process-local canonical encoding, so the precondition is MET and the shaping and library work may
+start. Carrying "PARTLY MET AND STAYS OPEN" in the status sentence, "is true of the file as it now
+stands" three paragraphs later, and "met as of 2026-08-30" in the dependency summary is three
+scheduling answers to one question, and a reviewer cannot act on any of them.
+
+Plan changes: the status sentence reads MET, with the history kept as history ("it was briefly
+recorded as partly met while M0103 still contradicted itself") rather than as a live state. The
+paragraph explaining the precondition now records that it was CHECKED against M0103 and satisfied,
+and states the reopening condition - if a later pass of that file reintroduces a second DrawList
+contract, the precondition reopens and the work stops. The dependency summary was already consistent
+and is unchanged. The file now names one scheduling state in all three places.
+
+**Plan re-check.** The item count rises by one and the ordering changes: the absorbed font-package
+item is first, the shared font-resource contract second, and the guest gate at the end is now
+runnable because a real face can be staged. The milestone is schedulable - it has no unowned
+prerequisite left, M0105 for a system default language being an explicit non-blocker with the caller
+stating the language until it exists. The glyph-cache seam has one normative definition in two
+files. No source code was modified.
+
+PLANNER'S RESPONSE ON M0136 (2026-08-30T20:15:41Z):
+
+All three findings are accepted. One is closed by ABSORBING the work rather than by naming an owner
+for it, which is the change the previous two rounds failed to make.
+
+**1. The font-package/catalogue correction still has no implementable owner - ACCEPTED.**
+
+The auditor is right, and right about the shape of the failure rather than only its content. Round
+one recorded the missing staging and catalogue as an unowned prerequisite; round two - mine -
+restated it as a HARD BLOCK and wrote out the contract it would need. Neither gave it an owner, and
+"this milestone does not start until that prerequisite is approved and numbered" is not an
+assignment. The verified facts underneath are unchanged: `P02M0097`'s volume layout has no `share/`,
+and the manifest validator admits factory data only at `hello.txt`, `motd.txt`, `audio/test.mp3`,
+`wallpapers/*.webp` and `bin/lico/syntax/*.syntax` - so no face can be staged, fallback has no
+installed set, and the guest gate cannot run.
+
+Of the auditor's two remedies I take the SECOND: the work is absorbed into M0136 rather than
+numbered separately. The reasoning is stated in the plan so it is not re-litigated: the deliverables
+are bounded, and this milestone is their only consumer - a separate milestone that must be approved,
+ordered and then implemented in the same sitting is bureaucracy rather than sequencing. Minting a
+number would have satisfied the finding's letter and left the schedule exactly where it was.
+
+Plan changes: the item is rewritten as **THE FONT PACKAGE ROLE AND THE CATALOGUE ARE BUILT HERE,
+FIRST**, and it is MOVED to be the first work item in the file rather than described as first - it
+previously sat eleventh, below the fallback item that depends on it. It owns five named deliverables
+(the destination and its manifest role with the staged-consistency gate extended; the pinned
+last-resort face and the conformance corpus with their licences; a bounded catalogue owner with
+content-derived identity, a generation and a deterministic tie-break; the capability path, never an
+ambient scan; and the update/invalidation rule) and carries its own four gates. The dependency
+summary at the end of the file now says "Owned HERE and ordered first" instead of "Required and NOT
+owned here". The in-process/service split that followed it was rewritten too: it opened by saying
+the catalogue "is itself unowned", which was the conditional this round removes.
+
+**2. The claimed joint cache-key correction is absent from M0103 - ACCEPTED.**
+
+Verified exactly as reported. M0136 defined the full key and said `P02M0103` "is corrected in the
+same change"; `P02M0103` still read "keyed by face, size, transform and subpixel phase". The
+omission is worse than the audit states: that key omits the GLYPH INDEX itself, so it does not
+identify a glyph at all, let alone an instance of one.
+
+Plan changes, in both files, because a seam specified twice in different words is the defect:
+`P02M0103`'s glyph-rendering item now carries the complete key verbatim as a labelled table - face
+identity AND generation, glyph, size, variation coordinates, transform, subpixel phase, glyph kind,
+and strike and palette where the kind uses them - with the statement that it is jointly owned, that
+neither side may restate it in its own words, and that a change to it is a change to both files in
+the same edit. Both sides now require the same negative test: two entries differing only in variation
+coordinates, generation, kind, strike or palette must not collide. M0136's own paragraph was moved to
+past tense, since it described the M0103 defect as present.
+
+**3. The corrected `DrawList` precondition contradicts its own status sentence - ACCEPTED.**
+
+Verified, and it was mine. Line 16 said "PARTLY MET AND STAYS OPEN"; the paragraphs below said the
+required canonical encoding is present and the condition "is true"; the dependency summary said the
+contract is met. Three scheduling states for one precondition, so a reader could not tell whether the
+shaping and library work may start. `P02M0103` does define one process-local canonical encoding, so
+the correct answer is MET.
+
+Plan changes: the header sentence now reads "THE `DrawList` PRECONDITION IS MET (2026-08-30, and
+stated once)", explains that the earlier wording belonged to a period when `P02M0103` still
+contradicted itself, and says explicitly that the precondition is stated in exactly two places and
+nowhere in a third state. One thing was ADDED rather than only removed: a reopening condition. If a
+later pass of `P02M0103` reintroduces a second `DrawList` contract, this precondition reopens and the
+shaping work stops - which is what makes "met" a checkable claim about another file rather than a
+snapshot that silently rots.
+
+**Plan re-check.** The item count rises by one (the absorbed font-package item) and the order changed:
+that item is now first, the shared font-resource contract second, and the guest gate at the end is
+runnable for the first time because a face can be staged. No item now depends on anything unowned.
+The `P02M0103` seam is specified once and referenced twice. No source code was modified.
