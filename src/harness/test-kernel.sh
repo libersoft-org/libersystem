@@ -275,6 +275,30 @@ progress_count() {
 ) &
 STALL_WATCHER=$!
 
+# THE COMPILE IS SERIALIZED; THE GUEST RUN IS NOT.
+#
+# `TEST_SELECTION` and `TEST_TAGS` are `option_env!`, so they are COMPILE-TIME: two runs of one
+# architecture with different selections are two different kernels, and both are built in the shared
+# Cargo target directory. Nothing held a lock over that, so two concurrent selections could compile
+# over each other's intermediates - which is what the model-verifier's own re-audit hit, an
+# enumerated `.rcgu.o` gone before `nm` opened it.
+#
+# A lock around the whole `cargo test` would serialize the BOOTS as well, which is most of the wall
+# clock and the whole point of running them in parallel. So the build is taken under the lock, alone,
+# and the run below then finds everything up to date and compiles nothing. The staged medium is
+# already private per selection - `mkimage.sh` names the test ISO by its content key - so what was
+# left shared was exactly this step.
+mkdir -p "$REPO_ROOT/.build/state"
+(
+	flock 8
+	cd "$ROOT/kernel"
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" cargo build "${TARGET_ARGS[@]}" --tests
+) 8>"$REPO_ROOT/.build/state/kernel-test-build.lock" >>"$RUN_LOG" 2>&1 || {
+	echo "test-kernel: the selection-specific kernel did not build" >&2
+	tail -20 "$RUN_LOG" >&2
+	exit 1
+}
+
 set +e
 (
 	cd "$ROOT/kernel"

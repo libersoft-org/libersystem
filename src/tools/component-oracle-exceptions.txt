@@ -14,30 +14,21 @@ session_service	NO ORACLE. Nothing in the suite fails when this service breaks. 
 time_service	NO ORACLE. The RTC tests assert what the KERNEL reads off the clock hardware; nothing asserts what this service answers to a client. Same shape as session_service and recorded for the same reason.
 virtio_input	NO ORACLE. This line used to name `kernel.services.input_service_streams_pointer_events`, and that test does not exercise this driver: the pointer device is interactive-only, so the test spawns InputService and - in its own words - "plays the driver itself" by sending raw events on a producer end it keeps. Breaking `virtio_input` cannot make it fail, and nothing else in the suite asserts an effect of it. A change to it selects builds and a smoke boot. Recorded as the gap it is rather than as the coverage it is not.
 
-# AND FIFTEEN WHOSE ORACLE EXISTS AND WHOSE `covers` CANNOT SAY SO.
+# AND THE FIFTEEN THAT USED TO BE HERE ARE ANNOTATIONS NOW.
 #
-# This is a finding about the MECHANISM, not about these components, and it is worth the space.
-# `verify-model` enforces that `covers X` implies the test's body can REACH X, and reach is the
-# forward closure of what the body was seen to LAUNCH. A test that asserts a driver's effect never
-# launches the driver: DeviceManager binds it during boot, and ServiceManager starts the services.
-# So the annotation is TRUE about failure - break the driver and the test goes red - and refused by
-# the model, correctly, because the model cannot see the path.
+# They were a finding about the MECHANISM: `verify-model` enforces that `covers X` implies the test's
+# body can REACH X, reach was the forward closure of what the body was seen to LAUNCH, and a test
+# that asserts a driver's effect never launches the driver - DeviceManager binds it at boot and
+# ServiceManager starts the services. So fifteen annotations that were TRUE about failure - break the
+# driver and the test goes red - were refused by the model, correctly, because the model could not
+# see the path.
 #
-# Each line names the test that DOES fail. That is what makes these different from the two above: an
-# oracle exists and is identified, and what is missing is the selector's ability to be told. Closing
-# it needs the reach relation to include the boot chain - a declared edge from what the manifest
-# stages to what boots it - which is its own piece of work and not an annotation.
-virtio_blk	oracle: kernel.services.kernel_reads_file_through_storage_service - the file is served over this disk. `covers` refused: the test launches no driver, DeviceManager binds it at boot.
-virtio_console	oracle: kernel.services.the_console_answers_a_program_through_its_own_channel - the banner goes out through this driver's transmit queue. Same refusal.
-virtio_gpu	oracle: kernel.services.display_service_restores_the_console_surface. Same refusal.
-virtio_net	oracle: kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock - a lease is a real round trip through this NIC. Same refusal.
-virtio_snd	oracle: kernel.hardware.virtio_snd_driver_captures_a_period_from_the_device. Same refusal.
-xhci	oracle: kernel.hardware.xhci_driver_enumerates_the_usb_bus. Same refusal.
-audio_service	oracle: kernel.services.audio_service_enforces_scope_and_mixes_streams. Same refusal, from the service side: ServiceManager starts it, the test does not.
-config_service	oracle: kernel.services.config_service_serves_the_tree. Same refusal.
-device_manager	oracle: kernel.hardware.device_manager_reacts_to_a_driver_crash. Same refusal.
-device_service	oracle: kernel.hardware.device_service_lists_devices. Same refusal.
-display_service	oracle: kernel.services.display_service_restores_the_console_surface. Same refusal.
-log_service	oracle: kernel.services.log_service_speaks_generated_bindings. Same refusal.
-process_service	oracle: kernel.services.process_service_lists_every_started_program. Same refusal.
-system_graph_service	oracle: kernel.kernel.system_graph_reflects_live_state. Same refusal.
+# The reach relation now includes the boot chain: a kernel test runs inside a booted guest, so the
+# components the manifest STAGES are live before any test body runs, and `unreachable_covers` seeds
+# reach with them. Each of the fifteen tests carries its `bin.<component>` declaration, so a change
+# to one of those drivers or services selects the test that fails when it breaks rather than builds
+# and a smoke boot. See `kerneltests::unreachable_covers` and
+# `the_boot_chain_is_part_of_what_a_kernel_test_reaches`.
+#
+# What is left below is the real list: components with no oracle at all, and two whose oracle is on
+# a guest this census cannot see. Those are gaps, and they read as gaps.

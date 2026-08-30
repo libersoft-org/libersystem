@@ -790,7 +790,7 @@ fn object_info_get_reports_object() {
 	assert!(DONE.load(Ordering::SeqCst));
 }
 
-tagged_test!(system_graph_reflects_live_state, [Kernel], id = "kernel.kernel.system_graph_reflects_live_state", covers = ["kernel"]);
+tagged_test!(system_graph_reflects_live_state, [Kernel], id = "kernel.kernel.system_graph_reflects_live_state", covers = ["kernel", "bin.system_graph_service"]);
 fn system_graph_reflects_live_state() {
 	use object::address_space::AddressSpace;
 	use object::channel::Channel;

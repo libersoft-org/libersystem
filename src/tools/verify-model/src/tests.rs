@@ -1117,10 +1117,29 @@ fn covers_must_be_reachable_from_what_the_test_touches() {
 	let touched: BTreeSet<String> = [String::from("bin.audioconv")].into_iter().collect();
 	// Reached through the tool's own provider chain, without the test naming it.
 	let ok = kernel_test("t", &["flac", "audioconv"]);
-	assert!(crate::kerneltests::unreachable_covers(&ok, &touched, &model.graph).is_empty());
+	let nothing_staged: BTreeSet<String> = BTreeSet::new();
+	assert!(crate::kerneltests::unreachable_covers(&ok, &touched, &model.graph, &nothing_staged).is_empty());
 	// Nothing leads from a codec tool to a filesystem.
 	let bad = kernel_test("t", &["liberfs"]);
-	assert_eq!(crate::kerneltests::unreachable_covers(&bad, &touched, &model.graph), vec![String::from("liberfs")]);
+	assert_eq!(crate::kerneltests::unreachable_covers(&bad, &touched, &model.graph, &nothing_staged), vec![String::from("liberfs")]);
+}
+
+// AND THE BOOT CHAIN IS REACH, which is what fifteen exception lines were about.
+//
+// A kernel test runs in a booted guest, so the staged drivers and services are live before its body
+// runs: a test that asserts a file read over a disk reaches that disk's driver without ever
+// launching it. Reach computed from launches alone refused those declarations - correctly, given
+// what it could see - and the fix is to let it see the boot.
+#[test]
+fn the_boot_chain_is_part_of_what_a_kernel_test_reaches() {
+	let model = model();
+	// A test that launches nothing at all, which is most of them.
+	let touched: BTreeSet<String> = BTreeSet::new();
+	let test = kernel_test("t", &["bin.virtio_blk"]);
+	let nothing_staged: BTreeSet<String> = BTreeSet::new();
+	assert_eq!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph, &nothing_staged), vec![String::from("bin.virtio_blk")], "with nothing staged there is no boot chain and the declaration is unreachable");
+	assert!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph, &model.staged).is_empty(), "and on a machine whose boot stages that driver, a test asserting its effect reaches it");
+	assert!(model.staged.contains("bin.virtio_blk"), "the staged set is what the manifest stages, read rather than assumed");
 }
 
 #[test]
@@ -1129,7 +1148,7 @@ fn the_converse_is_reported_and_never_enforced() {
 	let model = model();
 	let touched: BTreeSet<String> = [String::from("bin.audioconv"), String::from("bin.storage_service")].into_iter().collect();
 	let test = kernel_test("t", &["flac"]);
-	assert!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph).is_empty(), "the declaration is fine");
+	assert!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph, &BTreeSet::new()).is_empty(), "the declaration is fine");
 	// Both launched programs are reported, including the one the test is actually about: a person
 	// reading this decides whether `bin.audioconv` belongs in the declaration. The tool does not.
 	assert_eq!(crate::kerneltests::launched_but_not_covered(&test, &touched, &model.graph), vec![String::from("bin.audioconv"), String::from("bin.storage_service")], "the omissions are reported rather than corrected");
@@ -1143,7 +1162,7 @@ fn a_dev_dependency_is_not_runtime_reach() {
 	let model = model();
 	let touched: BTreeSet<String> = [String::from("kernel")].into_iter().collect();
 	let test = kernel_test("t", &["webp"]);
-	assert_eq!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph), vec![String::from("webp")], "the kernel dev-depends on webp; that is not the guest reaching it");
+	assert_eq!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph, &BTreeSet::new()), vec![String::from("webp")], "the kernel dev-depends on webp; that is not the guest reaching it");
 }
 
 #[test]
@@ -1209,7 +1228,7 @@ fn every_annotation_in_this_tree_is_reachable() {
 	let mut bad = Vec::new();
 	for test in &model.kernel_tests.tests {
 		let touched = model.kernel_tests.touches.get(&test.name).cloned().unwrap_or_default();
-		for component in crate::kerneltests::unreachable_covers(test, &touched, &model.graph) {
+		for component in crate::kerneltests::unreachable_covers(test, &touched, &model.graph, &model.staged) {
 			bad.push(format!("{} covers {component}", test.name));
 		}
 	}

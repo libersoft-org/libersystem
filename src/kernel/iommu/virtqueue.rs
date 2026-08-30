@@ -14,6 +14,28 @@ use abi::{VIRTIO_DESC_F_NEXT, VIRTIO_DESC_F_WRITE};
 
 use crate::mem::frame::PAGE_SIZE;
 
+// HOW LONG ONE REQUEST MAY POLL FOR ITS COMPLETION.
+//
+// The default is the boot's: large enough that an emulated device answering in microseconds is never
+// cut off, and small enough that a device answering never does not hang the boot. The release path
+// lowers it around a detach - see `iommu::detach_for` - and puts it back.
+static SPIN_BUDGET: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(10_000_000);
+
+pub fn spin_budget() -> u64 {
+	SPIN_BUDGET.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+// Set it, returning what it was, so a caller restores rather than assumes the default.
+pub fn set_spin_budget(spins: u64) -> u64 {
+	SPIN_BUDGET.swap(spins, core::sync::atomic::Ordering::Relaxed)
+}
+
+// WHAT A TEARDOWN MAY SPEND. A tenth of the boot's, because a release runs inside DeviceManager's
+// single event loop and every other device's supervision waits behind it. Milliseconds on any
+// machine this boots, and an expiry is `Unconfirmed` - which quarantines the claim rather than
+// freeing anything, so a short wait can only be more conservative.
+pub const TEARDOWN_SPINS: u64 = 1_000_000;
+
 // The rings, at the offsets the specification lays them out at within their own frames. Each ring
 // gets a frame of its own rather than being packed: a frame is the unit the allocator hands out, and
 // three of them is a negligible cost next to arithmetic that has to be right.
@@ -149,10 +171,17 @@ impl VirtQueue {
 			core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
 			write16(self.notify, 0);
 		}
-		// A bounded poll. The number is large enough that an emulated device answering in
-		// microseconds is never cut off, and small enough that a device answering never does not
-		// hang the boot.
-		for _ in 0..10_000_000u64 {
+		// A bounded poll, and the bound is the CALLER'S SITUATION rather than one number.
+		//
+		// The boot can afford to wait for a device that answers slowly; a TEARDOWN cannot, because
+		// it runs inside DeviceManager's single event loop - the syscall that releases a claim does
+		// not return until this does, and every other device's supervision is behind it. A wedged
+		// controller could hold that loop for the whole of the boot-time budget.
+		//
+		// A shorter budget is not a weaker check: an expiry is `Fault::Unconfirmed`, the detach is
+		// not confirmed, and the claim is QUARANTINED - which keeps its frames and vectors out of
+		// circulation. Cutting the wait short can only make the release more conservative.
+		for _ in 0..spin_budget() {
 			// SAFETY: the used ring's index field, in this queue's own frame.
 			let used = unsafe { read16(self.used + 2) };
 			if used != self.used_seen {

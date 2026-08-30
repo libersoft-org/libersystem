@@ -237,6 +237,24 @@ media_current() {
 	[[ -f "$path" && -f "$path.key" && "$(<"$path.key")" == "$key" ]]
 }
 
+# OLD GENERATIONS OF A CONTENT-ADDRESSED FIXTURE, SWEPT.
+#
+# A name that carries its key grows one file per distinct fixture set and nothing else would ever
+# remove them. A file a live guest is READING is never touched: `fuser` answers that, and its absence
+# is answered by keeping the file, which is the safe direction for a sweep. Age is the second guard -
+# a generation younger than twelve hours may be another run's, whether or not it has it open yet.
+media_sweep() {
+	local prefix="$1" ext="$2" keep="$3" stale
+	for stale in "$prefix"*"$ext"; do
+		[[ -f "$stale" && "$stale" != "$keep" ]] || continue
+		[[ -n "$(find "$stale" -mmin +720 -print -quit 2>/dev/null)" ]] || continue
+		if command -v fuser >/dev/null && fuser -s "$stale" 2>/dev/null; then
+			continue
+		fi
+		rm -f "$stale" "$stale.key"
+	done
+}
+
 # Publish a verified candidate: rename first, then record the key. In that order, because a key
 # written before the rename would describe an image that is not there yet.
 media_publish() {
@@ -327,9 +345,16 @@ qemu_prepare_media_images() {
 		exit 1
 	fi
 
-	FAT_DISK="$QEMU_BUILD_DIR/fat-media${suffix}.img"
+	# CONTENT-ADDRESSED FINAL NAMES. The key was already content-derived and was written BESIDE a
+	# fixed name, so two runs whose fixtures differ - a different volume directory, a different
+	# generation of the same one - wrote and read one path: the second published over the first while
+	# the first's guest was reading it. The key is in the NAME now, so two generations coexist and a
+	# run reads only its own; the `.key` sidecar stays, because it is what says the file was
+	# completely written rather than merely named.
 	local fat_key candidate
 	fat_key="$(media_key fat "$voldir" mkfs.exfat mformat mcopy)"
+	FAT_DISK="$QEMU_BUILD_DIR/fat-media${suffix}.$fat_key.img"
+	media_sweep "$QEMU_BUILD_DIR/fat-media${suffix}." .img "$FAT_DISK"
 	if ! media_current "$FAT_DISK" "$fat_key"; then
 		candidate="$FAT_DISK.$$.candidate"
 		rm -f "$candidate"
@@ -352,9 +377,10 @@ qemu_prepare_media_images() {
 		fi
 	fi
 
-	ISO_DISK="$QEMU_BUILD_DIR/iso-media${suffix}.iso"
 	local iso_key
 	iso_key="$(media_key iso "$voldir" xorriso genisoimage)"
+	ISO_DISK="$QEMU_BUILD_DIR/iso-media${suffix}.$iso_key.iso"
+	media_sweep "$QEMU_BUILD_DIR/iso-media${suffix}." .iso "$ISO_DISK"
 	if ! media_current "$ISO_DISK" "$iso_key"; then
 		candidate="$ISO_DISK.$$.candidate"
 		rm -f "$candidate"
@@ -371,9 +397,10 @@ qemu_prepare_media_images() {
 		fi
 	fi
 
-	UDF_DISK="$QEMU_BUILD_DIR/udf-media${suffix}.udf"
 	local udf_key
 	udf_key="$(media_key udf "$voldir" mkfs.udf)"
+	UDF_DISK="$QEMU_BUILD_DIR/udf-media${suffix}.$udf_key.udf"
+	media_sweep "$QEMU_BUILD_DIR/udf-media${suffix}." .udf "$UDF_DISK"
 	if ! media_current "$UDF_DISK" "$udf_key" && command -v mkfs.udf >/dev/null; then
 		candidate="$UDF_DISK.$$.candidate"
 		rm -f "$candidate"
@@ -1066,10 +1093,17 @@ qemu_run_x86_64() {
 	qemu_attach_virtio_net qemu_args vnet0 "$hostfwd" "$virtio_opts"
 
 	# virtio-serial + virtconsole: mirrors a second console to a file.
+	#
+	# PER RUN, for the reason `qemu_attach_virt_interactive` gives about the same file: one name per
+	# mode is a capture two guests of one architecture write, and a capture two guests write
+	# describes neither. Nothing outside this script looks it up by name; the sweep removes the ones
+	# whose run is gone.
+	local vcon_out="$QEMU_BUILD_DIR/virtio-console${artifact_suffix}.$$.out"
+	scratch_sweep "$QEMU_BUILD_DIR/virtio-console${artifact_suffix}" .out
 	qemu_args+=(
 		-device "virtio-serial-pci,$virtio_opts"
 		-device virtconsole,chardev=vcon
-		-chardev "file,id=vcon,path=$QEMU_BUILD_DIR/virtio-console${artifact_suffix}.out"
+		-chardev "file,id=vcon,path=$vcon_out"
 	)
 
 	# xHCI USB host controller + hub with keyboard, tablet, and optional storage.

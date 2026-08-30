@@ -707,6 +707,19 @@ pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8, generation: u64) -> 
 // that is quiet from one whose mappings may still be live - and the release above has to distinguish
 // them: a confirmed teardown frees the slot, an unconfirmed one quarantines it.
 pub fn detach_for(index: usize, bus: u8, dev: u8, func: u8) -> bool {
+	// A SHORTER WAIT THAN THE BOOT'S, because this one runs inside DeviceManager's event loop.
+	//
+	// `Claim::release` does not return until this does, and the manager's single loop supervises
+	// every other device behind it - so a controller that has stopped answering could hold the whole
+	// control plane for the boot-time budget. The budget is restored before returning, on every
+	// path, because the boot's own attaches must keep the longer one.
+	let previous_budget = virtqueue::set_spin_budget(virtqueue::TEARDOWN_SPINS);
+	let confirmed = detach_for_inner(index, bus, dev, func);
+	virtqueue::set_spin_budget(previous_budget);
+	confirmed
+}
+
+fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// NOTHING ATTACHED IS NOTHING TO CONFIRM, and that is a success rather than a failure: a device
 	// this controller never translated has no mapping that could outlive its binding.
 	let Some(domain) = domain_of(index as u32) else { return true };

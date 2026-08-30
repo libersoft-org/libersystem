@@ -141,7 +141,7 @@ fn device_table_exposes_the_xhci_controller() {
 	assert!(mapped != 0 && !syscall::sys_is_err(mapped), "the xHCI register file should map to a valid address");
 }
 
-tagged_test!(xhci_driver_enumerates_the_usb_bus, [Drivers, Usb, Slow], id = "kernel.hardware.xhci_driver_enumerates_the_usb_bus", covers = ["kernel"]);
+tagged_test!(xhci_driver_enumerates_the_usb_bus, [Drivers, Usb, Slow], id = "kernel.hardware.xhci_driver_enumerates_the_usb_bus", covers = ["kernel", "bin.xhci"]);
 fn xhci_driver_enumerates_the_usb_bus() {
 	use object::channel::{Channel, Message};
 	use object::device_memory::DeviceMemory;
@@ -451,7 +451,7 @@ fn a_pci_function_nothing_binds_is_still_inventoried_and_holds_nothing() {
 	crate::serial_println!("    {unresolved} PCI function(s) nothing binds are inventoried, identified and hold nothing; {blocks} controllers of one kind hold {blocks} rows");
 }
 
-tagged_test!(device_service_lists_devices, [Service, Drivers], id = "kernel.hardware.device_service_lists_devices", covers = ["kernel"]);
+tagged_test!(device_service_lists_devices, [Service, Drivers], id = "kernel.hardware.device_service_lists_devices", covers = ["kernel", "bin.device_service"]);
 fn device_service_lists_devices() {
 	use object::channel::Message;
 
@@ -533,7 +533,7 @@ tagged_test!(
 	device_manager_reacts_to_a_driver_crash,
 	[Drivers, Process, ArchX86_64],
 	id = "kernel.hardware.device_manager_reacts_to_a_driver_crash",
-	covers = ["kernel"]
+	covers = ["kernel", "bin.device_manager"]
 );
 #[cfg(target_arch = "x86_64")]
 fn device_manager_reacts_to_a_driver_crash() {
@@ -708,7 +708,7 @@ fn a_device_masters_the_bus_only_while_it_is_claimed() {
 	assert!(DONE.load(Ordering::SeqCst), "the probe thread ran to completion");
 }
 
-tagged_test!(virtio_snd_driver_captures_a_period_from_the_device, [Drivers, Pci, Audio], id = "kernel.hardware.virtio_snd_driver_captures_a_period_from_the_device", covers = ["kernel"]);
+tagged_test!(virtio_snd_driver_captures_a_period_from_the_device, [Drivers, Pci, Audio], id = "kernel.hardware.virtio_snd_driver_captures_a_period_from_the_device", covers = ["kernel", "bin.virtio_snd"]);
 fn virtio_snd_driver_captures_a_period_from_the_device() {
 	// The REAL driver against the REAL device: the receive queue, the input-stream search, the
 	// capture stream's set-up and the inverted used-ring handling, all of which exist only for

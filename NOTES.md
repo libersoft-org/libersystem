@@ -1,5 +1,6 @@
 # Bugs / changes
 
+
 - why are drivers in drivers/core/ (is core directory necessary?)
 - when running the app from shell as "xxx.lsexe" and not just "xxx", it doesn't work
 - when image is opened through imgview (like: vol://system/wallpapers> imgview logo.webp) and then escape is pressed, then command line is stuck, CTRL+C helps, but it takes a few seconds before it reacts
@@ -17,7 +18,10 @@
 - everything else should be in /bin/base-tools
 - all of these directories should be in PATH, so we can call any of these utilities from anywhere ... also we need an utility for showing and adding / removing from / to this PATH.
 - rename /bin/ to /apps/ (because some apps can contain other files than binaries)... /libs/ stays as it is, because these are standard system libraries, don't move it to /apps/.
+- src/user/apps/tools - move apps to their respective directories - the same as in booted system - like src/user/apps/lico/, src/user/apps/audio-tools etc.
 
+- audit user apps
+- audit drivers
 - some of the tools miss --json parameter
 - lico, licoedit and licoview look horrible
 - architecture audit (!!!)
