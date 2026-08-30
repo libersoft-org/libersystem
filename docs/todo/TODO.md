@@ -242,6 +242,14 @@ or preventing further development of `v1`.
 - [x] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)
 - [x] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md)
 - [x] [P02M0168 - The kernel brings up every core the firmware lists and then two tables assume sixty-four](P02M0168.md)
+- [ ] [P02M0169 - Three bounded correctness debts: prepared launches, LSIDL rights and scheduler truth](P02M0169.md)
+- [ ] [P02M0170 - Verification evidence belongs to one revision and one immutable test artifact](P02M0170.md)
+- [ ] [P02M0171 - A signed release can still be old: enforce a monotonic boot floor](P02M0171.md)
+- [ ] [P02M0172 - DMA isolation policy is registry data, not a kernel device-type list](P02M0172.md)
+- [ ] [P02M0173 - Virtio-IOMMU enforces the AArch64 and RISC-V QEMU profiles](P02M0173.md)
+- [ ] [P02M0174 - IPv6 at layer three: addressing, ICMPv6 and neighbour discovery](P02M0174.md)
+- [ ] [P02M0175 - Dual-stack transports, DNS and NetworkService](P02M0175.md)
+- [ ] [P02M0176 - Audit unsafe boundaries in the kernel and userspace before changing them](P02M0176.md)
 
 ### Definition of done (phase 2)
 

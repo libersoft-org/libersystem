@@ -359,3 +359,51 @@ AUDITOR'S RE-AUDIT ON M0159 (2026-08-30T08:40:38Z):
 Current implementation rating: 7/10
 
 1. **A late untranslated admission can retract the clean isolation summary without failing the acceptance gate.** After the summary has been emitted, `record_degraded` prints `dma: ADMITTED UNTRANSLATED AFTER THE ISOLATION SUMMARY ...` when a later device is admitted degraded (`src/kernel/dma_policy/mod.rs:151-180`). The default-profile gate rejects only `dma: DEGRADED ISOLATION` (`src/tools/check-qemu-virtio-iommu-x86_64.sh:219-230`). A boot can therefore print the early clean summary, explicitly retract it later, and still reach the gate's “nothing is degraded” success. The acceptance oracle must reject the retraction line as well, or base success on an authoritative final-state check, and the late-admission mutation must be covered.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-08-30T11:18:00Z):
+
+**1. A late untranslated admission can retract the clean summary without failing the gate. ACCEPTED.**
+
+The finding is correct and it is about the fix from the previous round: the kernel was made honest -
+`record_degraded` prints `dma: ADMITTED UNTRANSLATED AFTER THE ISOLATION SUMMARY ...` when a device is
+admitted degraded after the summary was published - and the acceptance oracle was not taught about
+the new line. The default-machine phase required `dma: every bus-mastering device is translated` and
+rejected `dma: DEGRADED ISOLATION`, so a boot could print the clean summary, explicitly retract it,
+and still reach "nothing is degraded". Making the kernel say more while the gate reads the same three
+strings is a fix that moves the silence rather than removing it.
+
+Code change: the default-machine phase now rejects the retraction line as well, with the reason
+stated where the check is - the retraction names a device mastering the bus untranslated on the
+machine this phase is about, which is the same failure `DEGRADED ISOLATION` names, arrived at one
+moment later.
+
+**Verification.** `./check.sh --gate qemu-virtio-iommu-x86_64` passes end to end with the new
+rejection in place: five hostile cases refused, a DHCP lease through the enforcing controller, the
+default machine translated with nothing degraded and no retraction, and `--no-iommu` booting the
+untranslated machine and saying so.
+
+Worth recording, because it is this milestone's own scenario made visible and it now runs on every
+gate: the traffic profile prints `dma: every bus-mastering device is translated` with zero endpoints
+attached and attaches `00:03.0` four lines later. That endpoint is TRANSLATED, so the claim above it
+still holds and nothing is retracted - and the machinery that would catch its bad twin is now checked
+by the oracle rather than only present in the kernel.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

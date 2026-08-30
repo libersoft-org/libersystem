@@ -524,3 +524,78 @@ Current implementation rating: 8/10
 1. **The topology report still counts firmware-described CPUs rather than confirmed online CPUs, and it omits the fallback policy.** `report_machine` binds online CPUs and then emits only one aggregate, while the per-node report counts and prints `Topology::cpus()` firmware records (`src/kernel/main.rs:1018-1026`; `src/kernel/mem/numa/mod.rs:210-225`). A timed-out or offline CPU consequently remains reported under its node. The report prints distances and pool totals but never states the requested-first/nearest/tie fallback rule (`src/kernel/mem/numa/mod.rs:237-247`; `src/kernel/mem/frame/mod.rs:1136-1153`). M1 says an absent/timed-out CPU creates no logical affinity, and M6 explicitly requires online CPUs plus distance/fallback policy in bounded output (`docs/todo/P02M0152.md:77-81,192-194`). Report the confirmed logical bindings per node and the actual fallback rule, keeping firmware descriptions separate if they are diagnostically useful.
 
 2. **The exact-graph/placement gate remains incomplete on both device-tree profiles.** `check-qemu-numa.sh` deliberately omits CPU-assignment comparisons on aarch64/riscv64 and does not require the three `kernel.smp.numa.*` placement identities there; those identities are pinned only in the x86 phase, while the DT phase pins memory/model tests (`src/tools/check-qemu-numa.sh:199-203,249-265`). The guest graph test checks the parser against its own resulting topology (`src/kernel/mem/numa/tests.rs:40-73`), so a consistently swapped CPU-to-node map can pass, and a tag/selection regression can silently omit the placement tests on DT. M5 requires the exact normalized node/CPU/range graph plus node-placement execution for all three named profiles (`docs/todo/P02M0152.md:138-164`). Compare the DT profile's declared hardware CPU assignments to the normalized logical bindings and require the placement test identities in each profile's result log.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0152 (2026-08-30T11:15:00Z):
+
+**1. The topology report counts firmware-described CPUs rather than confirmed online ones, and omits
+the fallback policy. ACCEPTED on both halves.**
+
+Confirmed. The per-node line counted `Topology::cpus()` - what firmware DESCRIBED - so a core that
+timed out or never answered was still reported under its node, and M1's rule that an absent or
+timed-out CPU creates no logical affinity was invisible in the one place a reader looks. And the
+report printed the distance matrix, which is the fallback's INPUT, while never stating the rule those
+distances are used by: a reader given a matrix and no rule cannot tell a machine that prefers the
+nearest node from one that round-robins, and both print exactly those lines.
+
+Code changes:
+- `smp::numa::online_on` stops being `#[cfg(test)]` - the boot report is a production caller - and
+  the per-node line now prints BOTH numbers: `N processor(s) described, K online`. They are different
+  facts and both are diagnostically useful, which is what the re-audit's "keeping firmware
+  descriptions separate if they are useful" asks for.
+- The report states the fallback rule after the distances: the requested node first, then the rest by
+  ascending distance, ties by ascending node id, unaffiliated memory last. That is transcribed from
+  the code rather than described - `Topology::fallback_order` sorts by `(node != from, distance,
+  node.0)` and the allocator's own copy keys unaffiliated pools `(true, u32::MAX, u32::MAX)`.
+- The topology test now calls `bind_online()` before `report()`, in the order a boot performs it.
+  `report_machine` binds and then reports, so a test that reported first was exercising the reporting
+  path against a state no boot produces - every node showing zero online cores - which is how the new
+  assertion caught itself the first time it ran.
+- The gate's "no processors" case is split to match: a node with none DESCRIBED fails as before, and a
+  node that described processors and brought none online now fails too, which was previously
+  unexpressible.
+
+**2. The exact-graph and placement gate is incomplete on both device-tree profiles. ACCEPTED.**
+
+Confirmed on both counts, and the CPU half was a deliberate omission with a reason that only covered
+part of the ground. The reason stands for the INTEGERS: a hart id and an MPIDR are the machine's own
+numbering while the profile names logical cpus, so grepping for `node 0 cpu 0` on a device-tree port
+asserts a coincidence of QEMU's mapping rather than a property of the kernel. What does not follow is
+omitting the comparison entirely, which accepts exactly the graph the whole exact-graph work exists
+to reject: these profiles are symmetric 2+2 with near-equal memory, so a SWAPPED assignment satisfies
+every count, every pool and every distance the phase checked.
+
+Code changes: the device-tree phase now compares the assignments BY THEIR SHAPE, which is
+numbering-independent and still swap-sensitive. The profile puts the first two processors on node 0
+and the last two on node 1, so however the machine numbers them: node 0 reports exactly two
+identifiers, node 1 exactly two, and every one of node 0's is strictly below every one of node 1's. A
+swap fails the last of those. And the phase now requires the three `kernel.smp.numa.*` placement
+identities - `only_cores_that_came_up_are_bound_to_a_node`,
+`placement_names_a_core_of_the_node_it_was_asked_for`,
+`a_thread_placed_on_a_node_runs_on_a_core_of_that_node` - which were pinned on x86_64 alone, so a tag
+or selection regression that stopped running them on the device-tree ports would have been invisible:
+the phase asserted pools, a report and the memory tests, none of which needs a core to have been
+bound to a node at all.
+
+**Verification.** `./check.sh --gate numa-profile-x86_64` passes and reports `2 processor(s)
+described, 2 online` for both nodes. The device-tree profiles and the full sweep are recorded at the
+end of this round.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

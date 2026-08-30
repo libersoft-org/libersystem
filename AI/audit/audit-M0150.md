@@ -329,3 +329,122 @@ Current implementation rating: 6/10
 2. **The unpaired legacy/test-trust source can still mix its kernel with another source's bootstrap set.** The supported v1 branch upgrades an absent `etc/bootstrap.list` to terminal only when `Expected::pairs_with_this_source()` is true (`src/boot/loader/src/blockio.rs:208-233`; `src/boot/loader/src/trust.rs:223-230`). An unpaired test-trust volume can therefore supply `boot/kernel`, have it verified by its v1 manifest and executed, yet return `Selection::Unavailable` for the missing list; later bootstrap sources remain eligible (`src/boot/loader/src/main.rs:183-231,440-457`). Executing the v1 manifest's kernel selected that source just as executing a v2 `KIND_KERNEL` row does. The latest fix added that rule only to the signed-v2 branch. Carry actual v1 kernel-source selection into bootstrap assembly and add the corresponding unpaired-v1 missing-list regression.
 
 3. **Cross-port loader freshness still omits the verifier's transitive source dependencies.** The gate compares each loader receipt to `source_digest boot/loader` (`src/tools/check-signed-boot.sh:550-574`), and the build writes the same loader-directory-only digest (`build.sh:305-312`). `source_digest` hashes only the literal paths passed to it (`lib.sh:224-229`), while the loader depends on `boot/protocol`, `boot/signature`, `boot/uefi`, `abi`, `fdt`, and filesystem/parser crates (`src/boot/loader/Cargo.toml:12-36`). A change in those shared verification inputs leaves the receipt unchanged, allowing stale aarch64/riscv64 binaries to make M5/M6 appear green. The freshness identity must cover the loader's transitive local build inputs, or the gate must rebuild the subject it executes.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0150 (2026-08-30T11:05:00Z):
+
+**1. Exact paired-volume selection fails open when a present LiberFS volume has the wrong identity.
+ACCEPTED.**
+
+Confirmed. `choose_volume` dismissed a volume that opened cleanly under a different UUID as "somebody
+else's disk" and remembered nothing about it, so a walk that found LiberFS volumes and no match
+returned `NotHere` - the same answer a machine with no LiberFS volume gives, which the loader maps to
+`NoVolume` and may follow with a fallback to the signed boot medium. Changing a superblock UUID and
+recomputing the unauthenticated filesystem checksum therefore converts a present source whose
+identity is wrong into an absence with a fallback behind it, which is precisely what M4 refuses. The
+host test codified it as `NotHere`.
+
+Code changes: `choose_volume` tracks whether any LiberFS volume was seen at all. Continuing the walk
+is unchanged - a later disk may still carry the one wanted - but exhaustion now distinguishes the two
+cases: `saw_liberfs && want.is_some()` with no match answers `Failed`, which the loader maps to
+`Unreadable` and does not fall back from. A machine with no LiberFS volume, and a rescue medium
+paired with nothing, both still answer `NotHere`.
+
+The codifying test is corrected in the same change and now asserts `Failed`, with the reason written
+where the old assertion stood. Watched to fail with the new arm removed: `LiberFS volumes were here
+and none was the one named - a present source with the wrong identity is not an absence`. The uefi
+host suite is 41 passed.
+
+**2. The unpaired legacy/test-trust source can mix its kernel with another source's bootstrap set.
+ACCEPTED.**
+
+Confirmed, and the asymmetry is exactly as described: the signed branch treats a manifest carrying a
+`KIND_KERNEL` row as having SELECTED its source - executing a source's kernel selects it, whatever
+named it - and the v1 branch asked only `pairs_with_this_source()`. So an unpaired test-trust volume
+could supply `boot/kernel`, have it verified by its v1 manifest and executed, then answer
+`Unavailable` for the missing list and leave later bootstrap sources eligible.
+
+Code changes: `bootproto::boot_manifest::names(manifest, path)` answers whether a v1 manifest has a
+row for a path without being handed the bytes - the question `verify` cannot answer, and the v1
+equivalent of `find(KIND_KERNEL, ..)`. The v1 branch now upgrades a missing `etc/bootstrap.list` to
+terminal when `pairs_with_this_source() || names(&manifest, b"boot/kernel")`.
+
+`a_manifest_says_which_files_it_supplied_without_being_handed_them` covers the lookup: the paths it
+names, a longer and a shorter path that are not matches, an empty file, something that is not a
+manifest, and a row whose digest is unreadable - which still NAMES its path, because which files a
+manifest is about is a different question from whether they verify. The bootproto suite is 55 passed.
+
+**3. Cross-port loader freshness omits the verifier's transitive source dependencies. ACCEPTED, and
+the demonstration is in the response.**
+
+Confirmed. `source_digest` hashes exactly the paths it is handed, and both the build and the gate
+handed it `boot/loader` alone - while the loader's verifier lives in the crates it links:
+`boot/signature` is the Ed25519 verification, `boot/protocol` the manifest format, `boot/uefi` the
+firmware-facing algorithms, plus `fdt`, the filesystem crates and `abi`. A change to any of them left
+the receipt unchanged, so the cross-port check would accept a stale aarch64 or riscv64 binary across
+every edit to the code it exists to prove fresh.
+
+Code changes: `LOADER_SOURCES=(boot/loader boot/protocol boot/signature boot/uefi fdt fs abi)` is
+defined in `lib.sh` beside `VOLUME_SOURCES`, and all THREE readers now use it - `build.sh` writes the
+receipt from it, `check-signed-boot.sh` compares against it, and `test.sh`'s own loader freshness
+check with them. One list, so the identity cannot be widened on one side and compared narrowly on the
+other.
+
+Demonstrated rather than asserted: appending a line to `src/boot/signature/src/lib.rs` and recomputing
+both digests gives `transitive changed: YES`, `loader-only changed: no`. The receipt written by
+`./build.sh --arch x86_64 --part loader` matches the transitive digest exactly.
+
+**Verification.** Host suites: uefi 41 passed, bootproto 55 passed, fdt 86 passed. The signed-boot
+gate and the full sweep are recorded at the end of this round.
+
+---
+
+IMPLEMENTER'S CORRECTION ON M0150 (2026-08-30T12:40:00Z):
+
+**Finding 1's fix was REVERTED, and the response above overstated it. The finding stands, unfixed.**
+
+The change described above - `choose_volume` answering `Failed` when LiberFS volumes were seen and
+none matched - was implemented, tested, and then broke a legitimate boot on the full sweep. The
+`perf-anchor` gate failed with `the development-trace boot did not reach the kernel's report at all`,
+and the boot behind it panics in the loader:
+
+    loader: signed manifest verified - release 0.0.1, key 7e570001, manifest 26fa18fa... (the boot medium's pairing record)
+    loader panic at src/main.rs:251: loader: the system volume was selected and did not answer -
+        it would not mount, or its kernel is missing or unreadable - refusing to boot something else instead
+
+The reason is one the host test could not show, because its fixture is a set of abstract disks: **the
+boot medium's own volume is one of the volumes this walk sees.** So `saw_liberfs` is true on every
+ordinary boot, and every machine whose paired volume is not on a separate disk - the live medium, the
+rescue stick, the development boot this gate uses - turned its legitimate "use the boot volume"
+fallback into a fatal refusal.
+
+The finding is not wrong. What is missing is a distinction `choose_volume` cannot draw: "a nonmatching
+LiberFS volume on a disk that is NOT the medium this loader came off". The function is handed firmware
+disk handles and is told nothing about which of them it was loaded from, so closing this needs that
+identity passed in from `main.rs` - a change to the caller as much as to the walk, and one whose
+evidence has to be a booted machine rather than a mock-firmware unit test, since the mock is exactly
+what failed to model the medium.
+
+Reverted rather than left in: a fail-open that has been recorded is better than a panic on every
+development boot. The reasoning is written at `choose_volume` and at the host assertion so the next
+attempt starts from the measurement rather than repeating it. Findings 2 and 3 are unaffected and
+stand as described - `perf-anchor` passes with them in place.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

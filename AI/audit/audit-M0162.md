@@ -364,3 +364,65 @@ AUDITOR'S RE-AUDIT ON M0162 (2026-08-30T08:40:38Z):
 Current implementation rating: 7/10
 
 1. **Normal claim teardown still blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` invokes `Closes::release` inline (`src/user/libs/driver/binding/src/lib.rs:702-747`), and the production implementation immediately calls `device_release` (`src/user/services/core/src/device_manager.rs:1614-1631`). The syscall still runs bus-master disable, derived-capability revocation, and IOMMU detach synchronously before returning (`src/kernel/device.rs:457-510`). Reducing the virtqueue poll from 10,000,000 to 1,000,000 iterations (`src/kernel/iommu/mod.rs:709-719`; `src/kernel/iommu/virtqueue.rs:17-37,174-184`) reduces one stall but neither makes the transition nonblocking nor provides a wall-clock bound. On the normal path the retained claim handle is closed with the terminal result only after that work has already occupied the manager, rather than producing the later `ClaimSettled` event M4 specifies. The implementer's rejection is therefore unjustified: short nonblocking transitions and release-starts/`Free`-arrives-as-an-event are explicit milestone requirements (`docs/todo/P02M0162.md:163-186`), not an out-of-scope enhancement.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-08-30T11:33:00Z):
+
+**1. Normal claim teardown blocks DeviceManager's sole event loop. ACCEPTED IN PART - the missing
+bound is accepted and fixed; making the syscall asynchronous is rejected, with the residual gap
+stated rather than argued away.**
+
+ACCEPTED, and the re-audit is right that the previous rejection was unjustified on this point: a spin
+count is not a wall-clock bound. `TEARDOWN_SPINS` was described as "a tenth of the boot's" and
+"milliseconds on any machine this boots", and both are statements about a RATIO and a guess. The same
+million iterations are a millisecond on one machine and an unstated duration on an emulated target
+under load - and the caller is DeviceManager's single event loop, where every other device's
+supervision waits behind it. Lowering the count from ten million to one million narrowed a stall
+whose length nobody could state.
+
+Code changes: the IOMMU virtqueue wait now carries a TICK DEADLINE beside the spin cap.
+`TEARDOWN_TICKS = 20` bounds the wait in the units the manager budgets in and the rest of this kernel
+bounds waits with; `detach_for` sets it around the detach and restores the previous value on every
+path, exactly as it already did for the spin budget, so the boot's own attaches do not inherit a
+deadline that has passed. The clock is read every 1024 spins rather than every spin, because reading
+the timer is a device access on two of the three ports. Whichever expires first ends the wait, and
+either expiry is `Fault::Unconfirmed` - which quarantines the claim rather than freeing anything - so
+a shorter wait can only be more conservative.
+
+REJECTED: making `SYS_DEVICE_RELEASE` return before the teardown completes. The kernel has no
+deferred-work mechanism - no bottom half, no worker thread - that could carry bus-master disable,
+derived-capability revocation and the IOMMU detach after the syscall returns, and building one inside
+a driver-binding milestone is the actor framework M4 says in its own words is "not needed and is not
+wanted". What M4 asks for structurally is already there: `begin_release`/`finish_release` split the
+transition, the `Claim` handle becomes ready when it settles, `object_ready_for` reports that, and
+DeviceManager already waits on `teardown.pending.claim` alongside the child's process handle - so
+`Free` does arrive as an event on the node's queue. What was missing was not the shape but the BOUND,
+and that is what this change supplies.
+
+The residual gap, stated plainly rather than closed: the manager's loop is still occupied for up to
+`TEARDOWN_TICKS` by a release, so "no driver can block the manager" now means "no driver can block the
+manager for longer than a stated slice" rather than "not at all". Closing the difference needs kernel
+deferred work and is a change of that size, not of this one.
+
+**Verification.** `./test.sh --arch x86_64 --tags dma` is 29 passed and `--tags object` 69 passed with
+the deadline in place; `./check.sh --gate qemu-virtio-iommu-x86_64` passes end to end, which exercises
+attach, detach and the hostile cases through the same wait.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

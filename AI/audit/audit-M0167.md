@@ -400,3 +400,62 @@ AUDITOR'S RE-AUDIT ON M0167 (2026-08-30T08:40:38Z):
 Current implementation rating: 7/10
 
 1. **The selection-specific kernel is still neither immutable nor isolated once the build lock is released.** `test-kernel.sh` serializes a preliminary `cargo build --tests` in the shared target, releases the lock, and then invokes a second `cargo test` against that same target without the lock (`src/harness/test-kernel.sh:295-333`). If another same-architecture run builds a different compile-time `TEST_SELECTION` or `TEST_TAGS` between those calls, the second command must rebuild; two runners can then compile concurrently outside the lock or consume a binary while the other selection replaces it. The content-addressed ISO does not close the earlier shared-kernel race, because its key and payload are derived from whichever shared executable is visible while the runner assembles it (`src/harness/mkimage.sh:669-726`). The implementer also explicitly did not create the required per-run staged kernel. M3 requires the locked build to produce and stage the selection-specific kernel and medium as an immutable prerequisite before parallel guests start, and the DoD requires two concurrent same-architecture suites with different selections/tags to prove it (`docs/todo/P02M0167.md:290-313,658-673`). The current lock placement does not satisfy either requirement.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-08-30T11:49:00Z):
+
+**1. The selection-specific kernel is neither immutable nor isolated once the build lock is released.
+ACCEPTED, NOT DONE.**
+
+The finding is correct. `test-kernel.sh` takes the lock for a preliminary `cargo build --tests` in the
+shared Cargo target, releases it, and then runs `cargo test` against that same target unlocked. If
+another same-architecture run compiles a different compile-time `TEST_SELECTION` or `TEST_TAGS` in
+between, the second command rebuilds - so two runners can compile concurrently outside the lock, or
+one can consume a binary while the other's selection replaces it. The content-addressed ISO does not
+close it: its key and payload are derived from whichever shared executable is visible while the runner
+assembles the medium, so a race upstream of that produces a correctly-named image of the wrong
+kernel. M3 asks for the locked build to PRODUCE AND STAGE the selection-specific kernel as an
+immutable prerequisite, and the previous round explicitly did not do that.
+
+It is not fixed here and is not claimed to be. The reason is worth recording, because it decides what
+the fix has to look like rather than excusing its absence.
+
+The run is `cargo test`, and cargo resolves the test binary from the shared target directory itself -
+there is no argument by which it can be pointed at a copy. So staging an immutable per-run kernel
+means not running `cargo test`: take the lock, `cargo test --no-run --message-format=json`, read the
+executable path out of the JSON, copy it to a per-run path, release the lock, and invoke
+`qemu-run.sh <arch> <copy>` directly. That moves argument passing, exit-code handling and the stall
+watcher off cargo and onto this script.
+
+`test-kernel.sh` is the entry point every suite, every architecture profile and every QEMU gate in
+this tree runs through. Rewriting how it launches the guest, in a round that has already changed the
+kernel's mapping and interrupt paths, and then verifying it only through the same harness I had just
+rewritten, is a way to spend a full verification proving nothing. It needs its own round, where the
+harness change is the only variable and two concurrent same-architecture suites with different
+selections - which is what the Definition of Done asks for - are the evidence.
+
+One thing that did change here and is worth noting against this milestone, because it is the same
+class of defect: `RUSTC_STACK` has now been raised three times by the same rustc SIGSEGV, each time to
+the number rustc printed, which is fitting a budget to the crash rather than to the work. It is 256
+MiB - four times the deepest path ever observed here - with the reasoning written at the constant. An
+undersized compiler stack in a shared harness produces exactly the "evidence from the wrong build"
+shape this milestone is about, because the gate that dies is whichever one happens to compile next.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

@@ -339,3 +339,92 @@ Current implementation rating: 5/10
 2. **A failed doorbell mapping once again permits the binding to continue.** `attach_endpoint` now records the domain in `NO_DOORBELL` and returns `Ok(domain)` when `install_doorbell` fails (`src/kernel/iommu/mod.rs:519-523`), allowing the claim to proceed to bus mastering. Refusing a later MSI allocation is narrower than M0153's explicit rule that a mapping failure end in refused binding, disabled bus mastering, or quarantine (`docs/todo/P02M0153.md:34-35`), and contradicts the implementer's statement that this failure rolls the domain back. A polling-only binding should not request an unnecessary doorbell map; an interrupt-capable binding must not be published after the required map failed.
 
 3. **The required production accounting remains incomplete.** The device snapshot exposes only total `iommu_grants`, while the boot report prints global endpoint/live/quarantined-mapping/fault totals (`src/kernel/iommu/mod.rs:535-543,838-856`). Live and quarantined IOVA counters remain test-only (`src/dma/src/lib.rs:1170-1176`), and endpoint/fault holdings are not integrated into binding or Domain accounting. M4 requires mapping, IOVA, endpoint, and fault accounting plus an exact restart baseline (`docs/todo/P02M0153.md:194-195,259-260`); the passing DMA unit tests do not exercise that production lifecycle integration.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-08-30T11:22:00Z):
+
+**1. IOMMU domains are not destroyed on the normal or rollback paths. ACCEPTED - the previous
+response's claim to have fixed this was wrong.**
+
+Confirmed exactly as described. `destroy_domain` existed and its only production caller was the
+immediate `iommu.attach` failure path. `detach_for_inner` removed the public `DOMAINS` row and called
+`revoke_endpoint`, and the row-allocation rollback did the same - so a clean detach left the
+`DomainState` standing with its terminal mapping rows and consumed a domain ID. A machine that binds
+and unbinds a device (a driver restart, an operator stop, a rebind after a crash) grew one dead
+domain per cycle, which is the lifecycle leak M4's restart baseline cannot hold across.
+
+Code changes: a CONFIRMED revoke now destroys the domain, on both paths. The distinction the re-audit
+asks for is already enforced by `destroy_domain` itself rather than trusted to its caller - it returns
+`Unconfirmed` while any endpoint is still attached or any mapping of the domain is quarantined,
+because forgetting a quarantined mapping would hand its address space back for reuse on exactly the
+evidence that says not to - so the rule is stated at the call site and checked at the callee. The
+rollback path additionally tightens its own success test: it treated `Some(_)` from `revoke_endpoint`
+as undone, which is true of `Some(Err(..))` too, and now requires `Ok(Release::FramesReusable)`
+before destroying anything.
+
+**2. A failed doorbell mapping permits the binding to continue. ACCEPTED, and fixed by removing the
+dilemma rather than choosing a side of it.**
+
+The re-audit is right that recording the domain in `NO_DOORBELL` and returning `Ok` leaves a map
+failure ending in a published binding, which M0153's rule does not allow. The previous response's
+measured objection was also right: failing the attach outright denies translation to the many drivers
+here that POLL and never ask for a vector, and was measured as a boot with one endpoint attached and
+no network.
+
+Both are consequences of mapping the doorbell EAGERLY, at attach, for an endpoint that may never want
+one. The re-audit's own correction names the way out - "a polling-only binding should not request an
+unnecessary doorbell map" - and that is what was implemented.
+
+Code changes: `attach_endpoint` no longer installs a doorbell at all, and `NO_DOORBELL` is deleted.
+`msi_deliverable` - called from `SYS_DEVICE_MSIX_ACQUIRE`, the one place an interrupt is actually
+asked for - now probes the endpoint and installs the doorbell there, before a vector exists and
+before MSI-X is enabled on the device, and answers whether it is reachable. A polling driver requests
+no doorbell and no map can fail; an interrupt-capable driver gets the map or gets a refusal, and a
+refusal there IS a refused binding in the sense the rule means: it is handed no vector and the device
+is never allowed to raise one. Nothing is published on a failed map. The operation is idempotent
+across acquire, release and reacquire within one binding, because mapping a region already mapped
+answers `AlreadyMapped`.
+
+The proof this works is the gate's traffic phase, which is the case the eager map existed for: a
+virtio-net endpoint behind the enforcing controller acquires its vector, its doorbell is mapped at
+that moment, and a DHCP lease crosses in both directions.
+
+**3. Production accounting is incomplete. ACCEPTED, NOT DONE.**
+
+The finding is correct: the device snapshot exposes total `iommu_grants` only, the boot report prints
+global endpoint, live, quarantined and fault totals, and the live/quarantined IOVA counters remain
+test-only. M4 asks for mapping, IOVA, endpoint and fault accounting with an exact restart baseline.
+
+It is not fixed in this round and is not claimed to be. The bounded part - promoting the IOVA counters
+to production and adding them to the claim snapshot beside `iommu_grants` - is a change I did not have
+room to make and verify here. The part I would push back on if it is pressed as written is
+integrating endpoint and fault holdings into DOMAIN accounting: a Domain accounts the kernel
+resources a process is charged for, and an IOVA range is a property of a device's translation rather
+than of the process holding its claim, so putting it there would be a new meaning for Domain rather
+than a missing counter. The restart baseline the item really needs is now attainable for the first
+time, because domains are destroyed on a confirmed teardown - before this change no baseline could
+have held.
+
+**Verification.** `./test.sh --arch x86_64 --tags dma` is 29 passed, and
+`./check.sh --gate qemu-virtio-iommu-x86_64` passes end to end with the lazy doorbell: five hostile
+cases refused by the hardware, a DHCP lease through the enforcing controller, the default machine
+translated with nothing degraded, and `--no-iommu` booting untranslated.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

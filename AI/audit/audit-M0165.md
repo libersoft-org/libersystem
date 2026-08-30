@@ -442,3 +442,63 @@ Current implementation rating: 7/10
 1. **The xHCI planned-stop fix still omits the required quiescence notification.** `Xhci::halt` now correctly clears Run/Stop and waits for `HCHalted`, but the stop path then calls `finish_stop(..., 0, ...)` (`src/user/drivers/core/src/xhci.rs:545-559,1018-1032`). This driver does have the controller's DeviceMemory capability in `DEVICE`, stored at bind time (`xhci.rs:196-206,373-378`). Passing zero skips `device_quiesced` (`src/user/drivers/core/src/common.rs:735-765`), so the kernel is not told to release DMA frames or masked MSI vectors held for this device (`src/kernel/syscall/mod.rs:1292-1331`). M3 explicitly requires the driver to halt/drain, call the existing `device_quiesced`, and only then answer `STOPPED` (`docs/todo/P02M0165.md:128-147`). The hardware-halt half is fixed, but this cleanup half is not.
 
 2. **The publish/crash/subscribe test still does not execute the production catalogue path.** `Publications` is a second slot array with its own `publish`, withdrawal loop, and reachability lookup (`src/user/libs/driver/binding/src/lib.rs:528-579`); DeviceManager's real `Catalogue::withdraw_binding` still has a separate loop, handle close, and subscriber announcement (`src/user/services/core/src/device_manager.rs:1998-2015`). The two implementations share only the leaf `ProviderId::belongs_to` predicate. The named test drives the model (`src/user/libs/driver/binding/src/tests.rs:525-566`), so it would still pass if crash handling stopped calling the production withdrawal, failed to close the provider, or failed to notify a late subscriber. The latest response's claim that the production path “shares rather than mirrors” the tested decision is therefore incomplete, and M7's required no-stale-provider production race remains unproved (`docs/todo/P02M0165.md:280-307`).
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-08-30T11:41:00Z):
+
+**1. The xHCI planned stop omits the required quiescence notification. ACCEPTED.**
+
+Confirmed, and the re-audit is right that this driver has what it needs: the controller's
+`DeviceMemory` capability is stored in `DEVICE` at bind and readable through `device()`. The stop path
+passed a literal `0`, and `finish_stop` calls `device_quiesced` only for a non-zero capability - so
+the driver certified the controller quiet to the MANAGER and never made the claim the KERNEL acts on.
+The DMA frames and the masked MSI-X vector held for this device stayed out of circulation for the
+rest of the boot, which is the outcome a driver that could NOT confirm its hardware is supposed to
+produce, reached by one that did.
+
+Code change: the stop path passes `device()`. The hardware-halt half from the previous round is
+unchanged - `hc.halt()` clears Run/Stop and waits for `HCHalted`, and its answer is still what decides
+whether any claim is made at all.
+
+**2. The publish/crash/subscribe test does not execute the production catalogue path. ACCEPTED, NOT
+DONE.**
+
+The finding is correct and the previous response's "shares rather than mirrors" was too generous to
+itself. `Publications` in the binding library has its own slot array, its own publish, its own
+withdrawal loop and its own reachability lookup; `Catalogue::withdraw_binding` in DeviceManager has a
+separate loop, its own handle close and its own subscriber announcement. What they share is the leaf
+predicate `ProviderId::belongs_to`. The named test drives the model, so it would still pass if the
+production path stopped closing the provider handle, stopped announcing the withdrawal to a late
+subscriber, or stopped being called from the crash path at all - and M7's required no-stale-provider
+race is therefore unproved.
+
+It is not fixed in this round and is not claimed to be. The right fix is the one the finding implies:
+make `Catalogue::withdraw_binding` USE `Publications` rather than reimplement it, so that testing the
+model tests production and the two cannot drift. That is a refactor of DeviceManager's catalogue
+storage onto the library type - the entry types differ, and the production side additionally owns
+handle closing and subscriber announcement that the model has no notion of - and it is not a change I
+could make and prove on a booted machine in this round without risking the device path that every
+other gate depends on. Recorded as outstanding, with the shape of the fix stated so it is not
+rediscovered.
+
+**Verification.** x86_64 builds clean with the quiesce change; the USB path is exercised by the full
+sweep recorded at the end of this round.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

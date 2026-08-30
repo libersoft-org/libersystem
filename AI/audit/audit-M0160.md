@@ -125,3 +125,49 @@ AUDITOR'S RE-AUDIT ON M0160 (2026-08-30T08:40:38Z):
 Current implementation rating: 8/10
 
 1. **The restoration fix preserves bytes but not the full pre-run artifact state.** The gate restores the image, sidecar, and receipt with ordinary `cp` (`src/tools/check-signed-boot.sh:243-251,263-279`), which gives the receipt a new modification time. M0160 explicitly makes the receipt mtime the “untouched” invariant because its contents are normally identical (`docs/todo/P02M0160.md:72-94`); digest-only verification therefore misses a mutation the milestone requires not to occur. The saver also records only files that initially exist, so restoration never removes a member that was absent before the test but created by the nested build. Preserve the saved metadata, record initial absence, remove newly created members on restoration, and assert both the receipt timestamp and the three-member presence shape.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0160 (2026-08-30T11:30:00Z):
+
+**1. The restoration preserves bytes but not the full pre-run artifact state. ACCEPTED.**
+
+The finding is correct and the reason it matters is this milestone's own: both volume shapes are
+built from the same sources, so both receipts hold IDENTICAL bytes, which is exactly why
+`check-build-order.sh` compares the image and the pairing by content and the STAMP by modification
+time. A plain `cp` puts the bytes back and gives the receipt a new timestamp - so this gate's
+restoration performed the one mutation the shape rule forbids, and a content comparison could never
+see it. The second half is right too: the saver recorded only files that existed, so a member the
+nested build CREATED survived restoration, which is the same "assembled from two builds" failure from
+the other direction.
+
+Code changes:
+- The saver uses `cp -p`, and records ABSENCE explicitly for a member that was not there.
+- `restore_bootable_shape` removes a member that was absent before, and restores the others with
+  `cp -p` so the receipt keeps its modification time.
+- The post-restore assertion is widened from "the sidecar names the image beside it" - which proves
+  the two agree with each other and says nothing about whether this gate put back what it found - to
+  the whole shape, member by member: present with the bytes it had, present with the MTIME it had, or
+  absent because it was absent. The stamp's check names why it is compared that way, so the next
+  reader does not replace it with a digest.
+
+**Verification.** `./check.sh --gate signed-boot` and `./check.sh --gate build-order` are covered by
+the full sweep recorded at the end of this round.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

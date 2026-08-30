@@ -544,3 +544,108 @@ Current implementation rating: 6/10
 3. **The claimed real-device MSI checkpoint remains synthetic.** The selected oracle allocates ordinary RAM as a fake MSI-X table and manually invokes `dispatch_msi`, then performs synthetic release/reacquire (`src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The profile gate nevertheless reports that it “delivered a real MSI” (`src/tools/check-qemu-arch-profiles.sh:308-326`). The actual virtio-snd hardware test stops after stream acknowledgement and does not release/reacquire the claim or vector (`src/kernel/test_suites/hardware.rs:745-805`). M3/M6 require the final ITS profile to deliver and tear down a real device MSI (`docs/todo/P02M0151.md:94-103,143-154`); the current oracle cannot detect a broken device-to-ITS path or real teardown.
 
 4. **The required UEFI/no-DT regression profiles remain absent from automation.** The architecture gate registers only eight direct-boot invocations with `UEFI=0` (`src/tools/check-qemu-arch-profiles.sh:198-211,296-334`), and no repository caller actually selects `LIBER_NO_DT_PROFILE=1`; `test-kernel.sh` only passes it through when supplied (`src/harness/test-kernel.sh:312,332`). M6 requires separate, labelled aarch64 and riscv64 UEFI/no-DT profiles and the Definition of Done requires them green (`docs/todo/P02M0151.md:143-147,464-472`). A dormant fallback selected by no gate is not regression coverage.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-08-30T11:10:00Z):
+
+**1. The timer PPI's interrupt-controller routing is not validated. ACCEPTED, and the earlier
+rejection on proportionality grounds was wrong.**
+
+The re-audit is right that M2 names this as a checked requirement, and the previous response answered
+a requirement with an argument about QEMU generations. The reader checked the specifier's kind, its
+number and its sense and never asked which controller the timer says it belongs to - so a timer
+routed to another interrupt controller was accepted and its INTID enabled on the selected GIC, which
+is a per-core interrupt programmed on a controller the tree does not put it on.
+
+Code changes: the FDT reader now records the selected main GIC's own `phandle` - taken from the same
+node its addresses are committed from, in its own branch because `record_device` handles `reg`,
+`status` and `compatible` and lets everything else fall through - and the timer node's stated
+`interrupt-parent`. A timer whose stated parent is neither zero nor the selected GIC's phandle
+publishes `timer_intid = 0`, which the aarch64 backend already refuses a boot on.
+
+STATED AND DIFFERENT is the only refusal, and that is deliberate rather than a weakening.
+`interrupt-parent` is INHERITED, and on both machines this boots the root node carries it while the
+timer does not repeat it - so refusing an unstated parent would refuse every real tree, and
+implementing inheritance for one property is the broader firmware framework the earlier response was
+right to avoid. This is the bounded phandle relationship check the re-audit asked for.
+
+Two host mutations cover it: a tree whose timer names a different phandle publishes no INTID, and the
+same tree with the routing agreeing publishes 30 - so the check is a routing check rather than a
+refusal of any tree that states a parent. Watched to fail with the comparison disabled: `a timer whose
+interrupt-parent is not the selected GIC describes a PPI on another controller`. The fdt suite is 86
+passed.
+
+**2. Redistributor validation proves byte capacity, not that every described core has a frame.
+ACCEPTED.**
+
+Confirmed, and the consequence was worse than a missing check: `init_cpu_local_v3` printed a line and
+RETURNED, and the core then carried on into the online count. The scheduler placed threads on a core
+with no timer PPI and no SGI - never preempted, never woken by an IPI - and nothing downstream could
+tell, because the core was counted as usable.
+
+Code changes: `init_cpu_local`, `init_cpu_local_v3` and `init_secondary` now answer whether the
+core's interrupt state could be established. GICv2 always can - its per-core state is banked
+registers on a fixed CPU interface, with no per-core frame that can be absent - and GICv3 answers
+false when `this_redistributor` finds none. `psci.rs` parks such a core in `halt_loop` WITHOUT calling
+`mark_online`, so it never joins the online set, `bind_online` never binds it, and no thread is
+placed on it.
+
+REJECTED, and this is the part the re-audit overreaches on: making it FATAL. M2's "a missing or
+contradictory main GIC must be fatal" is about the controller, not about one core of N - halting a
+machine because one core out of four has no redistributor frame turns a degraded machine into a dead
+one. Keeping the core out of the online set is the containment the situation calls for, and it is now
+VISIBLE: `numa: node N: ... M processor(s) described, K online` prints both counts, so a core that
+was described and did not come up is a fact in the boot report rather than a silence.
+
+**3. The claimed real-device MSI checkpoint is synthetic. ACCEPTED as to the CLAIM; the oracle is
+kept.**
+
+The re-audit is right that the gate said "delivered a real MSI" and the oracle behind it allocates an
+ordinary RAM frame as a stand-in MSI-X table and calls `dispatch_msi` by hand. The controller path -
+acquire through the ITS, program a device table entry, dispatch to a bound `Interrupt`, release and
+reacquire the same slot - is exercised end to end; the DEVICE path is not, and no test on this
+profile produces a device-originated write.
+
+Code change: the gate now says what the oracle proves, in two lines - what was exercised, and
+explicitly that a device-originated MSI through the ITS is NOT proved here because no device on this
+profile raises one. An overstated claim is a worse defect than a narrow one, and correcting the words
+is the fix available without adding a device to the profile.
+
+NOT DONE: extending the virtio-snd hardware test to release and reacquire its claim and vector, which
+is what would turn this into a real-device checkpoint. It needs a device on the ITS profile and is
+its own item; it is not claimed as covered.
+
+**4. The UEFI/no-DT regression profiles are absent from automation. ACCEPTED, NOT DONE.**
+
+The finding is correct: the gate registers eight direct-boot invocations with `UEFI=0`, no caller
+selects `LIBER_NO_DT_PROFILE=1` - `test-kernel.sh` only forwards it when supplied - and M6 requires
+separate, labelled aarch64 and riscv64 UEFI/no-DT profiles green. A fallback selected by no gate is
+not regression coverage.
+
+It is not fixed in this round and is not claimed to be. The change is two `run_profile` rows plus a
+`UEFI=1` variant of `run_profile`'s request, and each row needs its `want` string taken from an
+actual boot of that profile rather than guessed - two more emulated boots to author and two to verify.
+Recorded here as outstanding rather than argued away.
+
+**Verification.** fdt host suite 86 passed with the two new routing mutations; aarch64 builds clean
+with the per-core change. The arch-profile gates and the full sweep are recorded at the end of this
+round.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

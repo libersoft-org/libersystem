@@ -417,3 +417,61 @@ AUDITOR'S RE-AUDIT ON M0164 (2026-08-30T08:40:38Z):
 Current implementation rating: 5/10
 
 1. **The provider catalogue is still not the production discovery path.** No driver-provider consumer service subscribes to it; the service-side catalogue users only request binding snapshots. DeviceManager still takes providers into fixed `net_client`, `gpu_client`, `snd_client`, `input_client`, and USB locals, then sends fixed `NET`/`GPU`/`SND`/`INPUT`/`USB` handoffs to ServiceManager (`src/user/services/core/src/device_manager.rs:441-475,656-665,1072-1143`). Block discovery likewise remains the four-entry `BOOT_BLOCK_TAGS`/probe bootstrap route. Consequently an additional or late provider may be recorded in the catalogue but cannot be discovered by a real consumer. This remains the expressly scoped seam change and late-subscriber behavior required by the milestone (`docs/todo/P02M0164.md:288-320`); the latest implementer response correctly acknowledges it as not fixed.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-08-30T11:37:00Z):
+
+**1. The provider catalogue is not the production discovery path. ACCEPTED, NOT DONE.**
+
+The finding is correct in every particular and it remains correct after this round. DeviceManager
+still takes providers into fixed `net_client`, `gpu_client`, `snd_client`, `input_client` and USB
+locals and hands them to ServiceManager as fixed `NET`/`GPU`/`SND`/`INPUT`/`USB` messages; block
+discovery is still the four-entry `BOOT_BLOCK_TAGS` and probe route; and no service-side consumer
+subscribes to the catalogue - the ones that use it ask for binding snapshots. So an additional or late
+provider can be recorded in the catalogue and cannot be reached by a real consumer, which is the
+expressly scoped seam change the milestone asks for.
+
+It is not fixed here and is not claimed to be. What follows is the state of the work rather than an
+argument against it, because the finding does not need answering - it needs doing.
+
+Two things are now in place that were not when this milestone was first written, and they are the
+half the seam change consumes: `provider-catalogue` serves `subscribe` as a live stream carrying the
+snapshot, the additions AND the withdrawals (`provider-info.live`), and `@op(3) open` mints a
+connection per consumer, verifying slot, provider generation and binding generation and refusing a
+consumer beyond the number the driver's registry entry declares. A late subscriber is therefore
+serviceable. What has not been done is migrating the five existing services onto it.
+
+The reason that migration is not a small change, recorded because it is the trap waiting for whoever
+does it: the handoff those five capabilities travel on is POSITIONAL.
+`ServiceManager::drive_runtime_drivers` sends `DRIVERS` and then performs eight bare `recv_blocking`
+calls in a fixed order - net frames, gpu, snd, input, usb block, usb query, usb pointer, raw keys -
+with no tags. I proved that experimentally in an earlier round by inserting ONE extra message into
+that sequence: every capability after it arrived one place late, and the boot came up with
+`network_service: FAILED to start - frames: driver frame channel not delivered`. So the migration
+cannot add to the handshake; it has to REPLACE it, which means changing ServiceManager's bootstrap
+ordering and every one of those five consumers in one change, and proving the result on a booted
+machine rather than in a unit test. That is the work, and it is a milestone-sized piece of it rather
+than a finding to fold into a round that also touched twelve other milestones.
+
+No partial migration was attempted, deliberately: half the services arriving through the catalogue
+and half through the positional handshake is a worse state than either, because the handshake's
+positions would then be counted differently on the two paths.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

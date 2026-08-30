@@ -237,9 +237,15 @@ pub fn init_secondary() -> bool {
 // Per-core setup: the CPU interface on, the timer PPI and the SGIs unmasked, CNTP armed.
 fn init_cpu_local() -> bool {
 	if v3() {
-		return init_cpu_local_v3();
-	}
-	{
+		// AND THE TIMER IS ARMED FOR BOTH PATHS, BELOW. Returning `init_cpu_local_v3()` straight out
+		// of here skipped `arm_local_timer` on every GICv3 machine: the controller came up, the timer
+		// PPI was unmasked, and nothing ever programmed the compare register - so the boot's
+		// five-tick wait spun to its two-billion-iteration bound and the machine never got past it.
+		// A refusal is the only early return this function may take.
+		if !init_cpu_local_v3() {
+			return false;
+		}
+	} else {
 		unsafe {
 			// Allow all priorities through (PMR high) and enable the CPU interface.
 			core::ptr::write_volatile(gicc(GICC_PMR), 0xf0);
@@ -251,10 +257,10 @@ fn init_cpu_local() -> bool {
 			let reg = gicd(GICD_ISENABLER + (timer_intid() as usize / 32) * 4);
 			core::ptr::write_volatile(reg, 1 << (timer_intid() % 32));
 		}
+		// GICv2's per-core state is banked registers on a fixed CPU interface: there is no per-core
+		// frame that can be absent, so this path cannot fail the way v3's can.
 	}
 	arm_local_timer();
-	// GICv2's per-core state is banked registers on a fixed CPU interface: there is no per-core
-	// frame that can be absent, so this path cannot fail the way v3's can.
 	true
 }
 

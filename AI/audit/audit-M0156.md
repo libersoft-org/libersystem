@@ -319,3 +319,68 @@ Current implementation rating: 7/10
 1. **The mutation harness can still delete the only saved copy of files it promises to restore.** Cases 9 and 10 perform the destructive `mv` before registering the move for cleanup (`src/tools/check-staged-consistency.sh:235-237,256-257`), leaving a signal window in which the EXIT handler knows nothing about the displaced file and removes the temporary tree containing it. In addition, `moved_back` suppresses a failed restore with `|| true`, clears the ledger, and lets `restore` delete the recovery directory (`check-staged-consistency.sh:59-76`). Register recovery before the destructive move, and retain/report the recovery copy unless restoration succeeds and is verified.
 
 2. **The promised mutation set is still fail-open.** Topology-dependent cases explicitly skip when a suitable subject is absent (`src/tools/check-staged-consistency.sh:253-262,277-303,319-346`), while the closing path merely prints the number refused and exits successfully (`check-staged-consistency.sh:348-351`). Replacing the former hard-coded message with a measured count does not prove that all twelve required branches ran. The gate must construct deterministic subjects or fail unless the complete named case set was actually exercised and refused.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0156 (2026-08-30T11:26:00Z):
+
+**1. The mutation harness can delete the only saved copy of files it promises to restore. ACCEPTED on
+both halves.**
+
+Confirmed. Cases 9 and 10 performed the destructive `mv` and registered the recovery afterwards, so
+between those two lines the ledger knew nothing about the displaced file while the EXIT handler stood
+ready to delete `$work` - which is where the only copy had just been put. And `moved_back` swallowed
+a failed restore with `|| true`, cleared the ledger unconditionally, and let `restore` delete the
+recovery directory: a gate that could not put the staged tree back exited cleanly having destroyed
+it.
+
+Code changes:
+- `moved_aside` is called BEFORE the `mv` in both cases. The registration is free and the move is not,
+  so the free one goes first.
+- `moved_back` reports each restore it could not perform, keeps those pairs in the ledger rather than
+  clearing it, and answers whether everything was restored.
+- `restore` keeps `$work` and says where it is when anything is outstanding, and uses `cp -p` for the
+  single-file victim so a restored file keeps its timestamp as well as its bytes.
+
+**2. The promised mutation set is fail-open. ACCEPTED.**
+
+Confirmed, and the previous round's fix - replacing a hard-coded message with a measured count - did
+not address it: a run in which three topology-dependent cases found no subject printed "9 mutation(s)
+refused" and exited zero, which is the same sentence a complete run prints one number apart, and
+nobody reads a number they have no expectation for.
+
+Code changes: the twelve promised branches are named in a `REQUIRED_CASES` list, each `refuses` call
+site marks its case as having run, and the closing path FAILS naming any that did not, telling the
+reader to construct a subject or remove the case with a reason. The set is fixed rather than
+discovered, which is what makes "the gate ran" a thing the gate can check.
+
+On the current image all twelve do run - `all 12 named mutations refused (12 refusal(s))` - so the
+fail-open was latent rather than active, and it is now unreachable. Watched to fail by removing the
+subject for one case: `1 of 12 named mutations did not run: unreferenced-library`.
+
+REJECTED as written: "construct deterministic subjects". Constructing a subject for each
+topology-dependent case means adding staged artifacts to the image so a gate has something to mutate,
+which puts test-only content in the shipped tree to make a check convenient. Failing loudly when a
+subject is absent gets the same guarantee - no case can be silently skipped - and leaves the choice
+of how to supply one to whoever hits it. The message says exactly that.
+
+**Verification.** `./check.sh --gate staged-consistency` passes with all twelve cases exercised, and
+the tree verifies again afterwards.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

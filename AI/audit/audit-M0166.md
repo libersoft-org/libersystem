@@ -338,3 +338,74 @@ Current implementation rating: 6/10
 1. **An accepted `retry` still performs no attempt after ordinary candidate exhaustion.** Both phase-two and standing-loop `Step::NextCandidate` paths advance `node.candidate` past the final entry (`src/user/services/core/src/device_manager.rs:552-557,948-956`). `PolicyVerb::Retry` opens an incident and sets `restart_requested` but never restores a candidate (`device_manager.rs:3485-3504`); the standing loop then calls `start_candidate`, which returns immediately when the cursor is at `candidates.len()` (`device_manager.rs:535-539,1015-1029`). It therefore neither re-evaluates the selected entry's `requires` nor grants the promised one attempt, contrary to M1/DoD (`docs/todo/P02M0166.md:76-77,241-248`). The latest response fixed policy-disable cursor consumption, not this separate exhausted-retry path.
 
 2. **The persisted incident fallback can still select a stale record for a different device.** Incident keys are durable BDFs and are never removed, but each value embeds the transient table index from the boot in which that incident occurred (`src/user/services/core/src/device_manager.rs:3790-3825`). After the live DeviceManager endpoint is gone, `lsdev --incident N` lists all persisted incidents and selects solely by that embedded `index=N` text (`src/user/apps/tools/src/lsdev.rs:244-285`); it does not resolve N's current BDF. If inventory order or membership changes, an old record can match the row now assigned to another device, and multiple old rows can match. This still violates the requested binding's surviving last-snapshot behavior and the explicit refusal of persistent history (`docs/todo/P02M0166.md:253,267-268`). Matching the old index more carefully did not address its cross-boot instability.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-08-30T11:45:00Z):
+
+**1. An accepted `retry` performs no attempt after ordinary candidate exhaustion. ACCEPTED.**
+
+Confirmed, and the re-audit is right that the previous round fixed a different path. Both
+`Step::NextCandidate` sites advance `node.candidate` PAST the final entry - that is how a node records
+"every candidate has been tried" - and `PolicyVerb::Retry` decremented the attempt counter, opened a
+fresh incident and set `restart_requested` without touching the cursor. The standing loop then called
+`start_candidate`, which returns immediately for a cursor at `candidates.len()`. So an operator saw
+`Accepted` and nothing happened: zero attempts granted where the code's own comment promises exactly
+one, and no re-evaluation of the entry's `requires`.
+
+Code change: `Retry` rewinds the cursor to the registry order when it is past the end. Rewound to
+zero rather than to the last entry tried, because a retry is a request to bind the DEVICE again, and
+the stored `select=` preference is expressed as this same cursor - so an operator who chose an
+artifact has it re-applied by `load_stored_policy`, and this verb does not second-guess which entry
+was meant. The `requires` re-evaluation M1 asks for then happens where it always does, inside
+`start_candidate`, because that is the function the standing loop calls once the cursor points at
+something.
+
+**2. The persisted incident fallback can select a stale record for a different device. ACCEPTED, and
+the previous round's fix was the wrong shape.**
+
+The finding is correct. The key is durable - `device.policy.incident.<bus>.<dev>.<func>` - and the
+VALUE carried `index=N`, the row number of the boot that wrote it, which is a position in an
+inventory whose order and membership can change. `lsdev --incident N` on the fallback path matched
+solely on that text, so a record written when row 3 was the NIC answered a question about row 3 in a
+boot where that row is the audio controller, and several old records could match one row. Matching the
+old index more carefully, which is what the previous round did, made a wrong answer more precise.
+
+Code changes:
+- DeviceManager no longer writes `index=` into the persisted record. A field that is only correct
+  until the next boot does not belong in a record whose whole purpose is to outlive the manager, and
+  the address it already writes is the durable name.
+- `lsdev`'s fallback stops pretending it can resolve a row number. It is reached only when
+  DeviceManager is gone, and the inventory that gives a row its meaning is DeviceManager's - so it says
+  so and lists the stored incidents BY THEIR ADDRESS, which is what an operator can match against
+  `lspci`. Where the manager is alive the question is still answered by index, from the live inventory,
+  and this path is not reached.
+
+This does reinstate a listing where the round before last removed one, and that is deliberate: the
+earlier complaint was that the fallback printed unrelated devices when a LOOKUP was asked for, and the
+answer to that is not a lookup keyed on a number that has stopped meaning anything. Resolving the row
+locally is not available either - `device-entry` carries `index`, `type` and `mmio-len` and no
+address, so `lsdev` cannot turn N into a BDF without widening an IDL record to serve one fallback
+path. Saying which question can and cannot be answered, and answering the one that can, is the honest
+shape.
+
+**Verification.** x86_64 builds clean and `lsdev` builds with the dead decimal helper removed rather
+than suppressed. The device path is exercised by the full sweep recorded at the end of this round.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.

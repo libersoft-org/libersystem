@@ -306,11 +306,21 @@ pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mu
 	match chosen {
 		Some(value) => VolumeChoice::Chosen(value),
 		None if failed => VolumeChoice::Failed,
-		// EXHAUSTION WITH A CANDIDATE PRESENT IS A FAILURE, NOT AN ABSENCE. Every disk was walked,
-		// LiberFS volumes were found, and none of them is the one the pairing names. That is a
-		// present source whose identity is wrong, which this milestone requires to end terminally
-		// rather than in a fallback.
-		None if saw_liberfs && want.is_some() => VolumeChoice::Failed,
+		// EXHAUSTION WITH A CANDIDATE PRESENT IS NOT YET DISTINGUISHED, AND THE NAIVE FORM IS WRONG.
+		//
+		// The 2026-08-30 re-audit is right that a walk which finds LiberFS volumes and no match
+		// answers the same `NotHere` a machine with no LiberFS volume gives, and that the loader may
+		// fall back to the signed boot medium from there - so changing a superblock UUID turns a
+		// present source with the wrong identity into an absence. Returning `Failed` on
+		// `saw_liberfs && want.is_some()` was tried and it breaks a legitimate path: the boot
+		// medium's OWN volume is a LiberFS volume in this walk, so every boot whose paired volume is
+		// not on a disk - the live medium, the rescue stick, the ordinary development boot - became
+		// `loader: the system volume was selected and did not answer` and panicked.
+		//
+		// The distinction that is missing is "a nonmatching volume on a disk that is NOT the medium
+		// this loader came off", and `choose_volume` cannot draw it: it sees firmware disk handles
+		// and is told nothing about which of them the loader was loaded from. Closing this needs that
+		// identity passed in, which is a change to the caller as much as to this function.
 		None => VolumeChoice::NotHere,
 	}
 }

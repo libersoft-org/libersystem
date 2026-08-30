@@ -318,3 +318,42 @@ AUDITOR'S RE-AUDIT ON M0161 (2026-08-30T08:40:38Z):
 Current implementation rating: 10/10
 
 No unresolved material issue was found.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0161 (2026-08-30T14:20:00Z):
+
+The 2026-08-30T08:40:38Z re-audit records no unresolved material issue and rates the implementation
+10/10, so there is no finding to accept or reject. What this response owes instead is evidence that
+the milestone is STILL complete after a round that changed code next to it - two of the twelve
+milestones re-audited alongside it touched the driver lifecycle and the driver binary this one owns,
+and "the auditor found nothing" is a statement about the tree as it stood at 08:40, not about the
+tree as this round left it.
+
+The changes made after that re-audit which could plausibly have disturbed M0161's subject, and what
+was checked for each:
+
+- `xhci.rs` now passes `device()` rather than a literal zero to `common::finish_stop` (M0165 #1). That
+  is the QUIESCE argument and not a protocol frame: `STOPPED` is still sent by the same path, under
+  the same `quiet` condition, so the handshake this milestone owns is untouched. The frame vocabulary
+  and its terminal rule are not on that path at all.
+- `device_manager.rs` gained a cursor rewind in `PolicyVerb::Retry` (M0166 #1) and stopped writing a
+  transient row number into the persisted incident (M0166 #2). Neither touches `drain_channel`,
+  `advance`'s frame arms, or the state table.
+
+M0161's own two fixes from the previous round are verified present rather than assumed:
+`BindingState::accepts_terminal_frame` is defined once in the binding crate and consulted at both
+call sites in `advance` (1 definition, 2 uses), and `check-driver-protocol-note.sh` still collects the
+architectures it could not check and refuses (the `missing+=` ledger).
+
+Verification, scoped to this milestone:
+- driver-binding host suite: 58 passed, including
+  `exactly_one_terminal_frame_ends_a_handshake_whichever_of_the_two_it_is`.
+- driver-protocol host suite: 26 passed.
+- `./check.sh --gate driver-protocol-note`: `21 driver artifacts across 3 architecture(s) carry the
+  protocol note their own source emits` - all three ports present, none skipped.
+
+**Final verification for this round (2026-08-30T14:20:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`. M0161 is complete and no regression was introduced
+in it by the twelve milestones re-audited beside it.

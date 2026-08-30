@@ -149,3 +149,98 @@ Current implementation rating: 5/10
 2. **The MSI late-registration rollback can tear down a replacement vector owner.** `sys_device_msix_acquire` allocates and binds an `Interrupt`, then on a losing `register_derived` calls `release_unused_msi` (`src/kernel/syscall/mod.rs:1515-1543`). That frees the registry slot without clearing the local object's `bound` flag (`src/kernel/arch/x86_64/interrupts/mod.rs:152-168`, with the same ownership split on the other ports). When the local `Arc` subsequently drops, `Interrupt::drop` still sees `bound == true` and calls architectural `unbind` (`src/kernel/object/interrupt.rs:110-119`). Another core may have reacquired the freed slot in between, so the stale rollback can mask/retire the replacement binding. The failed-registration path must disarm the object's ownership exactly once before making the slot reusable.
 
 3. **The required hostile-holder proof remains materially absent, so rejecting the missing cases is unjustified.** The MMIO test injects a fake `mapped_at` value and never installs or accesses a PTE; the interrupt test calls `mark_bound` on an arbitrary vector without the MSI registry/hardware path; and the derivation test calls `register_derived` directly (`src/kernel/object/claim/tests.rs:97-127,306-338,373-399`). There is still no claim-integrated DMA revocation case or two-thread same-handle attenuating-send case; the channel tests exercise only single-thread transfers and failed-send restoration (`src/kernel/object/channel/tests.rs:327-437`). M9 and the Definition of Done explicitly require raw-address, DMA, live-vector, and concurrent same-handle proofs (`docs/todo/P02M0098.md:193-204,241-252`). These are not redundant tests: the synthetic seams miss the two surviving lifecycle defects above.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-08-30T10:55:00Z):
+
+**1. An already-derived MMIO object can publish a raw mapping after release. ACCEPTED - a real race,
+and the sharpest finding of this round.**
+
+Confirmed by reading the two paths together. `sys_device_memory_map` reserves the object
+(`claim_mapping`, CAS 0 -> `RESERVED`), allocates a virtual range, installs the PTEs, and only THEN
+records where it mapped. A release landing inside that sequence swept the object, found `RESERVED`,
+and `teardown_mapping` returned having unmapped nothing - correctly, because nothing was recorded
+yet - and the syscall then stored the live address. The claim reaches `Free` with a live mapping of
+device registers behind it, and no later sweep will ever visit it. The late-`register_derived`
+barrier cannot help: the object was registered when the claim was created.
+
+Code changes:
+- `DeviceMemory` gains a terminal `REVOKED` tombstone beside `RESERVED`. `teardown_mapping` now
+  swaps `REVOKED` in rather than zero, so the object is permanently unmappable afterwards - a fresh
+  `claim_mapping` on a released object also fails, which the old zero allowed.
+- `set_mapped_in` is REPLACED by `commit_mapping`, a CAS off `RESERVED`. A sweep that ran during the
+  build makes it fail, and the function is the only way to reach the mapped state - the second path
+  is gone rather than guarded.
+- `sys_device_memory_map` rolls back on a failed commit: it unmaps the pages it installed and frees
+  the range, then returns `ERR_INVALID`. The builder is the only thing that can remove a mapping
+  nothing else can see.
+
+`kernel.object.claim.a_release_that_lands_mid_map_leaves_no_mapping_behind` reproduces the window
+exactly rather than racing for it - reserve, install PTEs, release, attempt the commit - and asserts
+the commit is refused, that no PTE survives, and that the object cannot be reserved again. Watched to
+fail with `commit_mapping` restored to an unconditional store: `a claim that ended while the mapping
+was being built does not get to publish it`.
+
+**2. The MSI late-registration rollback can tear down a replacement vector owner. ACCEPTED.**
+
+Confirmed, and the chain is exactly as described. `bind_msi` succeeds and marks the object bound;
+`register_derived` then fails; `release_unused_msi` masks the entry and calls `REGISTRY.free(slot)`,
+which clears the binding and marks the slot UNUSED - immediately reusable - without clearing the
+local object's `bound` flag. The `Arc` drops at end of scope, `Interrupt::drop` sees `bound == true`
+and calls the architectural `unbind`, which for an MSI vector masks the entry, unmaps its table page
+and RETIRES the slot. Another core can have acquired and bound that slot in between.
+
+Code changes: `Interrupt::disown` clears the ownership flag without touching the hardware, and the
+`register_derived` failure path calls it BEFORE `release_unused_msi`. The order is the fix rather
+than a narrowing of the window: disowning first makes the later `Drop` a no-op, so exactly one path
+gives the slot back and it is the rollback.
+
+`kernel.object.claim.a_rolled_back_msi_acquire_does_not_unbind_the_slots_next_owner` binds, performs
+the rollback in the syscall's order, re-acquires the freed slot, binds a replacement and then drops
+the first object - asserting the replacement is still bound. Watched to fail with the `disown` call
+removed: `the rolled-back acquire's drop did not tear down the slot's new owner`.
+
+**3. The hostile-holder proof is materially absent. ACCEPTED IN PART, and the accepted part is the
+half that would have caught the two defects above.**
+
+ACCEPTED and fixed: the MMIO test asserted that a NUMBER had been cleared. It handed the object a
+fabricated `mapped_at` and never installed a page-table entry, so a revocation that left the tables
+untouched passed it exactly as one that did not. It now drives the production sequence -
+`claim_mapping`, real `space.map`, `commit_mapping` - asserts through `arch::paging::translate` that
+the entry EXISTS before the release, and asserts it is gone afterwards. That is the raw-address proof
+M9 asks for, and it is what makes the release's reach into the address space a measured fact.
+
+ACCEPTED and fixed: the two surviving lifecycle defects now have tests of their own, described above.
+The audit's argument that the synthetic seams miss them is correct and is the reason those tests
+exist.
+
+NOT DONE, and stated rather than rejected: the claim-integrated DMA revocation case and the
+two-thread same-handle attenuating-send case. Both are legitimate M9 items. The DMA path IS wired -
+`sys_dma_buffer_create` registers the buffer as derived and its registration-failure branch orphans
+the frames rather than returning them - so what is missing is a test, not the mechanism. The
+concurrent same-handle case needs two threads racing one handle table, which the kernel suite can
+express (`sched::spawn_on` is used this way in the NUMA matrix) but which is a larger piece of work
+than this round could carry alongside the two defects. Neither is claimed as covered.
+
+**Verification.** `./test.sh --arch x86_64 --tags object` is 69 passed with the three claim tests
+green, and `--tags dma` 29 passed. Both new tests were watched to fail against the exact pre-fix
+behaviour. The full sweep is recorded at the end of this round.
+
+**Final verification for this round (2026-08-30T14:05:00Z).** `./check.sh` is green on every gate and
+conformance suite, and `./test.sh --arch all` passes on all three: x86_64 370, aarch64 358,
+riscv64 361, `test.sh: all architectures passed`.
+
+Two things the sweep caught that are worth recording here rather than only in the milestone they
+belong to, because both are the kind a scoped run hides:
+
+- A regression introduced by this round's own aarch64 change. Making `init_cpu_local` answerable
+  turned its `if v3() { .. } else { .. }` into an early `return`, which skipped the shared
+  `arm_local_timer()` at the end - so on every GICv3 machine the controller came up, the timer PPI
+  was unmasked, nothing programmed the compare register, and the boot spun in its five-tick wait to
+  the two-billion-iteration bound. Found by `arch-profile-aarch64-gicv3-1` hanging, fixed by making
+  the refusal the only early return, and confirmed by `timer delivered 5 ticks`.
+- `./check.sh` still cannot go green in a single pass: gates that rebuild the system volume change
+  the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
+  the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
+  refuse; the ordering is what it is reporting.
