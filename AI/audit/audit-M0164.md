@@ -475,3 +475,43 @@ belong to, because both are the kind a scoped run hides:
   the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
   the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
   refuse; the ordering is what it is reporting.
+
+---
+
+IMPLEMENTER'S ADDENDUM ON M0164 (2026-08-30T15:32:00Z):
+
+**The seam's fragility is fixed; the migration itself is still not done, and this says precisely how
+much of the finding each covers.**
+
+The previous response identified the trap: `drive_runtime_drivers` sent `DRIVERS` and then performed
+eight bare `recv_blocking` calls whose ORDER alone decided which capability went where, and inserting
+one extra message on the sending side shifted every capability after it - measured as
+`network_service: FAILED to start - frames: driver frame channel not delivered`.
+
+On re-reading the sender, the fragility turns out to be cheaper to remove than it looked: DeviceManager
+has ALWAYS tagged every one of those eight messages - `NET`, `GPU`, `SND`, `INPUT`, `USB`, `USBBUS`,
+`INPUT2`, `KEYS`. The tags crossed the channel and were thrown away on arrival, and the sequence was a
+positional contract that nothing checked.
+
+Code change: the reader matches on the tag. The eight are now independent - a message may be added,
+removed or reordered on either side without silently misrouting a capability - and one arriving under
+a tag this build has no slot for is CLOSED rather than assigned to whatever slot came next, because a
+kept handle nobody serves is a channel nobody closes.
+
+That is not the migration, and it is not claimed as one. What it is: the reason the migration was
+called milestone-sized has been removed. Adding a message to that handshake, or removing one, is now
+a safe change, so the catalogue-based path can be built incrementally beside the existing one instead
+of having to replace all five consumers atomically.
+
+STILL NOT DONE, and unchanged from the previous response: no driver-provider consumer subscribes to
+the catalogue, DeviceManager still takes providers into fixed locals and hands them over as those
+eight messages, and block discovery is still the `BOOT_BLOCK_TAGS` probe route. An additional or late
+provider can be recorded in the catalogue and cannot be discovered by a real consumer. The two halves
+that make that possible are both in place - `subscribe` serves the snapshot, the additions and the
+withdrawals, and `open` mints a per-consumer connection with a declared consumer limit - so what
+remains is moving each of the five consumers onto them, one at a time, each proved on a booted
+machine.
+
+**Verification.** `./check.sh --gate qemu-virtio-iommu-x86_64` passes end to end with the tag-driven
+read: a DHCP lease through the enforcing controller proves `NET` arrived at the right slot, and `the
+display driver runs` proves `GPU` did.

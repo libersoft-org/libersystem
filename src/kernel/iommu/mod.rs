@@ -537,6 +537,17 @@ pub fn grants_for(index: u32) -> usize {
 	with(|controller| controller.iommu().mappings_in(domain)).unwrap_or(0)
 }
 
+// HOW MANY OF THEM ARE QUARANTINED - a mapping whose invalidation the device never confirmed.
+//
+// The counter existed and was read by the DMA crate's own unit tests and by nothing else, so the
+// production lifecycle carried a total that could not be broken down. This is the half that decides
+// whether a released claim's address space may be reused: a quarantined range is out of circulation
+// for the life of the boot, and a manager that cannot see one cannot reconstruct that fact.
+pub fn quarantined_grants_for(index: u32) -> usize {
+	let Some(domain) = domain_of(index) else { return 0 };
+	with(|controller| controller.iommu().quarantined_addresses(domain)).unwrap_or(0)
+}
+
 // Whether an MSI vector for this device can actually be delivered: either it is not translated at all,
 // or its domain carries a mapping for the doorbell its interrupts are written to.
 // MAP THE DOORBELL FOR THIS DEVICE, NOW THAT AN INTERRUPT IS BEING ASKED FOR.

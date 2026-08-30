@@ -314,15 +314,55 @@ RUSTC_STACK="${RUST_MIN_STACK:-268435456}"
 # already private per selection - `mkimage.sh` names the test ISO by its content key - so what was
 # left shared was exactly this step.
 mkdir -p "$REPO_ROOT/.build/state"
+STAGED_TEST_KERNEL="$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.elf"
 (
 	flock 8
 	cd "$ROOT/kernel"
-	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests
+	# THE BUILT BINARY'S PATH, ASKED FOR RATHER THAN GUESSED. `--message-format=json` names the
+	# executable cargo produced; the last `compiler-artifact` line carrying one for the `kernel`
+	# target is this selection's test binary.
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests --message-format=json >"$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" || exit 1
+	built="$(
+		python3 - "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json" <<'PYEOF'
+import json, sys
+found = ""
+for line in open(sys.argv[1], encoding="utf-8", errors="replace"):
+    line = line.strip()
+    if not line.startswith("{"):
+        continue
+    try:
+        row = json.loads(line)
+    except ValueError:
+        continue
+    if row.get("reason") == "compiler-artifact" and row.get("executable") and row.get("target", {}).get("name") == "kernel":
+        found = row["executable"]
+print(found)
+PYEOF
+	)"
+	[[ -n "$built" && -f "$built" ]] || {
+		echo "test-kernel: cargo did not name a test executable for this selection" >&2
+		exit 1
+	}
+	# STAGED WHILE THE LOCK IS STILL HELD, which is the whole point of this step.
+	#
+	# The run below used to be `cargo test`, which resolves the binary out of the SHARED Cargo target
+	# directory - so between the locked build and the unlocked run, another same-architecture runner
+	# compiling a different compile-time `TEST_SELECTION` or `TEST_TAGS` could replace the very
+	# executable this run was about to boot, or force this run to rebuild outside the lock. The
+	# content-addressed ISO does not close that: its key and payload are derived from whichever shared
+	# executable is visible while the medium is assembled.
+	#
+	# A per-run copy, made under the lock, is immutable for the life of this run by construction. It
+	# costs one file copy of a binary that is already on this disk.
+	cp "$built" "$STAGED_TEST_KERNEL"
+	rm -f "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"
 ) 8>"$REPO_ROOT/.build/state/kernel-test-build.lock" >>"$RUN_LOG" 2>&1 || {
 	echo "test-kernel: the selection-specific kernel did not build" >&2
 	tail -20 "$RUN_LOG" >&2
 	exit 1
 }
+# The staged copy is this run's, and it goes when the run does.
+trap 'rm -f "$STAGED_TEST_KERNEL" "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"' EXIT
 
 set +e
 (
@@ -337,7 +377,19 @@ set +e
 	# that publishes no tree gets a named refusal instead of QEMU `virt`'s controller addresses. It had
 	# no setter anywhere in the tree - the only occurrence was the consumer - so the authorised profile
 	# was unreachable and the refusal it guards was untestable.
-	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" RUST_MIN_STACK="$RUSTC_STACK" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" cargo "${TEST_ARGS[@]}"
+	# THE RUNNER, ON THIS RUN'S OWN COPY, rather than `cargo test` on the shared target.
+	#
+	# `cargo test` builds (a no-op here - the locked step above already did it) and then invokes the
+	# configured runner with whatever binary the shared directory holds AT THAT MOMENT. Calling the
+	# runner directly on the staged copy is the same command with the race removed: nothing between
+	# the lock and here can change what boots.
+	#
+	# `TEST_TAGS`, `TEST_SELECTION` and `LIBER_NO_DT_PROFILE` are COMPILE-time and are already baked
+	# into the copy, so they are not passed here. `TEST=1` is not: `qemu-run.sh` reads it at RUN time
+	# to select test mode - the debug-exit device and the exit-code mapping that turn a finished suite
+	# into a process status. Dropping it was measured as a suite that printed `71 passed` and then sat
+	# until the harness timed it out, because nothing had told the guest how to power off.
+	TEST=1 SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" "$ROOT/harness/qemu-run.sh" "$ARCH" "$STAGED_TEST_KERNEL"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

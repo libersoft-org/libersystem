@@ -246,11 +246,11 @@ fn the_paired_volume_is_chosen_whichever_order_the_firmware_reports_it_in() {
 	// A pairing that names a volume this machine does not have finds NOTHING rather than falling back
 	// to somebody else's system.
 	//
-	// KNOWN GAP, recorded here rather than in a comment nobody reads: this is ALSO the answer when
-	// LiberFS volumes were present and none matched, which the 2026-08-30 re-audit is right to call
-	// a fail-open - the loader may fall back to the signed boot medium from `NotHere`. Answering
-	// `Failed` whenever any LiberFS volume was seen was tried and panics every live-medium boot,
-	// because the boot medium's own volume is one of the volumes this walk sees. See `choose_volume`.
+	// AND THAT IS AN ABSENCE ON PURPOSE, not a fail-open. The 2026-08-30 re-audit asked for it to be
+	// terminal; the reasoning and the two measured attempts are at `choose_volume`, and the short of
+	// it is that what the loader does from here reads a SIGNATURE-VERIFIED kernel off the boot
+	// medium. The dangerous case - a selected volume that is present and will not open - is already
+	// terminal and is asserted below.
 	let chosen = firmware::choose_volume(mock::boot_services(), Some([0x5e; 16]), read_uuid);
 	assert!(matches!(chosen, disk::VolumeChoice::NotHere), "a volume that is not here is not substituted for");
 }

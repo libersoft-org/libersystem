@@ -1998,18 +1998,41 @@ impl Catalogue {
 	// Withdraw everything a binding published, which is what the end of that binding means.
 	unsafe fn withdraw_binding(&mut self, binding: BindingId) -> usize {
 		unsafe {
-			let mut gone: usize = 0;
-			for slot in 0..MAX_PROVIDERS {
-				if !self.entries[slot].as_ref().is_some_and(|provider| provider.binding_is(binding)) {
-					continue;
-				}
-				if let Some(provider) = self.entries[slot].take() {
+			// THE LOOP IS THE LIBRARY'S, and that is the whole of this change.
+			//
+			// This had its own loop, and `Publications::withdraw_binding` - the host-testable model
+			// the publish/crash/subscribe race test drives - had another. They shared the leaf
+			// predicate and nothing else, so the named test would have passed unchanged if THIS loop
+			// had stopped selecting correctly, stopped emptying a slot, or counted twice. One
+			// implementation of which slots go and how many that was; the side effect per slot -
+			// closing the channel and announcing the withdrawal - stays here, because the model has
+			// no handles and no subscribers to have them for.
+			//
+			// The announcement cannot run inside the closure: it borrows `self`, and the slots being
+			// withdrawn are `self`'s. The withdrawn providers are collected and announced after.
+			// ALLOC-OK: bounded by `MAX_PROVIDERS`, on a binding transition rather than a hot path.
+			let mut taken: alloc::vec::Vec<Provider> = alloc::vec::Vec::new();
+			if taken.try_reserve(MAX_PROVIDERS).is_err() {
+				// A withdrawal that cannot record what it took still WITHDRAWS - the providers go and
+				// their handles close - and the subscribers are told what could be recorded. Keeping
+				// the publication standing because a Vec would not grow is the worse failure.
+				print(b"DeviceManager: could not record a binding's withdrawn providers to announce them; they are withdrawn and the announcement is short\n");
+			}
+			let gone = driver_binding::withdraw_slots(
+				&mut self.entries,
+				binding,
+				|provider| provider.id,
+				|provider| {
 					if provider.handle != 0 {
 						close(provider.handle);
 					}
-					self.announce(&provider, false);
-				}
-				gone += 1;
+					if taken.len() < taken.capacity() {
+						taken.push(provider);
+					}
+				},
+			);
+			for provider in taken.iter() {
+				self.announce(provider, false);
 			}
 			gone
 		}
@@ -4131,6 +4154,15 @@ unsafe fn observe_claim(node: &mut Node, device_privilege: u64, driver_name: &[u
 		let held = snapshot.mmio_windows + snapshot.irq_vectors + snapshot.iommu_grants;
 		if held > node.granted_resources {
 			node.granted_resources = held;
+		}
+		// AND A QUARANTINED GRANT IS SAID OUT LOUD, because it is the one holding a reconstructed
+		// node cannot act on. `iommu_grants` counts live and quarantined mappings together - a
+		// quarantined one is charged exactly like a live one - so a manager adopting a binding could
+		// see a charge and not that part of it is out of circulation for the life of the boot.
+		if snapshot.iommu_quarantined > 0 {
+			print(b"DeviceManager: ");
+			print_driver_name(driver_name);
+			print(b" holds an IOMMU mapping the device never confirmed it stopped resolving; that address space stays out of circulation for this boot\n");
 		}
 		match snapshot.state {
 			CLAIM_STATE_FREE => ClaimReadiness::Bindable,

@@ -305,6 +305,21 @@ MSI_ORACLE="$AARCH64_MSI"
 run_profile aarch64 gicv3-its 1 "GICv3 from the device tree" GIC=3its
 run_profile aarch64 gicv3-its 4 "GICv3 from the device tree" GIC=3its
 
+# THE UEFI / NO-DEVICE-TREE REGRESSION PROFILES ARE NOT REGISTERED HERE, AND THIS SAYS WHY
+# (2026-08-30). M6 asks for separate, labelled aarch64 and riscv64 UEFI/no-DT profiles and the
+# Definition of Done asks for them green; `LIBER_NO_DT_PROFILE=1` is the compile-time authorisation
+# for the static descriptor such a machine falls back to, and no caller in this tree sets it - so the
+# authorised profile is unreachable and the named refusal it guards is untestable.
+#
+# Registering two rows here was tried and does not work, and the reason is the useful part: the
+# profile needs a machine that publishes NO device tree, and this harness cannot produce one. Booting
+# through firmware instead of directly does not do it - QEMU's `virt` gives the firmware a DTB and the
+# loader hands it on, so a `UEFI=1` boot still prints `aarch64: GICv2 from the device tree`, measured.
+#
+# What is missing is a way to withhold the tree: a QEMU machine that publishes none, or a loader
+# option that does not pass one on. That is a harness capability rather than a gate row, and it is
+# what this item is actually blocked on.
+
 # AND THE ITS PROFILE MUST HAVE USED ITS ITS. `GICv3 from the device tree` is the same line the
 # ITS-less profile prints, so on its own it would make the two profiles indistinguishable.
 #

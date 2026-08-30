@@ -244,3 +244,44 @@ belong to, because both are the kind a scoped run hides:
   the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
   the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
   refuse; the ordering is what it is reporting.
+
+---
+
+IMPLEMENTER'S ADDENDUM ON M0098 (2026-08-30T15:20:00Z):
+
+**Finding 3's two remaining cases are now covered, so nothing in this re-audit is left open.**
+
+The previous response accepted finding 3 in part and left the claim-integrated DMA case and the
+two-thread same-handle case explicitly NOT DONE. Both are now written.
+
+`kernel.object.claim.ending_a_claim_takes_the_dma_buffers_it_authorised` is the third kind of derived
+capability, and the one M9 names that had no test. A `DmaBuffer` created against a device capability
+is stamped with the CLAIM that capability carries and registered in the derived table for the same
+reason the MMIO mapping and the interrupt are - its frames are physical addresses a device may still
+have in a live descriptor. The test creates the buffer the way the syscall does, asserts the derived
+table grew by one, asserts the buffer holds real frames, releases the claim, and asserts the buffer's
+generation moved - every capability to it invalid - and that the registry row is gone.
+
+It also gives the shared held-frames table back, and that is worth recording because it is how the
+test first failed: a released claim ORPHANS a buffer's frames against the device index rather than
+freeing them, and that table is bounded and shared. Leaving this test's entries in it took room from
+`kernel.object.dma_buffer`'s own capacity case, which fills the table exactly - so that test failed
+for a reason of somebody else's on the first run.
+
+`kernel.object.claim.two_threads_attenuating_one_handle_move_it_exactly_once` is the concurrent
+same-handle case. The existing channel tests drive a sender and a receiver, each with its own handle,
+so nothing there contends for a single table entry; this puts two threads in ONE process - one handle
+table - both attenuating-sending the SAME handle over their own endpoints. An attenuating send MOVES
+the handle, so the property is exactly one delivery and one refusal: the test asserts one answer is
+`0`, the other is `ERR_BAD_HANDLE` by name rather than some other failure, and that the source entry
+is spent once. The failure it rules out is a send that reads the entry, builds the attenuated
+capability, and only then removes the source - both threads would pass the read and the receiver
+would get the capability twice, which is a capability duplicated by a race.
+
+One defect in the test itself is recorded because it is a trap for the next person: the thread's slot
+index was first packed into the entry argument's high half, which COLLIDES with the handle encoding -
+a `Handle` carries its generation up there, so `argument >> 32` is the generation and one thread wrote
+the other's result. Two entry points instead of a packed argument.
+
+**Verification.** `./test.sh --arch x86_64 --tags object` is 71 passed and `--tags dma` 30 passed,
+both new tests among them.

@@ -428,3 +428,40 @@ belong to, because both are the kind a scoped run hides:
   the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
   the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
   refuse; the ordering is what it is reporting.
+
+---
+
+IMPLEMENTER'S ADDENDUM ON M0153 (2026-08-30T15:22:00Z):
+
+**Finding 3's bounded half is now done. The Domain-accounting half is still rejected, for the reason
+given before.**
+
+The previous response accepted finding 3 and left it NOT DONE. What is now built is the part the
+finding is concretely right about: the live and quarantined IOVA counters existed, were read by the
+DMA crate's own unit tests and by nothing else, so the production lifecycle carried a total that
+could not be broken down.
+
+Code changes:
+- `iommu::quarantined_grants_for(index)` promotes `quarantined_addresses` to a production reader.
+- `DeviceClaimSnapshot` carries `iommu_quarantined` beside `iommu_grants`. It takes the struct's
+  reserved padding word, so the size and every offset before it are unchanged.
+- `device.rs` fills it from the kernel's own records at the moment of the read, as it does the other
+  three.
+- DeviceManager says so when adopting a binding that holds one: `iommu_grants` counts live and
+  quarantined mappings TOGETHER - a quarantined one is charged exactly like a live one, deliberately -
+  so a manager reconstructing a binding could see a charge and not that part of it is out of
+  circulation for the life of the boot. That distinction is the one a reconstructed node cannot act
+  on without being told.
+
+Still REJECTED: integrating endpoint and fault holdings into DOMAIN accounting. A Domain accounts the
+kernel resources a process is charged for; an IOVA range is a property of a device's translation
+rather than of the process holding its claim, so putting it there would be a new meaning for Domain
+rather than a missing counter. The binding-level accounting the milestone actually needs is what the
+snapshot now carries.
+
+And the restart baseline M4 asks for is attainable for the first time, which is worth stating: before
+this round's finding-1 fix destroyed domains on a confirmed teardown, no baseline could have held
+across a restart at all, because every bind/unbind cycle left a domain behind.
+
+**Verification.** `./test.sh --arch x86_64 --tags dma` is 30 passed; the DMA crate's own suite is 54
+passed; `./check.sh --gate qemu-virtio-iommu-x86_64` passes end to end.

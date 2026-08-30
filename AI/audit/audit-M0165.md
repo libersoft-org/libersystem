@@ -502,3 +502,34 @@ belong to, because both are the kind a scoped run hides:
   the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
   the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
   refuse; the ordering is what it is reporting.
+
+---
+
+IMPLEMENTER'S ADDENDUM ON M0165 (2026-08-30T15:28:00Z):
+
+**Finding 2 is now fixed. The previous response left it NOT DONE.**
+
+The finding was right: `Publications` in the binding crate had its own withdrawal loop, DeviceManager's
+`Catalogue::withdraw_binding` had another, and they shared only the leaf predicate
+`ProviderId::belongs_to`. So the named publish/crash/subscribe race test drove the model and would
+have passed unchanged if the production loop had stopped selecting correctly.
+
+Code changes: the LOOP is extracted into the binding crate as `withdraw_slots` - over any slot array,
+with the identity read by a closure and the per-slot side effect supplied by another - and both
+callers use it. `Publications::withdraw_binding` passes an empty effect; `Catalogue::withdraw_binding`
+passes the one that closes the channel handle, and announces the withdrawal to subscribers afterwards
+(the announcement borrows `self`, so the withdrawn providers are collected and announced after the
+loop rather than inside it).
+
+What is shared is now what CAN be: which slots belong to the binding, that each is emptied exactly
+once, and how many that was. What cannot is the side effect - the model has no handles and no
+subscribers to have them for - and the split is stated at the function so a reader can see exactly how
+much of the decision the host test covers.
+
+Watched to fail: with the shared loop's predicate disabled,
+`a_crash_between_publish_and_subscribe_withdraws_what_was_published` fails. It could not have failed
+that way before this change, which is the finding restated as a measurement.
+
+**Verification.** Driver-binding host suite 58 passed; x86_64 builds clean;
+`./check.sh --gate qemu-virtio-iommu-x86_64` passes end to end, which exercises the real catalogue
+through a booted machine.

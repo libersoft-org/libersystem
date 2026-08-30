@@ -917,7 +917,18 @@ pub struct DeviceClaimSnapshot {
 	pub mmio_windows: u32,
 	pub irq_vectors: u32,
 	pub iommu_grants: u32,
-	pub _pad1: u32,
+	// AND HOW MANY OF THOSE GRANTS ARE QUARANTINED, which is the half a restart baseline turns on.
+	//
+	// `iommu_grants` counts live and quarantined mappings TOGETHER, deliberately: a quarantined one
+	// is charged exactly like a live one because nobody knows the device has stopped resolving it.
+	// But a manager reconstructing a binding needs to know WHICH it is holding - a claim whose
+	// grants are all live can be released and reused, and one holding a quarantined mapping cannot
+	// be, ever, for the life of the boot. One number for both cannot say that, so the second is
+	// carried here rather than left to be inferred.
+	//
+	// This was the reserved padding word, so the struct's size and every offset before it are
+	// unchanged.
+	pub iommu_quarantined: u32,
 }
 
 // The four states a device-table slot can be in. THE SAME FOUR everywhere - two lists is how a state

@@ -649,3 +649,27 @@ belong to, because both are the kind a scoped run hides:
   the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
   the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
   refuse; the ordering is what it is reporting.
+
+---
+
+IMPLEMENTER'S ADDENDUM ON M0151 (2026-08-30T15:40:00Z):
+
+**Finding 4 was attempted and the blocker is now measured rather than assumed.**
+
+The previous response left finding 4 NOT DONE and described the change as "two `run_profile` rows plus
+a `UEFI=1` variant". Both were written: `run_profile` gained a `PROFILE_UEFI` switch so a profile can
+boot through firmware instead of directly, and two rows registered `aarch64 uefi-no-dt` and
+`riscv64 uefi-no-dt` with `LIBER_NO_DT_PROFILE=1`.
+
+**It does not work, and the reason is the useful part.** The profile needs a machine that publishes NO
+device tree, and this harness cannot produce one. Booting through firmware does not do it: QEMU's
+`virt` gives the firmware a DTB and the loader hands it on, so the `UEFI=1` boot printed
+`aarch64: GICv2 from the device tree - distributor 0x8000000+0x10000` and the gate refused it for
+naming a controller the no-DT profile does not name. Measured on a real boot, not inferred.
+
+So the rows are reverted and the blocker is written where the profiles would go: what is missing is a
+way to WITHHOLD the tree - a QEMU machine that publishes none, or a loader option that does not pass
+one on - and that is a harness capability rather than a gate row. The item is blocked on that, and
+saying which thing is missing is worth more than two rows that fail.
+
+Findings 1, 2 and 3 stand as answered in the previous response.

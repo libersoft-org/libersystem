@@ -236,29 +236,42 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 		if !send_blocking(dm_control, b"DRIVERS", storage) {
 			return;
 		}
-		if let Received::Message { handle: net, .. } = recv_blocking(dm_control, buf) {
-			*net_frames = net;
-		}
-		if let Received::Message { handle: gpu, .. } = recv_blocking(dm_control, buf) {
-			*gpu_client = gpu;
-		}
-		if let Received::Message { handle: snd, .. } = recv_blocking(dm_control, buf) {
-			*snd_client = snd;
-		}
-		if let Received::Message { handle: input, .. } = recv_blocking(dm_control, buf) {
-			*input_raw = input;
-		}
-		if let Received::Message { handle: usb, .. } = recv_blocking(dm_control, buf) {
-			*block5_client = usb;
-		}
-		if let Received::Message { handle: usbq, .. } = recv_blocking(dm_control, buf) {
-			*usbq_client = usbq;
-		}
-		if let Received::Message { handle: ptr, .. } = recv_blocking(dm_control, buf) {
-			*usb_pointer = ptr;
-		}
-		if let Received::Message { handle: keys, .. } = recv_blocking(dm_control, buf) {
-			*raw_keys = keys;
+		// READ BY THEIR TAGS, NOT BY THEIR POSITION.
+		//
+		// This was eight bare `recv_blocking` calls whose order alone decided which capability went
+		// where, while the sender has always TAGGED every one of them - `NET`, `GPU`, `SND`, `INPUT`,
+		// `USB`, `USBBUS`, `INPUT2`, `KEYS`. So the tags were carried across the channel and thrown
+		// away on arrival, and the sequence was a positional contract that nothing checked.
+		//
+		// MEASURED, not theorised: inserting a single extra message on the sending side shifted every
+		// capability after it by one and the boot came up with `network_service: FAILED to start -
+		// frames: driver frame channel not delivered`. A seam that cannot survive a message being
+		// added is a seam nothing may be added to, and this milestone's whole subject is adding
+		// providers to it.
+		//
+		// Reading by tag makes the eight independent: a message may be added, removed or reordered on
+		// either side without silently misrouting a capability, and one that arrives under a tag this
+		// build does not know is CLOSED rather than assigned to whatever slot came next.
+		for _ in 0..8 {
+			let Received::Message { len, handle } = recv_blocking(dm_control, buf) else { break };
+			let tag: &[u8] = &buf[..len.min(buf.len())];
+			match tag {
+				b"NET" => *net_frames = handle,
+				b"GPU" => *gpu_client = handle,
+				b"SND" => *snd_client = handle,
+				b"INPUT" => *input_raw = handle,
+				b"USB" => *block5_client = handle,
+				b"USBBUS" => *usbq_client = handle,
+				b"INPUT2" => *usb_pointer = handle,
+				b"KEYS" => *raw_keys = handle,
+				_ => {
+					// A capability under a tag this build has no slot for is not silently kept: it
+					// would be a channel nobody serves and a handle nobody closes.
+					if handle != 0 {
+						close(handle);
+					}
+				}
+			}
 		}
 	}
 }

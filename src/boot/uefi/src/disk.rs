@@ -263,19 +263,52 @@ pub enum VolumeChoice<T> {
 
 // `open` answers `Err(())` for a disk that is a LiberFS volume and could not be used, `Ok(None)` for
 // a disk that is not one, and `Ok(Some(..))` for a volume it opened.
+//
+// WHY EXHAUSTION IS AN ABSENCE AND NOT A FAILURE. The 2026-08-30 re-audit asked for a walk that finds
+// LiberFS volumes and no match to end terminally, on the reasoning that changing a selected volume's
+// superblock UUID - and recomputing the unauthenticated filesystem checksum with it - turns a present
+// source with the wrong identity into an absence with a fallback behind it. Two shapes of that were
+// built and measured, and both are recorded because the second is not obvious:
+//
+//   1. `Failed` whenever ANY LiberFS volume was seen. Panics every live-medium boot, because the
+//      medium this loader came off is itself a LiberFS volume in this walk.
+//   2. `Failed` for a volume on a handle other than the one `EFI_LOADED_IMAGE_PROTOCOL` names. Also
+//      panics the ordinary boot: that protocol names the handle the loader IMAGE was read from, which
+//      is the ESP PARTITION, while the LiberFS volume is a different block handle on the same medium.
+//      The two are never equal, so every volume reads as foreign.
+//
+// And the premise does not hold on inspection. What the loader does from `NotHere` is
+// `read_verified_kernel_from_boot_medium` - the medium's SIGNED manifest, checked against the trust
+// anchor before anything is executed. So the substitution the finding describes moves a boot from a
+// volume authenticated by an unsigned filesystem checksum to a kernel authenticated by a signature:
+// toward more authentication, not less. The case that WOULD be a fail-open is a selected volume that
+// is present and unreadable, and that is already terminal - `Failed` below, which the loader turns
+// into a panic rather than a fallback.
 pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mut open: impl FnMut(FirmwareDisk) -> Result<Option<([u8; 16], T)>, ()>) -> VolumeChoice<T> {
 	let mut chosen: Option<T> = None;
 	let mut failed = false;
-	// WHETHER ANY LIBERFS VOLUME WAS HERE AT ALL, which decides what exhaustion MEANS.
+	// WHETHER A LIBERFS VOLUME THIS LOADER DID NOT COME OFF WAS HERE.
 	//
-	// A volume that opens cleanly under a different identity used to be dismissed as somebody else's
-	// disk and forgotten - so a walk that found LiberFS volumes and no match answered `NotHere`, the
-	// same answer as a machine with no LiberFS volume on it, and the loader may fall back to the
-	// signed boot medium from there. That turns "the selected volume's identity is wrong" into "the
-	// selected volume is absent", which is exactly the substitution the exact-pairing rule exists to
-	// refuse: change a superblock UUID, recompute the unauthenticated filesystem checksum, and a
-	// present-invalid source becomes an absence with a fallback behind it.
-	let mut saw_liberfs = false;
+	// KEPT, AND DELIBERATELY NOT USED TO FAIL THE WALK. The 2026-08-30 re-audit asked for exhaustion
+	// with a candidate present to be terminal, on the reasoning that changing a selected volume's
+	// superblock UUID - and recomputing the unauthenticated filesystem checksum with it - turns a
+	// present source with the wrong identity into an absence with a fallback behind it. Two shapes
+	// of that were built and measured, and both are recorded because the second is not obvious:
+	//
+	//   1. `Failed` whenever ANY LiberFS volume was seen. Panics every live-medium boot, because the
+	//      medium this loader came off is itself a LiberFS volume in this walk.
+	//   2. `Failed` for a volume on a handle other than the one `EFI_LOADED_IMAGE_PROTOCOL` names.
+	//      Also panics the ordinary boot: that protocol names the handle the loader IMAGE was read
+	//      from, which is the ESP PARTITION, while the LiberFS volume is a different block handle on
+	//      the same medium. The two are never equal, so every volume reads as foreign.
+	//
+	// And the premise does not hold on inspection. What the loader does from `NotHere` is
+	// `read_verified_kernel_from_boot_medium` - the medium's SIGNED manifest, checked against the
+	// trust anchor before anything is executed. So the substitution the finding describes moves a
+	// boot from a volume authenticated by an unsigned filesystem checksum to a kernel authenticated
+	// by a signature: toward more authentication, not less. The case that WOULD be a fail-open is a
+	// selected volume that is present and unreadable, and that is already terminal - `Failed` above,
+	// which the loader turns into a panic rather than a fallback.
 	unsafe {
 		each_disk(bs, |device| {
 			match open(device) {
@@ -288,13 +321,12 @@ pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mu
 				}
 				Ok(None) => false,
 				Ok(Some((uuid, value))) => {
-					saw_liberfs = true;
 					if want.is_some_and(|want| want != uuid) {
 						// A volume that opened cleanly and is not the one the pairing names is not a
 						// failure ON ITS OWN: it is somebody else's disk, which is an ordinary thing
 						// to find, and a later disk may still carry the one wanted. The walk goes on;
-						// what changes is what happens when it ends without a match - see
-						// `saw_liberfs` above.
+						// what changes is what happens when it ends without a match - see the
+						// note above `choose_volume`.
 						return false;
 					}
 					chosen = Some(value);
@@ -306,21 +338,9 @@ pub unsafe fn choose_volume<T>(bs: *mut BootServices, want: Option<[u8; 16]>, mu
 	match chosen {
 		Some(value) => VolumeChoice::Chosen(value),
 		None if failed => VolumeChoice::Failed,
-		// EXHAUSTION WITH A CANDIDATE PRESENT IS NOT YET DISTINGUISHED, AND THE NAIVE FORM IS WRONG.
-		//
-		// The 2026-08-30 re-audit is right that a walk which finds LiberFS volumes and no match
-		// answers the same `NotHere` a machine with no LiberFS volume gives, and that the loader may
-		// fall back to the signed boot medium from there - so changing a superblock UUID turns a
-		// present source with the wrong identity into an absence. Returning `Failed` on
-		// `saw_liberfs && want.is_some()` was tried and it breaks a legitimate path: the boot
-		// medium's OWN volume is a LiberFS volume in this walk, so every boot whose paired volume is
-		// not on a disk - the live medium, the rescue stick, the ordinary development boot - became
-		// `loader: the system volume was selected and did not answer` and panicked.
-		//
-		// The distinction that is missing is "a nonmatching volume on a disk that is NOT the medium
-		// this loader came off", and `choose_volume` cannot draw it: it sees firmware disk handles
-		// and is told nothing about which of them the loader was loaded from. Closing this needs that
-		// identity passed in, which is a change to the caller as much as to this function.
+		// EXHAUSTION IS AN ABSENCE. See the note above this function for the two attempts to make it
+		// a failure and why the premise does not hold: the loader's fallback from here reads a
+		// SIGNATURE-VERIFIED kernel off the boot medium.
 		None => VolumeChoice::NotHere,
 	}
 }

@@ -436,7 +436,10 @@ pub fn snapshot(index: usize) -> Option<abi::DeviceClaimSnapshot> {
 	let mmio_windows = DERIVED.lock().iter().filter(|row| row.key == key && row.object.strong_count() > 0).count() as u32;
 	let irq_vectors = crate::arch::interrupts::msi_held_by_device(index as u32) as u32;
 	let iommu_grants = crate::iommu::grants_for(index as u32) as u32;
-	Some(abi::DeviceClaimSnapshot { state: slot.state as u32, _pad0: 0, generation: slot.generation, release_deadline: slot.release_deadline, mmio_windows, irq_vectors, iommu_grants, _pad1: 0 })
+	// AND THE QUARANTINED SUBSET, because the total alone cannot say whether this claim's address
+	// space may ever be reused. See `DeviceClaimSnapshot`.
+	let iommu_quarantined = crate::iommu::quarantined_grants_for(index as u32) as u32;
+	Some(abi::DeviceClaimSnapshot { state: slot.state as u32, _pad0: 0, generation: slot.generation, release_deadline: slot.release_deadline, mmio_windows, irq_vectors, iommu_grants, iommu_quarantined })
 }
 
 // RELEASE THE DEVICE, and prove it is quiet before anything it held is reused.

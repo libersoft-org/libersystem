@@ -525,6 +525,33 @@ impl ProviderId {
 	}
 }
 
+// THE WITHDRAWAL ITSELF, over any slot array, so the model and the production catalogue run ONE
+// implementation instead of two that agree today.
+//
+// They used to share only the leaf predicate `ProviderId::belongs_to`: DeviceManager's
+// `Catalogue::withdraw_binding` had its own loop, its own handle close and its own subscriber
+// announcement, and `Publications::withdraw_binding` had a loop of its own. So the named
+// publish/crash/subscribe test drove the model and would have passed unchanged if the production
+// loop had stopped selecting correctly - which is the gap M7's race is supposed to close.
+//
+// What is shared is what CAN be: which slots belong to the binding, that each is emptied exactly
+// once, and how many that was. What cannot is the side effect per slot - the production catalogue
+// closes a channel handle and announces the withdrawal to subscribers, and the model has neither - so
+// that arrives as a closure and is the caller's. Stating the split here is the point: a reader can
+// see exactly how much of the decision the host test covers.
+pub fn withdraw_slots<T>(slots: &mut [Option<T>], binding: BindingId, id_of: impl Fn(&T) -> ProviderId, mut withdrawn: impl FnMut(T)) -> usize {
+	let mut gone = 0;
+	for slot in slots.iter_mut() {
+		if slot.as_ref().is_some_and(|held| id_of(held).belongs_to(binding)) {
+			if let Some(held) = slot.take() {
+				withdrawn(held);
+			}
+			gone += 1;
+		}
+	}
+	gone
+}
+
 // WHAT A BINDING'S END TAKES WITH IT, AND WHAT A SUBSCRIBER MAY STILL REACH.
 //
 // The catalogue that answers subscribers lives in DeviceManager, holds channel handles and cannot be
@@ -560,15 +587,10 @@ impl<const N: usize> Publications<N> {
 	}
 
 	// EVERYTHING THAT BINDING PUBLISHED, GONE. Returns how many were withdrawn.
+	//
+	// The LOOP is `withdraw_slots` below rather than a second copy of it - see there for why.
 	pub fn withdraw_binding(&mut self, binding: BindingId) -> usize {
-		let mut gone = 0;
-		for slot in self.slots.iter_mut() {
-			if slot.is_some_and(|(id, _)| id.belongs_to(binding)) {
-				*slot = None;
-				gone += 1;
-			}
-		}
-		gone
+		withdraw_slots(&mut self.slots, binding, |(id, _)| *id, |_| {})
 	}
 
 	// What a subscriber asking for `kind` can reach. `None` is an answer: a consumer that arrives

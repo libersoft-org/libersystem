@@ -216,7 +216,18 @@ requested_arguments=("$@")
 artifact_output_root="$build_root/image/$target"
 provider_output_dir="$artifact_output_root"
 artifact_log_dir="$artifact_output_root/logs"
-rust_min_stack="${RUST_MIN_STACK:-67108864}"
+# THE COMPILER'S OWN STACK, SIZED WITH HEADROOM RATHER THAN TO THE DEEPEST PATH MEASURED SO FAR.
+#
+# 64 MiB was the number rustc printed the last time it crashed here, and it crashed again - a SIGSEGV
+# compiling `config_service` for aarch64 in the shared-image build. Raising it to whatever the latest
+# crash advises is fitting the budget to the failure; this is four times the deepest path that has
+# ever been observed in this tree, and it matches `test-kernel.sh`, so the two build paths no longer
+# hold different opinions about the same compiler.
+#
+# The cost is address space and not memory: a thread stack is committed page by page as it is used, so
+# an oversized bound costs nothing on the builds that do not need it, while an undersized one costs a
+# SIGSEGV in whatever happens to compile next.
+rust_min_stack="${RUST_MIN_STACK:-268435456}"
 force_rebuild="${LIBER_IMAGE_REBUILD:-0}"
 if [[ "$force_rebuild_flag" == 1 ]]; then
 	force_rebuild=1

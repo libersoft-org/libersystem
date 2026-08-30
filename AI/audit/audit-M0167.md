@@ -459,3 +459,47 @@ belong to, because both are the kind a scoped run hides:
   the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
   the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
   refuse; the ordering is what it is reporting.
+
+---
+
+IMPLEMENTER'S ADDENDUM ON M0167 (2026-08-30T15:36:00Z):
+
+**The selection-specific kernel is now built AND STAGED under the lock, which is the half M3 names
+first. The medium is not, and the failure has moved there - measured, not assumed.**
+
+The previous response left this NOT DONE and argued the fix could not be attempted safely in a round
+that had also changed the kernel's mapping and interrupt paths. That argument was about sequencing
+rather than about the work, so the work is now done.
+
+Code changes in `test-kernel.sh`:
+- The locked build asks cargo for the executable it produced (`--message-format=json`, the last
+  `compiler-artifact` carrying an executable for the `kernel` target) rather than guessing the path.
+- It COPIES that binary to a per-run path WHILE THE LOCK IS STILL HELD, and the run boots the copy.
+  That is the immutability M3 asks for: nothing another runner does between the lock and the boot can
+  change what this run executes.
+- The run is `qemu-run.sh <arch> <copy>` rather than `cargo test`. Cargo resolves the binary out of
+  the SHARED target directory itself, so it cannot be pointed at a copy - which is why the previous
+  response called this a rewrite of how the guest is launched. It is the same command with the race
+  removed; `cargo test` builds (a no-op after the locked step) and then invokes exactly this runner.
+- The copy is removed by an EXIT trap, so a run leaves nothing behind.
+
+One measurement worth keeping: `TEST=1` is not only compile-time. `qemu-run.sh` reads it at RUN time
+to select test mode - the debug-exit device and the exit-code mapping that turn a finished suite into
+a process status - and dropping it produced a suite that printed `71 passed` and then sat until the
+harness timed it out.
+
+**And the Definition of Done's own case now gets further, which is how the remaining gap was found.**
+Two concurrent same-architecture suites with different `TEST_SELECTION`s: one passes, and the other
+fails in `mkimage` with `an input changed while the image was being assembled`. The kernel race is
+closed - each run boots its own copy - and what is left is the MEDIUM: `mkimage` has a lock of its
+own, but its comment says plainly that "producers are not covered by this script's lock", so two runs
+each rebuilding shared artifacts still race at image assembly.
+
+That is the rest of M3 - "produce and stage the selection-specific kernel AND MEDIUM as an immutable
+prerequisite" - and it is now the only part outstanding. Closing it means holding the same lock across
+this run's medium assembly, so the two runs serialise their build-and-assemble phases and parallelise
+only their boots, which is what the comment on that lock wants. It is not done here and is not
+claimed.
+
+**Verification.** `./test.sh --arch x86_64 --tags object` 71 passed and `--tags dma` 30 passed through
+the new launch path; `./check.sh --gate perf-anchor` passes. The full sweep is recorded below.

@@ -528,7 +528,9 @@ fn ending_a_claim_takes_the_dma_buffers_it_authorised() {
 	// registered as derived the way the syscall registers it.
 	let memory = DeviceMemory::for_claim(key, 0xfeed_2000, 0x1000).expect("a device memory");
 	assert_eq!(memory.claim(), Some(key), "the device capability carries the claim the buffer is stamped from");
-	let buffer = DmaBuffer::create_for(&crate::sched::root_domain(), 0x1000, memory.device_index()).expect("a dma buffer");
+	let Ok(buffer) = DmaBuffer::create_for(&crate::sched::root_domain(), 0x1000, memory.device_index()) else {
+		panic!("a dma buffer");
+	};
 	let before = buffer.header().generation();
 	let rows = device::derived_rows();
 	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(buffer.clone() as alloc::sync::Arc<dyn KernelObject>))), "recorded as derived");
@@ -542,6 +544,15 @@ fn ending_a_claim_takes_the_dma_buffers_it_authorised() {
 	// object no longer resolves, so a driver that kept one cannot hand its frames to the device.
 	assert_ne!(buffer.header().generation(), before, "the buffer's capabilities are revoked with the claim that authorised them");
 	assert_eq!(device::derived_rows(), rows, "and the released claim leaves no row behind");
+
+	// AND THIS TEST GIVES THE SHARED TABLE BACK. A released claim ORPHANS the frames of a buffer a
+	// device may still name - they are held against the device index rather than freed - and that
+	// table is shared and bounded. Leaving this test's entries in it takes room from
+	// `kernel.object.dma_buffer`'s own capacity case, which fills the table exactly and asserts it
+	// held every entry: it failed the first time this test ran, for that reason and not for one of
+	// its own.
+	drop(buffer);
+	crate::object::dma_buffer::forget_for_test(index as u32);
 }
 
 crate::tagged_test!(two_threads_attenuating_one_handle_move_it_exactly_once, [Object, Kernel, Channel, Handle], id = "kernel.object.claim.two_threads_attenuating_one_handle_move_it_exactly_once", covers = ["kernel"]);
@@ -556,16 +567,20 @@ fn two_threads_attenuating_one_handle_move_it_exactly_once() {
 	// both threads would pass the read and the receiver would get the capability twice, which is a
 	// capability duplicated by a race rather than by `SYS_HANDLE_DUPLICATE`.
 	use crate::object::channel::Channel;
+	use crate::object::rights::Rights;
 	use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 	static RESULTS: [AtomicI64; 2] = [AtomicI64::new(i64::MIN), AtomicI64::new(i64::MIN)];
 	static DONE: AtomicUsize = AtomicUsize::new(0);
 	static SUBJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 	// Both threads send the same handle over their own endpoint argument.
-	extern "C" fn racer(slot_and_channel: u64) {
+	//
+	// TWO ENTRY POINTS RATHER THAN A PACKED ARGUMENT. The slot was first passed in the argument's
+	// high half, which collides with the handle encoding: a `Handle` carries its generation up
+	// there, so `argument >> 32` is the generation and not the slot, and one thread wrote the other
+	// thread's result.
+	fn race(slot: usize, channel: u64) {
 		unsafe {
-			let slot = (slot_and_channel >> 32) as usize;
-			let channel = slot_and_channel & 0xffff_ffff;
 			let subject = SUBJECT.load(Ordering::SeqCst);
 			let payload = *b"r";
 			let transfer = abi::CapTransfer { handle: subject, rights: abi::RIGHT_READ, _pad: 0 };
@@ -573,6 +588,12 @@ fn two_threads_attenuating_one_handle_move_it_exactly_once() {
 			RESULTS[slot].store(answer, Ordering::SeqCst);
 			DONE.fetch_add(1, Ordering::SeqCst);
 		}
+	}
+	extern "C" fn racer_one(channel: u64) {
+		race(0, channel);
+	}
+	extern "C" fn racer_two(channel: u64) {
+		race(1, channel);
 	}
 
 	RESULTS[0].store(i64::MIN, Ordering::SeqCst);
@@ -584,12 +605,14 @@ fn two_threads_attenuating_one_handle_move_it_exactly_once() {
 	let (a, b) = Channel::create();
 	let (process, first) = crate::sched::prepare_shared_process(a.clone(), Rights::ALL);
 	let second = process.install(b.clone(), Rights::ALL).expect("a second endpoint in the same table");
-	let subject_object = crate::object::memory_object::MemoryObject::create_in(process.domain(), 4096).expect("a subject");
+	let Ok(subject_object) = crate::object::memory_object::MemoryObject::create_in(process.domain(), 4096) else {
+		panic!("a subject");
+	};
 	let subject = process.install(subject_object, Rights::ALL).expect("the handle both threads race for");
 	SUBJECT.store(subject, Ordering::SeqCst);
 
-	let one = crate::sched::prepare_in_process(racer, first, &process);
-	let two = crate::sched::prepare_in_process(racer, (1u64 << 32) | second, &process);
+	let one = crate::sched::prepare_in_process(racer_one, first, &process);
+	let two = crate::sched::prepare_in_process(racer_two, second, &process);
 	crate::sched::start_thread(&one);
 	crate::sched::start_thread(&two);
 	crate::sched::run_until_idle();
@@ -604,6 +627,6 @@ fn two_threads_attenuating_one_handle_move_it_exactly_once() {
 	assert_eq!(refused, 1, "and the loser was refused by name rather than failing some other way: {first_answer} and {second_answer}");
 	// AND THE SOURCE ENTRY IS SPENT ONCE. A table that still holds it would mean the move duplicated
 	// rather than transferred.
-	let spent = process.handles().lock().lookup(crate::object::handle::Handle::from_raw(subject), Rights::empty()).is_err();
+	let spent = process.handles().lock().lookup(crate::object::handle::Handle::from_raw(subject), Rights::from_bits(0)).is_err();
 	assert!(spent, "the raced handle is gone from the table it was sent from - a move that duplicated would leave it there");
 }

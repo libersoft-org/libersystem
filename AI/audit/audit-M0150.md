@@ -448,3 +448,47 @@ belong to, because both are the kind a scoped run hides:
   the content key `qemu-virtio-iommu-x86_64`'s freshness preflight compares, so that gate fails at
   the end of a full sweep and passes when re-run against a rebuilt image. The preflight is right to
   refuse; the ordering is what it is reporting.
+
+---
+
+IMPLEMENTER'S SECOND CORRECTION ON M0150 (2026-08-30T15:25:00Z):
+
+**Finding 1 was attempted a SECOND time, with the boot medium identified, and it fails too. The
+finding is now REJECTED on its premise rather than left open.**
+
+The first correction recorded that answering `Failed` whenever any LiberFS volume was seen panics
+every live-medium boot, because the medium this loader came off is itself a LiberFS volume in the
+walk, and identified the missing distinction as "a nonmatching volume on a disk that is NOT the
+medium this loader came off".
+
+That distinction was then built. `choose_volume` took the boot device's firmware handle,
+`FirmwareDisk::handle()` supplied the per-disk identity - the type already carries it, with a comment
+saying it exists for exactly this - and the loader passed `BOOT_DEVICE`, which it sets from
+`EFI_LOADED_IMAGE_PROTOCOL`. The host tests passed, including a new one asserting both halves.
+
+**The ordinary boot panicked again**, and the reason is the one the mock firmware cannot model:
+`EFI_LOADED_IMAGE_PROTOCOL` names the handle the loader IMAGE was read from, which is the ESP
+PARTITION, while the LiberFS volume is a DIFFERENT block handle on the same medium. The two are never
+equal, so every volume read as foreign and every boot with a paired volume absent became
+`loader: the system volume was selected and did not answer`.
+
+Two shapes, two measurements, and both are now recorded at `choose_volume` so a third attempt starts
+from them.
+
+**And on inspection the premise does not hold.** What the loader does from `NotHere` is
+`read_verified_kernel_from_boot_medium` - the medium's SIGNED manifest, checked against the trust
+anchor before anything executes. So the substitution the finding describes moves a boot from a volume
+authenticated by an UNSIGNED filesystem checksum to a kernel authenticated by a SIGNATURE: toward
+more authentication, not less. An attacker who rewrites a superblock UUID does not gain code
+execution; they downgrade the machine to the signed medium it was booted from.
+
+The case that WOULD be a fail-open is a selected volume that is present and unreadable, and that is
+already terminal - `VolumeChoice::Failed`, which the loader turns into a panic rather than a fallback,
+with its own assertion in the host suite.
+
+So finding 1 is REJECTED: the behaviour it calls a fail-open is a documented fallback to a
+signature-verified kernel, and the two implementations of the change it asks for each break a working
+boot. Findings 2 and 3 stand as fixed.
+
+**Verification.** uefi host suite 41 passed; `./check.sh --gate perf-anchor` passes, which is the gate
+that caught both attempts.
