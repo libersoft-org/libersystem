@@ -189,6 +189,21 @@ pub unsafe fn negotiate_for(capability: u64, mmio_base: u64, info: &DeviceInfo, 
 // device-specific features) that `want_word0` names and the device offers. The
 // accepted set is kept on the returned device (`features_word0`), so the driver can
 // tell which of its wants the device granted.
+// The reset above, addressed by the common-configuration base rather than by a `Virtio`.
+pub unsafe fn quiesce_at(common: u64) -> bool {
+	unsafe {
+		w8(common + CFG_DEVICE_STATUS, 0);
+		let mut spins: u32 = 0;
+		while r8(common + CFG_DEVICE_STATUS) != 0 {
+			spins += 1;
+			if spins > 100_000 {
+				return false;
+			}
+		}
+		true
+	}
+}
+
 pub unsafe fn negotiate_features(mmio_base: u64, info: &DeviceInfo, want_word0: u32) -> Option<Virtio> {
 	unsafe {
 		let common: u64 = mmio_base + info.common_offset as u64;
@@ -322,17 +337,13 @@ impl Virtio {
 	// Returns whether the device confirmed. A device that does not is one whose descriptors may
 	// still be live, so its driver must NOT report a clean stop - see `common::finish_stop`.
 	pub unsafe fn quiesce(&self) -> bool {
-		unsafe {
-			w8(self.common + CFG_DEVICE_STATUS, 0);
-			let mut spins: u32 = 0;
-			while r8(self.common + CFG_DEVICE_STATUS) != 0 {
-				spins += 1;
-				if spins > 100_000 {
-					return false;
-				}
-			}
-			true
-		}
+		unsafe { quiesce_at(self.common) }
+	}
+
+	// The common-configuration address, for the stop path that has to reach this device from a loop
+	// several calls below where the `Virtio` lives - see `common::remember_virtio`.
+	pub fn common_base(&self) -> u64 {
+		self.common
 	}
 
 	// Read the ISR-status register: returns the pending-interrupt reason bits and, on a

@@ -242,7 +242,17 @@ pub unsafe fn bringup_bound(bootstrap: u64, bind: &Bind, resources: &Resources, 
 		// reset -> negotiate -> features-ok, and the reset is also what says the frames a previous
 		// driver of this device left behind are safe to recycle (see `virtio::negotiate_for`).
 		match virtio::negotiate_for(resources.device, base, &bind.info, want_word0) {
-			Some(device) => device,
+			Some(device) => {
+				// REMEMBERED SO THE STOP PATH CAN REACH IT.
+				//
+				// A planned stop must reset the device before it certifies that the device is quiet,
+				// and the loops that read the stop - `serve_blocks`, `event_loop`, `serve` - are
+				// several calls below the one place the `Virtio` exists. Threading it through four
+				// signatures would make each driver responsible for remembering; recording it HERE,
+				// where every virtio driver already passes, makes it impossible to forget.
+				remember_virtio(&device);
+				device
+			}
 			// The device did not negotiate. RETRYABLE, and said so: the part may yet come up, and
 			// this is the case a rebind exists for.
 			None => failed(bootstrap, bind, proto::DriverFailureCode::DeviceNotResponding),
@@ -692,6 +702,29 @@ pub unsafe fn stopped(bootstrap: u64, bind: &Bind) -> bool {
 // So the helpers now only LATCH the stop, and `finish_stop` is what answers it - after the driver's
 // own cleanup, which is the only code that knows what "finished or abandoned" means for this device.
 static STOP_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+// THE DEVICE THIS DRIVER BROUGHT UP, so the stop path can stop it.
+//
+// One per process, because a driver drives one device - which is what `Bind` is about. Zero until
+// `bringup_bound` records one, and a driver that never bound has nothing to quieten.
+static VIRTIO_COMMON: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+fn remember_virtio(device: &Virtio) {
+	VIRTIO_COMMON.store(device.common_base(), core::sync::atomic::Ordering::Release);
+}
+
+// STOP THE DEVICE AND WAIT FOR IT TO SAY SO - the virtio transport's own reset.
+//
+// This is what `STOPPED` certifies, and no driver was doing it: the reset happened at BRING-UP and
+// a planned stop left the queues live. Returns whether the device confirmed; a driver whose device
+// does not must not report a clean stop.
+pub unsafe fn quiesce_virtio() -> bool {
+	let common = VIRTIO_COMMON.load(core::sync::atomic::Ordering::Acquire);
+	if common == 0 {
+		return false;
+	}
+	unsafe { virtio::quiesce_at(common) }
+}
 
 // Whether the manager has asked this driver to stop. `true` means the exit is a PLANNED one and the
 // driver owes a `STOPPED` once it has finished up.
