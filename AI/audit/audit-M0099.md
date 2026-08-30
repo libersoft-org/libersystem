@@ -1054,3 +1054,74 @@ maintained counts. Every prerequisite row now matches the contract of the milest
 including the two that are only partly met, and every "first consumer" reads the same way in the
 head, the items and the tables. The file still closes nothing and says so. No source code was
 modified.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-08-30T22:42:14Z):
+
+Rating: 4/10
+
+1. **The device-node identity correction still has neither the owner it claims nor consistent ownership.**
+
+   M0099 calls the discriminated identity an architectural prerequisite “owned elsewhere” and says
+   it has “ONE separately numbered owner” which no driver builds
+   (`docs/todo/P02M0099.md:240-259,284-289`), but no such numbered owner is named anywhere in the
+   roadmap. Consumers are not consistently blocked either: PL011 simply requires ACPI/FDT identity
+   (`:529-532`), and HID-over-I2C is blocked only on an I2C controller even though the group
+   introduction says it also needs this identity (`:674-679,767-773`). The USB alternative then
+   assigns a USB-interface binding unit with its own generation to the first class item
+   (`:681-696`), even though USB-interface identity is one of the cross-cutting cases expressly
+   removed from driver ownership (`:240-248`). The response's claim that this now has one separately
+   numbered owner is therefore incorrect. Number the prerequisite and block every firmware/subfunction
+   consumer on it, or accurately leave it as an unowned blocked prerequisite; do not assign part of
+   the same identity migration back to a class driver.
+
+2. **The Phase-2 maintenance correction can close while High current-driver debts that it says it owns remain open, and its DRV-003 gate is incomplete.**
+
+   The debt rule says each finding closes with the affected family's next item
+   (`docs/todo/P02M0099.md:1193-1199`), but the new `virtio-blk maintenance` item names only
+   DRV-001/DRV-003 and `xHCI maintenance` only DRV-003 (`:338-366`). They omit the still-listed High
+   block/USB defects DRV-002, DRV-005, DRV-006, DRV-007, DRV-008 and DRV-012 (`:1219-1235`), so the
+   next changes to those families can close in direct contradiction to the ownership rule. Even the
+   named DRV-003 correction requires only a short-object/size refusal (`:338-343,364-366`), while the
+   plan later correctly records that `READ` authority is also missing (`:1210-1216`) and the mapping
+   path checks only `Rights::MAP` (`src/kernel/syscall/mod.rs:2234-2247`). Put each applicable debt and
+   regression case in the actionable maintenance item or give it a separate owner, and make DRV-003's
+   gate cover the complete type/rights/size contract rather than size alone.
+
+3. **One of the host-test seam's permitted implementations cannot pass its fixed gate.**
+
+   The plan permits either extracting a pure protocol/parser crate or adding a host-test feature to
+   the driver crate, but fixes success to
+   `cargo test --manifest-path src/user/drivers/core/Cargo.toml --lib`
+   (`docs/todo/P02M0099.md:1109-1124`). That command still fails with duplicate `panic_impl`: the
+   driver crate unconditionally depends on `rt` (`src/user/drivers/core/Cargo.toml:50-68`), whose
+   unconditional panic handler is at `src/user/runtime/rt/src/lib.rs:13,94-100`. Merely extracting
+   parsers makes the extracted crate host-testable; it does not stop the fixed driver-crate command
+   from linking the runtime. Choose the cfg/feature design if that exact command remains the gate, or
+   make the extracted crate's own tests and watched mutation the gate.
+
+4. **The P02M0167 evidence-isolation prerequisite remains materially unsatisfied.**
+
+   M0099 relies on P02M0167 for isolated run identity and artifacts and on its tri-architecture
+   results (`docs/todo/P02M0099.md:94-100,140,1139-1145`). The latest M0167 history records that two
+   same-architecture suites with different selections still race during medium assembly and that
+   staging the selection-specific medium under the build lock is the remaining work
+   (`AI/audit/audit-M0167.md:465-502`). Current code matches that account: `test-kernel.sh` releases
+   the build lock after staging only the kernel (`src/harness/test-kernel.sh:318-365`), and
+   `qemu-run.sh` assembles the medium later (`src/harness/qemu-run.sh:946-952`), while `mkimage.sh`
+   explicitly leaves producers outside its lock and only detects an input change afterward
+   (`src/harness/mkimage.sh:552-553,722-726`). Mark run isolation unsatisfied in the matrix, as the
+   plan already does for P0164 accounting, until the immutable-medium/concurrent-selection gate
+   passes; otherwise item evidence can still be absent or race-dependent.
+
+5. **The claim that every missing destination is blocked in its own item remains false.**
+
+   The plan makes this an explicit invariant (`docs/todo/P02M0099.md:1096-1108`), yet USB HID Power is
+   an ordinary actionable item that publishes to a nonexistent “platform power service” (`:786-791`),
+   and ACPI battery/thermal names the same absent service while recording only the AML block
+   (`:600-610`). The current typed surface has no battery/thermal/UPS destination;
+   `system-power` is only the narrow reboot/power-off interface (`src/idl/process.lsidl:111-132`). USB
+   HID Power therefore has no observable-effect path, and battery/thermal remains uncloseable even
+   after AML exists. Mark both items blocked on an approved platform-power state/service contract, or
+   assign that bounded destination split explicitly.

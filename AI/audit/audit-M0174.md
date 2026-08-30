@@ -209,3 +209,17 @@ buffers, the IPv4 trim precedent, the user-mode-only netdev, and the `service-lo
 none of them has to be rediscovered. The Definition of done was rewritten clause by clause to be
 falsifiable, and its last clause now states the conformance gap in the plan's own voice. No source
 code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-08-30T22:25:50Z):
+
+Rating: 6/10
+
+Four material issues remain.
+
+1. **M3's blanket multicast suppression contradicts M2's unknown-option action behavior.** M2 requires IPv6 option action bits, while M3 says no error is generated for a multicast destination (`docs/todo/P02M0174.md:61-62`, `:74-78`). [RFC 8200 section 4.2](https://www.rfc-editor.org/rfc/rfc8200.html#section-4.2) requires action `10` to generate Parameter Problem Code 2 even for multicast, whereas action `11` suppresses it for multicast. [RFC 4443 section 2.4](https://www.rfc-editor.org/rfc/rfc4443.html#section-2.4) also exempts that action-`10` case and Packet Too Big from the general multicast restriction. State the exact exceptions and test action `10` versus `11` plus the applicable Packet Too Big case.
+
+2. **The MLDv2 contract requires prohibited all-nodes reports and omits MLD-specific query validation.** M4 requires reports when joining and leaving `ff02::1` (`docs/todo/P02M0174.md:103-108`), but current [RFC 9777](https://www.rfc-editor.org/rfc/rfc9777.html) makes all-nodes membership permanent and requires that no MLD messages be sent for it. Reports belong to solicited-node and other reportable groups. Valid MLD queries also require a link-local source, Hop Limit 1, and Router Alert; invalid queries are discarded. Specify those checks and hostile-query fixtures—the adjacent hop-limit-255 rule is for ND, not MLD.
+
+3. **M0174 and M0175 assign the frozen L3 decisions to both layers.** M0174 says egress returns the selected source, route, next hop, and PMTU and that M0175 adds nothing (`docs/todo/P02M0174.md:153-156`). M0175 separately owns route/neighbour lookup, PMTU refusal, RFC 6724 source selection, and caller overrides while saying it only consumes the frozen seam (`docs/todo/P02M0175.md:104-111`, `:123-131`, `:151-160`). With multiple addresses and routers, the seam neither exposes candidates nor accepts a caller-selected route/source. Assign selection to one layer and freeze a request/response shape that supports that ownership.
+
+4. **The effective-link MTU completion claim has no matching oracle.** M8 tests an RA MTU option below 1280, but the Definition of done requires IPv6 refusal with IPv4 preserved when the effective link itself is below 1280 (`docs/todo/P02M0174.md:169-175`, `:201-202`). A low invalid RA option on a normal link is ignored and exercises a different branch. Add a fixture whose effective link MTU is 576 or 1279 and assert per-family readiness and fixed-buffer behavior, keeping the low-RA-option case as a separate rejection test.

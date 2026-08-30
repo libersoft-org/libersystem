@@ -824,3 +824,67 @@ had deferred. Ordering is explicit and gated: the lockfile first and blocking ev
 then the substrate, then the converging audit link, with the platform port pinned into the patch
 series the lockfile records. Two measured stop conditions replace one unowned block, and the
 completion section says the milestone is approvable. No source code was modified.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-08-30T22:42:14Z):
+
+Rating: 4/10
+
+1. **The configuration is still not pinned, and the new “lockfile first” rule is self-blocking.**
+
+   The plan names `Vulkan-Loader` and `Vulkan-Headers`, but supplies no exact revision, archive digest,
+   patch digest, toolchain file, tool identity, sysroot digest, compiler-runtime selection or fully
+   selected CMake option set; it only says a future lockfile will carry them
+   (`docs/todo/P02M0135.md:118-146`). The previous accepted pinning correction therefore remains
+   incomplete, and the threading, TLS, lifecycle and surface conclusions are still derived from an
+   unknown build.
+
+   The proposed remedy cannot run in its stated order. Nothing else may start until the lockfile is
+   complete (`:118-123,459-464`), but the lockfile must already digest the LiberSystem platform-port
+   patch (`:129-130`) whose design and implementation are a later deliverable (`:413-434`), three
+   target toolchain files (`:140`), and the profile sysroot (`:141`). The sysroot is itself sized partly
+   from “facilities the inventory names” (`:186-195`), while pass 1 cannot produce that inventory
+   without the sysroot (`:148-158`). The implementer must violate the first gate to create inputs the
+   gate requires. Commit the actual pin and prerequisite inputs before approval, or state a bootstrap
+   and freeze order that can produce them before the inventory build.
+
+2. **The audit-only/no-staging contract makes the required guest evidence impossible.**
+
+   The plan says no pinned output is staged, installed, imported or named by a manifest and that the
+   audit-linked ELF is discarded (`docs/todo/P02M0135.md:32-38,56-59,145-146`). It later requires that
+   same audit-linked loader to run in a guest through the real ported provider path (`:449-452,520-523`)
+   after passing identity/provider checks (`:477-486`). The current launch path resolves executable
+   and library paths from manifest-generated tables and accepts a dynamic image only with an expected
+   identity and exact `DT_NEEDED`/provider closure
+   (`src/user/services/core/src/process_service.rs:206-218,231-299,531-560,679-710`). An artifact that
+   is never manifest-named or staged cannot traverse that path. Define a quarantined test-only
+   manifest/staging lifecycle for the audit artifact while still forbidding production installation,
+   or narrow the guest claim; the current requirements cannot both hold.
+
+3. **“Pre-launch selection” still leaves the provider edge and bounded lookup mechanism undecided.**
+
+   The selected actor remains “ProcessService, or a narrow registry”
+   (`docs/todo/P02M0135.md:401-402`), the plan says this needs no new ProcessService mechanism (`:411`),
+   and the port section merely requires its implementation to state what provider object and export
+   query will exist (`:423-434`). It never decides how a runtime-selected ICD becomes an authenticated
+   edge of the immutable identity/`DT_NEEDED` graph, nor how the loader receives a provider-scoped
+   handle and resolves symbols from it.
+
+   Today ProcessService discovers only `DT_NEEDED` edges and requires the identity provider set to
+   equal them (`src/user/services/core/src/process_service.rs:206-218,283-299,338-346,679-710`). The
+   kernel stores exports in a private, process-wide flat `(name, address)` vector with no module
+   provenance and exposes no ring-3 provider query
+   (`src/kernel/object/process/mod.rs:170-186,313-347`). Thus neither “add the selected ICD” nor
+   provider-bounded `dlsym` is represented by the current mechanism. Choose the actor, the
+   artifact/identity edge, and the concrete provider-reference/export-query ABI, including failure
+   and rollback; a list of questions for the future port to answer is not the accepted concrete model.
+
+4. **The final surface gate still contradicts the corrected two-pass derivation.**
+
+   Pass 2 says the substrate surface equals the audit-link-resolved set at the fixed point and
+   explicitly says object undefined-symbol equality is not the gate
+   (`docs/todo/P02M0135.md:160-175`). The Host/Build Done gate still requires equality with the
+   “derived undefined-symbol closure” (`:468-469`), which is pass 1's acknowledged over-approximation.
+   Make the completion gate name the converged audit-link-resolved set per target; otherwise the
+   accepted final-link correction remains ambiguous and can reintroduce unused surface.

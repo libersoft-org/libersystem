@@ -473,3 +473,47 @@ snapshot that silently rots.
 that item is now first, the shared font-resource contract second, and the guest gate at the end is
 runnable for the first time because a face can be staged. No item now depends on anything unowned.
 The `P02M0103` seam is specified once and referenced twice. No source code was modified.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-08-30T22:42:14Z):
+
+Rating: 6/10
+
+1. **The absorbed catalogue item left contradictory start conditions.**
+
+   The dependency header says shaping/library work may start “as soon as” the M0103b font-resource
+   contract is frozen (`docs/todo/P02M0136.md:12-14`), and the next section still calls that seam the
+   milestone's first item (`:73`). The accepted correction instead makes the font-package/catalogue
+   item first and says nothing else may start before it (`:88-100,118-119`). These are different
+   executable schedules: if M0103b freezes first, the header authorizes parsing/shaping while the
+   catalogue item forbids it. Make catalogue completion followed by seam freeze the same ordered
+   prerequisites everywhere.
+
+2. **The accepted closed-profile-before-parser correction is not enforced.**
+
+   The planner promised a closed profile (`AI/audit/audit-M0136.md:162-167`) and explicitly claimed it
+   would be closed before parser implementation (`:203-205`). The current plan lists the hostile-font
+   parser first (`docs/todo/P02M0136.md:160-164`) and only afterward asks to publish the profile
+   (`:166-178`), without a freeze-before-parser gate. Exact table versions, lookup types,
+   variation/colour subsets and supported scripts can therefore still be selected after parser work
+   begins. Move publication/freeze before parsing and make it a start gate.
+
+3. **The shared `GlyphRun` representation remains conditional after the response claimed it was chosen.**
+
+   The joint contract still asks whether results use homogeneous runs or per-glyph faces, selecting
+   homogeneous runs only “unless a measurement says otherwise”
+   (`docs/todo/P02M0136.md:140-150`). No measurement, threshold, owner or pre-freeze gate exists,
+   while the pipeline and fallback already assume homogeneous runs (`:194-214`). A later measurement
+   can therefore change the shared ABI after M0103 or M0136 implements it. Make the choice
+   unconditional, or own and complete a bounded decision gate before freezing either side.
+
+4. **The jointly owned “complete” glyph-cache key omits state that changes an LCD glyph mask.**
+
+   The key contains face/generation, glyph, size/transform, variations, phase, kind, strike and palette
+   (`docs/todo/P02M0136.md:151-158`; `docs/todo/P02M0103.md:1277-1299`). M0103 also requires LCD
+   rendering to vary by `SubpixelLayout`—RGB/BGR and horizontal/vertical—and to fall back to grayscale
+   for unknown layouts, rotated/non-axis-aligned transforms and transparent offscreen layers
+   (`docs/todo/P02M0103.md:1194-1200`). Those modes can currently reuse one cached subpixel mask. Add
+   the layout/rasterization mode to the key, or define a canonical layout-independent cached form and
+   perform layout mapping after lookup; the current key is not complete.

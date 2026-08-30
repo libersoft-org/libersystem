@@ -246,3 +246,19 @@ M7 (event-driven service) -> M8 (clients and text) -> M9 (matrix). A "What is th
 forces" section records the six tree facts an implementer would otherwise rediscover. The Definition
 of done gained clauses for the transmit side, DNS correlation and the inbound budgets so each is
 falsifiable on its own. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-08-30T22:25:50Z):
+
+Rating: 5/10
+
+Four material issues remain.
+
+1. **M2 still does not specify a minimally correct TCP sender.** An unacknowledged queue, tracked send window, “an RTO,” and retry limit (`docs/todo/P02M0175.md:85-102`) omit RTT sampling, dynamic RFC 6298/Karn RTO and exponential backoff, basic congestion-window/slow-start/congestion-avoidance behavior, and sender-side zero-window probing. These are basic TCP requirements, not the advanced congestion control refused at `:223-225`; [RFC 9293 sections 3.8.1-3.8.2 and 3.8.6.1](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.1) require them. Pin a bounded basic sender profile, distinguish retransmission from persist handling, and test changing RTT, backoff, congestion-window flight limits, a closed/reopened peer window, and a lost window update.
+
+2. **DNS is the only named internal UDP operation whose replies become correlated and validated.** M8 merely says to migrate SNTP, while M7's flow-keyed pending store supplies no request identity (`docs/todo/P02M0175.md:151-167`). Today UDP dispatch accepts SNTP solely by source port; its request transmit timestamp is zero, its event carries only a Unix scalar, and `do_sntp` accepts the first such event (`src/user/services/core/src/net.rs:668-689`, `:1236-1269`, `:1523-1535`; `src/user/services/core/src/network_service.rs:1258-1282`). That value resets the wall clock. Require full tuple/framing/checksum validation, a per-request transmit value matched against the reply's originate timestamp as required by [RFC 5905](https://www.rfc-editor.org/rfc/rfc5905.html), mode/version/leap/stratum/transmit validation, and spoof/replay/cross-request fixtures.
+
+   DHCP has the same class of omission: the current client uses a fixed transaction ID and parses replies without checking `xid` or `chaddr`; the first OFFER/ACK of the expected type advances the exchange (`src/user/services/core/src/net.rs:1318`, `:1392-1434`; `src/user/services/core/src/network_service.rs:1190-1224`). [RFC 2131 section 4.4.1](https://www.rfc-editor.org/rfc/rfc2131.html#section-4.4.1) requires a recorded random transaction ID and discarding nonmatching offers. Include DHCP client/transaction/state correlation and hostile fixtures instead of preserving this behavior merely as “green.”
+
+3. **The stated UDP scope contradicts the explicit DHCPv6 refusal.** The Goal includes DHCP, DNS, and SNTP “plus their IPv6 equivalents” (`docs/todo/P02M0175.md:14-19`), while this plan explicitly refuses DHCPv6 (`:227-228`) and M0174 assigns IPv6 configuration to SLAAC/RDNSS and also refuses DHCPv6 (`docs/todo/P02M0174.md:110-139`, `:207-210`). Replace the phrase with the actual scope, such as DHCPv4 plus DNS and SNTP over both address families, and make the test matrix match it.
+
+4. **The frozen M0174 egress seam contradicts M0175's selection ownership.** M0174 returns the selected source, route, next hop, and PMTU and says M0175 adds nothing (`docs/todo/P02M0174.md:153-156`). M0175 nevertheless owns route/neighbour lookup, PMTU refusal, default source selection, and caller overrides while also saying it only consumes that seam (`docs/todo/P02M0175.md:104-111`, `:123-131`, `:151-154`). Assign selection to one layer and freeze a request/response shape capable of expressing that ownership before M0174 completes.

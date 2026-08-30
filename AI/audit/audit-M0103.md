@@ -887,3 +887,80 @@ be met with the mechanisms that exist: `a-common` needs no display, `b` needs on
 `g` need no thread runtime, `f` needs no Extended feature, and the completion object's guarantee is
 enforced where the plan says it is. Ordering is `s-common` -> `a-common` -> `s-2d` -> `b` -> `c`, with
 `a-wsi` beside them and `e`-onward Phase 4. No source code was modified.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-08-30T22:42:14Z):
+
+Rating: 3/10
+
+1. **Pass 10 remains a blocking second roadmap, and the claimed `s` Definition of Done was never added to the authoritative plan.**
+
+   Pass 10 accurately lists twenty-one contract corrections, nineteen of them still unchecked, and
+   says they block their owning parts (`docs/todo/P02M0103.md:2062-2089`). It simultaneously calls
+   itself only a review record and says every work item lives in an authoritative section
+   (`:2054-2060`). That is false: splitting `s` into freeze gates remains an unchecked pass-10 item
+   (`:2103-2107`), while `s-common` and `s-2d` are already used as hard prerequisites despite having
+   no sections or gates (`:39,102-103,411`). Likewise, the checked review entry claims `s` received a
+   Definition of Done (`:2094-2101`), but the authoritative per-part Done list starts with `a-common`
+   and contains no `s` condition (`:1974-2017`). The earlier second-roadmap defect was enumerated, not
+   resolved: there is still no declarable specification-freeze point that can release `a-common` or
+   `b`.
+
+2. **The completion contract still mandates both the rejected one-shot `Event` and the channel wrapper, and the wrapper alone does not enforce the hostile boundary.**
+
+   The normative WSI item still says the mechanism is a one-shot `Event`, assigns WAIT-only and
+   SIGNAL-only authority, and requires reset and duplicate-signal refusal
+   (`docs/todo/P02M0103.md:788-810`). It then selects a channel endpoint and ownership-consuming Rust
+   wrapper (`:811-857`). Pass 10 again describes memory ordering in terms of the old Event and its
+   WAIT/SIGNAL rights (`:2173-2181`). The current Event is only an unpaired boolean latch
+   (`src/kernel/object/event/mod.rs:16-42`), and there is no SIGNAL right
+   (`src/abi/src/lib.rs:1030-1049`). Moreover, signal-once is proven only for a producer that uses the
+   safe wrapper; a hostile WSI client can send through the reusable raw channel endpoint. Replace all
+   Event prose with one channel contract and make the receiver enforce one terminal message and close
+   the endpoint, with exact attenuated rights; memory ordering must refer to channel send/receive, not
+   the rejected Event.
+
+3. **The accepted `f-ext` scope split was not propagated through the core specification and gates.**
+
+   The sole `SCENE3D_PROFILE_1.md` item still consists of PBR, environment filtering, shadows, bloom,
+   fog and root motion (`docs/todo/P02M0103.md:353-357`), leaving the core scene profile unspecified
+   and making its freeze depend on Extended features. Core `soft3d` still requires vertex work for
+   skinning and morph targets (`:1822-1825`), and the mandatory `i` benchmark still requires shadows
+   and a postprocess pass and reports postprocess timing (`:1948-1958`). Because `i` closes only after
+   meeting that frame budget (`:2014-2017`), optional `f-ext` remains a core gate despite the contrary
+   claim at `:2007-2009`. The per-part Done list also has no `f-ext` condition (`:1974-2017`), although
+   the response said the new part had its own gates. Separate the core and Extended scene freezes,
+   remove or condition Extended work in `g` and `i`, and add the promised `f-ext` Done gate.
+
+4. **The sponsorship correction still contradicts the authoritative accounting protocol.**
+
+   The accounting item says client-created images are necessarily charged to the client's Domain and
+   that the enforcing counter is therefore correct (`docs/todo/P02M0103.md:882-888`); the supply row
+   again requires creation in “ITS OWN Domain” (`:915-920`). The immediately following row correctly
+   withdraws that claim because the service cannot distinguish a requester-created object from a
+   deliberately sponsored object (`:921-938`). The kernel charges the syscall caller
+   (`src/kernel/syscall/mod.rs:585-595`), while `ObjectInfo` exposes no charged Domain
+   (`src/abi/src/lib.rs:691-729`). Rewrite the introductory and supply rows around the selected
+   sponsorship contract: the supplier transfers valid storage, DisplayService is not charged, and
+   requester-Domain attribution is not claimed.
+
+5. **The promised non-transferable surface channel is not enforceable by the mechanism stated.**
+
+   The plan says DisplayService refuses a surface whose channel moved process and claims that watching
+   the creator makes this enforceable (`docs/todo/P02M0103.md:956-976`). A channel message identifies
+   only the endpoint on which it arrives (`src/kernel/object/channel/mod.rs:10-13`); neither it nor
+   `ObjectInfo` reports the current holder process. Watching the creator detects death, not a live
+   transfer. Require the client endpoint to be supplied without `RIGHT_TRANSFER` and
+   `RIGHT_DUPLICATE`, making transfer fail structurally, rather than promising service-side detection
+   the current ABI cannot perform.
+
+6. **The jointly owned “complete” glyph-cache key still omits state that changes an LCD glyph mask.**
+
+   The key in M0103 and M0136 contains face/generation, glyph, size/transform, variations, phase, kind,
+   strike and palette (`docs/todo/P02M0103.md:1277-1299`; `docs/todo/P02M0136.md:151-158`). M0103 also
+   requires LCD rendering to vary by `SubpixelLayout`—RGB/BGR and horizontal/vertical—and to fall back
+   to grayscale for unknown layouts, rotated/non-axis-aligned transforms and transparent offscreen
+   layers (`docs/todo/P02M0103.md:1194-1200`). Those modes can currently reuse one cached subpixel mask.
+   Add the layout/rasterization mode to the key, or explicitly define a canonical layout-independent
+   cached representation and perform layout mapping after lookup; the current key is not complete.

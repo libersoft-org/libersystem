@@ -177,3 +177,15 @@ M4 is its regression; M5 and M6 are independent of both. Each item names the fil
 changes rather than a subject area. The Definition of done was rewritten so every clause is
 falsifiable by a named fixture, including the exhaustiveness assertion and the three single-release
 outcomes. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0169 (2026-08-30T22:25:50Z):
+
+Rating: 6/10
+
+The planner substantially corrected the prior findings, but three material gaps remain.
+
+1. **A lost or malformed `launch_prepared` reply still has no recovery owner.** M2 starts its ownership rules only after `launch_prepared` succeeds (`docs/todo/P02M0169.md:78-93`). The generated client can transfer the bootstrap handle and then receive a transport failure or malformed reply (`src/user/libs/protocol/process-proto/src/generated/liber/process/v1.rs:872-905`; `src/user/libs/ipc/ipc-client/src/lib.rs:38-52`), after ProcessService has already retained the prepared record (`src/user/services/core/src/process_service.rs:878-892`). PermissionManager then has neither the koid nor a task handle with which to cancel it (`src/user/services/core/src/permission_manager.rs:801-806`), and dropping the temporary client does not close the shared service channel whose teardown drives ProcessService cleanup. Give prepare a caller-chosen transaction identity with idempotent status/cancel, or an equivalently bounded owner connection whose teardown is confirmed, and fault-test lost and malformed prepare replies.
+
+2. **Empty and non-name `@rights` arguments disappear before M5 can reject them.** The parser accepts zero arguments and numeric arguments, but `collect_rights` retains only names (`src/tools/lsidl-gen/src/parser.rs:186-223`, `:579-589`). Validation iterates the resulting vector and generation skips it when empty (`src/tools/lsidl-gen/src/validate.rs:220-232`; `src/tools/lsidl-gen/src/codegen.rs:573-576`). Thus `@rights()` and `@rights(1)` become indistinguishable from no annotation and can generate an unguarded method, contrary to the Definition of done. Preserve annotation presence, reject empty/non-name/malformed rights lists, and add compile-fail fixtures.
+
+3. **The generated denial path leaks a decoded transferred handle.** Dispatch decodes the handle, clears the request handle list, and then returns `Denied` without closing the decoded capability (`src/tools/lsidl-gen/src/codegen.rs:554-618`; a generated instance is `src/user/libs/protocol/display-proto/src/generated/liber/display/v1.rs:824-865`). `Handles` is non-owning and `clear` only erases handle numbers (`src/wire/src/lib.rs:359-375`, `:493-497`); the serve loop closes only handles still in that list (`src/user/runtime/rt/src/lib.rs:1987-2005`). M5 must close every decoded request capability not handed to the service on denial and prove it with a close/resource-baseline fixture, not merely assert that the metadata list is empty.

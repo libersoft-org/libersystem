@@ -185,3 +185,15 @@ M1-M3 are independent of all of them. A "What this milestone refuses" line was a
 not a general CI system - the envelope, the class model and the identity manifest exist to make one
 release run's claim checkable, and nothing more. Dependencies now name P02M0173, whose five profile
 rows M4's class model has to accept whichever milestone lands first. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0170 (2026-08-30T22:25:50Z):
+
+Rating: 6/10
+
+The revised plan resolves most prior structural findings, but three evidence-integrity gaps remain.
+
+1. **Content addressing does not provide the stable medium boundary that M1-M2 assume.** M1 categorically rejects holding the build lock across medium construction because the medium is content-addressed, while M2 requires two same-architecture suites to overlap and both succeed (`docs/todo/P02M0170.md:52-70`). The current builder explicitly runs producers outside its lock and aborts if an input changes during assembly (`src/harness/mkimage.sh:722-726`); the M0167 implementation history records this exact disjoint same-architecture overlap making one run fail (`AI/audit/audit-M0167.md:491-502`). Detection is not stabilization. The ISO is also renamed to an ordinary writable pathname that QEMU later opens (`src/harness/mkimage.sh:351-359`, `:446-455`; `src/harness/qemu-run.sh:925-952`, `:1018-1024`). Require serialization through a stable snapshot point or run-private immutable snapshots of every medium input, plus digest-verified handoff to QEMU, and exercise concurrent construction and pathname replacement.
+
+2. **An envelope cannot preserve logs that cleanup deletes.** M7 records paths and digests and publishes before cleanup, and M9 calls the resulting dossier durable (`docs/todo/P02M0170.md:113-141`). Current multi-boot gates keep logs below trap-deleted temporary directories (`src/tools/check-qemu-arch-profiles.sh:46-65`, `:130`, `:212-218`; `src/tools/check-qemu-virtio-iommu-x86_64.sh:91-112`, `:147-158`). Persist the log bytes in the durable run-owned output before cleanup, make envelopes reference those objects, and test that failed-gate logs remain readable and digest-matching after producer exit.
+
+3. **Pre/post identities do not prove that source bytes were immutable while used.** M8 relies on before/after identity checks, and M9 permits a clean detached worktree (`docs/todo/P02M0170.md:122-141`). A detached worktree remains writable; a file can be changed, consumed, and restored before the post-check. A Git tree identity does not change for ordinary worktree edits at all. M10's generic in-progress mutation fixture does not cover mutate-use-restore. Make the source snapshot genuinely non-writable or bind each producer to verified immutable input bytes, and add that regression.

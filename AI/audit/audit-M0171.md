@@ -128,3 +128,15 @@ fresh-variables behavior - the two properties that make this implementable witho
 other boot on this machine. Dependencies note that P02M0172 also proposes an authenticated
 loader-to-kernel value, so if both are in flight the manifest evolves once. No source code was
 modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-08-30T22:25:50Z):
+
+Rating: 6/10
+
+The updated plan adds useful constraints and tests, but the planner's three accepted corrections remain incomplete at their decision points.
+
+1. **The enforcing identity and provisioning ceremony are still instructions to decide later.** M2 says to define which profile identifiers enforce, the representation of unprovisioned state, the provisioning authority and initial floor, and the persistent variables-image owner (`docs/todo/P02M0171.md:54-68`), but supplies none of those values or actors. Compile-time profile selection prevents disk selection, but it does not distinguish a legitimate first boot from deletion of already-provisioned state; those states are observationally identical unless provisioning leaves a trusted external fact. Name the exact enforcing/non-enforcing profiles, ceremony authority, initial-floor rule, durable provisioned marker/state transition, and store lifecycle in the plan.
+
+2. **M3 does not actually freeze the state record it says is frozen.** It lists fields that a future implementation must choose, but gives no magic/version bytes, layout, endianness encoding, reserved-byte values, integrity/commit construction, vendor GUID, slot names, attribute mask, or maximum size (`docs/todo/P02M0171.md:70-88`). These details decide whether torn bytes are rejected and whether absent state is distinguishable from firmware failure; they are the substance of the prior finding, not implementation trivia. Put the canonical record and UEFI constants in the plan before relying on the two-slot proof.
+
+3. **Recovery authorization remains an unresolved fork.** M5 still says “Choose ONE” between a signed-purpose field and a separate recovery-loader profile (`docs/todo/P02M0171.md:100-113`). Those choices change the signed schema, root roles, firmware enrollment, artifacts, M6 signer transition, and evidence matrix. Select and specify one design now; cross-use tests cannot define which trust model they are meant to prove.

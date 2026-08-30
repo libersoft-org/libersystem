@@ -112,3 +112,9 @@ still implementable: M1 (topology) -> M2 (portable backend) -> M3 (bypass transi
 (`DmaAddress` consumers) -> M5/M6 (evidence) -> M7 (enforcing becomes ordinary). The dependency on
 P02M0170 is unchanged and now carries more weight, since the dossier is what enforces phase
 completeness. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0173 (2026-08-30T22:25:50Z):
+
+Rating: 10/10
+
+No unresolved material findings. The updated plan is internally consistent, its evidence phases have explicit artifacts and oracles, and its composite-row contract is representable by M0170's catalog prerequisites and per-key evidence envelopes. The planner's corrections are complete and independently supported by the current harness, kernel paths, and qualified QEMU properties.

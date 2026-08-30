@@ -130,3 +130,15 @@ explicitly the LAST behavioural change, after every producer has been migrated, 
 that keeps this from breaking the current test and non-x86 paths on the way in. The Definition of
 done now states the producer coverage and the non-overruling of operator selection as separate
 falsifiable clauses. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-08-30T22:25:50Z):
+
+Rating: 6/10
+
+The authority-boundary decision and removal of the permissive fallback are sound, but three integration contracts are still incomplete.
+
+1. **The promised producer matrix and authenticated handoff are not actually specified.** M2 tells the implementer to create a table for every architecture, boot path, and run mode, but the plan contains no such table or values (`docs/todo/P02M0172.md:48-59`). M3 similarly lists a signed field, a `BootInfo` value/provenance, and a direct-boot equivalent without fixing their encodings or defining how each trusted entry path establishes provenance rather than copying an untrusted assertion (`:61-72`). Add the actual matrix, missing-value semantics, versioned handoff layout, and per-path validation/producer rules before fail-closed admission is implementable.
+
+2. **The signed DMA mode has no boot-wide source/equality rule.** A boot can validate multiple medium and volume manifests; M0171 explicitly latches equality for its generation field. M0172 adds DMA mode to authenticated metadata but never chooses one authoritative manifest or requires every selected signed manifest to carry the same value (`docs/todo/P02M0172.md:40-72`). Two individually valid same-release manifests can therefore disagree about enforcement. Define the authoritative source or an equality latch and add a mixed-mode signed-set refusal fixture.
+
+3. **M4 incorrectly treats name normalization as undefined and can diverge from the existing manifest identity.** The system-manifest parser already constrains program names to 1-64 ASCII alphanumeric, underscore, or hyphen bytes and rejects duplicates (`src/tools/system-manifest/src/lib.rs:901-902`, `:1207-1213`). M4 says to define normalization, encoding, and maximum width later (`docs/todo/P02M0172.md:74-84`) while the request/claim/grant/report ABI still carries no entry name. Adopt the existing grammar verbatim, choose the bounded ABI representation and migration now, and test that persisted selection, generated tables, kernel claims, and reporting use identical bytes.
