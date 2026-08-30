@@ -311,7 +311,11 @@ fi
 #     looks like: it records fewer edges, and every edge it does record still checks out. Only the
 #     manifest can notice, and only in this direction - so without this case the reverse branch could
 #     be deleted and the gate would stay green.
-declared="$(src/tools/system-manifest.sh export-json 2>/dev/null | jq -r --arg artifact "$(basename "$consumer" .lslib)" '.libraries[$artifact].providers[]? // empty' 2>/dev/null | head -1 || true)"
+# THE FIRST LINE TAKEN BY EXPANSION, NOT BY `head`. `head` closes its input, and under `pipefail`
+# that reads as a failed pipeline - a check whose result depends on how much the previous stage had
+# left to write.
+declared="$(src/tools/system-manifest.sh export-json 2>/dev/null | jq -r --arg artifact "$(basename "$consumer" .lslib)" '.libraries[$artifact].providers[]? // empty' 2>/dev/null || true)"
+declared="${declared%%$'\n'*}"
 if [[ -n "$declared" ]]; then
 	mutate "$consumer"
 	llvm-objcopy --dump-section .note.liber.identity="$work/note" "$consumer" /dev/null 2>/dev/null || fail "could not read the consumer's note"

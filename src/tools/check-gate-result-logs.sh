@@ -46,7 +46,10 @@ for gate in "$root"/check-*.sh "$root/../../verify.sh"; do
 	# ONE quoted string (`[^"]*\*`), which `find "$BUILD_DIR/logs/test" -name "<arch>-*-guest.log"`
 	# is not: the glob is in the next word. Both spellings, and the glob is looked for on the line
 	# rather than at a fixed distance from the directory.
-	if grep -E '(\.build|\$\{?BUILD_DIR\}?)/logs/test' <<<"$code" | grep -q '\*'; then
+	# COLLECTED THEN MATCHED, for the reason the hygiene gate gives: `grep -q` closes its input on
+	# the first match and under `pipefail` that reads as a failed pipeline.
+	log_dir_lines="$(grep -E '(\.build|\$\{?BUILD_DIR\}?)/logs/test' <<<"$code" || true)"
+	if [[ -n "$log_dir_lines" ]] && grep -q '\*' <<<"$log_dir_lines"; then
 		echo "gate-result-logs: $name starts a guest and then globs .build/logs/test - that reads whichever run finished last, which is not necessarily its own" >&2
 		failed=1
 		continue

@@ -275,6 +275,17 @@ progress_count() {
 ) &
 STALL_WATCHER=$!
 
+# THE COMPILER'S OWN STACK, RAISED, because the test build of this kernel overflows the default.
+#
+# `rustc` crashed with SIGSEGV compiling `kernel (bin "kernel" test)` for riscv64 and printed its own
+# advice: "you can increase rustc's stack size by setting RUST_MIN_STACK". The test build is the
+# largest thing this tree compiles - the whole kernel plus every test module and eleven codec crates
+# in one crate graph - and the failure is a compiler stack overflow rather than anything in the code:
+# the same sources build without `--tests`.
+#
+# Set for BOTH cargo invocations below, because either can be the one that compiles it.
+RUSTC_STACK="${RUST_MIN_STACK:-33554432}"
+
 # THE COMPILE IS SERIALIZED; THE GUEST RUN IS NOT.
 #
 # `TEST_SELECTION` and `TEST_TAGS` are `option_env!`, so they are COMPILE-TIME: two runs of one
@@ -292,7 +303,7 @@ mkdir -p "$REPO_ROOT/.build/state"
 (
 	flock 8
 	cd "$ROOT/kernel"
-	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" cargo build "${TARGET_ARGS[@]}" --tests
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" RUST_MIN_STACK="$RUSTC_STACK" cargo build "${TARGET_ARGS[@]}" --tests
 ) 8>"$REPO_ROOT/.build/state/kernel-test-build.lock" >>"$RUN_LOG" 2>&1 || {
 	echo "test-kernel: the selection-specific kernel did not build" >&2
 	tail -20 "$RUN_LOG" >&2
@@ -312,7 +323,7 @@ set +e
 	# that publishes no tree gets a named refusal instead of QEMU `virt`'s controller addresses. It had
 	# no setter anywhere in the tree - the only occurrence was the consumer - so the authorised profile
 	# was unreachable and the refusal it guards was untestable.
-	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" cargo "${TEST_ARGS[@]}"
+	TEST=1 TEST_TAGS="$TAGS" TEST_SELECTION="${TEST_SELECTION:-}" LIBER_NO_DT_PROFILE="${LIBER_NO_DT_PROFILE:-}" RUST_MIN_STACK="$RUSTC_STACK" SERIAL="file:$GUEST_LOG" timeout --kill-after=5s "$LIMIT" cargo "${TEST_ARGS[@]}"
 ) >"$RUN_LOG" 2>&1
 status=$?
 set -e

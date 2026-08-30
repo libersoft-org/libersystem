@@ -385,22 +385,27 @@ fn the_placement_matrix_runs_through_the_real_allocator() {
 	//
 	//    ITS OWN SECTION, AFTER THE TOTALS ABOVE, because a kernel thread has a kernel STACK: those
 	//    frames are taken from the node the thread was placed on and are not given back until it is
-	//    reaped, so a global count compared across a spawn is comparing two different machines. The
-	//    per-node figure this section does assert is the one the spawn cannot move - the stack is
-	//    charged to node `first` and the frame under test belongs to node `second`.
+	//    reaped, so a global count compared across a spawn is comparing two different machines.
+	//
+	//    AND THE PER-NODE FIGURE IS TAKEN ON THE FREEING CORE, not here. The stack is allocated
+	//    PREFERRING the node the thread was placed on, and preference is not a guarantee: on riscv64
+	//    it came out of node 1's pool, so a count taken before the spawn was short by the whole
+	//    stack and the assertion failed on a free that had worked perfectly. Reading the count
+	//    inside the thread, after its stack exists and immediately before the free, cancels the
+	//    stack whichever pool it came from - and leaves exactly the claim being made: the free put
+	//    this frame back in the pool that owns its ADDRESS, from a core of another node.
 	let Some(travelling) = crate::mem::frame::allocate_strict(second) else {
 		crate::serial_println!("numa-matrix: incomplete - node {} could not serve the frame for the cross-node free", second.0);
 		return;
 	};
-	let owner_before = crate::mem::frame::free_in_node(Some(second));
-	if !remote_free(first, travelling) {
+	if !remote_free(first, second, travelling) {
 		// SAFETY / NEVER-MAPPED: still this test's frame, never mapped, freed exactly once here
 		// because no other core took it.
 		unsafe { crate::mem::frame::deallocate(travelling) };
 		crate::serial_println!("numa-matrix: incomplete - no core of node {} other than this one took the cross-node free, so it was made locally", first.0);
 		return;
 	}
-	assert_eq!(crate::mem::frame::free_in_node(Some(second)), owner_before.map(|count| count + 1), "a frame of node {} freed by a core of node {} did not go back to node {}'s pool", second.0, first.0, second.0);
+	assert_eq!(crate::mem::frame::free_in_node(Some(second)), Some(freed_from() + 1), "a frame of node {} freed by a core of node {} did not go back to node {}'s pool", second.0, first.0, second.0);
 	assert!(crate::mem::frame::pools_agree_with_total(), "and the pools still add up after a core of another node gave a frame back");
 	crate::serial_println!("numa-matrix: complete - node {} exhausted, strict refused, preferred fell back to node {}, a span stayed on it, a core of node {} freed node {}'s frame, and every per-node total returned", first.0, second.0, first.0, second.0);
 }
@@ -411,16 +416,23 @@ fn the_placement_matrix_runs_through_the_real_allocator() {
 // and the argument is the frame itself; the flag is what tells the caller whether the free happened
 // there or has still to be made here. Bounded, like every other cross-core wait in this suite: a
 // core that is busy or asleep must weaken the claim rather than hang the run.
-fn remote_free(node: topology::NodeId, frame: u64) -> bool {
+fn remote_free(node: topology::NodeId, owner: topology::NodeId, frame: u64) -> bool {
+	// SEEN BY THE CORE THAT DOES THE FREEING, so the thread's own kernel stack cancels out - see the
+	// step that calls this.
+	static OWNER: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+	static BEFORE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 	use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 	static FREED: AtomicBool = AtomicBool::new(false);
 	extern "C" fn body(frame: u64) {
+		let owner = topology::NodeId(OWNER.load(AtomicOrdering::SeqCst));
+		BEFORE.store(crate::mem::frame::free_in_node(Some(owner)).unwrap_or(usize::MAX), AtomicOrdering::SeqCst);
 		// SAFETY: the caller allocated this frame, never mapped it, and does not free it itself once
 		// this thread has been started - `FREED` is what tells it so.
 		// NEVER-MAPPED: allocated by the matrix above and freed without entering a page table.
 		unsafe { crate::mem::frame::deallocate(frame) };
 		FREED.store(true, AtomicOrdering::SeqCst);
 	}
+	OWNER.store(owner.0, AtomicOrdering::SeqCst);
 
 	crate::smp::numa::bind_online();
 	// A CORE OF THIS NODE THAT IS NOT THE ONE ASKING.
@@ -445,9 +457,17 @@ fn remote_free(node: topology::NodeId, frame: u64) -> bool {
 	crate::sched::spawn_on(cpu, body, frame);
 	for _ in 0..2_000_000u64 {
 		if FREED.load(AtomicOrdering::SeqCst) {
+			FREED_FROM.store(BEFORE.load(AtomicOrdering::SeqCst), AtomicOrdering::SeqCst);
 			return true;
 		}
 		core::hint::spin_loop();
 	}
 	false
+}
+
+// The owning node's free count as the FREEING core saw it, immediately before the free.
+static FREED_FROM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+fn freed_from() -> usize {
+	FREED_FROM.load(core::sync::atomic::Ordering::SeqCst)
 }

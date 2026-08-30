@@ -93,7 +93,12 @@ weak_placement() {
 weak_matrix() {
 	local where="$1"
 	shift
-	if grep -ah "numa-matrix:" "$@" | grep -aqv "numa-matrix: complete"; then
+	# A HERE-STRING, NOT A PIPE. `grep -q` closes its input on the first match, and under `pipefail`
+	# that reads as a failed pipeline - which is a check whose success depends on how much output the
+	# first stage had left to write. The lines are collected first and matched second.
+	local said
+	said="$(grep -ah "numa-matrix:" "$@" || true)"
+	if [[ -n "$said" ]] && grep -aqv "numa-matrix: complete" <<<"$said"; then
 		echo "qemu-numa: the placement matrix did not make its full claim on the $where profile" >&2
 		grep -ah "numa-matrix:" "$@" >&2
 		exit 1
@@ -160,10 +165,18 @@ if wanted x86_64; then
 
 	# 4. AND THE TESTS THAT STEER AN ALLOCATION RAN. On the one-node profile these report themselves
 	#    skipped, which is what makes requiring them here meaningful.
-	for name in strict_fails_where_preferred_falls_back a_contiguous_span_never_crosses_two_nodes every_frame_returns_to_the_pool_that_owns_its_address the_placement_matrix_runs_through_the_real_allocator the_reference_model_and_the_allocator_agree_over_a_trace; do
+	# `[ok]` ON THE SAME LINE, WHICH IS ONLY TRUE OF A TEST THAT PRINTS NOTHING.
+	#
+	# The runner writes the test's name, then whatever the test printed, then `[ok]` - so for a test
+	# with output the marker is on the NEXT line, and a single-line grep cannot see it. The two tests
+	# that print are asserted by their own completion lines instead, which say more than `[ok]` does:
+	# the matrix names every claim it made, and the comparison names the trace it walked.
+	for name in strict_fails_where_preferred_falls_back a_contiguous_span_never_crosses_two_nodes every_frame_returns_to_the_pool_that_owns_its_address; do
 		grep -aqh "kernel.mem.numa.$name\.\.\..*\[ok\]" ${logs[@]} || fail "kernel.mem.numa.$name did not run or did not pass"
 		echo "qemu-numa:   $name passed"
 	done
+	grep -aqh "the model and the allocator agreed on every placement decision in the trace" ${logs[@]} || fail "the reference model and the allocator were not compared over a trace"
+	echo "qemu-numa:   the_reference_model_and_the_allocator_agree_over_a_trace passed"
 	# AND THE PLACEMENT HALF: a thread asked for node 1 ran on a core whose normalized node is 1.
 	for name in only_cores_that_came_up_are_bound_to_a_node placement_names_a_core_of_the_node_it_was_asked_for a_thread_placed_on_a_node_runs_on_a_core_of_that_node; do
 		grep -aqh "kernel.smp.numa.$name\.\.\..*\[ok\]" ${logs[@]} || fail "kernel.smp.numa.$name did not run or did not pass"
@@ -218,9 +231,11 @@ for port in aarch64 riscv64; do
 	# THE SAME NAMED TESTS AS x86_64, on the profiles that used to be checked for pools and a report
 	# and nothing else. Three profiles were the milestone's evidence and only one of them was asked
 	# whether an allocation had been steered.
-	for name in strict_fails_where_preferred_falls_back a_contiguous_span_never_crosses_two_nodes every_frame_returns_to_the_pool_that_owns_its_address the_placement_matrix_runs_through_the_real_allocator the_reference_model_and_the_allocator_agree_over_a_trace; do
+	for name in strict_fails_where_preferred_falls_back a_contiguous_span_never_crosses_two_nodes every_frame_returns_to_the_pool_that_owns_its_address; do
 		grep -aqh "kernel.mem.numa.$name\.\.\..*\[ok\]" ${port_logs[@]} || fail "$port: kernel.mem.numa.$name did not run or did not pass"
 	done
+	# The two that print are asserted by their own lines - see the x86_64 phase.
+	grep -aqh "the model and the allocator agreed on every placement decision in the trace" ${port_logs[@]} || fail "$port: the reference model and the allocator were not compared over a trace"
 	weak_matrix "$port" ${port_logs[@]}
 	echo "qemu-numa:   $port: $(grep -a -m 1 -o 'numa:   node 0: .*' ${port_logs[@]})"
 	echo "qemu-numa:   $port: $(grep -a -m 1 -o 'numa:   node 1: .*' ${port_logs[@]})"
