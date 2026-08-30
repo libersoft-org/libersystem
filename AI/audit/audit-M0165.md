@@ -366,3 +366,69 @@ Current implementation rating: 6/10
 1. **Several planned-stop paths still acknowledge hardware quiescence without establishing it.** `common::finish_stop` does no device reset or halt: with a nonzero capability it merely makes the trust-based `device_quiesced` assertion and then emits `STOPPED` (`src/user/drivers/core/src/common.rs:684-716`), while the kernel explicitly says it cannot verify that the caller reset the hardware (`src/kernel/syscall/mod.rs:1284-1324`). `virtio_gpu` passes capability `0` on both stop exits, and xHCI also passes `0` without stopping or resetting its running controller; xHCI's only halt/reset and quiescence assertion are in bring-up (`src/user/drivers/core/src/virtio_gpu.rs:440-455`, `src/user/drivers/core/src/xhci.rs:473-495,1000-1011`). These paths can report a clean planned stop even though device queues/controller work was ended only by the forced claim teardown that follows, rather than by M3's required drain/abandon, flush, quiesce, then acknowledge sequence (`docs/todo/P02M0165.md:128-147,320-322`).
 
 2. **The required publish/crash/subscribe race still does not exercise catalogue withdrawal or a late subscriber.** The named host test explicitly skips catalogue behavior, compares only two provider identities, and checks the generic holdings ledger (`src/user/libs/driver/binding/src/tests.rs:525-543`). The cited guest test is still a local `DeviceState` enum driven from a crash notification and never runs DeviceManager, `Catalogue::withdraw_binding`, or subscription (`src/kernel/test_suites/hardware.rs:531-568`). A regression that leaves the crashed binding's provider reachable would therefore pass the registered race coverage, contrary to M7's required no-stale-provider baseline (`docs/todo/P02M0165.md:285-307,329-331`).
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-08-30T01:36:00Z):
+
+**Finding 1 - `STOPPED` certifies hardware quiescence that several drivers never establish: ACCEPTED
+and fixed.** The finding is right in every part, including the part that makes it serious: the kernel
+explicitly cannot verify the claim, so it has to be true when it is made, and it was not being made
+by anybody.
+
+*The transport's own stop.* `virtio::quiesce_at` writes device status 0 and waits for the device to
+read back 0 - the virtio reset, which is the device saying it has stopped using the queues. That
+happened at BRING-UP and never on the stop path.
+
+*Reaching the device from the stop path.* The loops that read a stop - `serve_blocks`, `event_loop`,
+`pointer_loop`, `serve` - are several calls below the one place a `Virtio` exists, and threading it
+through four signatures would make every driver responsible for remembering. `common::bringup_bound`
+records the device's common-configuration base as it hands the `Virtio` back, and
+`common::quiesce_virtio` performs the reset from there. Every virtio driver that binds gets it by
+construction rather than by remembering to.
+
+*xHCI.* It passed `0` and exited with the controller RUNNING - command ring, event ring and every
+transfer ring live, all of them DMA - while sending `STOPPED`, which certifies the opposite. The
+comment there said "the quiesce is the device's own reset path", and that path runs at bring-up.
+`Xhci::halt` clears Run/Stop and waits for `USBSTS.HCHalted`, which is the specification's own
+handshake and the same pair `reset` performs before it resets.
+
+*virtio-gpu.* It also passed `0`, with a live queue capability and a DMA-backed scanout. It now
+passes `gpu.q.capability` and the reset's answer, so the kernel can reclaim what it was holding.
+
+*And the acknowledgement is refused when quiescence is not established.* `finish_stop` takes the
+driver's own answer about its hardware and, when it is false, says so and sends nothing: the
+manager's deadline then takes the forced path, the claim is quarantined, and what it held stays out
+of circulation. That is the correct outcome for a device that may still be mastering the bus, and it
+is what "must fall through to the forced/quarantine path" asks for. Every call site was previously
+certifying quiescence it had not established, because there was no argument in which to say so.
+
+**Finding 2 - the publish/crash/subscribe race never executes the catalogue decision: ACCEPTED and
+fixed, with one limit stated plainly.**
+
+The named test said "Whatever the catalogue does next" and compared two identities, which is exactly
+as reported. The decision now has a host-testable form that the production path SHARES rather than
+mirrors:
+
+- `ProviderId::belongs_to(binding)` is the rule - the same function AND the same generation, so a
+  provider published by a binding that is over is not this binding's. DeviceManager's
+  `Provider::binding_is`, which `Catalogue::withdraw_binding` selects on, calls it.
+- `driver_binding::Publications<N>` is that decision with the channel handles taken out: publish,
+  withdraw by binding, and what a subscriber asking for a kind reaches.
+- The race test now drives M7's sequence in order: publish before anyone asks; the binding ends and
+  the publication goes with it; a subscriber arriving THEN finds nothing rather than a server that
+  is gone; the device binds again and publishes; the subscriber reaches the REPLACEMENT; and
+  withdrawing the previous binding a second time takes nothing, because same address and different
+  generation is a different binding.
+
+Watched to fail: with `belongs_to` replaced by `same_function` - the generation ignored, which is the
+regression this exists to catch - the last assertion fails and the other 56 tests pass.
+
+*The limit, stated rather than implied:* `Publications` carries the identity rules and not the
+channel bookkeeping, so what is proved is which publications a binding's end withdraws and which
+generation is reachable afterwards. Closing the withdrawn provider's handle is still only exercised
+in the guest. That is a smaller gap than the one the finding names, and it is the honest description
+of what this test covers.
+
+**Verification.** `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline`:
+57 passed. `./build.sh --arch x86_64` clean with every driver's stop path rebuilt.

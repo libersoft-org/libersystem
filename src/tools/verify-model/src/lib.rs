@@ -71,6 +71,13 @@ pub struct Model {
 	pub graph: Graph,
 	pub catalog: Catalog,
 	pub kernel_tests: kerneltests::Discovery,
+	// WHAT THE BOOT PUTS ON THE MACHINE A KERNEL TEST RUNS ON.
+	//
+	// Kept because it is half of the reach relation and was computed and thrown away. A kernel test
+	// runs inside a booted guest: DeviceManager binds the staged drivers and ServiceManager starts
+	// the staged services before any test body runs, so a test asserting a driver's effect reaches
+	// that driver through the BOOT rather than by launching it. See `kerneltests::unreachable_covers`.
+	pub staged: std::collections::BTreeSet<String>,
 	// Which components can behave differently per target, found by scanning rather than declared.
 	pub arch_risk: std::collections::BTreeMap<String, archrisk::Risk>,
 }
@@ -109,7 +116,7 @@ impl Model {
 		let catalog = Catalog::build(&crates, &registry, &graph, &staged, &kernel_tests.tests);
 		catalog.validate(&registry)?;
 		let arch_risk = archrisk::scan(repo_root, &Ownership::new(&registry, &crates))?;
-		Ok(Model { repo_root: repo_root.to_path_buf(), registry, crates, manifest, graph, catalog, kernel_tests, arch_risk })
+		Ok(Model { repo_root: repo_root.to_path_buf(), registry, crates, manifest, graph, catalog, kernel_tests, staged, arch_risk })
 	}
 
 	pub fn ownership(&self) -> Ownership<'_> {

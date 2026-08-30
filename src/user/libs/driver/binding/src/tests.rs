@@ -551,18 +551,18 @@ fn a_crash_between_publish_and_subscribe_withdraws_what_was_published() {
 	const KIND: u16 = 7;
 	let mut catalogue: Publications<4> = Publications::new();
 	assert!(catalogue.publish(published, KIND).is_some(), "the driver published before anyone asked");
-	assert_eq!(catalogue.reachable(KIND), Some(published), "and it is reachable while its binding is live");
+	assert!(catalogue.reachable(KIND) == Some(published), "and it is reachable while its binding is live");
 
 	assert_eq!(catalogue.withdraw_binding(published.binding), 1, "the binding's end withdraws what it published");
-	assert_eq!(catalogue.reachable(KIND), None, "so a consumer arriving now finds nothing, rather than a server that is gone");
+	assert!(catalogue.reachable(KIND).is_none(), "so a consumer arriving now finds nothing, rather than a server that is gone");
 	assert_eq!(catalogue.live(), 0, "and the catalogue is empty, not merely unreachable");
 
 	assert!(catalogue.publish(after_rebind, KIND).is_some(), "the device is bound again and publishes");
-	assert_eq!(catalogue.reachable(KIND), Some(after_rebind), "and the subscriber reaches the REPLACEMENT");
+	assert!(catalogue.reachable(KIND) == Some(after_rebind), "and the subscriber reaches the REPLACEMENT");
 	// THE OLD GENERATION IS NOT REACHABLE BY ITS OWN IDENTITY EITHER. Withdrawing by the previous
 	// binding must not take the new one with it - same bus address, different generation.
 	assert_eq!(catalogue.withdraw_binding(published.binding), 0, "the previous binding has nothing left to withdraw");
-	assert_eq!(catalogue.reachable(KIND), Some(after_rebind), "and the replacement is untouched by it");
+	assert!(catalogue.reachable(KIND) == Some(after_rebind), "and the replacement is untouched by it");
 }
 
 #[test]

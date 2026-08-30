@@ -564,9 +564,21 @@ pub const RUNTIME_REACH: [&str; 7] = ["link.static", "link.dynamic", "format", "
 // scenario that starts StorageService in order to test `component_host` asserts nothing about
 // StorageService, and inferring coverage from a launch is the `touches = covers` collapse that would
 // inflate every declaration back to the full suite one honest-looking gate at a time.
-pub fn unreachable_covers(test: &KernelTest, touched: &BTreeSet<String>, graph: &crate::graph::Graph) -> Vec<String> {
+pub fn unreachable_covers(test: &KernelTest, touched: &BTreeSet<String>, graph: &crate::graph::Graph, staged: &BTreeSet<String>) -> Vec<String> {
 	let mut reachable: BTreeSet<String> = BTreeSet::new();
-	for component in touched {
+	// THE BOOT CHAIN IS PART OF REACH, and leaving it out was the whole of a fifteen-line exception
+	// list.
+	//
+	// A kernel test runs inside a BOOTED GUEST. DeviceManager binds the staged drivers and
+	// ServiceManager starts the staged services before any test body runs, so a test that asserts a
+	// driver's effect - a file read over that disk, a lease over that NIC - never LAUNCHES the
+	// driver and reaches it anyway. Reach computed from launches alone therefore refused fifteen
+	// `covers` declarations that were true about failure: break the driver and the test goes red.
+	//
+	// The other direction is still not inferred. Being on the machine is not coverage; the author's
+	// `covers` is still the claim, and this only stops the model from calling a true claim
+	// impossible. See the comment above this function, which says why that asymmetry is deliberate.
+	for component in touched.iter().chain(staged.iter()) {
 		if graph.contains(component) {
 			reachable.extend(graph.reaches(component, &RUNTIME_REACH));
 		}

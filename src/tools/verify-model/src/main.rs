@@ -1478,7 +1478,7 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 	let mut uncovered: Vec<String> = Vec::new();
 	for test in &model.kernel_tests.tests {
 		let touched = model.kernel_tests.touches.get(&test.name).cloned().unwrap_or_default();
-		for component in verify_model::kerneltests::unreachable_covers(test, &touched, &model.graph) {
+		for component in verify_model::kerneltests::unreachable_covers(test, &touched, &model.graph, &model.staged) {
 			unreachable.push(format!("{} covers '{component}', which its body cannot reach - it launches nothing that leads there", test.id));
 		}
 		for component in verify_model::kerneltests::launched_but_not_covered(test, &touched, &model.graph) {
