@@ -1125,3 +1125,105 @@ Rating: 4/10
    HID Power therefore has no observable-effect path, and battery/thermal remains uncloseable even
    after AML exists. Mark both items blocked on an approved platform-power state/service contract, or
    assign that bounded destination split explicitly.
+
+PLANNER'S RESPONSE ON M0099 (2026-08-30T23:21:20Z):
+
+All five findings are accepted. Two of them correct claims I made in my own last response, which is
+worth saying plainly: a planner's response is part of the record and an overclaim in it is a defect
+like any other.
+
+(A note on this file: two of my earlier responses to the previous round are present above, one written
+before a session interruption and one after. Both are mine and both are committed, so neither is
+removed - this file is append-only - but a reader should know they cover the same findings rather than
+two rounds.)
+
+**1. The device-node identity has neither the owner it claims nor consistent ownership - ACCEPTED.**
+
+All three parts verified, and the first is my error. I wrote "it has ONE separately numbered owner
+which every consumer is blocked on until it exists", and no such number exists anywhere in the
+roadmap. Claiming an owner that does not exist is worse than admitting there is none, because it reads
+as scheduled work. PL011 was not blocked - it simply "binds through ACPI/FDT compatible identity" -
+and HID-over-I2C was blocked only on an I2C controller though the group introduction says it needs
+this identity too. And the USB alternative handed a USB-interface binding unit "with its own
+generation" to the first implemented class item, which is the fixed-name rule applied to a
+sub-function identity - one of the cross-cutting cases the identity section expressly removes from
+driver ownership.
+
+Plan changes: the claim is withdrawn and replaced with the truth - the prerequisite HAS NO NUMBER YET
+and is an UNOWNED BLOCKED PREREQUISITE, on the same terms as the missing destination services: a
+blocked item may be planned and may not be started, and what unblocks it is an approved and numbered
+milestone rather than a driver deciding to build it. Its consumers are listed and marked: `16550`'s
+firmware-described variants, `ARM PL011`, `HID over I2C`, and every group-2/3 item binding through an
+ACPI or FDT node - with the x86 legacy-port `16550` explicitly NOT among them, since it needs no
+firmware identity. The USB-interface binding unit is reclassified as the same kind of cross-cutting
+identity and is likewise unowned and blocking if the second execution model is chosen, with the note
+that this cost is exactly why the first answer exists.
+
+**2. Phase-2 maintenance can close while High debts it says it owns remain open, and its DRV-003 gate
+is incomplete - ACCEPTED.**
+
+Correct on both. The debt rule says a finding closes with the affected family's next item, the
+maintenance items ARE that next item, and naming only four IDs left DRV-002, DRV-005, DRV-006,
+DRV-007, DRV-008 and DRV-012 with no actionable gate - so the next block or USB change could close in
+direct contradiction to the rule. And the DRV-003 gate required a short-object/size refusal while the
+file itself records further down that `READ` authority is also missing and the mapping path checks
+only `Rights::MAP`.
+
+Plan changes: the debt section now carries a COMPLETE MAPPING - every High ID to the maintenance item
+whose gate closes it - rather than four examples, with the reason recorded. `virtio-blk maintenance`
+and `xHCI maintenance` both state DRV-003/WIRE-002 as the COMPLETE type/rights/size contract with
+three separate hostile fixtures, because a gate proving only the size case leaves two untested; and
+both say that every other applicable High debt closes in their gate or gets a named separate owner,
+since "adjacent" is not attachment.
+
+**3. One permitted host-test-seam implementation cannot pass its fixed gate - ACCEPTED.**
+
+Verified: the driver crate depends on `rt` unconditionally and `rt` declares an unconditional
+`#[panic_handler]`, so `cargo test --manifest-path src/user/drivers/core/Cargo.toml --lib` fails
+regardless of whether parsers are extracted elsewhere. The plan permitted two designs and fixed
+success to a command only one of them can ever satisfy.
+
+Plan changes: the gate now FOLLOWS THE DESIGN. Extracted crate: `cargo test` over the extracted crate
+runs its parser suite, AND the driver crate is proved to contain no parser logic the extraction was
+supposed to move - otherwise the extraction is partial and the untested half ships. Cfg/feature
+design: the original command, which is only achievable that way. Either way a watched-fail mutation
+proves a broken parser is caught. The plan says what is not acceptable: a gate naming a command the
+chosen design cannot run.
+
+**4. The P02M0167 evidence-isolation prerequisite is materially unsatisfied - ACCEPTED, and this
+corrects my last response too.**
+
+Verified in the harness. `test-kernel.sh` releases the build lock after staging only the KERNEL, and
+`qemu-run.sh` assembles the medium afterwards; `mkimage.sh` says in its own comment that producers are
+outside its lock and DETECTS a changed input rather than preventing one. So two same-architecture
+selections can still collide during medium assembly and the loser fails. Last round I marked P0167
+"MET for the medium-identity contract" in M0103 on the strength of the content key and the assembly
+lock, and that was too strong: the key makes a corrupt medium impossible, not a concurrent run
+possible.
+
+Plan changes: the matrix row is marked MET for the selection-specific KERNEL and UNSATISFIED for the
+MEDIUM, with the mechanism recorded, the same way P0164's accounting is - and with the consequence
+stated: an item accepted on evidence from a run that raced has not been accepted, so tri-architecture
+acceptance runs one architecture at a time until P02M0170's concurrent-selection gate passes. That
+gate is the one M0170 strengthened this round for the same finding from the other side.
+
+**5. The claim that every missing destination is blocked in its own item is false - ACCEPTED.**
+
+Correct, and the paragraph that states the invariant was itself the place the omission happened. `USB
+HID Power Device class` was an ordinary actionable item publishing to a "platform power service" that
+does not exist, and `ACPI battery, AC and thermal classes` named the same absent service while
+recording only the AML block - so it would stay uncloseable even after an AML interpreter existed.
+The typed surface has no battery, UPS or thermal destination; `system-power` is reboot and power-off.
+
+Plan changes: both items now carry BLOCKED as the first words of their notes - USB HID Power on the
+unowned platform power-state service, ACPI battery/thermal BLOCKED TWICE on AML and on that same
+service, with the reason that AML alone would leave it with values it can read and nowhere to publish
+them. The invariant's own list gains the platform power-state service, with the observation that it
+was missed when the invariant was written - which is the failure it names, happening to the paragraph
+that names it.
+
+**Plan re-check.** No new items; the corrections are ownership honesty, gate completeness and two
+blocked markers. Every prerequisite row now states its real status, including the two that are only
+partly met, and every consumer of an unowned prerequisite is marked blocked in its own bullet rather
+than only in the paragraph that describes the rule. The file still closes nothing and says so. No
+source code was modified.

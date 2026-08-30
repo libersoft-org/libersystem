@@ -185,3 +185,11 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0160 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 10/10
+
+No unresolved material issue remains. The signed-boot mutation now snapshots all three shape members, records initial absence, restores preserved metadata through the EXIT path, removes members that were initially absent, and verifies bytes, presence, pairing, and timestamps (`src/tools/check-signed-boot.sh:243-332`).

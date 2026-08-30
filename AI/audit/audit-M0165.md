@@ -547,3 +547,13 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0165 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 6/10
+
+1. **The hardware-quiescence correction missed two live virtio planned-stop paths.** `virtio_console` ends in `online_and_stand`; `stand` handles `STOP` by calling `stopped` directly without resetting the device or calling `device_quiesced` (`src/user/drivers/core/src/virtio_console.rs:20-35`; `src/user/drivers/core/src/common.rs:372-435`). `dev_channel::heartbeat` does the same while its queues and device remain live (`src/user/drivers/core/src/dev_channel.rs:181-219`). Both bypass the new `finish_stop` safeguard (`src/user/drivers/core/src/common.rs:735-765`) and can certify a clean planned stop before hardware is quiet, contrary to M3 and the Definition of Done's quiesce-then-ack order (`docs/todo/P02M0165.md:128-147,320-322`). The xHCI correction is valid, but the response's all-stop-path claim is incomplete.
+
+2. **`withdraw_slots` does not close the production race-evidence gap claimed by the addendum.** The registered publish/crash/subscribe race still drives `Publications`, not DeviceManager's crash invocation, catalogue-handle closure, or subscription stream (`src/user/libs/driver/binding/src/tests.rs:525-566`). Sharing `withdraw_slots` proves slot selection and emptying only; the test still passes if the crash path ceases to call production withdrawal or its side effects regress. There is also a concrete side-effect failure: if the production temporary vector cannot reserve, `withdraw_binding` removes and closes all providers but records none, so it sends no withdrawal announcements and existing subscribers retain stale metadata (`src/user/services/core/src/device_manager.rs:1998-2037`). M7 requires this named race to establish the no-stale-provider post-race baseline (`docs/todo/P02M0165.md:280-307,329-331`). The 58 passing binding-library tests confirm only the model/shared-loop portion, not the claimed production behavior.

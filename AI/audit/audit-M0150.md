@@ -506,3 +506,11 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0150 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 8/10
+
+1. **The wrong-UUID rejection remains unjustified: authenticating the fallback does not preserve the signed source-selection decision.** The milestone says an attacker controlling either medium cannot substitute a source and that a present-but-invalid selected source can never become a fallback decision (`docs/todo/P02M0150.md:23-29`); M3/M4 and the Definition of Done make the signed paired UUID part of that selection and require selected-source metadata failure to be terminal (`docs/todo/P02M0150.md:109-138,410-416`). Current `choose_volume` skips every cleanly mounted LiberFS volume whose unauthenticated superblock UUID differs from the signed `want` and returns `NotHere` on exhaustion (`src/boot/uefi/src/disk.rs:323-345`). The loader maps that to `NoVolume` and executes the boot-medium fallback (`src/boot/loader/src/main.rs:241-244,704-716`). An attacker can therefore change the paired volume's UUID and filesystem checksum so its signed manifest is never examined. The fallback's signature authenticates the substituted bytes, but it does not make bypassing the signed pairing policy compliant with M4. The two attempted coarse presence/handle checks breaking legitimate boots explains why those attempts were wrong; it does not invalidate the explicit invariant or close it.

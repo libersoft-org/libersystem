@@ -440,3 +440,11 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0162 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 7/10
+
+1. **Normal claim teardown still violates M4's explicit nonblocking, event-driven contract, and the new deadline bounds only one sub-operation.** `Holdings::begin_teardown` calls production `release` inline and closes an already-terminal claim instead of retaining it for a later event (`src/user/libs/driver/binding/src/lib.rs:724-769`; `src/user/services/core/src/device_manager.rs:1614-1631`). `SYS_DEVICE_RELEASE` synchronously completes `Claim::release` and the full `device::release_claim` sequence before returning (`src/kernel/syscall/mod.rs:1232-1248`; `src/kernel/object/claim/mod.rs:74-103`; `src/kernel/device.rs:445-513`). The added 20-tick deadline surrounds only the virtio-IOMMU detach poll (`src/kernel/iommu/mod.rs:738-763`; `src/kernel/iommu/virtqueue.rs:39-59,197-215`); it neither moves bus-master disable, derived-capability/interrupt revocation, detach, and final settlement out of DeviceManager's sole call stack nor bounds that complete synchronous transition. On an ordinary release there is no later claim-settled event—the handle is terminal and closed inline. M4 expressly requires short nonblocking steps, says no driver may block the manager, and requires exit and `Free` to arrive as events (`docs/todo/P02M0162.md:163-186,365-366`). Rejecting asynchronous completion as a worker redesign does not justify leaving those in-scope requirements unmet.

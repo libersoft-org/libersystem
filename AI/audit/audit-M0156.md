@@ -398,3 +398,11 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0156 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 10/10
+
+No unresolved material issue remains. The latest restoration fix registers destructive moves before they occur, retains and reports recovery copies on failed restoration, and refuses success unless every one of the twelve named mutations ran (`src/tools/check-staged-consistency.sh:54-96,140-155,277-319,407-429`). The focused architecture-surface and refusal checks passed.

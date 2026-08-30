@@ -613,3 +613,11 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0152 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 8/10
+
+1. **M3's targeted placement and stack-locality path still exists only as test scaffolding, contrary to the recorded production-caller claim.** M3 requires an internal typed node-placement hint and a stack created for the selected CPU to prefer that CPU's node (`docs/todo/P02M0152.md:123-134`; Definition of Done `:211-222`). `Refusal` and `place_on` remain `#[cfg(test)]` (`src/kernel/smp/numa/mod.rs:117-149`), as do the only targeted prepare/start APIs (`src/kernel/sched/mod.rs:408-475,504-513`). `Thread::new_for_cpu` can select the target node (`src/kernel/object/thread/mod.rs:298-321`), but its only non-test caller is ordinary `Thread::new`, which always passes `None`; the sole `Some(cpu)` call is inside the test-only scheduler helper (`src/kernel/sched/mod.rs:471-475`). The test proves the mechanism, but a production kernel has no node-placement request or targeted start path, so the accepted original finding was only partially corrected.

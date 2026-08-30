@@ -888,3 +888,81 @@ Rating: 4/10
    “derived undefined-symbol closure” (`:468-469`), which is pass 1's acknowledged over-approximation.
    Make the completion gate name the converged audit-link-resolved set per target; otherwise the
    accepted final-link correction remains ambiguous and can reintroduce unused surface.
+
+PLANNER'S RESPONSE ON M0135 (2026-08-30T23:21:20Z):
+
+All four findings are accepted. The first two describe rules I wrote last round that cannot both be
+followed, and the auditor is right about each.
+
+**1. The configuration is not pinned and the "lockfile first" rule is self-blocking - ACCEPTED.**
+
+The cycle is real and I built it. Last round I made one complete lockfile a gate on every other item;
+that lockfile has to digest the LiberSystem platform-port patch, which is a later deliverable, three
+toolchain files, and the profile sysroot - while the sysroot is sized from "the facilities the
+inventory names" and pass 1 cannot produce that inventory without a sysroot to compile against. The
+implementer would have had to violate the first gate to create the inputs the gate demands.
+
+Plan changes: the pin is SPLIT into two halves with a stated freeze order, so each gates what it can
+actually precede. The BOOTSTRAP PIN - both project revisions and archive digests, the three toolchain
+files, the tool identities and flags, the full CMake option set, the generated-source policy, and a
+MINIMAL BOOTSTRAP SYSROOT sized from the option set rather than from the inventory - is frozen first
+and gates pass 1; it contains no output of this milestone and therefore has no cycle. The DERIVED PIN
+- the platform-port patch series with per-patch digests, the generated-source digests as produced,
+the final profile sysroot digest, and the compiler-runtime the converged link selected - is frozen at
+the END of pass 2 and gates COMPLETION. The order is written out: bootstrap pin -> pass 1 ->
+substrate -> platform port -> converging pass 2 -> derived pin.
+
+On the digests themselves my position is unchanged and stated again here: I cannot supply revisions
+and SHA-256 values offline, and a fabricated digest is worse than a stated obligation because it
+looks checkable and is not. What the plan can do - and now does - is make the obligation gate the
+right step instead of an impossible one.
+
+**2. The audit-only/no-staging contract makes the required guest evidence impossible - ACCEPTED.**
+
+Verified: the launch path resolves executables and libraries from manifest-generated tables and
+admits a dynamic image only with an expected identity and an exact `DT_NEEDED`/provider closure. An
+artifact that is never staged and never manifest-named cannot traverse it - and the guest gate I
+added last round requires exactly that traversal. Both requirements could not hold.
+
+Plan changes: the term becomes **AUDIT-LINKED AND QUARANTINE-STAGED**, and the distinction is stated
+as the one the audit link already rests on: what this milestone refuses is PRODUCTION IMPORT, not the
+file's existence. The artifact is named in a TEST-ONLY manifest role in a test-only image built by
+the gate and deleted with it; it is absent from the shipping manifest, absent from every shipping
+image, and named by no production role - and a gate asserts that the shipping image contains no
+artifact derived from the pinned upstream, watched to fail. Every "discarded"/"nothing is staged"
+sentence was updated, including the TLS scan's.
+
+**3. Pre-launch selection leaves the provider edge and lookup mechanism undecided - ACCEPTED.**
+
+Correct that a list of questions for the port to answer is not the accepted concrete model, and both
+constraining facts are as described: ProcessService discovers only `DT_NEEDED` edges and requires the
+identity provider set to EQUAL them, and the kernel's export registry is a process-wide flat
+`Vec<(String, u64)>` with no module provenance and no ring-3 query.
+
+Plan changes, all decided rather than delegated. THE ACTOR is ProcessService, not "or a narrow
+registry" - one actor, because the edge must exist before the closure is built. THE IDENTITY EDGE:
+the selected ICD becomes an ORDINARY DECLARED DEPENDENCY for that launch, added to both the
+dependency set and the expected identity set before the equality check runs, so the existing
+"identity set equals `DT_NEEDED` set" invariant holds WITH the ICD inside it rather than being
+weakened to admit it. SYMBOL RESOLUTION is the decision that keeps this bounded: ONE WELL-KNOWN ENTRY
+SYMBOL per ICD and no `dlsym` equivalent at all - the Vulkan ICD ABI is already shaped that way, a
+driver exposes a single documented entry point and every further address comes from the function
+pointer it returns, so the port resolves that one symbol as an ordinary provider export and goes
+through it thereafter. A provider-scoped export query would need module provenance in the kernel's
+export table and a new ring-3 syscall, which is a kernel redesign a substrate audit has no business
+doing. `dlopen`/`dlclose` become take-a-reference and drop-it; failure and rollback are stated.
+
+**4. The final surface gate contradicts the two-pass derivation - ACCEPTED.**
+
+Correct and it is a plain inconsistency: pass 2 says the surface equals the audit-link-resolved set
+at the fixed point and says in as many words that object-closure equality is NOT the gate, while the
+Host/Build Done gate still required equality with "the derived undefined-symbol closure" - pass 1's
+acknowledged over-approximation, which would have reintroduced exactly the unused surface the
+correction removed.
+
+Plan changes: the gate now names the CONVERGED AUDIT-LINK-RESOLVED SET, per target, with the reason
+recorded so it is not re-broken.
+
+**Plan re-check.** Item count unchanged. The freeze order is now stated in three places that agree -
+M1's split, the completion paragraph, and the gate list - and the guest gate is runnable for the
+first time because the artifact it launches can be staged. No source code was modified.

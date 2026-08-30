@@ -479,3 +479,17 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 5/10
+
+1. **Malformed fault events bypass the claimed per-call work bound.** `VirtioIommu::drain_faults` advances its bound only after a record decodes; malformed records `continue` without increasing `written` (`src/dma/src/virtio_iommu.rs:499-527`). A controller that continuously supplies malformed events can therefore keep one drain call running indefinitely, before `poll_faults` can apply its outer 64-valid-event ceiling (`src/kernel/iommu/mod.rs:816-853`). This directly misses M5 and hostile case 12's bounded fault-storm work requirement (`docs/todo/P02M0153.md:197-204,214-232`).
+
+2. **Faults raised during teardown can still lose their domain and binding generation.** `detach_for_inner` drains once, removes the device-to-domain row, revokes/detaches the endpoint, optionally destroys the domain, and only then drains again (`src/kernel/iommu/mod.rs:766-812`). The backend resolves an event's domain only from its current attached table (`src/dma/src/virtio_iommu.rs:468-471,499-527`), and the generic layer can stamp a generation only while that domain state survives (`src/dma/src/lib.rs:1128-1148`). A fault queued after the pre-drain or caused by teardown is consequently reported as domain/generation zero, contrary to M2/M5's required endpoint/domain/generation attribution (`docs/todo/P02M0153.md:163-164,197-204`).
+
+3. **The endpoint/fault-accounting rejection contradicts M4, and the new mapping counters become false on the quarantine path.** M4 expressly requires mapping, IOVA, endpoint, and fault counters in binding/Domain accounting plus an exact restart baseline (`docs/todo/P02M0153.md:184-195,245-260`). `DeviceClaimSnapshot` exposes mapping totals and a quarantined subset but no endpoint or fault count (`src/kernel/device.rs:424-442`; `src/abi/src/lib.rs:901-931`). More seriously, teardown removes the `DOMAINS` row before it knows whether revoke was confirmed; an unconfirmed backend domain/mappings are deliberately retained, but `grants_for` and `quarantined_grants_for` require the removed row and return zero (`src/kernel/iommu/mod.rs:530-549,766-805`). A quarantined claim can therefore report no IOMMU holdings. The global report's unassociated totals (`src/kernel/iommu/mod.rs:902-920`) do not repair per-binding reconstruction.
+
+4. **The lazy-doorbell correction is not idempotent and still does not enforce the stated map-failure outcome.** `msi_deliverable` calls `install_doorbell` on every MSI acquisition and claims an existing map is success (`src/kernel/iommu/mod.rs:551-575`), but `map_identity` reserves the exact range and an existing mapping returns `Fault::Overlaps`; no `AlreadyMapped` result exists (`src/dma/src/lib.rs:190-216,440-458,924-949`). Release/reacquire within one binding therefore fails. On a genuine map failure the syscall refuses only the vector and leaves the claimed, bus-mastering endpoint/domain active (`src/kernel/syscall/mod.rs:1463-1482`), rather than ending in refused binding, disabled bus mastering, or quarantine as the milestone explicitly requires (`docs/todo/P02M0153.md:27-35`).

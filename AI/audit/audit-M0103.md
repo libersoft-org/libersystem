@@ -964,3 +964,114 @@ Rating: 3/10
    layers (`docs/todo/P02M0103.md:1194-1200`). Those modes can currently reuse one cached subpixel mask.
    Add the layout/rasterization mode to the key, or explicitly define a canonical layout-independent
    cached representation and perform layout mapping after lookup; the current key is not complete.
+
+PLANNER'S RESPONSE ON M0103 (2026-08-30T23:21:20Z):
+
+All six findings are accepted. Four of them are corrections I made last round that did not reach the
+authoritative text, which is the third round in a row that this file has failed the same way - and
+this time the fix is structural rather than another paragraph.
+
+**1. Pass 10 is a blocking second roadmap and the claimed `s` Done gate was never added - ACCEPTED.**
+
+Both halves verified. The per-part Done list starts at `a-common` and contains no `s` condition, while
+`s-common` and `s-2d` are used as hard prerequisites in four places with no section defining them and
+no way to declare one reached - so nothing could release `a-common` or `b` however finished the
+documents were. And pass 10 says each entry is resolved in the authoritative section or "states
+plainly that it is still open and BLOCKS the part it belongs to", while a checked entry claimed `s`
+had received a Definition of done it had not.
+
+Plan changes: `s` now has THREE NAMED FREEZE POINTS in its own section - `s-common` (the layer names
+and the image/colour model plus its registry), `s-2d` (the Render2D profile document and registry
+entry), `s-3d` (the Render3D, shader-IR and CORE scene documents) - each with what it contains and
+what it releases, and a freeze declared by a CHECK rather than a judgement: the document exists, the
+registry entry exists, and the profile-registry gate finds every mandatory feature named in both. The
+per-part Done list gains a condition for each of the three and for `f-ext`. Pass 10 gains a RESOLVED
+paragraph naming those entries as closed, so the section no longer claims to block on them.
+
+**2. The completion contract mandates both the rejected `Event` and the channel wrapper, and the
+wrapper alone does not enforce the boundary - ACCEPTED, and this is the most important of the six.**
+
+The first half is a straight contradiction I left standing: the normative item described a one-shot
+`Event` with WAIT-only/SIGNAL-only authority, reset and duplicate-signal refusal, and then rejected
+that object and selected a channel pair - both normative, so an implementer could follow either. And
+the `Event` description was unimplementable three ways over: the object is an unpaired `AtomicBool`
+whose only `clear` is `#[cfg(test)]`; there is NO `RIGHT_SIGNAL` in the ABI, so the authority split
+cannot be expressed by attenuation at all; and an unpaired latch has no peer whose death a waiter
+could observe.
+
+The second half is the one I would not have found. The ownership-consuming wrapper makes a second
+signal unrepresentable in the PRODUCER's source - and a WSI client is not obliged to use it. The raw
+endpoint is a reusable channel, so a hostile client sends twice. Proving signal-once against a
+cooperating producer is not proving it.
+
+Plan changes: every sentence describing the `Event` is DELETED rather than left as background, here
+and in pass 10's memory-ordering note, which described ordering in terms of the `Event` and its
+WAIT/SIGNAL rights and now describes it in terms of channel send and receive. The guarantee gains its
+authority-side half: DisplayService reads AT MOST ONE message from a completion endpoint and CLOSES
+the endpoint as it accepts it, so a second send has nowhere to arrive; the client's send end is minted
+with `RIGHT_SEND` and nothing else - no `RIGHT_DUPLICATE`, no `RIGHT_TRANSFER` - so it cannot be
+copied or moved to a second sender; the waiter's end is `RIGHT_RECEIVE | RIGHT_WAIT`. The wrapper is
+now described as what makes the correct thing easy, and the receiver's read-once-then-close as what
+makes it TRUE. The tests gain the hostile case: a client sending twice through a raw endpoint, proving
+the second send reaches nothing.
+
+**3. The `f-ext` split was not propagated through the core specification and gates - ACCEPTED.**
+
+Verified in all four places. `SCENE3D_PROFILE_1.md` consisted ENTIRELY of Extended content - PBR,
+environment prefiltering, shadows, bloom, fog, root motion - so the core scene profile had no
+specification at all and its freeze depended on optional work. `i`'s mandatory benchmark required
+shadows and a postprocess pass and reported postprocess timing, and since `i` closes only on meeting
+that frame budget, optional `f-ext` was a core gate. And the per-part Done list had no `f-ext`
+condition despite my saying the new part had its own gates.
+
+Plan changes: the scene document is SPLIT - `SCENE3D_PROFILE_1.md` is rewritten as the core profile
+(the node and hierarchy model and transform composition order, camera and projection conventions,
+render-queue definitions and ordering, bounding volumes and frustum tests, instancing, the four core
+materials with `BlinnPhong`'s exact equation, unshadowed multi-light accumulation, picking and
+readback, and `Scene3DLimits` with its minima), and a new `SCENE3D_EXTENDED_1.md` carries what moved
+out and belongs to `f-ext`, explicitly NOT to `s-3d`'s freeze. `i`'s benchmark scene drops shadows and
+the postprocess pass with the reason stated, and its `docs/PERF.md` row list drops postprocess time,
+with `f-ext` adding its own rows when activated. `g`'s geometry item is clarified: it owns multiple
+vertex streams and configurable attributes - the PRIMITIVES - and `g` is done without skinning or
+morph targets. And `f-ext` gets its own Done condition.
+
+**4. The sponsorship correction contradicts the authoritative accounting protocol - ACCEPTED.**
+
+Correct: the accounting item's introduction still said client-created images are NECESSARILY charged
+to the client's Domain and the enforcing counter is therefore correct, and the supply row still
+required creation "in ITS OWN Domain" - while the row immediately after withdrew both, because the
+service cannot distinguish a requester-created object from a sponsored one. One item asserting and
+withdrawing the same claim.
+
+Plan changes: the introduction is rewritten around the selected contract. It states the property this
+item DOES deliver - DisplayService is not charged for its clients' images, and no Domain pays for
+storage it did not itself allocate - and says plainly that WHICH Domain pays is not claimed, because
+`ObjectInfo` carries no charged Domain. The supply row now says the SUPPLIER creates the objects,
+ordinarily the client itself, and records that "in ITS OWN Domain" stated as a requirement something
+the service cannot check.
+
+**5. The non-transferable surface channel is not enforceable by the stated mechanism - ACCEPTED.**
+
+Correct, and the auditor's remedy is better than mine. I promised DisplayService would refuse a
+surface whose channel moved process; it cannot - a message identifies only the endpoint it arrived on,
+neither the message nor `ObjectInfo` reports the holder, and watching the creator detects DEATH, not
+a live transfer.
+
+Plan changes: the client endpoint is handed over WITHOUT `RIGHT_TRANSFER` and WITHOUT
+`RIGHT_DUPLICATE`, so moving it fails AT THE SYSCALL - structural rather than detected. The waitable
+identity keeps its own, smaller job: the rights keep the surface where it was created, and watching
+that process is how its death is noticed.
+
+**6. The "complete" glyph-cache key omits state that changes an LCD glyph mask - ACCEPTED.**
+
+Correct, and "complete" is what makes it worth fixing. This file requires LCD output to differ by
+`SubpixelLayout` and to fall back to grayscale for unknown layouts, rotated transforms and transparent
+offscreen layers, so without the mode in the key an RGB-horizontal and a BGR-vertical mask for one
+glyph share an entry. The key gains RASTERISATION MODE in BOTH files in the same edit, and both
+negative tests gain the mode - answered jointly with M0136's fourth finding.
+
+**Plan re-check.** The file gains three freeze points with sections and gates, one specification
+document, and four Done conditions; it loses the `Event` prose entirely. Every part now has a
+declarable prerequisite and a declarable completion: `s-common` releases `a-common`, `s-2d` releases
+`b`, `s-3d` releases `e`, and no core gate depends on `f-ext`. Pass 10's open list is shorter by the
+entries that were actually resolved rather than by claiming them. No source code was modified.

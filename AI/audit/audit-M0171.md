@@ -140,3 +140,68 @@ The updated plan adds useful constraints and tests, but the planner's three acce
 2. **M3 does not actually freeze the state record it says is frozen.** It lists fields that a future implementation must choose, but gives no magic/version bytes, layout, endianness encoding, reserved-byte values, integrity/commit construction, vendor GUID, slot names, attribute mask, or maximum size (`docs/todo/P02M0171.md:70-88`). These details decide whether torn bytes are rejected and whether absent state is distinguishable from firmware failure; they are the substance of the prior finding, not implementation trivia. Put the canonical record and UEFI constants in the plan before relying on the two-slot proof.
 
 3. **Recovery authorization remains an unresolved fork.** M5 still says “Choose ONE” between a signed-purpose field and a separate recovery-loader profile (`docs/todo/P02M0171.md:100-113`). Those choices change the signed schema, root roles, firmware enrollment, artifacts, M6 signer transition, and evidence matrix. Select and specify one design now; cross-use tests cannot define which trust model they are meant to prove.
+
+PLANNER'S RESPONSE ON M0171 (2026-08-30T23:21:20Z):
+
+All three findings are accepted. All three are the same complaint - a plan that says what to decide
+instead of deciding - and this round decides them in the file.
+
+**1. The enforcing identity and provisioning ceremony are instructions to decide later - ACCEPTED.**
+
+Fair, and the technical point inside it is the one that mattered: compile-time profile selection stops
+a disk attacker CHOOSING a non-enforcing path, and it does nothing about telling a legitimate first
+boot from deletion of already-provisioned state. Those two are observationally identical unless
+provisioning leaves a durable fact behind, and without that distinction the whole floor is defeated
+by erasing it.
+
+Plan changes: M2 now carries the values as a table rather than a list of things to define.
+`rollback-enforcing` is a third `LIBER_TRUST_PROFILE` value and the only enforcing one; `test-trust`
+and the plain external-release profile are non-enforcing and keep today's per-run fresh-VARS
+behaviour unchanged. A separate `LiberSystemRollbackProvisioned` marker variable is written once by
+the ceremony and never cleared by a boot, and it is exactly what makes UNPROVISIONED (marker absent,
+both slots absent -> boot, refuse to advance, say so) distinguishable from a DELETED floor on a
+provisioned machine (-> refuse). The ceremony is one operator action against firmware NVRAM outside
+any booted LiberSystem, which is consistent with the threat model this milestone already states, and
+the initial floor is the generation of the artifact set it installs - never zero. The gate owns one
+persistent variables image for the whole sequence. Two negative fixtures: replacement media cannot
+select or downgrade the profile, and deleting the floor on a provisioned machine refuses rather than
+resets.
+
+**2. M3 does not freeze the record it says is frozen - ACCEPTED.**
+
+Correct, and the auditor is right that these are the substance and not implementation trivia: whether
+a torn write is detectable and whether absence is distinguishable from firmware failure are decided
+by the layout, the commit construction and the attribute mask.
+
+Plan changes: M3 now carries the record as a byte layout - a 64-byte record with an `LSROLLB1` magic,
+a little-endian `u32` version, a reserved word that must be zero to validate, a 32-byte product
+identity taken as the SHA-256 of the loader's existing compiled-in constant (fixed width so the
+record's size never depends on the product name), the `u64` floor, and a truncated SHA-256 COMMIT TAG
+last. Two design points are written down with their reasons: the tag is last so a partial write
+leaves it absent or wrong and the record fails rather than parsing as a plausible lower floor, and the
+SLOT INDEX is inside the tag so copying slot A's bytes over slot B does not yield a valid slot B -
+otherwise two valid records could be manufactured to force the floor down. The UEFI constants are
+fixed too: a product-owned vendor GUID rather than the shared global namespace, both slot names, the
+marker name, `NON_VOLATILE | BOOTSERVICE_ACCESS` with `RUNTIME_ACCESS` deliberately absent so nothing
+after ExitBootServices can touch the state, a mismatched attribute mask read as invalid, and a
+64-byte maximum.
+
+**3. Recovery authorization remains an unresolved fork - ACCEPTED.**
+
+Correct that "choose one" is not something a test matrix can be written against, since the two
+designs change the signed schema, the root roles, firmware enrolment, the artifacts and the M6 signer
+transition differently.
+
+**DECIDED: the signed PURPOSE field.** The manifest gains one `u32` beside M1's generation - `1`
+ordinary boot, `2` recovery, everything else refused - covered by the same signature and validated
+where product, architecture and source kind already are, with each compiled-in root carrying the
+purposes it may sign for. The separate recovery-loader profile is REJECTED rather than deferred, for
+two reasons now written into the plan: it would double M6 and M7 to express what one signed field
+expresses, and it would put a SECOND loader binary in the firmware's accepted set, which is the class
+of thing M6 exists to remove. It also keeps the manifest evolving once, which is what P02M0172 needs
+if it lands in the same period.
+
+**Plan re-check.** Seven items, unchanged in count and in order. The Definition of done gained the
+provisioned/unprovisioned distinction and now names the purpose design rather than "a separately
+authorized purpose". Every value M2, M3 and M5 previously told an implementer to choose is now in the
+file. No source code was modified.

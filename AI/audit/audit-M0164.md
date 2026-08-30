@@ -529,3 +529,13 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0164 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 3/10
+
+1. **The production-consumer migration remains openly unfinished.** No driver-provider consumer calls `provider_catalogue::Client::subscribe`; DeviceManager still stores fixed `net_client`, `gpu_client`, `snd_client`, and `input_client` locals and emits tagged bootstrap handles, while block delivery still uses the four-entry `BOOT_BLOCK_TAGS` route (`src/user/services/core/src/device_manager.rs:85,441-475,651-665,1078-1143`). A late or additional provider can be catalogued but no production service discovers it, contrary to the goal, late-subscriber Definition of Done, and explicitly scoped consumer-seam replacement (`docs/todo/P02M0164.md:15-19,304-320`). The latest addendum admits this is still not done, making the plan's `COMPLETE` status contradictory.
+
+2. **The claimed per-consumer factory and its declared bound are not sound even before migration.** `Provider.consumers` says it includes the first offered connection, but publication initializes it to zero; `Catalogue::take` and boot-time `mint_connection` hand out connections without checking or incrementing it, and only `open` enforces/increments the count (`src/user/services/core/src/device_manager.rs:1714-1750,1922,1944-1977,3584-3624`). Nothing decrements it after a client closes, and manifest validation accepts counts beyond the drivers' fixed capacity (`src/tools/system-manifest/src/lib.rs:877-882`; `src/user/drivers/core/src/common.rs:548-594`). More fundamentally, only `virtio_blk` retains a multi-client `Serving`. `wait_or_answer` rejects `CONNECT`, while `serve_or_answer` creates an ephemeral one-call `Serving` and loses newly accepted endpoints when it returns (`src/user/drivers/core/src/common.rs:452-540,612-646`; `src/user/drivers/core/src/virtio_blk.rs:246`; `src/user/drivers/core/src/virtio_snd.rs:316-338`; `src/user/drivers/core/src/virtio_net.rs:137-159`). Catalogue `open` can therefore return a client whose server end a non-block driver closes or never services. This violates M1's per-consumer connection and declared-limit contract (`docs/todo/P02M0164.md:37-54`) and invalidates the proposed one-service-at-a-time migration path.

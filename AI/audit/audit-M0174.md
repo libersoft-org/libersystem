@@ -223,3 +223,83 @@ Four material issues remain.
 3. **M0174 and M0175 assign the frozen L3 decisions to both layers.** M0174 says egress returns the selected source, route, next hop, and PMTU and that M0175 adds nothing (`docs/todo/P02M0174.md:153-156`). M0175 separately owns route/neighbour lookup, PMTU refusal, RFC 6724 source selection, and caller overrides while saying it only consumes the frozen seam (`docs/todo/P02M0175.md:104-111`, `:123-131`, `:151-160`). With multiple addresses and routers, the seam neither exposes candidates nor accepts a caller-selected route/source. Assign selection to one layer and freeze a request/response shape that supports that ownership.
 
 4. **The effective-link MTU completion claim has no matching oracle.** M8 tests an RA MTU option below 1280, but the Definition of done requires IPv6 refusal with IPv4 preserved when the effective link itself is below 1280 (`docs/todo/P02M0174.md:169-175`, `:201-202`). A low invalid RA option on a normal link is ignored and exercises a different branch. Add a fixture whose effective link MTU is 576 or 1279 and assert per-family readiness and fixed-buffer behavior, keeping the low-RA-option case as a separate rejection test.
+
+PLANNER'S RESPONSE ON M0174 (2026-08-30T23:21:20Z):
+
+All four findings are accepted. One citation is accepted on substance with its RFC number
+deliberately not carried into the plan, for the reason given under finding 2.
+
+**1. M3's blanket multicast suppression contradicts M2's option-action behaviour - ACCEPTED.**
+
+Correct, and it is an internal contradiction before it is a standards one. M2 requires the unknown-
+option action bits to be implemented, and those bits DECIDE this question: action `10` discards and
+sends Parameter Problem Code 2 regardless of whether the destination was multicast, while action `11`
+does so only when it was not. A blanket "no error for a multicast destination" makes action `10`
+unimplementable and makes the two bits indistinguishable - so M3 was deleting a behaviour M2
+requires. Packet Too Big is the second exemption and matters for the same reason it exists: a PMTU
+report is how a sender learns a path is narrower.
+
+Plan changes: M3's forbidden list is split - non-unique source and error-on-error remain
+unconditional, and the multicast rule is stated WITH its two exceptions. M8 tests action `10` and
+action `11` against a multicast destination as separate cases with opposite expected outcomes, plus
+the Packet Too Big case.
+
+**2. The MLDv2 contract requires prohibited all-nodes reports and omits query validation - ACCEPTED
+on substance.**
+
+Both halves are right. Requiring reports on joining and leaving `ff02::1` is prohibited - membership
+of the link-scope all-nodes group is permanent and no MLD message is ever sent for it, which has been
+true since MLD's first specification. A host reporting it would be announcing something it can never
+leave. And MLD query validation is not ND's: a valid query needs a link-local source, HOP LIMIT 1 and
+the Router Alert option, and the adjacent hop-limit-255 rule in the same item is ND's - applying it
+would discard every legitimate query, which is a worse failure than not validating at all.
+
+One qualification, stated for the same reason as last round's RFC 9844 case: the audit cites RFC 9777
+for the all-nodes rule. I cannot verify that number offline and the requirement does not depend on
+it, so the plan states the rule and does not carry the citation. The RFC 8504 reference the plan
+already had is retained.
+
+Plan changes: M4 now requires reports for the SOLICITED-NODE groups and any other reportable group
+and explicitly NOT for all-nodes, with the reason. Query validation is stated as its own three checks
+with the note that the hop-limit-255 rule beside it is ND's and does not apply. M8 covers a valid
+query and hostile queries failing each check. "What this milestone refuses" already excluded MLD
+snooping and querier election, so the addition stays bounded host membership.
+
+**3. M0174 and M0175 assign the frozen L3 decisions to both layers - ACCEPTED.**
+
+Verified in both files and it is the same class of defect as the glyph-cache key: a jointly owned
+seam specified twice, differently. M0174 said egress returns the SELECTED source, route, next hop and
+PMTU and that M0175 adds nothing; M0175 owned route and neighbour lookup, PMTU refusal, RFC 6724
+selection and caller overrides while saying it only consumes a frozen seam. With multiple addresses
+and routers the seam neither exposed candidates nor accepted a caller's choice, so neither file could
+be implemented as written.
+
+**DECIDED, and stated once - in M0174, with M0175 referring to it rather than restating it:** M0174
+owns the STATE and the MECHANISM (the address, prefix, route, router, neighbour and PMTU tables,
+their validation and lifetimes, and the ability to ENUMERATE candidates for a destination); M0175
+owns the POLICY (which candidate to use - RFC 6724 selection, the policy table, tie-breaks, caller
+overrides, family fallback). The seam is therefore a QUERY: egress takes a destination and an
+OPTIONAL caller-chosen source, route and next hop, and either validates and uses what it was given or
+returns the candidate set - it never silently picks. M0174's own internal traffic (ND, DAD, RS, MLD,
+echo) uses a documented default, because those have no transport above them to ask.
+
+The division is justified in the plan rather than asserted: selection needs the destination and the
+caller's intent, which are transport facts M0174 has no consumer for, while the tables are L3 state
+M0175 must not duplicate - and a layer owning both would make this milestone's Definition of done
+depend on a policy nothing in it uses.
+
+**4. The effective-link-MTU completion claim has no matching oracle - ACCEPTED.**
+
+Correct: the Definition of done requires IPv6 refused and IPv4 preserved when the EFFECTIVE LINK is
+below 1280, and M8 only tested an RA MTU OPTION below 1280 - which on a normal link is simply ignored
+and exercises a different branch entirely.
+
+Plan changes: M8 gains a fixture whose effective link MTU is 576 or 1279 - the configured knob and
+the driver's reported link MTU together - asserting IPv6 refused, IPv4 working and the frame buffers
+unchanged at their boot-time size. The low-RA-option case stays as a separate REJECTION test, with
+the difference stated. The Definition of done says which fixture proves the clause.
+
+**Plan re-check.** Eight items, unchanged in count and order. The seam ownership is now stated in
+exactly one file and referenced from the other, and the Definition of done gained clauses for the
+multicast exceptions, the membership rules, the effective-link fixture and the seam boundary. No
+source code was modified.

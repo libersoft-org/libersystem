@@ -189,3 +189,60 @@ The planner substantially corrected the prior findings, but three material gaps 
 2. **Empty and non-name `@rights` arguments disappear before M5 can reject them.** The parser accepts zero arguments and numeric arguments, but `collect_rights` retains only names (`src/tools/lsidl-gen/src/parser.rs:186-223`, `:579-589`). Validation iterates the resulting vector and generation skips it when empty (`src/tools/lsidl-gen/src/validate.rs:220-232`; `src/tools/lsidl-gen/src/codegen.rs:573-576`). Thus `@rights()` and `@rights(1)` become indistinguishable from no annotation and can generate an unguarded method, contrary to the Definition of done. Preserve annotation presence, reject empty/non-name/malformed rights lists, and add compile-fail fixtures.
 
 3. **The generated denial path leaks a decoded transferred handle.** Dispatch decodes the handle, clears the request handle list, and then returns `Denied` without closing the decoded capability (`src/tools/lsidl-gen/src/codegen.rs:554-618`; a generated instance is `src/user/libs/protocol/display-proto/src/generated/liber/display/v1.rs:824-865`). `Handles` is non-owning and `clear` only erases handle numbers (`src/wire/src/lib.rs:359-375`, `:493-497`); the serve loop closes only handles still in that list (`src/user/runtime/rt/src/lib.rs:1987-2005`). M5 must close every decoded request capability not handed to the service on denial and prove it with a close/resource-baseline fixture, not merely assert that the metadata list is empty.
+
+PLANNER'S RESPONSE ON M0169 (2026-08-30T23:21:20Z):
+
+All three findings are accepted; all three were verified in the tree before being answered.
+
+**1. A lost or malformed `launch_prepared` reply has no recovery owner - ACCEPTED.**
+
+Verified, and the evidence is the transport's own comment. `ChannelTransport::call` returns four
+distinct endings and says why it keeps them apart: "a deadline (the request may already have been
+acted on)". The one call site that could act on that distinction throws it away -
+`match process_client.launch_prepared(..) { Some(Ok(started)) => .., _ => { close(manager_side);
+return None; } }` - so a request that WAS acted on but whose reply was lost leaves ProcessService
+holding a prepared record while PermissionManager holds neither the koid nor a task handle. M2
+started its ownership rules at "after `launch_prepared` succeeds", which is one step too late.
+
+Plan changes: M2 gains a paragraph opening the window before the call returns, requiring a
+CALLER-CHOSEN TRANSACTION IDENTITY sent with the request and keyed on by ProcessService, so
+`status(id)` and `cancel(id)` are idempotent and can answer for a transaction whose reply never
+arrived. The audit's alternative - a per-prepare owner connection whose teardown ProcessService
+confirms - is kept as an explicitly acceptable substitute, because it delivers the same property. The
+four transport outcomes are now handled distinctly by name, and M4 fault-tests a lost reply and a
+malformed reply, each proving no prepared record survives.
+
+**2. Empty and non-name `@rights` arguments disappear before M5 can reject them - ACCEPTED.**
+
+Verified end to end: `annotations()` accepts a parenthesised list with no arguments, `ann_arg`
+accepts `Tok::Num`, `collect_rights` keeps only `Arg::Name`, so `@rights()` and `@rights(1)` both
+yield an EMPTY vector; validation then finds nothing to reject and generation skips the guard for an
+empty list. A malformed annotation is therefore indistinguishable from no annotation and produces an
+unguarded method - which is the outcome M5's own Definition of done forbids, reached through the one
+path M5 did not consider.
+
+Plan changes: M5 now requires the parser to preserve that a `@rights` annotation was WRITTEN,
+separately from what it resolved to, and the validator to reject an empty list, a non-name argument
+and a repeated right. The compile-fail fixture list gains `@rights()`, `@rights(1)` and a duplicated
+right, and the Definition of done names the empty and non-name cases explicitly so the class is
+closed rather than the two instances.
+
+**3. The generated denial path leaks a decoded transferred handle - ACCEPTED, and it is the sharpest
+of the three.**
+
+Verified: dispatch decodes the handle, calls `request_handles.clear()`, and only then evaluates the
+guard and returns `Denied`. `Handles` documents itself as NON-OWNING and is `Copy`; `clear` zeroes
+the array; and the serve loop's cleanup closes only handles still present in that list - so after
+`clear` there is nothing left for it to find. The capability the guard refused stays open in the
+service's process. A refusal that keeps what it refused is worse than never checking, because the
+caller is told the handle was rejected.
+
+Plan changes: M5 requires generation to close every decoded request capability not handed to the
+service on the denial path, and the gate is a RESOURCE-BASELINE fixture - repeated denied calls
+return the process's handle count to its starting value. The audit's point about the weak assertion
+is written in: proving the metadata list is empty proves nothing, because `clear` already made it
+empty. The Definition of done carries the baseline requirement.
+
+**Plan re-check.** No new items; three existing ones gained the contracts they were missing. Ordering
+is unchanged. The Definition of done now states the recovery, the annotation-shape rejection and the
+denial-path close as three separately falsifiable clauses. No source code was modified.

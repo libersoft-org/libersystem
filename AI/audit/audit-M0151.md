@@ -687,3 +687,15 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 6/10
+
+1. **The timer correction still does not validate the normal inherited routing or restrict the description to semantics the backend implements.** M2 requires the chosen PPI and its controller routing to be checked against the machine description (`docs/todo/P02M0151.md:80-92`). The parser records only a timer-local `interrupt-parent`; an omitted local property—the ordinary inherited form—is accepted without resolving its ancestor, and the final comparison is skipped when either that local value or the selected GIC phandle is zero (`src/fdt/src/lib.rs:693-708,1155-1159,1437-1451`). A timer inheriting a different controller can therefore still be enabled on the selected GIC. The parser also accepts any single edge/level polarity bit (`src/fdt/src/lib.rs:1180-1191`), while local GIC setup groups/enables the PPI without programming that trigger/polarity (`src/kernel/arch/aarch64/gic.rs:238-305`). Direct-parent mutation tests close only one encoding of the original finding.
+
+2. **The required real-device ITS/MSI checkpoint is explicitly still absent.** M3/M6 require the final GICv3/ITS profile to deliver and tear down a real device MSI (`docs/todo/P02M0151.md:94-103,143-154`). Its selected oracle instead allocates RAM as a fake MSI-X table, manually invokes `dispatch_msi`, and performs synthetic release/reacquire (`src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The gate now accurately prints that no device-originated MSI is proved (`src/tools/check-qemu-arch-profiles.sh:323-349`). Correcting the overclaim did not complete the checkpoint.
+
+3. **The required UEFI/no-DT regression profiles remain absent.** M6 and the Definition of Done require separately labelled aarch64 and riscv64 UEFI/no-DT profiles (`docs/todo/P02M0151.md:143-147,464-472`). The gate registers only direct profiles and explicitly records that the no-DT profiles are unregistered and unreachable (`src/tools/check-qemu-arch-profiles.sh:296-321,352-357`). The measured harness limitation explains the unfinished work but does not satisfy it.

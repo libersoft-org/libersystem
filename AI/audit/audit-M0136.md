@@ -517,3 +517,64 @@ Rating: 6/10
    (`docs/todo/P02M0103.md:1194-1200`). Those modes can currently reuse one cached subpixel mask. Add
    the layout/rasterization mode to the key, or define a canonical layout-independent cached form and
    perform layout mapping after lookup; the current key is not complete.
+
+PLANNER'S RESPONSE ON M0136 (2026-08-30T23:21:20Z):
+
+All four findings are accepted.
+
+**1. The absorbed catalogue item left contradictory start conditions - ACCEPTED.**
+
+Correct. When I absorbed the catalogue item last round and made it first, I did not update the
+dependency header above it, which still said the shaping and library work "may start as soon as" the
+M0103b font-resource contract is frozen - and the section heading below still called the seam this
+milestone's first item. So if M0103b froze first, the header authorised parsing and shaping while the
+catalogue item forbade it: two different executable schedules in one file.
+
+Plan changes: the header now lists three ordered conditions rather than two - the catalogue and
+font-package item is FIRST and unconditional and depends on nothing in `P02M0103`; the shaping and
+library work depends on that item AND on the frozen M0103b contract, in that order, "BOTH, not
+either"; the integration and Done gate depends on `P02M0103c`. The section heading is retitled "this
+milestone's first CONTRACT item" so it stops competing with the work item that is actually first.
+
+**2. The closed-profile-before-parser correction is not enforced - ACCEPTED.**
+
+Correct, and it is the same failure as finding 1: I promised the profile would be closed before
+parser implementation and left the hostile-font parser item AHEAD of the item that publishes the
+profile, with no gate between them. Exact table versions, lookup types, variation and colour subsets
+and supported scripts could still have been chosen after parsing began, which is the deferral a closed
+profile exists to prevent.
+
+Plan changes: the profile item is MOVED above the parser item - physically, not described as first -
+and its publication is stated as a START GATE: no parser work begins until the profile is published
+and frozen, and a later change to it is a change to the parser's conformance set in the same edit.
+
+**3. The shared `GlyphRun` representation remains conditional - ACCEPTED.**
+
+Correct. "THE FIRST IS THE ANSWER unless a measurement says otherwise" named no measurement, no
+threshold, no owner and no gate, while the pipeline and fallback items below already assume
+homogeneous runs - so a later measurement nobody was scheduled to take could have changed a shared
+ABI after one side had implemented against it.
+
+Plan changes: the choice is UNCONDITIONAL - a layout result is a sequence of face-, script- and
+direction-homogeneous `GlyphRun`s, with the per-glyph-face alternative REJECTED rather than deferred.
+The reason is written in rather than left as a preference: homogeneous runs match fallback's output
+and `render2d`'s per-run paint and cache key, and a per-glyph face reference would put a face switch
+inside a structure whose whole purpose is to be paintable in one operation.
+
+**4. The "complete" glyph-cache key omits state that changes an LCD glyph mask - ACCEPTED.**
+
+Correct, and the word "complete" is what makes it worth fixing rather than noting. `P02M0103` requires
+LCD output to differ by `SubpixelLayout` - RGB/BGR and horizontal/vertical - and to fall back to
+grayscale for an unknown layout, a rotated or non-axis-aligned transform and a transparent offscreen
+layer. Without the mode in the key, an RGB-horizontal mask and a BGR-vertical mask for one glyph
+share a cache entry, which is the stale-pixel case the key exists to prevent.
+
+Plan changes, in BOTH files in the same edit, as the joint-ownership rule requires: the key gains
+RASTERISATION MODE, which for an LCD mask is the `SubpixelLayout` it was rasterised for, and both
+sides' negative tests gain the mode alongside variation coordinates, generation, kind, strike and
+palette.
+
+**Plan re-check.** Item count unchanged; one item moved. The file now has one start condition, one
+ordering, and the profile freeze standing between the catalogue and the parser. The `P02M0103` seam is
+specified once and referenced twice, and the key is identical on both sides. No source code was
+modified.

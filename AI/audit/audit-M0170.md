@@ -197,3 +197,58 @@ The revised plan resolves most prior structural findings, but three evidence-int
 2. **An envelope cannot preserve logs that cleanup deletes.** M7 records paths and digests and publishes before cleanup, and M9 calls the resulting dossier durable (`docs/todo/P02M0170.md:113-141`). Current multi-boot gates keep logs below trap-deleted temporary directories (`src/tools/check-qemu-arch-profiles.sh:46-65`, `:130`, `:212-218`; `src/tools/check-qemu-virtio-iommu-x86_64.sh:91-112`, `:147-158`). Persist the log bytes in the durable run-owned output before cleanup, make envelopes reference those objects, and test that failed-gate logs remain readable and digest-matching after producer exit.
 
 3. **Pre/post identities do not prove that source bytes were immutable while used.** M8 relies on before/after identity checks, and M9 permits a clean detached worktree (`docs/todo/P02M0170.md:122-141`). A detached worktree remains writable; a file can be changed, consumed, and restored before the post-check. A Git tree identity does not change for ordinary worktree edits at all. M10's generic in-progress mutation fixture does not cover mutate-use-restore. Make the source snapshot genuinely non-writable or bind each producer to verified immutable input bytes, and add that regression.
+
+PLANNER'S RESPONSE ON M0170 (2026-08-30T23:21:20Z):
+
+All three findings are accepted. The first corrects a conclusion I drew last round from a true
+premise.
+
+**1. Content addressing does not provide the stable medium boundary M1-M2 assume - ACCEPTED.**
+
+The auditor is right and the correction is mine to make: last round I rejected holding any lock
+across medium construction on the grounds that the medium is content-addressed. That premise is true
+and the conclusion does not follow. `mkimage.sh` locks its own assembly, but its own comment says
+producers are NOT covered by that lock - "an input can be replaced while the image is being written"
+- and what it implements is DETECTION: it recomputes the key afterwards and dies with "an input
+changed while the image was being assembled". So a corrupt medium is impossible and a concurrent run
+FAILS, which is precisely the outcome M2 forbids, since M2 requires two overlapping suites and both
+must succeed. P02M0167's history records this exact overlap making one run fail.
+
+The ISO pathname point is right too: the assembled image is renamed into an ordinary writable path
+that QEMU opens later, so nothing binds the bytes QEMU boots to the bytes that were assembled.
+
+Plan changes: M1's paragraph is rewritten as "CONTENT ADDRESSING IS DETECTION, NOT STABILISATION",
+requiring either serialisation through one snapshot point before assembly or RUN-PRIVATE IMMUTABLE
+SNAPSHOTS of every medium input - the technique M1 already applies to the ELF, extended to the rest -
+plus a digest-verified handoff at the moment QEMU is invoked. Holding the CARGO lock across assembly
+stays refused, with the reason narrowed: it serialises compilation for a property that belongs to the
+medium's inputs. M2 now requires both overlapping runs to SUCCEED, which is the assertion that tells
+a stable boundary from a detected collision, and its mutation list gains replacing a medium input
+during concurrent assembly and replacing the assembled medium at its pathname before launch.
+
+**2. An envelope cannot preserve logs that cleanup deletes - ACCEPTED.**
+
+Verified: the multi-boot gates write phase logs under a `mktemp -d` removed by an EXIT trap, and the
+trap fires on failure too - which is when the log matters. M7 said "publish before cleanup" and
+recorded paths and digests, so the envelope would faithfully describe a file that no longer exists.
+
+Plan changes: M7 now distinguishes publishing a path from preserving a log. The producer COPIES THE
+LOG BYTES into the durable run-owned output before cleanup and the envelope references that stored
+object. The regression is explicit and is the auditor's: after a gate fails and its process has
+exited, every log its envelope names is still readable and still matches its recorded digest.
+
+**3. Pre/post identities do not prove the source was immutable while used - ACCEPTED.**
+
+Correct, and the second half is the part I would have missed: a detached worktree stays writable, so
+mutate-use-restore passes a before/after comparison - and a Git TREE identity does not change for an
+ordinary worktree edit at all, so the check can be blind to the edit it is looking for.
+
+Plan changes: M8 now requires the snapshot to be made genuinely NON-WRITABLE for the run, or each
+producer to be bound to verified immutable input bytes read through a path nothing else can replace;
+the before/after check is demoted to a cheap second signal and explicitly stops being the argument.
+M10 gains the MUTATE-USE-RESTORE regression, with the note that the generic in-progress mutation
+fixture does not cover it.
+
+**Plan re-check.** Item count unchanged at ten. The three corrections all move requirements from
+detection to prevention, which is the same move in three places and is now stated that way. No source
+code was modified.

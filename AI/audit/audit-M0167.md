@@ -517,3 +517,11 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0167 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 8/10
+
+1. **The selection-specific medium remains outside the build/staging lock, leaving the exact same-architecture race M3 requires closed.** `test-kernel.sh` locks only the Cargo build and per-run kernel copy, releases the lock, and later invokes `qemu-run.sh` (`src/harness/test-kernel.sh:303-365,367-393`). x86 assembles its test ISO after that boundary (`src/harness/qemu-run.sh:925-952`) under `mkimage`'s separate image lock; `mkimage` itself states its producers are not covered and refuses if an input changes during assembly (`src/harness/mkimage.sh:669-726`). The latest addendum measured the required two-selection concurrency case failing at exactly this point and explicitly leaves it undone. M3 requires the kernel and medium to be produced and staged as one immutable prerequisite, and the Definition of Done requires concurrent different-selection/different-tag suites to pass (`docs/todo/P02M0167.md:290-315,658-673`).

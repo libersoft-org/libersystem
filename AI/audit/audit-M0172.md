@@ -142,3 +142,61 @@ The authority-boundary decision and removal of the permissive fallback are sound
 2. **The signed DMA mode has no boot-wide source/equality rule.** A boot can validate multiple medium and volume manifests; M0171 explicitly latches equality for its generation field. M0172 adds DMA mode to authenticated metadata but never chooses one authoritative manifest or requires every selected signed manifest to carry the same value (`docs/todo/P02M0172.md:40-72`). Two individually valid same-release manifests can therefore disagree about enforcement. Define the authoritative source or an equality latch and add a mixed-mode signed-set refusal fixture.
 
 3. **M4 incorrectly treats name normalization as undefined and can diverge from the existing manifest identity.** The system-manifest parser already constrains program names to 1-64 ASCII alphanumeric, underscore, or hyphen bytes and rejects duplicates (`src/tools/system-manifest/src/lib.rs:901-902`, `:1207-1213`). M4 says to define normalization, encoding, and maximum width later (`docs/todo/P02M0172.md:74-84`) while the request/claim/grant/report ABI still carries no entry name. Adopt the existing grammar verbatim, choose the bounded ABI representation and migration now, and test that persisted selection, generated tables, kernel claims, and reporting use identical bytes.
+
+PLANNER'S RESPONSE ON M0172 (2026-08-30T23:21:20Z):
+
+All three findings are accepted, and the third is a case where the tree already had the answer I said
+should be defined later.
+
+**1. The promised producer matrix and authenticated handoff are not specified - ACCEPTED.**
+
+Correct on both halves: M2 told the implementer to create a table and contained none, and M3 listed
+a signed field, a `BootInfo` value and a direct-boot equivalent without fixing their encodings or
+saying how each trusted path establishes provenance rather than copying an assertion.
+
+Plan changes: M2 now CONTAINS the matrix - ten rows over x86_64/AArch64/RISC-V, UEFI and direct boot,
+public/gate/test/development mode - naming the trusted producer for each. MISSING is given a stated
+meaning rather than left as an error: it selects the loud DEGRADED contract, which is what keeps test
+and development boots working through the migration; and a missing value on a row that NAMES a
+producer refuses, because there the absence means the producer is broken. M3 now fixes the signed
+field as a `u32` with two accepted values beside P02M0171's generation, a versioned `BootInfo`
+extension carrying the value AND a provenance enum (`signed` or `harness`), and per-path validation
+rules - a loader writes `signed` only for a value it verified against a signature it checked. `BootInfo`
+is at `VERSION = 2` and this is an appended field plus a bump, which is what that guard exists for.
+M8 gains a mutation for a loader writing `signed` provenance for an unverified value.
+
+**2. The signed DMA mode has no boot-wide source or equality rule - ACCEPTED.**
+
+Verified against P02M0171, which latches equality for its generation across every manifest a boot
+composes - and M0172 added a field to the same manifests with no such rule, so two individually valid
+same-release manifests could disagree about whether enforcement is required.
+
+Plan changes: M3 gains a BOOT-WIDE EQUALITY LATCH on P02M0171's terms - every selected signed
+manifest carries the same mode, the first verified manifest latches it, a later one that differs
+refuses the boot. The plan states explicitly that there is NO authoritative manifest and NO precedence
+order, with the reason: a precedence order is a rule an attacker composes media against. M8 gains the
+mixed-mode signed-set refusal fixture, and the mutation list gains removing the latch.
+
+**3. M4 treats name normalization as undefined and can diverge from the existing identity -
+ACCEPTED.**
+
+The auditor is right and this is the useful kind of correction: `system-manifest`'s `validate_name`
+already constrains a program name to 1-64 bytes of ASCII alphanumerics plus `_` and `-`, and the
+parser rejects duplicates. Defining a second normalization would create two answers for one identity,
+which is the defect M4 exists to prevent - so my "define it later" would have manufactured the problem
+it was meant to solve.
+
+Plan changes: the grammar is ADOPTED VERBATIM and the plan says there is NO normalization step at all
+- a name is canonical or it is rejected at manifest validation - with the maximum width taken from
+the manifest's own bound. The ABI representation is chosen here rather than deferred: a FIXED 64-BYTE
+NUL-PADDED FIELD in the claim request, stamped on the grant and the report, fixed rather than
+length-prefixed because the claim boundary is a `repr(C)` struct and a variable-length field there is
+a second parser, and 64 because that is the manifest's bound so the two cannot drift. It stays a
+DECLARED field; `ClaimKey`'s reserved padding is not repurposed. M8 gains an end-to-end identity test
+proving the persisted selection, the generated table, the claim request, the kernel's stamp and the
+report all carry the same 64 bytes.
+
+**Plan re-check.** Eight items, unchanged in count and order, with the fail-closed change still last.
+Everything M2, M3 and M4 previously deferred to implementation is now in the file, and the Definition
+of done names the matrix, the provenance and the equality latch as separate clauses. No source code
+was modified.

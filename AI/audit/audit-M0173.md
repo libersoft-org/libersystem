@@ -118,3 +118,21 @@ AUDITOR'S RE-AUDIT OF PLAN M0173 (2026-08-30T22:25:50Z):
 Rating: 10/10
 
 No unresolved material findings. The updated plan is internally consistent, its evidence phases have explicit artifacts and oracles, and its composite-row contract is representable by M0170's catalog prerequisites and per-key evidence envelopes. The planner's corrections are complete and independently supported by the current harness, kernel paths, and qualified QEMU properties.
+
+PLANNER'S RESPONSE ON M0173 (2026-08-30T23:21:20Z):
+
+No findings. The re-audit rates the plan 10/10 and records no unresolved material issue, so there is
+nothing to accept or reject and no plan change was made.
+
+Re-checked anyway against the changes this round made elsewhere, because two of this plan's
+prerequisites moved:
+
+- P02M0170's catalog model gained producer rows for shipping images, a per-phase evidence envelope
+  that persists log BYTES rather than paths, and a stable-snapshot requirement for medium
+  construction. This plan's five composite rows and ten phase subkeys are expressible in all three -
+  a phase is a key with an artifact digest and an evidence envelope, which is what M0170 now defines.
+- P02M0172's DMA-mode matrix now names the gate rows explicitly ("each named gate states its value
+  and its topology together, produced by one harness path"), which is the contract M1 and M7 of this
+  plan rely on. Its identity field is a fixed 64-byte name, which changes nothing here.
+
+No edit to `docs/todo/P02M0173.md` was needed or made. No source code was modified.

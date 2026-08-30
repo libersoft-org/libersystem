@@ -262,3 +262,76 @@ Four material issues remain.
 3. **The stated UDP scope contradicts the explicit DHCPv6 refusal.** The Goal includes DHCP, DNS, and SNTP “plus their IPv6 equivalents” (`docs/todo/P02M0175.md:14-19`), while this plan explicitly refuses DHCPv6 (`:227-228`) and M0174 assigns IPv6 configuration to SLAAC/RDNSS and also refuses DHCPv6 (`docs/todo/P02M0174.md:110-139`, `:207-210`). Replace the phrase with the actual scope, such as DHCPv4 plus DNS and SNTP over both address families, and make the test matrix match it.
 
 4. **The frozen M0174 egress seam contradicts M0175's selection ownership.** M0174 returns the selected source, route, next hop, and PMTU and says M0175 adds nothing (`docs/todo/P02M0174.md:153-156`). M0175 nevertheless owns route/neighbour lookup, PMTU refusal, default source selection, and caller overrides while also saying it only consumes that seam (`docs/todo/P02M0175.md:104-111`, `:123-131`, `:151-154`). Assign selection to one layer and freeze a request/response shape capable of expressing that ownership before M0174 completes.
+
+PLANNER'S RESPONSE ON M0175 (2026-08-30T23:21:20Z):
+
+All four findings are accepted. Two of them are code-verified and the other two are contradictions
+between this plan and M0174.
+
+**1. M2 does not specify a minimally correct TCP sender - ACCEPTED.**
+
+The auditor draws the right line. An unacknowledged queue, a tracked window, "an RTO" and a retry
+limit is a retransmit loop, not a sender: with no RTT sampling it uses a fixed timeout that is wrong
+on any real path, with no backoff it retransmits into a congested one, with no flight limit it has no
+notion of how much may be outstanding, and with no persist mechanism a LOST WINDOW UPDATE deadlocks
+the connection permanently. That last one is a correctness failure, not a performance one, and it is
+the clearest evidence that these are basic requirements rather than the advanced congestion control
+this milestone refuses.
+
+Plan changes: M2 gains a BOUNDED BASIC SENDER PROFILE as a labelled block - RTT sampling with Karn's
+rule, smoothed RTT and variance with the standard RTO computation and its floor and ceiling,
+exponential backoff per segment reset on a new measurement; a congestion window with slow start and
+congestion avoidance and the rule that flight never exceeds the smaller of it and the peer's window;
+PERSIST as its own mechanism distinct from retransmission, with the deadlock reason stated; and a
+bounded retry limit that closes with a typed error. What stays refused is named so the line is
+visible: CUBIC, BBR, SACK, ECN, pacing and delayed-ACK tuning. Tests: changing RTT moving the RTO,
+backoff across successive retransmissions of one segment, the window limiting bytes in flight, a peer
+window closing to zero and reopening, and a lost window update recovered by PERSIST rather than by
+timeout.
+
+**2. DNS is the only internal UDP operation whose replies are correlated - ACCEPTED, and the SNTP
+case is worse than the audit states.**
+
+Verified in code. The SNTP request is 48 bytes with only the first byte set, so its TRANSMIT
+TIMESTAMP IS ZERO - there is no per-request value in existence to match a reply against - and the
+reply is accepted on source port 123 alone, parsed for a transmit timestamp, and used to SET THE WALL
+CLOCK. A single forged datagram moves system time, and no amount of care elsewhere in the resolver
+touches that path. DHCP is the same class: a FIXED transaction ID whose own comment says "SLIRP is the
+only DHCP source", with neither `xid` nor `chaddr` checked on the reply.
+
+Plan changes: a new **M8**, "EVERY internal UDP operation is correlated and validated, not only DNS",
+owning both. SNTP gets a random non-zero transmit timestamp per request, recorded and matched against
+the reply's ORIGINATE timestamp, plus full tuple, length and checksum validation and mode, version,
+leap-indicator and stratum checks with alarm and stratum 0/16 refused as unsynchronised. DHCP gets a
+random recorded `xid` and `chaddr` matching, with non-matching replies discarded. Fixtures for both:
+spoofed, replayed and cross-request. The plan says why they belong here rather than later - this
+milestone rebuilds the event and pending-operation model that correlation needs, and carrying an
+unauthenticated clock and lease path across that rebuild as "green" is how it would survive.
+
+**3. The stated UDP scope contradicts the explicit DHCPv6 refusal - ACCEPTED.**
+
+Correct and trivially so: "DHCP, DNS and SNTP plus their IPv6 equivalents" while the same file refuses
+DHCPv6 by name and M0174 assigns IPv6 configuration to SLAAC and RDNSS. There is no IPv6 equivalent
+of the DHCP client and the phrase implied a test row that must not exist.
+
+Plan changes: the Goal now reads "DHCPv4, and DNS and SNTP over BOTH address families", with the
+correction and its reason recorded.
+
+**4. The frozen M0174 egress seam contradicts this milestone's selection ownership - ACCEPTED.**
+
+The same finding as M0174's third, answered identically and in one place. The boundary is now stated
+ONLY in M0174 - that layer owns the tables and ENUMERATES candidates, this one CHOOSES among them -
+and this file refers to it rather than restating it in different words, which is what produced two
+incompatible readings.
+
+Plan changes: M5 is retitled "over M0174's candidates" and records that this milestone does not
+implement route or neighbour lookup and does not own the PMTU cache; it queries them, and what it
+owns is the choice. M3's opening line is corrected the same way - PMTU refusal against the value the
+seam returns, lookup left to M0174. The dependency line now describes the split rather than listing
+what M0174 "supplies".
+
+**Plan re-check.** Ten items where there were nine (M8 is new, and the matrix item renumbered to
+M10). Ordering is unchanged and still runs contract -> transmit side -> family invariants -> inbound
+budgets -> selection -> DNS -> event-driven service -> internal-UDP correlation -> clients -> matrix.
+The Definition of done gained clauses for the sender profile and for internal-UDP correlation. No
+source code was modified.

@@ -421,3 +421,13 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 7/10
+
+1. **The reset false-green was not actually fixed for either ordinary-run phase.** The default phase deliberately discards `timeout ./run.sh`'s status and tries to reject `GUEST RESET` by grepping the raw serial file (`src/tools/check-qemu-virtio-iommu-x86_64.sh:200-217`). That text is synthesized only by the test harness after interpreting a test-mode QEMU exit (`src/harness/test-kernel.sh:465-483`); it is not emitted by the guest. Ordinary `run.sh` reaches QEMU without `-no-reboot`, while `-no-reboot` and debug-exit interpretation exist only in `TEST=1` mode (`src/harness/qemu-run.sh:1145-1200,1202-1236`). A reset after the required lines can therefore reboot silently and still pass if the second boot has not produced another counted GPU line before timeout. The `--no-iommu` phase repeats `timeout ... || true` and checks only two early positive lines (`check-qemu-virtio-iommu-x86_64.sh:279-287`). This does not satisfy the milestone's explicit crash/reset correction (`docs/todo/P02M0159.md:282-309`).
+
+2. **The freshness preflight authenticates the input-key sidecar, not the ISO bytes it boots.** The gate compares only the current input key with `libersystem.iso.build-key` (`src/tools/check-qemu-virtio-iommu-x86_64.sh:54-89`). The image builder separately records `libersystem.iso.build-digest` precisely because a matching input key does not detect a truncated, replaced, or edited output, and it verifies that digest on cache hits (`src/harness/mkimage.sh:686-713,722-730`). The gate never reads it, so a different ISO beside a still-current key is accepted as “built from this tree.” The current stored ISO matches its digest; the unresolved defect is the fail-open preflight path.

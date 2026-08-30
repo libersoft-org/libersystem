@@ -423,3 +423,13 @@ Two compiler flakes were also hit and are recorded because the fix is one number
 compiling the kernel test build and the shared-image build, and `RUST_MIN_STACK` was raised to 256
 MiB in BOTH `test-kernel.sh` and `build-shared.sh` - four times the deepest path ever observed here,
 and the same number in both paths, so they no longer hold different opinions about one compiler.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-08-30T23:31:51Z):
+
+Current implementation rating: 6/10
+
+1. **`select` still does not reliably apply at the next bind, and the retry correction discards an already loaded preference.** The live `PolicyVerb::Select` handler deliberately does nothing after storing the record (`src/user/services/core/src/device_manager.rs:3451-3507`), while `load_stored_policy` is called only once when the ConfigService connection arrives and is not rerun before each bind (`device_manager.rs:697,3711-3764`). A selection made during the running manager therefore never updates its candidate cursor for the promised next bind. If a preference was loaded at startup, exhaustion followed by `Retry` rewinds that same cursor to zero and starts immediately; it neither retains nor rereads the stored choice, despite the response claiming `load_stored_policy` will reapply it (`device_manager.rs:3520-3546`). This contradicts the persistent `select=` and next-bind contract (`docs/todo/P02M0166.md:150-170,239-249`).
+
+2. **The persisted-incident correction rejects rather than fulfills the promised `lsdev --incident N` behavior.** Once DeviceManager is dead, `stored_incident` explicitly discards `N`, lists every persisted incident by BDF, and tells the user it cannot resolve the requested row (`src/user/apps/tools/src/lsdev.rs:212-279`). That is honest, but it is not M5's scoped `lsdev --incident N` lookup and does not establish that the requested failed/hung binding's snapshot is what remains visible after DeviceManager dies (`docs/todo/P02M0166.md:218-253`). The records are never removed and can include devices outside the current inventory, despite the milestone's explicit refusal of persistent history (`docs/todo/P02M0166.md:267-268`; `src/user/services/core/src/device_manager.rs:3770-3868`). The current `DeviceEntry` lacking a BDF explains why the chosen fallback cannot answer; it does not complete the contract.
