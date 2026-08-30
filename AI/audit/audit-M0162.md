@@ -311,3 +311,48 @@ AUDITOR'S RE-AUDIT ON M0162 (2026-08-29T23:02:31Z):
 Current implementation rating: 7/10
 
 1. **Normal claim teardown still blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` invokes `Closes::release` inline (`src/user/libs/driver/binding/src/lib.rs:618-663`), and the production implementation immediately calls `device_release` (`src/user/services/core/src/device_manager.rs:1595-1631`). `Claim::release` then runs the complete `device::release_claim` operation synchronously before settling (`src/kernel/object/claim.rs:82-96`, `src/kernel/device.rs:457-498`), including an IOMMU request that can poll for 10,000,000 iterations (`src/kernel/iommu/virtqueue.rs:152-187`). Thus the retained waitable claim is normally closed with a terminal result only after the expensive work has already occupied the manager; it produces a later `ClaimSettled` event only when another caller was already performing the release. This still violates M4's short, non-blocking transition requirement and its requirement that release start teardown whose `Free` result arrives as an event (`docs/todo/P02M0162.md:163-186`), so one slow device can prevent unrelated nodes from being supervised.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-08-30T01:52:00Z):
+
+**Finding 1 - the normal teardown runs the device release synchronously inside DeviceManager's sole
+event loop: ACCEPTED as an analysis, fixed in the half that can be fixed here, and the other half
+REJECTED for this milestone with the reason stated.**
+
+*What is true.* The call chain is exactly as reported: `Holdings::begin_teardown` calls
+`Closes::release` inline, `Syscalls::release` enters `device_release`, and `Claim::release` does not
+return until the kernel's `release_claim` does - including an IOMMU request that polls. The retained
+waitable claim handle is therefore bypassed on the normal path: the manager receives the terminal
+state directly and closes the handle, and waits for `ClaimSettled` only when another caller was
+already releasing. The host tests do not disprove it, for the reason given - their `Closes` records a
+release rather than executing the kernel path.
+
+*What was fixed.* The harm the finding names is that a slow or non-responsive device stalls
+supervision of every unrelated node, and the size of that stall was the boot-time poll budget: ten
+million spins, chosen so an emulated device answering in microseconds is never cut off. That number
+is right for a boot and wrong for a teardown, which runs inside the manager's loop. `detach_for` now
+lowers the budget to `TEARDOWN_SPINS` around the detach and restores it afterwards, so a controller
+that has stopped answering holds the control plane for milliseconds rather than for the boot's
+budget. A shorter wait can only make the release MORE conservative: an expiry is `Unconfirmed`, the
+detach is not confirmed, and the claim is quarantined with its frames and vectors held out of
+circulation.
+
+*What was not, and why.* Making release genuinely asynchronous - latch, schedule, settle the claim
+from somewhere else - needs something to do the work after the syscall returns, and this kernel has
+no production kernel-thread facility to put it on: `sched::spawn` and `spawn_on` are `#[cfg(test)]`,
+and every long-lived kernel activity in this tree is either an interrupt handler or the scheduler's
+own loop. Introducing a kernel worker for device teardown is a design decision with its own lock
+ordering, its own interaction with process death, and its own failure modes; it is a milestone, not
+an edit inside this one. Doing it badly here would be worse than the bounded blocking, because the
+teardown is the path that must not go wrong.
+
+Recorded as the open item it is: M4's "release starts teardown and `Free` arrives as an event" is not
+true on the normal path, and what stands between the current shape and it is a kernel worker.
+
+**One interaction worth recording**, because it runs the other way: the M0098 work in this same pass
+made the forced release MORE thorough - every interrupt derived from the claim is now unbound inside
+`release_claim` rather than whenever its last reference happens to go, and the terminal state folds in
+whether that confirmed. That is more work on the synchronous path, not less. It is also the work that
+makes a release actually release, so the two findings pull in opposite directions and the ordering
+matters: the release has to be correct before it can be made asynchronous.

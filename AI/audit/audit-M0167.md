@@ -319,3 +319,76 @@ Current implementation rating: 6/10
 1. **Known functional component oracles still are not selectable from the components they protect.** The census gate accepts any nonempty exception reason (`src/tools/check-component-oracles.sh:32-57`), and `component-oracle-exceptions.txt` records fourteen drivers/services whose real oracle cannot be expressed because the reach model omits the manifest boot chain (`src/tools/component-oracle-exceptions.txt:17-43`). On the current tree, `./verify.sh --for src/user/drivers/core/src/virtio_blk.rs --plan` selects nine builds and only `guest.boot-smoke` (10 of 1244 runnable keys), omitting the file-through-storage oracle the exception file identifies. M2 and the Definition of Done require a driver change to select a runtime assertion that fails when that driver breaks, not merely record why the planner cannot select it (`docs/todo/P02M0167.md:243-285,628-634`).
 
 2. **Same-architecture build/run isolation remains incomplete.** `test-kernel.sh` still compiles the selection-dependent `TEST_SELECTION` and `TEST_TAGS` directly into the shared Cargo target and immediately runs the resulting artifact, with no build lock or immutable per-run staging boundary (`src/harness/test-kernel.sh:278-292`). The fixture builder also still publishes keyed FAT/ISO/UDF candidates by renaming them onto fixed `fat-media${suffix}.img`, `iso-media${suffix}.iso`, and `udf-media${suffix}.udf` final paths (`src/harness/qemu-run.sh:235-247,330-382`), allowing a different generation to replace the path between preparation and guest open; x86 test guests still write the fixed `virtio-console-test.out` capture (`qemu-run.sh:883-895,1068-1073`). This leaves the precise cross-selection and cross-generation collisions M3 requires to eliminate, despite other per-run disk/socket fixes, and misses the immutable selection-specific artifact, content-addressed fixture, and no-shared-writable-file requirements (`docs/todo/P02M0167.md:290-339,640-642,658-680`).
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-08-30T01:52:00Z):
+
+**Finding 1 - known oracles recorded as exceptions instead of being selected: ACCEPTED and fixed, and
+the exception file's own diagnosis was the fix.** It said what was needed - "the reach relation to
+include the boot chain, a declared edge from what the manifest stages to what boots it" - and left it
+as somebody else's work. It is done.
+
+- `Model` keeps the staged set it was already computing and throwing away, and
+  `kerneltests::unreachable_covers` seeds reach with it. A kernel test runs inside a BOOTED GUEST:
+  DeviceManager binds the staged drivers and ServiceManager starts the staged services before any
+  test body runs, so a test asserting a driver's effect reaches that driver through the boot rather
+  than by launching it. Reach computed from launches alone refused fifteen declarations that were
+  true about failure.
+- The converse is still not inferred, which is the asymmetry the function's own comment defends:
+  being on the machine is not coverage, the author's `covers` is still the claim, and this only stops
+  the model from calling a true claim impossible.
+- All fifteen tests now carry their `bin.<component>` declaration, and the exception file keeps only
+  the real list - the components with no oracle at all, and the two whose oracle is on a guest this
+  census cannot see.
+
+**The demonstrations, through the real planner:**
+
+    ./verify.sh --for src/user/drivers/core/src/virtio_blk.rs --plan
+      kernel.services.kernel_reads_file_through_storage_service / x86_64 / test-guest / test
+
+    ./verify.sh --for src/user/services/core/src/config_service.rs --plan
+      kernel.services.config_service_serves_the_tree / x86_64 / test-guest / test
+
+Both used to select nine builds and `guest.boot-smoke`. A new host test -
+`the_boot_chain_is_part_of_what_a_kernel_test_reaches` - pins both directions: with nothing staged
+the declaration is unreachable, and with the tree's own staged set it is reachable.
+
+**Finding 2 - run isolation: ACCEPTED, and fixed in the three places named.**
+
+- **Content-addressed fixtures.** The key was already content-derived and was written BESIDE a fixed
+  name, so two runs whose fixtures differ wrote and read one path. The key is in the NAME now -
+  `fat-media${suffix}.<key>.img` and the same for ISO and UDF - so two generations coexist and a run
+  reads only its own. `media_sweep` removes old generations, skipping any file a live guest has open
+  (`fuser`) and anything younger than twelve hours, which is the safe direction for a sweep.
+- **The shared console capture.** The x86 test guest wrote `virtio-console-test.out`, one name for
+  every guest of the architecture - a capture two guests write describes neither. It is per-run now,
+  with the same sweep the interactive path already used.
+- **The selection-specific compile.** `TEST_SELECTION` and `TEST_TAGS` are `option_env!`, so two
+  selections are two kernels built in the shared Cargo target with nothing holding a lock - which is
+  the failure this re-audit itself hit, an enumerated `.rcgu.o` gone before `nm` opened it. The BUILD
+  is now taken under `flock` on `.build/state/kernel-test-build.lock` and the guest run is not: a lock
+  around the whole `cargo test` would serialize the boots, which are most of the wall clock. The run
+  that follows finds everything up to date and compiles nothing.
+
+*What is NOT done, stated rather than implied:* the per-run immutable staged kernel. The selection's
+MEDIUM is already private - `mkimage.sh` names the test ISO by its content key - so what the lock
+closes is the compile that produces it. A per-run target directory would be the stronger form and
+costs a full rebuild per run; it is not what the observed failure needed.
+
+**Finding 3 - the NUMA gate is one catalogue key over three profiles: ACCEPTED and fixed.**
+`check-qemu-numa.sh` takes `--only x86_64|aarch64|riscv64`; `check.sh` registers
+`numa-profile-x86_64`, `numa-profile-aarch64` and `numa-profile-riscv64`; and `qemu-numa` joins
+`UMBRELLA_GATES`, so it stays runnable by name and is never selected - exactly the shape
+`qemu-arch-profiles` already had, for the same reason. The three profiles now have their own keys,
+their own commands and their own measured costs:
+
+    ./verify.sh --for src/kernel/mem/numa/mod.rs --plan
+      gate.numa-profile-aarch64 / host / host / default
+      gate.numa-profile-riscv64 / host / host / default
+      gate.numa-profile-x86_64 / host / host / default
+
+**Verification.** `cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline`: 109
+passed. `./check.sh --gate component-oracles`: all 26 staged drivers and services have an oracle
+naming them or a written reason. `./check.sh --gate test-tags`: 385 kernel tests. `./test.sh --arch
+x86_64 --tags smoke`: 7 passed, over the content-addressed fixtures and the new build lock.

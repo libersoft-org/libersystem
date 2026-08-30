@@ -369,3 +369,43 @@ AUDITOR'S RE-AUDIT ON M0164 (2026-08-29T23:02:31Z):
 Current implementation rating: 5/10
 
 1. **The provider catalogue is still not the discovery path used by production consumers.** No driver-provider consumer service calls `provider_catalogue::Client::subscribe`; the service-side catalogue clients only request the binding snapshot. DeviceManager continues to take catalogue handles into fixed `net_client`, `gpu_client`, `snd_client`, `input_client`, and USB locals and sends the corresponding `NET`/`GPU`/`SND`/`INPUT`/`USB` bootstrap handles to ServiceManager (`src/user/services/core/src/device_manager.rs:441-451,656-665,1078-1143`). Block discovery likewise remains a four-entry `BOOT_BLOCK_TAGS`/probe handoff, which ServiceManager routes as fixed `FATBLOCK`, `ISOBLOCK`, and `UDFBLOCK` roles (`src/user/services/core/src/device_manager.rs:82-85,431-475`; `src/user/services/core/src/service_manager/bootstrap.rs:398-458,575-700`). Additional published providers can be recorded, but a real service cannot discover them or arrive after boot and subscribe to the existing set. This remains contrary to the late-subscriber Definition of Done and the expressly scoped consumer-seam change (`docs/todo/P02M0164.md:304-320`).
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-08-30T01:52:00Z):
+
+**Finding 1 - the catalogue is not the discovery path any production consumer uses: ACCEPTED, and NOT
+FIXED in this pass. This is an open item, not a rejection.**
+
+The finding is correct in every particular and it is the milestone's own requirement: "Each service
+changes at one seam - where it used to receive a handle, it subscribes"
+(`docs/todo/P02M0164.md:314-317`). No consumer calls `provider_catalogue::Client::subscribe`; the two
+services that hold a catalogue connection ask only for the binding snapshot. The per-kind injection
+is intact.
+
+I started the smallest complete instance - AudioService, whose `SND` handle has one consumer and one
+oracle - and stopped when the shape of the change became clear, because a half-done seam is worse
+than an untouched one: a service that both receives a fixed handle and subscribes is exactly the
+state this finding already rejects. What it takes, end to end:
+
+1. `route_offers` must stop taking `AUDIO` into `snd_client`, so the provider stays in the catalogue
+   rather than being handed out - and with it the first offer's consumer count, which otherwise makes
+   the subscriber's `open` the SECOND ask against a kind that admits one;
+2. the `SND` slot must leave DeviceManager's bootstrap to ServiceManager, which is read
+   POSITIONALLY at every hop, so both sides move together;
+3. `bootstrap.rs`'s `audio_service`/`SND` role and the manifest role go with them;
+4. AudioService subscribes, holds the stream channel in its wait set, and calls `open` on a
+   `ProviderInfo` that arrives - which is also the late-subscriber and arrives-later case, since
+   `subscribe` answers with what is published now and continues as the stream;
+5. and ServiceManager's driver status view, which answers `driver.virtio_snd` from `snd_client != 0`,
+   needs another source - the comment beside it already says this is "the provider-routing item and
+   not this one", which is precisely this milestone.
+
+That is a boot-path change across four files plus a status surface. I am not making it in the same
+pass as ten other milestones' fixes and immediately before their verification run: if the sweep then
+failed I could not attribute it, and the failure mode of getting this wrong is a machine that does
+not boot.
+
+The manifest edit I had begun was reverted, so the tree carries no half-seam. What it carries is this
+record of exactly what the seam costs and why it was deferred - which is the state the DoD is in, and
+saying otherwise would be the thing this audit is about.
