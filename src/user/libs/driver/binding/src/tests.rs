@@ -541,6 +541,28 @@ fn a_crash_between_publish_and_subscribe_withdraws_what_was_published() {
 	// M7 asks after this race; the other half is the transaction, and comparing two identities said
 	// nothing about it.
 	assert_baseline_after_teardown(&mut attempt_that_reached(0x2000), "a crash between publish and subscribe");
+
+	// AND THE CATALOGUE DECISION IS DRIVEN, which "whatever the catalogue does next" was not.
+	//
+	// The sequence M7 names, in order: a driver publishes, its binding ends before any consumer has
+	// subscribed, the device is bound again, and a subscriber arrives. What must be reachable is the
+	// REPLACEMENT and nothing else - a subscriber that finds the first generation finds a provider
+	// whose server is gone, which is the failure nobody can attribute.
+	const KIND: u16 = 7;
+	let mut catalogue: Publications<4> = Publications::new();
+	assert!(catalogue.publish(published, KIND).is_some(), "the driver published before anyone asked");
+	assert_eq!(catalogue.reachable(KIND), Some(published), "and it is reachable while its binding is live");
+
+	assert_eq!(catalogue.withdraw_binding(published.binding), 1, "the binding's end withdraws what it published");
+	assert_eq!(catalogue.reachable(KIND), None, "so a consumer arriving now finds nothing, rather than a server that is gone");
+	assert_eq!(catalogue.live(), 0, "and the catalogue is empty, not merely unreachable");
+
+	assert!(catalogue.publish(after_rebind, KIND).is_some(), "the device is bound again and publishes");
+	assert_eq!(catalogue.reachable(KIND), Some(after_rebind), "and the subscriber reaches the REPLACEMENT");
+	// THE OLD GENERATION IS NOT REACHABLE BY ITS OWN IDENTITY EITHER. Withdrawing by the previous
+	// binding must not take the new one with it - same bus address, different generation.
+	assert_eq!(catalogue.withdraw_binding(published.binding), 0, "the previous binding has nothing left to withdraw");
+	assert_eq!(catalogue.reachable(KIND), Some(after_rebind), "and the replacement is untouched by it");
 }
 
 #[test]

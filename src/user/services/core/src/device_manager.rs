@@ -2043,7 +2043,10 @@ impl Provider {
 	// Whether this provider belongs to that binding - the same function AND the same generation,
 	// because a provider published by a binding that is over is not this binding's.
 	fn binding_is(&self, binding: BindingId) -> bool {
-		self.id.binding == binding
+		// THE SHARED RULE, not a second copy of it. `driver_binding::ProviderId::belongs_to` is what
+		// the host-testable `Publications` asks as well, so the withdrawal this catalogue performs
+		// and the one the race test drives are the same decision.
+		self.id.belongs_to(binding)
 	}
 }
 

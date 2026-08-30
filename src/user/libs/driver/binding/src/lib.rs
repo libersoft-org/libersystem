@@ -497,6 +497,74 @@ impl ProviderId {
 	pub const fn new(binding: BindingId, slot: u16, generation: u32) -> Self {
 		Self { binding, slot, generation }
 	}
+
+	// WHETHER THIS PUBLICATION BELONGS TO THAT BINDING - the same function AND the same generation.
+	//
+	// A provider published by a binding that is over is not this binding's, however identical the
+	// bus address is: `BindingId`'s equality carries the generation, which is what makes a rebind of
+	// one device distinguishable from the binding it replaced. The catalogue's withdrawal and the
+	// model below both ask this, so what is tested is what runs.
+	pub fn belongs_to(self, binding: BindingId) -> bool {
+		self.binding == binding
+	}
+}
+
+// WHAT A BINDING'S END TAKES WITH IT, AND WHAT A SUBSCRIBER MAY STILL REACH.
+//
+// The catalogue that answers subscribers lives in DeviceManager, holds channel handles and cannot be
+// built on a host - so the RACE M7 names, a driver that publishes and crashes before any consumer
+// subscribes, had no test that ran the decision at all. The named case compared two identities and
+// said "whatever the catalogue does next", which is the half that was missing.
+//
+// This is that decision with the handles taken out: which publications a binding's end withdraws,
+// and which generation a subscriber arriving afterwards reaches. It shares `belongs_to` with the
+// production withdrawal, so the rule is one rule; what it does not carry is the channel bookkeeping,
+// and that is stated rather than implied.
+pub struct Publications<const N: usize> {
+	slots: [Option<(ProviderId, u16)>; N],
+}
+
+impl<const N: usize> Default for Publications<N> {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
+impl<const N: usize> Publications<N> {
+	pub const fn new() -> Self {
+		Self { slots: [None; N] }
+	}
+
+	// Record a publication. `None` when there is no room, which a caller must treat as a refusal
+	// rather than as a publication nobody can find.
+	pub fn publish(&mut self, id: ProviderId, kind: u16) -> Option<usize> {
+		let at = self.slots.iter().position(Option::is_none)?;
+		self.slots[at] = Some((id, kind));
+		Some(at)
+	}
+
+	// EVERYTHING THAT BINDING PUBLISHED, GONE. Returns how many were withdrawn.
+	pub fn withdraw_binding(&mut self, binding: BindingId) -> usize {
+		let mut gone = 0;
+		for slot in self.slots.iter_mut() {
+			if slot.is_some_and(|(id, _)| id.belongs_to(binding)) {
+				*slot = None;
+				gone += 1;
+			}
+		}
+		gone
+	}
+
+	// What a subscriber asking for `kind` can reach. `None` is an answer: a consumer that arrives
+	// after the only publisher's binding ended must find nothing rather than a provider whose server
+	// is gone.
+	pub fn reachable(&self, kind: u16) -> Option<ProviderId> {
+		self.slots.iter().flatten().find(|(_, published)| *published == kind).map(|(id, _)| *id)
+	}
+
+	pub fn live(&self) -> usize {
+		self.slots.iter().flatten().count()
+	}
 }
 
 // ------------------------------------------------------- the incident window
