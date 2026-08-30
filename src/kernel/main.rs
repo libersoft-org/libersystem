@@ -933,6 +933,14 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		// So the boot is up, said as the weaker claim it is. The isolation report and the resident-
 		// manager watch belong to a machine that is running, and a shell that attaches after this
 		// point still works - `console_shell_loop` is what feeds it.
+		// THE ISOLATION REPORT IS NOT GATED ON THIS, AND MUST NOT BE. Reaching this line says the
+		// machine is up, not that DeviceManager has finished binding - so the summary that follows
+		// can be taken while a driver is still on its way to the bus. That is a real gap and it is
+		// closed where it lives, in `dma_policy`: a summary already printed retracts itself the
+		// moment a later device is admitted untranslated. Gating the return on a readiness message
+		// instead was tried twice and is wrong both ways round - it reboots a working machine whose
+		// console never attaches, and the only channel that could carry the message is a POSITIONAL
+		// handshake whose ninth reader does not exist.
 		if !process.is_terminated() && !crash_seen(crash_rx, koid) {
 			serial_println!("recovery: SystemManager (koid {}) is running, so the system is up without an attached shell", koid);
 			return true;

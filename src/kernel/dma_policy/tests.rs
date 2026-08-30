@@ -155,3 +155,53 @@ fn a_protected_driver_refuses_a_machine_whose_iommu_did_not_come_up() {
 	set_isolation_expected(was_expected);
 	set_enforcing(was_enforcing);
 }
+
+crate::tagged_test!(a_published_isolation_claim_retracts_itself_when_a_later_device_falsifies_it, [Dma, Kernel], id = "kernel.dma_policy.a_published_isolation_claim_retracts_itself_when_a_later_device_falsifies_it", covers = ["kernel"]);
+fn a_published_isolation_claim_retracts_itself_when_a_later_device_falsifies_it() {
+	// THE SUMMARY IS TAKEN AT A MOMENT SOMEBODY ELSE CHOOSES. `report` is called when the kernel's
+	// supervisor decides the system is up, and on a machine whose console never attaches that
+	// decision is made on a deadline rather than on a device count - so a driver can still be on its
+	// way to the bus when the strongest sentence this kernel prints about isolation goes out.
+	//
+	// Nothing else in the log would contradict it: admissions are recorded, not printed. So the
+	// question this test asks is what happens to a claim that was true when it was made and is not
+	// true a moment later.
+	forget_degraded_for_test();
+	let was = enforcing();
+	let was_expected = isolation_expected();
+	set_isolation_expected(false);
+
+	// BEFORE ANYTHING IS PUBLISHED THERE IS NOTHING TO RETRACT, and a machine that binds every one of
+	// its devices untranslated before the summary must not print a word of this - the summary itself
+	// is where those devices are named.
+	set_enforcing(false);
+	assert_eq!(admit(0x1041, 0, 3, 0), BindDecision::DegradedUntranslated);
+	assert_eq!(retractions_for_test(), 0, "an admission before the summary is what the summary is FOR");
+
+	// NOW THE CLAIM IS PUBLISHED, in the shape that matters: translating, nothing degraded, which is
+	// the line that says "dma: every bus-mastering device is translated".
+	forget_degraded_for_test();
+	set_enforcing(true);
+	assert!(degraded_devices().is_empty());
+	report();
+
+	// AND A DEVICE BINDS AFTERWARDS WITHOUT TRANSLATION. This is the boot the summary cannot describe:
+	// it was taken before this driver reached the bus.
+	set_enforcing(false);
+	assert_eq!(admit(0x1041, 0, 3, 0), BindDecision::DegradedUntranslated);
+	assert_eq!(retractions_for_test(), 1, "a claim that stopped being true says so at the moment it stops");
+
+	// ONCE PER DEVICE, LIKE THE RECORD ITSELF. A driver that opens its device repeatedly must not
+	// turn one fact into a flood - the deduplication that keeps the audit list readable keeps this
+	// line readable too.
+	assert_eq!(admit(0x1041, 0, 3, 0), BindDecision::DegradedUntranslated);
+	assert_eq!(retractions_for_test(), 1, "the same device again is the same fact");
+
+	// A DIFFERENT DEVICE IS A DIFFERENT FACT.
+	assert_eq!(admit(0x1050, 0, 4, 0), BindDecision::DegradedUntranslated);
+	assert_eq!(retractions_for_test(), 2);
+
+	forget_degraded_for_test();
+	set_isolation_expected(was_expected);
+	set_enforcing(was);
+}

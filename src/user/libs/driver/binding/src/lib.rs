@@ -89,6 +89,22 @@ impl BindingState {
 	// | `Backoff` | `Failed` | the absolute TIME budget expired |
 	// | `Failed` | `Binding` | an operator retry |
 	// | `Quarantined` | - | terminal for the boot |
+	// Whether a TERMINAL HANDSHAKE FRAME - `READY` or `FAILED` - may still be acted on.
+	//
+	// The handshake ends in exactly one of the two, and a second is refused. That rule lived at one
+	// of its two call sites and only by accident: `READY` was refused because `Online -> Online` is
+	// not an edge in the table above, while `FAILED` computed a failure cause and tore the binding
+	// down from wherever it was - so `READY` followed by `FAILED` on one generation dismantled a
+	// binding that had come up, which is the opposite of refusing a second terminal frame.
+	//
+	// `Binding` is the whole of it because `Binding -> Online` is the only edge into `Online`: a
+	// handshake that can still end is one that has not ended. A driver that dies AFTER coming up is
+	// a different fact with its own events - the channel closing, the watchdog going unanswered, the
+	// process exiting - and none of them is a frame the driver sent about its handshake.
+	pub fn accepts_terminal_frame(self) -> bool {
+		matches!(self, BindingState::Binding)
+	}
+
 	pub fn may_move_to(self, to: BindingState) -> bool {
 		matches!(
 			(self, to),

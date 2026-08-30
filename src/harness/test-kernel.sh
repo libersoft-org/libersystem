@@ -283,8 +283,14 @@ STALL_WATCHER=$!
 # in one crate graph - and the failure is a compiler stack overflow rather than anything in the code:
 # the same sources build without `--tests`.
 #
+# AND THE NUMBER IS THE ONE THE REST OF THE TREE ALREADY USES. 32 MiB was enough for the riscv64
+# build that prompted this and is MARGINAL: the same crash came back on aarch64 gicv3, from a run
+# that had passed this gate an hour earlier, which is what a stack sized just above the deepest path
+# looks like. `build-shared.sh` has settled on 64 MiB for every consumer it compiles; a second
+# opinion about the same compiler's stack, half the size, is a flake waiting for a deeper crate.
+#
 # Set for BOTH cargo invocations below, because either can be the one that compiles it.
-RUSTC_STACK="${RUST_MIN_STACK:-33554432}"
+RUSTC_STACK="${RUST_MIN_STACK:-67108864}"
 
 # THE COMPILE IS SERIALIZED; THE GUEST RUN IS NOT.
 #

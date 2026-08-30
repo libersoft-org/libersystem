@@ -85,10 +85,20 @@ PY
 
 checked=0
 archs_seen=0
+# EVERY PORT, OR THIS GATE HAS NOT PROVED WHAT THE MILESTONE ASKS. An architecture whose build root
+# is absent used to be SKIPPED, and the gate refused only when all three were: a build root holding
+# x86_64 alone exited zero and printed "7 driver artifacts across 1 architecture(s)", which reads as
+# a pass and is a third of one. The note has to survive three linker scripts and three package
+# builds - that is precisely why the evidence is required on all three - so a missing port is a port
+# whose notes nothing has looked at, not a port that is fine.
+missing=()
 for arch in x86_64 aarch64 riscv64; do
 	staged="$BUILD_DIR/boot/bootstrap-$arch/libexec"
 	volume="$BUILD_DIR/boot/volume-$arch.pkg"
-	[[ -d "$staged" && -f "$volume" ]] || continue
+	[[ -d "$staged" && -f "$volume" ]] || {
+		missing+=("$arch")
+		continue
+	}
 	archs_seen=$((archs_seen + 1))
 
 	# The staged files, by name. Exact attribution: this driver, this note.
@@ -139,8 +149,11 @@ for arch in x86_64 aarch64 riscv64; do
 	echo "driver-note: $arch - $found staged driver file(s) and $in_volume note(s) in the volume, all declaring protocol version $version"
 done
 
-if [[ "$archs_seen" == 0 ]]; then
-	echo "driver-note: no architecture has both a staged bootstrap set and a system volume. Build first:  ./build.sh --arch all" >&2
+if [[ "${#missing[@]}" -gt 0 ]]; then
+	echo "driver-note: no staged bootstrap set or system volume for: ${missing[*]}" >&2
+	echo "    This milestone's evidence is the note surviving into the PACKAGED artifact on all three" >&2
+	echo "    ports, and an architecture that is not built is one whose notes nothing has looked at." >&2
+	echo "    Build first:  ./build.sh --arch all" >&2
 	exit 1
 fi
 echo "driver-note: $checked driver artifacts across $archs_seen architecture(s) carry the protocol note their own source emits"

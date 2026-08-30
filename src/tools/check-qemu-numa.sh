@@ -154,6 +154,25 @@ if wanted x86_64; then
 		echo "qemu-numa:   ${line#*numa:   }"
 	done
 
+	# 2b. AND THE GRAPH IS THE ONE THIS PROFILE DESCRIBES, assignment by assignment.
+	#
+	#     Counting nodes and processors accepts a graph whose assignments are SWAPPED: this profile gives
+	#     each node two cores and near-equal memory, so a machine that has them the wrong way round
+	#     satisfies every count above. What the profile actually says is `cpus=0-1` on node 0, `cpus=2-3`
+	#     on node 1, and a non-local distance of 21 against a local 10 - and the kernel now prints each
+	#     of those, so they can be compared rather than assumed.
+	for pair in "0 0" "0 1" "1 2" "1 3"; do
+		set -- $pair
+		# THE END OF THE LINE, ALLOWING THE CARRIAGE RETURN. A guest's serial log is CRLF, so a bare `$`
+		# anchor never matches - and an unanchored one would let `cpu 1` match `cpu 10`.
+		grep -aqhE "numa:     node $1 cpu $2[[:space:]]*$" ${logs[@]} || fail "the profile puts cpu $2 on node $1 and the kernel does not"
+	done
+	for triple in "0 0 10" "0 1 21" "1 0 21" "1 1 10"; do
+		set -- $triple
+		grep -aqhE "numa:   distance $1 -> $2: $3[[:space:]]*$" ${logs[@]} || fail "the profile declares distance $1 -> $2 as $3 and the kernel read something else"
+	done
+	echo "qemu-numa:   the normalized graph is the profile's: cpus 0,1 on node 0, cpus 2,3 on node 1, and 10/21 distances"
+
 	# 3. THE ALLOCATOR WAS PARTITIONED. One pool per memory-bearing node plus the unaffiliated one.
 	for node in 0 1; do
 		grep -aqh "numa:   pool node $node:" ${logs[@]} || fail "node $node has no pool of its own"
@@ -226,6 +245,13 @@ for port in aarch64 riscv64; do
 	}
 	for node in 0 1; do
 		grep -aqh "numa:   pool node $node:" ${port_logs[@]} || fail "$port: node $node has no pool of its own"
+	done
+	# THE SAME GRAPH COMPARISON AS x86_64 - the distances, which the device tree declares the same
+	# way. The CPU IDS are not compared here: a hart id and an MPIDR are the machine's own numbering
+	# and the profile names logical cpus, so the two need not be the same integers.
+	for triple in "0 0 10" "0 1 21" "1 0 21" "1 1 10"; do
+		set -- $triple
+		grep -aqhE "numa:   distance $1 -> $2: $3[[:space:]]*$" ${port_logs[@]} || fail "$port: the profile declares distance $1 -> $2 as $3 and the kernel read something else"
 	done
 	weak_placement "$port" ${port_logs[@]}
 	# THE SAME NAMED TESTS AS x86_64, on the profiles that used to be checked for pools and a report

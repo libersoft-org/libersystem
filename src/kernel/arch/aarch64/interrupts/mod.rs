@@ -125,6 +125,10 @@ fn device_itt(devid: u32) -> Option<u64> {
 				held.store(u32::MAX, Ordering::Release);
 				// SAFETY: allocated by this call, never mapped into any address space, and the ITS
 				// was not told about it - the MAPD is what failed.
+				// NEVER-MAPPED: allocated three lines above, never entered a page table, and the
+				// controller was never told about it - the MAPD that would have told it is the call
+				// that failed. So no core and no device can translate this frame, which is what the
+				// plain door requires and what `retire` exists for when it cannot be said.
 				unsafe { crate::mem::frame::deallocate(frame) };
 				return None;
 			}

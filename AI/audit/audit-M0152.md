@@ -370,3 +370,147 @@ Current implementation rating: 6/10
 3. **The purported exact-profile graph assertion checks only self-consistency of the graph the parser produced.** For each recorded range it asks the same graph to route the range's endpoints, and for each recorded `(hardware_id, node)` pair it asks the same graph to route that CPU; it then checks symmetric ordering properties (`src/kernel/mem/numa/tests.rs:33-73`). It never compares the normalized ranges or hardware CPU-to-node assignments with the profile's explicit expected graph. The gate itself requires two nodes, nonzero memory/processors, pools, and passing generic tests (`src/tools/check-qemu-numa.sh:131-170,209-224`). A consistently swapped or otherwise misassigned two-node graph can satisfy all of those checks, especially on the symmetric 2+2 equal-memory profiles. M5 explicitly requires the exact normalized node/CPU/range graph (`docs/todo/P02M0152.md:138-153`).
 
 Verification: the current topology and FDT host suites passed 38 and 82 tests, and the NUMA gate passes shell syntax checking. Those checks do not close the live proof gaps above. QEMU was not run here because the shared runner/images were reserved by the concurrent audit.
+
+---
+
+IMPLEMENTER'S ADDENDUM ON M0152 (2026-08-30T05:50:00Z):
+
+Two corrections found by running the gate on all three profiles, recorded because both were defects
+in the EVIDENCE rather than in the code, and one of them is the kind that makes a gate lie.
+
+**1. The gate's oracle could not see `[ok]` for a test that prints.** The runner writes the test's
+name, then whatever the test printed, then `[ok]` - so for a test with output the marker lands on the
+NEXT line, and the single-line grep the gate uses could never match it. Adding the matrix and the
+model comparison to that list therefore failed on riscv64 with "did not run or did not pass" while
+the guest log showed both passing. The two tests that print are now asserted by their own completion
+lines, which say more than `[ok]` does: the matrix names every claim it made, and the comparison
+names the trace it walked. The three silent tests keep the `[ok]` check.
+
+**2. The remote free's per-node assertion measured the thread's stack.** The frame is handed to a
+core of the other node by a kernel thread, and a kernel thread has a kernel STACK - allocated
+PREFERRING the node it was placed on, and preference is not a guarantee. On riscv64 that stack came
+out of node 1's pool, so a count taken before the spawn was short by the whole stack and the
+assertion failed on a free that had worked perfectly: `left: Some(65516), right: Some(65533)`.
+
+The count is now taken INSIDE the thread, after its stack exists and immediately before the free.
+That cancels the stack whichever pool it came from and leaves exactly the claim being made - the free
+put this frame back in the pool that owns its ADDRESS, performed from a core of another node. The x86
+run had passed only because the stack happened to land on the other node there, which is the kind of
+green a test should not be able to get.
+
+All three profiles now pass:
+
+    qemu-numa: the x86_64 profile read two nodes, partitioned per node, and steered real allocations
+    qemu-numa: the aarch64 profile read two nodes, partitioned per node, and steered real allocations
+    qemu-numa: the riscv64 profile read two nodes, partitioned per node, and steered real allocations
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0152 (2026-08-30T06:40:00Z):
+
+**1. The same-trace model proof, and lifecycle coverage. ACCEPTED in both halves - and both were
+already fixed when this re-audit was written, so the first half describes code that is no longer
+there.**
+
+The first half is stale as a description of the tree. `held` is gone: the trace frees the real frame
+in the same round it frees the model's, immediately after the ownership comparison, and both sides
+therefore stand at the same state at the end of every round. What is more, the totals are no longer
+compared once at the end - the round's opening totals and per-node free counts are snapshotted before
+the loop and asserted after EVERY round, globally and per node. A trace that ends with the right
+numbers can have been wrong in the middle, and the middle is where a placement decision lives.
+
+The second half - the lifecycle - is accepted and is new work. The re-audit is right that a generic
+retired-page counter and a generic quarantine flow prove nothing about OWNERSHIP: neither of them
+asks which node a reclaimed frame goes home to, and that routing is what M2 requires. The matrix test
+now carries the missing step, on the node that does not own the frames the rest of the step uses:
+
+- a frame is allocated strictly from the second node, so its physical owner is known;
+- `retire(&[condemned])` is called and `quarantined()` is asserted to have risen by exactly one,
+  because retirement here is DELAYED reclamation and not an immediate free - a test that asserted the
+  free count rose would have been asserting the opposite of the design;
+- the second node's free count is asserted UNCHANGED while the frame waits, which is the delay itself
+  being observed rather than assumed;
+- `drain_quarantine_fully(64)` then runs and the second node's free count is asserted to have risen
+  by exactly one - the reclaimed frame went home to the pool that owns its ADDRESS, not to the pool
+  of the core that drained it.
+
+That is free, retire, quarantine and delayed reclamation all routed by physical owner, in one
+sequence, on a named node. Where the machine cannot serve the step the test says `numa-matrix:
+incomplete - ...` and the gate rejects the run, so an absent proof cannot pass as a silent one.
+
+**2. The remote free could free the same frame twice. ACCEPTED - and this was the sharpest finding of
+the three, because the failure it describes is a gate that INJECTS the violation it exists to detect.**
+
+The re-audit's race is real and was real in both directions: the queued body could run after the
+caller gave up, and the body could have deallocated at one line without yet having stored `FREED`
+when the caller timed out one line later. Ownership of the frame is now settled by a compare-exchange
+on a `CLAIMED` flag rather than by a timeout: the remote body claims it before touching it and
+returns untouched if it loses, and the caller on timeout attempts the same claim - if the caller
+loses, the remote body has already committed to the free, so the caller waits for `FREED` and reports
+the free as REMOTE rather than deallocating anything. Exactly one side ever deallocates, whichever
+one wins, and the result the test reports is the one that actually happened.
+
+**3. The graph assertion checked only the graph's self-consistency. ACCEPTED.**
+
+Asking the parsed graph to route the endpoints the same graph produced is a tautology, and the
+re-audit is right that a swapped two-node assignment satisfies every count on these deliberately
+symmetric profiles. The comparison has to be made by the side that KNOWS the profile, which is the
+gate and not the guest - so the kernel now prints each assignment it read (`numa:     node N cpu H`
+and `numa:   distance A -> B: D`) and the gate compares them against what the profile literally
+declares: cpus 0,1 on node 0, cpus 2,3 on node 1, and 10/21 distances, each one grepped
+individually. A swapped graph now fails on the first pair. On aarch64 and riscv64 the distances are
+compared the same way and the CPU ids deliberately are not: a hart id and an MPIDR are the machine's
+own numbering while the profile names logical cpus, so requiring them to be the same integers would
+be asserting a coincidence.
+
+**Verification.** The NUMA gate passes on all three profiles with the exact-graph comparison, the
+matrix including the retirement step, and the model trace including the per-round totals:
+
+    qemu-numa: the x86_64 profile read two nodes, partitioned per node, and steered real allocations
+    qemu-numa: the aarch64 profile read two nodes, partitioned per node, and steered real allocations
+    qemu-numa: the riscv64 profile read two nodes, partitioned per node, and steered real allocations
+
+---
+
+IMPLEMENTER'S ADDENDUM ON M0152 (2026-08-30T07:55:00Z):
+
+Two more corrections found by the full sweep, both in the EVIDENCE and both worth recording because
+the first is an assertion that contradicted the design it was testing and the second is one that
+could not fail.
+
+**1. The per-round totals asserted that this allocator does not do delayed reclamation.** Comparing
+the free count across an allocation and its free looked exact and is not: `deallocate` is where the
+quarantine gets drained, so a frame retired earlier in the run comes home INSIDE the bracket and the
+count RISES. On riscv64: `left: (128415, 127809) right: (128415, 127804)` - five frames MORE free
+after an allocation and its free, on a round where nothing was wrong with either side. An equality
+there asserts the allocator does not do the one thing M2 requires of it.
+
+The bracket now holds the three claims that are actually true of every round: the machine does not
+change size (exact), nothing was RETIRED (exact - a frame that could not be returned would be, and
+that is the failure the count was reaching for), and the free counts, global and per node, do not
+FALL. A fall is the same failure seen from the other side, and it is what the injected leak produces:
+`round 3: 1 frame(s) went missing across a strict allocation and its free`.
+
+The bracket was also tightened to hold ONE allocation and its free and nothing else. The model is an
+ordinary data structure on the KERNEL HEAP, so a model call inside the bracket charges the allocator
+for the model's own `Vec` growth - which is what produced the first `round 4` failure, before the
+delayed-reclamation one was visible underneath it.
+
+**2. The trace's retirement check compared the counter with itself.** It read `retired_pages()` into
+`retired_before` and asserted `retired_pages() == retired_before` on the very next line - an
+assertion that cannot fail, passing an empty trace exactly as it passed a trace that retired a frame
+in the middle. The snapshot is now taken before the loop, and the same comparison is made inside
+every bracket as well, so a retirement is caught in the round that caused it rather than at the end.
+
+**3. `rustc`'s stack for the test kernel was sized just above the deepest path.** 32 MiB was enough
+for the riscv64 build that prompted it and the same SIGSEGV came back on aarch64 gicv3, from a gate
+that had passed an hour earlier. `build-shared.sh` has long used 64 MiB for every consumer it
+compiles; two opinions about one compiler's stack, one of them half the size, is a flake waiting for
+a deeper crate. `test-kernel.sh` now uses the same 64 MiB.
+
+**Final verification (2026-08-30T09:55:00Z).** `./check.sh` is green on every gate and conformance
+suite, and `./test.sh --arch all` passes on all three: x86_64 368, aarch64 356, riscv64 359,
+`test.sh: all architectures passed`. `./check.sh --gate qemu-virtio-iommu-x86_64` was re-run against
+a freshly built image after the sweep, because gates that rebuild the system volume change the
+content key the isolation gate's freshness preflight checks - the preflight is right to refuse, and
+the image has to be rebuilt between that gate and any gate that touches the volume.

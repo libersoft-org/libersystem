@@ -27,6 +27,32 @@ static ENFORCING: AtomicBool = AtomicBool::new(false);
 // per device that bound without translation.
 static DEGRADED: SpinLock<Vec<Degraded>> = SpinLock::new(Vec::new());
 
+// WHETHER THE ISOLATION SUMMARY HAS ALREADY BEEN PUBLISHED.
+//
+// `report` is printed once the boot devices have bound, and "have bound" is a judgement the kernel
+// makes from the outside: it is the moment its supervisor decides the system is up. That moment can
+// legitimately arrive while a driver is still on its way to the bus - a machine whose console never
+// attaches gets there on a deadline, not on a device count - and a summary taken then says "every
+// bus-mastering device is translated" about a machine that may be about to admit one that is not.
+//
+// Nothing else in the log would contradict it: admissions are RECORDED rather than printed, on
+// purpose, so the list replaces a scattering of lines. So the summary is the only statement a reader
+// has, and a stale one is indistinguishable from a true one. This flag is what lets the claim
+// retract itself: once it has been published, a later degraded admission says so at the moment it
+// happens.
+static REPORTED: AtomicBool = AtomicBool::new(false);
+
+// HOW MANY TIMES A PUBLISHED CLAIM HAS BEEN RETRACTED, so a test can assert the retraction rather
+// than assert the flag that leads to it. The line itself goes to the serial console, which a kernel
+// test cannot read back; the count is the same event, observed from inside.
+#[cfg(test)]
+static RETRACTIONS: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub fn retractions_for_test() -> usize {
+	RETRACTIONS.load(Ordering::Relaxed)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Degraded {
 	pub device_type: u16,
@@ -123,16 +149,35 @@ pub fn admit(device_type: u16, bus: u8, dev: u8, func: u8) -> BindDecision {
 // The record is still deduplicated: a driver that opens its device repeatedly must not grow the
 // list it is audited from.
 fn record_degraded(entry: Degraded) {
-	let mut degraded = DEGRADED.lock();
-	if degraded.iter().any(|held| *held == entry) {
-		return;
+	// THE LOCK IS RELEASED BEFORE ANYTHING IS PRINTED. The line below is the only place this module
+	// prints while a caller is mid-admission, and doing it under the list's lock would put the
+	// serial path inside a section every other reader of the list waits on.
+	let late: bool = {
+		let mut degraded = DEGRADED.lock();
+		if degraded.iter().any(|held| *held == entry) {
+			return;
+		}
+		// ALLOC-OK: bounded by the number of PCI functions the boot scan resolved, and this is the
+		// boot path rather than an interrupt.
+		if degraded.try_reserve(1).is_err() {
+			return;
+		}
+		degraded.push(entry);
+		REPORTED.load(Ordering::Relaxed)
+	};
+	// A PUBLISHED CLAIM THAT STOPPED BEING TRUE SAYS SO, HERE, AT THE MOMENT IT STOPS.
+	//
+	// The summary is printed when the supervisor decides the system is up, and that decision can be
+	// made on a deadline over a machine whose devices are still binding. Everything admitted
+	// afterwards would then be invisible: the record is silent by design and the summary is already
+	// behind in the log. One line at the moment of admission costs nothing on the boots where it
+	// never fires, and on the boot where it does it is the difference between an audit trail and a
+	// wrong sentence nobody can see is wrong.
+	if late {
+		#[cfg(test)]
+		RETRACTIONS.fetch_add(1, Ordering::Relaxed);
+		crate::serial_println!("dma: ADMITTED UNTRANSLATED AFTER THE ISOLATION SUMMARY - {} at {:02x}:{:02x}.{} masters the bus untranslated, so the summary above is no longer this machine's state", abi::device_type_name(entry.device_type as u32), entry.bus, entry.dev, entry.func);
 	}
-	// ALLOC-OK: bounded by the number of PCI functions the boot scan resolved, and this is the boot
-	// path rather than an interrupt.
-	if degraded.try_reserve(1).is_err() {
-		return;
-	}
-	degraded.push(entry);
 }
 
 // The device has given the bus back, so it is no longer one of the devices reaching memory
@@ -174,17 +219,26 @@ pub fn report() {
 	let degraded = degraded_devices();
 	if enforcing() && degraded.is_empty() {
 		crate::serial_println!("dma: every bus-mastering device is translated");
+		// ARMED ON THE CLEAN PATH TOO, and this is the path that needs it. "Every bus-mastering
+		// device is translated" is the strongest sentence this kernel prints about isolation, and it
+		// is the one a later admission falsifies.
+		REPORTED.store(true, Ordering::Relaxed);
 		return;
 	}
 	crate::serial_println!("dma: DEGRADED ISOLATION - {} device(s) master the bus untranslated (enforcing={})", degraded.len(), enforcing());
 	for entry in &degraded {
 		crate::serial_println!("dma:   {} at {:02x}:{:02x}.{}", abi::device_type_name(entry.device_type as u32), entry.bus, entry.dev, entry.func);
 	}
+	REPORTED.store(true, Ordering::Relaxed);
 }
 
 #[cfg(test)]
 pub fn forget_degraded_for_test() {
 	DEGRADED.lock().clear();
+	// AND THE PUBLISHED-CLAIM FLAG WITH IT, because a test that calls `report` would otherwise leave
+	// every later test's admission printing a retraction of a summary that belongs to another test.
+	REPORTED.store(false, Ordering::Relaxed);
+	RETRACTIONS.store(0, Ordering::Relaxed);
 }
 
 #[cfg(test)]

@@ -196,54 +196,115 @@ fn the_reference_model_and_the_allocator_agree_over_a_trace() {
 	let mut model = topology::pools::Pools::new(distances.clone(), &frames);
 
 	// A DETERMINISTIC TRACE, walked by both. Sixteen rounds over the node list: a strict allocation, a
-	// preferred one, and a free of what the preferred one returned.
-	let mut held: alloc::vec::Vec<(u64, topology::NodeId)> = alloc::vec::Vec::new();
+	// preferred one, and a free of each - on BOTH sides, in the same round.
+	//
+	// THE TOTALS ARE COMPARED AFTER EVERY OPERATION, not once at the end. A trace that ends with the
+	// right numbers can have been wrong in the middle, and the middle is where a placement decision
+	// lives.
+	//
+	// AND THE MODEL IS OUTSIDE EVERY BRACKET, which is the part that has to be got right. The model
+	// is an ordinary data structure on the KERNEL HEAP, and a heap that grows takes a frame from the
+	// same allocator this is measuring - so a bracket with a model call inside it charges the
+	// allocator for the model's own `Vec`. Measured, on riscv64: `round 4: the allocator's totals did
+	// not come back`, on a round where nothing was wrong with either side. Each bracket now holds one
+	// allocation and its free and nothing else at all.
+	//
+	// The scratch row is allocated ONCE, above the loop, for the same reason: building it per round
+	// would allocate inside the measurement.
+	//
+	// AND THE COUNTS ARE A FLOOR, NOT AN EQUALITY, because this allocator's reclamation is DELAYED.
+	// A free can hand back more than it was given: `deallocate` is where the quarantine gets drained,
+	// so a frame some earlier test retired comes home inside this bracket and the count RISES.
+	// Measured, on riscv64: `left: (128415, 127809) right: (128415, 127804)` - five frames MORE free
+	// after an allocation and its free, from a round where nothing was wrong. An equality here
+	// asserts that this allocator does not do the one thing M2 requires it to do.
+	//
+	// What must hold exactly is the other two: the machine does not change size, and NOTHING IS
+	// RETIRED - a frame this trace could not return would be, and that is the failure the count was
+	// reaching for. A count that FALLS is that same failure seen from the other side.
+	let mut counts_before: alloc::vec::Vec<Option<usize>> = nodes.iter().map(|_| None).collect();
+	let retired_start = crate::mem::frame::retired_pages();
 	for round in 0..16usize {
 		let want = nodes[round % nodes.len()];
-		// STRICT: both sides must agree on whether the requested node could serve it.
+
+		// STRICT, ON THE ALLOCATOR, MEASURED ALONE. Both sides must agree on whether the requested
+		// node could serve it - but the model is asked afterwards, outside the bracket.
+		let totals_before = crate::mem::frame::totals();
+		for (at, node) in nodes.iter().enumerate() {
+			counts_before[at] = crate::mem::frame::free_in_node(Some(*node));
+		}
 		let real_strict = crate::mem::frame::allocate_strict(want);
-		let model_strict = model.alloc_strict(want);
-		assert_eq!(real_strict.is_some(), model_strict.is_some(), "round {round}: the allocator and the model disagree about whether node {} can serve a strict allocation", want.0);
+		let real_strict_node = real_strict.map(crate::mem::topology_node_of);
 		if let Some(frame) = real_strict {
-			assert_eq!(crate::mem::topology_node_of(frame), topology::Affinity::Node(want), "round {round}: a STRICT allocation came from a node other than the one asked for, which is the one thing strict means");
 			// SAFETY: allocated by this call and never mapped.
 			unsafe { crate::mem::frame::deallocate(frame) };
 		}
+		let (total_after, free_after) = crate::mem::frame::totals();
+		assert_eq!(total_after, totals_before.0, "round {round}: the machine changed size across a strict allocation and its free");
+		assert!(free_after >= totals_before.1, "round {round}: {} frame(s) went missing across a strict allocation and its free", totals_before.1 - free_after);
+		assert_eq!(crate::mem::frame::retired_pages(), retired_start, "round {round}: a frame could not be returned after a strict allocation and was retired - the trace lost memory the model says it still has");
+		for (at, node) in nodes.iter().enumerate() {
+			let now = crate::mem::frame::free_in_node(Some(*node));
+			assert!(now >= counts_before[at], "round {round}: node {}'s own free count fell across a strict allocation and its free, from {:?} to {now:?} - the frame did not go back to the pool that owns its address", node.0, counts_before[at]);
+		}
+		if real_strict.is_some() {
+			assert_eq!(real_strict_node, Some(topology::Affinity::Node(want)), "round {round}: a STRICT allocation came from a node other than the one asked for, which is the one thing strict means");
+		}
+		let model_strict = model.alloc_strict(want);
+		assert_eq!(real_strict.is_some(), model_strict.is_some(), "round {round}: the allocator and the model disagree about whether node {} can serve a strict allocation", want.0);
 		if let Some(frame) = model_strict {
 			model.free(frame, Some(want));
 		}
 
-		// PREFERRED: both must land on the same NODE - the requested one while it has memory, which
-		// `alloc_strict` succeeding above has just established.
-		let Some(real) = crate::mem::frame::allocate_preferred(want) else {
+		// PREFERRED, THE SAME SHAPE. Both must land on the same NODE - the requested one while it has
+		// memory, which `alloc_strict` succeeding above has just established.
+		let totals_before = crate::mem::frame::totals();
+		for (at, node) in nodes.iter().enumerate() {
+			counts_before[at] = crate::mem::frame::free_in_node(Some(*node));
+		}
+		let real = crate::mem::frame::allocate_preferred(want);
+		let real_node = real.map(crate::mem::topology_node_of);
+		if let Some(frame) = real {
+			// THE SAME OWNERSHIP ON BOTH SIDES, WHICH IS WHAT MAKES IT ONE TRACE.
+			//
+			// This HELD the real frame and freed the model's - and a comment claiming both were
+			// freed sat directly above the push that kept one. The two states diverged on the first
+			// round and stayed diverged: the model was full for the whole trace while the allocator
+			// was being drained, so every later comparison was between two different machines and
+			// the model could never have reached a fallback the allocator reached. Both are freed
+			// now, in the same round, and the pressure the second phase needs is INJECTED into both
+			// rather than accumulated in one.
+			// SAFETY: allocated by this call and never mapped.
+			unsafe { crate::mem::frame::deallocate(frame) };
+		}
+		let (total_after, free_after) = crate::mem::frame::totals();
+		assert_eq!(total_after, totals_before.0, "round {round}: the machine changed size across a preferred allocation and its free");
+		assert!(free_after >= totals_before.1, "round {round}: {} frame(s) went missing across a preferred allocation and its free", totals_before.1 - free_after);
+		assert_eq!(crate::mem::frame::retired_pages(), retired_start, "round {round}: a frame could not be returned after a preferred allocation and was retired - the trace lost memory the model says it still has");
+		for (at, node) in nodes.iter().enumerate() {
+			let now = crate::mem::frame::free_in_node(Some(*node));
+			assert!(now >= counts_before[at], "round {round}: node {}'s own free count fell across a preferred allocation and its free, from {:?} to {now:?} - the frame did not go back to the pool that owns its address", node.0, counts_before[at]);
+		}
+		if real.is_none() {
 			crate::serial_println!("numa-fixture: the allocator ran out during the trace at round {round}");
 			break;
-		};
+		}
 		let Some(modelled) = model.alloc_preferred(want) else {
 			panic!("round {round}: the allocator served a preferred allocation and the model refused one - the model describes a machine with less memory than this trace uses");
 		};
-		let real_node = crate::mem::topology_node_of(real);
 		let model_node = model.owner_of(modelled).map(topology::Affinity::Node).unwrap_or(topology::Affinity::Unknown);
-		assert_eq!(real_node, model_node, "round {round}: a preferred allocation for node {} came from {real_node:?} in the allocator and {model_node:?} in the model", want.0);
-		// THE SAME OWNERSHIP ON BOTH SIDES, WHICH IS WHAT MAKES IT ONE TRACE.
-		//
-		// This held the real frame and freed the model's. The two states then diverged on the first
-		// round and stayed diverged: the model was full for the whole trace while the allocator was
-		// being drained, so every later comparison was between two different machines and the model
-		// could never have reached a fallback the allocator reached. Both are freed here, and the
-		// pressure the matrix below needs is INJECTED into both rather than accumulated in one.
-		held.push((real, want));
+		assert_eq!(real_node, Some(model_node), "round {round}: a preferred allocation for node {} came from {real_node:?} in the allocator and {model_node:?} in the model", want.0);
 		model.free(modelled, Some(want));
 		assert!(model.consistent(), "round {round}: the model's own totals stopped adding up");
 	}
 
-	// AND EVERY FRAME GOES BACK, to the pool that owns its address.
-	let retired_before = crate::mem::frame::retired_pages();
-	for (frame, _) in held.drain(..) {
-		// SAFETY: each was allocated by this test and never mapped.
-		unsafe { crate::mem::frame::deallocate(frame) };
-	}
-	assert_eq!(crate::mem::frame::retired_pages(), retired_before, "a frame this trace allocated could not be returned and was retired - the trace lost memory the model says it still has");
+	// AND NOTHING WAS RETIRED OVER THE WHOLE TRACE. Every frame was freed in its own round; a frame
+	// that could not be returned would be retired, which is memory lost rather than restored.
+	//
+	// THE SNAPSHOT IS THE ONE FROM BEFORE THE LOOP. This read the counter and compared it with
+	// itself on the next line, so it was an assertion that could not fail - a retirement in the
+	// middle of the trace passed it exactly as an empty trace did.
+	assert_eq!(crate::mem::frame::retired_pages(), retired_start, "a frame this trace allocated could not be returned and was retired - the trace lost memory the model says it still has");
 
 	// PHASE TWO: THE SAME TRACE WITH NODE 0 EMPTY ON BOTH SIDES.
 	//
@@ -374,6 +435,41 @@ fn the_placement_matrix_runs_through_the_real_allocator() {
 	// SAFETY / NEVER-MAPPED: as above.
 	unsafe { crate::mem::frame::deallocate(back) };
 
+	// 6b. AND A RETIREMENT IS ROUTED BY THE FRAME'S OWNER TOO.
+	//
+	//     M2 asks that freeing, retirement and delayed reclamation all route by the frame's PHYSICAL
+	//     owner, and the suite proved the first with a per-node count and the other two only through
+	//     a generic counter that says nothing about which pool paid. A frame taken from node
+	//     `second` and RETIRED must be charged to node `second`: it is out of circulation, so that
+	//     node's free count is one lower than it was and stays there.
+	let Some(condemned) = crate::mem::frame::allocate_strict(second) else {
+		crate::serial_println!("numa-matrix: incomplete - node {} could not serve the frame for the retirement", second.0);
+		return;
+	};
+	let owner_free = crate::mem::frame::free_in_node(Some(second));
+	let quarantined_before = crate::mem::frame::quarantined();
+	// SAFETY / NEVER-MAPPED: allocated by the call above, never entered a page table, and retired
+	// rather than freed - which holds it until every core has been told to forget its mappings.
+	unsafe { crate::mem::frame::retire(&[condemned]) };
+	// RETIREMENT IS DELAYED RECLAMATION, NOT AN IMMEDIATE FREE. The frame goes to the quarantine and
+	// waits there for the shootdown; what M2 asks is that neither the wait nor the return leaks it
+	// into the wrong pool.
+	assert_eq!(crate::mem::frame::quarantined(), quarantined_before + 1, "a retired frame waits in the quarantine");
+	assert_eq!(crate::mem::frame::free_in_node(Some(second)), owner_free, "and while it waits it is not in any node's free count - least of all another node's");
+	assert!(crate::mem::frame::pools_agree_with_total(), "and the pools still add up with a frame held out of one of them");
+
+	//     AND THE DELAYED RECLAMATION GOES HOME. The drain is what returns a quarantined frame, and
+	//     it must return it to the pool that owns its ADDRESS - which is the same rule the free path
+	//     follows, applied to the path that runs much later and on whichever core drains.
+	if crate::mem::frame::drain_quarantine_fully(64) {
+		assert_eq!(crate::mem::frame::quarantined(), quarantined_before, "the quarantine drained");
+		assert_eq!(crate::mem::frame::free_in_node(Some(second)), owner_free.map(|count| count + 1), "a frame reclaimed out of the quarantine went back to the node that owns its address");
+		assert!(crate::mem::frame::pools_agree_with_total(), "and the pools add up again afterwards");
+	} else {
+		crate::serial_println!("numa-matrix: incomplete - the quarantine did not drain, so the delayed reclamation could not be followed home");
+		return;
+	}
+
 	// 7. AND A FRAME OF ONE NODE IS GIVEN BACK BY A CORE OF ANOTHER.
 	//
 	//    `deallocate` finds the pool from the frame rather than from whoever is freeing it, which is
@@ -423,15 +519,29 @@ fn remote_free(node: topology::NodeId, owner: topology::NodeId, frame: u64) -> b
 	static BEFORE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 	use core::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 	static FREED: AtomicBool = AtomicBool::new(false);
+	// WHO OWNS THE FREE, DECIDED BY A COMPARE-AND-EXCHANGE AND NOT BY A DEADLINE.
+	//
+	// The bounded wait below can expire while the spawned thread is between its own deallocate and
+	// the flag that reports it - and the queued thread is not cancelled, so it can also run long
+	// after the wait gave up. Both cases end with the caller freeing a frame the thread also freed,
+	// which is a double free injected by the test that exists to prove ownership is respected.
+	//
+	// The frame has exactly one owner: whoever wins this CAS frees it, and the loser does nothing.
+	static CLAIMED: AtomicBool = AtomicBool::new(false);
 	extern "C" fn body(frame: u64) {
+		if CLAIMED.compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire).is_err() {
+			// The caller gave up first and owns the frame. Nothing here may touch it.
+			return;
+		}
 		let owner = topology::NodeId(OWNER.load(AtomicOrdering::SeqCst));
 		BEFORE.store(crate::mem::frame::free_in_node(Some(owner)).unwrap_or(usize::MAX), AtomicOrdering::SeqCst);
-		// SAFETY: the caller allocated this frame, never mapped it, and does not free it itself once
-		// this thread has been started - `FREED` is what tells it so.
+		// SAFETY: this thread won the CAS above, so it is the only owner of this frame. The caller
+		// allocated it and never mapped it.
 		// NEVER-MAPPED: allocated by the matrix above and freed without entering a page table.
 		unsafe { crate::mem::frame::deallocate(frame) };
 		FREED.store(true, AtomicOrdering::SeqCst);
 	}
+	CLAIMED.store(false, AtomicOrdering::SeqCst);
 	OWNER.store(owner.0, AtomicOrdering::SeqCst);
 
 	crate::smp::numa::bind_online();
@@ -462,7 +572,18 @@ fn remote_free(node: topology::NodeId, owner: topology::NodeId, frame: u64) -> b
 		}
 		core::hint::spin_loop();
 	}
-	false
+	// THE WAIT EXPIRED. Take the frame back through the same CAS the thread uses: winning it means
+	// the thread has not started its free and never will be allowed to, so the caller may free it.
+	// Losing means the thread is inside its free right now - so this waits for the flag rather than
+	// touching the frame, and reports the free as the remote one it is.
+	if CLAIMED.compare_exchange(false, true, AtomicOrdering::AcqRel, AtomicOrdering::Acquire).is_ok() {
+		return false;
+	}
+	while !FREED.load(AtomicOrdering::SeqCst) {
+		core::hint::spin_loop();
+	}
+	FREED_FROM.store(BEFORE.load(AtomicOrdering::SeqCst), AtomicOrdering::SeqCst);
+	true
 }
 
 // The owning node's free count as the FREEING core saw it, immediately before the free.

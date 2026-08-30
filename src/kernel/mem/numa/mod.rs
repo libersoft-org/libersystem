@@ -214,6 +214,31 @@ pub fn report() {
 			let memory = found.memory_of(*node);
 			let cpus = found.cpus().iter().filter(|(_, owner)| owner == node).count();
 			crate::serial_println!("numa:   node {}: {} MiB, {} processor(s)", node.0, memory / (1024 * 1024), cpus);
+			// WHICH PROCESSORS, AND WHERE THE MEMORY IS - not just how many and how much.
+			//
+			// A gate can compare a COUNT with the profile it launched and still accept a graph whose
+			// assignments are swapped: two nodes of equal size with two cores each satisfy every
+			// count on a machine that has them the wrong way round. These are the assignments
+			// themselves, which is what M5 means by the exact normalized graph and what M6 allows
+			// the report to carry - bounded by the node and CPU counts, which are small.
+			for (hardware_id, owner) in found.cpus().iter().filter(|(_, owner)| owner == node) {
+				crate::serial_println!("numa:     node {} cpu {}", owner.0, hardware_id);
+			}
+			// THE RANGES ONLY IN A TEST BUILD. A machine's firmware describes memory in many small
+			// pieces - fifteen on the x86_64 profile - and a line each would triple the length of
+			// every ordinary boot's report for a fact only a gate compares. M6 allows the exact
+			// ranges to be exposed under test, which is where they are read.
+			if cfg!(test) {
+				for range in found.ranges().iter().filter(|range| range.node == *node) {
+					crate::serial_println!("numa:     node {} range {:#x}..{:#x}", node.0, range.base, range.end());
+				}
+			}
+		}
+		// AND HOW FAR EACH NODE IS FROM EACH, which decides every fallback and was never printed.
+		for from in found.nodes() {
+			for to in found.nodes() {
+				crate::serial_println!("numa:   distance {} -> {}: {}", from.0, to.0, found.distance(*from, *to));
+			}
 		}
 	}) else {
 		crate::serial_println!("numa: no memory topology - one pool, no locality{}", absence_clause());

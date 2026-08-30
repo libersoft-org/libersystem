@@ -1152,3 +1152,30 @@ fn a_predicate_a_rule_does_not_state_is_not_asked() {
 	// And a rule that states NOTHING matches everything, which is why `system-manifest` refuses one.
 	assert!(Match::default().matches(&xhci));
 }
+
+#[test]
+fn exactly_one_terminal_frame_ends_a_handshake_whichever_of_the_two_it_is() {
+	// THE RULE THE MANAGER USED TO HOLD ON ONE SIDE ONLY. `READY` was refused a second time because
+	// the table has no `Online -> Online` edge, and `FAILED` was not - it does not move to a fixed
+	// state, it computes a cause and goes through the teardown, and the teardown is legitimately
+	// reachable from `Online` because a driver can crash after coming up. So `READY` then `FAILED`
+	// on one generation took an online binding apart on the strength of a frame the handshake had
+	// already ended, while the milestone's rule is that a second terminal frame is refused.
+	//
+	// It is asked of the STATE now, in one place, so both arms answer the same way.
+	assert!(BindingState::Binding.accepts_terminal_frame(), "the handshake is what a terminal frame ends");
+	for &state in EVERY_STATE.iter() {
+		if state == BindingState::Binding {
+			continue;
+		}
+		assert!(!state.accepts_terminal_frame(), "{:?} accepted a terminal frame outside a handshake", core::str::from_utf8(state.name()));
+	}
+	// AND `Online` IS THE ONE THAT MATTERS, because it is the state a first terminal frame produces
+	// and therefore the only one a SECOND one can arrive in.
+	assert!(!BindingState::Online.accepts_terminal_frame(), "a binding that is up has already had its one terminal frame");
+	// The two facts are the same fact seen from either side: the only edge into `Online` is from a
+	// handshake, so "the handshake can still end" and "this state is `Binding`" cannot come apart.
+	for &state in EVERY_STATE.iter() {
+		assert_eq!(state.accepts_terminal_frame(), state.may_move_to(BindingState::Online), "{:?} disagrees with the table about whether its handshake is still open", core::str::from_utf8(state.name()));
+	}
+}

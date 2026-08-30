@@ -3070,7 +3070,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// `Step::Online` a second time. The handshake ends in one `READY` or one `FAILED`;
 					// a driver that sends another is not making a transition, and the refusal the
 					// table already computes is the answer - it just had to be read.
-					if !node.record.move_to(BindingState::Online, None) {
+					if !node.record.state.accepts_terminal_frame() || !node.record.move_to(BindingState::Online, None) {
 						print(b"DeviceManager: a second terminal frame on a binding that is already past its handshake - refused\n");
 						return Step::Again;
 					}
@@ -3098,6 +3098,19 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// frame and there should not be one: the two are different facts and the protocol
 				// already has a word for each.
 				BindingEvent::Failed { code, .. } => {
+					// AND THE SAME RULE ON THIS SIDE OF THE CHOICE, which is where it was missing.
+					//
+					// `READY` was refused a second time because the state table has no `Online ->
+					// Online` edge; `FAILED` was not, because it does not move to a fixed state - it
+					// computes a cause and goes through the teardown, and the teardown is reachable
+					// from `Online` for the good reason that a driver can crash after coming up. So
+					// `READY` then `FAILED` on one generation took an online binding apart on the
+					// strength of a frame the handshake had already ended. It is a second terminal
+					// frame and it is refused like the other one.
+					if !node.record.state.accepts_terminal_frame() {
+						print(b"DeviceManager: a second terminal frame on a binding that is already past its handshake - refused\n");
+						return Step::Again;
+					}
 					// A DRIVER THAT SAID WHY. Retryability is read off the code rather than decided
 					// again here: `device-not-responding` and `out-of-memory` are the two a second
 					// attempt can change, and the other three describe a driver that has read its

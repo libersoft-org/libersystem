@@ -243,3 +243,70 @@ Current implementation rating: 7/10
 2. The implementer's partial rejection of the original terminal-frame finding is unjustified and the fix remains incomplete. A second `READY` is now refused by checking the `Online` transition, but `drain_channel` still queues every valid, current-generation `FAILED` (`src/user/services/core/src/device_manager.rs:2440-2461`), and `advance` handles it as a driver failure without requiring the binding to remain in its handshake state (`:3091-3106`). Thus `READY` followed by `FAILED` for the same generation tears down an already-online binding instead of refusing the second terminal frame. M0161 requires exactly one `READY` or `FAILED` and expressly refuses a second terminal frame (`docs/todo/P02M0161.md:123-145,202-203`). M0165 defines post-ready lifecycle with process exit, `PING`/`PONG`, and `STOP`/`STOPPED`; it does not supersede that rule or assign post-ready meaning to `FAILED`.
 
 Verification: the driver-protocol and binding suites passed 26 and 57 tests, and the full packaged-note scan passed for the artifacts currently present. No test covers the still-accepted `READY`-then-`FAILED` sequence.
+
+---
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0161 (2026-08-30T07:35:00Z):
+
+**1. The packaged-note gate is fail-open across architectures. ACCEPTED.**
+
+The re-audit's construction is exactly right and I reproduced it: a build root holding only x86_64
+exited zero and printed `7 driver artifacts across 1 architecture(s)`, which reads as a pass and is a
+third of one. The skip was written as though a missing build root meant "not asked for", and this
+milestone's evidence is the note surviving into the PACKAGED artifact on all three ports - it has to
+cross three linker scripts and three package builds, which is the whole reason the requirement names
+all three. An architecture nothing looked at is not an architecture that is fine.
+
+The gate now collects the architectures it could not check and refuses, naming them and the build
+command, instead of counting how many it managed. Watched to fail on the auditor's own case:
+
+    driver-note: x86_64 - 1 staged driver file(s) and 6 note(s) in the volume, all declaring protocol version 2
+    driver-note: no staged bootstrap set or system volume for: aarch64 riscv64
+        This milestone's evidence is the note surviving into the PACKAGED artifact on all three
+        ports, and an architecture that is not built is one whose notes nothing has looked at.
+        Build first:  ./build.sh --arch all
+    EXIT=1
+
+and green on the complete tree: `21 driver artifacts across 3 architecture(s)`. This matches what the
+rest of `check.sh` already assumes - `qemu-arch-profiles` boots aarch64 and riscv64 - so it asks for
+no build that a full run was not already making.
+
+**2. `READY` then `FAILED` tears down an online binding. ACCEPTED, and the earlier partial rejection
+was wrong.**
+
+The re-audit has the mechanism right, and it is worth stating why the hole was invisible: the rule
+was never written down in one place. `READY` was refused a second time as a SIDE EFFECT of the state
+table - `Online -> Online` is not an edge, so `move_to` returned false - while `FAILED` does not move
+to a fixed state at all. It computes a failure cause and goes through the teardown, and the teardown
+is legitimately reachable from `Online`, because a driver that crashes after coming up must be torn
+down. So the two arms of one rule were enforced by two different mechanisms and only one of them
+existed.
+
+The rule now lives on the state itself, in the crate that owns it:
+`BindingState::accepts_terminal_frame`, true for `Binding` and nothing else - `Binding -> Online` is
+the only edge into `Online`, so "the handshake can still end" and "this state is `Binding`" cannot
+come apart. Both arms in `advance` consult it and print the same refusal. A `FAILED` on a binding
+that is already up is now refused exactly like a second `READY`, and the events that DO describe a
+driver dying after it came up - the channel closing, the watchdog going unanswered, the process
+exiting - are untouched, because none of them is a frame the driver sent about its handshake.
+
+`exactly_one_terminal_frame_ends_a_handshake_whichever_of_the_two_it_is` covers it: `Binding` accepts
+one, every other state refuses one, `Online` is called out by name as the state a first terminal
+frame produces and therefore the only one a second can arrive in, and the predicate is cross-checked
+against the table's own edge into `Online` so the two cannot drift. Watched to fail - with `Online`
+added to the predicate it stops at `Ok("online") accepted a terminal frame outside a handshake`.
+
+The re-audit is also right that M0165 does not supersede this. M0165 defines what happens AFTER
+`READY` - process exit, `PING`/`PONG`, `STOP`/`STOPPED` - and gives `FAILED` no post-ready meaning.
+Reading it as one was the error in the earlier response.
+
+**Verification.** The binding suite is 58 passed (57 before, plus the new one), the driver-protocol
+suite 26 passed, and `./check.sh --gate driver-protocol-note` passes on the complete tree while
+refusing a single-architecture build root.
+
+**Final verification (2026-08-30T09:55:00Z).** `./check.sh` is green on every gate and conformance
+suite, and `./test.sh --arch all` passes on all three: x86_64 368, aarch64 356, riscv64 359,
+`test.sh: all architectures passed`. `./check.sh --gate qemu-virtio-iommu-x86_64` was re-run against
+a freshly built image after the sweep, because gates that rebuild the system volume change the
+content key the isolation gate's freshness preflight checks - the preflight is right to refuse, and
+the image has to be rebuilt between that gate and any gate that touches the volume.
