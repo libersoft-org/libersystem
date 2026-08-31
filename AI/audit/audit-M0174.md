@@ -303,3 +303,21 @@ the difference stated. The Definition of done says which fixture proves the clau
 exactly one file and referenced from the other, and the Definition of done gained clauses for the
 multicast exceptions, the membership rules, the effective-link fixture and the seam boundary. No
 source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-08-31T00:17:04Z):
+
+Rating: 8/10
+
+1. **The accepted MLDv2 correction still omits the timers and source-specific state required by the
+   behavior it claims.** M4 requires bounded reports on join/leave and a response to a “general or
+   group-specific query” (`docs/todo/P02M0174.md:114-130`), but it does not cover Multicast Address and
+   Source Specific Queries, delayed/merged pending responses, or state-change report retransmission.
+   M6 then calls its aggregate scheduler exhaustive while listing DAD, RS, ND, NUD, prefix, address,
+   router, RDNSS and PMTU timers but no MLD timer (`:166-176`), and M8 names only generic report/query
+   handling (`:215-221`). Current [RFC 9777 sections 6.1-6.3](https://www.rfc-editor.org/rfc/rfc9777.html#section-6)
+   defines three query kinds, random response delay bounded by the query, per-interface/address/source
+   pending state with combination rules, and Robustness-Variable retransmission of state-change
+   reports. Without those bounded timers, a source-specific query is unanswered and one lost join
+   report can still defeat membership on the snooping link this correction exists to support. Add
+   these host-listener timers/state to M4/M6 and cover source-specific, merged-query and lost-first-
+   report cases in M8; this does not require a public multicast API, querier role or routing work.

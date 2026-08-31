@@ -200,3 +200,30 @@ report all carry the same 64 bytes.
 Everything M2, M3 and M4 previously deferred to implementation is now in the file, and the Definition
 of done names the matrix, the provenance and the equality latch as separate clauses. No source code
 was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-08-31T00:17:04Z):
+
+Rating: 5/10
+
+1. **The producer matrix and missing-value rule contradict one another and contain overlapping rows
+   with no precedence.** The matrix assigns `no-iommu` to any `--no-iommu` run, but also assigns
+   `ABSENT` to any test-mode or development instance (`docs/todo/P02M0172.md:58-75`), so a development
+   or test `--no-iommu` run has two answers. The following text says a missing value deliberately
+   selects the loud degraded contract for those migration paths (`:77-82`), while M6 says every
+   missing mode is refused (`:161-168`). It also leaves an authenticated-loader development path
+   ambiguous: “development instance = ABSENT” conflicts with the rule that a producer-backed loader
+   path missing its signed field refuses. Make the rows disjoint or define explicit precedence, and
+   state one missing-mode behavior per path before fail-closed admission.
+
+2. **The trusted direct-boot handoff has no carrier and occurs too late in the current boot order.**
+   M3 says the host harness writes a `BootInfo` field with `harness` provenance
+   (`docs/todo/P02M0172.md:107-117`). Direct AArch64 and RISC-V entry receives a raw DTB, however, and
+   the kernel constructs and publishes its own BootInfo later
+   (`src/kernel/arch/aarch64/boot.rs:947-968`, `:988-1028`;
+   `src/kernel/arch/riscv64/boot.rs:608-629`, `:677-705`). On both production paths, `device::init` and
+   `dma_policy::init` run before that construction (`src/kernel/arch/aarch64/boot.rs:1044-1052`;
+   `src/kernel/arch/riscv64/boot.rs:719-726`). Thus the harness cannot write the promised field into
+   an object that does not yet exist, and admission consumes no authenticated mode before deciding.
+   Define the actual trusted early carrier (for example a bounded fw_cfg or FDT property), its
+   validation/provenance rule, and parsing before DMA admission; merely naming the later BootInfo field
+   is not an implementable direct-boot contract.

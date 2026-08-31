@@ -59,6 +59,53 @@ impl Transport for Wire {
 	}
 }
 
+// A CONTROLLER THAT SUPPLIES NOTHING BUT MALFORMED EVENTS CANNOT HOLD ONE DRAIN OPEN.
+//
+// `drain_faults` advanced its budget only when a record DECODED: a malformed one `continue`d without
+// touching the counter, so the loop ended only when the transport ran dry. A controller producing
+// malformed records forever therefore kept one call inside that loop forever, and the outer
+// 64-valid-event ceiling never got a chance to apply because it counts what the function RETURNS.
+// A dropped record now spends a slot of the same budget, so the work per call is bounded by the
+// buffer whatever the device sends.
+//
+// `endless` is the hostile case exactly: `take_event` never says empty and never returns anything
+// that decodes.
+#[test]
+fn a_controller_supplying_only_malformed_events_cannot_hold_a_drain_open() {
+	struct Endless;
+	impl Transport for Endless {
+		fn request(&mut self, _bytes: &[u8], answer: &mut [u8], status_at: usize) -> Result<(), Fault> {
+			if status_at < answer.len() {
+				answer[status_at] = S_OK;
+			}
+			Ok(())
+		}
+		// NEVER EMPTY AND NEVER VALID. One byte is shorter than any fault record, so it can never
+		// decode - which is what makes this the storm the bound exists for rather than a queue of
+		// events somebody has to read.
+		fn take_event(&mut self, out: &mut [u8]) -> usize {
+			if out.is_empty() {
+				return 0;
+			}
+			out[0] = 0xff;
+			1
+		}
+	}
+
+	let config = Config::parse(&config_bytes()).expect("a valid config");
+	let features = negotiate(REQUIRED | F_BYPASS_CONFIG).expect("negotiated");
+	let mut backend = VirtioIommu::new(Endless, config, features).expect("backend");
+	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: None, access: Access::Read, reason: Fault::NotMapped }; 8];
+	// It RETURNS, which is the whole assertion: before the fix this call did not.
+	let taken = backend.drain_faults(&mut out);
+	assert_eq!(taken, 0, "nothing decoded, so nothing is reported - the caller is told there are no events to read");
+	assert_eq!(backend.dropped_faults(), out.len(), "every slot of the budget was spent on a malformed record, and the count says so rather than the drop being silent");
+	// And a second call is bounded the same way rather than the first having consumed a queue that
+	// never empties.
+	assert_eq!(backend.drain_faults(&mut out), 0);
+	assert_eq!(backend.dropped_faults(), out.len() * 2);
+}
+
 fn config_bytes() -> Vec<u8> {
 	let mut bytes = Vec::new();
 	bytes.extend_from_slice(&0x1000u64.to_le_bytes()); // page size mask: 4 KiB only

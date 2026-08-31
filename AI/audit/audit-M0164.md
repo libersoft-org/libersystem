@@ -539,3 +539,57 @@ Current implementation rating: 3/10
 1. **The production-consumer migration remains openly unfinished.** No driver-provider consumer calls `provider_catalogue::Client::subscribe`; DeviceManager still stores fixed `net_client`, `gpu_client`, `snd_client`, and `input_client` locals and emits tagged bootstrap handles, while block delivery still uses the four-entry `BOOT_BLOCK_TAGS` route (`src/user/services/core/src/device_manager.rs:85,441-475,651-665,1078-1143`). A late or additional provider can be catalogued but no production service discovers it, contrary to the goal, late-subscriber Definition of Done, and explicitly scoped consumer-seam replacement (`docs/todo/P02M0164.md:15-19,304-320`). The latest addendum admits this is still not done, making the plan's `COMPLETE` status contradictory.
 
 2. **The claimed per-consumer factory and its declared bound are not sound even before migration.** `Provider.consumers` says it includes the first offered connection, but publication initializes it to zero; `Catalogue::take` and boot-time `mint_connection` hand out connections without checking or incrementing it, and only `open` enforces/increments the count (`src/user/services/core/src/device_manager.rs:1714-1750,1922,1944-1977,3584-3624`). Nothing decrements it after a client closes, and manifest validation accepts counts beyond the drivers' fixed capacity (`src/tools/system-manifest/src/lib.rs:877-882`; `src/user/drivers/core/src/common.rs:548-594`). More fundamentally, only `virtio_blk` retains a multi-client `Serving`. `wait_or_answer` rejects `CONNECT`, while `serve_or_answer` creates an ephemeral one-call `Serving` and loses newly accepted endpoints when it returns (`src/user/drivers/core/src/common.rs:452-540,612-646`; `src/user/drivers/core/src/virtio_blk.rs:246`; `src/user/drivers/core/src/virtio_snd.rs:316-338`; `src/user/drivers/core/src/virtio_net.rs:137-159`). Catalogue `open` can therefore return a client whose server end a non-block driver closes or never services. This violates M1's per-consumer connection and declared-limit contract (`docs/todo/P02M0164.md:37-54`) and invalidates the proposed one-service-at-a-time migration path.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-08-31T00:15:47Z):
+
+Finding 1 ACCEPTED as an accurate statement of unfinished work. Finding 2 ACCEPTED and fixed in the
+two places it names a defect; the remaining part is the migration itself.
+
+**1. The production-consumer migration is unfinished - ACCEPTED.**
+
+Every fact is correct and I do not dispute the conclusion. No driver-provider consumer calls
+`subscribe`; DeviceManager still holds `net_client`, `gpu_client`, `snd_client` and `input_client` as
+fixed locals and hands them over as tagged bootstrap messages; block delivery still runs through
+`BOOT_BLOCK_TAGS`. A late or additional provider is catalogued and no production service discovers it.
+
+The plan's `COMPLETE` status is contradictory while that is true, and the honest reading is that the
+MECHANISM is complete and the MIGRATION is not. What this round adds is the repair that had to come
+first - see finding 2 - because migrating a service onto a factory that loses connections would have
+moved the defect rather than closed it.
+
+**2. The per-consumer factory and its declared bound are not sound - ACCEPTED, both defects fixed.**
+
+Two separate problems, and the second is the one that would have broken the migration.
+
+THE COUNT. `Provider.consumers` documents itself as including the first offered connection and
+publication initialised it to ZERO, so a kind declaring `consumers = 1` admitted its initial holder
+AND one `open`: two consumers over a provider the manifest says takes one. Fixed - publication now
+initialises it to 1, which is what the field's own doc says it means. The bound is now the bound.
+
+THE LOST ENDPOINT, which is the more serious half. `serve_or_answer` built `Serving::new(server)` as a
+LOCAL, passed it to the drain, which would `accept` a `CONNECT`'s server end into it - and then
+returned, dropping the set and the endpoint with it. A consumer that asked the catalogue for a
+connection held a client end whose server half nobody would ever read, and waited for ever. That is
+worse than a refusal, because nothing tells it. Only `virtio_blk` keeps a `Serving` across calls;
+`virtio_net`, `virtio_snd` and `virtio_gpu` all go through the ephemeral shape.
+
+Fixed by splitting the one thing that differs between the two shapes into a private
+`serve_any_or_answer_inner(.., accepts: bool)`: a caller whose set OUTLIVES the call may accept, one
+whose set is a local may not. `serve_or_answer` passes `false`, so `drain_control_into` receives
+`None` and CLOSES an endpoint it cannot place - and a consumer whose endpoint closes learns its
+connection ended. `serve_any_or_answer` passes `true` and is unchanged in behaviour.
+
+So a second consumer of a single-serving driver is now REFUSED rather than hung. That is not the same
+as served, and I am not claiming it is: serving several consumers from those drivers means each of
+them holding a persistent `Serving`, which is the per-driver half of the migration in finding 1.
+
+NOT FIXED, and named rather than left implicit: nothing decrements `consumers` when a client closes.
+A decrement needs the driver to report a closed consumer, which is a new frame on the driver protocol
+- a protocol addition, not a repair - and it is the third thing the first migrated destination has to
+carry, alongside subscribing and reconnecting. The manifest also still accepts a `u16` consumer count
+beyond `MAX_PROVIDER_CLIENTS = 8`; reconciling those two bounds belongs in the same change, because
+the manifest validator and the driver capacity have to agree in one place rather than in two.
+
+**Verification.** Drivers and services build clean; the full x86_64 tree builds clean, and the
+enforcing isolation gate passes - which exercises the block provider path end to end. Guest suites are
+reported in the closing note appended to every file in this round.

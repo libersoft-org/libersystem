@@ -252,3 +252,27 @@ fixture does not cover it.
 **Plan re-check.** Item count unchanged at ten. The three corrections all move requirements from
 detection to prevention, which is the same move in three places and is now stated that way. No source
 code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0170 (2026-08-31T00:17:04Z):
+
+Rating: 5/10
+
+1. **The accepted stable-medium correction was not applied to the normative M1.** M1 still says not
+   to protect media construction because the medium is content-addressed and the ELF is run-private
+   (`docs/todo/P02M0170.md:52-61`); M2 merely lists concurrent input/path replacement as mutations
+   (`:63-72`). The current builder explicitly permits a producer to change during assembly and only
+   detects the change afterwards (`src/harness/mkimage.sh:722-726`). That prevents caching corrupt
+   output but makes one of two overlapping runs fail, contradicting M2's requirement that both succeed.
+   Nothing in M1 now creates immutable run-private snapshots of every medium input or a digest-verified
+   QEMU handoff, despite the latest planner response saying those requirements were added. Stabilize
+   the complete input snapshot at a defined boundary (or serialize that boundary) and bind the bytes
+   opened by QEMU to the recorded digest.
+
+2. **The release-set invariants still allow a same-cardinality substitution to self-certify.** M4
+   independently checks architecture presence and minimum class cardinality but never freezes the
+   exact required variant/key set (`docs/todo/P02M0170.md:81-97`). Deleting one mandatory row while
+   inserting or relabeling a different row in the same class can preserve every stated invariant; the
+   catalog-derived expected evidence then blesses the substituted set. The stable fully qualified key
+   identifies a row but does not independently say which keys are obligatory. Freeze the closed
+   required key/variant set (or an equivalent independent manifest) and add a replacement mutation,
+   not only deletion/reclassification.

@@ -1951,6 +1951,52 @@ fn the_timer_interrupt_is_read_from_the_tree_and_not_assumed() {
 	assert_eq!(at(routed_here).parse().expect("parses").timer_intid, 30, "a timer that names the selected GIC is the ordinary case and is read");
 }
 
+// AND THE INHERITED FORM IS THE ONE REAL TREES USE, SO IT IS THE ONE THAT HAS TO BE CHECKED.
+//
+// The routing check above only ever compared a timer-LOCAL `interrupt-parent`, and treated an
+// unstated one as unknown-and-therefore-accepted. `interrupt-parent` is INHERITED, and the ordinary
+// shape on both machines this reader boots is a root that states it and a timer that does not - so
+// the check was skipped on exactly the trees it was written for, and a timer inheriting a different
+// controller had its INTID enabled on the selected GIC anyway. The timer is a root child, so the
+// value it inherits is the root's.
+//
+// Both directions, because a check that refuses everything passes the first half of this on its own.
+#[test]
+fn a_timer_inheriting_another_controller_is_not_armed_on_the_selected_gic() {
+	// The four (kind, number, flags) triples the ARM generic timer names: secure EL1, non-secure
+	// EL1, virtual, hypervisor. Kind 1 is a PPI; the reader takes the second, whose INTID is 14+16.
+	fn interrupts(a: u32, b: u32, c: u32, d: u32) -> Vec<u8> {
+		let mut out = Vec::new();
+		for number in [a, b, c, d] {
+			out.extend_from_slice(&1u32.to_be_bytes());
+			out.extend_from_slice(&number.to_be_bytes());
+			out.extend_from_slice(&0xf08u32.to_be_bytes());
+		}
+		out
+	}
+
+	fn tree(root_parent: u32, gic_phandle: u32) -> &'static [u8] {
+		let mut builder = Builder::new();
+		builder.begin("");
+		builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2);
+		// STATED ON THE ROOT AND NOT ON THE TIMER, which is the inherited form.
+		builder.prop_u32("interrupt-parent", root_parent);
+		builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+		builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+		builder.begin("intc@8000000").prop_str("compatible", "arm,gic-v3").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x080a_0000, 0xf6_0000)).prop_u32("phandle", gic_phandle).end();
+		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &interrupts(13, 14, 11, 10)).end();
+		builder.end();
+		builder.finish()
+	}
+
+	// The root routes interrupts to controller 7; the GIC this reader selected is phandle 1. The
+	// timer states nothing, so it belongs to 7 - and its PPI is not this GIC's to arm.
+	assert_eq!(at(tree(7, 1)).parse().expect("parses").timer_intid, 0, "a timer that INHERITS a different interrupt controller describes a PPI on that controller; enabling its INTID on the selected GIC arms an interrupt the tree does not put there");
+
+	// The same tree with the root routing to the selected GIC is the ordinary machine, and is read.
+	assert_eq!(at(tree(1, 1)).parse().expect("parses").timer_intid, 30, "a timer that inherits the selected GIC is every real tree this reader boots, and refusing it would refuse them all");
+}
+
 // A GICv3 REDISTRIBUTOR REGION TOO SMALL TO HOLD ONE FRAME IS NOT A MAIN CONTROLLER.
 //
 // One 0x1000 minimum was applied to both a GICv2 CPU interface and a v3 redistributor range, and

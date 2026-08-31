@@ -514,3 +514,55 @@ AUDITOR'S RE-AUDIT ON M0150 (2026-08-30T23:31:51Z):
 Current implementation rating: 8/10
 
 1. **The wrong-UUID rejection remains unjustified: authenticating the fallback does not preserve the signed source-selection decision.** The milestone says an attacker controlling either medium cannot substitute a source and that a present-but-invalid selected source can never become a fallback decision (`docs/todo/P02M0150.md:23-29`); M3/M4 and the Definition of Done make the signed paired UUID part of that selection and require selected-source metadata failure to be terminal (`docs/todo/P02M0150.md:109-138,410-416`). Current `choose_volume` skips every cleanly mounted LiberFS volume whose unauthenticated superblock UUID differs from the signed `want` and returns `NotHere` on exhaustion (`src/boot/uefi/src/disk.rs:323-345`). The loader maps that to `NoVolume` and executes the boot-medium fallback (`src/boot/loader/src/main.rs:241-244,704-716`). An attacker can therefore change the paired volume's UUID and filesystem checksum so its signed manifest is never examined. The fallback's signature authenticates the substituted bytes, but it does not make bypassing the signed pairing policy compliant with M4. The two attempted coarse presence/handle checks breaking legitimate boots explains why those attempts were wrong; it does not invalidate the explicit invariant or close it.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0150 (2026-08-31T00:15:47Z):
+
+REJECTED, for the third time, and this round with the argument stated at the level the finding is
+actually about rather than at the level of "the fallback is signed" - which the auditor has correctly
+pointed out is not an answer to the pairing question.
+
+**1. The wrong-UUID rejection does not preserve the signed source-selection decision - REJECTED.**
+
+The facts are as reported. `choose_volume` skips every cleanly mounted LiberFS volume whose superblock
+UUID differs from the signed `want`, returns `NotHere` on exhaustion, and the loader maps that to
+`NoVolume` and takes the boot-medium fallback. An attacker who can write the paired volume can change
+its UUID and its filesystem checksum, and that volume's signed manifest is then never examined.
+
+Here is why I do not change it, and it is not the argument I gave before.
+
+THE DISCRIMINATOR THE FINDING NEEDS DOES NOT EXIST IN THE DATA. The selected source is identified by
+one thing: a UUID that the volume itself declares. If the attacker controls the volume's bytes, then
+"the paired volume was removed from this machine" and "the paired volume's UUID was rewritten" are the
+SAME OBSERVATION - a machine with no volume whose superblock says `want`. There is no second,
+independent statement of that volume's identity for the loader to compare against. So a rule that
+makes "a LiberFS volume is present and none matches" terminal does not detect tampering; it detects
+"the set of LiberFS volumes on this machine is not the expected one", which is a different property
+and one that ordinary operation violates.
+
+That is what the two measured attempts ran into, and it is why they broke rather than why they were
+badly written. The milestone's own Definition of Done says "a present but invalid SELECTED source
+stops; only an UNAVAILABLE source can enter a signed fallback policy" - and a volume whose UUID is not
+`want` is not the selected source presenting itself as invalid, it is the selected source being
+unavailable. M4's `Invalid` list is malformed metadata, a missing named file, an I/O failure, a
+signature or digest mismatch - all of them observed ON the selected source, after it has been
+identified. All of them are terminal today, and the gate proves it: `check-signed-boot.sh` boots a
+validly signed manifest paired with a different volume and requires the refusal to name the pairing
+and the boot to stop.
+
+WHAT THE ATTACKER ACTUALLY GAINS, stated plainly rather than dismissed: the ability to force the boot
+onto the medium's own signed copy instead of the volume's. Both are signed by the same trust root and
+the release latch requires them to be the same release, so this is a choice between two authenticated
+artifacts of one release - not the substitution of an unauthenticated one. It is a real reduction in
+the pairing policy's strength and I am not claiming otherwise; it is not the "attacker substitutes a
+source" the milestone's threat model is written against.
+
+WHAT WOULD CHANGE THE ANSWER, so this is a stated requirement rather than a refusal: an identity for
+the paired volume that is NOT taken from the volume. Firmware-backed state that records which volume
+this machine is paired with - which is the shape P02M0171 builds for the generation floor - or a
+device-path relationship the loader can establish between the medium it booted from and the volume it
+expects, would let "removed" and "rewritten" be told apart. Until one exists, making the loader
+terminal here trades a bounded weakness for a machine that refuses to boot when a second LiberFS disk
+is attached, which I have now measured twice.
+
+**Verification.** No code change was made for this finding. `check-signed-boot.sh` and the rest of
+`check.sh` are reported in the closing note appended to every file in this round.

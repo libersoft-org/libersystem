@@ -384,16 +384,30 @@ pub struct VirtioIommu<T: Transport> {
 	// the one the kernel mints, so the domain's is the one that survives; this layer reports the
 	// endpoint and the domain and leaves the generation to whoever owns domains.
 	attached: Vec<(DomainId, EndpointId)>,
+	// HOW MANY FAULT RECORDS THIS BACKEND COULD NOT DECODE, since boot.
+	//
+	// A dropped record spends a slot of the per-call budget in `drain_faults`, which is what stops a
+	// controller supplying malformed events forever from holding one drain call open. Counting them
+	// as well as dropping them is what makes that visible: a machine whose fault queue is producing
+	// nothing but noise looks, from the events alone, exactly like one producing nothing at all.
+	dropped_faults: usize,
 }
 
 impl<T: Transport> VirtioIommu<T> {
+	// Fault records this backend read and could not decode. Reported rather than only counted,
+	// because a queue producing only malformed events is indistinguishable from a quiet one if the
+	// drop is silent.
+	pub fn dropped_faults(&self) -> usize {
+		self.dropped_faults
+	}
+
 	// Build a backend from a device that has already been probed. `features` must be what
 	// `negotiate` returned for what the device offered, and `config` what it published.
 	pub fn new(transport: T, config: Config, features: u64) -> Result<Self, Fault> {
 		if features & REQUIRED != REQUIRED {
 			return Err(Fault::Unconfirmed);
 		}
-		Ok(Self { transport, config, features, next_domain: config.domain_start.max(1), attached: Vec::new() })
+		Ok(Self { transport, config, features, next_domain: config.domain_start.max(1), attached: Vec::new(), dropped_faults: 0 })
 	}
 
 	pub fn config(&self) -> &Config {
@@ -497,7 +511,12 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 	}
 
 	fn drain_faults(&mut self, out: &mut [FaultEvent]) -> usize {
+		// `written` is the BUDGET and `kept` is the ANSWER: a malformed record spends the first
+		// without advancing the second, so the caller is told how many events it may read and the
+		// loop cannot be held open by records that never decode.
 		let mut written = 0;
+		let mut kept = 0;
+		let mut dropped = 0usize;
 		let mut raw = [0u8; FAULT_LEN];
 		while written < out.len() {
 			let taken = self.transport.take_event(&mut raw);
@@ -516,15 +535,29 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 			// `Generation(0)` is this layer saying it does not know, not a binding it is naming: the
 			// generation is filled in by the caller from the domain, which is where it is held.
 			let Ok(mut event) = decode_fault(&raw[..taken.min(FAULT_LEN)], Generation(0), DomainId(0)) else {
+				// A MALFORMED RECORD COSTS A SLOT, and that is what bounds this loop.
+				//
+				// It used to `continue` without touching `written`, so the only thing ending the
+				// drain was the transport running out of events - and a controller that supplies
+				// malformed records forever kept one call inside this loop forever. The outer
+				// per-poll ceiling never got a chance to apply, because it counts what this
+				// function RETURNS. Charging a dropped record against the same budget as a good one
+				// makes the work per call bounded by `out.len()` whatever the device sends, which is
+				// the property the fault-storm case is about; the good events behind a bad one are
+				// still read, just on the next call rather than this one.
+				dropped += 1;
+				written += 1;
 				continue;
 			};
 			if let Some((domain, _)) = self.attached.iter().find(|(_, e)| *e == event.endpoint) {
 				event.domain = *domain;
 			}
-			out[written] = event;
+			out[kept] = event;
+			kept += 1;
 			written += 1;
 		}
-		written
+		self.dropped_faults = self.dropped_faults.saturating_add(dropped);
+		kept
 	}
 
 	fn enforces_directions(&self) -> bool {

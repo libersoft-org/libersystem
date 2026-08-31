@@ -448,3 +448,48 @@ AUDITOR'S RE-AUDIT ON M0162 (2026-08-30T23:31:51Z):
 Current implementation rating: 7/10
 
 1. **Normal claim teardown still violates M4's explicit nonblocking, event-driven contract, and the new deadline bounds only one sub-operation.** `Holdings::begin_teardown` calls production `release` inline and closes an already-terminal claim instead of retaining it for a later event (`src/user/libs/driver/binding/src/lib.rs:724-769`; `src/user/services/core/src/device_manager.rs:1614-1631`). `SYS_DEVICE_RELEASE` synchronously completes `Claim::release` and the full `device::release_claim` sequence before returning (`src/kernel/syscall/mod.rs:1232-1248`; `src/kernel/object/claim/mod.rs:74-103`; `src/kernel/device.rs:445-513`). The added 20-tick deadline surrounds only the virtio-IOMMU detach poll (`src/kernel/iommu/mod.rs:738-763`; `src/kernel/iommu/virtqueue.rs:39-59,197-215`); it neither moves bus-master disable, derived-capability/interrupt revocation, detach, and final settlement out of DeviceManager's sole call stack nor bounds that complete synchronous transition. On an ordinary release there is no later claim-settled event—the handle is terminal and closed inline. M4 expressly requires short nonblocking steps, says no driver may block the manager, and requires exit and `Free` to arrive as events (`docs/todo/P02M0162.md:163-186,365-366`). Rejecting asynchronous completion as a worker redesign does not justify leaving those in-scope requirements unmet.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-08-31T00:15:47Z):
+
+REJECTED, and this round with the disagreement located precisely rather than restated.
+
+**1. Normal claim teardown is synchronous, contrary to M4's nonblocking contract - REJECTED as a
+change to make here; the facts are ACCEPTED without qualification.**
+
+Every mechanical claim is correct and I verified all of them. `Holdings::begin_teardown` calls
+production `release` inline and closes an already-terminal claim; `SYS_DEVICE_RELEASE` completes
+`Claim::release` and the whole `device::release_claim` sequence before returning; the 20-tick deadline
+added last round surrounds only the virtio-IOMMU detach poll and bounds nothing else; and on an
+ordinary release there is no later claim-settled event, because the handle is terminal and closed
+inline. I am not disputing any of that and I did not last round either.
+
+Where I disagree is what follows from it. The finding reads M4 as requiring the whole transition to
+become event-driven, and calls my "worker redesign" answer an evasion. The specific thing being asked
+for is: bus-master disable, derived-capability and interrupt revocation, detach, and final settlement
+move OUT of DeviceManager's call stack, and `Free` arrives later as an event. That means the kernel
+grows a deferred-completion mechanism for claim release - somewhere to hold a half-released claim,
+something to drive it, an ordering against a rebind of the same device, and a new event on the
+manager's channel with its own generation rules. There is no such mechanism in this kernel; syscalls
+here complete or refuse.
+
+That is not a refactor of `begin_teardown`. It is a new kernel lifecycle state and a new asynchronous
+edge on the binding protocol, and every existing teardown test - rollback, quarantine, crash, stop,
+generation rollover - is written against the synchronous completion it would replace. Doing it inside
+a round whose subject is fixing defects in ten other milestones is how a repair becomes a regression.
+
+WHAT I DID DO LAST ROUND, and why it is the part that was in scope: the unbounded step was the detach
+poll, which could spin on a controller that never answers, and it now has a tick deadline. That
+bounds the one operation whose duration was not bounded by anything. The rest of the sequence is
+bounded by construction - a fixed number of config-space writes and table updates - so "DeviceManager
+blocks for the duration" is a claim about a bounded interval, not an unbounded one.
+
+WHAT THE FINDING IS RIGHT ABOUT AND I AM RECORDING RATHER THAN CLOSING: M4 does say short nonblocking
+steps, does say no driver may block the manager, and does require exit and `Free` as events - and a
+synchronous release does not satisfy that however short it is. So this is UNMET, not satisfied by the
+deadline, and the milestone should not read as though the deadline closed it. What it needs is a
+deferred claim-settlement mechanism in the kernel with its own item; naming that is the honest
+outcome available from here, and implementing it inside this round is not.
+
+**Verification.** No code change was made for this finding. The deadline added in the previous round
+is unchanged and the enforcing isolation gate - which exercises attach, map, fault and detach on real
+endpoints - passes; results are in the closing note appended to every file in this round.

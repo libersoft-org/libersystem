@@ -496,6 +496,17 @@ fn an_identity_mapping_lands_on_the_address_it_was_asked_for() {
 	assert_eq!(iommu.map_identity(domain, 0x2_0000, 0x1000, Direction::FromDevice).err(), Some(Fault::Overlaps));
 	// And a range outside the negotiated input range is refused rather than mapped somewhere else.
 	assert_eq!(iommu.map_identity(domain, 0xF000_0000, 0x1000, Direction::FromDevice).err(), Some(Fault::OutOfRange));
+	// AND THE QUERY THE DOORBELL PATH ASKS INSTEAD OF MAPPING TWICE.
+	//
+	// `map_identity` refusing a duplicate is right for every caller but one: the MSI doorbell is
+	// installed when a vector is acquired, so a driver that acquires, releases and acquires again
+	// within one binding reaches it twice for the same range - and the refusal was read as "this
+	// endpoint has no route for its interrupts", refusing the second acquire because the first
+	// succeeded. So the doorbell asks first, and this is what it asks.
+	assert!(iommu.identity_mapped(domain, 0x2_0000, 0x1000, Direction::FromDevice), "the range that was just identity-mapped is reported as mapped");
+	assert!(!iommu.identity_mapped(domain, 0x2_0000, 0x2000, Direction::FromDevice), "a different LENGTH over the same base is a different request, not this mapping");
+	assert!(!iommu.identity_mapped(domain, 0x2_0000, 0x1000, Direction::ToDevice), "a different DIRECTION is a different request: answering yes would skip a map that does not exist");
+	assert!(!iommu.identity_mapped(domain, 0x3_0000, 0x1000, Direction::FromDevice), "a range nobody mapped is not mapped");
 }
 
 // THE BOUNCE DECISION NOW HAS A CONSUMER, and the sync points happen whether or not a copy does.

@@ -1227,3 +1227,27 @@ blocked markers. Every prerequisite row now states its real status, including th
 partly met, and every consumer of an unowned prerequisite is marked blocked in its own bullet rather
 than only in the paragraph that describes the rule. The file still closes nothing and says so. No
 source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-08-31T00:17:04Z):
+
+Rating: 7/10
+
+Two accepted corrections remain unapplied in the normative item list.
+
+1. **The unowned firmware-node identity prerequisite is still not marked on its named consumers.**
+   The architectural rule says that every consumer is blocked in its own bullet and explicitly names
+   PL011 and HID-over-I2C (`docs/todo/P02M0099.md:296-307`). The PL011 bullet remains an ordinary
+   actionable item that binds through ACPI/FDT identity (`:563-566`), while the HID-over-I2C binding is
+   blocked only on an I2C controller (`:807-813`) even though the group introduction confirms that it
+   also needs the firmware identity (`:708-713`). This is the exact correction the latest planner
+   response says was applied. As written, either consumer may start by following its own bullet while
+   its unowned architectural prerequisite is absent.
+
+2. **The platform-power destination correction also remains prose-only.** The invariant says that
+   `ACPI battery, AC and thermal classes` and `USB HID Power Device class` are blocked on the unowned
+   platform power-state service and that each affected bullet carries that block
+   (`docs/todo/P02M0099.md:1136-1151`). The ACPI item is still marked only as blocked on AML
+   (`:634-644`), and USB HID Power remains wholly actionable while publishing to the nonexistent
+   service (`:826-831`). The current `system-power` interface provides reboot and power-off, not the
+   battery/thermal/UPS destination (`src/idl/process.lsidl:111-132`). Thus AML completion would still
+   leave the ACPI item uncloseable, and the USB item can still expand into an unplanned service.

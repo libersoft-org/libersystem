@@ -1396,6 +1396,15 @@ struct Node {
 	// The registry candidates left to try, most specific first, and which one is being tried.
 	candidates: Vec<&'static Entry>,
 	candidate: usize,
+	// THE OPERATOR'S CHOICE, IF THERE IS ONE - an index into `candidates`.
+	//
+	// The cursor above is where the next bind STARTS; this is where it starts BY PREFERENCE. They are
+	// the same value until something moves the cursor, and the difference only matters on the paths
+	// that rewind it: a retry after exhaustion used to rewind to zero and hand an operator the
+	// registry order instead of the driver they selected, because the preference existed only as a
+	// stored string nothing reread until the next boot. Set by the live `select` verb and by
+	// `load_stored_policy`, which are the two places a preference can come from.
+	preferred: Option<usize>,
 	// One ordered queue. Two nodes are independent; one node never handles two events at once.
 	queue: BindingQueue,
 	// The heartbeat, armed when this node comes `Online` and only for an entry that declared a
@@ -1506,7 +1515,7 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None, incident_stored: false, teardown: None, disabled_by_policy: false }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None, incident_stored: false, teardown: None, disabled_by_policy: false }
 	}
 
 	// Queue one event for this node.
@@ -1919,7 +1928,13 @@ impl Catalogue {
 					continue;
 				};
 				self.generation = self.generation.wrapping_add(1);
-				let provider = Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle, consumers: 0 };
+				// ONE, NOT ZERO: the offer this publication carries IS a connection, and the field says
+				// so. Initialising it to zero made the declared bound off by one in the direction
+				// that matters - a kind declaring `consumers = 1` admitted its initial holder AND one
+				// `open`, so two consumers competed over a provider the manifest said takes one. The
+				// count is what `open` checks against `Entry::provides`, and the first offer has to be
+				// inside it or the bound describes something other than what is served.
+				let provider = Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle, consumers: 1 };
 				// AND EVERYONE WATCHING THAT KIND IS TOLD, which is the live half of a subscription:
 				// a consumer that subscribed before this driver bound sees it appear.
 				self.announce(&provider, true);
@@ -2010,14 +2025,20 @@ impl Catalogue {
 			//
 			// The announcement cannot run inside the closure: it borrows `self`, and the slots being
 			// withdrawn are `self`'s. The withdrawn providers are collected and announced after.
-			// ALLOC-OK: bounded by `MAX_PROVIDERS`, on a binding transition rather than a hot path.
-			let mut taken: alloc::vec::Vec<Provider> = alloc::vec::Vec::new();
-			if taken.try_reserve(MAX_PROVIDERS).is_err() {
-				// A withdrawal that cannot record what it took still WITHDRAWS - the providers go and
-				// their handles close - and the subscribers are told what could be recorded. Keeping
-				// the publication standing because a Vec would not grow is the worse failure.
-				print(b"DeviceManager: could not record a binding's withdrawn providers to announce them; they are withdrawn and the announcement is short\n");
-			}
+			//
+			// ON THE STACK, AND THEREFORE UNCONDITIONALLY (2026-08-30). This collected into a `Vec`
+			// with a `try_reserve` whose failure was handled by printing a line and carrying on - and
+			// on that path `capacity()` is zero, so the closure pushed NOTHING, every provider was
+			// removed and closed, and not one withdrawal was announced. Every subscriber then kept
+			// metadata for providers that no longer exist, for the rest of the boot, which is exactly
+			// the stale-provider state the withdrawal exists to prevent. The comment claimed the
+			// announcement was merely "short"; it was absent.
+			//
+			// `MAX_PROVIDERS` is the sum of every `provides` bound this image's registry declares - a
+			// compile-time constant and a small one - so the array that holds them needs no allocator
+			// at all and the failure mode goes with it.
+			let mut taken: [Option<Provider>; MAX_PROVIDERS] = [const { None }; MAX_PROVIDERS];
+			let mut count: usize = 0;
 			let gone = driver_binding::withdraw_slots(
 				&mut self.entries,
 				binding,
@@ -2026,13 +2047,16 @@ impl Catalogue {
 					if provider.handle != 0 {
 						close(provider.handle);
 					}
-					if taken.len() < taken.capacity() {
-						taken.push(provider);
+					if count < taken.len() {
+						taken[count] = Some(provider);
+						count += 1;
 					}
 				},
 			);
-			for provider in taken.iter() {
-				self.announce(provider, false);
+			for slot in taken.iter().take(count) {
+				if let Some(provider) = slot {
+					self.announce(provider, false);
+				}
 			}
 			gone
 		}
@@ -3298,7 +3322,7 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 			return Ok(PolicyOutcome::NotStored);
 		}
 		// AND NOW THE EFFECT ON THE NODE, which is the half only this program can perform.
-		unsafe { apply_policy(node, verb, self.catalogue) };
+		unsafe { apply_policy(node, verb, artifact.as_str(), self.catalogue) };
 		Ok(PolicyOutcome::Accepted)
 	}
 
@@ -3448,7 +3472,7 @@ unsafe fn begin_operator_stop(node: &mut Node, catalogue: &mut Catalogue) {
 
 // What a verb does to the node itself. The write has already happened; this is the half no other
 // component can perform.
-unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, catalogue: &mut Catalogue) {
+unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifact: &str, catalogue: &mut Catalogue) {
 	unsafe {
 		use proto::system::PolicyVerb;
 		match verb {
@@ -3503,8 +3527,32 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, catalog
 					print(b"DeviceManager: the stored disable is lifted; this device is not stopped, so nothing is restarted\n");
 				}
 			}
-			// SELECT CHANGES NOTHING NOW. It is stored, and it applies at the next bind.
-			PolicyVerb::Select => {}
+			// SELECT MOVES THE CURSOR NOW, AND THAT IS WHAT "APPLIES AT THE NEXT BIND" MEANS.
+			//
+			// This did nothing at all, on the reasoning that the record is stored and the stored
+			// record is read at startup - which makes a selection apply at the next BOOT, not the
+			// next bind. `load_stored_policy` runs once, when the ConfigService connection arrives,
+			// and nothing reruns it; an operator who selected a driver and then stopped and started
+			// the device got the registry order again, and the contract this milestone states is
+			// "the next bind".
+			//
+			// The cursor IS the preference - `load_stored_policy` expresses a stored `select=` by
+			// setting exactly this field - so applying it here and applying it at startup are the
+			// same operation on the same state, which is what keeps the two paths from disagreeing.
+			// The candidate was already validated against this node's list by `decide_policy`, which
+			// refuses an artifact the image never declared for this device.
+			//
+			// It still does NOT disturb a running binding: moving the cursor changes which candidate
+			// the NEXT bind starts from and touches neither the record nor the live driver.
+			PolicyVerb::Select => match node.candidates.iter().position(|entry| entry.name == artifact.as_bytes()) {
+				Some(at) => {
+					node.candidate = at;
+					node.preferred = Some(at);
+				}
+				// Unreachable through the served verb, which validated it; a caller that reaches
+				// here with an unknown artifact changes nothing rather than silently rewinding.
+				None => print(b"DeviceManager: the selected artifact is not a candidate for this device; the cursor is unchanged\n"),
+			},
 			// A RETRY GRANTS EXACTLY ONE FURTHER ATTEMPT and does not reset the automatic budget:
 			// without that rule the two mechanisms meet in the table with nothing said, and whoever
 			// implements it decides for themselves whether an operator can spend the budget again.
@@ -3529,14 +3577,18 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, catalog
 				// candidate asked it to start nothing. An operator saw `Accepted` and nothing
 				// happened, which is the one outcome a policy verb may not produce.
 				//
-				// Rewound to the REGISTRY ORDER rather than to the last entry tried: a retry is a
-				// request to bind the device again, and the stored `select=` preference is expressed
-				// as this same cursor, so an operator who chose an artifact gets it re-applied by
-				// `load_stored_policy` on the next start rather than by this verb second-guessing
-				// which entry was meant. The `requires` re-evaluation the milestone asks for then
-				// happens where it always does, inside `start_candidate`.
+				// Rewound TO THE SELECTED CANDIDATE where there is one, and to the registry order
+				// otherwise (corrected 2026-08-30).
+				//
+				// This rewound to zero unconditionally, and said the stored preference would be
+				// re-applied by `load_stored_policy` "on the next start" - which is the next BOOT.
+				// So an operator who selected a driver, watched it exhaust its candidates and asked
+				// for a retry got the registry order instead of their choice, on the one verb whose
+				// whole purpose is "try again". The preference lives in `node.preferred`, which both
+				// the stored-policy load and the live `select` verb set, so a retry consults the same
+				// field rather than inventing which entry was meant.
 				if node.candidate >= node.candidates.len() {
-					node.candidate = 0;
+					node.candidate = node.preferred.unwrap_or(0);
 				}
 				// ASKED FOR, AND THE LOOP PERFORMS IT. A state change alone would not do: `advance`
 				// is event-driven and a node sitting in `Failed` or `Backoff` raises no event, so
@@ -3751,6 +3803,10 @@ unsafe fn load_stored_policy(nodes: &mut [Node], config: u64) {
 			match node.candidates.iter().position(|entry| entry.name == wanted) {
 				Some(at) => {
 					node.candidate = at;
+					// AND IT SURVIVES A REWIND. `Retry` after exhaustion resets the cursor, and
+					// without the preference recorded beside it that reset handed the operator the
+					// registry order instead of their stored choice.
+					node.preferred = Some(at);
 					print(b"DeviceManager: ");
 					print_driver_name(wanted);
 					print(b" is the stored choice for this device and is tried first\n");

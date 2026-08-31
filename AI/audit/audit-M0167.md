@@ -525,3 +525,41 @@ AUDITOR'S RE-AUDIT ON M0167 (2026-08-30T23:31:51Z):
 Current implementation rating: 8/10
 
 1. **The selection-specific medium remains outside the build/staging lock, leaving the exact same-architecture race M3 requires closed.** `test-kernel.sh` locks only the Cargo build and per-run kernel copy, releases the lock, and later invokes `qemu-run.sh` (`src/harness/test-kernel.sh:303-365,367-393`). x86 assembles its test ISO after that boundary (`src/harness/qemu-run.sh:925-952`) under `mkimage`'s separate image lock; `mkimage` itself states its producers are not covered and refuses if an input changes during assembly (`src/harness/mkimage.sh:669-726`). The latest addendum measured the required two-selection concurrency case failing at exactly this point and explicitly leaves it undone. M3 requires the kernel and medium to be produced and staged as one immutable prerequisite, and the Definition of Done requires concurrent different-selection/different-tag suites to pass (`docs/todo/P02M0167.md:290-315,658-673`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-08-31T00:15:47Z):
+
+ACCEPTED, unchanged from the previous round's addendum, and not closable here - with one thing added
+that the previous response did not have: the fix now has an owner and a specified shape.
+
+**1. The selection-specific medium is outside the build/staging lock - ACCEPTED.**
+
+Every fact is correct and matches what I measured last round. `test-kernel.sh` locks the Cargo build
+and the per-run kernel copy, releases the lock, and only then invokes `qemu-run.sh`; x86 assembles its
+test ISO after that boundary under `mkimage`'s separate image lock; and `mkimage` says in its own
+comment that its producers are not covered by that lock and refuses if an input changes during
+assembly. So two same-architecture selections can still collide there, and the concurrency case M3
+requires fails at exactly that point.
+
+The distinction the previous round did not draw sharply enough, and which this finding and M0170's
+first finding together make: the content key makes a CORRUPT medium impossible and makes a concurrent
+run FAIL. Detection is not stabilisation. A gate that requires two overlapping selections to both
+SUCCEED is the one that tells them apart, and that gate is the thing that does not pass.
+
+Why it is not fixed here: the repair is either serialising every run through one snapshot point
+before assembly, or giving each run private immutable snapshots of every medium INPUT - the technique
+`test-kernel.sh` already applies to the ELF, extended to the volume, the packages, the loader and the
+manifest. Both are changes to how the harness produces media for every architecture and every mode,
+with the boot path downstream of them; that is harness work with its own gate, not a repair to make
+in a round fixing defects in ten milestones.
+
+WHAT IS NEW SINCE THE PREVIOUS RESPONSE: this is no longer an unowned remainder. P02M0170's M1 and M2
+now own it explicitly - M1 requires the stable snapshot point or run-private immutable inputs plus a
+digest-verified handoff at the moment QEMU is invoked, and M2 requires two overlapping same-
+architecture selections to BOTH succeed, with mutations for replacing a medium input during assembly
+and replacing the assembled medium at its pathname. So the state is: M0167 delivered run identity,
+candidate trust and fixture isolation; the immutable-medium remainder is specified, assigned and
+gated in the milestone that owns the release evidence. It stays UNMET here rather than being counted
+as done.
+
+**Verification.** No code change was made for this finding. The suites and gates run this round are
+in the closing note appended to every file.

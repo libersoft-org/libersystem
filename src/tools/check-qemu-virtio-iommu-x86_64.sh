@@ -79,6 +79,25 @@ KERNEL_ELF="$BUILD_ROOT/cargo/kernel/x86_64-unknown-none/debug/kernel"
 # into a blank one.
 current_key="$(LIBER_IMAGE_PRINT_KEY=1 "$HERE/../harness/mkimage.sh" iso "$KERNEL_ELF" || true)"
 [[ -n "$current_key" ]] || fail "the image builder could not compute this tree's image key - build first:  ./build.sh --arch x86_64"
+# AND THE BYTES, NOT ONLY THE KEY THEY WERE BUILT FROM.
+#
+# The key describes the INPUTS. `mkimage.sh` records `$ISO.build-digest` separately, and verifies it
+# on a cache hit, precisely because a matching input key says nothing about the output: an ISO that
+# was truncated, edited or replaced after it was built sits beside a still-current key and this
+# preflight called it "built from this tree". The builder already computes the digest it expects, so
+# the gate reads the same sidecar rather than inventing a second answer.
+if [[ -f "$ISO.build-digest" ]]; then
+	actual_digest="$(sha256sum "$ISO" | awk '{print $1}')"
+	if [[ "$actual_digest" != "$(<"$ISO.build-digest")" ]]; then
+		echo "qemu-virtio-iommu: $ISO does not match the digest recorded when it was built" >&2
+		echo "qemu-virtio-iommu:   recorded $(<"$ISO.build-digest")" >&2
+		echo "qemu-virtio-iommu:   on disk  $actual_digest" >&2
+		echo "qemu-virtio-iommu:   the image was changed after it was built - rebuild it:  ./image.sh --format iso" >&2
+		exit 1
+	fi
+else
+	fail "$ISO carries no build digest, so its bytes cannot be checked - rebuild it:  ./image.sh --format iso"
+fi
 if [[ "$current_key" != "$(<"$ISO.build-key")" ]]; then
 	echo "qemu-virtio-iommu: $ISO was not built from this tree" >&2
 	echo "qemu-virtio-iommu:   the image was built from $(<"$ISO.build-key")" >&2
@@ -208,13 +227,39 @@ timeout 120 ./run.sh --smp 4 --serial "file:$default_log" >/dev/null 2>&1 || tru
 # panicked ten seconds later passed this phase. The greps that follow assert the absence of degraded
 # rows and of faults; these assert the absence of the boot ending badly, which is the same kind of
 # check and was the one missing.
-for bad in "KERNEL PANIC" "GUEST RESET" "loader: FATAL"; do
-	if grep -aq "$bad" "$default_log"; then
-		echo "qemu-virtio-iommu: the default run printed '$bad' - the machine may be translated and it did not survive the boot" >&2
-		grep -a -m 5 -B 2 "$bad" "$default_log" >&2
+survived_the_boot() {
+	local log="$1" phase="$2" bad boots
+	for bad in "KERNEL PANIC" "loader: FATAL"; do
+		if grep -aq "$bad" "$log"; then
+			echo "qemu-virtio-iommu: the $phase run printed '$bad' - the machine may be translated and it did not survive the boot" >&2
+			grep -a -m 5 -B 2 "$bad" "$log" >&2
+			exit 1
+		fi
+	done
+	# A RESET IS COUNTED, NOT GREPPED FOR - and the string this used to look for could never appear.
+	#
+	# `GUEST RESET` is synthesized by `test-kernel.sh` when it interprets a TEST-mode QEMU exit; the
+	# guest never prints it, and an ordinary `./run.sh` is not test mode, so the grep matched nothing
+	# on every run and passed. Worse, an ordinary run has no `-no-reboot` - that flag and the
+	# debug-exit device exist only under `TEST=1` - so a triple fault after the required lines
+	# REBOOTS, the second boot appends to the same serial file, and the assertions above still find
+	# what the first boot printed.
+	#
+	# The loader prints its banner exactly once per boot, so more than one of them in one serial log
+	# IS the reset. This is the oracle the phase was missing, and it works without changing how an
+	# ordinary run is launched.
+	boots="$(grep -ac "LiberSystem UEFI loader" "$log" || true)"
+	if [[ "${boots:-0}" -gt 1 ]]; then
+		echo "qemu-virtio-iommu: the $phase run booted $boots times - the guest reset after printing its lines, and a reboot is not a pass" >&2
 		exit 1
 	fi
-done
+	if [[ "${boots:-0}" -eq 0 ]]; then
+		echo "qemu-virtio-iommu: the $phase run never printed the loader banner - it did not boot far enough for anything below to mean what it says" >&2
+		exit 1
+	fi
+}
+
+survived_the_boot "$default_log" "default"
 
 grep -aq "dma: every bus-mastering device is translated" "$default_log" || {
 	echo "qemu-virtio-iommu: the DEFAULT run is not translated - an ordinary boot walks the degraded path" >&2
@@ -282,6 +327,8 @@ echo "qemu-virtio-iommu:   the default machine is translated, nothing is degrade
 echo "qemu-virtio-iommu: booting --no-iommu, the machine without one"
 plain_log="$work/plain.log"
 timeout 120 ./run.sh --no-iommu --smp 4 --serial "file:$plain_log" >/dev/null 2>&1 || true
+[[ -s "$plain_log" ]] || fail "the --no-iommu run produced no serial output"
+survived_the_boot "$plain_log" "--no-iommu"
 grep -aq "iommu: no virtio-iommu on this machine" "$plain_log" || fail "--no-iommu still put a controller in the machine"
 grep -aq "dma: DEGRADED ISOLATION" "$plain_log" || fail "--no-iommu did not report the degraded state it is for"
 echo "qemu-virtio-iommu:   --no-iommu boots the untranslated machine and says so"

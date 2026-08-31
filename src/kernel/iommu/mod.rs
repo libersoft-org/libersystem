@@ -533,7 +533,7 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 // charge. A device that is not translated holds none, which is the honest answer rather than zero
 // standing in for "no controller".
 pub fn grants_for(index: u32) -> usize {
-	let Some(domain) = domain_of(index) else { return 0 };
+	let Some(domain) = domain_of(index).or_else(|| retained_domain_of(index)) else { return 0 };
 	with(|controller| controller.iommu().mappings_in(domain)).unwrap_or(0)
 }
 
@@ -544,8 +544,24 @@ pub fn grants_for(index: u32) -> usize {
 // whether a released claim's address space may be reused: a quarantined range is out of circulation
 // for the life of the boot, and a manager that cannot see one cannot reconstruct that fact.
 pub fn quarantined_grants_for(index: u32) -> usize {
-	let Some(domain) = domain_of(index) else { return 0 };
+	let Some(domain) = domain_of(index).or_else(|| retained_domain_of(index)) else { return 0 };
 	with(|controller| controller.iommu().quarantined_addresses(domain)).unwrap_or(0)
+}
+
+// DEVICES WHOSE DETACH WAS NOT CONFIRMED, AND THE DOMAIN THAT OUTLIVED THEM.
+//
+// `detach_for_inner` removes the live `DOMAINS` row before it revokes, because after the revoke the
+// device is no longer translated and must not read as though it were. On the UNCONFIRMED path the
+// backend's domain and its quarantined mappings are deliberately retained - nobody knows whether the
+// device can still reach them - and the two facts together meant `grants_for` and
+// `quarantined_grants_for` answered ZERO for exactly the binding whose holdings matter most: a
+// manager reconstructing the charge saw a claim with no IOMMU holdings and quarantined pages behind
+// it. This list is the association that survives the row, and nothing else reads it: a retained
+// domain is not a live one, so admission, `msi_deliverable` and `domain_of` are untouched by it.
+static RETAINED: SpinLock<Vec<(u32, dma::DomainId)>> = SpinLock::new(Vec::new());
+
+fn retained_domain_of(index: u32) -> Option<dma::DomainId> {
+	RETAINED.lock().iter().find(|(device, _)| *device == index).map(|(_, domain)| *domain)
 }
 
 // Whether an MSI vector for this device can actually be delivered: either it is not translated at all,
@@ -607,6 +623,16 @@ fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::Doma
 		// refused the one access anybody makes to it. QEMU's trace named it exactly:
 		// `virt_start=0xfee00000 ... flags=1`, a read-only mapping, and the MSI arriving as
 		// `flag=2`.
+		// ALREADY INSTALLED IS ALREADY DONE. The doorbell is mapped when a vector is ASKED FOR, so a
+		// driver that acquires, releases and acquires again within one binding arrives here twice for
+		// the same range - and `map_identity` refuses a duplicate with `Overlaps`, which this read as
+		// "no route for its interrupts" and turned into a refused second acquire. Asking first is
+		// what makes the lazy install idempotent; `map_identity` keeps its refusal for every other
+		// caller.
+		if iommu.identity_mapped(domain, region.base, region.len, dma::Direction::FromDevice) {
+			mapped = true;
+			continue;
+		}
 		match iommu.map_identity(domain, region.base, region.len, dma::Direction::FromDevice) {
 			// SAID ONCE, NOT ONCE PER DOMAIN. Every endpoint on this machine writes the same
 			// doorbell, so a line per domain is eleven copies of one fact - the scattering the
@@ -775,12 +801,28 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// exactly where a fault most needs attributing: a device faulting as its binding ends is the case
 	// the containment policy is for. Drained again afterwards, because the revoke itself can produce
 	// one.
+	// The generation this binding was made at, captured while the domain still answers - it is what
+	// the post-revoke drain stamps on a fault the backend can no longer attribute.
+	let generation = with(|controller| controller.iommu().generation_of(domain)).flatten();
+	let endpoint = requester_of(bus, dev, func);
 	poll_faults();
 	DOMAINS.lock().retain(|(device, _)| *device != index as u32);
 	let confirmed = match revoke_endpoint(domain, bus, dev, func) {
 		Ok(dma::Release::FramesReusable) => true,
 		other => {
 			crate::serial_println!("iommu: {:02x}:{:02x}.{} was not confirmed detached ({other:?}) - its pages stay quarantined", bus, dev, func);
+			// AND THE ASSOCIATION IS KEPT SO THE HOLDINGS STAY REPORTABLE. The live row is gone -
+			// this device is not translated any more - but its domain and its quarantined mappings
+			// are not, and a claim snapshot that answered zero for them would say the opposite of
+			// what quarantine means. ALLOC-OK: one entry per unconfirmed detach, which is a
+			// per-binding event and not a hot path; a short heap loses the association rather than
+			// the quarantine, and says so.
+			let mut retained = RETAINED.lock();
+			if retained.try_reserve(1).is_ok() {
+				retained.push((index as u32, domain));
+			} else {
+				crate::serial_println!("iommu: no room to record that {:02x}:{:02x}.{} left a quarantined domain behind - its holdings will report as zero", bus, dev, func);
+			}
 			false
 		}
 	};
@@ -809,13 +851,34 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// fault raised between two of those moments is reported late. It is never LOST - the device
 	// keeps it queued - and it is never unbounded, because the drain is bounded by the buffer.
 	// Interrupt-driven delivery is not implemented here.
-	poll_faults();
+	//
+	// ATTRIBUTED, because by here the backend cannot be: the revoke above took this endpoint out of
+	// its attached table, so a fault queued since the pre-drain would otherwise be reported as
+	// domain zero at generation zero. This drain supplies the binding that was ending.
+	poll_faults_attributed(generation.map(|g| (endpoint, domain, g)));
 	confirmed
 }
 
 // Take whatever the device has reported and record it. Bounded by a fixed buffer, so a flooding
 // endpoint does bounded work per call and cannot decide how much the kernel allocates.
 pub fn poll_faults() {
+	poll_faults_attributed(None)
+}
+
+// Drain and report faults, optionally supplying the attribution a TEARDOWN knows and the backend no
+// longer does.
+//
+// THE TEARDOWN DRAIN IS THE ONE THAT LOSES THE ANSWER. The backend resolves an event's domain from
+// its own attached table, and the revoke that ends a binding removes the endpoint from it - so a
+// fault queued between the pre-drain and the revoke, or caused BY the revoke, is drained afterwards
+// with `DomainId(0)` and `Generation(0)` behind it. That is the moment a fault most needs
+// attributing: a device faulting as its binding ends is what the containment policy exists for, and
+// "domain 0, generation 0" is the report saying it does not know.
+//
+// So the caller that is tearing an endpoint down passes what it still knows. It is applied ONLY to
+// an event whose endpoint matches and whose domain the backend could not resolve - a fault from
+// another endpoint keeps its own attribution, and a resolved one is never overwritten by a guess.
+pub fn poll_faults_attributed(during_teardown: Option<(dma::EndpointId, dma::DomainId, Generation)>) {
 	// THE CEILING IS THE BOUND, and it is a whole number of drains rather than a buffer size. This
 	// used to loop until the queue answered empty, with a comment saying the work was bounded -
 	// which was true of each drain and not of the loop around them. An endpoint faulting faster than
@@ -829,7 +892,13 @@ pub fn poll_faults() {
 		if taken == 0 {
 			return;
 		}
-		for event in out.iter().take(taken) {
+		for event in out.iter_mut().take(taken) {
+			if let Some((endpoint, domain, generation)) = during_teardown {
+				if event.endpoint == endpoint && event.domain == dma::DomainId(0) {
+					event.domain = domain;
+					event.generation = generation;
+				}
+			}
 			// SAID WITH THE ADDRESS WHEN THERE IS ONE. A report the controller sent without an
 			// address is a real fault reported in less detail, and printing a zero for it would be
 			// this side inventing a number the device did not send.

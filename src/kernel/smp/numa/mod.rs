@@ -116,10 +116,18 @@ pub fn online_on(node: NodeId) -> usize {
 
 // Why a placement could not be made. TYPED, because "no CPU" and "no such node" are different
 // answers and a caller that cannot tell them apart cannot report either.
-// TEST-ONLY UNTIL SOMETHING ASKS FOR A PLACEMENT. The hint is what M3 owes and it is exercised
-// directly; the callers that will use it are a service asking for a thread on a node, which
-// this tree explicitly does not add - "the scheduler exposes enough placement to prove topology is
-// used and stops there". A public API with no caller would be the opposite of that.
+//
+// STILL TEST-ONLY, AND THE REASON IS NOW WRITTEN AS A LIMIT RATHER THAN A PREFERENCE (2026-08-30).
+// `place_on` is the NODE -> CPU direction, and nothing in this kernel asks it: there is no
+// production kernel-thread spawner in this tree at all - `spawn_with_object` and its siblings are
+// themselves `#[cfg(test)]` - so a production caller cannot be wired without adding the service M3's
+// last bullet explicitly refuses ("the scheduler exposes enough placement to prove topology is used
+// and stops there").
+//
+// What the SHIPPING kernel does use is the other direction: `Thread::new` names the creating core, so
+// `cpu_node` decides the node its kernel stack is taken from. That is M3's third bullet and it is in
+// the product; this hint is the half whose consumer does not exist yet, and saying so is more honest
+// than inventing one to make it reachable.
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Refusal {

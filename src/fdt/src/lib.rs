@@ -705,6 +705,20 @@ impl Fdt {
 			// reader to implement inheritance for one property.
 			let mut gic_phandle: u32 = 0;
 			let mut timer_parent: u32 = 0;
+			// THE ROOT'S `interrupt-parent`, WHICH IS THE ONE THE TIMER INHERITS.
+			//
+			// `interrupt-parent` is an inherited property, and the previous version treated an
+			// unstated one as "not checkable" and skipped the comparison - so a timer inheriting a
+			// DIFFERENT controller from its ancestor was accepted and its INTID enabled on the
+			// selected GIC, which is the case the check exists for. It was justified by not wanting
+			// to implement inheritance for one property, and for THIS node that argument does not
+			// hold: the ARM generic timer is a root CHILD on every machine this reader boots, so its
+			// only ancestor is the root and the whole of the inheritance is this one value.
+			//
+			// A tree that nests the timer deeper is one this reader does not claim to read: the
+			// resolution below applies only at depth 1, and anything else keeps the old
+			// unstated-is-accepted behaviour rather than resolving an ancestor it did not track.
+			let mut root_interrupt_parent: u32 = 0;
 			let mut timer_intid: u32 = 0;
 			let mut timer_compatible = false;
 			// The versioned binding, which this reader never checked: entering distance-map mode on
@@ -1109,7 +1123,14 @@ impl Fdt {
 							// the high cells out and silently keeping the low bits. An address
 							// this reader cannot represent is a tree it is not for, and saying so
 							// is a rule rather than a truncation nobody can see.
-							if self.str_eq(pname, "#address-cells") && len == 4 {
+							// THE ROOT'S `interrupt-parent`, WHICH IS WHAT THE TIMER INHERITS. Read here
+							// because this is the block a depth-0 property reaches: the chain below
+							// is this block's `else`, so a `depth == 0` arm added to it can never be
+							// taken - which is how the first attempt at this check compiled, ran and
+							// changed nothing.
+							if self.str_eq(pname, "interrupt-parent") && len == 4 {
+								root_interrupt_parent = self.be32(val);
+							} else if self.str_eq(pname, "#address-cells") && len == 4 {
 								let cells = self.be32(val);
 								if cells > MAX_CELLS {
 									return None;
@@ -1441,13 +1462,20 @@ impl Fdt {
 			// selected describes a PPI on THAT controller - and enabling its INTID on the selected
 			// GIC arms a per-core interrupt the tree does not say belongs there.
 			//
-			// STATED AND DIFFERENT is the only refusal. `interrupt-parent` is inherited, so a timer
-			// that states nothing is routed by its ancestors - the ordinary shape on both machines
-			// this boots - and refusing that would refuse every real tree. A stated parent that
-			// matches, or a tree in which the GIC declares no phandle to compare against, is
-			// accepted. Zeroing rather than flagging, because the caller already refuses a boot with
-			// no timer: this is the same absence, arrived at for a stated reason.
-			if timer_parent != 0 && gic_phandle != 0 && timer_parent != gic_phandle {
+			// THE EFFECTIVE PARENT IS THE STATED ONE OR THE INHERITED ONE, and checking only the
+			// stated one was the hole (corrected 2026-08-30). `interrupt-parent` is inherited, and
+			// the ordinary shape on both machines this reader boots is a root that states it and a
+			// timer that does not - so "unstated is accepted" skipped the check on exactly the trees
+			// it was written for, and a timer inheriting a different controller was enabled on the
+			// selected GIC anyway. The timer is a root child, so the inherited value is the root's
+			// and resolving it is one lookup rather than an inheritance implementation.
+			//
+			// A tree in which the GIC declares no phandle still has nothing to compare against and is
+			// still accepted; that is a tree this reader cannot check rather than one it has checked.
+			// Zeroing rather than flagging, because the caller already refuses a boot with no timer:
+			// this is the same absence, arrived at for a stated reason.
+			let effective_parent = if timer_parent != 0 { timer_parent } else { root_interrupt_parent };
+			if effective_parent != 0 && gic_phandle != 0 && effective_parent != gic_phandle {
 				timer_intid = 0;
 			}
 			// AND NO CHILD REGION MAY SHARE BYTES WITH THE CONTROLLER OR WITH THE OTHER CHILD.

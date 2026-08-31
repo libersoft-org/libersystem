@@ -966,3 +966,49 @@ recorded so it is not re-broken.
 **Plan re-check.** Item count unchanged. The freeze order is now stated in three places that agree -
 M1's split, the completion paragraph, and the gate list - and the guest gate is runnable for the
 first time because the artifact it launches can be staged. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-08-31T00:17:04Z):
+
+Rating: 4/10
+
+1. **The configuration is still not pinned, and the completion gate recreates the accepted pinning
+   cycle.** The plan contains no actual Vulkan-Loader/Vulkan-Headers revisions, archive SHA-256 values,
+   toolchain-file digests, tool identities, or bootstrap-sysroot digest; it only specifies what a
+   future bootstrap lock must contain (`docs/todo/P02M0135.md:146-182`). More importantly, the corrected
+   order says only the bootstrap pin gates pass 1 and places the platform port and final sysroot in a
+   derived pin at the end (`:146-164`), but the Host/Build gate again requires the complete lock,
+   including the platform port and sysroot, before anything else starts (`:529-534`). The latest
+   response's claimed split is therefore both unfilled and contradicted by the controlling completion
+   gate.
+
+2. **The quarantine-staging correction left mutually exclusive lifecycle rules.** The main contract
+   requires the audit-linked ELF to be named in a test-only manifest and quarantine-staged in the
+   gate's test image (`docs/todo/P02M0135.md:32-54`, `:75-82`, `:184-190`). Pass 2 still requires
+   “nothing staged and nothing kept but the evidence” (`:204-210`), and the deferral section still
+   defines the deferred production import as including “staging it, naming it in a manifest”
+   (`:612-614`). Those stale normative sentences authorize discarding or deferring the only executable
+   the mandatory guest launch needs. The test-only versus shipping distinction is otherwise adequate;
+   these two sentences must follow it.
+
+3. **The launch-selected ICD cannot become an “ordinary declared dependency” under the identity model
+   the plan preserves.** The proposed v2 identity embeds a fixed set of direct-provider digests in the
+   authenticated consumer record (`docs/todo/P02M0135.md:387-410`). Current ProcessService likewise
+   parses a fixed provider list from the ELF identity, derives dependencies only from `DT_NEEDED`, and
+   requires exact equality before loading (`src/user/services/core/src/process_service.rs:139-168`,
+   `:338-347`, `:679-710`). The correction instead directs ProcessService to append the selected ICD to
+   both the dependency set and the expected identity set at launch (`docs/todo/P02M0135.md:478-485`),
+   although the latter is authenticated immutable input. The metadata fields and their binding to code
+   remain deferred (`:509-516`). A digest-bound selection edge or an explicit v2 rule is required; the
+   current text either cannot pass its equality check or weakens the identity edge while claiming no
+   new ProcessService mechanism (`:456`).
+
+4. **The one-symbol loader port does not cover the ICD interfaces the pinned upstream may admit.** The
+   plan requires exactly one well-known export per ICD and calls that the universal Vulkan ICD ABI
+   shape (`docs/todo/P02M0135.md:486-494`). Khronos's official
+   [Loader/Driver Interface](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md)
+   requires interface versions 2-6 to export `vk_icdNegotiateLoaderICDInterfaceVersion` in addition to
+   `vk_icdGetInstanceProcAddr`; version 0 has a different multi-export bootstrap. Version 7 is the case
+   that permits the additional interface functions to be obtained through
+   `vk_icdGetInstanceProcAddr`. The plan neither pins/restricts the admitted interface to version 7 nor
+   defines legacy negotiation. A one-symbol synthetic provider can therefore pass while the actual
+   pinned loader remains incompatible with an upstream-supported ICD.

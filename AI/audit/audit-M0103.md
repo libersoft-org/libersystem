@@ -1075,3 +1075,38 @@ document, and four Done conditions; it loses the `Event` prose entirely. Every p
 declarable prerequisite and a declarable completion: `s-common` releases `a-common`, `s-2d` releases
 `b`, `s-3d` releases `e`, and no core gate depends on `f-ext`. Pass 10's open list is shorter by the
 entries that were actually resolved rather than by claiming them. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-08-31T00:17:04Z):
+
+Rating: 3/10
+
+1. **The specification-freeze correction is still internally contradictory and does not freeze the
+   acknowledged blocking choices.** The authoritative per-part freeze gates require documents and
+   registry entries (`docs/todo/P02M0103.md:2049-2055`), while pass 10 first says the `s` split is
+   resolved (`:2150-2153`), then lists that split among the still-open blockers (`:2163-2165`), says
+   the split itself blocks work (`:2180-2182`), and leaves its correction unchecked (`:2196-2200`).
+   The checked `s` completion text requires every alternative, semantic hash, minimum limit and
+   tolerance to be fixed (`:2187-2194`), but those requirements are absent from the authoritative
+   gates. Correspondingly, the normative work still leaves hazards as “refused or defined,” leaves
+   `Depth32F` at “Choose one,” and says no 2D/3D conversion is needed (`:1626-1628`, `:1646-1654`,
+   `:1670-1675`) while pass 10 records those as unresolved corrections (`:2211-2247`). The Scene3D
+   registry coverage defect likewise remains open at `:2249-2253`. There is still no single canonical,
+   executable freeze boundary.
+
+2. **The sponsorship correction still asserts and withdraws requester attribution in the same
+   normative item.** The accounting introduction says client-created images necessarily make the
+   client Domain the charged Domain and therefore make the enforcing counter correct
+   (`docs/todo/P02M0103.md:924-930`). The same item later permits a supplier in another Domain and
+   expressly withdraws requester attribution (`:942-955`, `:971-993`). Current allocation charges the
+   creating syscall caller (`src/kernel/syscall/mod.rs:585-595`), while `ObjectInfo` exposes no charged
+   Domain (`src/abi/src/lib.rs:721-729`). The two guarantees cannot both be implemented or tested.
+
+3. **The duplicate-completion gate still claims a property that read-once-then-close cannot provide.**
+   The revised contract correctly permits DisplayService to process at most one outcome, but it also
+   says a second raw send has nowhere to arrive and requires a hostile test proving that
+   (`docs/todo/P02M0103.md:874-899`). A client can enqueue both messages before the first receive:
+   channels accept sends below their queue limit (`src/kernel/object/channel/mod.rs:262-295`), whose
+   default is 64 (`:30`, `:188-199`). Even at depth one, receive frees the slot and wakes a blocked
+   sender before userspace closes the endpoint (`:319-349`). The enforceable contract is one processed
+   outcome plus reclamation of queued capabilities, not failure or non-arrival of every second send;
+   the current hostile gate is therefore nondeterministic and overclaims the primitive.

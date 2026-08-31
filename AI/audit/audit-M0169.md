@@ -246,3 +246,30 @@ empty. The Definition of done carries the baseline requirement.
 **Plan re-check.** No new items; three existing ones gained the contracts they were missing. Ordering
 is unchanged. The Definition of done now states the recovery, the annotation-shape rejection and the
 denial-path close as three separately falsifiable clauses. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0169 (2026-08-31T00:17:04Z):
+
+Rating: 7/10
+
+1. **The caller-ID recovery design does not survive the late reply it is intended to recover from.**
+   M2 directs a caller that receives `TimedOut` or `ReceiveFailed` to issue `status(id)`/`cancel(id)`
+   on the transaction (`docs/todo/P02M0169.md:84-105`). `ChannelTransport::call`, however, reads
+   exactly one queued message (`src/user/libs/ipc/ipc-client/src/lib.rs:39-52`), and a generated call
+   treats one correlation mismatch as failure without draining or multiplexing
+   (`src/user/libs/protocol/process-proto/src/generated/liber/process/v1.rs:872-905`). If the timed-out
+   launch's reply arrives late, the next status call consumes that stale launch reply and fails its
+   correlation check; the real status reply remains queued and can poison the next call in turn.
+   Recovery therefore needs either a fresh owner-scoped connection, a correlation-aware receive/drain
+   protocol, or the per-prepare owner connection the plan mentions as an alternative. The plan must
+   select and test one; its primary caller-ID path is not recoverable on the current shared channel.
+
+2. **The new transaction identity lacks the ownership and lifetime rules required by its promised
+   outcomes.** M2 says ProcessService keys a prepared record on a caller-chosen ID and must answer
+   “already released,” but it does not scope the key to the owner, define collision/retry/replay
+   behavior, or bound retention of terminal records (`docs/todo/P02M0169.md:93-100`). Current prepared
+   state deliberately keys authority by owner channel plus koid because a koid alone let one client
+   start or cancel another client's launch (`src/user/services/core/src/process_service.rs:372-388`,
+   `:899-925`), and disconnect cleanup is owner-scoped (`:1023-1041`). A global caller ID would
+   reintroduce that class of bug; immediately deleting the ID cannot answer “already released,” while
+   retaining it forever is unbounded. Freeze `(owner,id)`, collision/idempotency semantics and bounded
+   terminal cleanup, and exercise cross-owner and reused-ID cases.

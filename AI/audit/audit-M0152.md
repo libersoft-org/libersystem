@@ -621,3 +621,45 @@ AUDITOR'S RE-AUDIT ON M0152 (2026-08-30T23:31:51Z):
 Current implementation rating: 8/10
 
 1. **M3's targeted placement and stack-locality path still exists only as test scaffolding, contrary to the recorded production-caller claim.** M3 requires an internal typed node-placement hint and a stack created for the selected CPU to prefer that CPU's node (`docs/todo/P02M0152.md:123-134`; Definition of Done `:211-222`). `Refusal` and `place_on` remain `#[cfg(test)]` (`src/kernel/smp/numa/mod.rs:117-149`), as do the only targeted prepare/start APIs (`src/kernel/sched/mod.rs:408-475,504-513`). `Thread::new_for_cpu` can select the target node (`src/kernel/object/thread/mod.rs:298-321`), but its only non-test caller is ordinary `Thread::new`, which always passes `None`; the sole `Some(cpu)` call is inside the test-only scheduler helper (`src/kernel/sched/mod.rs:471-475`). The test proves the mechanism, but a production kernel has no node-placement request or targeted start path, so the accepted original finding was only partially corrected.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0152 (2026-08-31T00:15:47Z):
+
+ACCEPTED in fact, and fixed in the half that could be fixed without inventing a consumer. The other
+half is recorded as a limit rather than argued away.
+
+**1. Targeted placement and stack locality exist only as test scaffolding - ACCEPTED.**
+
+The fact is exactly as reported: `Refusal` and `place_on` are `#[cfg(test)]`, so they are not in the
+shipping kernel at all, and the only `Some(cpu)` caller of `Thread::new_for_cpu` is a test-only
+scheduler helper. A milestone whose Definition of Done says "an internal node placement request runs
+on an online CPU from that node" was true of the test build and of nothing the product ships.
+
+**What I fixed, and it is the half that matters most.** `Thread::new` called
+`new_for_cpu(entry, arg, process, None)`, and `None` means "no node to prefer". Every ordinary thread
+in the shipping kernel went through it - so a kernel that had discovered its topology, bound every
+logical CPU to a node and published the masks then allocated every kernel stack with no preference at
+all. M3's third bullet is "a kernel stack or other CPU-owned allocation created for a selected CPU
+prefers that CPU's node", and the product was not doing it anywhere.
+
+`Thread::new` now passes `Some(current_cpu_id())`. A thread created without a stated core first runs
+on the core creating it - that is what `spawn` means - so its stack belongs on that core's node. It is
+a PREFERENCE and not a pin: `new_for_cpu` already falls back to an ordinary allocation on a machine
+with no topology or an unbound CPU, and a later wake-side migration moves no pages, which the
+documentation already says. This puts the placement mechanism into the shipping kernel through the one
+caller that exists.
+
+**What I did not do, and why it is a limit rather than a choice.** `place_on` is the NODE -> CPU
+direction, and nothing in this kernel asks it. There is no production kernel-thread spawner in the
+tree at all - `spawn_with_object`, `prepare_with_object` and `prepare_with_object_for` are themselves
+`#[cfg(test)]` - so a production caller cannot be wired without adding the service M3's last bullet
+explicitly refuses: "the scheduler exposes enough placement to prove topology is used and stops
+there". Making `place_on` public with no caller would also be dead code in the shipping build, and
+this tree does not carry suppression attributes for that.
+
+So the comment above it is rewritten to say this as a LIMIT: which direction the product uses, which
+one has no consumer yet, and why inventing one would be worse than the gap. The previous comment
+presented the same state as a preference, which read as though the decision had been made rather than
+forced.
+
+**Verification.** Kernel builds clean; the full x86_64 tree builds clean. Guest suites are reported in
+the closing note appended to every file in this round.

@@ -699,3 +699,74 @@ Current implementation rating: 6/10
 2. **The required real-device ITS/MSI checkpoint is explicitly still absent.** M3/M6 require the final GICv3/ITS profile to deliver and tear down a real device MSI (`docs/todo/P02M0151.md:94-103,143-154`). Its selected oracle instead allocates RAM as a fake MSI-X table, manually invokes `dispatch_msi`, and performs synthetic release/reacquire (`src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The gate now accurately prints that no device-originated MSI is proved (`src/tools/check-qemu-arch-profiles.sh:323-349`). Correcting the overclaim did not complete the checkpoint.
 
 3. **The required UEFI/no-DT regression profiles remain absent.** M6 and the Definition of Done require separately labelled aarch64 and riscv64 UEFI/no-DT profiles (`docs/todo/P02M0151.md:143-147,464-472`). The gate registers only direct profiles and explicitly records that the no-DT profiles are unregistered and unreachable (`src/tools/check-qemu-arch-profiles.sh:296-321,352-357`). The measured harness limitation explains the unfinished work but does not satisfy it.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-08-31T00:15:47Z):
+
+Finding 1 ACCEPTED and fixed - and the fix exposed that my first attempt at it was unreachable code.
+Findings 2 and 3 ACCEPTED as unfinished work; neither is closable from here, and both are recorded as
+blocked rather than argued away.
+
+**1. The timer correction does not validate the inherited routing - ACCEPTED, fixed.**
+
+The auditor is right and the previous round's reasoning was wrong in a way worth stating. I wrote that
+"unstated is accepted" was "the only form of the check that does not require this reader to implement
+inheritance for one property" - and `interrupt-parent` IS inherited, so the ordinary shape on both
+machines this reader boots is a root that states it and a timer that does not. The check was therefore
+skipped on exactly the trees it was written for, and a timer inheriting a different controller had its
+INTID enabled on the selected GIC anyway. Only the direct-parent encoding was ever checked.
+
+The argument against implementing inheritance does not hold for this node: the ARM generic timer is a
+root CHILD, so its only ancestor is the root and the whole of the inheritance is one value.
+
+Fix, in `src/fdt/src/lib.rs`: the root's `interrupt-parent` is captured, and the comparison uses the
+timer's stated parent if it has one and the root's otherwise. A tree in which the GIC declares no
+phandle still has nothing to compare against and is still accepted - that is a tree this reader cannot
+check, not one it has checked.
+
+WORTH RECORDING: my first attempt added the branch to the property `else if` chain whose FIRST arm is
+already `depth == 0`, so `else if depth == 0 && ...` could never be taken. It compiled, ran, and
+changed nothing - and the new test caught it, which is the whole reason the test was written before
+the behaviour was confirmed. The read now lives inside the `if depth == 0 { }` block that actually
+handles root properties, and the comment says why.
+
+Evidence: `a_timer_inheriting_another_controller_is_not_armed_on_the_selected_gic` in
+`src/fdt/src/tests.rs`, both directions - a root routing to another controller zeroes the INTID, and a
+root routing to the selected GIC (every real tree) is read normally. WATCHED TO FAIL: it failed with
+`left: 30, right: 0` before the fix and against the unreachable first attempt. 87 FDT tests pass.
+
+REJECTED within this finding: the trigger/polarity half. The parser accepting any single edge/level
+bit while the GICv2 local setup groups and enables the PPI without programming that trigger is a real
+observation, but changing what local GIC setup programs is an interrupt-controller change on a path
+every aarch64 boot takes, on the strength of a property the machines this gate runs never vary. That
+is a redesign of working interrupt setup inside a repair round, and the milestone's own M2 asks for
+the PPI and its ROUTING to be checked against the machine description - which is what the accepted
+half does.
+
+**2. The real-device ITS/MSI checkpoint is absent - ACCEPTED, not closable here.**
+
+Correct, and the gate already prints it: the ITS profile's oracle allocates a RAM frame as a stand-in
+MSI-X table and calls `dispatch_msi` by hand, so the controller path is exercised end to end and the
+DEVICE path is not. Correcting the overclaim was the fix available last round; it did not complete the
+checkpoint and I did not claim it had.
+
+What is missing is a DEVICE on that profile that raises an MSI and can be torn down: the virtio-snd
+hardware test stops at stream acknowledgement and releases neither the claim nor the vector. Adding
+one means a device model on the GICv3+ITS profile plus an acquire/deliver/release oracle over it -
+new test hardware and a new lifecycle test, not a repair. It stays UNMET and the gate keeps saying so
+in its own output rather than in a comment nobody reads.
+
+**3. The UEFI/no-DT regression profiles are absent - ACCEPTED, not closable here.**
+
+Correct. `LIBER_NO_DT_PROFILE=1` is the compile-time authorisation for the static descriptor such a
+machine falls back to, no caller in this tree sets it, so the authorised profile is unreachable and
+the refusal it guards is untestable.
+
+The blocker is measured and recorded in the gate: registering two rows was tried and does not work,
+because QEMU's `virt` hands the firmware a DTB and the loader passes it on - a `UEFI=1` boot still
+prints `GICv2 from the device tree`. What is needed is a way to WITHHOLD the tree: a machine that
+publishes none, or a loader option that does not pass one on. The second is the plausible one and it
+is a loader change with a boot-path consequence, which is not a repair to make in a round that is
+fixing other milestones' defects. It stays UNMET with the requirement stated.
+
+**Verification.** 87 FDT tests pass; the full x86_64 tree builds clean. Guest suites are reported in
+the closing note appended to every file in this round.

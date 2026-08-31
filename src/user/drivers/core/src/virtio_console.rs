@@ -24,14 +24,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let _rx = device.setup_queue(0);
 		let tx = device.setup_queue(1);
 		device.driver_ok();
-		let ok = match tx {
-			Some(q) => write_console(&q, BANNER),
-			None => false,
+		// KEPT, NOT DROPPED: the queue's capability is what `finish_stop` hands to `device_quiesced`
+		// when the manager asks this driver to stop, so the kernel may reclaim the frames and masked
+		// vectors this binding was holding. It used to go out of scope with the `match` and the stop
+		// path had nothing to name.
+		let (ok, queue_capability) = match &tx {
+			Some(q) => (write_console(q, BANNER), q.capability),
+			None => (false, 0),
 		};
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-console", &device, if ok { b"tx ok" } else { b"tx failed" });
 		let report: &[u8] = &line[..n];
-		common::online_and_stand(bootstrap, &bind, report, 0, 0)
+		common::online_and_stand(bootstrap, &bind, report, 0, 0, queue_capability)
 	}
 }
 

@@ -335,3 +335,26 @@ M10). Ordering is unchanged and still runs contract -> transmit side -> family i
 budgets -> selection -> DNS -> event-driven service -> internal-UDP correlation -> clients -> matrix.
 The Definition of done gained clauses for the sender profile and for internal-UDP correlation. No
 source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-08-31T00:17:04Z):
+
+Rating: 8/10
+
+1. **The accepted “every internal UDP operation” correction remains incomplete for DHCP.** M8 gives
+   SNTP full tuple, UDP length/checksum and request/semantic validation, but DHCP receives only a
+   random `xid`, `chaddr` matching and three fixtures (`docs/todo/P02M0175.md:206-227`). It does not
+   require DHCP UDP length/checksum/destination-port validation or bind replies to the selected
+   offer/server/address and the current SELECTING, REQUESTING, RENEWING or REBINDING state. That is
+   material because multiple legitimate servers in the named racing fixture share the client's
+   `xid` and `chaddr`; those fields alone cannot distinguish the chosen offer. Current dispatch still
+   selects DHCP solely by source port (`src/user/services/core/src/net.rs:668-689`), and `parse_dhcp`
+   publishes the parsed lease before the caller checks message type or state (`:1392-1434`). The
+   blocking handshake and lease clock apply or reject the event only afterwards
+   (`src/user/services/core/src/network_service.rs:1190-1224`, `:1063-1080`), so even a supposedly
+   ignored late/racing reply can overwrite stored lease data. RFC 2131's
+   [client behavior](https://www.rfc-editor.org/rfc/rfc2131.html#section-4.4.1) selects one offer and
+   identifies the selected server/requested address. Require a staged, state-specific transaction:
+   validate complete UDP framing; freeze the selected server/address; define which OFFER/ACK/NAK is
+   admissible in each phase, including renew/rebind rules; and commit lease state atomically only
+   after validation. Add hostile late and competing valid OFFER/ACK/NAK cases that prove rejected
+   frames cannot mutate the lease.

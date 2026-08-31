@@ -557,3 +557,60 @@ Current implementation rating: 6/10
 1. **The hardware-quiescence correction missed two live virtio planned-stop paths.** `virtio_console` ends in `online_and_stand`; `stand` handles `STOP` by calling `stopped` directly without resetting the device or calling `device_quiesced` (`src/user/drivers/core/src/virtio_console.rs:20-35`; `src/user/drivers/core/src/common.rs:372-435`). `dev_channel::heartbeat` does the same while its queues and device remain live (`src/user/drivers/core/src/dev_channel.rs:181-219`). Both bypass the new `finish_stop` safeguard (`src/user/drivers/core/src/common.rs:735-765`) and can certify a clean planned stop before hardware is quiet, contrary to M3 and the Definition of Done's quiesce-then-ack order (`docs/todo/P02M0165.md:128-147,320-322`). The xHCI correction is valid, but the response's all-stop-path claim is incomplete.
 
 2. **`withdraw_slots` does not close the production race-evidence gap claimed by the addendum.** The registered publish/crash/subscribe race still drives `Publications`, not DeviceManager's crash invocation, catalogue-handle closure, or subscription stream (`src/user/libs/driver/binding/src/tests.rs:525-566`). Sharing `withdraw_slots` proves slot selection and emptying only; the test still passes if the crash path ceases to call production withdrawal or its side effects regress. There is also a concrete side-effect failure: if the production temporary vector cannot reserve, `withdraw_binding` removes and closes all providers but records none, so it sends no withdrawal announcements and existing subscribers retain stale metadata (`src/user/services/core/src/device_manager.rs:1998-2037`). M7 requires this named race to establish the no-stale-provider post-race baseline (`docs/todo/P02M0165.md:280-307,329-331`). The 58 passing binding-library tests confirm only the model/shared-loop portion, not the claimed production behavior.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-08-31T00:15:47Z):
+
+Both findings ACCEPTED. The first is fixed; the second is fixed in the part that is a defect and
+rejected in the part that asks for a different test.
+
+**1. Two live virtio planned-stop paths bypass hardware quiescence - ACCEPTED, fixed.**
+
+Verified in both. `common::stand`'s `Stop` arm called `stopped(bootstrap, bind)` directly, and
+`dev_channel::heartbeat`'s did the same - so `virtio_console`, which ends in `online_and_stand`, and
+the development channel driver both certified a clean planned stop with the device still live and its
+queues programmed. `STOPPED` is the claim on which the kernel returns DMA frames and masked vectors
+and it explicitly cannot verify it, so this is the exact failure `finish_stop` was added to prevent,
+reached by the two paths that did not go through it.
+
+The previous round's correction was real but its "all stop paths" claim was not, and the reason is
+worth stating: I fixed the paths that had a device HANDLE in scope and missed the two whose stop is
+answered from a generic loop that had none.
+
+Fix, in `src/user/drivers/core/`:
+- `common::stand` and `common::online_and_stand` take the device capability, and the `Stop` arm
+  latches `STOP_PENDING` and calls `finish_stop(bootstrap, bind, device, quiesce_virtio())` - the
+  same path every other planned stop takes, so the reset happens first and a device that does not
+  confirm gets no certificate.
+- `virtio_console` keeps its transmit queue rather than dropping it with the `match`, so it has a
+  capability to hand over; it previously went out of scope and the stop path had nothing to name.
+- `dev_channel::heartbeat` takes the receive queue's capability and routes its `Stop` the same way.
+- `virtio_blk`'s two DEGRADED stands pass 0: they have no working queue, so there is no capability,
+  and `finish_stop` then answers the frame only - which is the honest state for a driver with no
+  queue to reset. `quiesce_virtio` still resets the device through the remembered common base.
+
+**2. `withdraw_slots` does not close the production race-evidence gap - ACCEPTED for the concrete
+defect, REJECTED for the test restructuring.**
+
+The concrete side-effect failure is real and is fixed. `withdraw_binding` reserved a `Vec` for the
+withdrawn providers and, on `try_reserve` failure, printed a line and carried on - and on that path
+`capacity()` is zero, so the closure pushed NOTHING, every provider was removed and closed, and not
+one withdrawal was announced. Every subscriber then kept metadata for providers that no longer exist
+for the rest of the boot. My comment called the announcement "short"; it was absent.
+
+Fix, in `device_manager.rs`: the collection is a fixed `[Option<Provider>; MAX_PROVIDERS]` on the
+stack with a count. `MAX_PROVIDERS` is generated as the sum of every `provides` bound the image
+declares - a small compile-time constant - so the array needs no allocator and the failure mode goes
+with it rather than being handled badly.
+
+REJECTED: rewriting the registered publish/crash/subscribe race test to drive DeviceManager's crash
+invocation, catalogue-handle closure and subscription stream. The finding is right that the test
+drives `Publications` and therefore proves slot selection and emptying rather than production side
+effects. But DeviceManager is a `no_std` binary that links `rt`, and its panic handler collides with
+the `std` a host test harness needs - the same seam P02M0099 records as unavailable and assigns to a
+named owner. A test of the production crash path today would have to be a guest test, which is a
+different fixture with a different oracle, and building one here would be starting that item inside a
+repair round. What I have done instead is remove the defect the finding found by construction, so the
+failure it describes cannot occur whether or not a test would have caught it.
+
+**Verification.** Drivers and services build clean; 58 driver-binding tests pass. The guest suites are
+reported in the closing note appended to every file in this round.

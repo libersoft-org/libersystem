@@ -369,7 +369,7 @@ pub unsafe fn online(bootstrap: u64, bind: &Bind, report: &[u8], offers: &[(u16,
 // `service` is the provider this driver serves, or 0 for one that serves none. It travels in an
 // `OFFER` BEFORE the `READY`, because the manager holds offers unpublished until the terminal frame:
 // a driver that dies between the two announces nothing.
-pub unsafe fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], service: u64, provider_kind: u16) -> ! {
+pub unsafe fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], service: u64, provider_kind: u16, device: u64) -> ! {
 	unsafe {
 		print_line(report);
 		if service != 0 && !offer(bootstrap, bind, provider_kind, 0, service) {
@@ -378,7 +378,7 @@ pub unsafe fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], servi
 		if !ready(bootstrap, bind) {
 			exit();
 		}
-		stand(bootstrap, bind);
+		stand(bootstrap, bind, device);
 	}
 }
 
@@ -389,7 +389,7 @@ pub unsafe fn online_and_stand(bootstrap: u64, bind: &Bind, report: &[u8], servi
 // answered, so "is this driver's control path making progress" had no way to be asked. The answer
 // echoes the sequence it was asked with, on the same channel and through the same frame codec as
 // every other event.
-pub unsafe fn stand(bootstrap: u64, bind: &Bind) -> ! {
+pub unsafe fn stand(bootstrap: u64, bind: &Bind, device: u64) -> ! {
 	unsafe {
 		let mut buf: [u8; proto::HEADER_LEN + proto::MAX_PAYLOAD] = [0u8; proto::HEADER_LEN + proto::MAX_PAYLOAD];
 		loop {
@@ -425,13 +425,21 @@ pub unsafe fn stand(bootstrap: u64, bind: &Bind) -> ! {
 						exit();
 					}
 				}
-				// A STOP IS ANSWERED. `stand` treated every opcode other than `PING` as terminal and
-				// exited, so a driver standing on its channel - `virtio_console` is one - never sent
-				// `STOPPED` at all and the manager waited out its forced-teardown deadline for a
-				// driver that had done exactly what it was asked. It has no work to drain, which is
-				// what makes answering immediately the honest reply rather than a shortcut.
+				// A STOP IS ANSWERED, AFTER THE DEVICE IS QUIET. `stand` treated every opcode other
+				// than `PING` as terminal and exited, so a driver standing on its channel -
+				// `virtio_console` is one - never sent `STOPPED` at all and the manager waited out
+				// its forced-teardown deadline for a driver that had done exactly what it was asked.
+				//
+				// AND THEN IT ANSWERED TOO EARLY. The first correction called `stopped` directly from
+				// here, which certifies a clean stop - the kernel gives back DMA frames and masked
+				// vectors on the strength of it and cannot check the claim - while the device was
+				// still live with its queues programmed. Having no work to DRAIN is not the same as
+				// having no hardware to STOP. This goes through `finish_stop` like every other
+				// planned-stop path, so the reset happens first and a device that does not confirm
+				// gets no certificate.
 				proto::Opcode::Stop => {
-					stopped(bootstrap, bind);
+					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+					finish_stop(bootstrap, bind, device, quiesce_virtio());
 					exit();
 				}
 				// Anything else on this channel ends the stand, which is what dropping the channel
@@ -493,8 +501,20 @@ pub unsafe fn wait_or_answer(bootstrap: u64, bind: &Bind, handles: &[u64]) -> Op
 // which ends the driver the way it always has.
 pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool {
 	unsafe {
+		// THE SET IS EPHEMERAL, SO IT MAY NOT ACCEPT - and it used to (corrected 2026-08-30).
+		//
+		// `Serving::new(server)` lives for this call. `drain_control_into` was handed it and would
+		// `accept` a `CONNECT`'s server end into it; this function then returned and the set was
+		// dropped, taking the endpoint with it. A consumer that asked the catalogue for a connection
+		// held a client end whose server half nobody was ever going to read, and waited for ever -
+		// which is worse than being refused, because nothing tells it.
+		//
+		// So this shape REFUSES a second consumer: `drain_control_into(.., None)` closes an endpoint
+		// it cannot place, and a consumer whose endpoint closes learns its connection ended. A driver
+		// that means to serve several holds its own `Serving` across calls and uses
+		// `serve_any_or_answer`; `virtio_blk` is the one that does.
 		let mut one = Serving::new(server);
-		serve_any_or_answer(bootstrap, bind, &mut one).is_some()
+		serve_any_or_answer_inner(bootstrap, bind, &mut one, false).is_some()
 	}
 }
 
@@ -505,6 +525,13 @@ pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool 
 // a provider - a driver's own control path - and so a caller that will never see a `CONNECT` does
 // not have to hold a set to say so.
 pub unsafe fn serve_any_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving) -> Option<usize> {
+	unsafe { serve_any_or_answer_inner(bootstrap, bind, serving, true) }
+}
+
+// The two shapes above, with the one thing that differs between them named: whether a `CONNECT` may
+// be ACCEPTED into `serving`. A caller whose set outlives the call may; one whose set is a local may
+// not, because accepting into a set that is about to be dropped loses the endpoint.
+unsafe fn serve_any_or_answer_inner(bootstrap: u64, bind: &Bind, serving: &mut Serving, accepts: bool) -> Option<usize> {
 	unsafe {
 		loop {
 			// THE MANAGER'S CHANNEL IS DRAINED FIRST, EVERY PASS, and that is not a nicety.
@@ -513,7 +540,8 @@ pub unsafe fn serve_any_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Ser
 			// it starves everything after it in the set - and a busy driver would never see a ping,
 			// which is precisely the driver a watchdog must not kill. Measured: every virtio-blk in
 			// the machine was declared wedged while serving StorageService as fast as it could.
-			match drain_control_into(bootstrap, bind, Some(serving)) {
+			let placed = if accepts { Some(&mut *serving) } else { None };
+			match drain_control_into(bootstrap, bind, placed) {
 				Control::Continue => {}
 				Control::Stop => {
 					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);

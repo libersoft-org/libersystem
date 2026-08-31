@@ -1151,6 +1151,31 @@ impl<B: Backend> Iommu<B> {
 	// How many endpoints this controller is translating for. Part of the baseline a restart is
 	// asserted against - see `iommu::report`.
 	// Every mapping this domain still holds, live or quarantined. See `iommu::grants_for`.
+	// WHETHER THIS EXACT IDENTITY MAPPING IS ALREADY LIVE IN THIS DOMAIN.
+	//
+	// `map_identity` deliberately REFUSES a duplicate - a caller asking twice for one range is asking
+	// for two mappings and gets `Overlaps`, which is the contract its own test pins. The MSI doorbell
+	// is the one caller for which asking twice is not a mistake: it is installed at the moment a
+	// vector is acquired, so a driver that acquires, releases and acquires again within one binding
+	// reaches it twice for the same range. That caller asks THIS first and skips the map when the
+	// answer is yes, which keeps the refusal where it belongs and makes the doorbell path idempotent
+	// without making every identity mapping so.
+	//
+	// EXACT, and only for the domain's current generation: same address, same length, same direction,
+	// still live. Anything else is a different request and still overlaps.
+	pub fn identity_mapped(&self, domain: DomainId, address: u64, len: u64, direction: Direction) -> bool {
+		let Some(generation) = self.domains.get(&domain).map(|state| state.generation) else { return false };
+		self.mappings.values().any(|m| m.domain == domain && m.generation == generation && m.state == MappingState::Live && m.iova.0 == address && m.physical == address && m.len == len && m.direction == direction)
+	}
+
+	// The generation a domain was created at, or None if there is no such domain.
+	//
+	// Read by a teardown that has to attribute a fault the backend can no longer resolve: the answer
+	// has to be taken while the domain still exists, which is before the revoke that ends it.
+	pub fn generation_of(&self, domain: DomainId) -> Option<Generation> {
+		self.domains.get(&domain).map(|state| state.generation)
+	}
+
 	pub fn mappings_in(&self, domain: DomainId) -> usize {
 		self.mappings.values().filter(|m| m.domain == domain && m.state != MappingState::Released).count()
 	}

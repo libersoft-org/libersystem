@@ -205,3 +205,23 @@ if it lands in the same period.
 provisioned/unprovisioned distinction and now names the purpose design rather than "a separately
 authorized purpose". Every value M2, M3 and M5 previously told an implementer to choose is now in the
 file. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-08-31T00:17:04Z):
+
+Rating: 7/10
+
+1. **Signed purpose has no boot-wide equality/source rule.** M1 explicitly latches one generation
+   across every medium and volume manifest (`docs/todo/P02M0171.md:45-52`), while M5 validates each
+   manifest's purpose against purpose-scoped roots but never requires all manifests selected for one
+   boot to have the same purpose (`:173-196`). A mixed ordinary/recovery artifact set can therefore be
+   composed from individually valid signatures, allowing recovery-authorized content into part of an
+   ordinary boot set despite the Definition of done's cross-use claim (`:238-247`). Latch one purpose
+   for the complete selected set and add a mixed-purpose refusal before advancing the floor.
+
+2. **The claimed frozen UEFI vendor GUID is still an instruction to allocate one.** The constants
+   block supplies slot names, marker, attributes and size, but its `vendor GUID` value is “one GUID
+   allocated ... written into the plan” rather than an actual GUID (`docs/todo/P02M0171.md:133-144`).
+   The latest response says every value was put in the file; this one was not. Without a concrete
+   namespace value, different loader/tool/fixture implementations can use different variables while
+   each follows the plan. Put the literal GUID in the canonical constants block and use it in the
+   mocked-firmware and OVMF gates.

@@ -1477,7 +1477,18 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 	// the only endpoints that need one are the ones that reach this line, and a failure refuses
 	// before a vector exists and before MSI-X is enabled on the device.
 	if !crate::iommu::msi_deliverable(index as u32, bus, dev, func) {
-		crate::serial_println!("device: {index} is translated and its domain has no route for an MSI doorbell - refusing to hand out a vector that could not be delivered");
+		// AND THE DEVICE STOPS MASTERING THE BUS, because refusing only the vector is not one of the
+		// three endings this milestone allows a map failure to have.
+		//
+		// The rule is "a refused binding, disabled bus mastering, or a quarantined device"; a doorbell
+		// map that failed used to end in none of them - the vector was refused and the endpoint stayed
+		// claimed and bus-mastering, which is a device that can still reach memory and can no longer
+		// tell anyone it did. Disabling bus mastering is the middle ending and the proportionate one:
+		// it does not tear down a binding the manager may still want to report on, and it stops the
+		// DMA. The device is left claimed and quiet; the driver sees the refusal and the manager sees
+		// a binding whose device is no longer mastering.
+		crate::device::disable_bus_master(index as usize);
+		crate::serial_println!("device: {index} is translated and its domain has no route for an MSI doorbell - refusing the vector and disabling bus mastering rather than leaving it able to reach memory");
 		return ERR_UNSUPPORTED;
 	}
 	// Our MSI message address encodes an 8-bit xAPIC destination. If the running

@@ -431,3 +431,44 @@ Current implementation rating: 7/10
 1. **The reset false-green was not actually fixed for either ordinary-run phase.** The default phase deliberately discards `timeout ./run.sh`'s status and tries to reject `GUEST RESET` by grepping the raw serial file (`src/tools/check-qemu-virtio-iommu-x86_64.sh:200-217`). That text is synthesized only by the test harness after interpreting a test-mode QEMU exit (`src/harness/test-kernel.sh:465-483`); it is not emitted by the guest. Ordinary `run.sh` reaches QEMU without `-no-reboot`, while `-no-reboot` and debug-exit interpretation exist only in `TEST=1` mode (`src/harness/qemu-run.sh:1145-1200,1202-1236`). A reset after the required lines can therefore reboot silently and still pass if the second boot has not produced another counted GPU line before timeout. The `--no-iommu` phase repeats `timeout ... || true` and checks only two early positive lines (`check-qemu-virtio-iommu-x86_64.sh:279-287`). This does not satisfy the milestone's explicit crash/reset correction (`docs/todo/P02M0159.md:282-309`).
 
 2. **The freshness preflight authenticates the input-key sidecar, not the ISO bytes it boots.** The gate compares only the current input key with `libersystem.iso.build-key` (`src/tools/check-qemu-virtio-iommu-x86_64.sh:54-89`). The image builder separately records `libersystem.iso.build-digest` precisely because a matching input key does not detect a truncated, replaced, or edited output, and it verifies that digest on cache hits (`src/harness/mkimage.sh:686-713,722-730`). The gate never reads it, so a different ISO beside a still-current key is accepted as “built from this tree.” The current stored ISO matches its digest; the unresolved defect is the fail-open preflight path.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-08-31T00:15:47Z):
+
+Both findings ACCEPTED and both fixed.
+
+**1. The reset false-green was not fixed for either ordinary-run phase - ACCEPTED, fixed.**
+
+Verified and the auditor is exactly right about the mechanism. `GUEST RESET` is synthesized by
+`test-kernel.sh` when it interprets a TEST-mode QEMU exit; the guest never prints it. An ordinary
+`./run.sh` is not test mode, so the grep I added matched nothing on every run and the phase passed
+on the strength of a check that could not fire. Worse, an ordinary run has no `-no-reboot` - that
+flag and the debug-exit device exist only under `TEST=1` - so a triple fault after the required lines
+REBOOTS, the second boot appends to the same serial file, and every assertion still finds what the
+first boot printed.
+
+Fix, in `src/tools/check-qemu-virtio-iommu-x86_64.sh`: a `survived_the_boot` helper that keeps the
+panic and `loader: FATAL` greps and replaces the unmatchable string with a BOOT COUNT. The loader
+prints `LiberSystem UEFI loader` exactly once per boot, so more than one of them in one serial log IS
+the reset - an oracle that works without changing how an ordinary run is launched. Zero of them is
+also a failure, because a log that never reached the loader makes everything below it meaningless.
+
+The `--no-iommu` phase now runs the same helper. It previously had NO survival check at all and did
+not even assert its log was non-empty; the finding is right that it repeats `|| true` and checks two
+early positive lines, and both halves are now covered by the same code as the default phase rather
+than by a second copy that could drift.
+
+**2. The freshness preflight authenticates the sidecar, not the ISO bytes - ACCEPTED, fixed.**
+
+Verified. The gate compared only the current input key against `libersystem.iso.build-key`.
+`mkimage.sh` records `libersystem.iso.build-digest` separately and verifies it on cache hits, for
+exactly the reason the finding gives: a matching input key says nothing about the output, so a
+truncated, edited or replaced ISO beside a still-current key read as "built from this tree". The
+builder already computes the answer; the gate simply never asked.
+
+Fix: the preflight now reads `$ISO.build-digest` and compares it against `sha256sum` of the ISO
+itself, before the input-key comparison, printing both values on a mismatch. A missing digest sidecar
+is a refusal rather than a skip - an image whose bytes cannot be checked is not one this gate may
+call fresh.
+
+**Verification.** `bash -n` clean. The gate was run against a freshly built image; its result is in
+the closing note appended to every file in this round.

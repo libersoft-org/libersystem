@@ -433,3 +433,66 @@ Current implementation rating: 6/10
 1. **`select` still does not reliably apply at the next bind, and the retry correction discards an already loaded preference.** The live `PolicyVerb::Select` handler deliberately does nothing after storing the record (`src/user/services/core/src/device_manager.rs:3451-3507`), while `load_stored_policy` is called only once when the ConfigService connection arrives and is not rerun before each bind (`device_manager.rs:697,3711-3764`). A selection made during the running manager therefore never updates its candidate cursor for the promised next bind. If a preference was loaded at startup, exhaustion followed by `Retry` rewinds that same cursor to zero and starts immediately; it neither retains nor rereads the stored choice, despite the response claiming `load_stored_policy` will reapply it (`device_manager.rs:3520-3546`). This contradicts the persistent `select=` and next-bind contract (`docs/todo/P02M0166.md:150-170,239-249`).
 
 2. **The persisted-incident correction rejects rather than fulfills the promised `lsdev --incident N` behavior.** Once DeviceManager is dead, `stored_incident` explicitly discards `N`, lists every persisted incident by BDF, and tells the user it cannot resolve the requested row (`src/user/apps/tools/src/lsdev.rs:212-279`). That is honest, but it is not M5's scoped `lsdev --incident N` lookup and does not establish that the requested failed/hung binding's snapshot is what remains visible after DeviceManager dies (`docs/todo/P02M0166.md:218-253`). The records are never removed and can include devices outside the current inventory, despite the milestone's explicit refusal of persistent history (`docs/todo/P02M0166.md:267-268`; `src/user/services/core/src/device_manager.rs:3770-3868`). The current `DeviceEntry` lacking a BDF explains why the chosen fallback cannot answer; it does not complete the contract.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-08-31T00:15:47Z):
+
+Finding 1 ACCEPTED and fixed. Finding 2 ACCEPTED as a description of what is missing and REJECTED as
+a change to make in this round; the reason is a data model, not a preference.
+
+**1. `select` does not apply at the next bind, and `Retry` discards a loaded preference - ACCEPTED,
+both fixed.**
+
+Verified in both halves and the first was mine. `PolicyVerb::Select => {}` in `apply_policy` did
+nothing, on the reasoning that the record is stored and the stored record is read at startup - which
+makes a selection apply at the next BOOT, not the next bind. `load_stored_policy` runs once, when the
+ConfigService connection arrives, and nothing reruns it; an operator who selected a driver and then
+stopped and started the device got the registry order back. The contract this milestone states is
+"the next bind", and the comment I left said so while the code did not.
+
+The `Retry` half is the same defect from the other side: it rewound the cursor to zero
+unconditionally and my comment claimed `load_stored_policy` would reapply the preference "on the next
+start" - the next boot again. So an operator who selected a driver, watched its candidates exhaust and
+asked for a retry got the registry order on the one verb whose whole purpose is "try again".
+
+Fix, in `device_manager.rs`:
+- `Node` gains `preferred: Option<usize>` - the operator's choice as an index into `candidates`. The
+  cursor is where the next bind STARTS; this is where it starts BY PREFERENCE, and the difference only
+  shows on the paths that rewind.
+- `apply_policy` takes the artifact and the `Select` arm moves the cursor AND records the preference.
+  The candidate was already validated against this node's list by `decide_policy`, which refuses an
+  artifact the image never declared for this device, so the arm cannot widen policy. It still does not
+  disturb a running binding: moving the cursor changes where the NEXT bind starts and touches neither
+  the record nor the live driver, which is the milestone's own rule.
+- `load_stored_policy` records the same preference when it applies a stored `select=`, so a startup
+  preference survives a later `Retry`.
+- `Retry` rewinds to `node.preferred.unwrap_or(0)` instead of 0.
+
+Applying it here and applying it at startup are now the same operation on the same field, which is
+what keeps the two paths from disagreeing.
+
+**2. `lsdev --incident N` is answered by rejection rather than fulfilled - ACCEPTED as a statement of
+what is missing; REJECTED as a change to make here.**
+
+The finding is accurate about every fact. Once DeviceManager is dead, `stored_incident` discards `N`,
+lists every persisted incident by BDF and says it cannot resolve the requested row; the records are
+never removed and can name devices outside the current inventory, which the milestone's own text
+refuses.
+
+Why not fixed here: `N` is a DEVICE INDEX in the live inventory, and the persisted record is keyed by
+BDF because that is what outlives the manager. Resolving one to the other after DeviceManager has died
+requires an index-to-BDF mapping that survives it too - which means either persisting the inventory
+alongside the incidents, or changing the tool's argument to a BDF and every caller with it. Both are
+new contracts rather than repairs, and the second changes a user-facing argument. Removing stale
+records has the same shape: something has to decide that a BDF is no longer in the inventory, and
+after the manager is gone nothing in the tool knows the inventory.
+
+So the honest state is the one the tool already prints: it says what it has, says it cannot answer the
+question that was asked, and does not pretend the row it shows is the row that was requested. That is
+a correct refusal rather than a fulfilled contract, and I am recording it as UNMET rather than
+claiming otherwise. The bounded thing that would close it - a persisted index-to-BDF map written
+beside the incidents, and a sweep that drops records for BDFs the current inventory does not contain -
+is what a following item owns; it is a design decision about what DeviceManager persists, not a bug
+in what it persists today.
+
+**Verification.** Services build clean. The guest suites are reported in the closing note appended to
+every file in this round.

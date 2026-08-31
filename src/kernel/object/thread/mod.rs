@@ -296,7 +296,20 @@ impl Thread {
 	}
 
 	pub fn new(entry: extern "C" fn(u64), arg: u64, process: Arc<Process>) -> Option<Arc<Self>> {
-		Self::new_for_cpu(entry, arg, process, None)
+		// THE CREATING CORE IS A NAMED CORE, and passing `None` here threw that away.
+		//
+		// `new_for_cpu(.., None)` means "no node to prefer", and every ordinary thread in the
+		// shipping kernel went through it - so a kernel that had discovered its topology, bound every
+		// logical CPU to a node and published the masks then allocated every kernel stack with no
+		// preference at all. The placement mechanism existed and the product never used it, which is
+		// the gap between "the test proves the mechanism" and "the kernel uses it".
+		//
+		// A thread created without a stated core will FIRST run on the core creating it - that is
+		// what `spawn` means - so its stack belongs on that core's node. This is a PREFERENCE and not
+		// a pin: `new_for_cpu` falls back to an ordinary allocation on a machine with no topology or
+		// an unbound cpu, and the thread may later migrate on a wake, which moves no pages and is
+		// documented as not doing so.
+		Self::new_for_cpu(entry, arg, process, Some(crate::sched::current_cpu_id()))
 	}
 
 	// The same, for a thread being created to run on a NAMED cpu: its kernel stack is allocated

@@ -190,7 +190,7 @@ impl Port<'_> {
 // A frame that is not a PING for this generation is dropped, and any handle on it closed - the same
 // answer `adopt` gives, because a driver that is serving has nothing to do with a resource it was not
 // expecting.
-unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64) -> bool {
+unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64) -> bool {
 	unsafe {
 		let mut buf: [u8; 64] = [0u8; 64];
 		loop {
@@ -213,8 +213,14 @@ unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64) -> bool {
 							// AND A STOP IS ANSWERED. This driver read its bootstrap for pings alone,
 							// so a manager asking it to stop waited out the forced-teardown deadline
 							// for a driver that had nothing to drain.
+							// AND THE DEVICE IS STOPPED BEFORE THE STOP IS CERTIFIED. This answered
+							// `stopped` directly while its queues and its device were still live -
+							// and `STOPPED` is the claim on which the kernel gives back DMA frames
+							// and masked vectors, which it cannot itself verify. Routed through
+							// `finish_stop` like every other planned stop, so the reset happens
+							// first and a device that does not confirm gets no certificate.
 							driver_protocol::Opcode::Stop => {
-								common::stopped(bootstrap, bind);
+								common::finish_stop(bootstrap, bind, device_capability, common::quiesce_virtio());
 								return false;
 							}
 							_ => {}
@@ -287,7 +293,7 @@ unsafe fn pump(device: &Virtio, bind: &common::Bind, irq: u64, bootstrap: u64, b
 			// driver has gone - so a driver serving normally never answered a PING, and its registry
 			// entry declares a 100ms deadline. The manager would have declared it wedged. Every
 			// serving driver answers in its own loop; this one now does too.
-			if !heartbeat(bind, bootstrap) {
+			if !heartbeat(bind, bootstrap, rx.capability) {
 				exit();
 			}
 			// Nothing left either way: block on the device interrupt, the agent's channel and the

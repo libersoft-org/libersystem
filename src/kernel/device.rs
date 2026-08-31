@@ -547,6 +547,18 @@ fn bus_master(entry: &DeviceEntry, on: bool) {
 	crate::arch::pci::set_bus_master(entry.bus, entry.dev, entry.func, on);
 }
 
+// STOP THIS DEVICE MASTERING THE BUS, by index, without ending its claim.
+//
+// The one caller is the MSI-doorbell map failure in `SYS_DEVICE_MSIX_ACQUIRE`. The isolation rule
+// says a map failure ends in a refused binding, disabled bus mastering, or quarantine, and refusing
+// only the vector was none of the three: the device kept its claim and kept reaching memory while
+// losing the one channel it had for saying so. This is the middle ending, and it is deliberately
+// narrower than a release - the claim, its record and its report all survive, so the manager can
+// still see what happened to a binding it made.
+pub fn disable_bus_master(index: usize) {
+	with(index, |entry| bus_master(entry, false));
+}
+
 // A DEVICE THE MACHINE DOES NOT HAVE, so that the claim table can be tested without taking a device
 // something else is driving.
 //

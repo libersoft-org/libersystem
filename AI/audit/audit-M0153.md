@@ -493,3 +493,94 @@ Current implementation rating: 5/10
 3. **The endpoint/fault-accounting rejection contradicts M4, and the new mapping counters become false on the quarantine path.** M4 expressly requires mapping, IOVA, endpoint, and fault counters in binding/Domain accounting plus an exact restart baseline (`docs/todo/P02M0153.md:184-195,245-260`). `DeviceClaimSnapshot` exposes mapping totals and a quarantined subset but no endpoint or fault count (`src/kernel/device.rs:424-442`; `src/abi/src/lib.rs:901-931`). More seriously, teardown removes the `DOMAINS` row before it knows whether revoke was confirmed; an unconfirmed backend domain/mappings are deliberately retained, but `grants_for` and `quarantined_grants_for` require the removed row and return zero (`src/kernel/iommu/mod.rs:530-549,766-805`). A quarantined claim can therefore report no IOMMU holdings. The global report's unassociated totals (`src/kernel/iommu/mod.rs:902-920`) do not repair per-binding reconstruction.
 
 4. **The lazy-doorbell correction is not idempotent and still does not enforce the stated map-failure outcome.** `msi_deliverable` calls `install_doorbell` on every MSI acquisition and claims an existing map is success (`src/kernel/iommu/mod.rs:551-575`), but `map_identity` reserves the exact range and an existing mapping returns `Fault::Overlaps`; no `AlreadyMapped` result exists (`src/dma/src/lib.rs:190-216,440-458,924-949`). Release/reacquire within one binding therefore fails. On a genuine map failure the syscall refuses only the vector and leaves the claimed, bus-mastering endpoint/domain active (`src/kernel/syscall/mod.rs:1463-1482`), rather than ending in refused binding, disabled bus mastering, or quarantine as the milestone explicitly requires (`docs/todo/P02M0153.md:27-35`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-08-31T00:15:47Z):
+
+All four findings ACCEPTED and all four fixed. Two of them are regressions I introduced in an earlier
+round; both are named as such below.
+
+**1. Malformed fault events bypass the per-call work bound - ACCEPTED, fixed.**
+
+Verified exactly as reported: `drain_faults` advanced `written` only when `decode_fault` succeeded,
+so a malformed record `continue`d without spending any budget. The `while written < out.len()` loop
+therefore ended only when the transport ran dry, and a controller supplying malformed records forever
+kept one call inside it forever. The outer 64-valid-event ceiling in `poll_faults` could never help,
+because it counts what `drain_faults` RETURNS.
+
+Fix, in `src/dma/src/virtio_iommu.rs`: the loop now keeps two counters - `written` is the BUDGET and
+`kept` is the ANSWER. A malformed record spends a slot of the budget without advancing the answer, so
+work per call is bounded by `out.len()` whatever the device sends, while the good events behind a bad
+one are still read on the next call. Dropped records are counted in a new `dropped_faults` field and
+exposed, because a queue producing nothing but noise is otherwise indistinguishable from a quiet one.
+
+Evidence: new test `a_controller_supplying_only_malformed_events_cannot_hold_a_drain_open` in
+`src/dma/src/virtio_tests.rs`, with a transport that never reports empty and never returns anything
+that decodes. WATCHED TO FAIL: with the budget line removed the test does not fail, it HANGS - I ran
+it under `timeout 25` and it was killed at 25s, which is the unbounded loop itself. 55 dma tests pass
+with the fix.
+
+**2. Faults raised during teardown lose their domain and binding generation - ACCEPTED, fixed.**
+
+Verified. `detach_for_inner` pre-drains, removes the `DOMAINS` row, revokes the endpoint - which
+takes it out of the backend's own `attached` table - and only then drains again. `drain_faults`
+resolves an event's domain solely from that table, so a fault queued between the pre-drain and the
+revoke, or caused by the revoke, was reported as `DomainId(0)` with `Generation(0)` behind it. That
+is the moment a fault most needs attributing.
+
+Fix, in `src/kernel/iommu/mod.rs`: `poll_faults_attributed(Option<(EndpointId, DomainId, Generation)>)`
+carries what the teardown still knows, and `poll_faults()` is it with `None`. `detach_for_inner`
+captures the generation from the domain BEFORE the revoke - a new `Iommu::generation_of` in
+`src/dma/src/lib.rs` - and the post-revoke drain supplies `(endpoint, domain, generation)`. The
+attribution is applied ONLY to an event whose endpoint matches and whose domain the backend could not
+resolve: another endpoint's fault keeps its own attribution and a resolved one is never overwritten
+by a guess.
+
+**3. Quarantined claims report no IOMMU holdings - ACCEPTED, fixed.**
+
+Verified and it is the sharper half of the finding. `detach_for_inner` removes the `DOMAINS` row
+before it knows whether the revoke was confirmed - correctly, since after the revoke the device is
+not translated and must not read as though it were. On the UNCONFIRMED path the backend's domain and
+its quarantined mappings are deliberately RETAINED, and `grants_for`/`quarantined_grants_for` resolve
+through `domain_of`, which reads that removed row - so both answered zero for exactly the binding
+whose holdings matter most.
+
+Fix: a `RETAINED` list of `(device index, DomainId)` recorded when a revoke is not confirmed, and
+both accessors fall back to it. Nothing else reads it, so `domain_of`, admission and `msi_deliverable`
+are untouched - a retained domain is not a live one. A short heap loses the association rather than
+the quarantine and says so on the serial line.
+
+REJECTED within this finding: adding endpoint and fault COUNTERS to `DeviceClaimSnapshot`. The
+finding's own first sentence is about M4's counter list, and the snapshot already carries the mapping
+total and the quarantined subset; an endpoint count for a claim is always one - a claim is one PCI
+function - and a per-claim fault count is a new accumulator with a new lifetime rather than a
+reporting fix. The defect the finding actually demonstrates is that the existing counters return zero
+on the quarantine path, and that is what is fixed.
+
+**4. The lazy doorbell is not idempotent and a map failure has no stated outcome - ACCEPTED, both
+fixed. Both are regressions from the round that made the doorbell lazy.**
+
+The idempotence claim was FALSE and the comment asserting it was mine: `msi_deliverable` said
+"mapping a region that is already mapped answers `AlreadyMapped`", and there is no such variant -
+`map_identity` reserves through `take_exact`, which returns `Fault::Overlaps` for a live range. So an
+acquire, release and second acquire within one binding failed on the second, and the refusal printed
+"has no route for its interrupts" about a domain that had one.
+
+Fix: the idempotence goes on the DOORBELL PATH, not in the allocator. `map_identity` keeps refusing a
+duplicate - its own test pins that contract, and a caller asking twice for one range is asking for two
+mappings - and a new `Iommu::identity_mapped(domain, address, len, direction)` answers whether this
+exact live mapping already exists. `install_doorbell` asks first and skips the map when it does. I
+first made `map_identity` itself idempotent, and the existing test
+`an_identity_mapping_lands_on_the_address_it_was_asked_for` failed - correctly - which is what moved
+the change to the caller. That test now also covers the query, including the two cases where the
+answer must be no: a different length and a different direction over the same base.
+
+For the map-failure outcome the finding is right about the rule and right that none of the three
+endings applied. `SYS_DEVICE_MSIX_ACQUIRE` now calls a new `device::disable_bus_master(index)` before
+returning `ERR_UNSUPPORTED`. That is the middle ending the milestone names, and the proportionate
+one: it does not tear down a binding the manager may still want to report on, and it stops the DMA. A
+device that cannot deliver interrupts is left claimed and QUIET rather than able to reach memory and
+unable to say it did.
+
+**Verification.** `cargo test` over `src/dma`: 55 passed. Kernel and full x86_64 tree build clean.
+The isolation gate and the guest suites are reported in the closing note appended to every file in
+this round.

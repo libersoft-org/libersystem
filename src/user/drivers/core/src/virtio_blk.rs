@@ -73,7 +73,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => {
 				let mut line = [0u8; 64];
 				let n = common::describe_state(&mut line, b"virtio-blk", &device, b"DEGRADED", b"no request queue");
-				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0)
+				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0, 0)
 			}
 		};
 		let ok: bool = verify_archive(&queue);
@@ -89,7 +89,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => {
 				let mut line = [0u8; 64];
 				let n = common::describe_state(&mut line, b"virtio-blk", &device, b"DEGRADED", b"no channel");
-				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0)
+				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0, 0)
 			}
 		};
 		let mut line = [0u8; 64];

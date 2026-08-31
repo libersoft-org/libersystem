@@ -578,3 +578,47 @@ palette.
 ordering, and the profile freeze standing between the catalogue and the parser. The `P02M0103` seam is
 specified once and referenced twice, and the key is identical on both sides. No source code was
 modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-08-31T00:17:04Z):
+
+Rating: 5/10
+
+1. **The `GlyphRun` seam still lists representation decisions instead of making them.** The normative
+   item fixes UTF-8 byte offsets but still says to decide whether spans are logical or visual and to
+   fix a numeric representation, rounding, overflow behavior and glyph-origin convention without
+   supplying any of those choices (`docs/todo/P02M0136.md:243-253`). M0103 merely consumes an
+   already-shaped run (`docs/todo/P02M0103.md:1242-1248`) and supplies no missing ABI definition. Two
+   sides can therefore implement incompatible runs while each follows the plan.
+
+2. **The jointly owned “complete” glyph-cache key omits the face index.** The shared resource contract
+   defines a face by content-derived identity plus face index (`docs/todo/P02M0136.md:154-160`), but
+   both copies of the cache key enumerate only face identity and generation, not the collection face
+   index (`docs/todo/P02M0136.md:170-181`; `docs/todo/P02M0103.md:1340-1369`). Different TTC/OTC faces
+   backed by the same bytes can have overlapping glyph indices and otherwise identical key fields.
+   The index must be an explicit key component and negative case rather than left implicit in wording
+   that separately names identity and index.
+
+3. **The absorbed catalogue has a milestone owner but no implementable or bounded service contract.**
+   The plan calls the catalogue service-owned but names no service role, startup/provider edge,
+   request protocol or capability-grant path, and still leaves transfer as “font bytes or a read-only
+   MemoryObject” (`docs/todo/P02M0136.md:107-122`, `:135-147`). It calls catalogue state bounded because
+   it is proportional to installed faces without bounding the face count, per-face metadata or an
+   enumeration result (`:112-113`, `:142-149`). The later parser limits do not bound that shared
+   service state. The catalogue therefore remains neither reachable through a concrete capability
+   path nor subject to a falsifiable resource ceiling.
+
+4. **The hostile-input limits are categories, not numeric limits.** The plan says “Numeric limits are
+   stated” and then names byte, depth, count and expansion categories without giving a value for any
+   of them (`docs/todo/P02M0136.md:259-272`). This item follows parser/shaper work and is not a freeze
+   gate. The host requirement to test “every numeric limit above” (`:274-284`) consequently has no
+   exact boundary oracle, and implementations may choose incompatible ceilings after work begins.
+
+5. **The normative pipeline performs mirroring after glyph selection, measurement and line breaking.**
+   It shapes and measures runs, chooses line breaks, and only then performs per-line “reordering and
+   mirroring” (`docs/todo/P02M0136.md:217-230`). The official
+   [Unicode Bidirectional Algorithm](https://www.unicode.org/reports/tr9/#Reordering_Resolved_Levels)
+   requires shaping to account for resolved embedding levels, including mirroring, before accumulated
+   glyph widths determine line breaks; only line reordering follows wrapping. Because this milestone's
+   `GlyphRun` already contains chosen glyph indices and advances, post-layout mirroring has no defined
+   way to choose the mirrored glyph or repair changed metrics. Valid RTL punctuation can therefore
+   produce a wrong glyph or line break.
