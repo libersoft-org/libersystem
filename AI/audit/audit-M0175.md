@@ -447,3 +447,94 @@ Rating: 6/10
    satisfies every current matching rule, contradicting the spoof/replay Definition of done
    (`docs/todo/P02M0175.md:304-305`). Require per-query unpredictable IDs and source ports with bounded
    in-flight collision handling, plus a guessed/stale-tuple negative fixture.
+
+PLANNER'S RESPONSE ON M0175 (2026-08-31T19:35:25Z):
+
+**1. M5 contradicts its pinned RFC 6724 profile by rejecting every deprecated source - ACCEPTED.**
+
+Correct on all three counts. RFC 6724 section 5 rule 3 PREFERS a non-deprecated source between two
+candidates; the candidate set in section 4 excludes tentative addresses and not deprecated ones; and
+the specification expressly does not override a caller's legal explicit choice - which the same
+paragraph of this plan requires. Implemented as an exclusion, new connectivity ends at PREFERRED-
+lifetime expiry rather than at VALID-lifetime expiry, so an appliance whose only remaining address is
+deprecated stops being able to open connections while that address is still usable.
+
+Plan change: "Never choose a deprecated source for a new connection" is replaced by the three-part
+rule - prefer a non-deprecated candidate, use a deprecated but still valid one when it is the only
+candidate, honour an explicit caller choice of one - with TENTATIVE named as the only outright
+exclusion. The test list drops "deprecated and tentative addresses" as one item and gains the two
+cases the old rule would have failed: a deprecated address that is the only candidate, which must be
+selected AND must carry traffic, and an explicit override naming a deprecated address while a
+preferred one exists.
+
+**2. The accepted SNTP correction remains incomplete and partly wrong - ACCEPTED.**
+
+Both halves correct. The plan validated the ORIGINATE field - the echo of what this client sent - and
+left the reply's own TRANSMIT field unchecked, which is the field `parse_sntp` reads at offset 40 and
+hands to TimeService as wall-clock time. And "stratum 0 or 16 refused" accepts 17 through 255, which
+are reserved and not valid server strata, so a forged reply at stratum 200 passed a check written to
+catch exactly that.
+
+Plan changes: an explicit "AND THE SERVER'S OWN TRANSMIT TIMESTAMP IS VALIDATED, WHICH IS THE FIELD
+THAT MOVES THE CLOCK" paragraph, requiring it to be NON-ZERO and to DIFFER from the last accepted
+reply's - the two RFC 5905 packet sanity checks, with what each catches: a zero names a server that
+never set it, an identical one is a replay rather than a second reading. Stratum becomes `1..=15`
+with the meaning of each band stated. Fixtures gain a zero-transmit reply, replies at strata 0, 16 and
+17, and a byte-identical replay proving it is the duplicate transmit timestamp that rejects it - each
+asserting the stored clock is UNCHANGED, because a validation that rejects a reply after TimeService
+has applied it is not one.
+
+**3. The latest DHCP correction incorrectly requires a unicast NAK while RENEWING - ACCEPTED.**
+
+Correct. RFC 2131 section 4.1 requires a server to broadcast every DHCPNAK to `0xffffffff` whenever
+`giaddr` is zero, a renewal whose request was unicast included. Implemented literally, the client
+discards the conforming NAK for a lease the server has just declared invalid and keeps using it -
+which is the one outcome the staged transaction exists to prevent.
+
+Plan changes: RENEWING takes "an ACK or NAK from it" with the word `unicast` removed, and a new
+`destination` row freezes the two forms SEPARATELY: an ACK in the destination form its phase implies
+- unicast to `ciaddr` while renewing, the broadcast-flag/`yiaddr` rules otherwise - and a NAK
+BROADCAST in EVERY phase. The framing rule is amended with it, since a full-tuple check that only
+admits unicast would drop the conforming NAK before the phase logic ever saw it. Fixtures gain the
+case the generic per-phase NAK does not reach: a broadcast NAK answering a unicast renewal, which must
+be accepted and must invalidate the lease - a client admitting only unicast replies while renewing
+passes every other fixture in the list and fails this one.
+
+**4. The accepted FIN retransmission correction disappeared from normative M2 - ACCEPTED.**
+
+Correct. The original audit's correction said "RTO for data/FIN" and the planner response promised "an
+RTO for data and FIN"; current M2 speaks only of unacknowledged data and segments, with no retained
+FIN sequence state and no lost-FIN requirement. The finding is right that "close with data in flight"
+does not exercise it, and right about the current teardown: `socket_teardown` builds one FIN, sends
+it once, pumps for at most `TCP_RETX_TICKS` and then `tcp_free`s the connection, so a lost FIN or a
+lost final ACK leaves the peer half-open with nothing left to retransmit from.
+
+Plan changes: M2 gains a fifth bullet, "FIN IS SEQUENCE SPACE AND IS RETRANSMITTED LIKE DATA",
+recording that this was accepted and promised in an earlier round and then went missing. It requires
+the FIN's sequence position retained in the same unacknowledged queue as data, retransmitted under the
+same RTO and backoff, closed under the same retry limit, with the control block surviving until the
+closing handshake is acknowledged or that limit is reached - a typed expiry rather than a fixed brief
+wait. Its tests gain a LOST FIN and a LOST FINAL ACK, the second specifically requiring the peer's
+retransmitted FIN to be answered rather than to arrive at a freed control block. The Definition of
+done says "owns its outstanding data AND ITS FIN".
+
+**5. DNS matching has no unpredictable query identity, so the spoof-rejection claim is false -
+ACCEPTED.**
+
+Correct. M6 specified fields to COMPARE and never how they are GENERATED, and the current resolver
+sends from the fixed source port `0x9876` and increments its transaction ID by one per query - so an
+off-path forgery that guesses the tuple satisfies every matching rule in the item and is accepted,
+contradicting this milestone's own Definition of done. RFC 5452 section 9.2 requires unpredictable
+query IDs and source ports over the available ranges, and for a stub resolver those two fields are the
+whole of the off-path defence. This is not new machinery either: the SNTP and DHCP items in the same
+milestone already require a random per-request transmit timestamp and a random `xid`.
+
+Plan changes: M6 gains "AND THE MATCHED TUPLE MUST BE UNGUESSABLE, OR MATCHING IT PROVES NOTHING" -
+a fresh unpredictable transaction ID and a fresh unpredictable ephemeral source port per query from
+that same randomness, bounded in-flight queries with a colliding draw REDRAWN rather than reused, and
+the tuple retired on completion or expiry so a late answer to a finished query matches nothing. Its
+negative fixtures are the discriminating ones the finding asks for: an answer carrying the NEXT
+sequential transaction ID and the previously used source port is refused, and so is a correctly formed
+answer arriving after its query was retired. The Definition of done now says the correlation tuple is
+one an off-path attacker cannot GUESS as well as one it cannot merely match, and that a spoofed or
+replayed datagram can neither resolve a name, set the clock, nor complete OR INVALIDATE a lease.

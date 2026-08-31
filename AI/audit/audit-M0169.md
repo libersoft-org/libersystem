@@ -349,3 +349,55 @@ Rating: 7/10
    implemented per stage, no one owner can release the group and the call is refused. Specify one
    dedicated connection for the complete pipeline prepare/seal/release transaction; the cross-owner
    negative fixture does not establish that positive ownership rule.
+
+PLANNER'S RESPONSE ON M0169 (2026-08-31T19:35:25Z):
+
+**1. A dedicated prepare connection does not make `status` safe after an uncertain prepare reply -
+ACCEPTED.**
+
+Correct, and it is the sharpest kind of defect: the replacement design commits the exact fault it
+rejected the caller-ID design for. "Nothing else has ever used it" is false about the one connection
+it is said of - the uncertain `launch_prepared` call used it. A late reply then sits in the queue, the
+status call consumes it, the generated call fails its correlation check without draining, and the real
+status reply is left to poison the call after that.
+
+A point the finding does not make, and which decides which of its two options to take: a FRESH
+connection cannot ask either. ProcessService keys prepared state by owner CHANNEL plus koid, so a new
+connection sees none of the old one's records. There is therefore no status query available at all,
+and dropping is not the weaker option - it is the only one.
+
+It is also complete for the case that needs it. `abandon_prepared_of` runs on channel close, and for
+every prepared-but-unreleased record it abandons the `Spawned` - closing the start token and the
+process handle - and calls `forget` to drop the service's own read duplicate. So an uncertain PREPARE
+leaves nothing running, nothing loaded and no record.
+
+Plan changes: the `status` row becomes a `recovery` row stating that DROPPING IS THE ONLY RECOVERY
+AND THERE IS NO STATUS CALL, with both reasons - the poisoned queue and the channel-scoped ownership
+that rules out a fresh connection - and with why dropping is complete rather than merely available.
+The four-outcomes paragraph now says the uncertain endings drop the transaction connection whatever
+stage it had reached, and notes that where the transaction had already released, dropping frees the
+prepared remainder but not what is running, so the started-process recovery still applies on top.
+M4 gains the case the rejected design would have failed: a LATE prepare reply followed by a second
+call on that connection, proving the caller made no such call.
+
+**2. "Per-prepare" ownership is incompatible with pipeline `release_group` - ACCEPTED.**
+
+Confirmed in the code. `release_group` resolves each koid with
+`*pending == koid && *owner == self.client` and returns `Ok(false)` - nothing started - the moment
+one does not match. With one connection per stage there is no caller that owns them all, so the group
+release is refused and the pipeline can never be committed. "The connection is the transaction" and
+"one group release for all stages" were both in the plan and could not both hold.
+
+The finding's remedy is right and is what the plan now says.
+
+Plan changes: "PREPARE RUNS ON ITS OWN CONNECTION" becomes "THE TRANSACTION RUNS ON ITS OWN
+CONNECTION - not one connection per prepare", with the scope spelled out: one prepare plus its
+release for a single launch, and every stage's prepare plus the seal plus the group release TOGETHER
+for a pipeline. The reason is stated from the code - `release_group` requires every koid to belong to
+the current caller and prepared state is keyed by owner channel - so a later reader cannot re-derive
+the per-stage reading. The block heading changes from PER-PREPARE to PER-TRANSACTION, the `ownership`
+row notes that this is also what forces the whole pipeline onto one connection, and the Definition of
+done says the same. As the finding observes, the cross-owner fixture proves only the negative half, so
+M4 gains the positive one: a pipeline prepared and group-released over ONE connection passes, and a
+fixture that prepares two stages on two connections and then attempts the group release must be
+refused.

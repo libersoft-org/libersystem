@@ -289,3 +289,63 @@ Rating: 6/10
    yields neither defined state; writing the marker first instead yields a provisioned machine with
    missing records and an immediate refusal. Specify a commit order (normally validated slots before
    a marker written last) and the boot/ceremony behavior for every partial state.
+
+PLANNER'S RESPONSE ON M0171 (2026-08-31T19:35:25Z):
+
+**1. Firmware authorization is not bound to the `rollback-enforcing` loader identity - ACCEPTED.**
+
+Correct, and it is the gap between this milestone's own goal sentence and its mechanism. The goal says
+"firmware authenticates a current, anti-rollback-aware loader"; M6 delivers only "revoke the previous
+signer, enroll the current one", and Secure Boot authenticates a SIGNER - the firmware cannot read
+`LIBER_TRUST_PROFILE` and has no way to ask. So a current, correctly signed, NON-enforcing
+`external-release` loader on replacement media is accepted and ignores the floor, defeating the
+milestone's whole claim without touching NVRAM - which is squarely inside the stated threat model,
+where the attacker controls persistent boot media.
+
+The gates confirm nothing stands in the way: `check-secure-boot.sh` signs whichever loader occupies
+the shared output path without consulting its profile, and `check-trust-profile.sh` builds several
+profiles to that same path. M2's media-downgrade fixture therefore had no mechanism that could make
+it fail.
+
+Plan changes: M2's value table gains a "the signing identity" row requiring a SEPARATE SIGNER for
+`rollback-enforcing` loaders, that identity being the only loader signer enrolled on a machine
+provisioned for enforcement, with the non-enforcing profiles keeping a signer such a machine does not
+authorise - and the signing step naming the profile it signs rather than inferring it from a path.
+The reasoning is written in, including why the firmware cannot do this itself. M2's negative fixture
+is changed to offer a CURRENT, correctly signed, NON-ENFORCING loader, with the note that an
+old-signer loader is M6's fixture and proves only that revocation works. M7 runs the same case against
+the persistent image.
+
+**2. The canonical commit tag leaves the slot-index bytes undefined - ACCEPTED.**
+
+Correct. Every other field in the record is frozen to the byte - offset, width, endianness, legal
+values - and the tag's appended slot index has none of those, so the loader, the provisioning tool,
+the mocked firmware and the OVMF fixture can each produce an incompatible tag while following this
+plan. The tag is also the field that makes cross-slot copying detectable, so an undefined encoding
+leaves the protection holding by luck.
+
+Plan change: the index is frozen as ONE BYTE with exactly two legal values - slot A `0x00`, slot B
+`0x01` - the hashed input restated as exactly 57 bytes, and the wrong forms named explicitly (a
+`u32`, an ASCII digit, a little-endian word) so none of the four producers invents one. M7's host
+fixtures gain cross-slot validation in both directions: a valid slot A record copied verbatim into
+slot B is refused, and the reverse.
+
+**3. Interrupted provisioning states are unclassified - ACCEPTED.**
+
+Correct. Unprovisioned required marker absent AND both slots absent, provisioned required the marker
+present, and the ceremony wrote three variables with no ordering, readback or recovery rule - so power
+loss after one or both slots but before the marker produced a machine in neither state, with no
+defined behaviour. The finding's observation that writing the marker first is worse is also right:
+that yields a provisioned machine with missing records and therefore a permanent refusal.
+
+Plan changes: a commit order is fixed - slot A, readback and validate; slot B, readback and validate;
+the marker LAST - with a failed readback aborting before the marker so a machine with failing NVRAM
+stays unprovisioned rather than becoming one that refuses every boot. UNPROVISIONED is redefined as
+marker ABSENT, whatever the slots contain, which is what the ordering makes correct: everything
+written before the marker is uncommitted by definition, and re-running the ceremony overwrites both
+slots unconditionally rather than reading what a previous attempt left. Writing the marker first is
+named as the one forbidden order. A five-row table then classifies EVERY combination with no fourth
+answer, including marker-present-one-slot-valid (the valid slot is authoritative and the other is
+rewritten on the next successful advance) and marker-present-neither-valid (refuses, and is not
+recoverable by deleting the marker - the attack the marker exists to defeat). M7 boots each
+interrupted state and proves it provisions afterwards.

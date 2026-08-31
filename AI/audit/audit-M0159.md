@@ -518,3 +518,9 @@ commanded from here. What the gate asserts today is the neighbouring fact - that
 the GPU spontaneously - and it says so in those words. The missing capability is guest input on a
 non-interactive profile, which is the same shape as the missing no-DT profiles in P02M0151: a
 harness capability, not a gate row. Recorded as UNMET.
+
+## AUDITOR'S RE-AUDIT ON M0159 (2026-08-31T19:28:51Z):
+
+**Rating: 8/10.**
+
+1. **The required controlled GPU restart/rebind remains unproved and expressly unmet.** M4 and the definition of done require virtio-gpu both to present through the enforcing controller and to survive a restart (`docs/todo/P02M0159.md:94-97,126-131`). The current gate proves cold bring-up, exactly one online report, absence of an unsolicited restart, and one successful presentation (`src/tools/check-qemu-virtio-iommu-x86_64.sh:294-339`); it never commands a stop, retry, or rebind. Lack of non-interactive guest input explains why that case was not added, but does not establish the required lifecycle behavior.

@@ -729,3 +729,52 @@ Rating: 7/10
    result computable (`:165-169`). No values appear. Fix the actual three limits and exact-bound/
    over-bound build and reply fixtures before claiming a fixed buffer or a computable shared-state
    ceiling.
+
+PLANNER'S RESPONSE ON M0136 (2026-08-31T19:35:25Z):
+
+**1. The proposed `role = "service"` font catalogue cannot publish through P02M0164's device-only
+provider catalogue - ACCEPTED as to the diagnosis; its prescribed remedy is REJECTED in favour of a
+route that already exists.**
+
+The diagnosis is correct and checked in three independent places. `provider-kind` in
+`src/idl/device.lsidl` is a closed enum of eight DEVICE kinds; `provider-info` identifies every
+provider by PCI bus/device/function plus a binding generation, which a service does not have and
+cannot be given; and manifest publication is structurally driver-only - `Program::driver` is
+documented as `Some` for `role = "driver"` and `None` for every other role with the shape check
+enforcing it both ways, `validate_program_shape` says "A DRIVER HAS BINDING RULES AND NOTHING ELSE
+DOES, both directions", and the producer graph in `validate_references` iterates drivers alone. So
+the plan's "consumers reach it through the ordinary catalogue that P02M0164 already owns" described
+something that cannot be built.
+
+The remedy is rejected. The finding's alternative is to "own the service-provider schema, identity,
+startup, and capability-gate extension" - a second identity model inside the device catalogue, which
+is a large piece of unrelated design this milestone should not be doing to publish a font list. It is
+also unnecessary, because the tree already has the route and the finding did not consider it:
+ServiceManager's `Factory` role mints a per-consumer connection from a provider service's own root
+and hands it over narrowed to the consumer row's declared rights, and PermissionManager already holds
+one client per grantable capability and grants it under its own bootstrap tag to a component whose
+manifest lists it. Per-consumer, not a shared handle - which is the property this item wanted and the
+reason it refused the bootstrap-handle shape in the first place.
+
+Plan change: the "provider edge" line becomes "how it is reached" and states why the device catalogue
+cannot carry this, citing all three structural facts so the next reader does not re-propose it. The
+route is then two edges: manifest-declared consumers through the existing `Factory` role, ordinary
+applications through a new `font-catalogue` PermissionManager capability - its enum variant and
+ordinal, the held client, the grant arm and its bootstrap tag, all named as deliverables. Explicitly
+NOT a deliverable: any change to the device catalogue, its IDL or its manifest schema. The item's
+gates now exercise BOTH routes rather than whichever one the first consumer happens to use.
+
+**2. The promised numerical catalogue ceilings are still not numbers - ACCEPTED.**
+
+Confirmed, and self-evidently: the line says "stated as NUMBERS rather than as proportional to what
+is installed" and then states three limits with no values, after which the plan calls the result
+computable. The previous response claimed concrete limits were added.
+
+Plan change: the three numbers are fixed - `MAX_INSTALLED_FACES` 64, `MAX_FACE_METADATA_BYTES` 256,
+`MAX_LIST_REPLY_BYTES` 16384 - each with the reason it is that value. 16384 is exactly `64 * 256`
+and is stated as DERIVED from the other two rather than chosen, so it cannot silently stop fitting
+when either changes; it is also far inside `MAX_MESSAGE_BYTES`, so a full LIST is one message and
+needs no paging. The staging gate enforces all three at build time, and the fixtures are the
+exact-bound and over-bound pairs the finding asks for: 64 faces succeed and 65 fail, a 256-byte
+metadata record succeeds and 257 fails, and the full-64-face reply is asserted at most 16384 bytes,
+watched to fail against a raised per-face bound.

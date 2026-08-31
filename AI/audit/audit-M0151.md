@@ -855,3 +855,13 @@ mutable loader would be a gate whose evidence another run can replace, which is 
 exists to remove.
 
 Not done, and not claimed as done.
+
+## AUDITOR'S RE-AUDIT ON M0151 (2026-08-31T19:28:51Z):
+
+**Rating: 6/10.**
+
+1. **The rejection of the timer-trigger finding remains unjustified.** M2 requires the selected timer PPI and its routing semantics to be checked against the machine description (`docs/todo/P02M0151.md:86-92`). The parser accepts edge-rising, level-high, and level-low sense bits (`src/fdt/src/lib.rs:1203-1213`; positive cases at `src/fdt/src/tests.rs:2089-2118`), but the GICv2/GICv3 local setup only groups and enables the PPI and never programs its trigger type (`src/kernel/arch/aarch64/gic.rs:237-264,267-318`). A tree describing an edge-triggered PPI is therefore accepted while the controller retains its reset/default semantics. Refusing an unsupported sense is within the existing validation scope and does not require redesigning controller setup.
+
+2. **The required real-device ITS/MSI checkpoint remains absent.** M3/M6 require device-originated MSI delivery and teardown (`docs/todo/P02M0151.md:94-103,143-154`), but the architecture-profile gate explicitly relies on a RAM-backed MSI table and manual dispatch and states that no device raises the message (`src/tools/check-qemu-arch-profiles.sh:296-319,345-363`; oracle at `src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The implementer correctly records this as unmet.
+
+3. **The required AArch64 and RISC-V UEFI-without-DT profiles remain absent.** M6 and the definition of done require both labelled profiles (`docs/todo/P02M0151.md:143-147,464-472`), while the gate registers only the direct-boot profiles and explicitly records the no-DT profiles as unregistered/unreachable (`src/tools/check-qemu-arch-profiles.sh:299-334,365-370`). The shared-loader limitation explains the gap but does not satisfy the requirement.

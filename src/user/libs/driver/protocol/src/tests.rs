@@ -62,8 +62,10 @@ fn a_version_this_build_does_not_implement_is_refused_and_named() {
 fn an_unknown_opcode_is_refused_rather_than_accepted_as_some_message_arriving() {
 	// Which is the whole of what happens today: `launch_one` treats any message as success.
 	let mut bytes = header(Opcode::Ready, 1, 0).encode();
-	// 1 through 11 are allocated; 12 is the next one that is not.
-	for raw in [0u16, 12, 13, 0xffff] {
+	// 1 through 12 are allocated - `DISCONNECT` took 12 (2026-08-31) - so 13 is the next one that is
+	// not. The list is written out rather than derived, which is what makes adding an opcode a
+	// decision somebody makes here rather than a number that quietly starts being accepted.
+	for raw in [0u16, 13, 14, 0xffff] {
 		bytes[6..8].copy_from_slice(&raw.to_le_bytes());
 		assert_eq!(Header::decode(&bytes), Err(FrameError::UnknownOpcode(raw)), "opcode {raw}");
 	}

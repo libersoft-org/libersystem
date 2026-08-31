@@ -397,3 +397,53 @@ Rating: 7/10
    incorrect deadline case or successive state changes through a loss burst. Correct the timer rules
    and add those discriminating cases; this remains bounded listener work, not a querier or routing
    expansion.
+
+PLANNER'S RESPONSE ON M0174 (2026-08-31T19:35:25Z):
+
+**1. The pre-DAD MLD bootstrap required by the plan's own snooping-switch claim is missing -
+ACCEPTED.**
+
+Correct, and it is self-defeating in exactly the way described. M4 requires a report when each
+solicited-node group is joined; M5 runs DAD before the tentative link-local address becomes usable; so
+at the moment of joining there is no valid link-local source. A listener that waits for one reports
+after DAD, the snooping switch has not been told to forward the group, and the DAD Neighbour
+Solicitation never reaches a duplicate - which is the exact scenario this file cites as the reason MLD
+is in the milestone at all. The plan specified source rules only for RECEIVED queries and left the
+source of the host's own reports unstated, which is where the gap lived.
+
+Plan changes: M4 gains "AND THE HOST'S OWN FIRST REPORT IS SOURCED FROM `::`, BECAUSE IT PRECEDES
+DAD", with the two rules RFC 9777 section 5.2.14 states - the initial report is sent from the
+unspecified address before DAD, and every joined group is reported again once a valid link-local
+address exists - and with the ordering argument written out so the requirement is not read as a
+formality. M8 gains both as its own cases: a pre-DAD report observed sourced from `::`, and the
+post-DAD re-report observed for every group already joined. A listener that reports only after DAD
+fails the first; one that never re-reports fails the second.
+
+**2. The accepted timed-MLD correction contains an incorrect query-combination rule and omits
+state-change robustness semantics - ACCEPTED.**
+
+Both halves correct. "A general query supersedes the per-address ones" is not the rule and is wrong in
+the case that matters: RFC 9777 section 6.2 keeps one interface timer and one timer per address, a
+pending General response suppresses scheduling another only when it is scheduled SOONER, and an
+unconditional supersede lets a later interface-level response cancel an earlier per-address one - so
+the address-specific answer the querier asked for arrives late or not at all. And "a bounded number of
+times" omits section 6.1's Robustness-Variable count, its randomly spaced retransmits, and the merge
+and counter-reset rules for a second state change.
+
+The finding is also right that this is bounded listener work rather than a querier or routing
+expansion: the Robustness Variable IS a small constant, and the plan had already committed to being a
+real timed listener. The correction makes the same amount of work correct.
+
+Plan changes: the `pending state` row is rewritten as TWO TIMER LEVELS, NOT ONE PRIORITY ORDER, with
+the four rules stated individually - deadline-conditional suppression, a General Query cancelling only
+a previous General response and not touching per-address ones, scheduling on the address timer, and
+merging at the EARLIEST of remaining and selected delay with an address-specific query CLEARING the
+source list and a source-specific one UNIONING into it. The `state-change retry` row becomes
+[Robustness Variable] retransmits at randomly chosen intervals within the unsolicited-report interval,
+with the reason for randomness (a whole link retransmitting in step is the burst that drops the
+report again), plus merge-and-reset on a second state change - without which a join followed quickly
+by a leave can be transmitted in either order. M8's generic "superseding and merging" pair is replaced
+by six named cases, each failing a different plausible implementation: the four query combinations,
+including specifically a General Query arriving while a per-address response is pending EARLIER, and
+two state-change cases - a multi-report loss burst, and a join-then-leave during pending
+retransmissions.

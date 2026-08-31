@@ -306,3 +306,73 @@ Rating: 5/10
    saying “fixed-length” does not let the harness producer and three kernel consumers agree on bytes.
    Freeze the names and exact record encodings, including malformed/unknown handling, before claiming
    every matrix path has an existing carrier at admission time.
+
+PLANNER'S RESPONSE ON M0172 (2026-08-31T19:35:25Z):
+
+**1. The revised producer matrix is not disjoint, because "test" and "gate" overlap with no
+discriminator - ACCEPTED.**
+
+Correct, and the existing enforcing gate is the proof rather than a hypothetical.
+`check-qemu-virtio-iommu-x86_64.sh` invokes `test.sh`, whose runner sets `TEST=1`, and it supplies
+its own enforcing controller through `QEMU_EXTRA`. That boot is a `gate` row by ownership and a
+`test` row by `TEST=1`, and the two rows answer oppositely - "as that gate declares" against
+`ABSENT`. The harness makes the collision visible from the other side too: `qemu_run_x86_64` reads
+`TEST=1` as "untranslated" and attaches no controller, while the gate has attached one. P02M0173's
+gate rows are deliberately test-kernel phases as well, so this is the normal case. "Run mode is
+decided first" named no carrier and no value, so the rule was unimplementable.
+
+Plan change: M2 gains an authoritative carrier. `LIBER_RUN_MODE` holds exactly one of `test`,
+`development`, `public` or `gate` and is the only thing consulted for the outer key; `TEST`, the
+development scalar, `--no-iommu` and `BOOT_IMAGE` keep their meanings and none is read as a run mode
+- `TEST=1` selects the test KERNEL and MEDIUM, which is a different question from what policy the
+boot runs under. Who sets it is stated: a named gate sets `gate` before invoking anything and the
+invoked runner does not overwrite it, `test.sh` sets `test` ONLY WHEN UNSET (which is what makes the
+gate's value survive its own use of the test runner), `run.sh` sets `public`, the development
+instance sets `development`. Unset is a broken producer and refuses. And the boundary is tested
+rather than asserted: each named gate proves it runs under `gate`, and the enforcing IOMMU gate
+specifically proves its test-kernel phase does not fall to the `test` row.
+
+**2. The non-x86 enforcing rollout cannot land in the declared dependency order - ACCEPTED.**
+
+Correct. `virtio-iommu-pci` is attached only inside `qemu_run_x86_64`, so the non-x86 harness has
+endpoints and no controller; M6 makes an `enforcing-required` mode refuse when enforcement is absent
+or failed; and P02M0173, which exclusively owns that topology, is planned after this milestone and
+lists it among its own prerequisites. Landing M0172 first would refuse every public non-x86 boot. The
+"once P02M0173's profiles exist" clause was in the producer column while the mode column said
+`enforcing-required` unconditionally - a dependency cycle written as a footnote. The finding is also
+right that the public DIRECT rows carry it, not only the UEFI ones, so the break is not hypothetical
+for a harness that boots those architectures directly today.
+
+Plan changes: the matrix splits the direct row by architecture and both non-x86 public rows point at
+a stated LANDING TRANSITION instead of carrying a value. While this milestone lands they are
+`no-iommu` PRODUCED by the same named producer as every other public row - a trusted, produced, named
+mode and not an absence, so `iommu-required` still refuses, only `trusted-untranslated` enters the
+loud degraded inventory, and a missing value still refuses. That is deliberate: it keeps the
+fail-closed change landing everywhere at once with only the VALUE differing, rather than parking those
+rows on the test/development absence rule. When P02M0173 lands its topology it flips both rows, which
+is an item of P02M0173 and needs no admission change because M6 already refuses an enforcing mode
+without working enforcement. Dependencies records it as a two-sided obligation - this milestone must
+not ship `enforcing-required` there, and P02M0173 is not done until it has flipped them - because
+either order taken alone breaks the boots.
+
+**3. The accepted direct-carrier correction does not define a wire contract - ACCEPTED.**
+
+Correct. The correction named a shape and no names, lengths or encodings, and no such carrier exists
+in the tree to copy them from, so one harness producer and three kernel consumers had nothing to agree
+on. "Fixed-length" is not a length. This file's sibling freezes a 64-byte record to the offset, so the
+standard is established.
+
+Plan change: ONE FORMAT carried two ways, frozen to the byte. An 8-byte record: magic `LSDM` at 0,
+format version 1 at 4, DMA mode at 5 (`1` = `enforcing-required`, `2` = `no-iommu`), provenance at
+6 (`2` = `harness`), reserved zero at 7. Deliberate decisions written in rather than left implicit:
+there is no encoding for absence, because absence is the record not being there and M2 already answers
+that; `1` (`signed`) is MALFORMED on this carrier and is refused rather than trusted, because a
+direct-boot carrier is exactly where a media-controlled value must not be able to claim
+authentication; and the provenance is one byte so the enum has a single encoding across both carriers
+and the signed manifest field. The x86_64 carrier is the `fw_cfg` file `opt/org.libersystem.dma-mode`
+containing exactly those bytes; the device-tree carrier is the property `libersystem,dma-mode` under
+this product's node, as a BYTE STRING and not cells, so no cell endianness applies and the two
+carriers are byte-identical. Malformed and absent yield the same outcome - mode ABSENT, and the
+named-producer rule refuses - distinguished only in what is reported, and nothing about a malformed
+record is ever interpreted, which is what stops a corrupt record from being a downgrade. The
+Definition of done gains the carrier, the run mode and the non-x86 landing rule.

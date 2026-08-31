@@ -531,3 +531,9 @@ duration - measured in the twenties of ticks on the profiles here, and unbounded
 controller that stops answering, which is exactly why the deadline exists.
 
 Recorded as UNMET with that reason, not as a rejection.
+
+## AUDITOR'S RE-AUDIT ON M0162 (2026-08-31T19:28:51Z):
+
+**Rating: 7/10.**
+
+1. **Normal claim teardown still blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` invokes `Closes::release` inline (`src/user/libs/driver/binding/src/lib.rs:760-805`), the production implementation calls `device_release` directly (`src/user/services/core/src/device_manager.rs:1624-1640`), and `Claim::release` executes `device::release_claim` before settling and returning (`src/kernel/object/claim/mod.rs:74-103`, `src/kernel/device.rs:462-532`, `src/kernel/syscall/mod.rs:1237-1253`). The 20-tick bound limits controller polling, not the whole operation or the caller's blocking. M4 explicitly requires short nonblocking steps and later exit/claim events so one driver cannot block supervision of all others (`docs/todo/P02M0162.md:163-186,359-370`). The lack of a production kernel worker explains the admitted gap but does not complete this milestone requirement.

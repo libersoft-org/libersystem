@@ -645,3 +645,11 @@ named `_pad1` at offset 36 - the field replaced by `iommu_quarantined` in an ear
 it. The assertion now names `iommu_quarantined => 36` and `iommu_faults => 40` with the size at 48,
 and the 28 `abi` tests pass. Worth recording separately from this milestone: a frozen layout whose
 freeze does not compile is not frozen.
+
+## AUDITOR'S RE-AUDIT ON M0153 (2026-08-31T19:28:51Z):
+
+**Rating: 7/10.**
+
+1. **The retained-domain association is still fallible despite the response's opposite claim.** `iommu::init` allocates the table with `try_reserve_exact` and deliberately leaves it without slots on failure (`src/kernel/iommu/mod.rs:214-225`). An unconfirmed detach can then fail `RETAINED.get_mut(index)` and explicitly reports that the device's holdings will read as zero (`src/kernel/iommu/mod.rs:874-887`). The quarantine remains safe, but M4 and the definition of done require exact per-binding mapping/quarantine accounting rather than a zero report under memory pressure (`docs/todo/P02M0153.md:184-195,259-260`).
+
+2. **A confirmed-teardown fault is attributed in the log but not charged to the binding counter.** The confirmed path destroys and removes `DomainState` before its final attributed fault drain (`src/kernel/iommu/mod.rs:904-920`; removal at `src/dma/src/lib.rs:1045-1058`). `drain_faults_during` then patches the event's domain and generation before recording it, but increments the per-domain counter only if that now-removed state still exists (`src/dma/src/lib.rs:1162-1183`). M5's durable event attribution is corrected, but M4's exposed per-binding fault accounting remains incomplete for faults raised during a confirmed revoke.

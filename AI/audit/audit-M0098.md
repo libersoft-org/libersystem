@@ -411,3 +411,13 @@ a real controller, not a registry row count.
 
 Verification: x86_64 373 passed; riscv64 and aarch64 suites and `./check.sh` in the same pass - see
 the verification note at the end of the M0167 response.
+
+## AUDITOR'S RE-AUDIT ON M0098 (2026-08-31T19:28:51Z):
+
+**Rating: 5/10.**
+
+1. **The generation-safe MSI correction still permits stale hardware effects.** `sys_device_msix_acquire` checks `Claim::is_settled` only before reading the device (`src/kernel/syscall/mod.rs:1460-1466`), while `domain_for_generation` returns `Ok(None)` without checking the claim slot when the device has no IOMMU domain and `msi_deliverable` treats that as deliverable (`src/kernel/iommu/mod.rs:622-630,1013-1018`). Release and reclaim can therefore overtake an untranslated-device call, after which the stale call programs the replacement binding's MSI-X entry before the late `register_derived` rejection (`src/kernel/syscall/mod.rs:1547-1604`). The `NoRoute` rollback has a second instance of the same race: `disable_bus_master_for` validates the key under `CLAIMS`, drops that lock, and only then writes configuration space, so a complete release/reclaim between those operations lets the old generation disable the new one (`src/kernel/device.rs:607-616`).
+
+2. **MMIO revocation treats an unconfirmed cross-CPU TLB shootdown as success.** `DeviceMemory::teardown_mapping` ignores the boolean returned by `mem::tlb::shootdown` and unconditionally frees the virtual range (`src/kernel/object/device_memory.rs:184-222`), although the shootdown returns `false` for uncovered CPUs or a timeout (`src/kernel/mem/tlb.rs:63-103,137-178`). `revoke_effects_of` consequently reports this local operation as quiet, allowing the claim to become `Free` while another CPU may retain a BAR translation. That is contrary to the forced-revocation and confirmed-teardown requirements.
+
+3. **The last-reference interrupt correction still loses a failed RISC-V unbind.** A release sweep can fail to upgrade the weak reference after the last strong count reaches zero while `Interrupt::drop` is still running; `Drop` ignores the result of `unbind` (`src/kernel/object/interrupt.rs:126-135`). RISC-V records a failed disable by quarantining the slot (`src/kernel/arch/riscv64/interrupts/mod.rs:47-67`), but `MsiRegistry::has_unbound` deliberately excludes quarantined slots (`src/kernel/arch/common/msi.rs:154-170`). `settled_vectors` can therefore report success and the claim can become `Free` even though the interrupt teardown was not confirmed (`src/kernel/device.rs:484-517`).

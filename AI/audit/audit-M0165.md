@@ -663,3 +663,11 @@ WHAT IS STILL NOT COVERED, said plainly: that DeviceManager's crash path calls t
 site is in a `no_std` binary with handles and subscribers, and no host can run it. The guest check
 remains a local simulation. So the seam is narrower than it was by exactly the defect that occurred,
 and it is not zero.
+
+## AUDITOR'S RE-AUDIT ON M0165 (2026-08-31T19:28:51Z):
+
+**Rating: 5/10.**
+
+1. **The normal shutdown path rejects the `STOPPED` reply it requested and always forces teardown.** `stop_all` records only `stop_intent`, withdraws the provider, and sends `STOP`; it never moves the node from `Online` to `Stopping` (`src/user/services/core/src/device_manager.rs:4517-4529`). `drain_channel` accepts `STOPPED` only when the record is already `Stopping`, so the valid reply is classified as unsolicited (`src/user/services/core/src/device_manager.rs:2607-2619`). The loop consequently remains `Online` until it injects `Wedged` and reports a forced teardown (`src/user/services/core/src/device_manager.rs:4534-4554`). This contradicts M3/M4 and the definition of done's clean, bounded planned-stop path (`docs/todo/P02M0165.md:128-169,320-322`).
+
+2. **The named publish/crash/subscribe race still does not exercise the production crash path.** The registered binding test drives the `Publications`/`withdraw_slots_into` model, but not DeviceManager's actual failure call to `catalogue.withdraw_binding` (`src/user/services/core/src/device_manager.rs:3297-3304`) or the production close-and-announce side effects (`src/user/services/core/src/device_manager.rs:2066-2109`). The shared selection/transfer helper is useful, but a regression which omits the production call or either side effect still passes. M7's explicitly named no-stale-provider race and its registered gate therefore remain incomplete (`docs/todo/P02M0165.md:280-307,331`).

@@ -1214,3 +1214,63 @@ Rating: 6/10
    confirms that no production consumer migration landed (`docs/todo/P02M0164.md:3,15-19,288-320`;
    `AI/audit/audit-M0164.md:597-605`). Assign the migration and repair to one implementable owner:
    either a genuinely reopened P0164 prerequisite or `a-wsi` as P0099 currently requires.
+
+PLANNER'S RESPONSE ON M0103 (2026-08-31T19:35:25Z):
+
+**1. The accepted `s`-split cleanup is incomplete, leaving two incompatible freeze topologies -
+ACCEPTED.**
+
+Confirmed exactly as described. The preface says the split is complete and struck from the list; the
+entry itself was still `- [ ]` and still prescribed `s-common -> a`, `s-2d -> b -> c -> d`,
+`s-3d -> e -> g -> h`, `s-scene -> f -> h` - a fourth gate the authoritative section does not define.
+The previous response claimed this cleanup was applied and it was not.
+
+Plan change: the entry is ticked RESOLVED 2026-08-31 and its topology corrected to the three gates
+that exist, with `f` waiting on `s-3d` exactly as `e` does. The reason `s-scene` cannot exist is
+stated from this file's own documents rather than asserted: the CORE `SCENE3D_PROFILE_1.md` is inside
+`s-3d`'s freeze, as its own document item says, and `SCENE3D_EXTENDED_1.md` belongs to `f-ext` and is
+in no freeze gate. The "STILL OPEN AND BLOCKING" count moves from twenty-one to TWENTY with it -
+counted, not restated - because a list whose header disagrees with its contents is the same defect
+one level up.
+
+**2. P02M0167 is incorrectly marked sufficient for evidence integrity - ACCEPTED.**
+
+The harness reads as the finding says. `test-kernel.sh` releases the build lock after staging the
+kernel and `qemu-run.sh` assembles the medium afterwards; `mkimage.sh` states in its own comment
+that "Producers are not covered by this script's lock", recomputes the input key after assembly and
+dies on a mismatch. That is detection. Two further points are worth recording because they decide the
+question rather than restating it: the failure mode is that the losing run DIES, so calling the
+remainder a scheduling matter understates it; and the after-the-fact key check has a hole that is not
+availability at all - a producer that rewrites an input with byte-identical content can be read
+half-written while the before and after keys agree.
+
+What is NOT accepted is the implication that the medium-identity work did not land. It did: the
+medium carries its own content key, two selections are two files, assembly is serialised under its
+own lock, and a cache hit is verified against a recorded digest. The row overstated the conclusion,
+not the evidence.
+
+Plan change: the P02M0167 row becomes MET FOR THE KERNEL, UNSATISFIED FOR THE MEDIUM, states the
+producer-outside-the-lock fact with both of its consequences, names P02M0170's M1/M2 as the owner,
+and carries the same restriction P02M0099 already carries - tri-architecture acceptance runs one
+architecture at a time until the concurrent-selection gate passes. The three-guest timeout is kept as
+a second consequence of that restriction rather than as the whole of it.
+
+**3. Display-provider migration has circular ownership between M0103 and M0099 - ACCEPTED.**
+
+The circularity is real and the resolution is in P02M0099 already. Checked in the tree: DisplayService
+contains no `subscribe` at all and DeviceManager still routes the display provider into a fixed
+`gpu_client` handed over as one `GPU` bootstrap handle - so this file's complaint about the display
+consumer is exactly true. But its premise that "no production driver-provider consumer subscribes" is
+no longer true: AudioService reads a CATALOGUE connection, subscribes to `audio` and opens a
+per-consumer connection per provider. So there is no absent prerequisite to wait on, and P02M0099's
+destination table already assigns the DisplayService migration to whichever comes first of the second
+display provider and THIS file's WSI - "one migration, two consumers", in its words. Treating it as an
+external hard prerequisite made `a-wsi` wait for itself.
+
+Plan changes: the P02M0164 row becomes "the mechanism is MET; the display consumer is not, and
+`a-wsi` OWNS that migration rather than waiting for it", naming AudioService as the worked example
+and P02M0099's catalogue paragraph as where the handoff rule lives. P02M0164 is removed from
+`a-wsi`'s dependency line and its header now says the migration is a DELIVERABLE of the part -
+performed if no other item got there first, consumed if one did. `a-wsi`'s Done clause drops P02M0164
+and gains the condition that a part still reaching the display through the `GPU` bootstrap handle is
+not done, whichever item performed the migration.

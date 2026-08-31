@@ -1315,3 +1315,49 @@ Rating: 7/10
    it (`device_manager.rs:1743-1759`). Define one coherent first-public-handoff rule and apply the
    declared limit/accounting to every minted connection, including the boot-probe path, alongside the
    already planned close decrement and manifest ceiling.
+
+PLANNER'S RESPONSE ON M0099 (2026-08-31T19:35:25Z):
+
+**1. The P02M0164 connection-factory prerequisite is stale and cannot perform the first catalogue
+migration - ACCEPTED as to the plan, REJECTED as to every code claim in it.**
+
+The conclusion is right and the premises are not, so the plan change is the OPPOSITE of the one
+prescribed. Each premise, checked against the tree as it now stands:
+
+- "the current publication already initializes the count to one" - it initialises it to ZERO. The
+  publication site reads `consumers: 0`, and the retained offered channel is counted separately by
+  `outstanding`, which adds one while `handle != 0`.
+- "served `open` therefore refuses before the first production destination can obtain a connection" -
+  it does not. `open` HANDS OUT the retained offered channel as the first connection, moving it
+  (`held.handle = 0; held.consumers += 1`) rather than duplicating it, and only mints a new pair once
+  that one is gone. That is the "one coherent first-public-handoff rule" the finding asks for, and it
+  exists.
+- "the retained initial endpoint is available only through private `Catalogue::take`" - `take` is
+  still there for the boot's own routing and now counts what it takes, but it is no longer the only
+  way to the endpoint.
+- "the same accounting is also bypassed by boot-time `mint_connection`, which neither checks the
+  declared limit nor increments it" - it does both. It computes `admits` from the driver's registry
+  entry, refuses and prints when `outstanding >= admits`, and increments after a successful
+  `CONNECT`.
+- unstated by the finding but required by the same plan paragraph: `Catalogue::disconnected`
+  decrements, and `system-manifest` carries `MAX_PROVIDER_CLIENTS = 8` and refuses an entry
+  declaring more.
+
+So the accounting repair landed, with the AudioService migration that owned it. What was stale is the
+PLAN: it still described the accounting as a BROKEN PREREQUISITE in three places and told the first
+destination migration to fix it.
+
+Plan changes:
+
+- The prerequisite matrix row for P02M0164 now reads MET for discovery, withdrawal, the requires-edge
+  AND live connection accounting, and says what is actually outstanding: the remaining DESTINATIONS,
+  not the mechanism.
+- The catalogue paragraph's "BUT ITS CONNECTION ACCOUNTING IS UNSATISFIED" block is replaced by "AND
+  ITS CONNECTION ACCOUNTING HAS LANDED". It is kept rather than deleted because what replaced the
+  three defects is a RULE later migrations must follow, and it is now written out: existing-plus-
+  promised is the number every minting path checks; the offered channel is the first public
+  connection and `open` is where it is handed out, moved and never duplicated; every minting path is
+  accounted including the boot probe; and the manifest bound is reconciled at build time.
+- The destination table's AudioService row is marked DONE with what it did - reads a CATALOGUE
+  connection, subscribes to `audio`, opens per provider, drops on withdrawal - so a later second
+  audio provider owns only its device-side PCM contract and not a migration that has happened.

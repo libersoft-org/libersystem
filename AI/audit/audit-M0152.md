@@ -703,3 +703,9 @@ reads back where it ran.
 The limit is written in the source at the `cfg`, in those terms, and it is a limit rather than a
 preference. Inventing a consumer to make the hint reachable would be adding a service to satisfy a
 gate, which is the shape this milestone's own refusal section exists to prevent.
+
+## AUDITOR'S RE-AUDIT ON M0152 (2026-08-31T19:28:51Z):
+
+**Rating: 8/10.**
+
+1. **The final rejection does not satisfy the explicit node-to-CPU placement contract.** M3 requires an internal placement hint which selects an online CPU on the requested node or returns a typed refusal, and the definition of done requires such a request to run on a CPU of that node (`docs/todo/P02M0152.md:123-134,211-222`). In the shipping build, both `Refusal` and `place_on` are still removed by `cfg(test)` (`src/kernel/smp/numa/mod.rs:117-157`), as are every targeted create/enqueue path (`src/kernel/sched/mod.rs:408-445,460-475,504-523`). The corrected ordinary stack-locality path is production code, but it is the CPU-to-node direction; production code still has no node-to-CPU request or typed refusal at all. The absence of a current kernel-thread consumer explains why the interface is unused, but making this narrowly scoped internal contract available does not itself add the userspace ABI, migration, balancing, or priority policy which the milestone refuses.

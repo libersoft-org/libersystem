@@ -1127,3 +1127,67 @@ Rating: 5/10
    (`src/user/runtime/rt/src/lib.rs:51-74`). Keep the inventory-driven branch authoritative and remove
    the empty-set conclusion; any retained constructor, destructor, or `errno` use needs the positive
    lifecycle gates the plan already describes.
+
+PLANNER'S RESPONSE ON M0135 (2026-08-31T19:35:25Z):
+
+**1. The accepted pinning finding remains incomplete, so downstream branch decisions are assertions
+about an unknown build - REJECTED, with its one material half already answered by finding 3.**
+
+Rejected as stated. The finding asks the plan document to carry literal values - a Vulkan-Loader
+revision, an archive SHA-256, toolchain-file digests, a bootstrap-sysroot digest. A plan is not a
+lockfile. The bootstrap pin is a checked-in artifact this milestone produces as its first step, the
+plan freezes its CONTENTS and its position in the freeze order, and a commit hash transcribed into
+markdown is a value nothing reads, nothing verifies and nothing keeps current - it would go stale
+before the implementer used it and no gate would notice. Two of the listed items are also already
+supplied: the CMake option set is named in full, option by option, with the reason each one changes
+the inventory; and it is the plan's own choice rather than a measured fact, which is why it can be.
+
+The material half - "downstream branch decisions are assertions about an unknown build" - is right
+about exactly one branch, and it is finding 3's. The others were checked and are already
+inventory-driven rather than premises: TLS is "MANDATORY if and only if the derived inventory shows
+`PT_TLS`, TLS symbols or TLS relocations"; thread creation and TLS are named as the two measured
+STOP CONDITIONS that pause the milestone; and Variant B is selected "unless the inventory says
+otherwise". Those are conditionals on a measurement, not claims about an unknown build. The lifecycle
+one was not, and it is fixed under finding 3.
+
+**2. The selection-slot correction leaves the incompatible ProcessService contract in force and never
+defines how a selected slot enters the eager dependency closure - ACCEPTED.**
+
+Both halves confirmed. The contradiction is in the file: the decision paragraph says (a) "needs no
+new PROCESSSERVICE mechanism", and the later correction has ProcessService choose a digest from the
+staged set and bind it into a slot, which is a mechanism and a new one. And the technical gap is real
+- checked in the tree: `collect` recurses only over `DT_NEEDED`, and
+`identity_matches_dependencies` requires `identity.providers.len() == dependencies.len()` with a
+matching entry per dependency. A digest occupying a selection slot enters none of that; it would make
+the two sets differ in length and fail the launch.
+
+Plan changes: "adds it to the verified closure" becomes "RESOLVES IT INTO", with the reason - an
+append is the one thing an exact-equality check cannot accept. The "needs no new mechanism" sentence
+is struck and replaced by what (a) actually buys, which is the LOCATION of the new work rather than
+its absence: everything happens before the first thread, so no `dlopen` seam is created. And the
+mechanism is stated so it is not inferred: a resolved slot becomes a DEPENDENCY NODE AND A LOAD-ORDER
+NODE BEFORE THE EQUALITY CHECK RUNS - resolution first, the resolved provider joins the effective
+dependency set and the recursive collection, then the comparison. The consumer therefore needs no
+`DT_NEEDED` entry for the ICD, which is the point since it is built against a candidate set, and the
+equality check keeps its exact meaning because the chosen digest was named in the authenticated
+record before the launch.
+
+**3. The statement that a C99 build has an empty lifecycle set is false and can suppress mandatory
+positive gates - ACCEPTED.**
+
+Correct, and it is wrong twice over. C versus C++ does not decide ELF lifecycle: `.init_array`,
+`.fini_array` and `errno` are C facilities and a C99 file using `__attribute__((constructor))`
+produces an initialiser like any other. And it contradicts this file twice - pass 1 is required to
+inventory exactly those facilities, and the ABI item says each mechanism "is decided by what pass 1
+and pass 2 actually name". The gate text's own bullet list includes an `errno` case, which an empty
+set would have made unreachable. Predicting EMPTY is also the single most damaging prediction to get
+wrong, because it is the only one that SUPPRESSES gates rather than adding them.
+
+Plan change: the empty-set conclusion is struck and the inventory-driven branch made authoritative
+with no expected-set claim at all. A measured constructor, destructor, `atexit` registration or
+`errno` use makes the positive gates mandatory for exactly those mechanisms - and makes the
+init/fini RUNNER a deliverable, since `liber_rt_start` performs the ABI check and calls the entry
+point directly and no runner exists in this tree. A measured absence still yields FORBIDDEN and the
+artifact check the ABI item describes: a measured empty set, not a predicted one. The gate heading
+is broadened from "C++ mechanism" to "lifecycle mechanism", because `.init_array` and `errno` were
+being filed under a language that does not own them.

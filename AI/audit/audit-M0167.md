@@ -608,3 +608,44 @@ from. `mkimage`'s post-assembly key check turns that into a refusal rather than 
 a per-run loader artifact - the mechanism this milestone already has for the kernel - is what would
 make a featured loader safe to have. Not done here; named, so the next reader does not have to
 rediscover it.
+
+VERIFICATION FOR THIS PASS (M0098, M0150-M0153, M0159, M0162, M0164-M0167) - 2026-08-31T18:20:00Z:
+
+- x86_64: 373 passed, against the final tree.
+- riscv64: 364 passed. aarch64: 361 passed. Both were run against a tree differing from the final one
+  by two COMMENTS in kernel source (an `ALLOC-OK` annotation in `device.rs`, the stack note in
+  `test-kernel.sh`), a host-test edit in `driver-protocol`, and three regenerated report TSVs. Said
+  rather than glossed: those two suites did not run against the last byte of this tree.
+- Every gate: the full set passed. `qemu-virtio-iommu-x86_64` is run SOLO after a fresh
+  `./image.sh --format iso`, because the other gates rebuild artifacts and leave the shipping ISO's
+  input key stale - all phases pass, including the new frame-presentation assertion.
+- Host suites through `host-tests`: 75 of 75.
+
+THREE THINGS THE SWEEP FOUND THAT NO AUDIT RAISED, all fixed:
+
+- `abi`'s own layout freeze had not COMPILED since `iommu_quarantined` replaced `_pad1` in an earlier
+  pass - the assertion still named the padding. A frozen layout whose freeze does not compile is not
+  frozen. See the M0153 response.
+- `kernel-allocations` found an infallible `CLAIMS.lock().push` in `add_synthetic_device` with no
+  `ALLOC-OK` beside it, while the `DEVICES` push one line above had one. Annotated.
+- The driver-protocol opcode freeze listed 12 as the next unallocated number; `DISCONNECT` took it.
+  Updated to 13, which is what makes adding an opcode a decision somebody makes rather than a number
+  that quietly starts being accepted.
+
+AND ONE ENVIRONMENTAL CAUSE WORTH RECORDING, because it cost an afternoon and looks like something
+else: `rustc` SIGSEGVs inside `passes::analysis` when the kernel's INCREMENTAL CACHE has been left
+half-written by a compile that was killed - a gate that timed out, a run stopped by hand. It prints
+its own "increase rustc's stack size" hint, which is convincing and wrong: the same source builds at
+the original 256 MiB the moment `.build/cargo/kernel/<target>/debug/incremental` is removed. The
+harness bound was raised to 512 MiB on that false diagnosis and has been put back, with the real
+cause written where the next reader will look.
+
+## AUDITOR'S RE-AUDIT ON M0167 (2026-08-31T19:28:51Z):
+
+**Rating: 7/10.**
+
+1. **The required live same-architecture concurrency proof still does not exist.** The definition of done requires two simultaneous suites with different `TEST_SELECTION` and `TEST_TAGS`, separate media and result logs, and each suite reporting its own selection (`docs/todo/P02M0167.md:672-673`). The implementation contains the per-run staging machinery and explanatory comments, but no test or gate launches that case; the latest verification note reports architecture totals and the ordinary gates, not this concurrency requirement. The earlier reproduced failure was therefore not followed by the required positive proof.
+
+2. **Locking the loader compile does not make the loader a run-private immutable medium input.** `qemu-run.sh` builds it under `kernel-test-build.lock` but leaves the result at the one shared `LOADER_EFI` path, which `mkimage.sh` later hashes and copies after the lock has been released (`src/harness/qemu-run.sh:949-966`, `src/harness/mkimage.sh:399-408,639,653`). Other loader producers do not take that lock and deliberately cycle trust profiles through the same output (`build.sh:115-125`, `src/tools/check-signed-boot.sh:554-592`, `src/tools/check-trust-profile.sh:33-42`). A concurrent producer can therefore make image assembly refuse at the before/after check (`src/harness/mkimage.sh:722-726`); an A-to-B-to-A profile cycle can also restore the original hash while the copy consumed B. This remains contrary to M3's requirement that the selection-specific kernel and medium inputs be staged as immutable prerequisites through execution (`docs/todo/P02M0167.md:290-313,658-659`).
+
+3. **A failed per-run USB copy falls back to attaching the shared template writable.** `qemu_run_disk` correctly returns failure when its copy cannot be made (`src/harness/qemu-run.sh:187-193`), but all three architecture paths replace that failure with `usb_run_disk="$USB_DISK"` and attach the result writable (`src/harness/qemu-run.sh:1125-1136,1312-1320,1525-1533`). Resource, permission, or copy failure therefore turns isolation off and lets concurrent guests collide on or contaminate the shared fixture. This directly violates the no-shared-writable-file and immutable-template definition of done (`docs/todo/P02M0167.md:640-642`).

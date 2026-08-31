@@ -345,3 +345,54 @@ Rating: 6/10
    identity collection can therefore make the dossier name bytes different from those exercised.
    Bind each tool/firmware use to immutable verified bytes, or verify at the use boundary, and extend
    mutate-use-restore coverage beyond source files.
+
+PLANNER'S RESPONSE ON M0170 (2026-08-31T19:35:25Z):
+
+**1. The stable-medium boundary does not stabilize snapshot ACQUISITION against the producers -
+ACCEPTED.**
+
+Correct. Both options stabilise what happens after the inputs are in hand and neither constrains a
+producer: SNAPSHOT copies live paths and a producer can rewrite one during the copy, SERIALISE holds
+off other runs and holds off no producer at all. M2's mutation fixture mutates during ASSEMBLY, which
+is after acquisition, so the gate could not have caught it either. The plan had correctly diagnosed
+"content addressing is detection, not stabilisation" and then left the race one step upstream.
+
+Two forms are worth naming because they need different answers, and only one of them is the obvious
+one: a TORN read, where a producer rewrites an input with byte-identical content and the copy catches
+it half-written - here the before and after keys AGREE while describing bytes the medium was not
+built from, so the existing check is blind to it; and a MIXED-GENERATION set, where each input is
+individually whole but they come from either side of a publication.
+
+Plan changes: M1 gains "AND ACQUISITION IS THE OTHER RACE; NEITHER OPTION CLOSES IT BY ITSELF", both
+forms stated, and two required halves rather than one. ATOMIC PUBLICATION - every producer of a medium
+input publishes by temporary file plus rename - closes the torn read, and closes it for readers this
+milestone does not own. A SNAPSHOT POINT PRODUCERS TAKE closes the mixed-generation set, which atomic
+rename cannot: it is the existing build lock, held for the duration of the COPY only, never across
+assembly and never across a compile - the exclusion this milestone continues to refuse. The recorded
+per-input digests stay and stop being the argument: they prove after the fact that the boundary held
+rather than making it hold. M2's mutation list gains mutation during ACQUISITION rather than assembly,
+stated as reaching a window the assembly-time mutation does not, and non-atomic publication of an
+input.
+
+**2. The identity manifest hashes tools and firmware but does not bind the bytes actually used -
+ACCEPTED.**
+
+Correct on both halves. M8's manifest records resolved tool paths, hashes and firmware image hashes at
+one moment; the immutability rule that follows it and the MUTATE-USE-RESTORE regression that follows
+that both speak only of the SOURCE snapshot. And the harness does resolve later: QEMU is found through
+`PATH` and executed after identity collection, and the environment-selected OVMF path is opened later
+still. A replaced-and-restored compiler, QEMU binary or firmware image therefore makes the dossier name
+bytes the run did not use - through exactly the mutate-use-restore shape the source half already
+refuses, on inputs it does not cover.
+
+Of the finding's two remedies the cheaper one is made the requirement, because the manifest already
+carries the digests: VERIFY AT THE USE BOUNDARY. The resolved path is re-hashed at the moment of
+invocation and compared with its manifest entry, and a mismatch fails the run rather than being
+recorded; binding each use to an immutable verified copy is named as an acceptable stronger answer
+rather than an alternative to it.
+
+Plan change: M8 gains "AND THE MANIFEST BINDS THE BYTES USED, NOT ONLY THE BYTES SEEN ONCE", with the
+two resolution points named from the harness so the gap is reproducible, the use-boundary rule, and
+the extension of MUTATE-USE-RESTORE to a replaced-and-restored TOOL and a replaced-and-restored
+FIRMWARE IMAGE - three input classes the identity block claims, and one fixture cannot stand for all
+of them.

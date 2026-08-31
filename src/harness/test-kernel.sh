@@ -292,21 +292,21 @@ STALL_WATCHER=$!
 # rather than to the work.
 #
 # The test build is the largest thing this tree compiles - the whole kernel plus every test module
-# and eleven codec crates in one crate graph - and it only grows. The cost is address space and not
-# memory: a thread stack is committed page by page as it is used, so an oversized bound costs nothing
-# on the builds that do not need it, while an undersized one costs a SIGSEGV in whatever gate happens
-# to compile next.
+# and eleven codec crates in one crate graph - and it only grows. 256 MiB is four times the deepest
+# path that has ever been observed here. The cost is address space and not memory: a thread stack is
+# committed page by page as it is used, so an oversized bound costs nothing on the builds that do not
+# need it, while an undersized one costs a SIGSEGV in whatever gate happens to compile next.
 #
-# RAISED FROM 256 MiB TO 512 (2026-08-31), because "it only grows" turned out to be a prediction. The
-# kernel took one more dependency - `device-proto`, so its own suites can answer the provider
-# catalogue with the generated encoders rather than a hand-written copy of the wire format - and the
-# next tag-subset compile overflowed: `note: backtrace dumped due to SIGSEGV`, inside
-# `rustc_interface::passes::analysis`, on riscv64 and on x86_64 alike. Nothing about the failure names
-# the stack unless you read rustc's own hint, which is how a green sweep turns into a gate that
-# "failed" with a page of addresses in it.
+# A `SIGSEGV` HERE IS NOT ALWAYS THIS NUMBER, and 2026-08-31 spent an afternoon on the difference.
+# `rustc` crashed inside `passes::analysis` on two architectures and printed its own "increase
+# rustc'"'"'s stack size" hint, which is a convincing thing to believe. It was the INCREMENTAL CACHE: a
+# compile killed part-way - a gate that timed out, a run stopped by hand - leaves
+# `.build/cargo/kernel/<target>/debug/incremental` in a state the next compile faults on, and the
+# same source builds cleanly at 256 MiB the moment that directory is removed. Raising the bound
+# hides it for one run and it comes back. Remove the directory.
 #
 # Set for BOTH cargo invocations below, because either can be the one that compiles it.
-RUSTC_STACK="${RUST_MIN_STACK:-536870912}"
+RUSTC_STACK="${RUST_MIN_STACK:-268435456}"
 
 # THE COMPILE IS SERIALIZED; THE GUEST RUN IS NOT.
 #

@@ -694,3 +694,11 @@ accepts counts beyond the driver's hard maximum. ACCEPTED, all three.**
   with a comment saying whose it is - the tool builds for the host and the driver library is `no_std`
   for the target - and the check is what keeps them in step. Three cases in the manifest suite: at the
   limit, past it, and past it across two kinds; watched to fail.
+
+## AUDITOR'S RE-AUDIT ON M0164 (2026-08-31T19:28:51Z):
+
+**Rating: 5/10.**
+
+1. **The production migration to catalogue discovery is still only one consumer deep.** AudioService now subscribes, but DeviceManager retains fixed private boot-block, network, display, input, USB, and related handle routes (`src/user/services/core/src/device_manager.rs:431-451,650-665,819-856,1087-1145`), and ServiceManager still injects those handles into named services (`src/user/services/core/src/service_manager/bootstrap.rs:230-275,389-480`). This leaves the hand-written per-kind seams and a compiled provider count which M1/M3 and the definition of done require the catalogue to replace (`docs/todo/P02M0164.md:37-54,288-312,318-323`). Completing Audio proves the mechanism but does not complete the stated per-consumer migration.
+
+2. **Block-volume roles are still assigned positionally rather than by the required format/origin/root decision.** DeviceManager sorts exactly four block providers by BDF and labels their positions system, FAT media, ISO, and UDF (`src/user/services/core/src/device_manager.rs:819-850`). Only the system instance probes candidates against the loader's UUID; ServiceManager injects the remaining roles by fixed tags and StorageService trusts those tags (`src/user/services/core/src/service_manager/bootstrap.rs:389-474`, `src/user/services/storage/src/service.rs:255-267`). This does not implement M2's format-plus-origin distinction or the definition of done's three `RootSelection` outcomes and FAT-media-versus-FAT-USB ordering cases (`docs/todo/P02M0164.md:71-121,290-305`).

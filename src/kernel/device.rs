@@ -637,6 +637,9 @@ pub fn add_synthetic_device() -> usize {
 	// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed.
 	table.push(DeviceEntry { device_type: u16::MAX, transport: abi::TRANSPORT_PLAIN_PCI, vendor: 0xffff, product: 0xffff, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: 0x1f, func: 7, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false });
 	drop(table);
+	// ALLOC-OK: the claim slot for the row just appended, on the same `#[cfg(test)]` terms as the row
+	// itself - the two are one entry and a table with a device and no slot for it is worse than a
+	// test that could not allocate.
 	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0 });
 	index
 }

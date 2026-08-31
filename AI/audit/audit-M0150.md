@@ -617,3 +617,9 @@ read"), and the medium side now shares the vocabulary and the endings - but prod
 is present and unreadable through the FIRMWARE reader needs fault injection into OVMF, which this
 harness has no way to do. The refusals above are reachable by reading the code and are not covered by
 a boot.
+
+## AUDITOR'S RE-AUDIT ON M0150 (2026-08-31T19:28:51Z):
+
+**Rating: 8/10.**
+
+1. **A signed optional early artifact can disappear without making the selected source invalid.** `read_verified_package` reads the payload through the `Option`-returning `read_boot_file` and returns `None` before it reads the already-verified manifest (`src/boot/loader/src/main.rs:603-617`). It therefore cannot distinguish “the manifest has no row for this optional artifact” from “the manifest names the artifact but its bytes are now absent or unreadable.” `volume.pkg` is optional on all three ports, and `init.pkg` is also optional on AArch64 and RISC-V, after which hand-off proceeds (`src/boot/loader/src/arch/x86_64/mod.rs:71-85`, `src/boot/loader/src/arch/aarch64/mod.rs:57-70`, `src/boot/loader/src/arch/riscv64/mod.rs:89-100`). The signed `system-volume.img` path has the same ordering: the image is read as an `Option`, and manifest coverage is checked only inside the `Some` arm (`src/boot/loader/src/main.rs:440-455`). Deleting or making unreadable a payload which the signed manifest selected can thus silently remove it and reach kernel hand-off or another bootstrap path, contrary to M3/M4's terminal treatment of a missing named file or I/O failure (`docs/todo/P02M0150.md:109-138`).
