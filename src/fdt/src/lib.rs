@@ -1207,8 +1207,27 @@ impl Fdt {
 							// cell was skipped entirely, so a tree carrying either published its
 							// number as the timer's INTID and the machine armed a timer whose own
 							// description did not agree on how it fires.
+							// AND THE SENSE HAS TO BE ONE THIS KERNEL ACTUALLY PROGRAMS, WHICH IS A
+							// LEVEL (2026-08-31).
+							//
+							// "Exactly one bit set" was the previous rule, and it accepted an
+							// EDGE-triggered specifier - which nothing then acted on: the GICv2 and
+							// GICv3 per-core setup groups the timer PPI, sets its priority and
+							// enables it, and never writes `ICFGR` at all. So a tree describing an
+							// edge-triggered timer was accepted and the controller kept its reset
+							// semantics, which for a PPI is level: the machine armed a timer whose
+							// own description disagreed with how the controller was going to deliver
+							// it, which is exactly the acceptance this cell was read to prevent.
+							//
+							// A LEVEL IS ALSO THE ONLY CORRECT ANSWER for the part this describes.
+							// The architected timer asserts its output while `CNTP_CTL.ISTATUS` is
+							// set and holds it until the compare register is reprogrammed, so an
+							// edge specifier is a wrong description of the hardware and not merely
+							// an unsupported one. Refusing it is validation, not a controller
+							// change; programming a trigger type this kernel has no other use for
+							// would be the redesign.
 							let sense = self.be32(val + 20) & IRQ_SENSE_MASK;
-							if kind == PPI_KIND && number < PPI_COUNT && sense.count_ones() == 1 {
+							if kind == PPI_KIND && number < PPI_COUNT && (sense == IRQ_SENSE_LEVEL_HIGH || sense == IRQ_SENSE_LEVEL_LOW) {
 								timer_intid = number + PPI_INTID_BASE;
 							}
 						} else if in_distance_map && self.str_eq(pname, "compatible") {
@@ -1671,6 +1690,12 @@ const PPI_INTID_BASE: u32 = 16;
 // unsupported or contradictory trigger published its number as the timer's INTID and the machine
 // then armed a timer whose sense the description did not agree on.
 const IRQ_SENSE_MASK: u32 = 0xf;
+
+// The two senses this kernel delivers a timer PPI with, from the GIC binding's low nibble. Edge
+// rising (1) and edge falling (2) are the other two, and neither is programmed anywhere in this
+// kernel - see where the timer specifier is read.
+const IRQ_SENSE_LEVEL_HIGH: u32 = 4;
+const IRQ_SENSE_LEVEL_LOW: u32 = 8;
 
 fn ranges_overlap(a: u64, a_len: u64, b: u64, b_len: u64) -> bool {
 	let (a_end, b_end) = match (a.checked_add(a_len), b.checked_add(b_len)) {

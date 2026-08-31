@@ -671,3 +671,72 @@ and it is not zero.
 1. **The normal shutdown path rejects the `STOPPED` reply it requested and always forces teardown.** `stop_all` records only `stop_intent`, withdraws the provider, and sends `STOP`; it never moves the node from `Online` to `Stopping` (`src/user/services/core/src/device_manager.rs:4517-4529`). `drain_channel` accepts `STOPPED` only when the record is already `Stopping`, so the valid reply is classified as unsolicited (`src/user/services/core/src/device_manager.rs:2607-2619`). The loop consequently remains `Online` until it injects `Wedged` and reports a forced teardown (`src/user/services/core/src/device_manager.rs:4534-4554`). This contradicts M3/M4 and the definition of done's clean, bounded planned-stop path (`docs/todo/P02M0165.md:128-169,320-322`).
 
 2. **The named publish/crash/subscribe race still does not exercise the production crash path.** The registered binding test drives the `Publications`/`withdraw_slots_into` model, but not DeviceManager's actual failure call to `catalogue.withdraw_binding` (`src/user/services/core/src/device_manager.rs:3297-3304`) or the production close-and-announce side effects (`src/user/services/core/src/device_manager.rs:2066-2109`). The shared selection/transfer helper is useful, but a regression which omits the production call or either side effect still passes. M7's explicitly named no-stale-provider race and its registered gate therefore remain incomplete (`docs/todo/P02M0165.md:280-307,331`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-08-31T20:12:01Z):
+
+**1. The normal shutdown path rejects the `STOPPED` reply it requested and always forces teardown -
+ACCEPTED. This is the most serious thing in this round and the finding has it exactly right.**
+
+Traced and confirmed end to end. `stop_all` recorded `stop_intent`, withdrew the provider and sent
+`STOP` - and left the record `Online`. `drain_channel` admits a `STOPPED` frame only from a node that
+is already `Stopping`, and that restriction is correct and deliberate: a planned stop is a state the
+manager put the node INTO, and a driver announcing one nobody asked for is describing a conversation
+that did not happen. So every driver that answered this shutdown CORRECTLY had its answer refused as
+unsolicited and printed as such.
+
+MEASURED RATHER THAN REASONED ABOUT, and the measurement corrects the finding on one point. The last
+verified guest log of the previous round carries NINE
+`said it had stopped and nothing had asked it to` lines and ZERO
+`did not answer the stop inside its slice`. So the forced-teardown branch is not what ran: the refused
+driver exits immediately afterwards, the `Exited` event arrives, and the node leaves `Online` by that
+path. The teardown completed - down the wrong road, with nine well-behaved drivers publicly accused of
+a protocol violation on every shutdown, and the clean planned-stop path M3/M4 exist to produce
+unreachable by any of them.
+
+The same suite after the fix carries ZERO refusals, zero forced teardowns and zero quarantines at
+shutdown. What it does NOT yet show is the `stopped cleanly` line, and I am not claiming it does: that
+prints from `resolve_teardown`, which needs both confirmations to land, and at shutdown the machine
+halts before they do. The same is true before and after this change. What the fix establishes is that
+the answer is now ADMISSIBLE - the node is in the state that admits it, and the frame is no longer
+refused - which is the defect the finding names.
+
+`begin_operator_stop` ten lines away had this right - withdraw, `move_to(Stopping)`, send - so the
+shape existed and this path had lost one line of it.
+
+Changes: `stop_all` performs `record.move_to(BindingState::Stopping, None)` after the withdrawal and
+before the `STOP`, and says so if the transition is refused. `Online -> Stopping` is already a legal
+edge of the record's table.
+
+AND THE DRAIN LOOP'S CONDITION HAD TO CHANGE WITH IT, WHICH I GOT WRONG ON THE FIRST ATTEMPT AND AM
+RECORDING RATHER THAN QUIETLY FIXING. The original condition was `state != Online`, which worked only
+because the node was left `Online`: any reaction moved it out and ended the wait. The obvious
+replacement - wait while it is `Stopping` - is a DIFFERENT wait, because a node stays `Stopping` while
+its TEARDOWN runs. That version waited for the teardown to complete and then reported a forced stop
+against drivers that had answered correctly; the run that measured it turned an ordinary shutdown into
+`did not answer the stop inside its slice` and a quarantine, which is the opposite of the defect being
+fixed.
+
+What the wait is for is that the driver REACTED, and a reaction is the binding ENDING - a driver that
+answers `STOPPED` and one that exits both give it up, and one that is present and silent keeps it. So
+the loop ends when the node leaves `Stopping` OR its binding is gone, and the forced branch fires only
+for still-`Stopping`-and-still-bound, which is the one case that is genuinely a failure to answer.
+
+**2. The named publish/crash/subscribe race still does not exercise the production crash path -
+ACCEPTED; partly closed, and I am not claiming more than that.**
+
+The finding is right. `withdraw_slots_into` is the library's and has its own test, but DeviceManager's
+call to `catalogue.withdraw_binding` on the failure path, and the two side effects per withdrawn
+provider - closing the channel and announcing the withdrawal - are in a `no_std` binary nothing can
+drive on a host. A regression that dropped either side effect, or the call itself, would pass.
+
+What I could close, I closed: the announcement is now COUNTED against what the library says it
+emptied, and a mismatch prints. That turns "a loop that stopped visiting a provider" from something
+only an unwritable test could catch into a checked invariant on a per-binding path - the failure it
+guards is a subscriber holding metadata for a publication that no longer exists, which is the
+stale-provider state M7 names.
+
+What I could not close, and am not pretending to: nothing exercises the crash path's CALL to
+`withdraw_binding`, or the `close` and `send` themselves. Making those testable means driving
+DeviceManager's event loop on a host, which this milestone already records as the wall it met, and
+extracting it is a redesign rather than a regression. M7's registered gate remains incomplete on that
+clause.

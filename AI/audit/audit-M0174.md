@@ -447,3 +447,16 @@ by six named cases, each failing a different plausible implementation: the four 
 including specifically a General Query arriving while a per-address response is pending EARLIER, and
 two state-change cases - a multi-report loss burst, and a join-then-leave during pending
 retransmissions.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-08-31T19:58:23Z):
+
+Rating: 8/10
+
+1. **The accepted L3-policy ownership correction left default-router selection assigned to both
+   milestones.** M5 still makes M0174's router list perform “deterministic selection”
+   (`docs/todo/P02M0174.md:215-218`). M6 instead assigns candidate choice and tie-breaks to M0175,
+   says M0174 enumerates candidates, and says its egress never silently picks for the caller
+   (`:242-266`); the Definition of done claims neither file owns the other's half (`:341-342`).
+   With multiple routers, selecting a route/next hop is the policy decision this split was introduced
+   to locate. Replace M5's phrase with deterministic ordering/enumeration and expiry, or explicitly
+   restrict it to M0174's internal control traffic and tie it to M6's documented internal default.

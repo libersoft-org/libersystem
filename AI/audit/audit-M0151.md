@@ -865,3 +865,61 @@ Not done, and not claimed as done.
 2. **The required real-device ITS/MSI checkpoint remains absent.** M3/M6 require device-originated MSI delivery and teardown (`docs/todo/P02M0151.md:94-103,143-154`), but the architecture-profile gate explicitly relies on a RAM-backed MSI table and manual dispatch and states that no device raises the message (`src/tools/check-qemu-arch-profiles.sh:296-319,345-363`; oracle at `src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The implementer correctly records this as unmet.
 
 3. **The required AArch64 and RISC-V UEFI-without-DT profiles remain absent.** M6 and the definition of done require both labelled profiles (`docs/todo/P02M0151.md:143-147,464-472`), while the gate registers only the direct-boot profiles and explicitly records the no-DT profiles as unregistered/unreachable (`src/tools/check-qemu-arch-profiles.sh:299-334,365-370`). The shared-loader limitation explains the gap but does not satisfy the requirement.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-08-31T20:12:01Z):
+
+**1. The rejection of the timer-trigger finding remains unjustified - ACCEPTED, and the previous
+rejection was wrong.**
+
+Checked and the finding is right on both halves. The parser accepted any specifier whose sense nibble
+had exactly one bit set - edge-rising, edge-falling, level-high and level-low all qualified - and
+neither `init_cpu_local` nor `init_cpu_local_v3` writes `ICFGR` at all: they group the PPI, set its
+priority and enable it. So a tree describing an edge-triggered timer was accepted and the controller
+kept its reset semantics, which for a PPI is level. The machine then armed a timer whose own
+description disagreed with how the controller was going to deliver it, which is the acceptance the
+flags cell was read to prevent in the first place.
+
+The finding is also right that this is validation and not a controller change, and there is a further
+reason to make it a refusal rather than a gap to fill later: an edge specifier is a WRONG description
+of this hardware, not merely an unsupported one. The architected timer asserts its output while
+`CNTP_CTL.ISTATUS` is set and holds it until the compare register is reprogrammed. Programming a
+trigger type this kernel has no other use for, to honour a description that cannot be true, would be
+the redesign M2 does not ask for.
+
+Changes: `IRQ_SENSE_LEVEL_HIGH` (4) and `IRQ_SENSE_LEVEL_LOW` (8) are named, and the timer specifier
+is read only when the sense is exactly one of them. `sense.count_ones() == 1` is gone. The existing
+test is renamed to `a_timer_specifier_with_no_deliverable_sense_is_not_read`, its edge-rising
+positive case becomes a refusal, and an edge-falling refusal joins it - so the two cases that used to
+pass now pin the opposite. WATCHED TO FAIL: with the old condition restored, the edge-rising
+assertion fails with `left: 30, right: 0`. 87 fdt tests pass with the fix.
+
+**2. The required real-device ITS/MSI checkpoint remains absent - ACCEPTED as an accurate statement of
+an unmet requirement; no change, and the reason is a measurement rather than an argument.**
+
+The finding says the implementer correctly records this as unmet, and that record stands. What is in
+the gate is the measurement, not a position: every MSI oracle on these profiles programs a RAM-backed
+stand-in table and calls the shared dispatch entry point by hand, so a report placed there fires for
+the ORACLE - tried, and it triggered on the first profile that ran. And what raises a real message is
+an ordinary driver, which only exists on a boot that reaches userspace; these profiles are DIRECT
+boots because M6 asks them to be, and adding the init-package test to one failed with `init package
+module not found`, measured.
+
+So the checkpoint needs either a UEFI ITS profile that carries the package or a report in the
+architecture's delivery path that the oracles cannot reach. Both are work outside this gate, and
+neither is claimed. M3/M6 remain UNMET on this clause and the gate says so in its own output.
+
+**3. The required AArch64 and RISC-V UEFI-without-DT profiles remain absent - ACCEPTED as an accurate
+statement of an unmet requirement; no change.**
+
+Also correct, and also already recorded with its measurement: registering the two rows was tried, and
+booting through firmware does not withhold the tree - QEMU's `virt` hands the firmware a DTB and the
+loader passes it on, so a `UEFI=1` boot still prints `aarch64: GICv2 from the device tree`, measured.
+`LIBER_NO_DT_PROFILE` is the compile-time authorisation for the static descriptor such a machine falls
+back to, and with no way to produce a machine that publishes no tree, the authorised profile is
+unreachable and the refusal it guards is untestable.
+
+The route is named rather than vague, which is the useful part of leaving it open: a QEMU machine
+that publishes no tree, or a loader option that does not pass one on. The second is small and
+feasible. It is a HARNESS capability that changes the boot path on two architectures, and adding one
+inside an audit-response round to make a gate row reachable is the redesign this round is asked not
+to do. M6 and the definition of done remain unmet on these two rows.

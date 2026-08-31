@@ -49,6 +49,11 @@ declare -A GATES=(
 	# QEMU profile with a virtio-iommu and two hostile `edu` endpoints, each told to reach memory it
 	# was never given. What is checked is the SENTINEL MEMORY, not the error code.
 	["qemu-virtio-iommu-x86_64"]="tools/check-qemu-virtio-iommu-x86_64.sh"
+	# TWO SUITES OF ONE ARCHITECTURE AT ONCE, each proving it ran its OWN selection. The per-run
+	# staging of the kernel, the medium and the loader was argued for in comments and reproduced by
+	# hand once; this is the standing proof, and it is the one gate here that deliberately overlaps
+	# two guests rather than avoiding it.
+	["concurrent-selection"]="tools/check-concurrent-selection.sh"
 	# The other direction. `capability-model` explores what the model can do; this
 	# replays what the KERNEL did against it, and requires the checker to refuse eleven deliberate
 	# defects before it is trusted with a real trace.

@@ -421,3 +421,80 @@ the verification note at the end of the M0167 response.
 2. **MMIO revocation treats an unconfirmed cross-CPU TLB shootdown as success.** `DeviceMemory::teardown_mapping` ignores the boolean returned by `mem::tlb::shootdown` and unconditionally frees the virtual range (`src/kernel/object/device_memory.rs:184-222`), although the shootdown returns `false` for uncovered CPUs or a timeout (`src/kernel/mem/tlb.rs:63-103,137-178`). `revoke_effects_of` consequently reports this local operation as quiet, allowing the claim to become `Free` while another CPU may retain a BAR translation. That is contrary to the forced-revocation and confirmed-teardown requirements.
 
 3. **The last-reference interrupt correction still loses a failed RISC-V unbind.** A release sweep can fail to upgrade the weak reference after the last strong count reaches zero while `Interrupt::drop` is still running; `Drop` ignores the result of `unbind` (`src/kernel/object/interrupt.rs:126-135`). RISC-V records a failed disable by quarantining the slot (`src/kernel/arch/riscv64/interrupts/mod.rs:47-67`), but `MsiRegistry::has_unbound` deliberately excludes quarantined slots (`src/kernel/arch/common/msi.rs:154-170`). `settled_vectors` can therefore report success and the claim can become `Free` even though the interrupt teardown was not confirmed (`src/kernel/device.rs:484-517`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-08-31T20:12:01Z):
+
+**1. The generation-safe MSI correction still permits stale hardware effects - ACCEPTED, both halves.**
+
+Both are real and both are now closed.
+
+THE UNTRANSLATED PATH WAS NEVER CHECKED AT ALL. `domain_for_generation` answers `Ok(None)` for a
+device the controller does not translate, and `msi_deliverable` read that as `Deliverable`. Those are
+different statements: the first says "there is no domain to compare against", the second says "the
+caller is current", and nothing verified the second. On a machine with no IOMMU it was the ONLY
+statement being made, so the whole generation defence was inapplicable to every MSI acquisition on
+that machine - not narrowed, absent.
+
+The claim slot is the authority that can answer for a device with no domain, and `device::claim_is_current`
+already existed for exactly this comparison and was not being used here. `msi_deliverable`'s
+`Ok(None)` arm now returns `Deliverable` only when the claim still names this binding, and `Stale`
+otherwise - which `sys_device_msix_acquire` already maps to `ERR_ACCESS_DENIED` touching nothing.
+
+AND THE CHECK IS REPEATED IMMEDIATELY BEFORE THE HARDWARE IS TOUCHED. Everything between the
+top-of-syscall `is_settled` test and `acquire_msi_unique` can take a while - a capability lookup, a
+device-table read, and for a translated endpoint a doorbell probe and map that reach the controller -
+so the window was the whole body. `sys_device_msix_acquire` now re-checks `claim_is_current(key)` as
+the last statement before the device's table is written, gives the reserved handle slot back and
+returns `ERR_ACCESS_DENIED`. What that does NOT claim: a check before an action narrows a window and
+does not close it. What closes the remaining sliver is unchanged and is arithmetic - `register_derived`
+refuses the stale generation under `CLAIMS` and the rollback disowns the interrupt before the slot is
+freed, and `acquire_unique_live` refuses outright once the replacement binding holds a live vector.
+
+THE `NoRoute` ROLLBACK HAD THE SAME SHAPE AND IS NOW WRITTEN THE WAY THIS FILE ALREADY HAD IT
+RIGHT ELSEWHERE. `disable_bus_master_for` took `CLAIMS`, dropped it, and only then wrote configuration
+space - so a complete release and reclaim between the two lines let this generation take the NEXT one
+off the bus, which is the precise damage the key was added to prevent. `mmio_capability_dropped`, ten
+lines away, holds both locks across its own `bus_master` for the same decision about the same
+register; `disable_bus_master_for` now does too, in this file's one lock order - DEVICES then CLAIMS.
+
+**2. MMIO revocation treats an unconfirmed cross-CPU TLB shootdown as success - ACCEPTED.**
+
+Correct. `mem::tlb::shootdown` returns `false` for a core it could not reach and for a wait that went
+on too long, says so in its own contract, and `teardown_mapping` discarded it and freed the virtual
+range anyway. `revoke_effects_of` then reported the revocation quiet, so the claim could reach `Free`
+while another core still held a translation for the BAR - and separately, whatever is mapped at that
+range NEXT is reachable through the stale entry.
+
+The comment at `revoke_effects_of` was the load-bearing error: it said only an interrupt can answer
+no because "everything else here is a local operation that cannot fail". A cross-core shootdown is
+neither local nor infallible.
+
+Changes: `teardown_mapping` returns `bool`. On an unconfirmed shootdown it RETAINS the virtual range
+rather than freeing it - the same choice `frame::retire` makes for physical pages, and for the same
+reason: losing an address range is a cost, handing back one a live core can still translate is a
+correctness failure - prints why, and answers `false`. `revoke_effects_of` returns it. The variable it
+feeds in `release_claim` is renamed `interrupts_quiet` -> `derived_quiet`, because a name that says
+"interrupts" invites the next reader to put an unrelated failure somewhere else, and its message now
+says "everything it derived" rather than "every interrupt". The `Drop` path discards the answer
+explicitly - there is no caller there to refuse - and the range is still retained and still reported.
+
+**3. The last-reference interrupt correction still loses a failed RISC-V unbind - ACCEPTED.**
+
+Correct, and the interaction is exactly as described: `Weak::upgrade` fails as soon as the strong
+count reaches zero, which is BEFORE `Interrupt::drop` has run, so the sweep counts the row quiet; the
+drop then calls `unbind`, discards its result, and riscv64 quarantines the still-armed slot; and
+`has_unbound` excludes quarantined slots, so `settled_vectors` reports settled.
+
+The exclusion itself is NOT the defect and is not touched. It is there for a measured reason written
+at `has_unbound` - a slot stranded by an EARLIER binding must not make every later claim of that
+device unreleasable, which was reproduced on riscv64 - and removing it would trade this bug for that
+one. The two questions are different: "is a teardown outstanding" (a boolean, correctly excluding
+quarantine) and "did THIS release strand a vector" (which a boolean cannot answer, because a device
+that already had one stranded would answer yes for ever).
+
+So the count is what separates them. `MsiRegistry::quarantined_for(owner)` counts this device's
+quarantined slots; each architecture exposes it as `msi_quarantined_for_device`; and `release_claim`
+samples it before the sweep and again after `settled_vectors`. A quarantine that appeared DURING the
+release makes the teardown unconfirmed and says so by name; one that predates it is ignored, which
+keeps the property `has_unbound`'s exclusion exists for. The claim then goes `Quarantined` rather than
+`Free`, which is what an unconfirmed interrupt teardown means everywhere else in this file.

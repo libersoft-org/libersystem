@@ -1558,6 +1558,22 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 	if !thread.handles().lock().reserve(1) {
 		return ERR_RESOURCE_EXHAUSTED;
 	}
+	// AND THE BINDING IS STILL THE ONE THAT ASKED, CHECKED HERE - the last statement before the
+	// device's table is written (2026-08-31).
+	//
+	// Everything above this line can take a while: a capability lookup, a device-table read, and for
+	// a translated endpoint a doorbell probe and map that reach the controller. The claim was
+	// checked once, at the top, and a release plus a reclaim anywhere in that span left this call
+	// programming the REPLACEMENT binding's MSI-X entry - with `register_derived` below rejecting
+	// the stale generation afterwards, which rolls the bookkeeping back after the hardware effect
+	// has already happened.
+	//
+	// Checked against the claim slot rather than the domain, because that is the authority that
+	// answers for an endpoint the controller does not translate as well as one it does.
+	if !device::claim_is_current(key) {
+		thread.handles().lock().release_reservation(1);
+		return ERR_ACCESS_DENIED;
+	}
 	let vector = match arch::interrupts::acquire_msi_unique(table_phys, dest, index as u32) {
 		Some(v) => v,
 		None => {

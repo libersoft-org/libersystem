@@ -623,3 +623,49 @@ a boot.
 **Rating: 8/10.**
 
 1. **A signed optional early artifact can disappear without making the selected source invalid.** `read_verified_package` reads the payload through the `Option`-returning `read_boot_file` and returns `None` before it reads the already-verified manifest (`src/boot/loader/src/main.rs:603-617`). It therefore cannot distinguish “the manifest has no row for this optional artifact” from “the manifest names the artifact but its bytes are now absent or unreadable.” `volume.pkg` is optional on all three ports, and `init.pkg` is also optional on AArch64 and RISC-V, after which hand-off proceeds (`src/boot/loader/src/arch/x86_64/mod.rs:71-85`, `src/boot/loader/src/arch/aarch64/mod.rs:57-70`, `src/boot/loader/src/arch/riscv64/mod.rs:89-100`). The signed `system-volume.img` path has the same ordering: the image is read as an `Option`, and manifest coverage is checked only inside the `Some` arm (`src/boot/loader/src/main.rs:440-455`). Deleting or making unreadable a payload which the signed manifest selected can thus silently remove it and reach kernel hand-off or another bootstrap path, contrary to M3/M4's terminal treatment of a missing named file or I/O failure (`docs/todo/P02M0150.md:109-138`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0150 (2026-08-31T20:12:01Z):
+
+**1. A signed optional early artifact can disappear without making the selected source invalid -
+ACCEPTED.**
+
+Correct, and correct about both call sites and about why they behave the same way.
+
+`read_boot_file` returns `Option`, which collapses two answers the medium gives separately: "this
+file is not on it" and "this medium could not be read". `MediumRead` was added in an earlier round for
+exactly that distinction, and it was applied to the manifest reads and not to the PAYLOAD reads -
+`read_verified_package` read its package through the `Option` reader, and the live system volume was
+read the same way with the manifest coverage check sitting INSIDE its `Some` arm. So the check only
+ran when the file was present, which is the one case that did not need it.
+
+The consequence is the one the finding states. `volume.pkg` is optional on all three ports and
+`init.pkg` is optional on AArch64 and RISC-V, so deleting a payload the signed manifest selected - or
+having its sectors go bad - was indistinguishable from a medium that never carried one, and the boot
+went on to hand-off or to another bootstrap source. On a machine whose system volume is missing,
+`init.pkg` IS the userspace, which is the case M3/M4 make terminal.
+
+Changes, and they make the two sites the same shape:
+
+- `read_verified_package` reads its payload with `read_boot_file_reported`. `Unreadable` panics
+  immediately - a failing medium is not a medium without the file, and that holds on the test-trust
+  profile too. The payload is then carried as an `Option` past the manifest verification, and the
+  ABSENT case is decided against the manifest rather than before it: if the signed manifest carries a
+  `KIND_PACKAGE` row for this name, the medium is saying it carries one and it is gone, which panics.
+  Only absent AND unnamed returns `None`, which is the optional artifact this function exists for.
+  The no-manifest test-trust arm returns whatever the medium had, which on that profile is the whole
+  of the check.
+- The live system volume read is now the same three-way split: `Unreadable` panics, and an absent
+  image is checked against `KIND_SYSTEM_VOLUME` in the boot medium's signed manifest before it is
+  called absent. The coverage check for a PRESENT image is unchanged and stays where it was.
+
+What is deliberately NOT changed: an artifact that is absent and that the manifest does not name is
+still optional and still returns `None`. The rule is that the MANIFEST decides what the medium was
+supposed to carry, which is the same authority every other decision on this path already defers to.
+
+AND THE NEW REFUSAL CANNOT FIRE ON A MEDIUM THIS TREE BUILDS, checked against the producer rather
+than assumed: `stage_signed_boot_manifest` adds a `package:` or `system-volume:` row only inside
+`if [[ -n "$payload" && -f "$payload" ]]`, so a row exists only for an artifact that was staged. A
+manifest that names one and a medium that does not carry it is therefore not a build this harness can
+produce - it is an artifact removed after signing, which is the case the refusal is for. Both the
+x86_64 and the aarch64 boots in this round's verification go through the changed path and reach
+userspace.

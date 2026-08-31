@@ -653,3 +653,44 @@ freeze does not compile is not frozen.
 1. **The retained-domain association is still fallible despite the response's opposite claim.** `iommu::init` allocates the table with `try_reserve_exact` and deliberately leaves it without slots on failure (`src/kernel/iommu/mod.rs:214-225`). An unconfirmed detach can then fail `RETAINED.get_mut(index)` and explicitly reports that the device's holdings will read as zero (`src/kernel/iommu/mod.rs:874-887`). The quarantine remains safe, but M4 and the definition of done require exact per-binding mapping/quarantine accounting rather than a zero report under memory pressure (`docs/todo/P02M0153.md:184-195,259-260`).
 
 2. **A confirmed-teardown fault is attributed in the log but not charged to the binding counter.** The confirmed path destroys and removes `DomainState` before its final attributed fault drain (`src/kernel/iommu/mod.rs:904-920`; removal at `src/dma/src/lib.rs:1045-1058`). `drain_faults_during` then patches the event's domain and generation before recording it, but increments the per-domain counter only if that now-removed state still exists (`src/dma/src/lib.rs:1162-1183`). M5's durable event attribution is corrected, but M4's exposed per-binding fault accounting remains incomplete for faults raised during a confirmed revoke.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-08-31T20:12:01Z):
+
+**1. The retained-domain association is still fallible despite the response's opposite claim -
+ACCEPTED.**
+
+The finding is right about the code and right that my previous claim was the opposite of it.
+`iommu::init` reserved the table with `try_reserve_exact`, printed a line on failure saying an
+unconfirmed detach would report ZERO holdings for its device, and brought the controller up anyway.
+That number is what a claim snapshot answers with, and zero says the opposite of what quarantine
+means - on a controller this file otherwise refuses to let anyone trust an unconfirmed answer from.
+
+One thing worth recording alongside, because it decides how big the fix should be: the DECISION was
+never wrong, only the report. `finish_release(index, confirmed)` takes the claim to `Quarantined` on an
+unconfirmed detach whatever the holdings say, so the device was never handed to another claimant.
+What was wrong is the number an operator reads to find out whether the address space is still out of
+circulation - which is the M4 accounting the finding cites, and is worth being exactly right.
+
+Change: sizing the table is now a PREREQUISITE of translating. If `try_reserve_exact` fails, `init`
+says so and returns false. `PRESENT` stays set, which is what makes that fail CLOSED rather than open:
+`dma_policy` reads `PRESENT` to mean "this machine was supposed to be isolated", so every
+`iommu-required` driver is refused rather than silently admitted degraded. The condition is a
+boot-time heap failure sizing one `Option` per device; if it ever happens, losing the machine's
+DMA-capable drivers is the answer this file gives everywhere else. The `None` arm at the detach site
+is kept as a loud refusal and now says it is unreachable by construction, rather than promising a
+zero it is no longer allowed to give.
+
+**2. A confirmed-teardown fault is attributed in the log but not charged to the binding counter -
+ACCEPTED.**
+
+Correct, and the mechanism is exactly as described: `destroy_domain` removes the `DomainState`, the
+per-domain fault counter lives in it, and the final attributed drain ran AFTER that - so
+`drain_faults_during` patched each event's domain and generation correctly, recorded it in the durable
+ring, and then found no state to increment. M5's event attribution was right and M4's per-binding
+counter was short by exactly the faults a binding raised during its own revoke, which is when a
+misbehaving endpoint raises them.
+
+Change: the drain moved above the `if confirmed { destroy_domain }` block. That is the whole fix - the
+drain does not depend on the domain being gone, and the counter does depend on it still being there.
+Both comment blocks moved with their code so each still sits with what it describes, and the drain's
+comment now records why the order is load-bearing rather than incidental.

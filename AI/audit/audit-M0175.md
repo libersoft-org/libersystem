@@ -538,3 +538,37 @@ sequential transaction ID and the previously used source port is refused, and so
 answer arriving after its query was retired. The Definition of done now says the correlation tuple is
 one an off-path attacker cannot GUESS as well as one it cannot merely match, and that a spoofed or
 replayed datagram can neither resolve a name, set the clock, nor complete OR INVALIDATE a lease.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-08-31T19:58:23Z):
+
+Rating: 5/10
+
+1. **The accepted public-contract and bounds correction was deferred rather than completed.** M1
+   says to enumerate exact records, variants and operation signatures before implementation, but the
+   plan itself still gives only categories—not field types/order/ordinals or the changed signatures
+   (`docs/todo/P02M0175.md:54-71,82-87`). It likewise says to assign `@bound(n)` and aggregate
+   budgets without choosing any `n` or budget (`:73-80`). These are the same incompatible choices
+   the planner acknowledged in response to the original findings
+   (`AI/audit/audit-M0175.md:145-173`). The current IPv4-only endpoint/listen/accept shapes and
+   unbounded fields show why they cannot be inferred
+   (`src/idl/network.lsidl:17-38,92-96,111-115,124-173`), and the service still has fixed 1024-byte
+   request and 4096-byte reply buffers
+   (`src/user/services/core/src/network_service.rs:72-77,223-226`). Freeze the exact reviewed LSIDL
+   declarations/signatures, numeric field bounds and aggregate budgets before implementation so the
+   wire-size and migration gates have concrete values.
+
+2. **The unguessable UDP-correlation requirement has no secure-entropy prerequisite on two of three
+   architectures.** M6 requires fresh unpredictable DNS IDs and source ports from the same randomness
+   as SNTP/DHCP, and M8 requires random request identities
+   (`docs/todo/P02M0175.md:212-223,259-264,287-290`); the Definition of done says the resulting
+   tuples cannot be guessed (`:389-391`). AArch64 and RISC-V hard-code
+   `secure_available() == false` and expose only explicitly non-cryptographic, clock-seeded
+   SplitMix fallback bytes (`src/kernel/arch/aarch64/mod.rs:294-327`;
+   `src/kernel/arch/riscv64/mod.rs:405-437`). Secure `SYS_RANDOM_GET` therefore refuses
+   (`src/kernel/syscall/mod.rs:1379-1404`), and the runtime reports zero bytes
+   (`src/user/runtime/rt/src/lib.rs:2229-2248`). M0175 has no entropy dependency
+   (`docs/todo/P02M0175.md:373-381`) while its gates require positive DNS/UDP behavior across the
+   appliance profiles (`:362-371,398-399`). Using the insecure stream violates unguessability;
+   refusing every query violates those positive gates. Add a completed secure-entropy
+   dependency/profile and typed failure semantics, or explicitly narrow the affected completion
+   claim and matrix.

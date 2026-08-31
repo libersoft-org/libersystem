@@ -78,6 +78,20 @@ pub struct DeviceEntry {
 	pub index: u32,
 	pub r#type: DeviceType,
 	pub mmio_len: u64,
+	/// WHERE THIS ROW IS ON THE BUS, from the KERNEL's own device table (added 2026-08-31).
+	///
+	/// The kernel has always known it - `device-info` carries it, and it is what makes two devices of
+	/// one class distinguishable - and this record did not, so a reader holding a ROW NUMBER had no
+	/// way to turn it into a device identity without asking DeviceManager. That mattered on exactly
+	/// the path where DeviceManager is gone: `lsdev --incident N` fell back to a stored side-record
+	/// mapping row to address, validated by comparing the MMIO window length. A length is not an
+	/// identity - two disks of one model share it - so equal-sized devices reordering between
+	/// inventories resolved a row to another device's incident. Carrying the address here answers the
+	/// question from the kernel, which is present whether any service is or not, and deletes the
+	/// side-record rather than making it cleverer.
+	pub bus: u32,
+	pub dev: u32,
+	pub func: u32,
 }
 
 impl DeviceEntry {
@@ -119,13 +133,19 @@ impl DeviceEntry {
 		w.u32(self.index)?;
 		self.r#type.write(w)?;
 		w.u64(self.mmio_len)?;
+		w.u32(self.bus)?;
+		w.u32(self.dev)?;
+		w.u32(self.func)?;
 		Some(())
 	}
 	pub fn read(r: &mut Reader) -> Option<DeviceEntry> {
 		let index = r.u32()?;
 		let r#type = DeviceType::read(r)?;
 		let mmio_len = r.u64()?;
-		Some(DeviceEntry { index, r#type, mmio_len })
+		let bus = r.u32()?;
+		let dev = r.u32()?;
+		let func = r.u32()?;
+		Some(DeviceEntry { index, r#type, mmio_len, bus, dev, func })
 	}
 }
 
@@ -1018,9 +1038,14 @@ pub enum PolicyOutcome {
 	/// so. `disable`, `enable` and `select` are still accepted on one, because they are about the
 	/// NEXT bind.
 	Quarantined = 3,
-	/// An `enable` arriving while a disable's teardown is still in flight. The operator retries once
-	/// the node reaches `disabled`; cancelling the intent would mean a device that was never
-	/// observed to be disabled at all, which is worse to explain than a refusal that says why.
+	/// THE VERB IS RIGHT AND THE MOMENT IS NOT, and the operator's next move is to look at the state.
+	///
+	/// Two cases. An `enable` arriving while a disable's teardown is still in flight: the operator
+	/// retries once the node reaches `disabled`, because cancelling the intent would mean a device
+	/// that was never observed to be disabled at all, which is worse to explain than a refusal that
+	/// says why. And a `retry` on a node with nothing to retry - one that is online, still binding,
+	/// being torn down, waiting on a dependency, or disabled - where a retry would open an incident
+	/// for a binding that did not fail.
 	Busy = 4,
 	/// The verb reached a node it cannot apply to - a boot-critical binding, whose policy would live
 	/// on a volume that is not mounted when that binding is made.
@@ -2292,6 +2317,15 @@ impl DeviceEntry {
 		out.push(',');
 		out.push_str("\"mmio-len\":");
 		let _ = write!(out, "{}", self.mmio_len);
+		out.push(',');
+		out.push_str("\"bus\":");
+		let _ = write!(out, "{}", self.bus);
+		out.push(',');
+		out.push_str("\"dev\":");
+		let _ = write!(out, "{}", self.dev);
+		out.push(',');
+		out.push_str("\"func\":");
+		let _ = write!(out, "{}", self.func);
 		out.push('}');
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -2304,16 +2338,31 @@ impl DeviceEntry {
 		out.push_str(", ");
 		out.push_str("mmio-len=");
 		let _ = write!(out, "{}", self.mmio_len);
+		out.push_str(", ");
+		out.push_str("bus=");
+		let _ = write!(out, "{}", self.bus);
+		out.push_str(", ");
+		out.push_str("dev=");
+		let _ = write!(out, "{}", self.dev);
+		out.push_str(", ");
+		out.push_str("func=");
+		let _ = write!(out, "{}", self.func);
 		out.push('}');
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
-		crate::codec::cbor::map(out, 3);
+		crate::codec::cbor::map(out, 6);
 		crate::codec::cbor::text(out, "index");
 		crate::codec::cbor::uint(out, self.index as u64);
 		crate::codec::cbor::text(out, "type");
 		self.r#type.to_cbor_into(out);
 		crate::codec::cbor::text(out, "mmio-len");
 		crate::codec::cbor::uint(out, self.mmio_len as u64);
+		crate::codec::cbor::text(out, "bus");
+		crate::codec::cbor::uint(out, self.bus as u64);
+		crate::codec::cbor::text(out, "dev");
+		crate::codec::cbor::uint(out, self.dev as u64);
+		crate::codec::cbor::text(out, "func");
+		crate::codec::cbor::uint(out, self.func as u64);
 	}
 }
 

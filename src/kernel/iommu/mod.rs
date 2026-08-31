@@ -214,14 +214,28 @@ pub fn init() -> bool {
 	// ONE RETAINED SLOT PER DEVICE, before any binding can need one. `device::init` has already
 	// resolved the table - `main` calls it first, and says so - so the size is known and this is the
 	// only allocation the association ever needs.
+	//
+	// AND A TABLE THAT CANNOT BE SIZED REFUSES TRANSLATION RATHER THAN DEGRADING ITS ACCOUNTING
+	// (corrected 2026-08-31). This used to print a line saying an unconfirmed detach would report
+	// ZERO holdings for its device, and then bring the controller up anyway. That is the one number
+	// an operator reads to find out whether a quarantined address space is still out of circulation,
+	// and answering zero says the opposite of what quarantine means - on a controller this file
+	// otherwise refuses to let anybody trust an unconfirmed answer from.
+	//
+	// So the allocation is a PREREQUISITE of translating at all. `PRESENT` stays set, which is what
+	// makes this fail CLOSED: `dma_policy` reads it to mean "this machine was supposed to be
+	// isolated", so every `iommu-required` driver is refused rather than silently admitted degraded.
+	// The condition is a boot-time heap failure sizing one `Option` per device, which is to say it
+	// does not happen - and if it ever does, losing the machine's DMA-capable drivers is the answer
+	// this file gives everywhere else.
 	{
 		let mut retained = RETAINED.lock();
 		retained.clear();
 		if retained.try_reserve_exact(crate::device::count()).is_err() {
-			crate::serial_println!("iommu: no room for the retained-domain table - an unconfirmed detach will report zero holdings for its device");
-		} else {
-			retained.resize(crate::device::count(), None);
+			crate::serial_println!("iommu: no room for the retained-domain table - translation is refused rather than run with accounting it cannot keep");
+			return false;
 		}
+		retained.resize(crate::device::count(), None);
 	}
 	match bring_up(index) {
 		Ok(controller) => {
@@ -622,7 +636,17 @@ pub enum MsiRoute {
 pub fn msi_deliverable(index: u32, generation: u64, bus: u8, dev: u8, func: u8) -> MsiRoute {
 	let domain = match domain_for_generation(index, generation) {
 		Ok(Some(domain)) => domain,
-		Ok(None) => return MsiRoute::Deliverable,
+		// AN UNTRANSLATED ENDPOINT IS STILL CHECKED, AGAINST THE CLAIM (2026-08-31).
+		//
+		// `Ok(None)` says "this device has no domain", and this arm read it as "the caller is
+		// current" - which is a different statement and was never verified. On a machine with no
+		// IOMMU, or for any endpoint the controller does not translate, that made the whole
+		// generation defence inapplicable: a release and a reclaim during the call left the stale
+		// caller programming the REPLACEMENT binding's MSI-X entry, and only `register_derived`
+		// noticed - after the hardware effect. The claim slot is the authority that can answer for a
+		// device with no domain, and the comparison is the same arithmetic one.
+		Ok(None) if crate::device::claim_is_current(abi::ClaimKey { device_index: index, _pad: 0, generation }) => return MsiRoute::Deliverable,
+		Ok(None) => return MsiRoute::Stale,
 		// THE DOMAIN UNDER THIS INDEX IS SOMEBODY ELSE'S. Nothing is mapped and nothing is disabled:
 		// the caller's own binding has ended, and acting on the device now would be this generation
 		// reaching into the next one. See `domain_for_generation`.
@@ -880,14 +904,34 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 			let mut retained = RETAINED.lock();
 			match retained.get_mut(index) {
 				Some(slot) => *slot = Some(domain),
-				// The device table grew after `init` sized this, which cannot happen after boot -
-				// but a lost association is a device reporting zero holdings while its address space
-				// is out of circulation, so it says so rather than passing quietly.
-				None => crate::serial_println!("iommu: no slot to record that {:02x}:{:02x}.{} left a quarantined domain behind - its holdings will report as zero", bus, dev, func),
+				// UNREACHABLE BY CONSTRUCTION, and kept as a refusal rather than deleted. `init`
+				// now refuses to translate at all unless it could size one slot per device, and the
+				// device table does not grow after boot - so reaching this means one of those two
+				// facts stopped being true, and a lost association is a device reporting zero
+				// holdings while its address space is out of circulation.
+				None => crate::serial_println!("iommu: no slot to record that {:02x}:{:02x}.{} left a quarantined domain behind - its holdings would report as zero, which is not an answer this controller may give", bus, dev, func),
 			}
 			false
 		}
 	};
+	// A BINDING CHANGE IS WHEN THE FAULTS ARE COLLECTED. Bounded, and said plainly: this kernel
+	// polls the event queue at binding transitions and at boot rather than on an interrupt, so a
+	// fault raised between two of those moments is reported late. It is never LOST - the device
+	// keeps it queued - and it is never unbounded, because the drain is bounded by the buffer.
+	// Interrupt-driven delivery is not implemented here.
+	//
+	// ATTRIBUTED, because by here the backend cannot be: the revoke above took this endpoint out of
+	// its attached table, so a fault queued since the pre-drain would otherwise be reported as
+	// domain zero at generation zero. This drain supplies the binding that was ending.
+	//
+	// AND IT RUNS BEFORE THE DOMAIN IS DESTROYED, WHICH IS WHAT LETS THE BINDING BE CHARGED
+	// (corrected 2026-08-31). This drain used to sit AFTER `destroy_domain`, and destroying a domain
+	// removes its `DomainState` - the structure the per-domain fault counter lives in. So
+	// `drain_faults_during` attributed each event correctly into the durable ring and then found no
+	// state to increment, and the last faults a binding ever raised - the ones raised DURING its
+	// revoke, which is exactly when a misbehaving endpoint raises them - were charged to nobody.
+	// M5's event attribution was right and M4's per-binding counter was short by them.
+	poll_faults_attributed(generation.map(|g| (endpoint, domain, g)));
 	// AND A CONFIRMED REVOKE DESTROYS THE DOMAIN, which nothing did.
 	//
 	// The public row was removed and the endpoint revoked, and the `DomainState` behind them stayed:
@@ -901,6 +945,9 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// mapping of the domain is quarantined, because forgetting a quarantined mapping would hand its
 	// address space back for reuse on exactly the evidence that says not to. So the rule is stated
 	// here and enforced there.
+	//
+	// AND IT HAPPENS AFTER THE DRAIN ABOVE, which is what lets the binding be charged for the faults
+	// its own revoke raised. See that paragraph.
 	if confirmed {
 		match with(|controller| controller.iommu().destroy_domain(domain)) {
 			Some(Ok(_)) => {}
@@ -908,16 +955,6 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 			None => {}
 		}
 	}
-	// A BINDING CHANGE IS WHEN THE FAULTS ARE COLLECTED. Bounded, and said plainly: this kernel
-	// polls the event queue at binding transitions and at boot rather than on an interrupt, so a
-	// fault raised between two of those moments is reported late. It is never LOST - the device
-	// keeps it queued - and it is never unbounded, because the drain is bounded by the buffer.
-	// Interrupt-driven delivery is not implemented here.
-	//
-	// ATTRIBUTED, because by here the backend cannot be: the revoke above took this endpoint out of
-	// its attached table, so a fault queued since the pre-drain would otherwise be reported as
-	// domain zero at generation zero. This drain supplies the binding that was ending.
-	poll_faults_attributed(generation.map(|g| (endpoint, domain, g)));
 	confirmed
 }
 

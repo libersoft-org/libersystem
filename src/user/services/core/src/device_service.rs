@@ -67,7 +67,9 @@ unsafe fn device_entry(i: u64) -> Option<DeviceEntry> {
 		if !device_info(i, &mut info) {
 			return None;
 		}
-		Some(DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len })
+		// The address comes straight from the kernel table, which is what makes a row number
+		// resolvable to a device without asking any service. See `device-entry`.
+		Some(DeviceEntry { index: i as u32, r#type: type_of(info.device_type), mmio_len: info.bar_len, bus: info.bus as u32, dev: info.dev as u32, func: info.func as u32 })
 	}
 }
 

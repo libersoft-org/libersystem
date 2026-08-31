@@ -702,3 +702,59 @@ accepts counts beyond the driver's hard maximum. ACCEPTED, all three.**
 1. **The production migration to catalogue discovery is still only one consumer deep.** AudioService now subscribes, but DeviceManager retains fixed private boot-block, network, display, input, USB, and related handle routes (`src/user/services/core/src/device_manager.rs:431-451,650-665,819-856,1087-1145`), and ServiceManager still injects those handles into named services (`src/user/services/core/src/service_manager/bootstrap.rs:230-275,389-480`). This leaves the hand-written per-kind seams and a compiled provider count which M1/M3 and the definition of done require the catalogue to replace (`docs/todo/P02M0164.md:37-54,288-312,318-323`). Completing Audio proves the mechanism but does not complete the stated per-consumer migration.
 
 2. **Block-volume roles are still assigned positionally rather than by the required format/origin/root decision.** DeviceManager sorts exactly four block providers by BDF and labels their positions system, FAT media, ISO, and UDF (`src/user/services/core/src/device_manager.rs:819-850`). Only the system instance probes candidates against the loader's UUID; ServiceManager injects the remaining roles by fixed tags and StorageService trusts those tags (`src/user/services/core/src/service_manager/bootstrap.rs:389-474`, `src/user/services/storage/src/service.rs:255-267`). This does not implement M2's format-plus-origin distinction or the definition of done's three `RootSelection` outcomes and FAT-media-versus-FAT-USB ordering cases (`docs/todo/P02M0164.md:71-121,290-305`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-08-31T20:12:01Z):
+
+**1. The production migration to catalogue discovery is still only one consumer deep - ACCEPTED as an
+accurate statement of an unmet requirement; not implemented in this round, and the reason is scope
+rather than difficulty.**
+
+Every fact checks out. AudioService subscribes and opens; DeviceManager still routes block, network,
+display, input and USB through fixed private handles; ServiceManager still injects those into named
+services by tag. So the hand-written per-kind seams M1/M3 require the catalogue to replace are still
+there, and one migrated consumer proves the mechanism rather than completing the migration.
+
+What I am NOT doing is migrating the rest inside this round, and I want to be exact about why rather
+than call it out of scope and move on. Each remaining destination is a separate piece of work with
+its own device-side contract - the versioned PCM, frame-plus-link, block, scanout and event-stream
+contracts - plus a service-side attach, detach and reconnect, plus the removal of that service's
+bootstrap handshake. That is five migrations across DeviceManager, ServiceManager and five services.
+It is the kind of change this round is instructed to avoid, and it is already assigned: P02M0099's
+destination table names an owner for each one, and this milestone's own "what it refuses" section says
+reworking the services that consume providers is not its work.
+
+The connection accounting those migrations depend on DID land - publication counts from zero, the
+offered channel is handed out by served `open` and counted, every minting path including the boot
+probe checks the declared bound, closes decrement, and the manifest ceiling is reconciled against
+`MAX_PROVIDER_CLIENTS` - so the next migration starts from a working seam rather than repairing one.
+M1/M3 and the definition of done remain UNMET on the per-consumer migration clause.
+
+**2. Block-volume roles are still assigned positionally rather than by the required format/origin/root
+decision - ACCEPTED in part; the finding overstates one half, and the remaining half is not
+implemented in this round.**
+
+Two corrections to the finding first, both checkable:
+
+- The SYSTEM volume is not positional. DeviceManager mints a probe connection per block provider and
+  StorageService picks by the loader's `RootSelection` uuid through `mount_by_uuid`, so a paired
+  volume at a later bus address is found. The finding says as much.
+- FAT MEDIA VERSUS FAT USB IS ALREADY SEPARATED BY ORIGIN, which the finding treats as missing. The
+  USB block provider is not one of the four sorted by address: it is taken inside `route_offers`,
+  from the offers of the driver that published it, so "which controller published this" is what
+  routes it. That is the origin half of M2, and it is in the tree.
+
+What IS positional is the remaining three among the virtio-blk providers - system, then FAT media,
+then ISO, then UDF by bus address - and the code says so itself: "STILL BY ARRIVAL ORDER, AND THAT IS
+THE NEXT ITEM'S SUBJECT". So M2's checkbox and M2's own code comment disagree about whether M2 is
+done, and the finding is right that the DoD's format clause and its three-`RootSelection`-outcome
+coverage are unmet.
+
+Not implemented here, and precisely why: ISO9660 and UDF are distinct formats and would settle those
+two roles outright, but the format probe belongs to StorageService by this milestone's own deliberate
+division - "keeping a filesystem out of the process that hands out device authority is worth the one
+hand-off it costs" - and the role assignment happens in DeviceManager before any storage instance
+exists. Closing it means a new hand-off: mint the probe connections (done), have a prober answer with
+each provider's format, then assign. That is M2's remaining half, it changes the boot volume
+hand-off across three processes and the wire between them, and it is the redesign this round is asked
+not to undertake. Recorded as unmet rather than argued away; the code comment already told the truth
+and the checkbox is what is wrong.

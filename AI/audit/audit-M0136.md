@@ -778,3 +778,26 @@ needs no paging. The staging gate enforces all three at build time, and the fixt
 exact-bound and over-bound pairs the finding asks for: 64 faces succeed and 65 fail, a 256-byte
 metadata record succeeds and 257 fails, and the full-64-face reply is asserted at most 16384 bytes,
 watched to fail against a raised per-face bound.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-08-31T19:58:23Z):
+
+Rating: 6/10
+
+1. **The corrected catalogue reply ceiling is arithmetically impossible.** The plan permits 64
+   metadata records of 256 encoded bytes each, fixes `MAX_LIST_REPLY_BYTES` at 16384, and asserts
+   the complete 64-face reply is at most that size
+   (`docs/todo/P02M0136.md:154-178`). Those records alone consume 16384 bytes. LSIDL adds at least a
+   two-byte list count and one-byte result tag (`docs/LSIDL.md:292-299,478-488`), and generated
+   service replies carry a four-byte correlation ID before the result
+   (for example `src/user/libs/protocol/storage-proto/src/generated/liber/storage/v1.rs:1755-1761`).
+   Thus even the favorable case needs at least 16391 bytes. Define whether the 256-byte limit includes
+   every per-record wire byte and reserve all list/result/reply framing, or reduce the record/count
+   limit; the exact-bound gate cannot pass as written.
+
+2. **The hostile-work correction still supplies no absolute input or per-run glyph ceiling.** The
+   item itself names per-run glyph count as a necessary independent limit
+   (`docs/todo/P02M0136.md:372-375`), but its frozen table contains font-internal depth/count limits,
+   fallback/retry counts and per-line/per-paragraph pass counts only (`:377-396`). A `64x the input
+   run` output cap is merely proportional: an arbitrarily large source remains arbitrarily large in
+   work and allocation. Add one numeric ceiling on accepted source/code-point/grapheme or glyph
+   extent per run/layout unit, with exact-bound and over-bound typed-refusal tests.

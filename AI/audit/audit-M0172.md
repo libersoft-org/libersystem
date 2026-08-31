@@ -376,3 +376,20 @@ carriers are byte-identical. Malformed and absent yield the same outcome - mode 
 named-producer rule refuses - distinguished only in what is reported, and nothing about a malformed
 record is ever interpreted, which is what stops a corrupt record from being a downgrade. The
 Definition of done gains the carrier, the run mode and the non-x86 landing rule.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-08-31T19:58:23Z):
+
+Rating: 6/10
+
+1. **The run-mode correction never carries run mode to the component that must distinguish allowed
+   from fatal absence.** `LIBER_RUN_MODE` is a host-shell discriminator
+   (`docs/todo/P02M0172.md:63-89`), while kernel admission must treat the identical absent DMA-mode
+   state as expected for test/development but fatal for public/gate
+   (`:91-102,156-172,313-323`). The planned `BootInfo` extension carries only DMA mode and
+   provenance (`:197-205`), and the direct carrier contains magic, version, DMA mode, provenance
+   and reserved bytes—no run mode (`:221-253`). Current `BootInfo` likewise has no such field
+   (`src/boot/protocol/src/lib.rs:158-218`). Consequently an early kernel cannot distinguish an
+   intentionally carrier-less test/development boot from a public/gate boot whose named producer lost
+   its carrier, which defeats the fail-closed half of the matrix. Carry a trusted run-mode value into
+   early kernel state, or give test/development an explicit DMA-mode record too so absence has one
+   universally fatal meaning.

@@ -1191,3 +1191,20 @@ point directly and no runner exists in this tree. A measured absence still yield
 artifact check the ABI item describes: a measured empty set, not a predicted one. The gate heading
 is broadened from "C++ mechanism" to "lifecycle mechanism", because `.init_array` and `errno` were
 being filed under a language that does not own them.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-08-31T19:58:23Z):
+
+Rating: 8/10
+
+1. **The latest rejection is justified for generated digests, but not for the still-unselected build
+   profile.** A plan need not duplicate the lockfile's eventual revisions and archive/tool digests.
+   This plan does, however, claim to prepare one named, pinned configuration and says the file picks
+   it (`docs/todo/P02M0135.md:23-30,102-108`). Only `BUILD_TESTS=OFF` and all
+   `BUILD_WSI_*_SUPPORT=OFF` have values. The assembly/dispatch, loader-layer, debug, install and
+   shared/static choices are merely named for the future bootstrap pin, without selected values
+   (`:138-186`, especially `:171-176`). That contradicts the response's assertion that the full
+   CMake option set is already named with its choices
+   (`AI/audit/audit-M0135.md:1136-1143`). Static/shared and dispatch choices materially change the
+   object and link closure from which every later ABI, lifecycle and symbol-surface branch is derived.
+   Choose those remaining profile values in the plan; the machine-read lockfile can still own their
+   exact spelling and verification.

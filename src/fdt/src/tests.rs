@@ -2086,15 +2086,21 @@ fn a_v2m_frame_that_is_undersized_or_aliases_the_controller_is_refused() {
 	assert_eq!(at(tree(0x0801_0800, 0x1000)).parse().expect("parses").gic_msi, 0, "nor may it overlap the cpu interface");
 }
 
-// A TIMER SPECIFIER WHOSE THIRD CELL DOES NOT NAME ONE SENSE.
+// A TIMER SPECIFIER WHOSE THIRD CELL DOES NOT NAME A SENSE THIS KERNEL DELIVERS.
 //
 // The reader took the kind and the number and skipped the flags entirely, so a tree carrying an
 // unsupported or self-contradictory trigger published its number as the timer's INTID anyway. The
-// GIC binding puts the sense in the low nibble - edge-rising, edge-falling, level-high, level-low -
-// and exactly one of them is an interrupt this reader can program. Zero says nothing; two say two
-// contradictory things; both are a machine description that has to be refused rather than half-read.
+// GIC binding puts the sense in the low nibble - edge-rising, edge-falling, level-high, level-low.
+//
+// AND "EXACTLY ONE BIT" WAS NOT THE RIGHT RULE EITHER (corrected 2026-08-31). It accepted an
+// EDGE-triggered timer, and nothing in this kernel programs a trigger type: the GICv2 and GICv3
+// per-core setup groups the PPI, sets its priority and enables it, and never writes `ICFGR`. So an
+// edge specifier was accepted and the controller kept its reset semantics - level - and the machine
+// armed a timer whose description disagreed with how it would be delivered. A level is also the only
+// correct description of this hardware: the architected timer holds its output asserted while
+// `CNTP_CTL.ISTATUS` is set. So the two level senses are read and the two edge senses are refused.
 #[test]
-fn a_timer_specifier_with_no_single_sense_is_not_read() {
+fn a_timer_specifier_with_no_deliverable_sense_is_not_read() {
 	let with_flags = |flags: u32| -> &'static [u8] {
 		routed_machine(move |builder| {
 			let mut cells = Vec::new();
@@ -2109,13 +2115,17 @@ fn a_timer_specifier_with_no_single_sense_is_not_read() {
 
 	// THE BASELINE. 0xf08 is level-low with the PPI cpu mask above it, which is what every tree this
 	// system meets writes - so the refusals below are about the flags and not about the fixture.
-	assert_eq!(at(with_flags(0xf08)).parse().expect("parses").timer_intid, 30, "level-low is a sense, and the cpu mask above the nibble is not this reader's business");
+	assert_eq!(at(with_flags(0xf08)).parse().expect("parses").timer_intid, 30, "level-low is a sense this kernel delivers, and the cpu mask above the nibble is not this reader's business");
 	assert_eq!(at(with_flags(0xf04)).parse().expect("parses").timer_intid, 30, "so is level-high");
-	assert_eq!(at(with_flags(0x001)).parse().expect("parses").timer_intid, 30, "and edge-rising");
 
 	assert_eq!(at(with_flags(0xf00)).parse().expect("parses").timer_intid, 0, "a specifier naming no sense at all describes no interrupt this reader can program");
 	assert_eq!(at(with_flags(0xf0c)).parse().expect("parses").timer_intid, 0, "and one naming level-high AND level-low describes two, which is a tree contradicting itself");
 	assert_eq!(at(with_flags(0xf03)).parse().expect("parses").timer_intid, 0, "the same for both edges at once");
+	// THE TWO THAT USED TO PASS. A single edge bit is one sense and is still refused, because
+	// nothing here programs a trigger type - the controller would deliver it as a level whatever the
+	// tree said, and the architected timer is a level source in any case.
+	assert_eq!(at(with_flags(0x001)).parse().expect("parses").timer_intid, 0, "edge-rising names one sense and is not one this kernel programs; the controller would deliver it as a level");
+	assert_eq!(at(with_flags(0xf02)).parse().expect("parses").timer_intid, 0, "and the same for edge-falling");
 }
 
 // A GICv3 REDISTRIBUTOR RANGE THAT CANNOT COVER THE CORES THE TREE DESCRIBES.

@@ -1274,3 +1274,26 @@ and P02M0099's catalogue paragraph as where the handoff rule lives. P02M0164 is 
 performed if no other item got there first, consumed if one did. `a-wsi`'s Done clause drops P02M0164
 and gains the condition that a part still reaching the display through the `GPU` bootstrap handle is
 not done, whichever item performed the migration.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-08-31T19:58:23Z):
+
+Rating: 6/10
+
+1. **The accepted P02M0164 circularity correction was not propagated to the controlling prerequisite
+   text.** The matrix still lists P02M0164 provider reacquisition as a hard WSI prerequisite, and the
+   status prose still says restart/rebind is blocked on P02M0164's consumer migration
+   (`docs/todo/P02M0103.md:93-108,161-165`). That contradicts the corrected ownership paragraph
+   (`:120-136`) and the a-wsi section's explicit statement that P02M0164 is not a dependency and the
+   migration is this part's deliverable (`:689-701`). It also contradicts the planner's claim that
+   P02M0164 was removed from the dependency line
+   (`AI/audit/audit-M0103.md:1270-1275`). Remove the two stale prerequisite claims so the schedule
+   has one answer.
+
+2. **AudioService is not the attach/detach/reconnect worked example the correction says a-wsi should
+   copy.** The plan uses it to justify the P02M0164 mechanism and directs a-wsi to follow it
+   (`docs/todo/P02M0103.md:120-136`), but AudioService stores one anonymous provider, ignores
+   additional live providers, cannot identify or drop a withdrawn provider, and does not reopen an
+   already-live alternative after channel failure
+   (`src/user/services/core/src/audio_engine.rs:332-358,780-795`). Refer to P02M0099's intended
+   lifecycle contract, but do not present this incomplete implementation as the model for the WSI
+   migration.

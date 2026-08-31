@@ -298,6 +298,14 @@ pub fn claim_state(index: usize) -> Option<ClaimState> {
 // This is the arithmetic the whole milestone rests on: "everything derived from the previous claim"
 // is a set a comparison can name, so a mapping or a release carrying an old generation is refused
 // without any bookkeeping about what was derived when.
+//
+// AND IT IS THE ANSWER FOR AN ENDPOINT WITH NO DOMAIN (2026-08-31). `iommu::domain_for_generation`
+// makes the same comparison for a TRANSLATED endpoint, against the generation the controller
+// recorded for its domain - and a device the controller does not translate has no domain to compare,
+// so that path could only say "nothing to check". Its callers read that as "the caller is current",
+// which is a different statement and was not being verified anywhere: on a machine with no IOMMU it
+// was the only statement being made. This is the check for that case, against the authority that can
+// answer it, and `iommu::msi_deliverable` and `SYS_DEVICE_MSIX_ACQUIRE` both use it.
 pub fn claim_is_current(key: abi::ClaimKey) -> bool {
 	let claims = CLAIMS.lock();
 	match claims.get(key.device_index as usize) {
@@ -469,9 +477,15 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	};
 	// 1. BUS MASTERING FIRST. Everything below assumes the device is not starting new transactions.
 	with(index, |entry| bus_master(entry, false));
+	// What this device had ALREADY stranded before the release began. See the comparison below.
+	let quarantined_before = crate::arch::interrupts::msi_quarantined_for_device(index as u32);
 	// 2. Everything the claim minted stops working, without the holder's cooperation - and every
 	//    interrupt it derived is unbound HERE rather than whenever its last reference goes.
-	let interrupts_quiet = revoke_derived(key);
+	//
+	// `derived_quiet` rather than `interrupts_quiet` (renamed 2026-08-31): an MMIO window whose
+	// cross-core flush could not be confirmed answers no here too, and a name that says "interrupts"
+	// is a name that invites the next reader to put an unrelated failure somewhere else.
+	let derived_quiet = revoke_derived(key);
 	// 3. The translation, which is the other step that can fail to CONFIRM. `detach_for` reports a
 	//    detach it could not confirm and leaves the pages quarantined; the claim goes the same way,
 	//    because a device whose mappings may still be live is not a device to hand to anyone else.
@@ -495,10 +509,28 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	// Waiting for it is a handful of instructions inside `Arc::drop`; a slot still live after that is
 	// one nothing is going to settle, and an unconfirmed teardown is the honest answer.
 	let vectors_settled = settled_vectors(index as u32);
-	let interrupts_quiet = interrupts_quiet && vectors_settled;
-	let confirmed = translation_quiet && interrupts_quiet;
-	if !interrupts_quiet {
-		crate::serial_println!("device: {index} could not confirm that every interrupt it derived was unbound - the claim is not free");
+	// AND A SLOT QUARANTINED WHILE THIS RELEASE RAN IS A TEARDOWN THAT FAILED (added 2026-08-31).
+	//
+	// `settled_vectors` asks `has_unbound`, which deliberately does NOT count a quarantined slot -
+	// and that exclusion is right for the reason written at `has_unbound`: a slot stranded by an
+	// EARLIER binding must not make every later claim of the device unreleasable. But it also made
+	// this release blind to a quarantine happening right now, which is the case where the answer
+	// matters. `Interrupt::drop` discards its `unbind` result, and a last reference going away
+	// during the sweep is the ordinary way to reach it: `Weak::upgrade` fails as soon as the strong
+	// count hits zero, so the row is counted quiet, and the drop's failed unbind then quarantines
+	// the slot with nobody listening.
+	//
+	// The COUNT taken before the sweep and again after it separates the two without weakening
+	// either: what was already stranded is ignored, and what this release stranded is charged to it.
+	let quarantined_after = crate::arch::interrupts::msi_quarantined_for_device(index as u32);
+	let none_stranded_here = quarantined_after <= quarantined_before;
+	if !none_stranded_here {
+		crate::serial_println!("device: {index} quarantined an MSI slot while it was being released - its interrupt teardown was not confirmed");
+	}
+	let derived_quiet = derived_quiet && vectors_settled && none_stranded_here;
+	let confirmed = translation_quiet && derived_quiet;
+	if !derived_quiet {
+		crate::serial_println!("device: {index} could not confirm that everything it derived was torn down - the claim is not free");
 	}
 	// 4. THE TERMINAL STATE, AND ONLY THEN THE VECTORS.
 	//
@@ -604,16 +636,24 @@ fn bus_master(entry: &DeviceEntry, on: bool) {
 // released while its syscall ran would have taken the REPLACEMENT device off the bus - a driver that
 // did nothing wrong losing its DMA because its predecessor's refusal arrived late. The check holds
 // `CLAIMS`, which is the lock every other claim decision is taken under.
+// AND THE CHECK IS HELD ACROSS THE WRITE, not merely performed before it (2026-08-31).
+//
+// The check used to take `CLAIMS`, drop it, and only then reach config space - so a complete release
+// and reclaim between the two lines let this generation take the NEXT one off the bus, which is the
+// precise damage the key was added to prevent. Narrowing a window is not the same as closing it, and
+// the file already had the shape that closes it: `mmio_capability_dropped` holds both locks across
+// its own `bus_master`, and this is the same decision about the same register.
+//
+// DEVICES FIRST, THEN CLAIMS - the one order this file uses, stated at `mmio_capability_dropped`.
 pub fn disable_bus_master_for(key: abi::ClaimKey) {
 	let index = key.device_index as usize;
-	{
-		let claims = CLAIMS.lock();
-		let Some(slot) = claims.get(index) else { return };
-		if slot.generation != key.generation || slot.state != ClaimState::Claimed {
-			return;
-		}
+	let table = DEVICES.lock();
+	let claims = CLAIMS.lock();
+	let (Some(entry), Some(slot)) = (table.get(index), claims.get(index)) else { return };
+	if slot.generation != key.generation || slot.state != ClaimState::Claimed {
+		return;
 	}
-	with(index, |entry| bus_master(entry, false));
+	bus_master(entry, false);
 }
 
 // A DEVICE THE MACHINE DOES NOT HAVE, so that the claim table can be tested without taking a device
@@ -794,12 +834,16 @@ fn revoke_derived(key: abi::ClaimKey) -> bool {
 // device kept a bound, deliverable vector aimed at the old driver, and the next claimant could not
 // be given that slot either.
 //
-// Returns whether the teardown CONFIRMED, which only an interrupt can answer no to - see
-// `Interrupt::revoke` and riscv64's `unbind`. Everything else here is a local operation that cannot
-// fail, so `true` is a statement rather than an assumption.
+// Returns whether the teardown CONFIRMED. TWO of these can answer no, and the second was being
+// discarded (corrected 2026-08-31): an interrupt whose architectural unbind failed - see
+// `Interrupt::revoke` and riscv64's `unbind` - and an MMIO window whose cross-core TLB shootdown
+// could not be confirmed. The comment here called every non-interrupt case "a local operation that
+// cannot fail", and a shootdown is neither local nor infallible: it flushes every other core and
+// reports when it could not reach one. A `DmaBuffer`'s orphaning is the only line below that really
+// cannot fail.
 fn revoke_effects_of(object: &alloc::sync::Arc<dyn crate::object::KernelObject>) -> bool {
 	if let Some(memory) = object.as_any().downcast_ref::<crate::object::device_memory::DeviceMemory>() {
-		memory.teardown_mapping();
+		return memory.teardown_mapping();
 	}
 	if let Some(buffer) = object.as_any().downcast_ref::<crate::object::dma_buffer::DmaBuffer>() {
 		buffer.mark_orphaned();

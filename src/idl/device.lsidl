@@ -19,6 +19,20 @@ record device-entry {
 	index:    u32,
 	type:     device-type,
 	mmio-len: u64,
+	/// WHERE THIS ROW IS ON THE BUS, from the KERNEL's own device table (added 2026-08-31).
+	///
+	/// The kernel has always known it - `device-info` carries it, and it is what makes two devices of
+	/// one class distinguishable - and this record did not, so a reader holding a ROW NUMBER had no
+	/// way to turn it into a device identity without asking DeviceManager. That mattered on exactly
+	/// the path where DeviceManager is gone: `lsdev --incident N` fell back to a stored side-record
+	/// mapping row to address, validated by comparing the MMIO window length. A length is not an
+	/// identity - two disks of one model share it - so equal-sized devices reordering between
+	/// inventories resolved a row to another device's incident. Carrying the address here answers the
+	/// question from the kernel, which is present whether any service is or not, and deletes the
+	/// side-record rather than making it cleverer.
+	bus:      u32,
+	dev:      u32,
+	func:     u32,
 }
 
 /// Where a device binding is. One vocabulary, defined once: `lsdev`, the System Graph and the boot
@@ -176,9 +190,14 @@ enum policy-outcome {
 	/// so. `disable`, `enable` and `select` are still accepted on one, because they are about the
 	/// NEXT bind.
 	quarantined         = 3,
-	/// An `enable` arriving while a disable's teardown is still in flight. The operator retries once
-	/// the node reaches `disabled`; cancelling the intent would mean a device that was never
-	/// observed to be disabled at all, which is worse to explain than a refusal that says why.
+	/// THE VERB IS RIGHT AND THE MOMENT IS NOT, and the operator's next move is to look at the state.
+	///
+	/// Two cases. An `enable` arriving while a disable's teardown is still in flight: the operator
+	/// retries once the node reaches `disabled`, because cancelling the intent would mean a device
+	/// that was never observed to be disabled at all, which is worse to explain than a refusal that
+	/// says why. And a `retry` on a node with nothing to retry - one that is online, still binding,
+	/// being torn down, waiting on a dependency, or disabled - where a retry would open an incident
+	/// for a binding that did not fail.
 	busy                = 4,
 	/// The verb reached a node it cannot apply to - a boot-critical binding, whose policy would live
 	/// on a volume that is not mounted when that binding is made.

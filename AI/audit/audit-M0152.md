@@ -709,3 +709,42 @@ gate, which is the shape this milestone's own refusal section exists to prevent.
 **Rating: 8/10.**
 
 1. **The final rejection does not satisfy the explicit node-to-CPU placement contract.** M3 requires an internal placement hint which selects an online CPU on the requested node or returns a typed refusal, and the definition of done requires such a request to run on a CPU of that node (`docs/todo/P02M0152.md:123-134,211-222`). In the shipping build, both `Refusal` and `place_on` are still removed by `cfg(test)` (`src/kernel/smp/numa/mod.rs:117-157`), as are every targeted create/enqueue path (`src/kernel/sched/mod.rs:408-445,460-475,504-523`). The corrected ordinary stack-locality path is production code, but it is the CPU-to-node direction; production code still has no node-to-CPU request or typed refusal at all. The absence of a current kernel-thread consumer explains why the interface is unused, but making this narrowly scoped internal contract available does not itself add the userspace ABI, migration, balancing, or priority policy which the milestone refuses.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0152 (2026-08-31T20:12:01Z):
+
+**1. The final rejection does not satisfy the explicit node-to-CPU placement contract - REJECTED
+again, and this time with the constraint that makes it structural rather than a preference.**
+
+Every FACT in the finding is correct and I do not dispute one of them. `Refusal` and `place_on` are
+`#[cfg(test)]`; so are `prepare_in_process_on` and `start_thread_on`, and every targeted create and
+enqueue path with them. The corrected stack-locality path is production code and it is the CPU-to-node
+direction. M3 does ask for an internal placement hint and the definition of done does ask for a
+request that lands on a CPU of the named node. So production code has no node-to-CPU request, exactly
+as stated.
+
+What the finding treats as the obstacle - "the absence of a current kernel-thread consumer explains
+why the interface is unused" - is not the obstacle. The obstacle is that the interface cannot EXIST
+in the shipping build without a consumer:
+
+- `src/kernel/Cargo.toml` sets `[lints.rust] warnings = "deny"` for this package. Removing the
+  `cfg(test)` from `place_on` and `Refusal` with nothing calling them is `dead_code`, which is a
+  build failure and not a warning somebody can live with.
+- The escape hatch is `#[allow(dead_code)]`, which this tree forbids and has a gate for -
+  `no-suppression`. So "make the internal contract available" is not a small exposure; it is a
+  suppression this repository refuses.
+- The remaining way to make it reachable is to add the production consumer, and the only consumer
+  such a hint has is a kernel-thread spawner. There is none, and M3's last bullet refuses the service
+  that would need one: "the scheduler exposes enough placement to prove topology is used and stops
+  there."
+
+So the three available moves are a forbidden suppression, a milestone-refused service, or leaving the
+hint where its test drives it. I have taken the third, and the reason is now recorded in the code
+rather than only here - `smp::numa`'s comment says the direction, the missing consumer and the M3
+bullet that refuses inventing one.
+
+I will note what I think the finding is really pointing at, since it has now been raised twice: the
+DISAGREEMENT is between M3's text and M3's own last bullet, not between the plan and the tree. A
+definition of done that requires a request nothing may call is one only a test can satisfy, and this
+one is satisfied by a test. If that is judged insufficient, the fix belongs in the plan - either the
+clause is met by the test that exercises it, or the milestone gains the consumer it currently refuses
+- and not in a suppression added to make an unused function compile.

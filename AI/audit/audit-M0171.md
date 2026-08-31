@@ -349,3 +349,18 @@ answer, including marker-present-one-slot-valid (the valid slot is authoritative
 rewritten on the next successful advance) and marker-present-neither-valid (refuses, and is not
 recoverable by deleting the marker - the attack the marker exists to defeat). M7 boots each
 interrupted state and proves it provisions afterwards.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-08-31T19:58:23Z):
+
+Rating: 7/10
+
+1. **The provisioning state machine still assigns two outcomes to the same durable state.** M2 says
+   marker absent means unprovisioned and bootable without advancing, whatever either slot contains
+   (`docs/todo/P02M0171.md:93-104,125-150`). It also says a marker-present machine with neither slot
+   valid is not recoverable by deleting the marker, and M7 requires it to keep refusing after exactly
+   that deletion (`:146-150,316-320`). Once the marker is deleted, no durable fact distinguishes
+   that machine from the marker-absent combinations the table classifies as unprovisioned; the stated
+   algorithm must boot it and may overwrite both slots during a new ceremony. Either explicitly
+   exclude marker deletion from the threat/availability claim and remove the impossible fixture, or
+   keep the provisioned fact in independently non-clearable trusted state (or make absent-marker
+   enforcing boots fail closed and provision before their first boot).

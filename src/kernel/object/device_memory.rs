@@ -181,7 +181,10 @@ impl DeviceMemory {
 	// object is still alive and still held by whoever it was sent to. A handle that refuses is not
 	// evidence that a MAPPING is gone: the driver has a raw virtual address it has been using for as
 	// long as it has been running, and revoking the capability does not touch it. This does.
-	pub fn teardown_mapping(&self) {
+	// Answers whether the teardown was CONFIRMED. See the shootdown below: a cross-core flush that
+	// could not be confirmed leaves another core able to translate the BAR, and a claim whose
+	// terminal state was decided on the strength of `true` would publish `Free` over exactly that.
+	pub fn teardown_mapping(&self) -> bool {
 		// SWAPPED TO THE TOMBSTONE, NOT TO ZERO. Zero is the state a fresh object is in, so a sweep
 		// that wrote it left the object mappable again - and, worse, indistinguishable from one that
 		// had never been mapped, which is how an in-flight commit could publish past the sweep. The
@@ -191,7 +194,7 @@ impl DeviceMemory {
 			// NOTHING TO UNMAP HERE, AND THAT IS NOT THE SAME AS NOTHING TO DO. `RESERVED` means a
 			// map syscall is between its claim and its commit: the tombstone this just wrote is what
 			// makes that commit fail, and the syscall unmaps its own work.
-			return;
+			return true;
 		}
 		let space = self.mapped_in.lock().take();
 		for i in 0..self.pages() {
@@ -218,8 +221,25 @@ impl DeviceMemory {
 		//
 		// Blunt and synchronous, like every other caller: it flushes each online core and waits.
 		// This runs once per binding teardown, which is where that cost belongs.
-		crate::mem::tlb::shootdown();
+		//
+		// AND THE ANSWER IS READ (2026-08-31). `shootdown` returns `false` for a core it could not
+		// reach and for a wait that went on too long, and says so in its own contract - and this
+		// discarded it and freed the range anyway. Two consequences, and the second is the one this
+		// milestone is about: whatever is mapped at that virtual range NEXT is reachable through the
+		// stale entry, and `revoke_effects_of` reported the revocation quiet, so the claim could
+		// reach `Free` while another core still held a translation for the BAR.
+		//
+		// A RANGE THAT COULD NOT BE FLUSHED IS NOT GIVEN BACK. That is the same choice
+		// `frame::retire` makes for physical pages and for the same reason: losing an address range
+		// is a cost, and handing back one a live core can still translate is a correctness failure.
+		// The mapping itself is gone either way - the page-table entries were cleared above - so what
+		// is retained is the RANGE, not the access.
+		if !crate::mem::tlb::shootdown() {
+			crate::serial_println!("device: a revoked MMIO window could not confirm its cross-core flush - the virtual range is retained rather than reused, and the claim is not free");
+			return false;
+		}
 		crate::syscall::free_vrange(space.as_deref(), base, self.pages() as u64 * PAGE_SIZE);
+		true
 	}
 }
 
@@ -242,6 +262,10 @@ impl Drop for DeviceMemory {
 		if let Some(key) = self.claim {
 			crate::device::mmio_capability_dropped(key);
 		}
-		self.teardown_mapping();
+		// The answer has nowhere to go from a `Drop` - there is no caller to refuse - and it is not
+		// lost either: `teardown_mapping` says so on the console, and the range it could not confirm
+		// is retained rather than handed back. A forced release reads the same answer through
+		// `revoke_effects_of`, where there IS a claim to keep out of circulation.
+		let _ = self.teardown_mapping();
 	}
 }

@@ -1361,3 +1361,21 @@ Plan changes:
 - The destination table's AudioService row is marked DONE with what it did - reads a CATALOGUE
   connection, subscribes to `audio`, opens per provider, drops on withdrawal - so a later second
   audio provider owns only its device-side PCM contract and not a migration that has happened.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-08-31T19:58:23Z):
+
+Rating: 7/10
+
+1. **AudioService's catalogue migration is marked done but does not meet this plan's own lifecycle
+   contract.** The DONE row says AudioService opens every appearing provider and drops it on
+   withdrawal, leaving a later second audio provider responsible only for the device-side PCM
+   contract (`docs/todo/P02M0099.md:1185-1193`). The common contract, however, requires a versioned
+   device protocol plus attach, detach and reconnect (`:1207-1211`). Current AudioService holds one
+   anonymous `snd`: it opens only while that slot is zero, so additional live providers are ignored
+   (`src/user/services/core/src/audio_engine.rs:780-787`); on withdrawal it explicitly cannot tell
+   whether the event names its active provider and retains the connection (`:788-795`). If that
+   channel later fails, `driver_failed` only clears it (`:332-358`); an alternative whose original
+   publication was ignored is not reopened. The virtio-snd side is still an unversioned raw
+   byte/length protocol (`src/user/drivers/core/src/virtio_snd.rs:56-74`). Reclassify the row as
+   incomplete and keep the next applicable audio item responsible for provider identity, failover,
+   detach/reconnect and the versioned device-side contract.

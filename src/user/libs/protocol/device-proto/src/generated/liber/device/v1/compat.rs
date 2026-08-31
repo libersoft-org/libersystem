@@ -11,9 +11,9 @@ fn device_type_wire_is_stable() {
 }
 #[test]
 fn device_entry_wire_is_stable() {
-	let sample = DeviceEntry { index: 7, r#type: DeviceType::Unknown, mmio_len: 7 };
+	let sample = DeviceEntry { index: 7, r#type: DeviceType::Unknown, mmio_len: 7, bus: 7, dev: 7, func: 7 };
 	let bytes = sample.encode_vec().expect("encode");
-	let golden: &[u8] = &[7, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0];
+	let golden: &[u8] = &[7, 0, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0, 7, 0, 0, 0];
 	assert_eq!(bytes, golden);
 	assert_eq!(DeviceEntry::decode(&bytes).unwrap(), sample);
 }

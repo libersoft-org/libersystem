@@ -192,6 +192,13 @@ pub fn msi_live_for_device(device: u32) -> bool {
 	REGISTRY.has_unbound(device)
 }
 
+// How many of this device's slots are QUARANTINED - a vector stranded by a teardown the controller
+// refused. Sampled either side of a release so the ones stranded by THAT release can be told from
+// the ones it inherited. See `MsiRegistry::quarantined_for` and `device::release_claim`.
+pub fn msi_quarantined_for_device(device: u32) -> usize {
+	REGISTRY.quarantined_for(device)
+}
+
 pub fn msi_held_by_device(device: u32) -> usize {
 	REGISTRY.held_by_device(device)
 }

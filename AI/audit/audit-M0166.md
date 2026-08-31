@@ -544,3 +544,86 @@ persists, and the sweep removes what the current inventory does not have.
 2. **`retry` can reopen the automatic retry budget instead of granting exactly one attempt.** Each `Step::NextCandidate` resets `node.attempt` to zero, including after the final candidate is exhausted (`src/user/services/core/src/device_manager.rs:551-555,957-965`). The `Retry` arm then subtracts from that already-reset counter, opens a fresh incident, rewinds the candidate cursor, and requests a start (`src/user/services/core/src/device_manager.rs:3645-3687`). A retryable failure can consequently consume the normal three-attempt automatic budget again (`src/user/services/core/src/device_manager.rs:2798-2807`), while `Retry` is also accepted in states where no failed binding is available to retry. This violates the definition of done's explicit one-attempt action (`docs/todo/P02M0166.md:241-248`).
 
 3. **The persisted `--incident N` correction still validates a non-identity.** The row map stores only `<bar-len>.<BDF>`, and `resolved_address` trusts the recorded BDF whenever the current row has the same MMIO length (`src/user/services/core/src/device_manager.rs:4022-4042`, `src/user/apps/tools/src/lsdev.rs:153-175`). MMIO length is not unique; moreover, `forget_absent_incidents` retains every old row map whose numeric row still exists (`src/user/services/core/src/device_manager.rs:4059-4080`). If equal-sized devices reorder between inventories, the fallback can return another BDF's incident—or report no incident after that stale record is swept—rather than the device currently at `N`. The snapshot therefore still does not reliably survive DeviceManager's death as required (`docs/todo/P02M0166.md:218-253`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-08-31T20:12:01Z):
+
+**1. `select` mutates the identity of the current binding instead of only its next-bind preference -
+ACCEPTED.**
+
+Correct, and all three readers are real. `node.candidate` is a CURSOR - where the next bind starts -
+and it was also being read as "which driver this node is running". Those are the same value only
+until something moves the cursor, and `select` moves it deliberately. The comment above it promised
+it "touches neither the record nor the live driver", and:
+
+- `driver_name()` reads it, so the served `BindingRecord::artifact` and every console line about the
+  running driver reported the SELECTED one instead;
+- `settle_dependencies` reads it, so the selected entry's `requires` were applied to the RUNNING
+  binding - which can STOP a driver whose own requirements are met, and is the worst of the three;
+- the `Offered` arm reads it, so a late offer from the live driver was published against a `provides`
+  declaration that driver never made.
+
+Two facts needed two fields. `Node::running: Option<usize>` is latched with the binding at commit,
+from the cursor as it stands then, and cleared where the binding is taken. `Node::entry()` makes the
+choice once - the running candidate if there is one, the cursor otherwise - and the readers go through
+it. `select` is unchanged and now means what its comment says: it moves the cursor and the preference,
+and a driver already started keeps its identity.
+
+AND THERE WERE THREE MORE OF THE SAME KIND THAN THE FINDING NAMES, found by looking for every reader
+of the cursor rather than only the ones cited:
+
+- `mint_connection`'s `admits` and served `open`'s `admits` both read the declared CONSUMER BOUND for
+  a provider that belongs to a live binding. From the cursor, a `select` changed how many consumers a
+  running driver is held to - the selected candidate's number applied to the publisher's providers,
+  which either refuses a connection the driver would serve or admits one it will not;
+- the `READY` arm publishes the driver's providers, and read the cursor to find the `provides`
+  declaration to publish them against. A `select` between the bind commit and `READY` would have
+  published a live driver's providers under another entry's declaration.
+
+The two that remain on the cursor are correct there and stay: `start_candidate`'s loop and
+`matched_rule`, both of which run at bind time, when the cursor IS the entry being started.
+
+**2. `retry` can reopen the automatic retry budget instead of granting exactly one attempt -
+ACCEPTED, both halves.**
+
+The budget half is exactly as described. `Step::NextCandidate` resets `attempt` to zero every time it
+advances the cursor, including the advance PAST the final candidate that records exhaustion - which is
+the state a retry is for. So `attempt.saturating_sub(1)` subtracted one from zero, saturated at zero,
+and handed the node the whole three-attempt automatic budget again. The comment two lines above
+promised the opposite of what the code did.
+
+Fixed by setting rather than decrementing: `node.attempt = MAX_AUTOMATIC_ATTEMPTS - 1`.
+`may_try_again` allows another attempt while `attempt + 1 < MAX_AUTOMATIC_ATTEMPTS`, so exactly one
+remains whatever the counter held before - which is what the verb has always said it grants.
+
+The state half is also right and I had not seen it. `decide_policy` refused `Retry` only for
+`Quarantined`, so it was accepted on a node that is ONLINE, still BINDING, mid-teardown, waiting on a
+dependency or operator-disabled. On an online node it opened a fresh incident, rewound the cursor and
+asked the loop to start a candidate for a device that already has a driver running; on a disabled one
+it argued with `enable`, which is the verb that applies. `Retry` is now accepted only in `Failed`,
+`Backoff` and `Unbound` - the three states where an attempt has ended without a binding - and answers
+`Busy` otherwise, which is the existing "the verb is right and the moment is not" outcome. Its IDL
+documentation is extended to cover the second case rather than leaving the enum's meaning to the
+reader.
+
+**3. The persisted `--incident N` correction still validates a non-identity - ACCEPTED, and the
+side-record is gone rather than made cleverer.**
+
+The finding is right that an MMIO window length is not an identity, and right about the second-order
+effect: `forget_absent_incidents` kept every row map whose numeric row still existed, so a stale map
+outlived the device it described and then reported NO incident once that device's own address-keyed
+record was swept. Two devices of one model share a BAR length, so equal-sized devices reordering
+between inventories resolved a row to another device's incident while passing the check.
+
+The fix is to delete the question rather than answer it better. The whole side-record existed because
+`lsdev` could not turn a row number into a device address without DeviceManager - and the KERNEL has
+always known it: `DeviceInfo` carries bus, dev and func, and `device-entry` did not. So
+`device-entry` gains `bus`, `dev` and `func`, DeviceService fills them from the kernel table, and
+`resolved_address` asks the kernel - which is present whether DeviceManager is or not, which was the
+entire requirement. A row resolved that way is the device at that row by construction rather than by
+comparison.
+
+With that, `persist_incidents` no longer writes the map, `incident_index_key` is deleted, and
+`forget_absent_incidents` removes ALL `incident-at.` rows a previous boot left rather than the subset
+whose numbers no longer exist - keeping one alive because its NUMBER still exists is what let a stale
+one outlive its device. The IDL change is a pre-release record change, taken through `gen.sh
+--accept-breaking`; nothing here is versioned yet.

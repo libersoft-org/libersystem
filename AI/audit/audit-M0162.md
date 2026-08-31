@@ -537,3 +537,33 @@ Recorded as UNMET with that reason, not as a rejection.
 **Rating: 7/10.**
 
 1. **Normal claim teardown still blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` invokes `Closes::release` inline (`src/user/libs/driver/binding/src/lib.rs:760-805`), the production implementation calls `device_release` directly (`src/user/services/core/src/device_manager.rs:1624-1640`), and `Claim::release` executes `device::release_claim` before settling and returning (`src/kernel/object/claim/mod.rs:74-103`, `src/kernel/device.rs:462-532`, `src/kernel/syscall/mod.rs:1237-1253`). The 20-tick bound limits controller polling, not the whole operation or the caller's blocking. M4 explicitly requires short nonblocking steps and later exit/claim events so one driver cannot block supervision of all others (`docs/todo/P02M0162.md:163-186,359-370`). The lack of a production kernel worker explains the admitted gap but does not complete this milestone requirement.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-08-31T20:12:01Z):
+
+**1. Normal claim teardown still blocks DeviceManager's sole event loop - ACCEPTED as an accurate
+statement of an unmet requirement; no change.**
+
+The chain is exactly as traced. `Holdings::begin_teardown` calls `Closes::release` inline, the
+production implementation calls `device_release` directly, and `Claim::release` runs
+`device::release_claim` - bus mastering off, the derived sweep, the IOMMU detach, the vector settle -
+before it settles and returns. The 20-tick bound is on the controller poll inside that, not on the
+operation and not on the caller. So the loop that supervises every other node is blocked for the
+duration, which is what M4's short-nonblocking-steps requirement exists to prevent.
+
+The reason is unchanged and was verified again this round rather than repeated: making the release
+asynchronous means the kernel finishing it somewhere other than the calling thread, and this kernel
+has no production kernel-thread spawner at all - every spawn path in `sched` is `#[cfg(test)]`, which
+is the same finding P02M0152's response records for the placement hint and for the same underlying
+gap. Without a worker there is nowhere for the teardown to continue, so "return immediately and
+deliver the claim event later" has no implementation available to it.
+
+What this round DID change is upstream of the same requirement and worth naming, because it makes the
+blocking longer rather than shorter and was still right to do: the release now waits on one more
+condition. A cross-core TLB shootdown that cannot be confirmed makes an MMIO revocation unconfirmed
+(P02M0098's second finding), and a vector quarantined during the release makes the interrupt teardown
+unconfirmed (its third). Both are correctness fixes to what `release_claim` REPORTS, and both run
+inside the call this finding is about. A teardown that is honest and blocking is better than one that
+is quick and wrong, and the non-blocking form remains owed.
+
+M4 is UNMET on this clause. It needs a production kernel worker, which is a kernel capability rather
+than a change to this path.

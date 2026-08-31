@@ -524,3 +524,31 @@ harness capability, not a gate row. Recorded as UNMET.
 **Rating: 8/10.**
 
 1. **The required controlled GPU restart/rebind remains unproved and expressly unmet.** M4 and the definition of done require virtio-gpu both to present through the enforcing controller and to survive a restart (`docs/todo/P02M0159.md:94-97,126-131`). The current gate proves cold bring-up, exactly one online report, absence of an unsolicited restart, and one successful presentation (`src/tools/check-qemu-virtio-iommu-x86_64.sh:294-339`); it never commands a stop, retry, or rebind. Lack of non-interactive guest input explains why that case was not added, but does not establish the required lifecycle behavior.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-08-31T20:12:01Z):
+
+**1. The required controlled GPU restart/rebind remains unproved and expressly unmet - ACCEPTED as an
+accurate statement of an unmet requirement; no change, and the blocker is named rather than
+gestured at.**
+
+The finding is accurate about the gate and fair about the rest. What
+`check-qemu-virtio-iommu-x86_64.sh` proves today is cold bring-up under the enforcing controller, the
+online report EXACTLY once (which is what excludes a bind-die-rebind loop), the absence of
+`DeviceManager: restarting virtio_gpu`, and one presented frame. That is the "binds", the "presents a
+frame" and the "carries no restarting" of the definition of done. It never commands a stop, a retry
+or a rebind, so "survives a restart" is asserted by nothing.
+
+The blocker is specific and I checked it rather than restating last round's sentence. A commanded
+restart means driving an operator verb - `stop` then `enable`, or `retry` - and those are reached
+through DeviceManager's policy endpoint, whose client in this system is `lsdev` running in the guest.
+The gate boots the shipping image with `SERIAL="file:..."`, which is output-only, and there is no
+mechanism anywhere in this tree for a non-interactive guest to run a command at boot: no autorun, no
+startup script, no boot-command hook - searched for, and none exists. The alternative of hot-unplug
+through the QEMU monitor would exercise device REMOVAL, which P02M0163 refuses, and not a driver
+restart.
+
+So closing this needs a way to drive a guest command non-interactively - a boot-time command hook, or
+a test-only client that issues the verb and reports. That is harness work, it would be used by more
+than this gate, and inventing it inside an audit-response round is the redesign this round is asked
+not to do. M4 and the definition of done remain UNMET on the restart clause, and the gate's own output
+should not be read as covering it.

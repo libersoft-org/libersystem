@@ -396,3 +396,17 @@ two resolution points named from the harness so the gap is reproducible, the use
 the extension of MUTATE-USE-RESTORE to a replaced-and-restored TOOL and a replaced-and-restored
 FIRMWARE IMAGE - three input classes the identity block claims, and one fixture cannot stand for all
 of them.
+
+AUDITOR'S RE-AUDIT OF PLAN M0170 (2026-08-31T19:58:23Z):
+
+Rating: 8/10
+
+1. **M8's accepted tool/firmware correction remains a check-then-use race.** It requires re-hashing a
+   resolved pathname at the moment of invocation and makes an immutable verified copy only an
+   optional stronger answer (`docs/todo/P02M0170.md:218-234`). The harness still invokes QEMU by
+   pathname after argument construction (`src/harness/qemu-run.sh:1193-1203,1251`) and passes the
+   original OVMF pathname for QEMU to open later (`:977-985,1033-1039`). Either pathname can be
+   replaced after the hash check but before `execve` or QEMU's later `open`, then restored, so the
+   dossier can identify bytes the run never used. Make execution/opening through an immutable
+   verified copy or an equivalent descriptor-bound mechanism mandatory, and place the mutation
+   fixture specifically in the post-hash/pre-use window.

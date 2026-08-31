@@ -401,3 +401,20 @@ done says the same. As the finding observes, the cross-owner fixture proves only
 M4 gains the positive one: a pipeline prepared and group-released over ONE connection passes, and a
 fixture that prepares two stages on two connections and then attempts the group release must be
 refused.
+
+AUDITOR'S RE-AUDIT OF PLAN M0169 (2026-08-31T19:58:23Z):
+
+Rating: 8/10
+
+1. **The per-transaction owner-connection correction has no connection-minting seam at its caller.**
+   M2 now requires PermissionManager to open a fresh connection and conduct the entire single-launch
+   or pipeline transaction on it (`docs/todo/P02M0169.md:93-135`). PermissionManager currently
+   receives and stores exactly one already-connected ProcessService client
+   (`src/user/services/core/src/permission_manager.rs:606-614,1541-1544,1591`). ServiceManager owns
+   the factory and calls `service_connect(process_client)` once before transferring only that
+   resulting connection (`src/user/services/core/src/service_manager/bootstrap.rs:1122-1129`);
+   `service_connect` itself needs the factory endpoint so the server registers the new peer
+   (`src/user/runtime/rt/src/lib.rs:2068-2082`). Creating a raw channel pair in PermissionManager
+   would not do that, and the current broker does not resolve ProcessService. Specify which trusted
+   component retains/exposes the factory or mints an owner-scoped transaction connection, including
+   mint failure cleanup, before relying on connection lifetime as the rollback mechanism.

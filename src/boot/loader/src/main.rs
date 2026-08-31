@@ -440,7 +440,29 @@ pub extern "efiapi" fn efi_main(image_handle: Handle, system_table: *mut SystemT
 	// A live medium's volume is a FILE on the boot filesystem, so the disk scan above never saw it.
 	// Read it here, before the report below, and let it supply the bootstrap set the same way an
 	// installed system's partition does.
-	unsafe { LIVE_VOLUME = read_boot_file(bs, root, LIVE_VOLUME_FILE) };
+	// THE SAME THREE ANSWERS AS A PACKAGE, AND FOR THE SAME REASON (corrected 2026-08-31). This read
+	// collapsed "the medium carries no live volume" into "the live volume could not be read", and the
+	// manifest coverage check lived inside the `Some` arm - so deleting or corrupting the image the
+	// signed manifest selected removed it silently and the boot went on to the next bootstrap source.
+	// See `read_verified_package`, which this now matches.
+	let volume_read = read_boot_file_reported(bs, root, LIVE_VOLUME_FILE);
+	if let MediumRead::Unreadable = volume_read {
+		panic!("loader: the boot medium's live system volume could not be READ - that is a failing medium, not a medium without one");
+	}
+	unsafe {
+		LIVE_VOLUME = match volume_read {
+			MediumRead::Bytes(bytes) => Some(bytes),
+			_ => None,
+		}
+	};
+	// AND AN ABSENT ONE IS CHECKED AGAINST THE MANIFEST BEFORE IT IS CALLED ABSENT. A signed row for
+	// `system-volume.img` is the medium saying it carries one.
+	if unsafe { LIVE_VOLUME }.is_none()
+		&& let Some(manifest) = boot_medium_manifest(bs, root)
+		&& manifest.find(bootproto::manifest::KIND_SYSTEM_VOLUME, LIVE_VOLUME_FILE.as_bytes()).is_some()
+	{
+		panic!("loader: the boot medium's SIGNED manifest names a system volume the medium does not carry - refusing to boot as though it were never there");
+	}
 	if let Some(image) = unsafe { LIVE_VOLUME } {
 		// COVERED BEFORE IT IS MOUNTED OR PUBLISHED. This image is handed to the kernel as a module
 		// and read as a filesystem here; both are decisions taken on its contents, so the medium's
@@ -613,7 +635,28 @@ fn read_pairing(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) ->
 // not in the manifest at all, stops the boot. There is no third answer: a module the kernel is about
 // to run is not something to hand over with a warning.
 pub(crate) fn read_verified_package(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>, name: &str) -> Option<&'static [u8]> {
-	let bytes = read_boot_file(bs, root, name)?;
+	// ABSENT, UNREADABLE AND "THE MANIFEST NAMED IT" ARE THREE ANSWERS, AND THIS READ GAVE ONE
+	// (corrected 2026-08-31).
+	//
+	// The payload was read through the `Option`-returning reader, which collapses "the medium does
+	// not carry this file" into "the medium could not be read" - and the caller treats `None` as the
+	// legitimate absence of an OPTIONAL artifact and boots on. `volume.pkg` is optional on all three
+	// ports and `init.pkg` is optional on two of them, so a signed payload that was DELETED, or whose
+	// sectors have gone bad, silently became "this medium does not carry one" and the boot proceeded
+	// to hand-off or to another bootstrap source. That is the terminal case M3/M4 name - a named file
+	// missing, or an I/O failure - taken as a normal one.
+	//
+	// The manifest is therefore read FIRST, and the three cases are separated against it: unreadable
+	// is terminal whatever the manifest says, a payload the manifest NAMES and the medium does not
+	// carry is terminal, and only a payload that is absent AND unnamed is the optional artifact this
+	// returns `None` for.
+	// The bytes, if the medium carries them. An ABSENT payload is still checked against the manifest
+	// below before it is called optional; an unreadable one never gets that far.
+	let payload: Option<&'static [u8]> = match read_boot_file_reported(bs, root, name) {
+		MediumRead::Bytes(bytes) => Some(bytes),
+		MediumRead::Absent => None,
+		MediumRead::Unreadable => panic!("loader: a package the boot medium should carry could not be READ - that is a failing medium, not a medium without one"),
+	};
 	let signed = match read_boot_file_reported(bs, root, "etc/boot.manifest2") {
 		MediumRead::Bytes(signed) => signed,
 		// The same profile split every other read on this medium makes: an authenticated build does
@@ -626,7 +669,9 @@ pub(crate) fn read_verified_package(bs: *mut BootServices, root: Option<*mut uef
 				"loader: THIS PACKAGE IS NOT AUTHENTICATED - the boot medium carries no signed manifest, and this build accepts it
 ",
 			);
-			return Some(bytes);
+			// Whatever the medium had, which on this profile is the whole of the check. `None` here
+			// is a medium with neither a manifest nor the payload, which is a legitimate absence.
+			return payload;
 		}
 		// AND AN UNREADABLE ONE IS NOT AN ABSENT ONE, on EITHER profile. The test-trust arm above is
 		// for a medium that carries no manifest by design; a medium that carries one and cannot be
@@ -641,6 +686,16 @@ pub(crate) fn read_verified_package(bs: *mut BootServices, root: Option<*mut uef
 	scratch.resize(bootproto::manifest::DOMAIN.len() + signed.len(), 0);
 	let Some(manifest) = trust::verify_for(signed, &trust::Expected::medium(), &mut scratch) else {
 		panic!("loader: the boot medium's signed manifest was refused - see the line above");
+	};
+	let Some(bytes) = payload else {
+		// NAMED AND NOT THERE IS NOT OPTIONAL. The manifest is the medium's statement about what it
+		// carries; a row for this artifact means the build put one here and it is gone. Returning
+		// `None` would let the boot continue down the unsigned fallback the row exists to make
+		// unnecessary, which is the substitution this whole path prevents.
+		if manifest.find(bootproto::manifest::KIND_PACKAGE, name.as_bytes()).is_some() {
+			panic!("loader: the boot medium's SIGNED manifest names a package the medium does not carry - refusing to boot as though it were never there");
+		}
+		return None;
 	};
 	if !blockio::covered_by(&manifest, bootproto::manifest::KIND_PACKAGE, name.as_bytes(), bytes) {
 		panic!("loader: a package on the boot medium is not what its SIGNED manifest records - refusing to hand it to the kernel");

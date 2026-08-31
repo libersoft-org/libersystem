@@ -162,6 +162,20 @@ impl<const N: usize> MsiRegistry<N> {
 	// claim of a device whose earlier binding stranded a vector, which is a device already paying for
 	// it once. Measured on riscv64: a test that deliberately quarantines device 12's EID made the next
 	// synthetic claim of index 12 unreleasable.
+	// HOW MANY OF `owner`'S SLOTS ARE QUARANTINED - a stranded vector, counted rather than tested.
+	//
+	// `has_unbound` answers "is a teardown still outstanding" and excludes these deliberately, for
+	// the reason above. A release needs the other question - "did THIS teardown strand one" - and a
+	// boolean cannot answer it, because a device that already had one stranded would answer yes for
+	// ever. The caller samples this before its sweep and again after, and the DIFFERENCE is what
+	// belongs to the release. See `device::release_claim`.
+	pub fn quarantined_for(&self, owner: u32) -> usize {
+		if owner == u32::MAX {
+			return 0;
+		}
+		(0..N).filter(|&slot| self.used[slot].load(Ordering::Acquire) && self.quarantined[slot].load(Ordering::Acquire) && self.owner[slot].load(Ordering::Acquire) == owner).count()
+	}
+
 	pub fn has_unbound(&self, owner: u32) -> bool {
 		if owner == u32::MAX {
 			return false;

@@ -1413,6 +1413,22 @@ struct Node {
 	// The registry candidates left to try, most specific first, and which one is being tried.
 	candidates: Vec<&'static Entry>,
 	candidate: usize,
+	// WHICH CANDIDATE THE LIVE BINDING IS ACTUALLY RUNNING - latched when the bind commits, cleared
+	// when it ends (added 2026-08-31).
+	//
+	// `candidate` is a CURSOR: where the next bind starts. It was also being read as "which driver
+	// this node is running", and those are the same value only until an operator moves the cursor.
+	// `select` moves it deliberately - that is the whole verb - and its own comment promised it
+	// "touches neither the record nor the live driver", which three readers made untrue: the served
+	// binding record's `artifact`, the dependency rules `settle_dependencies` applies, and the
+	// `provides` declaration a late `OFFER` from the RUNNING driver is published against. So
+	// selecting a future driver renamed the running one, applied the wrong driver's `requires` to it
+	// - which can STOP a driver whose own requirements are met - and published its providers against
+	// a declaration it never made.
+	//
+	// Two facts, so two fields. Nothing reads this when there is no binding; `entry()` is where the
+	// choice between them is made once.
+	running: Option<usize>,
 	// THE OPERATOR'S CHOICE, IF THERE IS ONE - an index into `candidates`.
 	//
 	// The cursor above is where the next bind STARTS; this is where it starts BY PREFERENCE. They are
@@ -1532,7 +1548,7 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None, incident_stored: false, teardown: None, disabled_by_policy: false }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, running: None, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None, incident_stored: false, teardown: None, disabled_by_policy: false }
 	}
 
 	// Queue one event for this node.
@@ -1559,10 +1575,20 @@ impl Node {
 	// failure an operator is trying to diagnose, and on a node where registry entries had matched and
 	// been attempted. The last candidate is the one the failure is about.
 	fn driver_name(&self) -> &'static [u8] {
-		match self.candidates.get(self.candidate).or_else(|| self.candidates.last()) {
+		match self.entry().or_else(|| self.candidates.last().copied()) {
 			Some(entry) => entry.name,
 			None => b"",
 		}
+	}
+
+	// THE REGISTRY ENTRY THIS NODE IS DESCRIBED BY RIGHT NOW - the one it is RUNNING if it is running
+	// anything, and otherwise the one the cursor is on.
+	//
+	// One place makes this choice, because the three readers that need it were each making it
+	// differently by reading the cursor directly, and a cursor an operator can move is not a
+	// description of a live driver. See `Node::running`.
+	fn entry(&self) -> Option<&'static Entry> {
+		self.candidates.get(self.running.unwrap_or(self.candidate)).copied()
 	}
 
 	// Whether this node still has work in flight - a driver that has been sent `BIND` and has not
@@ -1779,7 +1805,10 @@ unsafe fn mint_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize
 		// number the entry declares. A driver whose entry says it serves one consumer and is asked
 		// for two by the boot itself is a manifest that is wrong about the driver, and finding that
 		// out here is the point of declaring it.
-		let admits = node.candidates.get(node.candidate).and_then(|entry| entry.provides.iter().find(|&&(declared, _, _)| declared == kind)).map_or(1, |&(_, _, consumers)| consumers);
+		// FROM THE ENTRY THE PUBLISHER IS RUNNING, not the cursor - see `Node::entry`. A provider
+		// belongs to a live binding, so its declared consumer bound is that driver's declaration and
+		// not whichever candidate an operator has since selected for the next bind.
+		let admits = node.entry().and_then(|entry| entry.provides.iter().find(|&&(declared, _, _)| declared == kind)).map_or(1, |&(_, _, consumers)| consumers);
 		if taken >= admits {
 			print(b"DeviceManager: a provider was asked for one more connection than its driver declares it admits; refused\n");
 			return 0;
@@ -2101,11 +2130,24 @@ impl Catalogue {
 				print(b"DeviceManager: the withdrawal buffer is smaller than the catalogue, which cannot happen - nothing was withdrawn\n");
 				return 0;
 			};
+			// AND THE TWO SIDE EFFECTS ARE COUNTED AGAINST WHAT WAS EMPTIED (added 2026-08-31).
+			//
+			// The selection and the transfer are the library's and have their own test; the `close`
+			// and the `announce` are here, where no host test can reach them - so a loop that stopped
+			// visiting a provider would leave a subscriber holding metadata for a publication that no
+			// longer exists, which is the stale-provider state the withdrawal exists to prevent, and
+			// nothing would have said so. The count the library returns is what this can be checked
+			// against, and checking it costs one comparison on a per-binding path.
+			let mut announced: usize = 0;
 			for provider in taken.iter().flatten() {
 				if provider.handle != 0 {
 					close(provider.handle);
 				}
 				self.announce(provider, false);
+				announced += 1;
+			}
+			if announced != gone {
+				print(b"DeviceManager: a withdrawal emptied more slots than it announced; a subscriber is now holding a provider that is gone\n");
 			}
 			gone
 		}
@@ -3086,6 +3128,10 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// IN FLIGHT. The transaction's holdings become the node's binding, which is what the
 		// central wait watches and what a rollback gives back.
 		node.binding = Some(Binding { domain: txn.held.domain, process: txn.held.process, channel: txn.held.channel, claim: txn.held.claim, key: txn.key });
+		// AND WHICH CANDIDATE IS RUNNING IT. Latched with the binding, from the cursor as it stands
+		// now, so a later `select` cannot change the answer for a driver already started. See
+		// `Node::running`.
+		node.running = Some(node.candidate);
 		txn.commit();
 		true
 	}
@@ -3135,8 +3181,13 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// announcing itself must announce nothing, and wrong afterwards, where there is no
 				// handshake left to be half way through.
 				BindingEvent::Offered { .. } => {
-					if node.record.state == BindingState::Online {
-						let entry = node.candidates[node.candidate];
+					// AGAINST THE DECLARATION THE RUNNING DRIVER ACTUALLY MADE - see `Node::entry`.
+					// This read the cursor, so a late offer from a live driver was published against
+					// whichever entry an operator had since selected: the wrong `provides` set, and
+					// the wrong consumer bound for a kind the running driver never declared.
+					if node.record.state == BindingState::Online
+						&& let Some(entry) = node.entry()
+					{
 						catalogue.publish_all(node.id, entry, &mut node.offers);
 					}
 					continue;
@@ -3219,7 +3270,10 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// bring-up succeeded, and what follows is a different incident.
 					node.attempt = 0;
 					node.incident = Incident::open();
-					let entry = node.candidates[node.candidate];
+					// The entry this binding is RUNNING - see `Node::entry`. Latched at the bind
+					// commit, so a `select` between the commit and this `READY` cannot publish the
+					// live driver's providers against another candidate's declaration.
+					let Some(entry) = node.entry() else { continue };
 					catalogue.publish_all(node.id, entry, &mut node.offers);
 					// SUPERVISION STARTS WHERE THE DRIVER SAYS IT IS UP, not at the bind: before
 					// `READY` the bind budget is what bounds it, and two deadlines over one
@@ -3311,6 +3365,9 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			// TAKEN out of the node first, so an interrupted rollback cannot be re-entered against
 			// handles it has already given back.
 			let Some(binding) = node.binding.take() else { return Step::Done };
+			// The binding is over, so there is no running candidate any more and the cursor is the
+			// only answer again. See `Node::running`.
+			node.running = None;
 			let mut txn = binding.into_attempt();
 			// A PLANNED STOP IS NEVER RETRIED, whatever the cause reads as: the whole point of
 			// asking a driver to stop is that it stays stopped.
@@ -3472,7 +3529,10 @@ unsafe fn settle_dependencies(nodes: &mut [Node], catalogue: &Catalogue) -> usiz
 	unsafe {
 		let mut moved: usize = 0;
 		for node in nodes.iter_mut() {
-			let Some(entry) = node.candidates.get(node.candidate).copied() else { continue };
+			// THE ENTRY THE NODE IS ACTUALLY DESCRIBED BY, not the cursor - see `Node::entry`. Read
+			// from the cursor, an operator selecting a future driver applied THAT driver's
+			// `requires` to the running one, which stops a binding whose own requirements are met.
+			let Some(entry) = node.entry() else { continue };
 			if entry.requires.is_empty() {
 				continue;
 			}
@@ -3654,7 +3714,22 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				// starts a candidate for a node it finds in `Backoff`, which is where a retry with a
 				// budget belongs; from there the ordinary machinery runs exactly one attempt, because
 				// the incident is fresh and `Retry` does not reset the automatic budget.
-				node.attempt = node.attempt.saturating_sub(1);
+				// EXACTLY ONE, COUNTED FROM THE BOUND RATHER THAN FROM WHATEVER THE COUNTER HOLDS
+				// (corrected 2026-08-31).
+				//
+				// `attempt.saturating_sub(1)` assumed the counter was at the bound, and on the case
+				// this verb exists for it is at ZERO: `Step::NextCandidate` resets `attempt` to 0
+				// every time it advances the cursor, including the advance PAST the final candidate
+				// that records exhaustion. So a retry after exhaustion subtracted one from zero,
+				// saturated at zero, and handed the node the whole automatic budget again - three
+				// further attempts where the operator asked for one, and the comment two lines up
+				// promising it "does not reset the automatic budget" was describing the opposite of
+				// what happened.
+				//
+				// Set rather than decremented: `may_try_again` allows another attempt while
+				// `attempt + 1 < MAX_AUTOMATIC_ATTEMPTS`, so leaving exactly one means starting from
+				// one below the bound whatever the counter happened to be.
+				node.attempt = MAX_AUTOMATIC_ATTEMPTS.saturating_sub(1);
 				node.incident = Incident::open();
 				// AND THE CURSOR IS REWOUND WHEN THERE IS NOTHING LEFT TO TRY, which is the case this
 				// granted zero attempts in.
@@ -3735,7 +3810,9 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 			// which is the difference between a consumer that knows and one that waits for ever.
 			let (token, admits) = {
 				let held = self.catalogue.entries[slot].as_ref().expect("the slot was just found");
-				let admits = self.nodes.iter().find(|node| node.id.same_function(held.id.binding) && node.id.generation == held.id.binding.generation).and_then(|node| node.candidates.get(node.candidate)).and_then(|entry| entry.provides.iter().find(|&&(kind, _, _)| kind == held.kind)).map_or(1, |&(_, _, consumers)| consumers);
+				// The publisher's own declaration, from the entry it is RUNNING - see `Node::entry`
+				// and the same read in `mint_connection`.
+				let admits = self.nodes.iter().find(|node| node.id.same_function(held.id.binding) && node.id.generation == held.id.binding.generation).and_then(|node| node.entry()).and_then(|entry| entry.provides.iter().find(|&&(kind, _, _)| kind == held.kind)).map_or(1, |&(_, _, consumers)| consumers);
 				(held.token, admits)
 			};
 			// EXISTING PLUS PROMISED, not just handed out - see `outstanding`. The branch below hands
@@ -3838,6 +3915,23 @@ fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -
 			// operator saying so does not make it so.
 			if node.record.state == BindingState::Quarantined {
 				return none(PolicyOutcome::Quarantined);
+			}
+			// AND THERE HAS TO BE SOMETHING TO RETRY (added 2026-08-31).
+			//
+			// Quarantine was the only state this refused, so `retry` was accepted on a node that is
+			// ONLINE, still BINDING, in the middle of a teardown, waiting on a dependency or
+			// operator-disabled - none of which is a binding that failed. On an online node it opened
+			// a fresh incident, rewound the cursor and asked the loop to start a candidate for a
+			// device that already has a driver running; on a disabled one it argued with the verb
+			// that actually applies, which is `enable`.
+			//
+			// The three states where a retry means something are the ones where an attempt has ENDED
+			// without a binding: `Failed`, `Backoff`, and `Unbound` with the candidates exhausted.
+			// `busy` is the answer for the rest - the same "not now, and here is why" the enable path
+			// gives - because the operator's next move is to look at the state rather than to try a
+			// different verb.
+			if !matches!(node.record.state, BindingState::Failed | BindingState::Backoff | BindingState::Unbound) {
+				return none(PolicyOutcome::Busy);
 			}
 			// AN ACTION, NOT A STORED PREFERENCE. Nothing is written.
 			none(PolicyOutcome::Accepted)
@@ -4019,26 +4113,19 @@ fn persist_incidents(nodes: &mut [Node], config: u64) {
 			if client.set(&proto::system::ConfigEntry { key, value }).is_none() {
 				continue;
 			}
-			// AND THE ROW NUMBER IS RESOLVABLE AGAIN - through a SEPARATE record, checked against the
-			// hardware rather than believed.
+			// AND NOTHING WRITES A ROW MAP ANY MORE (removed 2026-08-31).
 			//
-			// `lsdev --incident N` asks by row, and the record is keyed by address because that is
-			// what identifies a device across boots; putting the row INSIDE the record made it wrong
-			// the moment the inventory changed, which is why it was taken out. What is written here
-			// is the other direction, on its own key, carrying the one fact a reader can CHECK: the
-			// length of the device's MMIO window, which `DeviceService` answers for that row out of
-			// the kernel's live table - and the kernel is there whether this program is or not. A
-			// row whose stored length does not match what the machine reports for it now is a map
-			// from another inventory, and the reader says so instead of resolving it.
-			let mut at = alloc::string::String::new();
-			push_number(&mut at, node.info.bar_len);
-			at.push('.');
-			push_number(&mut at, node.id.bus as u64);
-			at.push('.');
-			push_number(&mut at, node.id.dev as u64);
-			at.push('.');
-			push_number(&mut at, node.id.func as u64);
-			let _ = client.set(&proto::system::ConfigEntry { key: incident_index_key(node.index), value: at });
+			// A second record used to be written here, mapping row number to
+			// `<mmio-len>.<bus>.<dev>.<func>`, so `lsdev --incident N` could turn a row into an
+			// address with this program gone. It was validated by comparing the stored MMIO length
+			// against what the kernel reports for that row - and a window length is not an identity:
+			// two devices of one model share it, so equal-sized devices reordering between
+			// inventories resolved a row to another device's incident while passing the check.
+			//
+			// `device-entry` now carries the address from the kernel's own table, so the reader asks
+			// the machine instead. This record's only purpose was to answer a question the kernel can
+			// answer, and a persisted copy of a fact the authority still holds is one more thing that
+			// can be wrong.
 			node.incident_stored = true;
 		}
 	}
@@ -4065,13 +4152,13 @@ unsafe fn forget_absent_incidents(nodes: &[Node], config: u64) {
 		let Some(Ok(entries)) = client.list() else { return };
 		let mut stale: Vec<alloc::string::String> = Vec::new();
 		for entry in entries.iter() {
-			if let Some(rest) = entry.key.strip_prefix("device.policy.incident-at.") {
-				// Keyed by this boot's row number, and rewritten by `persist_incidents` - so what is
-				// stale here is a row the current inventory does not have at all.
-				let known = rest.parse::<u64>().is_ok_and(|index| nodes.iter().any(|node| node.index == index));
-				if !known {
-					stale.push(entry.key.clone());
-				}
+			// A ROW MAP FROM A BOOT THAT STILL WROTE THEM. Nothing writes these any longer - the
+			// address comes from the kernel's device table now, see `persist_incidents` - so every
+			// one of them is a leftover and all of them go, rather than the ones whose row number
+			// happens not to exist. Keeping a row map alive because its NUMBER still exists is what
+			// let a stale one outlive the device it described.
+			if entry.key.starts_with("device.policy.incident-at.") {
+				stale.push(entry.key.clone());
 				continue;
 			}
 			let Some(rest) = entry.key.strip_prefix("device.policy.incident.") else { continue };
@@ -4084,17 +4171,6 @@ unsafe fn forget_absent_incidents(nodes: &[Node], config: u64) {
 			let _ = client.remove(&key);
 		}
 	}
-}
-
-// Where the ROW NUMBER of a device that has an incident is mapped to its address, under the same
-// reserved prefix. Separate from the record itself because it is the half that expires: the address
-// identifies a device across boots and the row does not. See `persist_incidents`.
-fn incident_index_key(index: u64) -> alloc::string::String {
-	let mut key = alloc::string::String::from("device.policy.incident-at.");
-	let mut number = [0u8; 20];
-	let n = decimal(index, &mut number);
-	key.push_str(core::str::from_utf8(&number[..n]).unwrap_or("0"));
-	key
 }
 
 // Where one device's last incident is kept, under the same reserved prefix as its policy so both are
@@ -4525,6 +4601,25 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 			// during the drain. A driver asked to finish while work keeps being handed to it is a
 			// driver that cannot finish.
 			catalogue.withdraw_binding(nodes[at].id);
+			// AND THE NODE ENTERS `Stopping`, WHICH IS WHAT MAKES THE ANSWER ADMISSIBLE (corrected
+			// 2026-08-31).
+			//
+			// This recorded the intent, withdrew the provider and sent `STOP` - and left the record
+			// `Online`. `drain_channel` admits a `STOPPED` frame only from a node that is already
+			// `Stopping`, deliberately: a planned stop is a state the manager put the node INTO, and
+			// a driver announcing one nobody asked for is describing a conversation that did not
+			// happen. So every driver that answered this shutdown correctly had its answer REFUSED
+			// as unsolicited, the node stayed `Online` for the whole slice, and the loop below then
+			// injected `Wedged` and reported a FORCED teardown. The clean path could not be taken by
+			// any driver, however well behaved - the one outcome M3 exists to produce was
+			// unreachable, and the milestone's own "never claims the work was flushed" line was being
+			// printed on every shutdown.
+			//
+			// `begin_operator_stop` had this right and this did not; the shape is now the same in
+			// both, and `Online -> Stopping` is a legal edge of the record's own table.
+			if !nodes[at].record.move_to(BindingState::Stopping, None) {
+				print(b"DeviceManager: a node could not enter the teardown for a planned stop; its exit is what will end the binding\n");
+			}
 			let name: &[u8] = nodes[at].driver_name();
 			if !send_frame(channel, driver_protocol::Opcode::Stop, generation, &[], 0, 0) {
 				// The channel is already gone: there is nothing to ask and nothing to wait for.
@@ -4535,6 +4630,23 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 			// clean flush happened. The slice is the teardown reserve this node's incident already
 			// carries, so a stop is bounded by the same budget everything else on this node is.
 			let deadline: u64 = clock().saturating_add(nodes[at].incident.teardown_reserve.max(driver_protocol::MAX_HEARTBEAT_DEADLINE as u64));
+			// WHAT THE WAIT IS FOR IS "THE DRIVER REACTED", AND THAT IS NOT THE SAME AS "THE
+			// TEARDOWN FINISHED" (2026-08-31, and this half was got wrong first).
+			//
+			// The original condition was `state != Online`, which worked because the node was left
+			// `Online`: any reaction moved it out and ended the wait. Putting the node into
+			// `Stopping` above breaks that reading, and the obvious replacement - wait while it is
+			// `Stopping` - is a DIFFERENT wait: a node stays `Stopping` while its teardown runs, so
+			// that version waited for the teardown to complete and reported a FORCED stop against
+			// every driver whose teardown outlived the slice. Measured: it turned an ordinary
+			// shutdown into `did not answer the stop inside its slice` for a driver that had
+			// answered.
+			//
+			// The reaction is the binding ENDING. A driver that answers `STOPPED` and one that exits
+			// both give their binding up, and `advance` takes it in both cases; a driver that is
+			// still there and silent keeps it. So the wait ends when the node leaves `Stopping` OR
+			// when its binding is gone, and the forced branch below fires only for the one case that
+			// is actually a failure to answer - still `Stopping`, still holding its binding.
 			while clock() < deadline {
 				drain_channel(&mut nodes[at], buf);
 				if nodes[at].queue.is_empty() {
@@ -4542,11 +4654,11 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 					continue;
 				}
 				let _ = advance(&mut nodes[at], name, catalogue);
-				if nodes[at].record.state != BindingState::Online {
+				if nodes[at].record.state != BindingState::Stopping || nodes[at].binding.is_none() {
 					break;
 				}
 			}
-			if nodes[at].record.state == BindingState::Online {
+			if nodes[at].record.state == BindingState::Stopping && nodes[at].binding.is_some() {
 				print(b"DeviceManager: ");
 				print(name);
 				print(b" did not answer the stop inside its slice; the teardown is FORCED and nothing here says its work was flushed\n");

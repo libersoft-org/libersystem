@@ -150,28 +150,36 @@ fn outcome_text(outcome: PolicyOutcome) -> &'static [u8] {
 	}
 }
 
-// THE ADDRESS OF THE DEVICE AT ROW `index`, if the stored map can be CHECKED against this machine.
+// THE ADDRESS OF THE DEVICE AT ROW `index`, ASKED OF THE KERNEL.
 //
-// `None` means the question cannot be answered by row here: no map, no device at that row, or a map
-// whose recorded MMIO length disagrees with what the kernel reports for that row now - which is a map
-// written by a boot with a different inventory. See `stored_incident`.
-fn resolved_address(client: &mut ConfigClient, devsvc: u64, index: u32) -> Option<String> {
+// ONE SOURCE, AND IT IS THE ONE THAT CANNOT BE STALE (rewritten 2026-08-31). This used to read a
+// side-record DeviceManager persisted - row number to `<mmio-len>.<bus>.<dev>.<func>` - and validate
+// it by comparing the recorded MMIO length against what the kernel reports for that row now. That
+// check cannot do what it was asked to: an MMIO window length is not an identity, two devices of one
+// model have the same one, and equal-sized devices reordering between inventories therefore resolved
+// a row to ANOTHER device's incident while passing the check. The sweep made it worse rather than
+// safer - it kept every row map whose numeric row still existed, so a stale map outlived the device
+// it described and then reported no incident at all once that device's own record was swept.
+//
+// `device-entry` now carries the address, out of the kernel's device table. The kernel is there
+// whether DeviceManager is or not, which is the whole requirement, and a row number resolved from it
+// is the device at that row by construction rather than by comparison. `None` means only that the
+// service could not be asked or the row does not exist.
+fn resolved_address(devsvc: u64, index: u32) -> Option<String> {
 	if devsvc == 0 {
 		return None;
 	}
-	let mut key = String::from("device.policy.incident-at.");
-	let mut digits = [0u8; 20];
-	let written = decimal(index as u64, &mut digits);
-	key.push_str(core::str::from_utf8(&digits[..written]).ok()?);
-	let Some(Ok(stored)) = client.get(&key) else { return None };
-	// `<mmio-len>.<bus>.<dev>.<func>` - the length first because it is the part that is checked.
-	let (len, address) = stored.split_once('.')?;
-	let recorded: u64 = len.parse().ok()?;
 	let entry = DeviceClient::new(devsvc).get(&index)?.ok()?;
-	if entry.mmio_len != recorded {
-		return None;
+	let mut address = String::new();
+	for (at, part) in [entry.bus, entry.dev, entry.func].iter().enumerate() {
+		if at != 0 {
+			address.push('.');
+		}
+		let mut digits = [0u8; 20];
+		let written = decimal(*part as u64, &mut digits);
+		address.push_str(core::str::from_utf8(&digits[..written]).ok()?);
 	}
-	Some(String::from(address))
+	Some(address)
 }
 
 // One decimal number into `out`, answering how many bytes it wrote. This program has no formatter.
@@ -273,17 +281,16 @@ unsafe fn stored_incident(config: u64, devsvc: u64, index: u32) {
 			return;
 		}
 		let mut client = ConfigClient::new(config);
-		// THE ROW NUMBER IS RESOLVED AGAINST THE HARDWARE, NOT AGAINST A REMEMBERED LIST.
+		// THE ROW NUMBER IS RESOLVED AGAINST THE KERNEL, NOT AGAINST A REMEMBERED LIST.
 		//
-		// DeviceManager writes a separate `incident-at.<row>` record carrying the length of that
-		// device's MMIO window beside its address. `DeviceService` answers that length for the same
-		// row out of the KERNEL's device table, which is there whether DeviceManager is or not - so
-		// the map is checked rather than believed, and a row whose stored length does not match what
-		// the machine reports for it now is a map from another inventory and is refused.
+		// `DeviceService` answers the address for that row out of the KERNEL's device table, which is
+		// there whether DeviceManager is or not - so a row number is turned into a device identity by
+		// reading the machine rather than by trusting and re-checking something a dead service wrote.
+		// See `resolved_address`.
 		//
 		// This is what makes `--incident N` answerable on the path where the manager is gone. Listing
-		// everything by address, below, is the fallback for when the check cannot be made or fails.
-		if let Some(at) = resolved_address(&mut client, devsvc, index) {
+		// everything by address, below, is the fallback for when the service cannot be asked.
+		if let Some(at) = resolved_address(devsvc, index) {
 			let mut key = String::from("device.policy.incident.");
 			key.push_str(&at);
 			match client.get(&key) {

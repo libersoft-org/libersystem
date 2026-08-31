@@ -649,3 +649,52 @@ cause written where the next reader will look.
 2. **Locking the loader compile does not make the loader a run-private immutable medium input.** `qemu-run.sh` builds it under `kernel-test-build.lock` but leaves the result at the one shared `LOADER_EFI` path, which `mkimage.sh` later hashes and copies after the lock has been released (`src/harness/qemu-run.sh:949-966`, `src/harness/mkimage.sh:399-408,639,653`). Other loader producers do not take that lock and deliberately cycle trust profiles through the same output (`build.sh:115-125`, `src/tools/check-signed-boot.sh:554-592`, `src/tools/check-trust-profile.sh:33-42`). A concurrent producer can therefore make image assembly refuse at the before/after check (`src/harness/mkimage.sh:722-726`); an A-to-B-to-A profile cycle can also restore the original hash while the copy consumed B. This remains contrary to M3's requirement that the selection-specific kernel and medium inputs be staged as immutable prerequisites through execution (`docs/todo/P02M0167.md:290-313,658-659`).
 
 3. **A failed per-run USB copy falls back to attaching the shared template writable.** `qemu_run_disk` correctly returns failure when its copy cannot be made (`src/harness/qemu-run.sh:187-193`), but all three architecture paths replace that failure with `usb_run_disk="$USB_DISK"` and attach the result writable (`src/harness/qemu-run.sh:1125-1136,1312-1320,1525-1533`). Resource, permission, or copy failure therefore turns isolation off and lets concurrent guests collide on or contaminate the shared fixture. This directly violates the no-shared-writable-file and immutable-template definition of done (`docs/todo/P02M0167.md:640-642`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-08-31T20:12:01Z):
+
+**1. The required live same-architecture concurrency proof still does not exist - ACCEPTED, and it
+exists now.**
+
+The finding is right and the criticism behind it is the useful part: the staging machinery is all
+there and every piece of it was argued for in a comment, the failure was reproduced once by hand, and
+nothing standing proved the property. A property with no gate is a property that regresses quietly.
+
+New gate `concurrent-selection` (`src/tools/check-concurrent-selection.sh`, registered in
+`check.sh`). It launches two x86_64 suites at once with different `--tags`, waits for BOTH before
+judging either, and requires both to succeed - which is the assertion that distinguishes a stable
+boundary from a collision the builder merely detects, since a collision in this tree makes
+`mkimage.sh` recompute its key and DIE rather than produce a wrong medium.
+
+The identity assertion is the part worth explaining. Two runs that both pass prove nothing about
+isolation - they would both pass if one had booted the other's kernel. `TEST_TAGS` is a COMPILE-TIME
+filter, baked into the binary by `option_env!`, so the tags a guest ANNOUNCES are a property of the
+executable that booted rather than of the command line that asked for it. The gate reads each run's
+own logs through `result_logs` (never the newest on disk - that read is the thing this is about),
+checks the two runs wrote different files, and requires each guest's `test tags: requested=` line to
+name its OWN selection and the two to differ. A run that booted the other's staged kernel says so.
+
+**2. Locking the loader compile does not make the loader a run-private immutable medium input -
+ACCEPTED.**
+
+Correct, and the A-to-B-to-A observation is the sharp one: the before/after key check cannot detect a
+profile cycle that restores the original hash while the copy consumed the middle state. Locking the
+compile left the result at the one shared `LOADER_EFI` path, `mkimage.sh` hashes and copies it after
+the lock is released, and `build.sh`, `check-signed-boot.sh` and `check-trust-profile.sh` all write
+that path without taking the lock - the last of them deliberately cycling trust profiles through it.
+
+Fixed the same way the kernel already was, which is the point: the loader is now COPIED to
+`.build/state/loader-<arch>.<pid>.efi` inside the locked block, `scratch_sweep` cleans it up the way it
+does every other per-run file, and `mkimage.sh` is invoked with `LOADER_EFI` pointing at the staged
+copy. Nothing that happens to the shared path between the lock and the copy can reach the medium. A
+failed build or a failed stage now fails the run instead of falling through to whatever is at the
+shared path.
+
+**3. A failed per-run USB copy falls back to attaching the shared template writable - ACCEPTED.**
+
+Correct, in all three architecture paths, and it is the plainest defect in this round: the three-line
+comment directly above each one explains why the fixture must not be shared, and the `||` on the same
+line reinstated exactly that. A full disk, a permission problem or any other copy failure silently
+turned isolation off and let two guests of one architecture write into one file.
+
+There is no degraded form of "this run has its own copy": either it does, or the run is not the thing
+that was asked for. All three sites now print why and exit 1.

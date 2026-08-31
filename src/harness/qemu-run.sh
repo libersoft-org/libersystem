@@ -956,14 +956,35 @@ qemu_run_x86_64() {
 		#
 		# The LOCK ONLY, not the medium: `mkimage.sh` is content-addressed and takes its own assembly
 		# lock, so what this has to serialise is the compile.
+		#
+		# AND IT IS STAGED UNDER THAT LOCK, NOT MERELY COMPILED UNDER IT (2026-08-31). Locking the
+		# compile left the result at the ONE shared output path, which `mkimage.sh` then hashes and
+		# copies after the lock has been released - and other producers write that same path without
+		# taking this lock at all: `build.sh` builds it, and the signed-boot and trust-profile gates
+		# deliberately CYCLE trust profiles through it. So a concurrent producer could make image
+		# assembly abort at its before/after check, and an A-to-B-to-A profile cycle could restore the
+		# original hash while the copy had consumed B - a medium whose recorded identity names bytes
+		# it was not built from, which the content key cannot detect because it agrees.
+		#
+		# A per-run copy made under the lock is immutable for this run by construction, which is
+		# exactly what `test-kernel.sh` does for the kernel and for the same reason. It costs one copy
+		# of a binary already on this disk.
 		mkdir -p "$REPO_ROOT/.build/state"
+		local staged_loader="$REPO_ROOT/.build/state/loader-$TARGET_ARCH.$$.efi"
+		scratch_sweep "$REPO_ROOT/.build/state/loader-$TARGET_ARCH" .efi
 		(
 			flock 7
-			cd "$HERE/../boot/loader" && cargo build
-		) 7>"$REPO_ROOT/.build/state/kernel-test-build.lock" >&2
+			cd "$HERE/../boot/loader" && cargo build || exit 1
+			cp "$REPO_ROOT/.build/cargo/loader/x86_64-unknown-uefi/debug/libersystem-loader.efi" "$staged_loader"
+		) 7>"$REPO_ROOT/.build/state/kernel-test-build.lock" >&2 || {
+			echo "qemu-run: the loader did not build, or its run-private copy could not be staged" >&2
+			exit 1
+		}
 		local iso_mode="iso"
 		[[ "${TEST:-0}" == "1" ]] && iso_mode="testiso"
-		iso="$("$HERE/mkimage.sh" "$iso_mode" "$kernel")"
+		# The medium is assembled from the STAGED loader, so nothing that happens to the shared path
+		# between here and the copy can reach it.
+		iso="$(LOADER_EFI="$staged_loader" "$HERE/mkimage.sh" "$iso_mode" "$kernel")"
 	fi
 
 	# UEFI firmware (OVMF): the platform boots through UEFI, not SeaBIOS - the ISO is
@@ -1132,7 +1153,17 @@ qemu_run_x86_64() {
 		# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
 		# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
 		# system disk already takes, and `scratch_sweep` inside it is the cleanup.
-		usb_run_disk="$(qemu_run_disk "$USB_DISK")" || usb_run_disk="$USB_DISK"
+		usb_run_disk="$(qemu_run_disk "$USB_DISK")" || {
+			# A COPY THAT FAILED IS A RUN THAT CANNOT BE ISOLATED, AND IT FAILS (2026-08-31).
+			#
+			# This fell back to attaching the shared template WRITABLE - the exact arrangement the three
+			# lines above exist to remove, reinstated by a defensive `||` on the one path where it matters.
+			# So a full disk, a permission problem or any other copy failure silently turned isolation off,
+			# and two guests of one architecture wrote into one fixture again. There is no degraded form of
+			# "this run has its own copy": either it does or the run is not the thing that was asked for.
+			echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
+			exit 1
+		}
 		qemu_args+=(-drive "file=$usb_run_disk,if=none,id=vusb,format=raw")
 	fi
 	qemu_attach_xhci qemu_args "$usb_storage_id"
@@ -1316,7 +1347,17 @@ qemu_run_aarch64() {
 	# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
 	# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
 	# system disk already takes, and `scratch_sweep` inside it is the cleanup.
-	usb_run_disk="$(qemu_run_disk "$USB_DISK")" || usb_run_disk="$USB_DISK"
+	usb_run_disk="$(qemu_run_disk "$USB_DISK")" || {
+		# A COPY THAT FAILED IS A RUN THAT CANNOT BE ISOLATED, AND IT FAILS (2026-08-31).
+		#
+		# This fell back to attaching the shared template WRITABLE - the exact arrangement the three
+		# lines above exist to remove, reinstated by a defensive `||` on the one path where it matters.
+		# So a full disk, a permission problem or any other copy failure silently turned isolation off,
+		# and two guests of one architecture wrote into one fixture again. There is no degraded form of
+		# "this run has its own copy": either it does or the run is not the thing that was asked for.
+		echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
+		exit 1
+	}
 	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
 	qemu_attach_xhci qemu_args vusb
 
@@ -1529,7 +1570,17 @@ qemu_run_riscv64() {
 	# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
 	# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
 	# system disk already takes, and `scratch_sweep` inside it is the cleanup.
-	usb_run_disk="$(qemu_run_disk "$USB_DISK")" || usb_run_disk="$USB_DISK"
+	usb_run_disk="$(qemu_run_disk "$USB_DISK")" || {
+		# A COPY THAT FAILED IS A RUN THAT CANNOT BE ISOLATED, AND IT FAILS (2026-08-31).
+		#
+		# This fell back to attaching the shared template WRITABLE - the exact arrangement the three
+		# lines above exist to remove, reinstated by a defensive `||` on the one path where it matters.
+		# So a full disk, a permission problem or any other copy failure silently turned isolation off,
+		# and two guests of one architecture wrote into one fixture again. There is no degraded form of
+		# "this run has its own copy": either it does or the run is not the thing that was asked for.
+		echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
+		exit 1
+	}
 	qemu_args+=(-drive "if=none,id=vusb,format=raw,file=$usb_run_disk")
 	qemu_attach_xhci qemu_args vusb
 
