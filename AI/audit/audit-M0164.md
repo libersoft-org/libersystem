@@ -603,3 +603,94 @@ reported in the closing note appended to every file in this round.
 2. **The public factory cannot deliver the first connection for the default single-consumer provider.** Publication records `consumers = 1` while retaining the original driver handle privately (`src/user/services/core/src/device_manager.rs:1723-1733,1930-1941`). `open` refuses once the recorded count reaches that declared limit and has no path to hand out the retained handle (`src/user/services/core/src/device_manager.rs:3630-3677`); that original remains accessible only through the private `Catalogue::take` path the migration was meant to replace (`src/user/services/core/src/device_manager.rs:1949-1993`). Drivers without a custom connection factory reject `CONNECT` (`src/user/drivers/core/src/common.rs:502-518`). The default public provider is therefore unusable by its intended first subscriber.
 
 3. **Connection accounting neither includes boot-time mints nor releases capacity.** The boot `mint_connection` path does not check or increment the provider's open count (`src/user/services/core/src/device_manager.rs:1743-1759`) even when used for the block probe (`src/user/services/core/src/device_manager.rs:822-841`), so a declared bound can already be undercounted before public opens begin. Conversely, `open` only increments and driver endpoint close does not decrement (`src/user/drivers/core/src/common.rs:605-620`), so ordinary churn permanently exhausts capacity. The manifest accepts counts beyond the driver's hard maximum of eight as well (`src/tools/system-manifest/src/lib.rs:877-882,1471-1475`, `src/user/drivers/core/src/common.rs:582-620`). These are material contradictions in M1's declaration-bound connection contract.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-08-31T06:05:00Z):
+
+**1. The required production migration to catalogue discovery remains unfinished. ACCEPTED, AND
+DONE - for the smallest complete instance, which is the one this file already named.**
+
+AudioService no longer receives its device. It holds a `provider-catalogue` connection, subscribes to
+the audio kind, and opens a connection to a provider that arrives - which is also the late-publication
+case, since a subscription answers with what is published now and continues as the stream.
+
+End to end, and every step is in the tree rather than in a plan:
+
+- DeviceManager's `route_offers` no longer takes the audio provider into a slot. The publication stays
+  in the catalogue with its offered channel intact.
+- The `SND` tag stays in the boot hand-off and carries no channel. It is read POSITIONALLY at every
+  hop, so dropping the message would shift every read after it - and what travels behind the tag now
+  is the one thing the supervisor ever did with that handle: a byte saying whether this machine has a
+  sound driver bound, which its driver status view reports and which only DeviceManager knows.
+- The manifest role changed from `SND` (`kind = device`) to `CATALOGUE` (`kind = factory`, provider
+  `device_manager`, source `SERVE`), LAST in the list, and the ordinary `RoleKind::Factory` arm mints
+  it - the same path `device_service` and `system_graph_service` already use for their binding
+  snapshot. No override in `bootstrap.rs`.
+- `audio_engine::run` reads ADMIN, SERVE, CATALOGUE, reports online, then subscribes. `serve` holds
+  the subscription in its wait set beside the admin channel, the clients and the streams; a `live`
+  frame for a kind it has no device for is opened and becomes `state.snd`.
+
+TWO REAL DEFECTS FELL OUT OF DOING IT, and both were invisible while nothing used the seam:
+
+- `serve_catalogue_once` sent every dispatch reply with `send_blocking(channel, bytes, 0)` - the
+  bytes WITHOUT the reply handles. `open` answers with a discriminant, the handle's index and the
+  handle itself, so the index arrived and the capability did not; the client decoded `take_handle`
+  off a reply that had none and answered `None`. The production `open` could never have worked.
+  AudioService is its first consumer and found it on the first boot.
+- Sourcing the driver status view from DeviceManager's binding snapshot - which is the better shape
+  and which I tried first - DEADLOCKS. It runs on the boot path, the call blocks until DeviceManager
+  answers, and DeviceManager can be inside a `send_blocking` to the supervisor at the same moment.
+  Measured: the boot stopped at exactly that line, twice. The fact rides the message already being
+  sent instead, and the reason is written where the next reader will hit it.
+
+Proof: the x86_64 boot prints `DeviceManager: providers published after every device - ... 1 audio`
+followed by `AudioService: an audio provider was published and this service connected to it`. The
+two kernel suites that stand in for the supervisor while AudioService comes up now answer the
+subscription and the connection through the GENERATED encoders - `tests::serve_provider_catalogue`,
+built on `device-proto`, which the kernel now links for the same reason it links `driver-protocol`.
+373 tests pass on x86_64.
+
+The other kinds still route by hand. Each is its own seam and moves on its own; this one is done, and
+"no production consumer subscribes" is no longer true.
+
+**2. The public factory cannot deliver the first connection for the default single-consumer provider.
+ACCEPTED.**
+
+Right, and it was my own change that made it so. Publication set `consumers = 1` on the argument that
+the offer a publication carries IS a connection - and the offer is not handed to anybody at
+publication: it sits in the entry until `take` or `open` moves it. A kind declaring one consumer was
+therefore already at its limit, `open` refused, and the one channel it may serve was reachable only
+through the private `Catalogue::take` this milestone exists to replace.
+
+- Publication records `consumers = 0`. The count is what it says it is: how many consumers have been
+  GIVEN a connection.
+- `open` hands out the offered channel when one is still there - moved, not duplicated, like `take` -
+  and mints only when it is gone. That is what lets the public factory deliver the FIRST connection.
+- The bound is checked against `outstanding` = connections handed out PLUS the offered channel while
+  it is still unclaimed. The offered one is not a consumer yet, but it is a connection this driver
+  made and is serving, so a path that would MINT a new one has to count it - otherwise a provider
+  declaring one consumer gets a second endpoint minted for a driver already serving the first, which
+  is the two-consumers-one-reply-queue failure the factory exists to prevent. A path that hands out
+  the offered channel does not add to it: the same connection moves from promised to held.
+
+**3. Connection accounting neither includes boot-time mints nor releases capacity, and the manifest
+accepts counts beyond the driver's hard maximum. ACCEPTED, all three.**
+
+- `mint_connection` now checks the declaration and increments. It did neither, so a declared bound was
+  understated before the first public `open`: the block probe takes one connection per block provider
+  and the role that mounts it takes another, and neither appeared against the number the entry
+  declares. A driver whose entry says it serves one consumer and is asked for two by the boot itself
+  is a manifest that is wrong about the driver, and finding that out is the point of declaring it.
+  `Catalogue::take` counts too.
+- CAPACITY IS RELEASED. `Opcode::Disconnect = 12`, driver -> manager, one publisher-local token: a
+  consumer of the provider published under that token has gone. `Serving` keeps the token beside each
+  endpoint - taken from the `CONNECT` frame that delivered it - and `close_at` answers with it, so
+  `virtio_blk` tells the manager which publication lost a client. `Catalogue::disconnected` decrements,
+  saturating: a driver reporting more departures than it was given connections is one to disbelieve,
+  not a count to wrap. Without this the bound was a LIFETIME quota and not the concurrent bound the
+  declaration reads as - a provider admitting one consumer was spent by its first client leaving.
+- The manifest refuses an entry declaring more connections than a driver can serve:
+  `sum(most * consumers) > MAX_PROVIDER_CLIENTS`. The product, because `most` publications each
+  admitting `consumers` are all served out of the one fixed set. The constant is repeated in the tool
+  with a comment saying whose it is - the tool builds for the host and the driver library is `no_std`
+  for the target - and the check is what keeps them in step. Three cases in the manifest suite: at the
+  limit, past it, and past it across two kinds; watched to fail.

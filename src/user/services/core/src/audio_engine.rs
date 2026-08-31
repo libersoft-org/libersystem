@@ -12,6 +12,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use ipc_client::ChannelTransport;
 use pcm::encode::{Remix, Resample};
 use pcm::{Format, OUTPUT_RATE};
 use proto::codec::Buffer;
@@ -20,6 +21,7 @@ use proto::system::audio::{self, Service as AudioService};
 use proto::system::audio_admin::{self, Service as AdminService};
 use proto::system::pcm_capture::{self, Service as PcmCaptureService};
 use proto::system::pcm_stream::{self, Service as PcmService};
+use proto::system::{ProviderInfo, ProviderKind, provider_catalogue};
 use rt::*;
 
 const PERIOD_FRAMES: usize = 512;
@@ -656,18 +658,62 @@ impl PcmCaptureService for CaptureCall<'_> {
 pub fn run(bootstrap: u64) -> ! {
 	let mut bootstrap_buf: [u8; 256] = [0; 256];
 	unsafe {
-		let snd: u64 = match recv_blocking(bootstrap, &mut bootstrap_buf) {
-			Received::Message { len, handle } if len >= 3 && &bootstrap_buf[..3] == b"SND" => handle,
-			_ => fail_bootstrap(bootstrap, b"snd", b"driver channel not delivered"),
-		};
 		let admin: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"ADMIN").unwrap_or_else(|| fail_bootstrap(bootstrap, b"admin", b"audio admin channel not delivered"));
 		let root: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
+		// THE DEVICE IS DISCOVERED, NOT HANDED OVER (2026-08-31).
+		//
+		// This service used to be given the sound driver's channel under `SND`, routed to it by
+		// DeviceManager out of a slot of its own - the per-kind injection P02M0164 exists to replace.
+		// What arrives now is a connection to the provider CATALOGUE, and this service asks it for
+		// the audio kind. Two things follow that the injection could not do: a sound card bound
+		// AFTER this service started reaches it, because a subscription answers with what is
+		// published now and continues as a stream; and a machine with two of them has a second
+		// entry to offer rather than a slot that is already full.
+		//
+		// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
+		let catalogue: u64 = recv_tagged(bootstrap, &mut bootstrap_buf, b"CATALOGUE").unwrap_or(0);
 		send_blocking(bootstrap, b"AudioService: online", 0);
-		serve(root, admin, Audio::new(snd));
+		// The subscription is opened BEFORE anything is served, so the snapshot and the stream are
+		// one operation - a provider published between the two would otherwise be lost, which is the
+		// same race as a service started later seeing nothing.
+		let providers: u64 = if catalogue == 0 { 0 } else { provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Audio).unwrap_or(0) };
+		if providers == 0 {
+			// NOT A FAILURE. A boot that granted no catalogue connection, or a machine whose
+			// catalogue refuses the subscription, is a system with no sound - which this service is
+			// built to report rather than to die of.
+			print(b"AudioService: no provider subscription - this instance serves no device\n");
+		}
+		serve(root, admin, catalogue, providers, Audio::new(0));
 	}
 }
 
-unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
+// OPEN A CONNECTION TO ONE PUBLISHED PROVIDER, or answer zero.
+//
+// The catalogue mints the pair and hands the driver the server end; what comes back is the client
+// end this service talks the driver's byte protocol over - the same channel `SND` used to carry,
+// reached by asking instead of by being given.
+unsafe fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
+	if catalogue == 0 {
+		return 0;
+	}
+	match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(info) {
+		Some(Ok(handle)) => handle,
+		// A REFUSAL IS SAID. A kind that admits one consumer refuses the second ask, and a service
+		// that cannot tell that from "no device" cannot report either.
+		Some(Err(_)) => {
+			unsafe { print(b"AudioService: the catalogue refused a connection to the audio provider it published\n") };
+			0
+		}
+		// A TRANSPORT THAT DID NOT ANSWER IS NOT AN ABSENT DEVICE either, and a service that cannot
+		// tell the two apart cannot report what its machine has.
+		None => {
+			unsafe { print(b"AudioService: the catalogue did not answer the connection it published\n") };
+			0
+		}
+	}
+}
+
+unsafe fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: Audio) -> ! {
 	unsafe {
 		let mut clients: Vec<Client> = alloc::vec![Client { chan: root, scope: Scope::Full }];
 		let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
@@ -687,9 +733,16 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 			}
 
 			let driver_first: bool = state.snd != 0 && state.driver_pending != DriverPending::None;
-			let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len() + state.captures.len() + 1);
+			let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len() + state.captures.len() + 2);
 			if driver_first {
 				waits.push(state.snd);
+			}
+			// THE SUBSCRIPTION IS WAITED ON LIKE ANY OTHER ENDPOINT, which is what makes a provider
+			// published after this service started reachable at all. It sits before the clients for
+			// the same reason the manager's channel does elsewhere: a busy service must not starve
+			// the path that tells it its device has arrived or gone.
+			if providers != 0 {
+				waits.push(providers);
 			}
 			waits.push(admin);
 			waits.extend(clients.iter().map(|client| client.chan));
@@ -708,6 +761,49 @@ unsafe fn serve(root: u64, admin: u64, mut state: Audio) -> ! {
 				continue;
 			}
 			let ready_chan: u64 = waits[ready as usize];
+			// A PUBLICATION OR A WITHDRAWAL. `live` is what tells them apart, and it is the whole of
+			// what this service does about either: take a connection to a device it has none for, and
+			// let go of one whose provider has gone.
+			if providers != 0 && ready_chan == providers {
+				let mut frame: [u8; 256] = [0; 256];
+				match recv_blocking(providers, &mut frame) {
+					Received::Message { len, handle } => {
+						if handle != 0 {
+							close(handle);
+						}
+						let mut frame_handles = wire::Handles::new();
+						let Some(info) = provider_catalogue::subscribe_read(&frame[..len], &mut frame_handles) else {
+							print(b"AudioService: a provider frame did not decode\n");
+							continue;
+						};
+						{
+							if info.live && state.snd == 0 {
+								let opened = open_provider(catalogue, &info);
+								if opened == 0 {
+									print(b"AudioService: an audio provider is published and this service could not connect to it\n");
+								} else {
+									state.snd = opened;
+									print(b"AudioService: an audio provider was published and this service connected to it\n");
+								}
+							} else if !info.live && state.snd != 0 {
+								// The provider this service is on may or may not be the one being
+								// withdrawn, and nothing here can tell: the connection carries no
+								// identity back. What a withdrawal DOES mean is that a driver went
+								// away, and the driver channel closing is the authoritative signal -
+								// which `driver_failed` already handles on the next wait.
+								print(b"AudioService: an audio provider was withdrawn\n");
+							}
+						}
+					}
+					// THE SUBSCRIPTION ENDED. DeviceManager is gone or dropped it; this service keeps
+					// whatever device it already has and stops expecting new ones.
+					Received::Closed => {
+						close(providers);
+						providers = 0;
+					}
+				}
+				continue;
+			}
 			if driver_first && ready_chan == state.snd {
 				// A capture reply carries a whole period, so it is received into a buffer that can
 				// hold one rather than into the small request scratch.

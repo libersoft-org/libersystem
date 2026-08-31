@@ -231,6 +231,16 @@ pub fn irq_info(index: usize) -> Option<abi::IrqInfo> {
 // Free every MSI vector that is masked and waiting for `device` to be confirmed stopped, and answer
 // how many. Reached from `SYS_DEVICE_QUIESCED`.
 // How many MSI slots this device still holds. See `MsiRegistry::held_by_device`.
+// WHETHER THIS DEVICE STILL HOLDS A SLOT WHOSE TEARDOWN HAS NOT HAPPENED.
+//
+// `unbind` RETIRES a slot (pending) and a disable the controller refused QUARANTINES it, so a slot
+// that is neither is one still bound - and a claim release that publishes `Free` over one of those
+// gives a vector back while an unbind is still on its way to it. See `device::settled_vectors` and
+// `MsiRegistry::has_unbound`, which states why a quarantined slot is settled rather than outstanding.
+pub fn msi_live_for_device(device: u32) -> bool {
+	REGISTRY.has_unbound(device)
+}
+
 pub fn msi_held_by_device(device: u32) -> usize {
 	REGISTRY.held_by_device(device)
 }

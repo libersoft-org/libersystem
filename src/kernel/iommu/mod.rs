@@ -211,6 +211,18 @@ pub fn init() -> bool {
 	// degraded instead of being refused. The line below announced that every such driver would be
 	// refused, one statement before the code made that untrue.
 	PRESENT.store(true, Ordering::Release);
+	// ONE RETAINED SLOT PER DEVICE, before any binding can need one. `device::init` has already
+	// resolved the table - `main` calls it first, and says so - so the size is known and this is the
+	// only allocation the association ever needs.
+	{
+		let mut retained = RETAINED.lock();
+		retained.clear();
+		if retained.try_reserve_exact(crate::device::count()).is_err() {
+			crate::serial_println!("iommu: no room for the retained-domain table - an unconfirmed detach will report zero holdings for its device");
+		} else {
+			retained.resize(crate::device::count(), None);
+		}
+	}
 	match bring_up(index) {
 		Ok(controller) => {
 			*CONTROLLER.lock() = Some(controller);
@@ -548,6 +560,18 @@ pub fn quarantined_grants_for(index: u32) -> usize {
 	with(|controller| controller.iommu().quarantined_addresses(domain)).unwrap_or(0)
 }
 
+// AND HOW MANY FAULTS THIS BINDING RAISED. The fourth of the four counters M4 names - mapping, IOVA,
+// endpoint and fault - and the one the claim snapshot did not carry.
+//
+// A controller-wide total cannot answer "did this restart come back to its baseline" for one device:
+// a driver that crashes, is rebound and faults again adds to the same number as the device beside it.
+// The count lives with the DOMAIN, which is the binding, so a retained domain still answers for the
+// binding that left it behind.
+pub fn faults_for(index: u32) -> u64 {
+	let Some(domain) = domain_of(index).or_else(|| retained_domain_of(index)) else { return 0 };
+	with(|controller| controller.iommu().faults_in(domain)).unwrap_or(0)
+}
+
 // DEVICES WHOSE DETACH WAS NOT CONFIRMED, AND THE DOMAIN THAT OUTLIVED THEM.
 //
 // `detach_for_inner` removes the live `DOMAINS` row before it revokes, because after the revoke the
@@ -558,10 +582,31 @@ pub fn quarantined_grants_for(index: u32) -> usize {
 // manager reconstructing the charge saw a claim with no IOMMU holdings and quarantined pages behind
 // it. This list is the association that survives the row, and nothing else reads it: a retained
 // domain is not a live one, so admission, `msi_deliverable` and `domain_of` are untouched by it.
-static RETAINED: SpinLock<Vec<(u32, dma::DomainId)>> = SpinLock::new(Vec::new());
+// ONE SLOT PER DEVICE, SIZED ONCE AT BRING-UP, so recording the association cannot fail.
+//
+// It was a growable list with a `try_reserve` in front of it, and the failure arm kept the
+// quarantine and LOST the association - so an unconfirmed detach under memory pressure left a device
+// whose claim reports zero IOMMU holdings while its address space is permanently out of circulation.
+// M4 asks for an exact post-teardown baseline, and "exact unless the heap was short at the wrong
+// moment" is not one. The table is the device table's shape and is filled at `init`, which runs
+// after `device::init` has resolved it.
+static RETAINED: SpinLock<Vec<Option<dma::DomainId>>> = SpinLock::new(Vec::new());
 
 fn retained_domain_of(index: u32) -> Option<dma::DomainId> {
-	RETAINED.lock().iter().find(|(device, _)| *device == index).map(|(_, domain)| *domain)
+	RETAINED.lock().get(index as usize).copied().flatten()
+}
+
+// What asking for an MSI vector found. THREE ANSWERS, because the two failures call for opposite
+// responses: an endpoint whose domain has no route is a live binding to disable, and one whose
+// domain belongs to a later binding is a caller to refuse without touching the device at all.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MsiRoute {
+	// Either the endpoint is not translated, or its domain now carries the doorbell mapping.
+	Deliverable,
+	// The endpoint is translated and its interrupts have nowhere to land.
+	NoRoute,
+	// The device is claimed by a DIFFERENT binding than the caller's. Nothing was done to it.
+	Stale,
 }
 
 // Whether an MSI vector for this device can actually be delivered: either it is not translated at all,
@@ -574,8 +619,15 @@ fn retained_domain_of(index: u32) -> Option<dma::DomainId> {
 //
 // IDEMPOTENT, because a driver may acquire, release and acquire again across one binding: mapping a
 // region that is already mapped answers `AlreadyMapped`, which is the same success as mapping it.
-pub fn msi_deliverable(index: u32, bus: u8, dev: u8, func: u8) -> bool {
-	let Some(domain) = domain_of(index) else { return true };
+pub fn msi_deliverable(index: u32, generation: u64, bus: u8, dev: u8, func: u8) -> MsiRoute {
+	let domain = match domain_for_generation(index, generation) {
+		Ok(Some(domain)) => domain,
+		Ok(None) => return MsiRoute::Deliverable,
+		// THE DOMAIN UNDER THIS INDEX IS SOMEBODY ELSE'S. Nothing is mapped and nothing is disabled:
+		// the caller's own binding has ended, and acting on the device now would be this generation
+		// reaching into the next one. See `domain_for_generation`.
+		Err(_) => return MsiRoute::Stale,
+	};
 	let endpoint = requester_of(bus, dev, func);
 	let installed = with(|controller| {
 		let iommu = controller.iommu();
@@ -583,10 +635,10 @@ pub fn msi_deliverable(index: u32, bus: u8, dev: u8, func: u8) -> bool {
 		install_doorbell(iommu, domain, endpoint, &regions).map_err(|_| ())
 	});
 	match installed {
-		Some(Ok(())) => true,
+		Some(Ok(())) => MsiRoute::Deliverable,
 		_ => {
 			crate::serial_println!("iommu: domain {} has no route for its interrupts - no MSI vector is handed out for it", domain.0);
-			false
+			MsiRoute::NoRoute
 		}
 	}
 }
@@ -664,6 +716,14 @@ fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::Doma
 			crate::serial_println!("iommu: endpoint {:#x} reported no MSI doorbell and this port names none", endpoint.0);
 			return Ok(());
 		};
+		// ALREADY INSTALLED IS ALREADY DONE, on this branch as much as on the probed one above.
+		// The guard was added where the endpoint REPORTS its doorbell and not here, so an endpoint
+		// on the platform fallback - one offering no `F_PROBE`, or probing and listing no MSI region
+		// - still met `Overlaps` on its second acquire and lost its vector for it. The two branches
+		// map the same kind of region for the same reason and are idempotent on the same terms.
+		if iommu.identity_mapped(domain, base, len, dma::Direction::FromDevice) {
+			return Ok(());
+		}
 		match iommu.map_identity(domain, base, len, dma::Direction::FromDevice) {
 			Ok(_) => {
 				if !DOORBELL_REPORTED.swap(true, Ordering::AcqRel) {
@@ -818,10 +878,12 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 			// per-binding event and not a hot path; a short heap loses the association rather than
 			// the quarantine, and says so.
 			let mut retained = RETAINED.lock();
-			if retained.try_reserve(1).is_ok() {
-				retained.push((index as u32, domain));
-			} else {
-				crate::serial_println!("iommu: no room to record that {:02x}:{:02x}.{} left a quarantined domain behind - its holdings will report as zero", bus, dev, func);
+			match retained.get_mut(index) {
+				Some(slot) => *slot = Some(domain),
+				// The device table grew after `init` sized this, which cannot happen after boot -
+				// but a lost association is a device reporting zero holdings while its address space
+				// is out of circulation, so it says so rather than passing quietly.
+				None => crate::serial_println!("iommu: no slot to record that {:02x}:{:02x}.{} left a quarantined domain behind - its holdings will report as zero", bus, dev, func),
 			}
 			false
 		}
@@ -888,17 +950,14 @@ pub fn poll_faults_attributed(during_teardown: Option<(dma::EndpointId, dma::Dom
 	let mut out = [dma::FaultEvent { endpoint: dma::EndpointId(0), domain: dma::DomainId(0), generation: Generation(0), address: None, access: dma::Access::Read, reason: Fault::NotMapped }; 8];
 	let mut reported = 0usize;
 	while reported < MOST_PER_CALL {
-		let taken = drain_faults(&mut out);
+		// THE ATTRIBUTION GOES IN WITH THE DRAIN, not over the buffer afterwards. It used to be
+		// applied here, to events `record` had already stored - so the line below named the binding
+		// and the bounded ring a supervisor reads kept `domain 0, generation 0` for the same fault.
+		let taken = drain_faults(&mut out, during_teardown);
 		if taken == 0 {
 			return;
 		}
-		for event in out.iter_mut().take(taken) {
-			if let Some((endpoint, domain, generation)) = during_teardown {
-				if event.endpoint == endpoint && event.domain == dma::DomainId(0) {
-					event.domain = domain;
-					event.generation = generation;
-				}
-			}
+		for event in out.iter().take(taken) {
 			// SAID WITH THE ADDRESS WHEN THERE IS ONE. A report the controller sent without an
 			// address is a real fault reported in less detail, and printing a zero for it would be
 			// this side inventing a number the device did not send.
@@ -927,14 +986,36 @@ pub fn poll_faults_attributed(during_teardown: Option<(dma::EndpointId, dma::Dom
 // `Ok(None)` is "this device is not translated", which is not a failure: it is every device in this
 // tree today. `Err` is a device that IS translated and whose mapping did not confirm - and the
 // caller must not hand out an address for one of those.
-pub fn map_device_buffer(index: u32, physical: u64, len: u64) -> Result<Option<(dma::MappingId, dma::DmaAddress)>, Fault> {
-	let Some(domain) = domain_of(index) else { return Ok(None) };
+pub fn map_device_buffer(index: u32, generation: u64, physical: u64, len: u64) -> Result<Option<(dma::MappingId, dma::DmaAddress)>, Fault> {
+	let Some(domain) = domain_for_generation(index, generation)? else { return Ok(None) };
 	map_for_device(domain, physical, len, dma::Direction::Bidirectional).map(Some)
 }
 
 // Which domain a device's endpoint was attached to, if it was.
 fn domain_of(index: u32) -> Option<dma::DomainId> {
 	DOMAINS.lock().iter().find(|(device, _)| *device == index).map(|(_, domain)| *domain)
+}
+
+// The same, CONFIRMED to be the domain of the binding the caller holds.
+//
+// `domain_of` answers by device INDEX, and an index is a slot that outlives the binding sitting in
+// it. A syscall reads the claim off the capability it was given, does its allocation, and only then
+// asks which domain to map into - so a release and a reclaim in between put the REPLACEMENT
+// binding's domain under the old caller's index, and the mapping or the doorbell landed in a domain
+// that caller never had authority over. Registering the derived object afterwards refuses the stale
+// generation, which is a rollback of the bookkeeping after the hardware effect has already happened.
+//
+// The claim's generation is what tells the two apart and the controller already records one per
+// domain, so the check is arithmetic - which is the form M2 requires a stale binding to be refused
+// in. `Ok(None)` is "this device is not translated"; `Err(StaleGeneration)` is "it is, and not for
+// you"; a controller that cannot answer at all is the same refusal, because a mapping made into a
+// domain nothing can confirm is a mapping made on trust.
+fn domain_for_generation(index: u32, generation: u64) -> Result<Option<dma::DomainId>, Fault> {
+	let Some(domain) = domain_of(index) else { return Ok(None) };
+	match with(|controller| controller.iommu().generation_of(domain)) {
+		Some(Some(current)) if current.0 == generation => Ok(Some(domain)),
+		_ => Err(Fault::StaleGeneration),
+	}
 }
 
 // Close one translation. The frames behind it are reusable only when this says `FramesReusable`.
@@ -959,8 +1040,11 @@ pub fn with<R>(f: impl FnOnce(&mut Controller) -> R) -> Option<R> {
 }
 
 // Take the faults the device has reported since last time, bounded by the caller's buffer.
-pub fn drain_faults(out: &mut [dma::FaultEvent]) -> usize {
-	with(|controller| controller.iommu().drain_faults(out)).unwrap_or(0)
+//
+// `during_teardown` is what the caller ending a binding still knows and the backend no longer does -
+// it reaches the DURABLE record rather than only the returned buffer. See `Iommu::drain_faults_during`.
+fn drain_faults(out: &mut [dma::FaultEvent], during_teardown: Option<(dma::EndpointId, dma::DomainId, Generation)>) -> usize {
+	with(|controller| controller.iommu().drain_faults_during(out, during_teardown)).unwrap_or(0)
 }
 
 // The controller's state, for the boot report.

@@ -560,14 +560,26 @@ fn read_pairing(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) ->
 	// it, and it is read only after that manifest has been verified for THIS product, THIS
 	// architecture and this source kind. A medium whose manifest names no volume - a rescue stick,
 	// the test medium - answers zero and keeps the fallback, and it says so.
-	let Some(bytes) = read_boot_file(bs, root, "etc/boot.manifest2") else {
+	let bytes = match read_boot_file_reported(bs, root, "etc/boot.manifest2") {
+		MediumRead::Bytes(bytes) => bytes,
 		// A MEDIUM WITH NO SIGNED MANIFEST NAMES NO VOLUME, and on an authenticated build that is
 		// not a medium to boot at all - which the kernel and bootstrap reads below refuse for
 		// themselves. Here it means only that there is no pairing to be had.
-		if !trust::IS_TEST_TRUST {
-			arch::serial::write_str("loader: the boot medium carries no SIGNED manifest, so it names no system volume and this build cannot take one on trust\n");
+		MediumRead::Absent => {
+			if !trust::IS_TEST_TRUST {
+				arch::serial::write_str("loader: the boot medium carries no SIGNED manifest, so it names no system volume and this build cannot take one on trust\n");
+			}
+			return None;
 		}
-		return None;
+		// AND A MANIFEST THAT IS THERE AND CANNOT BE READ IS NOT ONE THAT IS ABSENT. It is the same
+		// case as one that does not verify, arrived at one step earlier: the medium says which
+		// volume it wants and this loader cannot find out which. Falling through to "names no
+		// volume" would take the first LiberFS volume in the machine - the behaviour the pairing
+		// exists to remove - because a sector went bad.
+		MediumRead::Unreadable => {
+			arch::serial::write_str("loader: FATAL - the boot medium's signed manifest is present and could not be read, so which volume it names cannot be established\n");
+			arch::halt();
+		}
 	};
 	let mut scratch = alloc::vec::Vec::new();
 	if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + bytes.len()).is_err() {
@@ -602,17 +614,25 @@ fn read_pairing(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) ->
 // to run is not something to hand over with a warning.
 pub(crate) fn read_verified_package(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>, name: &str) -> Option<&'static [u8]> {
 	let bytes = read_boot_file(bs, root, name)?;
-	let Some(signed) = read_boot_file(bs, root, "etc/boot.manifest2") else {
+	let signed = match read_boot_file_reported(bs, root, "etc/boot.manifest2") {
+		MediumRead::Bytes(signed) => signed,
 		// The same profile split every other read on this medium makes: an authenticated build does
 		// not publish an unverified module, and a test-trust one says what it is doing.
-		if !trust::IS_TEST_TRUST {
-			panic!("loader: a package is on the boot medium and the medium carries no SIGNED manifest - refusing to hand it to the kernel");
-		}
-		arch::serial::write_str(
-			"loader: THIS PACKAGE IS NOT AUTHENTICATED - the boot medium carries no signed manifest, and this build accepts it
+		MediumRead::Absent => {
+			if !trust::IS_TEST_TRUST {
+				panic!("loader: a package is on the boot medium and the medium carries no SIGNED manifest - refusing to hand it to the kernel");
+			}
+			arch::serial::write_str(
+				"loader: THIS PACKAGE IS NOT AUTHENTICATED - the boot medium carries no signed manifest, and this build accepts it
 ",
-		);
-		return Some(bytes);
+			);
+			return Some(bytes);
+		}
+		// AND AN UNREADABLE ONE IS NOT AN ABSENT ONE, on EITHER profile. The test-trust arm above is
+		// for a medium that carries no manifest by design; a medium that carries one and cannot be
+		// read is a medium whose module nothing can be checked against, and handing that to the
+		// kernel is the failure the signed path exists to remove. See `MediumRead`.
+		MediumRead::Unreadable => panic!("loader: a package is on the boot medium and the medium's signed manifest is present and unreadable - refusing to hand it to the kernel"),
 	};
 	let mut scratch = alloc::vec::Vec::new();
 	if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + signed.len()).is_err() {
@@ -835,6 +855,51 @@ pub(crate) fn read_boot_file(bs: *mut BootServices, root: Option<*mut uefi::File
 	read_from_fat(bs, name.as_bytes())
 }
 
+// The same read, keeping the absent-versus-unreadable distinction the manifest paths turn on.
+//
+// ORDINARY FILES KEEP THE `Option`. A kernel or a package that is not there is refused by name a
+// line later, and the callers that decide a TRUST question on an absence are the three that read a
+// manifest - so those are the ones that ask this.
+//
+// A firmware `Failed` is "something is there and this reader could not get it", which is already the
+// unreadable answer: the FAT backend is given its chance and, if it cannot produce the bytes either,
+// the file is unreadable rather than absent - even where FAT reports `NotFound`, because a firmware
+// that opened it and a FAT reader that cannot find it disagree about the medium, and disagreement is
+// not evidence of absence.
+pub(crate) fn read_boot_file_reported(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>, name: &str) -> MediumRead {
+	let mut separated = [0u8; 128];
+	let firmware_name = if name.len() < separated.len() {
+		for (i, &b) in name.as_bytes().iter().enumerate() {
+			separated[i] = if b == b'/' { b'\\' } else { b };
+		}
+		core::str::from_utf8(&separated[..name.len()]).ok()
+	} else {
+		None
+	};
+	let mut firmware_had_it = false;
+	if let Some(root) = root
+		&& let Some(firmware_name) = firmware_name
+	{
+		match unsafe { uefi::file::read_file_reported(bs, root, firmware_name) } {
+			uefi::file::FirmwareRead::Bytes(bytes) => return MediumRead::Bytes(bytes),
+			uefi::file::FirmwareRead::Absent => return MediumRead::Absent,
+			uefi::file::FirmwareRead::Failed => {
+				firmware_had_it = true;
+				arch::serial::write_str("loader: the firmware could not read ");
+				arch::serial::write_str(name);
+				arch::serial::write_str(" off the boot volume; reading the medium as FAT\n");
+			}
+		}
+	} else {
+		arch::serial::write_str("loader: the firmware did not mount the boot volume; reading it as FAT\n");
+	}
+	match read_from_fat_reported(bs, name.as_bytes()) {
+		MediumRead::Bytes(bytes) => MediumRead::Bytes(bytes),
+		MediumRead::Absent if firmware_had_it => MediumRead::Unreadable,
+		other => other,
+	}
+}
+
 // The kernel from the BOOT MEDIUM, checked against the manifest that medium carries.
 //
 // The system-volume branch checks its kernel against the volume's manifest; this is the other
@@ -902,7 +967,16 @@ fn write_variable(value: Option<u8>) {
 }
 
 fn boot_medium_manifest(bs: *mut BootServices, root: Option<*mut uefi::FileProtocol>) -> Option<bootproto::manifest::Manifest<'static>> {
-	let signed = read_boot_file(bs, root, "etc/boot.manifest2")?;
+	// ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS HERE, and the caller's fallback is why: `None`
+	// sends it to the v1 checksum manifest, which is the arm a medium with no signed manifest at all
+	// is entitled to. A medium whose signed manifest is THERE and could not be read is not entitled
+	// to it: the strongest statement about this boot exists on the medium and this loader could not
+	// establish it. See `MediumRead`.
+	let signed = match read_boot_file_reported(bs, root, "etc/boot.manifest2") {
+		MediumRead::Bytes(bytes) => bytes,
+		MediumRead::Absent => return None,
+		MediumRead::Unreadable => panic!("loader: the boot medium's signed manifest is present and could not be read - refusing rather than falling back to the checksum one"),
+	};
 	let mut scratch = alloc::vec::Vec::new();
 	if scratch.try_reserve_exact(bootproto::manifest::DOMAIN.len() + signed.len()).is_err() {
 		panic!("loader: no room to verify the boot medium's signed manifest");
@@ -1019,15 +1093,45 @@ pub(crate) enum Visit {
 // installer or rescue stick looks like on firmware that only understands its own disk. Read-only,
 // like everything else here.
 pub(crate) fn read_from_fat(bs: *mut BootServices, path: &[u8]) -> Option<&'static [u8]> {
-	let mut found: Option<&'static [u8]> = None;
+	match read_from_fat_reported(bs, path) {
+		MediumRead::Bytes(bytes) => Some(bytes),
+		_ => None,
+	}
+}
+
+// WHAT A READ OF THE BOOT MEDIUM FOUND. THREE ANSWERS, because two of them decide opposite things.
+//
+// A manifest that is ABSENT is a medium that carries none - a rescue stick, the test medium - and
+// the profile decides what to do about that. A manifest that is THERE AND UNREADABLE is a medium
+// that says which product, which volume and which digests it wants, and cannot be believed: a
+// corrupt FAT, a failing disk, a firmware that opens the file and cannot read it. Collapsing the
+// second into the first is what let a damaged medium take the v1 checksum fallback, hand a package
+// over unauthenticated, or name no system volume and fall back to the first LiberFS one it found -
+// which is the pairing turned off by a broken sector rather than by a decision.
+pub(crate) enum MediumRead {
+	Bytes(&'static [u8]),
+	// The medium was read and this file is not on it.
+	Absent,
+	// The medium is there and could not be read, or was read and could not be retained.
+	Unreadable,
+}
+
+// The same read, with that distinction kept. See `MediumRead`.
+pub(crate) fn read_from_fat_reported(bs: *mut BootServices, path: &[u8]) -> MediumRead {
+	let mut found = MediumRead::Unreadable;
 	with_boot_medium(bs, |disk| {
 		let Some(mut fs) = fat::FatFs::mount_read_only(disk) else { return Visit::NotAMedium };
 		// MOUNTED IS THE ANSWER, whether or not this file is on it. A FAT medium missing one file is
 		// still this boot's medium, and looking for that file on a second one is how a system gets
 		// assembled out of two.
-		if let Ok(bytes) = fs.read_file(path) {
-			found = retain(bs, &bytes);
-		}
+		found = match fs.read_file(path) {
+			// AND A READ THAT COULD NOT BE RETAINED IS NOT A FILE THAT IS NOT THERE. The bytes exist
+			// and the loader has nowhere to put them, which is the same answer a failing disk gives:
+			// this medium's manifest could not be established.
+			Ok(bytes) => retain(bs, &bytes).map_or(MediumRead::Unreadable, MediumRead::Bytes),
+			Err(fat::FsError::NotFound) => MediumRead::Absent,
+			Err(_) => MediumRead::Unreadable,
+		};
 		Visit::Mounted { done: true }
 	});
 	found

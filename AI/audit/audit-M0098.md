@@ -311,3 +311,103 @@ and the same number in both paths, so they no longer hold different opinions abo
 3. **The last-reference interrupt teardown can race claim release and be mistaken for confirmed revocation.** Both `Interrupt::revoke` and `Drop` take ownership with `bound.swap(false)`, but `revoke` returns success whenever it loses that swap and `Drop` ignores the result of the architectural unbind (`src/kernel/object/interrupt.rs:115-135`). Once the strong count reaches zero, the release sweep's weak upgrade can fail while `Drop` is still unbinding, so the sweep can report the claim quiet and release its slot before that unbind has completed or even when it later fails. A late x86 unbind may then mask the MSI-X entry already used by a replacement binding; a failed RISC-V unbind is likewise no longer reflected in the terminal claim state. This contradicts the milestone's required teardown-before-reuse ordering.
 
 4. **The added same-handle race test still does not establish the required concurrent case.** It starts two cooperative threads on the current run queue without a barrier or another forced interleaving around capability lookup and attenuation (`src/kernel/object/claim/tests.rs:558-631`). Both operations can complete serially, so the test can pass without exercising the race M9 and the definition of done explicitly require. The DMA addendum is also sequential and checks registry rows rather than proving that an old generation cannot alter the replacement generation's IOMMU state (`src/kernel/object/claim/tests.rs:512-555`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-08-31T06:05:00Z):
+
+**1. The late derived-object registration check does not prevent stale-generation DMA or MSI side
+effects. ACCEPTED.**
+
+Verified against the code and the finding is exact. `sys_dma_buffer_create` read the claim off the
+`DeviceMemory` capability, called `DmaBuffer::create_for(.., device_index)`, and that reached
+`iommu::map_device_buffer(index, ..)` -> `domain_of(index)`, which answers with whatever domain
+occupies that INDEX now. A release and a reclaim during the allocation therefore installed the
+mapping in the REPLACEMENT binding's domain, and `register_derived` refused the stale generation
+afterwards - a rollback of the bookkeeping after the hardware effect. The MSI path had the same
+shape: `claim.is_settled()` once, then generation-blind `msi_deliverable(index, ..)` and
+`disable_bus_master(index)`.
+
+The fix makes the generation part of the request rather than a check that follows it:
+
+- `iommu::domain_for_generation(index, generation)` resolves the domain and confirms the controller
+  records that generation for it. `Ok(None)` is "this device is not translated";
+  `Err(StaleGeneration)` is "it is, and not for you"; a controller that cannot answer at all is the
+  same refusal, because a mapping into a domain nothing can confirm is one made on trust. The
+  comparison is arithmetic over the generation the controller already stores per domain, which is
+  the form M2 requires a stale binding to be refused in.
+- `map_device_buffer(index, generation, ..)` and `msi_deliverable(index, generation, ..)` both go
+  through it. `DmaBuffer::create_for` now takes `Option<abi::ClaimKey>` instead of
+  `Option<u32>` - the index alone cannot say which binding a buffer belongs to, and that was the
+  defect.
+- `msi_deliverable` answers `MsiRoute::{Deliverable, NoRoute, Stale}`. The two failures call for
+  opposite responses: `NoRoute` is a live binding whose interrupts have nowhere to land and the
+  device is taken off the bus; `Stale` touches nothing at all and refuses the caller with
+  `ERR_ACCESS_DENIED`, because a generation that has ended does not get to act on the one that
+  replaced it.
+- `device::disable_bus_master` became `disable_bus_master_for(key)`, which verifies the claim slot
+  under `CLAIMS` before touching config space - so a refusal arriving late cannot take the
+  replacement binding's device off the bus.
+
+Test: `kernel.iommu.a_buffer_from_a_previous_binding_is_not_mapped_into_the_next_one` attaches the
+fixture endpoint at a known generation and requires `Err(StaleGeneration)` for the generation before
+it and the one after it, and a successful map for its own - so the refusal is arithmetic rather than
+a mapping path that stopped working. It runs on the enforcing profile and says `iommu-fixture:
+absent` elsewhere, which is how every other IOMMU boundary property in that file is proved.
+
+**2. Revoking a mapped MMIO capability does not invalidate remote CPUs' cached translations.
+ACCEPTED.**
+
+`DeviceMemory::teardown_mapping` called `AddressSpace::unmap` per page, and that path clears the PTE
+and invalidates THIS core's translation buffer only - `mem::tlb`'s own first paragraph says nothing
+else is told. A driver is a process with threads; one on another core kept a live translation to the
+BAR after the claim reached `Free`, which is precisely the half of M2's revocation this method
+exists to perform. The freed virtual range has the same problem one step later.
+
+`crate::mem::tlb::shootdown()` is now called after the pages are unmapped and before `free_vrange`,
+which is the same placement every other caller uses. It is blunt - it flushes each online core and
+waits - and it runs once per binding teardown, which is where that cost belongs. Deadlock is not a
+concern here: `SpinLock::lock` services pending shootdowns while it spins, which is the other half of
+that mechanism and is documented in `sync.rs`.
+
+**3. The last-reference interrupt teardown can race claim release and be mistaken for confirmed
+revocation. ACCEPTED.**
+
+`revoke_derived` upgrades each row's weak reference and answers `true` for every row whose object is
+already gone. That is the ordinary case - a driver that closed its handle before the release - AND
+the case where the last `Arc` is being dropped right now: `Weak::upgrade` fails as soon as the strong
+count reaches zero, which is BEFORE `Interrupt::drop` has run its unbind. The sweep then reported the
+claim quiet, `finish_release` published `Free`, `release_msi_for_device` put the vectors back into
+circulation, and a late unbind masked whichever binding had since taken the slot - the exact hazard
+`Interrupt::disown` exists to prevent on the rollback path. A riscv64 unbind that FAILED was equally
+invisible: `Drop` ignores the result.
+
+The registry answers both without new bookkeeping. `unbind` RETIRES a slot (it becomes pending) and a
+disable the hardware refused QUARANTINES it, so a slot this device still holds LIVE is one whose
+teardown has neither completed nor failed - it has not happened yet. `arch::interrupts::msi_live_for_device`
+exposes `MsiRegistry::has_live` on all three ports, and `device::settled_vectors` waits a bounded
+number of spins for the device's slots to reach a terminal state before the release is allowed to
+confirm. The wait is a handful of instructions inside `Arc::drop` by construction; a slot still live
+after it is one nothing is going to settle, and the claim is not `Free`. A count rather than a clock,
+because this runs with interrupts masked under no timer the teardown may rely on.
+
+**4. The added same-handle race test still does not establish the required concurrent case.
+ACCEPTED.**
+
+The serial form does catch the regression the definition of done names by construction - a send that
+looks up, clones and does not spend the source lets the SECOND call find the entry, and the test
+asserts exactly one delivery and a spent slot. What it never did is put two threads inside the
+transaction at once, which is what the item asks for.
+
+`two_threads_attenuating_one_handle_move_it_exactly_once` now runs its racers on cores 1 and 2 with
+the same barrier `kernel.arch.concurrent_page_table_stress` uses, and the barrier is CHECKED: a pair
+that never met fails the test rather than reporting a race it did not run. `sched::prepare_in_process_on`
+is the new seam - a thread in an existing process, built for a named core, so the kernel stack is
+allocated in that core's node rather than the creating core's. A topology with fewer than three cores
+still runs the pair on one core and still proves exactly-once; it does not claim to have raced them.
+Measured on x86_64: the test passes on the parallel path.
+
+The DMA addendum stays sequential and is answered by finding 1 instead: what proves an old generation
+cannot alter the replacement's IOMMU state is the refusal in `domain_for_generation`, tested against
+a real controller, not a registry row count.
+
+Verification: x86_64 373 passed; riscv64 and aarch64 suites and `./check.sh` in the same pass - see
+the verification note at the end of the M0167 response.

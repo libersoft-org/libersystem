@@ -48,12 +48,29 @@ struct DisplaySurface {
 	client: DisplayClient,
 }
 
+// WHETHER THE FIRST PRESENT HAS BEEN REPORTED, and how it went. A frame reaching the display is what
+// P02M0159's M4 asks the enforcing profile to show - "not 'it printed online': a frame reaches the
+// display" - and this service DISCARDED the answer, so a boot where every present failed looked
+// exactly like one where they all landed. One line, once, on the first of each outcome: presenting is
+// a hot path and a line per frame would be the scattering this tree keeps removing.
+static PRESENTED: core::sync::atomic::AtomicU8 = core::sync::atomic::AtomicU8::new(0);
+const PRESENT_UNREPORTED: u8 = 0;
+const PRESENT_OK: u8 = 1;
+const PRESENT_FAILED: u8 = 2;
+
 impl Surface for DisplaySurface {
 	fn raster(&self) -> &Raster {
 		&self.raster
 	}
 	fn present(&self, x: u32, y: u32, w: u32, h: u32) {
-		let _ = surface::present(&self.client, Rect { x, y, width: w, height: h });
+		let landed = matches!(surface::present(&self.client, Rect { x, y, width: w, height: h }), Some(Ok(())));
+		let want = if landed { PRESENT_OK } else { PRESENT_FAILED };
+		if PRESENTED.load(core::sync::atomic::Ordering::Relaxed) & want == 0 && PRESENTED.fetch_or(want, core::sync::atomic::Ordering::AcqRel) & want == 0 {
+			unsafe {
+				print(if landed { b"ConsoleService: a frame reached the display\n".as_slice() } else { b"ConsoleService: a frame did NOT reach the display\n".as_slice() });
+			}
+		}
+		let _ = PRESENT_UNREPORTED;
 	}
 }
 

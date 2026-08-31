@@ -243,7 +243,10 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 		// EVERY CONSUMER OF THIS DISK, not the one that asked first. A second subscriber gets its
 		// own endpoint from the manager and it arrives here as a `CONNECT`; this is the set they
 		// accumulate in, and the loop below serves whichever has work.
-		let mut serving = common::Serving::new(blk_server);
+		// TOKEN ZERO, because `online` names its offers by their position in its own list and this
+		// driver publishes exactly one. The token is what a `DISCONNECT` names, so it has to be the
+		// one the offer was made under.
+		let mut serving = common::Serving::new(blk_server, 0);
 		loop {
 			// THE MANAGER'S PING IS ANSWERED BY THIS LOOP, not by a second one. An idle driver
 			// parked in `recv_blocking` would otherwise look exactly like a wedged one, which is
@@ -286,7 +289,14 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 				// driver, because there was only ever one; with several, a consumer that closes is
 				// one client leaving and the rest keep their disk. The last one leaving is not an
 				// exit either - the manager decides when a binding ends, not the last reader.
-				_ => serving.close_at(at),
+				//
+				// AND THE MANAGER IS TOLD, so the place this consumer held against the `consumers`
+				// bound comes back. Without it the count only ever rose and a provider admitting one
+				// consumer was spent by the first client that ever opened it.
+				_ => {
+					let token = serving.close_at(at);
+					common::disconnected(bootstrap, bind, token);
+				}
 			}
 		}
 	}

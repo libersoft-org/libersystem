@@ -320,3 +320,28 @@ catalog change. The mutation list gains REPLACEMENT beside deletion and reclassi
 
 **Plan re-check.** Item count unchanged at ten. M1 and M2 now say the same thing about the medium
 boundary, which is what the previous round claimed and did not deliver. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0170 (2026-08-31T03:28:50Z):
+
+Rating: 6/10
+
+1. **The new stable-medium boundary still does not stabilize snapshot acquisition against the
+   producers.** M1 correctly notes that current producers sit outside `mkimage.sh`'s lock, but its
+   `SNAPSHOT` option merely copies live inputs to private paths and its `SERIALISE` option merely
+   serializes runs while they copy (`docs/todo/P02M0170.md:59-76`). Neither requires the writers of
+   those live volume/package/loader/manifest inputs to publish immutable run-specific objects or to
+   participate in the snapshot-point lock. A producer can therefore replace or write an input during
+   the copy, moving the race into acquisition or producing a mixed-generation snapshot. M2 mutates an
+   input only during assembly (`:86-93`), after acquisition. Make acquisition atomic relative to every
+   producer publication (or make all producer outputs run-private/immutable) and exercise mutation
+   during acquisition itself.
+
+2. **The identity manifest hashes tools and firmware but does not bind the bytes actually used.** M8
+   records resolved tool paths and firmware hashes once, while the later immutability rule and
+   mutate-use-restore regression cover only the source snapshot/file
+   (`docs/todo/P02M0170.md:169-186`). Current gates resolve and execute QEMU later through `PATH`, and
+   QEMU opens the environment-selected OVMF path later (`src/harness/qemu-run.sh:962-970,1018-1023,
+   1179-1187,1236`). Replacing and restoring a compiler, QEMU executable, or firmware image after
+   identity collection can therefore make the dossier name bytes different from those exercised.
+   Bind each tool/firmware use to immutable verified bytes, or verify at the use boundary, and extend
+   mutate-use-restore coverage beyond source files.

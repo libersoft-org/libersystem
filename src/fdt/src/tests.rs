@@ -169,6 +169,25 @@ fn machine(body: impl FnOnce(&mut Builder)) -> &'static [u8] {
 	builder.finish()
 }
 
+// THE SAME, WITH AN INTERRUPT CONTROLLER THE TREE ACTUALLY ROUTES TO.
+//
+// `machine` builds a root that states no `interrupt-parent` beside no controller at all, which is
+// right for the memory and cpu cases and wrong for every TIMER one: the reader refuses a timer whose
+// routing it cannot check, so a fixture with nothing to check against answers zero for that reason
+// and proves nothing about the specifier it was written to test. Root-stated parent and a GICv3 that
+// answers to it - the ordinary machine, with the case under test as the only variable.
+fn routed_machine(body: impl FnOnce(&mut Builder)) -> &'static [u8] {
+	let mut builder = Builder::new();
+	builder.begin("");
+	builder.prop_u32("#address-cells", 2).prop_u32("#size-cells", 2).prop_u32("interrupt-parent", 1);
+	builder.begin("memory@40000000").prop("device_type", b"memory\0").prop_reg64(0x4000_0000, 0x2000_0000).end();
+	builder.begin("cpus").prop_u32("#address-cells", 1).prop_u32("#size-cells", 0).begin("cpu@0").prop_u32("reg", 0).end().end();
+	builder.begin("intc@8000000").prop_str("compatible", "arm,gic-v3").prop("reg", &gic_reg(0x0800_0000, 0x1_0000, 0x080a_0000, 0xf6_0000)).prop_u32("phandle", 1).end();
+	body(&mut builder);
+	builder.end();
+	builder.finish()
+}
+
 #[test]
 fn a_hole_in_the_memory_map_is_not_reported_as_memory() {
 	// THE ARITHMETIC USED TO CLAIM THE HOLE. `ram_base` was the first bank's base and `ram_size` the
@@ -1886,14 +1905,14 @@ fn the_timer_interrupt_is_read_from_the_tree_and_not_assumed() {
 		}
 		out
 	};
-	let virt = machine(|builder| {
+	let virt = routed_machine(|builder| {
 		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &interrupts(13, 14, 11, 10)).end();
 	});
 	assert_eq!(at(virt).parse().expect("parses").timer_intid, 30, "QEMU virt's non-secure EL1 physical timer is PPI 14, which is INTID 30 - the number the backend had compiled in");
 
 	// A MACHINE THAT NAMES ANOTHER PPI IS READ, not overridden. This is the case the compiled
 	// constant was silently wrong about. PPI 11 is INTID 27 - a different number, and a legal one.
-	let other = machine(|builder| {
+	let other = routed_machine(|builder| {
 		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &interrupts(13, 11, 11, 10)).end();
 	});
 	assert_eq!(at(other).parse().expect("parses").timer_intid, 27, "a tree naming PPI 11 means INTID 27, and reading 30 there arms an interrupt the machine did not describe");
@@ -1905,13 +1924,13 @@ fn the_timer_interrupt_is_read_from_the_tree_and_not_assumed() {
 	// tagged. Published, it becomes INTID 36 - which GICv3 shifts a 32-bit enable word by and GICv2
 	// reads as a distributor SPI, neither of which is the timer. Unset is what lets the caller
 	// refuse a machine it cannot drive.
-	let past_the_range = machine(|builder| {
+	let past_the_range = routed_machine(|builder| {
 		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &interrupts(13, 20, 11, 10)).end();
 	});
 	assert_eq!(at(past_the_range).parse().expect("parses").timer_intid, 0, "PPI 20 is not a PPI - sixteen of them exist, and a number past that is a specifier this reader cannot decode");
 
 	// NOR IS A CELL TAGGED AS SOMETHING ELSE. Kind 0 is an SPI; a timer is not on the distributor.
-	let not_a_ppi = machine(|builder| {
+	let not_a_ppi = routed_machine(|builder| {
 		let mut cells = interrupts(13, 14, 11, 10);
 		cells[12..16].copy_from_slice(&0u32.to_be_bytes());
 		builder.begin("timer").prop_str("compatible", "arm,armv8-timer").prop("interrupts", &cells).end();
@@ -1925,7 +1944,7 @@ fn the_timer_interrupt_is_read_from_the_tree_and_not_assumed() {
 	assert_eq!(at(none).parse().expect("parses").timer_intid, 0, "no timer node is no timer interrupt - zero is 'the tree said nothing', not a default");
 
 	// A node named `timer` that is not the ARM generic timer is not one either.
-	let foreign = machine(|builder| {
+	let foreign = routed_machine(|builder| {
 		builder.begin("timer").prop_str("compatible", "some,other-timer").prop("interrupts", &interrupts(13, 14, 11, 10)).end();
 	});
 	assert_eq!(at(foreign).parse().expect("parses").timer_intid, 0, "a timer this reader does not implement names no interrupt it can arm");
@@ -1995,6 +2014,16 @@ fn a_timer_inheriting_another_controller_is_not_armed_on_the_selected_gic() {
 
 	// The same tree with the root routing to the selected GIC is the ordinary machine, and is read.
 	assert_eq!(at(tree(1, 1)).parse().expect("parses").timer_intid, 30, "a timer that inherits the selected GIC is every real tree this reader boots, and refusing it would refuse them all");
+
+	// AND A ROUTING THIS READER CANNOT CHECK IS NOT ONE IT HAS CHECKED (2026-08-31).
+	//
+	// Both operands used to have to be nonzero before the comparison happened at all, so the two
+	// trees below - a timer with no effective parent, and a selected controller declaring no
+	// phandle - skipped it and had their PPI enabled on a controller nothing tied them to. Neither
+	// shape occurs on the machines this reader boots, which is exactly why it went unnoticed: what
+	// it costs is nothing, and what it accepted was every tree that says less than it should.
+	assert_eq!(at(tree(0, 1)).parse().expect("parses").timer_intid, 0, "a timer with no effective interrupt parent names no controller, and arming its INTID on the selected GIC is a routing decision the tree did not make");
+	assert_eq!(at(tree(1, 0)).parse().expect("parses").timer_intid, 0, "a selected controller with no phandle cannot be the one the timer routes to, because nothing can name it");
 }
 
 // A GICv3 REDISTRIBUTOR REGION TOO SMALL TO HOLD ONE FRAME IS NOT A MAIN CONTROLLER.
@@ -2067,7 +2096,7 @@ fn a_v2m_frame_that_is_undersized_or_aliases_the_controller_is_refused() {
 #[test]
 fn a_timer_specifier_with_no_single_sense_is_not_read() {
 	let with_flags = |flags: u32| -> &'static [u8] {
-		machine(move |builder| {
+		routed_machine(move |builder| {
 			let mut cells = Vec::new();
 			for number in [13u32, 14, 11, 10] {
 				cells.extend_from_slice(&1u32.to_be_bytes());

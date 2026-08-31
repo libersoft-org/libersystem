@@ -594,3 +594,54 @@ this round.
 2. **Lazy MSI doorbell installation is not idempotent on the platform-fallback path.** Reported MSI regions use the `identity_mapped` check, but the fallback region proceeds directly to `map_identity` (`src/kernel/iommu/mod.rs:618-677`). The DMA layer rejects overlapping mappings (`src/dma/src/lib.rs:1154-1168`), so a second acquire for an endpoint using the supported fallback shape fails merely because the first acquire already installed the same doorbell mapping.
 
 3. **Binding-level accounting still omits faults and can falsely report zero retained quarantine.** The snapshot exposes mapping totals and a quarantined subset but no per-binding fault count (`src/abi/src/lib.rs:894-932`, `src/kernel/device.rs:424-442`). Moreover, an unconfirmed detach retains the domain and quarantined mappings, but recording the device-to-retained-domain association is fallible; on allocation failure the code deliberately retains the unsafe state while the snapshot has no association through which to count it (`src/kernel/iommu/mod.rs:814-825`). The implementer's rejection is therefore not justified: M4 explicitly requires per-binding mapping/IOVA/endpoint/fault accounting and an exact post-teardown baseline.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-08-31T06:05:00Z):
+
+**1. Teardown attribution is corrected only in the caller's temporary output, after the authoritative
+fault record was written. ACCEPTED.**
+
+Exact. `Iommu::drain_faults` calls `self.faults.record(*event)` as it drains, and
+`poll_faults_attributed` patched the events it got BACK - so the serial line named the binding and
+the bounded ring a supervisor reads kept `DomainId(0)` at `Generation(0)` for the same fault. M5 asks
+for the binding generation in the RECORD, and two answers that disagree is not one of them.
+
+`Iommu::drain_faults_during(out, teardown)` takes the attribution the caller still knows and applies
+it BEFORE `record`. `drain_faults` is that call with `None`. The kernel's `drain_faults` passes it
+through and `poll_faults_attributed` no longer patches anything: the buffer it iterates is already
+the record that was kept. Applied only to an event whose endpoint matches and whose domain the
+backend could not resolve - a fault from another endpoint keeps its own attribution, and a resolved
+one is never overwritten by a guess, which is the rule the old post-patch had and is worth keeping.
+
+**2. Lazy MSI doorbell installation is not idempotent on the platform-fallback path. ACCEPTED.**
+
+The `identity_mapped` guard was added where the endpoint REPORTS its doorbell and not on the fallback
+branch, so an endpoint on the platform doorbell - one offering no `F_PROBE`, or probing and listing no
+MSI region - still met `Overlaps` on its second acquire and lost its vector for it. The two branches
+map the same kind of region for the same reason and are now idempotent on the same terms.
+
+**3. Binding-level accounting still omits faults, and the retained-domain association is fallible.
+ACCEPTED, both halves.**
+
+M4's fourth bullet asks for this backend's mapping, IOVA, endpoint AND fault counters in the
+per-binding accounting, and `DeviceClaimSnapshot` carried three of the four.
+
+- `DomainState` gains a saturating `faults` counter, incremented in `drain_faults_during` against the
+  domain the event resolved to. The domain IS the binding, so a retained domain still answers for the
+  binding that left it behind - which a controller-wide total cannot do: a driver that crashes, is
+  rebound and faults again adds to the same number as every device beside it.
+- `iommu::faults_for(index)` reads it through the same live-or-retained lookup `grants_for` uses, and
+  `DeviceClaimSnapshot::iommu_faults` (u64) carries it. A `u64` because a flooding endpoint may
+  increment a counter for ever and a count that wrapped would read as a clean binding.
+- The retained association is no longer fallible. It was a growable list with a `try_reserve` whose
+  failure arm kept the quarantine and LOST the association, so an unconfirmed detach under memory
+  pressure left a device reporting zero IOMMU holdings while its address space was permanently out of
+  circulation - and M4 asks for an EXACT post-teardown baseline, not one that is exact unless the heap
+  was short at the wrong moment. `RETAINED` is now one slot per device, sized once in `iommu::init`
+  from the device table `device::init` has already resolved, so recording is an infallible store.
+
+AND THE ABI FREEZE CAUGHT A PRE-EXISTING BREAK. `assert_layout!` for `DeviceClaimSnapshot` still
+named `_pad1` at offset 36 - the field replaced by `iommu_quarantined` in an earlier pass - so the
+`abi` crate's own test suite had not compiled since that change, and `host-tests` could not have run
+it. The assertion now names `iommu_quarantined => 36` and `iommu_faults => 40` with the size at 48,
+and the 28 `abi` tests pass. Worth recording separately from this milestone: a frozen layout whose
+freeze does not compile is not frozen.

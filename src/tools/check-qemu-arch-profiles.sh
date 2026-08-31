@@ -303,6 +303,19 @@ run_profile aarch64 gicv3 1 "GICv3 from the device tree" GIC=3
 run_profile aarch64 gicv3 4 "GICv3 from the device tree" GIC=3
 MSI_ORACLE="$AARCH64_MSI"
 run_profile aarch64 gicv3-its 1 "GICv3 from the device tree" GIC=3its
+# A REAL-DEVICE ITS/MSI CHECKPOINT IS NOT REACHABLE FROM THESE PROFILES, AND THIS IS THE MEASUREMENT
+# (2026-08-31). M3 and M6 ask for one, and it was tried here rather than argued about:
+#
+#   - every MSI oracle on these profiles programs a RAM-backed stand-in table and calls the shared
+#     dispatch entry point by hand, so a report emitted there cannot tell a device-raised message
+#     from the kernel calling itself - the oracle triggered it on the first run;
+#   - what raises a real one is an ordinary driver, and a driver only exists on a boot that reaches
+#     userspace. These profiles are DIRECT boots, which is what M6 asks them to be, and a direct boot
+#     carries no init package: adding `kernel.boot.init_package_starts_system_manager` to this
+#     profile's selection failed with `init package module not found`, measured.
+#
+# So the checkpoint needs either a UEFI ITS profile that carries the package, or a delivery-path
+# report the oracles cannot reach. Both are work this gate does not own, and neither is claimed here.
 run_profile aarch64 gicv3-its 4 "GICv3 from the device tree" GIC=3its
 
 # THE UEFI / NO-DEVICE-TREE REGRESSION PROFILES ARE NOT REGISTERED HERE, AND THIS SAYS WHY

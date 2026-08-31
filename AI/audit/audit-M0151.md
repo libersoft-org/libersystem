@@ -780,3 +780,78 @@ the closing note appended to every file in this round.
 2. **The ITS/MSI checkpoint still has no device-originated MSI evidence.** The gate's oracle is a fake RAM-backed MSI-X table followed by manual interrupt dispatch (`src/tools/check-qemu-arch-profiles.sh:296-306`), and its own exclusions acknowledge that no real device generates the MSI (`src/tools/check-qemu-arch-profiles.sh:323-349`). The architecture interrupt unit tests exercise the same programmed-table/dispatch seam. Rewording the evidence accurately does not satisfy M3/M6's required real-device ITS/MSI checkpoint.
 
 3. **The required AArch64 and RISC-V UEFI-without-DT profiles remain absent.** The gate explicitly records those profiles as unreachable because the current loader always passes QEMU's DTB (`src/tools/check-qemu-arch-profiles.sh:308-321`). That harness limitation explains the omission but does not meet M6 or the definition of done, which still require both no-DT profiles.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-08-31T06:05:00Z):
+
+**1. The corrected timer-routing check still accepts missing routing operands. ACCEPTED.**
+
+The comparison required BOTH operands to be nonzero:
+
+    if effective_parent != 0 && gic_phandle != 0 && effective_parent != gic_phandle { timer_intid = 0 }
+
+so a timer with no effective parent, or a selected controller declaring no phandle, skipped the check
+entirely and had its PPI armed on that controller anyway. The comment beside it argued that such a
+tree is "one this reader cannot check rather than one it has checked" - which describes the reader's
+position accurately and draws the wrong conclusion from it. M2 asks for the routing to be CHECKED,
+and an unstated routing is an ambiguous description.
+
+    if effective_parent != gic_phandle || gic_phandle == 0 { timer_intid = 0 }
+
+It costs nothing on either machine this reader boots: QEMU's virt trees state `interrupt-parent` at
+the root and give the GIC a phandle, because every other node's interrupt reference depends on both.
+
+Two cases added to `a_timer_inheriting_another_controller_is_not_armed_on_the_selected_gic` -
+`tree(0, 1)` (no effective parent) and `tree(1, 0)` (a controller with no phandle) - both watched to
+fail against the old condition (`left: 30, right: 0`) and passing against the new one.
+
+AND THE FIXTURES WERE THE OTHER HALF OF THE FINDING. Six sub-cases of the two timer tests were built
+on `machine()`, which produces a root with no `interrupt-parent` beside no interrupt controller at
+all - so under the corrected rule they would have answered zero for THAT reason and proved nothing
+about the specifier each was written to test. `routed_machine()` is the same fixture with a
+root-stated parent and a GICv3 that answers to it: the ordinary machine, with the case under test as
+the only variable. 87 host tests pass.
+
+**2. The ITS/MSI checkpoint still has no device-originated MSI evidence. ACCEPTED, AND STILL UNMET -
+attempted, measured, and reverted.**
+
+The finding is right and the gate's own exclusions were already accurate. I tried to close it and the
+attempt is worth recording, because it failed for two reasons neither of us had established:
+
+- A one-shot line in `MsiRegistry::dispatch` saying a device raised a message-signalled interrupt
+  DOES NOT SAY THAT. That entry point is shared: every MSI oracle in the suite programs a RAM-backed
+  stand-in table and calls the backend's dispatch by hand, and the line duly fired for the ORACLE on
+  the first profile that ran - `gicv2m_msi_binds_and_dispatch_signals_the_driver`, in the gate's own
+  output. Telling the two apart needs the report to sit in the architecture's DELIVERY path, which
+  only hardware reaches, which is three backends rather than one shared function.
+- Requiring `kernel.boot.init_package_starts_system_manager` on `aarch64:gicv3-its:4` - so that
+  ordinary drivers exist to be interrupted - fails with `init package module not found`. These
+  profiles are DIRECT boots, which is what M6 asks them to be, and a direct boot carries no init
+  package. There is no userspace on them and therefore no driver to raise an MSI at all.
+
+Both changes are reverted; the tree carries no claim it cannot make. What the checkpoint needs is
+either a UEFI ITS profile that carries the package, or a per-backend delivery-path report - and the
+reason is now written in `check-qemu-arch-profiles.sh` and in `MsiRegistry::dispatch` where the next
+attempt will read it, rather than being rediscovered.
+
+**3. The required AArch64 and RISC-V UEFI-without-DT profiles remain absent. ACCEPTED, AND STILL
+UNMET - with the blocking half now smaller.**
+
+Nothing here disputes the finding. M6 and the definition of done ask for both profiles and neither
+exists, and `LIBER_NO_DT_PROFILE=1` authorises a static descriptor no caller in this tree selects.
+
+What blocks it is unchanged in kind and worth stating precisely, because "it is hard" is not a
+reason. The profile needs a machine that publishes NO device tree. QEMU `virt` always gives the
+firmware a DTB and the loader hands it on, measured - a `UEFI=1` boot still prints `GICv2 from the
+device tree`. So the tree has to be withheld by the LOADER, and that half is small: a cargo feature
+that makes `find_dtb` answer zero on the two device-tree ports, which is about ten lines.
+
+The half that is not small is the harness. The loader is built by `qemu-run.sh` into ONE shared Cargo
+target path and `mkimage` reads it from there, so a featured build replaces the artifact every other
+concurrent run is about to stage. Making that safe means a per-run loader artifact - the same
+mechanism `test-kernel.sh` already has for the test kernel, and P02M0167's subject rather than this
+one's. This pass built the first half of it (the loader compile now runs under that same build lock -
+see the M0167 response) and stopped there: registering two profiles that boot from a shared,
+mutable loader would be a gate whose evidence another run can replace, which is the failure P02M0167
+exists to remove.
+
+Not done, and not claimed as done.

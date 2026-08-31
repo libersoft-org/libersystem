@@ -929,6 +929,15 @@ pub struct DeviceClaimSnapshot {
 	// This was the reserved padding word, so the struct's size and every offset before it are
 	// unchanged.
 	pub iommu_quarantined: u32,
+	// AND HOW MANY FAULTS THIS BINDING RAISED, which is the fourth counter P02M0153's M4 names
+	// beside the mapping, IOVA and endpoint ones - and the one this struct did not carry.
+	//
+	// A controller-wide total cannot answer "did this restart come back to its baseline" for ONE
+	// device: a driver that crashes, is rebound and faults again adds to the same number as every
+	// device beside it. Counted against the DOMAIN, which is the binding, so a retained domain still
+	// answers for the binding that left it behind. `u64`, because a flooding endpoint may increment
+	// a counter for ever and a count that wrapped would read as a clean binding.
+	pub iommu_faults: u64,
 }
 
 // The four states a device-table slot can be in. THE SAME FOUR everywhere - two lists is how a state

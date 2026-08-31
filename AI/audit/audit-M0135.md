@@ -1086,3 +1086,44 @@ negotiates in the admitted range.
 paragraph and in the gate list; the quarantine lifecycle reads the same in the contract, in pass 2
 and in the deferral; and the loader port names a mechanism for every question it previously listed.
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-08-31T03:28:50Z):
+
+Rating: 5/10
+
+1. **The accepted pinning finding remains incomplete, so the plan's downstream branch decisions are
+   still assertions about an unknown build.** The plan repeatedly calls the configuration pinned and
+   approvable, but supplies no Vulkan-Loader/Vulkan-Headers revision, archive SHA-256, toolchain-file
+   digest, tool identities and flags, selected CMake values, or bootstrap-sysroot digest; it only
+   requires a future bootstrap record to supply them (`docs/todo/P02M0135.md:112-183,564-580,636-650`).
+   The latest response expressly confirms that these values were not supplied
+   (`AI/audit/audit-M0135.md:1035-1038`). Splitting bootstrap and derived pins correctly removes the
+   ordering cycle, but it does not resolve the original missing-pin half. Until the bootstrap record
+   exists, the claims that tests and WSI are off, that the production build has no thread/TLS needs,
+   and that its lifecycle surface is empty have not been derived from a reproducible input; the plan
+   cannot call that configuration pinned or approvable yet.
+
+2. **The selection-slot correction leaves the incompatible ProcessService contract in force and
+   never defines how a selected slot enters the eager dependency closure.** The discovery item still
+   says ProcessService simply adds the ICD to the verified closure and that this requires no new
+   ProcessService mechanism (`docs/todo/P02M0135.md:451-462`). Its later correction introduces a new
+   v2 selection-slot grammar and requires ProcessService to choose and bind a staged digest
+   (`:484-506`). Current ProcessService derives dependencies only from `DT_NEEDED`, compares that set
+   exactly with the fixed identity-provider list, and recursively loads only those names
+   (`src/user/services/core/src/process_service.rs:139-168,206-218,283-299,338-346,679-710`). An ICD
+   absent from `DT_NEEDED` does not enter that resolver merely because its digest occupies a selection
+   slot. State explicitly that resolved slots become dependency/load-order nodes before the equality
+   check, and remove the contradictory no-new-mechanism/ordinary-edge text.
+
+3. **The statement that a C99 build has an empty lifecycle set is false and can suppress mandatory
+   positive gates.** Pass 1 correctly inventories `.init_array`, `.fini_array`, and `errno`, and the
+   ABI item makes the measured inventory authoritative (`docs/todo/P02M0135.md:192-202,298-329`). The
+   controlling guest-gate text nevertheless declares the expected supported set empty because the
+   production closure is C99, and says those gates therefore are not written (`:611-626`). C versus
+   C++ does not decide ELF initializers: the upstream Vulkan-Loader revision already examined in this
+   audit has non-Windows constructor and destructor entry points and uses `errno`
+   ([official source](https://github.com/KhronosGroup/Vulkan-Loader/blob/b1d75f38257ffa71d7aa93552d2e2793296309aa/loader/loader.c#L2228-L2232)),
+   while LiberSystem startup currently calls the entry point without an init/fini runner
+   (`src/user/runtime/rt/src/lib.rs:51-74`). Keep the inventory-driven branch authoritative and remove
+   the empty-set conclusion; any retained constructor, destructor, or `errno` use needs the positive
+   lifecycle gates the plan already describes.

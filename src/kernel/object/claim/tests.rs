@@ -528,7 +528,7 @@ fn ending_a_claim_takes_the_dma_buffers_it_authorised() {
 	// registered as derived the way the syscall registers it.
 	let memory = DeviceMemory::for_claim(key, 0xfeed_2000, 0x1000).expect("a device memory");
 	assert_eq!(memory.claim(), Some(key), "the device capability carries the claim the buffer is stamped from");
-	let Ok(buffer) = DmaBuffer::create_for(&crate::sched::root_domain(), 0x1000, memory.device_index()) else {
+	let Ok(buffer) = DmaBuffer::create_for(&crate::sched::root_domain(), 0x1000, memory.claim()) else {
 		panic!("a dma buffer");
 	};
 	let before = buffer.header().generation();
@@ -566,12 +566,27 @@ fn two_threads_attenuating_one_handle_move_it_exactly_once() {
 	// send that reads the entry, builds the attenuated capability, and only then removes the source:
 	// both threads would pass the read and the receiver would get the capability twice, which is a
 	// capability duplicated by a race rather than by `SYS_HANDLE_DUPLICATE`.
+	//
+	// AND ON TWO CORES, WITH A BARRIER, WHERE THE MACHINE HAS THEM. Both racers used to be queued on
+	// the CURRENT core and released with `run_until_idle`, which runs one to completion and then the
+	// other: that proves the lookup-clone-send shape above is gone, because a send that does not
+	// spend the source entry lets the SECOND call find it - but it never puts two threads inside the
+	// transaction at once, which is the case the definition of done names. The barrier is the same
+	// one `kernel.arch.concurrent_page_table_stress` uses, and it is CHECKED: a pair that never met
+	// says so instead of reporting a race it did not run.
 	use crate::object::channel::Channel;
 	use crate::object::rights::Rights;
 	use core::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 	static RESULTS: [AtomicI64; 2] = [AtomicI64::new(i64::MIN), AtomicI64::new(i64::MIN)];
 	static DONE: AtomicUsize = AtomicUsize::new(0);
 	static SUBJECT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+	// How many racers have reached the line before the syscall, and whether one gave up waiting for
+	// the other. Both are reset per run.
+	static ARRIVE: AtomicUsize = AtomicUsize::new(0);
+	static BARRIER_LOST: AtomicUsize = AtomicUsize::new(0);
+	// Whether this run is the two-core one. A single-core topology still runs the pair and still
+	// proves exactly-once; it does not claim to have raced them.
+	static PARALLEL: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
 	// Both threads send the same handle over their own endpoint argument.
 	//
@@ -582,6 +597,21 @@ fn two_threads_attenuating_one_handle_move_it_exactly_once() {
 	fn race(slot: usize, channel: u64) {
 		unsafe {
 			let subject = SUBJECT.load(Ordering::SeqCst);
+			// SHOULDER TO SHOULDER BEFORE THE SYSCALL, so the two lookups are inside the transaction
+			// together rather than one after the other. Bounded, because a core that never arrives
+			// must fail this test rather than hang the suite.
+			if PARALLEL.load(Ordering::SeqCst) {
+				ARRIVE.fetch_add(1, Ordering::SeqCst);
+				let mut spins = 0u64;
+				while ARRIVE.load(Ordering::SeqCst) < 2 {
+					core::hint::spin_loop();
+					spins += 1;
+					if spins > 2_000_000_000 {
+						BARRIER_LOST.fetch_add(1, Ordering::SeqCst);
+						break;
+					}
+				}
+			}
 			let payload = *b"r";
 			let transfer = abi::CapTransfer { handle: subject, rights: abi::RIGHT_READ, _pad: 0 };
 			let answer = crate::arch::syscall::invoke(crate::syscall::SYS_CHANNEL_SEND_ATTENUATED, channel, payload.as_ptr() as u64, payload.len() as u64, &transfer as *const abi::CapTransfer as u64) as i64;
@@ -599,6 +629,12 @@ fn two_threads_attenuating_one_handle_move_it_exactly_once() {
 	RESULTS[0].store(i64::MIN, Ordering::SeqCst);
 	RESULTS[1].store(i64::MIN, Ordering::SeqCst);
 	DONE.store(0, Ordering::SeqCst);
+	ARRIVE.store(0, Ordering::SeqCst);
+	BARRIER_LOST.store(0, Ordering::SeqCst);
+	// Cores 1 and 2, like the page-table stress: core 0 is the one running this test and it has to
+	// stay free to observe. The test topologies boot with more (x86 nproc, aarch64 8, riscv64 4).
+	let parallel = crate::smp::cpu_count() >= 3;
+	PARALLEL.store(parallel, Ordering::SeqCst);
 
 	// One process, one handle table. The subject is a MemoryObject because it is the cheapest thing
 	// to mint with real rights; what is under test is the table entry, not the object.
@@ -611,13 +647,30 @@ fn two_threads_attenuating_one_handle_move_it_exactly_once() {
 	let subject = process.install(subject_object, Rights::ALL).expect("the handle both threads race for");
 	SUBJECT.store(subject, Ordering::SeqCst);
 
-	let one = crate::sched::prepare_in_process(racer_one, first, &process);
-	let two = crate::sched::prepare_in_process(racer_two, second, &process);
-	crate::sched::start_thread(&one);
-	crate::sched::start_thread(&two);
-	crate::sched::run_until_idle();
+	if parallel {
+		let one = crate::sched::prepare_in_process_on(1, racer_one, first, &process);
+		let two = crate::sched::prepare_in_process_on(2, racer_two, second, &process);
+		assert!(crate::sched::start_thread_on(1, &one), "the first racer was queued on core 1");
+		assert!(crate::sched::start_thread_on(2, &two), "the second racer was queued on core 2");
+		let mut spins = 0u64;
+		while DONE.load(Ordering::SeqCst) < 2 {
+			core::hint::spin_loop();
+			spins += 1;
+			assert!(spins < 20_000_000_000, "the racing threads did not finish");
+		}
+	} else {
+		let one = crate::sched::prepare_in_process(racer_one, first, &process);
+		let two = crate::sched::prepare_in_process(racer_two, second, &process);
+		crate::sched::start_thread(&one);
+		crate::sched::start_thread(&two);
+		crate::sched::run_until_idle();
+	}
 
 	assert_eq!(DONE.load(Ordering::SeqCst), 2, "both threads ran");
+	// THE BARRIER FIRST, for the reason the page-table stress states: a pair that never met did not
+	// exercise the concurrent case, and a test that says nothing when it did not run is the shape
+	// this tree has a gate named after.
+	assert_eq!(BARRIER_LOST.load(Ordering::SeqCst), 0, "the racers never met at the barrier, so two attenuating sends were never inside the transaction together");
 	let (first_answer, second_answer) = (RESULTS[0].load(Ordering::SeqCst), RESULTS[1].load(Ordering::SeqCst));
 	// EXACTLY ONE MOVED IT. The other finds the entry gone and is refused - it does not deliver a
 	// second copy, and it does not succeed silently.

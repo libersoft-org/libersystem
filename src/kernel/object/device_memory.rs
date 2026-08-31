@@ -206,6 +206,19 @@ impl DeviceMemory {
 				None => {}
 			}
 		}
+		// AND EVERY OTHER CORE IS TOLD, before the range is given back.
+		//
+		// `AddressSpace::unmap` clears the PTE and invalidates THIS core's translation buffer, and
+		// `mem::tlb` says in its own first paragraph that nothing else is told. A driver is a process
+		// with threads, and one of them on another core keeps a cached translation for the BAR - so
+		// revoking the capability and tearing the mapping out still left that thread reaching the
+		// device's registers, which is the exact half of M2's revocation this method exists to
+		// perform. The freed virtual range has the same problem one step later: whatever is mapped
+		// there next is reachable through the stale entry.
+		//
+		// Blunt and synchronous, like every other caller: it flushes each online core and waits.
+		// This runs once per binding teardown, which is where that cost belongs.
+		crate::mem::tlb::shootdown();
 		crate::syscall::free_vrange(space.as_deref(), base, self.pages() as u64 * PAGE_SIZE);
 	}
 }

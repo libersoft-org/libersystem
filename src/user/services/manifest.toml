@@ -406,7 +406,10 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/audio_service.lsexe"
-providers = ["pcm", "wire", "lsrt"]
+# `device-proto` and `ipc-client` because this service DISCOVERS its device: it holds a
+# provider-catalogue connection and subscribes to the audio kind rather than being handed a driver
+# channel. `base-proto` comes with the catalogue's error type.
+providers = ["pcm", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
 name = "beep"
@@ -1682,12 +1685,6 @@ state_scope = "session"
 dependencies = ["log_service", "device_manager", "process_service"]
 
 [[services.roles]]
-tag = "SND"
-kind = "device"
-provider = "device_manager"
-presence = "optional"
-
-[[services.roles]]
 tag = "ADMIN"
 kind = "serve-root"
 provider = "self"
@@ -1698,6 +1695,23 @@ tag = "SERVE"
 kind = "serve-root"
 provider = "self"
 interface = "liber:audio@1/audio"
+
+# THE PROVIDER CATALOGUE, WHICH IS HOW THIS SERVICE FINDS ITS DEVICE.
+#
+# It used to be `SND`: DeviceManager took the audio provider into a slot of its own and routed the
+# driver's channel down the boot chain to here. That is the per-kind injection P02M0164 replaces -
+# a service reaches a device by SUBSCRIBING to the kind it needs, so a card bound after this service
+# started is one it can still connect to, and a second one is an entry rather than a full slot.
+#
+# LAST, like every addition to a role list: these are read POSITIONALLY from the generated
+# `BOOTSTRAP_ROLES`, so anything inserted in the middle shifts every read after it.
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "SERVE"
+interface = "liber:device@1/provider-catalogue"
+presence = "optional"
 
 [[services]]
 name = "config_service"

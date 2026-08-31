@@ -569,3 +569,42 @@ in the closing note appended to every file.
 **Rating: 8/10.**
 
 1. **The selection-specific boot medium is still not stable for the full run boundary.** `test-kernel.sh` holds the selection lock while compiling and staging the per-run ELF, then releases it before `qemu-run.sh` executes (`src/harness/test-kernel.sh:303-365,367`). The x86 path assembles its ISO only afterward (`src/harness/qemu-run.sh:925-952`). `mkimage.sh` has a separate assembly lock and aborts if an input changes, but the input producers remain outside that lock (`src/harness/mkimage.sh:722-726`). Detecting a replacement prevents false evidence but does not provide M3's required immutable, selection-specific medium through execution; the implementer has also reproduced a concurrent selection failure. Assigning the remaining ownership to planned M0170 does not complete M0167's unchanged definition of done.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-08-31T06:05:00Z):
+
+**1. The selection-specific boot medium is still not stable for the full run boundary. PARTLY
+REJECTED on evidence, and the part that is right is fixed.**
+
+REJECTED, for the medium itself. Read end to end this pass:
+
+- `test-kernel.sh` compiles under `kernel-test-build.lock` and copies the executable to
+  `.build/state/kernel-test-$ARCH.$$.elf` while the lock is still held. That copy is this run's by
+  construction and is handed to `qemu-run.sh` directly, so nothing between the lock and the boot can
+  change what runs.
+- `mkimage.sh testiso` writes `$SLUG-test.$key.iso`, and `image_input_key` hashes the kernel it was
+  given - the per-run copy. Two selections are two keys and therefore two FILES; replacing one is not
+  something that can happen to the other. The path is published by rename and its bytes never change
+  afterwards.
+- The stale sweep cannot take a live run's medium: it skips anything younger than twelve hours and
+  anything `fuser` reports open, and its own comment says absence of `fuser` keeps the file.
+
+So the medium IS selection-specific and immutable through execution. What the finding describes -
+`mkimage` aborting when an input changes mid-assembly - is the behaviour for a producer OUTSIDE the
+image's own inputs, and it ends in a refusal rather than in a medium built from two trees. A refusal
+is not false evidence.
+
+ACCEPTED, for the producer the item's own list misses. `qemu-run.sh` builds the LOADER on the way to
+the medium - `cd boot/loader && cargo build` - and nothing held anything over it. Every loader build
+in this tree shares one Cargo target directory, so two guests starting together entered that line
+together, which is exactly the race item 0 names for the kernel: an intermediate replaced or removed
+while another invocation is reading it. The kernel half was fixed by building under a lock and
+staging a private copy; this producer was left outside. It now takes the same
+`kernel-test-build.lock`. The lock only, not the medium: `mkimage.sh` is content-addressed and has
+its own assembly lock, so what had to be serialised is the compile.
+
+A consequence worth recording, because P02M0151's no-DT profiles need it: the loader is still built
+to ONE shared path, so a build with different FEATURES would replace the artifact other runs stage
+from. `mkimage`'s post-assembly key check turns that into a refusal rather than a wrong medium, but
+a per-run loader artifact - the mechanism this milestone already has for the kernel - is what would
+make a featured loader safe to have. Not done here; named, so the next reader does not have to
+rediscover it.

@@ -229,6 +229,19 @@ pub enum Opcode {
 	// reads as responsive, and a busy driver and a wedged one look the same. An answer that does not
 	// echo the number it was asked with is not an answer to this question.
 	Pong = 8,
+	// driver -> manager, after the handshake. One publisher-local token: a CONSUMER of the provider
+	// this driver published under that token has gone, and the driver is serving one fewer.
+	//
+	// THE BOUND IS ON CONCURRENT CONSUMERS, WHICH IS WHY THIS HAS TO EXIST. A registry entry declares
+	// how many consumers a kind admits, and the manager counts one per connection it mints. With no
+	// message in this direction the count only ever rose - so ordinary churn, a consumer that opens
+	// and closes, spent the declaration permanently and a provider declaring one consumer was
+	// unusable after its first client left. That is a LIFETIME quota, and it is not what the
+	// declaration says.
+	//
+	// The TOKEN and not the manager's identity, for the same reason `WITHDRAW` names one: a driver
+	// never sees a `ProviderId`. Not terminal, and not a withdrawal: the provider stays published.
+	Disconnect = 12,
 }
 
 impl Opcode {
@@ -247,6 +260,7 @@ impl Opcode {
 			9 => Some(Opcode::Stop),
 			10 => Some(Opcode::Stopped),
 			11 => Some(Opcode::Connect),
+			12 => Some(Opcode::Disconnect),
 			_ => None,
 		}
 	}
@@ -260,7 +274,7 @@ impl Opcode {
 	// silently discard whatever a driver attached beyond it - capabilities gone, nobody told.
 	pub fn handle_count(self) -> usize {
 		match self {
-			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped => 0,
+			Opcode::Bind | Opcode::Ready | Opcode::Failed | Opcode::Withdraw | Opcode::Disconnect | Opcode::Ping | Opcode::Pong | Opcode::Stop | Opcode::Stopped => 0,
 			Opcode::Resource | Opcode::Offer | Opcode::Connect => 1,
 		}
 	}
@@ -571,6 +585,18 @@ pub fn heartbeat_period(deadline: u32) -> u32 {
 
 // The publisher-local token a `WITHDRAW` names.
 pub fn decode_withdraw(payload: &[u8]) -> Result<u16, FrameError> {
+	decode_u16(payload)
+}
+
+// The publisher-local token a `DISCONNECT` names - which provider lost a consumer.
+pub fn decode_disconnect(payload: &[u8]) -> Result<u16, FrameError> {
+	decode_u16(payload)
+}
+
+// The publisher-local token a `CONNECT` names - which of this driver's publications the endpoint in
+// that frame is a connection to. The driver keeps it with the endpoint so it can say, when that
+// consumer goes, WHICH provider is serving one fewer.
+pub fn decode_connect(payload: &[u8]) -> Result<u16, FrameError> {
 	decode_u16(payload)
 }
 

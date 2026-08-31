@@ -455,11 +455,17 @@ fn audiorec_records_a_capture_stream_and_never_publishes_a_failed_one() {
 	let (snd_host, snd_service) = Channel::create();
 	let (audio_admin, admin) = Channel::create();
 	let _audio_service = spawn_dynamic_test_process(sched::root_domain(), audio_elf, audio_boot_user);
-	send_cap(&audio_boot_kernel, b"SND", snd_service, Rights::ALL).expect("the driver channel");
 	send_cap(&audio_boot_kernel, b"ADMIN", admin, Rights::ALL).expect("the admin channel");
 	send_cap(&audio_boot_kernel, b"SERVE", service_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the serve channel");
+	// THE PROVIDER CATALOGUE, LAST. AudioService is not handed a device any more - it subscribes to
+	// the audio kind and opens a connection to what it finds, so the harness answers that
+	// conversation. See `serve_provider_catalogue`.
+	let (catalogue_server, catalogue_client) = Channel::create();
+	send_cap(&audio_boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
 	sched::run_until_idle();
 	assert_eq!(&audio_boot_kernel.recv().expect("AudioService online report").bytes[..], b"AudioService: online");
+	crate::tests::serve_provider_catalogue(&catalogue_server, snd_service).expect("the catalogue answered the subscription and the connection");
+	sched::run_until_idle();
 
 	// THE CAPTURE GRANT, WHICH IS NOT THE PLAYBACK ONE. `open-captures` is op 2 on `audio-admin`;
 	// what it mints may record and may not make a sound, which the next block checks.

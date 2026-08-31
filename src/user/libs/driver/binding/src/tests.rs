@@ -563,6 +563,39 @@ fn a_crash_between_publish_and_subscribe_withdraws_what_was_published() {
 	// binding must not take the new one with it - same bus address, different generation.
 	assert_eq!(catalogue.withdraw_binding(published.binding), 0, "the previous binding has nothing left to withdraw");
 	assert!(catalogue.reachable(KIND) == Some(after_rebind), "and the replacement is untouched by it");
+
+	// AND EVERY PROVIDER THE WITHDRAWAL REMOVES IS HANDED BACK, which is the half the production
+	// catalogue got wrong and this model could not see.
+	//
+	// DeviceManager closes a channel and announces the withdrawal to subscribers PER PROVIDER, over
+	// the items the withdrawal collected - and collecting them used to be the caller's, into a `Vec`
+	// whose short-allocation path silently kept nothing. Every provider was then removed and closed
+	// and no withdrawal was announced, so every subscriber kept metadata for providers that no longer
+	// exist. `withdraw_slots_into` is the transfer, here, driven: what comes back must be exactly
+	// what was emptied, one to one, and a removal that reports fewer is the defect.
+	let function = BindingId::new(0, 9, 0, 5);
+	let three = [ProviderId::new(function, 0, 1), ProviderId::new(function, 1, 1), ProviderId::new(function, 2, 1)];
+	// One provider of ANOTHER binding, which must survive - a withdrawal that hands back too much is
+	// as wrong as one that hands back too little.
+	let other = ProviderId::new(BindingId::new(0, 9, 1, 5), 3, 1);
+	let mut slots: [Option<ProviderId>; 4] = [Some(three[0]), Some(other), Some(three[1]), Some(three[2])];
+	let mut out: [Option<ProviderId>; 4] = [None; 4];
+	let gone = super::withdraw_slots_into(&mut slots, function, |id| *id, &mut out).expect("the buffer is as long as the catalogue");
+	assert_eq!(gone, 3, "the binding published three and its end withdraws three");
+	assert_eq!(out[..gone].iter().flatten().count(), gone, "every slot the withdrawal emptied came back to the caller - one that did not would be closed and never announced");
+	for id in three {
+		assert!(out[..gone].iter().flatten().any(|held| *held == id), "the withdrawal handed back every provider it emptied");
+	}
+	assert!(out[gone..].iter().all(Option::is_none), "and nothing past the count was written");
+	assert_eq!(slots.iter().flatten().count(), 1, "the other binding's publication is untouched");
+	assert!(slots.iter().flatten().all(|held| *held == other), "and it is the one that belongs to the other binding");
+
+	// A BUFFER THAT CANNOT RECEIVE WHAT IS ABOUT TO BE REMOVED REMOVES NOTHING. The alternative is
+	// the defect itself: providers emptied with nowhere to carry them to the announcement.
+	let mut small: [Option<ProviderId>; 1] = [None];
+	let mut again: [Option<ProviderId>; 4] = [Some(three[0]), Some(other), Some(three[1]), Some(three[2])];
+	assert!(super::withdraw_slots_into(&mut again, function, |id| *id, &mut small).is_none(), "a short buffer is refused");
+	assert_eq!(again.iter().flatten().count(), 4, "and nothing was removed on the refused path");
 }
 
 #[test]

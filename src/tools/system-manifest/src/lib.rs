@@ -484,6 +484,15 @@ pub struct Driver {
 // uses for services - one question about two subjects, not two constants that drift.
 pub const MAX_HEARTBEAT_DEADLINE: u32 = 100;
 
+// HOW MANY PROVIDER CONNECTIONS ONE DRIVER SERVES AT ONCE.
+//
+// The same number `drivers::common::MAX_PROVIDER_CLIENTS` is, and it is a property of the driver
+// library rather than of this tool: a driver holds a fixed set of endpoints and closes an arriving
+// `CONNECT` it cannot place. Repeated here because this crate builds for the HOST and that one is
+// `no_std` for the target; keeping them in step is what the check below exists for, and a change to
+// either without the other makes a manifest the manager accepts and a driver refuses.
+pub const MAX_PROVIDER_CLIENTS: u32 = 8;
+
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 pub struct Provides {
 	pub kind: ProviderKindName,
@@ -1472,6 +1481,18 @@ fn validate_references(libraries: &BTreeMap<Name, Library>, programs: &BTreeMap<
 			if provides.most == 0 {
 				push_error(errors, format!("programs.{name}.driver.provides"), "`most = 0` declares a publication that may never happen, which is what leaving the row out already says");
 			}
+		}
+		// AND NO ENTRY MAY DECLARE MORE CONNECTIONS THAN A DRIVER CAN SERVE.
+		//
+		// `consumers` is what DeviceManager checks an `open` against, and the driver library holds a
+		// FIXED set of endpoints per driver - `MAX_PROVIDER_CLIENTS`, below. An entry declaring more
+		// than that describes a provider the manager will happily mint connections for and the driver
+		// will close on arrival, which a consumer reads as a connection that ended rather than one it
+		// was never going to get. The product is what counts: `most` publications of a kind, each
+		// admitting `consumers`, all served out of the one set.
+		let endpoints: u32 = driver.provides.iter().map(|provides| u32::from(provides.most) * u32::from(provides.consumers)).sum();
+		if endpoints > MAX_PROVIDER_CLIENTS {
+			push_error(errors, format!("programs.{name}.driver.provides"), format!("this entry declares {endpoints} provider connection(s) and a driver serves at most {MAX_PROVIDER_CLIENTS}"));
 		}
 	}
 	// A STRUCTURAL CYCLE ACROSS ENTRIES. Reachability over "this driver requires a kind that driver

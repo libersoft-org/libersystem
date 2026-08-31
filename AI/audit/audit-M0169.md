@@ -322,3 +322,30 @@ another's prepare. The four transport outcomes keep their distinct handling, wit
 
 **Plan re-check.** Item count unchanged; M2 states one mechanism where it previously stated a primary
 and an alternative. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0169 (2026-08-31T03:28:50Z):
+
+Rating: 7/10
+
+1. **A dedicated prepare connection does not make `status` safe after an uncertain prepare reply.**
+   The plan correctly explains that `ChannelTransport::call` consumes exactly one reply and a
+   correlation mismatch does not drain the queue (`docs/todo/P02M0169.md:93-100`;
+   `src/user/libs/ipc/ipc-client/src/lib.rs:38-52`;
+   `src/user/libs/protocol/process-proto/src/generated/liber/process/v1.rs:872-905`). It then claims
+   `status` can be asked on that same connection because no stale reply can be waiting, “because
+   nothing else has ever used it” (`docs/todo/P02M0169.md:102-127`). The uncertain `launch_prepared`
+   call itself used it. If that launch reply arrives late, the next status call consumes the launch
+   reply, rejects its correlation, and leaves the real status reply queued. On uncertain prepare,
+   either unconditionally drop the owner connection and rely on disconnect cleanup, or add a
+   correlation-aware drain/recovery protocol; the current same-connection status claim repeats the
+   exact poisoning defect the correction identifies.
+
+2. **“Per-prepare” ownership is incompatible with pipeline `release_group` unless one connection owns
+   the whole pipeline transaction.** ProcessService keys prepared records by `(owner channel, koid)`
+   and `release_group` requires every named koid to belong to the current caller
+   (`src/user/services/core/src/process_service.rs:372-388,941-972`). M2 says each prepare runs on its
+   own connection and that the connection is the transaction (`docs/todo/P02M0169.md:93-119`), while
+   the same plan requires one group release for all pipeline stages (`:143-166`). If “per-prepare” is
+   implemented per stage, no one owner can release the group and the call is refused. Specify one
+   dedicated connection for the complete pipeline prepare/seal/release transaction; the cross-owner
+   negative fixture does not establish that positive ownership rule.

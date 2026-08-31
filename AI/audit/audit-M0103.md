@@ -1180,3 +1180,37 @@ because that depends on scheduling and is not a property of this primitive.
 **Plan re-check.** No new parts. The freeze boundary is now in one place and every `s` sub-part reads
 its own row through it; the accounting item states one contract from its opening line; and the
 completion contract claims only what the channel gives it. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-08-31T03:28:50Z):
+
+Rating: 6/10
+
+1. **The accepted `s`-split cleanup is still incomplete, leaving two incompatible freeze
+   topologies in the plan.** The review-record rule says every entry is either corrected and ticked or
+   remains open and blocking (`docs/todo/P02M0103.md:2195-2201`), and the new preface says the split is
+   complete and struck from the list (`:2203-2209`). The actual entry remains unchecked and still
+   prescribes a four-way topology containing `s-scene` (`:2261-2265`), while the authoritative plan
+   defines only `s-common`, `s-2d`, and `s-3d`. This is the exact cleanup the latest planner response
+   claimed to have applied (`AI/audit/audit-M0103.md:1121-1140`).
+
+2. **P02M0167 is still incorrectly marked sufficient for evidence integrity.** M0103 says medium
+   identity is met and treats only three-guest performance as outstanding
+   (`docs/todo/P02M0103.md:127-137`). In the current harness the build lock ends before `qemu-run.sh`,
+   x86 builds its medium afterward, and `mkimage.sh` explicitly leaves producers outside its lock and
+   aborts if an input changes (`src/harness/test-kernel.sh:303-367`;
+   `src/harness/qemu-run.sh:925-952`; `src/harness/mkimage.sh:722-726`). P02M0167's reproduced
+   same-architecture overlap still loses one run, P02M0170 now owns the stable snapshot/serialization
+   fix (`docs/todo/P02M0170.md:52-93`), and P02M0099 correctly requires serial architecture evidence
+   until that gate passes (`docs/todo/P02M0099.md:140-152`). Content addressing detects a collision;
+   it does not make the affected acceptance result trustworthy. M0103 must carry the same serial
+   restriction or remain blocked on P02M0170.
+
+3. **Display-provider migration has circular ownership between M0103 and M0099.** M0103 treats the
+   absent P02M0164 production-consumer migration as an external hard prerequisite and blocks `a-wsi`
+   on it (`docs/todo/P02M0103.md:120-126,670-674,2116-2122`). P02M0099 instead assigns the
+   DisplayService subscribe/attach/detach/reconnect migration to the first second-display-provider
+   item **and P0103's WSI**, including the first-migration connection repair
+   (`docs/todo/P02M0099.md:213-237,1173-1183`). P02M0164 remains marked complete while its own audit
+   confirms that no production consumer migration landed (`docs/todo/P02M0164.md:3,15-19,288-320`;
+   `AI/audit/audit-M0164.md:597-605`). Assign the migration and repair to one implementable owner:
+   either a genuinely reopened P0164 prerequisite or `a-wsi` as P0099 currently requires.

@@ -439,7 +439,9 @@ pub fn snapshot(index: usize) -> Option<abi::DeviceClaimSnapshot> {
 	// AND THE QUARANTINED SUBSET, because the total alone cannot say whether this claim's address
 	// space may ever be reused. See `DeviceClaimSnapshot`.
 	let iommu_quarantined = crate::iommu::quarantined_grants_for(index as u32) as u32;
-	Some(abi::DeviceClaimSnapshot { state: slot.state as u32, _pad0: 0, generation: slot.generation, release_deadline: slot.release_deadline, mmio_windows, irq_vectors, iommu_grants, iommu_quarantined })
+	// AND WHAT ITS ENDPOINT ASKED FOR AND WAS REFUSED. See `DeviceClaimSnapshot::iommu_faults`.
+	let iommu_faults = crate::iommu::faults_for(index as u32);
+	Some(abi::DeviceClaimSnapshot { state: slot.state as u32, _pad0: 0, generation: slot.generation, release_deadline: slot.release_deadline, mmio_windows, irq_vectors, iommu_grants, iommu_quarantined, iommu_faults })
 }
 
 // RELEASE THE DEVICE, and prove it is quiet before anything it held is reused.
@@ -477,6 +479,23 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	// EVERY RESOURCE, NOT ONE OF THEM. The terminal state was derived from the IOMMU alone, so a
 	// vector whose unbind could not be confirmed - a riscv64 hart that did not answer, which
 	// quarantines the still-armed slot - was charged to a claim this then published as `Free`.
+	// AND A ROW THE SWEEP COULD NOT REACH IS NOT A VECTOR THAT IS QUIET.
+	//
+	// `revoke_derived` upgrades each row's weak reference and answers `true` for every row whose
+	// object is already gone - which is the ordinary case, a driver that closed its handle before the
+	// release, AND the case where the last `Arc` is being dropped right now: `Weak::upgrade` fails as
+	// soon as the strong count reaches zero, which is BEFORE `Interrupt::drop` has run its unbind.
+	// The sweep then reported the claim quiet, `finish_release` published `Free`, the vectors went
+	// back into circulation, and the late unbind masked whichever binding had since taken the slot -
+	// the exact hazard `Interrupt::disown` exists to prevent on the rollback path.
+	//
+	// The registry answers it directly and needs no new bookkeeping: `unbind` RETIRES a slot (it
+	// becomes pending) and a disable the hardware refused QUARANTINES it, so a slot this device still
+	// holds LIVE is one whose teardown has neither completed nor failed - it has not happened yet.
+	// Waiting for it is a handful of instructions inside `Arc::drop`; a slot still live after that is
+	// one nothing is going to settle, and an unconfirmed teardown is the honest answer.
+	let vectors_settled = settled_vectors(index as u32);
+	let interrupts_quiet = interrupts_quiet && vectors_settled;
 	let confirmed = translation_quiet && interrupts_quiet;
 	if !interrupts_quiet {
 		crate::serial_println!("device: {index} could not confirm that every interrupt it derived was unbound - the claim is not free");
@@ -511,6 +530,29 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 		crate::serial_println!("device: {:02x}:{:02x}.{} was NOT confirmed torn down - device {index} is quarantined for this boot and nothing it held is reused", bus, dev, func);
 	}
 	Ok(state)
+}
+
+// WAIT FOR THIS DEVICE'S MSI SLOTS TO REACH A TERMINAL STATE, and answer whether they did.
+//
+// A slot is live between `bind` and the `unbind` that retires or quarantines it. Every unbind this
+// release is responsible for has either already run - the sweep called `Interrupt::revoke` - or is
+// running inside a concurrent `Arc::drop` a few instructions away. So the wait is bounded and short
+// by construction, and the bound is a count rather than a clock because this runs with interrupts
+// masked under no timer this teardown may rely on.
+//
+// A device with no MSI vectors at all answers `true` on the first read, which is every device that
+// polls.
+const VECTOR_SETTLE_SPINS: u32 = 100_000;
+
+fn settled_vectors(device: u32) -> bool {
+	for _ in 0..VECTOR_SETTLE_SPINS {
+		if !crate::arch::interrupts::msi_live_for_device(device) {
+			return true;
+		}
+		core::hint::spin_loop();
+	}
+	crate::serial_println!("device: {device} still holds a live MSI slot after its derived capabilities were swept - its interrupt teardown is not confirmed");
+	false
 }
 
 // The one MMIO capability a binding derived has gone, so the device stops mastering the bus.
@@ -555,7 +597,22 @@ fn bus_master(entry: &DeviceEntry, on: bool) {
 // losing the one channel it had for saying so. This is the middle ending, and it is deliberately
 // narrower than a release - the claim, its record and its report all survive, so the manager can
 // still see what happened to a binding it made.
-pub fn disable_bus_master(index: usize) {
+// UNDER THE KEY THAT ASKED FOR IT, so a binding that has already ended cannot stop the one that
+// replaced it.
+//
+// This took a bare index, and an index outlives the binding occupying it: a caller whose claim was
+// released while its syscall ran would have taken the REPLACEMENT device off the bus - a driver that
+// did nothing wrong losing its DMA because its predecessor's refusal arrived late. The check holds
+// `CLAIMS`, which is the lock every other claim decision is taken under.
+pub fn disable_bus_master_for(key: abi::ClaimKey) {
+	let index = key.device_index as usize;
+	{
+		let claims = CLAIMS.lock();
+		let Some(slot) = claims.get(index) else { return };
+		if slot.generation != key.generation || slot.state != ClaimState::Claimed {
+			return;
+		}
+	}
 	with(index, |entry| bus_master(entry, false));
 }
 

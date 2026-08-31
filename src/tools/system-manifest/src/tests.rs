@@ -417,6 +417,21 @@ fn a_requirement_nothing_in_the_image_produces_is_refused_when_the_registry_is_b
 	// A kind this system does not have fails to PARSE, like every other closed set here.
 	let unknown = driver("provides = [{ kind = \"quantum\", most = 1 }]\n");
 	assert!(!errors(&unknown).is_empty(), "an unknown provider kind must not parse");
+
+	// AND NO ENTRY MAY DECLARE MORE CONNECTIONS THAN A DRIVER CAN SERVE.
+	//
+	// `consumers` is the bound DeviceManager mints against; the driver library holds a fixed set of
+	// endpoints and CLOSES a `CONNECT` it cannot place. An entry declaring more describes a provider
+	// whose extra consumers are minted and then hung up on, which a consumer reads as a connection
+	// that ended rather than one it was never going to get. The two numbers live in different
+	// crates - one host, one `no_std` - so nothing but this makes them agree.
+	let at_the_limit = driver("provides = [{ kind = \"block\", most = 2, consumers = 4 }]\n");
+	assert_eq!(errors(&at_the_limit), "", "eight is what a driver serves, and an entry declaring exactly that is not over it");
+	let past_it = driver("provides = [{ kind = \"block\", most = 3, consumers = 3 }]\n");
+	assert!(errors(&past_it).contains("a driver serves at most"), "{}", errors(&past_it));
+	// AND IT IS THE SUM ACROSS KINDS, not one row at a time: they are all served out of one set.
+	let across_kinds = driver("provides = [{ kind = \"block\", most = 1, consumers = 5 }, { kind = \"usb-bus\", most = 1, consumers = 5 }]\n");
+	assert!(errors(&across_kinds).contains("a driver serves at most"), "{}", errors(&across_kinds));
 }
 
 #[test]

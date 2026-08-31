@@ -179,8 +179,17 @@ impl DmaBuffer {
 		Self::create_for(domain, size, None)
 	}
 
-	// The same, for a buffer whose physical address is about to be handed to device `device`.
-	pub fn create_for(domain: &Arc<Domain>, size: usize, device: Option<u32>) -> Result<Arc<Self>, MemoryError> {
+	// The same, for a buffer whose physical address is about to be handed to a device.
+	//
+	// THE CLAIM RATHER THAN THE INDEX, because the index alone cannot say WHICH BINDING of that
+	// device this buffer is for - and the translation is installed into whichever domain occupies
+	// the index at the moment this runs. A release and a reclaim while this call is allocating put
+	// the replacement binding's domain there, so the mapping went into a domain the caller had no
+	// authority over and the stale-generation refusal that followed came after the effect. The
+	// generation travels with the request and `iommu::map_device_buffer` refuses on it.
+	pub fn create_for(domain: &Arc<Domain>, size: usize, claim: Option<abi::ClaimKey>) -> Result<Arc<Self>, MemoryError> {
+		let device = claim.map(|key| key.device_index);
+		let generation = claim.map_or(0, |key| key.generation);
 		// A ceiling and checked arithmetic, for the reason `MemoryObject::create_in` has them: the
 		// size is a caller's number and the product below is what the quota is then checked against.
 		if size as u64 > abi::MAX_OBJECT_BYTES {
@@ -227,7 +236,7 @@ impl DmaBuffer {
 		// stated rather than dressed up: narrowing it needs the create syscall to say which way the
 		// buffer is used, which the protected endpoints will need when they are migrated.
 		let translation = match device.filter(|_| crate::iommu::translating()) {
-			Some(index) => match crate::iommu::map_device_buffer(index, base, (pages * PAGE_SIZE as usize) as u64) {
+			Some(index) => match crate::iommu::map_device_buffer(index, generation, base, (pages * PAGE_SIZE as usize) as u64) {
 				Ok(Some(mapped)) => Some(mapped),
 				Ok(None) => None,
 				// AN UNCONFIRMED MAP DOES NOT SAY THE FRAMES ARE FREE.

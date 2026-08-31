@@ -68,11 +68,15 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 	use crate::object::process::Process;
 	use crate::object::rights::Rights;
 	const DEVICE: u32 = 7;
+	// The buffers below belong to a BINDING of that device, which is what the create path takes now:
+	// the generation is what stops a mapping from landing in a later binding's domain. These test
+	// devices are not translated, so the key is here to name the device rather than to be checked.
+	const BINDING: abi::ClaimKey = abi::ClaimKey { device_index: DEVICE, _pad: 0, generation: 1 };
 	let domain = crate::sched::root_domain();
 	assert_eq!(super::held_frames_for_test(DEVICE), 0, "nothing is held for this device to begin with");
 
 	// 1. A buffer whose owner CLOSED it: the frames go back at once, exactly as before.
-	let Ok(deliberate) = DmaBuffer::create_for(&domain, 2 * PAGE_SIZE as usize, Some(DEVICE)) else {
+	let Ok(deliberate) = DmaBuffer::create_for(&domain, 2 * PAGE_SIZE as usize, Some(BINDING)) else {
 		panic!("a 2-page DMA buffer should allocate");
 	};
 	drop(deliberate);
@@ -81,7 +85,7 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 	// 2. A buffer whose owner was TERMINATED holding it. The process teardown marks it, so the drop
 	//    that follows keeps the frames out of circulation.
 	let process = Process::new(AddressSpace::create().expect("an address space"), domain.clone()).expect("a test process");
-	let Ok(orphan) = DmaBuffer::create_for(&domain, 3 * PAGE_SIZE as usize, Some(DEVICE)) else {
+	let Ok(orphan) = DmaBuffer::create_for(&domain, 3 * PAGE_SIZE as usize, Some(BINDING)) else {
 		panic!("a 3-page DMA buffer should allocate");
 	};
 	let frames: alloc::vec::Vec<u64> = orphan.frames().to_vec();

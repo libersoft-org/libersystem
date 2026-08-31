@@ -1296,3 +1296,22 @@ Plan changes:
 **Plan re-check.** No new items and no reordering; four bullets gained the block their own invariant
 already required of them. The invariant paragraph and the bullets now agree, which is the property
 the finding is about. The count of BLOCKED bullets in the file is 25. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-08-31T03:28:50Z):
+
+Rating: 7/10
+
+1. **The P02M0164 connection-factory prerequisite is stale and still cannot perform the first
+   catalogue migration.** The plan says publication initializes `consumers` to zero and prescribes
+   counting the initial/taken endpoint as part of the first migration (`docs/todo/P02M0099.md:213-236`),
+   but the current publication already initializes the count to one
+   (`src/user/services/core/src/device_manager.rs:1931-1937`). With the manifest default of one
+   consumer (`src/tools/system-manifest/src/lib.rs:877-882`), served `open` therefore refuses before
+   the first production destination can obtain a connection (`device_manager.rs:3645-3655`). The
+   retained initial endpoint is available only through private `Catalogue::take`
+   (`device_manager.rs:1949-1993`), while the destination migrations are explicitly required to move
+   to `subscribe` plus per-consumer `open` (`docs/todo/P02M0099.md:1173-1195`). The same accounting is
+   also bypassed by boot-time `mint_connection`, which neither checks the declared limit nor increments
+   it (`device_manager.rs:1743-1759`). Define one coherent first-public-handoff rule and apply the
+   declared limit/accounting to every minted connection, including the boot-probe path, alongside the
+   already planned close decrement and manifest ceiling.

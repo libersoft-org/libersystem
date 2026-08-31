@@ -151,6 +151,24 @@ impl<const N: usize> MsiRegistry<N> {
 		(0..N).any(|slot| self.used[slot].load(Ordering::Acquire) && !self.pending[slot].load(Ordering::Acquire) && self.owner[slot].load(Ordering::Acquire) == owner)
 	}
 
+	// WHETHER `owner` STILL HOLDS A SLOT WHOSE TEARDOWN HAS NOT HAPPENED - bound, and neither retired
+	// nor quarantined.
+	//
+	// Different from `has_live`, and the difference is exactly what a claim release needs. `has_live`
+	// answers "may this device acquire another vector", so it counts a QUARANTINED slot: that slot is
+	// out of circulation and the device may not have a second one. This answers "is an unbind still
+	// outstanding" - and a quarantined slot's unbind HAPPENED, it failed, which is why the slot is out
+	// of circulation for the life of the boot. Counting it here would refuse to confirm every LATER
+	// claim of a device whose earlier binding stranded a vector, which is a device already paying for
+	// it once. Measured on riscv64: a test that deliberately quarantines device 12's EID made the next
+	// synthetic claim of index 12 unreleasable.
+	pub fn has_unbound(&self, owner: u32) -> bool {
+		if owner == u32::MAX {
+			return false;
+		}
+		(0..N).any(|slot| self.used[slot].load(Ordering::Acquire) && !self.pending[slot].load(Ordering::Acquire) && !self.quarantined[slot].load(Ordering::Acquire) && self.owner[slot].load(Ordering::Acquire) == owner)
+	}
+
 	// Bind `intr` to `slot` so `dispatch` wakes it when the slot's vector fires.
 	// Returns false if the slot is already bound to a live Interrupt.
 	pub fn bind(&self, slot: usize, intr: &Arc<Interrupt>) -> bool {
@@ -171,6 +189,13 @@ impl<const N: usize> MsiRegistry<N> {
 
 	// Wake the driver bound to `slot`, if any. MSI is edge-triggered and unshared, so
 	// there is no level source to mask - just signal.
+	// A REPORT HERE WOULD NOT SAY WHAT IT LOOKS LIKE IT SAYS, and this comment is the measurement
+	// (2026-08-31). A line saying "a device raised a message-signalled interrupt" was added here to
+	// give P02M0151's ITS checkpoint the device-originated evidence it asks for - and this entry point
+	// is shared: every MSI oracle in the suite programs a RAM-backed stand-in table and calls the
+	// backend's dispatch by hand, so the line fired for the ORACLE on the first profile that ran it.
+	// Distinguishing the two needs the report to sit in the architecture's DELIVERY path, which only
+	// hardware reaches. Left as it was rather than carrying a claim the code cannot make.
 	pub fn dispatch(&self, slot: usize) {
 		if let Some(intr) = self.bound[slot].lock().as_ref().and_then(Weak::upgrade) {
 			intr.signal();

@@ -707,3 +707,25 @@ mirroring with the resolved levels and leaves only reordering to the line.
 **Plan re-check.** No new items. Four items that named decisions now make them, and the pipeline's
 normative order is one a `GlyphRun` can actually be produced by. The seam is specified once and
 `P02M0103` carries the same key. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-08-31T03:28:50Z):
+
+Rating: 7/10
+
+1. **The proposed `role = "service"` font catalogue cannot publish through P02M0164's device-only
+   provider catalogue.** The plan says the service publishes `font-catalogue` through the ordinary
+   P0164 catalogue (`docs/todo/P02M0136.md:112-128`). The current catalogue has a closed set of device
+   provider kinds and every `provider-info` is identified by PCI BDF plus binding/provider generations
+   (`src/idl/device.lsidl:109-143,239-261`). Manifest publication is also structurally driver-only:
+   only a driver row can carry the binding declaration, non-driver rows reject it, and the producer
+   graph iterates only drivers (`src/tools/system-manifest/src/lib.rs:466-479,1272-1281,1446-1475`). A
+   service has neither a device binding nor a publication/startup path in that catalogue. Define a
+   real service-resolution route, or explicitly own the service-provider schema, identity, startup,
+   and capability-gate extension instead of describing the current device catalogue as already usable.
+
+2. **The promised numerical catalogue ceilings are still not numbers.** The latest response says
+   concrete limits were added, but the normative plan merely asks for “a maximum” face count,
+   per-face metadata size, and LIST result size (`docs/todo/P02M0136.md:129-135`) and then calls the
+   result computable (`:165-169`). No values appear. Fix the actual three limits and exact-bound/
+   over-bound build and reply fixtures before claiming a fixed buffer or a computable shared-state
+   ceiling.

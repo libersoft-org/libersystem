@@ -752,6 +752,10 @@ struct DomainState {
 	generation: Generation,
 	endpoints: Vec<EndpointId>,
 	attached_confirmed: bool,
+	// EVERY FAULT ATTRIBUTED TO THIS BINDING. A number rather than a ring, for the reason `FaultLog`
+	// states: a flooding device may increment a counter for ever and may not decide how much memory
+	// the kernel keeps. Saturating, because a count that wrapped would read as a clean binding.
+	faults: u64,
 }
 
 // A bounded record of what the hardware refused.
@@ -838,7 +842,7 @@ impl<B: Backend> Iommu<B> {
 	// the stronger one.
 	pub fn create_domain(&mut self, base: u64, len: u64, reserved: Vec<Reserved>, generation: Generation) -> Result<DomainId, Fault> {
 		let (id, _confirmed) = self.backend.domain_create()?;
-		self.domains.insert(id, DomainState { space: IovaSpace::new(base, len, reserved), generation, endpoints: Vec::new(), attached_confirmed: false });
+		self.domains.insert(id, DomainState { space: IovaSpace::new(base, len, reserved), generation, endpoints: Vec::new(), attached_confirmed: false, faults: 0 });
 		Ok(id)
 	}
 
@@ -1138,14 +1142,51 @@ impl<B: Backend> Iommu<B> {
 	// An endpoint this side has no domain for keeps `Generation(0)`, which is a value no binding ever
 	// carries: generations start at 1.
 	pub fn drain_faults(&mut self, out: &mut [FaultEvent]) -> usize {
+		self.drain_faults_during(out, None)
+	}
+
+	// The same, for a caller that is TEARING AN ENDPOINT DOWN and therefore still knows what the
+	// backend no longer does.
+	//
+	// THE RECORD IS WRITTEN HERE, WHICH IS WHY THE ATTRIBUTION HAS TO ARRIVE HERE.
+	//
+	// The teardown's fix-up used to be applied by the caller to the events it got BACK, after
+	// `record` had already stored them - so the serial line showed the reconstructed binding and the
+	// bounded ring a supervisor reads kept `DomainId(0)` at `Generation(0)` for the same fault. M5
+	// asks for the binding generation in the RECORD, and two answers that disagree is not one of
+	// them. The caller supplies what it knows and the correction happens before the event is kept.
+	//
+	// Applied ONLY to an event whose endpoint matches and whose domain the backend could not resolve:
+	// a fault from another endpoint keeps its own attribution, and a resolved one is never overwritten
+	// by a guess.
+	pub fn drain_faults_during(&mut self, out: &mut [FaultEvent], teardown: Option<(EndpointId, DomainId, Generation)>) -> usize {
 		let taken = self.backend.drain_faults(out);
 		for event in out.iter_mut().take(taken) {
 			if let Some(state) = self.domains.get(&event.domain) {
 				event.generation = state.generation;
 			}
+			if let Some((endpoint, domain, generation)) = teardown
+				&& event.endpoint == endpoint
+				&& event.domain == DomainId(0)
+			{
+				event.domain = domain;
+				event.generation = generation;
+			}
+			// AND THE BINDING IS CHARGED FOR IT. M4 asks for this backend's fault counter beside its
+			// mapping, IOVA and endpoint counters in the per-binding accounting - and a total across
+			// the controller cannot answer "did this restart come back to its baseline" for one
+			// device. The domain is the binding, so the count lives with the domain's other state.
+			if let Some(state) = self.domains.get_mut(&event.domain) {
+				state.faults = state.faults.saturating_add(1);
+			}
 			self.faults.record(*event);
 		}
 		taken
+	}
+
+	// How many faults this domain has been charged with. See `drain_faults_during`.
+	pub fn faults_in(&self, domain: DomainId) -> u64 {
+		self.domains.get(&domain).map_or(0, |state| state.faults)
 	}
 
 	// How many endpoints this controller is translating for. Part of the baseline a restart is

@@ -480,3 +480,41 @@ the closing note appended to every file in this round.
 1. **Degraded admission fails open when its audit row cannot be allocated.** `admit` returns `DegradedUntranslated` regardless of whether `record_degraded` succeeds, while `record_degraded` silently returns when `DEGRADED.try_reserve` fails (`src/kernel/dma_policy/mod.rs:131-166`). The endpoint can therefore master untranslated with no durable degraded row and no retraction target; the report can subsequently claim every endpoint is translated (`src/kernel/dma_policy/mod.rs:168-180,204-232`). That contradicts M7's mandatory audited degraded state and the milestone's containment goal.
 
 2. **The gate still does not prove frame presentation or a controlled restart/rebind.** It accepts one GPU reaching `ONLINE` and the absence of an unsolicited restart (`src/tools/check-qemu-virtio-iommu-x86_64.sh:294-322`). The driver explicitly reaches online before a frame exists, the first frame is later submitted by ConsoleService, and ConsoleService discards the synchronous presentation result (`src/user/drivers/core/src/virtio_gpu.rs:380-412`, `src/user/services/core/src/console_service.rs:44-57`). Nor does the gate deliberately restart and rebind the protected endpoint. Rejecting spontaneous restarts is not evidence that the required controlled restart survives, so the unchanged M4 and definition-of-done checkpoint remains unmet.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-08-31T06:05:00Z):
+
+**1. Degraded admission fails open when its audit row cannot be allocated. ACCEPTED.**
+
+Exact, and the direction of the failure is the point. `admit` returned `DegradedUntranslated`
+whatever `record_degraded` did, and `record_degraded` returned silently when its `try_reserve`
+failed - so under memory pressure an endpoint mastered memory untranslated with NO durable row:
+nothing to retract, no `forget_degraded` target, and a `report` that could go on to print "every
+bus-mastering device is translated" over a machine where one is not. M7 makes the degraded state an
+AUDITED one, and an unaudited degradation is not a weaker version of it; it is the untracked bypass
+this milestone exists to remove.
+
+`record_degraded` answers whether the row is RECORDED - which includes "it was already there",
+because a duplicate is one audited device and not a failure to audit one - and `admit` returns
+`Refused` when it is not, with a line naming the device. Failing closed costs a device that could
+have run; failing open costs the isolation claim.
+
+**2. The gate does not prove frame presentation or a controlled restart/rebind. ACCEPTED for the
+first half and FIXED; ACCEPTED and UNMET for the second, said plainly.**
+
+FRAME PRESENTATION. The finding is right about the mechanism: the driver reaches `ONLINE` before a
+frame exists - it has a device, not a picture - the first frame is submitted later by ConsoleService,
+and `DisplaySurface::present` DISCARDED the result (`let _ = surface::present(..)`). A boot where
+every present failed behind the controller therefore looked exactly like one where they all landed.
+
+ConsoleService now says which, once per outcome: `a frame reached the display` or `a frame did NOT
+reach the display`. One line and not one per frame, because presenting is a hot path and a line per
+frame is the scattering this tree keeps removing. The gate requires the first and refuses the second.
+Measured on the x86_64 boot: the line is present.
+
+CONTROLLED RESTART. Not done, and the reason is a harness limit rather than a judgement. The gate
+boots `./run.sh` with the serial redirected to a file; there is no path for it to issue `lsdev
+disable`/`enable` or `retry` at the guest, so the restart it would have to command cannot be
+commanded from here. What the gate asserts today is the neighbouring fact - that nothing restarted
+the GPU spontaneously - and it says so in those words. The missing capability is guest input on a
+non-interactive profile, which is the same shape as the missing no-DT profiles in P02M0151: a
+harness capability, not a gate row. Recorded as UNMET.

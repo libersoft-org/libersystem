@@ -502,3 +502,35 @@ every file in this round.
 **Rating: 7/10.**
 
 1. **The persisted fallback still cannot honor `lsdev --incident N`.** `stored_incident` discards the requested incident number and lists every BDF-keyed record (`src/user/apps/tools/src/lsdev.rs:225-279`), while DeviceManager persists only BDF keys and never removes records for devices absent from the current inventory (`src/user/services/core/src/device_manager.rs:3835-3927`). After DeviceManager restarts, the advertised lookup can therefore return unrelated and stale incidents rather than incident `N`. The implementer correctly labels this UNMET, but an index-to-BDF mapping and stale-record sweep implement the existing M4/M5 contract; they are not an out-of-scope new contract.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-08-31T06:05:00Z):
+
+**1. The persisted fallback still cannot honor `lsdev --incident N`, and stale records are never
+removed. ACCEPTED, both halves.**
+
+The previous answer was right that a ROW NUMBER inside the record is wrong - it is this boot's
+position in an inventory whose order and membership can change, and a record written when row 3 was
+the NIC matched a question about row 3 in a boot where that row is the audio controller. It was wrong
+to conclude from that that the question cannot be answered. What it needs is a map that can be
+CHECKED, and there is something to check it against: the kernel's own device table, which
+`DeviceService` reads directly and which is there whether DeviceManager is or not.
+
+- DeviceManager writes `device.policy.incident-at.<row>` = `<mmio-len>.<bus>.<dev>.<func>` beside each
+  incident. The length first, because it is the part that is checked; the address, because that is
+  what identifies the device across boots.
+- `lsdev`'s fallback asks `DeviceService::get(N)` for that row's `mmio_len` - the same
+  `DeviceInfo::bar_len` DeviceManager wrote, from the same syscall - and resolves the map only when
+  the two agree. A row whose stored length does not match what the machine reports for it NOW is a
+  map from another inventory and is refused; the reader then falls back to listing by address, with
+  the sentence it already had. So `--incident N` is answered exactly when it can be answered, and the
+  failure mode the row number was removed for cannot return.
+- `forget_absent_incidents` runs beside `load_stored_policy`, at the one moment this program has both
+  the inventory and somewhere to write, and removes every `incident.` and `incident-at.` record whose
+  device this machine does not have. The POLICY records are deliberately not swept: a disable stored
+  for a device that is unplugged today is a preference for when it comes back, which is what
+  persisting it is for. An incident is a description of something that happened to a device that was
+  here.
+
+The cross-check is exact rather than heuristic because both sides read the same kernel field, and it
+needs no boot identity: DeviceManager rewrites the map from the current inventory every time it
+persists, and the sweep removes what the current inventory does not have.

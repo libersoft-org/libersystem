@@ -85,7 +85,7 @@ fn draining_faults_without_a_controller_is_bounded_and_empty() {
 	// The fault path is polled from the kernel's own loop, so it has to be safe to call on a machine
 	// with no IOMMU at all - the alternative is a call site that has to know, and one that forgets.
 	let mut out = [dma::FaultEvent { endpoint: dma::EndpointId(0), domain: dma::DomainId(0), generation: dma::Generation(0), address: None, access: dma::Access::Read, reason: dma::Fault::NotMapped }; 4];
-	let taken = drain_faults(&mut out);
+	let taken = drain_faults(&mut out, None);
 	if !present() {
 		assert_eq!(taken, 0, "no controller reports no faults");
 	}
@@ -289,5 +289,48 @@ fn one_numeric_address_means_different_memory_to_two_endpoints() {
 	let _ = unmap_for_device(mapping_b);
 	let _ = revoke_endpoint(domain_a, first.bus, first.dev, first.func);
 	let _ = revoke_endpoint(domain_b, second.bus, second.dev, second.func);
+	poll_faults();
+}
+
+crate::tagged_test!(a_buffer_from_a_previous_binding_is_not_mapped_into_the_next_one, [Dma, Kernel, Pci], id = "kernel.iommu.a_buffer_from_a_previous_binding_is_not_mapped_into_the_next_one", covers = ["kernel"]);
+fn a_buffer_from_a_previous_binding_is_not_mapped_into_the_next_one() {
+	// THE DOMAIN IS CHOSEN BY DEVICE INDEX, AND AN INDEX OUTLIVES THE BINDING IN IT.
+	//
+	// `sys_dma_buffer_create` reads the claim off the capability it was handed, allocates, and only
+	// then asks which domain to map into. A release and a reclaim in between put the REPLACEMENT
+	// binding's domain under that index, so the old caller's mapping landed in a domain it had no
+	// authority over - and the derived-object registration that refuses the stale generation runs
+	// AFTERWARDS, which rolls back the bookkeeping and not the translation. The generation now
+	// travels with the request.
+	//
+	// Asked of the fixture rather than of a fake, for the reason this whole file states: a domain is
+	// something a controller creates, and there is no controller to invent here.
+	let Some((edu, enforcing)) = fixture() else {
+		crate::serial_println!("iommu-fixture: absent (no edu device on this machine)");
+		return;
+	};
+	if !enforcing {
+		crate::serial_println!("iommu-fixture: generation case skipped - no enforcing IOMMU on this machine");
+		return;
+	}
+	let Some(index) = (0..crate::device::count()).find(|&i| crate::device::with(i, |d| d.bus == edu.bus && d.dev == edu.dev && d.func == edu.func).unwrap_or(false)) else {
+		panic!("the fixture's function is on the bus and has no device-table row - the binder could not name it either");
+	};
+	const BINDING: u64 = 0x5eed_0001;
+	let sentinel = super::edu::Sentinel::new(0x33).expect("a frame for the sentinel");
+	assert!(attach_for(index, edu.bus, edu.dev, edu.func, BINDING), "the fixture's endpoint attaches under a binding of its own");
+
+	// THE NEXT BINDING'S NUMBER, AND THE ONE BEFORE IT. Neither is this domain's, and a mapping for
+	// either would be one generation reaching into another's address space.
+	assert_eq!(map_device_buffer(index as u32, BINDING + 1, sentinel.physical, 0x1000), Err(dma::Fault::StaleGeneration), "a later binding's number mapped into this binding's domain");
+	assert_eq!(map_device_buffer(index as u32, BINDING - 1, sentinel.physical, 0x1000), Err(dma::Fault::StaleGeneration), "an earlier binding's number mapped into this binding's domain");
+
+	// AND THE BINDING'S OWN NUMBER STILL WORKS, so the refusal above is arithmetic on the generation
+	// rather than a mapping path that stopped working.
+	let mapped = map_device_buffer(index as u32, BINDING, sentinel.physical, 0x1000).expect("the binding's own generation maps");
+	let (mapping, _) = mapped.expect("the fixture is translated, so the map answers with one");
+	let _ = unmap_for_device(mapping);
+	assert!(detach_for(index, edu.bus, edu.dev, edu.func), "the fixture's endpoint detaches");
+	crate::serial_println!("iommu-fixture: generation case PASSED - only the live binding's generation maps into its domain");
 	poll_faults();
 }

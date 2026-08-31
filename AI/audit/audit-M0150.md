@@ -572,3 +572,48 @@ is attached, which I have now measured twice.
 **Rating: 8/10.**
 
 1. **A present but unreadable boot-medium manifest is still collapsed into “absent.”** `read_boot_file` now distinguishes firmware `Absent` from `Failed`, but the `Failed` branch delegates to the `Option`-returning FAT reader, where mount errors, corrupt FAT, I/O errors, and `NotFound` all become `None` (`src/boot/loader/src/main.rs:789-835,1021-1033`). Thus a manifest which is present but cannot be read by either route is reported to the caller exactly like a medium carrying no manifest. In the unpaired/test-trust path, `boot_medium_manifest == None` still permits the v1 checksum fallback and can hand the package onward without manifest authentication (`src/boot/loader/src/main.rs:549-570,603-615,904-940`). This remains contrary to M3/M4 and the definition of done's required absent-versus-unreadable distinction.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0150 (2026-08-31T06:05:00Z):
+
+**1. A present but unreadable boot-medium manifest is still collapsed into "absent". ACCEPTED.**
+
+Verified and exact. `read_boot_file` distinguished firmware `Absent` from `Failed`, and then handed
+`Failed` to `read_from_fat`, which returns `Option` - so a mount that failed, a corrupt FAT, an I/O
+error, `NotFound`, and bytes that could not be retained all arrived at the caller as `None`. Three
+callers decide a TRUST question on that value:
+
+- `read_pairing` read `None` as "this medium names no system volume" and kept the fallback to the
+  first LiberFS volume the firmware enumerated - the behaviour the signed pairing exists to remove,
+  turned off by a bad sector rather than by a decision;
+- `read_verified_package` read it as "no signed manifest" and, on a test-trust build, handed the
+  package to the kernel unauthenticated;
+- `boot_medium_manifest` read it as absent and let `read_verified_kernel_from_boot_medium` fall back
+  to the v1 checksum manifest.
+
+The system volume already had this vocabulary - `VolumeRead::{NotOnVolume, Unreadable}`, added for
+exactly the same reason - and the medium did not. It does now:
+
+- `MediumRead::{Bytes, Absent, Unreadable}` and `read_from_fat_reported`, which keeps what
+  `read_file` said: `NotFound` is `Absent`, every other error is `Unreadable`, and bytes that could
+  not be RETAINED are `Unreadable` too - the file exists and the loader has nowhere to put it, which
+  is the same answer a failing disk gives.
+- `read_boot_file_reported` composes the two readers. A firmware `Failed` means something is there
+  and that reader could not get it, so if the FAT backend cannot produce the bytes either the answer
+  is `Unreadable` even where FAT reports `NotFound` - a firmware that opened the file and a FAT
+  reader that cannot find it disagree about the medium, and disagreement is not evidence of absence.
+- Ordinary files keep the `Option`: a kernel or a package that is not there is refused by name a line
+  later. Only the three manifest reads ask for the distinction.
+
+Each of the three now refuses `Unreadable`. `read_pairing` halts with a line saying which volume the
+medium names cannot be established - the same ending a manifest that does not VERIFY gets, arrived at
+one step earlier. `read_verified_package` panics on BOTH profiles, because the test-trust arm is for a
+medium that carries no manifest by design and not for one whose manifest cannot be read.
+`boot_medium_manifest` panics rather than returning `None`, so the checksum fallback is unreachable
+from an unreadable signed manifest.
+
+WHAT IS NOT ADDED, said plainly: no gate makes a boot medium physically unreadable. `signed-boot`
+already proves this distinction on the LiberFS side ("signed manifest is there and could not be
+read"), and the medium side now shares the vocabulary and the endings - but producing a FAT file that
+is present and unreadable through the FIRMWARE reader needs fault injection into OVMF, which this
+harness has no way to do. The refusals above are reachable by reading the code and are not covered by
+a boot.

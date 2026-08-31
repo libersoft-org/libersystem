@@ -444,7 +444,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		let mut probe_blocks: [u64; BOOT_BLOCK_TAGS.len()] = [0; BOOT_BLOCK_TAGS.len()];
 		let mut net_client: u64 = 0;
 		let mut gpu_client: u64 = 0;
-		let mut snd_client: u64 = 0;
 		let mut input_client: u64 = 0;
 		let mut usb_client: u64 = 0;
 		let mut usbq_client: u64 = 0;
@@ -648,14 +647,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
 					#[cfg(feature = "development")]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery, &mut dev);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery, &mut dev);
 					#[cfg(not(feature = "development"))]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut snd_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery);
 					// NOT CLOSED: `Recovery` holds it, because rebinding a crashed driver means
 					// reading its artifact off the volume again. See `Recovery`.
 					send_blocking(bootstrap, b"NET", net_client);
 					send_blocking(bootstrap, b"GPU", gpu_client);
-					send_blocking(bootstrap, b"SND", snd_client);
+					// THE TAG CARRIES A FACT, NOT A CHANNEL. AudioService subscribes for its provider
+					// now, so this program routes no audio channel - and the boot hand-off is read
+					// POSITIONALLY at every hop, so dropping the message would shift every read
+					// after it. What travels behind the tag is the one thing the supervisor did with
+					// that handle: whether this machine has a sound driver bound at all, which its
+					// driver status view reports and which only this program knows.
+					let audio: [u8; 4] = [b'S', b'N', b'D', u8::from(catalogue.count_of(driver_protocol::provider::AUDIO) > 0)];
+					send_blocking(bootstrap, &audio, 0);
 					send_blocking(bootstrap, b"INPUT", input_client);
 					send_blocking(bootstrap, b"USB", usb_client);
 					send_blocking(bootstrap, b"USBBUS", usbq_client);
@@ -695,6 +701,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					policy_config = handle;
 					// READ BACK WHAT WAS STORED, now that there is somewhere to read it from.
 					load_stored_policy(&mut nodes, policy_config);
+					// AND THE RECORDS THAT NO LONGER DESCRIBE ANYTHING GO. The one moment this
+					// program has both the inventory and somewhere to write - see the function.
+					forget_absent_incidents(&nodes, policy_config);
 				}
 				Received::Message { .. } => {
 					// THE DRIVERS GO DOWN BEFORE THIS PROGRAM DOES, and in reverse dependency
@@ -858,7 +867,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -930,9 +939,9 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 					Step::Online => {
 						state[nodes[at].index as usize] = STATE_ONLINE;
 						#[cfg(feature = "development")]
-						route_offers(&mut nodes[at], catalogue, name, storage, console_input, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer, dev);
+						route_offers(&mut nodes[at], catalogue, name, storage, console_input, net_client, gpu_client, input_client, usb_client, usbq_client, usb_pointer, dev);
 						#[cfg(not(feature = "development"))]
-						route_offers(&mut nodes[at], catalogue, name, net_client, gpu_client, snd_client, input_client, usb_client, usbq_client, usb_pointer);
+						route_offers(&mut nodes[at], catalogue, name, net_client, gpu_client, input_client, usb_client, usbq_client, usb_pointer);
 					}
 					// The same candidate, once more. The window and the attempt budget have already
 					// said there is room for it.
@@ -1075,7 +1084,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 // extra two told apart by the literal bytes `USBBUS` and `POINTER` in the messages that followed -
 // so what a capability was for was decided by parsing a string the driver chose.
 #[allow(clippy::too_many_arguments)]
-unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, net_client: &mut u64, gpu_client: &mut u64, snd_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, net_client: &mut u64, gpu_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let _ = driver_name;
 		// PUBLISHED FIRST, ROUTED SECOND. Everything this binding offered enters the catalogue with
@@ -1088,9 +1097,17 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		if *gpu_client == 0 {
 			*gpu_client = catalogue.take(driver_protocol::provider::DISPLAY);
 		}
-		if *snd_client == 0 {
-			*snd_client = catalogue.take(driver_protocol::provider::AUDIO);
-		}
+		// AND AUDIO IS NOT ROUTED AT ALL ANY MORE, which is the point (2026-08-31).
+		//
+		// It was taken into a slot of this program's and handed down the boot chain to
+		// AudioService - the per-kind injection this milestone exists to replace. AudioService now
+		// SUBSCRIBES: it holds a `provider-catalogue` connection, asks for the audio kind, and opens
+		// a connection to whichever provider that answers with or arrives later. So the publication
+		// stays in the catalogue with its offered channel intact, and `open` hands that channel to
+		// the first consumer - which is also what makes the late-publication case work, since a
+		// sound card bound after the service started reaches it down the same subscription.
+		//
+		// The other kinds still route; each is its own seam and moves on its own.
 		// The development channel driver hands up a raw byte channel, and the agent that speaks the
 		// protocol over it is started here rather than by ServiceManager. It exists exactly when the
 		// device does, it has no other client, and its whole reason to be a separate process is to
@@ -1727,9 +1744,15 @@ struct Provider {
 	token: u16,
 	// The channel the driver serves it on. Zero for a free slot.
 	handle: u64,
-	// HOW MANY CONSUMERS HAVE BEEN GIVEN A CONNECTION TO IT, the first offer included. Bounded by
-	// what the driver's registry entry declares for the kind - see `Entry::provides` - so a kind
-	// that admits one refuses the second ask instead of answering with an endpoint nobody serves.
+	// HOW MANY CONSUMERS HAVE BEEN GIVEN A CONNECTION TO IT - the offered channel included, from the
+	// moment it is handed to somebody rather than from publication. Bounded by what the driver's
+	// registry entry declares for the kind - see `Entry::provides` - so a kind that admits one
+	// refuses the second ask instead of answering with an endpoint nobody serves.
+	//
+	// EVERY PATH THAT HANDS ONE OUT COUNTS, and every consumer that goes gives its place back: the
+	// bound is on CONCURRENT consumers, and a number that only rose would spend a declaration of one
+	// on the first client that ever connected. See `Catalogue::take`, `mint_connection`,
+	// `Devices::open` and `Catalogue::disconnected`.
 	consumers: u16,
 }
 
@@ -1740,20 +1763,40 @@ struct Provider {
 // with whoever holds the original, which is the "two consumers competing over one reply queue" the
 // whole per-consumer factory exists to prevent - and a change meant to honour that rule committed
 // exactly it once, so it is written here where the next caller will read it.
-unsafe fn mint_connection(catalogue: &Catalogue, nodes: &[Node], slot: usize) -> u64 {
+unsafe fn mint_connection(catalogue: &mut Catalogue, nodes: &[Node], slot: usize) -> u64 {
 	unsafe {
-		let Some(provider) = catalogue.entries[slot].as_ref() else { return 0 };
-		let binding = provider.id.binding;
-		let Some((control, generation)) = nodes.iter().find(|node| node.id.same_function(binding) && node.id.generation == binding.generation).and_then(|node| node.binding.as_ref().map(|live| (live.channel, node.id.generation))) else {
+		let Some((binding, token, kind, taken)) = catalogue.entries[slot].as_ref().map(|provider| (provider.id.binding, provider.token, provider.kind, outstanding(provider))) else {
+			return 0;
+		};
+		let Some(node) = nodes.iter().find(|node| node.id.same_function(binding) && node.id.generation == binding.generation) else {
+			return 0;
+		};
+		// AND THE BOOT'S OWN CONNECTIONS ARE CHECKED AGAINST THE DECLARATION TOO.
+		//
+		// This minted without consulting or incrementing anything, so a declared bound was already
+		// understated before the first public `open`: the block probe takes one connection per block
+		// provider and the role that mounts it takes another, and neither appeared against the
+		// number the entry declares. A driver whose entry says it serves one consumer and is asked
+		// for two by the boot itself is a manifest that is wrong about the driver, and finding that
+		// out here is the point of declaring it.
+		let admits = node.candidates.get(node.candidate).and_then(|entry| entry.provides.iter().find(|&&(declared, _, _)| declared == kind)).map_or(1, |&(_, _, consumers)| consumers);
+		if taken >= admits {
+			print(b"DeviceManager: a provider was asked for one more connection than its driver declares it admits; refused\n");
+			return 0;
+		}
+		let Some((control, generation)) = node.binding.as_ref().map(|live| (live.channel, node.id.generation)) else {
 			return 0;
 		};
 		let Some((server, client)) = channel() else { return 0 };
 		let mut payload = [0u8; driver_protocol::OFFER_PAYLOAD_LEN];
-		payload[..2].copy_from_slice(&provider.token.to_le_bytes());
+		payload[..2].copy_from_slice(&token.to_le_bytes());
 		if !send_frame(control, driver_protocol::Opcode::Connect, generation, &payload[..2], server, u32::MAX) {
 			close(server);
 			close(client);
 			return 0;
+		}
+		if let Some(held) = catalogue.entries[slot].as_mut() {
+			held.consumers = held.consumers.saturating_add(1);
 		}
 		client
 	}
@@ -1928,13 +1971,18 @@ impl Catalogue {
 					continue;
 				};
 				self.generation = self.generation.wrapping_add(1);
-				// ONE, NOT ZERO: the offer this publication carries IS a connection, and the field says
-				// so. Initialising it to zero made the declared bound off by one in the direction
-				// that matters - a kind declaring `consumers = 1` admitted its initial holder AND one
-				// `open`, so two consumers competed over a provider the manifest said takes one. The
-				// count is what `open` checks against `Entry::provides`, and the first offer has to be
-				// inside it or the bound describes something other than what is served.
-				let provider = Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle, consumers: 1 };
+				// ZERO, BECAUSE NOBODY HAS BEEN GIVEN A CONNECTION YET. This was `1` on the argument
+				// that the offer a publication carries IS a connection - and the offer is not handed
+				// to anybody at publication: it sits in this entry until `take` or `open` moves it.
+				// Counting it here made the DEFAULT provider unusable through the public factory:
+				// `open` refuses at the declared limit, a kind declaring one consumer was already at
+				// it, and the retained handle was reachable only through the private `take` this
+				// milestone exists to replace.
+				//
+				// The count is now what it says it is - how many consumers have been GIVEN a
+				// connection - and every path that hands one out is the path that increments it:
+				// `take`, `mint_connection` and `open`.
+				let provider = Provider { id: ProviderId::new(binding, slot as u16, self.generation), kind: offers.kinds[index], token: offers.tokens[index], handle, consumers: 0 };
 				// AND EVERYONE WATCHING THAT KIND IS TOLD, which is the live half of a subscription:
 				// a consumer that subscribed before this driver bound sees it appear.
 				self.announce(&provider, true);
@@ -1986,6 +2034,10 @@ impl Catalogue {
 			Some(provider) => {
 				let handle = provider.handle;
 				provider.handle = 0;
+				// AND IT IS ONE CONSUMER, COUNTED. This moved a connection to a consumer without
+				// touching the count, so the declared bound described the connections `open` had
+				// minted and not the ones this provider is actually serving.
+				provider.consumers = provider.consumers.saturating_add(1);
 				handle
 			}
 			None => 0,
@@ -2037,26 +2089,23 @@ impl Catalogue {
 			// `MAX_PROVIDERS` is the sum of every `provides` bound this image's registry declares - a
 			// compile-time constant and a small one - so the array that holds them needs no allocator
 			// at all and the failure mode goes with it.
+			// AND THE TRANSFER IS THE LIBRARY'S TOO (2026-08-31). The closure used to close the
+			// channel AND copy the provider into the array the announcement loop reads, and that
+			// second half is a decision a host test could not see: the version before this one
+			// collected into a `Vec` whose short-allocation path silently copied nothing, so every
+			// provider was removed and closed and no withdrawal was announced. `withdraw_slots_into`
+			// is driven by `driver-binding`'s own test and answers with exactly what it emptied; what
+			// is left here is a `close` and a `send`, neither of which is a choice.
 			let mut taken: [Option<Provider>; MAX_PROVIDERS] = [const { None }; MAX_PROVIDERS];
-			let mut count: usize = 0;
-			let gone = driver_binding::withdraw_slots(
-				&mut self.entries,
-				binding,
-				|provider| provider.id,
-				|provider| {
-					if provider.handle != 0 {
-						close(provider.handle);
-					}
-					if count < taken.len() {
-						taken[count] = Some(provider);
-						count += 1;
-					}
-				},
-			);
-			for slot in taken.iter().take(count) {
-				if let Some(provider) = slot {
-					self.announce(provider, false);
+			let Some(gone) = driver_binding::withdraw_slots_into(&mut self.entries, binding, |provider| provider.id, &mut taken) else {
+				print(b"DeviceManager: the withdrawal buffer is smaller than the catalogue, which cannot happen - nothing was withdrawn\n");
+				return 0;
+			};
+			for provider in taken.iter().flatten() {
+				if provider.handle != 0 {
+					close(provider.handle);
 				}
+				self.announce(provider, false);
 			}
 			gone
 		}
@@ -2066,6 +2115,17 @@ impl Catalogue {
 	// about: two controllers of one kind each publishing one is not one controller publishing two.
 	fn count_for(&self, binding: BindingId, kind: u16) -> usize {
 		self.entries.iter().filter(|entry| entry.as_ref().is_some_and(|provider| provider.binding_is(binding) && provider.kind == kind)).count()
+	}
+
+	// A CONSUMER OF ONE PUBLICATION HAS GONE, so its place against the declared bound comes back.
+	//
+	// Named by the publisher's own token, like a withdrawal: a driver never sees a `ProviderId`.
+	// Saturating, because a driver reporting more departures than it was given connections is a
+	// driver to disbelieve rather than a count to wrap into a bound nobody declared.
+	fn disconnected(&mut self, binding: BindingId, token: u16) {
+		if let Some(provider) = self.entries.iter_mut().filter_map(Option::as_mut).find(|provider| provider.binding_is(binding) && provider.token == token) {
+			provider.consumers = provider.consumers.saturating_sub(1);
+		}
 	}
 
 	// How many providers this binding has published, of any kind.
@@ -2078,6 +2138,21 @@ impl Catalogue {
 	fn count_of(&self, kind: u16) -> usize {
 		self.entries.iter().filter(|entry| entry.as_ref().is_some_and(|provider| provider.kind == kind)).count()
 	}
+}
+
+// HOW MANY CONNECTIONS TO THIS PROVIDER EXIST OR ARE PROMISED.
+//
+// The connections handed out, PLUS the offered channel while it is still sitting in the entry. The
+// offered one is not a consumer yet - nobody holds it - but it is a connection this driver made and
+// is serving, and it will go to whoever asks next. So a path that would MINT a new one has to count
+// it, or a provider declaring one consumer would mint a second endpoint for a driver already serving
+// the first, and the two would compete over one reply queue - the exact failure the per-consumer
+// factory exists to prevent.
+//
+// A path that hands out the OFFERED channel does not add to this: it moves the same connection from
+// promised to held.
+fn outstanding(provider: &Provider) -> u16 {
+	provider.consumers.saturating_add(u16::from(provider.handle != 0))
 }
 
 // One comparable number for a function's place on the bus, so "lowest address first" is one
@@ -2550,6 +2625,11 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 				driver_protocol::Opcode::Withdraw => {
 					if let Ok(token) = driver_protocol::decode_withdraw(header.payload(buf)) {
 						node.push(BindingEvent::Withdrawn { generation, token });
+					}
+				}
+				driver_protocol::Opcode::Disconnect => {
+					if let Ok(token) = driver_protocol::decode_disconnect(header.payload(buf)) {
+						node.push(BindingEvent::Disconnected { generation, token });
 					}
 				}
 				// Manager-to-driver opcodes, coming the wrong way. Refused, not ignored.
@@ -3104,6 +3184,15 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					print(if withdrawn.is_some() { b" withdrew a provider it had published\n" } else { b" withdrew a provider that was not published under that token\n" });
 					continue;
 				}
+				// ONE PLACE GIVEN BACK against what the entry declares. The bound is on CONCURRENT
+				// consumers, and with nothing coming this way the count only rose - so a kind
+				// admitting one was refused for the rest of the boot the moment its first consumer
+				// closed. Saturating, because a driver reporting more departures than connections is
+				// a driver to disbelieve, not a count to wrap.
+				BindingEvent::Disconnected { token, .. } => {
+					catalogue.disconnected(node.id, token);
+					continue;
+				}
 				BindingEvent::Ready { .. } => {
 					// THE TRANSACTION COMMITS. What it took stays taken, and everything held
 					// unpublished through the handshake enters the catalogue here - in one place,
@@ -3649,9 +3738,31 @@ impl proto::system::provider_catalogue::Service for CatalogueView<'_> {
 				let admits = self.nodes.iter().find(|node| node.id.same_function(held.id.binding) && node.id.generation == held.id.binding.generation).and_then(|node| node.candidates.get(node.candidate)).and_then(|entry| entry.provides.iter().find(|&&(kind, _, _)| kind == held.kind)).map_or(1, |&(_, _, consumers)| consumers);
 				(held.token, admits)
 			};
-			if self.catalogue.entries[slot].as_ref().is_some_and(|held| held.consumers >= admits) {
+			// EXISTING PLUS PROMISED, not just handed out - see `outstanding`. The branch below hands
+			// out the offered channel, which is already inside this number and does not add to it.
+			if self.catalogue.entries[slot].as_ref().is_some_and(|held| outstanding(held) > admits || (held.handle == 0 && held.consumers >= admits)) {
 				print(b"DeviceManager: a provider was asked for one more consumer than its driver declares it admits; refused\n");
 				return Err(proto::system::Error::Denied);
+			}
+			// THE OFFERED CHANNEL IS THE FIRST CONNECTION, AND THIS IS WHERE IT IS HANDED OUT.
+			//
+			// A publication carries the endpoint the driver made itself, and it sat in the entry
+			// reachable only through the private `Catalogue::take` - the hand-written routing this
+			// milestone exists to delete. So the PUBLIC factory could not deliver the first
+			// connection for the default single-consumer provider at all: minting a second one for a
+			// driver that declares it serves one is exactly what the bound above refuses, and the
+			// one it may serve was being held back.
+			//
+			// Moved rather than duplicated, like `take`: a duplicate shares the driver's reply queue
+			// with whoever holds the original, which is the failure the per-consumer factory exists
+			// to prevent.
+			if let Some(held) = self.catalogue.entries[slot].as_mut()
+				&& held.handle != 0
+			{
+				let offered = held.handle;
+				held.handle = 0;
+				held.consumers += 1;
+				return Ok(offered);
 			}
 			// THE BINDING THAT PUBLISHED IT has to still be the one that is bound: a `CONNECT` sent
 			// on a channel whose generation has moved on is a frame the driver drops, and answering
@@ -3905,11 +4016,85 @@ fn persist_incidents(nodes: &mut [Node], config: u64) {
 			}
 			let key = incident_key(node.id);
 			let mut client = proto::system::config::Client::new(ChannelTransport { chan: config });
-			if client.set(&proto::system::ConfigEntry { key, value }).is_some() {
-				node.incident_stored = true;
+			if client.set(&proto::system::ConfigEntry { key, value }).is_none() {
+				continue;
 			}
+			// AND THE ROW NUMBER IS RESOLVABLE AGAIN - through a SEPARATE record, checked against the
+			// hardware rather than believed.
+			//
+			// `lsdev --incident N` asks by row, and the record is keyed by address because that is
+			// what identifies a device across boots; putting the row INSIDE the record made it wrong
+			// the moment the inventory changed, which is why it was taken out. What is written here
+			// is the other direction, on its own key, carrying the one fact a reader can CHECK: the
+			// length of the device's MMIO window, which `DeviceService` answers for that row out of
+			// the kernel's live table - and the kernel is there whether this program is or not. A
+			// row whose stored length does not match what the machine reports for it now is a map
+			// from another inventory, and the reader says so instead of resolving it.
+			let mut at = alloc::string::String::new();
+			push_number(&mut at, node.info.bar_len);
+			at.push('.');
+			push_number(&mut at, node.id.bus as u64);
+			at.push('.');
+			push_number(&mut at, node.id.dev as u64);
+			at.push('.');
+			push_number(&mut at, node.id.func as u64);
+			let _ = client.set(&proto::system::ConfigEntry { key: incident_index_key(node.index), value: at });
+			node.incident_stored = true;
 		}
 	}
+}
+
+// EVERY STORED INCIDENT FOR A DEVICE THIS MACHINE NO LONGER HAS, REMOVED.
+//
+// The records outlive this program deliberately, and nothing ever took one away - so a machine that
+// lost a card kept its last incident for ever, and `lsdev`'s fallback listed it beside the live ones
+// with nothing to say which was which. M4 makes this program the owner of the reserved prefix, and
+// owning a set of records includes deciding when one stops describing anything.
+//
+// Run when the ConfigService connection arrives, beside `load_stored_policy`, which is the one moment
+// this program has both the inventory and somewhere to write. THE POLICY RECORDS ARE NOT SWEPT: a
+// disable stored for a device that is unplugged today is a preference for when it comes back, which
+// is exactly what persisting it is for. An incident is a description of something that happened to a
+// device that was here.
+unsafe fn forget_absent_incidents(nodes: &[Node], config: u64) {
+	unsafe {
+		if config == 0 {
+			return;
+		}
+		let mut client = proto::system::config::Client::new(ChannelTransport { chan: config });
+		let Some(Ok(entries)) = client.list() else { return };
+		let mut stale: Vec<alloc::string::String> = Vec::new();
+		for entry in entries.iter() {
+			if let Some(rest) = entry.key.strip_prefix("device.policy.incident-at.") {
+				// Keyed by this boot's row number, and rewritten by `persist_incidents` - so what is
+				// stale here is a row the current inventory does not have at all.
+				let known = rest.parse::<u64>().is_ok_and(|index| nodes.iter().any(|node| node.index == index));
+				if !known {
+					stale.push(entry.key.clone());
+				}
+				continue;
+			}
+			let Some(rest) = entry.key.strip_prefix("device.policy.incident.") else { continue };
+			if !nodes.iter().any(|node| incident_key(node.id).ends_with(rest) && incident_key(node.id).len() == "device.policy.incident.".len() + rest.len()) {
+				stale.push(entry.key.clone());
+			}
+		}
+		for key in stale {
+			print(b"DeviceManager: a stored incident names a device this machine no longer has; it is removed rather than listed beside the live ones\n");
+			let _ = client.remove(&key);
+		}
+	}
+}
+
+// Where the ROW NUMBER of a device that has an incident is mapped to its address, under the same
+// reserved prefix. Separate from the record itself because it is the half that expires: the address
+// identifies a device across boots and the row does not. See `persist_incidents`.
+fn incident_index_key(index: u64) -> alloc::string::String {
+	let mut key = alloc::string::String::from("device.policy.incident-at.");
+	let mut number = [0u8; 20];
+	let n = decimal(index, &mut number);
+	key.push_str(core::str::from_utf8(&number[..n]).unwrap_or("0"));
+	key
 }
 
 // Where one device's last incident is kept, under the same reserved prefix as its policy so both are
@@ -4120,7 +4305,15 @@ unsafe fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut Catalo
 		let mut reply = [0u8; 4096];
 		let mut reply_handles = wire::Handles::new();
 		if let Some(written) = proto::system::provider_catalogue::dispatch(&mut view, &request, &mut request_handles, &mut reply, &mut reply_handles) {
-			send_blocking(channel, &reply[..written], 0);
+			// WITH WHATEVER THE REPLY CARRIES, and that is not a refinement (2026-08-31).
+			//
+			// `open` answers with a CONNECTION - a discriminant, the handle's index, and the handle
+			// itself - and this sent the bytes with a zero transfer, so the index arrived and the
+			// capability did not. The client decodes `take_handle` off a reply that has none and
+			// answers `None`, which reads as "the catalogue did not answer" - and the operation this
+			// milestone exists for could not work at all. Nothing had called it in production, so
+			// nothing had found out: AudioService is the first consumer to `open`.
+			send_caps_blocking(channel, &reply[..written], reply_handles.as_slice());
 		}
 		true
 	}

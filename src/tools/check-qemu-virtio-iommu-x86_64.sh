@@ -319,7 +319,24 @@ if grep -aq "DeviceManager: restarting virtio-gpu" "$default_log"; then
 	grep -a "virtio-gpu\|DeviceManager: restarting" "$default_log" >&2 || true
 	exit 1
 fi
-echo "qemu-virtio-iommu:   the default machine is translated, nothing is degraded, nothing faulted, and the display driver runs"
+# AND A FRAME REACHED THE DISPLAY, which is what M4 asks and what "it printed online" is not.
+#
+# The driver reports online before any frame exists - it has a device, not a picture - and the first
+# frame is submitted later by ConsoleService, which used to DISCARD the presentation result. So a boot
+# where every present failed behind the controller looked exactly like one where they all landed.
+# ConsoleService now says which, once, and this is the assertion that makes the difference a gate can
+# see rather than a reader.
+if ! grep -aq "ConsoleService: a frame reached the display" "$default_log"; then
+	echo "qemu-virtio-iommu: no frame reached the display on the default translated machine" >&2
+	grep -a "ConsoleService:\|virtio-gpu\|display" "$default_log" >&2 || true
+	exit 1
+fi
+if grep -aq "ConsoleService: a frame did NOT reach the display" "$default_log"; then
+	echo "qemu-virtio-iommu: a frame failed to reach the display on the default translated machine" >&2
+	grep -a "ConsoleService:\|virtio-gpu\|display" "$default_log" >&2 || true
+	exit 1
+fi
+echo "qemu-virtio-iommu:   the default machine is translated, nothing is degraded, nothing faulted, the display driver runs and a frame reached the screen"
 
 # AND `--no-iommu` STILL REACHES THE OTHER MACHINE, because a system that can only boot one of them
 # has not made isolation optional - it has made the machine without it unreachable, and that machine

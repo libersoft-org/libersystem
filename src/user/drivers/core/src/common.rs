@@ -171,6 +171,17 @@ pub unsafe fn offer(bootstrap: u64, bind: &Bind, provider_kind: u16, token: u16,
 	unsafe { send_frame_with(bootstrap, proto::Opcode::Offer, bind.generation, &payload, handle) }
 }
 
+// "A CONSUMER of the provider I published under this token has gone."
+//
+// Not a withdrawal: the provider stays published and the driver stays bound. What it releases is one
+// place against the `consumers` bound its registry entry declares - which the manager only ever
+// counted UP, so a provider admitting one consumer was unusable once its first client had left.
+pub unsafe fn disconnected(bootstrap: u64, bind: &Bind, token: u16) -> bool {
+	let mut payload = [0u8; proto::U16_PAYLOAD_LEN];
+	proto::encode_u16(token, &mut payload);
+	unsafe { send_frame(bootstrap, proto::Opcode::Disconnect, bind.generation, &payload) }
+}
+
 // "The provider I published under this token is going away."
 //
 // AFTER the handshake, and not terminal: this driver stays bound and its other publications stay
@@ -513,7 +524,9 @@ pub unsafe fn serve_or_answer(bootstrap: u64, bind: &Bind, server: u64) -> bool 
 		// it cannot place, and a consumer whose endpoint closes learns its connection ended. A driver
 		// that means to serve several holds its own `Serving` across calls and uses
 		// `serve_any_or_answer`; `virtio_blk` is the one that does.
-		let mut one = Serving::new(server);
+		// TOKEN ZERO AND NEVER READ: this set does not accept, so no endpoint in it is ever a
+		// provider connection whose end has to be reported. See `accepts` below.
+		let mut one = Serving::new(server, 0);
 		serve_any_or_answer_inner(bootstrap, bind, &mut one, false).is_some()
 	}
 }
@@ -583,15 +596,22 @@ pub const MAX_PROVIDER_CLIENTS: usize = 8;
 
 pub struct Serving {
 	ends: [u64; MAX_PROVIDER_CLIENTS],
+	// WHICH PUBLICATION EACH ENDPOINT BELONGS TO, so a consumer that goes can be reported as one
+	// consumer of THAT provider. A driver may publish several, and the manager's count is per
+	// provider - "somebody left" is not an answer it can apply.
+	tokens: [u16; MAX_PROVIDER_CLIENTS],
 	count: usize,
 }
 
 impl Serving {
-	// The first one, which the driver made itself and offered to the manager.
-	pub fn new(first: u64) -> Self {
+	// The first one, which the driver made itself and offered to the manager, under the token it
+	// offered it with.
+	pub fn new(first: u64, token: u16) -> Self {
 		let mut ends = [0u64; MAX_PROVIDER_CLIENTS];
 		ends[0] = first;
-		Self { ends, count: 1 }
+		let mut tokens = [0u16; MAX_PROVIDER_CLIENTS];
+		tokens[0] = token;
+		Self { ends, tokens, count: 1 }
 	}
 
 	pub fn as_slice(&self) -> &[u64] {
@@ -604,19 +624,29 @@ impl Serving {
 
 	// A consumer's endpoint has closed: drop it and keep the rest. The order of the others does not
 	// matter, so the last one fills the hole rather than everything shifting.
-	pub fn close_at(&mut self, index: usize) {
+	//
+	// ANSWERS WHICH PUBLICATION LOST A CONSUMER, so the caller can tell the manager - whose count is
+	// what the registry's `consumers` bound is checked against, and which only ever rose while
+	// nothing said a client had left.
+	pub fn close_at(&mut self, index: usize) -> u16 {
 		unsafe { close(self.ends[index]) };
+		let token = self.tokens[index];
 		self.count -= 1;
 		self.ends[index] = self.ends[self.count];
+		self.tokens[index] = self.tokens[self.count];
 		self.ends[self.count] = 0;
+		self.tokens[self.count] = 0;
+		token
 	}
 
-	// One more, from a `CONNECT`. False when this driver is already serving as many as it will.
-	fn accept(&mut self, end: u64) -> bool {
+	// One more, from a `CONNECT`, under the token that frame named. False when this driver is already
+	// serving as many as it will.
+	fn accept(&mut self, end: u64, token: u16) -> bool {
 		if self.count >= MAX_PROVIDER_CLIENTS {
 			return false;
 		}
 		self.ends[self.count] = end;
+		self.tokens[self.count] = token;
 		self.count += 1;
 		true
 	}
@@ -665,7 +695,11 @@ unsafe fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&m
 				// ONE MORE CONSUMER. The manager made the pair and kept the client end; this is the
 				// server end, and serving it is the whole of what a driver has to do about it.
 				proto::Opcode::Connect => {
-					let accepted = handle != 0 && serving.as_deref_mut().is_some_and(|serving| serving.accept(handle));
+					// THE TOKEN THE FRAME NAMES, kept with the endpoint. A frame whose payload does
+					// not decode is not a connection this driver can ever report the end of, so it
+					// is refused rather than served under a token nobody chose.
+					let token = proto::decode_connect(header.payload(&buf)).ok();
+					let accepted = handle != 0 && token.is_some_and(|token| serving.as_deref_mut().is_some_and(|serving| serving.accept(handle, token)));
 					if !accepted && handle != 0 {
 						// Full, or a loop that serves no provider. Closed rather than kept, so the
 						// consumer learns its connection ended instead of waiting on a server that
@@ -752,6 +786,16 @@ pub unsafe fn quiesce_virtio() -> bool {
 		return false;
 	}
 	unsafe { virtio::quiesce_at(common) }
+}
+
+// THE MANAGER HAS ASKED THIS DRIVER TO STOP, and the exit path owes a `STOPPED` for it.
+//
+// Every wait helper in this file latches it as it reads the frame; a driver with a heartbeat of its
+// own reads its own bootstrap and has to say so here, or `finish_stop` quiesces the device and
+// acknowledges nothing - the manager then waits out its forced-teardown deadline for a driver that
+// stopped cleanly and never said it had.
+pub fn latch_stop() {
+	STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
 }
 
 // Whether the manager has asked this driver to stop. `true` means the exit is a PLANNED one and the

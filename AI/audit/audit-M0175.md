@@ -395,3 +395,55 @@ phase moved on - each proving the stored lease is unchanged.
 
 **Plan re-check.** Item count unchanged at ten; M8 now gives DHCP the same depth of contract it gave
 SNTP, which is what "every internal UDP operation" was supposed to mean. No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-08-31T03:28:50Z):
+
+Rating: 6/10
+
+1. **M5 contradicts its pinned RFC 6724 profile by rejecting every deprecated source.** The plan says
+   “Never choose a deprecated source for a new connection” while also requiring RFC 6724 selection and
+   explicit caller overrides (`docs/todo/P02M0175.md:168-174`).
+   [RFC 6724 section 5](https://www.rfc-editor.org/rfc/rfc6724.html#section-5) prefers a nondeprecated
+   source; it does not make a still-valid deprecated address unusable, and it expressly does not
+   override a legal caller choice. The current rule ends new connectivity at preferred-lifetime expiry
+   when that is the only usable address, instead of at valid-lifetime expiry, and defeats the stated
+   override. Require the only-deprecated-candidate and explicit-override cases, or document a deliberate
+   non-RFC policy and its resulting loss of connectivity.
+
+2. **The accepted SNTP correction remains incomplete and partly wrong.** M8 requires mode/version/
+   leap/stratum checks but rejects only strata 0 and 16, and never validates the server transmit
+   timestamp (`docs/todo/P02M0175.md:206-218`), although the accepted audit required that validation
+   (`AI/audit/audit-M0175.md:258`). NTP's synchronized strata are 1 through 15; higher values are not
+   valid server strata, and [RFC 5905](https://www.rfc-editor.org/rfc/rfc5905.html) rejects a zero or
+   duplicate transmit timestamp. The current parser takes that field directly as wall-clock time and
+   TimeService applies it (`src/user/services/core/src/net.rs:1523-1534`;
+   `src/user/services/core/src/time_service.rs:98-109`). Require `1..=15`, nonzero transmit time, and
+   replay/duplicate rejection, with fixtures that prove invalid replies cannot mutate the clock.
+
+3. **The latest DHCP correction incorrectly requires a unicast NAK while RENEWING.** The state table
+   says RENEWING takes a “unicast ACK or NAK” from the selected server
+   (`docs/todo/P02M0175.md:229-247`). [RFC 2131 section 4.1](https://www.rfc-editor.org/rfc/rfc2131.html#section-4.1)
+   requires a server to broadcast every DHCPNAK to `0xffffffff` when `giaddr` is zero, including a
+   renewal whose request was unicast. Implemented literally, the plan discards the conforming NAK and
+   retains an invalid lease. Freeze ACK and NAK destination forms separately and add the broadcast
+   renewal-NAK case; the generic “NAK in each phase” fixture does not distinguish it.
+
+4. **The accepted FIN retransmission correction disappeared from normative M2.** The original audit
+   and planner response explicitly required and promised RTO handling for data **and FIN**
+   (`AI/audit/audit-M0175.md:15,102-108`), but current M2 describes only unacknowledged data/segments
+   and has no retained FIN sequence state or retransmission requirement
+   (`docs/todo/P02M0175.md:89-134`). “Close with data in flight” does not exercise a lost FIN or final
+   ACK. Current teardown demonstrates the material gap: it sends FIN once, waits briefly, then frees
+   the TCB (`src/user/services/core/src/network_service.rs:511-520,1426-1442`). Restore FIN ownership,
+   sequence-space retransmission, typed expiry, and lost-FIN/final-ACK fixtures.
+
+5. **DNS matching still has no unpredictable query identity, so the spoof-rejection claim is false.**
+   M6 matches transaction ID and ports but never requires their generation to be unpredictable
+   (`docs/todo/P02M0175.md:176-192`). Current code uses fixed source port `0x9876`, resets request state
+   to zero for each dispatch client, and increments the transaction ID predictably
+   (`src/user/services/core/src/network_service.rs:38-39,384,1239-1240`).
+   [RFC 5452 section 9.2](https://www.rfc-editor.org/rfc/rfc5452.html#section-9.2) requires unpredictable
+   query IDs and source ports over the available ranges. A forged answer with the predictable tuple
+   satisfies every current matching rule, contradicting the spoof/replay Definition of done
+   (`docs/todo/P02M0175.md:304-305`). Require per-query unpredictable IDs and source ports with bounded
+   in-flight collision handling, plus a guessed/stale-tuple negative fixture.

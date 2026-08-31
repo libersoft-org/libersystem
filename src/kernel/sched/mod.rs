@@ -501,6 +501,17 @@ pub fn prepare_in_process(entry: extern "C" fn(u64), argument: u64, process: &Ar
 	Thread::new(entry, argument, process.clone()).expect("out of memory for a kernel thread stack")
 }
 
+// The same, for a thread that is going to be started on a NAMED core - so two threads of ONE process
+// can race a shared handle table on two cores rather than taking turns on one.
+//
+// The cpu is given here for the reason `prepare_with_object_for` states: the kernel stack is
+// allocated while the thread is built, so naming the core afterwards has already put the stack in
+// the creating core's node.
+#[cfg(test)]
+pub fn prepare_in_process_on(cpu: usize, entry: extern "C" fn(u64), argument: u64, process: &Arc<Process>) -> Arc<Thread> {
+	Thread::new_for_cpu(entry, argument, process.clone(), Some(cpu)).expect("out of memory for a kernel thread stack")
+}
+
 // Release a prepared thread onto a NAMED core's run queue.
 //
 // The placement half of the NUMA contract, and the only way to ask for one: `start_thread` puts a

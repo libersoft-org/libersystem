@@ -499,3 +499,35 @@ endpoints - passes; results are in the closing note appended to every file in th
 **Rating: 7/10.**
 
 1. **Normal claim teardown is still synchronous rather than event-driven.** `Holdings::begin_teardown` invokes every release operation inline and then closes the terminal claim (`src/user/libs/driver/binding/src/lib.rs:734-769`); the production release implementation calls `device_release` directly (`src/user/services/core/src/device_manager.rs:1627-1640`), and the syscall performs the complete release before returning (`src/kernel/syscall/mod.rs:1242-1248`, `src/kernel/object/claim/mod.rs:82-96`, `src/kernel/device.rs:460-513`). The 20-tick bound applies only to virtio-IOMMU command polling, not to the whole transition (`src/kernel/iommu/mod.rs:769-789`, `src/kernel/iommu/virtqueue.rs:197-215`). The implementer correctly labels this UNMET, but difficulty or short observed duration does not satisfy M4's required nonblocking request followed later by `ClaimSettled`.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-08-31T06:05:00Z):
+
+**1. Normal claim teardown is still synchronous rather than event-driven. ACCEPTED as a statement of
+the tree, and the item stays UNMET. What is new is why, verified rather than asserted.**
+
+Every line of the finding checks out: `Holdings::begin_teardown` runs the release inline, the
+production release implementation calls `device_release` directly, and `sys_device_release` performs
+the whole teardown before returning. The 20-tick bound is the virtio-IOMMU command poll and not the
+transition. The label is UNMET and stays UNMET.
+
+What the previous response did not establish, and this one does: making the release NONBLOCKING is
+not a rearrangement of this milestone's code. The syscall would have to start the teardown and
+return, and something would then have to finish it - the bus-master disable, the derived sweep, the
+IOMMU detach with its own bounded wait, and the terminal `finish_release` that signals the claim. In
+this kernel there is nothing to run it. Verified this pass by reading every spawner in
+`src/kernel/sched/mod.rs`: `spawn`, `spawn_on`, `spawn_on_unwoken`, `spawn_with_object`,
+`prepare_*`, `start_thread*` and `spawn_in` are ALL `#[cfg(test)]`. The shipping kernel creates no
+kernel threads at all - every thread it builds is a userspace one made through `sys_thread_create`.
+
+So M4's shape needs a production kernel worker and a deferred-completion state for a syscall to
+return into, which is a new kernel facility and not a change to the binding lifecycle. That is
+outside what this milestone owns, and building it here would be adding a subsystem to satisfy a gate.
+
+The half that IS this milestone's is already there and is worth separating from the half that is not:
+the terminal result arrives on the claim handle as `ClaimSettled`, the manager waits on it in the
+same `wait_any` as everything else, and a teardown that does not confirm inside the deadline
+quarantines rather than freeing. What is missing is only that the REQUEST blocks its caller for the
+duration - measured in the twenties of ticks on the profiles here, and unbounded in principle on a
+controller that stops answering, which is exactly why the deadline exists.
+
+Recorded as UNMET with that reason, not as a rejection.

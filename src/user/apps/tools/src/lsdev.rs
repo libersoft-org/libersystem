@@ -48,7 +48,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// A verb, or the listing. `lsdev` with no verb reads and changes nothing, which is what a
 		// command called `ls` had better do.
 		if let Some(request) = parse_verb(&args) {
-			apply_verb(policy, config, request);
+			apply_verb(policy, config, devsvc, request);
 			exit();
 		}
 		query_devices(devsvc, JsonMode::parse(&args));
@@ -96,7 +96,7 @@ fn parse_verb(args: &[u8]) -> Option<VerbRequest> {
 }
 
 // Apply one verb and say what happened, in the words the outcome carries.
-unsafe fn apply_verb(policy: u64, config: u64, request: VerbRequest) {
+unsafe fn apply_verb(policy: u64, config: u64, devsvc: u64, request: VerbRequest) {
 	unsafe {
 		if policy == 0 {
 			eprint(b"lsdev: this boot granted no device-policy authority\n");
@@ -121,7 +121,7 @@ unsafe fn apply_verb(policy: u64, config: u64, request: VerbRequest) {
 				// dying is what killed the driver subtree, so an operator asking what happened is
 				// asking a process that is no longer there. The persisted copy is in ConfigService,
 				// which survives, and it carries the whole record rather than a summary of it.
-				None => stored_incident(config, request.index),
+				None => stored_incident(config, devsvc, request.index),
 			}
 			return;
 		}
@@ -148,6 +148,50 @@ fn outcome_text(outcome: PolicyOutcome) -> &'static [u8] {
 		PolicyOutcome::Refused => b"this binding is boot-critical, and its policy would live on a volume that is not mounted when it is made",
 		PolicyOutcome::NotStored => b"the preference could not be written down, so nothing was changed",
 	}
+}
+
+// THE ADDRESS OF THE DEVICE AT ROW `index`, if the stored map can be CHECKED against this machine.
+//
+// `None` means the question cannot be answered by row here: no map, no device at that row, or a map
+// whose recorded MMIO length disagrees with what the kernel reports for that row now - which is a map
+// written by a boot with a different inventory. See `stored_incident`.
+fn resolved_address(client: &mut ConfigClient, devsvc: u64, index: u32) -> Option<String> {
+	if devsvc == 0 {
+		return None;
+	}
+	let mut key = String::from("device.policy.incident-at.");
+	let mut digits = [0u8; 20];
+	let written = decimal(index as u64, &mut digits);
+	key.push_str(core::str::from_utf8(&digits[..written]).ok()?);
+	let Some(Ok(stored)) = client.get(&key) else { return None };
+	// `<mmio-len>.<bus>.<dev>.<func>` - the length first because it is the part that is checked.
+	let (len, address) = stored.split_once('.')?;
+	let recorded: u64 = len.parse().ok()?;
+	let entry = DeviceClient::new(devsvc).get(&index)?.ok()?;
+	if entry.mmio_len != recorded {
+		return None;
+	}
+	Some(String::from(address))
+}
+
+// One decimal number into `out`, answering how many bytes it wrote. This program has no formatter.
+fn decimal(value: u64, out: &mut [u8; 20]) -> usize {
+	if value == 0 {
+		out[0] = b'0';
+		return 1;
+	}
+	let mut digits = [0u8; 20];
+	let mut at: usize = 0;
+	let mut rest = value;
+	while rest > 0 && at < digits.len() {
+		digits[at] = b'0' + (rest % 10) as u8;
+		rest /= 10;
+		at += 1;
+	}
+	for i in 0..at {
+		out[i] = digits[at - 1 - i];
+	}
+	at
 }
 
 unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
@@ -222,13 +266,42 @@ unsafe fn query_devices(devsvc: u64, mode: Option<JsonMode>) {
 // means DeviceManager is gone. It says so rather than matching a number that named a different
 // device in the boot that wrote it.
 
-unsafe fn stored_incident(config: u64, index: u32) {
+unsafe fn stored_incident(config: u64, devsvc: u64, index: u32) {
 	unsafe {
 		if config == 0 {
 			eprint(b"lsdev: the device policy endpoint did not answer, and this boot granted no configuration read to look for the stored copy\n");
 			return;
 		}
 		let mut client = ConfigClient::new(config);
+		// THE ROW NUMBER IS RESOLVED AGAINST THE HARDWARE, NOT AGAINST A REMEMBERED LIST.
+		//
+		// DeviceManager writes a separate `incident-at.<row>` record carrying the length of that
+		// device's MMIO window beside its address. `DeviceService` answers that length for the same
+		// row out of the KERNEL's device table, which is there whether DeviceManager is or not - so
+		// the map is checked rather than believed, and a row whose stored length does not match what
+		// the machine reports for it now is a map from another inventory and is refused.
+		//
+		// This is what makes `--incident N` answerable on the path where the manager is gone. Listing
+		// everything by address, below, is the fallback for when the check cannot be made or fails.
+		if let Some(at) = resolved_address(&mut client, devsvc, index) {
+			let mut key = String::from("device.policy.incident.");
+			key.push_str(&at);
+			match client.get(&key) {
+				Some(Ok(value)) => {
+					print(value.as_bytes());
+					print(b"\n");
+					eprint(b"lsdev: DeviceManager did not answer - this is the persisted copy for the device at that row\n");
+					return;
+				}
+				// The row resolves and has no record: the honest answer, and the same one the live
+				// endpoint gives for a binding that has never failed.
+				Some(Err(_)) | None => {
+					print(b"nothing has gone wrong on this binding\n");
+					eprint(b"lsdev: DeviceManager did not answer - no incident is stored for the device at that row\n");
+					return;
+				}
+			}
+		}
 		// A ROW NUMBER CANNOT BE RESOLVED WITHOUT THE MANAGER, AND THIS PRETENDED IT COULD
 		// (corrected 2026-08-30).
 		//

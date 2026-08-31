@@ -1470,12 +1470,22 @@ impl Fdt {
 			// selected GIC anyway. The timer is a root child, so the inherited value is the root's
 			// and resolving it is one lookup rather than an inheritance implementation.
 			//
-			// A tree in which the GIC declares no phandle still has nothing to compare against and is
-			// still accepted; that is a tree this reader cannot check rather than one it has checked.
-			// Zeroing rather than flagging, because the caller already refuses a boot with no timer:
-			// this is the same absence, arrived at for a stated reason.
+			// AND A ROUTING THIS READER CANNOT CHECK IS REFUSED RATHER THAN ACCEPTED (corrected
+			// 2026-08-31). The comparison used to require BOTH operands to be nonzero, so a timer
+			// with no effective parent, or a selected controller declaring no phandle, skipped it
+			// entirely - and the PPI was then enabled on that controller on the strength of a
+			// description that never tied it there. "A tree this reader cannot check rather than one
+			// it has checked" describes the reader's position accurately and is the wrong CONCLUSION
+			// to draw from it: M2 asks for the routing to be checked, and an unstated routing is an
+			// ambiguous description, which this refuses.
+			//
+			// It costs nothing on either machine this reader boots: QEMU's virt trees state
+			// `interrupt-parent` at the root and give the GIC a phandle, because every other node's
+			// interrupt reference depends on both. Zeroing rather than flagging, because the caller
+			// already refuses a boot with no timer: this is the same absence, arrived at for a
+			// stated reason.
 			let effective_parent = if timer_parent != 0 { timer_parent } else { root_interrupt_parent };
-			if effective_parent != 0 && gic_phandle != 0 && effective_parent != gic_phandle {
+			if effective_parent != gic_phandle || gic_phandle == 0 {
 				timer_intid = 0;
 			}
 			// AND NO CHILD REGION MAY SHARE BYTES WITH THE CONTROLLER OR WITH THE OTHER CHILD.

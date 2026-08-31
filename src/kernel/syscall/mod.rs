@@ -614,11 +614,11 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	// names a `DeviceMemory` it holds, and the kernel reads BOTH which device this buffer is for and
 	// which binding of it - so ending that binding reaches this buffer without anything having to
 	// remember it was created.
-	let (device, claim): (Option<u32>, Option<abi::ClaimKey>) = if device_handle == 0 {
-		(None, None)
+	let claim: Option<abi::ClaimKey> = if device_handle == 0 {
+		None
 	} else {
 		match current_typed::<DeviceMemory>(device_handle, ObjectType::DeviceMemory, Rights::WRITE) {
-			Ok(memory) => (memory.device_index(), memory.claim()),
+			Ok(memory) => memory.claim(),
 			Err(e) => return e,
 		}
 	};
@@ -628,7 +628,12 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	let Some(guard) = thread.process().begin_extend() else {
 		return ERR_INVALID;
 	};
-	let object = match DmaBuffer::create_for(thread.domain(), size as usize, device) {
+	// THE KEY TRAVELS INTO THE MAPPING, not just into the registration below. The domain a buffer is
+	// mapped into used to be chosen by device INDEX at the moment `create_for` ran, so a release and
+	// a reclaim during this call installed the translation in the REPLACEMENT binding's domain - and
+	// `register_derived` then refused the old generation, after the effect. The generation is now
+	// part of the request, and `iommu::map_device_buffer` refuses on it before anything is mapped.
+	let object = match DmaBuffer::create_for(thread.domain(), size as usize, claim) {
 		Ok(o) => o,
 		Err(MemoryError::QuotaExceeded) => return ERR_RESOURCE_EXHAUSTED,
 		Err(MemoryError::OutOfMemory) => return ERR_NO_MEMORY,
@@ -1476,20 +1481,31 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 	// to, and it was recorded for a later refusal instead. Installing it HERE removes that dilemma:
 	// the only endpoints that need one are the ones that reach this line, and a failure refuses
 	// before a vector exists and before MSI-X is enabled on the device.
-	if !crate::iommu::msi_deliverable(index as u32, bus, dev, func) {
-		// AND THE DEVICE STOPS MASTERING THE BUS, because refusing only the vector is not one of the
-		// three endings this milestone allows a map failure to have.
-		//
-		// The rule is "a refused binding, disabled bus mastering, or a quarantined device"; a doorbell
-		// map that failed used to end in none of them - the vector was refused and the endpoint stayed
-		// claimed and bus-mastering, which is a device that can still reach memory and can no longer
-		// tell anyone it did. Disabling bus mastering is the middle ending and the proportionate one:
-		// it does not tear down a binding the manager may still want to report on, and it stops the
-		// DMA. The device is left claimed and quiet; the driver sees the refusal and the manager sees
-		// a binding whose device is no longer mastering.
-		crate::device::disable_bus_master(index as usize);
-		crate::serial_println!("device: {index} is translated and its domain has no route for an MSI doorbell - refusing the vector and disabling bus mastering rather than leaving it able to reach memory");
-		return ERR_UNSUPPORTED;
+	match crate::iommu::msi_deliverable(index as u32, key.generation, bus, dev, func) {
+		crate::iommu::MsiRoute::Deliverable => {}
+		// THE DEVICE UNDER THIS INDEX IS SOMEBODY ELSE'S NOW. The claim was live when this call
+		// checked it and its binding ended while the call was still running, so the domain the
+		// doorbell would go into and the device whose bus mastering would be disabled both belong to
+		// the NEXT binding. Refusing the caller is the whole of the answer: a generation that has
+		// ended does not get to act on the one that replaced it.
+		crate::iommu::MsiRoute::Stale => return ERR_ACCESS_DENIED,
+		crate::iommu::MsiRoute::NoRoute => {
+			// AND THE DEVICE STOPS MASTERING THE BUS, because refusing only the vector is not one of
+			// the three endings this milestone allows a map failure to have.
+			//
+			// The rule is "a refused binding, disabled bus mastering, or a quarantined device"; a
+			// doorbell map that failed used to end in none of them - the vector was refused and the
+			// endpoint stayed claimed and bus-mastering, which is a device that can still reach
+			// memory and can no longer tell anyone it did. Disabling bus mastering is the middle
+			// ending and the proportionate one: it does not tear down a binding the manager may
+			// still want to report on, and it stops the DMA. The device is left claimed and quiet;
+			// the driver sees the refusal and the manager sees a binding no longer mastering.
+			//
+			// UNDER THE KEY, so the disable cannot land on the binding that replaced this one.
+			crate::device::disable_bus_master_for(key);
+			crate::serial_println!("device: {index} is translated and its domain has no route for an MSI doorbell - refusing the vector and disabling bus mastering rather than leaving it able to reach memory");
+			return ERR_UNSUPPORTED;
+		}
 	}
 	// Our MSI message address encodes an 8-bit xAPIC destination. If the running
 	// core's LAPIC id does not fit (a >255-core machine), steer the vector to the

@@ -368,3 +368,32 @@ behaviour and does not carry the citation; the RFC 8504 reference it already had
 **Plan re-check.** Item count unchanged at eight. The membership work is now a listener with timers
 rather than two message handlers, and every timer it introduces is in the one scheduler M6 owns. No
 source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-08-31T03:28:50Z):
+
+Rating: 7/10
+
+1. **The pre-DAD MLD bootstrap required by the plan's own snooping-switch claim is still missing.**
+   M4 requires a report when each solicited-node group is joined and says that is what makes DAD work
+   behind a snooping switch, while M5 performs DAD before the tentative link-local address becomes
+   usable (`docs/todo/P02M0174.md:114-116,154-162`). At that point there is no valid link-local source.
+   [RFC 9777 section 5.2.14](https://www.rfc-editor.org/rfc/rfc9777.html#section-5.2.14) requires the
+   initial report to use `::` before DAD and recommends reporting all joined groups again once a valid
+   link-local address exists. The plan specifies only received-Query source validation
+   (`docs/todo/P02M0174.md:124-127`), and M8 has no pre-DAD-`::` or post-DAD re-report case (`:240-246`).
+   An implementation can therefore satisfy the current text yet fail the exact snooping-link DAD
+   scenario used to justify MLD.
+
+2. **The accepted timed-MLD correction contains an incorrect query-combination rule and still omits
+   state-change robustness semantics.** The plan says a General Query unconditionally supersedes
+   per-address responses (`docs/todo/P02M0174.md:138-150`).
+   [RFC 9777 section 6.2](https://www.rfc-editor.org/rfc/rfc9777.html#section-6.2) retains separate
+   interface and per-address timers: a pending General response suppresses another only when it is
+   scheduled sooner, and address/source-specific queries use earliest-deadline plus clear/union rules.
+   The plan also asks only for a bounded small constant of join/leave retries, omitting
+   [section 6.1](https://www.rfc-editor.org/rfc/rfc9777.html#section-6.1)'s Robustness-Variable-based
+   randomly spaced retransmits and the merge/counter reset rules for a second state change. M8's
+   generic supersede/merge and one-lost-report cases (`docs/todo/P02M0174.md:243-246`) do not catch the
+   incorrect deadline case or successive state changes through a loss burst. Correct the timer rules
+   and add those discriminating cases; this remains bounded listener work, not a querier or routing
+   expansion.

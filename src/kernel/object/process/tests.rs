@@ -89,9 +89,10 @@ fn the_lifecycle_guard_covers_the_whole_operation_and_not_just_its_first_line() 
 	// 1 and 3. A buffer created under the guard, held only by this test - no handle table anywhere
 	//    names it - and registered while the process is live.
 	const DEVICE: u32 = 0xD2;
+	const BINDING: abi::ClaimKey = abi::ClaimKey { device_index: DEVICE, _pad: 0, generation: 1 };
 	let buffer = {
 		let guard = process.begin_extend().expect("a live process gives out the guard");
-		let Ok(buffer) = DmaBuffer::create_for(&sched::root_domain(), 2 * PAGE_SIZE as usize, Some(DEVICE)) else {
+		let Ok(buffer) = DmaBuffer::create_for(&sched::root_domain(), 2 * PAGE_SIZE as usize, Some(BINDING)) else {
 			panic!("a 2-page DMA buffer should allocate");
 		};
 		assert!(guard.record_dma_buffer(&buffer), "the buffer joins the creating process's registry");

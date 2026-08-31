@@ -346,6 +346,11 @@ pub enum BindingEvent {
 	// A provider this driver published under `token` is going away. NOT terminal: the driver stays
 	// bound and its other publications stay published.
 	Withdrawn { generation: u64, token: u16 },
+	// A CONSUMER of the provider published under `token` has gone. Not a withdrawal and not
+	// terminal: the provider stays published, and what is released is one place against the
+	// `consumers` bound its registry entry declares. Without this the count only ever rose, so a
+	// provider admitting one consumer was spent by its first client leaving.
+	Disconnected { generation: u64, token: u16 },
 	// It answered a `PING` with this sequence. Whether that COUNTS is not this event's business:
 	// an answer echoing a number nobody asked with is still an answer that arrived, and the reader
 	// is what decides it does not reset the watchdog.
@@ -369,7 +374,7 @@ pub enum BindingEvent {
 impl BindingEvent {
 	pub fn generation(self) -> u64 {
 		match self {
-			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } | BindingEvent::Ponged { generation, .. } | BindingEvent::Wedged { generation } | BindingEvent::Stopped { generation } | BindingEvent::ClaimSettled { generation, .. } => generation,
+			BindingEvent::Ready { generation } | BindingEvent::Failed { generation, .. } | BindingEvent::Offered { generation } | BindingEvent::Exited { generation } | BindingEvent::Closed { generation } | BindingEvent::TimedOut { generation } | BindingEvent::Withdrawn { generation, .. } | BindingEvent::Disconnected { generation, .. } | BindingEvent::Ponged { generation, .. } | BindingEvent::Wedged { generation } | BindingEvent::Stopped { generation } | BindingEvent::ClaimSettled { generation, .. } => generation,
 		}
 	}
 }
@@ -550,6 +555,37 @@ pub fn withdraw_slots<T>(slots: &mut [Option<T>], binding: BindingId, id_of: imp
 		}
 	}
 	gone
+}
+
+// THE SAME, AND IT CARRIES WHAT IT REMOVED, so nothing between the removal and the announcement is
+// the caller's to get right.
+//
+// `withdraw_slots` hands each withdrawn item to a closure, and the production catalogue's closure did
+// two things: closed the channel and copied the item somewhere the announcement loop could reach.
+// The COPY is what went wrong - it collected into a `Vec` whose `try_reserve` failure was survivable,
+// so on that path every provider was removed and closed and NOT ONE withdrawal was announced, leaving
+// every subscriber holding metadata for providers that no longer exist. The host test could not see
+// it: the closure is production code and the model has neither handles nor subscribers.
+//
+// So the transfer moves in here, where it is driven by a test: `out[..returned]` is exactly the items
+// that were emptied, in slot order, one to one. What stays the caller's is the side effect per item -
+// closing a channel, announcing to subscribers - which is a syscall and a send, and neither is a
+// decision. `out` must be at least as long as `slots`; a shorter one is a caller that cannot receive
+// what it is about to remove, so nothing is removed and the answer is `None`.
+pub fn withdraw_slots_into<T>(slots: &mut [Option<T>], binding: BindingId, id_of: impl Fn(&T) -> ProviderId, out: &mut [Option<T>]) -> Option<usize> {
+	if out.len() < slots.len() {
+		return None;
+	}
+	let mut gone = 0;
+	for slot in slots.iter_mut() {
+		if slot.as_ref().is_some_and(|held| id_of(held).belongs_to(binding))
+			&& let Some(held) = slot.take()
+		{
+			out[gone] = Some(held);
+			gone += 1;
+		}
+	}
+	Some(gone)
 }
 
 // WHAT A BINDING'S END TAKES WITH IT, AND WHAT A SUBSCRIBER MAY STILL REACH.

@@ -131,6 +131,72 @@ fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::s
 // handshake it speaks. Built from the shared crate rather than from a hand-written copy of the frame
 // layout: a second copy is how the harness and the service drift, and a harness that drifts reports
 // a driver broken when the protocol moved under it.
+// THE CATALOGUE HALF OF PROVIDER DISCOVERY, for the two suites that stand in for the supervisor
+// while AudioService comes up.
+//
+// That service no longer RECEIVES its device. It is handed a `provider-catalogue` connection and
+// asks - `subscribe(audio)` for what is published and a stream of what appears later, then `open` on
+// one of them for a connection to serve. So a harness standing in for the supervisor has to answer
+// that conversation, and it answers through the GENERATED encoders for the reason `send_frame` uses
+// the driver protocol's own: a hand-written copy of a wire format is how a harness and a service
+// drift, and a drifted harness reports a service broken when the protocol moved under it.
+//
+// One provider, published before the subscription arrives, which is the ordinary shape: the device
+// was bound during the boot and the service starts afterwards.
+fn serve_provider_catalogue(server: &object::channel::Channel, provider: alloc::sync::Arc<dyn object::KernelObject>) -> Result<(), &'static str> {
+	use device_proto::codec as wire;
+	use device_proto::generated::liber::device::v1 as device;
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::rights::Rights;
+	let info = device::ProviderInfo { kind: device::ProviderKind::Audio, bus: 0, dev: 4, func: 0, binding_generation: 1, slot: 0, provider_generation: 1, live: true };
+
+	// 1. THE SUBSCRIPTION. The reply is the correlation number and one handle - the stream - and
+	//    nothing else; the client checks exactly that.
+	let request = server.recv().map_err(|_| "no subscribe request")?;
+	let corr = subscribe_correlation(&request.bytes).ok_or("the subscribe request did not decode")?;
+	let (stream_server, stream_client) = Channel::create();
+	let mut reply = alloc::vec::Vec::new();
+	reply.extend_from_slice(&corr.to_le_bytes());
+	server.send(Message::new(reply, alloc::vec![Capability::new(stream_client, Rights::ALL)])).map_err(|_| "the subscribe reply was refused")?;
+
+	// 2. THE SNAPSHOT, AS THE STREAM'S FIRST FRAME. This IDL's streams open from a snapshot, so
+	//    "what is published now" and "what appears later" are one channel and there is no second
+	//    step for a publication to be lost in.
+	let mut frame = [0u8; 64];
+	let mut frame_handles = wire::Handles::new();
+	let len = device::provider_catalogue::subscribe_frame(0, &info, &mut frame, &mut frame_handles).ok_or("the provider frame did not encode")?;
+	stream_server.send(Message::new(frame[..len].to_vec(), alloc::vec::Vec::new())).map_err(|_| "the provider frame was refused")?;
+	// The server end stays alive for the life of the test: a stream whose sender is dropped closes,
+	// and the service would read that as the catalogue going away.
+	core::mem::forget(stream_server);
+
+	// AND THE SERVICE IS LET RUN, because the next request does not exist until it has read that
+	// frame. `recv` here does not block - it answers "nothing yet" - so without this the open below
+	// would be asked for before the service had any reason to make it.
+	sched::run_until_idle();
+
+	// 3. THE CONNECTION. `Ok(handle)` is a discriminant, the handle's index, and the handle itself.
+	let request = server.recv().map_err(|_| "no open request")?;
+	let corr = subscribe_correlation(&request.bytes).ok_or("the open request did not decode")?;
+	let mut reply = alloc::vec::Vec::new();
+	reply.extend_from_slice(&corr.to_le_bytes());
+	reply.push(1);
+	reply.extend_from_slice(&0u32.to_le_bytes());
+	server.send(Message::new(reply, alloc::vec![Capability::new(provider, Rights::ALL)])).map_err(|_| "the open reply was refused")?;
+	Ok(())
+}
+
+// The correlation number every request on this interface carries, behind its opcode. Read rather
+// than assumed, because a client numbers its own calls and a harness answering with the wrong number
+// is a client that hangs.
+fn subscribe_correlation(bytes: &[u8]) -> Option<u32> {
+	if bytes.len() < 6 {
+		return None;
+	}
+	Some(u32::from_le_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]))
+}
+
 fn send_frame(channel: &object::channel::Channel, opcode: driver_protocol::Opcode, generation: u64, payload: &[u8], object: Option<alloc::sync::Arc<dyn object::KernelObject>>, rights: object::rights::Rights) -> Result<(), &'static str> {
 	let header = driver_protocol::Header { version: driver_protocol::VERSION, opcode, generation, payload_len: payload.len() as u32 };
 	// ALLOC-OK: `#[cfg(test)]`, one frame per handoff.
@@ -2793,7 +2859,6 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	send_cap(&process_boot_kernel, b"STORAGE", storage_client.clone(), Rights::ALL).expect("process storage bootstrap");
 	send_cap(&process_boot_kernel, b"REGISTRY", registry_client, Rights::ALL).expect("process registry bootstrap");
 	send_cap(&process_boot_kernel, b"SERVE", process_server, Rights::ALL).expect("process serve bootstrap");
-	send_cap(&boot_kernel, b"SND", snd_service, Rights::ALL).expect("snd bootstrap");
 	let (audio_admin, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("audio admin bootstrap");
 	// THE RIGHTS THE SUPERVISOR HANDS. A serve root reaches a real service narrowed to send,
@@ -2801,11 +2866,20 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	// plan refuses anything wider - correctly. A harness standing in for the supervisor has to
 	// stand in accurately, or the test agrees with nothing that happens on a real boot.
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("serve bootstrap");
+	// THE PROVIDER CATALOGUE, LAST, and it is how this service reaches its device now. See
+	// `serve_provider_catalogue`.
+	let (catalogue_server, catalogue_client) = Channel::create();
+	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("catalogue bootstrap");
 	sched::run_until_idle();
 	let storage_online = storage_boot_kernel.recv().expect("StorageService online report");
 	assert_eq!(&storage_online.bytes[..], b"StorageService: online (vol://system)");
 	let online = boot_kernel.recv().expect("AudioService online report");
 	assert_eq!(&online.bytes[..], b"AudioService: online");
+	// AND THEN IT ASKS. The report above is sent before the subscription, so the service is parked
+	// in its `subscribe` call by here - which is exactly the seam this proves: the device arrives
+	// because the service went looking for it.
+	serve_provider_catalogue(&catalogue_server, snd_service).expect("the catalogue answered the subscription and the connection");
+	sched::run_until_idle();
 	match scenario {
 		AudioServiceScenario::ScopeAndMixing => {
 			assert!(open(&service_client, 1, 4_000, 1).is_err(), "unsupported sample rate is refused");

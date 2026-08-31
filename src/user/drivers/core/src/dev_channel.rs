@@ -220,6 +220,15 @@ unsafe fn heartbeat(bind: &common::Bind, bootstrap: u64, device_capability: u64)
 							// `finish_stop` like every other planned stop, so the reset happens
 							// first and a device that does not confirm gets no certificate.
 							driver_protocol::Opcode::Stop => {
+								// LATCHED FIRST, AND THIS IS WHY `STOPPED` WAS NEVER SENT.
+								//
+								// `finish_stop` acknowledges a stop only when the flag says one was
+								// asked for - the wait helpers in `common` set it as they read the
+								// frame, and this driver reads its own bootstrap and did not. So the
+								// device was quiesced, the driver exited, and DeviceManager saw no
+								// clean-stop acknowledgement: a planned stop classified as a driver
+								// that went away, waiting out the forced-teardown deadline.
+								common::latch_stop();
 								common::finish_stop(bootstrap, bind, device_capability, common::quiesce_virtio());
 								return false;
 							}

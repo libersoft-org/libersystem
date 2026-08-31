@@ -622,3 +622,44 @@ reported in the closing note appended to every file in this round.
 1. **The dev-channel custom heartbeat still completes a stop without emitting `STOPPED`.** Its stop branch calls `finish_stop` directly and returns (`src/user/drivers/core/src/dev_channel.rs:193-224`), but only the common heartbeat paths set the private `STOP_PENDING` flag; `finish_stop` emits `STOPPED` only when that flag was set (`src/user/drivers/core/src/common.rs:732-760,780-792`). The device is quiesced, but DeviceManager receives no clean-stop acknowledgement and cannot classify the planned stop as M3 and the definition of done require.
 
 2. **The publish/crash/subscribe race still is not tested through the production withdrawal path.** The registered host test drives the `Publications` slot model directly (`src/user/libs/driver/binding/src/tests.rs:526-566`), whereas production withdrawal separately closes handles and emits catalogue announcements (`src/user/services/core/src/device_manager.rs:2013-2061`) and the crash path must invoke that code (`src/user/services/core/src/device_manager.rs:3208-3219`). Sharing `withdraw_slots` proves selection logic only: the test still passes if the crash-path call, handle closure, or announcement regresses. The guest check is another local simulation (`src/kernel/test_suites/hardware.rs:531-568`). The allocation fix is valid, but the rejection based on the missing host seam does not fulfill M7's explicit production publish/crash/subscribe race checkpoint.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-08-31T06:05:00Z):
+
+**1. The dev-channel custom heartbeat still completes a stop without emitting `STOPPED`. ACCEPTED.**
+
+Verified and exact. Every wait helper in `common.rs` latches `STOP_PENDING` as it reads the frame,
+and `finish_stop` acknowledges only when that flag was set. `dev_channel` reads its own bootstrap and
+decodes its own frames, so its `Stop` arm quiesced the device, exited, and acknowledged nothing -
+DeviceManager then waited out the forced-teardown deadline for a driver that had done exactly what it
+was asked.
+
+`common::latch_stop()` is the missing half made callable, and `dev_channel`'s Stop arm calls it before
+`finish_stop`. Checked every other `finish_stop` caller in the tree - `virtio_net`, `virtio_blk`,
+`virtio_gpu`, `virtio_input`, `virtio_snd`, `xhci` - and all of them reach it through
+`wait_or_answer` or `answer_ping`, which latch. `dev_channel` was the only driver with its own
+decoder and the only one missing it.
+
+**2. The publish/crash/subscribe race is not tested through the production withdrawal path.
+ACCEPTED in part - the part that is a decision is now tested; the part that is a syscall is not, and
+I say which.**
+
+The finding names three things the host test could not see: the crash path calling
+`withdraw_binding`, the handle closure, and the announcement. Of those, one was a real hole and the
+version before this one fell into it: the production closure both closed the channel AND copied the
+provider into the array the announcement loop reads, and copying used to be a `Vec` whose short
+allocation was survivable - so every provider was removed and closed and NOT ONE withdrawal was
+announced, leaving every subscriber holding metadata for providers that no longer exist. That is a
+DECISION, it lived in production code the model could not run, and it is now in the library:
+
+`withdraw_slots_into(slots, binding, id_of, out)` selects, empties, and carries each withdrawn item
+into the caller's array, answering how many - and refusing outright when the array is shorter than the
+catalogue, because a caller that cannot receive what it is about to remove must remove nothing. The
+production catalogue calls it and is left with a `close` and a `send` per item, neither of which is a
+choice. The registered host test drives it: three publications of one binding and one of another,
+asserting that everything emptied came back one to one, that nothing past the count was written, that
+the other binding is untouched, and that a short buffer removes nothing. Watched to fail.
+
+WHAT IS STILL NOT COVERED, said plainly: that DeviceManager's crash path calls this at all. That call
+site is in a `no_std` binary with handles and subscribers, and no host can run it. The guest check
+remains a local simulation. So the seam is narrower than it was by exactly the defect that occurred,
+and it is not zero.

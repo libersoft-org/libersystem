@@ -729,7 +729,7 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 	// Read by device INDEX rather than through a claim handle, so it carries no key: a caller that
 	// had one would not need this call.
 	assert_layout!(
-		covered, DeviceClaimSnapshot, 40, 8,
+		covered, DeviceClaimSnapshot, 48, 8,
 		state => 0,
 		// Explicit, for the reason every other `_pad` in this file is: the struct is copied to
 		// userspace with `size_of::<T>()` from a value built on the kernel stack.
@@ -743,7 +743,12 @@ fn every_marshalled_struct_has_the_layout_it_had() {
 		mmio_windows => 24,
 		irq_vectors => 28,
 		iommu_grants => 32,
-		_pad1 => 36,
+		// The old `_pad1`, spent on the quarantined subset (2026-08-29) - and this assertion still
+		// named the padding, which is how the field arrived unfrozen.
+		iommu_quarantined => 36,
+		// The fault counter (2026-08-31), which widens the struct rather than filling a hole: there
+		// was none left. Pre-release and deliberate, like the two above.
+		iommu_faults => 40,
 	);
 	assert_layout!(
 		covered, ClaimGrant, 32, 8,

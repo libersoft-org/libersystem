@@ -945,7 +945,22 @@ qemu_run_x86_64() {
 	else
 		# Direct harness callers, notably the x86_64 kernel suite, still own their test medium. Build the
 		# loader only here because an already-assembled BOOT_IMAGE has no use for a fresh loader binary.
-		(cd "$HERE/../boot/loader" && cargo build) >&2
+		#
+		# UNDER THE SAME BUILD LOCK THE TEST KERNEL IS COMPILED WITH, and for the same reason
+		# (2026-08-31). The loader shares one Cargo target directory with every other loader build in
+		# this tree, and nothing held anything over it: two guests starting together both entered this
+		# line, and two concurrent `cargo build`s over one target directory is the race M3's item 0
+		# names - an intermediate replaced or removed while the other invocation is reading it. The
+		# kernel half was fixed by building under a lock and staging a private copy; this is the other
+		# producer that feeds the same medium, and it was left outside.
+		#
+		# The LOCK ONLY, not the medium: `mkimage.sh` is content-addressed and takes its own assembly
+		# lock, so what this has to serialise is the compile.
+		mkdir -p "$REPO_ROOT/.build/state"
+		(
+			flock 7
+			cd "$HERE/../boot/loader" && cargo build
+		) 7>"$REPO_ROOT/.build/state/kernel-test-build.lock" >&2
 		local iso_mode="iso"
 		[[ "${TEST:-0}" == "1" ]] && iso_mode="testiso"
 		iso="$("$HERE/mkimage.sh" "$iso_mode" "$kernel")"

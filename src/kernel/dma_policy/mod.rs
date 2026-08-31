@@ -135,8 +135,19 @@ pub fn policy_for(device_type: u16) -> Policy {
 // milestone's Goal names - "It must never silently become untranslated DMA."
 pub fn admit(device_type: u16, bus: u8, dev: u8, func: u8) -> BindDecision {
 	let decision = dma::decide_bind(policy_for(device_type), enforcing());
-	if decision == BindDecision::DegradedUntranslated {
-		record_degraded(Degraded { device_type, bus, dev, func });
+	// AND THE DEGRADED ANSWER IS ONLY GIVEN IF IT CAN BE AUDITED.
+	//
+	// This called `record_degraded` and returned `DegradedUntranslated` whatever it answered, while
+	// `record_degraded` returned silently when its row could not be allocated - so under memory
+	// pressure a device mastered memory untranslated with NO durable row: nothing to retract, and a
+	// `report` that could go on to print "every bus-mastering device is translated" over a machine
+	// where one is not. M7 makes the degraded state an AUDITED one, and an unaudited degradation is
+	// not a weaker version of it - it is the untracked bypass this milestone exists to remove.
+	//
+	// Failing CLOSED costs a device that could have run; failing open costs the isolation claim.
+	if decision == BindDecision::DegradedUntranslated && !record_degraded(Degraded { device_type, bus, dev, func }) {
+		crate::serial_println!("dma: {} at {:02x}:{:02x}.{} would master the bus untranslated and its audit row could not be recorded - REFUSED rather than admitted unaudited", abi::device_type_name(device_type as u32), bus, dev, func);
+		return BindDecision::Refused;
 	}
 	decision
 }
@@ -148,19 +159,21 @@ pub fn admit(device_type: u16, bus: u8, dev: u8, func: u8) -> BindDecision {
 //
 // The record is still deduplicated: a driver that opens its device repeatedly must not grow the
 // list it is audited from.
-fn record_degraded(entry: Degraded) {
+// Answers whether the row is RECORDED - which includes "it was already there", because a duplicate
+// is one audited device and not a failure to audit one.
+fn record_degraded(entry: Degraded) -> bool {
 	// THE LOCK IS RELEASED BEFORE ANYTHING IS PRINTED. The line below is the only place this module
 	// prints while a caller is mid-admission, and doing it under the list's lock would put the
 	// serial path inside a section every other reader of the list waits on.
 	let late: bool = {
 		let mut degraded = DEGRADED.lock();
 		if degraded.iter().any(|held| *held == entry) {
-			return;
+			return true;
 		}
 		// ALLOC-OK: bounded by the number of PCI functions the boot scan resolved, and this is the
 		// boot path rather than an interrupt.
 		if degraded.try_reserve(1).is_err() {
-			return;
+			return false;
 		}
 		degraded.push(entry);
 		REPORTED.load(Ordering::Relaxed)
@@ -178,6 +191,7 @@ fn record_degraded(entry: Degraded) {
 		RETRACTIONS.fetch_add(1, Ordering::Relaxed);
 		crate::serial_println!("dma: ADMITTED UNTRANSLATED AFTER THE ISOLATION SUMMARY - {} at {:02x}:{:02x}.{} masters the bus untranslated, so the summary above is no longer this machine's state", abi::device_type_name(entry.device_type as u32), entry.bus, entry.dev, entry.func);
 	}
+	true
 }
 
 // The device has given the bus back, so it is no longer one of the devices reaching memory

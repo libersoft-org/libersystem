@@ -259,3 +259,33 @@ global namespace is kept.
 **Plan re-check.** Item count unchanged at seven. Every value M2, M3 and M5 name is now in the file,
 and the two latches - generation and purpose - are one mechanism rather than two descriptions of one.
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-08-31T03:28:50Z):
+
+Rating: 6/10
+
+1. **Firmware authorization is still not bound to the `rollback-enforcing` loader identity.** M2
+   keeps plain `external-release` as a current non-enforcing build (`docs/todo/P02M0171.md:54-75`),
+   while M6 only revokes the previous loader signer and enrolls a current signer (`:221-228`). Secure
+   Boot authenticates that signer, not `LIBER_TRUST_PROFILE`: the current gate signs whichever loader
+   occupies the shared output path without checking its profile
+   (`src/tools/check-secure-boot.sh:57-62`), and the profile gate builds multiple profiles to that same
+   path (`src/tools/check-trust-profile.sh:33-54`). A current non-enforcing loader signed by the newly
+   authorized signer bypasses the floor just as completely as the revoked pre-policy loader. Bind the
+   new firmware authorization to enforcing loader artifacts and test a current-authorized
+   non-enforcing loader, not only an old-signer loader; otherwise M2's media-downgrade fixture has no
+   mechanism that makes it fail.
+
+2. **The supposedly canonical commit tag still leaves the slot-index bytes undefined.** The record
+   hashes “the slot index appended” without specifying the A/B values, width, or byte encoding
+   (`docs/todo/P02M0171.md:105-131`). The loader, provisioning tool, mocked firmware, and OVMF fixture
+   can therefore produce incompatible tags while each follows the plan. Freeze the two literal index
+   encodings as part of the record layout and cover cross-slot validation.
+
+3. **Interrupted provisioning states are unclassified.** M2 defines unprovisioned only as marker
+   absent **and both** slots absent, and provisioned as marker present, while the ceremony writes three
+   independent variables without an ordering, readback, or recovery rule
+   (`docs/todo/P02M0171.md:76-94`). Power loss after one or both slots but before the marker therefore
+   yields neither defined state; writing the marker first instead yields a provisioned machine with
+   missing records and an immediate refusal. Specify a commit order (normally validated slots before
+   a marker written last) and the boot/ceremony behavior for every partial state.

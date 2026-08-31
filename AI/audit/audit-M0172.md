@@ -274,3 +274,35 @@ mode ABSENT, which on a direct row refuses because that row names a producer.
 **Plan re-check.** Item count unchanged at eight. The matrix, the missing-value rule and M6 now agree,
 and every path in the matrix names a carrier that exists at the point admission reads it. No source
 code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-08-31T03:28:50Z):
+
+Rating: 5/10
+
+1. **The revised producer matrix is still not disjoint in the current harness, because “test” and
+   “gate” are overlapping run modes with no discriminator.** M2 assigns every test boot `ABSENT` and
+   every named gate its declared mode (`docs/todo/P02M0172.md:55-93`). The existing IOMMU gate invokes
+   `test.sh` (`src/tools/check-qemu-virtio-iommu-x86_64.sh:116-119`), whose runner sets `TEST=1`
+   (`src/harness/test-kernel.sh:387-393`); M0173's gate rows likewise deliberately contain test-kernel
+   phases. The plan says run mode is decided first but defines neither the exclusive mode value nor
+   which signal makes a gate-owned test boot a `gate` instead of `test`. Implemented over the current
+   signals, one boot has both answers. Define one authoritative mutually exclusive run-mode carrier
+   and test every gate/test boundary before claiming the rows are disjoint.
+
+2. **The non-x86 enforcing rollout cannot land in the declared dependency order.** M2 assigns
+   `enforcing-required` to public AArch64/RISC-V defaults and says named-producer absence refuses
+   (`docs/todo/P02M0172.md:75-108`), and M6 refuses required bindings without working enforcement
+   (`:214-224`). P02M0173 exclusively owns adding those architectures' virtio-IOMMU topology and is
+   explicitly planned *after* M0172 (`docs/todo/P02M0173.md:1-15,60-73,168-176`); the current non-x86
+   harness has endpoints but no such controller. Completing M0172 first therefore either breaks the
+   public non-x86 boots or requires M0172 to implement M0173's work. Define an explicit intermediate
+   mode/landing transition, or coordinate the fail-closed switch with M0173 instead of imposing a
+   dependency cycle.
+
+3. **The accepted direct-carrier correction still does not define a wire contract.** M3 now names “an
+   `fw_cfg` file of this product's own” and “a property under this product's own node,” but supplies no
+   fw_cfg filename, FDT node/property names, record length/layout, numeric provenance encoding, or FDT
+   cell/byte encoding (`docs/todo/P02M0172.md:145-169`). No such DMA carrier currently exists; merely
+   saying “fixed-length” does not let the harness producer and three kernel consumers agree on bytes.
+   Freeze the names and exact record encodings, including malformed/unknown handling, before claiming
+   every matrix path has an existing carrier at admission time.

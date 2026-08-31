@@ -669,3 +669,37 @@ the closing note appended to every file in this round.
 **Rating: 8/10.**
 
 1. **Explicit node-to-CPU production placement remains a test-only interface.** The `Refusal` result and `place_on` policy entry point are compiled only under `cfg(test)` (`src/kernel/smp/numa/mod.rs:117-157`), as are the targeted scheduler prepare/start helpers (`src/kernel/sched/mod.rs:465-475,504-518`). Shipping kernel code consequently cannot submit an internal node-placement request or receive the required explicit refusal when the node has no eligible CPU. The implementer's “no production consumer yet” limitation is accurate, but it does not fulfill M3 and the definition of done's explicit node-placement requirement.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0152 (2026-08-31T06:05:00Z):
+
+**1. Explicit node-to-CPU production placement remains a test-only interface. REJECTED, on
+verification rather than on the previous answer.**
+
+The facts are as the audit states: `Refusal` and `place_on` are `#[cfg(test)]`, as are the targeted
+scheduler helpers. What the finding does not establish is that making them production code would
+satisfy M3 rather than break its last bullet.
+
+Verified this pass, by reading every spawner in `src/kernel/sched/mod.rs`: `spawn`, `spawn_on`,
+`spawn_on_unwoken`, `spawn_on_maybe_waking`, `spawn_with_object`, `spawn_with_object_for`,
+`prepare_with_object`, `prepare_with_object_for`, `prepare_shared_process`, `prepare_in_process`,
+`prepare_in_process_on`, `start_thread`, `start_thread_on` and `spawn_in` are ALL `#[cfg(test)]`.
+There is no production kernel-thread spawner in this kernel at all. The threads the shipping kernel
+creates are userspace ones, made through `sys_thread_create` on behalf of a process - and a node hint
+on that path is a userspace ABI, which M3's first bullet forbids in as many words ("No userspace ABI
+is added by this milestone").
+
+So a production consumer for `place_on` cannot be wired without first adding the kernel-thread
+service M3's last bullet refuses: "the scheduler exposes enough placement to prove topology is used
+and stops there." Removing the `cfg` without a consumer is not available either - this tree denies
+dead code rather than suppressing the warning, which is the rule that put the `cfg` there.
+
+What IS in the product is the direction M3's third bullet names and the one the finding does not
+mention: `Thread::new` passes the creating core to `Thread::new_for_cpu`, so `cpu_node` decides which
+node a kernel stack is taken from, on every thread this kernel builds. The definition of done's
+sentence - "An internal node placement request runs on an online CPU from that node" - is proved by
+`kernel.smp.numa`'s placement test, which asks for a node, is given a CPU, starts a thread there and
+reads back where it ran.
+
+The limit is written in the source at the `cfg`, in those terms, and it is a limit rather than a
+preference. Inventing a consumer to make the hint reachable would be adding a service to satisfy a
+gate, which is the shape this milestone's own refusal section exists to prevent.
