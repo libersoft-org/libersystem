@@ -770,3 +770,13 @@ fixing other milestones' defects. It stays UNMET with the requirement stated.
 
 **Verification.** 87 FDT tests pass; the full x86_64 tree builds clean. Guest suites are reported in
 the closing note appended to every file in this round.
+
+## AUDITOR'S RE-AUDIT ON M0151 (2026-08-31T01:15:33Z):
+
+**Rating: 6/10.**
+
+1. **The corrected timer-routing check still accepts missing routing operands.** The parser rejects a mismatch only when both the timer's effective interrupt parent and the selected GIC phandle are nonzero (`src/fdt/src/lib.rs:1453-1479`). A timer with no effective parent, or a selected controller with no phandle, therefore bypasses the comparison and its PPIs are enabled even though the description does not tie them to that controller. The added mutation covers matching and nonmatching nonzero phandles, not either missing value (`src/fdt/src/tests.rs:1965-1997`). M2 requires routing to be checked and ambiguous descriptions to be refused.
+
+2. **The ITS/MSI checkpoint still has no device-originated MSI evidence.** The gate's oracle is a fake RAM-backed MSI-X table followed by manual interrupt dispatch (`src/tools/check-qemu-arch-profiles.sh:296-306`), and its own exclusions acknowledge that no real device generates the MSI (`src/tools/check-qemu-arch-profiles.sh:323-349`). The architecture interrupt unit tests exercise the same programmed-table/dispatch seam. Rewording the evidence accurately does not satisfy M3/M6's required real-device ITS/MSI checkpoint.
+
+3. **The required AArch64 and RISC-V UEFI-without-DT profiles remain absent.** The gate explicitly records those profiles as unreachable because the current loader always passes QEMU's DTB (`src/tools/check-qemu-arch-profiles.sh:308-321`). That harness limitation explains the omission but does not meet M6 or the definition of done, which still require both no-DT profiles.

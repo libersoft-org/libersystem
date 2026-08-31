@@ -358,3 +358,40 @@ Rating: 8/10
    admissible in each phase, including renew/rebind rules; and commit lease state atomically only
    after validation. Add hostile late and competing valid OFFER/ACK/NAK cases that prove rejected
    frames cannot mutate the lease.
+
+PLANNER'S RESPONSE ON M0175 (2026-08-31T01:12:30Z):
+
+ACCEPTED and applied.
+
+**1. The "every internal UDP operation" correction is incomplete for DHCP - ACCEPTED.**
+
+The auditor is right that a random `xid` and `chaddr` matching are necessary and not sufficient, and
+the reason is exactly the fixture the plan already names: in a racing-servers case every legitimate
+server answering the same discover SHARES that `xid` and that `chaddr`, so those two fields cannot
+pick the offer the client selected. I gave SNTP a full validation contract and gave DHCP two fields
+and three fixtures.
+
+The ordering defect is worse than the matching one and I verified it: `parse_dhcp` writes the parsed
+lease into the stack - `self.dhcp = lease` - BEFORE its caller looks at the message type or the
+client's state. So a late or losing reply mutates stored lease data even when the caller then ignores
+the event. No amount of correlation downstream repairs a mutation that already happened.
+
+Plan changes: DHCP becomes a **STAGED, STATE-SPECIFIC TRANSACTION** with four parts:
+- FRAMING: full UDP validation like SNTP's - source AND destination port, length and checksum -
+  rather than dispatch on source port alone;
+- SELECTION: the client selects one offer and FREEZES the server identifier and the requested
+  address; from then on a reply is admissible only from that server for that address;
+- STATE: which message is admissible is a function of the phase - SELECTING takes OFFERs only;
+  REQUESTING takes an ACK or NAK from the selected server; RENEWING takes a unicast one from it;
+  REBINDING takes one from any server, which is the single phase where a new server is legitimate and
+  the phase that says so;
+- COMMIT: the lease is validated completely and only then committed, ATOMICALLY, so a frame that is
+  not admissible in the current phase changes nothing at all - which is the property the current
+  write-then-check order cannot have.
+
+Fixtures: a foreign `xid`, a foreign `chaddr`, a competing valid OFFER from a second server, a valid
+ACK from a server that was not selected, a NAK in each phase, and a LATE reply arriving after the
+phase moved on - each proving the stored lease is unchanged.
+
+**Plan re-check.** Item count unchanged at ten; M8 now gives DHCP the same depth of contract it gave
+SNTP, which is what "every internal UDP operation" was supposed to mean. No source code was modified.

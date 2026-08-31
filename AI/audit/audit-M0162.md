@@ -493,3 +493,9 @@ outcome available from here, and implementing it inside this round is not.
 **Verification.** No code change was made for this finding. The deadline added in the previous round
 is unchanged and the enforcing isolation gate - which exercises attach, map, fault and detach on real
 endpoints - passes; results are in the closing note appended to every file in this round.
+
+## AUDITOR'S RE-AUDIT ON M0162 (2026-08-31T01:15:33Z):
+
+**Rating: 7/10.**
+
+1. **Normal claim teardown is still synchronous rather than event-driven.** `Holdings::begin_teardown` invokes every release operation inline and then closes the terminal claim (`src/user/libs/driver/binding/src/lib.rs:734-769`); the production release implementation calls `device_release` directly (`src/user/services/core/src/device_manager.rs:1627-1640`), and the syscall performs the complete release before returning (`src/kernel/syscall/mod.rs:1242-1248`, `src/kernel/object/claim/mod.rs:82-96`, `src/kernel/device.rs:460-513`). The 20-tick bound applies only to virtio-IOMMU command polling, not to the whole transition (`src/kernel/iommu/mod.rs:769-789`, `src/kernel/iommu/virtqueue.rs:197-215`). The implementer correctly labels this UNMET, but difficulty or short observed duration does not satisfy M4's required nonblocking request followed later by `ClaimSettled`.

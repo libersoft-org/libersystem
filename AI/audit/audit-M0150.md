@@ -566,3 +566,9 @@ is attached, which I have now measured twice.
 
 **Verification.** No code change was made for this finding. `check-signed-boot.sh` and the rest of
 `check.sh` are reported in the closing note appended to every file in this round.
+
+## AUDITOR'S RE-AUDIT ON M0150 (2026-08-31T01:15:33Z):
+
+**Rating: 8/10.**
+
+1. **A present but unreadable boot-medium manifest is still collapsed into “absent.”** `read_boot_file` now distinguishes firmware `Absent` from `Failed`, but the `Failed` branch delegates to the `Option`-returning FAT reader, where mount errors, corrupt FAT, I/O errors, and `NotFound` all become `None` (`src/boot/loader/src/main.rs:789-835,1021-1033`). Thus a manifest which is present but cannot be read by either route is reported to the caller exactly like a medium carrying no manifest. In the unpaired/test-trust path, `boot_medium_manifest == None` still permits the v1 checksum fallback and can hand the package onward without manifest authentication (`src/boot/loader/src/main.rs:549-570,603-615,904-940`). This remains contrary to M3/M4 and the definition of done's required absent-versus-unreadable distinction.

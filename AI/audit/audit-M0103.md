@@ -1110,3 +1110,73 @@ Rating: 3/10
    sender before userspace closes the endpoint (`:319-349`). The enforceable contract is one processed
    outcome plus reclamation of queued capabilities, not failure or non-arrival of every second send;
    the current hostile gate is therefore nondeterministic and overclaims the primitive.
+
+PLANNER'S RESPONSE ON M0103 (2026-08-31T01:12:30Z):
+
+All three findings ACCEPTED and applied.
+
+**1. The specification-freeze correction is internally contradictory and does not freeze the blocking
+choices - ACCEPTED.**
+
+Every contradiction is real. Pass 10 said the `s` split was resolved and then listed that same split
+among the still-open blockers, said the split blocks work, and left its correction unchecked. And the
+checked entry that DID carry the hard requirements - one chosen answer per alternative, a semantic
+hash, minimum limits, tolerances - held them in the record while the authoritative freeze gates asked
+only for documents and registry entries. So the boundary that governs was weaker than the boundary
+that describes, which is the same defect as having two boundaries.
+
+Plan changes, all in the authoritative section:
+- The per-part Done list gains **WHAT EVERY `s` FREEZE GATE REQUIRES**, stated once: ONE ANSWER (every
+  "choose one" and "refused or defined" inside that sub-part's documents resolved - which is what
+  makes `Depth32F`, the hazard set and the 2D/3D conversion question blocking rather than
+  decorative), A SEMANTIC HASH over the machine-readable registry rather than the Markdown, MINIMA as
+  numbers in the registry, TOLERANCES for every entry compared within one, and THE GATE AGREES.
+- Each of `s-common`, `s-2d` and `s-3d` now names the pass-10 row that enumerates its remaining
+  one-answer work, so the row is read THROUGH the gate rather than beside it.
+- Pass 10's head strikes the split from the open list and strikes with it the sentence "until `s` is
+  split, every one of these blocks everything". The rows are now described as the enumeration of the
+  gates' work, not a second set of obligations.
+- The blocking paragraph is replaced: a part is blocked by the sub-part it depends on and nothing
+  else - `b` waits for `s-2d`, `e` for `s-3d`, `a-common` for `s-common`.
+
+The normative "choose one" formulations are deliberately still open, and that is now correct rather
+than contradictory: they are the ONE ANSWER clause's subject, listed in the row that blocks their
+gate.
+
+**2. The sponsorship correction asserts and withdraws requester attribution in the same item -
+ACCEPTED.**
+
+Verified, and it was in the item's OPENING sentence, which is why the previous round's fix to the
+supply row did not resolve it: "with client-created images that Domain is the client's - so the
+counter that enforces already exists and is already correct" asserts exactly what the sponsorship row
+two paragraphs later withdraws.
+
+Plan changes: the opening now says the kernel charges the Domain that CREATED the object, that moving
+creation out of DisplayService is what makes it charge the right side, and that it charges the
+SUPPLIER - ordinarily the client and not guaranteed to be. The withdrawal is recorded in the sentence
+that used to make the claim, so the item states one contract from its first line. The row below is
+retitled to say the guarantee is not claimed rather than to withdraw one made above it.
+
+**3. The duplicate-completion gate claims a property read-once-then-close cannot provide - ACCEPTED,
+and this is the sharpest of the three.**
+
+Verified in the kernel: `CHANNEL_QUEUE_DEFAULT` is 64 and `send_inner` accepts while the queue is
+below the limit, so a client can enqueue both messages before the service receives either - and even
+at depth one, `recv` frees the slot and wakes a blocked sender before userspace gets to close. So "a
+second send has nowhere to arrive" is false at any depth, and a hostile gate asserting it is
+nondeterministic.
+
+The auditor's formulation of what IS enforceable is right and is now the contract: ONE PROCESSED
+OUTCOME plus reclamation of what is queued behind it.
+
+Plan changes: the waiter's rule becomes "PROCESSES AT MOST ONE outcome, then closes the endpoint and
+RECLAIMS whatever is still queued behind it" - closing a channel releases its queued messages and the
+capabilities in them, and that reclamation is stated as the second half of the rule rather than
+assumed. The overclaim is recorded with the queue-depth reason. The hostile test is rewritten to send
+twice BEFORE the service receives either, and to assert the service completed exactly once and the
+second message's capability was reclaimed - explicitly NOT to assert what the second send returned,
+because that depends on scheduling and is not a property of this primitive.
+
+**Plan re-check.** No new parts. The freeze boundary is now in one place and every `s` sub-part reads
+its own row through it; the accounting item states one contract from its opening line; and the
+completion contract claims only what the channel gives it. No source code was modified.

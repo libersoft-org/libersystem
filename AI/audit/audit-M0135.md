@@ -1012,3 +1012,77 @@ Rating: 4/10
    `vk_icdGetInstanceProcAddr`. The plan neither pins/restricts the admitted interface to version 7 nor
    defines legacy negotiation. A one-symbol synthetic provider can therefore pass while the actual
    pinned loader remains incompatible with an upstream-supported ICD.
+
+PLANNER'S RESPONSE ON M0135 (2026-08-31T01:12:30Z):
+
+All four findings ACCEPTED and applied.
+
+**1. The completion gate recreates the pinning cycle - ACCEPTED.**
+
+Correct and it is my error. M1 split the lock into a bootstrap pin (gating pass 1) and a derived pin
+(gating completion) precisely to break the cycle where the lock had to digest the platform port and
+the final sysroot, which are outputs of the milestone. The Host/Build gate then went on demanding the
+complete lock "before anything else starts", which put the cycle straight back - and the gate is the
+controlling text, so the split was decorative.
+
+Plan changes: the gate becomes **THE TWO PINS ARE COMPLETE, EACH AT ITS OWN POINT**, listing what the
+bootstrap pin holds (both revisions and archive digests, three toolchain files, tool identities and
+flags, the full option set, the generated-source POLICY, the BOOTSTRAP sysroot digest) and what the
+derived pin holds (the platform-port patch series with per-patch digests, the generated-source
+digests as produced, the final sysroot digest, the compiler-runtime the converged link selected).
+Each half fails at its own point, and the reason the old wording was wrong is recorded in it.
+
+On the missing values themselves my position is unchanged and stated again: I cannot supply revisions
+and SHA-256 digests offline, and a fabricated digest is worse than a stated obligation because it
+looks checkable and is not. What the plan can do is make the obligation gate the step it can
+actually precede, which it now does.
+
+**2. The quarantine-staging correction left mutually exclusive lifecycle rules - ACCEPTED.**
+
+Verified: pass 2 still said "nothing staged and nothing kept but the evidence", and the deferral
+section still listed "staging it, naming it in a manifest" among the deferred production import. Both
+authorise discarding the one executable the mandatory guest launch needs.
+
+Plan changes: pass 2 now reads "Nothing is SHIPPED and nothing is kept but the evidence and the
+quarantine-staged ELF the guest gate launches", with the contradiction named. The deferral is
+narrowed to PRODUCTION IMPORT - naming it in a SHIPPING manifest, installing it, shipping anything
+built from it - and says explicitly that quarantine staging into the gate's own test-only image is
+not deferred and never was.
+
+**3. The launch-selected ICD cannot be an "ordinary declared dependency" - ACCEPTED, and the fix is a
+different mechanism.**
+
+The auditor is right and the previous design was self-contradictory: the expected identity set is
+authenticated immutable input, so appending the selected ICD to it at launch either fails the exact
+equality check or weakens the edge - and either way it is a new ProcessService mechanism, which the
+same paragraph claimed not to need.
+
+Plan changes: the edge becomes a **DECLARED SELECTION SLOT**. The v2 identity record gains a declared
+provider position carrying a KIND (`vulkan-icd`) and the CLOSED SET OF DIGESTS this consumer accepts
+in it, signed like every other provider digest. ProcessService chooses one of those digests from the
+staged set and binds it into the slot; equality holds unchanged, because the chosen provider was
+named - by digest - in the authenticated record before the launch. The metadata record SELECTS among
+the declared set and cannot widen it, which is what makes discovery a policy input rather than an
+authority: an operator may choose which admitted ICD runs and cannot introduce one the consumer was
+not built against.
+
+**4. One well-known symbol does not cover the ICD interfaces the upstream admits - ACCEPTED.**
+
+Correct, and I over-simplified the ABI. The Loader/Driver interface requires an ICD to export
+`vk_icdNegotiateLoaderICDInterfaceVersion` as well as `vk_icdGetInstanceProcAddr` for interface
+versions 2 through 6, and only at version 7 may the remaining interface functions come through
+`vk_icdGetInstanceProcAddr`. A one-symbol synthetic provider would pass the gate while the pinned
+loader could not talk to a real driver - the exact failure the guest gate was added to prevent.
+
+Plan changes: the admitted surface becomes **TWO WELL-KNOWN ENTRY SYMBOLS**, both resolved as
+ordinary provider exports at load time, with everything else coming from the function pointers they
+return. INTERFACE VERSION 0 IS REFUSED BY NAME, because its multi-export bootstrap would put a third
+and fourth symbol into a surface this milestone is defining as closed. The negotiated version is
+recorded in the inventory beside the symbols, so which version the substrate admits is a derived fact
+rather than an assumption, and the synthetic ICD the guest gate launches exports both symbols and
+negotiates in the admitted range.
+
+**Plan re-check.** Item count unchanged. The freeze order now reads the same in M1, in the completion
+paragraph and in the gate list; the quarantine lifecycle reads the same in the contract, in pass 2
+and in the deferral; and the loader port names a mechanism for every question it previously listed.
+No source code was modified.

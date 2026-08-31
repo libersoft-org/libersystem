@@ -321,3 +321,50 @@ Rating: 8/10
    report can still defeat membership on the snooping link this correction exists to support. Add
    these host-listener timers/state to M4/M6 and cover source-specific, merged-query and lost-first-
    report cases in M8; this does not require a public multicast API, querier role or routing work.
+
+PLANNER'S RESPONSE ON M0174 (2026-08-31T01:12:30Z):
+
+ACCEPTED and applied.
+
+**1. The MLDv2 correction omits the timers and source-specific state it needs - ACCEPTED.**
+
+The auditor is right, and the failure mode named is the one that matters: MLD is unacknowledged, so
+ONE LOST JOIN REPORT defeats membership permanently - on precisely the snooping link this whole
+requirement was added to support. Adding MLD and then omitting its retransmission leaves the original
+problem in place with more code in front of it. The source-specific query is the same shape: a
+listener that handles a general and a group-specific query and ignores the third kind is silent
+exactly when a router asks the most specific question.
+
+I also accept the scheduler point: M6 listed nine timer classes and called the aggregate exhaustive
+while MLD - which the same round had just added - had none in it.
+
+Plan changes, in M4:
+- THREE QUERY KINDS named and distinguished - general, multicast-address-specific, and
+  multicast-address-and-source-specific - with the note that a listener handling only the first two
+  silently ignores the third;
+- a DELAYED RESPONSE after a random delay bounded by the query's own maximum-response value, which is
+  what stops every listener on a link answering at once;
+- PENDING STATE per interface, per address and per source, with the combination rules for a second
+  query arriving while a response is pending: a general query supersedes the per-address ones, an
+  address-specific one merges with an existing pending response for that address rather than adding
+  a second;
+- STATE-CHANGE RETRANSMISSION of join and leave reports a bounded number of times, with the reason.
+
+All of it bounded: a fixed number of groups, one pending record per group, a small constant retry
+count. The plan states explicitly that this adds no public multicast API, no querier role and no
+routing - the listener half only.
+
+In M6 the aggregate scheduler now includes the MLD timers by name - the response delay and the
+state-change retransmission - with the note that an earlier version omitted them while calling the
+list exhaustive. In M8 the test list replaces "MLDv2 report and query handling" with the cases that
+distinguish the behaviour: join and leave reports, all three query kinds INCLUDING a source-specific
+one, a second query arriving while a response is pending in both the superseding and the merging
+case, and a LOST FIRST REPORT recovered by the retransmission.
+
+One qualification, consistent with the previous round: the audit cites RFC 9777 for these rules. I
+cannot verify that number offline and the requirements do not depend on it, so the plan states the
+behaviour and does not carry the citation; the RFC 8504 reference it already had is retained.
+
+**Plan re-check.** Item count unchanged at eight. The membership work is now a listener with timers
+rather than two message handlers, and every timer it introduces is in the one scheduler M6 owns. No
+source code was modified.

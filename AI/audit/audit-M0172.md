@@ -227,3 +227,50 @@ Rating: 5/10
    Define the actual trusted early carrier (for example a bounded fw_cfg or FDT property), its
    validation/provenance rule, and parsing before DMA admission; merely naming the later BootInfo field
    is not an implementable direct-boot contract.
+
+PLANNER'S RESPONSE ON M0172 (2026-08-31T01:12:30Z):
+
+Both findings ACCEPTED and applied. The second is the more serious: the handoff I specified could not
+have been implemented at all.
+
+**1. The producer matrix has overlapping rows and two contradictory missing-value rules - ACCEPTED.**
+
+Verified: a development `--no-iommu` run matched both "any target, `--no-iommu`" and "any target,
+development instance" and had two answers, and the text that followed said a missing value selects
+the loud degraded contract while M6 said every missing mode is refused.
+
+Plan changes: the matrix is rebuilt with RUN MODE as the outer key, decided first, because a test or
+development boot is a different kind of thing from a public one and the flag only chooses between the
+two enforcing values WITHIN a public or gate run. The rows are now disjoint by construction - test,
+development, public-UEFI (four rows), public-direct (two rows), gate - and a development run with
+`--no-iommu` matches exactly one.
+
+The missing-value rule is stated ONCE and derived from the row: where the producer is "nothing" (test
+and development) ABSENT is the CORRECT value and selects the loud degraded contract, permanently
+rather than as a migration allowance; where the producer is NAMED, ABSENT is a BROKEN PRODUCER and
+refuses, because a machine whose opinion was lost is not a machine without one. M6's sentence was
+rewritten to say the same thing instead of refusing every absence.
+
+**2. The trusted direct-boot handoff has no carrier and occurs too late - ACCEPTED.**
+
+The auditor is right and this was unimplementable as written. On a direct AArch64 or RISC-V boot the
+kernel receives a raw DTB and CONSTRUCTS its own `BootInfo` later - and `device::init` and
+`dma_policy::init` both run BEFORE that construction. So "the harness writes a `BootInfo` field with
+`harness` provenance" asked a host to write into an object that does not exist yet, and admission
+would have decided before any authenticated mode was parsed.
+
+Plan changes: M3's last bullet becomes **THE TRUSTED DIRECT-BOOT CARRIER, which is NOT `BootInfo` and
+could not have been**, naming what the kernel actually receives early: on x86_64 direct, an `fw_cfg`
+file of this product's own - beside the profile scalar and separate from it - carrying the mode and
+the `harness` provenance in a fixed-length record; on AArch64/RISC-V direct, a property under this
+product's own node in the device tree the harness passes, read by the existing FDT parser in the same
+pass that reads the memory map and the interrupt controller. Both are parsed BEFORE
+`dma_policy::init`, and the plan states that ordering as a REQUIREMENT rather than an implementation
+note, because a mode parsed after admission is a mode admission did not use. `BootInfo` still carries
+the value onward for reporting and userspace; it is not where admission gets it. The provenance rule
+is unchanged - the value reads `harness`, never `signed` - and a malformed or absent record makes the
+mode ABSENT, which on a direct row refuses because that row names a producer.
+
+**Plan re-check.** Item count unchanged at eight. The matrix, the missing-value rule and M6 now agree,
+and every path in the matrix names a carrier that exists at the point admission reads it. No source
+code was modified.

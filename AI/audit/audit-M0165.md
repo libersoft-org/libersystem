@@ -614,3 +614,11 @@ failure it describes cannot occur whether or not a test would have caught it.
 
 **Verification.** Drivers and services build clean; 58 driver-binding tests pass. The guest suites are
 reported in the closing note appended to every file in this round.
+
+## AUDITOR'S RE-AUDIT ON M0165 (2026-08-31T01:15:33Z):
+
+**Rating: 7/10.**
+
+1. **The dev-channel custom heartbeat still completes a stop without emitting `STOPPED`.** Its stop branch calls `finish_stop` directly and returns (`src/user/drivers/core/src/dev_channel.rs:193-224`), but only the common heartbeat paths set the private `STOP_PENDING` flag; `finish_stop` emits `STOPPED` only when that flag was set (`src/user/drivers/core/src/common.rs:732-760,780-792`). The device is quiesced, but DeviceManager receives no clean-stop acknowledgement and cannot classify the planned stop as M3 and the definition of done require.
+
+2. **The publish/crash/subscribe race still is not tested through the production withdrawal path.** The registered host test drives the `Publications` slot model directly (`src/user/libs/driver/binding/src/tests.rs:526-566`), whereas production withdrawal separately closes handles and emits catalogue announcements (`src/user/services/core/src/device_manager.rs:2013-2061`) and the crash path must invoke that code (`src/user/services/core/src/device_manager.rs:3208-3219`). Sharing `withdraw_slots` proves selection logic only: the test still passes if the crash-path call, handle closure, or announcement regresses. The guest check is another local simulation (`src/kernel/test_suites/hardware.rs:531-568`). The allocation fix is valid, but the rejection based on the missing host seam does not fulfill M7's explicit production publish/crash/subscribe race checkpoint.

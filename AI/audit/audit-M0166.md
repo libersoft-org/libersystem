@@ -496,3 +496,9 @@ in what it persists today.
 
 **Verification.** Services build clean. The guest suites are reported in the closing note appended to
 every file in this round.
+
+## AUDITOR'S RE-AUDIT ON M0166 (2026-08-31T01:15:33Z):
+
+**Rating: 7/10.**
+
+1. **The persisted fallback still cannot honor `lsdev --incident N`.** `stored_incident` discards the requested incident number and lists every BDF-keyed record (`src/user/apps/tools/src/lsdev.rs:225-279`), while DeviceManager persists only BDF keys and never removes records for devices absent from the current inventory (`src/user/services/core/src/device_manager.rs:3835-3927`). After DeviceManager restarts, the advertised lookup can therefore return unrelated and stale incidents rather than incident `N`. The implementer correctly labels this UNMET, but an index-to-BDF mapping and stale-record sweep implement the existing M4/M5 contract; they are not an out-of-scope new contract.

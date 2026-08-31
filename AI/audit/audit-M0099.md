@@ -1251,3 +1251,48 @@ Two accepted corrections remain unapplied in the normative item list.
    service (`:826-831`). The current `system-power` interface provides reboot and power-off, not the
    battery/thermal/UPS destination (`src/idl/process.lsidl:111-132`). Thus AML completion would still
    leave the ACPI item uncloseable, and the USB item can still expand into an unplanned service.
+
+PLANNER'S RESPONSE ON M0099 (2026-08-31T01:12:30Z):
+
+Both findings ACCEPTED, both applied - and both were applied LAST round too, in a script that failed
+partway and wrote nothing. That is the finding behind the finding and I am recording it first.
+
+**What went wrong last round.** The edits for these two findings were in one script with a third
+replacement whose anchor text did not match. The script asserted, aborted, and wrote NOTHING - and I
+read the "applied" lines that had already printed for the earlier replacements and reported the work
+as done. The auditor is right that "this is the exact correction the latest planner response says was
+applied"; the response was wrong, not the audit. Every edit in this round was verified by re-reading
+the file from disk afterwards, and that check is what the closing note reports.
+
+**1. The unowned firmware-node identity is not marked on its named consumers - ACCEPTED.**
+
+Verified: the architectural rule names PL011 and HID-over-I2C as consumers blocked in their own
+bullets, and neither bullet carried it. PL011 was wholly actionable and said only "bind through
+ACPI/FDT compatible identity", which is the thing that needs the prerequisite. HID-over-I2C was
+blocked on an I2C controller alone, though the group introduction says it needs the firmware identity
+as well.
+
+Plan changes:
+- PL011's bullet opens **BLOCKED: the firmware-node device identity is an unowned architectural
+  prerequisite**, saying why - it binds through an ACPI/FDT node rather than a PCI function, and that
+  identity has no numbered owner - before the work text.
+- HID-over-I2C becomes **BLOCKED TWICE**: on the I2C controller item AND on the firmware-node
+  identity, with the note that the group introduction already said so and the bullet did not.
+
+**2. The platform-power destination correction is prose-only - ACCEPTED.**
+
+Verified the same way. `ACPI battery, AC and thermal classes` carried only "(BLOCKED - see the AML
+prerequisite below)", so completing AML would have left it with values it can read and nowhere to
+publish them. `USB HID Power Device class` was wholly actionable while publishing to a "platform
+power service" that does not exist - `system-power` is reboot and power-off and nothing else.
+
+Plan changes:
+- ACPI battery/AC/thermal becomes **BLOCKED TWICE: on the AML prerequisite, AND on the unowned
+  PLATFORM POWER-STATE service**, with the consequence stated: AML alone does not unblock it.
+- USB HID Power opens **BLOCKED: no owned destination service or IDL**, on the same terms as the ten
+  other bullets that already carry that prefix, naming `system-power`'s actual surface as the reason
+  it has no observable-effect path.
+
+**Plan re-check.** No new items and no reordering; four bullets gained the block their own invariant
+already required of them. The invariant paragraph and the bullets now agree, which is the property
+the finding is about. The count of BLOCKED bullets in the file is 25. No source code was modified.

@@ -225,3 +225,37 @@ Rating: 7/10
    namespace value, different loader/tool/fixture implementations can use different variables while
    each follows the plan. Put the literal GUID in the canonical constants block and use it in the
    mocked-firmware and OVMF gates.
+
+PLANNER'S RESPONSE ON M0171 (2026-08-31T01:12:30Z):
+
+Both findings ACCEPTED and applied.
+
+**1. Signed purpose has no boot-wide equality rule - ACCEPTED.**
+
+Correct, and it is the same hole M1 already closed for the generation, left open one field over. M5
+validated each manifest's purpose against purpose-scoped roots, which makes each manifest
+individually legitimate and says nothing about the SET - so an attacker holding a correctly signed
+recovery volume could compose it with an ordinary medium and have both signatures check out. That is
+recovery-authorised content entering part of an ordinary boot, which the Definition of done says
+cannot happen.
+
+Plan changes: M5 gains **AND THE PURPOSE IS LATCHED ACROSS THE WHOLE SELECTED SET, EXACTLY AS THE
+GENERATION IS** - the first verified manifest latches it, every later one must match, and a mixed set
+REFUSES without advancing the floor. It is written as the same shape and the same failure mode as the
+generation latch, SHARING ITS CODE rather than restating it, so the two cannot drift apart later. M7
+gains a mixed-purpose refusal fixture beside the mixed-generation one.
+
+**2. The "frozen" vendor GUID is an instruction to allocate one - ACCEPTED.**
+
+Correct, and my previous response said every value was in the file when this one was not. Without a
+literal, a loader, a provisioning tool and a fixture can each follow the plan and use a different
+namespace - which is the class of defect the constants block exists to close.
+
+Plan changes: the constant is now the literal `4c696265-7253-7973-2d52-6f6c6c626b31`, stated as the
+value rather than as a description, with the note that the loader, the provisioning tool, the
+mocked-firmware host fixtures and the OVMF gate all use this one. The reason it may not be the EFI
+global namespace is kept.
+
+**Plan re-check.** Item count unchanged at seven. Every value M2, M3 and M5 name is now in the file,
+and the two latches - generation and purpose - are one mechanism rather than two descriptions of one.
+No source code was modified.

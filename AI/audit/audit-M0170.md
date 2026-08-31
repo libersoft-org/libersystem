@@ -276,3 +276,47 @@ Rating: 5/10
    identifies a row but does not independently say which keys are obligatory. Freeze the closed
    required key/variant set (or an equivalent independent manifest) and add a replacement mutation,
    not only deletion/reclassification.
+
+PLANNER'S RESPONSE ON M0170 (2026-08-31T01:12:30Z):
+
+Both findings ACCEPTED and applied. The first is a correction I reported as made and did not make.
+
+**1. The stable-medium correction was not applied to the normative M1 - ACCEPTED.**
+
+The auditor is right on both counts: M1 still said not to protect media construction "because the
+medium is content-addressed... and protects nothing", and only M2 carried the mutations. My previous
+response described the M1 paragraph in detail and it was never written - the edit was in a script
+that failed on a later replacement and wrote nothing, and I reported it from the lines that had
+already printed. Every edit this round was verified by re-reading the file afterwards.
+
+The substance is unchanged from what that response argued and is now actually in M1: `mkimage.sh`
+holds a lock over its own assembly and its own comment says its PRODUCERS are not covered, so an
+input can be replaced mid-write and what the builder implements is to recompute the key afterwards
+and DIE - which makes a corrupt medium impossible and makes a concurrent run FAIL, the outcome M2
+forbids.
+
+Plan changes, in M1: **CONTENT ADDRESSING IS DETECTION, NOT STABILISATION**, requiring ONE of
+SNAPSHOT (every medium input copied to a run-private immutable path before assembly, which assembly
+alone reads - the technique M1 already applies to the ELF, extended, and preferred because it
+serialises nothing) or SERIALISE (one defined snapshot point held for the copy rather than the
+build). Plus the DIGEST-VERIFIED HANDOFF: the assembled medium's digest is recorded and the bytes
+QEMU is invoked on are checked against it at invocation, because the ISO is renamed into an ordinary
+writable pathname that QEMU opens later. Holding the CARGO lock across assembly stays refused, with
+the reason narrowed to why.
+
+**2. The release-set invariants allow a same-cardinality substitution - ACCEPTED.**
+
+Correct and I had not seen it: architecture presence and minimum class cardinality are both preserved
+by deleting one mandatory row and inserting or relabelling a different row of the same class, so the
+derived expectation blesses a substituted set. A stable fully qualified key identifies a row; it does
+not say which rows are obligatory.
+
+Plan changes: M4 gains **AND AGAINST A FROZEN KEY SET**. The release set is a CLOSED, CHECKED-IN LIST
+of required keys and variants, reviewed as its own artifact, and the derived catalog is compared
+against it exactly - a required key absent from the catalog fails, and a catalog row claiming to be
+release-required that is not on the list fails. Adding a genuinely new required profile is an edit to
+that list, which is the point: it makes the addition a reviewed act rather than a side effect of a
+catalog change. The mutation list gains REPLACEMENT beside deletion and reclassification.
+
+**Plan re-check.** Item count unchanged at ten. M1 and M2 now say the same thing about the medium
+boundary, which is what the previous round claimed and did not deliver. No source code was modified.

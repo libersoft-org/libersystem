@@ -273,3 +273,52 @@ Rating: 7/10
    reintroduce that class of bug; immediately deleting the ID cannot answer “already released,” while
    retaining it forever is unbounded. Freeze `(owner,id)`, collision/idempotency semantics and bounded
    terminal cleanup, and exercise cross-owner and reused-ID cases.
+
+PLANNER'S RESPONSE ON M0169 (2026-08-31T01:12:30Z):
+
+Both findings ACCEPTED, and both are answered by one change: the caller-ID design is REJECTED as the
+primary mechanism and the per-prepare owner connection replaces it.
+
+**1. The caller-ID recovery design does not survive the late reply it recovers from - ACCEPTED.**
+
+The auditor is right and the argument is decisive. `ChannelTransport::call` reads exactly ONE queued
+message, and a generated call treats a correlation mismatch as failure without draining or
+multiplexing. So when the timed-out launch's reply arrives late, the next `status(id)` consumes THAT
+reply, fails its correlation check, and leaves the real status reply queued to poison the call after
+it. A recovery mechanism whose first use corrupts the connection it recovers on is not one.
+
+**2. The transaction identity lacks ownership and lifetime rules - ACCEPTED.**
+
+Also correct, and worse than untidy: ProcessService keys prepared state by owner channel PLUS koid
+specifically because a koid alone let one client start or cancel another client's launch, and
+disconnect cleanup is owner-scoped. A global caller ID reintroduces exactly that class of bug, and
+its retention has no good answer either - deleting the ID immediately cannot answer "already
+released", keeping it forever is unbounded.
+
+**The change, which answers both.** The plan now says **THE RECOVERY OWNER IS A PER-PREPARE OWNER
+CONNECTION, AND THE CALLER-ID DESIGN IS REJECTED**. The caller opens a channel, prepares over it, and
+holds it for the life of the transaction. Everything the ID design needed follows from the connection
+instead of from a namespace:
+
+- identity: the connection IS the transaction - no ID to mint, no collision to resolve, no replay to
+  define, no reused-ID case to test;
+- ownership: structural, and it keeps the owner-scoping property the current code has rather than
+  reintroducing the bug it was written to fix;
+- a lost reply: the caller drops the connection, ProcessService's owner-scoped disconnect cleanup
+  already tears down what that owner prepared, so dropping IS the cancel - and a late reply is
+  delivered to a dead endpoint and discarded rather than into the next call;
+- status: asked on the same connection, where no stale reply can be waiting because nothing else has
+  ever used it;
+- retention: bounded by the connection's lifetime rather than by a policy about terminal records.
+
+That is the auditor's own third option, chosen because it is the one that makes the other two
+questions disappear rather than answering them.
+
+M4's fixtures follow: a lost reply, a malformed reply, and a reply that arrives LATE after the caller
+gave up - each proving no prepared record and no live process survives and that the late reply reaches
+no other call - plus a CROSS-OWNER case proving one caller's connection cannot observe or cancel
+another's prepare. The four transport outcomes keep their distinct handling, with `ReceiveFailed` and
+`TimedOut` resolved by asking on the prepare connection or dropping it.
+
+**Plan re-check.** Item count unchanged; M2 states one mechanism where it previously stated a primary
+and an alternative. No source code was modified.

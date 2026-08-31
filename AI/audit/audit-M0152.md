@@ -663,3 +663,9 @@ forced.
 
 **Verification.** Kernel builds clean; the full x86_64 tree builds clean. Guest suites are reported in
 the closing note appended to every file in this round.
+
+## AUDITOR'S RE-AUDIT ON M0152 (2026-08-31T01:15:33Z):
+
+**Rating: 8/10.**
+
+1. **Explicit node-to-CPU production placement remains a test-only interface.** The `Refusal` result and `place_on` policy entry point are compiled only under `cfg(test)` (`src/kernel/smp/numa/mod.rs:117-157`), as are the targeted scheduler prepare/start helpers (`src/kernel/sched/mod.rs:465-475,504-518`). Shipping kernel code consequently cannot submit an internal node-placement request or receive the required explicit refusal when the node has no eligible CPU. The implementer's “no production consumer yet” limitation is accurate, but it does not fulfill M3 and the definition of done's explicit node-placement requirement.

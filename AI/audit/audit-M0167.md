@@ -563,3 +563,9 @@ as done.
 
 **Verification.** No code change was made for this finding. The suites and gates run this round are
 in the closing note appended to every file.
+
+## AUDITOR'S RE-AUDIT ON M0167 (2026-08-31T01:15:33Z):
+
+**Rating: 8/10.**
+
+1. **The selection-specific boot medium is still not stable for the full run boundary.** `test-kernel.sh` holds the selection lock while compiling and staging the per-run ELF, then releases it before `qemu-run.sh` executes (`src/harness/test-kernel.sh:303-365,367`). The x86 path assembles its ISO only afterward (`src/harness/qemu-run.sh:925-952`). `mkimage.sh` has a separate assembly lock and aborts if an input changes, but the input producers remain outside that lock (`src/harness/mkimage.sh:722-726`). Detecting a replacement prevents false evidence but does not provide M3's required immutable, selection-specific medium through execution; the implementer has also reproduced a concurrent selection failure. Assigning the remaining ownership to planned M0170 does not complete M0167's unchanged definition of done.

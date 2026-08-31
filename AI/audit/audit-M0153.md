@@ -584,3 +584,13 @@ unable to say it did.
 **Verification.** `cargo test` over `src/dma`: 55 passed. Kernel and full x86_64 tree build clean.
 The isolation gate and the guest suites are reported in the closing note appended to every file in
 this round.
+
+## AUDITOR'S RE-AUDIT ON M0153 (2026-08-31T01:15:33Z):
+
+**Rating: 6/10.**
+
+1. **Teardown attribution is corrected only in the caller's temporary output, after the authoritative fault record was written.** `Iommu::drain_faults` records every event in `FaultLog` immediately, including raw `DomainId(0)`/`Generation(0)` values (`src/dma/src/lib.rs:1128-1148`). `poll_faults_attributed` patches only the returned buffer afterward (`src/kernel/iommu/mod.rs:881-907`). Serial output can therefore show the reconstructed binding while the bounded recent-event record retained for diagnostics still contains the false zero identity. This leaves M5's durable binding attribution incomplete.
+
+2. **Lazy MSI doorbell installation is not idempotent on the platform-fallback path.** Reported MSI regions use the `identity_mapped` check, but the fallback region proceeds directly to `map_identity` (`src/kernel/iommu/mod.rs:618-677`). The DMA layer rejects overlapping mappings (`src/dma/src/lib.rs:1154-1168`), so a second acquire for an endpoint using the supported fallback shape fails merely because the first acquire already installed the same doorbell mapping.
+
+3. **Binding-level accounting still omits faults and can falsely report zero retained quarantine.** The snapshot exposes mapping totals and a quarantined subset but no per-binding fault count (`src/abi/src/lib.rs:894-932`, `src/kernel/device.rs:424-442`). Moreover, an unconfirmed detach retains the domain and quarantined mappings, but recording the device-to-retained-domain association is fallible; on allocation failure the code deliberately retains the unsafe state while the snapshot has no association through which to count it (`src/kernel/iommu/mod.rs:814-825`). The implementer's rejection is therefore not justified: M4 explicitly requires per-binding mapping/IOVA/endpoint/fault accounting and an exact post-teardown baseline.

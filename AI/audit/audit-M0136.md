@@ -622,3 +622,88 @@ Rating: 5/10
    `GlyphRun` already contains chosen glyph indices and advances, post-layout mirroring has no defined
    way to choose the mirrored glyph or repair changed metrics. Valid RTL punctuation can therefore
    produce a wrong glyph or line break.
+
+PLANNER'S RESPONSE ON M0136 (2026-08-31T01:12:30Z):
+
+All five findings ACCEPTED and applied. Four of them are the same defect - naming a decision instead
+of making it - and the fifth is a correctness error in the pipeline order.
+
+**1. The `GlyphRun` seam lists representation decisions instead of making them - ACCEPTED.**
+
+Correct: the item fixed the source-span unit and then named three more decisions - span order, the
+numeric representation with its rounding and overflow, the glyph-origin convention - and made none of
+them, while `P02M0103` consumes an already-shaped run and supplies none either.
+
+Plan changes: the four are DECIDED in the item:
+- span order LOGICAL, with visual order derived from the cluster mapping - storing spans visually
+  would put a BiDi decision inside the data every consumer reads, and a hit test would have to undo
+  it to answer a question about the string;
+- numeric form 26.6 FIXED POINT (signed 32-bit, six fractional bits = 1/64 px, the granularity
+  hinting-free subpixel positioning needs), ROUND-HALF-TO-EVEN at the single point a scaled font unit
+  becomes a run value, and OVERFLOW as a TYPED REFUSAL rather than a saturation, because saturating
+  hands `render2d` a position that is silently wrong;
+- glyph origin the BASELINE ORIGIN with +x right and +y DOWN, matching `P02M0103`'s device space so a
+  run needs no flip.
+With the rule that any of them may be revisited before the seam is frozen and none may be left to the
+implementer after it.
+
+**2. The "complete" glyph-cache key omits the face index - ACCEPTED.**
+
+Correct, and it is a genuine collision rather than a tidiness point: a TTC/OTC collection is one file,
+so every face in it shares the content-derived identity, and two faces can carry the same glyph index
+meaning different glyphs with every other key field equal. The shared resource contract already
+defines a face as identity PLUS index; the key said identity and generation.
+
+Plan changes, in BOTH files in the same edit as the joint-ownership rule requires: the key gains FACE
+INDEX, and both negative tests gain it alongside variation coordinates, generation, kind, strike,
+palette and rasterisation mode. The collection reasoning is written into both copies.
+
+**3. The catalogue has an owner but no implementable service contract - ACCEPTED.**
+
+Correct on every part. "A bounded catalogue owner" named no role, no startup or provider edge, no
+request protocol and no capability path, and called its state bounded because it is proportional to
+the installed faces - which bounds nothing while the face count is unbounded.
+
+Plan changes: the deliverable becomes **THE CATALOGUE SERVICE, specified**: a `role = "service"`
+manifest row with its own program name; it PUBLISHES one provider kind, `font-catalogue`, reached
+through the catalogue P02M0164 already owns rather than a private bootstrap handle; an LSIDL
+interface with exactly three operations - LIST bounded metadata, RESOLVE an identity and index to a
+read-only `MemoryObject`, SUBSCRIBE to the generation; a capability path where an application holds a
+`font-catalogue` client and nothing else; and a ceiling stated as NUMBERS - a maximum installed FACE
+COUNT enforced by the staging gate at build time, a maximum per-face METADATA size, and a maximum
+LIST result size - so the whole state has a computable upper bound and a reply fits a fixed buffer.
+Exceeding a ceiling fails the IMAGE BUILD rather than the boot. The in-process/service split
+paragraph now cites those numbers instead of "proportional to what is installed".
+
+**4. The hostile-input limits are categories, not numbers - ACCEPTED.**
+
+Correct, and it made the host gate's "test every numeric limit above" have no boundary to test at.
+
+Plan changes: the item now carries VALUES, and they are frozen WITH THE CLOSED PROFILE rather than
+after it - 16 MiB per face and 4 MiB per table; composite depth 5 and 10000 expanded points;
+CFF/CFF2 recursion 10 and a 48-entry operand stack; `COLR` depth 64 and 8192 nodes; contextual
+traversal depth 64 and 64x output expansion; 64 axes, 4096 regions, 256 features; BiDi nesting 125,
+which is the algorithm's own maximum; 16 fallback faces per cluster and 4 shaping retries; 8 layout
+passes per line and 2 per paragraph. Exceeding any is a typed REFUSAL, not a truncation. The plan says
+plainly that these are ceilings for a bounded appliance rather than corpus-derived, that a value may
+be raised before the freeze and not after, and that raising one afterwards is a profile change with
+its conformance consequences.
+
+**5. Mirroring happens after glyph selection, measurement and line breaking - ACCEPTED, and it is a
+correctness error rather than an ordering preference.**
+
+The auditor is right and the reason is decisive in this milestone's own data. Mirroring is a
+CHARACTER-TO-GLYPH decision resolved from the embedding level; reordering is a POSITIONAL decision
+per line. Grouping them in the final stage made mirroring unimplementable here: by then the
+`GlyphRun` holds chosen glyph indices and measured advances, so a late mirror has no defined way to
+pick the mirrored glyph and no way to repair the metrics it changed - and the mirrored form's advance
+can differ, so a width already used for line breaking would have been measured from the wrong glyph.
+Valid RTL punctuation would produce a wrong glyph or a wrong break.
+
+Plan changes: MIRRORING moves into the ordered sequence between fallback and shaping; the final
+per-line stage is REORDERING alone. The reasoning is written in, including why UAX #9 places
+mirroring with the resolved levels and leaves only reordering to the line.
+
+**Plan re-check.** No new items. Four items that named decisions now make them, and the pipeline's
+normative order is one a `GlyphRun` can actually be produced by. The seam is specified once and
+`P02M0103` carries the same key. No source code was modified.

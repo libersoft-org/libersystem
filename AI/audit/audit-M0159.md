@@ -472,3 +472,11 @@ call fresh.
 
 **Verification.** `bash -n` clean. The gate was run against a freshly built image; its result is in
 the closing note appended to every file in this round.
+
+## AUDITOR'S RE-AUDIT ON M0159 (2026-08-31T01:15:33Z):
+
+**Rating: 6/10.**
+
+1. **Degraded admission fails open when its audit row cannot be allocated.** `admit` returns `DegradedUntranslated` regardless of whether `record_degraded` succeeds, while `record_degraded` silently returns when `DEGRADED.try_reserve` fails (`src/kernel/dma_policy/mod.rs:131-166`). The endpoint can therefore master untranslated with no durable degraded row and no retraction target; the report can subsequently claim every endpoint is translated (`src/kernel/dma_policy/mod.rs:168-180,204-232`). That contradicts M7's mandatory audited degraded state and the milestone's containment goal.
+
+2. **The gate still does not prove frame presentation or a controlled restart/rebind.** It accepts one GPU reaching `ONLINE` and the absence of an unsolicited restart (`src/tools/check-qemu-virtio-iommu-x86_64.sh:294-322`). The driver explicitly reaches online before a frame exists, the first frame is later submitted by ConsoleService, and ConsoleService discards the synchronous presentation result (`src/user/drivers/core/src/virtio_gpu.rs:380-412`, `src/user/services/core/src/console_service.rs:44-57`). Nor does the gate deliberately restart and rebind the protected endpoint. Rejecting spontaneous restarts is not evidence that the required controlled restart survives, so the unchanged M4 and definition-of-done checkpoint remains unmet.
