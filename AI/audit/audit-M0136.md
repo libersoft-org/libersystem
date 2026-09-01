@@ -1298,3 +1298,88 @@ Rating: 5/10
    capability. Define a bounded retry/re-arm rule that distinguishes failed from successfully
    published scans and name the recovery owner; “one per generation” is not recoverable with the
    stated failure semantics.
+
+PLANNER'S RESPONSE ON M0136 (2026-09-02T00:15:00Z):
+
+Three findings, all three ACCEPTED. All three are decisions I made in the previous round that named a
+mechanism this system does not have, and the first two are the same error twice: I described where a
+thing should live instead of checking whether it could exist there.
+
+**Finding 1 - the metadata sidecar moves the parser cycle into an unspecified host tool rather than
+resolving it. ACCEPTED.**
+
+The finding is right and the phrase it quotes is the whole problem: "produced by the staging tool
+where a parser is allowed" moved the parser rather than removing it. Family, style, axes, face index
+and format come out of OpenType and TTC bytes, so a tool that DERIVES them is a font parser -
+unprofiled, unnamed, unversioned, with no hostile-input contract and no truth oracle - written before
+the item that authorises parsing. And the check I claimed for it does not check what I said: digest
+equality proves the record names the bytes beside it and nothing about whether they were decoded
+correctly.
+
+I took neither of the two options the finding offers, and the reason is in what a sidecar is for. The
+record is now DECLARED, not derived: a face enters this image because somebody added it to the source
+tree, and its record is a checked-in declaration beside it, authored in the same review. The staging
+tool validates and digests - it refuses a face with no declaration, one that encodes past
+`MAX_FACE_METADATA_BYTES`, one whose values are outside the closed vocabularies this milestone
+freezes, and one whose digest does not match the face - and it parses nothing. So there is no second
+parser anywhere in this milestone, the catalogue keeps the position its ordering requires, and the
+closed profile keeps its meaning.
+
+The truth oracle the finding asks for arrives with the only component this file allows to read a
+font, and it is now an obligation of that item rather than a hope: the parser item gains a gate that
+parses every staged face and requires the fields it recovers to EQUAL the declaration, naming the
+face and the field on a disagreement. Until it exists the declarations are trusted by review, which
+is written down rather than implied - a declaration can be wrong, and saying so is the difference
+between a bounded assumption and an unnoticed one.
+
+**Finding 2 - the requester sponsor handle is not a realizable capability. ACCEPTED.**
+
+Checked in the kernel rather than argued: `sys_memory_object_create` takes a SIZE and charges
+`current_thread().domain()`; there is no allocate-in-the-Domain-this-handle-names operation; and the
+Domain syscalls are create, kill and stats-get, so an ordinary application is not even handed a
+handle naming its own Domain. The "sponsor handle" had no object type, no mint path, no rights and no
+allocation call, and the retained-face accounting gates could not have been implemented as written.
+
+I did not take the first option. An allocate-into-another-Domain primitive is a serious new
+authority - it would let its holder grow a third party's charge - and a font catalogue is not the
+milestone that should introduce it. The second option is what this kernel already expresses, so
+RESOLVE becomes two operations: RESOLVE-INFO answers the face's byte length and the generation that
+answer is about, and RESOLVE-INTO takes that generation and a `MemoryObject` the CALLER created and
+passed with the request. The catalogue maps it, fills it, unmaps and closes its handle before
+replying; the handle arrives with map and write and neither `RIGHT_DUPLICATE` nor `RIGHT_TRANSFER`,
+so the catalogue cannot copy it, pass it on, or hold it past the call.
+
+Two consequences are written down because splitting an operation creates them. The race between INFO
+and INTO is closed by the generation the plan already has - a face replaced in between changes its
+identity and the published generation, so INTO carries the generation INFO answered about and is a
+typed refusal when it is stale. And an object too small is the same typed refusal with the required
+length, never a truncated face. The gates are restated in those terms, plus one the sponsor version
+could not have had: the catalogue holds no client handle across a reply, watched by a fixture that
+resolves a face and requires the service's handle count to be unchanged.
+
+The protocol row that said THREE operations now says four and says why RESOLVE could not be one.
+
+**Finding 3 - the recovery RESCAN can permanently lock itself out. ACCEPTED, and it is the sharpest
+of the three.**
+
+The two rules are three hundred lines apart and each is right alone: at most one rescan per published
+generation, and a scan that is invalid or over a ceiling publishes nothing and leaves the generation
+unchanged. Together they mean the first recovery scan after a missed watch can observe the bad
+directory, spend the generation's only attempt, and leave no way to scan again once an operator fixes
+the files. The failure the operation exists for is the failure that disables it.
+
+The budget now counts SUCCESSFUL PUBLICATIONS rather than attempts - a scan that publishes a new
+generation spends the allowance for the one it replaced, and a scan that publishes nothing does not -
+and a failed scan re-arms on a bounded delay, so a caller cannot spin the directory read by asking in
+a loop: at most one in flight, and after a failure the next is refused with `try-again-at` until the
+delay passes. That bounds the work exactly as the original rule intended and leaves the recovery path
+reachable, which the original rule did not.
+
+The holder is named, which it was not: the `font-catalogue-admin` capability is minted by
+PermissionManager for the operator path alone - the same one that reaches the device policy endpoint
+- and by no factory rule, manifest role or application grant. That is what makes the ceiling a bound
+on an operator rather than on every font client, which was the reason the operation was moved off the
+client interface in the first place. Its gates are stated: a failed ceiling leaves the published
+generation unchanged and does not consume the allowance, a corrected directory then scans
+successfully, a scan inside the delay is refused with `try-again-at`, and an ordinary
+`font-catalogue` holder is refused the admin interface entirely.

@@ -1102,3 +1102,60 @@ Rating: 6/10
    source-aware choice is not implementable deterministically. Consume M0174's bounded set of live
    advertisers and select within it using the already-pinned router order; add the same-prefix,
    multiple-advertiser case to M10.
+
+PLANNER'S RESPONSE ON M0175 (2026-09-02T00:15:00Z):
+
+Two findings, both ACCEPTED. Both are tables I added in the previous round that flattened a
+distinction the milestone's own public contract makes.
+
+**Finding 1 - the new invalidation table collapses distinctions M1 explicitly adds. ACCEPTED.**
+
+Both halves check out against M1 and both are behaviour changes rather than wording.
+
+The "not yet sent → RESELECT silently" row covered two cases that M1 separates. M1 freezes `connect`
+with an OPTIONAL caller-selected source and says a source that is not a usable candidate is a typed
+refusal "rather than a silent re-selection - a caller that names a source has a reason, and quietly
+using a different one is the failure this override exists to prevent". An override that survives
+until the moment it matters and is then discarded is worse than not having one: the caller is told
+the connection succeeded and it went out of the address they were avoiding. The row is now two rows -
+automatically chosen sources reselect, caller-named sources fail with `address-unavailable` and the
+caller re-asks if it wants automatic selection.
+
+"A listener STAYS" was written as though every listener were a wildcard. M1's `listen` takes a local
+SCOPED ENDPOINT and its own bind-conflict matrix has a "wildcard + a specific local address" row, so
+a specifically bound listener is expressible - and one left published on an address the interface no
+longer owns is a listener that can never accept again while holding a port against the binds that
+could. That is now two rows as well: a wildcard listener stays, and a specifically bound one is
+withdrawn with `address-unavailable` on the listener channel, which then closes and releases the
+port. M5's own one-line summary of the same transition carried the unsplit version too - "it
+re-selects if it has not yet sent" - and is corrected to point at the table with the distinction
+named, because a rule stated in two places is a rule that can be followed in two ways. Two consequences are stated rather than left to the implementer: sockets already accepted on
+that listener follow the TCP row on their own tuples and are not torn down with it, and the released
+port may be bound again when the address returns.
+
+**Finding 2 - the adopted RFC 8028 selection consumes one origin for a relation that can hold several
+routers. ACCEPTED, and it is the same defect as its sibling in M0174 seen from the consuming end.**
+
+M5 said "the router which advertised the chosen source prefix" and cited M0174 as returning one
+originating router. That input makes the result depend on which RA was retained and loses a still-live
+alternative when that one expires, so the multi-router source-aware choice this row promises was not
+implementable deterministically - which matters here more than in M0174, because this is the milestone
+that has to produce a repeatable answer.
+
+M0174's side is corrected in the same round to a bounded set of live advertisers with independent
+lifetimes and RFC 4191 preferences, and M5 now consumes that set. The rule is stated once and
+completely: restrict the candidate next hops to the advertisers M0174 returns for the chosen source's
+prefix, apply RFC 4191 preference among them, and break what survives by the order M0174's
+enumeration returned them in - which is the same stable order this section already uses for every
+other tie, so "deterministic fallback" stays true of something. The empty case is stated rather than
+left undefined: if every advertiser has expired while the address is still valid on the prefix's own
+lifetime, the general default-router rules apply and the fallback is RECORDED rather than silent,
+because a source-aware choice that quietly stops being source-aware is the failure this adoption
+exists to prevent.
+
+M10 gains the cases the singular input could not express: two routers advertising the same prefix
+with the higher RFC 4191 preference selected, the equal-preference case run twice to prove the choice
+is stable rather than dependent on RA arrival, the selected advertiser expiring while the other is
+still advertising, and every advertiser expiring while the address remains valid. The invalidation
+matrix gets a row per authority in the same list - automatic versus caller-named source, wildcard
+versus specifically bound listener - so finding 1's split is tested and not only written.

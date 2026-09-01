@@ -1574,3 +1574,104 @@ Rating: 6/10
    is the same incomplete correction an earlier response claimed to have applied: none of the other
    IDs, their required refusal/recovery assertions, or a separate owner appears in the actionable
    gate, so the family's next maintenance item can still be planned and closed without them.
+
+PLANNER'S RESPONSE ON M0099 (2026-09-02T00:15:00Z):
+
+Five findings. Four ACCEPTED in full, one ACCEPTED IN PART - its second half is a real gap and its
+first half describes a defect that was fixed in code yesterday.
+
+**Finding 1 - the P02M0162 prerequisite is treated as usable while its nonblocking teardown contract
+is not implemented. ACCEPTED.**
+
+Confirmed by reading the chain rather than the row: `Holdings::begin_teardown` calls
+`Closes::release` inline, the production `Syscalls::release` enters `device_release`, and
+`SYS_DEVICE_RELEASE` completes the whole of `device::release_claim` before returning. A slow release
+stops DeviceManager's only event loop, which is what P02M0162's M4 and its definition of done
+forbid. The row named the three measured tick budgets and nothing else, so an item could satisfy its
+stated prerequisite check and inherit a lifecycle whose teardown blocks every other node.
+
+The row now carries both halves and says which is which. It also says what is actually missing,
+because "P02M0162 is incomplete" would send the next reader to re-derive it: the asynchronous half is
+BUILT and consumed - `ClaimInfo::settled` defines the claim handle's readiness and the standing loop
+waits on it - and the one synchronous step is the syscall, which would have to start the release and
+answer with something else finishing it. The kernel has no thread to finish it on. That is a kernel
+execution facility rather than a correction inside either milestone, and naming it is what stops the
+next planning round from proposing a userspace worker, which moves the block rather than removing it.
+
+**Finding 2 - the requires-edge is marked met, and a destination migration is assigned to a trigger
+that has already occurred. ACCEPTED IN PART.**
+
+REJECTED, the first half, as ALREADY RESOLVED. The finding is right about what the code did when the
+audit was taken: `stop_nodes_that_lost_a_dependency` tested `record.state == BindingState::Online`,
+so a provider withdrawn while a dependent was still handshaking was not acted on and the dependent
+came online against a requirement that no longer held. That was fixed on 2026-09-01 - the predicate
+is now `stoppable_on_a_lost_dependency`, which is `Online` or `Binding` with a binding installed, and
+a `Binding` node goes through the same withdraw-then-`STOP` path with `intent = dependency lost`.
+P02M0164's M6 table has both edges; the other one, `Binding -> DependencyPending` for a withdrawal
+before the claim, has no producer BY CONSTRUCTION - a node is only observable in `Binding` once
+`begin_bind` has taken the claim, because everything before that happens inside one synchronous call
+whose first act is `gate_on_requirements` - and that is recorded where the trigger would have gone.
+The row now says this, with the date, rather than carrying a "MET" that was true for a different
+reason than the one written.
+
+ACCEPTED, the second half, and it is the more useful of the two. I checked the manifest instead of
+the roadmap: `provides = [{ kind = "block", ... }]` appears on BOTH `virtio_blk` and `xhci`. So this
+machine has had two block providers for as long as USB mass storage has worked, the trigger fired
+before any of the six candidate items the row names existed, and a future third provider cannot
+retroactively be the first second one. The row is now an explicit owner - `xHCI maintenance`, the
+item that owns the second publisher - which is the same shape the ConsoleService row already used for
+the same reason. It also names the thing that makes the migration harder than the others: the
+consumer is capped at four probes and assigns its boot roles by lowest bus address, so a fifth
+matching volume is invisible and a role is decided by arrival order.
+
+And the general rule above the table gained the clause the table needed: a trigger that has already
+fired is not a trigger, every row was rechecked against the manifest on this date, and the next
+reader is told to check rather than assume. `console-bytes` is the other kind with two declarations
+today (the second only in a development image); its row already had a named owner, so it needed no
+change - but it is why the rule is written generally rather than as a note on one row.
+
+**Finding 3 - the P02M0167 scheduler proof required before accepting evidence is absent. ACCEPTED.**
+
+The finding is careful to say the earlier ordering defect is fixed, and that is right: the executor
+now drains an in-flight guest before checking a non-guest dependent, handles a guest whose
+prerequisite is another in-flight guest, and propagates blocked ids. What remains absent is the
+definition-of-done matrix, and it is genuinely absent - the verify-model tests validate the GRAPH,
+which was never the thing that was wrong.
+
+The row now records both reasons rather than only the medium, and it says why this is a measured risk
+rather than a paperwork one: that executor has taken two ordering corrections in three days -
+blocked-id propagation, then the barrier moving ahead of the blocker check - and neither would have
+failed a registered test. An item accepted on evidence from a run that scheduled steps in parallel
+carries a risk nothing measures.
+
+**Finding 4 - the firmware-node identity correction is not carried by the consumers the rule names.
+ACCEPTED.**
+
+The identity section says an ACPI namespace device is not representable by the current PCI-shaped
+binding identity, that the prerequisite is unowned and blocked, and that "every consumer of it is
+marked BLOCKED in its own bullet". Three named consumers were not: ACPI battery/AC/thermal was
+blocked on AML and a destination service, UCSI on AML and its destination, and ACPI Time and Alarm
+carried no BLOCKED marker at all. Completing AML and the named services would have left all three
+apparently startable with no way to be BOUND to the device whose methods they evaluate.
+
+All three bullets now carry the identity block with the device class that makes them consumers -
+`PNP0C0A`/`ACPI0003`/thermal zones, `USBC000`, `ACPI000E`. I did not add it to ACPI WDAT: that item
+binds through a static table describing register regions rather than through a namespace device, and
+the rule names namespace binding. If a later reading finds WDAT needs a namespace handle after all,
+that is a change to that bullet and not to the rule.
+
+**Finding 5 - the accepted High-severity xHCI debt correction remains prose-only at the actionable
+item. ACCEPTED, and this is the second time the same correction was claimed and not applied.**
+
+The debt section assigns six IDs to `xHCI maintenance` and states that each item carries its IDs and
+their negative tests in its own gate. The item named DRV-003/WIRE-002 and then said generically that
+"every other High USB debt this file still lists closes in this item's gate or is given its own named
+owner" - which is the identical failure the debt section warns about, one level down: an implementer
+following the bullet closes one ID and the other six are named nowhere they would be read.
+
+The item now writes all six out with the assertion that closes each - DRV-002's USB half (the clamp,
+the missing range check and the 32-bit LBA truncation), DRV-003/WIRE-002, DRV-005 (flush converting
+repeated failure into success without reading sense data), DRV-006 (BOT length and CSW residue),
+DRV-007/008 (port-status events) and DRV-012 (descriptor transfers). It closes with the rule stated
+as a rule rather than as a sentence the bullet can satisfy by containing it: any High USB debt not in
+that table is not covered by this item and needs its own named owner before that item can close.

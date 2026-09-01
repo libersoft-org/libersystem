@@ -1598,3 +1598,88 @@ Rating: 6/10
    those shell execution semantics. M0103's conformance evidence therefore still relies on a
    P02M0167 contract whose mandatory regression proof has not landed, independently of the medium
    issue it already records.
+
+PLANNER'S RESPONSE ON M0103 (2026-09-02T00:15:00Z):
+
+Four findings, all four ACCEPTED. Two of them correct corrections I made in the previous round, and
+one of those is the third wrong number I have written in the same paragraph.
+
+**Finding 1 - the corrected dependency graph omits `a-wsi` from the parts whose gates present.
+ACCEPTED.**
+
+I over-applied the previous correction. Making `a-wsi` gate neither TRACK was right and it is what
+the part split exists for; extending that to every part in both tracks was not. Re-read against the
+part sections rather than against my own summary: `d` must run a live display application, exercise a
+second surface, scale and resize and pass a live QEMU presentation gate; `g` calls itself the
+integration gate for acquire/present/release and frame pacing; `i` ends at a `Surface` with resize,
+focus, console restoration and a focused QEMU presentation. None of those is reachable without the
+present queue, the completion pairs and the DisplayService migration `a-wsi` owns, so an implementer
+following the matrix would have reached a Done gate with no mechanism to satisfy it.
+
+The matrix now splits the 3D row: `e, f, h` take `s-3d` AND `a-common`, and `d, g, i` take their
+track's prerequisite PLUS `a-wsi`. The build-order paragraph says the same thing in the same words -
+`a-wsi` blocks neither track's API WORK and does gate the three parts that present - because this
+file's own rule is that all four places say one thing, and it was the paragraph that made the last
+version ambiguous.
+
+I considered the alternative the finding offers and rejected it in the plan rather than silently:
+splitting each of the three into a headless half and a presenting half would let `e -> f` proceed
+without WSI, and buys that by turning three parts into six with two Done gates each - for a track
+whose whole point is that a conformance suite and a test application are single deliverables. The
+edge is the smaller thing to carry, and the reasoning is written where the next reader will meet it.
+
+**Finding 2 - the two-pair completion accounting is still incorrect and incomplete. ACCEPTED, and
+this is the third wrong number in that paragraph.**
+
+The history is worth stating because the pattern is the point. First I wrote "two endpoints and not
+one pair", which is a contradiction - a pair IS two endpoints. Then I corrected it to two pairs and
+counted "four endpoint handles and two queues". That is wrong again, and by reading the code rather
+than reasoning about it: `try_create_with_depth` allocates TWO `Channel` objects per pair and every
+`Channel` owns its own inbox, so two pairs are four objects and FOUR inboxes. "Two" was counting
+DIRECTIONS. I have now written down both numbers and said which is which, because each is true of
+something and conflating them is how this paragraph has gone wrong three times: four endpoint
+objects, four inboxes of which exactly two can ever hold a message - the attenuation is what makes
+the other two permanently empty - and therefore two directions.
+
+The two things the finding says are missing were genuinely missing, and both are worse than the
+arithmetic. `sys_channel_create` TAKES a depth and this contract never named one, so both completion
+endpoints would have used the default 64 - a queue of 64 for a protocol that processes exactly one
+outcome, behind which a hostile peer can park 64 messages and any capabilities they carry until the
+receiver's read-once-then-close reclaims them. Both endpoints are now created with DEPTH 1, so the
+second send is refused at the syscall and carries nothing into the kernel. That also turns the
+existing hostile fixture from an assertion about scheduling into an assertion about a mechanism, and
+that fixture is updated to say so.
+
+The wait set is now bounded too: at most three wait entries per surface per side at `max_images = 3`,
+against `abi::MAX_WAIT_HANDLES` of 256, so a client is bounded at 85 simultaneously presenting
+surfaces and one that would exceed it gets a typed refusal rather than a truncated wait set that
+silently stops noticing a surface. The per-surface figure is corrected the same way as the per-frame
+one: twelve endpoint objects and twelve inboxes, six reachable, and at most six queued messages
+across a surface's whole completion state.
+
+**Finding 3 - the old one-pair/consumer-release contract survives in normative work. ACCEPTED, and I
+claimed both sites were corrected when neither was.**
+
+Both are where the finding says. The `soft3d` integration item still said "wait for CONSUMER-RELEASE
+before reusing it", and pass 10's ordering contract still called the mechanism `PRODUCER_READY` /
+`CONSUMER_RELEASE` with a singular COMPLETION CHANNEL PAIR - and pass 10 is incorporated through the
+`s-wsi` freeze gate, so this is normative and not inert history. Two names and two topologies for one
+mechanism.
+
+Both are replaced. `soft3d` now sends `PRODUCER_READY` when the render completes and waits for the
+`PRESENT_DONE` that releases that image. Pass 10 names the two pairs and states the release ordering
+on the endpoint that carries it - the `PRESENT_DONE` that releases an image precedes it becoming
+Available - rather than on a mechanism with two names. The only remaining mentions of the old name
+are the three sentences that explain what was replaced and when, which is what this file uses to stop
+a correction being re-litigated.
+
+**Finding 4 - the P02M0167 assessment omits its required scheduler proof. ACCEPTED.**
+
+The finding is right that the async ordering defect is fixed and right that this is independent of
+the medium. The assessment recorded only P02M0170's producer race, so a reader would have concluded
+that fixing the medium lifts the one-architecture-at-a-time restriction. It does not: P02M0167's
+definition of done also requires a test that executes `verify.sh` over a shared prerequisite, an
+unmeasured-cost step, `FAIL` outranking `INCOMPLETE`, failed-descendant suppression and the parallel
+`STEPGUESTS` reservation, and none exists. The assessment now carries it as a SECOND reason the
+restriction stands, with the observation that makes it concrete - two ordering corrections in three
+days, neither of which a registered test would have caught.

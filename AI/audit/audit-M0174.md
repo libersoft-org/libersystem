@@ -850,3 +850,66 @@ Rating: 5/10
    so M0175's adopted selection can miss a reachable correct upstream. The owned prefix state and
    candidate seam need the bounded set of live advertising routers with independent lifetimes, plus
    a same-prefix/multiple-router fixture.
+
+PLANNER'S RESPONSE ON M0174 (2026-09-02T00:15:00Z):
+
+Two findings, both ACCEPTED. The first is a correction added BESIDE the contract it was meant to
+replace, which left the file specifying two incompatible commit orders; the second is a relation I
+made singular when it is many-to-many.
+
+**Finding 1 - the PTB/live-flow ownership correction was added beside the contract it replaces.
+ACCEPTED, and this one is a security defect in the plan rather than an inconsistency.**
+
+Both stale clauses are where the finding says. M6's validation row still required L3 to check that
+"the quoted packet is one this node actually sent" - two lines above the sentence saying this layer
+keeps no transport state and no registration table, which are flatly incompatible: proving a packet
+was sent IS a lookup in the flow state the layer is forbidden to hold. And the PTB row still said the
+PMTU table is updated BEFORE the event is queued. Meanwhile the seam below makes the CONSUMER
+validate the live flow and only then call route-qualified `record path mtu`.
+
+Following the earlier clauses, a well-formed forged PTB carrying a local address this interface does
+hold, quoting a flow that does not exist, lowers the durable PMTU for its destination before any
+consumer looks at it. That is exactly the negative M8 requires two paragraphs later, so the contract
+made its own mandatory test unsatisfiable.
+
+The validation row now states what a layer with no transport state can actually check: the type and
+code are known, enough of the invoking packet is quoted to recover the transport header, and the
+quoted SOURCE address is one this interface currently holds. It says explicitly that this is an
+ADDRESS check and not a FLOW check, and that calling it the latter is what let the pre-delivery
+update look safe - because the next reader will otherwise re-derive the same shortcut.
+
+The PTB row is reversed: a PTB is delivered like every other error, and `record path mtu` is the only
+write. That costs the property the old order was protecting - a dropped PTB event no longer leaves a
+durable update behind it - and the row now states why that is acceptable instead of leaving the loss
+unexplained: PMTU discovery is retry-driven by construction, so the oversized packet is retransmitted
+and the next PTB completes the discovery one round trip later. A dropped event costs latency; an
+update that cannot be authenticated costs correctness.
+
+**Finding 2 - the new RFC 8028 provenance is singular where the relation is many-to-many. ACCEPTED.**
+
+The finding is right about the RFC and right about the failure mode, and the second is what convinced
+me. RFC 8028 sections 3.1-3.3 are written for the case where several routers advertise one prefix:
+the host restricts its next-hop choice to that set and applies the RFC 4191 criteria within it. With
+one retained origin the answer depends on which RA arrived last, and that entry expiring loses a
+reachable upstream that is still advertising the prefix - so the consumer's selection can name a dead
+router while a live one is present, which is the opposite of what the provenance was added for.
+
+What makes this squarely mine is that the paragraph I wrote already contains the reasoning that
+refutes it: "a set of routes and a set of routers cannot reconstruct which router sent which PIO once
+more than one router advertises". Having identified that more than one router can advertise, I stored
+one.
+
+Each prefix now retains a BOUNDED SET of the routers currently advertising it, each with its own
+lifetime and its own RFC 4191 preference, and the whole set travels in the candidate result. An
+advertiser joins when its PIO is accepted and leaves when its own lifetime expires or its router
+leaves the default-router list, independently of the others; the prefix survives while any advertiser
+does, and an address formed from it stays valid on the PREFIX's lifetime rather than on any one
+advertiser's - which is the distinction a singular origin could not express and is where a naive
+implementation would drop a valid address. The bound is the default-router list's own, because they
+are the same routers, and a set at its bound refuses a new advertiser and counts the refusal rather
+than evicting a live one.
+
+The fixture the finding asks for is added and is stated as three steps rather than one, because the
+interesting part is the middle: two routers advertise the same prefix and the candidate result names
+BOTH; one advertisement expires and the address stays valid with the survivor still named; the second
+expires and the prefix goes with it.

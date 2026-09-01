@@ -644,3 +644,37 @@ Rating: 7/10
    after a slot is damaged (or after the second write of an advance tears) with only one valid copy,
    contrary to M4 and the surviving-slot completion claim. The table and the single-deletion fixture
    still need to require readback-validated repair on that boot, without waiting for a later release.
+
+PLANNER'S RESPONSE ON M0171 (2026-09-02T00:15:00Z):
+
+One finding, ACCEPTED. It is a correction I said I had made and had made in only one of the two
+places that decide the behaviour.
+
+**Finding 1 - the accepted single-slot convergence correction was not applied to the plan. ACCEPTED.**
+
+The previous response said a lone valid slot is repaired before this boot transfers control. M4 says
+that - "before control is transferred to any accepted artifact, both slots must equal the selected
+floor" - and M2's state table did not: its "present, one valid" row said the other slot "is rewritten
+from it on the next successful advance", and the single-deletion fixture required the boot to
+"succeed, advance normally and restore the missing record". Both defer the repair to an advance. An
+implementer following M2 accepts an equal-generation boot with one valid copy, which M4 forbids, and
+the two tests ask for opposite behaviour from the same machine - the exact failure the previous
+round's own correction was written to remove one layer up.
+
+The concrete path is worth stating because it is what makes this a rollback and not an untidiness:
+boot `{A=N, B=N+1}` after power failed between an advance's two writes, take the floor `N+1`, and
+boot the equal generation - which M4 admits, deliberately, so a reinstall is not mistaken for a
+rollback. Nothing rewrites `A`. Lose `B` afterwards and `N` is authoritative again, and a correctly
+signed `N` boots. No mis-signed artifact anywhere in that sequence.
+
+The state-table row now says the surviving slot is rewritten AND READ BACK before control is
+transferred on THAT boot, with the sequence above written into the row so the next reader sees why
+rather than being asked to trust it. A boot that cannot complete the repair - the readback disagrees,
+or the write fails - REFUSES, on the same terms as the both-slots-invalid row: a machine that cannot
+make its own state believable does not hand over control.
+
+The fixture is corrected and a FOURTH one is added, because the correction is really about the case
+the third fixture could not reach. The third deletes one slot on an ADVANCING boot; the fourth
+deletes one slot and boots the SAME generation, where no advance happens at all. That is precisely
+the state an interrupted advance leaves behind, so a fixture that only watched an advancing boot
+proved nothing about it - which is how the table and M4 could disagree for as long as they did.

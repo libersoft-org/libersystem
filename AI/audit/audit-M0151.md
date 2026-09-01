@@ -1258,3 +1258,11 @@ correctly refused to confirm a vector nobody had given back. The second was the 
 a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
 off the volume. Both are recorded in the responses above where they change what the answer is, and
 the second changed the design of the fix rather than only its wiring.
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-09-01T22:46:50Z):
+
+Current implementation rating: 8/10
+
+1. **The required AArch64 and RISC-V UEFI/no-DT regression profiles remain absent while M6 and the milestone are marked complete.** The gate now has a valid firmware-backed GICv3/ITS device-MSI checkpoint, but it explicitly says the two no-DT profiles are not registered and no caller selects `LIBER_NO_DT_PROFILE=1` (`src/tools/check-qemu-arch-profiles.sh:350-373`; the only build plumbing is `src/harness/test-kernel.sh:325-332`). Its registered firmware row still requires `GICv3 from the device tree`, so it is not either no-DT regression (`src/tools/check-qemu-arch-profiles.sh:350-357`). This leaves M6 and the Definition of Done's separately labelled compatibility boots unmet (`docs/todo/P02M0151.md:157-170,480-491`); the measured loader limitation explains the gap but does not justify the checked/COMPLETE status.
+
+Focused verification: the FDT suite passed 87 tests, the `smpboot` suite passed 18 tests, `arch-surface` passed over 61 production architecture files, and both architecture-profile scripts pass `bash -n`. The new device-originated ITS checkpoint is credited: the hardware test succeeds only after a real virtio-sound interrupt and then revokes/releases its vector, while the gate requires both the GIC acknowledge-path LPI line and the teardown line from that firmware row (`src/kernel/arch/aarch64/gic.rs:355-376`; `src/kernel/test_suites/hardware.rs:820-840`; `src/tools/check-qemu-arch-profiles.sh:401-420`). No QEMU run was started for this re-audit.

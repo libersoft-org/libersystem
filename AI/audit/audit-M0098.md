@@ -921,3 +921,13 @@ correctly refused to confirm a vector nobody had given back. The second was the 
 a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
 off the volume. Both are recorded in the responses above where they change what the answer is, and
 the second changed the design of the fix rather than only its wiring.
+
+AUDITOR'S RE-AUDIT ON M0098 (2026-09-01T22:46:50Z):
+
+Current implementation rating: 6/10
+
+1. **Publishing `Free` before returning pending MSI slots still lets the old release free a replacement binding's vector.** `release_claim` calls `finish_release`, which publishes `ClaimState::Free` under `CLAIMS`, drops that lock, and only afterwards calls the generation-blind `release_msi_for_device(index)` (`src/kernel/device.rs:613-615`). A replacement can claim the now-free device in that gap, acquire and publish an interrupt, and close it; `Interrupt::drop` retires that replacement slot as pending, and the old release's scan frees every pending slot with the same reused device index, without an owner generation (`src/kernel/arch/common/msi.rs:234-253,299-315`). The slot can therefore re-enter circulation on the old binding's quiescence while the replacement device is still live, defeating the pending state and M5's teardown-before-vector-reuse rule. The latest `disown()` correction protects the old syscall's local rollback, but does not make this terminal-state/vector-release pair generation-atomic.
+
+2. **The regression test added for the latest rollback fix can still pass without exercising it.** `a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` prints that no MSI vector was free and returns successfully (`src/kernel/object/claim/tests.rs:784-789`). This repeats the false-green shape just removed from the sibling forced-release test and conflicts with M9/Definition of Done's explicit rule that these tests cannot pass by finding nothing to test (`docs/todo/P02M0098.md:193-204,248-252`).
+
+Focused verification: the ABI suite passed 28 tests and the portable DMA suite passed 57 tests. The translated forced-release proof is registered indirectly by `qemu-virtio-iommu-x86_64`: its enforcing DMA run rejects every `iommu-fixture: absent` or `... skipped` line (`src/tools/check-qemu-virtio-iommu-x86_64.sh:152-159`), so that previously missing proof is credited. No guest run was started for this re-audit; the remaining MSI interleaving is not covered by either host suite.

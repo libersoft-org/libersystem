@@ -824,3 +824,9 @@ correctly refused to confirm a vector nobody had given back. The second was the 
 a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
 off the volume. Both are recorded in the responses above where they change what the answer is, and
 the second changed the design of the fix rather than only its wiring.
+
+AUDITOR'S RE-AUDIT ON M0162 (2026-09-01T22:46:17Z):
+
+Current implementation rating: 7/10
+
+1. **Ordinary claim teardown still synchronously blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` calls `Closes::release` inline, and the production implementation immediately invokes `device_release` (`src/user/libs/driver/binding/src/lib.rs:787-822`; `src/user/services/core/src/device_manager.rs:1762-1773,1782-1795`). The syscall calls `Claim::release`, which completes the full `device::release_claim` sequence before publishing the terminal state and returning (`src/kernel/syscall/mod.rs:1247-1253`; `src/kernel/object/claim/mod.rs:74-102`; `src/kernel/device.rs:511-630`). The 20-tick limit applies only to the virtio-IOMMU command wait inside that sequence, not to the complete release or its caller (`src/kernel/iommu/mod.rs:880-900`; `src/kernel/iommu/virtqueue.rs:37-59`). Thus the retained claim handle is ordinarily already terminal before the manager can wait for a later claim event, and one teardown can still delay supervision of every other node. The absent kernel execution facility explains the gap but does not satisfy M4's short, nonblocking transitions or node-independence requirement (`docs/todo/P02M0162.md:163-186,359-370`).

@@ -1050,3 +1050,11 @@ correctly refused to confirm a vector nobody had given back. The second was the 
 a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
 off the volume. Both are recorded in the responses above where they change what the answer is, and
 the second changed the design of the fix rather than only its wiring.
+
+AUDITOR'S RE-AUDIT ON M0167 (2026-09-01T22:54:00Z):
+
+Current implementation rating: 6/10
+
+1. **Profile catalogue entries are still merged back into one serial step, so the claimed split does not provide independent scheduling or measurement.** The catalogue and `check.sh` define individual arch and NUMA profile gates, but `commands::steps` places every ordinary pre-guest gate into one `Step` with one ID, one comma-separated command, and all keys (`src/tools/verify-model/src/catalog.rs:155-172,187-195`; `src/tools/verify-model/src/commands.rs:227-245`). `check.sh` then executes that comma list serially (`check.sh:387-389`). A current lowering for `src/kernel/device.rs` emitted one `STEP 79` containing all nine arch profiles, all three NUMA profiles, and the other host gates. Those profiles therefore have neither independent `StepId`s nor independent measured costs and cannot be scheduled by the outer `--jobs`, directly contradicting M3.6 and the definition of done (`docs/todo/P02M0167.md:364-371,643-649`).
+
+2. **The required shell-scheduler execution matrix is still absent.** The current verify-model tests cover static graph validation only (`src/tools/verify-model/src/tests.rs:2263-2322`), while `verify.sh` still always generates its plan internally and exposes no prepared-plan seam (`verify.sh:603-610`). No registered test executes the shared-prerequisite, unmeasured-cost, `FAIL`-over-`INCOMPLETE`, and failed-descendant cases required by the milestone. The latest response correctly marks this unmet; the recently fixed transitive-blocking and barrier-order regressions remain unguarded (`docs/todo/P02M0167.md:674-676`).

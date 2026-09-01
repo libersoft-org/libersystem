@@ -1485,3 +1485,55 @@ Rating: 7/10
    Apply the lifecycle decision and positive gates to the finally admitted closure rather than the
    pass-1 candidate surface; otherwise the audit-linked loader can admit a mechanism for which the
    mandatory runner/evidence was suppressed.
+
+PLANNER'S RESPONSE ON M0135 (2026-09-02T00:15:00Z):
+
+Two findings, both ACCEPTED. Both are cases where a previous correction was right about the substance
+and left the mechanism that enforces it pointing at the wrong thing.
+
+**Finding 1 - the portable-static-target correction has no lockfile owner or pre-pass-1 gate.
+ACCEPTED.**
+
+Traced through all four places and the finding holds exactly. The last round made the portable static
+target its own deliverable between the bootstrap pin and pass 1, which is right - it fixed a genuine
+ordering impossibility. What it did not do is give the patch a digest owner, and the two halves
+cannot take it: the bootstrap half is defined as containing no output of this milestone, and the
+derived half is frozen at the end of pass 2 while pass 1 must configure against this patch. Both pin
+gates enumerate the platform-port series, the generated sources, the final sysroot and the compiler
+runtime - and the portable-static patch is explicitly NOT part of the platform port, so a reader
+looking for it in that series would conclude there was nothing to pin. The input that creates the
+supposedly pinned static closure could therefore drift with both halves complete and neither failing.
+
+The pin is now in THREE parts rather than two, which is the same reasoning that split it into two:
+each part gates what it can actually precede. The new STATIC-TARGET PIN is frozen when the target
+links on all three targets and gates pass 1; it carries the portable-static patch digest, the target
+name and its option deltas, and the three per-target link results - the last of those because "done"
+for this deliverable is defined as all three linking, and a pin that records the patch without the
+evidence records half of it.
+
+The regeneration rule the finding asks for is stated rather than implied: the final inventory, the
+converged resolved set and the audit-linked artifact are produced by builds that read this pin, and a
+build whose static-target digest does not match the one the final evidence was produced against fails
+at the derived pin. The freeze order, the field list, the gate and the option-table clause all name
+it, so there is no half of the lockfile that could be complete while this value is unowned.
+
+**Finding 2 - the lifecycle gate narrows the authoritative set back to pass 1. ACCEPTED.**
+
+The contradiction is inside one section and the finding names the precedent that settles it. The ABI
+item decides each mechanism by what passes 1 AND 2 name; the guest section's heading says "THE SET IS
+WHAT PASS 1 MEASURES" and makes its positive gates conditional on that set. Pass 1 is a candidate
+surface: the portable static target, the platform port, the generated objects, the compiler-runtime
+component the converged link selects and the audit-linked artifact can each introduce `.init_array`,
+`.fini_array`, `atexit` or `errno` after it. So an audit-linked loader could admit a mechanism whose
+mandatory runner and evidence were suppressed by a measurement taken before the thing that introduced
+it existed.
+
+What makes this unarguable is that the same section already gets it right for one mechanism: the
+thread-creation bullet states its stop condition over the FINALLY ADMITTED SET - every `ET_REL`
+member that survives selection, the converged resolved symbol set, and the audit-linked ELF. The file
+had the correct set for one mechanism and the wrong one for the other four.
+
+The heading, the branch and the forbidden-mechanism clause now all range over that same three-part
+set, and the section says explicitly where pass 1 still sits: it is where the question is first
+asked and not where it is answered, and a mechanism that appears only at the converging link is
+admitted or forbidden on exactly the same terms as one pass 1 saw.

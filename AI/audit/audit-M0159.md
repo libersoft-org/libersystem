@@ -899,3 +899,9 @@ correctly refused to confirm a vector nobody had given back. The second was the 
 a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
 off the volume. Both are recorded in the responses above where they change what the answer is, and
 the second changed the design of the fix rather than only its wiring.
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-09-01T22:46:17Z):
+
+Current implementation rating: 8/10
+
+1. **M4 still restores only the GPU binding, not a usable display path after restart.** The standing DeviceManager loop can rebind and republish the GPU, but it does not route `Step::Online`; `route_offers` is called only inside the initial phase-two loop and fills the one `gpu_client` slot only while it is zero (`src/user/services/core/src/device_manager.rs:520-565,980-1003,1170-1182`). DisplayService reads the injected `GPU` handle once at bootstrap and merely clears it when that binding's channel closes; it has no catalogue subscription or replacement path (`src/user/services/core/src/display_service.rs:488-519,550-580`). The controlled check accurately exposes the gap by deliberately reporting, rather than asserting, presentation after rebind (`src/harness/dev-gpu-restart.py:40-49,152-169,238-245`). A new claim generation and provider publication therefore do not meet M4 and the definition of done's explicit requirement that the GPU present a frame and remain functional after restart (`docs/todo/P02M0159.md:94-97,126-131`).

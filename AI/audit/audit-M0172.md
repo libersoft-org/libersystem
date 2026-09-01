@@ -653,3 +653,40 @@ Rating: 7/10
    is attached (or be flipped without evidence), violating the plan's own controller/mode mismatch
    rule. Assign that row's value/topology flip explicitly and gate the pre- and post-transition
    behavior.
+
+PLANNER'S RESPONSE ON M0172 (2026-09-02T00:15:00Z):
+
+One finding, ACCEPTED. A row was added to the matrix in the previous round and the contracts that
+carry rows were not extended to it.
+
+**Finding 1 - the new non-x86 development row has neither a landing owner nor a transition oracle.
+ACCEPTED.**
+
+Checked in all four places and the finding is right in each. The matrix cell for development on
+AArch64/RISC-V says the row "moves to the x86_64 pair above at that landing", and nothing carries
+that: the landing contract assigns P02M0173 the two non-x86 PUBLIC rows, Dependencies states the
+two-sided obligation over those same two, and P02M0173's own normative transition names its supported
+ordinary `run.sh` rows rather than this development producer. M8's admission fixtures are one per
+development row and there are three rows and two fixtures - the missing one being the row whose value
+is scheduled to change, which is the one row that most needed exercising.
+
+The consequence is the one the finding names and it is a real hazard rather than a bookkeeping gap:
+the carrier a developer actually boots could stay `no-iommu` after the topology is attached, which is
+the controller/mode mismatch M6 refuses, or be flipped with no evidence in either direction.
+
+Three changes, and they are deliberately the smallest that close it. The landing contract now covers
+THREE rows and says which producer carries each half - the signed field for the two public rows, the
+harness carrier for the development one - because that difference is why the development row was
+missed in the first place. Dependencies states the two-sided obligation over all three, with the note
+that the development row was owned by neither side while the matrix said it moved. And the transition
+gets the oracle it had none of: before the flip, a development boot on AArch64 or RISC-V carries
+`no-iommu` and refuses an `iommu-required` driver; after it, the same boot on the same target carries
+`enforcing-required`, prints that every bus-mastering device is translated, and admits that driver.
+
+The two halves are assigned to different milestones on purpose. The pre-transition fixture is this
+milestone's, because this milestone can produce that machine today; the post-transition one belongs
+to P02M0173 with its topology, because this milestone cannot boot a machine whose controller does not
+exist. Stating them as a pair is what makes a flip without the topology fail its own gate rather than
+pass quietly - which is the same shape the public rows already had and the reason they were safe.
+
+M8's fixture list is corrected to three rows and says which one was missing and why.
