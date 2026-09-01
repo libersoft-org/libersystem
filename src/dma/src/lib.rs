@@ -806,6 +806,42 @@ impl FaultLog {
 	}
 }
 
+// A BINDING THAT IS GONE AND WHOSE FAULTS MAY NOT BE.
+//
+// The controller queues fault records and the kernel reads them in bounded batches, so an endpoint
+// that faulted hard enough to fill the queue leaves a TAIL behind when its binding ends. Nothing in
+// the record says which binding raised it: the backend resolves an event's domain from the endpoint's
+// attachment AT DRAIN TIME, and the generic layer stamps that domain's generation. So a tail read
+// after the endpoint was rebound came back wearing the REPLACEMENT's domain and generation - it
+// passed the cross-generation check that exists to stop exactly this, and the containment took the
+// replacement's bus mastering away for a fault it never raised.
+//
+// This is the missing half of the identity: what the kernel knew when the binding ended, kept until
+// the queue has been observed empty and the tail is provably gone.
+struct DetachedTail {
+	endpoint: EndpointId,
+	domain: DomainId,
+	generation: Generation,
+	// What this binding has been charged with SINCE its domain stopped existing. `DomainState` holds
+	// the count while the domain is alive and is destroyed with it; M4 asks for a per-binding fault
+	// counter, and a counter that disappears when the binding does cannot answer for the teardown
+	// that is the interesting case. See `Iommu::faults_in`.
+	faults: u64,
+	// Whether the controller's queue has been seen EMPTY since this binding was revoked.
+	//
+	// Until it has, a record naming this endpoint may be one of this binding's, and the safe reading
+	// is that it is: charging the replacement is the error that disables a healthy device, and
+	// charging the old binding costs at most a delayed containment that the next drain performs.
+	// Once the queue runs dry, everything queued before now has been read - so the tail is over and
+	// the record stops attributing, while its count stays for the accounting.
+	drained: bool,
+}
+
+// HOW MANY ENDED BINDINGS KEEP A TAIL RECORD. Bounded because this is fixed bookkeeping in a kernel:
+// a machine that restarts one driver in a loop must not grow a list per restart. The oldest DRAINED
+// record goes first - it no longer attributes anything - and only then the oldest of the rest.
+const MOST_DETACHED_TAILS: usize = 8;
+
 // The kernel's side of the contract: it owns the addresses, the ordering and the ledger, and it
 // reaches the hardware only through `Backend`.
 pub struct Iommu<B: Backend> {
@@ -814,11 +850,13 @@ pub struct Iommu<B: Backend> {
 	mappings: BTreeMap<MappingId, Mapping>,
 	next_mapping: u64,
 	faults: FaultLog,
+	// See `DetachedTail`. In revocation order, so the oldest is at the front.
+	detached: Vec<DetachedTail>,
 }
 
 impl<B: Backend> Iommu<B> {
 	pub fn new(backend: B, fault_capacity: usize) -> Self {
-		Self { backend, domains: BTreeMap::new(), mappings: BTreeMap::new(), next_mapping: 1, faults: FaultLog::new(fault_capacity) }
+		Self { backend, domains: BTreeMap::new(), mappings: BTreeMap::new(), next_mapping: 1, faults: FaultLog::new(fault_capacity), detached: Vec::new() }
 	}
 
 	pub fn backend(&self) -> &B {
@@ -1075,6 +1113,10 @@ impl<B: Backend> Iommu<B> {
 		// them out of a cache the kernel was never told was flushed.
 		let endpoint_gone = invalidated && detached;
 		let state = self.domains.get_mut(&domain).ok_or(Fault::UnknownEndpoint)?;
+		// WHAT THIS BINDING WAS, KEPT FOR THE FAULTS IT MAY STILL HAVE QUEUED - see `DetachedTail`.
+		// Taken here, while the domain still exists to be asked; the record itself is pushed below,
+		// once this borrow is over.
+		let ending = (endpoint, domain, state.generation);
 		state.endpoints.retain(|e| *e != endpoint);
 		if state.endpoints.is_empty() {
 			state.attached_confirmed = false;
@@ -1089,7 +1131,31 @@ impl<B: Backend> Iommu<B> {
 			let space = &mut self.domains.get_mut(&domain).expect("checked above").space;
 			let _ = if confirmed { space.release(iova) } else { space.quarantine(iova) };
 		}
+		self.remember_detached_tail(ending.0, ending.1, ending.2);
 		if every_one && endpoint_gone { Ok(Release::FramesReusable) } else { Ok(Release::Quarantined) }
+	}
+
+	// KEEP WHAT AN ENDING BINDING WAS, so a fault it queued cannot be charged to the next one.
+	//
+	// One record per endpoint: a second revocation of the same endpoint replaces the first, because
+	// an older tail cannot still be queued behind a newer one - the queue is FIFO, so the newer
+	// binding's tail is what a reader meets first and the older one has necessarily been read.
+	fn remember_detached_tail(&mut self, endpoint: EndpointId, domain: DomainId, generation: Generation) {
+		if let Some(existing) = self.detached.iter_mut().find(|tail| tail.endpoint == endpoint) {
+			existing.domain = domain;
+			existing.generation = generation;
+			existing.faults = 0;
+			existing.drained = false;
+			return;
+		}
+		while self.detached.len() >= MOST_DETACHED_TAILS {
+			// The oldest record that attributes nothing any more, and only then the oldest of all:
+			// dropping a record that is still attributing is what re-opens the defect, so it is the
+			// last thing this gives up.
+			let at = self.detached.iter().position(|tail| tail.drained).unwrap_or(0);
+			self.detached.remove(at);
+		}
+		self.detached.push(DetachedTail { endpoint, domain, generation, faults: 0, drained: false });
 	}
 
 	// REBIND. The binding's generation moves, so every mapping made under the old one is stale by
@@ -1162,6 +1228,20 @@ impl<B: Backend> Iommu<B> {
 	pub fn drain_faults_during(&mut self, out: &mut [FaultEvent], teardown: Option<(EndpointId, DomainId, Generation)>) -> usize {
 		let taken = self.backend.drain_faults(out);
 		for event in out.iter_mut().take(taken) {
+			// A TAIL FROM A BINDING THAT HAS ALREADY ENDED IS THAT BINDING'S, whatever is attached to
+			// the endpoint now - see `DetachedTail`. This is checked FIRST because everything below
+			// it reconstructs the attribution from the CURRENT state, which is the thing that was
+			// wrong: a record queued by an old binding and read after the endpoint was rebound came
+			// out carrying the replacement's domain and generation, satisfied the cross-generation
+			// check, and had the replacement's bus mastering taken away for it.
+			if let Some(tail) = self.detached.iter_mut().find(|tail| !tail.drained && tail.endpoint == event.endpoint) {
+				event.domain = tail.domain;
+				event.generation = tail.generation;
+				// CHARGED TO THE BINDING THAT RAISED IT, and to a counter that outlives its domain.
+				tail.faults = tail.faults.saturating_add(1);
+				self.faults.record(*event);
+				continue;
+			}
 			if let Some(state) = self.domains.get(&event.domain) {
 				event.generation = state.generation;
 			}
@@ -1181,12 +1261,37 @@ impl<B: Backend> Iommu<B> {
 			}
 			self.faults.record(*event);
 		}
+		// THE TAIL IS OVER WHEN THE QUEUE RUNS DRY, and that is the only proof available.
+		//
+		// `drain_faults` fills the buffer while the transport has records; taking fewer than the
+		// buffer holds means it answered empty, so everything queued before this call has now been
+		// read and no record still in flight can belong to a binding that ended before it. The
+		// records stay - their counts are the per-binding accounting - but they stop attributing, so
+		// a replacement that genuinely faults is charged to itself from here on.
+		if taken < out.len() {
+			for tail in self.detached.iter_mut() {
+				tail.drained = true;
+			}
+		}
 		taken
 	}
 
+	// HOW MANY ENDED BINDINGS ARE STILL HOLDING A TAIL RECORD. See `DetachedTail` - the bound is the
+	// property, so a test can assert it rather than reading the constant back.
+	pub fn detached_tails(&self) -> usize {
+		self.detached.len()
+	}
+
 	// How many faults this domain has been charged with. See `drain_faults_during`.
+	//
+	// INCLUDING WHAT ITS TAIL WAS CHARGED WITH AFTER IT WAS DESTROYED. `DomainState` dies with the
+	// domain, and a per-binding fault counter that resets when the binding ends cannot answer the one
+	// question it exists for - what a teardown's flood cost, and whether a restart came back to its
+	// baseline. See `DetachedTail`.
 	pub fn faults_in(&self, domain: DomainId) -> u64 {
-		self.domains.get(&domain).map_or(0, |state| state.faults)
+		let live: u64 = self.domains.get(&domain).map_or(0, |state| state.faults);
+		let tail: u64 = self.detached.iter().filter(|entry| entry.domain == domain).map(|entry| entry.faults).sum();
+		live.saturating_add(tail)
 	}
 
 	// How many endpoints this controller is translating for. Part of the baseline a restart is

@@ -549,8 +549,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
 					}
 					Step::NextCandidate if recovery.armed() => {
-						nodes[at].candidate += 1;
-						nodes[at].attempt = 0;
+						spend_candidate(&mut nodes[at]);
 						// AN OPERATOR'S ONE ATTEMPT IS SPENT HERE - see `Node::retry_once`. The
 						// cursor still advances, so a later request tries the entry after this one
 						// rather than the same one again; what does not happen is this program
@@ -818,6 +817,24 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 		while pump(nodes, first_node, catalogue, buf) {
 			// WHAT ARRIVED AND WHAT WENT AWAY, once per pass - see `settle_dependencies`.
 			settle_dependencies(nodes, catalogue);
+			// AND A NODE PARKED ON SOMEBODY ELSE'S RELEASE LOOKS AT THE CLAIM AGAIN.
+			//
+			// This is the re-read `BindStart::WaitingForTheClaim` promises, and nothing performed it
+			// on this phase: the node has no binding and no teardown, so it produces no event and no
+			// `Step`, and the only retry arm below consumes a `Step::Again` a passive node cannot
+			// answer with. A boot device briefly held by somebody else's teardown was therefore
+			// kept, waited for, and never bound. Bounded by the kernel's latched release deadline -
+			// `observe_claim` answers `Terminal` once it passes, which ends the node rather than
+			// parking it again.
+			for at in first_node..nodes.len() {
+				if !nodes[at].waiting_for_claim || clock() < nodes[at].retry_at {
+					continue;
+				}
+				let Some(entry) = nodes[at].candidates.get(nodes[at].candidate).copied() else { continue };
+				let Some(elf) = package.lookup(entry.artifact) else { continue };
+				let info = nodes[at].info;
+				begin_bind(&mut nodes[at], &info, elf, entry.name, 0, power, console_input, device_privilege);
+			}
 			for at in first_node..nodes.len() {
 				let name: &[u8] = nodes[at].driver_name();
 				match advance(&mut nodes[at], name, catalogue) {
@@ -841,7 +858,10 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 						let info = nodes[at].info;
 						begin_bind(&mut nodes[at], &info, elf, entry.name, 0, power, console_input, device_privilege);
 					}
-					Step::NextCandidate | Step::Done => {}
+					// RESTING IS NOT A VERDICT THIS PHASE ACTS ON either: a boot driver an operator
+					// disabled, or one parked on a provider that went away, keeps its cursor and is
+					// revived by whatever asked for the stop. See `Step::Resting`.
+					Step::NextCandidate | Step::Done | Step::Resting => {}
 				}
 			}
 		}
@@ -963,6 +983,12 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 					nodes[at].restart_requested = false;
 					start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 				}
+				// AND THE OTHER REASON A NODE IS WAITING TO BE LOOKED AT AGAIN - see
+				// `Node::waiting_for_claim`. The same re-read phase one performs, reached through
+				// the ordinary candidate path because this phase has the volume to read from.
+				if nodes[at].waiting_for_claim && clock() >= nodes[at].retry_at {
+					start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
+				}
 			}
 			for at in first_node..nodes.len() {
 				let name: &[u8] = nodes[at].driver_name();
@@ -990,8 +1016,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 						print(b"DeviceManager: ");
 						print(name);
 						print(b" did not bind; its resources are released and the next candidate follows\n");
-						nodes[at].candidate += 1;
-						nodes[at].attempt = 0;
+						spend_candidate(&mut nodes[at]);
 						// THE SAME RULE IN THE OTHER HANDLER - see `Node::retry_once`. Both advance
 						// the cursor and both start the next entry, so a one-shot honoured in only
 						// one of them is a one-shot that depends on which loop the node was in.
@@ -1001,7 +1026,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 							start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 						}
 					}
-					Step::Done => {}
+					Step::Done | Step::Resting => {}
 				}
 			}
 		}
@@ -1487,6 +1512,15 @@ struct Node {
 	// Two facts, so two fields. Nothing reads this when there is no binding; `entry()` is where the
 	// choice between them is made once.
 	running: Option<usize>,
+	// WHICH ENTRY THE BINDING THAT JUST ENDED WAS, latched when the binding is taken out of the node.
+	//
+	// `running` is cleared the moment the rollback starts, and the verdict that spends a candidate
+	// arrives later - after the child's exit and the claim have both confirmed. So the advance had
+	// only the cursor to work from, and the cursor is not a description of what ran: `select` moves
+	// it to the entry the NEXT bind must start from, and can be asked while a different entry is
+	// online. Advancing from there stepped over the operator's choice before anything had tried it.
+	// See `spend_candidate`.
+	spent: Option<usize>,
 	// THE OPERATOR'S CHOICE, IF THERE IS ONE - an index into `candidates`.
 	//
 	// The cursor above is where the next bind STARTS; this is where it starts BY PREFERENCE. They are
@@ -1533,6 +1567,16 @@ struct Node {
 	// THE TICK THIS NODE MAY TRY AGAIN AT, 0 for "now". Set by `back_off_until` instead of sleeping,
 	// so one node's delay is not every node's - see the comment there.
 	retry_at: u64,
+	// THIS NODE IS PARKED ON SOMEBODY ELSE'S RELEASE, and `retry_at` is when to look again.
+	//
+	// Different from every other reason a node sits in `Backoff`, and the difference is who ends it.
+	// An ordinary backoff ends with an attempt this node makes; this one ends when the device's
+	// claim reaches `Free` - or when the kernel's own latched release deadline passes and
+	// `observe_claim` answers `Terminal` instead, which is what bounds the wait. Nothing else marks
+	// it, so the bring-up loops had no way to tell a node that is waiting for a claim from one that
+	// has nothing left to do, and `pump` reported "no work in flight" and returned for the last time
+	// with the node still parked. See `BindStart::WaitingForTheClaim`.
+	waiting_for_claim: bool,
 	// A TEARDOWN WAITING FOR ITS CONFIRMATIONS. See `Teardown`.
 	teardown: Option<Teardown>,
 	// AN OPERATOR DISABLED THIS DEVICE, AND THAT IS A DESIRE RATHER THAN A STATE.
@@ -1616,7 +1660,7 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, running: None, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, incident_report: None, incident_stored: false, teardown: None, disabled_by_policy: false }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, running: None, spent: None, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, disabled_by_policy: false }
 	}
 
 	// Queue one event for this node.
@@ -2587,8 +2631,29 @@ unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, catalogue: &mut Catalo
 				soonest = deadline;
 			}
 		}
+		// A NODE PARKED ON SOMEBODY ELSE'S RELEASE IS WORK IN FLIGHT WITH NO HANDLE TO WAIT ON.
+		//
+		// `in_flight` is a question about HANDLES - a binding being brought up, or a teardown whose
+		// confirmations have not arrived - and a node waiting for a device's claim to reach `Free`
+		// has neither. So it contributed nothing to the set below, `set == 0` read as "nothing left
+		// to do", and the loop returned for the last time with the node still parked: the re-read
+		// `BindStart::WaitingForTheClaim` promises was never performed by anything. The wait such a
+		// node needs is a DEADLINE rather than a handle, so it is one here.
+		let parked: Option<u64> = nodes.iter().skip(in_flight_from).filter(|node| node.waiting_for_claim).map(|node| node.retry_at).min();
+		if let Some(due) = parked
+			&& (soonest == 0 || due < soonest)
+		{
+			soonest = due;
+		}
 		if set == 0 {
-			return false;
+			// Nothing to wake ON, so the deadline IS the wait. Bounded by the kernel's own latched
+			// release deadline rather than by anything here: once it passes, `observe_claim` answers
+			// `Terminal` and the next attempt ends the node instead of parking it again.
+			let Some(due) = parked else { return false };
+			if due > clock() {
+				sleep_until(due);
+			}
+			return true;
 		}
 		let ready: i64 = wait_any(&handles[..set], soonest);
 		if ready < 0 {
@@ -2968,6 +3033,28 @@ unsafe fn may_try_again(incident: &Incident, attempt: u32) -> bool {
 // records when it may try again and the loop's own wait is bounded by the soonest of them.
 // A BRING-UP LOOP HAS NOTHING ELSE TO DO, so it waits the node's backoff out where the standing loop
 // skips and comes back. Both honour the same deadline; they differ in what else they could be doing.
+// SPEND THE CANDIDATE THAT ENDED, which is not always the one the cursor is on.
+//
+// Both `Step::NextCandidate` handlers used to do `candidate += 1` directly, and that is only right
+// while the cursor still describes what ran. It does not after a `select`: that verb moves the cursor
+// to the entry the NEXT bind must start from, and an operator may ask for it while a DIFFERENT entry
+// is online. When that online entry then failed, the advance stepped past the selection and started
+// the entry after it - so the one verb whose whole contract is "this applies at the next bind" was
+// skipped by the next bind.
+//
+// The entry that ended is `Node::spent`, latched when the binding was taken out of the node; the
+// cursor is the answer only when nothing was running, which is the pre-claim failures
+// `start_candidate` advances for itself.
+fn spend_candidate(node: &mut Node) {
+	let ran: usize = node.spent.take().unwrap_or(node.candidate);
+	// A cursor already PAST what ran is a cursor somebody moved on purpose, and it stays where it
+	// was put. Anything at or before it advances, which is what "this entry is spent" means.
+	if node.candidate <= ran {
+		node.candidate = ran + 1;
+	}
+	node.attempt = 0;
+}
+
 unsafe fn wait_out_backoff(node: &Node) {
 	unsafe {
 		if node.retry_at > clock() {
@@ -3086,8 +3173,12 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// so ending the node permanently on the first transient shortage was the table's
 		// `Stopping -> Backoff` edge being unreachable from the one place that needed it.
 		let attempts_left: bool = may_try_again(&node.incident, node.attempt);
-		// The backoff this attempt was waiting out is spent; nothing should wake for it again.
+		// The backoff this attempt was waiting out is spent; nothing should wake for it again - and
+		// this attempt IS the re-read a parked node was waiting to make, so the park is over
+		// whatever this attempt turns out to be. The arm below sets it again if the claim is still
+		// being released.
 		node.retry_at = 0;
+		node.waiting_for_claim = false;
 		let mut txn = Attempt::new();
 		if !node.record.move_to(BindingState::Binding, None) {
 			print(b"DeviceManager: refusing an illegal transition into binding for ");
@@ -3124,6 +3215,14 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 				// the standing loop's wait is bounded by.
 				node.record.move_to(BindingState::Backoff, None);
 				node.retry_at = clock().saturating_add(BACKOFF_TICKS[0]);
+				// AND THE NODE IS MARKED AS PARKED ON THAT RELEASE, which is the half that was
+				// missing (2026-09-01). `retry_at` alone said WHEN to look again and nothing said
+				// that anything should: the node has no binding and no teardown, so `Node::in_flight`
+				// excludes it, `pump` found an empty wait set and answered "nothing in flight", and
+				// the bring-up loop returned with the re-read never performed. On a boot-critical
+				// device that is a manager reporting itself online with a zero system-block handle.
+				// See `Node::waiting_for_claim`.
+				node.waiting_for_claim = true;
 				return BindStart::WaitingForTheClaim;
 			}
 			ClaimReadiness::Terminal(cause) => return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, cause, driver_name, attempts_left)),
@@ -3288,6 +3387,15 @@ enum Step {
 	Again,
 	// Rolled back, and this candidate is spent. The next one, if there is one, follows.
 	NextCandidate,
+	// RESTING, WHICH IS NOT THE SAME AS SPENT. A teardown that was ASKED for landed where its intent
+	// says it lands - `Disabled` for an operator's stop, `DependencyPending` for a provider that went
+	// away - and neither of those is a candidate that failed. This exists because the two used to
+	// share `NextCandidate`, and the cursor advance that answer carries turned both landings into a
+	// spent entry: a one-candidate device disabled by an operator could never be enabled again, and a
+	// node parked on a lost dependency lost the entry `settle_dependencies` restarts it from. The
+	// node keeps its cursor and waits for whatever revives it - `PolicyVerb::Enable`, or the
+	// provider being published again.
+	Resting,
 	// Terminal: `Failed` or `Quarantined`. Nothing further happens on this node this boot.
 	Done,
 }
@@ -3535,8 +3643,11 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			// handles it has already given back.
 			let Some(binding) = node.binding.take() else { return Step::Done };
 			// The binding is over, so there is no running candidate any more and the cursor is the
-			// only answer again. See `Node::running`.
-			node.running = None;
+			// only answer again. See `Node::running`. WHICH ENTRY IT WAS is kept, because the
+			// answer arrives later than this: the teardown resolves on its own confirmations, and
+			// `spend_candidate` needs to know what ended rather than where the cursor has since
+			// been moved to. See `Node::spent`.
+			node.spent = node.running.take();
 			let mut txn = binding.into_attempt();
 			// A PLANNED STOP IS NEVER RETRIED, whatever the cause reads as: the whole point of
 			// asking a driver to stop is that it stays stopped.
@@ -3576,6 +3687,12 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					Step::Again
 				}
 				BindingState::Quarantined => Step::Done,
+				// A TEARDOWN THAT WAS ASKED FOR DID NOT SPEND A CANDIDATE - see `Step::Resting`.
+				// These two landings are where a PLANNED stop ends, and the entry that ran is the
+				// entry the node comes back on: an enable rebinds it and a returning provider
+				// restarts it. Reading them as a failed candidate advanced the cursor past the only
+				// entry either revival could use.
+				BindingState::Disabled | BindingState::DependencyPending => Step::Resting,
 				// Everything else is this candidate finished. `Failed` ends the node; the phases
 				// read `NextCandidate` as "there may be another entry to try".
 				_ => Step::NextCandidate,
@@ -3781,13 +3898,31 @@ unsafe fn settle_dependencies(nodes: &mut [Node], catalogue: &mut Catalogue) -> 
 // is the rule M3 states without qualification and the operator's stop and the shutdown both keep:
 // while a driver drains, its providers stayed in the catalogue, so a consumer could open a fresh
 // connection to a driver that had already been told to finish.
+// WHICH NODES A WITHDRAWAL CAN STOP - the ones that are USING what went away.
+//
+// `Online` was the whole answer, and M6's table names two: a requirement withdrawn while a node is
+// still HANDSHAKING is the same loss, and the node holds the same claim. Left out, a provider that
+// went away during a bind ran to completion and the dependent came online against a requirement that
+// no longer held - and then stayed there, because nothing asks again after `Online` except this
+// function, which had already made its pass. `Binding -> Stopping` is an edge the table has for
+// exactly this, and the intent carries it on to `DependencyPending` when the teardown confirms.
+//
+// The table's other pre-claim edge, `Binding -> DependencyPending`, has no trigger here on purpose:
+// a node is only observable in `Binding` once `begin_bind` has taken the claim and installed the
+// binding - everything before that happens inside one synchronous call, and `gate_on_requirements`
+// is asked at the start of it. So the pre-claim withdrawal cannot be observed from outside, and a
+// branch for it would be a branch nothing can reach.
+fn stoppable_on_a_lost_dependency(node: &Node) -> bool {
+	matches!(node.record.state, BindingState::Online | BindingState::Binding) && node.binding.is_some()
+}
+
 unsafe fn stop_nodes_that_lost_a_dependency(nodes: &mut [Node], catalogue: &mut Catalogue) -> usize {
 	unsafe {
 		// AND THE ORDINARY PASS ALLOCATES NOTHING. This runs on every turn of the standing loop -
 		// every catalogue query, every teardown confirmation, every deadline - and on all but a
 		// handful of them no node has lost anything. The closure below needs two vectors; asking the
 		// cheap question first means they are allocated on the passes that are going to use them.
-		if !nodes.iter().any(|node| node.record.state == BindingState::Online && node.entry().is_some_and(|entry| !entry.requires.is_empty() && !requirements_met(entry, catalogue))) {
+		if !nodes.iter().any(|node| stoppable_on_a_lost_dependency(node) && node.entry().is_some_and(|entry| !entry.requires.is_empty() && !requirements_met(entry, catalogue))) {
 			return 0;
 		}
 		// THE CLOSURE. A node is doomed when a kind it requires is provided by nothing that is
@@ -3799,7 +3934,7 @@ unsafe fn stop_nodes_that_lost_a_dependency(nodes: &mut [Node], catalogue: &mut 
 		for _ in 0..nodes.len() {
 			let mut grew = false;
 			for at in 0..nodes.len() {
-				if doomed[at] || nodes[at].record.state != BindingState::Online {
+				if doomed[at] || !stoppable_on_a_lost_dependency(&nodes[at]) {
 					continue;
 				}
 				let Some(entry) = nodes[at].entry() else { continue };
@@ -3939,6 +4074,15 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				if node.record.move_to(BindingState::Unbound, None) {
 					node.attempt = 0;
 					node.incident = Incident::open();
+					// AND THE CURSOR IS REWOUND WHEN THERE IS NOTHING LEFT TO TRY, exactly as
+					// `PolicyVerb::Retry` does it and for the same reason: `start_candidate` returns
+					// immediately at an exhausted cursor, so an enable that only lifted the desire
+					// and asked for a restart would report `Accepted` and start nothing. To the
+					// operator's own preference where there is one - a stored `select` is a choice
+					// about which driver, and it outlives the disable that came after it.
+					if node.candidate >= node.candidates.len() {
+						node.candidate = node.preferred.unwrap_or(0);
+					}
 					node.restart_requested = true;
 				} else {
 					print(b"DeviceManager: the stored disable is lifted; this device is not stopped, so nothing is restarted\n");

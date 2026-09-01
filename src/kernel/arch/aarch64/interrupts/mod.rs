@@ -146,6 +146,17 @@ fn spi_slot(intid: u32) -> Option<usize> {
 	if intid >= base && ((intid - base) as usize) < len { Some((intid - base) as usize) } else { None }
 }
 
+// WHETHER AN ACKNOWLEDGED INTID IS AN LPI THIS CONTROLLER'S ITS TRANSLATED.
+//
+// Asked by the exception path in `gic.rs` and by nothing else, because that is the only caller whose
+// INTID came out of the hardware. An LPI exists only where an ITS does: an ITS translates a device's
+// write to the translater register into an LPI and delivers it, so an intid at or above `LPI_BASE`
+// on a machine using the ITS is a message a DEVICE sent - which is the one thing this kernel's own
+// MSI oracles cannot produce, since they call `dispatch_msi` directly with a number they chose.
+pub fn is_device_lpi(intid: u32) -> bool {
+	USING_ITS.load(Ordering::Relaxed) && intid >= super::its::LPI_BASE && spi_slot(intid).is_some()
+}
+
 // The vector INTID a slot names, which is an SPI on a v2m machine and an LPI on an ITS one.
 fn slot_vector(slot: usize) -> u32 {
 	let base = if USING_ITS.load(Ordering::Relaxed) { super::its::LPI_BASE } else { BASE_SPI.load(Ordering::Relaxed) };

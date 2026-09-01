@@ -1458,3 +1458,30 @@ search, its environment overrides and every `dlopen` are REMOVED by the port rat
 unreachable, since a path nothing calls is still a path the closure admits and the inventory must
 explain. Gated on all three, including that the resolved symbol set contains no dynamic-loading or
 environment entry point. Actually supporting layers stays a separate authorised item.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-09-01T17:57:32Z):
+
+Rating: 7/10
+
+1. **The portable-static-target correction still has no lockfile owner or pre-pass-1 gate.** The
+   latest response calls it its own deliverable immediately after the bootstrap pin. In the current
+   plan it remains nested inside the pinned-configuration option prose, is explicitly *not* part of
+   the later platform port, and is described as a derived patch
+   (`docs/todo/P02M0135.md:198-210`). The bootstrap half cannot carry it because it is milestone
+   output, while the derived half and both pin gates enumerate only the **platform-port** patch series,
+   generated sources, final sysroot and compiler runtime (`:146-165,242-244,701-714`). Pass 1 is
+   nevertheless required to configure against this unowned patch. Thus the input that creates the
+   supposedly pinned static closure can drift without either lockfile half being incomplete, contrary
+   to the plan's rule that every pinned value comes from the half that owns it. Give this separate
+   early deliverable an explicit digest owner and gate, and ensure the final recorded evidence is
+   regenerated against that frozen patch.
+
+2. **The lifecycle gate still narrows the authoritative set back to pass 1.** The ABI item correctly
+   says lifecycle mechanisms are decided by what passes 1 **and 2** name, but the controlling guest
+   section says “THE SET IS WHAT PASS 1 MEASURES” and makes its positive gates conditional on that set
+   (`docs/todo/P02M0135.md:753-781`). The portable-static patch, platform port, generated objects,
+   compiler-runtime selection and converged audit link can all introduce `.init_array`, `.fini_array`,
+   `atexit` or `errno` after pass 1, just as the plan already recognised for thread-creation symbols.
+   Apply the lifecycle decision and positive gates to the finally admitted closure rather than the
+   pass-1 candidate surface; otherwise the audit-linked loader can admit a mechanism for which the
+   mandatory runner/evidence was suppressed.

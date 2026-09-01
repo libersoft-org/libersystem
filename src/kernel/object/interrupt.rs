@@ -98,8 +98,23 @@ impl Interrupt {
 	//
 	// `swap`, so the disarm happens exactly once and a caller cannot disarm a slot twice. Call it
 	// BEFORE making the slot reusable: the order is what closes the window rather than narrowing it.
-	pub fn disown(&self) {
-		self.bound.store(false, Ordering::Release);
+	//
+	// AND IT ANSWERS WHETHER THERE WAS ANYTHING TO DISARM, which is what a rollback has to know
+	// (2026-09-01). The comment above already said `swap`; the code was a `store`, so the previous
+	// value - the one fact that says whether this object still owned the binding - was thrown away,
+	// and every caller went on to free the slot unconditionally. That is the same cross-generation
+	// teardown this method exists to prevent, reached from the other side: a forced release
+	// `revoke`s the interrupt (which swaps `bound` to false and unbinds), publishes the claim
+	// `Free`, and `release_msi_for_device` returns the slot to circulation; a replacement claim
+	// takes it, binds its own interrupt and programs the entry; and only then does the old syscall
+	// resume, disarm nothing, and free a slot that has belonged to somebody else since.
+	//
+	// So the answer is the caller's authority to free: true means this object still held the
+	// binding and nothing else can have taken the slot, false means the release already took it and
+	// there is nothing here to give back.
+	#[must_use]
+	pub fn disown(&self) -> bool {
+		self.bound.swap(false, Ordering::AcqRel)
 	}
 
 	// TAKE THE VECTOR AWAY NOW, rather than when the last reference happens to go.

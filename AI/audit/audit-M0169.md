@@ -686,3 +686,9 @@ or after release, all three additionally require the retained task and group han
 confirm termination - which is the started-process recovery already written below. The fault matrix
 carries `PeerClosed` in both rows, because one ending means two different things depending on where
 it lands.
+
+AUDITOR'S RE-AUDIT OF PLAN M0169 (2026-09-01T17:57:32Z):
+
+Rating: 9/10
+
+No material unresolved issue was found in the updated plan.

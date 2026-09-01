@@ -1257,3 +1257,44 @@ previous generation stays current and stays served, the failure is reported with
 ceiling, and the generation does not advance - so a client's view is never partial and a bad drop into
 the directory cannot take fonts away from a running system. Gated with the one-past cases at runtime,
 not only at build.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-09-01T17:57:32Z):
+
+Rating: 5/10
+
+1. **The metadata-sidecar response moves the parser cycle into an unspecified host tool rather than
+   resolving it.** The catalogue must complete before anything else starts, yet its sidecars contain
+   family, style, axes, collection face index and format—facts obtained by parsing OpenType/TTC bytes
+   (`docs/todo/P02M0136.md:99-105,298-315`). The plan merely says a staging tool produces them “where
+   a parser is allowed.” It later makes the closed profile a start gate and says **no parser** is
+   written before that profile is frozen (`:419-429,490-508`), and assigns all parsing to the later
+   in-process parser. No sidecar producer, parser/version, accepted metadata-table profile, provenance,
+   hostile-input limits or truth oracle is named; digest equality proves only that a record names the
+   adjacent bytes, not that its metadata was decoded correctly. The original unprofiled duplicate
+   parser is therefore still required before the item that is supposed to authorize parsing. Own and
+   freeze the bounded sidecar-production contract before staging, or reorder it behind the same closed
+   profile/parser instead of exempting an unnamed host parser.
+
+2. **The requester “sponsor handle” is not a realizable capability in the current system and the plan
+   does not define the new mechanism.** `SYS_MEMORY_OBJECT_CREATE` accepts only a size and always
+   charges `current_thread().domain()` (`src/kernel/syscall/mod.rs:585-595`; the userspace wrapper is
+   `src/user/runtime/rt/src/lib.rs:2167-2172`). A Domain handle can currently be used for management,
+   statistics and process placement, but there is no allocate-a-MemoryObject-in-this-Domain operation;
+   an ordinary application is also not handed a handle naming its own Domain. The plan nevertheless
+   says RESOLVE receives unspecified “memory authority” and that the catalogue creates backing against
+   the Domain it names, without defining the sponsor's object type, mint/delivery path, required and
+   attenuated rights, allocation syscall/service operation, or lifetime (`docs/todo/P02M0136.md:275-294`).
+   The retained-face accounting gates therefore cannot be implemented as written. This correction must
+   either own that concrete allocation capability end to end or use caller-created backing that the
+   existing caller-charged syscall can actually produce.
+
+3. **The recovery RESCAN can permanently lock itself out after the failure it is meant to repair.**
+   The admin operation is limited to one request per *published generation*
+   (`docs/todo/P02M0136.md:271-274`), while an invalid or over-ceiling scan deliberately publishes
+   nothing and leaves that generation unchanged (`:355-364`). If the directory watch was dropped or
+   missed—the reason an explicit recovery operation survives—the first recovery scan can observe the
+   bad state, consume the generation's sole attempt, and leave no way to scan again after an operator
+   corrects the files. The plan also does not identify the trusted holder/mint path for the admin
+   capability. Define a bounded retry/re-arm rule that distinguishes failed from successfully
+   published scans and name the recovery owner; “one per generation” is not recoverable with the
+   stated failure semantics.

@@ -825,3 +825,28 @@ two implementations cannot disagree about it.
 M8 gains the two cases: an unreachable high-preference router against a reachable low-preference one,
 where the reachable one must come first; and two routers equal in both keys, where the address
 decides and decides the same way twice.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-09-01T17:59:17Z):
+
+Rating: 5/10
+
+1. **The accepted PTB/live-flow ownership correction was still added beside the contract it was
+   meant to replace.** M6 continues to require L3 to prove that the quoted packet was actually sent
+   while simultaneously forbidding L3 any transport state or registration table, and it still
+   updates PMTU before the event reaches the transport consumer
+   (`docs/todo/P02M0174.md:351-377`). The later seam instead makes the consumer validate the live
+   flow and only then call route-qualified `record path mtu` (`:412-424`). Those are incompatible
+   authentication and commit orders. Following the earlier clauses lets a well-formed forged PTB
+   change durable PMTU before the consumer rejects it, directly contradicting M8's no-live-flow
+   negative (`:379-384`). The stale validation and pre-delivery update clauses must be removed from
+   the normative contract.
+
+2. **The new RFC 8028 provenance is singular where the required relation is many-to-many.** M6 keeps
+   “which router” advertised the prefix from which a source was formed and retains one originating
+   router with that prefix (`docs/todo/P02M0174.md:389-406`). Multiple live routers may advertise the
+   same prefix; RFC 8028 sections 3.1-3.3 requires the host to remember the advertising next hops and,
+   when several advertise that prefix, select among that set using the RFC 4191 criteria. A single
+   origin can be overwritten by RA arrival order or expire while another valid advertiser remains,
+   so M0175's adopted selection can miss a reachable correct upstream. The owned prefix state and
+   candidate seam need the bounded set of live advertising routers with independent lifetimes, plus
+   a same-prefix/multiple-router fixture.

@@ -637,3 +637,19 @@ a controller - stated as a transition owned by that milestone rather than by thi
 flag-scope sentence now includes x86_64 development and says the flag chooses nothing on a machine
 with no controller. The producer paragraphs are split to match, with the translated development row
 written out and its reason recorded.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-09-01T17:59:17Z):
+
+Rating: 7/10
+
+1. **The new non-x86 development row has neither the promised landing owner nor a transition
+   oracle.** The matrix says AArch64/RISC-V development remains degraded until P02M0173 and then
+   moves to the enforcing development rows (`docs/todo/P02M0172.md:104-116,340-347`). The actual
+   landing contract and Dependencies assign P02M0173 only the two non-x86 **public** rows
+   (`:138-168,506-512`), while P02M0173's normative transition likewise names its supported ordinary
+   direct/UEFI `run.sh` rows, not this development producer. M3 then claims an admission fixture for
+   each development row but lists only x86_64 default and `--no-iommu` (`:359-363`); the third row is
+   not exercised. Consequently the development carrier can remain `no-iommu` after the new topology
+   is attached (or be flipped without evidence), violating the plan's own controller/mode mismatch
+   rule. Assign that row's value/topology flip explicitly and gate the pre- and post-transition
+   behavior.

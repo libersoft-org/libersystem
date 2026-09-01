@@ -782,7 +782,11 @@ fn virtio_snd_driver_captures_a_period_from_the_device() {
 	// that follow, each saying which kind it is.
 	send_bind(&kernel_ep, &info, key.generation, 2).expect("the BIND should send");
 	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
-	send_resource(&kernel_ep, driver_protocol::ResourceKind::Irq, key.generation, interrupt, Rights::ALL).expect("the IRQ resource should send");
+	// CLONED, so this harness keeps a reference of its own. It is the one that gives the vector back
+	// at the end - see the teardown below - and a test that handed away its only `Arc` could not.
+	// The kernel's own acquire path does the same: the syscall keeps one while the handle table gets
+	// another.
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Irq, key.generation, interrupt.clone(), Rights::ALL).expect("the IRQ resource should send");
 	sched::run_until_idle();
 
 	// THE TYPED FRAME, NOT THE HUMAN LINE. This asserted on the exact text of the driver's report -
@@ -810,6 +814,30 @@ fn virtio_snd_driver_captures_a_period_from_the_device() {
 	service.send(object::channel::Message::new(alloc::vec![2u8], alloc::vec::Vec::new())).expect("the capture stop should send");
 	sched::run_until_idle();
 	assert_eq!(wait_for_message(&service, 2_000).expect("the driver should acknowledge the stop"), b"OK", "the stop was not acknowledged");
+
+	// AND THE VECTOR IS GIVEN BACK, which this stopped short of (2026-09-01).
+	//
+	// It ended here, holding the claim and the MSI vector for the rest of the run - so the one test
+	// in this tree that drives a REAL device's MSI-X table proved delivery and never proved
+	// teardown, and P02M0151's checkpoint asks for both.
+	//
+	// THE REVOKE IS THIS HARNESS STANDING IN FOR `revoke_derived`, and it is here because of what
+	// this test is: it mints the `Interrupt` by hand, the way `sys_device_msix_acquire` does, and
+	// therefore never registers it in the claim's derived table. So the release cannot reach it -
+	// `settled_vectors` finds a slot that is bound and neither retired nor quarantined, answers that
+	// a teardown is still outstanding, and the claim publishes `Quarantined` rather than `Free`.
+	// Measured, not assumed: without this line the release answers `Ok(Quarantined)` and says on the
+	// console that the vector stays masked and held. That refusal is the kernel being right about a
+	// vector nobody gave back; the driver-shaped thing to do is give it back, which is what `revoke`
+	// is - the same call `revoke_derived` makes for a registered row, and on an ITS machine it is
+	// the discard of the event mapping.
+	assert!(interrupt.revoke(), "the architecture did not confirm the vector's teardown");
+	assert!(!arch::interrupts::is_bound(vector), "the revoked vector is still bound to this test's Interrupt");
+	// AND THEN THE CLAIM, released the production way with the driver still running: bus mastering
+	// off, everything derived revoked, the vectors settled, and only then the slot back into
+	// circulation.
+	assert_eq!(device::release_claim(key), Ok(device::ClaimState::Free), "the sound device's claim did not confirm its teardown");
+	crate::serial_println!("virtio-snd: the device's MSI vector was delivered on and then torn down with its claim");
 }
 
 // Receive one message from a channel, pumping the scheduler until it arrives or a WALL-CLOCK

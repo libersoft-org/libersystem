@@ -1078,3 +1078,27 @@ correlated against; TCP still connecting fails the same way; TCP established CLO
 what is acknowledged, and is not reselected because a connection is its tuple and a new source is a
 connection the peer knows nothing about; a listener stays, being bound to a port and a mode rather
 than to a route.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-09-01T17:59:17Z):
+
+Rating: 6/10
+
+1. **The new invalidation table collapses distinctions that M1's public contract explicitly adds.**
+   It silently reselects every not-yet-sent operation and keeps every listener
+   (`docs/todo/P02M0175.md:539-565`). M1, however, says an explicit caller-selected source must be
+   refused rather than silently replaced (`:219-227`), and supports specific-address listeners as
+   well as wildcards (`:203-229`). If that explicit source is invalidated before send, silent
+   reselection violates the caller's authority; if a specifically bound local address is invalidated,
+   the listener cannot remain published on an address the interface no longer owns. Split the table:
+   automatically selected unsent work may reselect, explicit-source work must fail, wildcard
+   listeners may stay, and specific-address listeners need a defined withdrawal/error transition.
+
+2. **The adopted RFC 8028 selection still consumes one origin for a relation that can contain several
+   routers.** M5 prefers “the” router which advertised the chosen source prefix and says M0174 returns
+   one originating router (`docs/todo/P02M0175.md:436-447`). RFC 8028 sections 3.1-3.3 explicitly
+   covers several routers advertising the same prefix: selection is restricted to all such routers
+   and then applies the RFC 4191 criteria. The singular input makes the result depend on which RA was
+   retained and loses a still-live alternative when that one expires, so the promised multi-router
+   source-aware choice is not implementable deterministically. Consume M0174's bounded set of live
+   advertisers and select within it using the already-pinned router order; add the same-prefix,
+   multiple-advertiser case to M10.

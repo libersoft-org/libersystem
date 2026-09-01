@@ -527,7 +527,7 @@ fn a_rolled_back_msi_acquire_does_not_unbind_the_slots_next_owner() {
 
 	// THE ROLLBACK, IN THE ORDER THE SYSCALL NOW PERFORMS IT: disown, then free. Reversing these two
 	// lines is the defect - the slot becomes reusable while this object still claims it.
-	first.disown();
+	assert!(first.disown(), "the rollback still owned the binding it is about to give back");
 	release_unused_msi(vector);
 	assert!(!is_bound(vector), "the rollback gave the binding back");
 
@@ -758,4 +758,61 @@ fn a_stale_faults_containment_does_not_reach_the_binding_that_replaced_it() {
 	assert_eq!(device::claim_state(index), Some(ClaimState::Claimed), "servicing the fault queue does not disturb a claim that has raised nothing");
 
 	device::release_claim(second).expect("the replacement releases");
+}
+
+crate::tagged_test!(a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns, [Object, Kernel, Interrupt], id = "kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns", covers = ["kernel"]);
+fn a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns() {
+	// THE SAME CROSS-GENERATION TEARDOWN AS THE TEST ABOVE, REACHED FROM THE OTHER SIDE.
+	//
+	// The sibling test proves that a rollback which disowns cannot tear down the slot's next owner
+	// through `Drop`. This one proves the other half, which the disown alone did not cover: the
+	// rollback's own `release_unused_msi`. A forced release REVOKES the interrupt this acquire had
+	// already registered - which unbinds the vector and retires the slot - publishes the claim
+	// `Free`, and gives the slot back through `release_msi_for_device`. A replacement claim can then
+	// acquire that slot and bind its own interrupt. When the old syscall finally resumes and its
+	// publication is refused for a stale key, it must free NOTHING: the slot it is holding a vector
+	// number for has belonged to somebody else since the release.
+	//
+	// The question is asked of `disown`, because that is where the answer lives - `revoke` swapped
+	// `bound` to false, so a rollback arriving afterwards is told it owns nothing and must not call
+	// `release_unused_msi` at all.
+	use crate::arch::interrupts::{acquire_msi, bind_msi, is_bound, release_msi_for_device, release_unused_msi, unbind};
+	use crate::mem::frame;
+	use crate::object::interrupt::Interrupt;
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	let owner: u32 = 43;
+	let Some(vector) = acquire_msi(table, 0, owner) else {
+		crate::serial_println!("    no MSI vector free on this machine - the rollback case is not exercised");
+		// SAFETY: allocated by this call and never mapped.
+		unsafe { frame::deallocate(table) };
+		return;
+	};
+	let stale = Interrupt::new(vector).expect("an interrupt object");
+	assert!(bind_msi(vector, &stale), "the acquiring syscall takes the slot");
+
+	// THE FORCED RELEASE'S HALF. `revoke_derived` reaches this object and calls `revoke`, which
+	// unbinds the vector - and the release then returns the slot to circulation.
+	stale.revoke();
+	assert!(!is_bound(vector), "the forced release took the binding away");
+	let _ = release_msi_for_device(owner);
+
+	// THE REPLACEMENT CLAIM, which takes the slot the release gave back.
+	let again = acquire_msi(table, 0, owner).expect("the released slot is handed out again");
+	assert_eq!(again, vector, "the same slot, which is what makes the collision below possible at all");
+	let replacement = Interrupt::new(vector).expect("a second interrupt object");
+	assert!(bind_msi(vector, &replacement), "the replacement takes the slot the release gave back");
+
+	// AND NOW THE OLD SYSCALL RESUMES. Its publication was refused, so it rolls back - and the
+	// rollback is exactly the two lines `sys_device_msix_acquire` runs.
+	if stale.disown() {
+		release_unused_msi(vector);
+	}
+	assert!(is_bound(vector), "the stale rollback freed a slot that belonged to the replacement");
+
+	drop(stale);
+	assert!(is_bound(vector), "and its drop did not tear the replacement down either");
+	unbind(vector);
+	let _ = release_msi_for_device(owner);
+	// SAFETY: allocated by this call and never mapped.
+	unsafe { frame::deallocate(table) };
 }

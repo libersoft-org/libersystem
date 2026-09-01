@@ -1613,9 +1613,12 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 		// The rollback would have torn down the replacement.
 		//
 		// Disowning first makes the `Drop` a no-op, so exactly one path gives the slot back and it
-		// is this one.
-		interrupt.disown();
-		arch::interrupts::release_unused_msi(vector);
+		// is this one - AND ONLY IF THERE WAS STILL A BINDING TO GIVE BACK. See `Interrupt::disown`:
+		// its answer is this rollback's authority to free the slot, because a release that ran while
+		// this syscall was in flight may already have taken it and handed it on.
+		if interrupt.disown() {
+			arch::interrupts::release_unused_msi(vector);
+		}
 		thread.handles().lock().release_reservation(1);
 		return ERR_RESOURCE_EXHAUSTED;
 	}
@@ -1637,8 +1640,19 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 		// The claim ended while this call was running. Everything this acquire built is given back
 		// in the order the rollback above uses - disowned first, so exactly one path frees the slot -
 		// and nothing was ever made deliverable.
-		interrupt.disown();
-		arch::interrupts::release_unused_msi(vector);
+		//
+		// AND THE SLOT IS FREED ONLY IF IT IS STILL THIS BINDING'S (2026-09-01). This arm is the one
+		// place the release is KNOWN to have run - that is what the refusal above means - so it is
+		// the one place where the slot may already have been retired by `revoke_derived`, returned
+		// to circulation by `release_msi_for_device` and acquired by a replacement claim. Freeing it
+		// unconditionally masked and unmapped the REPLACEMENT's MSI-X entry and dropped its
+		// registry binding: an old generation tearing down the next one, which is exactly what
+		// `disown` was introduced to stop on the rollback above. `disown` now answers whether the
+		// binding was still here, and a false answer means the release has already given the slot
+		// back and there is nothing for this rollback to do.
+		if interrupt.disown() {
+			arch::interrupts::release_unused_msi(vector);
+		}
 		thread.handles().lock().release_reservation(1);
 		return ERR_ACCESS_DENIED;
 	}

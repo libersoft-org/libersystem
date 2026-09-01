@@ -334,3 +334,70 @@ fn a_buffer_from_a_previous_binding_is_not_mapped_into_the_next_one() {
 	crate::serial_println!("iommu-fixture: generation case PASSED - only the live binding's generation maps into its domain");
 	poll_faults();
 }
+
+crate::tagged_test!(a_translated_address_stops_translating_when_its_claim_is_forced_to_end, [Dma, Kernel, Pci, Object], id = "kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end", covers = ["kernel"]);
+fn a_translated_address_stops_translating_when_its_claim_is_forced_to_end() {
+	// THE HOSTILE HOLDER, WITH A LIVE TRANSLATION IN ITS HAND.
+	//
+	// P02M0098's M9 names three revocations and its definition of done names them again: the MMIO
+	// window reached through the raw virtual address, the interrupt vector, and the DMA translation.
+	// The first two had a test each. The third was proved by two things that are not it - that a
+	// STALE-generation map is refused, and that the derived table's rows are revoked - and neither
+	// asks the question M9 does, which is what happens to an address the holder ALREADY HAS when the
+	// claim behind it is taken away without asking.
+	//
+	// So this holds a live translated IOVA across a forced release and asks the DEVICE. A ledger that
+	// says the mapping is gone and a controller that still translates it would satisfy every earlier
+	// test and none of this one.
+	let Some((edu, enforcing)) = fixture() else {
+		crate::serial_println!("iommu-fixture: absent (no edu device on this machine)");
+		return;
+	};
+	if !enforcing {
+		// WITHOUT A CONTROLLER THERE IS NO TRANSLATION TO REVOKE. Said rather than passed over: the
+		// untranslated machine's baseline is case 1's, and repeating it here would be a second
+		// answer to a question that already has one.
+		crate::serial_println!("iommu-fixture: forced-release case skipped - no enforcing IOMMU on this machine");
+		return;
+	}
+	let Some(index) = (0..crate::device::count()).find(|&i| crate::device::with(i, |d| d.bus == edu.bus && d.dev == edu.dev && d.func == edu.func).unwrap_or(false)) else {
+		panic!("the fixture's function is on the bus and has no device-table row - the binder could not name it either");
+	};
+	let sentinel = super::edu::Sentinel::new(0x5a).expect("a frame for the sentinel");
+
+	// THE BINDING, TAKEN THE WAY DEVICEMANAGER TAKES ONE, so the generation below is a real claim's
+	// and the release is the production forced one rather than a detach called by hand.
+	let key = crate::device::claim(index).expect("the fixture's function is claimable");
+	assert!(attach_for(index, edu.bus, edu.dev, edu.func, key.generation), "the fixture's endpoint attaches under its claim");
+	let (_mapping, iova) = map_device_buffer(index as u32, key.generation, sentinel.physical, 0x1000).expect("the binding's own generation maps").expect("the fixture is translated, so the map answers with an address");
+
+	// AND IT WORKS FIRST, which is what makes everything after it a claim about a revocation rather
+	// than about an address that never resolved. The device is told to write its buffer into RAM at
+	// the address the controller gave this binding, and the sentinel must change.
+	edu.set_bus_master(true);
+	let reached = edu.transfer(iova.get(), 0x1000, true);
+	assert!(!sentinel.intact(), "the device did not reach its own translated address (transfer completed={reached}) - there is no live translation here to revoke");
+
+	// THE FORCED RELEASE. Nothing asks the holder for anything, and the holder here is still very
+	// much alive: the device is mastering the bus with a translation it was given.
+	assert_eq!(crate::device::release_claim(key), Ok(crate::device::ClaimState::Free), "the forced release did not confirm its teardown");
+
+	// A SECOND BINDING ON THE SAME FUNCTION, and this is the part that makes the question honest.
+	// The release turns bus mastering off, so a test that stopped at the release would be proving
+	// the bus-master bit rather than the translation. The replacement puts the device back on the
+	// bus - under its own claim, its own generation and its own domain - and the OLD address must
+	// still reach nothing.
+	let next = crate::device::claim(index).expect("the function is claimable again once its release confirmed");
+	assert_ne!(next.generation, key.generation, "a replacement binding carries a generation of its own");
+	assert!(attach_for(index, edu.bus, edu.dev, edu.func, next.generation), "the replacement attaches");
+	sentinel.restore();
+	edu.set_bus_master(true);
+	let after = edu.transfer(iova.get(), 0x1000, true);
+	assert!(sentinel.intact(), "the ended binding's translated address still reached its frame under the replacement - a forced release left a usable mapping behind");
+	edu.set_bus_master(false);
+	crate::serial_println!("iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its frame when its claim was forced to end (transfer completed={after})");
+
+	assert!(detach_for(index, edu.bus, edu.dev, edu.func), "the replacement's endpoint detaches");
+	crate::device::release_claim(next).expect("the replacement releases");
+	poll_faults();
+}

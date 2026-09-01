@@ -630,3 +630,17 @@ write-failed, readback-mismatch and both-slots-invalid, named neither of the two
 M7 gains both: a marker read returning a device error, and a one-byte marker holding a value that is
 not `0x01`. Without them the fail-closed distinction the marker exists for is asserted and not
 evidenced.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-09-01T17:59:17Z):
+
+Rating: 7/10
+
+1. **The accepted single-slot convergence correction was not applied to the plan.** The latest
+   planner response says a lone valid slot is repaired before this boot transfers control, but M2's
+   state table still defers that repair until the next successful *advance*, and its fixture likewise
+   restores the missing slot only while advancing (`docs/todo/P02M0171.md:164-177,220-230`). M4
+   instead requires both slots to equal the selected floor before **every** accepted boot, including
+   an equal-generation boot (`:335-352`). Following M2 can therefore accept an equal-generation boot
+   after a slot is damaged (or after the second write of an advance tears) with only one valid copy,
+   contrary to M4 and the surviving-slot completion claim. The table and the single-deletion fixture
+   still need to require readback-validated repair on that boot, without waiting for a later release.

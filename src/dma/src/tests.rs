@@ -602,3 +602,71 @@ fn a_staged_buffer_copies_at_the_sync_points_and_tells_the_caches() {
 	let mut nothing: [u8; 0] = [];
 	assert!(matches!(crate::Bounce::new(staging(&mut nothing, 0x1000), &requirements), Err(crate::Fault::Malformed)));
 }
+
+#[test]
+fn a_tail_queued_by_an_ended_binding_is_not_charged_to_the_one_that_replaced_it() {
+	// THE FLOOD TAIL, WHICH THE GENERATION CHECK ALONE DID NOT CATCH.
+	//
+	// Each poll is bounded, so an endpoint that faults harder than one drain can read leaves records
+	// in the controller when its binding ends. Nothing in a record says which binding raised it: the
+	// backend resolves the domain from the endpoint's attachment AT DRAIN TIME, and this layer then
+	// stamps that domain's generation. So a tail read after the endpoint was rebound arrived wearing
+	// the REPLACEMENT's domain and generation - which is exactly what the cross-generation
+	// containment check compares against, so the check passed and the replacement had its bus
+	// mastering taken away for a fault it never raised.
+	//
+	// Driven through the queue and the rebind rather than by handing an old generation to the
+	// containment helper: the defect is in what the drain RECONSTRUCTS, and a test that supplies the
+	// answer cannot see it.
+	let (mut iommu, first) = iommu();
+	let endpoint = EndpointId(7);
+	iommu.attach(first, endpoint).expect("the first binding attaches");
+	iommu.revoke_endpoint(first, endpoint).expect("and its binding ends");
+	// The domain goes too, which is what a real teardown does - and is why the count below cannot
+	// live in `DomainState`.
+	iommu.destroy_domain(first).expect("the ended binding's domain is destroyed");
+
+	// THE REPLACEMENT, on the same endpoint, with its own domain and its own generation.
+	let second = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(2)).expect("a second domain");
+	iommu.attach(second, endpoint).expect("the replacement attaches");
+
+	// AND THE OLD BINDING'S TAIL, READ NOW. The backend reports what it can see, which is the
+	// endpoint attached to the REPLACEMENT's domain: this event is what the defect looked like.
+	iommu.backend_mut_for_test().queue_fault(event(7, second.0, 0x2000, Access::Write, Fault::NotMapped));
+	let mut out = [event(0, 0, 0, Access::Read, Fault::NotMapped); 4];
+	assert_eq!(iommu.drain_faults(&mut out), 1);
+	assert_eq!(out[0].domain, first, "the tail belongs to the binding that queued it");
+	assert_eq!(out[0].generation, Generation(1), "and carries that binding's generation, not the replacement's");
+	assert_eq!(iommu.faults_in(first), 1, "charged to the ended binding, whose domain no longer exists");
+	assert_eq!(iommu.faults_in(second), 0, "and not to the one that replaced it");
+
+	// AND THE TAIL IS OVER ONCE THE QUEUE HAS RUN DRY. The drain above took fewer events than the
+	// buffer holds, so everything queued before it has been read: a fault from here on is the
+	// replacement's own and is charged to it.
+	iommu.backend_mut_for_test().queue_fault(event(7, second.0, 0x3000, Access::Write, Fault::NotMapped));
+	assert_eq!(iommu.drain_faults(&mut out), 1);
+	assert_eq!(out[0].domain, second, "a fault raised after the tail was proved gone is the live binding's");
+	assert_eq!(out[0].generation, Generation(2));
+	assert_eq!(iommu.faults_in(second), 1, "and is charged to it");
+	assert_eq!(iommu.faults_in(first), 1, "while the ended binding's count stays where it was");
+}
+
+#[test]
+fn a_tail_record_is_bounded_and_gives_up_the_ones_that_attribute_nothing_first() {
+	// FIXED BOOKKEEPING. A machine that restarts one driver in a loop must not grow a record per
+	// restart, and the one it gives up must be one that no longer attributes anything.
+	let (mut iommu, _) = iommu();
+	for index in 0..(MOST_DETACHED_TAILS as u32 + 4) {
+		let domain = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(index as u64 + 1)).expect("a domain");
+		let endpoint = EndpointId(100 + index);
+		iommu.attach(domain, endpoint).expect("attached");
+		iommu.revoke_endpoint(domain, endpoint).expect("and ended");
+	}
+	assert!(iommu.detached_tails() <= MOST_DETACHED_TAILS, "the record is bounded however many bindings end");
+	// The most recent one still attributes: its tail is the one that can still be queued.
+	let last = EndpointId(100 + MOST_DETACHED_TAILS as u32 + 3);
+	let mut out = [event(0, 0, 0, Access::Read, Fault::NotMapped); 4];
+	iommu.backend_mut_for_test().queue_fault(event(last.0, 0, 0x4000, Access::Write, Fault::NotMapped));
+	assert_eq!(iommu.drain_faults(&mut out), 1);
+	assert_eq!(out[0].generation, Generation(MOST_DETACHED_TAILS as u64 + 4), "the newest ended binding still names itself");
+}

@@ -1511,3 +1511,66 @@ this system already runs on plus the remaining devices that share it, and what e
 that per-device work is smaller there than anywhere in group two - not that any of the six is in use.
 A parenthesis records what the sentence said and why it was wrong, so the next reader does not
 restore it from the header's phrasing.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-09-01T17:58:28Z):
+
+Rating: 6/10
+
+1. **The every-driver P02M0162 prerequisite is still treated as usable while its required
+   nonblocking teardown contract is not implemented.** The matrix carries P02M0162 as part of the
+   floor for every driver and singles out only the unmeasured target tick budgets as outstanding
+   (`docs/todo/P02M0099.md:103-120`). On the production path, however,
+   `Holdings::begin_teardown` still invokes `Closes::release` inline, DeviceManager's implementation
+   immediately enters `device_release`, and `Claim::release` completes the full claim teardown before
+   returning (`src/user/libs/driver/binding/src/lib.rs:787-823`;
+   `src/user/services/core/src/device_manager.rs:1718-1750`;
+   `src/kernel/object/claim/mod.rs:74-102`). A slow release can therefore stop DeviceManager's only
+   event loop, contrary to the P02M0162 contract this plan makes universal. Measuring the bind-window
+   constants does not repair that path, so a driver can currently satisfy M0099's stated prerequisite
+   check while inheriting a materially incomplete lifecycle foundation.
+
+2. **The plan incorrectly marks the P02M0164 requires-edge mechanism met and assigns some
+   destination migrations to triggers that have already occurred.** M0099 says the requires-edge is
+   met (`docs/todo/P02M0099.md:122-129`), but dependency-loss handling considers only nodes already
+   `Online`; a provider withdrawn while a dependent is `Binding` is neither moved directly to
+   `Stopping` nor rechecked before it can become online
+   (`src/user/services/core/src/device_manager.rs:3697-3707,3784-3817`). The destination table also
+   assigns StorageService migration to the first *second* block provider
+   (`docs/todo/P02M0099.md:1204-1233`), although the shipping manifest already declares block
+   providers for both `virtio_blk` and xHCI (`src/user/services/manifest.toml:1423,1580-1588`) and
+   the production consumer remains capped at four probes and assigns its boot roles positionally
+   (`src/user/services/core/src/device_manager.rs:82-85,431-444,848-888`;
+   `src/user/services/core/src/service_manager/bootstrap.rs:389-474`). Thus neither the dependency
+   lifecycle nor the block migration has the complete owner/status claimed by the plan; a future
+   third provider cannot retroactively be the first-second-provider trigger.
+
+3. **The P02M0167 scheduler proof required before accepting evidence is still absent.** M0099 limits
+   its P02M0167 exception to medium assembly and otherwise permits acceptance by running one
+   architecture at a time (`docs/todo/P02M0099.md:136-152`). The current executor now correctly
+   drains an in-flight guest before checking a non-guest dependent, handles guest-to-guest
+   prerequisites, and propagates blocked IDs (`verify.sh:846-897`); the earlier ordering defect is
+   therefore no longer a current-code finding. However, no registered test executes `verify.sh`
+   over the definition-of-done matrix: a prerequisite shared by two branches, an unmeasured-cost
+   step, `FAIL` outranking `INCOMPLETE`, failed-descendant suppression, and parallel/`STEPGUESTS`
+   completion (`docs/todo/P02M0167.md:671-676`). The verify-model tests prove graph construction,
+   not these shell scheduling semantics. Since that matrix is an explicit P02M0167 acceptance
+   requirement and the executor has already needed repeated ordering corrections, M0099 still
+   overstates the prerequisite by recording only the medium restriction.
+
+4. **The firmware-node identity correction is still not carried by all consumers the plan itself
+   names.** The identity rule says every ACPI/FDT-bound group-2/3 consumer is marked blocked in its
+   own bullet (`docs/todo/P02M0099.md:310-326`). ACPI battery/thermal is blocked only on AML and a
+   destination service, UCSI only on AML and its destination, and ACPI Time and Alarm only on AML
+   (`:712-723,732-752`), even though each is an ACPI namespace device and the same identity section
+   expressly says an ACPI namespace device is not representable by the current PCI-shaped binding
+   identity (`:267-285`). Completing AML and the named services would therefore leave these bullets
+   apparently startable while their binding identity remains unowned.
+
+5. **The accepted High-severity xHCI debt correction remains prose-only at the actionable item.** The
+   debt mapping assigns DRV-002, DRV-005, DRV-006, DRV-007/008 and DRV-012 to `xHCI maintenance` and
+   claims every item carries its IDs and negative tests in its own gate
+   (`docs/todo/P02M0099.md:1435-1459`). The actual xHCI item names only DRV-003/WIRE-002, then says
+   generically that every other High USB debt will close there or receive an owner (`:471-478`). That
+   is the same incomplete correction an earlier response claimed to have applied: none of the other
+   IDs, their required refusal/recovery assertions, or a separate owner appears in the actionable
+   gate, so the family's next maintenance item can still be planned and closed without them.

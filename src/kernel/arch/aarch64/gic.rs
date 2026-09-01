@@ -16,7 +16,7 @@
 // backing for the portable `apic` (tick) + `tsc` (cycle clock) contract when the
 // port routes through the portable scheduler.
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 // WHERE THE CONTROLLER IS, PUBLISHED BY THE CALLER THAT READ THE MACHINE. These were constants
 // naming QEMU's `virt` machine, so this driver could only run where that machine put them - and a
@@ -105,6 +105,8 @@ use crate::arch::common::time::TICK_HZ;
 // period and time ran at the core count times `TICK_HZ`. See `arch::common::time::TickClock`.
 static CLOCK: crate::arch::common::time::TickClock = crate::arch::common::time::TickClock::new();
 static INTERVAL: AtomicU64 = AtomicU64::new(0); // timer down-count per tick
+// Whether the first device-originated LPI has been reported. See the acknowledge path.
+static REPORTED_DEVICE_LPI: AtomicBool = AtomicBool::new(false);
 
 #[inline]
 fn gicd(off: usize) -> *mut u32 {
@@ -354,6 +356,21 @@ pub fn handle_irq(from_user: bool) {
 		arm_timer(INTERVAL.load(Ordering::Relaxed));
 		CLOCK.advance(super::tsc::now(), super::tsc::hz());
 	} else {
+		// A DEVICE-ORIGINATED LPI, SAID ONCE, AND SAID HERE BECAUSE HERE IS THE ONLY PLACE THAT CAN.
+		//
+		// P02M0151's checkpoint asks for a message a DEVICE sent through the ITS, and every report
+		// that could have carried the claim so far sat somewhere the kernel's own MSI oracles reach:
+		// they allocate an ordinary RAM frame as a stand-in MSI-X table and call `dispatch_msi` by
+		// hand, so a line inside the registry's dispatch fires for the oracle and says nothing about
+		// hardware. This INTID came out of the GIC's own acknowledge register a few lines above, so
+		// nothing but the interrupt controller can have put it there, and an LPI at all means an ITS
+		// translated a device's write to reach it.
+		//
+		// Once, because the interest is in whether the path works at all and a per-interrupt line
+		// would be a device flooding the console with a fact that stops being news after the first.
+		if super::interrupts::is_device_lpi(intid) && !REPORTED_DEVICE_LPI.swap(true, Ordering::Relaxed) {
+			crate::serial_println!("interrupts: a device raised INTID {intid} - an LPI the ITS translated and delivered");
+		}
 		// A device MSI - a GICv2m SPI or an ITS LPI: wake the bound userspace driver, if any.
 		super::interrupts::dispatch_msi(intid);
 	}

@@ -116,6 +116,8 @@ timer_ticked() {
 # backend at all: asking it an MSI question proves nothing, and that profile exists for the timer and
 # IPI paths. `MSI_ORACLE` empty means this profile makes no MSI claim, and it says so.
 MSI_ORACLE=""
+# THE ORACLE THAT NEEDS A DEVICE, empty on every profile that cannot supply one. See `run_profile`.
+DEVICE_MSI_ORACLE=""
 MULTI_CORE_ORACLES="kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick kernel.kernel.a_shootdown_is_answered_by_every_other_core kernel.sched.scheduler_runs_across_cores"
 
 # One profile: boot it, then ask the boot what machine it was on.
@@ -188,6 +190,17 @@ run_profile() {
 		selection="$MSI_ORACLE"
 	else
 		echo "arch-profiles:     no MSI backend on this profile - not requiring a full service bring-up"
+	fi
+	# AND, WHERE A PROFILE HAS ONE, THE ORACLE THAT NEEDS A DEVICE.
+	#
+	# The MSI oracle above allocates an ordinary RAM frame as a stand-in MSI-X table and calls the
+	# backend's dispatch by hand: it proves the CONTROLLER can allocate, deliver and release, and it
+	# cannot prove that a device raised anything. This one drives a real virtio-sound function -
+	# programs its MSI-X table, enables MSI-X on the function, and waits for the interrupt the device
+	# raises when a capture period is ready - so the message comes off the wire and is acknowledged
+	# through the controller's own IAR.
+	if [[ -n "$DEVICE_MSI_ORACLE" ]]; then
+		selection="${selection:+$selection,}$DEVICE_MSI_ORACLE"
 	fi
 	if [[ "$cores" -gt 1 ]]; then
 		local want_id
@@ -303,20 +316,32 @@ run_profile aarch64 gicv3 1 "GICv3 from the device tree" GIC=3
 run_profile aarch64 gicv3 4 "GICv3 from the device tree" GIC=3
 MSI_ORACLE="$AARCH64_MSI"
 run_profile aarch64 gicv3-its 1 "GICv3 from the device tree" GIC=3its
-# A REAL-DEVICE ITS/MSI CHECKPOINT IS NOT REACHABLE FROM THESE PROFILES, AND THIS IS THE MEASUREMENT
-# (2026-08-31). M3 and M6 ask for one, and it was tried here rather than argued about:
+# THE REAL-DEVICE ITS/MSI CHECKPOINT IS REACHED FROM THIS PROFILE, AND THIS IS HOW (2026-09-01).
 #
-#   - every MSI oracle on these profiles programs a RAM-backed stand-in table and calls the shared
-#     dispatch entry point by hand, so a report emitted there cannot tell a device-raised message
-#     from the kernel calling itself - the oracle triggered it on the first run;
-#   - what raises a real one is an ordinary driver, and a driver only exists on a boot that reaches
-#     userspace. These profiles are DIRECT boots, which is what M6 asks them to be, and a direct boot
-#     carries no init package: adding `kernel.boot.init_package_starts_system_manager` to this
-#     profile's selection failed with `init package module not found`, measured.
+# The previous measurement here concluded it was not reachable, and it was wrong in one step. It is
+# right that every MSI ORACLE programs a RAM-backed stand-in table and calls the shared dispatch by
+# hand, so no report on that path can tell a device-raised message from the kernel calling itself.
+# It is also right that a driver PROCESS needs userspace and that these are direct boots. What it
+# missed is that a device does not need a userspace driver to raise a message: the kernel's own
+# hardware suite already programs a real `virtio-sound-pci` function's MSI-X table and enables MSI-X
+# on the function, and the interrupt it then waits for is raised BY THAT DEVICE. On this profile the
+# controller translating it is the ITS, so the message is a device-originated LPI by construction.
 #
-# So the checkpoint needs either a UEFI ITS profile that carries the package, or a delivery-path
-# report the oracles cannot reach. Both are work this gate does not own, and neither is claimed here.
+# So the checkpoint needed two things rather than a new machine: a report on the path where the INTID
+# comes out of the GIC's acknowledge register - which no oracle can reach, because an oracle never
+# goes through it - and a teardown at the end of that test. Both are in place, and the assertions
+# below are what read them.
+# THE DEVICE HALF OF M3's CHECKPOINT, WHICH ONLY THIS PROFILE CAN ASK FOR. The machine carries a
+# `virtio-sound-pci` function and this profile's controller translates a device's write into an LPI,
+# so that test's own interrupt IS a device-originated message through the ITS - and it now releases
+# the vector with its claim at the end, which is the teardown half.
+#
+# ON THE FOUR-CORE ROW ONLY, because that is the log the assertions below read and one run of a real
+# driver bring-up is what the checkpoint needs. Asking both rows for it would pay for a second
+# emulated bring-up to prove the same sentence twice.
+DEVICE_MSI_ORACLE=kernel.hardware.virtio_snd_driver_captures_a_period_from_the_device
 run_profile aarch64 gicv3-its 4 "GICv3 from the device tree" GIC=3its
+DEVICE_MSI_ORACLE=""
 
 # THE UEFI / NO-DEVICE-TREE REGRESSION PROFILES ARE NOT REGISTERED HERE, AND THIS SAYS WHY
 # (2026-08-30). M6 asks for separate, labelled aarch64 and riscv64 UEFI/no-DT profiles and the
@@ -351,15 +376,28 @@ if [[ -z "$ONLY" || "$ONLY" == "aarch64:gicv3-its:4" ]]; then
 		grep -a "interrupts:\|its:" "$its_log" >&2
 		exit 1
 	fi
-	# AND THE CLAIM IS THE ONE THE ORACLE MAKES (corrected 2026-08-30). This said "delivered a REAL
-	# MSI", and the oracle behind it allocates an ordinary RAM frame as a stand-in MSI-X table and
-	# calls `dispatch_msi` by hand - the controller path is exercised end to end, the DEVICE path is
-	# not. A device-to-ITS write is what the ITS profile would have to see to say "real", and no test
-	# on this profile produces one: the virtio-snd hardware test stops at stream acknowledgement and
-	# releases neither the claim nor the vector. Saying what was proved is the fix available here;
-	# proving the device path needs a device on this profile, which is its own item.
-	echo "arch-profiles:   the ITS profile discovered its ITS, and a vector was acquired through it, programmed into a device table, dispatched to a bound Interrupt and released - by the kernel's own oracle rather than by a device"
-	echo "arch-profiles:   (a device-originated MSI through the ITS is NOT proved here - no device on this profile raises one)"
+	# THE CONTROLLER HALF, which is the oracle's: a vector acquired through the ITS, programmed into
+	# a device table, dispatched to a bound Interrupt and released. It says "by the kernel's own
+	# oracle" because that is what it is - the oracle allocates a RAM frame as a stand-in MSI-X table
+	# and calls `dispatch_msi` itself.
+	echo "arch-profiles:   the ITS profile discovered its ITS, and a vector was acquired through it, programmed into a device table, dispatched to a bound Interrupt and released - by the kernel's own oracle"
+	# AND THE DEVICE HALF, WHICH THE ORACLE CANNOT MAKE. This INTID came out of the GIC's own
+	# acknowledge register, so nothing but the interrupt controller put it there, and an LPI means an
+	# ITS translated a device's write to produce it. The oracles call `dispatch_msi` directly and
+	# never reach the line this greps for, which is the whole reason it sits where it does.
+	grep -aq "interrupts: a device raised INTID .* an LPI the ITS translated and delivered" "$its_log" || {
+		echo "arch-profiles: the ITS profile saw no device-originated LPI" >&2
+		grep -a "interrupts:\|virtio-snd:" "$its_log" >&2 || echo "    (it reported nothing about interrupts at all)" >&2
+		exit 1
+	}
+	# AND THE TEARDOWN THAT FOLLOWS IT. M3 asks for delivery AND teardown, and a vector that is
+	# delivered on and never given back is half a checkpoint.
+	grep -aq "virtio-snd: the device's MSI vector was delivered on and then torn down with its claim" "$its_log" || {
+		echo "arch-profiles: the ITS profile delivered a device LPI and did not prove its teardown" >&2
+		grep -a "virtio-snd:" "$its_log" >&2 || echo "    (the device oracle did not run)" >&2
+		exit 1
+	}
+	echo "arch-profiles:   $(grep -a -m 1 -o "interrupts: a device raised INTID.*" "$its_log"), and the vector was torn down with its claim"
 fi
 
 # The RISC-V AIA. Nothing to select: this runner's only riscv64 machine is `virt,aia=aplic-imsic`, so

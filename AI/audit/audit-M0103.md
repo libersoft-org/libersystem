@@ -1547,3 +1547,54 @@ the accounting. The per-frame cost paragraph said one endpoint per in-flight fra
 it now says four endpoints and two queues per frame, twelve handles and six queues per surface at
 `max_images = 3`, with a note that the old figure predated the second direction. The two other places
 that call completion "a channel endpoint pair" now say two pairs and point here.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-09-01T17:58:28Z):
+
+Rating: 6/10
+
+1. **The corrected dependency graph still omits `a-wsi` from parts whose mandatory gates present to
+   a Surface.** The controlling summaries say `a-wsi` gates neither track, and the prerequisite
+   matrix gives `d` and `i` no WSI dependency (`docs/todo/P02M0103.md:38-47,98-125,286-302`). Yet
+   `d` must run a live display application, exercise a second surface, scale and resize, and pass its
+   live QEMU presentation gate (`:1620-1677,2291-2295`); `g` calls itself the integration gate for
+   acquire/present/release and frame pacing (`:2088-2097`); and `i`'s required path ends at `Surface`
+   and its Done condition requires resize, focus, console restoration and focused QEMU presentation
+   (`:2135-2197,2310-2314`). Those items cannot complete without the present queue, completion pairs
+   and display migration owned by `a-wsi`. The latest response made the non-presenting `b`, `c` and
+   `e` independence real, but overextended it to the presentation gates; the matrix and build order
+   still need the WSI edge for the parts that actually present (or those mixed parts need an explicit
+   headless/presentation split).
+
+2. **The two-pair completion correction still has incorrect and incomplete resource accounting.** A
+   kernel `Channel` is one endpoint with its own inbox, and `try_create_with_depth` allocates two such
+   endpoint/inbox objects per pair (`src/kernel/object/channel/mod.rs:139-167,193-216`). Two pairs
+   therefore allocate four endpoint queues per present and twelve at `max_images = 3`, not the plan's
+   “two queues per frame” and six per surface (`docs/todo/P02M0103.md:980-1061`). The plan also never
+   fixes a completion-queue depth; the current default is 64 messages per endpoint
+   (`src/kernel/object/channel/mod.rs:24-31`), despite the protocol processing one outcome, and it
+   does not state the maximum simultaneous waiters/wait-set entries. This is not merely terminology:
+   the latest response explicitly claimed to have added exact queue/waiter accounting, while a
+   hostile peer can queue many messages and capabilities behind the one processed outcome and the
+   stated per-surface kernel-object bound is wrong.
+
+3. **The old one-pair/consumer-release contract still survives in normative work after the latest
+   response said both remaining sites were corrected.** The authoritative completion item selects
+   `PRODUCER_READY` and `PRESENT_DONE` on two pairs (`docs/todo/P02M0103.md:980-1028`). The `soft3d`
+   integration item still waits for `CONSUMER-RELEASE` (`:2088-2097`), and the pass-10 WSI contract
+   still calls the mechanism `PRODUCER_READY / CONSUMER_RELEASE` and singular `COMPLETION CHANNEL
+   PAIR` (`:2505-2517`). Pass 10 is incorporated through the `s-wsi` freeze gate, so this is not inert
+   history: it gives the normative WSI profile two names and two topologies. Replace those remaining
+   sites with the two-direction contract, including the release/acquire ordering on `PRESENT_DONE`.
+
+4. **The P02M0167 assessment still omits its required scheduler proof.** The plan marks kernel
+   evidence usable and records only the medium producer race as preventing parallel architecture
+   acceptance (`docs/todo/P02M0103.md:159-177`). The current executor now places the guest-drain
+   barrier before a non-guest dependent's blocker check, handles an in-flight guest prerequisite of
+   another guest, and propagates blocked IDs (`verify.sh:846-897`); the previously observed async
+   ordering defect is therefore fixed. What remains absent is the explicit P02M0167 definition-of-
+   done test that executes the shell scheduler over a shared prerequisite, an unmeasured-cost step,
+   `FAIL` outranking `INCOMPLETE`, failed-descendant suppression, and parallel/`STEPGUESTS` cases
+   (`docs/todo/P02M0167.md:671-676`). The verify-model unit tests cover graph validation rather than
+   those shell execution semantics. M0103's conformance evidence therefore still relies on a
+   P02M0167 contract whose mandatory regression proof has not landed, independently of the medium
+   issue it already records.

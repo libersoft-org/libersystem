@@ -166,6 +166,17 @@ impl Sentinel {
 		Some(Sentinel { physical, pattern })
 	}
 
+	// PUT THE PATTERN BACK, for a case that has to ask the same question twice.
+	//
+	// A test that proves a translated address WORKED and then proves it stopped working needs the
+	// frame in a known state for the second half, and the first half deliberately left it changed.
+	// Written here rather than by the caller, because "what a sentinel holds" is this type's own
+	// fact - a caller reaching into the direct map to restore it would be a second answer to it.
+	pub fn restore(&self) {
+		// SAFETY: this sentinel's own frame, through the direct map, owned by nobody else.
+		unsafe { core::ptr::write_bytes((crate::mem::hhdm_offset() + self.physical) as *mut u8, self.pattern, PAGE_SIZE as usize) };
+	}
+
 	// Whether every byte is still what was written. A device that reached this frame changed it.
 	pub fn intact(&self) -> bool {
 		let base = crate::mem::hhdm_offset() + self.physical;

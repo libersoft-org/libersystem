@@ -846,6 +846,41 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 		skipped+=("$label")
 		continue
 	fi
+	# A GUEST STEP IS THE ONLY THING `--jobs` LETS OVERLAP, and only with another guest step.
+	#
+	# The expensive item in any plan is a boot, and two boots of different targets have nothing to
+	# contend over now that every writable image is per-run. Everything else - a gate that boots one
+	# of its own, a conformance suite, a build - runs alone, because "how many QEMUs may run" must
+	# have exactly one answer on this machine and a gate's inner boot is not counted by this loop.
+	is_guest=0
+	[[ "$command" == *"./test.sh --arch "* ]] && is_guest=1
+	# THE BARRIER COMES BEFORE THE BLOCKER CHECK, AND THAT ORDER IS WHAT MAKES THE CHECK SOUND.
+	#
+	# It used to come after, and under `--jobs > 1` that made prerequisite suppression unsound for
+	# every parallel guest. A guest step is BACKGROUNDED, and its verdict enters `failed_ids` only
+	# when `record_one_step` runs behind this barrier - so the following non-guest step evaluated its
+	# blockers against a guest nothing had waited for, saw no failure, and ran against a log the
+	# failed guest never wrote. The emitted plan has exactly that edge: the `gate-after-guest` step
+	# requires every guest step, and its whole reason to exist is that it reads what a guest run
+	# produced. Draining first costs nothing - a non-guest step is behind this barrier either way -
+	# and it is the only point at which "did my prerequisite fail" has an answer.
+	#
+	# A GUEST WHOSE OWN PREREQUISITE IS STILL IN FLIGHT waits too. The emitted plan has no guest that
+	# requires another guest today, so this is the rule rather than the current shape of the graph:
+	# a check that is only correct for the edges the planner happens to emit is a check that breaks
+	# silently when it emits one more.
+	if ((is_guest == 0)); then
+		drain_guests
+	else
+		for req in ${step_reqs[$index]}; do
+			for at in "${!guest_indexes[@]}"; do
+				if [[ "${step_ids[${guest_indexes[$at]}]:-}" == "$req" ]]; then
+					drain_guests
+					break 2
+				fi
+			done
+		done
+	fi
 	# A STEP WHOSE PREREQUISITE FAILED IS NOT RUN. Its result could only be the prerequisite's
 	# failure a second time, in a form that names the wrong thing.
 	blockers=""
@@ -861,17 +896,6 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 		# and a grandchild runs against an output nothing produced.
 		blocked_ids["${step_ids[$index]:-}"]=1
 		continue
-	fi
-	# A GUEST STEP IS THE ONLY THING `--jobs` LETS OVERLAP, and only with another guest step.
-	#
-	# The expensive item in any plan is a boot, and two boots of different targets have nothing to
-	# contend over now that every writable image is per-run. Everything else - a gate that boots one
-	# of its own, a conformance suite, a build - runs alone, because "how many QEMUs may run" must
-	# have exactly one answer on this machine and a gate's inner boot is not counted by this loop.
-	is_guest=0
-	[[ "$command" == *"./test.sh --arch "* ]] && is_guest=1
-	if ((is_guest == 0)); then
-		drain_guests
 	fi
 	# A STEP THAT STARTS SEVERAL GUESTS AT ONCE TAKES THAT MANY SLOTS, AND IS NOT RUN WITHOUT THEM.
 	#
