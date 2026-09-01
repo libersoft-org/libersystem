@@ -722,3 +722,40 @@ fn two_threads_attenuating_one_handle_move_it_exactly_once() {
 	let spent = process.handles().lock().lookup(crate::object::handle::Handle::from_raw(subject), Rights::from_bits(0)).is_err();
 	assert!(spent, "the raced handle is gone from the table it was sent from - a move that duplicated would leave it there");
 }
+
+crate::tagged_test!(a_stale_faults_containment_does_not_reach_the_binding_that_replaced_it, [Object, Kernel, Pci, Dma], id = "kernel.object.claim.a_stale_faults_containment_does_not_reach_the_binding_that_replaced_it", covers = ["kernel"]);
+fn a_stale_faults_containment_does_not_reach_the_binding_that_replaced_it() {
+	// THE CONTROLLER'S QUEUE OUTLIVES THE BINDING THAT FILLED IT, which is what makes this a rule
+	// about generations rather than about liveness.
+	//
+	// The periodic drain reads faults in bounded batches, so a fault raised by generation N can be
+	// read after N has been torn down and the same device rebound as N+1. Containment that asked only
+	// "is a claim live here" then took the REPLACEMENT off the bus for something its predecessor did:
+	// a driver that did nothing wrong losing its DMA because the queue was long. The event carries
+	// the generation the drain attributed it to, and that is what decides.
+	let index = device::add_synthetic_device();
+
+	let first = device::claim(index).expect("the synthetic device claims");
+	assert_eq!(device::release_claim(first).expect("the first binding releases"), ClaimState::Free, "the synthetic device has nothing outstanding, so its teardown confirms");
+
+	let second = device::claim(index).expect("the same device is claimed again, which is the rebind this test is about");
+	assert_ne!(second.generation, first.generation, "a rebind is a new generation - without that there is nothing here to tell apart");
+
+	let (bus, dev, func) = device::with(index, |entry| (entry.bus, entry.dev, entry.func)).expect("the synthetic entry is in the table");
+
+	// The old generation's fault: reported, counted, and containing NOTHING.
+	assert!(device::contain_faulting_endpoint_of_a_live_binding(bus, dev, func, first.generation).is_none(), "a fault queued by the previous binding must not contain the one that replaced it - there is nothing left of the old binding to contain");
+	assert_eq!(device::claim_state(index), Some(ClaimState::Claimed), "and the replacement's claim is untouched by its predecessor's tail");
+
+	// The live generation's fault: contained, because that binding is the one still running.
+	assert_eq!(device::contain_faulting_endpoint_of_a_live_binding(bus, dev, func, second.generation), Some(index), "a fault raised by the binding that is running is exactly what this containment exists for");
+
+	// AND THE PERIODIC SERVICE ITSELF IS CALLABLE HERE, which is the other half of what M5 asks: the
+	// drain runs from the BSP's settle loop in production, and a test build never reaches that loop,
+	// so this is where the entry point is exercised at all. On a machine with no controller it
+	// returns having done nothing, which is the case every profile but the enforcing one is in.
+	crate::iommu::service_faults_if_due();
+	assert_eq!(device::claim_state(index), Some(ClaimState::Claimed), "servicing the fault queue does not disturb a claim that has raised nothing");
+
+	device::release_claim(second).expect("the replacement releases");
+}

@@ -1477,3 +1477,34 @@ Plan changes, in the WSI item and in the pass-10 rows that name it:
   and RECEIVING it has acquire semantics", which was written for one direction. It now says sending
   on EITHER endpoint has release semantics and receiving on it acquire semantics, and notes why that
   has to be said of both: each side is the sender of one transition and the receiver of the other.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-09-01T15:21:58Z):
+
+Rating: 7/10
+
+1. **The accepted part/freeze split still leaves contradictory prerequisite and execution orders in
+   controlling summaries.** The header says the complete 2D foundation through `b` and `c` is
+   delivered first and `a-wsi` follows it (`docs/todo/P02M0103.md:38-41`), while the `a` section says
+   `a-wsi` runs beside `b` and `c` (`:477-485`). The older build-order paragraph still requires
+   `s -> a -> b` and `s -> a -> e` (`:283-289`), which again makes all of `a-wsi` precede the two
+   non-presenting APIs. The prerequisite matrix compounds this by retaining one undivided `a` row
+   and omitting `s-wsi` and `a-common` from the WSI row (`:100-117`), even though the authoritative
+   subsection requires both (`:727-733`); conversely, the `b` and `e` section headers omit the
+   `s-2d` and `s-3d` freezes that the freeze section calls hard prerequisites (`:338-374,1161-1166,
+   1631-1636`). A project owner or implementer can therefore follow the matrix, the headline order,
+   or the part headers and get different approval/start boundaries. Choose the intended `a-wsi`
+   ordering once and make the matrix, build-order paragraph, and every part header state the same
+   four-freeze dependency graph.
+
+2. **The two-direction completion correction does not describe a realizable channel topology and
+   still undercounts its resources.** The plan continues to call completion one channel endpoint
+   pair (`docs/todo/P02M0103.md:183-186,897-903`), then says it is "TWO ENDPOINTS AND NOT ONE PAIR"
+   while assigning client-send/service-receive to `PRODUCER_READY` and service-send/client-receive
+   to `PRESENT_DONE` (`:960-987`). A kernel channel pair has exactly two connected endpoints and a
+   send on either endpoint arrives in the peer's inbox
+   (`src/kernel/object/channel/mod.rs:1-8,191-200`). One pair can carry both directions only by giving
+   each side both send and receive authority, contradicting the stated attenuation; two independently
+   attenuated directions require **two channel pairs/four endpoint handles per present**. The cost
+   text still budgets one endpoint per in-flight frame (`docs/todo/P02M0103.md:1014-1017`). Specify
+   creation, ownership, exact rights, close/failure behavior, and queue/waiter accounting for both
+   pairs, and update the per-frame bound accordingly.

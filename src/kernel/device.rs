@@ -181,11 +181,27 @@ pub fn contain_faulting_endpoint(bus: u8, dev: u8, func: u8) -> Option<usize> {
 // BINDING to contain, which is what M5's containment is about: "its binding is contained until
 // whoever holds it tears it down". Taking an unclaimed device off the bus from a background sweep
 // would stop the hostile-DMA cases mid-run and prove nothing about production.
-pub fn contain_faulting_endpoint_of_a_live_binding(bus: u8, dev: u8, func: u8) -> Option<usize> {
+pub fn contain_faulting_endpoint_of_a_live_binding(bus: u8, dev: u8, func: u8, generation: u64) -> Option<usize> {
 	let table = DEVICES.lock();
 	let claims = CLAIMS.lock();
 	let index = table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func)?;
-	if claims.get(index).map(|slot| slot.state) != Some(ClaimState::Claimed) {
+	let slot = claims.get(index)?;
+	if slot.state != ClaimState::Claimed {
+		return None;
+	}
+	// AND IT IS THE BINDING THAT FAULTED, NOT WHOEVER HOLDS THE ADDRESS NOW (2026-09-01).
+	//
+	// This checked only that SOME claim was live, which is the wrong question for a queue that
+	// outlives bindings. The controller's queue is drained in bounded batches, so a fault raised by
+	// generation N can be read after N has been torn down and the same BDF rebound as N+1 - and
+	// containing on "a claim is live" then takes the REPLACEMENT off the bus for something its
+	// predecessor did. A driver that did nothing wrong loses its DMA because the queue was long,
+	// which is the same cross-binding damage `disable_bus_master_for` carries a key to prevent.
+	//
+	// The event already knows whose it is: every `FaultEvent` carries the generation the drain
+	// attributed it to. A tail whose generation no longer matches is reported and counted and
+	// contains nothing, because there is nothing left of that binding to contain.
+	if slot.generation != generation {
 		return None;
 	}
 	bus_master(&table[index], false);
@@ -657,6 +673,41 @@ pub fn mmio_capability_dropped(key: abi::ClaimKey) {
 		return;
 	}
 	bus_master(entry, false);
+}
+
+// MAKE THIS BINDING'S VECTOR DELIVERABLE, OR REFUSE - the publication step, done under the claim.
+//
+// THE LAST STEP OF AN ACQUIRE IS ALSO A HARDWARE EFFECT, AND IT NEEDED THE SAME KEY EVERY OTHER ONE
+// HAS (2026-09-01). `register_derived` re-checks the generation and then RETURNS, dropping the claim
+// lock; the syscall afterwards unmasked the table entry and enabled MSI-X as two ordinary calls. A
+// release starting in that gap - another thread closing the process's last claim handle - disables
+// MSI-X, revokes the interrupt, settles the claim and frees the slot, and the old syscall then
+// resumes and unmasks a table entry belonging to no claim, or to whatever binding took the device
+// next. Masking the entry at programming time closed the window before `register_derived`; this
+// closes the one after it, which is the half that was left.
+//
+// Both writes happen under `DEVICES` then `CLAIMS`, the order this file states, with the generation
+// checked inside. So a release either lands entirely before this - and the key no longer matches, so
+// nothing is published and the caller is refused - or entirely after, and its own `msix_off` and
+// `revoke_derived` undo what this published. There is no interleaving in which an ended binding
+// leaves a live vector behind.
+//
+// Neither call takes a lock of its own: `unmask_msi` is a volatile write through a mapping the
+// programming step already made (`translate` walks the tables without `PT_LOCK`), and `msix_enable`
+// is a config write of the kind `bus_master` already performs under both locks.
+pub fn publish_msi_if_current(key: abi::ClaimKey, vector: u32, table_phys: u64) -> bool {
+	let index = key.device_index as usize;
+	let table = DEVICES.lock();
+	let claims = CLAIMS.lock();
+	let (Some(entry), Some(slot)) = (table.get(index), claims.get(index)) else { return false };
+	if slot.generation != key.generation || slot.state != ClaimState::Claimed {
+		return false;
+	}
+	crate::arch::interrupts::unmask_msi(vector, table_phys);
+	if entry.on_bus && entry.msix_cap != 0 {
+		crate::arch::pci::msix_enable(entry.bus, entry.dev, entry.func, entry.msix_cap);
+	}
+	true
 }
 
 // Stop the device at `index` using MSI-X at all: clear MSI-X Enable and set the Function Mask.

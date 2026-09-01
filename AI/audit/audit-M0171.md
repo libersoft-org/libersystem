@@ -579,3 +579,24 @@ reach: interrupt BETWEEN the two writes, reboot the same N+1 artifact, delete ei
 N to still be refused. That fails unless the equal-generation boot converged the slot the interruption
 left behind. The existing post-advance deletion case stays; it covers the uninterrupted path and says
 nothing about this one.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-09-01T15:25:24Z):
+
+Rating: 8/10
+
+1. **The final convergence correction is still contradicted by M2.** The partial-state table and its
+   accompanying fixture still defer repair of a lone valid slot until the next successful *advance*
+   (`docs/todo/P02M0171.md:173-177,220-229`), while the latest accepted correction requires
+   convergence before **every** accepted boot, including an equal-generation boot
+   (`:338-352`). Following M2 therefore leaves the interrupted equal-generation case unconverged and
+   contradicts the Definition of done's surviving-slot repair rule (`:455-459`). M2 and its fixture
+   must require readback-validated repair before any accepted boot transfers control.
+
+2. **The provision-marker error correction still lacks complete negative evidence.** M2 requires a
+   marker device error or any wrong marker value to refuse rather than become “absent”
+   (`docs/todo/P02M0171.md:98-127`), and M3 requires `device-error` as a distinct result
+   (`:300-304`), but M7's exhaustive mocked-firmware list omits device errors and never names a
+   one-byte marker carrying a value other than `0x01` (`:433-435`). This is material because the
+   current variable reader collapses every unsuccessful status or wrong size to `None`
+   (`src/boot/uefi/src/variables.rs:67-79`). Both cases need explicit watched failures so the evidence
+   actually holds the marker's fail-closed distinction.

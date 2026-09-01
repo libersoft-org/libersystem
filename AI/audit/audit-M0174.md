@@ -721,3 +721,50 @@ sent" case becomes the local-address one this layer can actually decide, and a n
 the split exists for - a forged PTB carrying a well-formed local tuple that matches no live flow does
 not change the PMTU for its destination. That last one would have passed against the previous wording,
 which is how I know the rewrite is not cosmetic.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-09-01T15:31:33Z):
+
+Rating: 6/10
+
+1. **The accepted PTB/correlation correction was added beside, not instead of, the contradictory
+   contract.** M3 still accepts a PTB update only after L3 proves that its quotation matches a recent
+   packet emitted on the route (`docs/todo/P02M0174.md:96-99`). M6 still requires L3 to prove the
+   quoted packet was sent while simultaneously forbidding L3 transport state or a registration table
+   (`:334-343`), and still updates the PMTU table before queueing the event (`:344-353`). The newly
+   added text instead says L3 performs only local/structural validation, the transport consumer proves
+   a live flow, and PMTU is applied only afterward through `record path mtu` (`:355-381`). These are
+   mutually exclusive validation, ownership and commit orders. Remove the stale M3/M6 clauses and
+   make the fixtures say whether “matched/unmatched” is an L3-local-address check or an M0175 live-flow
+   check; the latest accepted correction is not currently normative.
+
+2. **The new PMTU write cannot identify the route whose cache entry it is meant to update.** The
+   frozen seam says PMTU is queried for a chosen route and the layer owns route/router/next-hop state
+   (`docs/todo/P02M0174.md:365-370`), but the only consumer-authorised write is `record path mtu for
+   this destination` (`:376-381`). With the multiple routers and candidate routes required by M5,
+   one destination can be reached through more than one interface/route with different path MTUs.
+   A destination-only write can lower the wrong route or make one route's report poison all of them.
+   Carry the selected route/interface/next-hop identity (and validate its generation is still live)
+   in the consumer's write; the flow tuple alone does not identify which candidate M0175 selected.
+
+3. **The supposedly deterministic router enumeration still leaves its final order undecided.** M5
+   promises a total stable order by preference, reachability state and “a stated tie-break,” but does
+   not state the reachability ranking or the tie-break (`docs/todo/P02M0174.md:261-277`). This is not
+   only an internal-control default: M0175 explicitly uses M0174's enumeration order as its final
+   RFC 6724 tie-break (`docs/todo/P02M0175.md:397-401`). Two conforming implementations may therefore
+   select different routers for the same equal-preference/equal-policy candidates, while M0174's own
+   ND/RS/MLD/echo traffic also has no objective first entry. Freeze the exact ranking and final stable
+   key and add an equal-preference/equal-reachability fixture; replacing “selection” with an
+   unspecified ordering did not complete the accepted ownership correction.
+
+4. **The part of the router order that *is* stated has the RFC priority backwards.** M5 fixes the
+   order as preference first and reachability second, then makes its own ND/DAD/RS/MLD/echo traffic
+   use the first entry (`docs/todo/P02M0174.md:261-277`). RFC 4191 section 3.2 instead makes router
+   reachability primary and advertised preference secondary for a Default Router List, and its
+   routing-table algorithm likewise skips a preferred route whose next hop is unreachable while a
+   reachable alternative exists ([RFC 4191](https://www.rfc-editor.org/rfc/rfc4191.html#section-3.2)).
+   The frozen order can therefore put an unreachable high-preference router ahead of a reachable
+   lower-preference router, and M0174's control-traffic “first entry” rule will use it. Correct the
+   dimension order as well as defining the missing state ranking/tie-break, and gate an unreachable
+   high-preference router against a reachable lower-preference one.

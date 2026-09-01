@@ -963,3 +963,50 @@ over-bound outcomes:
 
 Each gets the exact-bound and over-bound pair M10 promises, with the typed refusal named beside it
 rather than a truncation.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-09-01T15:22:06Z):
+
+Rating: 5/10
+
+1. **The adopted RFC 8028 policy still depends on provenance that M0174's frozen seam does not
+   provide.** M5 says M0174 already enumerates routes with both their routers and their advertising
+   prefix, and uses that association to prefer the router which advertised the chosen source prefix
+   (`docs/todo/P02M0175.md:402-407`). M0174 freezes only usable source addresses, matching routes,
+   their routers, and PMTU; its PIO/default-router state never requires retaining or returning which
+   router advertised which source prefix (`docs/todo/P02M0174.md:248-277,362-386`). A set of routes
+   and routers cannot reconstruct that relation when different routers advertise different prefixes.
+   Either add the missing PIO-to-router provenance to M0174's owned state and candidate result, or do
+   not claim that this RFC 8028 choice is implementable through the frozen seam.
+
+2. **The accepted public-contract correction still does not freeze the listener or caller-override
+   semantics its tests require.** M1 asks for conflict/reuse rules for IPv4-only, IPv6-only and
+   dual-stack wildcard listeners but supplies no conflict matrix, reuse decision, or valid mapping
+   between a single local scoped endpoint and a dual-family wildcard
+   (`docs/todo/P02M0175.md:54-70,203-209`). M5 also requires and tests an explicit caller-selected
+   source, including a deprecated one, but M1 names no changed `connect` request or other public
+   operation through which a caller can express that source (`:418-437`). The current wire still has
+   only `connect(endpoint)` and `listen(port)` (`src/idl/network.lsidl:124-133`). Consequently M10's
+   same-port bind cases and M5's explicit-override case have no contract-level oracle or invocation.
+   Field order and ordinals can remain solely in the IDL, but these semantic choices and the request
+   shapes that carry them must be decided in the plan.
+
+3. **M4's newly numeric admission policy is internally contradictory and its promised reporting is
+   absent from M1.** The correction first says every over-bound case is a refusal which leaves all
+   existing connections untouched, then immediately asks implementation to choose an "admission or
+   eviction rule" (`docs/todo/P02M0175.md:342-359`). Eviction is incompatible with the preceding
+   normative refusal and with its exact/one-past test. The same paragraph promises capacity and drop
+   reporting through `capacity`, but M1's supposedly complete semantic-field list does not add any
+   half-open, unaccepted, TCB, RX/TX-byte, refusal, or drop fields; the existing record exposes only
+   four live counts (`src/idl/network.lsidl:40-48`). Choose admission/refusal consistently and freeze
+   the observable counters needed to verify each declared budget.
+
+4. **The accepted event-driven-runtime correction still leaves both its bound and its invalidation
+   transitions to implementation.** M7 requires a "bounded" durable event/pending-operation store
+   without a numeric capacity, per-kind accounting, or full-store outcome
+   (`docs/todo/P02M0175.md:490-500`), despite the plan's own corrected rule that resource-policy
+   numbers and over-bound behavior cannot be deferred. It also says an invalidated operation will
+   receive a defined error or close/reselect "according to" state without defining which live states
+   take which transition; M5 points to this as "M7's rule", but no such rule or error mapping exists
+   (`:414-416`). This is the exact state-loss/runtime redesign accepted from the original audit, so
+   its capacity and state-transition table need concrete oracles rather than another instruction to
+   define them during implementation.

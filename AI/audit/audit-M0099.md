@@ -1482,3 +1482,16 @@ I checked the one way this round could have reached it: several of the sibling m
 corrections touch shared seams - M0174's egress contract gained an operation, M0169's transaction
 connection changed hands - and none of them is referenced by this file. Its virtio-blk `REQUIRES` and
 CLASSIFICATION rows still carry P02M0153 and nothing else moved under them.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-09-01T15:25:24Z):
+
+Rating: 9/10
+
+1. **The rejected whole-group Phase-2 premise still survives in the ordering rule.** The corrected
+   header and group preamble explicitly say only the seven already-shipped devices run in the current
+   profiles and that the remaining virtio candidates are phased backlog
+   (`docs/todo/P02M0099.md:26-49,482-491`). The normative ordering bullet still justifies group 1 by
+   saying “The first group is what this system runs on today” (`:1112-1114`). That is the exact false
+   premise the earlier correction claimed to remove and again gives RNG, vsock, SCSI, crypto,
+   balloon/mem and virtio-fs current-platform priority on a rationale the plan itself disproves. The
+   priority sentence must distinguish the shipped foundation from the future entries in that group.

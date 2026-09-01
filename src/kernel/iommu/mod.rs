@@ -1038,11 +1038,36 @@ static LAST_PERIODIC_DRAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::
 // reach it, so this bounds the delay on any core that goes idle rather than promising a deadline.
 // That is a strict improvement on "never until teardown" and is written here as what it is.
 pub fn service_faults_if_due() {
-	// THE CHEAP TEST FIRST, AND IT HAS TO BE (2026-09-01). This asked `translating()` before the
-	// tick, and that function takes the controller's spinlock - so every idle core on the machine
-	// would have grabbed one lock per pass of a loop that spins, on a 64-core boot, to answer a
-	// question that changes once. The tick load and the compare-exchange are atomics on one word:
-	// they let exactly one core per tick reach anything that locks, which is also the rate limit.
+	// ONE CORE EVER LOOKS, AND THAT IS THE FIRST TEST BECAUSE IT IS THE ONLY FREE ONE (measured
+	// 2026-09-01).
+	//
+	// The first version asked `translating()` first, which takes the controller's spinlock; the
+	// second replaced that with two relaxed loads of SHARED words - the tick counter and the
+	// last-drain stamp. Both are cheap natively and neither is cheap where it lands: `cpu_idle_loop`
+	// does NOT halt while its run queue is non-empty, so during a spawn storm every idle hart spins
+	// the whole loop body at full speed, and under TCG several harts touching one line is emulated
+	// rather than coherent hardware.
+	//
+	// It showed up as a real regression rather than a theory.
+	// `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` measures exactly
+	// that woken-and-spinning path on emulated riscv64, and it failed two of three targeted runs
+	// with the shared loads in, against gaps consistently larger than any run before this change.
+	//
+	// So the gate is the core id, which is per-core state and touches nothing another hart can see.
+	// Every hart but one returns having read a register. What this costs is honesty about the
+	// guarantee, which was already weak: the drain bounds the delay on cpu 0 settling rather than on
+	// ANY core going idle. It is still the only production path that services a fault while the
+	// binding that caused it is running, which is the property M5 asks for.
+	//
+	// AND THE CALLER MOVED TO MATCH IT (2026-09-01). Gating to cpu 0 while the only call site was
+	// `cpu_idle_loop` made this unreachable: that loop is entered by SECONDARY cores alone, and the
+	// BSP settles in `main`'s own `run_until_idle`-and-halt. The two changes were each right and
+	// together they were dead code. The call is now in the BSP loop, so the core this gate admits is
+	// the core that arrives - and a single-core machine, which had no periodic drain under either
+	// arrangement, has one.
+	if crate::sched::current_cpu_id() != 0 {
+		return;
+	}
 	let now = crate::arch::apic::ticks();
 	let last = LAST_PERIODIC_DRAIN.load(core::sync::atomic::Ordering::Relaxed);
 	if now == last {
@@ -1105,7 +1130,7 @@ pub fn poll_faults_attributed_with(during_teardown: Option<(dma::EndpointId, dma
 			let (bus, dev, func) = ((event.endpoint.0 >> 8) as u8, ((event.endpoint.0 >> 3) & 0x1f) as u8, (event.endpoint.0 & 7) as u8);
 			let contained = match containment {
 				Containment::WhateverFaulted => crate::device::contain_faulting_endpoint(bus, dev, func),
-				Containment::OnlyLiveBindings => crate::device::contain_faulting_endpoint_of_a_live_binding(bus, dev, func),
+				Containment::OnlyLiveBindings => crate::device::contain_faulting_endpoint_of_a_live_binding(bus, dev, func, event.generation.0),
 			};
 			if let Some(index) = contained {
 				crate::serial_println!("iommu:   device {index} at {bus:02x}:{dev:02x}.{func} no longer masters the bus - its binding is contained until whoever holds it tears it down");

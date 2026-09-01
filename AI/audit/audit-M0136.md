@@ -1056,3 +1056,98 @@ The correction owns the mint rather than borrowing it:
 
 The reasoning that selected StorageService over the init package and over a broad client is
 unchanged and still stands - what changes is that the thing selected now exists.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-09-01T15:31:33Z):
+
+Rating: 5/10
+
+1. **The accepted catalogue-input correction still does not define the path or bootstrap role that
+   makes it executable.** The first deliverable continues to say only “the canonical FONT
+   DESTINATION and its manifest role” rather than selecting either one
+   (`docs/todo/P02M0136.md:107-110`). The later correction says ServiceManager mints a scoped client
+   for that destination and hands it to the catalogue “as its role,” while also acknowledging that a
+   manifest `Role` cannot carry a path and that an ordinary `Client` role duplicates the provider
+   root (`:158-188`). It never fixes the destination URI, the factory source/destination rule, or the
+   role tag/kind/source (or named ServiceManager dispatch case) that triggers this exceptional mint.
+   Adding `writable` to `open-directory` creates the missing storage primitive but not the startup
+   edge that invokes it. Freeze those identifiers and the corresponding manifest/bootstrap wiring;
+   otherwise P0097, the manifest validator, ServiceManager and the catalogue can each implement a
+   different unstated contract.
+
+2. **The catalogue is ordered before the only parser it needs to implement LIST and RESCAN.** Nothing
+   else may start before the catalogue item completes (`docs/todo/P02M0136.md:99-105,313-314`), but
+   that item must enumerate collection faces and publish family/style, axes, face index and format,
+   enforce per-face metadata bounds, and recompute metadata during RESCAN (`:208-238`). Obtaining
+   those values from OpenType/TTC bytes is parsing. The closed profile and hostile-font parser are
+   later items, and parser work is expressly forbidden until the profile is frozen (`:316-323,
+   384-402`); the plan also assigns parsing to the client process rather than the catalogue
+   (`:325-341`). No manifest-declared metadata sidecar or other non-parser source is specified. The
+   current order therefore requires an unprofiled duplicate parser inside the catalogue to complete
+   the prerequisite that allows the real parser to start. Either make staged, validated metadata the
+   catalogue's normative input or order the required bounded metadata parser/profile before
+   catalogue completion.
+
+3. **RESCAN is exposed to every font client and is neither authority- nor work-bounded.** LIST,
+   RESOLVE, SUBSCRIBE and RESCAN are on one catalogue interface, and both Factory consumers and
+   ordinary applications receive fresh clients to that same root
+   (`docs/todo/P02M0136.md:129-156,208-224`). Thus any application allowed to read a font can force a
+   complete directory reread, digest and metadata pass repeatedly. `MAX_FONT_CLIENTS` bounds live
+   endpoints, not requests per endpoint, so it does not bound this shared CPU/I/O work. The stated
+   reason for public RESCAN is also false: StorageService already provides a bounded directory
+   `watch` stream (`src/idl/storage.lsidl:267-282`), and scoped directory clients admit `OP_WATCH`
+   (`src/user/services/storage/src/service.rs:750-775`). Use that notification as the normal trigger
+   and keep any explicit recovery scan on a separately authorised/rate-bounded control edge; ordinary
+   font lookup authority must not include unbounded catalogue maintenance authority.
+
+4. **RESOLVE contradicts the caller-accounting and bounded-service claims.** RESOLVE returns a
+   read-only `MemoryObject` containing as much as a 16 MiB face
+   (`docs/todo/P02M0136.md:215-224,532-544`), while the plan says the catalogue holds only small
+   metadata and that allocations are charged to the calling application's Domain (`:325-343`). In
+   this kernel a MemoryObject is charged to the Domain that creates it and that charge remains until
+   the last reference disappears (`src/kernel/object/memory_object.rs:27-39,52-79`;
+   `src/kernel/syscall/mod.rs:585-594`). A catalogue-created object therefore remains charged to the
+   catalogue while a client retains it after transfer. One connection can issue repeated RESOLVEs
+   and retain many results; neither the client/subscriber counts nor the metadata ceilings bound
+   those bytes. Freeze a requester/sponsor-created backing or another explicit charge-and-lifetime
+   protocol, and add retained-result exhaustion/reclamation gates. Merely parsing the returned bytes
+   in-process does not move the backing's charge.
+
+5. **The canonical-equivalence policy is ordered too late to guarantee its own fallback result.** The
+   normative pipeline performs face fallback before shaping (`docs/todo/P02M0136.md:418-427`), but
+   the correction says equivalence is resolved inside shaping and nevertheless requires composed and
+   decomposed spellings to choose the same fallback face (`:429-453`). Grapheme atomicity only keeps a
+   sequence together; it does not make the raw coverage sets equal. For example, a face may cover
+   precomposed U+00E9 but not the U+0065/U+0301 pair, or vice versa, so fallback has already diverged
+   before the stage allowed to resolve equivalence runs. Define a canonical coverage view (with a
+   map back to the preserved original UTF-8 spans) before fallback, or withdraw the same-fallback
+   guarantee; the current policy and regression cannot both be implemented.
+
+Clarification to finding 4: the backing is producer/service-charged, not necessarily
+catalogue-created. StorageService currently creates the `MemoryObject` returned by `open`; if the
+catalogue copies it, the catalogue becomes the producer instead. In neither case does transferring
+the handle re-charge the object to the requesting application. The retained-result exhaustion defect
+and required charge/lifetime protocol are unchanged.
+
+6. **The proposed read-only-directory mint copies a filter that does not actually refuse every
+   mutation.** The correction says a `writable: false` directory will use the same request filter that
+   already refuses all mutation for a read-only file, and its negative gate tests only an unspecified
+   write, create and delete (`docs/todo/P02M0136.md:163-190`). In the current filter, however,
+   `writable` is consulted only for `Scope::File`, and its denial set omits `OP_MKDIR` and `OP_RMDIR`;
+   both operations are then admitted for any matching scoped path alongside the other filesystem
+   operations (`src/user/services/storage/src/service.rs:750-775`). Adding a boolean to the directory
+   variant without freezing the complete mutating-op denial set can therefore mint a supposedly
+   read-only client that creates or removes directories. Require and test refusal of `mkdir`, `rmdir`
+   and every other mutating opcode through the new directory scope; “same filter” is not a sufficient
+   correction while that filter has this hole.
+
+7. **The installed-face ceilings have no runtime replacement/RESCAN outcome.** The plan says the font
+   destination remains replaceable during a boot and RESCAN republishes its current contents, but it
+   defines exact/over-bound behavior for the 64-face and 256-byte-record ceilings only at staging time
+   (`docs/todo/P02M0136.md:195-220,229-277`). A writable destination can therefore become a 65-face
+   catalogue, or acquire a face whose metadata encodes to 257 bytes, after the image passed staging.
+   The service is not told whether to truncate LIST, discard only the offending face, tear down the
+   catalogue, or retain the previous generation. Freeze an atomic runtime refusal rule—normally keep
+   serving the last valid generation and report the failed rescan—and add one-past runtime replacement
+   gates. Build-time rejection alone does not preserve the stated runtime bounds.

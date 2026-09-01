@@ -753,6 +753,15 @@ skipped=()
 # declare a requirement on: nothing changed under them, so they were not selected and their absence is
 # not a failure. A requirement blocks only when it is in this plan AND it failed.
 declare -A failed_ids=()
+# AND THE STEPS THAT NEVER RAN BECAUSE SOMETHING THEY READ DID NOT, which is a different fact from
+# failing and has to be tracked separately for blocking to be TRANSITIVE.
+#
+# `failed_ids` is written by `record_one_step`, so it only ever names steps that actually ran. A
+# BLOCKED step records its label and no id, so its own dependents saw no failed prerequisite and ran:
+# in the graph this model emits - build -> guest -> gate-after-guest - a failed build blocked the
+# guest and then let the gate that reads the guest's log run anyway, against a log that was never
+# written. One level of suppression is not suppression.
+declare -A blocked_ids=()
 blocked=()
 step=0
 guest_pids=()
@@ -841,11 +850,16 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	# failure a second time, in a form that names the wrong thing.
 	blockers=""
 	for req in ${step_reqs[$index]}; do
-		[[ -n "${failed_ids[$req]:-}" ]] && blockers+=" $req"
+		if [[ -n "${failed_ids[$req]:-}" || -n "${blocked_ids[$req]:-}" ]]; then
+			blockers+=" $req"
+		fi
 	done
 	if [[ -n "$blockers" ]]; then
-		note "[$step/$count] BLOCKED: $label - ${blockers# } failed, and this step reads what it produces"
+		note "[$step/$count] BLOCKED: $label - ${blockers# } did not produce what this step reads"
 		blocked+=("$label")
+		# THIS STEP IS NOW A BLOCKER ITSELF. Without this line the suppression stops one level down
+		# and a grandchild runs against an output nothing produced.
+		blocked_ids["${step_ids[$index]:-}"]=1
 		continue
 	fi
 	# A GUEST STEP IS THE ONLY THING `--jobs` LETS OVERLAP, and only with another guest step.

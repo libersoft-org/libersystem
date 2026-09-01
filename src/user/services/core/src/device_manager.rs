@@ -1091,7 +1091,15 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 				print_driver_name(driver_name);
 				print(b" is named by the registry and not on the volume; trying the next candidate\n");
 				node.candidate += 1;
-				node.attempt = 0;
+				// AN OPERATOR'S BUDGET SURVIVES A CANDIDATE THAT NEVER STARTED - see
+				// `Node::retry_once` (2026-09-01). Resetting here unconditionally handed the NEXT
+				// candidate a full automatic budget, so one `retry` on a device whose first artifact
+				// is missing opened three attempts on the second. Nothing ran, so the operator's one
+				// attempt is not spent; what must not happen is it turning back into the automatic
+				// budget it was set one below.
+				if !node.retry_once {
+					node.attempt = 0;
+				}
 				continue;
 			};
 			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
@@ -1117,7 +1125,13 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 			// already put the node where the table says that belongs, so the only question left is
 			// whether there is another candidate to try.
 			node.candidate += 1;
-			node.attempt = 0;
+			// The same rule as the missing-artifact advance above: a candidate that could not be
+			// STARTED does not spend an operator's one attempt, and must not restore the automatic
+			// budget either. The flag itself is consumed where an attempt actually ends - the two
+			// `Step::NextCandidate` handlers - and when a bind comes online.
+			if !node.retry_once {
+				node.attempt = 0;
+			}
 		}
 	}
 }

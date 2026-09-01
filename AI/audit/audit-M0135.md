@@ -1383,3 +1383,36 @@ then a fact about the loader rather than about the consumer, and the synthetic c
 being what it always was - a way to RUN the thing. The same root set and whole-archive rule produce
 both the surface gate's inventory and the quarantine ELF, since two closures derived differently
 would make the gate and the artifact describe different programs.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-09-01T15:27:13Z):
+
+Rating: 7/10
+
+1. **The latest portable-static-target correction was not propagated into one authoritative freeze
+   order or owner.** M1 now puts the portable static target between the bootstrap pin and pass 1
+   (`docs/todo/P02M0135.md:161-165`), but the option row calls it a "NUMBERED PREREQUISITE" owned by
+   the later platform port, says only that it is constructed before pass 2, and gives it no separate
+   work item (`:183-203`). Most importantly, the final normative summary still claims that M1's
+   order is `bootstrap pin -> pass 1 -> substrate -> platform port -> pass 2 -> derived pin`, omitting
+   the new target entirely (`:769-770`). An implementer following that completion order reaches pass
+   1 without the target that pass 1 is now required to configure against; one following M1 must build
+   an unspecified portion of the platform port before the item which owns that port. Freeze one
+   order, identify the early target/patch as an actual deliverable, and use that same order in the
+   completion gate.
+
+2. **The loader port closes the ICD path but leaves the pinned loader's layer discovery/loading path
+   incompatible with the no-ambient-search policy.** The selected upstream is not only an ICD
+   loader: its production loader exports layer enumeration, discovers implicit and explicit layer
+   manifests through filesystem and environment paths, and dynamically resolves enabled layer
+   libraries; disabling tests and WSI does not remove that core path
+   ([official loader overview](https://github.com/KhronosGroup/Vulkan-Loader),
+   [official layer-discovery contract](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md)).
+   The corrected whole-archive/root rule admits the loader's public entry points, while the platform
+   port defines only a `vulkan-icd` selection slot and two ICD exports
+   (`docs/todo/P02M0135.md:268-287,525-662`). It never says what
+   `vkEnumerateInstanceLayerProperties` returns, how an application request for an explicit layer is
+   refused, or how the upstream layer search and `dlopen` calls are removed. The audit link can
+   therefore retain the forbidden file/environment/dynamic-loading substrate or the quarantined
+   loader can fail outside the one synthetic ICD call path. Within this milestone's narrow scope,
+   explicitly port the layer path to an empty/refusal policy (or separately authorize it) and gate
+   the exported enumeration/request behavior through the audit-linked loader.

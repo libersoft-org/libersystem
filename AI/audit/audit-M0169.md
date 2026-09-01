@@ -645,3 +645,21 @@ one a reader would otherwise re-propose: it can only fail after stages are runni
 is signal-wait-reap over processes that have already produced effects - a worse contract than not
 starting them. Leaving both open was also the defect M5 of this same file refuses by name, which is
 what made it inconsistent as well as unimplementable.
+
+AUDITOR'S RE-AUDIT OF PLAN M0169 (2026-09-01T15:25:24Z):
+
+Rating: 8/10
+
+1. **`PeerClosed` is incorrectly treated as harmless after a release may have committed.** M2 says
+   `PeerClosed` only means that ProcessService and its records are gone, while classifying only
+   `ReceiveFailed` and `TimedOut` as uncertain outcomes requiring started-process recovery
+   (`docs/todo/P02M0169.md:219-228`). The generated client correctly classifies all three as
+   `CommitUncertain`, because the server may have acted before dying
+   (`src/user/libs/protocol/process-proto/src/generated/liber/process/v1.rs:605-616`). In particular,
+   `release` removes the prepared token before attempting the start
+   (`src/user/services/core/src/process_service.rs:899-908`), and `release_group` removes every token
+   before starting members (`:941-970`). If the peer closes after either transition, disconnect
+   cleanup has no prepared token to abandon and loss of ProcessService's bookkeeping does not stop an
+   already released child. `PeerClosed` is safe as teardown recovery for an uncertain prepare, but
+   during or after release it must use the retained task/group to kill and confirm termination just
+   like the other commit-uncertain outcomes; the fault matrix must cover that stage-dependent case.

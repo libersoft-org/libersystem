@@ -453,6 +453,21 @@ pub(crate) fn console_shell_loop() {
 		// re-enter, which wakes whatever housekeeping (a display poll, a blink tick)
 		// came due in the meantime.
 		arch::serial::drain_tx();
+		// AND THE IOMMU'S FAULT QUEUE IS SERVICED HERE, ON THE ONE CORE THAT REACHES THIS LOOP.
+		//
+		// This lived in `cpu_idle_loop` and could not run: that loop is entered only by SECONDARY
+		// cores - `smp::start`, riscv64's `smp`, aarch64's `psci` are its three callers - while the
+		// BSP settles here, in `run_until_idle` plus a halt. Once `service_faults_if_due` was gated
+		// to cpu 0, to stop every hart touching its shared words during a spawn storm, the two facts
+		// met and the drain became unreachable on every machine: gated to a core that never called
+		// it. A one-core system had no periodic drain either way.
+		//
+		// Here, both hold. Cpu 0 is the only core doing the work, so no other hart pays for the
+		// check, and cpu 0 actually arrives - once per settle, which is what bounds how long a fault
+		// raised by a live binding can sit in the controller's queue. It is beside `drain_tx` because
+		// it is the same kind of thing: work the settled BSP owes the rest of the machine before it
+		// halts.
+		crate::iommu::service_faults_if_due();
 		arch::idle_halt();
 	}
 }

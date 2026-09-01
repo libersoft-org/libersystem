@@ -592,3 +592,23 @@ The matrix now has two development rows. The default one - no `--no-iommu` - is
 the flag chooses is the mode, which is what the previous row denied. M8 gains an admission fixture per
 row rather than one for "development": a default development boot admits an `iommu-required` driver,
 and a `--no-iommu` development boot refuses the same driver.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-09-01T15:21:58Z):
+
+Rating: 6/10
+
+1. **The latest development-mode correction is incomplete and incorrectly generalizes x86_64's
+   translated default to architectures whose topology does not yet exist.** The matrix now assigns
+   `enforcing-required` to a default development boot on **any target** and `no-iommu` only with the
+   flag (`docs/todo/P02M0172.md:91-103`), but the surrounding normative rules still say the flag
+   chooses a mode only within public/gate runs (`:59-61`) and that every test **and development**
+   producer writes the degraded value (`:167-181,187-198`). Following those stale rules makes the
+   ordinary translated x86_64 development boot emit `no-iommu` and fail M6's controller/mode check.
+   Following the new table breaks the other direction: the current harness adds
+   `virtio-iommu-pci` only in `qemu_run_x86_64`
+   (`src/harness/qemu-run.sh:1008-1065`), and P02M0173 explicitly owns the missing AArch64/RISC-V
+   topology (`docs/todo/P02M0173.md:1-15,60-73`). A default non-x86 development/profile boot therefore
+   has no enforcement capable of satisfying its new `enforcing-required` record and must refuse under
+   M6 (`docs/todo/P02M0172.md:405-415`). Split development by architecture and by P02M0173's landing
+   transition, then update every producer/missing-value paragraph and fixture to the same rows; the
+   x86_64 measurement does not justify an `any target` value.

@@ -1467,8 +1467,12 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 	let index = key.device_index as u64;
 	// AND A VECTOR NOTHING CAN DELIVER IS NOT HANDED OUT.
 	//
-	let (cap, table_phys, bus, dev, func) = match device::with(index as usize, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)) {
-		Some((cap, table_phys, bus, dev, func)) if cap != 0 => (cap, table_phys, bus, dev, func),
+	// The capability offset is still what says this device HAS MSI-X - a zero refuses here - but it
+	// is no longer carried down: `device::publish_msi_if_current` re-reads it from the table entry
+	// under the same lock it checks the claim under, so the enable cannot use an offset read before
+	// a rebind.
+	let (table_phys, bus, dev, func) = match device::with(index as usize, |d| (d.msix_cap, d.msix_table_phys, d.bus, d.dev, d.func)) {
+		Some((cap, table_phys, bus, dev, func)) if cap != 0 => (table_phys, bus, dev, func),
 		_ => return ERR_INVALID,
 	};
 	// AND THE DOORBELL IS MAPPED HERE, WHICH IS THE MOMENT IT IS ASKED FOR.
@@ -1615,21 +1619,29 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 		thread.handles().lock().release_reservation(1);
 		return ERR_RESOURCE_EXHAUSTED;
 	}
-	// AND ONLY NOW IS THE ENTRY MADE DELIVERABLE. `program_msix_entry` wrote it MASKED, so
-	// everything between it and here - the bind, and the generation re-check `register_derived`
-	// performs - happened against an entry the device could not raise.
+	// AND ONLY NOW IS THE ENTRY MADE DELIVERABLE - UNDER THE CLAIM, IN ONE STEP.
 	//
-	// That is what closes the last stale-generation window (2026-09-01). Disabling MSI-X at claim
-	// release stops a function staying enabled across a binding that ended; it does not stop a
-	// REPLACEMENT binding enabling it. A replacement that acquires a vector and then closes it leaves
-	// its slot PENDING, and `has_live` deliberately does not count a pending slot - so a caller whose
-	// claim ended while it was paused between its own check and `acquire_msi_unique` could take a
-	// fresh slot and write entry 0 of a function the replacement had already enabled, unmasked,
-	// before `register_derived` rejected its key. Masked programming makes that write inert.
-	arch::interrupts::unmask_msi(vector, table_phys);
-	// Turn on MSI-X now that its table entry is programmed; the device's INTx pin stays
-	// disabled (MSI-X is its interrupt source from here on).
-	arch::pci::msix_enable(bus, dev, func, cap);
+	// `program_msix_entry` wrote the entry MASKED, so everything between it and here - the bind, and
+	// the generation re-check `register_derived` performs - happened against an entry the device
+	// could not raise. That closed the window BEFORE this point: a stale caller could no longer
+	// publish a deliverable vector onto a function a replacement had enabled.
+	//
+	// The window AFTER it needed the same treatment (2026-09-01). `register_derived` drops the claim
+	// lock when it returns, and this used to be two ordinary calls - an unmask and an enable. A
+	// release starting in that gap disables MSI-X, revokes the interrupt and frees the slot, and this
+	// code then resumed and unmasked an entry belonging to no claim or to the next binding. So the
+	// publication is one operation that holds the claim and checks the generation inside it: see
+	// `device::publish_msi_if_current`. It either publishes this binding's vector or refuses,
+	// and a release cannot land in the middle of it.
+	if !device::publish_msi_if_current(key, vector, table_phys) {
+		// The claim ended while this call was running. Everything this acquire built is given back
+		// in the order the rollback above uses - disowned first, so exactly one path frees the slot -
+		// and nothing was ever made deliverable.
+		interrupt.disown();
+		arch::interrupts::release_unused_msi(vector);
+		thread.handles().lock().release_reservation(1);
+		return ERR_ACCESS_DENIED;
+	}
 	thread.handles().lock().insert_reserved(Capability::new(interrupt, Rights::ALL)).raw() as i64
 }
 
