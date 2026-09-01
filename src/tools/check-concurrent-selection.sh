@@ -32,15 +32,26 @@ fail() {
 	exit 1
 }
 
-# The two selections. Each is a tag the kernel suite actually has, and they do not overlap - so the
-# effective filter each guest prints is unique to its own run.
+# THE TWO SELECTIONS, AND THEY DIFFER IN BOTH DIMENSIONS (corrected 2026-09-01).
+#
+# A previous version varied only `TEST_TAGS` and left `TEST_SELECTION` unset, so `test-kernel.sh`
+# compiled both kernels with the same empty selection. That proves TAG isolation, and the requirement
+# is simultaneous suites with different `TEST_SELECTION` AND different `TEST_TAGS`, each reporting
+# its own selection - so the gate was weaker than the clause it exists for.
+#
+# `TEST_SELECTION` is an exact list of stable test IDs and the runner HARD-FAILS on one it does not
+# have, which is what makes a stale ID here a loud failure rather than a smaller run. The two sets are
+# disjoint, so each guest's log names its own tests and none of the other's - a stronger identity than
+# the tags line, and the one the definition of done asks for.
 A_TAGS="dma"
+A_SELECTION="kernel.object.channel.channel_endpoint_semantics,kernel.object.channel.blocking_wait_wakes_on_message"
 B_TAGS="domain"
+B_SELECTION="kernel.object.channel.a_returned_message_is_still_charged_to_the_sender,kernel.object.channel.channel_message_and_capability_transfer"
 
-echo "concurrent-selection: starting two x86_64 suites at once - tags '$A_TAGS' and '$B_TAGS'"
-(cd "$REPO_ROOT" && ./test.sh --arch x86_64 --tags "$A_TAGS") >"$work/a.log" 2>&1 &
+echo "concurrent-selection: starting two x86_64 suites at once, differing in BOTH selection and tags"
+(cd "$REPO_ROOT" && TEST_SELECTION="$A_SELECTION" ./test.sh --arch x86_64 --tags "$A_TAGS") >"$work/a.log" 2>&1 &
 a_pid=$!
-(cd "$REPO_ROOT" && ./test.sh --arch x86_64 --tags "$B_TAGS") >"$work/b.log" 2>&1 &
+(cd "$REPO_ROOT" && TEST_SELECTION="$B_SELECTION" ./test.sh --arch x86_64 --tags "$B_TAGS") >"$work/b.log" 2>&1 &
 b_pid=$!
 
 # BOTH ARE WAITED FOR BEFORE EITHER IS JUDGED, so a failure in the first does not leave the second
@@ -79,19 +90,46 @@ done
 cat "${a_logs[@]}" >"$work/a.result"
 cat "${b_logs[@]}" >"$work/b.result"
 
-# EACH GUEST ANNOUNCES THE FILTER IT WAS COMPILED WITH. A run that booted the other's staged kernel
-# prints the other's tags here, which is precisely the collision the staging is meant to prevent.
-selection_of() {
-	sed -n 's/^.*test tags: requested=\([^,]*\),.*$/\1/p' "$1" | tail -1
+# EACH GUEST RAN ITS OWN SELECTION AND ONLY ITS OWN.
+#
+# `TEST_SELECTION` is compiled in, so the tests a guest runs are a property of the executable that
+# booted rather than of the command line that asked for it. A run that booted the other's staged
+# kernel therefore runs the OTHER's tests, and says so by name in its own log - which is the
+# collision the per-run staging exists to prevent, and the reason this assertion is on the test IDs
+# rather than on "both passed". Two runs that both pass prove nothing about isolation.
+ran_ids() {
+	# The id is the start of each test line, before the `...`.
+	grep -aoE '^kernel\.[a-z_.0-9]+' "$1" | sed 's/\.*$//' | sort -u
 }
-a_seen="$(selection_of "$work/a.result")"
-b_seen="$(selection_of "$work/b.result")"
-[[ -n "$a_seen" ]] || fail "the '$A_TAGS' run's log does not say which selection its guest ran"
-[[ -n "$b_seen" ]] || fail "the '$B_TAGS' run's log does not say which selection its guest ran"
-[[ "$a_seen" == "$A_TAGS" ]] || fail "the run asked for '$A_TAGS' and its guest ran '$a_seen' - it booted a kernel built for another selection"
-[[ "$b_seen" == "$B_TAGS" ]] || fail "the run asked for '$B_TAGS' and its guest ran '$b_seen' - it booted a kernel built for another selection"
-[[ "$a_seen" != "$b_seen" ]] || fail "both guests ran the same selection, so the two runs were not independent"
+a_ran="$(ran_ids "$work/a.result")"
+b_ran="$(ran_ids "$work/b.result")"
+[[ -n "$a_ran" ]] || fail "the first run's log names no test that ran"
+[[ -n "$b_ran" ]] || fail "the second run's log names no test that ran"
 
-echo "concurrent-selection: both suites passed while overlapping, each on its own medium and its own logs"
-echo "concurrent-selection:   '$A_TAGS' -> $(basename "${a_logs[0]}")"
-echo "concurrent-selection:   '$B_TAGS' -> $(basename "${b_logs[0]}")"
+# ITS OWN, ALL OF THEM. A selection the runner could not satisfy is a hard failure inside the guest,
+# so a missing id here means the run booted something else.
+check_ran() {
+	local which="$1" selection="$2" ran="$3" id
+	while IFS= read -r id; do
+		[[ -z "$id" ]] && continue
+		grep -qxF "$id" <<<"$ran" || fail "the $which run selected '$id' and its guest did not run it - it booted a kernel built for another selection"
+	done < <(tr ',' '\n' <<<"$selection")
+}
+check_ran first "$A_SELECTION" "$a_ran"
+check_ran second "$B_SELECTION" "$b_ran"
+
+# AND NONE OF THE OTHER'S, which is the half that catches a swap rather than a stale log.
+check_absent() {
+	local which="$1" selection="$2" ran="$3" id
+	while IFS= read -r id; do
+		[[ -z "$id" ]] && continue
+		grep -qxF "$id" <<<"$ran" && fail "the $which run ran '$id', which belongs to the OTHER selection - the two guests were not independent"
+	done < <(tr ',' '\n' <<<"$selection")
+	return 0
+}
+check_absent first "$B_SELECTION" "$a_ran"
+check_absent second "$A_SELECTION" "$b_ran"
+
+echo "concurrent-selection: both suites passed while overlapping, each on its own medium, its own logs and its own selection"
+echo "concurrent-selection:   selection A ($A_TAGS) -> $(basename "${a_logs[0]}")"
+echo "concurrent-selection:   selection B ($B_TAGS) -> $(basename "${b_logs[0]}")"

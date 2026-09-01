@@ -1244,3 +1244,18 @@ a NEW option in a newer revision, which is a pin change and goes through the fre
 
 What stays with the lockfile and not here: the exact spelling of each flag, its verification, and the
 revisions and digests. The plan owns the choices; the machine-read file owns their form.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-09-01T02:10:36Z):
+
+Rating: 8/10
+
+1. **The no-self-thread stop condition covers pass 1 even though later phases can introduce the same
+   forbidden requirement.** The thread item stops only when “pass 1's inventory” names a
+   thread-creation symbol (`docs/todo/P02M0135.md:310-315`). Pass 2 expressly adds requirements exposed
+   only by archive, weak/COMDAT, and compiler-runtime selection (`:247-251`), and the platform port is
+   built after pass 1 (`:161-163,519-527`). The completion prose instead says a thread-creation symbol
+   in the *derived* inventory pauses the milestone (`:719-723`), while the watched gate refers only to
+   the ambiguous “recorded inventory” (`:705-707`). A port, generated object, compiler-runtime member,
+   or converged-link selection can therefore introduce self-threading after the only normative stop.
+   Apply the stop and gate to every finally admitted ET_REL member, the converged resolved set, and the
+   audit-linked ELF, parallel to Variant B's full-closure TLS scan.

@@ -554,12 +554,23 @@ fi
 LOADER_DIR="$PWD/src/boot/loader"
 RELEASE_KEY="d04ab232742bb4ab3a1368bd4615e4e6d0224ab71a016baf8520a332c9778737"
 LOADER_OUT=".build/cargo/loader/x86_64-unknown-uefi/debug/libersystem-loader.efi"
+# EVERY LOADER BUILD BELOW TAKES THE SHARED LOADER LOCK (2026-09-01).
+#
+# `LOADER_OUT` is the ONE output path every loader build in this tree writes, and this gate builds
+# several trust profiles through it. The test harness stages a run-private copy of that path so a
+# concurrent run cannot swap the bytes its medium is assembled from - and it was taking a lock these
+# writers ignored, which makes the lock a formality rather than a guarantee. A profile cycled through
+# here could be what a run copied, and an A-to-B-to-A cycle restores the original hash so the
+# before/after check agrees.
 
 cp "$esp" "$efi"
 mdel -i "$efi" ::/etc/boot.manifest2 2>/dev/null || fail "the medium carries no signed manifest to remove"
 
 # The test-trust loader, which may take the downgrade and must say so.
-(cd "$LOADER_DIR" && env LIBER_TRUST_PROFILE=test-trust cargo build --quiet) || fail "the test-trust loader did not build"
+(
+	mkdir -p .build/state
+	flock 9 && cd "$LOADER_DIR" && env LIBER_TRUST_PROFILE=test-trust cargo build --quiet
+) 9>.build/state/kernel-test-build.lock || fail "the test-trust loader did not build"
 mcopy -o -i "$efi" "$LOADER_OUT" ::/EFI/BOOT/BOOTX64.EFI
 downgrade_log="$work/downgrade-test-trust.log"
 boot_medium "$efi" "$downgrade_log"
@@ -571,7 +582,10 @@ grep -aq "THIS KERNEL IS NOT AUTHENTICATED" "$downgrade_log" || {
 echo "signed-boot: with the signed manifest removed, a test-trust build boots and SAYS the kernel is not authenticated"
 
 # The release loader, which must not.
-(cd "$LOADER_DIR" && env LIBER_TRUST_PROFILE=external-release LIBER_TRUST_KEY="$RELEASE_KEY" LIBER_TRUST_KEY_ID=42 cargo build --quiet) || fail "the release loader did not build"
+(
+	mkdir -p .build/state
+	flock 9 && cd "$LOADER_DIR" && env LIBER_TRUST_PROFILE=external-release LIBER_TRUST_KEY="$RELEASE_KEY" LIBER_TRUST_KEY_ID=42 cargo build --quiet
+) 9>.build/state/kernel-test-build.lock || fail "the release loader did not build"
 mcopy -o -i "$efi" "$LOADER_OUT" ::/EFI/BOOT/BOOTX64.EFI
 release_log="$work/downgrade-release.log"
 boot_medium "$efi" "$release_log"
@@ -589,7 +603,10 @@ echo "signed-boot: and a release build refuses it, naming the missing signed man
 
 # THE TREE IS LEFT WITH THE LOADER IT HAD. A gate that leaves a release-profile binary in the build
 # directory hands the next `./image.sh` a loader carrying a key nothing in this tree can sign with.
-(cd "$LOADER_DIR" && env LIBER_TRUST_PROFILE=test-trust cargo build --quiet) || fail "the test-trust loader did not rebuild"
+(
+	mkdir -p .build/state
+	flock 9 && cd "$LOADER_DIR" && env LIBER_TRUST_PROFILE=test-trust cargo build --quiet
+) 9>.build/state/kernel-test-build.lock || fail "the test-trust loader did not rebuild"
 
 # AND THE OTHER TWO PORTS. The Definition of done names three architectures for the MANIFEST claim
 # and one for the firmware one, and this gate collapsed both into "x86_64 only, and by design" - so

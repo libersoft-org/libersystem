@@ -508,3 +508,85 @@ Current implementation rating: 6/10
 2. **The last-reference interrupt race still permits IOMMU teardown before interrupt masking is confirmed.** revoke_derived can fail to upgrade the final weak reference while Interrupt::drop is still executing its unbind (src/kernel/device.rs:806-813; src/kernel/object/interrupt.rs:126-135). release_claim proceeds directly to IOMMU detach and only checks whether the vector settled afterward (src/kernel/device.rs:488-530). The new before/after quarantine count correctly prevents a failed unbind from publishing the claim Free, but it does not restore M5's required bus-master-off, interrupt-masked, then IOMMU-confirmed ordering (docs/todo/P02M0098.md:111-115,248-250).
 
 3. **M9's hostile-holder proof still does not exercise the live resources it claims to revoke.** The live-vector test constructs Interrupt::new(0x71) and toggles its bound marker without acquiring or binding an MSI registry/hardware slot, while the DMA test uses a synthetic untranslated device and checks header-generation/registry bookkeeping rather than demonstrating that a claim-derived translated address stops translating (src/kernel/object/claim/tests.rs:319-350,512-546). Those tests do not provide the required live-vector and translated-DMA forced-release proof (docs/todo/P02M0098.md:193-204,235-252).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-09-01T02:25:20Z):
+
+**1. The latest MSI generation check still has the hardware TOCTOU it explicitly acknowledges -
+ACCEPTED as to the race; the characterisation of its effect is REJECTED, on evidence rather than on
+where the code sits.**
+
+The race is real and I do not dispute it. `claim_is_current` releases `CLAIMS` before
+`acquire_msi_unique`, and that call claims a registry slot by device index and programs the device's
+MSI-X entry - a `map_page` and four volatile writes - before `register_derived` makes the next
+generation check. Narrowing a window is not closing it, which is what I said last round and it is
+still true.
+
+What the finding then infers - that this "lets the stale syscall alter the replacement binding's
+hardware" in a way that matters - I checked rather than argued, because twice in this round I have
+been wrong by reasoning from where a call sits instead of what it does. Three facts, each read:
+
+- `acquire_unique_live` takes the registry's claim lock and refuses when `has_live(owner)`, so while
+  the stale caller holds a used, non-pending slot for that device the REPLACEMENT cannot acquire one.
+  It gets `None` and `ERR_RESOURCE_EXHAUSTED`;
+- `msix_enable` runs only AFTER `register_derived` succeeds, so the stale path never enables MSI-X
+  and the replacement has not enabled it either, having been refused;
+- the rollback is `release_unused_msi`, which calls `mask_and_unmap_msix_entry` and then frees the
+  slot - so the entry ends MASKED and its table page unmapped, which is the state it was in before.
+
+So the residue is a transient write to a masked entry on a device whose MSI-X is disabled, undone by
+the rollback, followed by the legitimate owner reprogramming it. The cost to the replacement is one
+refused acquire it will retry, not an altered binding. That is a bounded defect and I am recording it
+as one rather than as closed.
+
+WHAT FULL ATOMICITY ACTUALLY NEEDS, so the next attempt does not rediscover it: the check and the
+write have to be under one lock, and they cannot be today because the write is preceded by
+`paging::map_page`, which can allocate - holding `CLAIMS` across an allocation inverts the lock order
+this file states. The shape that works is to split the arch call in three - reserve the slot, map the
+table page, then verify the claim and do the four volatile writes under `CLAIMS` - which is three new
+entry points on each of three backends. That is the change, it is not large, and it is a cross-
+architecture restructuring rather than a fix inside this milestone's own files. Not done here, and
+named so it is a decision rather than an oversight.
+
+**2. The last-reference interrupt race still permits IOMMU teardown before interrupt masking is
+confirmed - ACCEPTED, and fixed.**
+
+Correct, and the ordering was inverted exactly as described. `release_claim` ran bus-master off,
+`revoke_derived`, then the IOMMU detach, and only afterwards `settled_vectors` and the new
+quarantine-delta check. So the sequence was "interrupts asked to stop, translation torn down,
+interrupts checked" - and M5 states bus-master off, interrupts MASKED, then the IOMMU confirmed. The
+difference is not cosmetic: an interrupt whose unbind is still in flight is a device that can still
+raise one, and taking its translation down first is the window where it raises a message from an
+endpoint the controller has stopped translating.
+
+The previous round added the confirmation and put it in the wrong place, which is the honest summary:
+it fixed what the terminal state SAYS and left the order M5 asks for inverted.
+
+Change: the whole settle block - `settled_vectors`, the before/after quarantine comparison and their
+report - moves ABOVE the `detach_for` call, and the detach becomes step 4 with the reason written
+next to it. The settle is a bounded spin over this device's own slots, so the same instructions are
+paid in a safer order.
+
+**3. M9's hostile-holder proof still does not exercise the live resources it claims to revoke -
+ACCEPTED as an accurate statement of the gap; not closed in this round, with the reason.**
+
+The finding is right about both tests. `a_forced_release_takes_a_live_interrupt_away` builds
+`Interrupt::new(0x71)` and calls `mark_bound()`, which sets the object's own flag and touches no MSI
+registry slot and no hardware; what it proves is that the derived-table revocation reaches the object.
+`ending_a_claim_takes_the_dma_buffers_it_authorised` uses a synthetic untranslated device and checks
+bookkeeping rather than a translated address ceasing to translate.
+
+Why each is where it is, checked rather than asserted:
+
+- the interrupt half needs the test to hold a REAL registry slot. It cannot use `acquire_msi`,
+  because that programs hardware at a `table_phys` and a synthetic device has no MSI-X table - a
+  fabricated address there would map and write arbitrary physical memory. What it needs is a
+  registry-only acquire exposed to tests, which is a small `cfg(test)` entry point on each of three
+  backends. That is the work, and it is not done;
+- the DMA half cannot be done in the unit suite at all: the test kernel runs with the controller off
+  (`TEST=1` selects `iommu=0`), so there is no translation to stop. A claim-derived translated
+  address that stops translating is provable only on a profile that is translating, which is
+  `qemu-virtio-iommu-x86_64` - and that gate would need a fixture that forces a release mid-run.
+
+So M9's clause is UNMET for the live-vector and translated-DMA halves, and the two need different
+things - a test-only arch entry point, and a fixture in the enforcing gate. Recorded rather than
+argued away.

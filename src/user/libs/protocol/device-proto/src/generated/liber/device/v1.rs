@@ -238,6 +238,14 @@ pub enum FailureCause {
 	DriverReportedFailure = 9,
 	TeardownUnconfirmed = 10,
 	Hung = 11,
+	/// IT WAS ASKED TO STOP AND IT DID, which is not a failure (added 2026-09-01).
+	///
+	/// A planned stop used to travel as `driver-exited`, which renders as "it exited without saying
+	/// anything" - about a driver that had said exactly what it was asked to say - and that cause was
+	/// captured, reported and PERSISTED. An operator reading a stored incident row for a clean
+	/// shutdown was told the driver had crashed. A state and a cause are two halves of one answer, so
+	/// the honest half needed a value of its own.
+	Stopped = 12,
 }
 
 impl FailureCause {
@@ -292,6 +300,7 @@ impl FailureCause {
 			9 => Some(FailureCause::DriverReportedFailure),
 			10 => Some(FailureCause::TeardownUnconfirmed),
 			11 => Some(FailureCause::Hung),
+			12 => Some(FailureCause::Stopped),
 			_ => None,
 		}
 	}
@@ -2453,6 +2462,7 @@ impl FailureCause {
 			FailureCause::DriverReportedFailure => out.push_str("\"driver-reported-failure\""),
 			FailureCause::TeardownUnconfirmed => out.push_str("\"teardown-unconfirmed\""),
 			FailureCause::Hung => out.push_str("\"hung\""),
+			FailureCause::Stopped => out.push_str("\"stopped\""),
 		}
 	}
 	pub(crate) fn to_text_into(&self, out: &mut String) {
@@ -2469,6 +2479,7 @@ impl FailureCause {
 			FailureCause::DriverReportedFailure => out.push_str("driver-reported-failure"),
 			FailureCause::TeardownUnconfirmed => out.push_str("teardown-unconfirmed"),
 			FailureCause::Hung => out.push_str("hung"),
+			FailureCause::Stopped => out.push_str("stopped"),
 		}
 	}
 	pub(crate) fn to_cbor_into(&self, out: &mut Vec<u8>) {
@@ -2485,6 +2496,7 @@ impl FailureCause {
 			FailureCause::DriverReportedFailure => crate::codec::cbor::text(out, "driver-reported-failure"),
 			FailureCause::TeardownUnconfirmed => crate::codec::cbor::text(out, "teardown-unconfirmed"),
 			FailureCause::Hung => crate::codec::cbor::text(out, "hung"),
+			FailureCause::Stopped => crate::codec::cbor::text(out, "stopped"),
 		}
 	}
 }

@@ -2,7 +2,7 @@ package liber:device@1
 enum device-type(unknown=0,net=1,block=2,console=3,usb=4)
 record device-entry(index:u32,type:device-type,mmio-len:u64,bus:u32,dev:u32,func:u32)
 enum binding-state(unbound=0,dependency-pending=1,binding=2,online=3,stopping=4,backoff=5,failed=6,quarantined=7,disabled=8)
-enum failure-cause(none=0,driver-missing=1,protocol-mismatch=2,claim-refused=3,iommu-required=4,resource-exhausted=5,spawn-failed=6,handshake-timeout=7,driver-exited=8,driver-reported-failure=9,teardown-unconfirmed=10,hung=11)
+enum failure-cause(none=0,driver-missing=1,protocol-mismatch=2,claim-refused=3,iommu-required=4,resource-exhausted=5,spawn-failed=6,handshake-timeout=7,driver-exited=8,driver-reported-failure=9,teardown-unconfirmed=10,hung=11,stopped=12)
 record binding-record(index:u32,bus:u32,dev:u32,func:u32,generation:u64,state:binding-state,cause:failure-cause,attempts:u32,artifact:string,rule:u32,providers:u32,resources:u32)
 interface device
 method device.list op=1 () -> result<list<device-entry>, liber:base@1::error>

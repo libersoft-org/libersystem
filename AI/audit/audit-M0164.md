@@ -770,3 +770,79 @@ Current implementation rating: 4/10
 3. **Block-role selection remains positional and only partially probed.** DeviceManager mints probes for at most four providers, then takes providers by ascending BDF into fixed slots; ServiceManager assigns fixed FAT/ISO/UDF tags that StorageService trusts rather than probing those formats (src/user/services/core/src/device_manager.rs:819-856; src/user/services/core/src/service_manager/bootstrap.rs:389-474; src/user/services/storage/src/service.rs:255-268). This cannot select a matching system volume beyond the first four and does not implement the required format/origin/RootSelection decision or its coverage (docs/todo/P02M0164.md:71-121,288-305).
 
 4. **The rejection that FAT media and FAT USB are separated by provider origin is not supported by the implementation.** route_offers receives the current node but obtains USB storage through the global catalogue.take(BLOCK); take selects the lowest-BDF unclaimed block provider without filtering by the current binding or xHCI origin (src/user/services/core/src/device_manager.rs:1087-1154,2036-2066). An extra unclaimed non-xHCI block can therefore be labelled USBBLOCK. Phase order may make the expected provider likely, but it does not establish the required origin rule or either-order FAT-media/FAT-USB case (docs/todo/P02M0164.md:292-303).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-09-01T02:25:20Z):
+
+**1. The catalogue migration remains only one production consumer deep - ACCEPTED as accurate; not
+implemented in this round.**
+
+Correct, and P02M0099's own destination table now says so too - its AudioService row was corrected
+this cycle from DONE to PARTIAL, because "reaches its provider through the catalogue" is discovery and
+not the lifecycle contract. The remaining five destinations are still on their bootstrap handles.
+
+Not done here for the same reason as last round, restated because the finding is right to keep
+asking: each destination is a separate piece of work - the versioned device-side contract for its
+kind, the service-side attach, detach, failover and reconnect, and the removal of that service's
+bootstrap handshake - and P02M0099's table names an owner for each. Doing five of those inside an
+audit response is the redesign this round is instructed to avoid. The definition of done remains UNMET
+on the migration clause.
+
+**2. The dependency-arrival correction cannot take its success path - ACCEPTED, and this was a real
+functional bug rather than a coverage gap.**
+
+The finding is exactly right and it is the most serious thing in this audit.
+`settle_dependencies` asked for `DependencyPending -> Unbound` and did the rest of its work only if
+that transition succeeded. There is no such edge: the table permits `DependencyPending -> Binding`
+and `-> Disabled` and nothing else, deliberately, and `driver-binding` carries a test named
+`a_node_waiting_for_a_dependency_has_no_way_back_to_where_a_bind_begins` that asserts the refusal
+with the reason - "a node waiting for a provider that then goes away is waiting harder, not waiting
+less". So `move_to` returned false, `restart_requested` was never set, `moved` never counted it, and
+a driver whose declared requirement arrived stayed in `DependencyPending` for the rest of the boot.
+The requires-edge that M6 asks to WAKE a node could only ever put it to sleep.
+
+The code even described the right mechanism while using the wrong one: its comment said this is "the
+same mechanism an operator's retry uses", and the retry sets the flag and lets the bind path make the
+transition, which is exactly what this could not do through `Unbound`.
+
+Change: the `Unbound` hop is gone. The arm resets `attempt` and `retry_at`, sets
+`restart_requested`, prints and counts. The standing loop consumes the flag, calls
+`start_candidate`, and `begin_bind` performs `DependencyPending -> Binding` - the legal edge the
+table leaves open for precisely this.
+
+**3. Block-role selection remains positional and only partially probed - ACCEPTED as accurate; not
+implemented in this round.**
+
+Correct on both halves, and the finding adds a bound I had not written down: the probe set is capped
+at four, so a system volume published fifth cannot be matched at all. The role assignment past the
+system volume is still by ascending BDF into fixed slots, ServiceManager still injects FAT/ISO/UDF by
+fixed tag, and StorageService still trusts the tag rather than probing the format.
+
+What remains is M2's other half and it is unchanged from last round: the probe result has to reach
+the role assignment, and the probe belongs to StorageService by this milestone's own deliberate
+division while the assignment happens in DeviceManager before any storage instance exists. That is a
+new hand-off across three processes and the wire between them. The definition of done's format/origin/
+`RootSelection` decision and its three-outcome coverage remain UNMET, and the code comment saying the
+assignment is "STILL BY ARRIVAL ORDER" is the accurate description.
+
+**4. The rejection that FAT media and FAT USB are separated by provider origin is not supported by
+the implementation - ACCEPTED. My rejection was wrong, and wrong in a way I have now repeated.**
+
+The finding is right and I checked it rather than re-arguing. `route_offers` receives the node, and
+then calls `catalogue.take(BLOCK)`, which walks the whole catalogue and returns the lowest-BDF
+unclaimed provider of that kind. It does not consult the node, the binding, or the driver. So an extra
+unclaimed non-xHCI block provider could be handed over as `USBBLOCK`, and what makes the expected one
+likely is phase ordering rather than any origin rule.
+
+Last round I rejected this on the grounds that the take "sits inside `route_offers`, from the offers
+of the driver that published it". Where a call sits says nothing about what it selects. That is the
+same error as the AudioService row in P02M0099 - describing a mechanism by its context instead of its
+behaviour - made twice in one cycle, both times in a confident rejection, both times with the answer
+two lines away in the function being cited.
+
+Change: `Catalogue::take_from(binding, kind)` selects only among providers published by that binding,
+counting the consumer the same way `take` does. Every take in `route_offers` now uses it - block,
+net, display, input, console-bytes, USB bus and USB pointer - so a driver's offers are routed from
+that driver's own publications. The boot-volume loop keeps the global `take`, with a comment saying
+why: that caller IS choosing among every block provider by address, which is what `take` is for.
+This makes origin a rule where the milestone claims one; it does not by itself implement finding 3's
+format decision.

@@ -931,3 +931,44 @@ Current implementation rating: 6/10
 1. **The required real device-originated GICv3/ITS MSI proof remains absent.** M3 and M6 require an ITS profile that proves delivery and teardown from an actual device (docs/todo/P02M0151.md:92-103,141-154). The selected oracle allocates ordinary RAM as a stand-in MSI-X table and invokes dispatch_msi directly (src/kernel/arch/aarch64/interrupts/tests.rs:19-53); the profile gate expressly says no device raises that vector (src/tools/check-qemu-arch-profiles.sh:296-319,354-363). This verifies controller allocation, dispatch, and reuse, not the required device-to-ITS delivery path.
 
 2. **The separately labelled AArch64 and RISC-V UEFI-without-DT regressions are still unreachable.** The gate's registered profiles all invoke direct boot with UEFI=0 (src/tools/check-qemu-arch-profiles.sh:198-211,299-334,365-370). LIBER_NO_DT_PROFILE is consumed by the two kernels and passed into the test build, but no profile caller sets it to 1 (src/kernel/arch/aarch64/mod.rs:174; src/kernel/arch/riscv64/mod.rs:157; src/harness/test-kernel.sh:332). This leaves the explicit M3/M6 and definition-of-done rows unmet while the milestone is marked COMPLETE (docs/todo/P02M0151.md:1-3,71-103,141-154).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-09-01T02:25:20Z):
+
+**1. The required real device-originated GICv3/ITS MSI proof remains absent - ACCEPTED as an accurate
+statement of an unmet requirement; unchanged, and the blocker is a measurement rather than a
+position.**
+
+The finding restates what the gate already says about itself, and both are right. The oracle programs
+ordinary RAM as a stand-in MSI-X table and calls `dispatch_msi` directly, so what it proves is
+controller allocation, dispatch and slot reuse - not the device-to-ITS delivery path M3 and M6 ask
+for. The gate prints that limitation in its own output rather than leaving a reader to infer it.
+
+The two things that would close it were tried and are recorded in the gate's comment: a report placed
+in `MsiRegistry::dispatch` fires for the ORACLE, because that entry point is shared and every MSI
+test in the suite calls it by hand - measured, on the first profile that ran it; and a real message
+needs an ordinary driver, which needs userspace, which these DIRECT-boot profiles do not have -
+adding `kernel.boot.init_package_starts_system_manager` to one failed with `init package module not
+found`, measured. So it needs either a UEFI ITS profile carrying the init package, or a report in the
+architecture's delivery path that the oracles cannot reach. Neither is a change to this gate, and
+neither is claimed.
+
+M3 and M6 remain UNMET on this clause.
+
+**2. The separately labelled AArch64 and RISC-V UEFI-without-DT regressions are still unreachable -
+ACCEPTED as accurate; unchanged.**
+
+Also correct, and the finding adds a detail worth keeping: `LIBER_NO_DT_PROFILE` is consumed by both
+kernels and is passed through the test build, so the plumbing exists end to end and no caller sets it
+to 1. The profile is authorised and unreachable.
+
+Registering the rows was tried, and the reason it fails is the useful part: booting through firmware
+does not withhold the tree. QEMU's `virt` hands the firmware a DTB and the loader passes it on, so a
+`UEFI=1` boot still prints `aarch64: GICv2 from the device tree` - measured. What is missing is a way
+to produce a machine that publishes no tree: a QEMU machine that does not, or a loader option that
+declines to pass one on. The second is small and feasible, and it is a change to the BOOT PATH of two
+architectures made to reach a gate row - which is the redesign this round is asked not to undertake
+inside an audit response.
+
+M3, M6 and the definition of done remain UNMET on these two rows, and the milestone's COMPLETE label
+is wrong about them. That is a plan-side correction rather than a code one, and I am not making it
+here, but it should not be left implicit: the label and these two rows disagree.

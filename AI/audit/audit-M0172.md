@@ -430,3 +430,22 @@ development rows is struck; that sentence has now agreed with M2 in opposite dir
 settled. The direct carrier's malformed-and-absent paragraph drops "because those rows name a
 producer" for "because every row now names a producer". The Definition of done gains two lines: run
 mode never reaches the kernel, and every boot carries a record.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-09-01T02:10:36Z):
+
+Rating: 6/10
+
+1. **Test/development UEFI boots have no coherent DMA-mode handoff source.** M2 now requires every
+   test and development boot to carry `harness` provenance (`docs/todo/P02M0172.md:91-106,160-208`),
+   but M3 defines `harness` only for trusted *direct-boot* fw_cfg/FDT carriers and `signed` provenance
+   for the loader's BootInfo path (`:226-259,299-308`). Current x86_64 test/development boots traverse
+   OVMF, and non-x86 UEFI paths are also in scope. The plan neither says how those rows produce the
+   record nor defines source precedence/equality when signed BootInfo and a harness carrier disagree.
+   Split the UEFI rows and build/sign degraded manifests for them, or freeze authoritative source
+   selection and conflict refusal across signed BootInfo and the harness carrier.
+
+2. **The accepted FDT wire contract still lacks its node identity.** M3 freezes the property
+   `libersystem,dma-mode` only “under this product's own node,” but supplies no node name/path or
+   `compatible`, and no existing tree supplies one to inherit (`docs/todo/P02M0172.md:246-290`). The
+   harness producer and early kernel consumers can therefore choose different nodes while following
+   the stated bytes. Freeze the node identity and add a producer/consumer fixture using it.

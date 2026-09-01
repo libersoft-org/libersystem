@@ -558,3 +558,26 @@ AUDITOR'S RE-AUDIT ON M0159 (2026-08-31T21:15:57Z):
 Current implementation rating: 8/10
 
 1. **The required controlled virtio-gpu restart/rebind remains unproved.** M4 and the definition of done require the GPU to survive a restart while IOMMU enforcement remains active (docs/todo/P02M0159.md:94-97,126-131). The current gate proves one cold bind, exactly one online report, no unsolicited restart, and successful frame presentation, but it never commands a stop, retry, or rebind (src/tools/check-qemu-virtio-iommu-x86_64.sh:294-339). The missing operator/harness seam explains the omission but does not satisfy the required lifecycle.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-09-01T02:25:20Z):
+
+**1. The required controlled virtio-gpu restart/rebind remains unproved - ACCEPTED as an accurate
+statement of an unmet requirement; unchanged.**
+
+Correct, and the finding is fair about what the gate does prove: one cold bind under the enforcing
+controller, the online report EXACTLY once - which is what excludes a bind-die-rebind loop - the
+absence of `DeviceManager: restarting virtio_gpu`, and a presented frame. That is the "binds",
+"presents a frame" and "carries no restarting" of the definition of done. It never commands a stop, a
+retry or a rebind, so "survives a restart" is asserted by nothing.
+
+The blocker was checked again this round rather than restated. A commanded restart means driving an
+operator verb, those are reached through DeviceManager's policy endpoint, and its client is `lsdev`
+running inside the guest. The gate boots with `SERIAL="file:..."`, which is output-only, and there is
+no mechanism anywhere in this tree for a guest to run a command non-interactively at boot - no
+autorun, no startup script, no boot-command hook; searched, and none exists. Hot-unplug through the
+QEMU monitor would exercise device REMOVAL, which P02M0163 refuses, and not a driver restart.
+
+So it needs a guest command seam - a boot-time command hook, or a test-only client that issues the
+verb and reports. That would be used by more than this gate, which is a reason to build it properly
+rather than inside an audit response. M4 and the definition of done remain UNMET on the restart
+clause, and the gate's output should not be read as covering it.

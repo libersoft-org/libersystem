@@ -480,3 +480,33 @@ one genuine exception was already written in M6 and is now named in M5 too rathe
 reader to reconcile: this milestone's own control traffic - ND, DAD, RS, MLD, echo - has no transport
 above it to ask, and uses the FIRST entry of that order as its documented default. Both paragraphs
 now state the same rule in the same words.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-09-01T02:10:36Z):
+
+Rating: 6/10
+
+1. **The latest MLD retry correction misstates the Robustness Variable and gives its fixture an
+   impossible default.** M4 says a JOIN/LEAVE report is “retransmitted [Robustness Variable] times,”
+   default 2, while M8 requires delivery after losing more than one report
+   (`docs/todo/P02M0174.md:178-187,304-314`). [RFC 9777 section 6.1](https://www.rfc-editor.org/rfc/rfc9777.html#section-6.1)
+   defines the immediate report as the first of RV total transmissions; default RV=2 therefore
+   tolerates one loss, not more than one. Specify RV total transmissions and test RV-1 losses, or set
+   RV to at least 3 for the multi-loss fixture.
+
+2. **The claimed MLDv2 listener omits mandatory MLDv1-router compatibility.** M4 handles only v2
+   query/report state, M6's timer list has no Host Compatibility Mode or Older-Version-Querier-Present
+   timer, and M8 has no v1 query/report fixture (`docs/todo/P02M0174.md:114-191,242-252,292-314`).
+   [RFC 9777 section 8.2.1](https://www.rfc-editor.org/rfc/rfc9777.html#section-8.2.1) requires an MLDv2
+   host to enter per-interface v1 compatibility after a v1 General Query, use the v1 protocol, and
+   return after the compatibility timer. Without that path, membership and thus ND can fail behind a
+   v1 querier—the snooping-link case for which this milestone added MLD. Add the bounded compatibility
+   state, v1 Report/Done behavior, and transition/expiry fixtures.
+
+3. **The supposedly frozen L3-notification seam remains an incompatible implementation fork.** M6
+   leaves “a bounded event queue (or a generation/bitset model)” open without overflow, coalescing, or
+   resynchronization semantics (`docs/todo/P02M0174.md:237-252`), while M0175 says it consumes this
+   frozen contract without extending it and must not lose invalidations
+   (`docs/todo/P02M0175.md:279-289`). Those alternatives expose different consumer behavior; a full
+   queue can discard an address/route invalidation and leave a flow on dead state. Freeze loss-safe
+   semantics and the invalidation identity, and fixture overflow/coalescing/resync. Route/source/router
+   selection ownership itself is now consistent and needs no further correction.

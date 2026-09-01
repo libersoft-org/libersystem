@@ -848,3 +848,29 @@ whose refusal is only discovered after it has been read. The two are independent
 first, and the `64x` rule keeps applying inside them rather than being replaced. The host gate now
 requires every limit at its exact bound and one past it, naming these four specifically, with each
 over-bound case ending in the typed refusal rather than truncation or a larger allocation.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-09-01T02:10:36Z):
+
+Rating: 6/10
+
+1. **The catalogue correction still leaves ordinary-client isolation and subscription state
+   unbounded.** The protocol exposes persistent `SUBSCRIBE` (`docs/todo/P02M0136.md:147-150`) but then
+   claims that face count, metadata size, and LIST size bound the *whole* service and that no per-client
+   quota is needed (`:154-187`). Each live subscription retains endpoint/subscriber state independently
+   of installed faces; the analogous device catalogue consequently has a fixed `MAX_SUBSCRIBERS`
+   array (`src/user/services/core/src/device_manager.rs:1863-1898`). The ordinary-application route also
+   tells PermissionManager to hold one catalogue client and grant it onward (`P02M0136.md:138-142`).
+   The generic grant path duplicates that same endpoint (`permission_manager.rs:529-575`), while every
+   generated client starts correlation IDs at zero and `ChannelTransport` consumes the next single
+   reply (`src/tools/lsidl-gen/src/codegen.rs:833-855`; `src/user/libs/ipc/ipc-client/src/lib.rs:34-53`).
+   Concurrent applications can therefore consume each other's replies. Require fresh per-application
+   connections or real multiplexing, numeric live-client/subscriber bounds, typed over-bound refusal,
+   disconnect cleanup, and exact/over-bound concurrency gates.
+
+2. **The new reply-size regression rejects valid short metadata.** `MAX_FACE_METADATA_BYTES = 256` is
+   a maximum, yet the full-64-face fixture requires its LIST reply to be strictly larger than
+   `64 * 256 = 16384` (`docs/todo/P02M0136.md:158-195`). The separate exact-bound fixture makes only
+   one record 256 bytes. A correct 64-face catalogue containing shorter records can legitimately
+   encode below 16384 bytes including framing and fail this test. Apply the `>16384` assertion to a
+   fixture with 64 exactly-256-byte encoded records, or assert the actual framing bytes directly;
+   retain the ordinary 64-face whole-reply gate.

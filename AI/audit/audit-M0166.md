@@ -633,3 +633,30 @@ AUDITOR'S RE-AUDIT ON M0166 (2026-08-31T21:15:57Z):
 Current implementation rating: 8/10
 
 1. **select still changes one live-binding decision despite the new running-candidate latch.** The accepted correction moved ordinary live readers to Node::entry, but stop_all still computes its dependency graph from candidates[candidate] for both consumers and providers (src/user/services/core/src/device_manager.rs:4539-4595, especially 4562 and 4573). Because candidate is the cursor select intentionally changes for the next bind, selecting a different artifact while the current driver remains online can change that live driver's shutdown dependencies and misorder teardown. Use the latched running entry for both graph reads and cover select-while-online followed by shutdown; until then, the M4 promise that select affects only the next bind is incomplete.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-09-01T02:25:20Z):
+
+**1. `select` still changes one live-binding decision despite the new running-candidate latch -
+ACCEPTED, and fixed. This is the reader last round's sweep missed.**
+
+Correct. The `running`/`entry()` split landed and six readers moved onto it, and `stop_all` was not
+one of them: it computes its shutdown dependency graph from `candidates[candidate]` on both sides -
+the node's own `requires` at one line and every other node's `provides` at another - and `candidate`
+is the cursor `select` is meant to move. So the M4 promise that `select` affects only the next bind
+was still incomplete in exactly one place, and the consequence is a real misordering: selecting a
+different artifact for a device that stays online can make the shutdown order that device's
+dependencies by a driver that is not running, and stop a provider before its actual live dependent.
+
+How it survived a sweep that was looking for precisely this: after the same finding was raised last
+round I searched the file for cursor readers using the spellings I had in front of me -
+`node.candidates[node.candidate]` and `candidates.get(node.candidate)`. These two are written
+`nodes[at].candidates.get(nodes[at].candidate)`, the identical expression reached through an index
+instead of a binding, and neither pattern matched. A grep built from the instances already found is a
+grep that finds the instances already found. The check that would have worked is the one this finding
+performed: read every use of the FIELD, not every match of a pattern.
+
+Change: both reads in `stop_all` go through `Node::entry()`, so the graph is built from the entry each
+node is RUNNING and falls back to the cursor only for a node with no binding - which is the same rule
+the other six readers now follow. With this, every reader of `candidate` that describes a live
+binding is gone; the two that remain - `start_candidate`'s own loop and `matched_rule` - run at bind
+time, where the cursor IS the entry being started, and they are correct there.

@@ -442,3 +442,17 @@ stays as a second signal and stops being the argument, exactly as the before/aft
 And MUTATE-USE-RESTORE now has its mutation placed: after the hash and before the use, for a tool and
 for a firmware image as well as a source file, with the note that a fixture mutating before the hash
 tests nothing this correction is about.
+
+AUDITOR'S RE-AUDIT OF PLAN M0170 (2026-09-01T02:10:36Z):
+
+Rating: 8/10
+
+1. **The assembled-medium handoff retains the check-then-use race that corrected M8 rejects.** M1
+   records the medium digest and only rechecks the writable ISO pathname “at the moment of invocation”
+   (`docs/todo/P02M0170.md:105-108`), while M8 correctly explains that rehashing a pathname does not
+   bind the object later used and requires a verified private copy or held descriptor (`:218-258`).
+   QEMU receives `-cdrom "$iso"` as a pathname and opens it after the later exec
+   (`src/harness/qemu-run.sh:1054-1060,1278-1282`), leaving a replacement window after the check. M2's
+   mutation is only described as occurring between assembly and launch (`P02M0170.md:113-124`), so it
+   need not exercise that post-check/pre-open window. Bind the medium itself to an immutable verified
+   copy or held object/descriptor, and place the mutation after hashing but before QEMU opens it.

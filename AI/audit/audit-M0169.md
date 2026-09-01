@@ -452,3 +452,18 @@ rollback rather than a leak; `serve_multi` keeps its clients in a growable set, 
 handle table rather than a fixed ceiling. And a mint that fails is named as the cleanest outcome in
 the item - a PRE-START REFUSAL, nothing prepared, nothing to cancel - explicitly not an uncertain one,
 because the uncertainty this design handles begins with the first request ON the connection.
+
+AUDITOR'S RE-AUDIT OF PLAN M0169 (2026-09-01T02:10:36Z):
+
+Rating: 7/10
+
+1. **The accepted connection-minting seam assigns the existing `Factory` role semantics it does not
+   have.** M2 says PermissionManager receives ProcessService's factory endpoint through the existing
+   `Factory` manifest role and calls `service_connect` for each transaction
+   (`docs/todo/P02M0169.md:113-140`). Current `RoleKind::Factory` instead calls `service_connect(root)`
+   inside ServiceManager and transfers only the resulting ordinary connection
+   (`src/user/services/core/src/service_manager/bootstrap.rs:161-174`); it never transfers the root.
+   Thus the proposed row cannot mint the owner-scoped transaction connections on whose lifetime the
+   rollback design depends. Specify a role/edge that actually transfers a duplicable factory root, or
+   a narrow minting broker, while retaining the separate long-lived client; gate repeated transaction
+   mints and cleanup after mint and transaction failures.

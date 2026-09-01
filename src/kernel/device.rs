@@ -486,10 +486,6 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	// cross-core flush could not be confirmed answers no here too, and a name that says "interrupts"
 	// is a name that invites the next reader to put an unrelated failure somewhere else.
 	let derived_quiet = revoke_derived(key);
-	// 3. The translation, which is the other step that can fail to CONFIRM. `detach_for` reports a
-	//    detach it could not confirm and leaves the pages quarantined; the claim goes the same way,
-	//    because a device whose mappings may still be live is not a device to hand to anyone else.
-	let translation_quiet = if crate::iommu::translating() { crate::iommu::detach_for(index, bus, dev, func) } else { true };
 	// EVERY RESOURCE, NOT ONE OF THEM. The terminal state was derived from the IOMMU alone, so a
 	// vector whose unbind could not be confirmed - a riscv64 hart that did not answer, which
 	// quarantines the still-armed slot - was charged to a claim this then published as `Free`.
@@ -528,6 +524,21 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 		crate::serial_println!("device: {index} quarantined an MSI slot while it was being released - its interrupt teardown was not confirmed");
 	}
 	let derived_quiet = derived_quiet && vectors_settled && none_stranded_here;
+	// 4. AND ONLY NOW THE TRANSLATION, which is the other step that can fail to CONFIRM.
+	//    `detach_for` reports a detach it could not confirm and leaves the pages quarantined; the
+	//    claim goes the same way, because a device whose mappings may still be live is not a device
+	//    to hand to anyone else.
+	//
+	//    MOVED BELOW THE VECTOR SETTLE, WHICH IS THE ORDER M5 STATES (2026-09-01). The detach used to
+	//    run immediately after `revoke_derived` and the settle came afterwards, so the sequence was
+	//    bus-master off, interrupts asked to stop, TRANSLATION TORN DOWN, and only then a check that
+	//    the interrupts had actually stopped. M5's order is bus-master off, interrupts MASKED, then
+	//    the IOMMU confirmed - and the difference is not cosmetic: an interrupt whose unbind is still
+	//    in flight is a device that can still raise one, and taking its translation down first is the
+	//    window where it raises a message from an endpoint the controller has stopped translating.
+	//    The settle is a bounded spin over this device's own slots, so paying it before the detach
+	//    costs the same instructions in a safer order.
+	let translation_quiet = if crate::iommu::translating() { crate::iommu::detach_for(index, bus, dev, func) } else { true };
 	let confirmed = translation_quiet && derived_quiet;
 	if !derived_quiet {
 		crate::serial_println!("device: {index} could not confirm that everything it derived was torn down - the claim is not free");

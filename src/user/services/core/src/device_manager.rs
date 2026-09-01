@@ -845,6 +845,9 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 			};
 			*slot = mint_connection(catalogue, nodes, found);
 		}
+		// GLOBAL ON PURPOSE, unlike the takes in `route_offers`: this caller is choosing AMONG every
+		// block provider the boot found, by bus address, which is what `take` is for. See `take_from`
+		// for the other case, where one driver's own offers are being routed.
 		for slot in boot_blocks.iter_mut() {
 			*slot = catalogue.take(driver_protocol::provider::BLOCK);
 		}
@@ -1092,10 +1095,10 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		// the driver's own message, so a provider that nothing routes is still a provider the
 		// machine has - and is withdrawn with its binding rather than leaked.
 		if *net_client == 0 {
-			*net_client = catalogue.take(driver_protocol::provider::NET);
+			*net_client = catalogue.take_from(node.id, driver_protocol::provider::NET);
 		}
 		if *gpu_client == 0 {
-			*gpu_client = catalogue.take(driver_protocol::provider::DISPLAY);
+			*gpu_client = catalogue.take_from(node.id, driver_protocol::provider::DISPLAY);
 		}
 		// AND AUDIO IS NOT ROUTED AT ALL ANY MORE, which is the point (2026-08-31).
 		//
@@ -1115,7 +1118,7 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		// is started where that device is bound, and nowhere else.
 		#[cfg(feature = "development")]
 		{
-			let dev_bytes: u64 = catalogue.take(driver_protocol::provider::CONSOLE_BYTES);
+			let dev_bytes: u64 = catalogue.take_from(node.id, driver_protocol::provider::CONSOLE_BYTES);
 			if driver_name == b"dev_channel" && dev_bytes != 0 {
 				// The driver's bootstrap is kept rather than left to leak, because a replacement
 				// agent's wire is handed down over it; and a volume connection of this program's own
@@ -1142,7 +1145,7 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		// The pointer flavour of virtio_input offers an INPUT provider; the keyboard flavour offers
 		// none, so an absent one is a state rather than a failure.
 		if *input_client == 0 {
-			*input_client = catalogue.take(driver_protocol::provider::INPUT);
+			*input_client = catalogue.take_from(node.id, driver_protocol::provider::INPUT);
 		}
 		// The xHCI driver offers up to three: the USB stick's block service (absent when no
 		// mass-storage device is attached), its bus query channel for the `lsusb` inventory, and a
@@ -1150,13 +1153,13 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		// were held unpublished until its `READY`, so a controller that died between them published
 		// nothing.
 		if *usb_client == 0 {
-			*usb_client = catalogue.take(driver_protocol::provider::BLOCK);
+			*usb_client = catalogue.take_from(node.id, driver_protocol::provider::BLOCK);
 		}
 		if *usbq_client == 0 {
-			*usbq_client = catalogue.take(driver_protocol::provider::USB_BUS);
+			*usbq_client = catalogue.take_from(node.id, driver_protocol::provider::USB_BUS);
 		}
 		if *usb_pointer == 0 {
-			*usb_pointer = catalogue.take(driver_protocol::provider::POINTER);
+			*usb_pointer = catalogue.take_from(node.id, driver_protocol::provider::POINTER);
 		}
 		// ANYTHING STILL HELD IS A PROVIDER NOBODY ROUTES, and it is closed rather than leaked: a
 		// handle this service keeps forever is a channel the driver waits on forever.
@@ -2033,6 +2036,35 @@ impl Catalogue {
 	// The HANDLE is what moves, and it moves once. A second take of one kind answers 0 rather than
 	// handing one capability to two consumers, which is two consumers competing over one reply queue
 	// and not two connections.
+	// THE SAME MOVE, BUT ONLY FROM ONE PUBLISHER (added 2026-09-01).
+	//
+	// `take` below chooses among EVERY unclaimed provider of a kind, by bus address. That is right
+	// where the caller is choosing among all of them - the boot's four block volumes - and wrong
+	// where the caller is routing ONE driver's offers, which is what `route_offers` does: it was
+	// calling the global form, so "the USB stick's block service" was whichever block provider
+	// happened to be unclaimed and lowest-addressed at that moment, not the one the xHCI driver
+	// published. An extra unclaimed non-xHCI disk could therefore be handed over as `USBBLOCK`.
+	//
+	// The previous round rejected an audit finding about this on the grounds that the take sits
+	// inside `route_offers` and is therefore origin-scoped by construction. It is not: where a call
+	// SITS says nothing about what it SELECTS, and this one selected from the whole catalogue. The
+	// binding is what makes origin a rule rather than a likelihood, so it is passed in.
+	fn take_from(&mut self, binding: BindingId, kind: u16) -> u64 {
+		let Some(slot) = self.entries.iter().position(|entry| entry.as_ref().is_some_and(|held| held.kind == kind && held.handle != 0 && held.binding_is(binding))) else {
+			return 0;
+		};
+		match self.entries[slot].as_mut() {
+			Some(provider) => {
+				let handle = provider.handle;
+				provider.handle = 0;
+				// One consumer, counted - the same rule `take` states below.
+				provider.consumers = provider.consumers.saturating_add(1);
+				handle
+			}
+			None => 0,
+		}
+	}
+
 	fn take(&mut self, kind: u16) -> u64 {
 		// BY THE PUBLISHER'S ADDRESS ON THE BUS, ASCENDING - never by which driver finished first.
 		//
@@ -2783,6 +2815,7 @@ fn cause_name(cause: FailureCause) -> &'static [u8] {
 		FailureCause::HandshakeTimeout => b"it never answered its bind at all",
 		FailureCause::Hung => b"it came up and then stopped answering its control path",
 		FailureCause::DriverExited => b"it exited without saying anything",
+		FailureCause::Stopped => b"it was asked to stop and it did",
 		FailureCause::DriverReported(code) => code.name(),
 		FailureCause::TeardownUnconfirmed => b"the release did not confirm, so the device may still be live",
 	}
@@ -3322,11 +3355,16 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// land in `Quarantined`. The answer is recorded and the line is printed below,
 					// once there is something to base it on.
 					planned_stop = true;
-					// AND IT IS NOT `driver-exited`. That cause renders as "it exited without saying
-					// anything", which is the opposite of what a STOPPED frame is: the driver said
-					// exactly this. A planned stop that completes is not a failure, and the cause
-					// only travels so the shared teardown path has one to carry.
-					FailureCause::DriverExited
+					// AND IT IS NOT `driver-exited` - WHICH IT WAS, AND THE COMMENT KNEW (fixed
+					// 2026-09-01). The previous version returned `DriverExited` and said in as many
+					// words that the cause "renders as 'it exited without saying anything', which is
+					// the opposite of what a STOPPED frame is" - and then returned it anyway,
+					// arguing the cause "only travels so the shared teardown path has one to carry".
+					// It travels further: the shared path captures an incident, prints it and
+					// PERSISTS it, so a clean shutdown left a stored row telling the operator the
+					// driver had crashed. M3 requires a planned stop not to be classified as a crash,
+					// and a comment describing the lie is not the same as not telling it.
+					FailureCause::Stopped
 				}
 				// The process ended, or its channel closed with nothing terminal on it. Both are a
 				// driver that is gone without having said anything.
@@ -3538,23 +3576,38 @@ unsafe fn settle_dependencies(nodes: &mut [Node], catalogue: &Catalogue) -> usiz
 			}
 			let met: bool = requirements_met(entry, catalogue);
 			match node.record.state {
-				// WAITING, AND WHAT IT WAS WAITING FOR IS HERE. Back to `Unbound`, which is the
-				// state that INVITES a bind, and asked for exactly one attempt - the same mechanism
-				// an operator's retry uses, so a node woken by a publication and one woken by a
-				// person take the same path.
+				// WAITING, AND WHAT IT WAS WAITING FOR IS HERE. Asked for exactly one attempt - the
+				// same mechanism an operator's retry uses, so a node woken by a publication and one
+				// woken by a person take the same path.
+				//
+				// AND IT DOES NOT GO THROUGH `Unbound`, WHICH IS WHY IT NEVER WOKE (fixed
+				// 2026-09-01). This asked for `DependencyPending -> Unbound` first and did the rest
+				// of its work only if that transition succeeded. It cannot succeed: the record's
+				// table has no such edge, deliberately, and `driver-binding` has a test named
+				// `a_node_waiting_for_a_dependency_has_no_way_back_to_where_a_bind_begins` asserting
+				// the refusal with the reason - "a node waiting for a provider that then goes away is
+				// waiting harder, not waiting less". So `move_to` answered false, the flag was never
+				// set, nothing counted the node as moved, and a driver whose declared requirement
+				// arrived sat in `DependencyPending` for the rest of the boot. The requires-edge that
+				// M6 asks to WAKE a node only ever put it to sleep.
+				//
+				// The state this node needs is `Binding`, and `DependencyPending -> Binding` IS a
+				// legal edge - it is the one the table leaves open on purpose. `begin_bind` performs
+				// it, so the flag alone is the whole of the work here: the standing loop consumes it,
+				// calls `start_candidate`, and the ordinary bind path makes the transition. That is
+				// also exactly what the operator's retry does, which is what the comment above always
+				// claimed this shared with it.
 				BindingState::DependencyPending if met => {
-					if node.record.move_to(BindingState::Unbound, None) {
-						node.attempt = 0;
-						node.retry_at = 0;
-						node.restart_requested = true;
-						print(b"DeviceManager: ");
-						print_driver_name(entry.name);
-						print(
-							b" was waiting for a provider it declares in `requires`, and it is here now
+					node.attempt = 0;
+					node.retry_at = 0;
+					node.restart_requested = true;
+					print(b"DeviceManager: ");
+					print_driver_name(entry.name);
+					print(
+						b" was waiting for a provider it declares in `requires`, and it is here now
 ",
-						);
-						moved += 1;
-					}
+					);
+					moved += 1;
 				}
 				// ONLINE, AND WHAT IT DECLARED IS GONE. Stopped through the same teardown a crash
 				// takes, carrying the intent that says where it lands: `DependencyPending`, waiting
@@ -4235,6 +4288,7 @@ fn failure_cause_wire(cause: Option<FailureCause>) -> proto::system::FailureCaus
 		Some(FailureCause::DriverReported(_)) => proto::system::FailureCause::DriverReportedFailure,
 		Some(FailureCause::TeardownUnconfirmed) => proto::system::FailureCause::TeardownUnconfirmed,
 		Some(FailureCause::Hung) => proto::system::FailureCause::Hung,
+		Some(FailureCause::Stopped) => proto::system::FailureCause::Stopped,
 	}
 }
 
@@ -4559,7 +4613,13 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 		for _ in 0..nodes.len() {
 			let mut moved = false;
 			for at in 0..nodes.len() {
-				let Some(entry) = nodes[at].candidates.get(nodes[at].candidate) else { continue };
+				// THE ENTRY THIS NODE IS RUNNING, not the cursor - see `Node::entry` (fixed
+				// 2026-09-01). This shutdown orders nodes by their dependency graph, and reading the
+				// cursor built that graph out of whichever candidate an operator had SELECTED for the
+				// next bind. A `select` on a device that stays online could therefore order the
+				// shutdown by a driver that is not running: a provider stopped before its actual live
+				// dependent, which is the dependents-first rule this sort exists to keep.
+				let Some(entry) = nodes[at].entry() else { continue };
 				let mut want = 0usize;
 				for kind in entry.requires {
 					// Whoever publishes that kind: this node stands one level above the deepest of
@@ -4570,7 +4630,9 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 						if other == at {
 							continue;
 						}
-						let Some(provider) = nodes[other].candidates.get(nodes[other].candidate) else { continue };
+						// The same correction on the PROVIDER side: who publishes a kind is a fact
+						// about the driver that is running, not about the one selected next.
+						let Some(provider) = nodes[other].entry() else { continue };
 						if provider.provides.iter().any(|(declared, _, _)| declared == kind) {
 							want = want.max(depth[other] + 1);
 						}

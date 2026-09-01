@@ -229,6 +229,20 @@ pub enum FailureCause {
 	HandshakeTimeout,
 	// It exited without saying anything.
 	DriverExited,
+	// IT WAS ASKED TO STOP AND IT DID - which is not a failure, and is here because the teardown path
+	// carries a cause and a planned stop needs one that is TRUE (added 2026-09-01).
+	//
+	// The planned stop used to travel as `DriverExited`, with a comment saying the cause "only
+	// travels so the shared teardown path has one to carry". It travelled further than that: the
+	// shared path captures an incident, reports it and PERSISTS it, and `DriverExited` renders as
+	// "it exited without saying anything" - about a driver that had said exactly what it was asked
+	// to say. M3 requires a planned stop not to be classified as a crash, and an operator reading the
+	// stored incident row saw one.
+	//
+	// NOT RETRYABLE, and that is the point rather than an omission: a driver that stopped because it
+	// was told to is not a driver to bring back automatically. What brings it back is the operator
+	// verb or the dependency that returns, both of which ask for a bind on their own.
+	Stopped,
 	// It came up and then stopped answering its control path. RETRYABLE: nothing about a driver
 	// going quiet says the device is unusable.
 	//
@@ -249,6 +263,8 @@ impl FailureCause {
 			FailureCause::HandshakeTimeout | FailureCause::DriverExited | FailureCause::SpawnFailed | FailureCause::Hung => true,
 			FailureCause::DriverReported(code) => code.retryable(),
 			FailureCause::DriverMissing | FailureCause::ProtocolMismatch | FailureCause::ClaimRefused | FailureCause::IommuRequired | FailureCause::ResourceExhausted => false,
+			// A stop that was ASKED FOR is not a thing to retry. See the variant.
+			FailureCause::Stopped => false,
 			// Asked and answered `false` so the match is total, but the state machine never gets
 			// here: this cause ends at `Quarantined`, which has no edge out.
 			FailureCause::TeardownUnconfirmed => false,
@@ -268,6 +284,7 @@ impl FailureCause {
 			FailureCause::DriverReported(_) => b"driver-reported-failure",
 			FailureCause::Hung => b"hung",
 			FailureCause::TeardownUnconfirmed => b"teardown-unconfirmed",
+			FailureCause::Stopped => b"stopped",
 		}
 	}
 }

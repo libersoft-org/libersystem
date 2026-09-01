@@ -700,3 +700,30 @@ AUDITOR'S RE-AUDIT ON M0153 (2026-08-31T21:15:57Z):
 Current implementation rating: 8/10
 
 1. **The confirmed-teardown fault-counter correction remains unobservable because the state carrying it is immediately discarded.** detach_for_inner removes the live device-to-domain association before revoke/drain (src/kernel/iommu/mod.rs:888-895). The attributed drain now increments DomainState.faults, but faults_for can expose the count only through a live or retained association, and only the unconfirmed branch creates a retained one (src/kernel/iommu/mod.rs:577-586,894-934; src/dma/src/lib.rs:1162-1183). On a confirmed teardown, destroy_domain immediately removes DomainState and its counter (src/kernel/iommu/mod.rs:951-957; src/dma/src/lib.rs:1045-1058), so device::snapshot still reports zero for a fault raised during successful revoke (src/kernel/device.rs:446-452). Moving the drain fixed durable event attribution, but not M4's exposed per-binding fault accounting (docs/todo/P02M0153.md:184-195).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-09-01T02:25:20Z):
+
+**1. The confirmed-teardown fault-counter correction remains unobservable because the state carrying
+it is immediately discarded - ACCEPTED. My previous fix did half the job and I argued the other half
+away.**
+
+The finding is exactly right and the chain is worth writing out, because my last response reasoned
+past it. `detach_for_inner` removes the live device-to-domain row at the top; the attributed drain -
+which I moved earlier last round - now correctly charges the binding for the faults its own revoke
+raised; and then, on the CONFIRMED path, `destroy_domain` removes the `DomainState` those faults
+were charged to. `faults_for` reaches a count only through a live association or a retained one, and
+only the UNCONFIRMED branch creates a retained one. So `device::snapshot` still answered zero for
+exactly the faults the reorder was made to capture.
+
+What I said last round was that the domain is destroyed anyway, so nothing could read the count
+either way. That is true of the domain and false of the requirement: M4 asks for the count to be
+EXPOSED per binding, and the snapshot is where an operator reads it. I checked what the code does to
+the counter and not what the milestone asks the counter to be for.
+
+Change: a retained per-device count. `RETAINED_FAULTS` is sized beside `RETAINED` at `init` - and
+under the same rule, so a table that cannot be sized refuses translation rather than degrading the
+accounting. `detach_for_inner` copies the domain's final count into it after the attributed drain and
+BEFORE the destroy, on both paths: the unconfirmed one answers from its retained domain anyway, and
+having the number in two places that agree costs one store on a per-binding path. `faults_for` now
+tries the live domain, then the retained domain, then the retained count - so a confirmed teardown's
+faults survive the domain that was charged with them, which is what the snapshot needed.

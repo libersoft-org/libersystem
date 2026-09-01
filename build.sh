@@ -115,16 +115,31 @@ step_kernel() {
 step_loader() {
 	local arch="$1"
 	note "loader ($arch)"
-	case "$arch" in
-	# The host triple's UEFI target, and cargo takes the configuration of the working directory -
-	# which is why both of these `cd` into the loader rather than passing `--manifest-path`.
-	x86_64) (cd "$SRC_DIR/boot/loader" && cargo build) ;;
-	aarch64) (cd "$SRC_DIR/boot/loader" && cargo build --target aarch64-unknown-uefi) ;;
-	# riscv64 has no UEFI rustc target at all: its EFI application is assembled by hand from a
-	# static PIE, a linker script and objcopy, which is a program and lives in one.
-	riscv64) (cd "$SRC_DIR" && tools/build-loader-riscv64.sh) ;;
-	*) die "no loader for '$arch'" ;;
-	esac
+	# UNDER THE SHARED LOADER LOCK (2026-09-01).
+	#
+	# Every loader build in this tree writes ONE output path per target, and the test harness stages a
+	# run-private copy of it so a concurrent run cannot swap the bytes its medium is assembled from.
+	# That staging took `kernel-test-build.lock` and this writer did not, so the lock was held against
+	# nobody: this build could replace the shared output while the harness was copying it, and an
+	# A-to-B-to-A trust-profile cycle could even restore the original hash while the copy consumed B.
+	# A lock the other writers ignore does not make anything authoritative, so the writers take it.
+	mkdir -p "$SRC_DIR/../.build/state"
+	# IN A SUBSHELL, so the lock is released when the build finishes rather than held for the rest of
+	# this script: it protects the loader OUTPUT, and holding it across the volume and package steps
+	# would block a concurrent run's staging for no reason.
+	(
+		flock 9
+		case "$arch" in
+		# The host triple's UEFI target, and cargo takes the configuration of the working directory -
+		# which is why both of these `cd` into the loader rather than passing `--manifest-path`.
+		x86_64) (cd "$SRC_DIR/boot/loader" && cargo build) ;;
+		aarch64) (cd "$SRC_DIR/boot/loader" && cargo build --target aarch64-unknown-uefi) ;;
+		# riscv64 has no UEFI rustc target at all: its EFI application is assembled by hand from a
+		# static PIE, a linker script and objcopy, which is a program and lives in one.
+		riscv64) (cd "$SRC_DIR" && tools/build-loader-riscv64.sh) ;;
+		*) die "no loader for '$arch'" ;;
+		esac
+	) 9>"$SRC_DIR/../.build/state/kernel-test-build.lock"
 }
 
 # Assemble the boot packages from an ALREADY-BUILT userspace. Deliberately without a `user`

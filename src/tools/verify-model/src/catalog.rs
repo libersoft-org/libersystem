@@ -123,7 +123,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 61] = [
+const GATES: [(&str, &str); 62] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -253,6 +253,17 @@ const GATES: [(&str, &str); 61] = [
 	// REGISTERED LATE, which is the drift the entries above keep describing: it went into `check.sh`
 	// first and `verify-model check` would have reported it as a gate nothing selects.
 	("boot-harness", "harness.tools"),
+	// TWO SUITES OF ONE ARCHITECTURE AT THE SAME TIME, each proving it ran its own selection - the
+	// standing proof that the per-run staging of the kernel, the medium and the loader actually
+	// isolates concurrent runs. Its subject is the harness, because the staging it exercises is the
+	// harness's, and a change there is exactly what could break it.
+	//
+	// REGISTERED LATE, LIKE `boot-harness` ABOVE - and this time the drift was CAUGHT rather than
+	// described (2026-09-01). The gate went into `check.sh` and not into this list, and
+	// `verify-model check` failed with the message the entries above predict: "check.sh runs gate
+	// 'concurrent-selection', which the catalog does not know about - nothing would ever select it".
+	// The two lists exist to disagree loudly, and they did their job.
+	("concurrent-selection", "harness.tools"),
 	// A hand-written `extern` declaration and the generated function it is
 	// forwarded to are joined by a bare jump, so a signature that disagrees is a silent
 	// argument-register mismatch rather than a link error. One such pair made every transactional

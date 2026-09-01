@@ -394,3 +394,23 @@ counter, a fuse, or a TPM NV index with a write-once policy - which is a hardwar
 milestone does not have and does not claim. M7's impossible fixture is struck and replaced by one that
 proves the availability consequence: after the marker is deleted the machine boots, refuses to
 ADVANCE, and says it is unprovisioned.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-09-01T02:10:36Z):
+
+Rating: 7/10
+
+1. **Provision-marker failures are still unclassified and can be mistaken for absence.** M2 makes
+   marker ABSENT boot as unprovisioned and marker PRESENT enforce the floor
+   (`docs/todo/P02M0171.md:93-104`), but never defines the marker's valid byte or what a short,
+   malformed, wrong-attribute, access-denied, or device-error marker read does. M3 promises distinct
+   variable outcomes but gives the 64-byte exact-size rule for slot records beside a marker it calls
+   one byte (`:232-260`). Collapsing any marker failure to absence lets a previously provisioned
+   machine boot as unprovisioned. Freeze the valid marker byte, exact length, and attributes separately
+   from the 64-byte slot record, and require every non-absent invalid/error outcome to refuse.
+
+2. **Single-slot deletion has contradictory acceptance criteria.** The state table makes one valid
+   slot authoritative and boots from it (`docs/todo/P02M0171.md:132-149`), while M2's negative fixture
+   and the Definition of done say deleting “the floor record” on a provisioned machine refuses
+   (`:182-186,367-374`). Deleting one of the two records must therefore both boot and refuse. Clarify
+   that refusal means both slots missing/invalid and that one missing slot still boots, or change the
+   redundancy rule and its tests consistently.

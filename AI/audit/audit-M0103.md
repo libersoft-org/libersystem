@@ -1341,3 +1341,18 @@ CONTRACT - P02M0099's destination table for the lifecycle, its catalogue paragra
 first-public-handoff rule. It also says plainly that `a-wsi` is likely to be the first consumer in
 this tree that implements the contract fully and should expect to write it rather than copy it, which
 is a different and more useful expectation to set than "follow the one that already did it".
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-09-01T02:10:36Z):
+
+Rating: 7/10
+
+1. **The normative WSI specification has no freeze gate, so implementation can precede its unresolved
+   contract choices.** P02M0103s says normative specifications are frozen before implementation, but
+   defines only `s-common`, `s-2d`, and `s-3d` (`docs/todo/P02M0103.md:338-365`).
+   `WSI_PROFILE_1.md` is itself a normative specification item (`:383-385`), and the still-open WSI row
+   assigns material choices to it—memory/cache ordering, atomic surface configuration, and
+   pre-compositor multi-surface semantics (`:2281-2285,2386-2419`)—yet no freeze owns it. `a-wsi`
+   depends on `a-common`, P02M0141/P02M0165/P02M0166, and the completion object (`:705-709`), while its
+   Done clause merely requires those contracts to have been documented (`:2159-2167`). Add an `s-wsi`
+   freeze, or explicitly fold `WSI_PROFILE_1.md` and the five common freeze requirements into a named
+   prerequisite of `a-wsi`.

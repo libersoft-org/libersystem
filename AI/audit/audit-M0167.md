@@ -708,3 +708,69 @@ Current implementation rating: 6/10
 2. **The new guest-starting gate is outside the verification model and introduces another fixed parallel scheduler.** It is registered in check.sh but absent from catalog.rs's GATES list, even though verify-model check explicitly rejects a check.sh gate the catalogue does not know because no change can select it (check.sh:50-57; src/tools/verify-model/src/catalog.rs:126-225; src/tools/verify-model/src/main.rs:1442-1452). The script also starts two test.sh guests itself rather than expressing them as steps governed by verify.sh --jobs (src/tools/check-concurrent-selection.sh:40-51). Thus the claimed standing proof is not selectable by the model and a sweep can run two guests irrespective of its job bound, contradicting M3's one-scheduler contract (docs/todo/P02M0167.md:361-371,681-683).
 
 3. **The staged-loader shell lock does not protect against the other writers named by the correction.** qemu-run builds and copies the shared loader while holding kernel-test-build.lock, but build.sh, check-signed-boot.sh, and check-trust-profile.sh write the same libersystem-loader.efi output without taking that lock (src/harness/qemu-run.sh:960-987; build.sh:109-125; src/tools/check-signed-boot.sh:554-592; src/tools/check-trust-profile.sh:13-42). Another producer can therefore replace the shared output after this cargo build releases its own target lock but before or during the copy; holding a lock those writers ignore does not make the bytes staged for this run authoritative. This leaves the run-private immutable medium-input guarantee incomplete (docs/todo/P02M0167.md:290-313,658-659).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-09-01T02:25:20Z):
+
+**1. The new concurrency gate does not run the exact concurrency case the definition of done requires
+- ACCEPTED, and fixed.**
+
+Correct. The gate varied `TEST_TAGS` and never set `TEST_SELECTION`, so `test-kernel.sh` compiled
+both kernels with the same empty selection and what it proved was tag isolation. The clause asks for
+simultaneous suites with different `TEST_SELECTION` AND different `TEST_TAGS`, each reporting its
+own selection, and I wrote a gate for the requirement I remembered rather than the one written down.
+
+Change: each run now carries its own `TEST_SELECTION` - two disjoint pairs of real test IDs - as well
+as its own tags. The assertion changed with it, because it had to: when a selection is set the runner
+takes a different branch and never prints the `test tags:` line the old assertion read. It now
+extracts the test IDs each guest actually RAN from that guest's own logs and requires each run to
+contain all of its own and none of the other's. That is a stronger identity than the tags line - a run
+that booted the other's staged kernel runs the other's tests and says so by name - and it is what the
+clause means by "each reports its own selection".
+
+**2. The new guest-starting gate is outside the verification model and introduces another fixed
+parallel scheduler - ACCEPTED for the first half, which was a live breakage; ACCEPTED as accurate for
+the second, which is not fixed.**
+
+THE CATALOGUE HALF WAS A REAL FAILURE AND I SHIPPED IT. `verify-model check` compares check.sh's gate
+list against the catalogue's and fails on a gate check.sh runs that the catalogue does not know,
+because nothing would ever select it. I registered `concurrent-selection` in check.sh and not in
+`catalog.rs`, and the gate failed with exactly that message:
+`check.sh runs gate 'concurrent-selection', which the catalog does not know about`.
+
+Worse than the omission is how it survived: last round I ran the sweep as a batch with nine gates held
+back - `verify-model` among them - on the grounds that they were ordering-sensitive, and reported the
+result as clean. I excluded the one gate whose subject is the kind of change I had just made. The two
+lists exist to disagree loudly and they did; I had muted the thing that listens. This round's
+verification runs every gate.
+
+Change: `("concurrent-selection", "harness.tools")` joins `GATES`, and its size goes 61 -> 62. The
+subject is the harness because the staging it exercises is the harness's. Verified after the change:
+`verify-model` passes.
+
+THE SCHEDULER HALF IS ACCEPTED AND UNFIXED. The gate does start two `test.sh` guests itself rather
+than expressing them as steps under `verify.sh --jobs`, so a sweep bounded to one guest can still
+have two running inside this gate. That is a genuine contradiction of M3's one-scheduler contract and
+I am not going to argue it away: the requirement is inherently a two-guest case, so the resolution is
+not "start fewer guests" but for the scheduler to KNOW this gate costs two slots. That needs a cost or
+slot notion in the model that does not exist today - the catalogue carries a subject per gate and
+`GATES_AFTER_A_GUEST` for ordering, and nothing expresses "this one occupies two". Adding it is model
+work, it affects every gate's accounting, and it is not something to bolt on inside an audit response.
+Recorded as an open contradiction rather than as closed.
+
+**3. The staged-loader shell lock does not protect against the other writers named by the correction
+- ACCEPTED, and fixed.**
+
+Correct, and it is the sharpest form of the point: holding a lock that the other writers ignore does
+not make anything authoritative. `qemu-run.sh` built and copied the loader under
+`kernel-test-build.lock`, and `build.sh`, `check-signed-boot.sh` and `check-trust-profile.sh` all
+write the same `libersystem-loader.efi` without taking it - the last of them deliberately cycling
+trust profiles through that path, which makes it the most dangerous writer of the three. A profile
+cycled through could be what a run copied, and an A-to-B-to-A cycle restores the original hash so a
+before/after check agrees.
+
+Change: all three writers now take the same lock. `build.sh`'s `step_loader` wraps its build in a
+subshell holding it - a subshell so the lock is released when the build finishes rather than held
+across the volume and package steps, which would block a concurrent run's staging for no reason.
+`check-trust-profile.sh`'s `build` helper takes it around each profile build, and each of
+`check-signed-boot.sh`'s three loader builds is wrapped the same way. Verified after the change: the
+ordinary build completes without deadlocking, and `trust-profile` passes.

@@ -236,6 +236,13 @@ pub fn init() -> bool {
 			return false;
 		}
 		retained.resize(crate::device::count(), None);
+		let mut counts = RETAINED_FAULTS.lock();
+		counts.clear();
+		if counts.try_reserve_exact(crate::device::count()).is_err() {
+			crate::serial_println!("iommu: no room for the retained fault counts - translation is refused rather than run with accounting it cannot keep");
+			return false;
+		}
+		counts.resize(crate::device::count(), 0);
 	}
 	match bring_up(index) {
 		Ok(controller) => {
@@ -582,8 +589,12 @@ pub fn quarantined_grants_for(index: u32) -> usize {
 // The count lives with the DOMAIN, which is the binding, so a retained domain still answers for the
 // binding that left it behind.
 pub fn faults_for(index: u32) -> u64 {
-	let Some(domain) = domain_of(index).or_else(|| retained_domain_of(index)) else { return 0 };
-	with(|controller| controller.iommu().faults_in(domain)).unwrap_or(0)
+	// THE LIVE DOMAIN, THEN THE RETAINED ONE, THEN THE RETAINED COUNT. The third is what answers
+	// after a CONFIRMED teardown, whose domain is destroyed on purpose - see `RETAINED_FAULTS`.
+	match domain_of(index).or_else(|| retained_domain_of(index)) {
+		Some(domain) => with(|controller| controller.iommu().faults_in(domain)).unwrap_or(0),
+		None => RETAINED_FAULTS.lock().get(index as usize).copied().unwrap_or(0),
+	}
 }
 
 // DEVICES WHOSE DETACH WAS NOT CONFIRMED, AND THE DOMAIN THAT OUTLIVED THEM.
@@ -609,6 +620,22 @@ static RETAINED: SpinLock<Vec<Option<dma::DomainId>>> = SpinLock::new(Vec::new()
 fn retained_domain_of(index: u32) -> Option<dma::DomainId> {
 	RETAINED.lock().get(index as usize).copied().flatten()
 }
+
+// THE FAULT COUNT OF THE BINDING THAT LAST HELD THIS DEVICE, kept after its domain is gone (added
+// 2026-09-01).
+//
+// The count lives with the DOMAIN, which is the binding - that is the right home and it is what M4
+// asks for. But a CONFIRMED teardown destroys the domain, and destroying it takes the counter with
+// it: the attributed drain that runs just before it correctly charges the binding for the faults its
+// own revoke raised, and then `destroy_domain` removes the `DomainState` those faults were charged
+// to. So `faults_for` answered zero for exactly the faults the drain was moved earlier to capture -
+// the reorder fixed the durable EVENT attribution and left the exposed per-binding COUNT unchanged.
+//
+// A retained association does not help, because a destroyed domain answers zero however it is
+// reached. What survives is a number, so a number is what is kept: the domain's final count, copied
+// out while the domain still answers and read after it does not. Sized with `RETAINED`, at `init`,
+// for the reason stated there.
+static RETAINED_FAULTS: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
 
 // What asking for an MSI vector found. THREE ANSWERS, because the two failures call for opposite
 // responses: an endpoint whose domain has no route is a live binding to disable, and one whose
@@ -932,6 +959,20 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// revoke, which is exactly when a misbehaving endpoint raises them - were charged to nobody.
 	// M5's event attribution was right and M4's per-binding counter was short by them.
 	poll_faults_attributed(generation.map(|g| (endpoint, domain, g)));
+	// AND THE BINDING'S FINAL COUNT IS COPIED OUT WHILE THE DOMAIN STILL ANSWERS (added 2026-09-01).
+	//
+	// Between this line and the next block the domain may be destroyed, and its `DomainState` carries
+	// the per-binding fault counter the drain above has just finished updating. Reading it here is
+	// what lets `faults_for` answer after the domain is gone - which is the whole of M4's EXPOSED
+	// per-binding fault accounting, and the half the drain's reorder did not reach on its own.
+	//
+	// Written on BOTH paths, confirmed or not: an unconfirmed teardown keeps its domain and answers
+	// from it, and having the number in two places that agree costs one store on a per-binding path.
+	if let Some(count) = with(|controller| controller.iommu().faults_in(domain))
+		&& let Some(slot) = RETAINED_FAULTS.lock().get_mut(index)
+	{
+		*slot = count;
+	}
 	// AND A CONFIRMED REVOKE DESTROYS THE DOMAIN, which nothing did.
 	//
 	// The public row was removed and the endpoint revoked, and the `DomainState` behind them stayed:

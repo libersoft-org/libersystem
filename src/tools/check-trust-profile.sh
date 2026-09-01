@@ -30,8 +30,18 @@ hexdump_of() {
 	xxd -p "$1" | tr -d '\n'
 }
 
+# UNDER THE SHARED LOADER LOCK, like every other writer of this output (2026-09-01).
+#
+# This gate deliberately CYCLES trust profiles through the one loader output path, which makes it the
+# most dangerous writer of the three: a run staging its own copy could catch the profile this gate is
+# passing through, and an A-to-B-to-A cycle restores the original hash so a before/after check agrees.
+# The harness staging took this lock and the writers did not, so it was held against nobody.
 build() {
-	(cd "$LOADER" && env "$@" cargo build --quiet) || {
+	mkdir -p "../.build/state"
+	(
+		flock 9
+		cd "$LOADER" && env "$@" cargo build --quiet
+	) 9>"../.build/state/kernel-test-build.lock" || {
 		echo "trust-profile: the loader did not build with $*" >&2
 		exit 1
 	}

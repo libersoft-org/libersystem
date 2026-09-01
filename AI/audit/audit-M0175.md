@@ -625,3 +625,42 @@ saying its query identities are predictable. That is the same loud-degraded shap
 and it is the right trade here: an appliance that cannot resolve a name is worse than one that says
 out loud what its correlation is worth. The Definition of done's spoof/replay clause is narrowed to
 match, and says why it is narrowed rather than implying guessability is acceptable.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-09-01T02:10:36Z):
+
+Rating: 5/10
+
+1. **The public-contract correction remains incomplete beyond the latest response's justified
+   rejection of duplicated field order and ordinals.** M1 requires exact records, semantic fields, and
+   operation signatures before implementation and then claims those decisions are present
+   (`docs/todo/P02M0175.md:54-71,106-111`), but it still does not define the interface-identity value,
+   route/router/DNS-server fields, or the changed listen/accept/live-socket signatures. The concrete
+   fetch contract is already contradictory: it permits a 65,536-byte body in <=4,096-byte chunks
+   (`:80-104`), while the current operation returns one inline `list<u8>`
+   (`src/idl/network.lsidl:121-125`) and LSIDL's u16 list length caps it at 65,535
+   (`docs/LSIDL.md:475-489`). Choose the streaming/list-of-chunks/buffer operation and truncation-signal
+   shape, and freeze the other semantic fields/signatures; field order, ordinals, and exact spelling
+   can remain solely in the reviewed IDL.
+
+2. **The accepted numeric-budget correction did not supply M4's inbound-state budgets.** The new table
+   gives 64 total *sockets* and unacknowledged-transmit limits (`docs/todo/P02M0175.md:73-104`), but M4
+   still asks the implementer to define a half-open limit, established-but-unaccepted backlog, total
+   TCB cap, and aggregate receive/transmit byte budgets without any numbers (`:197-205`). A half-open
+   TCB is the expressly identified state that has no socket channel, so the socket count does not
+   resolve it; unacknowledged bytes also do not bound aggregate receive storage. Choose all four limits
+   and gate each exact/over-bound case.
+
+3. **The new “bounded basic sender profile” still leaves its interoperability policy unchosen.** M2
+   calls for a “standard” RTO with a floor and ceiling, initial-window and loss-response rules, and a
+   bounded retry count, but names neither an RFC/profile nor any of those values
+   (`docs/todo/P02M0175.md:152-180`). Two implementations can therefore choose incompatible RTO floors,
+   initial windows, loss reactions, and retry limits while passing the qualitative tests. Pin the basic
+   TCP profile and numeric policy; this does not require any of the advanced congestion-control work
+   the milestone explicitly refuses.
+
+4. **The entropy correction gives the milestone two incompatible completion gates.** Dependencies
+   calls secure entropy “a prerequisite” and says M0175 is waiting for FEAT_RNG/Zkr, then immediately
+   permits a visible predictable-identity mode until those exist (`docs/todo/P02M0175.md:419-440`);
+   the Definition of done likewise accepts that degraded mode (`:442-454`). Decide whether secure
+   entropy blocks M0175 or only its stronger unguessability gate, and align the dependency, release
+   matrix, and Definition of done with that one answer.

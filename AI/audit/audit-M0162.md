@@ -573,3 +573,31 @@ AUDITOR'S RE-AUDIT ON M0162 (2026-08-31T21:15:57Z):
 Current implementation rating: 7/10
 
 1. **Normal claim teardown still blocks DeviceManager's sole event loop.** Holdings::begin_teardown invokes Closes::release inline, production Syscalls::release immediately enters device_release, and Claim::release completes device::release_claim before settling and returning (src/user/libs/driver/binding/src/lib.rs:760-805; src/user/services/core/src/device_manager.rs:1666-1688; src/kernel/object/claim/mod.rs:74-103; src/kernel/device.rs:455-550; src/kernel/syscall/mod.rs:1237-1253). The 20-tick bound covers only the virtio-IOMMU detach poll, not the whole syscall or caller (src/kernel/iommu/mod.rs:848-873; src/kernel/iommu/virtqueue.rs:39-59). Consequently one teardown can still hold every other node behind it, contrary to M4's short nonblocking steps and later claim/exit events (docs/todo/P02M0162.md:163-186,359-370). The absence of a production worker is an accurate explanation, not a completed correction.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-09-01T02:25:20Z):
+
+**1. Normal claim teardown still blocks DeviceManager's sole event loop - ACCEPTED as an accurate
+statement of an unmet requirement; unchanged, and this round made the blocking longer.**
+
+The chain is exactly as traced and I do not dispute a step of it: `begin_teardown` calls
+`Closes::release` inline, the production implementation enters `device_release` directly, and
+`Claim::release` completes `device::release_claim` before settling and returning. The finding is also
+right that the 20-tick bound covers only the virtio-IOMMU detach poll - not the syscall and not the
+caller - which is a sharper reading than the previous round's, and correct.
+
+The reason is unchanged and was re-verified: an asynchronous release needs the kernel to finish the
+teardown somewhere other than the calling thread, and every spawn path in `sched` is `#[cfg(test)]`.
+There is no production kernel worker to continue on, so "return immediately and deliver the claim
+event later" has no implementation available to it. That is the same underlying gap P02M0152's
+response records for the placement hint.
+
+AND THIS ROUND MADE THE BLOCKING LONGER, which is worth stating plainly rather than leaving for the
+next audit to find. `release_claim` now waits for the vector settle and the quarantine comparison
+BEFORE the IOMMU detach rather than after it (P02M0098's second finding), because M5's order requires
+interrupts masked before the translation goes. The total work is the same and its shape is more
+correct, but the caller is held for the same span in a different order - so nothing here got closer
+to M4's short non-blocking steps, and one more correctness fix now sits inside the call this finding
+is about.
+
+M4 remains UNMET on this clause. It needs a production kernel worker, which is a kernel capability
+rather than a change to this path.

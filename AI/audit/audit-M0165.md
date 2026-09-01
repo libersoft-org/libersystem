@@ -750,3 +750,65 @@ Current implementation rating: 6/10
 2. **The publish/crash/subscribe race still does not exercise DeviceManager's production withdrawal side effects.** The host test drives Publications and withdraw_slots_into, while the guest check is a local enum simulation; neither executes DeviceManager's failure-path withdrawal call, closes the returned channels, or sends subscriber withdrawal announcements (src/user/libs/driver/binding/src/tests.rs:526-599; src/kernel/test_suites/hardware.rs:531-569; src/user/services/core/src/device_manager.rs:2095-2152,3351-3359). Removing any one of those production actions would still leave the tests green, so M7's named no-stale-provider race remains incompletely gated (docs/todo/P02M0165.md:280-307,309-331).
 
 3. **Reverse dependency shutdown is regressed when an operator has selected a different next driver.** stop_all computes both requires and provides from candidates[candidate], the mutable next-bind cursor, rather than Node::entry or the latched running candidate (src/user/services/core/src/device_manager.rs:4539-4595, especially 4562 and 4573). A select performed while the current binding stays online can therefore make shutdown order the future driver's dependency graph and stop a provider before its actual live dependent, violating M4's dependents-first teardown (docs/todo/P02M0165.md:149-174).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-09-01T02:25:20Z):
+
+**1. A valid planned STOPPED is still recorded and persisted as a crash - ACCEPTED.**
+
+Correct, and this is the same defect one layer deeper than the one fixed last round. That round
+stopped the manager REFUSING a correct `STOPPED` frame; the cause it then recorded was still
+`DriverExited`, which `cause_name` renders as "it exited without saying anything" - about a driver
+that had just said exactly what it was asked to say. The shared teardown path captures that incident,
+prints it and PERSISTS it, and both the operator endpoint and the stored row carry the false cause.
+
+The previous code knew: its comment said the cause "renders as 'it exited without saying anything',
+which is the opposite of what a STOPPED frame is", and then returned it anyway on the grounds that
+"the cause only travels so the shared teardown path has one to carry". It travels further than that.
+A comment describing the lie is not the same as not telling it, and M3 requires a planned stop not to
+be classified as a crash.
+
+Changes: `FailureCause::Stopped`, with `retryable() == false` - a driver that stopped because it was
+told to is not one to bring back automatically; what brings it back is the operator verb or the
+returning dependency, and both ask for a bind themselves. It renders as "it was asked to stop and it
+did", its wire name is `stopped`, and the IDL enum gains `stopped = 12` (a pre-release addition,
+taken through `gen.sh --accept-breaking`). The `Stopped` event arm returns it instead of
+`DriverExited`.
+And the System Graph renders it EMPTY, by that function's own stated rule: `last_failure` is where a
+failure goes, a driver asked to stop has not failed, and the same comment already gives that reason
+for `none` and for a binding waiting on a provider. The exhaustive match is what surfaced that
+decision - it refused to compile until the new variant was answered for, which is the check working.
+
+**2. The publish/crash/subscribe race still does not exercise DeviceManager's production withdrawal
+side effects - ACCEPTED as accurate; partially closed, and I am not claiming more.**
+
+The finding is right, and right about the guest check too - it is a local enum simulation, so neither
+half executes DeviceManager's failure-path `withdraw_binding`, its channel closes, or its subscriber
+announcements. Removing any one of those production actions would leave both tests green.
+
+What was closable, I closed last round and it stands: the announcement is COUNTED against what the
+library says it emptied, so a loop that stops visiting a provider is caught at run time on a
+per-binding path rather than by a test nobody can write. That converts one of the three actions from
+untested to self-checking.
+
+What remains is the call itself and the two side effects, and making those testable means driving
+DeviceManager's event loop on a host - which this milestone already records as the wall it met, and
+which is a restructuring of a `no_std` binary rather than a regression. M7's registered gate remains
+INCOMPLETE on that clause.
+
+**3. Reverse dependency shutdown is regressed when an operator has selected a different next driver -
+ACCEPTED, and this is a reader I missed in last round's own sweep.**
+
+Correct. `stop_all` builds its dependency graph from `candidates[candidate]` on both sides - the
+node's own `requires` and every other node's `provides` - and `candidate` is the cursor `select`
+exists to move. So a `select` on a device that stays online could order the shutdown by a driver that
+is not running, stopping a provider before its actual live dependent, which is the dependents-first
+rule the sort exists to keep.
+
+Worth recording why it survived: last round I swept the cursor readers after the same finding was
+raised against `select`, and I searched for `node.candidates[node.candidate]` and
+`candidates.get(node.candidate)`. These two are spelled `nodes[at].candidates.get(nodes[at].candidate)`
+- the same expression through an index rather than a binding - and the grep did not match them. A
+pattern written from the spellings I had already seen found only those.
+
+Change: both reads go through `Node::entry()`, which answers with the RUNNING candidate when there is
+a binding and the cursor otherwise. That is the same correction the other six readers took.

@@ -1411,3 +1411,16 @@ common contract - provider identity, the versioned device-side PCM contract, att
 and reconnect - rather than only the device-side half. The prerequisite matrix row is aligned with it:
 it now says AudioService reaches its provider through the catalogue and points at the destination row
 rather than repeating the claim.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-09-01T02:10:36Z):
+
+Rating: 8/10
+
+1. **The implementation-ready virtio-blk maintenance item omits its mandatory DMA prerequisite.**
+   The prerequisite matrix requires every DMA-capable driver to depend on P02M0153 in addition to
+   P02M0172 (`docs/todo/P02M0099.md:124-126`). The only maintenance entry declared ready to start lists
+   P02M0098/P02M0161/P02M0162, P02M0172, `object_info`, and the host-test seam in its explicit
+   `REQUIRES`, but not P02M0153; its classification invokes only the every-driver row and measured bind
+   windows (`:375-383,389-391`). Because this per-item block is the executable prerequisite list, it
+   contradicts the DMA row instead of propagating it. Add P02M0153's DMA/IOVA contract to this item's
+   `REQUIRES` and acceptance contract.

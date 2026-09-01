@@ -95,6 +95,12 @@ fn cause_text(cause: FailureCause) -> &'static [u8] {
 		FailureCause::DriverReportedFailure => b"driver-reported-failure",
 		FailureCause::TeardownUnconfirmed => b"teardown-unconfirmed",
 		FailureCause::Hung => b"hung",
+		// EMPTY, BY THIS FUNCTION'S OWN RULE. A driver that was asked to stop and did has not
+		// failed, and `last_failure` is where a failure goes - the same reason `none` renders empty
+		// two lines up, and the same reason the comment gives for a binding waiting on a provider.
+		// What happened to it is in the node's STATE; putting it here too would report a planned
+		// shutdown as a broken image.
+		FailureCause::Stopped => b"",
 	}
 }
 
