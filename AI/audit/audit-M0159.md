@@ -802,3 +802,100 @@ AUDITOR'S RE-AUDIT ON M0159 (2026-09-01T17:10:24Z):
 Current implementation rating: 8/10
 
 1. **The enforcing-profile restart still restores only the GPU binding, not a usable display path.** The controlled check intentionally reports post-rebind presentation instead of asserting it (`src/harness/dev-gpu-restart.py:40-49,152-169,244-245`). That limitation reflects current production behavior: the standing loop can rebind and republish the GPU but does not route `Step::Online` offers (`src/user/services/core/src/device_manager.rs:512-565`); `route_offers` is called only during initial phase-two bring-up and fills the one fixed `gpu_client` only while it is zero (`src/user/services/core/src/device_manager.rs:968-976,1145-1157`). DisplayService therefore retains the ended binding's channel after disable/enable. A new claim generation and provider count do not satisfy M4's requirement for a frame-reaching, functioning GPU after restart (`docs/todo/P02M0159.md:94-97,126-131`). The cold-boot gate's syntax and presentation assertions are intact, but they do not exercise this lifecycle.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-09-01T21:45:00Z):
+
+Three re-audits are answered here - `11:58:45Z`, `14:33:49Z` and `17:10:24Z`. All three carry one
+finding and it is the same one: the restart check drives a real rebind but neither restores nor
+proves display presentation, because DeviceManager cannot route a replacement provider to
+DisplayService.
+
+**Finding 1 (all three rounds) - the enforcing-profile restart restores only the GPU binding, not a
+usable display path. ACCEPTED, and unmet.**
+
+Every part of the trace is confirmed again against the current tree. `route_offers` fills each fixed
+consumer slot only `if *client == 0`, it has exactly one call site - the phase-two bring-up loop -
+and the standing loop does not route `Step::Online` offers. So a driver stopped and started after
+bring-up republishes its DISPLAY provider into the catalogue, nothing routes it, and DisplayService
+goes on holding the channel of the binding that ended. The check reports post-rebind presentation
+instead of asserting it, and that limitation is production behaviour rather than a weak check.
+
+What is NEW this round is that I stopped arguing about whose milestone it is and asked whether a
+DeviceManager-only fix exists. It does not, and the reason is worth recording because it is the
+argument for the migration rather than an excuse:
+
+The client slots - `net_client`, `gpu_client`, `input_client` and the rest - are locals of the same
+function the standing loop runs in, so the standing loop CAN reach them and could call `route_offers`
+again on a replacement publication. That would fill the local. It would not reach DisplayService.
+The handle was handed to that service by ServiceManager at bootstrap, positionally, under the role
+tag `GPU`; DisplayService reads it once from its bootstrap channel and holds it in `Scanout::gpu`.
+There is no channel from DeviceManager to DisplayService on which a REPLACEMENT could be delivered.
+So re-routing would leave the manager holding a fresh handle and the service holding a dead one -
+strictly worse than today, because the machine would then own a live provider nobody can reach and
+the catalogue would say the kind is taken.
+
+DisplayService already handles the first half correctly: its loop reads `Received::Closed` on the GPU
+channel and sets `scanout.gpu = 0`. What it cannot do is learn about the replacement, and the seam
+that lets it is the one AudioService already uses - a `provider-catalogue` connection and a
+subscription to its kind. That is P02M0164's M-item and its explicitly scoped "each service changes
+at one seam", and it is a change to DisplayService's start-up contract plus ServiceManager's role
+list plus DeviceManager's routing, on the boot-critical display path of three ports.
+
+I did not attempt it in this round, and that is a decision rather than an omission: this round's other
+changes are six defect fixes in the claim, IOMMU-attribution and binding-lifecycle paths, and adding
+a four-component bootstrap change to the display path on top of them would make a failure impossible
+to attribute. It is the next thing this milestone's M4 needs, it belongs to P02M0164's migration, and
+it is owed rather than argued about.
+
+So M4 stays unmet on its consumer half. What the restart check does prove - and what I am not
+claiming more than - is the driver-and-kernel half: a new claim generation, the translated profile
+intact, no IOMMU fault and no panic across the window, the rebound binding republishing its declared
+providers, a clean planned stop with `lsdev --incident` answering that nothing went wrong, and the
+guest's boot generation unchanged so none of it is a reboot wearing a rebind's name.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it
+was in flight, so each stamp below is against the tree that produced it.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed (193s) |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed (3456s) |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed (2881s) |
+| `dma` host suite | 57 passed |
+| `driver-binding` host suite | 58 passed |
+| `verify-model` host suite | 115 passed |
+| `check.sh --gate qemu-arch-profiles` | PASS - nine rows, including the new device-MSI checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+x86_64 is 376 where the previous round was 374: the two new kernel tests are
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` and
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end`. The second
+declines on a machine with no `edu` fixture and SAYS so; where it has one, it ran and passed:
+
+```
+iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its
+frame when its claim was forced to end (transfer completed=true)
+```
+
+And on the ITS checkpoint row:
+
+```
+its: up - 16 event id bits, 512 device ids, 8192 LPIs from INTID 8192
+interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered
+device: 6 released - 1 MSI vector(s) given back
+virtio-snd: the device's MSI vector was delivered on and then torn down with its claim
+```
+
+TWO THINGS FAILED DURING THE ROUND AND ARE REPORTED RATHER THAN SMOOTHED OVER. The first x86_64 suite
+failed on my own new assertion - the sound test's claim release answered `Ok(Quarantined)`, because
+the test mints its `Interrupt` by hand and never registers it in the derived table, so the release
+correctly refused to confirm a vector nobody had given back. The second was the ITS device oracle on
+a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
+off the volume. Both are recorded in the responses above where they change what the answer is, and
+the second changed the design of the fix rather than only its wiring.

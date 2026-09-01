@@ -777,3 +777,147 @@ Current implementation rating: 6/10
 2. **The required translated-DMA forced-release proof is still missing.** `ending_a_claim_takes_the_dma_buffers_it_authorised` uses an untranslated synthetic device and proves only object-generation/derived-row revocation (`src/kernel/object/claim/tests.rs:551-594`). The enforcing IOMMU generation fixture proves stale map admission, then explicitly unmaps before detach (`src/kernel/iommu/tests.rs:295-335`); it does not keep a live claim-derived IOVA across forced release and prove that device access through it faults. M9 and the definition of done explicitly require that hostile-holder case (`docs/todo/P02M0098.md:193-204,231-252`).
 
 Focused verification: the ABI suite passed 28 tests and the portable DMA suite passed 55 tests. No guest run was started; neither passing host suite exercises the MSI rollback interleaving or the missing translated forced-release case.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-09-01T21:45:00Z):
+
+Three re-audits are answered here - `11:58:45Z`, `14:33:49Z` and `17:10:50Z`. The first two rounds'
+FIXES were made and are in the tree; their responses were never appended, and that is my omission
+rather than a claim that the findings went away. Each is answered below with the change that closed
+it, and the newest round is answered with new work.
+
+**11:58:45Z, finding 1 - the MSI-X disable does not close every stale-generation delivery window.
+ACCEPTED, and closed.**
+
+The trace was right: the entry was written with vector control ZERO, so a stale caller that reached
+`program_msix_entry` after a replacement had enabled MSI-X published a DELIVERABLE vector onto
+somebody else's function, and only the later `register_derived` refused its key - by which time the
+hardware had already been written. Two changes closed it. `program_msix_entry` now writes vector
+control = 1 on all three ports, so everything between the programming and the commit happens against
+an entry the device cannot raise; and `release_claim` calls `msix_off`, so a released function stops
+being able to SEND a message rather than merely having this binding's entry masked.
+
+**11:58:45Z, finding 3 - the live-vector forced-release test can pass without exercising its subject.
+ACCEPTED, and closed.**
+
+`a_forced_release_takes_a_live_interrupt_away` printed a line and returned successfully when no
+vector was free. It now takes a genuine registry slot and `expect`s it, so the test cannot report a
+pass over a case it did not run - which is what the milestone's last definition-of-done line asks of
+every test here.
+
+**14:33:49Z, finding 1 - release after registration but before the acquire commits. ACCEPTED, and
+closed.**
+
+Confirmed as described: `register_derived` dropped the claim lock on return and the syscall then
+performed two separate operations - an unmask and an MSI-X enable - with a forced release able to
+land between them. `device::publish_msi_if_current(key, vector, table_phys)` is now the whole of the
+publication: it takes DEVICES then CLAIMS, re-checks the generation and the state under those locks,
+and unmasks and enables INSIDE them. A release cannot land in the middle of it, and a stale key is
+refused before anything is written.
+
+**17:10:50Z, finding 1 - the rollback is generation-blind and can tear down the replacement.
+ACCEPTED. This is a real defect and it is fixed.**
+
+I re-walked every step and the trace holds exactly. `register_derived` succeeds; a forced release
+reaches that row, `Interrupt::revoke` unbinds the vector and RETIRES the slot; `settled_vectors` sees
+no unbound slot, so the claim publishes `Free`; `release_msi_for_device` then clears `pending` and
+gives the slot back; a replacement claim acquires it and binds its own interrupt. The old syscall
+resumes, `publish_msi_if_current` correctly refuses the stale key - and the failure arm called
+`interrupt.disown()` followed by `release_unused_msi(vector)` unconditionally. On x86_64 that masks
+and unmaps the REPLACEMENT's MSI-X entry and clears its registry binding; the AArch64 and RISC-V
+forms release the current slot the same way. An old generation tearing down the next one, which is
+the exact hazard `disown` was introduced to prevent on the sibling rollback path.
+
+What made it possible is that `disown` threw away the one fact that answers it. Its own comment says
+"`swap`, so the disarm happens exactly once and a caller cannot disarm a slot twice" - and the code
+was a `store`, so the previous value was discarded and no caller could tell "I still owned this" from
+"the release already took it". `disown` is now the `swap` its comment describes and RETURNS that
+value, `#[must_use]`, and both acquire rollbacks free the slot only when it answers true. When it
+answers false the release has already retired the slot and there is nothing for the rollback to give
+back.
+
+The other two arms were checked rather than assumed. The `bind_msi` failure arm holds a slot that is
+acquired and NOT bound, and the `register_derived` arm holds one that is bound and not registered;
+in both, `has_unbound` sees the slot live, `settled_vectors` answers false, the claim publishes
+`Quarantined` instead of `Free`, and the vectors are never returned to circulation. So neither was
+reachable - but the guard is applied to the `register_derived` arm too, because a rollback whose
+safety depends on a property of a different function is one that breaks when that function changes.
+
+New test, and it drives the interleaving rather than asserting the helper:
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` binds a
+vector, revokes it the way `revoke_derived` does, gives the slot back through
+`release_msi_for_device`, lets a replacement acquire and bind it, and only then runs the rollback's
+own two lines. The replacement must still be bound afterwards, and its sibling assertion covers the
+`Drop`. With `disown` as a `store` this test fails.
+
+**11:58:45Z / 14:33:49Z / 17:10:50Z, finding 2 - the translated-DMA forced-release proof is absent.
+ACCEPTED three times, and it now exists.**
+
+The finding was right every time and my earlier answers pointed at two tests that prove something
+else: that a STALE-generation map is refused, and that the derived table's rows are revoked. Neither
+asks M9's question, which is what happens to an address the holder ALREADY HAS when the claim behind
+it is taken away without asking.
+
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end` asks it of the
+device. It claims the `edu` fixture the way DeviceManager claims a device, attaches its endpoint
+under that claim's generation, maps a sentinel frame and gets a translated IOVA, and then makes the
+device WRITE through that address and requires the sentinel to change - so everything after it is a
+statement about a revocation rather than about an address that never resolved. Then `release_claim`
+runs the production forced teardown with the device still live.
+
+The second half is what makes the question honest, and it is the part I had to think about rather
+than write. A forced release turns bus mastering off, so a test that stopped at the release would be
+proving the bus-master bit and not the translation. So it CLAIMS THE FUNCTION AGAIN - a second
+binding, its own generation, its own domain - which puts the device back on the bus legitimately,
+restores the sentinel, and requires that the old address now reaches nothing. `Sentinel::restore`
+was added for that, because "what a sentinel holds" is that type's own fact and a caller reaching
+into the direct map to reset it would be a second answer to it.
+
+It runs on the enforcing profile and says so when it declines an untranslated machine, rather than
+passing quietly.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it
+was in flight, so each stamp below is against the tree that produced it.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed (193s) |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed (3456s) |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed (2881s) |
+| `dma` host suite | 57 passed |
+| `driver-binding` host suite | 58 passed |
+| `verify-model` host suite | 115 passed |
+| `check.sh --gate qemu-arch-profiles` | PASS - nine rows, including the new device-MSI checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+x86_64 is 376 where the previous round was 374: the two new kernel tests are
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` and
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end`. The second
+declines on a machine with no `edu` fixture and SAYS so; where it has one, it ran and passed:
+
+```
+iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its
+frame when its claim was forced to end (transfer completed=true)
+```
+
+And on the ITS checkpoint row:
+
+```
+its: up - 16 event id bits, 512 device ids, 8192 LPIs from INTID 8192
+interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered
+device: 6 released - 1 MSI vector(s) given back
+virtio-snd: the device's MSI vector was delivered on and then torn down with its claim
+```
+
+TWO THINGS FAILED DURING THE ROUND AND ARE REPORTED RATHER THAN SMOOTHED OVER. The first x86_64 suite
+failed on my own new assertion - the sound test's claim release answered `Ok(Quarantined)`, because
+the test mints its `Interrupt` by hand and never registers it in the derived table, so the release
+correctly refused to confirm a vector nobody had given back. The second was the ITS device oracle on
+a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
+off the volume. Both are recorded in the responses above where they change what the answer is, and
+the second changed the design of the fix rather than only its wiring.

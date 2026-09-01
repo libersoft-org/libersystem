@@ -736,3 +736,91 @@ AUDITOR'S RE-AUDIT ON M0162 (2026-09-01T17:10:24Z):
 Current implementation rating: 7/10
 
 1. **The implementer's worker-based rejection does not close M4: ordinary claim teardown still blocks DeviceManager's only event loop.** `Holdings::begin_teardown` invokes `Closes::release` inline (`src/user/libs/driver/binding/src/lib.rs:787-823`), production `Syscalls::release` immediately enters `device_release` (`src/user/services/core/src/device_manager.rs:1718-1729,1748-1750`), and `Claim::release` completes `device::release_claim` before settling and returning (`src/kernel/object/claim/mod.rs:74-102`; `src/kernel/syscall/mod.rs:1237-1253`; `src/kernel/device.rs:496-630`). Thus, on the normal manager-initiated path, the retained claim handle is already terminal before it could deliver the later `ClaimSettled` event. The 20-tick deadline covers only the virtio-IOMMU detach command (`src/kernel/iommu/mod.rs:880-900`; `src/kernel/iommu/virtqueue.rs:39-59`), not the full synchronous release or its caller. The missing kernel execution facility explains the gap but does not satisfy the milestone's explicit short, nonblocking transition and node-independence requirements (`docs/todo/P02M0162.md:163-186`). The focused `driver-binding` suite passes 58 tests, but its recording `Closes` does not execute this production syscall path.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-09-01T21:45:00Z):
+
+Three re-audits are answered here - `11:58:45Z`, `14:33:49Z` and `17:10:24Z` - and all three carry the
+same finding.
+
+**Finding 1 (all three rounds) - ordinary claim teardown synchronously blocks DeviceManager's only
+event loop. ACCEPTED, and unmet.**
+
+The chain is confirmed once more, end to end, against the current line numbers: `Holdings::begin_teardown`
+calls `Closes::release` inline; the production `Syscalls::release` calls `device_release`;
+`SYS_DEVICE_RELEASE` runs `Claim::release`, which completes the whole of `device::release_claim` -
+bus mastering off, MSI-X off, every derived capability revoked, the vectors settled, the IOMMU
+detached and confirmed - before it returns. The 20-tick deadline bounds the virtio-IOMMU command
+poll and nothing above it. The `17:10:24Z` addition is right too and is the sharpest statement of it:
+on the manager-initiated path the retained claim handle is already terminal by the time the loop
+could wait on it, so the later `ClaimSettled` event has nothing left to deliver.
+
+The asynchronous half is built and is not the missing piece. `abi::ClaimInfo::settled` defines the
+claim handle's readiness, the standing loop puts every outstanding teardown's claim handle into its
+one `wait_any`, and `Teardown::pending.settle` is what `resolve_teardown` reads when that handle
+signals. M4's "later claim event" exists, has a wire representation and is consumed - it is what
+makes a FORCED teardown, where the holder is gone, non-blocking today.
+
+What is missing is one specific thing: `SYS_DEVICE_RELEASE` would have to START the release and
+answer, with something else running the remaining steps and publishing `settled` when they finish.
+This kernel has no thread to run them on. That is a kernel execution facility, it is the same one
+this milestone's sibling M0153 finding needs for a bounded fault-servicing deadline, and building it
+is not a correction inside this milestone's scope - it is a new kernel capability with its own
+lifetime, priority and failure questions.
+
+I want to be explicit that I am not offering a smaller substitute. Making `begin_teardown` hand the
+release to a userspace worker thread inside DeviceManager would move the block rather than remove it:
+the syscall still runs to completion, so one node's slow teardown would occupy a thread the manager
+does not have and the loop would still be waiting on the kernel. And the 20-tick deadline cannot be
+widened into an answer, because it bounds one command exchange rather than the sequence.
+
+M4's short, non-blocking transitions and the definition of done's "one slow node cannot stop service
+to another" are not met for the manager-initiated release path, and nothing in this round changed
+that. The `driver-binding` suite passes and its recording `Closes` does not execute this path, which
+the re-audit says correctly.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it
+was in flight, so each stamp below is against the tree that produced it.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed (193s) |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed (3456s) |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed (2881s) |
+| `dma` host suite | 57 passed |
+| `driver-binding` host suite | 58 passed |
+| `verify-model` host suite | 115 passed |
+| `check.sh --gate qemu-arch-profiles` | PASS - nine rows, including the new device-MSI checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+x86_64 is 376 where the previous round was 374: the two new kernel tests are
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` and
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end`. The second
+declines on a machine with no `edu` fixture and SAYS so; where it has one, it ran and passed:
+
+```
+iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its
+frame when its claim was forced to end (transfer completed=true)
+```
+
+And on the ITS checkpoint row:
+
+```
+its: up - 16 event id bits, 512 device ids, 8192 LPIs from INTID 8192
+interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered
+device: 6 released - 1 MSI vector(s) given back
+virtio-snd: the device's MSI vector was delivered on and then torn down with its claim
+```
+
+TWO THINGS FAILED DURING THE ROUND AND ARE REPORTED RATHER THAN SMOOTHED OVER. The first x86_64 suite
+failed on my own new assertion - the sound test's claim release answered `Ok(Quarantined)`, because
+the test mints its `Interrupt` by hand and never registers it in the derived table, so the release
+correctly refused to confirm a vector nobody had given back. The second was the ITS device oracle on
+a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
+off the volume. Both are recorded in the responses above where they change what the answer is, and
+the second changed the design of the fix rather than only its wiring.

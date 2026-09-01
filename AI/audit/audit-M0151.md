@@ -1134,3 +1134,127 @@ Current implementation rating: 6/10
 2. **The separately labelled AArch64 and RISC-V UEFI/no-DT regression profiles are still absent.** All registered rows are launched through the direct `UEFI=0` request (`src/tools/check-qemu-arch-profiles.sh:198-211,299-334,365-370`), while `LIBER_NO_DT_PROFILE` is merely forwarded by the build and no profile selects it (`src/harness/test-kernel.sh:332`). The gate itself says the positive no-DT boots cannot currently be produced (`src/tools/check-qemu-arch-profiles.sh:321-334`). That measured harness limitation does not satisfy M6 or the definition of done's required regression profiles (`docs/todo/P02M0151.md:143-154,464-477`).
 
 Focused verification: the FDT suite passed 87 tests, the `smpboot` suite passed 18 tests, and the `arch-surface` gate passed over 61 production architecture files. Those checks support the resolved parser, secondary-lifecycle and surface findings, but do not supply either missing profile-level proof above.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-09-01T21:45:00Z):
+
+Three re-audits are answered here - `11:58:45Z`, `14:33:49Z` and `17:10:50Z`. All three carry the
+same two findings, and both were correct each time. One of them is now closed by work in this round;
+the other is not, and I say what it is blocked on rather than restating the blocker as an argument.
+
+**Finding 1 (all three rounds) - the real device-originated GICv3/ITS MSI delivery-and-teardown
+checkpoint is missing. ACCEPTED, and it is now in place.**
+
+The finding was right, and so were two of the three steps in the gate's own note about why it could
+not be met. Every MSI ORACLE in this tree allocates an ordinary RAM frame as a stand-in MSI-X table
+and calls `dispatch_msi` by hand, so no report on that path can tell a device-raised message from
+the kernel calling itself - I had measured that when a line added to `MsiRegistry::dispatch` fired
+for the oracle on the first profile that ran it. And the profile rows are direct boots, which is what
+M6 asks them to be.
+
+What the note got wrong is the conclusion, and I want to record the shape of the error because I
+then made a second one of the same shape. The note reasoned: a real message needs a driver, a driver
+needs userspace, userspace needs an init package, a direct boot has none - therefore unreachable. The
+first step is false. The kernel's own hardware suite already programs a REAL `virtio-sound-pci`
+function's MSI-X table, unmasks the entry, sets MSI-X Enable on the function and then waits for the
+interrupt that device raises when a capture period is ready. The message exists on any machine
+carrying that function, and on an ITS machine it is a device-originated LPI by construction. No
+userspace driver is needed for the DEVICE to raise one.
+
+My second error was to conclude from that that a direct boot would do. It will not, and I found out
+by running it rather than by reasoning: the sound test reads its driver artifact off the VOLUME, and
+on a direct row it fails with `volume package module not found`. So the old note was reaching for a
+real obstacle and had misidentified it - the missing thing is not userspace, it is the volume
+package, and a firmware boot carries one.
+
+Four changes, and each is where it is for a reason:
+
+- `is_device_lpi` in the aarch64 interrupt backend, and a one-shot report in `gic.rs` on the branch
+  that dispatches a device MSI. That INTID comes out of the GIC's own acknowledge register a few
+  lines above, so nothing but the interrupt controller can have put it there, and an LPI at all means
+  an ITS translated a device's write to produce it. The oracles call `dispatch_msi` directly and
+  never pass through this point, which is why the report sits here rather than in the registry.
+- `virtio_snd_driver_captures_a_period_from_the_device` now RELEASES what it took. It ended at the
+  stream acknowledgement holding the claim and the vector for the rest of the run - so the one test
+  that drives a real device's MSI-X table proved delivery and never proved teardown, which is half of
+  what M3 asks. It now revokes the vector and runs the production forced claim release with the
+  driver still live, and asserts `Free` and an unbound vector. The revoke is explicit and commented,
+  because this test mints its `Interrupt` by hand and therefore never registers it in the claim's
+  derived table - without it the release correctly answers `Quarantined`, which I measured rather
+  than guessed.
+- A ninth gate row, `aarch64 gicv3-its-device` at four cores, booted through FIRMWARE. `run_profile`
+  gains a `PROFILE_UEFI` knob that is zero everywhere else: the eight discovery rows stay direct,
+  exactly as M6 asks, and this one is a checkpoint row that does not claim to be a discovery profile.
+- The ITS assertions. The gate now requires the delivery-path line and the teardown line from that
+  row's own log and fails with the interrupt and `virtio-snd` lines quoted when either is absent.
+
+Measured on that row before wiring it in: `its: up - 16 event id bits, 512 device ids, 8192 LPIs from
+INTID 8192`, then `interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered`,
+then `device: 6 released - 1 MSI vector(s) given back` and the teardown line. That is M3's "deliver
+and tear down a real device MSI", and the stale note claiming it was unreachable is replaced by the
+measurement that separates a direct boot from a firmware one.
+
+**Finding 2 (all three rounds) - the named AArch64 and RISC-V UEFI/no-DT regression profiles are
+absent. ACCEPTED, and still unmet.**
+
+Re-read and re-confirmed rather than assumed: every registered row is launched with `UEFI=0`,
+`LIBER_NO_DT_PROFILE` is forwarded by `test-kernel.sh` and selected by no caller, so the authorised
+static descriptor is unreachable and the refusal it guards is untestable.
+
+What blocks it is a harness capability and not a gate row, and the measurement stands: the profile
+needs a machine that publishes NO device tree, and booting through firmware does not produce one -
+QEMU's `virt` hands the firmware a DTB and the loader passes it on, so a `UEFI=1` boot still prints
+`aarch64: GICv2 from the device tree`. What is missing is a way to WITHHOLD the tree: a QEMU machine
+that publishes none, or a loader option that declines to pass one on. Neither exists here, and
+neither is something this milestone's code can supply.
+
+I am not offering the negative check again. The previous round suggested proving that an authorised
+static descriptor is NOT selected when a tree exists, and the re-audit's answer was correct: that is
+not either of the two positive regression boots M6 names, and a substitute that proves a different
+sentence is worse than an admitted gap. M6 and the definition of done are unmet on this item.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it
+was in flight, so each stamp below is against the tree that produced it.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed (193s) |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed (3456s) |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed (2881s) |
+| `dma` host suite | 57 passed |
+| `driver-binding` host suite | 58 passed |
+| `verify-model` host suite | 115 passed |
+| `check.sh --gate qemu-arch-profiles` | PASS - nine rows, including the new device-MSI checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+x86_64 is 376 where the previous round was 374: the two new kernel tests are
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` and
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end`. The second
+declines on a machine with no `edu` fixture and SAYS so; where it has one, it ran and passed:
+
+```
+iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its
+frame when its claim was forced to end (transfer completed=true)
+```
+
+And on the ITS checkpoint row:
+
+```
+its: up - 16 event id bits, 512 device ids, 8192 LPIs from INTID 8192
+interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered
+device: 6 released - 1 MSI vector(s) given back
+virtio-snd: the device's MSI vector was delivered on and then torn down with its claim
+```
+
+TWO THINGS FAILED DURING THE ROUND AND ARE REPORTED RATHER THAN SMOOTHED OVER. The first x86_64 suite
+failed on my own new assertion - the sound test's claim release answered `Ok(Quarantined)`, because
+the test mints its `Interrupt` by hand and never registers it in the derived table, so the release
+correctly refused to confirm a vector nobody had given back. The second was the ITS device oracle on
+a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
+off the volume. Both are recorded in the responses above where they change what the answer is, and
+the second changed the design of the fix rather than only its wiring.

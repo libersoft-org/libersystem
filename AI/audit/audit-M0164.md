@@ -1053,3 +1053,114 @@ Current implementation rating: 5/10
 2. **Block-volume discovery is still capped at four and assigns non-system roles by BDF position, not format/origin/`RootSelection`.** DeviceManager has four boot tags, four role handles, and four probe handles, mints only the first four block-provider probes, then fills the four roles through global lowest-BDF `Catalogue::take` (`src/user/services/core/src/device_manager.rs:82-85,431-444,848-888`). ServiceManager labels positions as FAT/ISO/UDF, and StorageService trusts those tags rather than probing their formats (`src/user/services/core/src/service_manager/bootstrap.rs:389-474`; `src/user/services/storage/src/service.rs:262-275`). The UUID path can select a system volume only from the four supplied probes (`src/user/services/storage/src/service.rs:175-260,3659-3677`); a fifth matching volume is invisible. This leaves M2 and the required all-`RootSelection`/either-order integration cases incomplete (`docs/todo/P02M0164.md:71-121,288-305`).
 
 3. **Dependency withdrawal during `Binding` is not handled, despite M6 defining both pre-claim and post-claim transitions.** `settle_dependencies` delegates loss handling to `stop_nodes_that_lost_a_dependency`, whose preflight and closure consider only nodes already `Online` (`src/user/services/core/src/device_manager.rs:3697-3707,3784-3817`). No other requirement check runs after `start_candidate` opens a binding (`src/user/services/core/src/device_manager.rs:2922-2950`). A provider withdrawn while a dependent is handshaking can therefore leave that binding running until it happens to become `Online` or fail for some unrelated reason, instead of moving directly to `DependencyPending` before claim or `Stopping` after claim as M6 requires (`docs/todo/P02M0164.md:225-254`). The passing 58 `driver-binding` and 15 `system-manifest` tests exercise the abstract table/build validation, not this missing DeviceManager trigger; the shipping manifest declares no `requires` edge to cover it in boot.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-09-01T21:45:00Z):
+
+Three re-audits are answered here - `11:58:45Z`, `14:33:49Z` and `17:10:24Z`. The first two rounds
+carry findings 1 and 2, which I accepted as unmet and which are still unmet; the newest round adds a
+third, which is a defect and is fixed.
+
+**Findings 1 and 2 (all three rounds) - the catalogue migration is one consumer deep, and block-role
+selection is capped at four and positional. ACCEPTED, and unmet.**
+
+Both are re-confirmed against the current tree rather than carried forward. DeviceManager still owns
+fixed boot-block arrays and one network/display/input/USB slot each, hands them to ServiceManager,
+and calls `route_offers` only from the phase-two bring-up loop; ServiceManager still injects fixed
+block, network and display roles; and the block roles are still four tags, four probes and four
+handles assigned by lowest-BDF `Catalogue::take`, with the UUID path able to inspect only those four.
+AudioService is the one consumer that subscribes.
+
+This round I measured one further consequence of finding 1 while answering the sibling M0159 audit,
+and it belongs here because it is the argument for finishing the migration rather than a separate
+complaint. Re-routing a replacement provider inside DeviceManager cannot fix the consumer half at
+all. The client slots are locals of the function the standing loop runs in, so the loop could call
+`route_offers` again - and that would fill the LOCAL and reach nobody. DisplayService was handed its
+GPU channel by ServiceManager at bootstrap, positionally, under the role tag `GPU`, and there is no
+channel from DeviceManager to that service on which a replacement could be delivered. So the seam
+this milestone names - "where it used to receive a handle, it subscribes" - is not one option among
+several for the display path; it is the only shape that works, exactly as it was for audio.
+
+I did not start the DisplayService conversion in this round. That is a decision: it changes that
+service's start-up contract, ServiceManager's role list and DeviceManager's routing at once, on the
+boot-critical display path of three ports, and this round's other changes are defect fixes in the
+claim, IOMMU-attribution and binding-lifecycle paths. Landing both together would make any failure
+unattributable. Finding 2 is owed for the reason recorded before and re-checked: selecting a volume
+by content means identifying each medium's filesystem BEFORE the roles are handed out, and the code
+that can do that lives in StorageService, which does not exist yet when ServiceManager assigns them.
+
+**17:10:24Z finding 3 - dependency withdrawal during `Binding` is not handled. ACCEPTED, and FIXED.**
+
+Confirmed exactly as described: `settle_dependencies` delegates loss handling to
+`stop_nodes_that_lost_a_dependency`, whose preflight and closure both tested
+`record.state == BindingState::Online`, and no other requirement check runs after `start_candidate`
+has opened a binding. A provider withdrawn while a dependent is handshaking left that binding running
+to completion, and the dependent came ONLINE against a requirement that no longer held - and then
+stayed there, because the only thing that asks again after `Online` is the function that had already
+made its pass.
+
+The doomed-set predicate is now `stoppable_on_a_lost_dependency`: `Online` or `Binding`, with a
+binding installed. A node caught in `Binding` goes through the same `begin_dependency_stop` as an
+online one - the provider withdrawn first, `Binding -> Stopping` (an edge the table has for exactly
+this), `STOP` sent, and `stop_intent = DependencyLost` carrying it on to `DependencyPending` when the
+teardown confirms.
+
+One part of M6's table I deliberately did NOT implement, and I want it recorded rather than found
+later. The table also names `Binding -> DependencyPending` for "withdrawn before the claim was
+taken". That transition has no trigger here because it has no observer: a node is only visible in
+`Binding` from outside once `begin_bind` has taken the claim and installed the binding - everything
+before that happens inside one synchronous call, whose first act on the entry is
+`gate_on_requirements`. A branch for the pre-claim case would be a branch nothing can reach. The
+edge stays in the table, where it costs nothing and documents the rule; the comment on
+`stoppable_on_a_lost_dependency` says why there is no producer for it.
+
+This fix composes with the sibling P02M0165 correction landed in the same round, and it needs it: a
+teardown landing at `DependencyPending` used to be read as a failed candidate, which advanced the
+cursor past the entry `settle_dependencies` would restart. Without that half, stopping a `Binding`
+node on a lost dependency would have moved it somewhere it could not come back from.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it
+was in flight, so each stamp below is against the tree that produced it.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed (193s) |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed (3456s) |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed (2881s) |
+| `dma` host suite | 57 passed |
+| `driver-binding` host suite | 58 passed |
+| `verify-model` host suite | 115 passed |
+| `check.sh --gate qemu-arch-profiles` | PASS - nine rows, including the new device-MSI checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+x86_64 is 376 where the previous round was 374: the two new kernel tests are
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` and
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end`. The second
+declines on a machine with no `edu` fixture and SAYS so; where it has one, it ran and passed:
+
+```
+iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its
+frame when its claim was forced to end (transfer completed=true)
+```
+
+And on the ITS checkpoint row:
+
+```
+its: up - 16 event id bits, 512 device ids, 8192 LPIs from INTID 8192
+interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered
+device: 6 released - 1 MSI vector(s) given back
+virtio-snd: the device's MSI vector was delivered on and then torn down with its claim
+```
+
+TWO THINGS FAILED DURING THE ROUND AND ARE REPORTED RATHER THAN SMOOTHED OVER. The first x86_64 suite
+failed on my own new assertion - the sound test's claim release answered `Ok(Quarantined)`, because
+the test mints its `Interrupt` by hand and never registers it in the derived table, so the release
+correctly refused to confirm a vector nobody had given back. The second was the ITS device oracle on
+a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
+off the volume. Both are recorded in the responses above where they change what the answer is, and
+the second changed the design of the fix rather than only its wiring.

@@ -908,3 +908,131 @@ Current implementation rating: 7/10
 2. **The new generation check does not fix a teardown-flood tail because generation is reconstructed from the current binding at drain time.** Each poll still stops after 64 events (`src/kernel/iommu/mod.rs:1102-1144`), and teardown removes the backend endpoint association before a bounded post-revoke drain (`src/kernel/iommu/mod.rs:903-998`; `src/dma/src/virtio_iommu.rs:482-485`). When an old queued event is finally read after the BDF is rebound, `VirtioIommu::drain_faults` assigns the domain currently attached to that endpoint (`src/dma/src/virtio_iommu.rs:513-555`), and the generic layer stamps that current domain's generation and fault counter (`src/dma/src/lib.rs:1162-1182`). It therefore appears to belong to the replacement and passes the new generation comparison before containment (`src/kernel/iommu/mod.rs:1127-1134`; `src/kernel/device.rs:184-208`). The added claim test supplies an old generation directly to the containment helper and never drives this queue/rebind attribution path (`src/kernel/object/claim/tests.rs:726-758`). An old binding's flood tail can still be charged to and disable the replacement, leaving M4/M5's durable attribution, accounting and cross-generation containment requirements unmet (`docs/todo/P02M0153.md:184-204,214-229,245-260`).
 
 Focused verification: the portable DMA/virtio-IOMMU suite passed all 55 tests. Its backend fault tests do not retain a bounded queue tail across teardown and rebind, and no guest run was started for this re-audit.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-09-01T21:45:00Z):
+
+Three re-audits are answered here - `11:58:45Z`, `14:33:49Z` and `17:10:50Z`. The first two rounds'
+fixes are in the tree and their responses were never appended; that is my omission. The newest
+round's second finding is a real defect and it is fixed.
+
+**11:58:45Z finding 1 / 14:33:49Z finding 1 / 17:10:50Z finding 1 - live faults have no timely,
+bounded servicing path. ACCEPTED at every step, and still not a guarantee.**
+
+The three rounds are a chain and each link was right:
+
+- at `11:58:45Z` there was no production servicing path at all - containment ran only from binding
+  teardown and the one-time boot report, so a fault from a long-lived endpoint sat queued while the
+  endpoint kept mastering the bus. `service_faults_if_due` was added for that;
+- at `14:33:49Z` that service was reachable only from `cpu_idle_loop`, which SECONDARY cores enter -
+  the BSP settles in `main` - so gating the drain to cpu 0 made it dead code, and a single-core
+  machine had no periodic drain at all. Two changes that were each right and together were nothing.
+  The call moved to the BSP's settle loop, beside the serial drain;
+- at `17:10:50Z` the finding is that this is still opportunistic: `run_until_idle` continues while
+  its run queue is non-empty, so a CPU-bound workload can leave a faulting endpoint mastering the bus
+  indefinitely. That is exactly right, and the service's own contract says so rather than claiming
+  otherwise.
+
+I am not closing it, and the reason is specific rather than an appeal to difficulty. The obvious
+place for a deadline is the timer interrupt, and it is the one place this must not go:
+`poll_faults_attributed_with` takes the controller's lock and then `device`'s, and an interrupted
+context may hold either - so a drain from the tick would deadlock against a syscall that was already
+inside the IOMMU. A `try_lock` version would not deadlock and would not be a guarantee either; it
+would be the same opportunism with a second mechanism. What a deadline actually needs is somewhere
+to run kernel work that is neither an interrupt nor a userspace thread, and this kernel has no such
+thing. That is the same missing facility this milestone's sibling M0162 finding names, and it is a
+kernel design item rather than a correction inside this milestone. M5's containment path exists and
+runs; its bound is "whenever cpu 0 next settles", which is written where a reader meets it.
+
+**11:58:45Z finding 2 / 14:33:49Z finding 2 / 17:10:50Z finding 2 - a teardown flood tail loses the
+ending binding's identity and can contain the replacement. ACCEPTED, and FIXED.**
+
+The `17:10:50Z` form of this is the one that named the mechanism exactly, and it defeated the
+generation check I added the round before - which is worth stating plainly, because that check was
+my answer to the previous round and the auditor is right that it did not touch this. The generation
+on a fault event is not carried by the record: `VirtioIommu::drain_faults` resolves the domain from
+the endpoint's attachment AT DRAIN TIME, and `Iommu::drain_faults_during` then stamps THAT domain's
+generation. So a tail read after the BDF was rebound arrived wearing the replacement's domain and
+generation, satisfied `contain_faulting_endpoint_of_a_live_binding`'s comparison, and had the
+replacement's bus mastering taken away for a fault it never raised. My claim test supplied an old
+generation directly to the helper and never drove the queue, so it could not see any of this.
+
+The fix supplies the missing half of the identity - what the kernel knew when the binding ended - and
+keeps it until the tail is provably gone. `Iommu` now holds a bounded list of `DetachedTail` records:
+endpoint, domain, generation, a fault count and whether the controller's queue has been observed
+empty since the revocation. `revoke_endpoint` records one, taking the generation while the domain
+still exists to be asked. `drain_faults_during` consults that list FIRST, before anything that
+reconstructs attribution from current state, and an event whose endpoint matches an undrained record
+is attributed to the binding that ended.
+
+Three properties I want to state rather than leave to be found:
+
+- **The clearing rule is a proof, not a timer.** `drain_faults` fills the caller's buffer while the
+  transport has records, so taking fewer than the buffer holds means the queue answered empty - and
+  everything queued before that call has been read. That is when the records stop attributing.
+- **The direction of the remaining error is deliberate.** Between a rebind and the first dry drain, a
+  fault the REPLACEMENT genuinely raises is charged to the old binding, so its containment waits for
+  the next drain. That is the conservative side: charging a replacement disables a healthy device,
+  and charging the ended binding costs a delay the next drain clears. It is a trade rather than an
+  oversight and it is written down as one.
+- **The accounting outlives the domain.** `DomainState::faults` is destroyed with its domain, so a
+  per-binding fault counter could not answer the question M4 asks it for - what a teardown's flood
+  cost. `faults_in` now sums the live domain's count and any tail records for it, so the count
+  survives `destroy_domain`.
+
+The list is bounded at eight records and gives up a DRAINED one first, because dropping a record that
+is still attributing is what re-opens the defect.
+
+Two tests, and they drive the queue and the rebind rather than asserting the helper:
+`a_tail_queued_by_an_ended_binding_is_not_charged_to_the_one_that_replaced_it` revokes a binding,
+destroys its domain, creates a replacement on the same endpoint, and queues the tail event carrying
+the REPLACEMENT's domain - which is what the backend reports - then requires the ended binding's
+domain and generation to come back out, and requires the NEXT fault, after the queue ran dry, to be
+the replacement's own. `a_tail_record_is_bounded_and_gives_up_the_ones_that_attribute_nothing_first`
+holds the bound. Both fail against the previous code.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it
+was in flight, so each stamp below is against the tree that produced it.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed (193s) |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed (3456s) |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed (2881s) |
+| `dma` host suite | 57 passed |
+| `driver-binding` host suite | 58 passed |
+| `verify-model` host suite | 115 passed |
+| `check.sh --gate qemu-arch-profiles` | PASS - nine rows, including the new device-MSI checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+x86_64 is 376 where the previous round was 374: the two new kernel tests are
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` and
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end`. The second
+declines on a machine with no `edu` fixture and SAYS so; where it has one, it ran and passed:
+
+```
+iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its
+frame when its claim was forced to end (transfer completed=true)
+```
+
+And on the ITS checkpoint row:
+
+```
+its: up - 16 event id bits, 512 device ids, 8192 LPIs from INTID 8192
+interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered
+device: 6 released - 1 MSI vector(s) given back
+virtio-snd: the device's MSI vector was delivered on and then torn down with its claim
+```
+
+TWO THINGS FAILED DURING THE ROUND AND ARE REPORTED RATHER THAN SMOOTHED OVER. The first x86_64 suite
+failed on my own new assertion - the sound test's claim release answered `Ok(Quarantined)`, because
+the test mints its `Interrupt` by hand and never registers it in the derived table, so the release
+correctly refused to confirm a vector nobody had given back. The second was the ITS device oracle on
+a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
+off the volume. Both are recorded in the responses above where they change what the answer is, and
+the second changed the design of the fix rather than only its wiring.

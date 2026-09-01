@@ -1021,3 +1021,127 @@ Current implementation rating: 5/10
 2. **A confirmed dependency-loss teardown consumes the binding candidate instead of remaining recoverably `DependencyPending`.** The stop-intent table correctly lands `DependencyLost` at `DependencyPending` (`src/user/libs/driver/binding/src/lib.rs:177-190`), but `advance` maps every resolved teardown other than `Backoff` or `Quarantined` to `Step::NextCandidate` (`src/user/services/core/src/device_manager.rs:3567-3582`). Both callers then increment the cursor (`src/user/services/core/src/device_manager.rs:551-562,989-1002`). For a one-candidate node `Node::entry()` becomes `None`, so `settle_dependencies` skips it and cannot request a restart when the provider returns (`src/user/services/core/src/device_manager.rs:1652-1660,3707-3749`); with multiple candidates it evaluates or starts a different entry. This contradicts M3's planned-stop landing and M4's dependency-loss/recovery behavior (`docs/todo/P02M0165.md:128-167`).
 
 3. **The named publish/crash/subscribe proof still stops before DeviceManager's production effects.** The host test verifies catalogue selection and slot transfer (`src/user/libs/driver/binding/src/tests.rs:525-599`), while production separately closes each provider handle and announces its withdrawal (`src/user/services/core/src/device_manager.rs:2192-2249`) when a binding ends (`src/user/services/core/src/device_manager.rs:3520-3528`). No registered test executes or asserts those two effects, so deleting either still leaves the named race test green. M7's explicit production no-stale-provider race remains incompletely proved (`docs/todo/P02M0165.md:280-331`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-09-01T21:45:00Z):
+
+Three re-audits are answered here - `11:58:45Z`, `14:33:49Z` and `17:16:37Z`. Two of the newest
+round's three findings are defects and both are fixed; the third is a proof gap and is unmet.
+
+**11:58:45Z finding 1 / 14:33:49Z finding 1 / 17:16:37Z finding 1 - a `Releasing` boot-device claim is
+never re-read. ACCEPTED at every step, and now FIXED.**
+
+The three rounds walked this in, and each correction was real and incomplete:
+
+- at `11:58:45Z` a `Releasing` claim was answered with the same `false` a refusal gives, so every pass
+  over the device SPENT a candidate and the list ran out - a transient state made permanent.
+  `BindStart::WaitingForTheClaim` was introduced so the cursor stays where it is;
+- at `14:33:49Z` the node was correctly RETAINED and still passive, and the boot loop exited without
+  consulting `retry_at`;
+- at `17:16:37Z` the finding is that the retention fix is incomplete for the reason the previous round
+  named and I had not closed: the node has no binding and no teardown, so `Node::in_flight` excludes
+  it, `pump` finds an empty wait set, and the phase returns for the last time with the re-read never
+  performed. The standing loop's retry seam is gated on `recovery.armed()`, which is not armed until
+  the volume handoff that needs this very provider. All of that is correct.
+
+What was missing was not a state but a MARKER and a waiter. Three changes:
+
+- `Node::waiting_for_claim` is set when `begin_bind` parks on `WaitAndSeeAgain` and cleared at the
+  top of every attempt. Nothing else distinguished a node parked on somebody else's release from one
+  with nothing left to do, which is why `pump` could not tell them apart;
+- `pump` now treats such a node as work in flight with no handle to wait on. Its `retry_at` joins the
+  earliest deadline, and when the handle set is otherwise EMPTY the deadline becomes the wait: it
+  sleeps to the soonest park and answers true, so the loop comes round instead of ending;
+- both bring-up phases re-read when the park is due. Phase one performs the attempt directly, because
+  it reads its artifacts out of the boot package; phase two goes through `start_candidate`, because it
+  has the volume. Neither invents a new path - both call what the ordinary attempt calls.
+
+The bound is the kernel's and not this manager's, which is the property M6 asks for: the release
+deadline is latched when the release starts, and once it passes `observe_claim` answers `Terminal`,
+so the next attempt ends the node instead of parking it again. There is no counter here that could
+disagree with it.
+
+**17:16:37Z finding 2 - a confirmed dependency-loss teardown consumes the binding candidate. ACCEPTED,
+and FIXED.**
+
+Confirmed as described, and it is the same root defect the sibling P02M0166 audit found from the
+other end. `advance` mapped every resolved teardown except `Backoff` and `Quarantined` to
+`Step::NextCandidate`, and both loop handlers read that as "spend this candidate and move on". A
+`DependencyLost` teardown lands at `DependencyPending` - correctly, by `confirmed_lands_at` - and then
+had its entry spent. On a one-candidate node `Node::entry()` becomes `None`, so `settle_dependencies`
+skips it entirely and can never restart it when the provider returns; with several candidates it
+would evaluate a different entry's `requires`.
+
+`Step::Resting` is the fix, and it is a new answer rather than a reinterpretation of an old one,
+because the two states genuinely differ: `NextCandidate` means "this candidate failed", `Done` means
+"nothing further this boot", and a planned landing is neither - it is a node keeping its cursor and
+waiting for whatever revives it. `advance` returns it for `Disabled` and `DependencyPending`, and
+both loops leave such a node alone. The revival paths are unchanged and now reach an entry that is
+still there: `settle_dependencies` sets `restart_requested` when the requirement is published again,
+and P02M0166's `Enable` does the same for a disable.
+
+**11:58:45Z finding 2 / 14:33:49Z finding 2 / 17:16:37Z finding 3 - the publish/crash/subscribe race
+has no assertion at DeviceManager's production seam. ACCEPTED, and unmet.**
+
+Re-checked and correct. The host test drives the `Publications` model and the shared slot-transfer
+helper; the kernel test is a local crash-state simulation; and the two production effects - closing
+each provider handle and announcing its withdrawal to subscribers when a binding ends - live in
+DeviceManager and are asserted by nothing. Deleting either leaves the named race test green, which
+is the definition of an unproved requirement.
+
+What blocks it is structural and I would rather name it than keep deferring it. DeviceManager is a
+`no_std` binary with no host test target; everything in this milestone that IS proved was proved by
+moving the logic into the `driver-binding` library, which is where `Holdings`, `StopIntent` and the
+publication model already live. The two effects here are not pure state: they close kernel handles
+and send on a channel. Proving them at the seam means giving that library the same treatment the
+teardown got - an effect trait the production path implements with syscalls and a test implements by
+recording - so the assertion can be "the withdrawal was announced and the handle was closed" rather
+than "the state table permits it". That is a contained change and it is the right one; it is not one
+to start beside this round's lifecycle corrections, in the same file, at the end of a round. It is
+owed, and M7 is unproved until it exists.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it
+was in flight, so each stamp below is against the tree that produced it.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed (193s) |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed (3456s) |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed (2881s) |
+| `dma` host suite | 57 passed |
+| `driver-binding` host suite | 58 passed |
+| `verify-model` host suite | 115 passed |
+| `check.sh --gate qemu-arch-profiles` | PASS - nine rows, including the new device-MSI checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+x86_64 is 376 where the previous round was 374: the two new kernel tests are
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` and
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end`. The second
+declines on a machine with no `edu` fixture and SAYS so; where it has one, it ran and passed:
+
+```
+iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its
+frame when its claim was forced to end (transfer completed=true)
+```
+
+And on the ITS checkpoint row:
+
+```
+its: up - 16 event id bits, 512 device ids, 8192 LPIs from INTID 8192
+interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered
+device: 6 released - 1 MSI vector(s) given back
+virtio-snd: the device's MSI vector was delivered on and then torn down with its claim
+```
+
+TWO THINGS FAILED DURING THE ROUND AND ARE REPORTED RATHER THAN SMOOTHED OVER. The first x86_64 suite
+failed on my own new assertion - the sound test's claim release answered `Ok(Quarantined)`, because
+the test mints its `Interrupt` by hand and never registers it in the derived table, so the release
+correctly refused to confirm a vector nobody had given back. The second was the ITS device oracle on
+a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
+off the volume. Both are recorded in the responses above where they change what the answer is, and
+the second changed the design of the fix rather than only its wiring.

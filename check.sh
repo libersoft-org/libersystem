@@ -153,6 +153,7 @@ declare -A GATES=(
 	["arch-profile-aarch64-gicv3-4"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv3:4"
 	["arch-profile-aarch64-gicv3-its-1"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv3-its:1"
 	["arch-profile-aarch64-gicv3-its-4"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv3-its:4"
+	["arch-profile-aarch64-gicv3-its-device-4"]="tools/check-qemu-arch-profiles.sh --only aarch64:gicv3-its-device:4"
 	["arch-profile-riscv64-aia-1"]="tools/check-qemu-arch-profiles.sh --only riscv64:aia:1"
 	["arch-profile-riscv64-aia-4"]="tools/check-qemu-arch-profiles.sh --only riscv64:aia:4"
 	# THE THREE NUMA PROFILES, ONE STEP EACH, for the reason directly above.

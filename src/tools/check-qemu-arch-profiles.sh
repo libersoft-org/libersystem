@@ -118,6 +118,10 @@ timer_ticked() {
 MSI_ORACLE=""
 # THE ORACLE THAT NEEDS A DEVICE, empty on every profile that cannot supply one. See `run_profile`.
 DEVICE_MSI_ORACLE=""
+# WHETHER THIS ROW BOOTS THROUGH FIRMWARE. Zero for every DISCOVERY profile, which M6 asks to be
+# direct boots, and one for the single CHECKPOINT row that needs what only a firmware boot carries.
+# See the device-MSI row below for the measurement that separates the two.
+PROFILE_UEFI=0
 MULTI_CORE_ORACLES="kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick kernel.kernel.a_shootdown_is_answered_by_every_other_core kernel.sched.scheduler_runs_across_cores"
 
 # One profile: boot it, then ask the boot what machine it was on.
@@ -217,10 +221,10 @@ run_profile() {
 	# the milestone names: the controller AND the bring-up read from the tree in front of them.
 	local -a request=()
 	if [[ -n "$selection" ]]; then
-		request=(env UEFI=0 "TEST_SELECTION=$selection" "$@" ./test.sh --arch "$arch" --smp "$cores")
-		echo "arch-profiles:     asking for $(tr ',' ' ' <<<"$selection" | wc -w) named test(s)"
+		request=(env "UEFI=$PROFILE_UEFI" "TEST_SELECTION=$selection" "$@" ./test.sh --arch "$arch" --smp "$cores")
+		echo "arch-profiles:     asking for $(tr ',' ' ' <<<"$selection" | wc -w) named test(s)$([[ "$PROFILE_UEFI" == 1 ]] && echo " (through firmware)")"
 	else
-		request=(env UEFI=0 "$@" ./test.sh --arch "$arch" --tags smoke --smp "$cores")
+		request=(env "UEFI=$PROFILE_UEFI" "$@" ./test.sh --arch "$arch" --tags smoke --smp "$cores")
 	fi
 	if ! "${request[@]}" >"$out" 2>&1; then
 		echo "arch-profiles: the integration suite failed on $arch $label at $cores core(s)" >&2
@@ -316,31 +320,41 @@ run_profile aarch64 gicv3 1 "GICv3 from the device tree" GIC=3
 run_profile aarch64 gicv3 4 "GICv3 from the device tree" GIC=3
 MSI_ORACLE="$AARCH64_MSI"
 run_profile aarch64 gicv3-its 1 "GICv3 from the device tree" GIC=3its
-# THE REAL-DEVICE ITS/MSI CHECKPOINT IS REACHED FROM THIS PROFILE, AND THIS IS HOW (2026-09-01).
+# THE REAL-DEVICE ITS/MSI CHECKPOINT, AND WHY IT IS ONE ROW BELOW RATHER THAN A PROPERTY OF THESE
+# (2026-09-01).
 #
-# The previous measurement here concluded it was not reachable, and it was wrong in one step. It is
-# right that every MSI ORACLE programs a RAM-backed stand-in table and calls the shared dispatch by
-# hand, so no report on that path can tell a device-raised message from the kernel calling itself.
-# It is also right that a driver PROCESS needs userspace and that these are direct boots. What it
-# missed is that a device does not need a userspace driver to raise a message: the kernel's own
-# hardware suite already programs a real `virtio-sound-pci` function's MSI-X table and enables MSI-X
-# on the function, and the interrupt it then waits for is raised BY THAT DEVICE. On this profile the
-# controller translating it is the ITS, so the message is a device-originated LPI by construction.
+# The previous note here concluded the checkpoint was unreachable. Two of its three steps hold: every
+# MSI ORACLE programs a RAM-backed stand-in table and calls the shared dispatch by hand, so no report
+# on that path can tell a device-raised message from the kernel calling itself; and these rows are
+# DIRECT boots, which is what M6 asks them to be. What it got wrong is the conclusion, and what makes
+# the difference is that the kernel's own hardware suite already programs a REAL `virtio-sound-pci`
+# function's MSI-X table and waits for the interrupt that device raises - so the message exists on
+# any machine carrying that function, and on an ITS machine it is a device-originated LPI by
+# construction.
 #
-# So the checkpoint needed two things rather than a new machine: a report on the path where the INTID
-# comes out of the GIC's acknowledge register - which no oracle can reach, because an oracle never
-# goes through it - and a teardown at the end of that test. Both are in place, and the assertions
-# below are what read them.
-# THE DEVICE HALF OF M3's CHECKPOINT, WHICH ONLY THIS PROFILE CAN ASK FOR. The machine carries a
-# `virtio-sound-pci` function and this profile's controller translates a device's write into an LPI,
-# so that test's own interrupt IS a device-originated message through the ITS - and it now releases
-# the vector with its claim at the end, which is the teardown half.
+# What the checkpoint needed was therefore two instruments and one machine, not a new capability:
 #
-# ON THE FOUR-CORE ROW ONLY, because that is the log the assertions below read and one run of a real
-# driver bring-up is what the checkpoint needs. Asking both rows for it would pay for a second
-# emulated bring-up to prove the same sentence twice.
-DEVICE_MSI_ORACLE=kernel.hardware.virtio_snd_driver_captures_a_period_from_the_device
+#   - a report where the INTID comes out of the GIC's own acknowledge register, which no oracle can
+#     reach because an oracle never passes through it - see `is_device_lpi` and `gic.rs`;
+#   - a teardown at the end of that test, which used to end holding the claim and the vector;
+#   - and a boot that CARRIES THE VOLUME PACKAGE. This is the part a direct boot cannot supply, and
+#     it is what the old note was reaching for: the sound test reads its driver artifact off the
+#     volume, and on a direct row it fails with `volume package module not found` - measured
+#     2026-09-01, by putting the oracle on this row and watching it fail exactly there.
+#
+# So the checkpoint is one row of its own, below, booted through firmware. The eight rows above stay
+# direct, which is what M6 asks of the DISCOVERY profiles; this one is not a discovery profile and
+# does not claim to be.
 run_profile aarch64 gicv3-its 4 "GICv3 from the device tree" GIC=3its
+
+# THE DEVICE HALF OF M3's CHECKPOINT - one row, through firmware, on the ITS machine. See the note
+# above for why it is separate. The machine carries a `virtio-sound-pci` function whose MSI-X table
+# the sound test programs itself; the ITS is what translates that device's write; and the test now
+# releases the vector with its claim, which is the teardown half M3 asks for beside the delivery.
+DEVICE_MSI_ORACLE=kernel.hardware.virtio_snd_driver_captures_a_period_from_the_device
+PROFILE_UEFI=1
+run_profile aarch64 gicv3-its-device 4 "GICv3 from the device tree" GIC=3its
+PROFILE_UEFI=0
 DEVICE_MSI_ORACLE=""
 
 # THE UEFI / NO-DEVICE-TREE REGRESSION PROFILES ARE NOT REGISTERED HERE, AND THIS SAYS WHY
@@ -381,23 +395,28 @@ if [[ -z "$ONLY" || "$ONLY" == "aarch64:gicv3-its:4" ]]; then
 	# oracle" because that is what it is - the oracle allocates a RAM frame as a stand-in MSI-X table
 	# and calls `dispatch_msi` itself.
 	echo "arch-profiles:   the ITS profile discovered its ITS, and a vector was acquired through it, programmed into a device table, dispatched to a bound Interrupt and released - by the kernel's own oracle"
-	# AND THE DEVICE HALF, WHICH THE ORACLE CANNOT MAKE. This INTID came out of the GIC's own
-	# acknowledge register, so nothing but the interrupt controller put it there, and an LPI means an
-	# ITS translated a device's write to produce it. The oracles call `dispatch_msi` directly and
-	# never reach the line this greps for, which is the whole reason it sits where it does.
-	grep -aq "interrupts: a device raised INTID .* an LPI the ITS translated and delivered" "$its_log" || {
-		echo "arch-profiles: the ITS profile saw no device-originated LPI" >&2
-		grep -a "interrupts:\|virtio-snd:" "$its_log" >&2 || echo "    (it reported nothing about interrupts at all)" >&2
+fi
+
+# THE DEVICE HALF, WHICH THE ORACLE CANNOT MAKE, read from the checkpoint row's own log.
+if [[ -z "$ONLY" || "$ONLY" == "aarch64:gicv3-its-device:4" ]]; then
+	device_log="$(run_result_log "$work/aarch64-gicv3-its-device-4.log")" || fail "the ITS device row did not say which logs it wrote"
+	# This INTID came out of the GIC's own acknowledge register, so nothing but the interrupt
+	# controller put it there, and an LPI means an ITS translated a device's write to produce it. The
+	# oracles call `dispatch_msi` directly and never reach the line this greps for, which is the whole
+	# reason it sits where it does.
+	grep -aq "interrupts: a device raised INTID .* an LPI the ITS translated and delivered" "$device_log" || {
+		echo "arch-profiles: the ITS device row saw no device-originated LPI" >&2
+		grep -a "interrupts:\|virtio-snd:\|its:" "$device_log" >&2 || echo "    (it reported nothing about interrupts at all)" >&2
 		exit 1
 	}
 	# AND THE TEARDOWN THAT FOLLOWS IT. M3 asks for delivery AND teardown, and a vector that is
 	# delivered on and never given back is half a checkpoint.
-	grep -aq "virtio-snd: the device's MSI vector was delivered on and then torn down with its claim" "$its_log" || {
-		echo "arch-profiles: the ITS profile delivered a device LPI and did not prove its teardown" >&2
-		grep -a "virtio-snd:" "$its_log" >&2 || echo "    (the device oracle did not run)" >&2
+	grep -aq "virtio-snd: the device's MSI vector was delivered on and then torn down with its claim" "$device_log" || {
+		echo "arch-profiles: the ITS device row delivered a device LPI and did not prove its teardown" >&2
+		grep -a "virtio-snd:" "$device_log" >&2 || echo "    (the device oracle did not run)" >&2
 		exit 1
 	}
-	echo "arch-profiles:   $(grep -a -m 1 -o "interrupts: a device raised INTID.*" "$its_log"), and the vector was torn down with its claim"
+	echo "arch-profiles:   $(grep -a -m 1 -o "interrupts: a device raised INTID.*" "$device_log"), and the vector was torn down with its claim"
 fi
 
 # The RISC-V AIA. Nothing to select: this runner's only riscv64 machine is `virt,aia=aplic-imsic`, so

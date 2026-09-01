@@ -123,7 +123,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 62] = [
+const GATES: [(&str, &str); 63] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -152,9 +152,9 @@ const GATES: [(&str, &str); 62] = [
 	// Its subject is the manifest, because what it enumerates is what the manifest stages: adding a
 	// driver there is what makes this ask a new question.
 	("component-oracles", "manifest"),
-	// ONE KEY PER PROFILE. `qemu-arch-profiles` runs all eight in one step, which is one duration
-	// divided eight ways - and `record_step` divides evenly, so every per-profile cost on disk was
-	// an artefact of the batching. These are the same eight profiles as separately schedulable
+	// ONE KEY PER PROFILE. `qemu-arch-profiles` runs them all in one step, which is one duration
+	// divided evenly - and `record_step` divides evenly, so every per-profile cost on disk was
+	// an artefact of the batching. These are the same profiles as separately schedulable
 	// steps, each with its own measured cost, which is what a cheapest-first order needs before it
 	// can be trusted. The umbrella stays for a person who wants all of them in one command.
 	("arch-profile-aarch64-gicv2-1", "kernel"),
@@ -163,6 +163,11 @@ const GATES: [(&str, &str); 62] = [
 	("arch-profile-aarch64-gicv3-4", "kernel"),
 	("arch-profile-aarch64-gicv3-its-1", "kernel"),
 	("arch-profile-aarch64-gicv3-its-4", "kernel"),
+	// THE DEVICE-MSI CHECKPOINT ROW, which is not a discovery profile: it boots the ITS machine
+	// through firmware, because the volume package a real driver's artifact is read from is what a
+	// direct boot does not carry. Its subject is still the kernel - the delivery path it asserts on
+	// is the GIC's acknowledge handler and the teardown is the claim release.
+	("arch-profile-aarch64-gicv3-its-device-4", "kernel"),
 	("arch-profile-riscv64-aia-1", "kernel"),
 	("arch-profile-riscv64-aia-4", "kernel"),
 	// The staged tree's provider chains, and the eight ways the check that reads them can be given
@@ -389,13 +394,13 @@ pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shado
 
 // GATES THAT ARE EXACTLY THE UNION OF OTHER GATES, and must therefore never be SELECTED.
 //
-// `check.sh` runs `qemu-arch-profiles` (all eight interrupt profiles, one command) and also runs the
-// eight `arch-profile-*` entries individually, because a person typing one name wants all of them and
-// the scheduler needs eight separately measured costs. Both were in the catalog and both cover
-// `kernel`, so any kernel change selected all nine - and `commands::steps` merges pre-guest gates into
-// one `./check.sh --gate a,b,...`, so the eight expensive emulated profiles ran ONCE EACH under their
+// `check.sh` runs `qemu-arch-profiles` (every interrupt profile, one command) and also runs the
+// `arch-profile-*` entries individually, because a person typing one name wants all of them and
+// the scheduler needs separately measured costs. Both were in the catalog and both cover
+// `kernel`, so any kernel change selected all of them - and `commands::steps` merges pre-guest gates into
+// one `./check.sh --gate a,b,...`, so the expensive emulated profiles ran ONCE EACH under their
 // own keys and then a SECOND time inside the umbrella. Measured in a full sweep: the gate step carried
-// the umbrella key and all eight profile keys.
+// the umbrella key and every profile key.
 //
 // The entry stays in `GATES` so the two lists still agree - check.sh really does run it - and it gets
 // no catalog check, so nothing can select it. Running the union by hand stays a command a person can

@@ -798,3 +798,127 @@ Current implementation rating: 6/10
 1. **Resolved planned teardowns advance the cursor a second time, breaking accepted `enable` and next-bind `select`.** A clean operator-disable teardown correctly lands at `Disabled`, but `advance` returns `Step::NextCandidate` for that landing (`src/user/services/core/src/device_manager.rs:3567-3582`) and both loop handlers increment `candidate` (`src/user/services/core/src/device_manager.rs:551-562,989-1002`). `Enable` moves the node to `Unbound` and requests a restart without rewinding the cursor (`src/user/services/core/src/device_manager.rs:3921-3945`); on a normal one-candidate device, `start_candidate` therefore immediately returns at the exhausted cursor (`src/user/services/core/src/device_manager.rs:1061-1075`). The registered dev GPU sequence requires precisely disable then enable to rebind (`src/harness/dev-gpu-restart.py:197-228`), so the production trace cannot meet it. The same extra increment skips a live `Select` preference: `Select` sets `candidate` to the requested next-bind entry (`src/user/services/core/src/device_manager.rs:3947-3971`), then a non-retryable or planned teardown advances past it before the next bind. This violates M1/M4 and the explicit enable/select definition of done (`docs/todo/P02M0166.md:48-80,148-172,239-249`).
 
 2. **The required production policy and authority proofs remain absent.** The development GPU script exercises only `disable`/`enable`, and the cursor defect above prevents that sequence from completing as specified (`src/harness/dev-gpu-restart.py:197-228`). No registered test invokes production `select` or `retry`, drives the state-sensitive policy decisions for `Quarantined`, or proves that a client holding ordinary `CAP_CONFIG` cannot write a well-formed `device.policy.*` record; the binding tests cover the state-table helper rather than those production paths (`src/user/libs/driver/binding/src/tests.rs:719-752`). The explicit under-test requirements therefore remain unmet (`docs/todo/P02M0166.md:239-251`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-09-01T21:45:00Z):
+
+Three re-audits are answered here - `11:58:45Z`, `14:33:49Z` and `17:16:37Z`. The newest round's
+first finding is a defect that made the milestone's own registered check unsatisfiable, and it is
+fixed.
+
+**14:33:49Z finding 1 - the one-shot retry loses its bound when `start_candidate` skips an unusable
+candidate. ACCEPTED, and closed.**
+
+The trace was right: `PolicyVerb::Retry` set `retry_once` and put `attempt` one below the automatic
+bound, and the flag was consumed only in the two asynchronous `Step::NextCandidate` handlers - while
+`start_candidate`'s own inline advances, for a missing artifact and for a pre-claim
+`BindStart::CandidateFailed`, reset `attempt = 0` and moved on without consuming it. So a later
+candidate received a full automatic budget from an operator request for ONE attempt. Both inline
+advances now leave `attempt` alone while `retry_once` is set: nothing ran, so the operator's attempt
+is not spent, and what must not happen is it turning back into the automatic budget it was set one
+below.
+
+**17:16:37Z finding 1 - a resolved planned teardown advances the cursor a second time, breaking
+accepted `enable` and next-bind `select`. ACCEPTED, and FIXED. This is the finding of the round.**
+
+It is correct in both halves and I confirmed each against the code rather than against the report.
+
+The disable/enable half first, because it is the one that made a registered check unsatisfiable. A
+clean operator disable lands at `Disabled` through `confirmed_lands_at`, and `advance` returned
+`Step::NextCandidate` for that landing; both loop handlers then incremented `candidate`. On an
+ordinary one-candidate device that leaves the cursor past the end. `Enable` moves the node to
+`Unbound` and asks for a restart without rewinding, so `start_candidate` returns immediately at the
+exhausted cursor - an operator sees `Accepted` and nothing happens, which is the one outcome this
+file's own comment on `Retry` says a policy verb may not produce. The registered `dev.gpu-restart`
+check requires precisely disable-then-enable to rebind, so the production trace could not have met
+it.
+
+The fix is a new `Step`, not a new special case. `NextCandidate` means "this candidate failed" and
+`Done` means "nothing further this boot"; a landing that was ASKED FOR is neither, and collapsing it
+into either is what produced the defect. `Step::Resting` is what `advance` answers for `Disabled` and
+`DependencyPending`: the node keeps its cursor and waits for whatever revives it. Both loops leave
+such a node alone, and both revival paths now find an entry that is still there.
+
+`Enable` also rewinds the cursor when it is past the end, exactly as `Retry` does and to the operator's
+own `preferred` where there is one. With `Step::Resting` that case is no longer reachable through a
+teardown - I added it anyway, because an enable whose success depends on no other path ever having
+walked the cursor is an enable that breaks the next time one does.
+
+The `select` half is the same extra increment seen from the other side, and it needed a different
+answer. The cursor is not a description of what RAN: `select` moves it to the entry the next bind
+must start from, and an operator may ask for that while a different entry is online. When the online
+entry then failed, `candidate += 1` stepped past the selection and `start_candidate` began the entry
+AFTER it - so the one verb whose whole contract is "this applies at the next bind" was skipped by the
+next bind. Both handlers now call `spend_candidate`, which advances past the entry that actually
+ended. That entry is `Node::spent`, latched where the binding is taken out of the node, because
+`running` is cleared when the rollback starts and the verdict arrives later - after the child's exit
+and the claim have both confirmed. A cursor already past what ran is a cursor somebody moved on
+purpose and is left where it was put.
+
+**11:58:45Z finding 1 / 14:33:49Z finding 2 / 17:16:37Z finding 2 - the production policy and
+authority proofs are absent. ACCEPTED, and unmet.**
+
+Re-checked and correct on every clause. No registered test invokes production `select` or `retry`,
+drives `PolicyView`/`decide_policy` through the state-sensitive decisions, distinguishes a quarantined
+retry from an accepted future-policy verb with resources and state unchanged, or shows that a client
+holding ordinary `CAP_CONFIG` cannot write a well-formed `device.policy.*` record. The binding tests
+assert the state-table helper. The `dev.gpu-restart` check exercises `disable`/`enable` and is the
+only production policy exercise there is.
+
+What blocks it is the same structural thing as the sibling M0165 finding, and it has the same answer:
+`decide_policy`, `PolicyView` and the served verbs live in a `no_std` binary with no host test
+target, and everything in these milestones that IS proved was proved by moving the decision into the
+`driver-binding` library and testing it there. The policy decision is a good candidate for exactly
+that treatment - it is a pure function of the node's state, the verb and the registry entry - and the
+authority half is not: it needs a ConfigService connection with real rights, which belongs in a gate
+rather than a unit test.
+
+I did not start either in this round, and I would rather say that plainly than offer a partial
+substitute. What this round did do for the policy path is remove the defect that would have made the
+first such proof fail on its first assertion: the enable that could not rebind.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it
+was in flight, so each stamp below is against the tree that produced it.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed (193s) |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed (3456s) |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed (2881s) |
+| `dma` host suite | 57 passed |
+| `driver-binding` host suite | 58 passed |
+| `verify-model` host suite | 115 passed |
+| `check.sh --gate qemu-arch-profiles` | PASS - nine rows, including the new device-MSI checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+x86_64 is 376 where the previous round was 374: the two new kernel tests are
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` and
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end`. The second
+declines on a machine with no `edu` fixture and SAYS so; where it has one, it ran and passed:
+
+```
+iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its
+frame when its claim was forced to end (transfer completed=true)
+```
+
+And on the ITS checkpoint row:
+
+```
+its: up - 16 event id bits, 512 device ids, 8192 LPIs from INTID 8192
+interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered
+device: 6 released - 1 MSI vector(s) given back
+virtio-snd: the device's MSI vector was delivered on and then torn down with its claim
+```
+
+TWO THINGS FAILED DURING THE ROUND AND ARE REPORTED RATHER THAN SMOOTHED OVER. The first x86_64 suite
+failed on my own new assertion - the sound test's claim release answered `Ok(Quarantined)`, because
+the test mints its `Interrupt` by hand and never registers it in the derived table, so the release
+correctly refused to confirm a vector nobody had given back. The second was the ITS device oracle on
+a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
+off the volume. Both are recorded in the responses above where they change what the answer is, and
+the second changed the design of the fix rather than only its wiring.

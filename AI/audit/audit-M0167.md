@@ -934,3 +934,119 @@ Current implementation rating: 7/10
 1. **A failed parallel guest prerequisite is discovered after its non-guest dependent has already passed the blocker check.** The latest `blocked_ids` change fixes propagation once a failure is known, but guest failures enter `failed_ids` only when `record_one_step` runs (`verify.sh:794-805`). For `--jobs > 1`, guests are backgrounded (`verify.sh:903-917`); when the following non-guest step is read, blocker evaluation happens first (`verify.sh:849-863`), and only afterward does the non-guest barrier call `drain_guests` and record the failed guest (`verify.sh:871-875,815-827`). The dependent is never rechecked and proceeds to execute. The emitted plan has exactly this guest -> after-guest-gate edge (`src/tools/verify-model/src/commands.rs:307-313`), so even direct prerequisite suppression is unsound for parallel guests, contrary to M4 (`docs/todo/P02M0167.md:426-455`).
 
 2. **The required shell-scheduler execution matrix remains absent.** The current verify-model tests validate graph structure, including duplicate IDs, missing edges and cycles, but no test executes `verify.sh` over the required shared prerequisite, unmeasured cost, `FAIL`-over-`INCOMPLETE`, failed-descendant suppression, and `STEPGUESTS`/parallel completion cases (`src/tools/verify-model/src/tests.rs:2265-2320`). The async ordering defect above would therefore leave the suite green. This explicit definition-of-done proof remains unmet (`docs/todo/P02M0167.md:671-676`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-09-01T21:45:00Z):
+
+Three re-audits are answered here - `11:58:45Z`, `14:33:49Z` and `17:16:37Z`. The newest round's
+first finding is a real soundness defect in the executor and it is fixed; the second is a proof gap
+and is not.
+
+**11:58:45Z finding 1 (first half) - the dependency graph is not validated. ACCEPTED, and closed.**
+
+Command emission computed layers by inserting `StepId`s and treated an unknown dependency as depth
+zero, overwriting a duplicate id and walking straight through a cycle. `commands::validate` now
+refuses duplicate ids, unresolvable edges and cycles before any layering happens, by Kahn's
+algorithm, with focused unit tests for each.
+
+**14:33:49Z finding 1 - failed-prerequisite suppression is not transitive. ACCEPTED, and closed.**
+
+The executor recorded only the ids of steps that actually FAILED, so a step skipped as `BLOCKED`
+marked nothing unavailable and a grandchild requiring it ran against an output nothing produced.
+`blocked_ids` was added and a BLOCKED step now records its own id, so suppression follows the chain
+rather than stopping one level down.
+
+**17:16:37Z finding 1 - a failed parallel guest is discovered after its dependent has passed the
+blocker check. ACCEPTED, and FIXED.**
+
+This is correct and it is the interesting kind of correct: the previous round's fix is sound about
+propagation and says nothing about ORDER, and the order was wrong. Under `--jobs > 1` a guest step is
+backgrounded, and its verdict reaches `failed_ids` only when `record_one_step` runs behind the
+barrier. The loop evaluated blockers FIRST and called `drain_guests` afterwards, as part of deciding
+what a non-guest step may overlap with. So the one edge the emitted plan actually has - every
+`gate-after-guest` step requires every guest step - was evaluated against guests nothing had waited
+for. A failed guest suite would block nothing, and the gate that reads the log that guest did not
+write would run.
+
+The barrier now comes BEFORE the blocker check. That is the only order in which the check can be
+sound: a non-guest step is behind the barrier either way, so nothing is paid for moving it, and it is
+the only point at which "did my prerequisite fail" has an answer at all.
+
+I also made the rule general rather than true-for-today. A guest step whose own prerequisite is still
+in flight as a backgrounded guest now waits too. The emitted plan has no guest that requires another
+guest - guests require builds, and the after-guest gate is not a guest - so that arm is unreachable
+right now. It is in because a check that is correct only for the edges the planner happens to emit is
+a check that breaks silently when it emits one more, and this is precisely the defect class the
+finding is about.
+
+**11:58:45Z finding 1 (second half) / 14:33:49Z finding 1 (second half) / 17:16:37Z finding 2 - the
+shell-scheduler execution matrix is absent. ACCEPTED, and unmet.**
+
+Correct, and the round proves the point better than the finding does: I have now fixed two ordering
+defects in this executor - transitive suppression and the barrier order - and neither could have been
+caught by anything registered. The verify-model tests validate graph STRUCTURE, and the structure was
+never wrong.
+
+What is missing is one seam, and I can now name it precisely rather than describing the gap.
+`verify.sh` obtains its plan from `cargo run ... commands --stdin` into `steps_file`, and everything
+after that line - the blocker suppression, the barrier, the `--jobs` reservation, the
+`STEPGUESTS` refusal, the `FAIL`-over-`INCOMPLETE` arithmetic - reads only that file. So an override
+that lets a prepared plan be supplied in the planner's own format makes the whole executor reachable
+from a test, and it costs nothing at run time. One detail makes it clean rather than invasive: a
+prepared plan carries no `KEY` lines, and `record_one_step` files nothing against the verification
+history when a step has no keys - so the executor can be driven over synthetic steps whose commands
+are `true` and `false` without touching the tree's record.
+
+I did not land it in this round. It needs the seam, a check script, a `check.sh` gate entry and a
+catalogue row in the model - and adding a step to the model changes the emitted plan, which is the
+subject of two other gates. Landing that beside a correction to the executor those gates run under
+would mean a failure I could not attribute to either. It is the next thing this milestone owes, the
+matrix it should cover is the one the finding lists - shared prerequisite, unmeasured cost,
+`FAIL` over `INCOMPLETE`, failed-descendant suppression, and `STEPGUESTS` against `--jobs` - and the
+definition of done stays unmet until it exists.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it
+was in flight, so each stamp below is against the tree that produced it.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed (193s) |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed (3456s) |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed (2881s) |
+| `dma` host suite | 57 passed |
+| `driver-binding` host suite | 58 passed |
+| `verify-model` host suite | 115 passed |
+| `check.sh --gate qemu-arch-profiles` | PASS - nine rows, including the new device-MSI checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+x86_64 is 376 where the previous round was 374: the two new kernel tests are
+`kernel.object.claim.a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` and
+`kernel.iommu.a_translated_address_stops_translating_when_its_claim_is_forced_to_end`. The second
+declines on a machine with no `edu` fixture and SAYS so; where it has one, it ran and passed:
+
+```
+iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its
+frame when its claim was forced to end (transfer completed=true)
+```
+
+And on the ITS checkpoint row:
+
+```
+its: up - 16 event id bits, 512 device ids, 8192 LPIs from INTID 8192
+interrupts: a device raised INTID 8192 - an LPI the ITS translated and delivered
+device: 6 released - 1 MSI vector(s) given back
+virtio-snd: the device's MSI vector was delivered on and then torn down with its claim
+```
+
+TWO THINGS FAILED DURING THE ROUND AND ARE REPORTED RATHER THAN SMOOTHED OVER. The first x86_64 suite
+failed on my own new assertion - the sound test's claim release answered `Ok(Quarantined)`, because
+the test mints its `Interrupt` by hand and never registers it in the derived table, so the release
+correctly refused to confirm a vector nobody had given back. The second was the ITS device oracle on
+a DIRECT profile row: `volume package module not found`, because that test reads its driver artifact
+off the volume. Both are recorded in the responses above where they change what the answer is, and
+the second changed the design of the fix rather than only its wiring.
