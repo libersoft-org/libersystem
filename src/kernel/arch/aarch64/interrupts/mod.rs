@@ -314,8 +314,11 @@ fn program_acquired(slot: usize, table_phys: u64, owner: u32) -> Option<u32> {
 // Write a device's MSI-X table entry 0 (reached through the physical direct map): the
 // message address is the GICv2m frame's MSI_SETSPI_NS register, so the device's DMA
 // write of the message data (the SPI number) raises that SPI in the GIC. Vector
-// control = 0 (unmasked). A driver must never write its own MSI-X table; only the
-// kernel programs it here.
+// control = 1 (MASKED until `unmask_msi`). A driver must never write its own MSI-X
+// table; only the kernel programs it here.
+//
+// PROGRAMMED MASKED, AND UNMASKED ONLY WHEN THE ACQUIRE HAS COMMITTED (2026-09-01) - see the
+// x86_64 port's comment at the same function for the stale-generation window this closes.
 fn program_msix_entry(table_phys: u64, spi: u32) {
 	program_msix_entry_at(table_phys, FRAME_BASE.load(Ordering::Relaxed) + MSI_SETSPI_NS, spi);
 }
@@ -328,8 +331,16 @@ fn program_msix_entry_at(table_phys: u64, msg_addr: u64, data: u32) {
 		entry.add(1).write_volatile((msg_addr >> 32) as u32); // message address high
 		// The message data: an SPI number to a v2m frame, an event id to an ITS.
 		entry.add(2).write_volatile(data);
-		entry.add(3).write_volatile(0); // vector control (unmasked)
+		entry.add(3).write_volatile(1); // vector control (MASKED until `unmask_msi`)
 	}
+}
+
+// Make the entry programmed above deliverable - the other half of its mask. This port reaches the
+// table through the physical direct map, so the caller supplies the address it programmed.
+pub fn unmask_msi(_vector: u32, table_phys: u64) {
+	let entry = super::paging::phys_to_virt(table_phys) as *mut u32;
+	// SAFETY: the same entry `program_msix_entry_at` wrote, through the same mapping.
+	unsafe { entry.add(3).write_volatile(0) };
 }
 
 // Bind `intr` to an MSI `vector` (an SPI INTID) so dispatch wakes it when the SPI

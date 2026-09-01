@@ -1218,6 +1218,11 @@ pub fn cpu_idle_loop() -> ! {
 		crate::mem::tlb::service_pending();
 		// An idle core has nothing better to do than push the serial ring to the wire.
 		arch::serial::drain_tx();
+		// NOR THAN SERVICE THE IOMMU'S FAULT QUEUE, which is the one production path that reaches a
+		// fault raised by a binding that is still running - see `iommu::service_faults_if_due`, which
+		// owns the rate limit and the rule about which devices a background drain may contain. Here
+		// rather than in the timer ISR because that call takes locks an interrupted context may hold.
+		crate::iommu::service_faults_if_due();
 		// Lost-wakeup-safe idle: mask interrupts, re-check the run queue under the mask,
 		// and only wait if it is still empty. arch::idle_halt is entered with interrupts
 		// masked and re-enables them across the wait (x86 `sti; hlt`, aarch64 / riscv WFI

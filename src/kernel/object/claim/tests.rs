@@ -347,13 +347,13 @@ fn a_forced_release_takes_a_live_interrupt_away() {
 	let index = device::add_synthetic_device();
 	let key = device::claim(index).expect("claimed");
 	let table = frame::allocate().expect("a frame for the fake MSI-X table");
-	let Some(vector) = acquire_msi(table, 0, index as u32) else {
-		crate::serial_println!("    no MSI vector free on this machine - the live-vector case is not exercised");
-		// SAFETY: allocated by this call and never mapped.
-		unsafe { frame::deallocate(table) };
-		device::release_claim(key).expect("released");
-		return;
-	};
+	// NO SKIP HERE, AND THAT IS DELIBERATE (2026-09-01). This printed a line and returned
+	// SUCCESSFULLY when no vector was free, so the one test that proves a forced release takes a live
+	// vector away could pass by finding nothing to take - which is exactly what M9 forbids of its
+	// tests. Every profile this tree runs has vectors to spare (192 on x86_64, 64 on aarch64, 62 on
+	// riscv64) against a handful of devices, so an exhausted registry here is a fact worth failing
+	// on rather than a machine this case does not apply to.
+	let vector = acquire_msi(table, 0, index as u32).expect("a free MSI vector for the device this test just added - an exhausted registry is a failure here, not a reason to skip");
 	let interrupt = Interrupt::new(vector).expect("an interrupt object");
 	assert!(bind_msi(vector, &interrupt), "the claim's driver takes the slot");
 	assert!(is_bound(vector), "and the controller says the vector is live");

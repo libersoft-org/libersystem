@@ -1322,3 +1322,25 @@ first. I checked the file's other three uses of the phrase afterwards: one is a 
 entirely - what the derived inventory does not name is not BUILT, which is the surface-closure scope -
 and the other two are dated historical notes. No live rule now reads the thread stop against anything
 but the final set.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-09-01T13:23:01Z):
+
+Rating: 8/10
+
+1. **The chosen static-loader profile is not an upstream three-target configuration, and the audit
+   link does not define a complete loader closure.** The bootstrap pin selects
+   `BUILD_STATIC_LOADER=ON` and relies on a static link for convergence
+   (`docs/todo/P02M0135.md:171-211`). In official Vulkan-Loader commit
+   [`cf32131e`](https://github.com/KhronosGroup/Vulkan-Loader/commit/cf32131e121d931795add2aa6e56ac5b1d0a45e5),
+   upstream records that this option was Apple-only, renames it `APPLE_STATIC_LOADER` because the old
+   name misleadingly implied all-platform support, and makes non-Apple use fail. None of the three
+   LiberSystem targets can therefore obtain the stated static loader from this bootstrap option; a
+   later platform-port patch could add a portable static target, but the plan neither assigns that
+   construction to the derived port nor reconciles it with pass 1's earlier bootstrap configuration.
+   Even with such a target, pass 2 only says to link the pinned configuration and treats ordinary
+   archive selection as authoritative without defining a root-symbol set or whole-archive/member-
+   admission rule (`:239-260`). That selects only members reachable from the synthetic consumer,
+   whose guest gate merely reaches synthetic ICD entry points (`:627-631`), so the fixed point can
+   describe a fixture-selected subset rather than the complete pinned loader. Make portable static-
+   target construction an explicit prerequisite/derived patch and define the deterministic complete
+   archive/root closure used by both the surface gate and quarantine ELF.

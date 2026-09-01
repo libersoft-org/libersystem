@@ -263,8 +263,19 @@ pub fn irq_info_len() -> usize {
 
 // Map a device's MSI-X table page uncacheable and write entry 0: message address
 // 0xFEE00000 | dest<<12 (physical destination, fixed delivery), message data = the
-// allocated vector (edge-triggered), vector control = 0 (unmasked). A driver must
+// allocated vector (edge-triggered), vector control = 1 (MASKED). A driver must
 // never write its own MSI-X table; only the kernel programs it here.
+//
+// PROGRAMMED MASKED, AND UNMASKED ONLY WHEN THE ACQUIRE HAS COMMITTED (2026-09-01). This wrote
+// vector control 0, so the entry became deliverable the instant it was written - before the caller's
+// claim generation had been re-checked by `register_derived`. Disabling MSI-X on the device at claim
+// release closed the window where the function was left enabled by a binding that had ended, but not
+// the one where a REPLACEMENT binding enables it: a replacement that acquires a vector and then
+// closes it leaves its slot PENDING, `has_live` deliberately does not count a pending slot, and a
+// stale-generation caller paused between its own check and this call can then take a fresh slot and
+// write entry 0 of a function the replacement has already enabled. Masking here makes that write
+// harmless - the entry is not deliverable until `unmask_msi`, which runs only after the generation
+// has been re-checked and the vector recorded as derived.
 fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
 	let virt = msix_virt(slot);
 	let offset = table_phys & 0xfff;
@@ -283,7 +294,26 @@ fn program_msix_entry(slot: usize, table_phys: u64, vector: u8, dest: u8) {
 		entry.add(0).write_volatile(msg_addr); // message address low
 		entry.add(1).write_volatile(0); // message address high
 		entry.add(2).write_volatile(vector as u32); // message data
-		entry.add(3).write_volatile(0); // vector control (unmasked)
+		entry.add(3).write_volatile(1); // vector control (MASKED until `unmask_msi`)
+	}
+}
+
+// Make the entry programmed above deliverable. The other half of `program_msix_entry`'s mask, and
+// the last step of a committed acquire - see the comment there for what runs between them.
+//
+// `table_phys` is unused on this port: the entry is reached through the per-slot window the
+// programming step mapped, at the offset it recorded.
+pub fn unmask_msi(vector: u32, _table_phys: u64) {
+	if !is_msi(vector) {
+		return;
+	}
+	let slot = (vector - MSI_BASE as u32) as usize;
+	let virt = msix_virt(slot);
+	if super::paging::translate(virt).is_some() {
+		let offset = MSIX_ENTRY_OFFSET[slot].load(Ordering::Acquire) as u64;
+		let entry = (virt + offset) as *mut u32;
+		// SAFETY: the same entry `program_msix_entry` wrote, through the same mapping.
+		unsafe { entry.add(3).write_volatile(0) };
 	}
 }
 

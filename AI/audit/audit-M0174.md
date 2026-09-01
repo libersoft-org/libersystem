@@ -648,3 +648,24 @@ M6 gains a third element with four parts:
 M8 gains the cross-flow negative this seam exists for: an error quoting flow A is delivered against
 flow A's tuple and does not terminate, resize or invalidate flow B; and an error whose quoted packet
 this node never sent is dropped at validation and reaches no consumer.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-09-01T13:23:01Z):
+
+Rating: 6/10
+
+1. **The accepted MLD source-cap correction has no promised overflow gate.** The plan now fixes
+   `MAX_RECORDED_SOURCES_PER_PENDING = 64` and degradation to address-specific response on overflow
+   (`docs/todo/P02M0174.md:220-236`), and the planner's response says M8 gained disjoint-list
+   exhaustion and merge cases (`AI/audit/audit-M0174.md:606-615`). Current M8 contains no source-cap,
+   exact-bound, over-bound, or degradation fixture (`docs/todo/P02M0174.md:396-437`). Add the promised
+   hostile disjoint-list test so the new bound and fallback have an executable oracle.
+
+2. **The typed ICMPv6 quotation contract requires proof it simultaneously forbids this layer from
+   retaining.** M6 accepts an error only when the quoted packet is one this node actually sent, and
+   requires L3 to establish that before delivery, yet says L3 keeps no transport state and no
+   registration table (`docs/todo/P02M0174.md:327-357`). Parsing a full tuple can route an event, but
+   a plausible local tuple does not prove that the quoted packet was emitted. Without bounded
+   transmitted-packet evidence, a forged quotation is indistinguishable at this boundary and can
+   authorize a PMTU update before the event is queued. Either specify bounded sent-packet correlation
+   here, or delegate live-flow validation to M0175 and limit L3 to structural/local checks; freeze the
+   ownership choice and its negative test rather than requiring an unimplementable combination.

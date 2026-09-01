@@ -167,6 +167,31 @@ pub fn contain_faulting_endpoint(bus: u8, dev: u8, func: u8) -> Option<usize> {
 	Some(index)
 }
 
+// The same, and ONLY for a device some binding currently holds.
+//
+// THE SERVICING PATH NEEDS A NARROWER RULE THAN THE TEARDOWN ONE (2026-09-01). `poll_faults` is
+// reached from three places now, and they do not want the same containment. A teardown and the boot
+// report are asking about a device whose story this kernel is already in the middle of; the periodic
+// drain added below is asking about EVERY endpoint, at an arbitrary moment, including the ones the
+// kernel's own conformance fixtures are deliberately making fault.
+//
+// Those fixtures attach an endpoint under a synthetic binding number and never `claim` the device -
+// `src/kernel/iommu/tests.rs` does exactly that with the `edu` function - so a device with no live
+// claim is either a test provoking a fault on purpose or a device no driver holds. Neither is a
+// BINDING to contain, which is what M5's containment is about: "its binding is contained until
+// whoever holds it tears it down". Taking an unclaimed device off the bus from a background sweep
+// would stop the hostile-DMA cases mid-run and prove nothing about production.
+pub fn contain_faulting_endpoint_of_a_live_binding(bus: u8, dev: u8, func: u8) -> Option<usize> {
+	let table = DEVICES.lock();
+	let claims = CLAIMS.lock();
+	let index = table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func)?;
+	if claims.get(index).map(|slot| slot.state) != Some(ClaimState::Claimed) {
+		return None;
+	}
+	bus_master(&table[index], false);
+	Some(index)
+}
+
 pub fn count() -> usize {
 	DEVICES.lock().len()
 }

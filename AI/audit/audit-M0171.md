@@ -533,3 +533,18 @@ record survived were automatically the right one.
 M7 gains the fixture the auditor asks for: after an accepted N-to-N+1 advance, delete either slot -
 one per run, both covered - and require N to still be refused. That is the case that fails if an
 advance converges only one slot, which is what makes it the right test for this correction.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-09-01T13:23:01Z):
+
+Rating: 7/10
+
+1. **An equal-generation retry after an interrupted two-write advance can still accept an
+   unconverged floor and later roll back.** The correction converges both slots only while processing
+   a higher generation (`docs/todo/P02M0171.md:311-337`) and separately says an equal generation is
+   bootable (`:338-339`). If power fails after the first validated write, the plan's own intermediate
+   state is `{A=N, B=N+1}` (`:327-333`). Rebooting the same `N+1` artifact then compares equal, and no
+   stated rule rewrites `A` before control is transferred. Losing `B` afterward makes `N`
+   authoritative and permits a signed `N` boot. Require convergence before every accepted boot whose
+   slots do not both equal the selected floor, including equal-generation recovery, and gate the
+   sequence interrupt-between-writes -> reboot `N+1` -> delete either slot -> prove `N` remains
+   refused. M7 currently deletes slots only after an uninterrupted accepted advance (`:393-404`).

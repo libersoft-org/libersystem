@@ -556,3 +556,30 @@ its delivery in ServiceManager's bootstrap, and the single row that uses it - Pe
 ProcessService - with a gate that the holder can CONNECT and can do nothing else with the handle,
 watched to fail by widening the rights, and that no other row in the shipped manifest carries the
 kind.
+
+AUDITOR'S RE-AUDIT OF PLAN M0169 (2026-09-01T13:23:01Z):
+
+Rating: 6/10
+
+1. **The new factory-root role rests on a false reachability premise and cannot safely coexist with
+   ServiceManager's root use.** M2 says PermissionManager cannot mint a transaction connection from
+   its existing ProcessService client and therefore adds a role that transfers ProcessService's root
+   (`docs/todo/P02M0169.md:113-173`). In fact, `serve_multi` intercepts `CONNECT_OP` on every client
+   channel, not only the root, and returns an independent connection
+   (`src/user/runtime/rt/src/lib.rs:1900-1908,1970-1980`). PermissionManager already receives a fresh
+   ProcessService connection (`src/user/services/core/src/service_manager/bootstrap.rs:1122-1129`;
+   `permission_manager.rs:1541-1544`), so `service_connect(procsvc)` supplies the required transaction
+   connection. ServiceManager also continues using its root to mint later launch connections
+   (`bootstrap.rs:195-213`). If the root is duplicated, the two holders share one reply queue and
+   recreate M2's cross-reply defect; if it is relinquished, ServiceManager loses later launch/restart
+   minting and ProcessService's root lifetime depends on PermissionManager. Use and gate `CONNECT` on
+   PermissionManager's existing independent client rather than adding the root-transfer role.
+
+2. **M3 still leaves two materially different pipeline-sealing designs open although the preferred
+   pre-commit design is already expressible.** It first requires group creation over prepared members,
+   then offers post-commit creation plus kill/wait/reap and says to choose one
+   (`docs/todo/P02M0169.md:270-280`). `launch_prepared` already returns the Process task handle before
+   release (`src/user/services/core/src/process_service.rs:875-892`), and
+   `sys_process_group_create` resolves those handles as `Process` with `MANAGE` without requiring the
+   processes to be running (`src/kernel/syscall/mod.rs:2059-2108`). Freeze the expressible pre-commit
+   seal; the current fork leaves incompatible atomicity and failure contracts to implementation.

@@ -2259,3 +2259,65 @@ fn evidence_under_another_model_does_not_qualify_a_candidate() {
 	}
 	assert!(store.evaluate("audio", "candidate-hash", crate::shadow::Universe::TestGuest, &log).is_err(), "evidence gathered under one model hash is not evidence about a different one - a candidate cannot borrow the current model's record to justify narrowing away from it");
 }
+
+// THE PLAN'S DEPENDENCY GRAPH IS VALIDATED, AND EACH OF THE THREE FAULTS IS REFUSED SEPARATELY.
+//
+// M4 names three properties - unique ids, resolvable dependencies, no cycles - and until 2026-09-01
+// the emitter checked none of them and could not: `layers.insert` overwrote a duplicate id, an
+// unknown dependency read as depth zero, and the relaxation stopped after a fixed number of passes
+// whatever it had converged to. All three produced a WRONG PLAN rather than an error, which is the
+// one outcome a scheduler cannot recover from, so each is asserted here on its own.
+fn step_for_test(id: &str, requires: &[&str]) -> crate::commands::Step {
+	crate::commands::Step { id: id.to_string(), requires: requires.iter().map(|r| (*r).to_string()).collect(), label: id.to_string(), command: String::from("true"), keys: Vec::new(), note: None, guests: 0 }
+}
+
+#[test]
+fn a_well_formed_plan_graph_is_accepted() {
+	let steps = vec![step_for_test("build:x86_64", &[]), step_for_test("guest:x86_64", &["build:x86_64"]), step_for_test("gate:after", &["guest:x86_64"])];
+	assert!(crate::commands::validate(&steps).is_ok(), "a chain with distinct ids and resolvable edges is exactly what the emitter is supposed to produce");
+}
+
+#[test]
+fn two_steps_sharing_an_id_are_refused() {
+	let steps = vec![step_for_test("gate:host", &[]), step_for_test("gate:host", &[])];
+	let faults = crate::commands::validate(&steps).expect_err("two steps with one id merge two costs into one figure that describes neither, and give the recorder one key for two runs");
+	assert!(faults.iter().any(|f| f.contains("share the id")), "the fault names the duplicate rather than some later symptom of it: {faults:?}");
+}
+
+#[test]
+fn a_dependency_naming_no_emitted_step_is_refused() {
+	let steps = vec![step_for_test("guest:x86_64", &["build:x86_64"])];
+	let faults = crate::commands::validate(&steps).expect_err("a step waiting on a prerequisite nobody emits is one the runner can never see satisfied");
+	assert!(faults.iter().any(|f| f.contains("which no step emits")), "the fault names the missing prerequisite: {faults:?}");
+}
+
+#[test]
+fn a_cycle_in_the_plan_graph_is_refused() {
+	let steps = vec![step_for_test("a", &["c"]), step_for_test("b", &["a"]), step_for_test("c", &["b"])];
+	let faults = crate::commands::validate(&steps).expect_err("a cycle has no valid order, so any order the emitter picks is arbitrary and its ordering claim is empty");
+	let named = faults.iter().find(|f| f.contains("depend on each other")).expect("the cycle is reported: {faults:?}");
+	for member in ["a", "b", "c"] {
+		assert!(named.contains(member), "every member of the cycle is named so a reader can break it: {named}");
+	}
+}
+
+#[test]
+fn a_missing_edge_is_not_also_reported_as_a_cycle() {
+	// The two faults are different repairs, and reporting one as the other sends the reader to the
+	// wrong place. An unresolvable edge is dropped before the cycle search for exactly that reason.
+	let steps = vec![step_for_test("only", &["absent"])];
+	let faults = crate::commands::validate(&steps).expect_err("the missing edge is still a fault");
+	assert!(faults.iter().any(|f| f.contains("which no step emits")), "{faults:?}");
+	assert!(!faults.iter().any(|f| f.contains("depend on each other")), "a step whose only edge is unresolvable does not depend on itself: {faults:?}");
+}
+
+#[test]
+fn the_real_plan_graph_validates() {
+	// The emitter's own output, not a fixture: this is the assertion that would catch a future step
+	// added with a duplicate id or an edge naming a step that was renamed.
+	let model = model();
+	let plan = plan_for(&model, &["src/kernel/device.rs"]);
+	let per_target = std::collections::BTreeMap::new();
+	let steps = crate::commands::steps(&plan, &per_target, &model.registry);
+	assert!(crate::commands::validate(&steps).is_ok(), "the plan this tree actually emits has a usable dependency graph");
+}

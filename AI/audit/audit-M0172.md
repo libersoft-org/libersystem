@@ -546,3 +546,19 @@ the firmware passing that tree on.
 
 No other change: the carrier decision, the signed-source-wins rule and the refusal on disagreement are
 unchanged.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-09-01T13:23:01Z):
+
+Rating: 7/10
+
+1. **The producer matrix assigns the wrong DMA mode to the normal development topology.** M2 maps
+   every development boot, with or without `--no-iommu`, to degraded `no-iommu`
+   (`docs/todo/P02M0172.md:91-106`). The current x86_64 development instance does not pass an IOMMU
+   override (`src/harness/lab.py:1137-1161`), while the ordinary non-test runner defaults to an
+   attached virtio-IOMMU and translated endpoints (`src/harness/qemu-run.sh:1008-1065`); the existing
+   GPU restart check explicitly depends on that translated default development instance
+   (`src/harness/dev-gpu-restart.py:11-22`). M6 nevertheless requires a `no-iommu` record to refuse
+   `iommu-required` entries and any unexpected controller/mode mismatch
+   (`docs/todo/P02M0172.md:391-401`). As written, admission must either reject the current default
+   development topology/drivers or violate its mismatch rule. Split default development from the
+   explicit `--no-iommu` path (enforcing versus degraded) and add admission fixtures for both.

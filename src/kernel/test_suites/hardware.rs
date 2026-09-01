@@ -185,6 +185,10 @@ fn xhci_driver_enumerates_the_usb_bus() {
 	let vector = arch::interrupts::acquire_msi(table_phys, dest, index as u32).expect("an MSI vector should be free");
 	let interrupt = object::interrupt::Interrupt::new(vector).expect("a test interrupt");
 	assert!(arch::interrupts::bind_msi(vector, &interrupt), "the MSI vector should bind");
+	// The entry is programmed MASKED - see `program_msix_entry` - so this harness unmasks it the way
+	// `sys_device_msix_acquire` does once its acquire has committed. Without it the device is enabled
+	// and its one entry still refuses to deliver.
+	arch::interrupts::unmask_msi(vector, table_phys);
 	arch::pci::msix_enable(bus, dev, func, msix_cap);
 
 	let (kernel_ep, user_ep) = object::channel::Channel::create();
@@ -763,6 +767,10 @@ fn virtio_snd_driver_captures_a_period_from_the_device() {
 	let vector = arch::interrupts::acquire_msi(table_phys, dest, index as u32).expect("an MSI vector should be free");
 	let interrupt = object::interrupt::Interrupt::new(vector).expect("a test interrupt");
 	assert!(arch::interrupts::bind_msi(vector, &interrupt), "the MSI vector should bind");
+	// The entry is programmed MASKED - see `program_msix_entry` - so this harness unmasks it the way
+	// `sys_device_msix_acquire` does once its acquire has committed. Without it the device is enabled
+	// and its one entry still refuses to deliver.
+	arch::interrupts::unmask_msi(vector, table_phys);
 	arch::pci::msix_enable(bus, dev, func, msix_cap);
 
 	let (kernel_ep, user_ep) = object::channel::Channel::create();

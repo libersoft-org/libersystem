@@ -1002,7 +1002,59 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 // Take whatever the device has reported and record it. Bounded by a fixed buffer, so a flooding
 // endpoint does bounded work per call and cannot decide how much the kernel allocates.
 pub fn poll_faults() {
-	poll_faults_attributed(None)
+	poll_faults_attributed_with(None, Containment::WhateverFaulted)
+}
+
+// WHICH DEVICES A DRAIN MAY TAKE OFF THE BUS - see `device::contain_faulting_endpoint_of_a_live_binding`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Containment {
+	// The device that faulted, claimed or not. The teardown and the boot report, which are already
+	// inside one device's story and are not sweeping every endpoint on the machine.
+	WhateverFaulted,
+	// Only a device a binding currently holds. The periodic drain, which runs at an arbitrary moment
+	// against every endpoint - including the ones this kernel's own hostile-DMA fixtures are making
+	// fault on purpose, under a synthetic binding and no claim.
+	OnlyLiveBindings,
+}
+
+// HOW OFTEN THE PERIODIC DRAIN MAY RUN, as a tick the last drain was taken on.
+//
+// One drain per tick across the whole machine: the compare-exchange is what makes it one core rather
+// than all of them, and the tick is what stops an idle core spinning through the controller's queue
+// as fast as it can loop.
+static LAST_PERIODIC_DRAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+// SERVICE FAULTS WHILE THE BINDINGS THAT CAUSED THEM ARE STILL RUNNING.
+//
+// M5 asks a hardware fault to reach the binding lifecycle's containment, and until now nothing drove
+// that in production: the only callers were the one boot report and the synchronous teardown, so a
+// fault raised by a long-lived endpoint sat in the controller's queue until that binding eventually
+// ended - and for a binding that never ends, for ever. The containment existed and nothing ran it.
+//
+// HERE, AND NOT IN THE TIMER INTERRUPT. `poll_faults` takes the controller's lock and then
+// `device`'s, and an interrupted context may hold either; the idle loop holds neither. It already
+// services TLB shootdowns and drains the serial ring for the same reason, and it is entered with
+// interrupts enabled. What it is NOT is a guarantee: a machine whose every core is busy does not
+// reach it, so this bounds the delay on any core that goes idle rather than promising a deadline.
+// That is a strict improvement on "never until teardown" and is written here as what it is.
+pub fn service_faults_if_due() {
+	// THE CHEAP TEST FIRST, AND IT HAS TO BE (2026-09-01). This asked `translating()` before the
+	// tick, and that function takes the controller's spinlock - so every idle core on the machine
+	// would have grabbed one lock per pass of a loop that spins, on a 64-core boot, to answer a
+	// question that changes once. The tick load and the compare-exchange are atomics on one word:
+	// they let exactly one core per tick reach anything that locks, which is also the rate limit.
+	let now = crate::arch::apic::ticks();
+	let last = LAST_PERIODIC_DRAIN.load(core::sync::atomic::Ordering::Relaxed);
+	if now == last {
+		return;
+	}
+	if LAST_PERIODIC_DRAIN.compare_exchange(last, now, core::sync::atomic::Ordering::AcqRel, core::sync::atomic::Ordering::Relaxed).is_err() {
+		return;
+	}
+	if !translating() {
+		return;
+	}
+	poll_faults_attributed_with(None, Containment::OnlyLiveBindings);
 }
 
 // Drain and report faults, optionally supplying the attribution a TEARDOWN knows and the backend no
@@ -1019,6 +1071,10 @@ pub fn poll_faults() {
 // an event whose endpoint matches and whose domain the backend could not resolve - a fault from
 // another endpoint keeps its own attribution, and a resolved one is never overwritten by a guess.
 pub fn poll_faults_attributed(during_teardown: Option<(dma::EndpointId, dma::DomainId, Generation)>) {
+	poll_faults_attributed_with(during_teardown, Containment::WhateverFaulted)
+}
+
+pub fn poll_faults_attributed_with(during_teardown: Option<(dma::EndpointId, dma::DomainId, Generation)>, containment: Containment) {
 	// THE CEILING IS THE BOUND, and it is a whole number of drains rather than a buffer size. This
 	// used to loop until the queue answered empty, with a comment saying the work was bounded -
 	// which was true of each drain and not of the loop around them. An endpoint faulting faster than
@@ -1047,7 +1103,11 @@ pub fn poll_faults_attributed(during_teardown: Option<(dma::EndpointId, dma::Dom
 			// mastering memory is a diagnostic where the milestone asks for containment: a device
 			// resolving addresses its own domain refuses is a device to stop, not to describe.
 			let (bus, dev, func) = ((event.endpoint.0 >> 8) as u8, ((event.endpoint.0 >> 3) & 0x1f) as u8, (event.endpoint.0 & 7) as u8);
-			if let Some(index) = crate::device::contain_faulting_endpoint(bus, dev, func) {
+			let contained = match containment {
+				Containment::WhateverFaulted => crate::device::contain_faulting_endpoint(bus, dev, func),
+				Containment::OnlyLiveBindings => crate::device::contain_faulting_endpoint_of_a_live_binding(bus, dev, func),
+			};
+			if let Some(index) = contained {
 				crate::serial_println!("iommu:   device {index} at {bus:02x}:{dev:02x}.{func} no longer masters the bus - its binding is contained until whoever holds it tears it down");
 			}
 		}

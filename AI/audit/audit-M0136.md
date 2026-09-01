@@ -1002,3 +1002,22 @@ one that cannot be fixed later:
   and the same total advance, take the same fallback decision, and report cluster byte spans differing
   only as the inputs' own byte lengths differ. Run for a Latin combining-acute case and for one of the
   profile's non-Latin scripts, because a Latin-only proof of this is the case that always works.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-09-01T13:23:01Z):
+
+Rating: 7/10
+
+1. **The accepted catalogue-input correction still specifies a confined, read-only StorageService
+   capability that the current role and storage contracts cannot create.** The plan gives the
+   catalogue a `Client` role on StorageService confined to the font directory and read-only
+   (`docs/todo/P02M0136.md:158-180`). `Role` has no path or scope field
+   (`src/tools/system-manifest/src/lib.rs:637-682`), and the `Client` executor only duplicates the
+   named provider root (`src/user/services/core/src/service_manager/bootstrap.rs:123-159`). Directory
+   confinement currently comes through `volume-admin.open-directory`, but that operation has no
+   read-only argument (`src/idl/storage.lsidl:355-370`): it creates `Scope::Directory`, whose request
+   filter admits mutation operations; only `Scope::File { writable: false }` blocks them
+   (`src/user/services/storage/src/service.rs:334-350,508-516,711-775`). Thus the nearest existing
+   route is confined but writable, while an ordinary `Client` is not confined at all. Explicitly own
+   the read-only directory-mint contract and its supervisor delivery in this milestone, with a
+   negative mutation gate; naming an existing `Client` role does not complete the accepted
+   least-authority correction.

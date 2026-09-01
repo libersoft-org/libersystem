@@ -56,6 +56,64 @@ pub struct Step {
 	pub guests: usize,
 }
 
+// THE DEPENDENCY GRAPH, VALIDATED BEFORE ANYTHING WALKS IT.
+//
+// M4 asks for exactly three properties and the emitter checked none of them: ids are unique, every
+// dependency names a step that exists, and the graph is acyclic. What the layering did instead was
+// silently absorb all three failures - `layers.insert` overwrites a duplicate id, an unknown
+// dependency reads as depth zero through `map_or(0, ..)`, and the relaxation runs a fixed number of
+// passes and stops, so a cycle simply produces whatever it produced.
+//
+// Each one is a wrong ANSWER rather than a crash, which is why they have to be refused here. Two
+// steps sharing an id merge two costs into one figure that describes neither and give the recorder
+// one key for two runs. A dependency naming nothing is a step the runner will never see satisfied -
+// it either waits for news that cannot come or, worse, treats the prerequisite as already met and
+// runs a step before what it reads. A cycle has no valid order at all, so the emitted one is
+// arbitrary and the plan's ordering claim is empty.
+//
+// Answered as a list rather than at the first fault: a plan with three bad edges should say so once.
+pub fn validate(steps: &[Step]) -> Result<(), Vec<String>> {
+	let mut faults: Vec<String> = Vec::new();
+	let mut seen: BTreeSet<&str> = BTreeSet::new();
+	for step in steps {
+		if !seen.insert(step.id.as_str()) {
+			faults.push(format!("two steps share the id '{}' - their costs and their recorded outcomes would merge into one", step.id));
+		}
+	}
+	for step in steps {
+		for required in &step.requires {
+			if !seen.contains(required.as_str()) {
+				faults.push(format!("step '{}' requires '{required}', which no step emits", step.id));
+			}
+		}
+	}
+	// A CYCLE, BY EXHAUSTING THE ORDER RATHER THAN BY COLOURING. Kahn's algorithm removes every step
+	// whose prerequisites are already out; whatever is left when nothing more can be removed is
+	// exactly the set that depends on itself. Missing edges were reported above and are ignored here
+	// so one broken reference does not also read as a cycle.
+	let known: BTreeSet<&str> = seen.clone();
+	let mut remaining: Vec<(&str, Vec<&str>)> = steps.iter().map(|step| (step.id.as_str(), step.requires.iter().map(String::as_str).filter(|id| known.contains(id)).collect())).collect();
+	let mut settled: BTreeSet<&str> = BTreeSet::new();
+	loop {
+		let before = settled.len();
+		for (id, requires) in &remaining {
+			if !settled.contains(id) && requires.iter().all(|need| settled.contains(need)) {
+				settled.insert(id);
+			}
+		}
+		if settled.len() == before {
+			break;
+		}
+	}
+	remaining.retain(|(id, _)| !settled.contains(id));
+	if !remaining.is_empty() {
+		let mut names: Vec<&str> = remaining.iter().map(|(id, _)| *id).collect();
+		names.sort_unstable();
+		faults.push(format!("these steps depend on each other and have no order: {}", names.join(", ")));
+	}
+	if faults.is_empty() { Ok(()) } else { Err(faults) }
+}
+
 // A long list is digested rather than spelled. Two hundred selected ids make a nine-kilobyte name,
 // and an identity has to be stable and distinct, not readable.
 fn scoped_id(kind: &str, scope: &str, parts: &[String]) -> String {

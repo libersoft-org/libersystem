@@ -866,3 +866,33 @@ be a unicast address on the same interface identity - a router's link-local in e
 produces - with the unspecified and multicast forms refused at validation rather than at use. The
 plan says in the row that this is a semantic field choice decided here and that only the variant's
 spelling belongs to the IDL, which is the distinction the finding draws.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-09-01T13:23:01Z):
+
+Rating: 5/10
+
+1. **The accepted RFC 6724 correction still delegates the policy it claims to pin.** M5 says to pin
+   an "applicable RFC 6724 profile", including its policy table, appliance tie-breaks, fallback
+   timing, and whichever RFC 8028 update it adopts, but supplies none of those choices
+   (`docs/todo/P02M0175.md:339-373`). The planner's original response claimed that this wording pins
+   them (`AI/audit/audit-M0175.md:138-141`); it only instructs the implementer to choose them. The
+   mixed-family and deterministic-fallback tests therefore have no exact oracle. Record the actual
+   policy-table rows, complete ordering/tie-break rules, RFC 8028 decision, and fallback timing in the
+   plan.
+
+2. **The entropy correction leaves M6's normative contract contradicting the release contract.** M6
+   still says the matched DNS tuple **must** be unguessable, mandates fresh unpredictable transaction
+   IDs and source ports on every query, and requires negatives against predictable reuse
+   (`docs/todo/P02M0175.md:375-397`). The dependency and Definition of done now explicitly permit
+   predictable query identities on AArch64 and RISC-V until secure entropy exists, limiting
+   unguessability to seeded profiles (`:551-605`). Those are incompatible completion rules for two of
+   the three target profiles. Make M6 itself conditional in the same terms as the release matrix and
+   separate all-profile correlation tests from secure-profile unguessability tests.
+
+3. **The accepted numeric-bounds correction still omits the DNS result and parser bounds.** M6
+   returns a "bounded" ordered address list and requires bounded CNAME and name-compression traversal
+   (`docs/todo/P02M0175.md:375-409`), while M10 promises exact-bound and over-bound CNAME/answer tests
+   (`:525-540`). M1's numeric table contains no maximum returned-address count, CNAME-chain depth,
+   answer-record count, or compression traversal/pointer limit (`:54-101`). Consequently the wire
+   shape, resource ceiling, overflow behavior, and test oracle remain implementation choices. Add the
+   missing numbers and typed over-bound outcomes within the existing DNS item.

@@ -129,16 +129,28 @@ fn program_acquired(slot: usize, table_phys: u64) -> Option<u32> {
 
 // Write a device's MSI-X table entry 0 (reached through the physical direct map): the
 // message address is a hart's IMSIC S-file, so the device's DMA write of the message
-// data (the EID) pends that EID on that hart. Vector control = 0 (unmasked). A driver
-// must never write its own MSI-X table; only the kernel programs it here.
+// data (the EID) pends that EID on that hart. Vector control = 1 (MASKED until
+// `unmask_msi`). A driver must never write its own MSI-X table; only the kernel
+// programs it here.
+//
+// PROGRAMMED MASKED, AND UNMASKED ONLY WHEN THE ACQUIRE HAS COMMITTED (2026-09-01) - see the
+// x86_64 port's comment at the same function for the stale-generation window this closes.
 fn program_msix_entry(table_phys: u64, msg_addr: u64, eid: u32) {
 	let entry = super::paging::phys_to_virt(table_phys) as *mut u32;
 	unsafe {
 		entry.add(0).write_volatile(msg_addr as u32); // message address low
 		entry.add(1).write_volatile((msg_addr >> 32) as u32); // message address high
 		entry.add(2).write_volatile(eid); // message data = the EID
-		entry.add(3).write_volatile(0); // vector control (unmasked)
+		entry.add(3).write_volatile(1); // vector control (MASKED until `unmask_msi`)
 	}
+}
+
+// Make the entry programmed above deliverable - the other half of its mask. This port reaches the
+// table through the physical direct map, so the caller supplies the address it programmed.
+pub fn unmask_msi(_vector: u32, table_phys: u64) {
+	let entry = super::paging::phys_to_virt(table_phys) as *mut u32;
+	// SAFETY: the same entry `program_msix_entry` wrote, through the same mapping.
+	unsafe { entry.add(3).write_volatile(0) };
 }
 
 // Bind `intr` to an MSI `vector` (an EID) so dispatch wakes it when the EID fires.

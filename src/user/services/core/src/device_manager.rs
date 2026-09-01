@@ -800,8 +800,14 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 			// into circulation with no record of whether it was quiet. Kept, pumped, and resolved
 			// like any other node in `Stopping`.
 			if gate_on_requirements(&mut node, entry, catalogue) {
-				let bound = begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege);
-				if bound || node.teardown.is_some() {
+				// AND A NODE WAITING FOR ITS CLAIM IS KEPT, WHICH IT WAS NOT (2026-09-01). This read
+				// the answer as a bool, so a device whose claim was still `Releasing` - parked in
+				// `Backoff` with `retry_at` set, waiting for the standing loop to look again - was
+				// dropped here and never bound at all. `begin_bind`'s own comment already said the
+				// boot path no longer did that; what had changed was the state it left behind, not
+				// what this did with it.
+				let started = begin_bind(&mut node, &info, elf, entry.name, 0, power, console_input, device_privilege);
+				if matches!(started, BindStart::Opened | BindStart::WaitingForTheClaim) || node.teardown.is_some() {
 					nodes.push(node);
 				}
 			}
@@ -1090,14 +1096,21 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 			};
 			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
 			let info = node.info;
-			let opened: bool = begin_bind(node, &info, elf, driver_name, key_producer, power, console_input, device_privilege);
+			let started = begin_bind(node, &info, elf, driver_name, key_producer, power, console_input, device_privilege);
 			unmap_object(file);
 			close(file);
 			// A TEARDOWN IN FLIGHT IS NOT A CANDIDATE THAT FAILED YET. Moving to the next entry here
 			// would start a second bind on a device whose first one has not been given back - the
 			// claim not confirmed `Free`, the child not confirmed dead. The central wait resolves it
 			// and answers `NextCandidate` when it has, which is where the candidate advances.
-			if opened || node.teardown.is_some() {
+			//
+			// AND NEITHER IS A CLAIM SOMEBODY ELSE IS STILL RELEASING (2026-09-01). That answer used
+			// to be the same `false` as a refusal, so every pass over a `Releasing` device spent one
+			// more candidate; once the cursor ran off the end the standing loop's retry started
+			// nothing, because there was nothing left to start. A device briefly held by a teardown
+			// could therefore exhaust its whole candidate list and never bind - a transient state
+			// made permanent. The cursor stays where it is and the node waits in `Backoff`.
+			if matches!(started, BindStart::Opened | BindStart::WaitingForTheClaim) || node.teardown.is_some() {
 				return;
 			}
 			// It could not even be opened - the claim refused, the spawn refused. `begin_bind` has
@@ -2975,7 +2988,31 @@ unsafe fn back_off_until(incident: &Incident, attempt: u32) -> u64 {
 // Returns false when the attempt could not be opened at all, having already put the node wherever
 // the table says a bind that failed this early belongs.
 #[allow(clippy::too_many_arguments)]
-unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64) -> bool {
+// WHAT STARTING A BIND ANSWERED, and why one bit could not say it (2026-09-01).
+//
+// `begin_bind` returned a bool, and every caller read `false` as "this candidate is spent". One of
+// its `false` paths does not mean that at all: a device whose claim is still `Releasing` is one
+// somebody else is giving back, and the node is parked in `Backoff` with `retry_at` set so the
+// standing loop looks again. Read as a failure, that path consumed a candidate per pass until the
+// cursor ran off the end of the list - after which the retry starts nothing, because there is
+// nothing left to start - and on the boot path it dropped the node entirely rather than keeping it.
+// A transient state became a permanent one by way of a return type that could not express it.
+//
+// The bind's own comment already said this was fixed. What had been fixed was the STATE TRANSITION
+// inside `begin_bind`; the callers still could not tell the two `false`s apart, so the defect stayed.
+enum BindStart {
+	// A claim was taken and a child started. The central wait owns it from here.
+	Opened,
+	// Nothing was started and this candidate IS spent - the claim was refused, the spawn failed.
+	CandidateFailed,
+	// Nothing was started and this candidate is NOT spent. The device's claim is still being
+	// released by whoever held it; the node waits in `Backoff` and the standing loop re-reads the
+	// claim when `retry_at` comes due. Bounded by the kernel's own latched release deadline, after
+	// which `observe_claim` answers `Terminal` instead and this stops being reachable.
+	WaitingForTheClaim,
+}
+
+unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name: &[u8], key_producer: u64, power: u64, console_input: u64, device_privilege: u64) -> BindStart {
 	unsafe {
 		// A STORED DISABLE IS CONSULTED BEFORE EVERY BIND, not applied once when it was read.
 		//
@@ -2990,7 +3027,7 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			print(b"DeviceManager: ");
 			print_driver_name(driver_name);
 			print(b" is disabled in stored policy; this bind does not start\n");
-			return false;
+			return BindStart::CandidateFailed;
 		}
 		if node.attempt == 0 {
 			// ONE WINDOW FOR THE WHOLE CHAIN OF ATTEMPTS, opened on the first and not per attempt.
@@ -3026,7 +3063,7 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 				print_driver_name(driver_name);
 				print(b" does not declare this build's driver protocol; refusing before the claim\n");
 				node.record.move_to(BindingState::Failed, Some(FailureCause::ProtocolMismatch));
-				return false;
+				return BindStart::CandidateFailed;
 			}
 		}
 		// WHETHER THIS NODE STILL HAS AN ATTEMPT, computed once and handed to every failure exit below.
@@ -3042,7 +3079,7 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			print(b"DeviceManager: refusing an illegal transition into binding for ");
 			print_driver_name(driver_name);
 			print(b"\n");
-			return false;
+			return BindStart::CandidateFailed;
 		}
 		node.record.attempts = node.attempt + 1;
 		// WHAT THIS DEVICE IS DOING, READ BEFORE IT IS ASSUMED FREE.
@@ -3073,9 +3110,9 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 				// the standing loop's wait is bounded by.
 				node.record.move_to(BindingState::Backoff, None);
 				node.retry_at = clock().saturating_add(BACKOFF_TICKS[0]);
-				return false;
+				return BindStart::WaitingForTheClaim;
 			}
-			ClaimReadiness::Terminal(cause) => return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, cause, driver_name, attempts_left),
+			ClaimReadiness::Terminal(cause) => return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, cause, driver_name, attempts_left)),
 		}
 		let grant: ClaimGrant = match device_claim(node.index, device_privilege) {
 			Ok(grant) => grant,
@@ -3085,8 +3122,8 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			// on the explicit condition that the distinguishable kernel path produce it, and nothing
 			// did. Everything else here is "somebody else holds it", which is `claim-refused` and is
 			// not worth waiting on either.
-			Err(errno) if errno == abi::ERR_ACCESS_DENIED => return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::IommuRequired, driver_name, attempts_left),
-			Err(_) => return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ClaimRefused, driver_name, attempts_left),
+			Err(errno) if errno == abi::ERR_ACCESS_DENIED => return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::IommuRequired, driver_name, attempts_left)),
+			Err(_) => return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ClaimRefused, driver_name, attempts_left)),
 		};
 		txn.held.claim = grant.claim;
 		txn.key = grant.key;
@@ -3096,7 +3133,7 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		node.id = node.id.rebound(grant.key.generation);
 		let (dm_side, driver_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
-			None => return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left),
+			None => return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left)),
 		};
 		txn.held.channel = dm_side;
 		// HELD BY THE TRANSACTION until the spawn consumes it - see `Attempt::driver_side`.
@@ -3116,14 +3153,14 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// reports - and a subtree that can be killed as a unit.
 		let domain: i64 = domain_create(u64::MAX, u64::MAX, u64::MAX);
 		if domain < 0 {
-			return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left);
+			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 		}
 		txn.held.domain = domain as u64;
 		let process: i64 = spawn_in(elf, driver_side, domain as u64);
 		if process < 0 {
 			// The spawn did NOT take the bootstrap handle - `spawn_prepared_in` says so - so it is
 			// still the transaction's and the rollback closes it.
-			return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::SpawnFailed, driver_name, attempts_left);
+			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::SpawnFailed, driver_name, attempts_left));
 		}
 		// Taken by the spawn: no longer this transaction's to close.
 		txn.held.driver_side = 0;
@@ -3150,28 +3187,28 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		if use_msix {
 			let irq: i64 = device_msix_acquire(grant.claim);
 			if irq < 0 {
-				return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left);
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 			}
 			txn.holds(driver_protocol::ResourceKind::Irq as u16, irq as u64);
 		}
 		if driver_name == b"virtio_input" || driver_name == b"xhci" {
 			let sink: i64 = duplicate(key_producer, RIGHT_SEND | RIGHT_TRANSFER);
 			if sink < 0 {
-				return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left);
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 			}
 			txn.holds(driver_protocol::ResourceKind::Keys as u16, sink as u64);
 			// A CONNECTION OF ITS OWN, not a copy of an authority. These two used to be handed a
 			// duplicate of the root-Domain handle - which can kill every process on the machine -
 			// so that the Power key would work. What they get now can ask for a reboot and
 			// nothing else, on a channel nobody else answers on.
-			let Some(connection) = service_connect(power) else { return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left) };
+			let Some(connection) = service_connect(power) else { return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left)) };
 			txn.holds(driver_protocol::ResourceKind::SysPower as u16, connection);
 			// The capability that lets those keystrokes reach the console at all. A duplicate
 			// per driver, for the same reason as the power connection.
 			if console_input != 0 {
 				let feed: i64 = duplicate(console_input, RIGHT_TRANSFER);
 				if feed < 0 {
-					return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left);
+					return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ResourceExhausted, driver_name, attempts_left));
 				}
 				txn.holds(driver_protocol::ResourceKind::Console as u16, feed as u64);
 			}
@@ -3186,7 +3223,7 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		let mut payload = [0u8; driver_protocol::MAX_PAYLOAD];
 		let payload_len = driver_protocol::encode_bind(info, resource_count as u16, &mut payload);
 		if !send_frame(dm_side, driver_protocol::Opcode::Bind, grant.key.generation, &payload[..payload_len], 0, 0) {
-			return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::DriverExited, driver_name, attempts_left);
+			return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::DriverExited, driver_name, attempts_left));
 		}
 		for index in 0..resource_count {
 			let (kind, handle) = txn.held.resources()[index];
@@ -3201,7 +3238,7 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			if !send_frame(dm_side, driver_protocol::Opcode::Resource, grant.key.generation, &kind_payload, handle, mask) {
 				// The send did not transfer it, so it is still the transaction's - and so is every
 				// entry after it, which is exactly what the rollback now closes.
-				return give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::DriverExited, driver_name, attempts_left);
+				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::DriverExited, driver_name, attempts_left));
 			}
 			txn.handed_over(handle);
 		}
@@ -3213,8 +3250,17 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// `Node::running`.
 		node.running = Some(node.candidate);
 		txn.commit();
-		true
+		BindStart::Opened
 	}
+}
+
+// `give_up_retryable` answers a bool and that bool is always `false` - see `give_up_with_budget`,
+// whose every path ends there. It is a "this did not open" marker rather than an outcome, so the
+// argument is taken and discarded: what it means at every use inside `begin_bind` is the same thing,
+// that nothing started and this candidate is spent. Where the node was LEFT - `Backoff`, `Failed`,
+// `Stopping` - is the record's business and the caller does not branch on it.
+fn bind_start_of(_did_not_open: bool) -> BindStart {
+	BindStart::CandidateFailed
 }
 
 // What one node's state machine decided, for the caller that knows what to do about it.

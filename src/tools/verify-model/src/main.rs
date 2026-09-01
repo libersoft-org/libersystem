@@ -1098,6 +1098,16 @@ fn run() -> Result<ExitCode, String> {
 			// The id breaks ties, so the emission is stable: a plan that reorders itself between two
 			// identical runs is one nobody can diff.
 			let mut ordered = verify_model::commands::steps(&plan, &per_target, &model.registry);
+			// VALIDATED BEFORE IT IS WALKED - see `commands::validate`. A plan whose graph is wrong
+			// is not a plan to emit with a warning: the runner would read it, wait on a step nobody
+			// emits, or run one before what it reads.
+			if let Err(faults) = verify_model::commands::validate(&ordered) {
+				for fault in &faults {
+					eprintln!("verify-model: {fault}");
+				}
+				eprintln!("verify-model: the plan's dependency graph is not usable, so no plan is emitted");
+				std::process::exit(1);
+			}
 			let mut layers: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
 			for _ in 0..ordered.len() {
 				for step in &ordered {

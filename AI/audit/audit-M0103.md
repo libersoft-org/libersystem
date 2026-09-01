@@ -1423,3 +1423,21 @@ the authoritative section, which was already correct:
   its self-justifying sentence is replaced by "the authoritative section defines no such gate",
   followed by a note saying the count moved and why. The reason `s-scene` is struck is untouched: the
   CORE `SCENE3D_PROFILE_1.md` is inside `s-3d`'s freeze and `SCENE3D_EXTENDED_1.md` is `f-ext`'s.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-09-01T13:23:01Z):
+
+Rating: 8/10
+
+1. **The WSI completion contract conflates producer-ready with presentation completion and assigns
+   the result channel in the wrong direction.** The present state machine requires DisplayService to
+   release a pending image and defines backend/service-known per-present outcomes and completed-present
+   timing (`docs/todo/P02M0103.md:792-846`). The selected channel pair instead gives the WSI client
+   `RIGHT_SEND` only and makes DisplayService the `RECEIVE | WAIT` side that processes the typed
+   "outcome" (`:878-978`). Pass 10 then calls that same pair the `PRODUCER_READY` /
+   `CONSUMER_RELEASE` mechanism, specifies only client-to-service producer-ready ordering, and merely
+   says that consumer release precedes availability (`:2428-2438`); the backend submission item also
+   anticipates producer-ready completion (`:2485-2493`). Render completion can tell DisplayService
+   that pixels are ready, but only DisplayService/backend can release the image and report presentation
+   outcome/timing to the client. One client-send/service-receive pair cannot carry both opposite-author
+   transitions. Specify the two directions separately, including endpoint rights/ownership and the
+   acquire/release ordering for each.

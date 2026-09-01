@@ -1615,6 +1615,18 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 		thread.handles().lock().release_reservation(1);
 		return ERR_RESOURCE_EXHAUSTED;
 	}
+	// AND ONLY NOW IS THE ENTRY MADE DELIVERABLE. `program_msix_entry` wrote it MASKED, so
+	// everything between it and here - the bind, and the generation re-check `register_derived`
+	// performs - happened against an entry the device could not raise.
+	//
+	// That is what closes the last stale-generation window (2026-09-01). Disabling MSI-X at claim
+	// release stops a function staying enabled across a binding that ended; it does not stop a
+	// REPLACEMENT binding enabling it. A replacement that acquires a vector and then closes it leaves
+	// its slot PENDING, and `has_live` deliberately does not count a pending slot - so a caller whose
+	// claim ended while it was paused between its own check and `acquire_msi_unique` could take a
+	// fresh slot and write entry 0 of a function the replacement had already enabled, unmasked,
+	// before `register_derived` rejected its key. Masked programming makes that write inert.
+	arch::interrupts::unmask_msi(vector, table_phys);
 	// Turn on MSI-X now that its table entry is programmed; the device's INTx pin stays
 	// disabled (MSI-X is its interrupt source from here on).
 	arch::pci::msix_enable(bus, dev, func, cap);
