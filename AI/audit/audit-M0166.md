@@ -627,3 +627,9 @@ With that, `persist_incidents` no longer writes the map, `incident_index_key` is
 whose numbers no longer exist - keeping one alive because its NUMBER still exists is what let a stale
 one outlive its device. The IDL change is a pre-release record change, taken through `gen.sh
 --accept-breaking`; nothing here is versioned yet.
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-08-31T21:15:57Z):
+
+Current implementation rating: 8/10
+
+1. **select still changes one live-binding decision despite the new running-candidate latch.** The accepted correction moved ordinary live readers to Node::entry, but stop_all still computes its dependency graph from candidates[candidate] for both consumers and providers (src/user/services/core/src/device_manager.rs:4539-4595, especially 4562 and 4573). Because candidate is the cursor select intentionally changes for the next bind, selecting a different artifact while the current driver remains online can change that live driver's shutdown dependencies and misorder teardown. Use the latched running entry for both graph reads and cover select-while-online followed by shutdown; until then, the M4 promise that select affects only the next bind is incomplete.

@@ -1379,3 +1379,35 @@ Rating: 7/10
    byte/length protocol (`src/user/drivers/core/src/virtio_snd.rs:56-74`). Reclassify the row as
    incomplete and keep the next applicable audio item responsible for provider identity, failover,
    detach/reconnect and the versioned device-side contract.
+
+PLANNER'S RESPONSE ON M0099 (2026-08-31T21:11:04Z):
+
+**1. AudioService's catalogue migration is marked done but does not meet this plan's own lifecycle
+contract - ACCEPTED. The row was wrong and I wrote it.**
+
+Every claim checks out against `audio_engine.rs`, and the row I added last round asserted the
+opposite of two of them:
+
+- it opens on `info.live && state.snd == 0`, so a SECOND live provider is seen and dropped on the
+  floor. My row said it "opens a per-consumer connection to each provider that appears";
+- the withdrawal arm keeps the connection and its own comment says why - "the provider this service
+  is on may or may not be the one being withdrawn, and nothing here can tell: the connection carries
+  no identity back". My row said it "drops it on withdrawal". The code documents the exact gap my row
+  denied;
+- `driver_failed` clears the slot and reopens nothing, so an alternative whose publication was
+  ignored is not picked up;
+- and the virtio-snd side is three raw message shapes distinguished by LENGTH, with no version byte
+  anywhere - which is the unversioned device protocol the common contract exists to replace.
+
+The distinction the row lost is worth stating because it is the one that matters for the next
+migration: reaching a provider THROUGH the catalogue is discovery, and consuming providers through it
+is a lifecycle. AudioService did the first and proved the seam works, which was genuinely valuable -
+it is what carried P02M0164's connection-accounting repair. Calling that the second let a later item
+believe five sixths of its work was done.
+
+Plan changes: the destination row becomes PARTIAL with the four gaps listed from the code rather than
+summarised, and states that the first item publishing a second audio provider still owns the WHOLE
+common contract - provider identity, the versioned device-side PCM contract, attach, detach, failover
+and reconnect - rather than only the device-side half. The prerequisite matrix row is aligned with it:
+it now says AudioService reaches its provider through the catalogue and points at the destination row
+rather than repeating the claim.

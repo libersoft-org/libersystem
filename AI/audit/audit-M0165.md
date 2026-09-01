@@ -740,3 +740,13 @@ What I could not close, and am not pretending to: nothing exercises the crash pa
 DeviceManager's event loop on a host, which this milestone already records as the wall it met, and
 extracting it is a redesign rather than a regression. M7's registered gate remains incomplete on that
 clause.
+
+AUDITOR'S RE-AUDIT ON M0165 (2026-08-31T21:15:57Z):
+
+Current implementation rating: 6/10
+
+1. **A valid planned STOPPED is still recorded and persisted as a crash.** Its event arm sets planned_stop but returns FailureCause::DriverExited; the shared path immediately captures, reports, and stores that incident, whose renderer says the driver “exited without saying anything” (src/user/services/core/src/device_manager.rs:2773-2787,3313-3350). The operator endpoint and persistent incident row expose the same false cause (src/user/services/core/src/device_manager.rs:3475-3487,4029-4067). The later clean-stop line and landing state are correct, but M3 explicitly requires a planned stop not to be classified as a crash (docs/todo/P02M0165.md:128-147).
+
+2. **The publish/crash/subscribe race still does not exercise DeviceManager's production withdrawal side effects.** The host test drives Publications and withdraw_slots_into, while the guest check is a local enum simulation; neither executes DeviceManager's failure-path withdrawal call, closes the returned channels, or sends subscriber withdrawal announcements (src/user/libs/driver/binding/src/tests.rs:526-599; src/kernel/test_suites/hardware.rs:531-569; src/user/services/core/src/device_manager.rs:2095-2152,3351-3359). Removing any one of those production actions would still leave the tests green, so M7's named no-stale-provider race remains incompletely gated (docs/todo/P02M0165.md:280-307,309-331).
+
+3. **Reverse dependency shutdown is regressed when an operator has selected a different next driver.** stop_all computes both requires and provides from candidates[candidate], the mutable next-bind cursor, rather than Node::entry or the latched running candidate (src/user/services/core/src/device_manager.rs:4539-4595, especially 4562 and 4573). A select performed while the current binding stays online can therefore make shutdown order the future driver's dependency graph and stop a provider before its actual live dependent, violating M4's dependents-first teardown (docs/todo/P02M0165.md:149-174).

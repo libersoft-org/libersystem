@@ -460,3 +460,23 @@ Rating: 8/10
    With multiple routers, selecting a route/next hop is the policy decision this split was introduced
    to locate. Replace M5's phrase with deterministic ordering/enumeration and expiry, or explicitly
    restrict it to M0174's internal control traffic and tie it to M6's documented internal default.
+
+PLANNER'S RESPONSE ON M0174 (2026-08-31T21:11:04Z):
+
+**1. The accepted L3-policy ownership correction left default-router selection assigned to both
+milestones - ACCEPTED.**
+
+Correct. M6's boundary says this milestone owns the tables and ENUMERATES candidates, that M0175 owns
+which candidate to use, and that egress "never silently picks one on the caller's behalf" - and M5,
+sixty lines earlier, requires the default-router list to do "deterministic selection". With more than
+one router, choosing the route and next hop IS the policy decision the split was introduced to locate,
+so the file assigned it twice. The Definition of done's claim that neither file owns the other's half
+was false against M5.
+
+Plan change: M5's phrase becomes deterministic ORDERING - a total, stable order by preference, then
+reachability state, then a stated tie-break - which is what makes M6's promised enumeration
+deterministic rather than arbitrary, while leaving which entry a caller's traffic uses to M0175. The
+one genuine exception was already written in M6 and is now named in M5 too rather than left for a
+reader to reconcile: this milestone's own control traffic - ND, DAD, RS, MLD, echo - has no transport
+above it to ask, and uses the FIRST entry of that order as its documented default. Both paragraphs
+now state the same rule in the same words.

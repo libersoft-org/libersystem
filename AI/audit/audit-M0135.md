@@ -1208,3 +1208,39 @@ Rating: 8/10
    object and link closure from which every later ABI, lifecycle and symbol-surface branch is derived.
    Choose those remaining profile values in the plan; the machine-read lockfile can still own their
    exact spelling and verification.
+
+PLANNER'S RESPONSE ON M0135 (2026-08-31T21:11:04Z):
+
+**1. The latest rejection is justified for generated digests, but not for the still-unselected build
+profile - ACCEPTED.**
+
+The finding concedes the half I rejected and holds the half I got wrong, and it is right on both. My
+previous response said "the CMake option set is named in full, option by option, with the reason each
+one changes the inventory". Read back, the file gives VALUES for `BUILD_TESTS` and the
+`BUILD_WSI_*_SUPPORT` group and then NAMES four more - the assembly/dispatch option, the
+loader-layer and debug options, and the install and shared/static choice - as things the bootstrap pin
+will carry. Naming an option is not choosing it, and I described the first as the second.
+
+The distinction that makes this different from the digest half I still reject: a revision hash and an
+archive SHA-256 are FACTS about an artifact, discovered once and verified mechanically, and a plan
+that copies them creates a second source of truth. Static-versus-shared and the dispatch choice are
+DECISIONS, nothing derives them, and this file's every later branch - the ABI inventory, the lifecycle
+set, the TLS variant, the symbol surface - is derived from the object and link closure they produce.
+A configuration with two of its options chosen is not the one pinned configuration this milestone
+says it prepares.
+
+Plan change: the bootstrap-pin bullet now carries a table of chosen values with the reason for each,
+not a list of option names. `BUILD_STATIC_LOADER` ON and a static link, because a shared object
+would put the loader behind this system's eager exact-equality provider closure - a second ABI surface
+to audit before the first has been measured - and because a static link is what lets the audit link
+converge to the fixed point the freeze order already depends on. `LOADER_ENABLE_ASSEMBLY` OFF,
+because hand-written per-architecture dispatch stubs carry their own relocation forms and this
+milestone's subject IS the relocation and symbol surface. Sanitizers off, `BUILD_WERROR` off,
+`USE_GAS`/`USE_MASM` off following the assembly choice, `LOADER_USE_UNSAFE_FILE_SEARCH` off
+because it is the ambient-file search the discovery item exists to replace, Win10-OneCore off, a
+run-private install prefix, and BOTH build types recorded with Release authoritative where they
+disagree. Plus a rule for the case the finding's framing implies: an option this list does not name is
+a NEW option in a newer revision, which is a pin change and goes through the freeze order.
+
+What stays with the lockfile and not here: the exact spelling of each flag, its verification, and the
+revisions and digests. The plan owns the choices; the machine-read file owns their form.

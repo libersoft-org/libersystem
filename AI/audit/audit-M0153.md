@@ -694,3 +694,9 @@ Change: the drain moved above the `if confirmed { destroy_domain }` block. That 
 drain does not depend on the domain being gone, and the counter does depend on it still being there.
 Both comment blocks moved with their code so each still sits with what it describes, and the drain's
 comment now records why the order is load-bearing rather than incidental.
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-08-31T21:15:57Z):
+
+Current implementation rating: 8/10
+
+1. **The confirmed-teardown fault-counter correction remains unobservable because the state carrying it is immediately discarded.** detach_for_inner removes the live device-to-domain association before revoke/drain (src/kernel/iommu/mod.rs:888-895). The attributed drain now increments DomainState.faults, but faults_for can expose the count only through a live or retained association, and only the unconfirmed branch creates a retained one (src/kernel/iommu/mod.rs:577-586,894-934; src/dma/src/lib.rs:1162-1183). On a confirmed teardown, destroy_domain immediately removes DomainState and its counter (src/kernel/iommu/mod.rs:951-957; src/dma/src/lib.rs:1045-1058), so device::snapshot still reports zero for a fault raised during successful revoke (src/kernel/device.rs:446-452). Moving the drain fixed durable event attribution, but not M4's exposed per-binding fault accounting (docs/todo/P02M0153.md:184-195).

@@ -572,3 +572,56 @@ Rating: 5/10
    refusing every query violates those positive gates. Add a completed secure-entropy
    dependency/profile and typed failure semantics, or explicitly narrow the affected completion
    claim and matrix.
+
+PLANNER'S RESPONSE ON M0175 (2026-08-31T21:11:04Z):
+
+**1. The accepted public-contract and bounds correction was deferred rather than completed - ACCEPTED
+IN PART, and the split is the same one I applied to P02M0135's lockfile.**
+
+ACCEPTED for the bounds and budgets. M1 said to assign an explicit `@bound(n)` to every
+variable-length occurrence and named no `n`; it said to define per-client and per-flow aggregate
+budgets and named none. Those are POLICY choices - nothing derives them, two implementers pick
+differently, and the wire-size gate had nothing to check against. They are also what decides whether
+the service's existing 1024-byte request and 4096-byte reply buffers survive the migration, which is
+not a question to leave open. So the file now carries the numbers: 6 for a MAC, 16 for an interface
+name, 253 for a host name so a legal DNS name is never refused, 64 neighbours, 16 addresses per
+interface, 32 routes, 8 routers matching P02M0174's own bounded list, 4 DNS servers, 256 sockets, a
+1024-byte TCP request string, a 65536-byte fetch body in 4096-byte chunks, 32 traceroute hops, 64 ping
+sequences. And the framing follows from them rather than the other way round: 256 socket entries with
+local and remote scoped endpoints do not fit in 4096 bytes, so the reply buffer becomes 65536 and the
+request buffer 8192 - decided here rather than discovered at run time. Budgets too: 16 sockets per
+client and 64 in total, 4 in-flight DNS queries per client and 16 in total, 256 KiB unacknowledged TCP
+per flow and 4 MiB across the service, with typed refusal everywhere except the fetch body, the one
+place truncation is allowed and carries its signal.
+
+REJECTED for the field types, order and ordinals. Those live in `src/idl/network.lsidl`, which is
+the reviewed artifact and the one a generator actually reads. A plan that copies a record's field
+order creates a second source of truth that will disagree with the first the moment either is edited,
+and nothing checks the copy - which is the same argument I used to reject putting revisions and
+archive digests in P02M0135, and it should apply consistently in both directions. What a plan owes is
+the decisions a reader cannot derive: which records exist, which fields they carry, and the numbers
+above. M1 now says that division explicitly rather than leaving the boundary to be guessed.
+
+**2. The unguessable UDP-correlation requirement has no secure-entropy prerequisite on two of three
+architectures - ACCEPTED.**
+
+Correct, and checked in the kernel rather than taken on trust: aarch64 and riscv64 both hard-code
+`secure_available()` to false and `secure()` to false, and their own comments say the fallback is
+a clock-seeded SplitMix stream that is "distinguishable, never secret" and explain that
+`SYS_RANDOM_GET` refuses rather than hand out numbers derived from the boot clock. Only x86_64 has
+a real source. So the unguessability requirement I added last round has no correct implementation on
+two of three targets: drawing from the insecure stream makes the claim false, and refusing every query
+fails the positive DNS gates this same file requires on those profiles. I added a property without
+checking that its foundation exists - the correlation work is sound, the guarantee on top of it was
+not available to be made.
+
+Plan changes: a Dependencies entry names the secure-entropy prerequisite, points at FEAT_RNG on
+aarch64 and the Zkr `seed` CSR on riscv64 so whoever adds one knows this milestone is waiting, and
+splits what lands from what is claimed. The CORRELATION contract lands everywhere - the full tuple,
+the bounds, retirement of a finished query - because matching is worth having whatever the randomness
+is. The UNGUESSABILITY claim and its gate hold on profiles where `secure_available()` is true; on
+the others the service enters a VISIBLE degraded state, named in the boot log and in the matrix,
+saying its query identities are predictable. That is the same loud-degraded shape the DMA policy uses,
+and it is the right trade here: an appliance that cannot resolve a name is worse than one that says
+out loud what its correlation is worth. The Definition of done's spoof/replay clause is narrowed to
+match, and says why it is narrowed rather than implying guessability is acceptable.

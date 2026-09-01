@@ -552,3 +552,9 @@ a test-only client that issues the verb and reports. That is harness work, it wo
 than this gate, and inventing it inside an audit-response round is the redesign this round is asked
 not to do. M4 and the definition of done remain UNMET on the restart clause, and the gate's own output
 should not be read as covering it.
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-08-31T21:15:57Z):
+
+Current implementation rating: 8/10
+
+1. **The required controlled virtio-gpu restart/rebind remains unproved.** M4 and the definition of done require the GPU to survive a restart while IOMMU enforcement remains active (docs/todo/P02M0159.md:94-97,126-131). The current gate proves one cold bind, exactly one online report, no unsolicited restart, and successful frame presentation, but it never commands a stop, retry, or rebind (src/tools/check-qemu-virtio-iommu-x86_64.sh:294-339). The missing operator/harness seam explains the omission but does not satisfy the required lifecycle.

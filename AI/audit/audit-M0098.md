@@ -498,3 +498,13 @@ samples it before the sweep and again after `settled_vectors`. A quarantine that
 release makes the teardown unconfirmed and says so by name; one that predates it is ignored, which
 keeps the property `has_unbound`'s exclusion exists for. The claim then goes `Quarantined` rather than
 `Free`, which is what an unconfirmed interrupt teardown means everywhere else in this file.
+
+AUDITOR'S RE-AUDIT ON M0098 (2026-08-31T21:15:57Z):
+
+Current implementation rating: 6/10
+
+1. **The latest MSI generation check still has the hardware TOCTOU it explicitly acknowledges.** sys_device_msix_acquire checks claim_is_current and releases the claim-table lock before acquire_msi_unique (src/kernel/syscall/mod.rs:1561-1577). The latter claims a registry slot by reused device index and programs and unmasks the MSI-X entry before register_derived performs the next generation check (src/kernel/arch/common/msi.rs:106-126; src/kernel/arch/x86_64/interrupts/mod.rs:198-207; src/kernel/syscall/mod.rs:1598-1617). A release and reclaim between those operations therefore lets the stale syscall alter the replacement binding's hardware whenever that binding has not acquired a vector yet. Refusing the later registration and releasing the slot rolls back bookkeeping only after the forbidden hardware effect; unique-live does not make the claim-generation check atomic with programming.
+
+2. **The last-reference interrupt race still permits IOMMU teardown before interrupt masking is confirmed.** revoke_derived can fail to upgrade the final weak reference while Interrupt::drop is still executing its unbind (src/kernel/device.rs:806-813; src/kernel/object/interrupt.rs:126-135). release_claim proceeds directly to IOMMU detach and only checks whether the vector settled afterward (src/kernel/device.rs:488-530). The new before/after quarantine count correctly prevents a failed unbind from publishing the claim Free, but it does not restore M5's required bus-master-off, interrupt-masked, then IOMMU-confirmed ordering (docs/todo/P02M0098.md:111-115,248-250).
+
+3. **M9's hostile-holder proof still does not exercise the live resources it claims to revoke.** The live-vector test constructs Interrupt::new(0x71) and toggles its bound marker without acquiring or binding an MSI registry/hardware slot, while the DMA test uses a synthetic untranslated device and checks header-generation/registry bookkeeping rather than demonstrating that a claim-derived translated address stops translating (src/kernel/object/claim/tests.rs:319-350,512-546). Those tests do not provide the required live-vector and translated-DMA forced-release proof (docs/todo/P02M0098.md:193-204,235-252).

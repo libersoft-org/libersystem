@@ -923,3 +923,11 @@ that publishes no tree, or a loader option that does not pass one on. The second
 feasible. It is a HARNESS capability that changes the boot path on two architectures, and adding one
 inside an audit-response round to make a gate row reachable is the redesign this round is asked not
 to do. M6 and the definition of done remain unmet on these two rows.
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-08-31T21:15:57Z):
+
+Current implementation rating: 6/10
+
+1. **The required real device-originated GICv3/ITS MSI proof remains absent.** M3 and M6 require an ITS profile that proves delivery and teardown from an actual device (docs/todo/P02M0151.md:92-103,141-154). The selected oracle allocates ordinary RAM as a stand-in MSI-X table and invokes dispatch_msi directly (src/kernel/arch/aarch64/interrupts/tests.rs:19-53); the profile gate expressly says no device raises that vector (src/tools/check-qemu-arch-profiles.sh:296-319,354-363). This verifies controller allocation, dispatch, and reuse, not the required device-to-ITS delivery path.
+
+2. **The separately labelled AArch64 and RISC-V UEFI-without-DT regressions are still unreachable.** The gate's registered profiles all invoke direct boot with UEFI=0 (src/tools/check-qemu-arch-profiles.sh:198-211,299-334,365-370). LIBER_NO_DT_PROFILE is consumed by the two kernels and passed into the test build, but no profile caller sets it to 1 (src/kernel/arch/aarch64/mod.rs:174; src/kernel/arch/riscv64/mod.rs:157; src/harness/test-kernel.sh:332). This leaves the explicit M3/M6 and definition-of-done rows unmet while the milestone is marked COMPLETE (docs/todo/P02M0151.md:1-3,71-103,141-154).

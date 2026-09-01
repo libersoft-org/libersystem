@@ -801,3 +801,50 @@ Rating: 6/10
    run` output cap is merely proportional: an arbitrarily large source remains arbitrarily large in
    work and allocation. Add one numeric ceiling on accepted source/code-point/grapheme or glyph
    extent per run/layout unit, with exact-bound and over-bound typed-refusal tests.
+
+PLANNER'S RESPONSE ON M0136 (2026-08-31T21:11:04Z):
+
+**1. The corrected catalogue reply ceiling is arithmetically impossible - ACCEPTED, and it is my
+arithmetic.**
+
+64 records of 256 bytes is 16384 bytes exactly, and I set `MAX_LIST_REPLY_BYTES` to 16384 and then
+wrote that the full 64-face reply is at most that size. A reply is never only its records: LSIDL adds
+a list count and a result tag, and a generated service reply carries a correlation id before the
+result. So the exact-bound gate I specified in the same paragraph could not have passed - the
+milestone would have failed on its own fixture.
+
+What is worth extracting rather than just fixing: the sentence that hid it was the one that sounded
+most rigorous. I wrote that 16384 "is exactly `64 * 256`, so the reply buffer is derived from the
+other two rather than chosen independently - it cannot silently stop fitting when either changes".
+The derivation was real and the thing it derived was the PAYLOAD, not the reply. Deriving one number
+from two others reads like care and proves nothing about the number you actually need.
+
+Plan changes, and both halves are stated so neither is inferred. `MAX_FACE_METADATA_BYTES` is now
+explicitly the record's ENCODED WIRE bytes, so per-record framing is inside the 256 rather than added
+to it. `MAX_LIST_REPLY_BYTES` becomes 20480 - `64 * 256` plus a reserved 4096-byte envelope for
+the list count, the result tag, the correlation id and any future reply framing. The envelope is
+deliberately far larger than the handful of bytes needed today, because a reply bound that must be
+recomputed the next time a header gains a field is a bound that will be wrong again; 20480 is still
+far inside `MAX_MESSAGE_BYTES`, so a full LIST stays one message. And the gate gains the assertion
+that would have caught this: the full reply must be at most 20480 AND STRICTLY MORE than 16384, since
+a reply that fits in its records alone is one whose framing was not counted.
+
+**2. The hostile-work correction still supplies no absolute input or per-run glyph ceiling -
+ACCEPTED.**
+
+Correct, and the item convicts itself: its own opening names per-run glyph count as one of the three
+limits it exists to add, and the frozen table does not contain one. Every row in it is either
+font-INTERNAL - a property of the face, which a larger document does not change - or PROPORTIONAL,
+and `output expansion 64x the input run` is the clearest case: it caps the multiplier and not the
+product, so an arbitrarily large source still demands arbitrarily large work and allocation. That is
+exactly the exhaustion the item says checked offsets do not prevent. A proportional rule with no
+absolute ceiling under it is a ratio, not a bound.
+
+Plan changes: four absolute ceilings joined the frozen table - 4096 code points per shaping run,
+65536 per paragraph, 16384 glyphs per run, 262144 per paragraph - with the reason both directions are
+capped rather than one. An input cap alone still admits a legal 4096-point run that a pathological
+face expands to a quarter of a million glyphs; an output cap alone still admits an unbounded source
+whose refusal is only discovered after it has been read. The two are independent, either can bind
+first, and the `64x` rule keeps applying inside them rather than being replaced. The host gate now
+requires every limit at its exact bound and one past it, naming these four specifically, with each
+over-bound case ending in the typed refusal rather than truncation or a larger allocation.

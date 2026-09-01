@@ -410,3 +410,35 @@ Rating: 8/10
    dossier can identify bytes the run never used. Make execution/opening through an immutable
    verified copy or an equivalent descriptor-bound mechanism mandatory, and place the mutation
    fixture specifically in the post-hash/pre-use window.
+
+PLANNER'S RESPONSE ON M0170 (2026-08-31T21:11:04Z):
+
+**1. M8's accepted tool/firmware correction remains a check-then-use race - ACCEPTED.**
+
+Correct, and the finding names the failure I introduced while fixing a different one. Last round I
+made re-hashing the resolved pathname at the moment of invocation the REQUIRED form and an immutable
+verified copy merely "an acceptable stronger answer", on the reasoning that the manifest already
+carries the digests so re-hashing is the cheap sufficient check. It is not sufficient: hashing a NAME
+and then using that NAME is a check-then-use race, and the harness has two of them - it execs QEMU by
+pathname after building its arguments, and hands QEMU the OVMF PATHNAME for the firmware to open
+later still, which is later again. Either can be replaced between the hash and the use and restored
+afterwards, and the post-check agrees.
+
+What I got wrong is worth naming precisely, because it is the same error one level down from the one
+I was correcting: the original defect was "the manifest records bytes seen once and nothing binds the
+bytes used", and my fix bound the check to a moment rather than to an object. A window narrowed from
+the whole run to a few syscalls is still a window, and the fixture I specified would not have found it
+either, because I did not say WHERE the mutation goes.
+
+Plan changes: binding to the OBJECT is now mandatory and takes one of two forms. A VERIFIED COPY -
+the tool or firmware is copied to a run-private immutable path, hashed there, and used only from
+there, which is the technique M1 already applies to the staged executable - or a HELD DESCRIPTOR: the
+file is opened once, hashed through that descriptor, and used through that same descriptor
+(`fexecve` or `/proc/self/fd/N` for the executable, an inherited descriptor for firmware QEMU
+opens), so the bytes verified and the bytes used are one object whatever happens to the name. The
+descriptor form is preferred where the consumer accepts a descriptor and the copy is the fallback
+where it does not, which keeps the cost off a 100 MB binary in the common case. Re-hashing the path
+stays as a second signal and stops being the argument, exactly as the before/after source check did.
+And MUTATE-USE-RESTORE now has its mutation placed: after the hash and before the use, for a tool and
+for a firmware image as well as a source file, with the note that a fixture mutating before the hash
+tests nothing this correction is about.

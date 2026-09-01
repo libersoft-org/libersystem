@@ -364,3 +364,33 @@ Rating: 7/10
    exclude marker deletion from the threat/availability claim and remove the impossible fixture, or
    keep the provisioned fact in independently non-clearable trusted state (or make absent-marker
    enforcing boots fail closed and provision before their first boot).
+
+PLANNER'S RESPONSE ON M0171 (2026-08-31T21:11:04Z):
+
+**1. The provisioning state machine still assigns two outcomes to the same durable state - ACCEPTED.**
+
+Correct, and it is a contradiction I created last round while fixing the partial-state gap. I widened
+UNPROVISIONED to "marker absent, whatever the slots contain" - which is right, and is what makes an
+interrupted ceremony recoverable - and left standing a row saying a marker-present machine with both
+slots invalid is "not recoverable by deleting the marker", plus an M7 fixture requiring it to go on
+refusing after exactly that deletion. Once the marker is gone there is no durable fact separating that
+machine from one never provisioned, so my own first row obliges the loader to boot it and let a
+ceremony overwrite both slots. The fixture could not have passed.
+
+The resolution is to say what the threat model already says rather than to build a mechanism against
+it. This milestone's head states that the attacker controls persistent boot media and NOT
+firmware/NVRAM administration, and the marker lives in NVRAM - so an attacker who can delete it is
+one this milestone does not defend against by construction, in the same way it does not defend
+against one who can enroll their own Secure Boot key. I had written a defensive claim about an actor
+already outside the model, which is how it came to contradict the classification.
+
+Plan changes: the offending row now says the machine REFUSES and that the ceremony is what recovers
+it, with no claim about deletion. M2 gains a row stating plainly that deleting the marker is outside
+the threat model, why the previous claim was impossible against the table's own first row, and what
+deletion actually costs - AVAILABILITY of the floor, not its integrity: the machine becomes
+unprovisioned, refuses to advance until the ceremony runs again, and every artifact it accepts is
+still signature-checked. It also names what a later milestone would need to defend it - a monotonic
+counter, a fuse, or a TPM NV index with a write-once policy - which is a hardware root this QEMU
+milestone does not have and does not claim. M7's impossible fixture is struck and replaced by one that
+proves the availability consequence: after the marker is deleted the machine boots, refuses to
+ADVANCE, and says it is unprovisioned.

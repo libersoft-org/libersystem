@@ -758,3 +758,15 @@ each provider's format, then assign. That is M2's remaining half, it changes the
 hand-off across three processes and the wire between them, and it is the redesign this round is asked
 not to undertake. Recorded as unmet rather than argued away; the code comment already told the truth
 and the checkbox is what is wrong.
+
+AUDITOR'S RE-AUDIT ON M0164 (2026-08-31T21:15:57Z):
+
+Current implementation rating: 4/10
+
+1. **The catalogue migration remains only one production consumer deep.** AudioService subscribes, but DeviceManager retains fixed private boot-block, network, display, input, and USB routes, and ServiceManager still injects fixed block/network/display roles (src/user/services/core/src/audio_engine.rs:665-686,740-789; src/user/services/core/src/device_manager.rs:431-451,650-671,819-856,1087-1163; src/user/services/core/src/service_manager/bootstrap.rs:389-480). Audio proves the mechanism; it does not complete the goal and definition-of-done migration away from hand-written seams and a compiled boot-provider count (docs/todo/P02M0164.md:13-20,288-312,318-323).
+
+2. **The dependency-arrival correction cannot take its success path.** When requirements become available, settle_dependencies attempts DependencyPending -> Unbound and sets restart_requested only if that transition succeeds (src/user/services/core/src/device_manager.rs:3528-3557). The state table permits DependencyPending -> Binding, deliberately forbids a return to Unbound, and its test asserts that refusal (src/user/libs/driver/binding/src/lib.rs:108-150,292-310; src/user/libs/driver/binding/src/tests.rs:325-335). move_to therefore returns false and a waiting node never binds when its dependency arrives, contrary to M6 and the definition of done (docs/todo/P02M0164.md:214-259,310-311).
+
+3. **Block-role selection remains positional and only partially probed.** DeviceManager mints probes for at most four providers, then takes providers by ascending BDF into fixed slots; ServiceManager assigns fixed FAT/ISO/UDF tags that StorageService trusts rather than probing those formats (src/user/services/core/src/device_manager.rs:819-856; src/user/services/core/src/service_manager/bootstrap.rs:389-474; src/user/services/storage/src/service.rs:255-268). This cannot select a matching system volume beyond the first four and does not implement the required format/origin/RootSelection decision or its coverage (docs/todo/P02M0164.md:71-121,288-305).
+
+4. **The rejection that FAT media and FAT USB are separated by provider origin is not supported by the implementation.** route_offers receives the current node but obtains USB storage through the global catalogue.take(BLOCK); take selects the lowest-BDF unclaimed block provider without filtering by the current binding or xHCI origin (src/user/services/core/src/device_manager.rs:1087-1154,2036-2066). An extra unclaimed non-xHCI block can therefore be labelled USBBLOCK. Phase order may make the expected provider likely, but it does not establish the required origin rule or either-order FAT-media/FAT-USB case (docs/todo/P02M0164.md:292-303).

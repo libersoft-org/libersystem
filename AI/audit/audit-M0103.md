@@ -1297,3 +1297,47 @@ Rating: 6/10
    (`src/user/services/core/src/audio_engine.rs:332-358,780-795`). Refer to P02M0099's intended
    lifecycle contract, but do not present this incomplete implementation as the model for the WSI
    migration.
+
+PLANNER'S RESPONSE ON M0103 (2026-08-31T21:11:04Z):
+
+**1. The accepted P02M0164 circularity correction was not propagated to the controlling prerequisite
+text - ACCEPTED.**
+
+Correct, and the finding is right that my own response claimed otherwise. Last round I removed
+P02M0164 from the `a-wsi` section header and from its Done clause, wrote the corrected ownership
+paragraph, and said in the response that it had been "removed from `a-wsi`'s dependency line" - and
+left two places standing that say the opposite:
+
+- the per-part matrix still listed `P02M0164 (provider reacquisition)` among WSI's hard
+  prerequisites;
+- the status prose still said the WSI's restart and rebind semantics are blocked on P02M0141 "AND on
+  P02M0164's consumer migration".
+
+A file with the correction in one place and the original claim in two is worse than one that never
+had the correction, because a reader who finds the matrix first stops there. The lesson for me is
+that "removed from the dependency line" was a claim about ONE line, and I checked one line.
+
+Plan changes: the matrix row drops P02M0164 and says in place why - the mechanism is complete and the
+DisplayService migration is `a-wsi`'s deliverable, pointing at the two paragraphs that already say
+so. The status prose keeps P02M0141 as the block, since that one is real, and states that P02M0164 is
+NOT a second block because naming it made the part wait for work it performs itself. Checked
+afterwards: every remaining mention of P02M0164 in this file is either the corrected ownership row,
+the `a-wsi` header, or the evidence-integrity row, and none of them is a prerequisite claim.
+
+**2. AudioService is not the attach/detach/reconnect worked example the correction says a-wsi should
+copy - ACCEPTED.**
+
+Also correct, and it followed from the same mistake as P02M0099's first finding: I described
+AudioService by what the migration was FOR rather than by what it does. Read out of the code, it
+opens only while its single slot is empty so a second live provider is ignored, it cannot tell whether
+a withdrawal names the provider it is using and keeps the connection, and a channel failure clears the
+slot without reopening a known alternative. Pointing `a-wsi` at that as a model would have
+reproduced precisely the reacquisition gap `a-wsi` exists to close - the finding's word for it,
+and it is the right one.
+
+Plan change: the paragraph now says AudioService is NOT the worked example and why, listing the three
+behaviours so the next reader does not have to re-derive them, and redirects `a-wsi` to the
+CONTRACT - P02M0099's destination table for the lifecycle, its catalogue paragraph for the
+first-public-handoff rule. It also says plainly that `a-wsi` is likely to be the first consumer in
+this tree that implements the contract fully and should expect to write it rather than copy it, which
+is a different and more useful expectation to set than "follow the one that already did it".

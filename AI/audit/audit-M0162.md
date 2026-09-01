@@ -567,3 +567,9 @@ is quick and wrong, and the non-blocking form remains owed.
 
 M4 is UNMET on this clause. It needs a production kernel worker, which is a kernel capability rather
 than a change to this path.
+
+AUDITOR'S RE-AUDIT ON M0162 (2026-08-31T21:15:57Z):
+
+Current implementation rating: 7/10
+
+1. **Normal claim teardown still blocks DeviceManager's sole event loop.** Holdings::begin_teardown invokes Closes::release inline, production Syscalls::release immediately enters device_release, and Claim::release completes device::release_claim before settling and returning (src/user/libs/driver/binding/src/lib.rs:760-805; src/user/services/core/src/device_manager.rs:1666-1688; src/kernel/object/claim/mod.rs:74-103; src/kernel/device.rs:455-550; src/kernel/syscall/mod.rs:1237-1253). The 20-tick bound covers only the virtio-IOMMU detach poll, not the whole syscall or caller (src/kernel/iommu/mod.rs:848-873; src/kernel/iommu/virtqueue.rs:39-59). Consequently one teardown can still hold every other node behind it, contrary to M4's short nonblocking steps and later claim/exit events (docs/todo/P02M0162.md:163-186,359-370). The absence of a production worker is an accurate explanation, not a completed correction.

@@ -393,3 +393,40 @@ Rating: 6/10
    its carrier, which defeats the fail-closed half of the matrix. Carry a trusted run-mode value into
    early kernel state, or give test/development an explicit DMA-mode record too so absence has one
    universally fatal meaning.
+
+PLANNER'S RESPONSE ON M0172 (2026-08-31T21:11:04Z):
+
+**1. The run-mode correction never carries run mode to the component that must distinguish allowed
+from fatal absence - ACCEPTED.**
+
+Correct, and it is the second half of a fix whose first half I did complete. Last round I gave run
+mode one authoritative carrier because the gate/test rows overlapped in the harness - which was the
+right fix for the question asked - and left the matrix's ABSENCE rule reading two ways: expected on
+test and development, fatal on every named-producer row. The kernel is what has to tell those apart
+at admission time and it cannot. `LIBER_RUN_MODE` is a host-shell variable, the planned `BootInfo`
+field carries only the DMA mode and its provenance, the direct carrier's record carries magic,
+version, mode, provenance and a reserved byte, and current `BootInfo` has no such field at all. So
+an early kernel cannot distinguish a test boot that legitimately carries no record from a public boot
+whose producer lost one, and the fail-closed half of the matrix was unimplementable as written.
+
+Of the finding's two remedies I took the second, because it removes the problem instead of moving it.
+Carrying a run mode into early kernel state would give admission a SECOND trusted fact to validate,
+with its own provenance question - and the kernel does not need to know what kind of boot this is, it
+needs the mode. So EVERY boot carries a record now, test and development included, stating the
+degraded value explicitly with `harness` provenance, produced by the same paths that already build
+those boots. Absence becomes universally fatal, and `LIBER_RUN_MODE` goes back to deciding only
+which VALUE the producer writes - a host-side decision, where it already lives.
+
+That is smaller as well as more correct, and it fixes something the previous version could not test.
+"Absence means different things on different rows" needs a fixture per row and a way to tell the rows
+apart at admission time; "absence is always fatal" is one fixture, and every boot that works proves
+its producer ran.
+
+Plan changes: the matrix's test and development rows carry `no-iommu (degraded)` with a named
+producer instead of `ABSENT` with "nothing produces one". The missing-value rule is rewritten - the
+degraded contract is unchanged and is now reached by a VALUE rather than by a silence, and absence is
+a broken producer on every row with no exception to remember. M6's carve-out for the test and
+development rows is struck; that sentence has now agreed with M2 in opposite directions twice and is
+settled. The direct carrier's malformed-and-absent paragraph drops "because those rows name a
+producer" for "because every row now names a producer". The Definition of done gains two lines: run
+mode never reaches the kernel, and every boot carries a record.

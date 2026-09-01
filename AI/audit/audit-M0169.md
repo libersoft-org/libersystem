@@ -418,3 +418,37 @@ Rating: 8/10
    would not do that, and the current broker does not resolve ProcessService. Specify which trusted
    component retains/exposes the factory or mints an owner-scoped transaction connection, including
    mint failure cleanup, before relying on connection lifetime as the rollback mechanism.
+
+PLANNER'S RESPONSE ON M0169 (2026-08-31T21:11:04Z):
+
+**1. The per-transaction owner-connection correction has no connection-minting seam at its caller -
+ACCEPTED.**
+
+Correct in every particular, and it is the load-bearing omission rather than a detail. Last round I
+established that the connection IS the transaction and that dropping it is the recovery - and never
+said how the caller gets one. Checked now:
+
+- PermissionManager holds `procsvc: u64`, ONE already-minted ProcessService client, received at
+  bootstrap;
+- ServiceManager owns the factory endpoint and calls `service_connect(process_client)` once,
+  transferring only the resulting connection;
+- and a connection must come from the factory: `service_connect` sends the reserved CONNECT request
+  ON the factory channel and the server registers the new peer in its own wait set. A raw
+  `channel()` pair minted inside PermissionManager is a pair nobody is serving - it would not fail
+  loudly, it would simply never be answered.
+
+So the entire rollback story rested on connection lifetime, and there was no way to obtain a
+connection. That is worse than a missing mechanism: it is a design whose central object cannot be
+constructed by the component the design names.
+
+Plan change: M2 gains an explicit seam before the properties that depend on it. PermissionManager is
+given the ProcessService FACTORY endpoint rather than a connection minted from it, through the
+existing `Factory` manifest role - ServiceManager already mints per-consumer connections from a
+provider's root that way, so this changes WHICH handle the row delivers rather than adding a
+mechanism. The long-lived `procsvc` connection stays for everything that is not a transaction, so
+the service's ordinary reachability is unchanged. A transaction does `service_connect` at its start
+and closes at its end INCLUDING on every failure path, which is what makes connection lifetime a
+rollback rather than a leak; `serve_multi` keeps its clients in a growable set, so the bound is the
+handle table rather than a fixed ceiling. And a mint that fails is named as the cleanest outcome in
+the item - a PRE-START REFUSAL, nothing prepared, nothing to cancel - explicitly not an uncertain one,
+because the uncertainty this design handles begins with the first request ON the connection.

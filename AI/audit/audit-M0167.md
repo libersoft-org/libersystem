@@ -698,3 +698,13 @@ turned isolation off and let two guests of one architecture write into one file.
 
 There is no degraded form of "this run has its own copy": either it does, or the run is not the thing
 that was asked for. All three sites now print why and exit 1.
+
+AUDITOR'S RE-AUDIT ON M0167 (2026-08-31T21:15:57Z):
+
+Current implementation rating: 6/10
+
+1. **The new concurrency gate does not run the exact concurrency case the definition of done requires.** check-concurrent-selection launches two tag-filtered suites with different TEST_TAGS, but it never supplies TEST_SELECTION; test-kernel therefore compiles both with the same empty TEST_SELECTION (src/tools/check-concurrent-selection.sh:35-44,82-93; src/harness/test-kernel.sh:313-332). It proves tag isolation only, while the explicit requirement is simultaneous suites with both different TEST_SELECTION and different TEST_TAGS, each reporting its own selection (docs/todo/P02M0167.md:672-673).
+
+2. **The new guest-starting gate is outside the verification model and introduces another fixed parallel scheduler.** It is registered in check.sh but absent from catalog.rs's GATES list, even though verify-model check explicitly rejects a check.sh gate the catalogue does not know because no change can select it (check.sh:50-57; src/tools/verify-model/src/catalog.rs:126-225; src/tools/verify-model/src/main.rs:1442-1452). The script also starts two test.sh guests itself rather than expressing them as steps governed by verify.sh --jobs (src/tools/check-concurrent-selection.sh:40-51). Thus the claimed standing proof is not selectable by the model and a sweep can run two guests irrespective of its job bound, contradicting M3's one-scheduler contract (docs/todo/P02M0167.md:361-371,681-683).
+
+3. **The staged-loader shell lock does not protect against the other writers named by the correction.** qemu-run builds and copies the shared loader while holding kernel-test-build.lock, but build.sh, check-signed-boot.sh, and check-trust-profile.sh write the same libersystem-loader.efi output without taking that lock (src/harness/qemu-run.sh:960-987; build.sh:109-125; src/tools/check-signed-boot.sh:554-592; src/tools/check-trust-profile.sh:13-42). Another producer can therefore replace the shared output after this cargo build releases its own target lock but before or during the copy; holding a lock those writers ignore does not make the bytes staged for this run authoritative. This leaves the run-private immutable medium-input guarantee incomplete (docs/todo/P02M0167.md:290-313,658-659).
