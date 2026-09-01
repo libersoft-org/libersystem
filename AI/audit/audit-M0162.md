@@ -601,3 +601,11 @@ is about.
 
 M4 remains UNMET on this clause. It needs a production kernel worker, which is a kernel capability
 rather than a change to this path.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0162 (2026-09-01T03:15:10Z):
+
+Current implementation rating: 7/10
+
+1. **Normal claim teardown still blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` invokes `Closes::release` inline (`src/user/libs/driver/binding/src/lib.rs:787-819`), production `Syscalls::release` immediately calls `device_release` (`src/user/services/core/src/device_manager.rs:1671-1686`), and the syscall runs `Claim::release` and the full `device::release_claim` sequence before returning (`src/kernel/syscall/mod.rs:1247-1253`; `src/kernel/object/claim/mod.rs:82-102`; `src/kernel/device.rs:470-575`). The 20-tick bound covers only virtio-IOMMU command polling (`src/kernel/iommu/mod.rs:881-900`; `src/kernel/iommu/virtqueue.rs:39-59,197-215`), not the syscall or caller. The implementer accurately admits this remains unmet; the absence of a production worker explains the gap but does not satisfy M4's short nonblocking steps/later claim event or the definition of done that one slow node cannot stop service to another (`docs/todo/P02M0162.md:163-186,359-370`).

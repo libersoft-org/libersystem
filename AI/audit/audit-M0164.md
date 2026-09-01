@@ -846,3 +846,17 @@ that driver's own publications. The boot-volume loop keeps the global `take`, wi
 why: that caller IS choosing among every block provider by address, which is what `take` is for.
 This makes origin a rule where the milestone claims one; it does not by itself implement finding 3's
 format decision.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0164 (2026-09-01T03:15:10Z):
+
+Current implementation rating: 3/10
+
+1. **The catalogue migration is still only one production consumer deep.** AudioService is the sole driver-provider consumer that subscribes and opens (`src/user/services/core/src/audio_engine.rs:679,699`); DeviceManager still holds and fills fixed boot-block, network, display, input, and USB locals/routes (`src/user/services/core/src/device_manager.rs:431-451,1090-1166`), and ServiceManager still injects fixed block/network/display roles (`src/user/services/core/src/service_manager/bootstrap.rs:421-480`). Late or additional providers remain undiscoverable by the other production consumers, contrary to the Goal and the explicitly scoped per-service seam/definition of done (`docs/todo/P02M0164.md:15-19,288-323`). The latest response accurately admits this remains unmet.
+
+2. **Block-role selection remains capped and positional instead of using the required format/origin/root decision.** DeviceManager has four `BOOT_BLOCK_TAGS`, four role handles, and four probes, mints at most four probe connections, then assigns the role handles by ascending-BDF `Catalogue::take` position (`src/user/services/core/src/device_manager.rs:82-85,431-444,819-859,2068-2106`). ServiceManager maps those positions to fixed FAT/ISO/UDF roles and StorageService trusts the tags (`src/user/services/core/src/service_manager/bootstrap.rs:389-474`; `src/user/services/storage/src/service.rs:255-268`). A fifth matching system volume is not probed, and ISO/UDF/FAT roles are not selected by content as M2 and the definition of done require (`docs/todo/P02M0164.md:71-121,288-305`). The latest response also admits this remains unmet.
+
+3. **The claimed non-first system-volume selection closes the connection it chose.** `mount_by_uuid` returns a `LiberFs<ChannelBlockDevice>` whose `chan` is the matching probe when the loader-selected UUID is not on the primary disk (`src/user/services/storage/src/service.rs:3453-3470,3643-3659`), but its caller unconditionally closes every probe immediately before retaining that returned filesystem (`:199-250`, especially `:233-235`). Subsequent system-volume I/O therefore uses a closed handle in precisely the alternate-disk case the audit history says was fixed. This invalidates M2's loader-selected identity path and its non-positional proof.
+
+4. **Closed catalogue clients are never reaped, so one consumer exit can hot-loop DeviceManager and permanently consume a client slot.** `CatalogueClients` is append-only and has no removal operation (`src/user/services/core/src/device_manager.rs:4372-4392,4491-4501`). `serve_catalogue_once` returns `false` when the peer is closed (`:4400-4403`), but the standing-loop caller ignores that result and retains the channel in every future `wait_any` (`:590-598,618-645`). A peer-closed channel is permanently readable (`src/kernel/object/channel/mod.rs:212-220`), so the dead slot stays ready, can starve later catalogue or teardown handles, and all eight slots are lifetime rather than live-client capacity. This materially breaks M3's served subscription seam under an ordinary consumer exit or restart.

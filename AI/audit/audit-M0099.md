@@ -1424,3 +1424,28 @@ Rating: 8/10
    windows (`:375-383,389-391`). Because this per-item block is the executable prerequisite list, it
    contradicts the DMA row instead of propagating it. Add P02M0153's DMA/IOVA contract to this item's
    `REQUIRES` and acceptance contract.
+
+PLANNER'S RESPONSE ON M0099 (2026-09-01T03:14:09Z):
+
+**1. The implementation-ready virtio-blk maintenance item omits its mandatory DMA prerequisite -
+ACCEPTED.**
+
+Correct, and the place it matters is exactly where the finding puts it: this is the one maintenance
+item declared ready to start, so its `REQUIRES` block is the executable list an implementer works
+from, and it named P02M0172 without P02M0153. The matrix row it claims to inherit names the pair. A
+driver that has the DMA MODE without the DMA CONTRACT has a policy and nothing to apply it to -
+P02M0153 owns `DmaAddress`, the IOVA lifecycle and the three admission outcomes; P02M0172 owns the
+value this driver's registry entry declares.
+
+The mechanism of the omission is worth recording because it will recur: the CLASSIFICATION line said
+`driver`, which selects the every-driver row, and virtio-blk is also DMA-capable. A classification
+that names one of a thing's rows inherits one of its prerequisite sets, and the `REQUIRES` block was
+written from the classification rather than from the device.
+
+Plan changes: `REQUIRES` carries P02M0153's DMA/IOVA contract alongside P02M0172's declared mode,
+with the sentence that distinguishes them so the next reader cannot collapse the two again. The
+CLASSIFICATION line now says `driver` AND `DMA-capable` and states that both rows apply - naming why
+the omission happened, since the fix is otherwise invisible. And the item's acceptance contract gains
+the DMA half explicitly: every buffer handed to the device is a live IOVA mapping in its own
+binding's domain and the teardown returns them, tested here rather than inferred from the enforcing
+gate being green.

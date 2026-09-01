@@ -972,3 +972,13 @@ inside an audit response.
 M3, M6 and the definition of done remain UNMET on these two rows, and the milestone's COMPLETE label
 is wrong about them. That is a plan-side correction rather than a code one, and I am not making it
 here, but it should not be left implicit: the label and these two rows disagree.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-09-01T03:15:10Z):
+
+Current implementation rating: 6/10
+
+1. **The required real device-originated GICv3/ITS MSI delivery-and-teardown checkpoint is still absent.** M3 requires the final ITS profile to deliver and tear down a real device MSI (`docs/todo/P02M0151.md:94-103`). Its selected oracle instead allocates ordinary RAM as a stand-in MSI-X table and calls `dispatch_msi` itself (`src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The gate explicitly records that no device-originated MSI is proved (`src/tools/check-qemu-arch-profiles.sh:296-319,354-362`). This proves allocation, synthetic dispatch, and slot reuse, not the required device-to-ITS path.
+
+2. **The required separately labelled AArch64 and RISC-V UEFI/no-DT regression profiles remain unreachable.** M6 and the definition of done require those profiles (`docs/todo/P02M0151.md:143-154,464-477`), but every registered profile uses direct `UEFI=0` boot (`src/tools/check-qemu-arch-profiles.sh:198-211,296-319,365-370`), and the gate itself says the no-DT rows are unregistered (`:321-334`). `LIBER_NO_DT_PROFILE` is only consumed by the two kernels and passed through the test build; no profile selects it (`src/kernel/arch/aarch64/mod.rs:174`, `src/kernel/arch/riscv64/mod.rs:157`, `src/harness/test-kernel.sh:332`). The measured harness limitation explains the omission but does not satisfy the milestone.

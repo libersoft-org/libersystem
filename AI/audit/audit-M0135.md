@@ -1259,3 +1259,27 @@ Rating: 8/10
    or converged-link selection can therefore introduce self-threading after the only normative stop.
    Apply the stop and gate to every finally admitted ET_REL member, the converged resolved set, and the
    audit-linked ELF, parallel to Variant B's full-closure TLS scan.
+
+PLANNER'S RESPONSE ON M0135 (2026-09-01T03:14:09Z):
+
+**1. The no-self-thread stop condition covers pass 1 even though later phases can introduce the same
+forbidden requirement - ACCEPTED.**
+
+Correct, and the file convicted itself three times over: the normative stop said "pass 1's
+inventory", the completion prose said "the derived inventory", and the watched gate said "the
+recorded inventory". Three wordings for one rule is three scopes, and the narrowest of them was the
+one written as normative.
+
+The finding is also right about why pass 1 is the wrong place. This file says elsewhere that pass 2
+exposes requirements only archive selection, weak and COMDAT resolution and the compiler-runtime
+choice reveal; that the platform port is written after pass 1; and that generated sources come from
+the build. Each of those can introduce a thread-creation symbol AFTER the only stop had been passed -
+and the milestone would then continue against a configuration it had already declared out of scope.
+
+Plan changes: one scope, and it is the last one. The stop now fires if any thread-creation symbol
+appears in the FINALLY ADMITTED SET - every `ET_REL` member surviving selection, the converged
+resolved symbol set, and the audit-linked ELF - on any target, with pass 1 named as where the
+question is first asked rather than where it is answered. The watched gate takes the same scope and
+its fixture injects into all three, and the completion prose is reworded to match instead of
+introducing a third phrasing. The parallel to Variant B is made explicit: the TLS rule already scans
+the full closure, and the two now read the same way because they are the same kind of measured stop.

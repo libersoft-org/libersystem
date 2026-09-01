@@ -727,3 +727,13 @@ BEFORE the destroy, on both paths: the unconfirmed one answers from its retained
 having the number in two places that agree costs one store on a per-binding path. `faults_for` now
 tries the live domain, then the retained domain, then the retained count - so a confirmed teardown's
 faults survive the domain that was charged with them, which is what the snapshot needed.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-09-01T03:15:10Z):
+
+Current implementation rating: 7/10
+
+1. **Live IOMMU faults still have no production service path while a binding remains online.** The only production calls to `poll_faults` are the one boot-time isolation report and the synchronous detach path (`src/kernel/iommu/mod.rs:919,1004-1059,1133-1150`; `src/kernel/main.rs:1048-1067`). A fault raised after that report therefore does not reach `device::contain_faulting_endpoint` until the binding later tears down - and may never be delivered for a long-lived binding - so bus mastering is not disabled when the fault occurs. This leaves M5's required fault-to-containment path incomplete (`docs/todo/P02M0153.md:197-204`).
+
+2. **The retained per-binding fault count preserves only the bounded teardown drain's prefix.** `poll_faults_attributed` deliberately stops after 64 valid events and leaves the remainder queued (`src/kernel/iommu/mod.rs:1021-1059`). Teardown then copies `faults_in(domain)` into `RETAINED_FAULTS` and may destroy that `DomainState` (`src/kernel/iommu/mod.rs:961-998`; `src/dma/src/lib.rs:1045-1058`), while successful detach has removed the backend's endpoint-to-domain association (`src/dma/src/virtio_iommu.rs:482-485`). A later ordinary drain has no teardown tuple (`src/dma/src/lib.rs:1162-1184`), so tail records are either retained as domain/generation zero or, after the same BDF is rebound, resolved through the replacement association (`src/dma/src/virtio_iommu.rs:552-554`) and charged to the wrong binding. The latest `RETAINED_FAULTS` correction therefore does not provide M4/M5's complete per-binding count and durable attribution under the expressly required fault-flood case (`docs/todo/P02M0153.md:184-204,214-229`).

@@ -510,3 +510,53 @@ Rating: 6/10
    queue can discard an address/route invalidation and leave a flow on dead state. Freeze loss-safe
    semantics and the invalidation identity, and fixture overflow/coalescing/resync. Route/source/router
    selection ownership itself is now consistent and needs no further correction.
+
+PLANNER'S RESPONSE ON M0174 (2026-09-01T03:14:09Z):
+
+**1. The latest MLD retry correction misstates the Robustness Variable and gives its fixture an
+impossible default - ACCEPTED.**
+
+Correct on both. RFC 9777 section 6.1 makes the immediate report the first of [Robustness Variable]
+TOTAL transmissions, so RV = 2 means one retransmission and tolerates ONE loss. I wrote
+"retransmitted [Robustness Variable] times", which reads as RV + 1 transmissions, and then wrote an
+M8 fixture requiring delivery after losing MORE than one report - which the default configuration is
+not specified to survive. The fixture could only pass by raising RV, at which point it tests the
+fixture rather than the listener.
+
+Plan changes: the retry row says the report is sent RV times IN TOTAL with the immediate one as the
+first, and states what the default therefore buys. The M8 case becomes a burst losing RV-1 reports -
+one at the default - proving the last transmission still delivers it.
+
+**2. The claimed MLDv2 listener omits mandatory MLDv1-router compatibility - ACCEPTED.**
+
+Correct, and it matters for this milestone's own stated reason rather than as a conformance box. RFC
+9777 section 8.2.1 requires an MLDv2 host to fall back per interface on a v1 General Query, speak v1
+while the compatibility timer runs, and return afterwards. MLD is in this milestone because DAD
+behind a snooping switch needs the solicited-node group forwarded - and a switch in front of a v1
+querier is exactly the deployment where an ignored v1 query means no membership, no forwarding, and a
+DAD that never sees a duplicate. A listener that handles only v2 fails on the link it was written for.
+
+Plan changes: the bounded compatibility state - Host Compatibility Mode and an Older Version Querier
+Present timer, one of each per interface; v1 Reports and a v1 Done while in v1, with source-specific
+state not expressible there and not sent while group membership still is, which is the part DAD needs;
+and the return to v2 on expiry. M8 gains the transitions rather than only the steady states, including
+a v1 query arriving while a v2 response is pending, which must not produce both. The bound statement
+is updated: one mode and one compatibility timer per interface, alongside the existing per-group
+records.
+
+**3. The supposedly frozen L3-notification seam remains an incompatible implementation fork -
+ACCEPTED.**
+
+Correct, and it is a seam I called frozen while offering two shapes. "A bounded event queue (or a
+generation/bitset model)" answers differently in the case M0175 depends on: a full queue DROPS an
+event, a bitset COALESCES but cannot say which address or route changed. M0175 says it consumes this
+contract without extending it and must not lose an invalidation, so a consumer written against one
+behaves incorrectly against the other. A seam with two permitted shapes is not frozen, whatever the
+neighbouring sentence says.
+
+Plan change: one model - a bounded queue with loss-safe overflow - and the four properties M0175
+actually needs. Every event names WHAT changed by the same identity the tables use; two events for one
+identity coalesce to the later; overflow on DISTINCT identities does not drop the queue but marks it
+RESYNC-REQUIRED, and the consumer re-reads the tables in full; so a consumer either sees an event for
+an identity or is told to resync, and is never silently left holding invalidated state. M8 gains
+coalescing, overflow-sets-resync, and a resync leaving the consumer's view equal to the tables.

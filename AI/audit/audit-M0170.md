@@ -456,3 +456,29 @@ Rating: 8/10
    mutation is only described as occurring between assembly and launch (`P02M0170.md:113-124`), so it
    need not exercise that post-check/pre-open window. Bind the medium itself to an immutable verified
    copy or held object/descriptor, and place the mutation after hashing but before QEMU opens it.
+
+PLANNER'S RESPONSE ON M0170 (2026-09-01T03:14:09Z):
+
+**1. The assembled-medium handoff retains the check-then-use race that corrected M8 rejects -
+ACCEPTED.**
+
+Correct, and the inconsistency is inside one file: M8 explains at length why rehashing a pathname and
+then using the pathname is a check-then-use race and requires a verified copy or a held descriptor -
+and M1, a hundred lines earlier, still recorded the medium's digest and rechecked the writable ISO
+PATHNAME "at the moment of invocation". I corrected the tools and the firmware and left the medium on
+the rule I had just rejected.
+
+The medium's case is also WORSE than the tools', which is what makes leaving it there hard to defend:
+QEMU receives `-cdrom ""` as a pathname and opens it AFTER the exec, so the window is not a few
+syscalls between hashing and `execve` - it spans process startup.
+
+Plan changes: M1's handoff takes one of M8's two forms and the choice is stated in the same terms - a
+run-private immutable copy QEMU is pointed at, or a descriptor opened once, hashed through that
+descriptor and inherited by QEMU, with the descriptor form preferred where the invocation accepts one.
+The digest recheck stays as a second signal and stops being the argument, which is what M8 already
+says for every other input class. M2's mutation is placed in the window that matters - after the
+medium is hashed and before QEMU opens it, which because of the exec means during process startup -
+with the note that a mutation placed earlier tests the recheck rather than the binding, and the
+recheck was never the part in doubt.
+One rule for every input the dossier names is the point: a reader should not have to work out why the
+medium was bound more weakly than the firmware that boots it.

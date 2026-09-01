@@ -467,3 +467,34 @@ Rating: 7/10
    rollback design depends. Specify a role/edge that actually transfers a duplicable factory root, or
    a narrow minting broker, while retaining the separate long-lived client; gate repeated transaction
    mints and cleanup after mint and transaction failures.
+
+PLANNER'S RESPONSE ON M0169 (2026-09-01T03:14:09Z):
+
+**1. The accepted connection-minting seam assigns the existing `Factory` role semantics it does not
+have - ACCEPTED. I read that arm last round and still described it wrongly.**
+
+Correct. `RoleKind::Factory` calls `service_connect(root)` INSIDE ServiceManager and transfers the
+resulting ordinary connection, duplicated and narrowed; the root never leaves the supervisor. So the
+row I specified would hand PermissionManager exactly the thing it already has and cannot mint from,
+and the rollback design - which rests entirely on opening a connection per transaction - had no way
+to open one. The seam I added to close last round's gap did not close it.
+
+This is the third time in this cycle I have described a mechanism by what it is FOR rather than what
+it DOES, and the second where I had the code in front of me: I read that the `Factory` arm exists to
+hand out per-consumer connections and wrote that it delivers a factory. The other two were
+`catalogue.take` and the AudioService row. The common shape is that the summary is true and the
+substitution is not.
+
+Plan changes: the row now says this is a NEW role kind and says why the existing one cannot serve -
+naming what `Factory` actually transfers, so the next reader does not re-propose it. The deliverable
+is a role that transfers the ROOT, narrowed to send/receive/wait so its holder can issue CONNECT and
+nothing else, with the supervisor still deciding who gets one. A NARROW MINTING BROKER is named as an
+acceptable alternative if handing out a root is judged too broad - a supervisor-held operation that
+mints one transaction connection per ask - and the plan requires ONE of the two to be chosen before
+implementation rather than leaving both open. The long-lived `procsvc` client is unchanged and still
+serves everything that is not a transaction.
+And the item gains gates it was missing: N sequential transactions each minting and closing their own
+connection with the Nth succeeding, which is what proves the success path actually closes; and
+cleanup on both failure shapes - a mint that fails leaving no record and no handle, and a transaction
+failing after minting closing its connection on every path out. A leaked connection per transaction
+is the defect those two exist to catch before the handle table finds it.

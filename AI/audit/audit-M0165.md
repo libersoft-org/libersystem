@@ -812,3 +812,15 @@ pattern written from the spellings I had already seen found only those.
 
 Change: both reads go through `Node::entry()`, which answers with the RUNNING candidate when there is
 a binding and the cursor otherwise. That is the same correction the other six readers took.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0165 (2026-09-01T03:15:10Z):
+
+Current implementation rating: 5/10
+
+1. **The planned-`STOPPED` correction changes the false cause but still records a successful stop as an incident/failure.** The new `FailureCause::Stopped` label is accurate, but the event falls straight into the unconditional `capture`/`report_incident`/`incident_report = Some` path (`src/user/services/core/src/device_manager.rs:3346-3388`). The live `incident()` endpoint consequently returns `present: true` (`:3513-3524`), and the standing loop persists it under `device.policy.incident.*` (`:4093-4182`); `lsdev --incident` treats absence as "nothing has gone wrong" (`src/user/apps/tools/src/lsdev.rs:108-115`). Hiding `Stopped` only from SystemGraph does not fix those two surfaces. This contradicts the event arm's own "not a failure and must not be recorded as one" rule and leaves M3's clean planned-stop classification incomplete (`docs/todo/P02M0165.md:128-147`).
+
+2. **A dependency-lost planned stop still accepts new work and tears down dependency chains in the wrong order.** When a required provider disappears, `settle_dependencies` sets `DependencyLost` and calls `begin_dependency_stop`, but that function deliberately does not call `catalogue.withdraw_binding`; it moves the node to `Stopping` and sends `STOP` while all of its providers remain open (`src/user/services/core/src/device_manager.rs:3612-3653`). They are withdrawn only later after that binding answers or exits (`:3389-3400`). Unlike operator and shutdown stops (`:3656-3674,4662-4665`), clients can connect and submit work during the drain; in A -> B -> C, B is stopped after losing C while A still sees B published, instead of A being stopped first. This violates M3's explicit "provider withdrawn and new connections refused FIRST" rule and M4's dependents-first teardown (`docs/todo/P02M0165.md:128-167,320-322`).
+
+3. **The named publish/crash/subscribe race remains incomplete at the production seam.** The registered host test exercises `Publications`/`withdraw_slots_into` selection and transfer (`src/user/libs/driver/binding/src/tests.rs:525-599`), not DeviceManager's failure-path call or the production channel-close and subscriber-announcement side effects (`src/user/services/core/src/device_manager.rs:2126-2185,3389-3400`); the kernel check likewise simulates a crash reaction rather than executing that catalogue path (`src/kernel/test_suites/hardware.rs:531-569`). Removing the production call, close, or announcement still leaves the gates green, so M7's named no-stale-provider race and registered gate remain incomplete (`docs/todo/P02M0165.md:280-331`). The latest response explicitly accepts this remaining gap.

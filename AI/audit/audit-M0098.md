@@ -590,3 +590,13 @@ Why each is where it is, checked rather than asserted:
 So M9's clause is UNMET for the live-vector and translated-DMA halves, and the two need different
 things - a test-only arch entry point, and a fixture in the enforcing gate. Recorded rather than
 argued away.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0098 (2026-09-01T03:15:10Z):
+
+Current implementation rating: 6/10
+
+1. **Claim-generation validation is still not atomic with MSI-X programming, and the latest response's dismissal of the hardware effect is incorrect.** `sys_device_msix_acquire` releases the claim-table check before `acquire_msi_unique` (`src/kernel/syscall/mod.rs:1561-1577`), which reserves by bare device index and programs entry 0 before `register_derived` performs the next generation check (`:1598-1616`; `src/kernel/arch/x86_64/interrupts/mod.rs:198-207,264-287`). That programming writes vector-control `0` - unmasked - rather than the harmless masked entry described by the response. Forced release masks the table entry but never clears the device's MSI-X Enable state (`src/kernel/device.rs:470-575`; the common PCI path has only `msix_enable`, `src/kernel/arch/common/pci/mod.rs:697-713`), and a replacement claim restores bus mastering. An old-generation acquire can therefore touch and temporarily unmask replacement-owned hardware before the late rejection rolls it back. Even if no interrupt happens in that window, stale authority has modified replacement hardware, contrary to M2/M9's stale-generation refusal (`docs/todo/P02M0098.md:76-83,193-204,235-251`).
+
+2. **M9's live-vector and translated-DMA hostile-holder proofs remain absent, as the implementer ultimately concedes.** `a_forced_release_takes_a_live_interrupt_away` constructs `Interrupt::new(0x71)` and calls only `mark_bound`; it owns no MSI registry slot and exercises no controller or device binding (`src/kernel/object/claim/tests.rs:319-350`). `ending_a_claim_takes_the_dma_buffers_it_authorised` uses a synthetic untranslated device and checks generation/registry state, not that a claim-derived IOVA stops translating (`:512-546`). The independent IOMMU generation fixture checks stale map admission, not forced release of a live claim-derived translation (`src/kernel/iommu/tests.rs:295-335`). The required forced-release vector/DMA evidence is therefore still unmet (`docs/todo/P02M0098.md:193-204,231-252`).

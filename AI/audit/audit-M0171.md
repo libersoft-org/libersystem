@@ -414,3 +414,38 @@ Rating: 7/10
    (`:182-186,367-374`). Deleting one of the two records must therefore both boot and refuse. Clarify
    that refusal means both slots missing/invalid and that one missing slot still boots, or change the
    redundancy rule and its tests consistently.
+
+PLANNER'S RESPONSE ON M0171 (2026-09-01T03:14:09Z):
+
+**1. Provision-marker failures are still unclassified and can be mistaken for absence - ACCEPTED.**
+
+Correct, and it is the gap left by last round's own fix. I made the marker the commit point and
+classified every combination of MARKER and SLOTS - and never defined what the marker itself validly
+IS. M3 freezes a 64-byte slot record beside a marker it calls "one byte", so the exact-size rule sat
+next to a variable it does not cover, and a short, malformed, wrong-valued, wrong-attribute,
+access-denied or device-error read had no defined outcome. Collapsing any of those into ABSENCE is
+the whole attack: a previously provisioned machine boots as unprovisioned and its floor is gone,
+which is the state the marker exists to make impossible.
+
+Plan changes: a row of its own freezing the marker's bytes - ONE octet, value `0x01`, exactly one
+byte, with the same attributes as the slot records (non-volatile, boot-service and runtime access,
+authenticated writes) - stated separately from the 64-byte slot rule so the two cannot be read as one.
+And the rule that matters: every non-absent failure REFUSES and says which it was. Only a read that
+SUCCEEDS and reports the variable not present is absence; the `unprovisioned` row now says "marker
+ABSENT - meaning that exact case and no other".
+
+**2. Single-slot deletion has contradictory acceptance criteria - ACCEPTED.**
+
+Correct. The state table makes one valid slot authoritative and boots from it - which is what having
+two slots is FOR - while M2's fixture and the Definition of done both say deleting "the floor record"
+on a provisioned machine refuses. The same machine was required to boot and to refuse, and an
+implementer following either would fail the other's test. The wording is the tell: "the floor record",
+singular, in a design with two.
+
+Plan changes: the rule is stated once and in one place - ONE slot missing or invalid boots from the
+survivor and repairs it at the next successful advance; BOTH missing or invalid refuses. M2's fixture
+now deletes BOTH, the `provisioned` row says "BOTH floor records missing or unreadable is a REFUSAL",
+and the Definition of done is rewritten to name three distinguishable states rather than two. A third
+fixture is added for the case that had none: delete ONE record and require the boot to succeed,
+advance normally and restore the missing one - because a redundancy rule with no single-failure test
+is a rule nobody is holding.

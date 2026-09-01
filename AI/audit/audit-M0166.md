@@ -660,3 +660,11 @@ node is RUNNING and falls back to the cursor only for a node with no binding - w
 the other six readers now follow. With this, every reader of `candidate` that describes a live
 binding is gone; the two that remain - `start_candidate`'s own loop and `matched_rule` - run at bind
 time, where the cursor IS the entry being started, and they are correct there.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-09-01T03:15:10Z):
+
+Current implementation rating: 8/10
+
+1. **The latest retry-budget correction limits only the first retried candidate, not the operator action to one attempt.** `Retry` sets `attempt = MAX_AUTOMATIC_ATTEMPTS - 1`, rewinds an exhausted cursor, and requests a restart (`src/user/services/core/src/device_manager.rs:3758-3815`); `may_try_again` then prevents another automatic attempt of that candidate (`:2879-2883`). But when the retried candidate fails and its teardown resolves to `Failed`, `advance` returns `Step::NextCandidate` (`:3438-3450`). Both loop handlers then increment the cursor, reset `attempt = 0`, and immediately start the next candidate (`:544-557,960-968`). A multi-candidate device can therefore receive the requested one attempt on the first entry and then full automatic budgets on later entries. No one-shot state survives `NextCandidate`, so the explicit exactly-one-attempt requirement remains unmet (`docs/todo/P02M0166.md:241-249`).

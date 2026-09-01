@@ -449,3 +449,42 @@ Rating: 6/10
    `compatible`, and no existing tree supplies one to inherit (`docs/todo/P02M0172.md:246-290`). The
    harness producer and early kernel consumers can therefore choose different nodes while following
    the stated bytes. Freeze the node identity and add a producer/consumer fixture using it.
+
+PLANNER'S RESPONSE ON M0172 (2026-09-01T03:14:09Z):
+
+**1. Test/development UEFI boots have no coherent DMA-mode handoff source - ACCEPTED.**
+
+Correct, and it is the hole last round's own fix opened. Removing the "absence is expected here"
+carve-out was right - it is what let absence mean one thing everywhere - and it left the test and
+development rows required to carry a produced record with no carrier on their path. Both carriers M3
+defines are DIRECT-boot ones: an `fw_cfg` file and a device-tree property. x86_64 test and
+development boots go through OVMF, and the non-x86 UEFI rows are in scope too. And the plan never
+said what happens when a signed `BootInfo` field and a harness carrier both appear.
+
+Plan changes, two decisions made here rather than left open. The UEFI carrier for test and
+development is the SAME `fw_cfg` file: it is a machine mechanism rather than a direct-boot one,
+available to a UEFI guest exactly as to a directly booted one, and the harness already writes the
+development profile scalar through it - so one record serves both paths and `harness` provenance
+means the same thing on each. Building and signing degraded manifests for every test boot was the
+alternative and is refused: it puts a signing step in front of the suite for a value the harness
+already controls. And precedence: the SIGNED source wins, and a boot presenting BOTH refuses -
+including when they agree, because two producers that agree by luck are still two producers and the
+matrix gives each row one.
+
+**2. The accepted FDT wire contract still lacks its node identity - ACCEPTED.**
+
+Correct. I froze the property name, the byte layout, the value encodings and the malformed handling,
+and wrote "under this product's own node" - and no tree in this system defines such a node, so there
+was nothing to inherit. The harness producer and the three kernel consumers could each choose a
+different path while following every byte I had frozen, which is the exact failure freezing a record
+is supposed to prevent. Freezing the contents of a thing and not its name leaves it unaddressable.
+
+Plan changes: the node is `/libersystem`, an immediate child of the root, with
+`compatible = "libersystem,boot-policy"`, and the CONSUMER MATCHES ON `compatible` rather than on the
+path - so a machine that places the node elsewhere is still read correctly and a node with the right
+name and the wrong `compatible` is not this record. M8 gains a producer/consumer pair fixture, run
+for both carriers since they share a format on purpose, with the negatives that distinguish a frozen
+identity from a convention: wrong `compatible`, right `compatible` under a different node name
+(which must still be found), wrong length, and a `signed` provenance byte on a carrier where only
+`harness` is legal. A frozen record only one side has ever written is a record with one
+implementation.

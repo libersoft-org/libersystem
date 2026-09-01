@@ -581,3 +581,11 @@ So it needs a guest command seam - a boot-time command hook, or a test-only clie
 verb and reports. That would be used by more than this gate, which is a reason to build it properly
 rather than inside an audit response. M4 and the definition of done remain UNMET on the restart
 clause, and the gate's output should not be read as covering it.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-09-01T03:15:10Z):
+
+Current implementation rating: 8/10
+
+1. **The required controlled virtio-gpu restart/rebind under IOMMU enforcement remains unproved, and the latest claimed blocker is no longer true of the current tree.** M4 and the definition of done require the GPU to survive a restart (`docs/todo/P02M0159.md:94-97,126-131`). The acceptance gate proves one cold bind, rejects an unsolicited restart, and observes one successful presentation; it never issues disable/enable/retry (`src/tools/check-qemu-virtio-iommu-x86_64.sh:294-339`). The response says no non-interactive guest-command seam exists, but the current harness boots ordinary `run.sh` over a bidirectional Unix-serial broker and exposes `lab sh` (`src/harness/lab.py:1-16,196-224,574-648,3067-3135`), while `lsdev --disable`, `--enable`, and `--retry` already drive DeviceManager policy (`src/user/apps/tools/src/lsdev.rs:68-95`). The requirement remains unmet, and its continued deferral is no longer justified by the stated harness limitation.

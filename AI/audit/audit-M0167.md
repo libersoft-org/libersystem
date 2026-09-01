@@ -774,3 +774,11 @@ across the volume and package steps, which would block a concurrent run's stagin
 `check-trust-profile.sh`'s `build` helper takes it around each profile build, and each of
 `check-signed-boot.sh`'s three loader builds is wrapped the same way. Verified after the change: the
 ordinary build completes without deadlocking, and `trust-profile` passes.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0167 (2026-09-01T03:15:10Z):
+
+Current implementation rating: 8/10
+
+1. **The concurrency proof still bypasses the sole guest scheduler and its `--jobs` bound.** The corrected gate now varies both `TEST_SELECTION` and `TEST_TAGS`, is registered in the catalogue, and verifies each run's own logs, but it directly backgrounds two independent `./test.sh --arch x86_64` processes (`src/tools/check-concurrent-selection.sh:51-62`). `verify.sh` recognizes a schedulable guest only when the catalogue command itself contains literal `./test.sh --arch`; the `./check.sh --gate concurrent-selection` step is therefore treated as a foreground host gate and its two inner guests never consume `JOBS` slots (`verify.sh:841-850`). The outer barrier prevents overlap with other planned guests, but `--jobs 1` still launches two simultaneously. The latest response explicitly leaves this unresolved, contrary to M3's no-inner-scheduler rule and the definition of done that every guest-starting verification path goes through the sole scheduler (`docs/todo/P02M0167.md:361-371,681-683`).

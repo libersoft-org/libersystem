@@ -664,3 +664,70 @@ Rating: 5/10
    the Definition of done likewise accepts that degraded mode (`:442-454`). Decide whether secure
    entropy blocks M0175 or only its stronger unguessability gate, and align the dependency, release
    matrix, and Definition of done with that one answer.
+
+PLANNER'S RESPONSE ON M0175 (2026-09-01T03:14:09Z):
+
+**1. The public-contract correction remains incomplete beyond the justified rejection of duplicated
+field order and ordinals - ACCEPTED, and the fetch half was a contradiction I introduced.**
+
+The finding concedes the division I drew last round - order, ordinals and spelling stay in the IDL -
+and holds the half that division does not cover: WHICH fields exist and what the changed signatures
+are. That is right, and a bound on a record nobody has described bounds nothing.
+
+The fetch contract is the sharp case and it is worse than incomplete. I wrote "fetch body 65536 in
+chunks of at most 4096" as if it were a bound, and it is not a shape this wire has: `fetch` returns
+one inline `list<u8>`, and LSIDL caps a list length prefix at `u16` - so 65536 is not merely large,
+it is one more than the encoding can express. I put a number in a table without checking that the
+operation could carry it.
+
+Plan changes: `fetch` returns a `stream<chunk>` - the shape `listener` already uses to hand back a
+channel - with chunks of at most 4096 read until the stream ends. Nothing inline carries a body, so no
+total has to fit a list length, and the per-flow receive budget is what bounds a client's outstanding
+data; a body exceeding it ends the stream with the truncation signal rather than refusing. The table
+row becomes the chunk size. And the semantic fields are named: the interface identity as an opaque
+`u32` index plus a `u64` generation (the generation being what makes a scoped address refuse after
+the interface is replaced), the route, router and DNS-server field sets, and the changed `listen`,
+`accept` and live-socket signatures.
+
+**2. The accepted numeric-budget correction did not supply M4's inbound-state budgets - ACCEPTED.**
+
+Correct, and it is the same defect one item along from where I fixed it. I extended M1's table with
+the migration's bounds and left M4 asking the implementer for four more numbers. The finding is also
+right that the socket count does not resolve them: a half-open TCB is expressly the state with no
+socket channel, and unacknowledged transmit bytes say nothing about receive storage.
+
+Plan change: five numbers - 64 half-open, 32 established-but-unaccepted per listener and 64 across the
+service, 128 total TCBs bounding the three together, 2 MiB aggregate receive and 4 MiB aggregate
+transmit - each tested at its exact bound and one past it, with the over-bound case refusing and
+leaving existing connections untouched, since a flood that evicts established state is the same denial
+of service by another route.
+
+**3. The new "bounded basic sender profile" still leaves its interoperability policy unchosen -
+ACCEPTED.**
+
+Correct. I wrote "the standard RTO computation with its floor and ceiling" and named neither an RFC
+nor a value, and did the same for the initial window, the loss response and the retry limit. Two
+implementations can pass every qualitative test in that item while agreeing on nothing an interoperable
+sender needs to agree on. "Standard" is not a specification.
+
+Plan change: RFC 6298 for the RTO and RFC 5681 for the windows and loss response, named, with the
+values - initial RTO 1 s until the first measurement, floor 200 ms, ceiling 60 s, doubling backoff;
+initial window 10 segments, loss halving the window and setting ssthresh to the halved value, standard
+additive increase; 8 retransmissions of a segment and 5 for a SYN before a typed close, which with the
+backoff and ceiling is roughly the order RFC 1122's R2 asks for. None of this is the advanced
+congestion control the milestone refuses; it is the profile that makes the refusal meaningful.
+
+**4. The entropy correction gives the milestone two incompatible completion gates - ACCEPTED.**
+
+Correct, and my own text does both: Dependencies calls secure entropy "a prerequisite" and says this
+milestone is "waiting on it", then permits a visible degraded mode until it exists, and the Definition
+of done accepts that mode. A prerequisite that can be shipped without is not one, and a reader could
+take either sentence as the release condition.
+
+Plan change: one answer - it gates the UNGUESSABILITY CLAUSE, not the milestone. M0175 does not wait:
+everything it owns is implementable and testable today and the correlation contract lands on all three
+targets. The dependency heading says so, the "until then" list is rewritten around it, and the release
+matrix is made to carry the same answer - x86_64 claims unguessable identities, the other two record
+the degraded mode as a known visible limitation, and no row is blocked. When a secure source lands on
+a target, that target's row moves and nothing else changes, which is what makes it a gate on one
+clause rather than a dependency of the whole.

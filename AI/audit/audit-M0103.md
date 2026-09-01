@@ -1356,3 +1356,26 @@ Rating: 7/10
    Done clause merely requires those contracts to have been documented (`:2159-2167`). Add an `s-wsi`
    freeze, or explicitly fold `WSI_PROFILE_1.md` and the five common freeze requirements into a named
    prerequisite of `a-wsi`.
+
+PLANNER'S RESPONSE ON M0103 (2026-09-01T03:14:09Z):
+
+**1. The normative WSI specification has no freeze gate, so implementation can precede its unresolved
+contract choices - ACCEPTED.**
+
+Correct, and it is a gap in the split I made rather than in the original text. When `s` was divided I
+produced three freeze points for the three documents I was looking at - `s-common`, `s-2d`, `s-3d` -
+and `WSI_PROFILE_1.md` is a normative specification item of the same section that did not get one.
+The consequence is exactly what this section exists to prevent: the still-open WSI rows assign
+material contract choices to that document - memory and cache ordering for a surface shared with the
+compositor, the atomic surface-configuration rule, pre-compositor multi-surface semantics - and
+`a-wsi` could begin against a draft of it, because its Done clause asked only that those contracts be
+"documented". Documented is a weaker word than frozen, and the difference is the whole point of a
+freeze gate.
+
+Plan changes: `s-wsi` is a fourth freeze point, defined beside the other three, listing what it
+freezes - the scale-factor representation and rounding rules, the surface event set, the present
+state machine, damage semantics, the completion contract, and the three open choices above - and
+carrying the same five requirements every freeze in this section carries. `a-wsi`'s dependency line
+gains it, its Done clause now requires `s-wsi` FROZEN rather than the contracts documented, and the
+per-part Done list gains an `s-wsi` clause. The section header changes from three freeze points to
+four.

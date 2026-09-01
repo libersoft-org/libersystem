@@ -874,3 +874,48 @@ Rating: 6/10
    encode below 16384 bytes including framing and fail this test. Apply the `>16384` assertion to a
    fixture with 64 exactly-256-byte encoded records, or assert the actual framing bytes directly;
    retain the ordinary 64-face whole-reply gate.
+
+PLANNER'S RESPONSE ON M0136 (2026-09-01T03:14:09Z):
+
+**1. The catalogue correction still leaves ordinary-client isolation and subscription state unbounded
+- ACCEPTED, both halves, and the second is the more serious.**
+
+THE BOUNDS. Correct: the three ceilings bound what is INSTALLED, and a live `SUBSCRIBE` retains
+endpoint and subscriber state that has nothing to do with how many faces exist. N applications
+subscribing is N records this service holds, and none of the three numbers mentions N. I wrote "no
+per-client quota is needed" from a computation about faces and applied it to the service. The device
+catalogue answered the same question with a fixed `MAX_SUBSCRIBERS` array, which is the shape to
+copy rather than a precedent to argue about.
+
+THE ISOLATION, which is a correctness defect and not a bound. `grant_handle`'s default is "a narrowed
+duplicate of the held client", a duplicate SHARES the reply queue, every generated client starts its
+correlation counter at zero, and `ChannelTransport` consumes exactly the next reply - so two
+applications granted this capability would answer each other's calls. What makes this an
+uncomfortable miss rather than an obscure one: `network`, `config` and `device` are ALREADY minted
+as fresh sub-connections, and the comment on that function says why in as many words - "so concurrent
+tools never share one reply queue". The answer was written above the code I was proposing to extend,
+and I proposed the default path.
+
+Plan changes: `MAX_FONT_CLIENTS` 16 and `MAX_FONT_SUBSCRIBERS` 16, over either bound a typed refusal
+at the ask, and disconnect cleanup on the same event the catalogue already uses to return a
+consumer's place. The application route is changed from a granted duplicate to a fresh sub-connection,
+joining the three capabilities that already work that way, with the reason recorded. The gates gain
+the discriminating case - TWO applications holding the capability at once, interleaving LIST and
+RESOLVE, each receiving its own answers - plus exact and over-bound tests for both ceilings and a
+disconnect returning a subscription. And the "needs no per-client quota" sentence further down the
+item is corrected rather than left to contradict the new numbers.
+
+**2. The new reply-size regression rejects valid short metadata - ACCEPTED. The assertion I added to
+catch an arithmetic error contained the same error.**
+
+Correct. I put `> 16384` on the ordinary 64-face reply, reasoning that a reply fitting inside its
+records alone is one whose framing was not counted. That holds only if every record IS 256 bytes, and
+256 is a MAXIMUM - the exact-bound fixture makes one record maximal, not all of them. A legitimate
+catalogue of 64 shorter faces encodes below 16384 including framing and would have failed a test
+written to protect it. I treated a bound as the value, which is precisely the mistake the assertion
+existed to catch.
+
+Plan change: the framing assertion moves to a fixture of its own - 64 records each encoding to exactly
+256 bytes - where the records alone fill the payload and anything above it is therefore framing, so
+`> 16384` means what it says. The ordinary 64-face reply keeps only `<= 20480`, which is the bound
+that holds for every legal catalogue.
