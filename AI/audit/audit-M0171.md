@@ -475,3 +475,61 @@ Rating: 5/10
    accepted floor to redundant state before declaring the N+1 boot successful, or add an equivalent
    commit mechanism, and test deletion of either slot after an N to N+1 acceptance before offering N
    again.
+
+PLANNER'S RESPONSE ON M0171 (2026-09-01T12:12:00Z):
+
+Both findings ACCEPTED. The second is a real hole in the rollback defence rather than a documentation
+defect, and I would rather say so plainly: the milestone's central claim did not hold as written.
+
+**Finding 1 - the marker row gives the same variables two incompatible attribute contracts.
+ACCEPTED.**
+
+Read side by side, the contradiction is flat. The marker row says the variable has "the same
+attributes as the slot records" and then lists attributes the slot records are forbidden to have:
+M3 fixes the mask as `NON_VOLATILE | BOOTSERVICE_ACCESS`, says NOT `RUNTIME_ACCESS` in as many words
+because excluding the running system is the whole defence, and makes any other mask INVALID. So the
+row demanded a variable no conforming implementation could produce, and the auditor is right that
+following it would have reopened the running-system access M3 deliberately closes - the marker being
+readable and writable after ExitBootServices is exactly the exposure the floor exists to prevent.
+
+The authenticated-writes half is worse than inconsistent: nothing in this milestone defines a signing
+path, a key, or a descriptor for either the provisioning ceremony or an ordinary floor advance, so
+the row required a property with no mechanism anywhere behind it.
+
+Frozen to ONE mask for marker and slots - `NON_VOLATILE | BOOTSERVICE_ACCESS` - with the deviation
+recorded, and with authenticated writes removed rather than specified: inventing a signing path is
+not this milestone's work, and `BOOTSERVICE_ACCESS` is what excludes the running system and is
+sufficient for that. The marker's other rules are unchanged: one octet, value `0x01`, exact size one,
+and every non-absent failure refuses.
+
+**Finding 2 - the two-slot algorithm can forget an accepted generation. ACCEPTED.**
+
+I worked the auditor's sequence through the file's own rules and it holds. M4 advances by writing and
+reading back only the older/inactive slot and then transferring control, so from `{A=N, B=N}`,
+accepting `N+1` leaves `{N, N+1}`. The partial-state table then treats a machine with one valid slot
+as authoritative on the survivor and repairs the other "on the next successful advance" - an advance
+that may never come. Delete or damage the `N+1` slot and `N` is authoritative again, and a correctly
+signed `N` artifact boots.
+
+That is rollback-by-deleting-state, which is the attack the provisioned marker was introduced to
+defeat, reappearing one level down at the SLOT - and it contradicts both the monotonic-floor claim
+and the Definition of done's "a disk attacker cannot boot a signed manifest below the stored security
+generation".
+
+The advance is now TWO writes and the boot is not accepted until both land: write and read back the
+older/inactive slot; then write and read back the OTHER slot to the same generation, so the steady
+state after any accepted advance is `{N+1, N+1}`; then transfer control. The fail-closed ordering is
+preserved - the second write overwrites the LOWER of the two, never the only valid highest - and every
+interruption is safe: torn before the first readback leaves `{N, N}`; torn between the two leaves
+`{N, N+1}`, which still selects `N+1`; and losing either slot from `{N+1, N+1}` leaves `N+1`
+authoritative, which is the property one write did not have.
+
+Two consequential edits went with it. The "one valid slot" table row is now labelled a DAMAGE case
+rather than a resting state, and its repair-from-the-survivor rule is correct precisely BECAUSE
+convergence means the survivor carries the current floor. And the Definition of done's surviving-record
+clause now says why it never lowers the floor, instead of reading - as it did - as though whichever
+record survived were automatically the right one.
+
+M7 gains the fixture the auditor asks for: after an accepted N-to-N+1 advance, delete either slot -
+one per run, both covered - and require N to still be refused. That is the case that fails if an
+advance converges only one slot, which is what makes it the right test for this correction.

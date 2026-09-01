@@ -514,3 +514,45 @@ Rating: 7/10
    (src/user/services/core/src/service_manager/bootstrap.rs:161-175). Because the per-transaction
    connection is M2's rollback owner for lost replies, implementation cannot begin until this seam is
    actually selected and specified.
+
+PLANNER'S RESPONSE ON M0169 (2026-09-01T12:12:00Z):
+
+**Finding 1 - the connection-minting correction defers its authority and API choice. ACCEPTED.**
+
+The auditor is right, and right for the reason that makes it blocking rather than untidy. M2's
+rollback OWNER is the per-transaction connection: what makes a lost reply recoverable is that the
+connection it was owed on is closed on every failure path. A milestone cannot be implemented while
+the seam that PRODUCES that connection is one of two materially different designs, and the two are
+not variants of one mechanism - they differ in who holds authority, in what the manifest carries, and
+in what a mint failure means.
+
+I also confirmed the previous round's premise, since it is what made the choice necessary: neither
+thing exists today. `RoleKind::Factory` calls `service_connect(root)` inside ServiceManager and
+transfers the resulting ordinary connection, so a `Factory` row hands over exactly what
+PermissionManager already has and cannot mint from; and there is no broker.
+
+Offering both and telling the implementer to pick was the same defect this file already refuses at
+M5 - "a previous version offered two designs and told the implementer to choose; that is not a choice
+a test matrix can be written against" - so leaving it at M2 was inconsistent with the file's own
+standard.
+
+CHOSEN: the new manifest role kind that transfers the ROOT, narrowed to send/receive/wait. The plan
+now records the decision, and records the broker as REFUSED rather than deleting it, so the next
+reader does not re-propose it. Three reasons, written into the plan:
+
+- authority stays where every other role puts it. The supervisor decides who gets a row; a broker
+  moves that decision into a running service's request handler, which is a second admission point
+  with its own bugs and its own audit surface.
+- there is nothing to specify. A role kind delivers a handle at start-up and the validator already
+  checks rows. A broker needs an operation, an ownership contract, a ceiling, a refusal shape and a
+  lifetime rule for a connection it handed out and no longer holds - all of which this milestone
+  would have to invent and none of which it needs.
+- the narrowing is identical either way. The holder receives the root narrowed to send/receive/wait
+  so it can issue CONNECT and nothing else; a broker does not make that narrower, it only moves who
+  applies it.
+
+The deliverable is now exactly one new `RoleKind`, its manifest spelling, its validator admission,
+its delivery in ServiceManager's bootstrap, and the single row that uses it - PermissionManager over
+ProcessService - with a gate that the holder can CONNECT and can do nothing else with the handle,
+watched to fail by widening the rights, and that no other row in the shipped manifest carries the
+kind.

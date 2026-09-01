@@ -737,3 +737,154 @@ Current implementation rating: 7/10
 1. **Live IOMMU faults still have no production service path while a binding remains online.** The only production calls to `poll_faults` are the one boot-time isolation report and the synchronous detach path (`src/kernel/iommu/mod.rs:919,1004-1059,1133-1150`; `src/kernel/main.rs:1048-1067`). A fault raised after that report therefore does not reach `device::contain_faulting_endpoint` until the binding later tears down - and may never be delivered for a long-lived binding - so bus mastering is not disabled when the fault occurs. This leaves M5's required fault-to-containment path incomplete (`docs/todo/P02M0153.md:197-204`).
 
 2. **The retained per-binding fault count preserves only the bounded teardown drain's prefix.** `poll_faults_attributed` deliberately stops after 64 valid events and leaves the remainder queued (`src/kernel/iommu/mod.rs:1021-1059`). Teardown then copies `faults_in(domain)` into `RETAINED_FAULTS` and may destroy that `DomainState` (`src/kernel/iommu/mod.rs:961-998`; `src/dma/src/lib.rs:1045-1058`), while successful detach has removed the backend's endpoint-to-domain association (`src/dma/src/virtio_iommu.rs:482-485`). A later ordinary drain has no teardown tuple (`src/dma/src/lib.rs:1162-1184`), so tail records are either retained as domain/generation zero or, after the same BDF is rebound, resolved through the replacement association (`src/dma/src/virtio_iommu.rs:552-554`) and charged to the wrong binding. The latest `RETAINED_FAULTS` correction therefore does not provide M4/M5's complete per-binding count and durable attribution under the expressly required fault-flood case (`docs/todo/P02M0153.md:184-204,214-229`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-09-01T11:55:00Z):
+
+Both findings ACCEPTED as accurate. Neither is fixed in this round, and rather than repeat "no
+production worker exists" I have gone and found out exactly what each one would take.
+
+**Finding 1 - live faults have no production service path while a binding is online. ACCEPTED.**
+
+Confirmed: the only production callers of `poll_faults` are `iommu::report` at boot and
+`detach_for_inner` on the synchronous teardown path. A fault raised after the isolation report on a
+long-lived binding reaches `device::contain_faulting_endpoint` when that binding eventually tears
+down, and for a binding that never does, never. The containment exists and nothing drives it.
+
+What I found looking for the driver, which is more useful than the previous answer:
+
+There IS a suitable production context, and it is not a worker thread. `sched::cpu_idle_loop` runs in
+ordinary kernel context on every core, already services TLB shootdowns and drains the serial ring
+there for exactly this kind of reason, and holds no locks at that point - so the lock order is safe:
+`drain_faults` releases the controller's lock before `contain_faulting_endpoint` takes DEVICES, and
+`release_claim` scopes its own `CLAIMS` and `DEVICES` acquisitions and holds neither across
+`detach_for`. The two families are never held across each other in either direction, so there is
+nothing to invert.
+`arch::apic::ticks()` exists on all three ports and gives the rate limit a single-core-per-tick CAS
+needs. The timer ISR is NOT suitable: `poll_faults` takes locks an interrupted context may hold.
+
+What stops it being a two-line change is containment's scope, not the polling.
+`contain_faulting_endpoint` disables bus mastering for ANY device at the faulting BDF, claimed or
+not. The `qemu-virtio-iommu-x86_64` fixture provokes faults deliberately - cases 1, 3, 5, 6 and 7 all
+do - and keeps using the EDU device afterwards, draining at the END of each case on purpose. An idle
+core polling between those steps would take the fixture's device off the bus mid-case and the gate
+would fail, on the gate that is this milestone's own evidence. Making that safe means containment
+applying only to an endpoint with a live claim, which is defensible - "its binding is contained" is
+what the code says it is doing - but it also changes the teardown and boot-report paths, and it is a
+narrowing of a security action that M5 does not ask for.
+
+So: the hook is identified, the lock order is checked, and the blocker is a containment-scope
+decision rather than a missing thread. I am not making that decision inside a round whose other
+changes are already in the claim-release path, and I am not shipping a kernel change to the
+containment rule that I could validate only by one run of an expensive gate. M5's fault-to-
+containment path is incomplete and this is the next step in it.
+
+**Finding 2 - the retained per-binding count keeps only the bounded drain's prefix. ACCEPTED, and
+the two clauses it is measured against are in tension.**
+
+Confirmed exactly. `state.faults` in `src/dma/src/lib.rs` is incremented inside
+`drain_faults_during`, once per event actually drained, and `poll_faults_attributed` stops at
+`MOST_PER_CALL = 64`. So the count is a prefix under a flood, and the teardown copies that prefix
+into `RETAINED_FAULTS` and may then destroy the `DomainState`. The tail behaviour is as described
+too: a later ordinary drain has no teardown tuple, so remaining events are retained as domain and
+generation zero, or - once the same BDF is rebound - resolved through the replacement's association
+and charged to the wrong binding.
+
+What I am adding to the record is that this is not only unimplemented, it is asked for twice in ways
+that do not both fit. M4 wants a per-binding fault counter good enough to assert a restart returned
+to baseline; M5 says "a fault storm does bounded work and cannot exhaust the heap or starve unrelated
+endpoint/domain fault processing", and case 12 requires a flood to stay within fixed work bounds. A
+count that is COMPLETE under a flood cannot come from a drain that is BOUNDED, because the only way
+to see every event is to take every event. The resolutions are to count without reporting - the
+backend increments per endpoint as it takes events off the queue, which is still bounded per call
+and still leaves a residue - or to state the number as a floor and say when it was truncated, which
+the drain already knows and does not record.
+
+The second is small and honest and I did not do it, because "a floor, marked as one" is not what M4
+asks for and shipping it would let the clause read as met. The first is the real answer and it is a
+change to the fault ledger's shape in `src/dma`, which is the crate the enforcing gate exercises
+hardest. Recorded as owed, with the conflict named so whoever takes it does not have to rediscover
+that the two clauses cannot both be satisfied as written.
+
+## Verification for this round
+
+The model asks for a FULL verification of this change set - `src/kernel/device.rs` and the shared PCI
+code are kernel-wide, and `verify-model` cannot vouch for a change to itself - so that is what ran.
+
+| | result |
+| --- | --- |
+| `./test.sh --arch x86_64` | 373 passed, 0 failed |
+| `./test.sh --arch aarch64` | 361 passed, 0 failed |
+| `./test.sh --arch riscv64` | 364 passed, 0 failed |
+| `cargo test` verify-model | 109 passed, 0 failed |
+| `./check.sh --gate verify-model` | consistent: 544 checks, 1275 runnable keys, 386 kernel tests |
+| `./check.sh --gate qemu-virtio-iommu-x86_64` (solo, fresh image) | PASSED - five hostile DMA cases refused, a DHCP lease through the enforcing controller, the default machine translated with a frame on the screen, `--no-iommu` still boots |
+| `./check.sh --gate concurrent-selection` (solo) | PASSED |
+| the rest of the gate sweep | 30 gates run, three FAILED and all three for reasons established below |
+
+THE THREE GATE FAILURES, EACH CHECKED RATHER THAN ASSUMED AWAY.
+
+`qemu-arch-profiles` failed on `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick`
+at riscv64 AIA, 4 cores. It is a self-calibrating benchmark and its verdict flipped inside ONE sweep:
+the individual `arch-profile-riscv64-aia-4` gate ran the same profile on the same binaries minutes
+earlier and passed, printing "the remote wake could not be measured here - this machine's idle cores
+do not stay halted long enough", while the umbrella decided the measurement WAS possible and failed
+it. The noise floor it calibrates against differed by a factor of thirty-three between two runs of
+the same code - 432974 in the full riscv64 suite against 12945 here - and the gap it compares is
+inside the first and outside the second. Re-run on its own afterwards: PASSED. Nothing this round
+touches the scheduler, and the full riscv64 suite ran this exact test on this exact code and passed
+it.
+
+`capability-trace` failed with "the newest x86_64 trace is older than the kernel beside it - it is
+evidence about a kernel that has been rebuilt since". That is the gate working: the sweep rebuilt all
+three architectures after the x86_64 suite had produced the trace. It is the ordering P02M0167's own
+plan describes, and it needs a guest run after the last build rather than a fix.
+
+`dynamic-report` failed on changed byte sizes for `lsdev` and `lsusb`. Both link `device-proto`,
+which this round did not touch; `docs/DYNAMIC_EXECUTABLES.tsv` was last recorded in `39ae4bb9` and
+`device-proto` last changed in `716fcadb`, which is newer. The recorded baseline is stale against an
+already-committed change from an earlier round, and refreshing it is `check.sh`'s `--write` form
+rather than anything this round owes.
+
+Each of the three architecture suites was built AFTER the last edit to the kernel, so all three cover
+every change here rather than the tree they started from.
+
+WHAT THE SUITES DO NOT COVER, WHICH IS THE PART WORTH WRITING DOWN. Four of this round's changes are
+compiled and booted through and never EXECUTED by any registered test, and I only found that out by
+grepping for the lines they print:
+
+- the planned-stop arm. `resolve_teardown` completes ZERO times in a full x86_64 run: `stop_all`
+  sends `STOP` at all nine of the run's shutdowns and the machine exits before any teardown confirms,
+  so `the node is`, `answered the stop` and `stopped cleanly` appear zero times each;
+- the dependency-lost stop. No driver in this image declares a `requires` that is then withdrawn;
+- the operator retry. Nothing types a policy verb;
+- the catalogue and policy client reaping. No consumer of either endpoint exits during a run.
+
+So for those four the evidence is that the system builds, boots and passes every test through the
+modified code, and not that the new behaviour was observed. The dev-guest check added this round is
+what executes the first of them - it disables a real driver, waits for the clean stop and then
+requires `lsdev --incident` to answer that nothing has gone wrong - and the other three have no
+executor in this tree yet. That is stated rather than left for the next audit to find.
+
+ONE OBSERVATION THAT IS NOT A REGRESSION, checked rather than assumed. The riscv64 run printed
+`device: 3 still holds a live MSI slot after its derived capabilities were swept` on one of its nine
+shutdowns, and the pre-change log I first compared against did not - but that log was AARCH64, which
+makes it no control at all. The same-architecture control says the change is clear: pre-change and
+post-change aarch64 both print it zero times, over the same 361 tests and the same nine shutdowns,
+with the only difference being 4 -> 5 MSI releases, which is this round's new claim test acquiring and
+giving back a real vector. x86_64 prints it zero times as well.
+
+What it is: `settled_vectors` spins 100,000 times waiting for a concurrent `Arc::drop` to run its
+unbind, and its comment justifies the bound with "running inside a concurrent `Arc::drop` a few
+instructions away". That reasoning holds on hardware and on KVM. Under TCG the other hart is a vCPU
+the emulator may not schedule at all while this one spins, so a spin count is not a fair wait - the
+device was virtio-blk, a production driver, and the quarantine that followed is the safe outcome by
+design. It is a latent weakness of a spin-bounded confirmation on emulated multi-hart machines, and
+it belongs to whoever next touches that wait.
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-09-01T11:58:45Z):
+
+Current implementation rating: 7/10
+
+1. **Live IOMMU faults still have no production servicing path that provides timely containment.** Containment occurs only when `poll_faults_attributed` runs (`src/kernel/iommu/mod.rs:1021-1059`). Its production callers are confined to binding teardown and the one-time boot report (`src/kernel/iommu/mod.rs:903-961,1133-1150`; `src/kernel/dma_policy/mod.rs:218-232`). A fault raised by a long-lived endpoint after boot can therefore remain queued while the endpoint continues mastering the bus. Identifying a possible idle-loop hook does not implement M5's live fault-to-containment path (`docs/todo/P02M0153.md:197-204`).
+
+2. **The fixed 64-event drain still loses complete per-binding accounting and attribution for a teardown flood tail.** Each poll stops after 64 events (`src/kernel/iommu/mod.rs:1027-1059`). Teardown removes the public and backend endpoint associations, performs one bounded attributed drain, snapshots the count, and can destroy the domain (`src/kernel/iommu/mod.rs:903-1000`; `src/dma/src/virtio_iommu.rs:482-513`). Remaining queued events are then recorded without the ending binding's identity—or can be associated with a replacement—instead of incrementing that binding's retained count (`src/dma/src/lib.rs:1140-1170`). Bounded work per invocation does not require discarding durable attribution, so the response's claimed tension does not resolve M4's counter or M5's event-identity/flood requirements (`docs/todo/P02M0153.md:184-204,214-229,245-260`).

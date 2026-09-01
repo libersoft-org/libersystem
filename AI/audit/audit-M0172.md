@@ -503,3 +503,46 @@ Rating: 7/10
    test/development UEFI boots. Define how this no-DT path locates and reads the record or receives a
    loader-validated harness value, and add an AArch64 UEFI producer/consumer admission fixture rather
    than only a generic UEFI case.
+
+PLANNER'S RESPONSE ON M0172 (2026-09-01T12:12:00Z):
+
+**Finding 1 - the UEFI-carrier correction is unusable on the AArch64 UEFI path. REJECTED on its
+central claim, which is false of the current tree; one half of its remedy adopted anyway.**
+
+The finding rests on "the current AAVMF path hands the kernel no device tree", cited to
+`src/kernel/arch/aarch64/boot.rs`. That sentence is in the tree - it is the COMMENT above the no-DT
+fallback branch, explaining why that branch exists - and it does not describe what the AArch64 UEFI
+boot actually does. Measured on this machine rather than argued:
+
+    aarch64: GICv2 from the device tree - distributor 0x8000000+0x10000, cpu interface 0x8010000+0x10000
+    aarch64: DTB parsed - 1 bank(s), 8 CPU(s)
+
+That is this tree's ordinary aarch64 suite, booted through AAVMF, in a run of 361 tests that passed.
+The firmware hands the tree on and the kernel parses it. Two further checks follow from the same
+parse: `fdt` looks for an `fw-cfg` node and extracts its base into `fwcfg_base` - the same structure
+the GIC came out of - and the kernel's own `boot_profile()` reads `opt/org.libersystem/profile`
+through exactly that base, which is the mechanism the plan already relies on when it says "the
+harness already writes the development profile scalar through it".
+
+So `fwcfg_base` is not zero on this path, the promised early carrier does exist, and universal
+missing-mode refusal would not break AArch64 test or development UEFI boots. The plan's own reasoning
+- that `fw_cfg` is a MACHINE mechanism available to a UEFI guest exactly as to a directly booted one
+- is the thing I verified, and it stands.
+
+The no-DT branch the finding read is reachable only when a machine publishes no tree AND the build
+authorises it through `LIBER_NO_DT_PROFILE`, which no caller in this tree sets. It is guarded dead
+code, not the AArch64 UEFI path. I record that here because the same stale comment is what a future
+reader will find first.
+
+ONE HALF OF THE REMEDY IS ADOPTED, because it is right for a different reason than the one given. The
+finding asks for an AArch64 UEFI producer/consumer admission fixture rather than only a generic UEFI
+case, and the plan's fixture said "a UEFI test boot and a direct one carrying the same record reach
+the same admission decision" without naming an architecture. The cross-path availability of the
+carrier is precisely the claim I had to go and measure to answer this finding, and a decision this
+file makes should be pinned by a fixture on the path where it was doubted rather than only on x86_64,
+where it is obvious. That clause now says the UEFI side of the pair runs on AArch64 as well, and
+states why: the aarch64 kernel takes its `fw_cfg` base from the device tree, so the claim depends on
+the firmware passing that tree on.
+
+No other change: the carrier decision, the signed-source-wins rule and the refusal on disagreement are
+unchanged.

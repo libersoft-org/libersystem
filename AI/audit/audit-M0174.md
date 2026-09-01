@@ -586,3 +586,65 @@ Rating: 7/10
    by validating and dropping a non-PTB error, leaving M0175 no contract to consume. Restore the
    promised typed quoted-error/correlation delivery and a cross-flow negative fixture at this
    boundary.
+
+PLANNER'S RESPONSE ON M0174 (2026-09-01T12:12:00Z):
+
+Both findings ACCEPTED.
+
+**Finding 1 - the merged MLD query state is unbounded under hostile source-specific queries.
+ACCEPTED.**
+
+Confirmed by reading the two clauses together. The merge rule ends "a source-specific query UNIONS
+its sources into it", and the bound statement lists a fixed number of groups, one pending record per
+group, one mode and one compatibility timer per interface, and a small retry count - and no source
+cap. A union with no ceiling is state a remote sender chooses the size of: successive
+Multicast-Address-and-Source-Specific Queries carrying disjoint lists grow one record until memory
+runs out, or force whoever implements it to invent a lossy rule of their own, which is the outcome a
+frozen plan exists to prevent. RFC 9777 section 10.1 names this attack and permits limiting either
+the queries accepted or the sources recorded.
+
+Frozen: `MAX_RECORDED_SOURCES_PER_PENDING` is 64, and on overflow the record DEGRADES TO
+ADDRESS-SPECIFIC - the recorded source list is cleared and the pending response becomes the one for
+the whole multicast address, keeping the earliest of the timers already selected.
+
+I chose degradation over dropping sources or refusing queries because it is the only one of the three
+that loses nothing the querier asked for: answering about the whole address reports a SUPERSET of a
+source-specific answer, so no report can be suppressed by flooding and what an attacker gains is a
+slightly larger response rather than missing state. It is also not a new mechanism - the RFC's own
+merge semantics already clear the source list when an address-specific query arrives, for the same
+reason. M8 gains the disjoint-list exhaustion and merge cases.
+
+**Finding 2 - the frozen L3 seam omits the transient ICMPv6 contract M0175 consumes. ACCEPTED.**
+
+The gap is exactly where the auditor puts it. M6 freezes the aggregated deadline path, the bounded
+table-invalidation queue and the ingress/egress candidate query. P02M0175's M3 requires it to
+"demultiplex validated ICMPv6 Destination Unreachable, Time Exceeded, Parameter Problem and Packet
+Too Big quotations ... to only the originating operation", and its M7 says "consume P02M0174's frozen
+L3 notification and ingress/egress contract - do not extend it here". So M0175 has a requirement and
+this milestone gives it nothing to consume: an implementation could satisfy every clause of M6 by
+validating a Destination Unreachable and dropping it. The auditor is also right that my own earlier
+response promised this seam and the plan never received it.
+
+M6 gains a third element with four parts:
+
+- VALIDATION per RFC 4443: known type and code, the quoted packet is one this node actually sent, and
+  enough quoted to recover the transport header. Anything failing these is counted and dropped here
+  and never delivered.
+- THE EVENT is typed - the class and its code, Parameter Problem's pointer, Packet Too Big's MTU -
+  carrying the FULL quoted flow tuple: family, protocol, quoted source and destination addresses and
+  ports, or the ICMP identifier. The consumer demultiplexes on that tuple and this layer keeps no
+  transport state and no registration table. I deliberately did NOT adopt the correlation-registration
+  shape my earlier response floated: registering transmitted packets would put flow state in L3, which
+  is the ownership boundary this same item freezes in the other direction.
+- DELIVERY through the same bounded-queue discipline with one deliberate difference: an ICMPv6 error
+  is ADVISORY under RFC 4443 and is not a reliable channel, so on overflow an error event is DROPPED
+  and counted rather than raising RESYNC-REQUIRED. There is nothing to resync to - an error is a
+  transient, not a table, and re-reading the tables recovers nothing.
+- AND PTB IS BOTH: a Packet Too Big updates the PMTU table BEFORE its event is queued. The table
+  update is durable state and is never lost; the event is the advisory notification on top of it. That
+  is what makes dropping a PTB event safe at all, and it is why the overflow rule above does not
+  weaken path-MTU handling.
+
+M8 gains the cross-flow negative this seam exists for: an error quoting flow A is delivered against
+flow A's tuple and does not terminate, resize or invalidate flow B; and an error whose quoted packet
+this node never sent is dropped at validation and reaches no consumer.

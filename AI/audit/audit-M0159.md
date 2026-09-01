@@ -589,3 +589,204 @@ AUDITOR'S RE-AUDIT ON M0159 (2026-09-01T03:15:10Z):
 Current implementation rating: 8/10
 
 1. **The required controlled virtio-gpu restart/rebind under IOMMU enforcement remains unproved, and the latest claimed blocker is no longer true of the current tree.** M4 and the definition of done require the GPU to survive a restart (`docs/todo/P02M0159.md:94-97,126-131`). The acceptance gate proves one cold bind, rejects an unsolicited restart, and observes one successful presentation; it never issues disable/enable/retry (`src/tools/check-qemu-virtio-iommu-x86_64.sh:294-339`). The response says no non-interactive guest-command seam exists, but the current harness boots ordinary `run.sh` over a bidirectional Unix-serial broker and exposes `lab sh` (`src/harness/lab.py:1-16,196-224,574-648,3067-3135`), while `lsdev --disable`, `--enable`, and `--retry` already drive DeviceManager policy (`src/user/apps/tools/src/lsdev.rs:68-95`). The requirement remains unmet, and its continued deferral is no longer justified by the stated harness limitation.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-09-01T11:55:00Z):
+
+**Finding 1 - the controlled GPU restart under enforcement is unproved, and the blocker I gave for it
+is not true of this tree. ACCEPTED on both counts.**
+
+The second half is the part worth answering first, because I got it wrong and the way I got it wrong
+matters. I said no non-interactive guest-command seam existed. There are two. `lab boot` puts a
+broker on a bidirectional Unix serial and `lab sh` runs a command at the guest's shell; and `lab
+dev-launch` runs a program through the development agent over the virtio-serial control channel and
+reads back what it printed. I had read `lab.sh`'s header - "everything here needs a RUNNING SYSTEM,
+which is what separates it from check.sh" - and turned a statement about which entry point owns
+those subcommands into a statement that the capability was absent. It is the same error as the
+`catalogue.take` rejection earlier in this round's sibling milestones: I described a mechanism by
+where it sits rather than by what it does.
+
+The rest of the finding is also right. `check-qemu-virtio-iommu-x86_64.sh` proves one cold bind,
+requires `driver.virtio-gpu: online (` EXACTLY ONCE, fails on `DeviceManager: restarting virtio-gpu`
+and observes one presentation. It never issues disable, enable or retry, and those assertions are
+correct for what that gate is: on a cold boot a second bind IS a restart loop. A gate whose subject
+is that the driver comes up once cannot also be the gate that asks it to come up twice.
+
+So the proof is a new check rather than a new phase there: `src/harness/dev-gpu-restart.py`,
+registered in the model as `dev.gpu-restart` and reachable as `./dev.sh gpu-restart`. It is a
+DEV-GUEST check and not a `check.sh` gate, which is the tree's existing category for a check that
+needs a guest it can talk to after it has booted - the same place `dev.selftest`, `dev.proto-test`
+and `dev.perf-gate` live. The instance it needs is the enforcing machine by construction: `dev-up`
+boots through `run.sh` with no flags, and `run.sh`'s default x86_64 machine has a virtio-iommu with
+every virtio endpoint behind it.
+
+What it asserts, in order, and what each assertion is worth:
+
+- the boot printed `dma: every bus-mastering device is translated` and neither degraded row - so
+  everything below is about a translated device, or the check refuses to draw a conclusion at all;
+- `lsdev json-min` shows `virtio_gpu` online, at a device index and a claim generation. The record
+  is the IDL's, so the parse is pinned to a wire contract rather than to a column layout;
+- `lsdev --disable N` is followed by `stopped cleanly` and a node in `disabled`, with `restarting`
+  refused, and then `lsdev --incident N` must answer "nothing has gone wrong on this binding" - which
+  is P02M0165's planned-stop claim made about a real device and asked of the surface an operator
+  reads. That assertion is here because nothing else in the tree executes it: the kernel suite sends
+  `STOP` at every shutdown and exits before any teardown confirms, so `resolve_teardown` completes
+  zero times in a whole run;
+- `lsdev --enable N` is followed by a SECOND `driver.virtio-gpu: online (` and a DIFFERENT claim
+  generation. The generation is what makes it a rebind: a node that never left would come back on
+  the number it had;
+- no `iommu: FAULT` and no `KERNEL PANIC` across the whole window, which is the question a restart
+  under enforcement asks that a restart without one does not - the old translation is torn down and
+  a new one attached, and a device left able to reach the old mapping says so here;
+- the rebound binding republished the providers it declares, which is the driver's own half of
+  coming back: a binding that acquired the device and offered nothing would be online and useless;
+- the guest's boot generation is unchanged, so none of the above is a reboot wearing a rebind's name.
+
+**And M4 is still not fully met, which I found while writing the check rather than while running it.**
+
+I had drafted a frame assertion - drive the console after the rebind and require no `a frame did NOT
+reach the display`. Before running it I went to check what re-establishes DisplayService's connection
+to the new binding, and nothing does. `route_offers` is the function that hands a published provider
+to each fixed consumer, and it has two properties that meet here: it fills a slot only `if *client ==
+0`, and it is called from ONE place - the phase-two bring-up loop - and never from the standing loop.
+So a driver rebound after bring-up publishes its DISPLAY provider into the catalogue, nothing routes
+it, and DisplayService goes on holding the handle of the binding that ended. The device comes back;
+the system's use of it does not.
+
+That is not a defect of this milestone to fix here: it is the per-service catalogue migration
+P02M0164 scopes, stated from the other end - AudioService already survives this, because it
+SUBSCRIBES and opens rather than being handed a slot once. So the check reports what the display did
+and asserts only what the driver and the kernel owe, with the reason written where a reader will meet
+it. Asserting frames would be asserting another milestone's unfinished work from this one; asserting
+nothing about it would let the report read as though the whole path was proved.
+
+So M4 stays unmet, and now for two separate reasons rather than the one the finding named. The
+restart is DRIVEN - there is a check that asks for it through the operator's own verbs, which my
+previous blocker wrongly said could not be reached - and it is not yet PROVED, because that check has
+not been able to run (see below). And even when it does, the consumer half will not pass: the device
+comes back and the display does not, for a reason that belongs to P02M0164's migration.
+
+The verbs are the operator's own - P02M0166's `disable` and `enable` through the production policy
+endpoint - so what is proved is the path an operator has, not a test hook.
+
+**AND IT HAS NOT RUN, WHICH I AM REPORTING RATHER THAN LEAVING TO BE DISCOVERED.**
+
+I tried to execute it and could not, and what stopped it is worth more than the check. The
+dev-guest category is unusable end to end, in three linked steps:
+
+1. `./dev.sh up` could not start a guest AT ALL. `cmd_dev_up` takes `dev-instance.lock` and HOLDS it
+   across the `run.sh` it launches, and `qemu-run.sh`'s ad-hoc-guest guard tests that same lock - so
+   the instance's own boot was refused by its own parent, with a message naming itself: "a
+   development instance is running and holds the system, media and USB images". Reproduced directly
+   rather than inferred: hold the lock and the guard's own `flock -n` returns non-zero.
+2. With that fixed the guest BOOTS - measured, and it is the machine this milestone wants: `dma:
+   every bus-mastering device is translated`, `iommu: virtio-iommu present, enforcing=true,
+   healthy=true`, `driver.virtio-gpu: online (00:0b.0)`, and `agent.dev: online (registry)`. But the
+   kernel's recovery ladder reports `no interactive shell within this target's boot window of 3000
+   tick(s)`, so `cmd_dev_up` times out waiting for a prompt.
+3. Because it timed out, it never reached `dev_identity_write`, and without a recorded boot
+   generation every `lab.py` dev-* command refuses - including `dev-launch`, which is the one this
+   check needs and which is otherwise ready to answer.
+
+So I fixed (1), in `lab.py` and `src/harness/qemu-run.sh` - two files outside this milestone, which I
+would not normally touch and am naming for that reason. The marker is set by exactly one caller for
+exactly the boot that IS the instance; it is deliberately not the profile name the guard's own
+comment rejects, because `scenario-cold` declares `DEV_PROFILE=1` too and is already covered by
+`artifact_suffix`. Every other guest is refused exactly as before, and a second `dev.sh up` cannot
+reach the guard - `cmd_dev_up` refuses on its own state check and its own non-blocking lock first.
+
+(2) and (3) I have not fixed. They are a boot-window property of the development profile and the
+identity write that depends on it, in a milestone that is not this one, and I am not debugging
+another component's bring-up blind at the end of a round whose other changes are in the claim-release
+path.
+
+Nothing had noticed any of this because nothing runs the dev-guest checks: `verify-history.json`
+holds no key for `dev.selftest`, `dev.proto-test` or `dev.perf-gate` either. Three registered checks
+that the model emits and the runner asks for could not have run.
+
+So the honest state of this finding: the seam exists, my previous blocker was false and I have said
+so, the check that uses the seam is written and registered, and it has NOT been executed. It is not
+evidence yet - not that the restart works, and not that the check would notice if it stopped. What it
+is, is the requirement written down as something that runs rather than as something owed, plus a
+measured account of the four things between it and a green result.
+
+## Verification for this round
+
+The model asks for a FULL verification of this change set - `src/kernel/device.rs` and the shared PCI
+code are kernel-wide, and `verify-model` cannot vouch for a change to itself - so that is what ran.
+
+| | result |
+| --- | --- |
+| `./test.sh --arch x86_64` | 373 passed, 0 failed |
+| `./test.sh --arch aarch64` | 361 passed, 0 failed |
+| `./test.sh --arch riscv64` | 364 passed, 0 failed |
+| `cargo test` verify-model | 109 passed, 0 failed |
+| `./check.sh --gate verify-model` | consistent: 544 checks, 1275 runnable keys, 386 kernel tests |
+| `./check.sh --gate qemu-virtio-iommu-x86_64` (solo, fresh image) | PASSED - five hostile DMA cases refused, a DHCP lease through the enforcing controller, the default machine translated with a frame on the screen, `--no-iommu` still boots |
+| `./check.sh --gate concurrent-selection` (solo) | PASSED |
+| the rest of the gate sweep | 30 gates run, three FAILED and all three for reasons established below |
+
+THE THREE GATE FAILURES, EACH CHECKED RATHER THAN ASSUMED AWAY.
+
+`qemu-arch-profiles` failed on `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick`
+at riscv64 AIA, 4 cores. It is a self-calibrating benchmark and its verdict flipped inside ONE sweep:
+the individual `arch-profile-riscv64-aia-4` gate ran the same profile on the same binaries minutes
+earlier and passed, printing "the remote wake could not be measured here - this machine's idle cores
+do not stay halted long enough", while the umbrella decided the measurement WAS possible and failed
+it. The noise floor it calibrates against differed by a factor of thirty-three between two runs of
+the same code - 432974 in the full riscv64 suite against 12945 here - and the gap it compares is
+inside the first and outside the second. Re-run on its own afterwards: PASSED. Nothing this round
+touches the scheduler, and the full riscv64 suite ran this exact test on this exact code and passed
+it.
+
+`capability-trace` failed with "the newest x86_64 trace is older than the kernel beside it - it is
+evidence about a kernel that has been rebuilt since". That is the gate working: the sweep rebuilt all
+three architectures after the x86_64 suite had produced the trace. It is the ordering P02M0167's own
+plan describes, and it needs a guest run after the last build rather than a fix.
+
+`dynamic-report` failed on changed byte sizes for `lsdev` and `lsusb`. Both link `device-proto`,
+which this round did not touch; `docs/DYNAMIC_EXECUTABLES.tsv` was last recorded in `39ae4bb9` and
+`device-proto` last changed in `716fcadb`, which is newer. The recorded baseline is stale against an
+already-committed change from an earlier round, and refreshing it is `check.sh`'s `--write` form
+rather than anything this round owes.
+
+Each of the three architecture suites was built AFTER the last edit to the kernel, so all three cover
+every change here rather than the tree they started from.
+
+WHAT THE SUITES DO NOT COVER, WHICH IS THE PART WORTH WRITING DOWN. Four of this round's changes are
+compiled and booted through and never EXECUTED by any registered test, and I only found that out by
+grepping for the lines they print:
+
+- the planned-stop arm. `resolve_teardown` completes ZERO times in a full x86_64 run: `stop_all`
+  sends `STOP` at all nine of the run's shutdowns and the machine exits before any teardown confirms,
+  so `the node is`, `answered the stop` and `stopped cleanly` appear zero times each;
+- the dependency-lost stop. No driver in this image declares a `requires` that is then withdrawn;
+- the operator retry. Nothing types a policy verb;
+- the catalogue and policy client reaping. No consumer of either endpoint exits during a run.
+
+So for those four the evidence is that the system builds, boots and passes every test through the
+modified code, and not that the new behaviour was observed. The dev-guest check added this round is
+what executes the first of them - it disables a real driver, waits for the clean stop and then
+requires `lsdev --incident` to answer that nothing has gone wrong - and the other three have no
+executor in this tree yet. That is stated rather than left for the next audit to find.
+
+ONE OBSERVATION THAT IS NOT A REGRESSION, checked rather than assumed. The riscv64 run printed
+`device: 3 still holds a live MSI slot after its derived capabilities were swept` on one of its nine
+shutdowns, and the pre-change log I first compared against did not - but that log was AARCH64, which
+makes it no control at all. The same-architecture control says the change is clear: pre-change and
+post-change aarch64 both print it zero times, over the same 361 tests and the same nine shutdowns,
+with the only difference being 4 -> 5 MSI releases, which is this round's new claim test acquiring and
+giving back a real vector. x86_64 prints it zero times as well.
+
+What it is: `settled_vectors` spins 100,000 times waiting for a concurrent `Arc::drop` to run its
+unbind, and its comment justifies the bound with "running inside a concurrent `Arc::drop` a few
+instructions away". That reasoning holds on hardware and on KVM. Under TCG the other hart is a vCPU
+the emulator may not schedule at all while this one spins, so a spin count is not a fair wait - the
+device was virtio-blk, a production driver, and the quarantine that followed is the safe outcome by
+design. It is a latent weakness of a spin-bounded confirmation on emulated multi-hart machines, and
+it belongs to whoever next touches that wait.
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-09-01T11:58:45Z):
+
+Current implementation rating: 8/10
+
+1. **The new restart check drives a real rebind, but M4 remains functionally incomplete and still has no passing proof.** `dev-gpu-restart.py` now drives production `disable`/`enable`, requires a new claim generation, checks the translated profile and absence of IOMMU faults, and waits for replacement publication (`src/harness/dev-gpu-restart.py:172-242`). However, it deliberately reports rather than asserts post-rebind presentation (`src/harness/dev-gpu-restart.py:40-49,152-169,244-245`), and the latest response admits it has never completed a run. The underlying consumer path also remains broken: `route_offers` has only its phase-two call site and fills the fixed display route only when `gpu_client` is zero (`src/user/services/core/src/device_manager.rs:968-970,1118-1130`), so the rebound GPU republishes while DisplayService retains the dead prior-binding channel. That is weaker than M4's requirement that a frame reach the display and the driver remain present after restart (`docs/todo/P02M0159.md:94-97,126-133`).

@@ -609,3 +609,118 @@ AUDITOR'S RE-AUDIT ON M0162 (2026-09-01T03:15:10Z):
 Current implementation rating: 7/10
 
 1. **Normal claim teardown still blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` invokes `Closes::release` inline (`src/user/libs/driver/binding/src/lib.rs:787-819`), production `Syscalls::release` immediately calls `device_release` (`src/user/services/core/src/device_manager.rs:1671-1686`), and the syscall runs `Claim::release` and the full `device::release_claim` sequence before returning (`src/kernel/syscall/mod.rs:1247-1253`; `src/kernel/object/claim/mod.rs:82-102`; `src/kernel/device.rs:470-575`). The 20-tick bound covers only virtio-IOMMU command polling (`src/kernel/iommu/mod.rs:881-900`; `src/kernel/iommu/virtqueue.rs:39-59,197-215`), not the syscall or caller. The implementer accurately admits this remains unmet; the absence of a production worker explains the gap but does not satisfy M4's short nonblocking steps/later claim event or the definition of done that one slow node cannot stop service to another (`docs/todo/P02M0162.md:163-186,359-370`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-09-01T11:55:00Z):
+
+**Finding 1 - normal claim teardown blocks DeviceManager's sole event loop. ACCEPTED, unmet.**
+
+The chain is exactly as traced and I re-walked all of it: `Holdings::begin_teardown` calls
+`Closes::release` inline, the production `Syscalls::release` calls `device_release`, and the syscall
+runs `Claim::release` and the whole `device::release_claim` sequence before returning. The 20-tick
+bound the previous rounds pointed at covers virtio-IOMMU command polling inside
+`src/kernel/iommu/virtqueue.rs` and nothing above it - so it bounds one step of the release and not
+the syscall, and certainly not the caller.
+
+What I want to correct is my own previous framing rather than the finding. I have been calling this
+"the absence of a production worker", which reads as though the whole asynchronous design is missing.
+It is not. The manager's half of it is already built and already specified: `abi::ClaimInfo` carries
+`settled`, whose own comment says it is "the bit the claim handle's readiness is defined by, so a
+manager parked in `wait_any` learns the device is back without polling"; the standing loop puts every
+outstanding teardown's claim handle into its one `wait_any`; and `Teardown::pending.settle` is what
+`resolve_teardown` reads when that handle becomes ready. M4's "later claim event" exists, has a wire
+representation, and is consumed.
+
+The one synchronous step is `SYS_DEVICE_RELEASE` itself, which runs the whole of `device::release_claim`
+- bus mastering off, derived objects revoked, vectors settled, IOMMU detached - before it returns. By
+the time the manager could wait on the claim handle, there is nothing left to wait for. So the change
+is a kernel one and it is a specific one: the syscall would have to START the release and answer, with
+the state machine `settled` already describes finishing it, and something has to run those remaining
+steps. The kernel has no thread to run them on, which is the same missing piece this milestone's
+sibling M0153 finding needs, and it is the whole of the work rather than the smaller half I described
+last round. `begin_teardown` calling `release` inline would then be harmless: it is only blocking
+because the syscall is.
+
+M4's short non-blocking steps and the definition of done's "one slow node cannot stop service to
+another" are not met for the teardown path, and nothing in this round changed that.
+
+## Verification for this round
+
+The model asks for a FULL verification of this change set - `src/kernel/device.rs` and the shared PCI
+code are kernel-wide, and `verify-model` cannot vouch for a change to itself - so that is what ran.
+
+| | result |
+| --- | --- |
+| `./test.sh --arch x86_64` | 373 passed, 0 failed |
+| `./test.sh --arch aarch64` | 361 passed, 0 failed |
+| `./test.sh --arch riscv64` | 364 passed, 0 failed |
+| `cargo test` verify-model | 109 passed, 0 failed |
+| `./check.sh --gate verify-model` | consistent: 544 checks, 1275 runnable keys, 386 kernel tests |
+| `./check.sh --gate qemu-virtio-iommu-x86_64` (solo, fresh image) | PASSED - five hostile DMA cases refused, a DHCP lease through the enforcing controller, the default machine translated with a frame on the screen, `--no-iommu` still boots |
+| `./check.sh --gate concurrent-selection` (solo) | PASSED |
+| the rest of the gate sweep | 30 gates run, three FAILED and all three for reasons established below |
+
+THE THREE GATE FAILURES, EACH CHECKED RATHER THAN ASSUMED AWAY.
+
+`qemu-arch-profiles` failed on `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick`
+at riscv64 AIA, 4 cores. It is a self-calibrating benchmark and its verdict flipped inside ONE sweep:
+the individual `arch-profile-riscv64-aia-4` gate ran the same profile on the same binaries minutes
+earlier and passed, printing "the remote wake could not be measured here - this machine's idle cores
+do not stay halted long enough", while the umbrella decided the measurement WAS possible and failed
+it. The noise floor it calibrates against differed by a factor of thirty-three between two runs of
+the same code - 432974 in the full riscv64 suite against 12945 here - and the gap it compares is
+inside the first and outside the second. Re-run on its own afterwards: PASSED. Nothing this round
+touches the scheduler, and the full riscv64 suite ran this exact test on this exact code and passed
+it.
+
+`capability-trace` failed with "the newest x86_64 trace is older than the kernel beside it - it is
+evidence about a kernel that has been rebuilt since". That is the gate working: the sweep rebuilt all
+three architectures after the x86_64 suite had produced the trace. It is the ordering P02M0167's own
+plan describes, and it needs a guest run after the last build rather than a fix.
+
+`dynamic-report` failed on changed byte sizes for `lsdev` and `lsusb`. Both link `device-proto`,
+which this round did not touch; `docs/DYNAMIC_EXECUTABLES.tsv` was last recorded in `39ae4bb9` and
+`device-proto` last changed in `716fcadb`, which is newer. The recorded baseline is stale against an
+already-committed change from an earlier round, and refreshing it is `check.sh`'s `--write` form
+rather than anything this round owes.
+
+Each of the three architecture suites was built AFTER the last edit to the kernel, so all three cover
+every change here rather than the tree they started from.
+
+WHAT THE SUITES DO NOT COVER, WHICH IS THE PART WORTH WRITING DOWN. Four of this round's changes are
+compiled and booted through and never EXECUTED by any registered test, and I only found that out by
+grepping for the lines they print:
+
+- the planned-stop arm. `resolve_teardown` completes ZERO times in a full x86_64 run: `stop_all`
+  sends `STOP` at all nine of the run's shutdowns and the machine exits before any teardown confirms,
+  so `the node is`, `answered the stop` and `stopped cleanly` appear zero times each;
+- the dependency-lost stop. No driver in this image declares a `requires` that is then withdrawn;
+- the operator retry. Nothing types a policy verb;
+- the catalogue and policy client reaping. No consumer of either endpoint exits during a run.
+
+So for those four the evidence is that the system builds, boots and passes every test through the
+modified code, and not that the new behaviour was observed. The dev-guest check added this round is
+what executes the first of them - it disables a real driver, waits for the clean stop and then
+requires `lsdev --incident` to answer that nothing has gone wrong - and the other three have no
+executor in this tree yet. That is stated rather than left for the next audit to find.
+
+ONE OBSERVATION THAT IS NOT A REGRESSION, checked rather than assumed. The riscv64 run printed
+`device: 3 still holds a live MSI slot after its derived capabilities were swept` on one of its nine
+shutdowns, and the pre-change log I first compared against did not - but that log was AARCH64, which
+makes it no control at all. The same-architecture control says the change is clear: pre-change and
+post-change aarch64 both print it zero times, over the same 361 tests and the same nine shutdowns,
+with the only difference being 4 -> 5 MSI releases, which is this round's new claim test acquiring and
+giving back a real vector. x86_64 prints it zero times as well.
+
+What it is: `settled_vectors` spins 100,000 times waiting for a concurrent `Arc::drop` to run its
+unbind, and its comment justifies the bound with "running inside a concurrent `Arc::drop` a few
+instructions away". That reasoning holds on hardware and on KVM. Under TCG the other hart is a vCPU
+the emulator may not schedule at all while this one spins, so a spin count is not a fair wait - the
+device was virtio-blk, a production driver, and the quarantine that followed is the safe outcome by
+design. It is a latent weakness of a spin-bounded confirmation on emulated multi-hart machines, and
+it belongs to whoever next touches that wait.
+
+AUDITOR'S RE-AUDIT ON M0162 (2026-09-01T11:58:45Z):
+
+Current implementation rating: 7/10
+
+1. **Normal claim teardown still blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` invokes `Closes::release` inline (`src/user/libs/driver/binding/src/lib.rs:787-819`), DeviceManager calls that inline and production `Syscalls::release` immediately enters `device_release` (`src/user/services/core/src/device_manager.rs:1691-1702,1721-1724`), and the syscall completes `Claim::release` and the full `device::release_claim` sequence before returning (`src/kernel/syscall/mod.rs:1247-1253`; `src/kernel/object/claim/mod.rs:82-102`; `src/kernel/device.rs:470-590`). The later claim-handle wait machinery exists, but ordinary release has already settled synchronously before DeviceManager can wait on it. The 20-tick limit covers only virtio-IOMMU command polling (`src/kernel/iommu/mod.rs:875-900`; `src/kernel/iommu/virtqueue.rs:39-59,197-215`), not the syscall or caller. M4's short nonblocking transitions/later claim event and the definition of done that one slow node cannot stop service to another therefore remain unmet (`docs/todo/P02M0162.md:163-186,359-370`).

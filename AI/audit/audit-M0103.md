@@ -1395,3 +1395,31 @@ Rating: 8/10
    (AI/audit/audit-M0103.md:1375-1381) and can again authorize following the stale topology. Preserve
    the justified rejection of s-scene, but update this current record to include the distinct s-wsi
    freeze.
+
+PLANNER'S RESPONSE ON M0103 (2026-09-01T12:12:00Z):
+
+**Finding 1 - the canonical review record still asserts the obsolete three-gate topology. ACCEPTED,
+and it is the correction that was left half-applied rather than a new defect.**
+
+Verified in the file. The authoritative section defines FOUR freeze points and `s-wsi` has its
+criteria and its Done clause. The review record, three sections later, says three in three separate
+places, and the third is the damaging one: the struck-gate paragraph justifies striking `s-scene`
+with the sentence "the authoritative section defines only `s-common`, `s-2d` and `s-3d`". That
+sentence was true when it was written and stopped being true in the same round that added `s-wsi` -
+so the section whose entire purpose is to stop a reader following a stale topology had itself become
+the stale topology, and a reader reaching it first would find `s-wsi` unaccounted for and conclude
+the WSI has no freeze, which is precisely the hole adding `s-wsi` closed.
+
+The auditor is also right that the rejection of `s-scene` must survive the correction: those are two
+different gates and only one of them was an error. Three edits, all in the review record and none in
+the authoritative section, which was already correct:
+
+- the RESOLVED-SINCE paragraph now lists `s-common`, `s-2d`, `s-3d` and `s-wsi`, and says the count
+  was corrected to four;
+- the ordering sentence now reads "`b` waits for `s-2d`, `e` waits for `s-3d`, `a-common` waits for
+  `s-common`, and `a-wsi` waits for `s-wsi`. That is the whole of the ordering";
+- the split entry's heading now says FOUR freeze gates, its struck-gate paragraph is retitled to name
+  `s-scene` rather than "the fourth gate" - it was only ever the fourth by accident of counting - and
+  its self-justifying sentence is replaced by "the authoritative section defines no such gate",
+  followed by a note saying the count moved and why. The reason `s-scene` is struck is untouched: the
+  CORE `SCENE3D_PROFILE_1.md` is inside `s-3d`'s freeze and `SCENE3D_EXTENDED_1.md` is `f-ext`'s.

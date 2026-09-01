@@ -777,3 +777,92 @@ Rating: 5/10
    a fabricated value or an undocumented sentinel in the public contract. Freeze an optional
    next-hop or direct/via route variant and its validation; this is a semantic field choice, not IDL
    spelling that can be deferred.
+
+PLANNER'S RESPONSE ON M0175 (2026-09-01T12:12:00Z):
+
+All four findings ACCEPTED. Three of them are corrections to text the previous round added, which is
+worth saying at the top: naming a standard, freezing a stream shape and narrowing an entropy claim
+each fixed a real defect and each left a new one behind it.
+
+**Finding 1 - the sender profile pins standards its concrete policy contradicts. ACCEPTED, on all
+three counts.**
+
+Checked against the documents rather than against the names:
+
+- RFC 6298 section 2 rule 2.4 says a computed RTO below one second SHOULD be rounded up to one
+  second. The row named RFC 6298 and specified a 200 ms floor, silently - which is the one thing
+  naming a standard is supposed to prevent.
+- RFC 5681 section 3.1 gives an initial window of two to four segments. IW10 is RFC 6928, and it has
+  a byte-capped formula rather than a flat segment count.
+- Most materially, "a loss response that halves the window" is the FAST-RECOVERY shape. RFC 5681
+  section 3.1 sets `ssthresh = max(FlightSize/2, 2*SMSS)` after a timeout and then `cwnd = 1*SMSS`.
+  One "loss response" applied to both cases would put half a window back on a path that had just
+  stopped delivering, which is the opposite of what a timeout means. The auditor is right that this
+  is the one with a behavioural consequence, not just a citation error.
+
+The profile is now one coherent policy with each number attributed:
+
+- the 200 ms floor STAYS and is recorded as a declared deviation, with the RFC's own note for that
+  rule - the large minimum is a conservative choice made for coarse-grained clocks, and the document
+  anticipates a smaller one being justified - and the reason it applies here: a bounded appliance on
+  an emulated link with a millisecond clock, where a one-second minimum turns every ordinary loss
+  into a one-second stall;
+- the initial window is RFC 6928 section 2, `min(10*SMSS, max(2*SMSS, 14600))`, byte cap included;
+- timeout and duplicate-ACK loss are separated: RTO gives `ssthresh = max(FlightSize/2, 2*SMSS)` then
+  `cwnd = 1*SMSS` and slow start; three duplicate ACKs give fast retransmit and fast recovery per
+  section 3.2. The plan now says explicitly that this is RFC 5681's core and NOT the "advanced
+  congestion control" the milestone refuses - that refusal is about CUBIC, BBR, ECN and SACK-based
+  recovery - because a reader could otherwise take the refusal as licence to omit fast retransmit;
+- and the numeric tests assert the policy: after a timeout `cwnd` is one SMSS and not half of
+  anything, after three duplicate ACKs it is `ssthresh + 3*SMSS`, and the initial window is the RFC
+  6928 formula at the fixture's SMSS.
+
+**Finding 2 - the fetch stream has neither the budget nor the terminal it invokes. ACCEPTED.**
+
+Both halves confirmed. The stream clause bounds a body by "the per-flow receive budget below" and no
+such budget followed: 256 KiB is unacknowledged TRANSMIT data - a different direction and a different
+question - and M4's 2 MiB is an aggregate across inbound state. So the one number the truncation rule
+depends on did not exist. And the opening and the terminal were both undefined, while `chunk` carries
+only data today.
+
+Frozen: `MAX_FETCH_BODY_BYTES` is 256 KiB per fetch, derived rather than picked - it is the same
+order as the per-flow unacknowledged TRANSMIT budget, and eight concurrent full-size bodies fit
+inside M4's 2 MiB aggregate receive cap, so one flow's bound cannot by itself exhaust the service's.
+I set it at a megabyte first and corrected it in the same round: under a 2 MiB aggregate that let two
+fetches take the whole thing, which is not a per-flow bound so much as a way to spell the aggregate
+twice. A body reaching it ends with the truncation terminal rather than a refusal - the caller keeps what it received, which is what makes this the one
+place truncation is allowed. The operation becomes `result<stream<chunk>, error>`, so a refusal before
+any body exists is the typed error every other operation uses rather than a zero-length stream the
+caller must interpret. Once open the stream ends in exactly one of three ways - COMPLETE, TRUNCATED,
+FAILED - because a caller that cannot tell them apart cannot know whether it holds the whole resource.
+Which field carries the outcome is left to the IDL, as the auditor allows; the three outcomes and the
+guarded open are semantics and are frozen here.
+
+**Finding 3 - the entropy narrowing leaves an impossible spoof-rejection claim. ACCEPTED.**
+
+The Definition of done said absolutely that "a spoofed or replayed datagram can neither resolve a
+name, set the clock, nor complete or invalidate a lease", and the sentence immediately after it
+carved out the case that makes the first false. On a profile whose transaction IDs and source ports
+are predictable - which the dependency section explicitly permits on aarch64 and riscv64 - an
+off-path attacker forges a datagram carrying the predicted tuple, and that datagram is spoofed and
+does resolve a name.
+
+The clause now separates what every profile can promise from what only a seeded one can: on EVERY
+profile a datagram whose tuple does not match a live request is rejected and one arriving after its
+request completed or expired matches nothing, so MISMATCHED, STALE and REPLAYED datagrams are
+refused; on profiles with a secure entropy source, and only there, an off-path attacker cannot
+produce a matching tuple either. A parenthesis records what the clause said and why it could not hold.
+
+**Finding 4 - the frozen route fields cannot represent M0174's on-link routes. ACCEPTED.**
+
+Correct and concrete. M0174 installs an on-link prefix route for every PIO with `L=1`, and an on-link
+route has no gateway - the destination is its own next hop. A mandatory next-hop `ip-address` forces
+either a fabricated value or an all-zeros sentinel whose meaning is written down nowhere, which is
+how two consumers come to disagree about what an unspecified address means in a public contract.
+
+The route now carries one of two forms: DIRECT, which carries no address and whose packet's
+destination is its own next hop, with neighbour resolution run against it; or VIA(a), where `a` must
+be a unicast address on the same interface identity - a router's link-local in every case M0174
+produces - with the unspecified and multicast forms refused at validation rather than at use. The
+plan says in the row that this is a semantic field choice decided here and that only the variant's
+spelling belongs to the IDL, which is the distinction the finding draws.

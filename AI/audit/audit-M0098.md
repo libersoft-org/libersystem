@@ -600,3 +600,160 @@ Current implementation rating: 6/10
 1. **Claim-generation validation is still not atomic with MSI-X programming, and the latest response's dismissal of the hardware effect is incorrect.** `sys_device_msix_acquire` releases the claim-table check before `acquire_msi_unique` (`src/kernel/syscall/mod.rs:1561-1577`), which reserves by bare device index and programs entry 0 before `register_derived` performs the next generation check (`:1598-1616`; `src/kernel/arch/x86_64/interrupts/mod.rs:198-207,264-287`). That programming writes vector-control `0` - unmasked - rather than the harmless masked entry described by the response. Forced release masks the table entry but never clears the device's MSI-X Enable state (`src/kernel/device.rs:470-575`; the common PCI path has only `msix_enable`, `src/kernel/arch/common/pci/mod.rs:697-713`), and a replacement claim restores bus mastering. An old-generation acquire can therefore touch and temporarily unmask replacement-owned hardware before the late rejection rolls it back. Even if no interrupt happens in that window, stale authority has modified replacement hardware, contrary to M2/M9's stale-generation refusal (`docs/todo/P02M0098.md:76-83,193-204,235-251`).
 
 2. **M9's live-vector and translated-DMA hostile-holder proofs remain absent, as the implementer ultimately concedes.** `a_forced_release_takes_a_live_interrupt_away` constructs `Interrupt::new(0x71)` and calls only `mark_bound`; it owns no MSI registry slot and exercises no controller or device binding (`src/kernel/object/claim/tests.rs:319-350`). `ending_a_claim_takes_the_dma_buffers_it_authorised` uses a synthetic untranslated device and checks generation/registry state, not that a claim-derived IOVA stops translating (`:512-546`). The independent IOMMU generation fixture checks stale map admission, not forced release of a live claim-derived translation (`src/kernel/iommu/tests.rs:295-335`). The required forced-release vector/DMA evidence is therefore still unmet (`docs/todo/P02M0098.md:193-204,231-252`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-09-01T11:55:00Z):
+
+Both findings ACCEPTED. The first is fixed; the second is half fixed and the other half is stated as
+still missing rather than argued away.
+
+**Finding 1 - the MSI-X programming window. ACCEPTED, and my previous answer was wrong on the fact
+it turned on.**
+
+I claimed the entry was programmed masked. It is not: `program_msix_entry` writes vector control 0
+on all three ports and each one says so in its own comment - `entry.add(3).write_volatile(0); //
+vector control (unmasked)` at `src/kernel/arch/x86_64/interrupts/mod.rs:286`,
+`aarch64/interrupts/mod.rs:331` and `riscv64/interrupts/mod.rs:140`. I described what the rollback
+does - `release_unused_msi` masks and unmaps - and reported it as what the acquire does. The auditor
+is right, and right about the consequence too: `msix_enable` had no counterpart anywhere in the tree,
+so MSI-X Enable survived the binding that set it and the next claim of that device inherited an
+interrupt-capable function.
+
+Fixed at the release rather than at the acquire, because that is where the authority actually leaks.
+`src/kernel/arch/common/pci/mod.rs` gains `msix_disable` - clear MSI-X Enable, set the Function Mask
+- with per-port wrappers in `x86_64/pci/mod.rs`, `aarch64/pci.rs` and `riscv64/pci.rs`, and
+`src/kernel/device.rs` calls it from `release_claim` in the same `with(index, ...)` that turns bus
+mastering off, through a `msix_off` helper carrying the same `on_bus` exclusion `bus_master` has
+plus `msix_cap == 0` for a function with no such capability.
+
+What that changes about the window the finding describes: the stale caller can still lose its claim
+between `claim_is_current` and `acquire_msi_unique` and still write entry 0 of a table that now
+belongs to a replacement. It can no longer make anything deliverable by doing so, because the
+release cleared the function's Enable bit and the replacement has not set it - `msix_enable` is the
+last statement of its own acquire, after `register_derived` has passed. The other order is already
+refused: if the replacement HAS acquired, `acquire_unique_live` sees the live slot and answers None
+before any programming happens. Memory space is deliberately left decoding, because the teardown
+still has to reach the table page to mask the entry.
+
+I considered programming the entry masked and unmasking after `register_derived`, and did not: it is
+a three-port change to the interrupt path whose value is entirely in the case the disable above
+already covers, and the kernel's own bring-up fixtures acquire through the same function and would
+each need the unmask threading through them.
+
+**Finding 2 - the M9 forced-release proofs. ACCEPTED. The vector half is now proved; the translated
+DMA half is not, and I am recording that rather than claiming it.**
+
+The description of both tests is exact. `a_forced_release_takes_a_live_interrupt_away` built
+`Interrupt::new(0x71)` and called `mark_bound()`, which owns no registry slot - so `revoke`'s
+`unbind` had nothing to retire, `settled_vectors` had nothing to wait for and
+`release_msi_for_device` had nothing to give back. The test proved that `revoke` sets two flags.
+
+`src/kernel/object/claim/tests.rs` now takes a real slot, using the fixture the ports' own interrupt
+suites use and the one already in this file: a frame standing in for the device's MSI-X table,
+`acquire_msi(table, 0, index as u32)` against the synthetic device's own index, and `bind_msi`. The
+`Arc` is still held across the release, so the holder is still running by definition. After the
+release it asserts `!is_bound(vector)` and `!msi_live_for_device(index)` - the controller, which the
+object's flags do not answer for - and `msi_held_by_device(index) == 0`, which is the other half of
+M9's claim: a vector held by a binding that has ended is a vector the next claimant cannot be given.
+A machine with no free vector prints that it skipped and gives the claim back rather than passing
+silently.
+
+I wrote that last assertion twice. The first version acquired again and required the SAME slot back,
+copying the rollback test beside it - and that test can make the assumption because it frees and
+re-acquires with nothing in between, where this one runs a whole claim release first. The registry
+hands out the lowest free slot, so the identity of the next one is a fact about what everything else
+on the machine happens to hold, and the assertion would have made this test's answer depend on the
+suite's order. What the release owes is that its own vectors are no longer charged to it.
+
+`ending_a_claim_takes_the_dma_buffers_it_authorised` is unchanged and the finding about it stands:
+it uses a synthetic untranslated device and asserts generation and registry rows, not that a
+claim-derived IOVA stops translating. Proving that needs the enforcing fixture - a claim on a
+translated endpoint, a mapping made under it, the `Arc` held, a forced release, and then a device
+access that must fault - which is `src/kernel/iommu/tests.rs` and the `qemu-virtio-iommu-x86_64`
+profile rather than the synthetic-device fixture this file has. It is not done, and M9 is not
+complete without it.
+
+## Verification for this round
+
+The model asks for a FULL verification of this change set - `src/kernel/device.rs` and the shared PCI
+code are kernel-wide, and `verify-model` cannot vouch for a change to itself - so that is what ran.
+
+| | result |
+| --- | --- |
+| `./test.sh --arch x86_64` | 373 passed, 0 failed |
+| `./test.sh --arch aarch64` | 361 passed, 0 failed |
+| `./test.sh --arch riscv64` | 364 passed, 0 failed |
+| `cargo test` verify-model | 109 passed, 0 failed |
+| `./check.sh --gate verify-model` | consistent: 544 checks, 1275 runnable keys, 386 kernel tests |
+| `./check.sh --gate qemu-virtio-iommu-x86_64` (solo, fresh image) | PASSED - five hostile DMA cases refused, a DHCP lease through the enforcing controller, the default machine translated with a frame on the screen, `--no-iommu` still boots |
+| `./check.sh --gate concurrent-selection` (solo) | PASSED |
+| the rest of the gate sweep | 30 gates run, three FAILED and all three for reasons established below |
+
+THE THREE GATE FAILURES, EACH CHECKED RATHER THAN ASSUMED AWAY.
+
+`qemu-arch-profiles` failed on `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick`
+at riscv64 AIA, 4 cores. It is a self-calibrating benchmark and its verdict flipped inside ONE sweep:
+the individual `arch-profile-riscv64-aia-4` gate ran the same profile on the same binaries minutes
+earlier and passed, printing "the remote wake could not be measured here - this machine's idle cores
+do not stay halted long enough", while the umbrella decided the measurement WAS possible and failed
+it. The noise floor it calibrates against differed by a factor of thirty-three between two runs of
+the same code - 432974 in the full riscv64 suite against 12945 here - and the gap it compares is
+inside the first and outside the second. Re-run on its own afterwards: PASSED. Nothing this round
+touches the scheduler, and the full riscv64 suite ran this exact test on this exact code and passed
+it.
+
+`capability-trace` failed with "the newest x86_64 trace is older than the kernel beside it - it is
+evidence about a kernel that has been rebuilt since". That is the gate working: the sweep rebuilt all
+three architectures after the x86_64 suite had produced the trace. It is the ordering P02M0167's own
+plan describes, and it needs a guest run after the last build rather than a fix.
+
+`dynamic-report` failed on changed byte sizes for `lsdev` and `lsusb`. Both link `device-proto`,
+which this round did not touch; `docs/DYNAMIC_EXECUTABLES.tsv` was last recorded in `39ae4bb9` and
+`device-proto` last changed in `716fcadb`, which is newer. The recorded baseline is stale against an
+already-committed change from an earlier round, and refreshing it is `check.sh`'s `--write` form
+rather than anything this round owes.
+
+Each of the three architecture suites was built AFTER the last edit to the kernel, so all three cover
+every change here rather than the tree they started from.
+
+WHAT THE SUITES DO NOT COVER, WHICH IS THE PART WORTH WRITING DOWN. Four of this round's changes are
+compiled and booted through and never EXECUTED by any registered test, and I only found that out by
+grepping for the lines they print:
+
+- the planned-stop arm. `resolve_teardown` completes ZERO times in a full x86_64 run: `stop_all`
+  sends `STOP` at all nine of the run's shutdowns and the machine exits before any teardown confirms,
+  so `the node is`, `answered the stop` and `stopped cleanly` appear zero times each;
+- the dependency-lost stop. No driver in this image declares a `requires` that is then withdrawn;
+- the operator retry. Nothing types a policy verb;
+- the catalogue and policy client reaping. No consumer of either endpoint exits during a run.
+
+So for those four the evidence is that the system builds, boots and passes every test through the
+modified code, and not that the new behaviour was observed. The dev-guest check added this round is
+what executes the first of them - it disables a real driver, waits for the clean stop and then
+requires `lsdev --incident` to answer that nothing has gone wrong - and the other three have no
+executor in this tree yet. That is stated rather than left for the next audit to find.
+
+ONE OBSERVATION THAT IS NOT A REGRESSION, checked rather than assumed. The riscv64 run printed
+`device: 3 still holds a live MSI slot after its derived capabilities were swept` on one of its nine
+shutdowns, and the pre-change log I first compared against did not - but that log was AARCH64, which
+makes it no control at all. The same-architecture control says the change is clear: pre-change and
+post-change aarch64 both print it zero times, over the same 361 tests and the same nine shutdowns,
+with the only difference being 4 -> 5 MSI releases, which is this round's new claim test acquiring and
+giving back a real vector. x86_64 prints it zero times as well.
+
+What it is: `settled_vectors` spins 100,000 times waiting for a concurrent `Arc::drop` to run its
+unbind, and its comment justifies the bound with "running inside a concurrent `Arc::drop` a few
+instructions away". That reasoning holds on hardware and on KVM. Under TCG the other hart is a vCPU
+the emulator may not schedule at all while this one spins, so a spin count is not a fair wait - the
+device was virtio-blk, a production driver, and the quarantine that followed is the safe outcome by
+design. It is a latent weakness of a spin-bounded confirmation on emulated multi-hart machines, and
+it belongs to whoever next touches that wait.
+
+AUDITOR'S RE-AUDIT ON M0098 (2026-09-01T11:58:45Z):
+
+Current implementation rating: 7/10
+
+1. **The MSI-X disable correction does not close every stale-generation delivery window.** The response assumes that after release either MSI-X remains disabled or a replacement interrupt remains live and blocks the stale caller. A third reachable state remains: an old syscall can pass its generation check and pause (`src/kernel/syscall/mod.rs:1561-1577`); release disables MSI-X (`src/kernel/device.rs:478`); a replacement claim can acquire an interrupt and re-enable MSI-X (`src/kernel/syscall/mod.rs:1618-1621`), then close that interrupt. `Interrupt::drop` only unbinds it (`src/kernel/object/interrupt.rs:126-135`), retirement leaves its slot pending (`src/kernel/arch/common/msi.rs:238-253`), and pending slots are excluded from the live-slot check (`src/kernel/arch/common/msi.rs:131-151`). The stale syscall can therefore reserve another slot and program shared table entry 0 unmasked while the replacement function remains enabled (`src/kernel/arch/common/msi.rs:106-115`; `src/kernel/arch/x86_64/interrupts/mod.rs:198-207,264-287`); only the later `register_derived` rejects its old key (`src/kernel/syscall/mod.rs:1598-1616`). An old generation can still transiently overwrite and unmask the replacement function's MSI-X entry, contrary to M2/M3 and the forced-release contract (`docs/todo/P02M0098.md:76-81,248`).
+
+2. **The required translated-DMA forced-release proof remains absent.** The claim test constructs a synthetic device and untranslated buffer, then checks generation revocation and registry rows (`src/kernel/object/claim/tests.rs:551-585`). It never installs a live translated IOVA or proves that the old DMA address stops translating after forced release. The IOMMU generation test checks stale map admission, not revocation of an already-live translation (`src/kernel/iommu/tests.rs:295-335`). This leaves M9 and its definition-of-done proof unmet (`docs/todo/P02M0098.md:193-204,231-252`).
+
+3. **The live-vector forced-release test can still pass without exercising its subject.** Although it now uses a genuine registry slot, allocation failure prints a skip message and returns successfully (`src/kernel/object/claim/tests.rs:343-355`). That conflicts with the requirement that every test name its device and none pass by finding nothing to test (`docs/todo/P02M0098.md:200-204,248-252`).

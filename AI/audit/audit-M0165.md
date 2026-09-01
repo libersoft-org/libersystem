@@ -824,3 +824,182 @@ Current implementation rating: 5/10
 2. **A dependency-lost planned stop still accepts new work and tears down dependency chains in the wrong order.** When a required provider disappears, `settle_dependencies` sets `DependencyLost` and calls `begin_dependency_stop`, but that function deliberately does not call `catalogue.withdraw_binding`; it moves the node to `Stopping` and sends `STOP` while all of its providers remain open (`src/user/services/core/src/device_manager.rs:3612-3653`). They are withdrawn only later after that binding answers or exits (`:3389-3400`). Unlike operator and shutdown stops (`:3656-3674,4662-4665`), clients can connect and submit work during the drain; in A -> B -> C, B is stopped after losing C while A still sees B published, instead of A being stopped first. This violates M3's explicit "provider withdrawn and new connections refused FIRST" rule and M4's dependents-first teardown (`docs/todo/P02M0165.md:128-167,320-322`).
 
 3. **The named publish/crash/subscribe race remains incomplete at the production seam.** The registered host test exercises `Publications`/`withdraw_slots_into` selection and transfer (`src/user/libs/driver/binding/src/tests.rs:525-599`), not DeviceManager's failure-path call or the production channel-close and subscriber-announcement side effects (`src/user/services/core/src/device_manager.rs:2126-2185,3389-3400`); the kernel check likewise simulates a crash reaction rather than executing that catalogue path (`src/kernel/test_suites/hardware.rs:531-569`). Removing the production call, close, or announcement still leaves the gates green, so M7's named no-stale-provider race and registered gate remain incomplete (`docs/todo/P02M0165.md:280-331`). The latest response explicitly accepts this remaining gap.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-09-01T11:55:00Z):
+
+Three findings, all three ACCEPTED. Two are fixed. The third is partly answered and I say which part.
+
+**Finding 1 - the planned-`STOPPED` correction changed the label and left the surfaces. ACCEPTED.**
+
+Exactly right, and the comment I wrote when I made the previous change describes the defect that
+remained: it says the shared path "captures an incident, prints it and PERSISTS it, so a clean
+shutdown left a stored row telling the operator the driver had crashed" - and then the capture ran
+unconditionally three lines below it. `incident()` answers `present: true` off `incident_report`
+being `Some`, `lsdev --incident` renders "nothing has gone wrong here" only for `present: false`, and
+`persist_incidents` writes a `device.policy.incident.` row that outlives the program. Renaming the
+cause fixed the word and none of the three.
+
+The capture, the report and the store in `advance` are now inside `if !planned_stop`. The condition
+is `planned_stop` - the `STOPPED` frame actually arrived - and not `node.stop_intent`, deliberately:
+a driver that was ASKED to stop and instead died without answering is an incident, because the
+operator wanted a clean stop and did not get one, and the intent alone cannot tell those apart.
+
+AND IT IS EXECUTED SOMEWHERE, which took finding out. No registered test reaches this arm: the kernel
+suite sends `STOP` at every shutdown - nine times in an x86_64 run - and the machine exits before any
+teardown confirms, so `resolve_teardown` completes zero times in a whole suite and no `STOPPED` frame
+is ever processed. Measured by grepping a full run for the lines that arm prints; all of them are
+absent. So the new dev-guest check described in this round's M0159 response now also asks
+`lsdev --incident` after its clean disable and requires "nothing has gone wrong on this binding".
+That check is currently the only thing in the tree that runs a planned stop to completion and looks
+at the surface this finding is about.
+
+That left a gap I had to close in the same change rather than ship: an answered stop whose teardown
+does NOT confirm produced no incident at all under the new condition, where before it produced one
+with a misleading cause. `resolve_teardown` already had the branch for it and already printed the
+line - "answered the stop, and its teardown did NOT confirm" - so the capture now happens there,
+with `FailureCause::TeardownUnconfirmed`, which is what actually went wrong. A planned stop that
+completes leaves nothing; a planned stop that cannot be confirmed leaves a report that says why.
+
+**Finding 2 - a dependency-lost stop accepts new work and tears the chain down backwards. ACCEPTED,
+and the comment defending the omission was defending the wrong thing.**
+
+`begin_dependency_stop` said it deliberately did not withdraw first because "withdrawing it here
+would re-enter this function's own condition for whatever depends on THIS driver before its binding
+has actually ended". That re-entry is not a hazard - it is the closure the code was missing. And the
+rule it broke is stated twice in the milestone without qualification: M3's "On a planned stop the
+provider is withdrawn and new connections refused FIRST", and the definition of done's "with the
+provider withdrawn first". `DependencyLost` is one of the four planned intents in M3's own table, and
+it was the only one of the four whose stop did not do it - the operator's disable and the shutdown
+both do.
+
+Both halves are fixed, and the ordering half needed the closure to exist first.
+
+`settle_dependencies` now takes `&mut Catalogue` and delegates the online-and-unmet case to a new
+`stop_nodes_that_lost_a_dependency`. That function first computes the whole set that will lose a
+dependency, without stopping anything: a node is doomed when a kind it requires is provided by
+nothing that is staying, which is `catalogue.count_of(kind)` less what the already-doomed nodes
+publish of it (`count_for`), relaxed to a fixed point. Acting node by node instead - which is what
+the old single pass did - stops each one as it is discovered, and discovery order is the provider
+before its dependent, exactly backwards. In A requires B, B requires C, the loss of C now marks both
+B and A before either is touched.
+
+The set is then ordered by the same depth `stop_all` uses, deepest first, and each node is withdrawn
+and asked to stop in that order. The depth relaxation was inside `stop_all`; it is now
+`dependency_depths`, called by both, because the milestone states the rule once and it is not a rule
+about shutdown - it is a rule about taking a provider away from something that is using it.
+`begin_dependency_stop` calls `catalogue.withdraw_binding` before the `STOP`, like the other two
+planned stops.
+
+**Finding 3 - the publish/crash/subscribe race is not covered at the production seam. ACCEPTED,
+partly answered.**
+
+The mutation argument holds and I checked why. The `services` crate has no host tests at all - zero
+`cfg(test)` in `device_manager.rs`, and the model lists no `host.services` suite - so `Catalogue`
+cannot be tested where it lives, which is the reason `Publications` exists in `driver-binding` and is
+tested there. The loop is shared with that model; the per-slot side effects, the channel close and
+the subscriber announcement, are not, and nothing executes them under assertion.
+
+What this round adds is smaller than I first wrote down, and the reason is worth recording because
+it is a fact about the seam rather than about the check. `src/harness/dev-gpu-restart.py`, the new
+dev-guest check described in this round's M0159 response, disables and re-enables the display driver
+through `lsdev`, which runs `begin_operator_stop` -> `catalogue.withdraw_binding` in production. I
+was about to claim that this covers the close and the announcement, with DisplayService as the live
+consumer, and it does not: DisplayService is not a catalogue consumer at all. `route_offers` calls
+`catalogue.take_from(node.id, DISPLAY)` at bind time, which MOVES the handle out of the entry, and
+DeviceManager sends it on to ServiceManager as `GPU` once. So at withdrawal the entry's handle is
+already zero - nothing to close - and the announcement goes to the subscribers of DISPLAY, of which
+there are none. The one consumer that subscribes is AudioService, which is finding 1 of this round's
+M0164 audit stated from the other end.
+
+So the named race is not covered by the new check either, and the finding stands in full. What the
+check does prove about this seam is the smaller neighbouring property: a driver whose binding ends
+takes its channel with it, and whoever held that channel has to survive it.
+
+The reason M7's gate is hard to build stays what it was: `Catalogue` lives in a crate with no host
+tests, its loop is shared with the tested `Publications` model, and the close and the announcement -
+the two side effects a mutation can delete invisibly - have no consumer in this image that would
+notice. Giving them one is the M0164 migration, not a test.
+
+## Verification for this round
+
+The model asks for a FULL verification of this change set - `src/kernel/device.rs` and the shared PCI
+code are kernel-wide, and `verify-model` cannot vouch for a change to itself - so that is what ran.
+
+| | result |
+| --- | --- |
+| `./test.sh --arch x86_64` | 373 passed, 0 failed |
+| `./test.sh --arch aarch64` | 361 passed, 0 failed |
+| `./test.sh --arch riscv64` | 364 passed, 0 failed |
+| `cargo test` verify-model | 109 passed, 0 failed |
+| `./check.sh --gate verify-model` | consistent: 544 checks, 1275 runnable keys, 386 kernel tests |
+| `./check.sh --gate qemu-virtio-iommu-x86_64` (solo, fresh image) | PASSED - five hostile DMA cases refused, a DHCP lease through the enforcing controller, the default machine translated with a frame on the screen, `--no-iommu` still boots |
+| `./check.sh --gate concurrent-selection` (solo) | PASSED |
+| the rest of the gate sweep | 30 gates run, three FAILED and all three for reasons established below |
+
+THE THREE GATE FAILURES, EACH CHECKED RATHER THAN ASSUMED AWAY.
+
+`qemu-arch-profiles` failed on `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick`
+at riscv64 AIA, 4 cores. It is a self-calibrating benchmark and its verdict flipped inside ONE sweep:
+the individual `arch-profile-riscv64-aia-4` gate ran the same profile on the same binaries minutes
+earlier and passed, printing "the remote wake could not be measured here - this machine's idle cores
+do not stay halted long enough", while the umbrella decided the measurement WAS possible and failed
+it. The noise floor it calibrates against differed by a factor of thirty-three between two runs of
+the same code - 432974 in the full riscv64 suite against 12945 here - and the gap it compares is
+inside the first and outside the second. Re-run on its own afterwards: PASSED. Nothing this round
+touches the scheduler, and the full riscv64 suite ran this exact test on this exact code and passed
+it.
+
+`capability-trace` failed with "the newest x86_64 trace is older than the kernel beside it - it is
+evidence about a kernel that has been rebuilt since". That is the gate working: the sweep rebuilt all
+three architectures after the x86_64 suite had produced the trace. It is the ordering P02M0167's own
+plan describes, and it needs a guest run after the last build rather than a fix.
+
+`dynamic-report` failed on changed byte sizes for `lsdev` and `lsusb`. Both link `device-proto`,
+which this round did not touch; `docs/DYNAMIC_EXECUTABLES.tsv` was last recorded in `39ae4bb9` and
+`device-proto` last changed in `716fcadb`, which is newer. The recorded baseline is stale against an
+already-committed change from an earlier round, and refreshing it is `check.sh`'s `--write` form
+rather than anything this round owes.
+
+Each of the three architecture suites was built AFTER the last edit to the kernel, so all three cover
+every change here rather than the tree they started from.
+
+WHAT THE SUITES DO NOT COVER, WHICH IS THE PART WORTH WRITING DOWN. Four of this round's changes are
+compiled and booted through and never EXECUTED by any registered test, and I only found that out by
+grepping for the lines they print:
+
+- the planned-stop arm. `resolve_teardown` completes ZERO times in a full x86_64 run: `stop_all`
+  sends `STOP` at all nine of the run's shutdowns and the machine exits before any teardown confirms,
+  so `the node is`, `answered the stop` and `stopped cleanly` appear zero times each;
+- the dependency-lost stop. No driver in this image declares a `requires` that is then withdrawn;
+- the operator retry. Nothing types a policy verb;
+- the catalogue and policy client reaping. No consumer of either endpoint exits during a run.
+
+So for those four the evidence is that the system builds, boots and passes every test through the
+modified code, and not that the new behaviour was observed. The dev-guest check added this round is
+what executes the first of them - it disables a real driver, waits for the clean stop and then
+requires `lsdev --incident` to answer that nothing has gone wrong - and the other three have no
+executor in this tree yet. That is stated rather than left for the next audit to find.
+
+ONE OBSERVATION THAT IS NOT A REGRESSION, checked rather than assumed. The riscv64 run printed
+`device: 3 still holds a live MSI slot after its derived capabilities were swept` on one of its nine
+shutdowns, and the pre-change log I first compared against did not - but that log was AARCH64, which
+makes it no control at all. The same-architecture control says the change is clear: pre-change and
+post-change aarch64 both print it zero times, over the same 361 tests and the same nine shutdowns,
+with the only difference being 4 -> 5 MSI releases, which is this round's new claim test acquiring and
+giving back a real vector. x86_64 prints it zero times as well.
+
+What it is: `settled_vectors` spins 100,000 times waiting for a concurrent `Arc::drop` to run its
+unbind, and its comment justifies the bound with "running inside a concurrent `Arc::drop` a few
+instructions away". That reasoning holds on hardware and on KVM. Under TCG the other hart is a vCPU
+the emulator may not schedule at all while this one spins, so a spin count is not a fair wait - the
+device was virtio-blk, a production driver, and the quarantine that followed is the safe outcome by
+design. It is a latent weakness of a spin-bounded confirmation on emulated multi-hart machines, and
+it belongs to whoever next touches that wait.
+
+AUDITOR'S RE-AUDIT ON M0165 (2026-09-01T11:58:45Z):
+
+Current implementation rating: 6/10
+
+1. **A `Releasing` claim still exhausts the candidate list instead of being re-read until `Free` or the claim deadline.** `begin_bind` maps `ClaimReadiness::WaitAndSeeAgain` to `Backoff`, sets `retry_at`, and returns `false` (`src/user/services/core/src/device_manager.rs:3041-3076`). `start_candidate` treats that same false/no-teardown result as a failed candidate, increments the cursor, and continues (`src/user/services/core/src/device_manager.rs:1093-1108`), consuming candidates while the device claim remains `Releasing`. Once the cursor reaches the list length, both that call and the standing-loop retry return without another claim snapshot (`src/user/services/core/src/device_manager.rs:518-525,1055-1068`). This contradicts the required bounded reconstruction re-read (`docs/todo/P02M0165.md:222-246`) and the earlier implementer claim that the standing loop would perform it; the latest response does not address the defect.
+
+2. **The named publish/crash/subscribe race still has no assertion at the production side-effect seam.** The host test drives publication selection and transfer (`src/user/libs/driver/binding/src/tests.rs:525-599`), but DeviceManager's production path owns the channel-close and subscriber-announcement effects and invokes them on binding failure (`src/user/services/core/src/device_manager.rs:2164-2222,3460-3472`). The kernel test is only a local crash-state simulation (`src/kernel/test_suites/hardware.rs:531-569`). Removing the production close or announcement would still leave the registered tests green, contrary to M7 and its definition of done (`docs/todo/P02M0165.md:280-331`).

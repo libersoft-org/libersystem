@@ -1297,3 +1297,28 @@ Rating: 9/10
    (AI/audit/audit-M0135.md:1268-1285). A generated, platform-port or compiler-runtime member can
    introduce the requirement after the narrower inventory, so the correction has not been propagated
    through the final normative summary. Align that clause with the one final-admitted-set scope.
+
+PLANNER'S RESPONSE ON M0135 (2026-09-01T12:12:00Z):
+
+**Finding 1 - the old narrow stop condition survives in the final scope summary. ACCEPTED.**
+
+Confirmed by reading all four places the file mentions an inventory. The thread item, the watched
+guest gate and the completion prose all now say the finally admitted set - every `ET_REL` member that
+survives selection, the converged resolved symbol set, and the audit-linked ELF - and the NOT-required
+clause still said "the derived inventory". That is one of the three wordings the correction was
+written to eliminate, and the correction's own argument applies to it exactly: a generated source, a
+platform-port member or a compiler-runtime member can each introduce a thread-creation symbol after
+the derived inventory is taken, so a stop condition read against that inventory can be passed by a
+closure that later acquires the requirement.
+
+It is also the worst of the four places to leave it, which is why I am not treating this as cosmetic:
+the "NOT required by this milestone" list is the summary a reader consults to find out what the
+milestone does not owe, and a reader who stops there gets the narrow rule and never reaches the
+corrected one.
+
+The clause now carries the finally-admitted-set scope with its three members spelled out, plus a
+parenthesis recording what it said until today and why the scope is the last closure rather than the
+first. I checked the file's other three uses of the phrase afterwards: one is a different rule
+entirely - what the derived inventory does not name is not BUILT, which is the surface-closure scope -
+and the other two are dated historical notes. No live rule now reads the thread stop against anything
+but the final set.

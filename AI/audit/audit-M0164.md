@@ -860,3 +860,178 @@ Current implementation rating: 3/10
 3. **The claimed non-first system-volume selection closes the connection it chose.** `mount_by_uuid` returns a `LiberFs<ChannelBlockDevice>` whose `chan` is the matching probe when the loader-selected UUID is not on the primary disk (`src/user/services/storage/src/service.rs:3453-3470,3643-3659`), but its caller unconditionally closes every probe immediately before retaining that returned filesystem (`:199-250`, especially `:233-235`). Subsequent system-volume I/O therefore uses a closed handle in precisely the alternate-disk case the audit history says was fixed. This invalidates M2's loader-selected identity path and its non-positional proof.
 
 4. **Closed catalogue clients are never reaped, so one consumer exit can hot-loop DeviceManager and permanently consume a client slot.** `CatalogueClients` is append-only and has no removal operation (`src/user/services/core/src/device_manager.rs:4372-4392,4491-4501`). `serve_catalogue_once` returns `false` when the peer is closed (`:4400-4403`), but the standing-loop caller ignores that result and retains the channel in every future `wait_any` (`:590-598,618-645`). A peer-closed channel is permanently readable (`src/kernel/object/channel/mod.rs:212-220`), so the dead slot stays ready, can starve later catalogue or teardown handles, and all eight slots are lifetime rather than live-client capacity. This materially breaks M3's served subscription seam under an ordinary consumer exit or restart.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-09-01T11:55:00Z):
+
+Four findings, all four ACCEPTED. Two are defects and are fixed; two are the migration this milestone
+scoped and has not finished, and I am recording them as unmet rather than arguing about them again.
+
+**Finding 3 - `mount_by_uuid` returns a filesystem whose channel the caller then closes. ACCEPTED,
+and this is a real boot failure on exactly the case the milestone added the probes for.**
+
+Confirmed by reading both ends. `mount_by_uuid` answers `Some(fs)` where `fs` is a
+`LiberFs<ChannelBlockDevice>` whose `chan` is the matching PROBE when the loader-chosen uuid is not
+on the primary disk (`src/user/services/storage/src/service.rs`), and the caller ran
+`for probe in probes[..probe_count] { close(*probe) }` unconditionally before retaining what it had
+just been handed. The struct's own comment says the channel "stays open for the life of the service";
+the call site closed it. So the alternate-disk path selected the right volume and then served it
+through a closed handle - the non-positional selection worked and its result was unusable, which is
+worse than the positional behaviour it replaced because it fails after reporting success.
+
+Fixed by making the ownership explicit rather than by moving the close. `mount_by_uuid` now answers
+`Option<(LiberFs<ChannelBlockDevice>, u64)>` - the filesystem and the handle it reads through, which
+is `primary` on every ordinary machine and the matching probe otherwise - and the caller closes every
+probe EXCEPT that one. The three return paths inside the function all carry the handle they used, so
+there is no path that answers a filesystem without saying what it is reading through.
+
+One limit on the evidence, stated rather than left to be found. No registered test reaches that
+branch: the harness machine puts the system volume on the first block device, so `mount_by_uuid`
+answers `first` on every run and the probes are never mounted. What the suite DOES cover is the path
+I had to change to fix it - every boot goes through the new return shape and the new close filter -
+so a regression in the ordinary case would be loud. Exercising the branch itself needs a test machine
+with a second LiberFS volume carrying the loader-chosen uuid, which is a change to the harness's disk
+set rather than to this service, and it is what would have caught this in the first place.
+
+**Finding 4 - closed catalogue clients are never reaped. ACCEPTED.**
+
+Confirmed in all three parts. `CatalogueClients` had `new` and `live` and no removal;
+`serve_catalogue_once` answered `false` for a gone peer and the standing loop discarded the answer;
+and `Channel::is_readable` is `!inbox.is_empty() || is_peer_closed()`, so the handle is readable for
+ever once the consumer exits. The loop therefore woke on it every pass, answered nothing, and the
+teardown handles - which go LAST in the wait set by construction - sat behind a dead one. The slot
+count was lifetime rather than live capacity, so eight consumer restarts exhausted a bound whose own
+comment says it is how many "may hold a connection at once".
+
+`CatalogueClients::retire(at)` closes the channel and moves the last live entry into the gap; the
+array is a set and the standing loop rebuilds its wait set from `live()` every pass, so nothing
+indexes across it. The loop now reads the serve function's answer and retires the connection the
+index belongs to.
+
+The same defect was in the POLICY half of that loop and the finding does not name it:
+`serve_policy_once` returned nothing at all, over the same `CatalogueClients` type, in the same
+`wait_any`. It now answers the same `bool` and is reaped the same way. Fixing one and not the other
+would have left the identical hot loop behind a different endpoint.
+
+Two limits I am stating rather than leaving to be discovered. The two ROOTS are never retired - they
+are this program's service registrations, not per-client connections, and there is no next client
+without them. And `ReceivedCaps` distinguishes `Message` from `Closed` and nothing finer, so a client
+whose request could not be received for some other reason is retired too; its end is closed, which
+that client observes as `PeerClosed` on its next call - a bounded ending, where the alternative is
+the endless wake this finding is about.
+
+**Finding 1 - the catalogue migration is one production consumer deep. ACCEPTED, and still unmet.**
+
+Re-read and confirmed: AudioService is the only driver-provider consumer that subscribes and opens;
+DeviceManager still holds fixed boot-block, network, display, input and USB locals and routes; and
+ServiceManager still injects fixed block/network/display roles. Nothing in this round changed that,
+and nothing in this round should have: converting a second consumer means moving that service's
+bootstrap off an injected role and onto a subscription, which is a change to that service's start-up
+contract and not to the catalogue. It is the milestone's Goal and it is not done.
+
+What I can add is a consequence I measured this round while building the display-restart check for
+this round's M0159 work, because "undiscoverable by the other production consumers" understates it.
+`route_offers` fills each fixed slot only `if *client == 0`, and it is called from ONE place - the
+phase-two bring-up loop in `launch_volume_drivers` - and never from the standing loop. So the fixed
+consumers do not merely miss a LATE provider. They miss a REPLACEMENT one: a driver that is stopped
+and started again after bring-up republishes its provider into the catalogue, nothing routes it, and
+the consumer goes on holding the handle of the binding that ended. Disable and re-enable the display
+driver and the device comes back while the display does not.
+
+AudioService survives exactly that, because it subscribes. That is the migration's value stated as a
+behaviour rather than as an architecture, and it is the strongest argument for finishing it that
+this round produced.
+
+**Finding 2 - block-role selection is capped and positional. ACCEPTED, and still unmet.**
+
+Also confirmed as described: four tags, four handles, four probes, assignment by ascending-BDF
+`Catalogue::take` position, ServiceManager mapping those positions to fixed FAT/ISO/UDF roles, and a
+fifth matching system volume not probed at all. Selecting by content instead means somebody must
+identify each medium's filesystem BEFORE the roles are handed out, and the code that can do that -
+the FAT, ISO and UDF probes - lives in StorageService, which does not exist yet at the moment
+ServiceManager assigns the roles. That is a bootstrap-ordering change across three components, not a
+correction inside one, and doing it at the end of a round whose other changes are in the same file
+would be the way to break the boot. Recorded as owed.
+
+## Verification for this round
+
+The model asks for a FULL verification of this change set - `src/kernel/device.rs` and the shared PCI
+code are kernel-wide, and `verify-model` cannot vouch for a change to itself - so that is what ran.
+
+| | result |
+| --- | --- |
+| `./test.sh --arch x86_64` | 373 passed, 0 failed |
+| `./test.sh --arch aarch64` | 361 passed, 0 failed |
+| `./test.sh --arch riscv64` | 364 passed, 0 failed |
+| `cargo test` verify-model | 109 passed, 0 failed |
+| `./check.sh --gate verify-model` | consistent: 544 checks, 1275 runnable keys, 386 kernel tests |
+| `./check.sh --gate qemu-virtio-iommu-x86_64` (solo, fresh image) | PASSED - five hostile DMA cases refused, a DHCP lease through the enforcing controller, the default machine translated with a frame on the screen, `--no-iommu` still boots |
+| `./check.sh --gate concurrent-selection` (solo) | PASSED |
+| the rest of the gate sweep | 30 gates run, three FAILED and all three for reasons established below |
+
+THE THREE GATE FAILURES, EACH CHECKED RATHER THAN ASSUMED AWAY.
+
+`qemu-arch-profiles` failed on `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick`
+at riscv64 AIA, 4 cores. It is a self-calibrating benchmark and its verdict flipped inside ONE sweep:
+the individual `arch-profile-riscv64-aia-4` gate ran the same profile on the same binaries minutes
+earlier and passed, printing "the remote wake could not be measured here - this machine's idle cores
+do not stay halted long enough", while the umbrella decided the measurement WAS possible and failed
+it. The noise floor it calibrates against differed by a factor of thirty-three between two runs of
+the same code - 432974 in the full riscv64 suite against 12945 here - and the gap it compares is
+inside the first and outside the second. Re-run on its own afterwards: PASSED. Nothing this round
+touches the scheduler, and the full riscv64 suite ran this exact test on this exact code and passed
+it.
+
+`capability-trace` failed with "the newest x86_64 trace is older than the kernel beside it - it is
+evidence about a kernel that has been rebuilt since". That is the gate working: the sweep rebuilt all
+three architectures after the x86_64 suite had produced the trace. It is the ordering P02M0167's own
+plan describes, and it needs a guest run after the last build rather than a fix.
+
+`dynamic-report` failed on changed byte sizes for `lsdev` and `lsusb`. Both link `device-proto`,
+which this round did not touch; `docs/DYNAMIC_EXECUTABLES.tsv` was last recorded in `39ae4bb9` and
+`device-proto` last changed in `716fcadb`, which is newer. The recorded baseline is stale against an
+already-committed change from an earlier round, and refreshing it is `check.sh`'s `--write` form
+rather than anything this round owes.
+
+Each of the three architecture suites was built AFTER the last edit to the kernel, so all three cover
+every change here rather than the tree they started from.
+
+WHAT THE SUITES DO NOT COVER, WHICH IS THE PART WORTH WRITING DOWN. Four of this round's changes are
+compiled and booted through and never EXECUTED by any registered test, and I only found that out by
+grepping for the lines they print:
+
+- the planned-stop arm. `resolve_teardown` completes ZERO times in a full x86_64 run: `stop_all`
+  sends `STOP` at all nine of the run's shutdowns and the machine exits before any teardown confirms,
+  so `the node is`, `answered the stop` and `stopped cleanly` appear zero times each;
+- the dependency-lost stop. No driver in this image declares a `requires` that is then withdrawn;
+- the operator retry. Nothing types a policy verb;
+- the catalogue and policy client reaping. No consumer of either endpoint exits during a run.
+
+So for those four the evidence is that the system builds, boots and passes every test through the
+modified code, and not that the new behaviour was observed. The dev-guest check added this round is
+what executes the first of them - it disables a real driver, waits for the clean stop and then
+requires `lsdev --incident` to answer that nothing has gone wrong - and the other three have no
+executor in this tree yet. That is stated rather than left for the next audit to find.
+
+ONE OBSERVATION THAT IS NOT A REGRESSION, checked rather than assumed. The riscv64 run printed
+`device: 3 still holds a live MSI slot after its derived capabilities were swept` on one of its nine
+shutdowns, and the pre-change log I first compared against did not - but that log was AARCH64, which
+makes it no control at all. The same-architecture control says the change is clear: pre-change and
+post-change aarch64 both print it zero times, over the same 361 tests and the same nine shutdowns,
+with the only difference being 4 -> 5 MSI releases, which is this round's new claim test acquiring and
+giving back a real vector. x86_64 prints it zero times as well.
+
+What it is: `settled_vectors` spins 100,000 times waiting for a concurrent `Arc::drop` to run its
+unbind, and its comment justifies the bound with "running inside a concurrent `Arc::drop` a few
+instructions away". That reasoning holds on hardware and on KVM. Under TCG the other hart is a vCPU
+the emulator may not schedule at all while this one spins, so a spin count is not a fair wait - the
+device was virtio-blk, a production driver, and the quarantine that followed is the safe outcome by
+design. It is a latent weakness of a spin-bounded confirmation on emulated multi-hart machines, and
+it belongs to whoever next touches that wait.
+
+AUDITOR'S RE-AUDIT ON M0164 (2026-09-01T11:58:45Z):
+
+Current implementation rating: 5/10
+
+1. **Production catalogue migration remains only one consumer deep.** AudioService subscribes and opens providers (`src/user/services/core/src/audio_engine.rs:658-700`), but DeviceManager still retains fixed boot-block arrays and single network/display/input/USB route locals (`src/user/services/core/src/device_manager.rs:431-451,1112-1194`), while ServiceManager still injects fixed device-role handles (`src/user/services/core/src/service_manager/bootstrap.rs:389-480`). `route_offers` has only its phase-two bring-up call site and fills the display slot only when the fixed `gpu_client` is zero (`src/user/services/core/src/device_manager.rs:968-970,1125-1130`), so a rebound GPU republishes but DisplayService retains the dead previous connection. Late, additional, and replacement providers remain undiscoverable by those consumers, contrary to the Goal and scoped per-service subscription seam/definition of done (`docs/todo/P02M0164.md:13-20,288-323`).
+
+2. **Block-role selection remains capped and positional instead of implementing format, origin, and `RootSelection`.** DeviceManager defines exactly four boot tags, four role handles, and four probe handles, mints probes for only four catalogue entries, and assigns the roles by `Catalogue::take` position (`src/user/services/core/src/device_manager.rs:82-85,431-444,842-880`). ServiceManager maps those positions to fixed FAT/ISO/UDF/USB tags, and StorageService trusts those tags rather than identifying the formats (`src/user/services/core/src/service_manager/bootstrap.rs:389-445`; `src/user/services/storage/src/service.rs:262-275`). A matching system volume outside the four-probe set is never considered, and non-system roles are not selected by content, leaving M2 and its three-input/either-order definition of done unmet (`docs/todo/P02M0164.md:71-121,288-305`).

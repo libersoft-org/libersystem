@@ -668,3 +668,117 @@ AUDITOR'S RE-AUDIT ON M0166 (2026-09-01T03:15:10Z):
 Current implementation rating: 8/10
 
 1. **The latest retry-budget correction limits only the first retried candidate, not the operator action to one attempt.** `Retry` sets `attempt = MAX_AUTOMATIC_ATTEMPTS - 1`, rewinds an exhausted cursor, and requests a restart (`src/user/services/core/src/device_manager.rs:3758-3815`); `may_try_again` then prevents another automatic attempt of that candidate (`:2879-2883`). But when the retried candidate fails and its teardown resolves to `Failed`, `advance` returns `Step::NextCandidate` (`:3438-3450`). Both loop handlers then increment the cursor, reset `attempt = 0`, and immediately start the next candidate (`:544-557,960-968`). A multi-candidate device can therefore receive the requested one attempt on the first entry and then full automatic budgets on later entries. No one-shot state survives `NextCandidate`, so the explicit exactly-one-attempt requirement remains unmet (`docs/todo/P02M0166.md:241-249`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-09-01T11:55:00Z):
+
+**Finding 1 - the retry budget bounds the candidate, not the operator's request. ACCEPTED.**
+
+The trace is right and I checked every step of it. `PolicyVerb::Retry` sets `attempt =
+MAX_AUTOMATIC_ATTEMPTS - 1`, which makes `may_try_again` refuse a second automatic attempt of THAT
+candidate - so the retried entry gets exactly one try, and `give_up_with` then resolves its teardown
+to `Failed`. `advance` answers `Step::NextCandidate` for anything that is not `Backoff` or
+`Quarantined`, and both loop handlers - the standing loop's and the bring-up loop's - do the same
+three things: `candidate += 1`, `attempt = 0`, `start_candidate`. The counter that carried the rule
+is per candidate, so advancing past the candidate discards it. A device with three declared
+candidates answered "try once" with one attempt plus a full automatic budget on each of the two
+entries after it.
+
+This is the third correction to this verb and the previous two were each right about the case they
+looked at - the first granted zero attempts, the second granted the whole budget back after
+exhaustion - so it is worth saying what was structurally wrong rather than only what the symptom
+was: an operator's request is one thing and `attempt` is a property of a candidate, and every
+version so far tried to express the first in the second.
+
+Fixed with state that outlives the cursor. `Node` gains `retry_once`, set by the verb beside the
+work it already does. Both `NextCandidate` handlers now `core::mem::take` it: when it was set, the
+cursor still advances - so a LATER request tries the entry after this one rather than the same one
+again - and this program does not start that entry unasked, saying so on the console. It is cleared
+when a binding reaches `Online`, because the granted attempt succeeded and a flag left set there
+would stop the first later crash from trying the next candidate, long after the request that set it
+was answered.
+
+The two handlers are corrected together deliberately. They are the same three lines in two loops,
+and a one-shot honoured in only one of them is a one-shot that depends on which phase the node
+happened to be in when the operator typed the command.
+
+## Verification for this round
+
+The model asks for a FULL verification of this change set - `src/kernel/device.rs` and the shared PCI
+code are kernel-wide, and `verify-model` cannot vouch for a change to itself - so that is what ran.
+
+| | result |
+| --- | --- |
+| `./test.sh --arch x86_64` | 373 passed, 0 failed |
+| `./test.sh --arch aarch64` | 361 passed, 0 failed |
+| `./test.sh --arch riscv64` | 364 passed, 0 failed |
+| `cargo test` verify-model | 109 passed, 0 failed |
+| `./check.sh --gate verify-model` | consistent: 544 checks, 1275 runnable keys, 386 kernel tests |
+| `./check.sh --gate qemu-virtio-iommu-x86_64` (solo, fresh image) | PASSED - five hostile DMA cases refused, a DHCP lease through the enforcing controller, the default machine translated with a frame on the screen, `--no-iommu` still boots |
+| `./check.sh --gate concurrent-selection` (solo) | PASSED |
+| the rest of the gate sweep | 30 gates run, three FAILED and all three for reasons established below |
+
+THE THREE GATE FAILURES, EACH CHECKED RATHER THAN ASSUMED AWAY.
+
+`qemu-arch-profiles` failed on `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick`
+at riscv64 AIA, 4 cores. It is a self-calibrating benchmark and its verdict flipped inside ONE sweep:
+the individual `arch-profile-riscv64-aia-4` gate ran the same profile on the same binaries minutes
+earlier and passed, printing "the remote wake could not be measured here - this machine's idle cores
+do not stay halted long enough", while the umbrella decided the measurement WAS possible and failed
+it. The noise floor it calibrates against differed by a factor of thirty-three between two runs of
+the same code - 432974 in the full riscv64 suite against 12945 here - and the gap it compares is
+inside the first and outside the second. Re-run on its own afterwards: PASSED. Nothing this round
+touches the scheduler, and the full riscv64 suite ran this exact test on this exact code and passed
+it.
+
+`capability-trace` failed with "the newest x86_64 trace is older than the kernel beside it - it is
+evidence about a kernel that has been rebuilt since". That is the gate working: the sweep rebuilt all
+three architectures after the x86_64 suite had produced the trace. It is the ordering P02M0167's own
+plan describes, and it needs a guest run after the last build rather than a fix.
+
+`dynamic-report` failed on changed byte sizes for `lsdev` and `lsusb`. Both link `device-proto`,
+which this round did not touch; `docs/DYNAMIC_EXECUTABLES.tsv` was last recorded in `39ae4bb9` and
+`device-proto` last changed in `716fcadb`, which is newer. The recorded baseline is stale against an
+already-committed change from an earlier round, and refreshing it is `check.sh`'s `--write` form
+rather than anything this round owes.
+
+Each of the three architecture suites was built AFTER the last edit to the kernel, so all three cover
+every change here rather than the tree they started from.
+
+WHAT THE SUITES DO NOT COVER, WHICH IS THE PART WORTH WRITING DOWN. Four of this round's changes are
+compiled and booted through and never EXECUTED by any registered test, and I only found that out by
+grepping for the lines they print:
+
+- the planned-stop arm. `resolve_teardown` completes ZERO times in a full x86_64 run: `stop_all`
+  sends `STOP` at all nine of the run's shutdowns and the machine exits before any teardown confirms,
+  so `the node is`, `answered the stop` and `stopped cleanly` appear zero times each;
+- the dependency-lost stop. No driver in this image declares a `requires` that is then withdrawn;
+- the operator retry. Nothing types a policy verb;
+- the catalogue and policy client reaping. No consumer of either endpoint exits during a run.
+
+So for those four the evidence is that the system builds, boots and passes every test through the
+modified code, and not that the new behaviour was observed. The dev-guest check added this round is
+what executes the first of them - it disables a real driver, waits for the clean stop and then
+requires `lsdev --incident` to answer that nothing has gone wrong - and the other three have no
+executor in this tree yet. That is stated rather than left for the next audit to find.
+
+ONE OBSERVATION THAT IS NOT A REGRESSION, checked rather than assumed. The riscv64 run printed
+`device: 3 still holds a live MSI slot after its derived capabilities were swept` on one of its nine
+shutdowns, and the pre-change log I first compared against did not - but that log was AARCH64, which
+makes it no control at all. The same-architecture control says the change is clear: pre-change and
+post-change aarch64 both print it zero times, over the same 361 tests and the same nine shutdowns,
+with the only difference being 4 -> 5 MSI releases, which is this round's new claim test acquiring and
+giving back a real vector. x86_64 prints it zero times as well.
+
+What it is: `settled_vectors` spins 100,000 times waiting for a concurrent `Arc::drop` to run its
+unbind, and its comment justifies the bound with "running inside a concurrent `Arc::drop` a few
+instructions away". That reasoning holds on hardware and on KVM. Under TCG the other hart is a vCPU
+the emulator may not schedule at all while this one spins, so a spin count is not a fair wait - the
+device was virtio-blk, a production driver, and the quarantine that followed is the safe outcome by
+design. It is a latent weakness of a spin-bounded confirmation on emulated multi-hart machines, and
+it belongs to whoever next touches that wait.
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-09-01T11:58:45Z):
+
+Current implementation rating: 7/10
+
+1. **The milestone's required production policy and security proofs remain absent.** The only current production policy exercise is the dev GPU check's `disable`/`enable` sequence (`src/harness/dev-gpu-restart.py:197-228`), and the latest response confirms that check has not completed. No registered test invokes `select` or `retry`, drives the production `PolicyView`/`decide_policy` path, distinguishes quarantined retry from accepted future-policy verbs while resources and state remain unchanged, or proves that a `CAP_CONFIG`-only connection cannot mutate `device.policy.*`. The binding tests cover helper state machinery and the device-proto tests cover codecs, so removing the new one-shot retry behavior would not fail them. The explicit policy/security cases in the definition of done remain unproved (`docs/todo/P02M0166.md:239-251`).

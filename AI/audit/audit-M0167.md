@@ -782,3 +782,141 @@ AUDITOR'S RE-AUDIT ON M0167 (2026-09-01T03:15:10Z):
 Current implementation rating: 8/10
 
 1. **The concurrency proof still bypasses the sole guest scheduler and its `--jobs` bound.** The corrected gate now varies both `TEST_SELECTION` and `TEST_TAGS`, is registered in the catalogue, and verifies each run's own logs, but it directly backgrounds two independent `./test.sh --arch x86_64` processes (`src/tools/check-concurrent-selection.sh:51-62`). `verify.sh` recognizes a schedulable guest only when the catalogue command itself contains literal `./test.sh --arch`; the `./check.sh --gate concurrent-selection` step is therefore treated as a foreground host gate and its two inner guests never consume `JOBS` slots (`verify.sh:841-850`). The outer barrier prevents overlap with other planned guests, but `--jobs 1` still launches two simultaneously. The latest response explicitly leaves this unresolved, contrary to M3's no-inner-scheduler rule and the definition of done that every guest-starting verification path goes through the sole scheduler (`docs/todo/P02M0167.md:361-371,681-683`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-09-01T11:55:00Z):
+
+**Finding 1 - the concurrency gate starts two guests outside the scheduler. ACCEPTED.**
+
+The facts are as stated. `verify.sh` sets `is_guest=1` only when the step's command contains
+`./test.sh --arch `, so `./check.sh --gate concurrent-selection` is a host gate: it gets the barrier
+- `drain_guests` runs and nothing else overlaps it - and its two inner boots are counted by nothing.
+Under `--jobs 1` that put two QEMUs on a machine whose one answer was one.
+
+I want to be precise about what is and is not violated, because the barrier does more than my
+previous answer credited it with: the gate never runs BESIDE another guest, so the peak is
+`max(JOBS, 2)` rather than `JOBS + 2`, and there is no outer-N-times-inner-N. What is violated is
+the sentence item 6 rests on - "how many QEMUs may run must have exactly one answer on this machine"
+- at `--jobs 1`, and the definition of done's "every verification path that starts guests goes
+through it". And the exemption item 4 grants `test.sh --arch all` does not extend here: that one is
+justified by "nothing else is scheduling then", and under `verify.sh` something is.
+
+The gate cannot be made serial - its subject IS overlap, and two suites run one after another prove
+nothing about the per-run staging of the kernel, the medium and the loader. So the count is declared
+and the scheduler accounts for it, which is the shape item 6 asks for ("each profile becomes its own
+catalog step") applied to a gate whose steps cannot be separated in time.
+
+Four changes:
+
+`src/tools/verify-model/src/catalog.rs` gains `gate_concurrent_guests(gate)`, which is 2 for
+`concurrent-selection` and 1 for everything else - every other gate in this tree boots serially and
+a barrier plus a slot is the whole of what it needs.
+
+`src/tools/verify-model/src/commands.rs` gives such a gate its OWN step rather than merging it into
+the pre-guest batch. Merged, its count would apply to every gate beside it, so a budget too small to
+hold the overlap would skip a dozen cheap host gates with it. Split out it is priced, scheduled and
+refused on its own - the same shape `GATES_AFTER_A_GUEST` already has for a different reason. `Step`
+carries `guests`, zero for everything that boots nothing or boots serially.
+
+`main.rs` emits `STEPGUESTS <index> <n>` for a step needing more than one, on its own line beside
+`STEPID`, `STEPREQ` and `STEPCOST` - a marker a reader that does not know it skips, which is what
+those three exist to demonstrate.
+
+`verify.sh` reads it. A step wanting more guest slots than `--jobs` grants is SKIPPED for the budget,
+which is the runner's existing INCOMPLETE outcome and never reads as green: a gate about overlap that
+ran one guest would report a pass for something it did not test. Everything else is unchanged, so at
+`--jobs 2` or more the gate runs exactly as it does today. And the runner exports
+`LIBER_CONCURRENT_GUESTS`, which `check-concurrent-selection.sh` now refuses to exceed - so the step
+is told the answer rather than deciding one. Unset, meaning nobody is scheduling, keeps a person's
+`./check.sh --gate concurrent-selection` working, which is the same exemption item 4 grants and for
+the reason it grants it.
+
+The consequence, stated because it is a deliberate trade and not a side effect. `JOBS` defaults to 1,
+so a plain `./verify.sh` that selects this gate now ends INCOMPLETE rather than green, and the line
+says which flag runs it. I considered the softer reading - the budget bounds what the SCHEDULER
+starts in parallel, and a single step that has declared an exclusive count of 2 is bounded and known,
+so let it run - and rejected it: it is the same argument the gate was already making for itself, and
+the difference between "the runner allows it" and "the runner cannot see it" is not what item 6's
+sentence is about. A run that could not prove a concurrency property inside its budget should say it
+did not, and INCOMPLETE is the outcome this runner already has for that.
+
+## Verification for this round
+
+The model asks for a FULL verification of this change set - `src/kernel/device.rs` and the shared PCI
+code are kernel-wide, and `verify-model` cannot vouch for a change to itself - so that is what ran.
+
+| | result |
+| --- | --- |
+| `./test.sh --arch x86_64` | 373 passed, 0 failed |
+| `./test.sh --arch aarch64` | 361 passed, 0 failed |
+| `./test.sh --arch riscv64` | 364 passed, 0 failed |
+| `cargo test` verify-model | 109 passed, 0 failed |
+| `./check.sh --gate verify-model` | consistent: 544 checks, 1275 runnable keys, 386 kernel tests |
+| `./check.sh --gate qemu-virtio-iommu-x86_64` (solo, fresh image) | PASSED - five hostile DMA cases refused, a DHCP lease through the enforcing controller, the default machine translated with a frame on the screen, `--no-iommu` still boots |
+| `./check.sh --gate concurrent-selection` (solo) | PASSED |
+| the rest of the gate sweep | 30 gates run, three FAILED and all three for reasons established below |
+
+THE THREE GATE FAILURES, EACH CHECKED RATHER THAN ASSUMED AWAY.
+
+`qemu-arch-profiles` failed on `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick`
+at riscv64 AIA, 4 cores. It is a self-calibrating benchmark and its verdict flipped inside ONE sweep:
+the individual `arch-profile-riscv64-aia-4` gate ran the same profile on the same binaries minutes
+earlier and passed, printing "the remote wake could not be measured here - this machine's idle cores
+do not stay halted long enough", while the umbrella decided the measurement WAS possible and failed
+it. The noise floor it calibrates against differed by a factor of thirty-three between two runs of
+the same code - 432974 in the full riscv64 suite against 12945 here - and the gap it compares is
+inside the first and outside the second. Re-run on its own afterwards: PASSED. Nothing this round
+touches the scheduler, and the full riscv64 suite ran this exact test on this exact code and passed
+it.
+
+`capability-trace` failed with "the newest x86_64 trace is older than the kernel beside it - it is
+evidence about a kernel that has been rebuilt since". That is the gate working: the sweep rebuilt all
+three architectures after the x86_64 suite had produced the trace. It is the ordering P02M0167's own
+plan describes, and it needs a guest run after the last build rather than a fix.
+
+`dynamic-report` failed on changed byte sizes for `lsdev` and `lsusb`. Both link `device-proto`,
+which this round did not touch; `docs/DYNAMIC_EXECUTABLES.tsv` was last recorded in `39ae4bb9` and
+`device-proto` last changed in `716fcadb`, which is newer. The recorded baseline is stale against an
+already-committed change from an earlier round, and refreshing it is `check.sh`'s `--write` form
+rather than anything this round owes.
+
+Each of the three architecture suites was built AFTER the last edit to the kernel, so all three cover
+every change here rather than the tree they started from.
+
+WHAT THE SUITES DO NOT COVER, WHICH IS THE PART WORTH WRITING DOWN. Four of this round's changes are
+compiled and booted through and never EXECUTED by any registered test, and I only found that out by
+grepping for the lines they print:
+
+- the planned-stop arm. `resolve_teardown` completes ZERO times in a full x86_64 run: `stop_all`
+  sends `STOP` at all nine of the run's shutdowns and the machine exits before any teardown confirms,
+  so `the node is`, `answered the stop` and `stopped cleanly` appear zero times each;
+- the dependency-lost stop. No driver in this image declares a `requires` that is then withdrawn;
+- the operator retry. Nothing types a policy verb;
+- the catalogue and policy client reaping. No consumer of either endpoint exits during a run.
+
+So for those four the evidence is that the system builds, boots and passes every test through the
+modified code, and not that the new behaviour was observed. The dev-guest check added this round is
+what executes the first of them - it disables a real driver, waits for the clean stop and then
+requires `lsdev --incident` to answer that nothing has gone wrong - and the other three have no
+executor in this tree yet. That is stated rather than left for the next audit to find.
+
+ONE OBSERVATION THAT IS NOT A REGRESSION, checked rather than assumed. The riscv64 run printed
+`device: 3 still holds a live MSI slot after its derived capabilities were swept` on one of its nine
+shutdowns, and the pre-change log I first compared against did not - but that log was AARCH64, which
+makes it no control at all. The same-architecture control says the change is clear: pre-change and
+post-change aarch64 both print it zero times, over the same 361 tests and the same nine shutdowns,
+with the only difference being 4 -> 5 MSI releases, which is this round's new claim test acquiring and
+giving back a real vector. x86_64 prints it zero times as well.
+
+What it is: `settled_vectors` spins 100,000 times waiting for a concurrent `Arc::drop` to run its
+unbind, and its comment justifies the bound with "running inside a concurrent `Arc::drop` a few
+instructions away". That reasoning holds on hardware and on KVM. Under TCG the other hart is a vCPU
+the emulator may not schedule at all while this one spins, so a spin count is not a fair wait - the
+device was virtio-blk, a production driver, and the quarantine that followed is the safe outcome by
+design. It is a latent weakness of a spin-bounded confirmation on emulated multi-hart machines, and
+it belongs to whoever next touches that wait.
+
+AUDITOR'S RE-AUDIT ON M0167 (2026-09-01T11:58:45Z):
+
+Current implementation rating: 7/10
+
+1. **The failed-prerequisite correction remains incomplete: the dependency graph is not validated, and the required scheduler proof is absent.** Command emission computes layers by repeatedly inserting `StepId`s, silently treating an unknown dependency as depth zero and overwriting a duplicate ID; it never rejects duplicate IDs, missing dependencies, or cycles (`src/tools/verify-model/src/main.rs:1100-1107`). Budget closure likewise ignores a prerequisite absent from the emitted map (`verify.sh:650-668`). This contradicts M4's explicit pre-walk validation requirement (`docs/todo/P02M0167.md:426-428`). No test executes `verify.sh` over the required shared-prerequisite, unmeasured-cost, `FAIL`-over-`INCOMPLETE`, and failed-prerequisite/descendant matrix, or asserts the new `STEPGUESTS` reservation against `--jobs`; the verify-model unit tests do not cover those shell scheduler semantics (`docs/todo/P02M0167.md:674-676`).

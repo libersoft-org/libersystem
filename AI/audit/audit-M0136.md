@@ -944,3 +944,61 @@ Rating: 7/10
    therefore take different fallback, shaping or cache paths or produce incompatible cluster/caret
    mappings while both implementations follow the plan. Freeze the policy and its original-source
    mapping before shaping.
+
+PLANNER'S RESPONSE ON M0136 (2026-09-01T12:12:00Z):
+
+Both findings ACCEPTED. Both are the same kind of defect - a row that names a decision and does not
+make one - and the first is load-bearing enough that nothing in the item could have been built.
+
+**Finding 1 - the catalogue has no defined authority or runtime path to the font bytes. ACCEPTED.**
+
+Verified against the row and against the manifest code. The item specifies the service row, both
+consumer edges, the protocol, the capability and three ceilings, and never says how the catalogue
+itself reaches a single byte of a font. `role = "service"` starts a program; it grants nothing. The
+delivered roles are `ServeRoot`, `Client`, `Factory`, `Privilege`, `Power`, `Package`, `Device` and
+`Payload`, and the catalogue was given none of them for its own input. So RESOLVE - "a read-only
+`MemoryObject` of its bytes" - had no source, and the replacement generation had no way to notice a
+replacement. The auditor is right that this cannot be implemented without inventing an undeclared
+capability, which is the exact thing the row forbids of its own clients one line further down.
+
+Decided rather than listed, because the auditor is also right that the three candidate sources differ
+in authority, restart and update semantics: a `Client` role on StorageService, CONFINED to the
+canonical font destination directory. The plan now carries that row and the reasoning for it, stated
+as a comparison so the alternatives are refused rather than merely unmentioned:
+
+- the INIT PACKAGE would make faces immutable for the life of a boot, which leaves SUBSCRIBE with
+  nothing to report and makes the item's own replacement gate reachable only by rebooting;
+- a BROAD StorageService client would give a font service authority over the whole volume - the
+  ambient authority this item refuses on behalf of its clients four lines below, and it cannot refuse
+  for them what it takes for itself.
+
+The same edit closes the half the finding names second: HOW it learns a face changed. The catalogue
+re-reads the directory and recomputes each face's identity digest, and bumps the generation when a
+digest, the name set or a face's metadata differs from what it last published. Nothing notifies it,
+because nothing in this tree currently can, and a design waiting for a notification nobody sends
+would not work. That makes the trigger explicit, and it adds a fourth operation - RESCAN - so
+replacement is observable at all; the protocol line now says four operations rather than three.
+
+**Finding 2 - canonical equivalence is a named decision rather than a decision. ACCEPTED.**
+
+Confirmed: the normative pipeline's first stage read "UTF-8 validation and canonical-equivalence
+policy", which is a slot. The consequences the auditor names are real - composed and decomposed
+spellings could take different fallback, shaping and cache paths, and two implementations could
+disagree about every cluster boundary in a decomposed run while both following the file.
+
+Frozen as PRESERVATION, in three parts, with the mapping question answered first because it is the
+one that cannot be fixed later:
+
+- the pipeline NEVER rewrites the caller's bytes - no NFC, NFD or NFKC - and every offset in a
+  `GlyphRun` is a byte offset into the ORIGINAL UTF-8. Normalising the buffer and then reporting
+  offsets into the normalised copy is how an engine returns caret positions that do not exist in the
+  caller's string, and no mapping back survives a decomposition that changes length;
+- equivalence is resolved INSIDE shaping. A canonical composition and its decomposition are one
+  grapheme cluster under UAX #29, so itemisation and fallback see one indivisible unit either way and
+  cannot route them to different faces; within a run the shaper applies the composition and
+  decomposition its tables require - which is what OpenType shaping does in any case - and may not
+  change cluster boundaries or the reported byte spans while doing it;
+- and it is tested: composed and decomposed spellings of one string produce the same glyph sequence
+  and the same total advance, take the same fallback decision, and report cluster byte spans differing
+  only as the inputs' own byte lengths differ. Run for a Latin combining-acute case and for one of the
+  profile's non-Latin scripts, because a Latin-only proof of this is the case that always works.

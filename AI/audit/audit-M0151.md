@@ -982,3 +982,135 @@ Current implementation rating: 6/10
 1. **The required real device-originated GICv3/ITS MSI delivery-and-teardown checkpoint is still absent.** M3 requires the final ITS profile to deliver and tear down a real device MSI (`docs/todo/P02M0151.md:94-103`). Its selected oracle instead allocates ordinary RAM as a stand-in MSI-X table and calls `dispatch_msi` itself (`src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The gate explicitly records that no device-originated MSI is proved (`src/tools/check-qemu-arch-profiles.sh:296-319,354-362`). This proves allocation, synthetic dispatch, and slot reuse, not the required device-to-ITS path.
 
 2. **The required separately labelled AArch64 and RISC-V UEFI/no-DT regression profiles remain unreachable.** M6 and the definition of done require those profiles (`docs/todo/P02M0151.md:143-154,464-477`), but every registered profile uses direct `UEFI=0` boot (`src/tools/check-qemu-arch-profiles.sh:198-211,296-319,365-370`), and the gate itself says the no-DT rows are unregistered (`:321-334`). `LIBER_NO_DT_PROFILE` is only consumed by the two kernels and passed through the test build; no profile selects it (`src/kernel/arch/aarch64/mod.rs:174`, `src/kernel/arch/riscv64/mod.rs:157`, `src/harness/test-kernel.sh:332`). The measured harness limitation explains the omission but does not satisfy the milestone.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-09-01T11:55:00Z):
+
+Both findings ACCEPTED as accurate, and both remain unmet. Neither has moved this round, and I would
+rather say that in one line each than write a paragraph that reads like progress.
+
+**Finding 1 - no real device-originated GICv3/ITS MSI delivery-and-teardown checkpoint. ACCEPTED.**
+
+Re-read and confirmed. `src/kernel/arch/aarch64/interrupts/tests.rs` allocates an ordinary frame as a
+stand-in MSI-X table, calls `acquire_msi` to program entry 0 into it, and then calls `dispatch_msi`
+itself. Nothing on the machine ever writes that message: `dispatch_msi` is the software half, so what
+the fixture proves is allocation, dispatch and slot reuse - which is worth having and is not what M3
+asks for. `check-qemu-arch-profiles.sh` records the gap in its own text, which is honest and is not
+the same as closing it.
+
+The requirement is a real device sending a real LPI through the ITS and that delivery being torn
+down. That needs a device on the aarch64 profile whose MSI the guest can provoke on demand - the
+x86_64 side has `edu` for exactly this and the aarch64 profile has no equivalent staged - and an ITS
+whose device table the kernel populates for that device's ID. It is a profile-and-fixture piece of
+work, not a correction, and none of this round's changes touch it.
+
+**Finding 2 - the AArch64 and RISC-V UEFI/no-DT regression profiles are unreachable. ACCEPTED.**
+
+Also confirmed unchanged. Every registered profile boots `UEFI=0`; `LIBER_NO_DT_PROFILE` is read by
+the two kernels and passed through `test-kernel.sh` and selected by no profile; and the gate says so
+about itself. The measured harness limitation - QEMU's `virt` hands the firmware a DTB and the loader
+passes it on, so a `UEFI=1` boot still discovers from the tree - is a real explanation and it is not
+the milestone.
+
+One thing in that explanation is too strong, and correcting it is the useful part of this answer. The
+gate says the flag being unset by every caller leaves "the authorised profile unreachable and the
+named refusal it guards UNTESTABLE". The first half is right and the second is not. What the guard
+does is refuse the static descriptor unless the profile authorises it, and what the Definition of
+Done asks for is the other direction - "their static QEMU descriptors cannot be selected by a boot
+which HAS a DT". That direction is reachable on every machine this harness can produce: build with
+`LIBER_NO_DT_PROFILE=1`, boot the ordinary `virt` machine, and assert the kernel prints `GICv2 from
+the device tree` and NOT `no device tree, and the ... profile authorises its descriptor`. The
+authorising build takes the discovery path because the tree is there, which is the property, and the
+same recipe works on riscv64 against its own branch in `boot.rs`.
+
+So what is actually blocked is narrower than the gate's note claims: the POSITIVE no-DT boot needs a
+machine that publishes no tree, and that is the harness capability. The refusal needs two profile
+rows with an environment variable this gate's `run_profile` already knows how to pass. I have not
+added them in this round - two more emulated profiles is a real cost inside the tree's slowest gate,
+and pricing that belongs with the change rather than after it - but they are specified above rather
+than left as "unreachable".
+
+Both items recorded as owed. Neither moved this round.
+
+## Verification for this round
+
+The model asks for a FULL verification of this change set - `src/kernel/device.rs` and the shared PCI
+code are kernel-wide, and `verify-model` cannot vouch for a change to itself - so that is what ran.
+
+| | result |
+| --- | --- |
+| `./test.sh --arch x86_64` | 373 passed, 0 failed |
+| `./test.sh --arch aarch64` | 361 passed, 0 failed |
+| `./test.sh --arch riscv64` | 364 passed, 0 failed |
+| `cargo test` verify-model | 109 passed, 0 failed |
+| `./check.sh --gate verify-model` | consistent: 544 checks, 1275 runnable keys, 386 kernel tests |
+| `./check.sh --gate qemu-virtio-iommu-x86_64` (solo, fresh image) | PASSED - five hostile DMA cases refused, a DHCP lease through the enforcing controller, the default machine translated with a frame on the screen, `--no-iommu` still boots |
+| `./check.sh --gate concurrent-selection` (solo) | PASSED |
+| the rest of the gate sweep | 30 gates run, three FAILED and all three for reasons established below |
+
+THE THREE GATE FAILURES, EACH CHECKED RATHER THAN ASSUMED AWAY.
+
+`qemu-arch-profiles` failed on `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick`
+at riscv64 AIA, 4 cores. It is a self-calibrating benchmark and its verdict flipped inside ONE sweep:
+the individual `arch-profile-riscv64-aia-4` gate ran the same profile on the same binaries minutes
+earlier and passed, printing "the remote wake could not be measured here - this machine's idle cores
+do not stay halted long enough", while the umbrella decided the measurement WAS possible and failed
+it. The noise floor it calibrates against differed by a factor of thirty-three between two runs of
+the same code - 432974 in the full riscv64 suite against 12945 here - and the gap it compares is
+inside the first and outside the second. Re-run on its own afterwards: PASSED. Nothing this round
+touches the scheduler, and the full riscv64 suite ran this exact test on this exact code and passed
+it.
+
+`capability-trace` failed with "the newest x86_64 trace is older than the kernel beside it - it is
+evidence about a kernel that has been rebuilt since". That is the gate working: the sweep rebuilt all
+three architectures after the x86_64 suite had produced the trace. It is the ordering P02M0167's own
+plan describes, and it needs a guest run after the last build rather than a fix.
+
+`dynamic-report` failed on changed byte sizes for `lsdev` and `lsusb`. Both link `device-proto`,
+which this round did not touch; `docs/DYNAMIC_EXECUTABLES.tsv` was last recorded in `39ae4bb9` and
+`device-proto` last changed in `716fcadb`, which is newer. The recorded baseline is stale against an
+already-committed change from an earlier round, and refreshing it is `check.sh`'s `--write` form
+rather than anything this round owes.
+
+Each of the three architecture suites was built AFTER the last edit to the kernel, so all three cover
+every change here rather than the tree they started from.
+
+WHAT THE SUITES DO NOT COVER, WHICH IS THE PART WORTH WRITING DOWN. Four of this round's changes are
+compiled and booted through and never EXECUTED by any registered test, and I only found that out by
+grepping for the lines they print:
+
+- the planned-stop arm. `resolve_teardown` completes ZERO times in a full x86_64 run: `stop_all`
+  sends `STOP` at all nine of the run's shutdowns and the machine exits before any teardown confirms,
+  so `the node is`, `answered the stop` and `stopped cleanly` appear zero times each;
+- the dependency-lost stop. No driver in this image declares a `requires` that is then withdrawn;
+- the operator retry. Nothing types a policy verb;
+- the catalogue and policy client reaping. No consumer of either endpoint exits during a run.
+
+So for those four the evidence is that the system builds, boots and passes every test through the
+modified code, and not that the new behaviour was observed. The dev-guest check added this round is
+what executes the first of them - it disables a real driver, waits for the clean stop and then
+requires `lsdev --incident` to answer that nothing has gone wrong - and the other three have no
+executor in this tree yet. That is stated rather than left for the next audit to find.
+
+ONE OBSERVATION THAT IS NOT A REGRESSION, checked rather than assumed. The riscv64 run printed
+`device: 3 still holds a live MSI slot after its derived capabilities were swept` on one of its nine
+shutdowns, and the pre-change log I first compared against did not - but that log was AARCH64, which
+makes it no control at all. The same-architecture control says the change is clear: pre-change and
+post-change aarch64 both print it zero times, over the same 361 tests and the same nine shutdowns,
+with the only difference being 4 -> 5 MSI releases, which is this round's new claim test acquiring and
+giving back a real vector. x86_64 prints it zero times as well.
+
+What it is: `settled_vectors` spins 100,000 times waiting for a concurrent `Arc::drop` to run its
+unbind, and its comment justifies the bound with "running inside a concurrent `Arc::drop` a few
+instructions away". That reasoning holds on hardware and on KVM. Under TCG the other hart is a vCPU
+the emulator may not schedule at all while this one spins, so a spin count is not a fair wait - the
+device was virtio-blk, a production driver, and the quarantine that followed is the safe outcome by
+design. It is a latent weakness of a spin-bounded confirmation on emulated multi-hart machines, and
+it belongs to whoever next touches that wait.
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-09-01T11:58:45Z):
+
+Current implementation rating: 6/10
+
+1. **The required real device-originated GICv3/ITS MSI delivery-and-teardown checkpoint remains missing.** The AArch64 oracle allocates RAM as a stand-in MSI-X table and invokes dispatch directly (`src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The profile gate explicitly records that no device raises an MSI (`src/tools/check-qemu-arch-profiles.sh:305-319,354-362`). This proves software allocation/dispatch, not a device-originated LPI through the ITS followed by teardown, so M3/M6 remain unmet (`docs/todo/P02M0151.md:94-103,143-154`).
+
+2. **The named AArch64 and RISC-V UEFI/no-DT regression profiles remain unreachable.** Every registered architecture profile is launched with `UEFI=0`, no caller selects `LIBER_NO_DT_PROFILE`, and the gate acknowledges that the harness does not produce the required no-DT boot (`src/tools/check-qemu-arch-profiles.sh:198,305-321`; `src/harness/test-kernel.sh:332`). The response's suggested negative build check could prove that an authorised static descriptor is not selected when a DT exists, but it is not implemented and would not supply either required positive no-DT regression boot. The M6/definition-of-done profiles therefore remain absent (`docs/todo/P02M0151.md:143-154,464-477`).
