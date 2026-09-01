@@ -157,5 +157,10 @@ pub fn msix_enable(bus: u8, dev: u8, func: u8, cap: u16) {
 	common::msix_enable::<Access>(bus, dev, func, cap);
 }
 
+// The other half - see `common::msix_disable`. A released claim leaves the function unable to send.
+pub fn msix_disable(bus: u8, dev: u8, func: u8, cap: u16) {
+	common::msix_disable::<Access>(bus, dev, func, cap);
+}
+
 #[cfg(test)]
 mod tests;

@@ -402,6 +402,25 @@ pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shado
 // type; paying for it twice in a sweep does not.
 const UMBRELLA_GATES: [&str; 2] = ["qemu-arch-profiles", "qemu-numa"];
 
+// HOW MANY GUESTS A GATE STARTS AT THE SAME TIME.
+//
+// One for a gate that boots nothing or boots serially - which is every other gate in this tree,
+// including the eight-profile ones: a barrier and a slot is the whole of what they need, and the
+// runner already gives them that.
+//
+// `concurrent-selection` is the exception and the reason this exists. Its subject IS overlap - two
+// same-architecture suites running at once, which is the collision P02M0167 measured - so it cannot
+// be made serial without deleting what it proves. Declaring the count is what lets the ONE scheduler
+// account for it: `verify.sh` takes that many of its slots and refuses to start the gate inside a
+// `--jobs` that cannot hold them, rather than the gate quietly making its own answer to "how many
+// QEMUs may run on this machine".
+pub fn gate_concurrent_guests(gate: &str) -> usize {
+	match gate {
+		"concurrent-selection" => 2,
+		_ => 1,
+	}
+}
+
 pub fn catalog_gate_names() -> BTreeSet<String> {
 	GATES.iter().map(|(name, _)| (*name).to_string()).collect()
 }
@@ -479,14 +498,33 @@ impl Catalog {
 		// to cover it. It does now: `dev-selftest.py` drives publication, refusal and rollback
 		// through that agent, so it is exactly the check a regression in it would fail.
 		let development_only: Vec<String> = crates.iter().flat_map(|entry| entry.binaries.iter()).filter(|binary| binary.required_features.iter().any(|feature| feature == "development")).map(|binary| crate::graph::binary_component(&binary.name)).collect();
+		//
+		// `dev.gpu-restart` is the fourth, and it is here rather than in `check.sh` for the reason
+		// this whole list exists: it needs a guest that can be TOLD to do something after it has
+		// booted. P02M0159's M4 asks the enforcing profile to show the display driver surviving a
+		// restart, and the gate that watches that profile requires the driver to come up EXACTLY
+		// ONCE - correctly, since on a cold boot a second bind is a restart loop. Asking for the
+		// restart is a different check from refusing one, and the persistent instance is the machine
+		// that can be asked: it boots through `run.sh`, whose default x86_64 machine puts every
+		// virtio endpoint behind a virtio-iommu, and `lsdev --disable`/`--enable` drive the
+		// operator's own policy path from inside it.
 		for (id, script, subject) in [
 			("dev.selftest", "harness/dev-selftest.py", "harness.boot"),
 			("dev.proto-test", "harness/proto-test.py", "proto"),
 			("dev.perf-gate", "harness/perf-gate.py", "harness.boot"),
+			("dev.gpu-restart", "harness/dev-gpu-restart.py", "harness.boot"),
 		] {
 			let mut covers = vec![subject.to_string()];
 			if id == "dev.selftest" {
 				covers.extend(development_only.iter().cloned());
+				covers.sort();
+				covers.dedup();
+			}
+			// WHOSE RESTART IT IS. The check drives the display driver through DeviceManager's
+			// policy verbs, so a change to either is exactly what could break it - and a check that
+			// covered only the harness would not be selected by the change it exists to catch.
+			if id == "dev.gpu-restart" {
+				covers.extend(["bin.virtio_gpu".to_string(), "bin.device_manager".to_string()]);
 				covers.sort();
 				covers.dedup();
 			}

@@ -1088,7 +1088,22 @@ qemu_run_x86_64() {
 	# the check that exists to stop exactly that. Now the exemption is `artifact_suffix`: a run that
 	# has been given a set of its own may proceed, and a run reaching for the unsuffixed set while a
 	# development instance holds it is refused, whatever profile it declares.
-	if [[ -z "$artifact_suffix" && -e "$QEMU_BUILD_DIR/dev-instance.lock" ]] && ! flock -n "$QEMU_BUILD_DIR/dev-instance.lock" true 2>/dev/null; then
+	#
+	# AND THE INSTANCE'S OWN BOOT IS NOT AN AD-HOC GUEST (2026-09-01). `lab.py`'s `dev-up` takes this
+	# very lock - `DEV_LOCK` is this file - and HOLDS it across the `run.sh` it starts, so the guest
+	# being brought up was refused by the lock its own parent had taken: `dev.sh up` built the image,
+	# wrote the ISO, launched the runner and died with "a development instance is running", naming
+	# itself. Reproduced directly: hold the lock and the guard's own `flock -n` returns non-zero.
+	# Nothing had noticed because nothing runs the dev-guest checks - `verify-history.json` has no
+	# key for any of the three.
+	#
+	# The exemption is the bring-up itself, and only `cmd_dev_up` sets it. It is deliberately NOT the
+	# profile name the comment above rejects: `scenario-cold` declares `DEV_PROFILE=1` too and is
+	# covered by `artifact_suffix`, while this marker is set by exactly one caller for exactly the one
+	# boot that IS the instance. A second `dev.sh up` cannot reach here - `cmd_dev_up` refuses on its
+	# own `dev_state` and its own non-blocking lock long before it starts a runner - and every other
+	# guest, having no marker, is refused exactly as it was.
+	if [[ "${LIBER_DEV_INSTANCE_BRINGUP:-0}" != "1" ]] && [[ -z "$artifact_suffix" && -e "$QEMU_BUILD_DIR/dev-instance.lock" ]] && ! flock -n "$QEMU_BUILD_DIR/dev-instance.lock" true 2>/dev/null; then
 		echo "qemu-run: a development instance is running and holds the system, media and USB images" >&2
 		echo "qemu-run: release it with \`./dev.sh down\` (or \`./dev.sh status\` to see what it is)" >&2
 		exit 1

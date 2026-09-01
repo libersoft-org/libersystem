@@ -42,6 +42,18 @@ pub struct Step {
 	// of their own rather than the keyless step this used to invent.
 	pub keys: Vec<crate::plan::PlanItemKey>,
 	pub note: Option<String>,
+	// HOW MANY GUESTS THIS STEP STARTS AT ONCE, which is the number `--jobs` is the answer for.
+	//
+	// Zero for everything that boots nothing and for a step whose guests are started SERIALLY: a
+	// gate that boots one machine after another needs one slot however many boots it makes, and the
+	// runner already puts every such step behind a barrier and runs it alone.
+	//
+	// It is not zero for a step whose whole subject is OVERLAP. `concurrent-selection` starts two
+	// same-architecture suites at the same time, and the runner counted it as a host gate - so at
+	// `--jobs 1` two guests ran on a machine whose one answer to "how many QEMUs may run" was one.
+	// The count travels with the step so the scheduler can refuse to start it inside a budget that
+	// cannot hold it, rather than the step deciding for itself.
+	pub guests: usize,
 }
 
 // A long list is digested rather than spelled. Two hundred selected ids make a nine-kilobyte name,
@@ -132,7 +144,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	for (architecture, parts) in &parts_by_arch {
 		let part_names: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
 		build_ids.insert((*architecture).to_string(), scoped_id("build", architecture, &part_names));
-		steps.push(Step { id: scoped_id("build", architecture, &part_names), requires: Vec::new(), label: format!("build {architecture}"), command: format!("./build.sh --arch {architecture} --part {}", parts.iter().copied().collect::<Vec<_>>().join(",")), keys: build_keys.get(architecture).cloned().unwrap_or_default(), note: None });
+		steps.push(Step { id: scoped_id("build", architecture, &part_names), requires: Vec::new(), label: format!("build {architecture}"), command: format!("./build.sh --arch {architecture} --part {}", parts.iter().copied().collect::<Vec<_>>().join(",")), keys: build_keys.get(architecture).cloned().unwrap_or_default(), note: None, guests: 0 });
 	}
 
 	// Host suites, one per crate per configuration. The configuration is in the command because it
@@ -140,7 +152,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// the one that never ships, and running only that one is what this model exists to stop.
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::HostSuite) {
 		let crate_name = item.key.check.strip_prefix("host.").unwrap_or(&item.key.check);
-		steps.push(Step { id: scoped_id("host", crate_name, &[item.key.configuration.clone()]), requires: Vec::new(), label: format!("host suite {crate_name} ({})", item.key.configuration), command: lower(CheckKind::HostSuite, &item.command, registry.configuration(&item.key.configuration).unwrap_or(&DEFAULT_CONFIGURATION)), keys: vec![item.key.clone()], note: None });
+		steps.push(Step { id: scoped_id("host", crate_name, &[item.key.configuration.clone()]), requires: Vec::new(), label: format!("host suite {crate_name} ({})", item.key.configuration), command: lower(CheckKind::HostSuite, &item.command, registry.configuration(&item.key.configuration).unwrap_or(&DEFAULT_CONFIGURATION)), keys: vec![item.key.clone()], note: None, guests: 0 });
 	}
 
 	// Gates and conformance suites each collapse into one call, because check.sh takes a list.
@@ -156,18 +168,30 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// The rest stay in front, where they are cheap and catch things early.
 	let gate_items: Vec<&crate::plan::PlanItem> = plan.items.iter().filter(|item| item.kind == CheckKind::Gate).collect();
 	let gate_name = |item: &crate::plan::PlanItem| item.key.check.strip_prefix("gate.").unwrap_or(&item.key.check).to_string();
+	// A GATE THAT STARTS GUESTS AT THE SAME TIME GETS ITS OWN STEP, and says how many.
+	//
+	// Merged into the batch it would carry its count for every gate beside it, so a budget too small
+	// to hold the overlap would skip a dozen cheap host gates with it. Split out, the scheduler can
+	// price it, refuse it inside a `--jobs` that cannot hold it, and run everything else regardless -
+	// which is the same shape `GATES_AFTER_A_GUEST` already has for a different reason.
+	let concurrent: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::gate_concurrent_guests(&gate_name(item)) > 1).collect();
 	let after_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str())).collect();
-	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str())).collect();
+	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str()) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1).collect();
+	for item in concurrent.iter() {
+		let name = gate_name(item);
+		let guests = crate::catalog::gate_concurrent_guests(&name);
+		steps.push(Step { id: scoped_id("gate-concurrent", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate ({guests} guests at once)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(format!("this gate's subject is overlap: it starts {guests} guests at the same time, so it needs that many of the runner's slots")), guests });
+	}
 	if !before_guest.is_empty() {
 		let names: Vec<String> = before_guest.iter().map(|item| gate_name(item)).collect();
-		steps.push(Step { id: scoped_id("gate", "host", &names), requires: Vec::new(), label: format!("{} gate(s)", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: before_guest.iter().map(|item| item.key.clone()).collect(), note: None });
+		steps.push(Step { id: scoped_id("gate", "host", &names), requires: Vec::new(), label: format!("{} gate(s)", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: before_guest.iter().map(|item| item.key.clone()).collect(), note: None, guests: 0 });
 	}
 	let gates_after_guest: Vec<&crate::plan::PlanItem> = after_guest;
 	let conformance_items: Vec<&crate::plan::PlanItem> = plan.items.iter().filter(|item| item.kind == CheckKind::Conformance).collect();
 	if !conformance_items.is_empty() {
 		let names: Vec<&str> = conformance_items.iter().map(|item| item.key.check.strip_prefix("conformance.").unwrap_or(&item.key.check)).collect();
 		let format_names: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
-		steps.push(Step { id: scoped_id("conformance", "host", &format_names), requires: Vec::new(), label: format!("{} conformance suite(s)", names.len()), command: format!("./check.sh --conformance {}", names.join(",")), keys: conformance_items.iter().map(|item| item.key.clone()).collect(), note: None });
+		steps.push(Step { id: scoped_id("conformance", "host", &format_names), requires: Vec::new(), label: format!("{} conformance suite(s)", names.len()), command: format!("./check.sh --conformance {}", names.join(",")), keys: conformance_items.iter().map(|item| item.key.clone()).collect(), note: None, guests: 0 });
 	}
 
 	// One boot per architecture, whatever the selection inside it.
@@ -205,7 +229,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 		} else {
 			(scoped_id("guest", architecture, &[String::from("all")]), format!("./test.sh --arch {architecture}"), None)
 		};
-		steps.push(Step { id, requires: build_ids.get(*architecture).cloned().into_iter().collect(), label: format!("kernel suite {architecture}"), command, keys: selected.clone(), note });
+		steps.push(Step { id, requires: build_ids.get(*architecture).cloned().into_iter().collect(), label: format!("kernel suite {architecture}"), command, keys: selected.clone(), note, guests: 0 });
 	}
 
 	// The two guest steps that stand in for a target's tests, and they are steps like any other.
@@ -219,7 +243,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::GuestFallback) {
 		let architecture = item.key.architecture.as_str();
 		let (label, note) = if item.key.check == "guest.whole-suite" { (format!("kernel suite {architecture} (unenumerated)"), String::from("the model could not enumerate this target's tests, so the whole suite runs and is recorded against one aggregate key")) } else { (format!("boot check {architecture}"), String::from("this target is booted and no test selected it, so it runs a named boot check rather than everything or nothing")) };
-		steps.push(Step { id: scoped_id("guest", architecture, &[item.key.check.clone()]), requires: build_ids.get(architecture).cloned().into_iter().collect(), label, command: item.command.clone(), keys: vec![item.key.clone()], note: Some(note) });
+		steps.push(Step { id: scoped_id("guest", architecture, &[item.key.check.clone()]), requires: build_ids.get(architecture).cloned().into_iter().collect(), label, command: item.command.clone(), keys: vec![item.key.clone()], note: Some(note), guests: 0 });
 	}
 
 	// The gates that read what a guest wrote, after the guests wrote it. Every guest step emitted
@@ -228,13 +252,13 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	if !gates_after_guest.is_empty() {
 		let names: Vec<String> = gates_after_guest.iter().map(|item| gate_name(item)).collect();
 		let guest_ids: Vec<String> = steps.iter().filter(|step| step.id.starts_with("guest:")).map(|step| step.id.clone()).collect();
-		steps.push(Step { id: scoped_id("gate-after-guest", "host", &names), requires: guest_ids, label: format!("{} gate(s) that read a guest run", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: gates_after_guest.iter().map(|item| item.key.clone()).collect(), note: Some(String::from("these read a log a guest run wrote, so they cannot run before one")) });
+		steps.push(Step { id: scoped_id("gate-after-guest", "host", &names), requires: guest_ids, label: format!("{} gate(s) that read a guest run", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: gates_after_guest.iter().map(|item| item.key.clone()).collect(), note: Some(String::from("these read a log a guest run wrote, so they cannot run before one")), guests: 0 });
 	}
 
 	// The development guest last: it needs an instance `./dev.sh up` left running, and qemu-run.sh
 	// refuses to combine DEV_PROFILE with TEST, so it can never share a boot with the suite above.
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::DevCheck) {
-		steps.push(Step { id: scoped_id("dev", &item.key.check, &[]), requires: Vec::new(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")) });
+		steps.push(Step { id: scoped_id("dev", &item.key.check, &[]), requires: Vec::new(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 0 });
 	}
 
 	steps

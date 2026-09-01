@@ -231,11 +231,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// given is tried first, so a machine whose first disk IS the system volume behaves
 			// exactly as it did; a probe is only reached when it is not.
 			let mounted = unsafe { mount_by_uuid(handle, &probes[..probe_count], chosen.map(|(_, want)| want)) };
+			// EVERY PROBE BUT THE ONE BEING SERVED THROUGH. `mount_by_uuid` answers with the handle
+			// its filesystem reads through, and on the case that function exists for - the chosen
+			// volume is not the first block device - that handle is one of these probes. Closing all
+			// of them closed the block channel of the filesystem about to be mounted.
+			let serving: u64 = mounted.as_ref().map_or(0, |&(_, chan)| chan);
 			for probe in probes[..probe_count].iter() {
-				unsafe { close(*probe) };
+				if *probe != serving {
+					unsafe { close(*probe) };
+				}
 			}
 			match mounted {
-				Some(fs) => {
+				Some((fs, _)) => {
 					// THE MOUNT IS REFUSED ON A MISMATCH, and that is the whole point of carrying
 					// the identity this far. Two LiberFS volumes are told apart by uuid and by
 					// nothing else, so an instance that mounted a volume the loader did not choose
@@ -3640,12 +3647,21 @@ unsafe fn read_blocks_chunked(chan: u64, sectors_per_block: u64, index: u64, cou
 // so mounting it competes with nobody. Answers the primary's mount when nothing matches, and the
 // uuid check at the call site then refuses it: a machine whose paired volume is not present says so
 // rather than serving somebody else's system.
-unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Option<LiberFs<ChannelBlockDevice>> {
+//
+// AND IT SAYS WHICH HANDLE THE FILESYSTEM IS READING THROUGH, because the caller closes the probes.
+//
+// This answered a bare `LiberFs`, and the block channel inside it - `ChannelBlockDevice::chan` - is
+// one of the probes on exactly the case this function exists for. The caller then closed every
+// probe it had passed in, so the alternate-disk path returned a filesystem whose device handle had
+// just been closed and the first read through it failed: the non-positional selection worked and
+// the volume it selected was unusable. The handle travels with the filesystem so the caller can
+// close the ones it is NOT keeping, which is the only set it ever meant to close.
+unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Option<(LiberFs<ChannelBlockDevice>, u64)> {
 	unsafe {
 		let first = mount_system_volume(primary);
-		let Some(want) = want else { return first };
+		let Some(want) = want else { return first.map(|fs| (fs, primary)) };
 		if first.as_ref().is_some_and(|fs| fs.uuid() == want) {
-			return first;
+			return first.map(|fs| (fs, primary));
 		}
 		for &probe in probes {
 			if probe == 0 {
@@ -3655,10 +3671,10 @@ unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) ->
 				&& fs.uuid() == want
 			{
 				print(b"StorageService: the volume the loader chose is not the first block device; serving the one that matches\n");
-				return Some(fs);
+				return Some((fs, probe));
 			}
 		}
-		first
+		first.map(|fs| (fs, primary))
 	}
 }
 

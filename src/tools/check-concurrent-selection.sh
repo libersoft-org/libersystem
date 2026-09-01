@@ -48,6 +48,21 @@ A_SELECTION="kernel.object.channel.channel_endpoint_semantics,kernel.object.chan
 B_TAGS="domain"
 B_SELECTION="kernel.object.channel.a_returned_message_is_still_charged_to_the_sender,kernel.object.channel.channel_message_and_capability_transfer"
 
+# AND THE NUMBER OF GUESTS IS THE SCHEDULER'S ANSWER, NOT THIS SCRIPT'S.
+#
+# This started two suites unconditionally. Under `verify.sh --jobs 1` that made two QEMUs run on a
+# machine whose one answer to "how many may run" was one - a second scheduler with a width of two,
+# which is the thing P02M0167's rule exists to forbid. The runner declares the budget it is willing
+# to hand this step; the gate refuses rather than exceeding it, and a budget that cannot hold the
+# overlap is a budget this gate cannot be proved in.
+#
+# Unset means nobody is scheduling - a person typing `./check.sh --gate concurrent-selection`, which
+# is the same exemption `test.sh --arch all` has and for the same reason.
+NEEDS_GUESTS=2
+if [[ -n "${LIBER_CONCURRENT_GUESTS:-}" ]] && ((LIBER_CONCURRENT_GUESTS < NEEDS_GUESTS)); then
+	fail "this gate starts $NEEDS_GUESTS guests at once and the runner allows ${LIBER_CONCURRENT_GUESTS} - it cannot be proved inside that budget"
+fi
+
 echo "concurrent-selection: starting two x86_64 suites at once, differing in BOTH selection and tags"
 (cd "$REPO_ROOT" && TEST_SELECTION="$A_SELECTION" ./test.sh --arch x86_64 --tags "$A_TAGS") >"$work/a.log" 2>&1 &
 a_pid=$!

@@ -713,6 +713,31 @@ pub fn msix_enable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
 	});
 }
 
+// TURN MSI-X OFF AGAIN: clear MSI-X Enable and set the Function Mask.
+//
+// THE OTHER HALF OF `msix_enable`, AND IT DID NOT EXIST. A claim release masked the device's table
+// ENTRY and unmapped the table page, and left the function itself enabled - so the next binding of
+// that device started with MSI-X Enable already set, inherited from a binding that had ended. That
+// is what made the window in `sys_device_msix_acquire` reachable: a stale-generation caller whose
+// claim check passed and whose claim was released while the call ran would program entry 0 of the
+// REPLACEMENT's table with vector control zero - unmasked - on a function that was already enabled,
+// and the late generation check in `register_derived` rolls the bookkeeping back after the device
+// has been made able to deliver. With the function disabled by the release, the same write reaches a
+// device that cannot send anything, and the replacement's own acquire is what enables it again.
+//
+// Both bits, because they answer different questions: Enable is whether the function uses MSI-X at
+// all, and the Function Mask is whether any of its vectors may be sent. A device left with Enable
+// clear and the mask clear is one bit away from delivering.
+//
+// Memory space is NOT touched. The teardown still has to reach the table page to mask the entry, and
+// a function whose BARs stopped responding mid-teardown is a function whose mask write goes nowhere.
+pub fn msix_disable<A: ConfigAccess>(bus: u8, dev: u8, func: u8, cap: u16) {
+	A::update32(bus, dev, func, cap, |dword| {
+		let mc = (((dword >> 16) as u16) & !MSIX_ENABLE) | MSIX_FUNCTION_MASK;
+		(dword & 0x0000_ffff) | ((mc as u32) << 16)
+	});
+}
+
 // Ensure a function decodes memory space without touching its interrupt-delivery mode. The riscv
 // INTx-over-PLIC path needs the BARs to respond but must NOT enable MSI-X: on QEMU virt the PLIC
 // receives only wired INTx, so a device switched to MSI-X would send a message nothing receives.

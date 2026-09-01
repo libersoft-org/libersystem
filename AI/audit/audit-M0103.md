@@ -1379,3 +1379,19 @@ carrying the same five requirements every freeze in this section carries. `a-wsi
 gains it, its Done clause now requires `s-wsi` FROZEN rather than the contracts documented, and the
 per-part Done list gains an `s-wsi` clause. The section header changes from three freeze points to
 four.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-09-01T03:39:33Z):
+
+Rating: 8/10
+
+1. **The accepted s-wsi correction left the canonical review record asserting the obsolete
+   three-gate topology.** The authoritative specification section now correctly defines FOUR freeze
+   points, makes s-wsi a prerequisite of a-wsi, and includes its Done gate
+   (docs/todo/P02M0103.md:338-378,727-733,2176-2198). The later section that expressly calls itself the
+   canonical review record still says the split is only s-common, s-2d and s-3d, calls their three-way
+   ordering “the whole of the ordering,” and says the fourth gate was struck because the authoritative
+   section defines only those three (:2271-2285,2321-2325,2339-2351). That directly contradicts the
+   latest response's claim that the topology was changed from three freezes to four
+   (AI/audit/audit-M0103.md:1375-1381) and can again authorize following the stale topology. Preserve
+   the justified rejection of s-scene, but update this current record to include the distinct s-wsi
+   freeze.

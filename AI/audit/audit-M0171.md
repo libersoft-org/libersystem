@@ -449,3 +449,29 @@ and the Definition of done is rewritten to name three distinguishable states rat
 fixture is added for the case that had none: delete ONE record and require the boot to succeed,
 advance normally and restore the missing one - because a redundancy rule with no single-failure test
 is a rule nobody is holding.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-09-01T03:39:33Z):
+
+Rating: 5/10
+
+1. **The latest marker correction gives the same variables two incompatible attribute contracts.**
+   The marker row says it has “the same attributes as the slot records” and then requires
+   non-volatile, boot-service, RUNTIME access and authenticated writes
+   (docs/todo/P02M0171.md:98-103). M3 freezes the variable attributes as only
+   NON_VOLATILE | BOOTSERVICE_ACCESS, explicitly forbids RUNTIME_ACCESS and makes any other mask
+   invalid (:262-278). It also defines no authenticated-write descriptor or signing path for the
+   ceremony or ordinary loader advances. No marker can satisfy both descriptions; following the
+   latest row also reopens running-system access that M3 deliberately excludes. Freeze one exact mask
+   for marker and slots and, if authenticated writes are intended, specify how both provisioning and
+   floor advances produce them.
+
+2. **The two-slot algorithm can forget an already accepted generation after the single-slot failure
+   it claims to survive.** A machine with one valid slot treats that survivor as authoritative and
+   repairs only on a later successful advance (docs/todo/P02M0171.md:150-167,206-215). M4 advances a
+   higher generation by writing and reading back only the older/inactive slot, then transfers control
+   (:294-305). Starting from {A=N, B=N}, accepting N+1 therefore leaves {N, N+1}; if the N+1 slot is
+   later deleted or damaged, N becomes authoritative and a correctly signed N artifact can boot.
+   That contradicts the monotonic-floor and damaged-state claims (:359-364,397-412). Converge the
+   accepted floor to redundant state before declaring the N+1 boot successful, or add an equivalent
+   commit mechanism, and test deletion of either slot after an N to N+1 acceptance before offering N
+   again.

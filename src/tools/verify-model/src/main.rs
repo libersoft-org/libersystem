@@ -1138,6 +1138,12 @@ fn run() -> Result<ExitCode, String> {
 				// seed for a step nobody has timed yet.
 				let measured = history.step_seconds(&step.id, &model_hash);
 				println!("STEPCOST\t{index}\t{:.0}", measured.unwrap_or_else(|| cost.estimate(&history, &step.keys)));
+				// HOW MANY GUEST SLOTS THIS STEP NEEDS AT ONCE - see `Step::guests`. Emitted only for
+				// a step that needs more than one, because one is what the runner already assumes for
+				// anything that boots and zero is what it assumes for everything else.
+				if step.guests > 1 {
+					println!("STEPGUESTS\t{index}\t{}", step.guests);
+				}
 				for key in &step.keys {
 					println!("KEY\t{index}\t{}", key.display());
 				}

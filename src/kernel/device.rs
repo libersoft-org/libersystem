@@ -476,7 +476,21 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 		return Ok(finish_release(index, false));
 	};
 	// 1. BUS MASTERING FIRST. Everything below assumes the device is not starting new transactions.
-	with(index, |entry| bus_master(entry, false));
+	//    AND MSI-X WITH IT: the function stops being able to SEND a message, not merely to have this
+	//    binding's entry masked.
+	//
+	//    The release masked the table entry and unmapped the page and left MSI-X ENABLED on the
+	//    function, so the device's enable bit survived the binding that set it. Two things followed
+	//    from that. The next binding started with an interrupt-capable function it had not enabled,
+	//    which is authority inherited across a revocation; and it made the window in
+	//    `sys_device_msix_acquire` reachable - a caller whose claim ended while its syscall ran
+	//    programs entry 0 with vector control zero, which on an already-enabled function is a
+	//    deliverable vector on hardware that now belongs to somebody else. The replacement enables
+	//    MSI-X itself, at the end of its own acquire, which is the only place that should.
+	with(index, |entry| {
+		bus_master(entry, false);
+		msix_off(entry);
+	});
 	// What this device had ALREADY stranded before the release began. See the comparison below.
 	let quarantined_before = crate::arch::interrupts::msi_quarantined_for_device(index as u32);
 	// 2. Everything the claim minted stops working, without the holder's cooperation - and every
@@ -618,6 +632,18 @@ pub fn mmio_capability_dropped(key: abi::ClaimKey) {
 		return;
 	}
 	bus_master(entry, false);
+}
+
+// Stop the device at `index` using MSI-X at all: clear MSI-X Enable and set the Function Mask.
+//
+// ONE PLACE, for the same reason `bus_master` is one place - and with the same exclusion, because a
+// function that is not on the bus has no config space to write. A device with no MSI-X capability
+// has nothing to turn off, and `msix_cap` of zero is how the scan says so.
+fn msix_off(entry: &DeviceEntry) {
+	if !entry.on_bus || entry.msix_cap == 0 {
+		return;
+	}
+	crate::arch::pci::msix_disable(entry.bus, entry.dev, entry.func, entry.msix_cap);
 }
 
 // Let the device at `index` master the bus, or stop it.

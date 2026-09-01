@@ -13,6 +13,7 @@ declare -A SPECIAL=(
 	["baseline"]="tools/measure-dev-baseline.sh"
 	["build"]="tools/dev-build.sh"
 	["selftest"]="harness/dev-selftest.py"
+	["gpu-restart"]="harness/dev-gpu-restart.py"
 )
 
 LAB_VERBS=(up down status console log ping publish generations type reset reboot restart stop key pointer clean loop rollback test launch)
@@ -30,6 +31,7 @@ verbs (other tools):
   baseline <scenario> [tags]   measure a development baseline
   build [arguments...]         build inside the development flow
   selftest                     run the development self-test
+  gpu-restart                  stop and restart the display driver on the translated machine
 
 examples:
   ./dev.sh up

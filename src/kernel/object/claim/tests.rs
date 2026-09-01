@@ -329,12 +329,35 @@ fn a_forced_release_takes_a_live_interrupt_away() {
 	//
 	// This holds the `Arc` across the release, which is the hostile case: nothing here lets the
 	// object drop, so anything the release does it has to do itself.
+	//
+	// AND THE VECTOR IS A REAL REGISTRY SLOT, NOT `Interrupt::new(0x71)` + `mark_bound` (2026-09-01).
+	//
+	// A hand-made object that only SAYS it is bound proves that `revoke` sets two flags. The property
+	// M9 states is about the interrupt controller: a claim released while its holder is still running
+	// leaves no vector the device can raise and no slot the next claimant cannot have. `mark_bound`
+	// owns no registry slot, so `unbind` had nothing to retire, `settled_vectors` had nothing to
+	// wait for and `release_msi_for_device` had nothing to give back - the three steps the release
+	// performs for a live vector were all reached with an empty table. The fixture below is the one
+	// the ports' own interrupt suites use: a frame standing in for the device's MSI-X table, a slot
+	// acquired against THIS device's index, and a binding the release has to take away.
+	use crate::arch::interrupts::{acquire_msi, bind_msi, is_bound, msi_held_by_device, msi_live_for_device};
+	use crate::mem::frame;
 	use crate::object::KernelObject;
 	use crate::object::interrupt::Interrupt;
 	let index = device::add_synthetic_device();
 	let key = device::claim(index).expect("claimed");
-	let interrupt = Interrupt::new(0x71).expect("an interrupt object");
-	interrupt.mark_bound();
+	let table = frame::allocate().expect("a frame for the fake MSI-X table");
+	let Some(vector) = acquire_msi(table, 0, index as u32) else {
+		crate::serial_println!("    no MSI vector free on this machine - the live-vector case is not exercised");
+		// SAFETY: allocated by this call and never mapped.
+		unsafe { frame::deallocate(table) };
+		device::release_claim(key).expect("released");
+		return;
+	};
+	let interrupt = Interrupt::new(vector).expect("an interrupt object");
+	assert!(bind_msi(vector, &interrupt), "the claim's driver takes the slot");
+	assert!(is_bound(vector), "and the controller says the vector is live");
+	assert!(msi_live_for_device(index as u32), "the device holds a slot whose teardown has not happened");
 	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(interrupt.clone() as alloc::sync::Arc<dyn KernelObject>))), "recorded as derived");
 	interrupt.signal();
 	assert!(interrupt.is_pending(), "a live interrupt that fired is pending");
@@ -343,6 +366,22 @@ fn a_forced_release_takes_a_live_interrupt_away() {
 
 	assert!(interrupt.is_revoked(), "the release revoked the interrupt itself, not only every handle to it");
 	assert!(!interrupt.is_pending(), "and what it had already delivered does not survive the release");
+	// THE CONTROLLER, WHICH IS THE HALF THE OBJECT'S FLAGS DO NOT ANSWER FOR. The holder is still
+	// running - this test holds the `Arc` - so nothing has dropped, and the vector must be unbound
+	// anyway: a released device that can still raise an interrupt has not been released.
+	assert!(!is_bound(vector), "the release unbound the live vector rather than leaving it aimed at the old holder");
+	assert!(!msi_live_for_device(index as u32), "and the device holds no slot whose teardown is outstanding");
+	// AND THE SLOT IS BACK IN CIRCULATION, which is the other half of M9's claim: a vector held by a
+	// binding that has ended is a vector the next claimant cannot be given.
+	//
+	// Asked as "this device holds none" rather than by acquiring again and asserting the SAME slot
+	// comes back. The registry hands out the lowest free slot, so the identity of the next one is a
+	// fact about what everything else on the machine happens to hold - which would make this test's
+	// answer depend on the suite's order. What the release owes is that its own vectors are no
+	// longer charged to it, and that is what this reads.
+	assert_eq!(msi_held_by_device(index as u32), 0, "a confirmed release gives its vectors back rather than keeping them charged to a binding that has ended");
+	// SAFETY: allocated by this call and never mapped.
+	unsafe { frame::deallocate(table) };
 	// AND IT CANNOT BE SIGNALLED AGAIN. The dispatch table holds this weakly and can still upgrade
 	// it for a message that was already in flight; what must not happen is that message reaching the
 	// old holder.

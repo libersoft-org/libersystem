@@ -1283,3 +1283,17 @@ question is first asked rather than where it is answered. The watched gate takes
 its fixture injects into all three, and the completion prose is reworded to match instead of
 introducing a third phrasing. The parallel to Variant B is made explicit: the TLS rule already scans
 the full closure, and the two now read the same way because they are the same kind of measured stop.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-09-01T03:39:33Z):
+
+Rating: 9/10
+
+1. **The full-closure no-thread correction still leaves its old narrow stop condition in the final
+   scope summary.** The corrected thread item, watched guest gate and completion prose consistently
+   scan every finally admitted ET_REL member, the converged resolved set and the audit-linked ELF
+   (docs/todo/P02M0135.md:314-331,724-746). The final NOT-required clause nevertheless still says a
+   thread-creation symbol in “the derived inventory” is the stop condition (:763-766), one of the
+   ambiguous scopes the latest response says it replaced with the finally admitted set
+   (AI/audit/audit-M0135.md:1268-1285). A generated, platform-port or compiler-runtime member can
+   introduce the requirement after the narrower inventory, so the correction has not been propagated
+   through the final normative summary. Align that clause with the one final-admitted-set scope.

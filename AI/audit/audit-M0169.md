@@ -498,3 +498,19 @@ connection with the Nth succeeding, which is what proves the success path actual
 cleanup on both failure shapes - a mint that fails leaving no record and no handle, and a transaction
 failing after minting closing its connection on every path out. A leaked connection per transaction
 is the defect those two exist to catch before the handle table finds it.
+
+AUDITOR'S RE-AUDIT OF PLAN M0169 (2026-09-01T03:39:33Z):
+
+Rating: 7/10
+
+1. **The connection-minting correction still defers its load-bearing authority and API choice.** M2
+   now correctly says the existing Factory role cannot transfer ProcessService's root, but leaves
+   either a new root-transferring manifest role or a supervisor-held minting broker as acceptable and
+   says one must be chosen before implementation (docs/todo/P02M0169.md:125-146). They are materially
+   different authority and protocol designs, and the broker alternative has no operation or ownership
+   contract. Current code confirms neither exists: RoleKind::Factory denotes a freshly minted ordinary
+   connection (src/tools/system-manifest/src/lib.rs:684-708), and ServiceManager calls
+   service_connect(root) and transfers only that connection
+   (src/user/services/core/src/service_manager/bootstrap.rs:161-175). Because the per-transaction
+   connection is M2's rollback owner for lost replies, implementation cannot begin until this seam is
+   actually selected and specified.

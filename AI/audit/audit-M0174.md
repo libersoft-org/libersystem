@@ -560,3 +560,29 @@ identity coalesce to the later; overflow on DISTINCT identities does not drop th
 RESYNC-REQUIRED, and the consumer re-reads the tables in full; so a consumer either sees an event for
 an identity or is told to resync, and is never silently left holding invalidated state. M8 gains
 coalescing, overflow-sets-resync, and a resync leaving the consumer's view equal to the tables.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-09-01T03:39:33Z):
+
+Rating: 7/10
+
+1. **The MLD query-merge state is still not bounded under hostile source-specific queries.** M4
+   requires repeated Multicast-Address-and-Source-Specific Queries to union their source lists into
+   one pending record (docs/todo/P02M0174.md:153-177), but its bound statement limits only group,
+   record, mode/timer and retry counts (:217-219). It gives no source cap, query/admission limit or
+   overflow behavior for the accumulated set. Successive disjoint queries can therefore grow one
+   record without bound or force an arbitrary lossy implementation, contradicting the hostile-input
+   resource claim. [RFC 9777 section 10.1](https://www.rfc-editor.org/rfc/rfc9777.html#section-10.1)
+   identifies this attack and permits limiting queries or recorded sources. Freeze a source bound and
+   safe overflow outcome, then exercise disjoint-list exhaustion and merge in M8.
+
+2. **The accepted frozen L3 seam still omits the transient ICMPv6 contract that M0175 consumes.** The
+   planner's first response said M6 would register transmitted-packet correlation and deliver typed,
+   validated PTB, error and invalidation events (AI/audit/audit-M0174.md:158-175). Current M6 freezes
+   table-invalidation queue semantics and route/source candidate egress, but says nothing about the
+   representation, correlation registration or durable delivery of Destination Unreachable, Time
+   Exceeded, Parameter Problem and PTB quotations (docs/todo/P02M0174.md:270-333). M0175 must
+   demultiplex those validated quotations by full flow tuple while consuming this seam without
+   extending it (docs/todo/P02M0175.md:230-238,334-343). An implementation can satisfy current M0174
+   by validating and dropping a non-PTB error, leaving M0175 no contract to consume. Restore the
+   promised typed quoted-error/correlation delivery and a cross-flow negative fixture at this
+   boundary.

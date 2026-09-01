@@ -919,3 +919,28 @@ Plan change: the framing assertion moves to a fixture of its own - 64 records ea
 256 bytes - where the records alone fill the payload and anything above it is therefore framing, so
 `> 16384` means what it says. The ordinary 64-face reply keeps only `<= 20480`, which is the bound
 that holds for every legal catalogue.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-09-01T03:39:33Z):
+
+Rating: 7/10
+
+1. **The catalogue service still has no defined authority or runtime path to the font bytes it
+   catalogues.** The first item now specifies the service row, both consumer routes,
+   LIST/RESOLVE/SUBSCRIBE and a read-only MemoryObject result, but never says which runtime role or
+   source gives the catalogue access to the canonical font destination or how it learns that a staged
+   face was replaced (docs/todo/P02M0136.md:107-164,236-254). A role = "service" program row only
+   starts the process; current service wiring must explicitly provide a Package, Client or Factory
+   role (src/tools/system-manifest/src/lib.rs:684-712; for example
+   src/user/services/manifest.toml:1899-1910). Choosing the whole init package, a confined
+   StorageService directory or another source changes authority, restart and update semantics. Without
+   that edge, the catalogue cannot implement RESOLVE or the replacement-generation gate without
+   inventing an undeclared capability.
+
+2. **The accepted canonical-equivalence correction remains a named decision rather than a
+   decision.** The normative pipeline says only “UTF-8 validation and canonical-equivalence policy”
+   (docs/todo/P02M0136.md:358-367). It never chooses preservation or normalization, defines how
+   normalized text maps back to the original UTF-8 byte spans required by GlyphRun, or adds a
+   canonically equivalent regression (:397-429,485-499). Composed and decomposed equivalents can
+   therefore take different fallback, shaping or cache paths or produce incompatible cluster/caret
+   mappings while both implementations follow the plan. Freeze the policy and its original-source
+   mapping before shaping.

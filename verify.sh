@@ -708,16 +708,26 @@ budget_select() {
 step_ids=()
 step_reqs=()
 step_costs=()
+# HOW MANY GUESTS A STEP STARTS AT THE SAME TIME, for the few that start more than one.
+#
+# `--jobs` answers "how many QEMUs may run on this machine", and the answer has to be the same
+# wherever it is asked - including inside a step. Every gate in this tree boots serially and needs
+# one slot; `concurrent-selection` exists to prove that two same-architecture suites do not collide,
+# so it starts two AT ONCE and cannot be made serial without deleting its subject. The model
+# declares the count, this reserves it, and a `--jobs` that cannot hold it does not run the step.
+step_guests=()
 while IFS=$'\t' read -r marker index rest; do
 	case "$marker" in
 	STEPID) step_ids[$index]="$rest" ;;
 	STEPREQ) step_reqs[$index]="${step_reqs[$index]:-} $rest" ;;
 	STEPCOST) step_costs[$index]="$rest" ;;
+	STEPGUESTS) step_guests[$index]="$rest" ;;
 	esac
 done <"$steps_file"
 for i in "${!step_ids[@]}"; do
 	step_reqs[$i]="${step_reqs[$i]:-}"
 	step_costs[$i]="${step_costs[$i]:-0}"
+	step_guests[$i]="${step_guests[$i]:-0}"
 done
 
 BUDGET_TOTAL=0
@@ -849,6 +859,23 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	if ((is_guest == 0)); then
 		drain_guests
 	fi
+	# A STEP THAT STARTS SEVERAL GUESTS AT ONCE TAKES THAT MANY SLOTS, AND IS NOT RUN WITHOUT THEM.
+	#
+	# It is behind the barrier above, so nothing else is running when it starts - but a barrier is
+	# not a budget. `concurrent-selection` starts two x86_64 suites simultaneously, and under
+	# `--jobs 1` that put two QEMUs on a machine whose one answer was one: an inner scheduler with a
+	# hardcoded width, which is exactly what this runner exists to be the only one of. Refused rather
+	# than trimmed, because a gate about overlap that runs one guest proves nothing and would report
+	# a pass for it. INCOMPLETE is the honest outcome and never reads as green.
+	wants_guests="${step_guests[$index]:-0}"
+	if ((wants_guests > JOBS)); then
+		note "[$step/$count] SKIPPED (budget): $label - it starts $wants_guests guests at once and --jobs is $JOBS; run it with --jobs $wants_guests or more"
+		skipped+=("$label")
+		continue
+	fi
+	# AND THE STEP IS TOLD WHAT IT MAY START, so it refuses rather than exceeding a number it was
+	# never given. The runner cannot see inside a gate; the gate can be told the answer.
+	export LIBER_CONCURRENT_GUESTS="$JOBS"
 	echo
 	note "[$step/$count] $label - $keys key(s)"
 	[[ -n "$note_text" ]] && note "        $note_text"

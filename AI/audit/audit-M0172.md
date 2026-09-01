@@ -488,3 +488,18 @@ identity from a convention: wrong `compatible`, right `compatible` under a diffe
 (which must still be found), wrong length, and a `signed` provenance byte on a carrier where only
 `harness` is legal. A frozen record only one side has ever written is a record with one
 implementation.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-09-01T03:39:33Z):
+
+Rating: 7/10
+
+1. **The accepted UEFI-carrier correction is still unusable on the in-scope AArch64 UEFI path.** M3
+   now assigns test/development UEFI boots the fw_cfg record and asserts it is available just as on
+   direct boot (docs/todo/P02M0172.md:320-338). The current AAVMF path, however, hands the kernel no
+   device tree (src/kernel/arch/aarch64/boot.rs:425-449); that branch leaves fwcfg_base at zero
+   (:523-554), and the only non-x86 reader immediately returns None for base zero
+   (src/kernel/arch/common/fwcfg/mod.rs:138-153). Attaching the machine device therefore does not
+   create the promised early carrier, and universal missing-mode refusal would break AArch64
+   test/development UEFI boots. Define how this no-DT path locates and reads the record or receives a
+   loader-validated harness value, and add an AArch64 UEFI producer/consumer admission fixture rather
+   than only a generic UEFI case.

@@ -512,7 +512,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// A NODE WAITING FOR A PROVIDER THAT HAS ARRIVED, AND ONE WHOSE PROVIDER HAS GONE. The
 			// standing loop is where a driver bound in phase two publishes what a later one waits
 			// for, and where a withdrawal reaches an online node.
-			settle_dependencies(&mut nodes, &catalogue);
+			settle_dependencies(&mut nodes, &mut catalogue);
 			for at in 0..nodes.len() {
 				let name: &[u8] = nodes[at].driver_name();
 				// A NODE WHOSE BACKOFF HAS COME DUE. `advance` is event-driven and a node parked in
@@ -551,7 +551,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					Step::NextCandidate if recovery.armed() => {
 						nodes[at].candidate += 1;
 						nodes[at].attempt = 0;
-						if nodes[at].candidate < nodes[at].candidates.len() {
+						// AN OPERATOR'S ONE ATTEMPT IS SPENT HERE - see `Node::retry_once`. The
+						// cursor still advances, so a later request tries the entry after this one
+						// rather than the same one again; what does not happen is this program
+						// starting it unasked.
+						if core::mem::take(&mut nodes[at].retry_once) {
+							print(b"DeviceManager: the attempt an operator asked for is spent; the next candidate is not started automatically\n");
+						} else if nodes[at].candidate < nodes[at].candidates.len() {
 							start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
 						}
 					}
@@ -592,6 +598,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				waiting[waiting_count] = client;
 				waiting_count += 1;
 			}
+			let catalogue_clients_at: usize = waiting_count;
 			for &client in catalogue_clients.live() {
 				waiting[waiting_count] = client;
 				waiting_count += 1;
@@ -635,11 +642,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						}
 						continue;
 					}
+					// AND A CONNECTION WHOSE PEER HAS GONE IS GIVEN BACK RATHER THAN WAITED ON AGAIN.
+					//
+					// A closed channel is readable for ever - that is how `recv` gets to report the
+					// closure instead of blocking - so a consumer that exited woke this wait on every
+					// pass and the loop spun answering nothing, with the teardown handles behind it
+					// starved by a dead handle in front. The serve functions answer whether the peer
+					// is still there, and a `false` from a MINTED connection retires it. The two
+					// roots are not retired: they are this program's service registrations, not
+					// per-client connections, and there is no next client without them.
 					if policy_service != 0 && (at == policy_at || (at >= policy_clients_at && at < policy_clients_at + policy_clients.live().len())) {
-						serve_policy_once(waiting[at], at == policy_at, &mut policy_clients, &mut nodes, &mut catalogue, policy_config, &mut buf);
+						let is_root: bool = at == policy_at;
+						if !serve_policy_once(waiting[at], is_root, &mut policy_clients, &mut nodes, &mut catalogue, policy_config, &mut buf) && !is_root {
+							print(b"DeviceManager: a device-policy client closed its connection; the slot is given back\n");
+							policy_clients.retire(at - policy_clients_at);
+						}
 					} else {
 						let is_root: bool = catalogue_service != 0 && at == 1;
-						serve_catalogue_once(waiting[at], is_root, &mut catalogue_clients, &mut catalogue, &nodes, &mut buf);
+						if !serve_catalogue_once(waiting[at], is_root, &mut catalogue_clients, &mut catalogue, &nodes, &mut buf) && !is_root {
+							print(b"DeviceManager: a provider-catalogue client closed its connection; the slot is given back\n");
+							catalogue_clients.retire(at - catalogue_clients_at);
+						}
 					}
 				}
 				continue;
@@ -963,7 +986,12 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 						print(b" did not bind; its resources are released and the next candidate follows\n");
 						nodes[at].candidate += 1;
 						nodes[at].attempt = 0;
-						if nodes[at].candidate < nodes[at].candidates.len() {
+						// THE SAME RULE IN THE OTHER HANDLER - see `Node::retry_once`. Both advance
+						// the cursor and both start the next entry, so a one-shot honoured in only
+						// one of them is a one-shot that depends on which loop the node was in.
+						if core::mem::take(&mut nodes[at].retry_once) {
+							print(b"DeviceManager: the attempt an operator asked for is spent; the next candidate is not started automatically\n");
+						} else if nodes[at].candidate < nodes[at].candidates.len() {
 							start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
 						}
 					}
@@ -1459,6 +1487,16 @@ struct Node {
 	stop_intent: driver_binding::StopIntent,
 	// What the last teardown found, if there has been one. Rendered by P02M0166; kept here because
 	// the node outlives the binding it is about, which is the whole reason the node exists.
+	// AN OPERATOR'S `retry` IS ONE ATTEMPT, AND THE ATTEMPT OUTLIVES THE CANDIDATE.
+	//
+	// `PolicyVerb::Retry` grants it by setting `attempt` one below the automatic bound, which stops
+	// `may_try_again` opening a second one - but ONLY for the candidate it was granted against.
+	// `Step::NextCandidate` advances the cursor and resets `attempt` to zero, so a device with more
+	// than one candidate answered a request for one attempt with one attempt on this entry and a
+	// FULL automatic budget on every entry after it. The counter cannot carry the rule because the
+	// counter is per candidate; this flag is per operator request, and it is what the two
+	// `NextCandidate` handlers read to stop rather than walk on.
+	retry_once: bool,
 	incident_report: Option<Diagnostic>,
 	// WHETHER THAT REPORT HAS BEEN WRITTEN SOMEWHERE THAT OUTLIVES THIS PROGRAM. See
 	// `persist_incidents`: held only here, the snapshot died with the manager that took it.
@@ -1551,7 +1589,7 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, running: None, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, incident_report: None, incident_stored: false, teardown: None, disabled_by_policy: false }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, running: None, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, incident_report: None, incident_stored: false, teardown: None, disabled_by_policy: false }
 	}
 
 	// Queue one event for this node.
@@ -2357,6 +2395,15 @@ unsafe fn resolve_teardown(node: &mut Node, driver_name: &[u8], now: u64) -> Opt
 				print(b" answered the stop, and its teardown did NOT confirm - nothing here says its work was flushed: ");
 				print(intent.name());
 				print(b"\n");
+				// AND THIS ONE IS AN INCIDENT, which is why `advance` no longer captures one for an
+				// answered stop. A planned stop that ends in `Quarantined` is a device that may still
+				// be live, and that is exactly the thing an operator has to be able to read
+				// afterwards - so the capture happens HERE, where the failure became known, and
+				// carries the cause that describes it rather than the one the stop was labelled with.
+				let report = capture(node, FailureCause::TeardownUnconfirmed);
+				report_incident(driver_name, &report);
+				node.incident_report = Some(report);
+				node.incident_stored = false;
 			}
 			return Some(BindingState::Quarantined);
 		}
@@ -3303,6 +3350,10 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// bring-up succeeded, and what follows is a different incident.
 					node.attempt = 0;
 					node.incident = Incident::open();
+					// AND THE OPERATOR'S ONE ATTEMPT SUCCEEDED, so there is nothing left to spend.
+					// A flag left set here would stop the FIRST later crash from trying the next
+					// candidate, long after the request that set it was answered.
+					node.retry_once = false;
 					// The entry this binding is RUNNING - see `Node::entry`. Latched at the bind
 					// commit, so a `select` between the commit and this `READY` cannot publish the
 					// live driver's providers against another candidate's declaration.
@@ -3382,10 +3433,30 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			// THE CAPTURE COMES FIRST, BEFORE ANYTHING IS GIVEN BACK. The Domain's counters cannot
 			// be read once the Domain is killed, and the process cannot be asked once it is signalled
 			// - so a capture taken after the rollback is a capture of the rollback.
-			let report = capture(node, cause);
-			report_incident(driver_name, &report);
-			node.incident_report = Some(report);
-			node.incident_stored = false;
+			//
+			// AND A DRIVER THAT ANSWERED A STOP IS NOT AN INCIDENT AT ALL (corrected 2026-09-01).
+			//
+			// This ran unconditionally. Naming the cause `Stopped` rather than `DriverExited` made
+			// the label honest and left every SURFACE saying the same wrong thing: `incident()`
+			// answers `present: true` off `incident_report` being set, `lsdev --incident` renders
+			// "nothing has gone wrong here" only for `present: false`, and `persist_incidents` writes
+			// a `device.policy.incident.` row that outlives this program. So an operator who disabled
+			// a device, or a machine that shut one down cleanly, found a stored report of it for the
+			// rest of the boot and the next one. The arm above says in as many words that a planned
+			// stop "is not a failure and must not be recorded as one"; this is where that stops being
+			// a comment.
+			//
+			// `planned_stop` and not `node.stop_intent`: the intent says what was ASKED FOR, and a
+			// driver that was asked to stop and instead died without answering is an incident - the
+			// operator wanted a clean stop and did not get one. The `STOPPED` frame is what makes it
+			// clean, and it is what this reads. An answered stop whose teardown then fails to confirm
+			// is captured in `resolve_teardown`, where that failure becomes known.
+			if !planned_stop {
+				let report = capture(node, cause);
+				report_incident(driver_name, &report);
+				node.incident_report = Some(report);
+				node.incident_stored = false;
+			}
 			// EVERYTHING THIS BINDING PUBLISHED GOES WITH IT, and the count is SAID.
 			//
 			// A provider outliving the binding that published it is a channel whose server is gone:
@@ -3563,9 +3634,16 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 // catalogue; the loops that own the node array already come round for the wait.
 //
 // Answers how many nodes it moved, so a caller can say whether anything changed.
-unsafe fn settle_dependencies(nodes: &mut [Node], catalogue: &Catalogue) -> usize {
+unsafe fn settle_dependencies(nodes: &mut [Node], catalogue: &mut Catalogue) -> usize {
 	unsafe {
 		let mut moved: usize = 0;
+		// EVERY NODE THAT WILL LOSE ITS DEPENDENCY, WORKED OUT BEFORE ANY OF THEM IS STOPPED.
+		//
+		// A stop withdraws what the node published, and that withdrawal is what takes the requirement
+		// away from ITS dependents - so the set is a closure and not a single pass. Computing it
+		// first is what makes the order below possible: acting node by node stops each one as it is
+		// discovered, which is the provider before its dependent, exactly backwards.
+		moved += stop_nodes_that_lost_a_dependency(nodes, catalogue);
 		for node in nodes.iter_mut() {
 			// THE ENTRY THE NODE IS ACTUALLY DESCRIBED BY, not the cursor - see `Node::entry`. Read
 			// from the cursor, an operator selecting a future driver applied THAT driver's
@@ -3609,21 +3687,10 @@ unsafe fn settle_dependencies(nodes: &mut [Node], catalogue: &Catalogue) -> usiz
 					);
 					moved += 1;
 				}
-				// ONLINE, AND WHAT IT DECLARED IS GONE. Stopped through the same teardown a crash
-				// takes, carrying the intent that says where it lands: `DependencyPending`, waiting
-				// for the provider to come back, rather than `Failed` for something that was not
-				// its fault.
-				BindingState::Online if !met => {
-					print(b"DeviceManager: ");
-					print_driver_name(entry.name);
-					print(
-						b" declares a provider in `requires` that has been withdrawn; stopping it
-",
-					);
-					node.stop_intent = driver_binding::StopIntent::DependencyLost;
-					begin_dependency_stop(node);
-					moved += 1;
-				}
+				// ONLINE, AND WHAT IT DECLARED IS GONE - handled by
+				// `stop_nodes_that_lost_a_dependency` above, which needs the whole set before it can
+				// order it. It is named here because this is the match a reader looks at to find out
+				// what happens to an online node whose requirement went away.
 				_ => {}
 			}
 		}
@@ -3631,14 +3698,102 @@ unsafe fn settle_dependencies(nodes: &mut [Node], catalogue: &Catalogue) -> usiz
 	}
 }
 
+// EVERY ONLINE NODE WHOSE DECLARED REQUIREMENT HAS GONE, STOPPED DEPENDENTS FIRST.
+//
+// Two rules meet here and the previous version kept neither.
+//
+// THE SET IS A CLOSURE. Stopping a node withdraws what it published, and that withdrawal is what
+// takes the requirement away from whatever depended on IT. Asking `requirements_met` once per node
+// against the live catalogue therefore sees only the first level: in A requires B, B requires C, the
+// loss of C stopped B, and A learned about it only after B's teardown had completed and withdrawn
+// B's providers - a pass later, and after the driver A was talking to had already gone. So the set
+// is closed here first, discounting the providers of nodes already known to be going, and nothing is
+// stopped while it is being computed.
+//
+// AND THE ORDER IS DEPENDENTS FIRST, by the same depth `stop_all` uses - the milestone states the
+// rule once and it is not a rule about shutdown, it is a rule about taking a provider away from
+// something that is using it.
+//
+// AND EACH ONE IS WITHDRAWN BEFORE IT IS ASKED. `begin_dependency_stop` deliberately did not, on the
+// reasoning that the teardown would withdraw them anyway and withdrawing here would re-enter this
+// function's own condition for the node's dependents. It would - and that re-entry IS the closure
+// above, which is the thing that was missing rather than a hazard to avoid. What the omission cost
+// is the rule M3 states without qualification and the operator's stop and the shutdown both keep:
+// while a driver drains, its providers stayed in the catalogue, so a consumer could open a fresh
+// connection to a driver that had already been told to finish.
+unsafe fn stop_nodes_that_lost_a_dependency(nodes: &mut [Node], catalogue: &mut Catalogue) -> usize {
+	unsafe {
+		// AND THE ORDINARY PASS ALLOCATES NOTHING. This runs on every turn of the standing loop -
+		// every catalogue query, every teardown confirmation, every deadline - and on all but a
+		// handful of them no node has lost anything. The closure below needs two vectors; asking the
+		// cheap question first means they are allocated on the passes that are going to use them.
+		if !nodes.iter().any(|node| node.record.state == BindingState::Online && node.entry().is_some_and(|entry| !entry.requires.is_empty() && !requirements_met(entry, catalogue))) {
+			return 0;
+		}
+		// THE CLOSURE. A node is doomed when a kind it requires is provided by nothing that is
+		// staying: `count_of` over the whole catalogue, less what the already-doomed nodes publish of
+		// that kind. Every pass can only add to the set, so `nodes.len()` passes is the worst case
+		// and the fixed point is reached however the nodes happen to be enumerated.
+		let mut doomed: Vec<bool> = alloc::vec![false; nodes.len()];
+		let mut any = false;
+		for _ in 0..nodes.len() {
+			let mut grew = false;
+			for at in 0..nodes.len() {
+				if doomed[at] || nodes[at].record.state != BindingState::Online {
+					continue;
+				}
+				let Some(entry) = nodes[at].entry() else { continue };
+				if entry.requires.is_empty() {
+					continue;
+				}
+				let lost = entry.requires.iter().any(|&kind| {
+					let leaving: usize = (0..nodes.len()).filter(|&other| doomed[other]).map(|other| catalogue.count_for(nodes[other].id, kind)).sum();
+					catalogue.count_of(kind) <= leaving
+				});
+				if lost {
+					doomed[at] = true;
+					grew = true;
+					any = true;
+				}
+			}
+			if !grew {
+				break;
+			}
+		}
+		if !any {
+			return 0;
+		}
+		let depth: Vec<usize> = dependency_depths(nodes);
+		let mut order: Vec<usize> = (0..nodes.len()).filter(|&at| doomed[at]).collect();
+		// Deepest first, the index breaking ties so two unrelated nodes at one level stop in a stable
+		// order rather than in whatever order the sort happened to leave them.
+		order.sort_by_key(|&at| (core::cmp::Reverse(depth[at]), at));
+		let mut moved: usize = 0;
+		for at in order {
+			print(b"DeviceManager: ");
+			print_driver_name(nodes[at].driver_name());
+			print(b" declares a provider in `requires` that has been withdrawn; stopping it\n");
+			nodes[at].stop_intent = driver_binding::StopIntent::DependencyLost;
+			begin_dependency_stop(&mut nodes[at], catalogue);
+			moved += 1;
+		}
+		moved
+	}
+}
+
 // Ask an online driver to stop because what it requires has gone. The same shape as the operator's
-// disable, and deliberately NOT calling `withdraw_binding` first: what this driver published is
-// withdrawn by the teardown that follows, and withdrawing it here would re-enter this function's own
-// condition for whatever depends on THIS driver before its binding has actually ended.
-unsafe fn begin_dependency_stop(node: &mut Node) {
+// disable, including the withdrawal that comes first - see `stop_nodes_that_lost_a_dependency`,
+// which is the only caller and which owns the ORDER the withdrawals happen in.
+unsafe fn begin_dependency_stop(node: &mut Node, catalogue: &mut Catalogue) {
 	unsafe {
 		let Some(binding) = &node.binding else { return };
 		let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
+		// THE PROVIDER IS WITHDRAWN AND NEW CONNECTIONS REFUSED FIRST, so nothing arrives during the
+		// drain. A driver asked to finish while work keeps being handed to it is a driver that
+		// cannot finish - which is why the operator's disable and the shutdown both do this, and why
+		// a planned stop that skipped it was the one intent of the four that let a consumer connect
+		// to a driver already on its way out.
+		catalogue.withdraw_binding(node.id);
 		if !node.record.move_to(BindingState::Stopping, None) {
 			print(b"DeviceManager: a lost dependency could not enter the teardown\n");
 			return;
@@ -3807,6 +3962,17 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				if node.candidate >= node.candidates.len() {
 					node.candidate = node.preferred.unwrap_or(0);
 				}
+				// AND THE ONE ATTEMPT IS THE WHOLE REQUEST, NOT ONE PER CANDIDATE (corrected
+				// 2026-09-01).
+				//
+				// Setting `attempt` to one below the bound spends the automatic budget for THIS
+				// candidate, and that is as far as a counter can reach: when the attempt fails,
+				// `advance` answers `Step::NextCandidate`, both loop handlers advance the cursor,
+				// reset `attempt` to zero and start the next entry with a full budget. A device with
+				// three candidates therefore answered "try once" with one attempt plus six more. The
+				// flag says the request is spent whatever the cursor does, and the handlers read it
+				// where they would otherwise walk on.
+				node.retry_once = true;
 				// ASKED FOR, AND THE LOOP PERFORMS IT. A state change alone would not do: `advance`
 				// is event-driven and a node sitting in `Failed` or `Backoff` raises no event, so
 				// nothing would ever start the attempt. The flag is consumed once by the standing
@@ -4330,9 +4496,12 @@ fn provider_kind_wire(kind: proto::system::ProviderKind) -> u16 {
 // channel is ready, and one request is one reply.
 // Answer one operator request. The endpoint is narrow by design and single-client: exactly one
 // connection is minted for the operator path, so there is nothing here to multiplex.
-unsafe fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients, nodes: &mut [Node], catalogue: &mut Catalogue, config: u64, buf: &mut [u8]) {
+// Answers false when the peer has gone, which is what lets the standing loop give the slot back -
+// see `CatalogueClients::retire`. It returned nothing, so a policy client that exited was waited on
+// for the rest of the boot exactly as a catalogue client was.
+unsafe fn serve_policy_once(service: u64, is_root: bool, clients: &mut CatalogueClients, nodes: &mut [Node], catalogue: &mut Catalogue, config: u64, buf: &mut [u8]) -> bool {
 	unsafe {
-		let ReceivedCaps::Message { len, handles } = recv_caps_blocking(service, buf) else { return };
+		let ReceivedCaps::Message { len, handles } = recv_caps_blocking(service, buf) else { return false };
 		for &handle in handles.as_slice() {
 			close(handle);
 		}
@@ -4344,7 +4513,7 @@ unsafe fn serve_policy_once(service: u64, is_root: bool, clients: &mut Catalogue
 			let op: u16 = u16::from_le_bytes([buf[0], buf[1]]);
 			if op == HEARTBEAT_OP {
 				send_blocking(service, b"PONG", 0);
-				return;
+				return true;
 			}
 			if op == CONNECT_OP && is_root {
 				match channel_pair_for_catalogue(clients) {
@@ -4355,7 +4524,7 @@ unsafe fn serve_policy_once(service: u64, is_root: bool, clients: &mut Catalogue
 						send_blocking(service, &[], 0);
 					}
 				}
-				return;
+				return true;
 			}
 		}
 		let mut view = PolicyView { nodes, catalogue, config };
@@ -4366,6 +4535,7 @@ unsafe fn serve_policy_once(service: u64, is_root: bool, clients: &mut Catalogue
 		if let Some(written) = proto::system::device_policy_admin::dispatch(&mut view, &request, &mut request_handles, &mut reply, &mut reply_handles) {
 			send_blocking(service, &reply[..written], 0);
 		}
+		true
 	}
 }
 
@@ -4388,6 +4558,31 @@ impl CatalogueClients {
 
 	fn live(&self) -> &[u64] {
 		&self.channels[..self.count]
+	}
+
+	// GIVE ONE BACK. The slot is capacity for a LIVE client, not a lifetime allocation.
+	//
+	// This structure was append-only, and a channel whose peer has closed is PERMANENTLY READABLE -
+	// that is what `Channel::is_readable` answers for a gone peer, so `recv` reports the closure
+	// rather than blocking. The standing loop puts every client in its one `wait_any`, so a consumer
+	// that exited left a handle that woke the loop on every pass, forever: DeviceManager spun
+	// answering nothing, and the teardown and catalogue handles behind it in the wait set were
+	// starved by a dead one in front. The eight slots were also spent for the life of the boot, so
+	// eight consumer restarts exhausted a bound meant to describe how many may hold a connection AT
+	// ONCE.
+	//
+	// The last live entry moves into the gap: the array is a set, the standing loop rebuilds its
+	// wait set from `live()` on every pass, and nothing indexes across a call to this.
+	unsafe fn retire(&mut self, at: usize) {
+		unsafe {
+			if at >= self.count {
+				return;
+			}
+			close(self.channels[at]);
+			self.count -= 1;
+			self.channels[at] = self.channels[self.count];
+			self.channels[self.count] = 0;
+		}
 	}
 }
 
@@ -4590,6 +4785,61 @@ unsafe fn observe_claim(node: &mut Node, device_privilege: u64, driver_name: &[u
 //
 // NOT BUS REMOVAL. The scan runs once and no removal event exists, so the only ways a controller
 // goes away are a shutdown and a teardown, and both are asked for from inside.
+// HOW FAR EACH NODE STANDS FROM A LEAF PROVIDER, following the kinds it requires to the nodes that
+// publish them.
+//
+// REVERSE DEPENDENCY ORDER IS DEPTH AND NOT A COUNT. Ordering by how many direct requirements a node
+// declares holds only for chains one deep: in A requires a kind B provides, and B requires a kind C
+// provides, A and B BOTH declare one requirement, their tie falls to enumeration order, and B can be
+// stopped before its own dependent A. The manifest validator accepts such chains - it refuses cycles
+// and orphans - so this is an ordinary supported registry, not an exotic one.
+//
+// A cycle cannot appear (refused at registry-build time), so the relaxation terminates; `nodes.len()`
+// passes is the worst case for a chain that happens to be enumerated backwards, and every pass is
+// over a handful of entries.
+//
+// THE ENTRY EACH NODE IS RUNNING, not the cursor - see `Node::entry`. Reading the cursor builds the
+// graph out of whichever candidate an operator had SELECTED for the next bind, so a `select` on a
+// device that stays online could order a teardown by a driver that is not running.
+//
+// SHARED, because two callers order by this rule and the milestone states it once: the shutdown, and
+// the dependency-lost stop that has to take dependents down before what they depend on.
+fn dependency_depths(nodes: &[Node]) -> Vec<usize> {
+	let mut depth: Vec<usize> = alloc::vec![0; nodes.len()];
+	for _ in 0..nodes.len() {
+		let mut moved = false;
+		for at in 0..nodes.len() {
+			let Some(entry) = nodes[at].entry() else { continue };
+			let mut want = 0usize;
+			for kind in entry.requires {
+				// Whoever publishes that kind: this node stands one level above the deepest of them.
+				// A requirement nothing in this image provides cannot occur - the manifest validator
+				// refuses it - and if it somehow did, it contributes nothing, which leaves the node a
+				// leaf rather than inventing a level for it.
+				for other in 0..nodes.len() {
+					if other == at {
+						continue;
+					}
+					// The same rule on the PROVIDER side: who publishes a kind is a fact about the
+					// driver that is running, not about the one selected next.
+					let Some(provider) = nodes[other].entry() else { continue };
+					if provider.provides.iter().any(|(declared, _, _)| declared == kind) {
+						want = want.max(depth[other] + 1);
+					}
+				}
+			}
+			if want != depth[at] {
+				depth[at] = want;
+				moved = true;
+			}
+		}
+		if !moved {
+			break;
+		}
+	}
+	depth
+}
+
 unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver_binding::StopIntent, buf: &mut [u8]) {
 	unsafe {
 		// EVERY SUBSCRIPTION IS CLOSED FIRST. A consumer learns a stream has ended by its producer
@@ -4609,44 +4859,7 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 		// it requires to the nodes that publish them. A cycle cannot appear (refused at registry-build
 		// time), so the relaxation below terminates; `nodes.len()` passes is the worst case for a
 		// chain that happens to be enumerated backwards, and every pass is over a handful of entries.
-		let mut depth: Vec<usize> = alloc::vec![0; nodes.len()];
-		for _ in 0..nodes.len() {
-			let mut moved = false;
-			for at in 0..nodes.len() {
-				// THE ENTRY THIS NODE IS RUNNING, not the cursor - see `Node::entry` (fixed
-				// 2026-09-01). This shutdown orders nodes by their dependency graph, and reading the
-				// cursor built that graph out of whichever candidate an operator had SELECTED for the
-				// next bind. A `select` on a device that stays online could therefore order the
-				// shutdown by a driver that is not running: a provider stopped before its actual live
-				// dependent, which is the dependents-first rule this sort exists to keep.
-				let Some(entry) = nodes[at].entry() else { continue };
-				let mut want = 0usize;
-				for kind in entry.requires {
-					// Whoever publishes that kind: this node stands one level above the deepest of
-					// them. A requirement nothing in this image provides cannot occur - the manifest
-					// validator refuses it - and if it somehow did, it contributes nothing, which
-					// leaves the node a leaf rather than inventing a level for it.
-					for other in 0..nodes.len() {
-						if other == at {
-							continue;
-						}
-						// The same correction on the PROVIDER side: who publishes a kind is a fact
-						// about the driver that is running, not about the one selected next.
-						let Some(provider) = nodes[other].entry() else { continue };
-						if provider.provides.iter().any(|(declared, _, _)| declared == kind) {
-							want = want.max(depth[other] + 1);
-						}
-					}
-				}
-				if want != depth[at] {
-					depth[at] = want;
-					moved = true;
-				}
-			}
-			if !moved {
-				break;
-			}
-		}
+		let depth: Vec<usize> = dependency_depths(nodes);
 		let mut order: Vec<usize> = (0..nodes.len()).collect();
 		// Deepest first: a dependent is stopped before what it depends on. The index breaks ties so
 		// two unrelated nodes at one level stop in a stable order rather than in whatever order the

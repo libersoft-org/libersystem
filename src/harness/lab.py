@@ -1130,7 +1130,11 @@ def cmd_dev_up(args):
 	# compile-time feature that is off everywhere else, so the persistent instance is the one
 	# configuration that asks for them. An ordinary build, and every test build, contains no
 	# trace of them.
-	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1')
+	# `LIBER_DEV_INSTANCE_BRINGUP` says THIS boot is the instance, which `qemu-run.sh` needs to know:
+	# the lock taken above is the one its ad-hoc-guest guard tests, and it is held across the runner
+	# started below - so without the marker the instance's own boot was refused by its own lock. See
+	# the guard for the reproduction.
+	env = dict(os.environ, SERIAL=f'unix:{DEV_SERIAL_SOCK},server', DEV_PROFILE='1', LIBER_DEVELOPMENT='1', LIBER_DEV_INSTANCE_BRINGUP='1')
 	qemu_log = open(DEV_QEMU_LOG, 'wb')
 	# THE IMAGE BUILD IS A STEP OF ITS OWN, because the runner no longer performs one.
 	#

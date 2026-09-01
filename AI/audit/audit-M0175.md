@@ -731,3 +731,49 @@ matrix is made to carry the same answer - x86_64 claims unguessable identities, 
 the degraded mode as a known visible limitation, and no row is blocked. When a secure source lands on
 a target, that target's row moves and nothing else changes, which is what makes it a gate on one
 clause rather than a dependency of the whole.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-09-01T03:39:33Z):
+
+Rating: 5/10
+
+1. **The latest sender-profile correction pins standards that its concrete policy contradicts.** M2
+   names RFC 6298 for RTO and RFC 5681 for loss/windows, then specifies a 200 ms RTO floor, an
+   unconditional ten-segment initial window and a generic loss response that halves the congestion
+   window (docs/todo/P02M0175.md:191-205). [RFC 6298 section 2](https://www.rfc-editor.org/rfc/rfc6298.html#section-2)
+   recommends rounding a computed RTO below one second up to one second, so 200 ms is an undeclared
+   deviation. RFC 5681's initial window is two to four segments; IW10 comes from
+   [RFC 6928 section 2](https://www.rfc-editor.org/rfc/rfc6928.html#section-2) and has a byte-capped
+   formula. Most materially, [RFC 5681 section 3.1](https://www.rfc-editor.org/rfc/rfc5681.html#section-3.1)
+   halves FlightSize into ssthresh after timeout but resets cwnd to one SMSS; “halve the window”
+   permits sending too much immediately after an RTO. Choose one coherent profile, distinguish
+   timeout from fast-recovery loss, and make the numeric tests assert that policy.
+
+2. **The accepted fetch-stream correction still has neither the budget nor the wire terminal it
+   invokes.** M1 says fetch returns stream<chunk>, that a body exceeding “the per-flow receive budget
+   below” ends with an explicit truncation signal, and that typed refusals apply elsewhere
+   (docs/todo/P02M0175.md:101-116). No per-flow receive budget follows: 256 KiB is unacknowledged
+   transmit data, while M4 supplies only a 2 MiB aggregate receive cap (:113-116,247-251). Nor does
+   the plan define whether stream opening is guarded or how an element/terminal distinguishes normal
+   completion, truncation and midstream failure. The current chunk carries only data
+   (src/idl/network.lsidl:158,162-165), and LSIDL requires result<stream<T>, E> when opening must return
+   a typed error (docs/LSIDL.md:368-383). Define the numeric per-flow receive threshold and the
+   semantic open/terminal status; exact declaration spelling and order can remain in the IDL.
+
+3. **The entropy narrowing still leaves an impossible spoof-rejection completion claim.** M6 says a
+   guessed matching tuple is accepted and therefore requires the tuple to be unpredictable
+   (docs/todo/P02M0175.md:304-315). Dependencies then explicitly permit predictable identities on
+   aarch64 and riscv64 and gate only the stronger unguessability claim (:474-505). The Definition of
+   done nevertheless still says absolutely that a spoofed datagram can never resolve a name, set the
+   clock or change a lease on any profile (:514-520). On a predictable profile, an off-path forged
+   response carrying the predicted tuple is precisely a spoofed datagram and passes correlation.
+   Scope off-path spoof rejection to secure-entropy profiles; all profiles can promise rejection of
+   mismatched, stale and replayed packets.
+
+4. **The newly frozen route fields cannot represent the on-link routes supplied by M0174.** M1 makes
+   every route carry a next-hop ip-address with no absent/direct form or sentinel semantics
+   (docs/todo/P02M0175.md:126-127). M0174 explicitly installs an on-link prefix route for PIO L=1 and
+   treats a caller-chosen next hop as optional (docs/todo/P02M0174.md:231-234,312-325). A direct route
+   has no fixed gateway; its packet's destination is the next hop. Requiring an address forces either
+   a fabricated value or an undocumented sentinel in the public contract. Freeze an optional
+   next-hop or direct/via route variant and its validation; this is a semantic field choice, not IDL
+   spelling that can be deferred.
