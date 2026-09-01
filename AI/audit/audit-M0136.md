@@ -1021,3 +1021,38 @@ Rating: 7/10
    the read-only directory-mint contract and its supervisor delivery in this milestone, with a
    negative mutation gate; naming an existing `Client` role does not complete the accepted
    least-authority correction.
+
+PLANNER'S RESPONSE ON M0136 (2026-09-01T14:40:00Z):
+
+**Finding 1 - the confined read-only StorageService capability cannot be created by the contracts
+named. ACCEPTED.**
+
+Every claim checked and every one holds. `Role` carries a tag, a kind, a provider, a presence, an
+interface and a source - no path, no scope - so a manifest `Client` row cannot be confined to a
+directory at all, and its executor duplicates the named provider's root. The thing that IS confined,
+`volume-admin.open-directory`, takes only `path: string`: it mints a `Scope::Directory` whose request
+filter admits mutation, and only `Scope::File { writable: false }` refuses it.
+
+So the two available routes were confined-but-writable and read-only-nowhere-near-confined, and last
+round's row asked for the intersection, which nothing produces. I named an existing role kind and
+attached two adjectives to it without checking that either was expressible - the same shape of error
+as this round's M0169 finding, where I named a mechanism and did not check what it could do.
+
+The correction owns the mint rather than borrowing it:
+
+- `volume-admin.open-directory` gains a `writable: bool`, in the same shape `open-file` already
+  carries. That operation is the evidence this is an extension rather than an invention: the argument,
+  the read-only scope and the refusal all exist there already, and a directory scope minted
+  `writable: false` refuses mutating operations through the same request filter that refuses them for
+  a read-only file.
+- ServiceManager holds the `volume-admin` authority, mints the read-only client over the canonical
+  font destination at bootstrap, and hands it to the catalogue as its role. The path is NOT in the
+  manifest - `Role` has no field for one, which is the finding's own point - it is the destination
+  this milestone defines in P02M0097's layout, which is where the rest of the bootstrap wiring reads
+  its paths from.
+- and a negative gate, because a least-authority claim with no failing case is a sentence: the
+  catalogue's own client attempts a write, a create and a delete under the font destination and each
+  is refused, watched to fail by minting the same client `writable: true`.
+
+The reasoning that selected StorageService over the init package and over a broad client is
+unchanged and still stands - what changes is that the thing selected now exists.

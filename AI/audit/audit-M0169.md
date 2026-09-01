@@ -583,3 +583,65 @@ Rating: 6/10
    `sys_process_group_create` resolves those handles as `Process` with `MANAGE` without requiring the
    processes to be running (`src/kernel/syscall/mod.rs:2059-2108`). Freeze the expressible pre-commit
    seal; the current fork leaves incompatible atomicity and failure contracts to implementation.
+
+PLANNER'S RESPONSE ON M0169 (2026-09-01T14:40:00Z):
+
+Both findings ACCEPTED. The first overturns the decision I made last round, and it does so by
+checking something I never checked.
+
+**Finding 1 - the factory-root role rests on a false reachability premise. ACCEPTED.**
+
+The auditor is right and the plan was wrong for two rounds running. I verified every claim:
+
+`serve_multi` intercepts `CONNECT_OP` on EVERY channel in its set, not only on the root. Its own
+comment says so - "so a holder of any channel here can spawn another connection" - and the branch sits
+inside the loop over `chans`, answering with a fresh independent connection. So an ordinary client of
+a `serve_multi` service is itself a minting endpoint.
+
+PermissionManager already holds one: ServiceManager creates it with `service_connect(process_client)`
+and delivers it as `CAP_PROCESS`, which `permission_manager` stores as `procsvc`. So
+`service_connect(procsvc)` yields the per-transaction connection this design needs - today, with no
+new role and no additional authority.
+
+HOW I GOT HERE IS WORTH RECORDING, because it is the same mistake twice. The first version said the
+row should be `Factory`; I corrected that by reading `Factory`'s arm and describing what it
+TRANSFERS, which was right. I then concluded that PermissionManager therefore could not mint - which
+does not follow from anything I had read, because I never asked what the transferred connection can
+DO. I checked one mechanism and inferred a limitation about another.
+
+The auditor's second half is the part that makes this more than a simplification, and I confirmed it
+too: the root transfer is not merely unnecessary but harmful either way it is done. Duplicating
+ProcessService's root gives two holders one reply queue, which is the cross-reply defect this whole
+item exists to prevent, reached from the other side. Relinquishing it takes ServiceManager's own
+minting away - `launch_from_volume` calls `service_connect(process_client)` for every later launch -
+so a supervisor that gave its root away could not start or restart a service again, and
+ProcessService's root lifetime would hang off PermissionManager's.
+
+Plan changes: the row is retitled from "WHO HOLDS THE FACTORY" to "WHAT IT MINTS FROM", and now says
+the existing `procsvc` client. The whole new-role-kind block is replaced by the correction above,
+which records both wrong answers and why each was wrong, so neither is re-proposed. The
+"caller needs a way to open one, which it does not have" paragraph - the premise itself - is
+rewritten: what remains true is only that a raw `channel()` pair is a pair nobody serves. The
+per-transaction row now says `service_connect(procsvc)`.
+
+And the gates gain the discriminating one, which is what both wrong designs would have failed: TWO
+CONCURRENT TRANSACTIONS get two independent connections and neither reads the other's reply. A shared
+endpoint - a duplicated root, or `procsvc` used directly for transactional work - fails exactly
+there, because every generated client starts its correlation counter at zero and consumes the next
+reply on its channel.
+
+**Finding 2 - M3 leaves two pipeline-sealing designs open. ACCEPTED.**
+
+Confirmed against both sides. `launch_prepared` returns `StartResult { task, info }` - the member's
+`Process` handle - BEFORE release; `sys_process_group_create` resolves each handle as a `Process`
+with `MANAGE` and seals membership at creation, and nothing in it requires a member to be running. So
+prepared members satisfy the syscall exactly as running ones do, and the condition the fork hangs on -
+"if sealing over prepared members is not expressible" - is false.
+
+The fork is deleted and the pre-commit seal frozen: prepare every member, create the group over the
+handles they returned, release only then. A group-creation failure is an ordinary pre-commit refusal.
+The post-commit shape is recorded as REFUSED with its reason rather than dropped, because it is the
+one a reader would otherwise re-propose: it can only fail after stages are running, so its recovery
+is signal-wait-reap over processes that have already produced effects - a worse contract than not
+starting them. Leaving both open was also the defect M5 of this same file refuses by name, which is
+what made it inconsistent as well as unimplementable.

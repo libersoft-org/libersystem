@@ -1441,3 +1441,39 @@ Rating: 8/10
    outcome/timing to the client. One client-send/service-receive pair cannot carry both opposite-author
    transitions. Specify the two directions separately, including endpoint rights/ownership and the
    acquire/release ordering for each.
+
+PLANNER'S RESPONSE ON M0103 (2026-09-01T14:40:00Z):
+
+**Finding 1 - the WSI completion conflates producer-ready with presentation completion and points the
+result channel the wrong way. ACCEPTED.**
+
+Verified against all three places. The present state machine requires DisplayService to release a
+pending image and defines per-present outcomes and completed-present timing. The selected mechanism
+is one channel pair on which the CLIENT holds `RIGHT_SEND` and DisplayService receives and waits.
+Pass 10 then calls that same pair the `PRODUCER_READY` / `CONSUMER_RELEASE` mechanism.
+
+Those are two transitions in opposite directions with different authors, and the auditor's statement
+of it is exact: render completion is the client telling the service its pixels are ready; the
+presentation outcome, its timing and the release of the image back to the client's pool can only come
+from the service and the backend. A single send end held by the client cannot carry the second, so
+the state machine's own requirements had no channel to travel on - the item specified a completion
+mechanism and then specified half of it.
+
+Plan changes, in the WSI item and in the pass-10 rows that name it:
+
+- the mechanism is now TWO endpoints, stated with their rights and owners.
+  `PRODUCER_READY` is client to service: the client holds `RIGHT_SEND` and nothing else, and
+  DisplayService receives and waits - which is the existing pair, unchanged, and everything already
+  written about one processed outcome, reclamation on close and the hostile double-send belongs to
+  it. `PRESENT_DONE` is service to client: DisplayService holds `RIGHT_SEND`, the client is given
+  `RIGHT_RECEIVE | RIGHT_WAIT` and no send right, and it carries the typed per-present outcome, the
+  completed-present timing and the release of the image. The authority split is the same shape in
+  both directions, so neither side can forge the other's transition - which is the DISTINCT AUTHORITY
+  requirement this item opens with, now true of both halves rather than one.
+- the ORDERING is stated because it is the reason for having two: a client may reuse an image only
+  after the `PRESENT_DONE` that releases it, and DisplayService may present only after the
+  `PRODUCER_READY` for that image. Each side waits on the endpoint it receives on, so neither polls.
+- the memory-ordering row in pass 10 said "SENDING the producer-ready outcome has release semantics
+  and RECEIVING it has acquire semantics", which was written for one direction. It now says sending
+  on EITHER endpoint has release semantics and receiving on it acquire semantics, and notes why that
+  has to be said of both: each side is the sender of one transition and the receiver of the other.

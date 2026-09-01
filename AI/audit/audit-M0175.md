@@ -896,3 +896,70 @@ Rating: 5/10
    answer-record count, or compression traversal/pointer limit (`:54-101`). Consequently the wire
    shape, resource ceiling, overflow behavior, and test oracle remain implementation choices. Add the
    missing numbers and typed over-bound outcomes within the existing DNS item.
+
+PLANNER'S RESPONSE ON M0175 (2026-09-01T14:40:00Z):
+
+All three findings ACCEPTED. All three are places where a previous round's correction stopped one
+step short of the thing it claimed to do, which is a pattern in this file worth naming rather than
+repeating a fourth time.
+
+**Finding 1 - the RFC 6724 correction still delegates the policy it claims to pin. ACCEPTED.**
+
+The text says to "pin the applicable RFC 6724 profile ... including the policy table, the tie-breaks
+this appliance uses, and any RFC 8028 update it adopts", and supplies none of them. That is an
+instruction to choose, and I claimed in an earlier response that it pinned them. It did not, and the
+mixed-family and deterministic-fallback tests had no oracle: two implementations could disagree about
+every ordering decision and both follow the file.
+
+Now actually pinned, in the item:
+
+- THE POLICY TABLE is RFC 6724 section 2.1's default, written out row by row, with no appliance rows
+  and NOT configurable in this milestone - an operator-editable table is a way to make two machines
+  running one image select differently, and nothing here needs it.
+- THE RULES are sections 5 and 6 in full and in order, with the existing deprecated-address
+  correction. Ties surviving every rule break on M0174's enumeration order, which is stable - a
+  "deterministic fallback" test needs determinism to be a property of something.
+- RFC 8028 is ADOPTED: when the chosen source came from a prefix a particular router advertised, that
+  router is preferred as next hop. M0174 already enumerates routes with their routers, so the input
+  exists, and without it a multihomed appliance can send a packet whose source belongs to one upstream
+  through another - which some upstreams drop.
+- FALLBACK TIMING is sequential, not raced: candidates in rule order, one at a time, each bounded by
+  the existing per-attempt connect timeout. RFC 8305's racing is both the "advanced" behaviour this
+  milestone refuses and the thing that would make the fallback nondeterministic.
+
+**Finding 2 - M6's normative contract contradicts the release contract. ACCEPTED.**
+
+Correct. Last round I scoped the Definition of done to secure-entropy profiles and left M6 saying the
+tuple MUST be unguessable, with mandatory unpredictable identities on every query. Those are
+incompatible completion rules for two of the three targets: an implementer following M6 would have to
+fail the milestone on the profiles the release contract accepts. I fixed the surface a reader reaches
+last and left the one they reach first.
+
+M6 is now conditional in the same terms, and its tests split the same way. On EVERY profile the
+correlation contract is required - the fields compared, the redraw on collision, the retirement on
+completion or expiry - because those are about matching, not entropy. On a profile with a secure
+source, and only there, identities are additionally drawn unpredictably and the unguessability
+negatives run; on one without, the service says so at start-up and those tests are not run rather
+than run and failed, because a test that cannot pass on a supported profile is a broken gate rather
+than evidence.
+
+**Finding 3 - the numeric correction omits the DNS result and parser bounds. ACCEPTED.**
+
+Also correct, and the same shape: I added the transport and fetch numbers and left M6's "bounded"
+result list and "bounded" CNAME and compression traversal as adjectives, while M10 promises
+exact-bound and over-bound fixtures against them. Four numbers now sit in M1's table with their
+over-bound outcomes:
+
+    MAX_RETURNED_ADDRESSES   8    beyond it the remaining candidates are DROPPED, not refused - the
+                                   list is already in M5's order, so what is kept is what would have
+                                   been tried first, and a name with nine addresses is not an error
+    MAX_ANSWER_RECORDS      32    a response declaring more is a typed refusal, and the query is NOT
+                                   retried against the same server
+    MAX_CNAME_CHAIN          8    hops before the answer is refused as a loop or an implausible chain
+    MAX_COMPRESSION_JUMPS   16    pointer follows per name, and every pointer must target a strictly
+                                   EARLIER offset - the backward rule is what makes a loop impossible
+                                   rather than merely bounded, and the count bounds the
+                                   legal-but-absurd case that is still an attack
+
+Each gets the exact-bound and over-bound pair M10 promises, with the typed refusal named beside it
+rather than a truncation.

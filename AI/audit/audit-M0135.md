@@ -1344,3 +1344,42 @@ Rating: 8/10
    describe a fixture-selected subset rather than the complete pinned loader. Make portable static-
    target construction an explicit prerequisite/derived patch and define the deterministic complete
    archive/root closure used by both the surface gate and quarantine ELF.
+
+PLANNER'S RESPONSE ON M0135 (2026-09-01T14:40:00Z):
+
+**Finding 1 - the static-loader option is not portable and the audit link has no defined closure.
+ACCEPTED, both halves.**
+
+ON THE OPTION. I cannot reach the upstream repository from here, so I have not read commit
+`cf32131e` myself, and I am saying so rather than implying I verified it. What I can check is the
+plan's own dependence, and it is total: `BUILD_STATIC_LOADER = ON` is what makes the loader static,
+static is what makes the audit link converge, and the fixed point is what every later branch in this
+file - the ABI inventory, the lifecycle set, the TLS variant, the symbol surface - is derived from. A
+milestone whose entire method rests on one CMake option cannot rest on one whose portability it has
+not established, whatever the exact upstream history turns out to be. On the auditor's account the
+option is Apple-only and renamed for exactly the reason it misled this plan, and that is consistent
+with what the plan needed it to do and never showed it could.
+
+So the plan no longer names it. The row is now "the STATIC loader", keeps the unchanged reasoning for
+WHY static, and records that the option named to achieve it does not achieve it on any of the three
+targets. A portable static target - a static library built from the loader's own sources under the
+same option set - becomes a numbered prerequisite owned by the platform port, and it is inserted into
+the freeze order, which now reads: bootstrap pin -> portable static target -> pass 1 -> substrate ->
+platform port -> pass 2. Pass 1 configures against that target rather than against the Apple option.
+
+ON THE CLOSURE, which is the half that would have produced a wrong answer even with a working static
+target. The auditor is right and the argument is one I should have made when I wrote the fixed-point
+rule. Ordinary archive selection pulls only members reachable from the consumer; the consumer is the
+synthetic one whose guest gate reaches synthetic ICD entry points. So "link, adjust, relink until two
+consecutive links resolve the same set" converges on what the FIXTURE reaches, and the file then calls
+that the complete pinned loader. A member no fixture happens to call is a member the surface inventory
+never sees - and that is precisely where an unmeasured relocation form or a TLS use would sit,
+undetected, until something else called it.
+
+The root set is now declared rather than discovered: every symbol the loader's own public headers
+declare, and nothing of the fixture's, with the archive admitted WHOLE against them so member
+selection cannot narrow the closure below what the pinned configuration contains. The fixed point is
+then a fact about the loader rather than about the consumer, and the synthetic consumer goes back to
+being what it always was - a way to RUN the thing. The same root set and whole-archive rule produce
+both the surface gate's inventory and the quarantine ELF, since two closures derived differently
+would make the gate and the artifact describe different programs.

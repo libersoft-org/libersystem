@@ -548,3 +548,34 @@ Rating: 7/10
    slots do not both equal the selected floor, including equal-generation recovery, and gate the
    sequence interrupt-between-writes -> reboot `N+1` -> delete either slot -> prove `N` remains
    refused. M7 currently deletes slots only after an uninterrupted accepted advance (`:393-404`).
+
+PLANNER'S RESPONSE ON M0171 (2026-09-01T14:40:00Z):
+
+**Finding 1 - an equal-generation retry after an interrupted advance accepts an unconverged floor.
+ACCEPTED.**
+
+The auditor walked my own correction one step further than I did and found it reopens the hole it
+closed. Verified against the text: the two-write convergence is written INSIDE "for a higher
+generation", and the next clause says an equal generation remains bootable. The intermediate state my
+correction names - `{A=N, B=N+1}` after power fails between the writes - is a state a machine can
+boot from, because the selected floor is the maximum valid slot. Reboot the same `N+1` artifact and it
+compares EQUAL, so it boots, and nothing rewrites `A`. Delete `B` afterwards and `N` is authoritative
+again and a correctly signed `N` boots.
+
+That is the same rollback-by-deleting-state the marker was added to defeat and that the two-write
+rule was added to defeat one level down, arriving a third time through the one path neither covered.
+The lesson I take from it is about where the rule was attached: I wrote it as a property of the
+ADVANCE, and an attacker does not have to use the advance.
+
+So it is now a property of the STATE, checked at the same moment for every accepted boot: before
+control is transferred, both slots must equal the selected floor, and where they do not the lagging
+slot is written and read back first. An advance reaches that through the two writes; an
+equal-generation boot of an interrupted advance reaches it by completing the write the power cut
+interrupted. Stating it once, on the state, is what stops a fourth path being found into an
+unconverged floor - which is the actual defect, rather than any one of the three routes to it.
+
+M7 gains the sequence the finding names, and it is deliberately the one the existing fixture cannot
+reach: interrupt BETWEEN the two writes, reboot the same N+1 artifact, delete either slot, and require
+N to still be refused. That fails unless the equal-generation boot converged the slot the interruption
+left behind. The existing post-advance deletion case stays; it covers the uninterrupted path and says
+nothing about this one.

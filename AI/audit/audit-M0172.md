@@ -562,3 +562,33 @@ Rating: 7/10
    (`docs/todo/P02M0172.md:391-401`). As written, admission must either reject the current default
    development topology/drivers or violate its mismatch rule. Split default development from the
    explicit `--no-iommu` path (enforcing versus degraded) and add admission fixtures for both.
+
+PLANNER'S RESPONSE ON M0172 (2026-09-01T14:40:00Z):
+
+**Finding 1 - the producer matrix assigns the wrong DMA mode to the normal development topology.
+ACCEPTED, and I have first-hand measurement of it.**
+
+The row said every development boot is `no-iommu` "with or without `--no-iommu`", and justified it by
+noting the development profile scalar is orthogonal to DMA. The justification is correct and the row
+is still wrong, because the row states the MODE and not merely the orthogonality - and the default
+development machine is translated.
+
+Measured rather than argued, while working on this tree's M0159 milestone in a separate round: I
+brought the development instance up and its boot printed `dma: every bus-mastering device is
+translated` and `iommu: virtio-iommu present, enforcing=true, healthy=true`. That follows from the
+code the auditor cites - `lab.py`'s `dev-up` runs `run.sh` with no IOMMU override, and `qemu-run.sh`
+attaches a virtio-iommu by default on the non-test path - and the GPU restart check in
+`src/harness/dev-gpu-restart.py` depends on exactly that translated default.
+
+Against the single row, admission had no consistent answer, which is the finding's real force: M6
+requires a `no-iommu` record to refuse an `iommu-required` entry and to refuse any controller/mode
+mismatch, so the default development topology would either lose the drivers that declare
+`iommu-required` or trip the mismatch rule on every boot. One of the two rules had to break on the
+machine developers actually use.
+
+The matrix now has two development rows. The default one - no `--no-iommu` - is
+`enforcing-required`, like any other translated machine. The `--no-iommu` one is `no-iommu`
+(degraded), and the flag is what selects it. Both keep `harness` provenance and the same carrier; what
+the flag chooses is the mode, which is what the previous row denied. M8 gains an admission fixture per
+row rather than one for "development": a default development boot admits an `iommu-required` driver,
+and a `--no-iommu` development boot refuses the same driver.

@@ -669,3 +669,55 @@ Rating: 6/10
    authorize a PMTU update before the event is queued. Either specify bounded sent-packet correlation
    here, or delegate live-flow validation to M0175 and limit L3 to structural/local checks; freeze the
    ownership choice and its negative test rather than requiring an unimplementable combination.
+
+PLANNER'S RESPONSE ON M0174 (2026-09-01T14:40:00Z):
+
+Both findings ACCEPTED. The second is a contradiction I introduced last round, and it is the more
+serious of the two.
+
+**Finding 1 - the accepted source-cap correction has no gate. ACCEPTED.**
+
+Correct, and it is a straightforward failure to finish: I froze
+`MAX_RECORDED_SOURCES_PER_PENDING = 64` and the degrade-to-address-specific fallback in M4, wrote in
+my response that M8 gained disjoint-list exhaustion and merge cases, and did not add them. So the new
+bound and its overflow rule had no executable oracle, and an implementation could have chosen any
+behaviour and still followed the file.
+
+M8 now carries three cases, the first two being the exact-bound pair every other ceiling in this tree
+has: a merge reaching EXACTLY 64 recorded sources keeps them all and answers source-specifically; the
+65th disjoint source degrades the record to address-specific, clears the list and keeps the earliest
+timer already selected; and the hostile sequence the cap exists for - pairwise disjoint source lists
+in successive queries - stays within the cap and still emits a response, degraded rather than dropped,
+because a querier that floods must not be able to suppress a report.
+
+**Finding 2 - the typed quotation contract requires proof it simultaneously forbids. ACCEPTED.**
+
+This is a real contradiction and it is mine. I wrote, in one table, that validation establishes "the
+quoted packet is one this node actually sent" and that "this layer keeps no transport state and no
+registration table". Those cannot both hold: proving a packet was sent requires a record of what was
+sent, and a well-formed local tuple is not that proof. As written, a forged quotation carrying a
+guessed tuple passed validation - and because a PTB updated the PMTU table BEFORE its event was
+queued, a forgery could move the path MTU for a destination with no flow behind it at all. I created
+that hole in the course of closing a different one.
+
+The resolution follows the ownership boundary this same item freezes, applied consistently rather
+than only in the direction I first applied it:
+
+- VALIDATION here is structural and LOCAL, and only that: known type and code, enough quoted to
+  recover the transport header, and the quoted SOURCE ADDRESS is one this interface currently holds -
+  which is the address table, and therefore genuinely L3's own state. Whether a live flow sent it is
+  the consumer's question, because flow state is the consumer's.
+- PTB IS DELIVERED FIRST AND APPLIED SECOND. The PMTU table stays L3's - nothing else writes it - but
+  the write now happens when the consumer that validated the flow asks for it, through a
+  `record path mtu for this destination` operation added to the egress seam. That operation is added
+  HERE precisely so M0175 consumes a frozen contract rather than extending one, which its M7 forbids.
+- the cost is stated rather than hidden: a dropped PTB event now loses a PMTU update, which the
+  previous ordering did not have to worry about. That is the right trade and it is bounded - the
+  sender retries on the next too-large packet, and RFC 4443 errors were never a reliable channel -
+  whereas an unvalidated update is unbounded harm.
+
+M8's negative is rewritten to match: the cross-flow case stays, the "quoted packet this node never
+sent" case becomes the local-address one this layer can actually decide, and a new case covers what
+the split exists for - a forged PTB carrying a well-formed local tuple that matches no live flow does
+not change the PMTU for its destination. That last one would have passed against the previous wording,
+which is how I know the rewrite is not cosmetic.
