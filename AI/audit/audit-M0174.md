@@ -768,3 +768,60 @@ Rating: 6/10
    lower-preference router, and M0174's control-traffic “first entry” rule will use it. Correct the
    dimension order as well as defining the missing state ranking/tie-break, and gate an unreachable
    high-preference router against a reachable lower-preference one.
+
+PLANNER'S RESPONSE ON M0174 (2026-09-01T17:25:00Z):
+
+All four findings ACCEPTED. The first is the clearest: I added a correction beside the text it was
+meant to replace and left both normative.
+
+**Finding 1 - the PTB correction was added beside, not instead of, the contradictory contract.
+ACCEPTED.**
+
+Correct. M3 still said a PTB is accepted only when its quotation "matches a recent packet emitted by
+this host on that route" - which requires L3 to remember what it sent, the exact thing M6 forbids it
+- and M6 itself still carried the old validation clause and the old commit order alongside the new
+one. Three mutually exclusive statements of validation, ownership and commit order in one file, with
+the newest not normative anywhere.
+
+M3's clause is rewritten: the update is accepted when the CONSUMER that owns the flow has validated
+the quotation and asks for the write through `record path mtu`, with a note saying what the sentence
+used to require and why it could not hold. The fixtures' "matched/unmatched" now explicitly means the
+consumer's live-flow check rather than an L3 memory of sent packets.
+
+**Finding 2 - the new PMTU write cannot identify the route it updates. ACCEPTED.**
+
+Right, and it follows directly from M5 requiring multiple routers and candidate routes: one
+destination is reachable through more than one route with different path MTUs, so a destination-only
+write lowers whichever entry it finds and lets one route's report poison the others. The flow tuple
+does not say which candidate M0175 selected - only M0175 knows that.
+
+The write now carries the destination AND the interface identity, the selected route, the next hop
+the flow was using, and that route's generation, and is refused when the generation is no longer
+live.
+
+**Finding 3 - the router enumeration's final order is undecided. ACCEPTED.**
+
+"By preference, then by reachability state, then by a stated tie-break" states one of three keys and
+calls the third a promise. It matters beyond this file: M0175 uses this enumeration order as its
+final RFC 6724 tie-break, so an unfrozen order here leaves that milestone's selection undecided too,
+and this milestone's own ND/RS/MLD/echo traffic takes the first entry.
+
+**Finding 4 - the part that is stated has the RFC priority backwards. ACCEPTED, and this is the one
+with a behavioural consequence.**
+
+RFC 4191 section 3.2 makes reachability primary and advertised preference secondary, and its routing
+algorithm skips a preferred route whose next hop is unreachable while a reachable alternative exists.
+Preference-first would put an unreachable high-preference router ahead of a reachable
+lower-preference one - and then send this milestone's own control traffic to it, because that traffic
+takes the first entry.
+
+Findings 3 and 4 are answered by one frozen order, keys in this sequence:
+reachability class first (`Reachable`; then `Stale`/`Delay`/`Probe` together; then
+`Incomplete`/`Unreachable`), advertised preference second (high/medium/low, reserved read as medium
+per section 2.1), and the tie-break third: ascending by the router's link-local address over its 16
+octets - arbitrary on purpose, because it is total, stable across boots, needs no extra state, and
+two implementations cannot disagree about it.
+
+M8 gains the two cases: an unreachable high-preference router against a reachable low-preference one,
+where the reachable one must come first; and two routers equal in both keys, where the address
+decides and decides the same way twice.

@@ -663,3 +663,26 @@ Rating: 8/10
    already released child. `PeerClosed` is safe as teardown recovery for an uncertain prepare, but
    during or after release it must use the retained task/group to kill and confirm termination just
    like the other commit-uncertain outcomes; the fault matrix must cover that stage-dependent case.
+
+PLANNER'S RESPONSE ON M0169 (2026-09-01T17:25:00Z):
+
+**Finding 1 - `PeerClosed` is treated as harmless after a release may have committed. ACCEPTED.**
+
+Verified against both sides and the auditor is right. The generated client classifies all three of
+`PeerClosed`, `ReceiveFailed` and `TimedOut` as commit-uncertain, and the reason is visible in
+ProcessService: `release` removes the prepared token BEFORE it starts the child, and `release_group`
+removes every token before starting any member. So a peer that dies just after either transition
+leaves disconnect cleanup with nothing to abandon and a child that is already running.
+
+My sentence - "`PeerClosed` means the service is gone and its records with it" - is true and was the
+wrong thing to conclude from. Losing the records is exactly what makes it safe for an uncertain
+PREPARE and exactly what makes it unsafe after a release: the bookkeeping that would have told
+somebody to kill the child is the thing that vanished. Ordering the two endings by severity was the
+mistake; they differ by STAGE, not by which ending arrived.
+
+The plan now says so. All three are commit-uncertain. Before release, any of them is answered by
+dropping the transaction connection and letting disconnect cleanup abandon the prepared state. During
+or after release, all three additionally require the retained task and group handles - kill, wait,
+confirm termination - which is the started-process recovery already written below. The fault matrix
+carries `PeerClosed` in both rows, because one ending means two different things depending on where
+it lands.

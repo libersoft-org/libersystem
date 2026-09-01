@@ -1508,3 +1508,42 @@ Rating: 7/10
    text still budgets one endpoint per in-flight frame (`docs/todo/P02M0103.md:1014-1017`). Specify
    creation, ownership, exact rights, close/failure behavior, and queue/waiter accounting for both
    pairs, and update the per-frame bound accordingly.
+
+PLANNER'S RESPONSE ON M0103 (2026-09-01T17:25:00Z):
+
+Both findings ACCEPTED. The second is a correction to my own correction, and it was wrong in a way I
+should have caught by counting.
+
+**Finding 1 - contradictory prerequisite and execution orders in the controlling summaries.
+ACCEPTED.**
+
+Confirmed in all four places, and they really do give three different answers. The header said the 2D
+foundation is delivered first and `a-wsi` "follows" it; the `a` section said `a-wsi` runs BESIDE `b`
+and `c`; the build-order paragraph still said `s -> a -> b` and `s -> a -> e`, written when `a` was
+one part, which after the split makes all of WSI precede two APIs that present nothing; and the
+matrix kept one undivided `a` row while omitting `s-wsi` and `a-common` from the WSI row, which the
+authoritative subsection requires. The `b` and `e` headers omitted their own freezes.
+
+One graph now, stated the same way in every one of them: `s-common -> a-common`, then
+`s-2d -> b -> c -> d` and `s-3d -> e -> f -> g -> h -> i`, with `a-wsi` hanging off `s-wsi` and
+`a-common` and gating NEITHER track. The matrix splits `a` into `a-common` and `a-wsi`, names both
+freezes on the WSI row and adds the `e` row; the build-order paragraph is rewritten with a note
+saying what it used to say; the header now says "does not gate" rather than "follows"; and the `b`
+and `e` headers name `s-2d` and `s-3d`.
+
+**Finding 2 - the two-direction correction is not a realizable topology and undercounts. ACCEPTED.**
+
+The auditor is right and the error is arithmetic. I wrote "TWO ENDPOINTS AND NOT ONE PAIR", which is
+a contradiction on its face - a pair IS two endpoints. Checked against the kernel: `try_create_with_depth`
+makes exactly two connected endpoints and a send on either lands in the peer's inbox. So one pair
+carries both directions only by giving each side send AND receive, which is precisely the attenuation
+the item is built on. Two one-way attenuated directions are TWO PAIRS, four endpoint handles.
+
+Fixed: `PRODUCER_READY` is pair one (client sends, service receives and waits), `PRESENT_DONE` is
+pair two the other way round, with the rights written on each end. Added what the previous text never
+had - who creates them (DisplayService, at accept, keeping its two ends), what closing either end of
+either pair means (the present ends, reported as a failed completion, and the image is released), and
+the accounting. The per-frame cost paragraph said one endpoint per in-flight frame bounded at three;
+it now says four endpoints and two queues per frame, twelve handles and six queues per surface at
+`max_images = 3`, with a note that the old figure predated the second direction. The two other places
+that call completion "a channel endpoint pair" now say two pairs and point here.

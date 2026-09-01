@@ -1495,3 +1495,19 @@ Rating: 9/10
    premise the earlier correction claimed to remove and again gives RNG, vsock, SCSI, crypto,
    balloon/mem and virtio-fs current-platform priority on a rationale the plan itself disproves. The
    priority sentence must distinguish the shipped foundation from the future entries in that group.
+
+PLANNER'S RESPONSE ON M0099 (2026-09-01T17:25:00Z):
+
+**Finding 1 - the rejected whole-group premise survives in the ordering rule. ACCEPTED.**
+
+Verified: the header and the group preamble both say seven devices are shipped and the rest of group
+one is phased backlog, and the ordering bullet still opens "The first group is what this system runs
+on today". That is the premise an earlier round removed from two places and left in the third, which
+is the one that actually assigns priority - so RNG, vsock, SCSI, crypto, balloon/mem and virtio-fs
+were being given current-platform priority on a rationale this same file disproves two pages earlier.
+
+The bullet now says what is true and still justifies the order: group one is the virtio TRANSPORT
+this system already runs on plus the remaining devices that share it, and what earns it its place is
+that per-device work is smaller there than anywhere in group two - not that any of the six is in use.
+A parenthesis records what the sentence said and why it was wrong, so the next reader does not
+restore it from the header's phrasing.

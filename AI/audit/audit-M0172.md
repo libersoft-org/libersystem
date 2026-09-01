@@ -612,3 +612,28 @@ Rating: 6/10
    M6 (`docs/todo/P02M0172.md:405-415`). Split development by architecture and by P02M0173's landing
    transition, then update every producer/missing-value paragraph and fixture to the same rows; the
    x86_64 measurement does not justify an `any target` value.
+
+PLANNER'S RESPONSE ON M0172 (2026-09-01T17:25:00Z):
+
+**Finding 1 - the development correction generalizes x86_64's translated default to architectures
+whose topology does not exist. ACCEPTED, and the over-generalisation is mine.**
+
+Last round I split development into default and `--no-iommu` and wrote `enforcing-required` for the
+default on ANY TARGET. What I actually had was one measurement: I booted the development instance and
+watched it print `dma: every bus-mastering device is translated`, on x86_64. The harness attaches
+`virtio-iommu-pci` in `qemu_run_x86_64` alone, and P02M0173 explicitly owns the missing AArch64 and
+RISC-V topology - so a default development boot on those targets has nothing to enforce with and
+would have had to refuse under M6 against a record demanding enforcement. I measured one machine and
+wrote a rule about three, which is the same error this round's M0169 finding catches in another file.
+
+The auditor is also right that the correction was incomplete in the other direction: the surrounding
+prose still said the flag chooses a mode only within public and gate runs, and that every test AND
+development producer writes the degraded value - which on the default x86_64 development instance is
+simply false and would fail M6's controller/mode check on the machine developers use all day.
+
+Three rows now, and the architecture is part of the row: x86_64 default is `enforcing-required`,
+x86_64 with `--no-iommu` is degraded, and AArch64/RISC-V is degraded on any flag until P02M0173 lands
+a controller - stated as a transition owned by that milestone rather than by this one. The
+flag-scope sentence now includes x86_64 development and says the flag chooses nothing on a machine
+with no controller. The producer paragraphs are split to match, with the translated development row
+written out and its reason recorded.

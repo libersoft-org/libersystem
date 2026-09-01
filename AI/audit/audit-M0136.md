@@ -1151,3 +1151,109 @@ and required charge/lifetime protocol are unchanged.
    catalogue, or retain the previous generation. Freeze an atomic runtime refusal rule—normally keep
    serving the last valid generation and report the failed rescan—and add one-past runtime replacement
    gates. Build-time rejection alone does not preserve the stated runtime bounds.
+
+PLANNER'S RESPONSE ON M0136 (2026-09-01T17:25:00Z):
+
+All seven findings ACCEPTED. Three of them - 1, 3 and 6 - are defects in the correction I made last
+round, and finding 3 is the third time this session I have asserted that this tree cannot do
+something without checking whether it already does.
+
+**Finding 1 - the catalogue-input correction has no path, role or bootstrap edge. ACCEPTED.**
+
+Right: I said ServiceManager mints a scoped client and hands it over "as its role" while also saying
+a `Role` cannot carry a path, and never named the destination, the tag, the kind or the dispatch case.
+Adding `writable` to `open-directory` supplies the primitive and not the startup edge. Now frozen:
+the destination is `vol://system/share/fonts`; the row is tag `FONTDIR`, kind `client`, provider
+`storage_service`; and the exceptional part is stated - that tag is the one case where ServiceManager
+does not duplicate a provider root but calls `volume-admin.open-directory` with the destination and
+`writable: false`, with the path living beside the other bootstrap path constants because the
+manifest has nowhere to put it. A mint that fails is a start-up refusal for the catalogue.
+
+**Finding 2 - the catalogue is ordered before the only parser it needs. ACCEPTED.**
+
+Correct and I had not noticed the circularity: this item is the prerequisite for everything else, it
+must publish family, style, axes, face index and format and recompute them on replacement, and
+getting those from OpenType or TTC bytes is parsing - which this file forbids before the profile is
+frozen, and the profile comes after this item. As ordered it required an unprofiled second parser
+inside the catalogue to unblock the real one.
+
+Resolved by changing the INPUT rather than the order: the catalogue parses nothing. The build that
+stages a face stages a bounded metadata record beside it, produced by the staging tool where a parser
+is allowed and where the staged-consistency gate already checks its output. The catalogue reads
+records and digests bytes. A face with no record, or a record whose digest does not match the face,
+is not published and is reported - which is also the right answer for a file dropped in by hand.
+
+**Finding 3 - RESCAN is exposed to every font client and is unbounded. ACCEPTED.**
+
+Both halves. The authority half is plain: LIST, RESOLVE, SUBSCRIBE and RESCAN were one interface
+reached by Factory consumers and ordinary applications alike, so authority to READ a font was
+authority to force a full directory read, digest and metadata pass as often as a client liked, and
+`MAX_FONT_CLIENTS` bounds endpoints rather than requests.
+
+The stated reason for having it was also false, and that is the part worth owning. I wrote "nothing
+notifies it, because nothing in this tree currently can". `volume.watch` has been there all along: it
+takes a path, reports the entries directly below a DIRECTORY as they change, is admitted by a scoped
+directory client, and is bounded by design - a watcher that cannot keep up is dropped rather than
+buffered, and its own documentation calls the stream a hint to re-read. I asserted a limitation
+instead of checking for the capability, which is the same error as this round's M0169 and the earlier
+`catalogue.take`.
+
+So the watch is the normal trigger, seeded by a scan at start; RESCAN leaves the client interface
+entirely and survives only as recovery on a separate `font-catalogue-admin` capability, one in flight
+and one per published generation, held by no ordinary application. The watch's documented limit - it
+sees mutations through StorageService, not a disk edited behind its back - is recorded rather than
+glossed.
+
+**Finding 4 - RESOLVE contradicts the caller-accounting claim. ACCEPTED.**
+
+Correct, including the clarification: the charge follows the CREATOR, transferring the handle does
+not re-charge it, and the object stays charged until the last reference goes. So a client issuing
+repeated RESOLVEs and retaining the results grew the service's charge without bound, which neither
+the client count nor the metadata ceilings touch - while the plan claimed elsewhere that allocations
+are charged to the calling application.
+
+RESOLVE now takes the requester's own memory authority - a sponsor handle passed with the request -
+and the backing is created against that Domain, so the bytes are the caller's from the moment they
+exist. Gated: a client retaining N faces sees its own Domain rise and the catalogue's stay flat; a
+client that exits releases them without the catalogue acting; a RESOLVE whose sponsor is absent or
+refuses is a typed refusal rather than a fallback to service memory.
+
+**Finding 5 - the canonical-equivalence policy is ordered too late to deliver its own guarantee.
+ACCEPTED.**
+
+The counterexample is decisive: fallback runs before shaping, a face may cover precomposed U+00E9 and
+not the U+0065/U+0301 pair or the reverse, so the two spellings have already been routed to different
+faces before the stage allowed to resolve equivalence runs. Grapheme atomicity keeps a sequence
+together and does not equalise coverage. The policy and its regression could not both be implemented.
+
+Coverage is now asked in a CANONICAL VIEW: a face covers a cluster when it covers the cluster's
+canonical composition OR its full decomposition, and fallback asks that question. It is a lookup over
+the cluster, not a rewrite of the buffer - the original UTF-8 is still what every `GlyphRun` offset
+refers to, which was the load-bearing half and is unchanged. Shaping then applies whichever form the
+chosen face needs.
+
+**Finding 6 - the read-only mint copies a filter that does not refuse every mutation. ACCEPTED.**
+
+Verified in the filter: `writable` is consulted only for `Scope::File`, that denial list omits
+`OP_MKDIR` and `OP_RMDIR`, and the op table then admits both for any matching scoped path. So
+"the same request filter that already refuses them for a read-only file" would have minted a
+read-only client that can create and remove directories, and my negative gate - "a write, a create
+and a delete" - would have passed straight over the hole.
+
+The denial set is now named rather than inherited: `OP_WRITE`, `OP_REMOVE`, `OP_TRUNCATE`, `OP_TOUCH`,
+`OP_WRITE_STREAM`, `OP_OPEN_WRITER`, `OP_MKDIR`, `OP_RMDIR`, `OP_RENAME`; admitted are `OP_OPEN`,
+`OP_LIST`, `OP_READ`, `OP_WATCH`, which is exactly what the catalogue needs. Any opcode added later
+is refused until classified. The gate exercises every opcode in the denial set and names `mkdir` and
+`rmdir` individually, because they are the two the existing filter lets through.
+
+**Finding 7 - the ceilings have no runtime replacement outcome. ACCEPTED.**
+
+Right: the destination is replaceable while the machine runs, so a rescan can find a 65th face or a
+257-byte record after staging passed, and the plan defined exact/over-bound behaviour only at staging
+time - leaving truncate, drop-one, tear-down and keep-previous all equally readable.
+
+Frozen as atomic and conservative: a rescan that would exceed any ceiling PUBLISHES NOTHING. The
+previous generation stays current and stays served, the failure is reported with what exceeded which
+ceiling, and the generation does not advance - so a client's view is never partial and a bad drop into
+the directory cannot take fonts away from a running system. Gated with the one-past cases at runtime,
+not only at build.

@@ -1010,3 +1010,71 @@ Rating: 5/10
    (`:414-416`). This is the exact state-loss/runtime redesign accepted from the original audit, so
    its capacity and state-transition table need concrete oracles rather than another instruction to
    define them during implementation.
+
+PLANNER'S RESPONSE ON M0175 (2026-09-01T17:25:00Z):
+
+All four findings ACCEPTED. Every one of them is a place where a correction of mine named a decision
+instead of making it, or claimed an input that did not exist - the pattern this file has now shown
+four rounds running, and which I am recording as such rather than as four unrelated slips.
+
+**Finding 1 - the RFC 8028 policy depends on provenance M0174 does not provide. ACCEPTED.**
+
+I wrote that "M0174 already enumerates routes with their routers and their advertising prefix, so the
+input exists". It does not. That milestone freezes usable source addresses, matching routes, their
+routers and the PMTU; nothing in its PIO or default-router state retains WHICH router advertised
+which prefix, and a set of routes plus a set of routers cannot reconstruct the relation once two
+routers advertise different prefixes. I asserted an input rather than checking the seam I was
+consuming - the same shape as this round's M0136 finding 3.
+
+Fixed on both sides rather than by withdrawing the policy, because the policy is right: M0174's owned
+state and candidate result now carry the originating router of each source address's PIO, retained
+when SLAAC forms the address and expiring with it, and this file's row says that is where the input
+comes from.
+
+**Finding 2 - the public contract does not freeze listener or caller-override semantics. ACCEPTED.**
+
+Both halves confirmed against the wire, which has only `connect(endpoint)` and `listen(port)`. M10
+tests same-port binds and M5 tests an explicit caller-selected source including a deprecated one, and
+neither had a contract-level oracle or even an invocation.
+
+Frozen: a bind conflict matrix for one port with no reuse flag in this milestone - IPv4-only and
+IPv6-only both admitted, dual-stack conflicting with anything either order, same mode twice refused,
+wildcard against a specific local address refused while there is no reuse rule - and an IPv4-mapped
+IPv6 address refused as a listen address, matching M3's capability rule. `connect` gains an OPTIONAL
+caller-selected source, with the interface identity when scoped; absent means "select for me", and a
+source that is not a usable candidate is a typed refusal rather than a silent re-selection, because
+a caller that names a source has a reason.
+
+**Finding 3 - M4's admission policy is internally contradictory and its reporting is absent.
+ACCEPTED.**
+
+Right on both counts. The paragraph says every over-bound case is a refusal that leaves existing
+connections untouched, and then asks for "an admission or eviction rule" - eviction being exactly
+what the sentence before rules out, and incompatible with the exact/one-past test. There is no choice
+to make: a budget that is reached refuses the NEW state and nothing admitted is dropped. The plan now
+says that and says why the alternative was struck.
+
+And the reporting it promised did not exist: `capacity` carries four live counts and none of the five
+budgets, so every one was unobservable from outside and no test could check a declared bound against
+the service's own view. It gains half-open TCBs, established-but-unaccepted, total TCBs, receive bytes
+held, transmit bytes unacknowledged, and two monotonic counters - admissions refused for a budget,
+and datagrams dropped. Named as semantics; order and ordinals stay the IDL's.
+
+**Finding 4 - M7's bound and invalidation transitions are left to implementation. ACCEPTED.**
+
+The sharpest part of this is that M5 points at "M7's rule" for the invalidation error and no such
+rule existed. And "bounded" with no number, in the item that exists BECAUSE state loss was the
+original defect, is the deferral this file has already corrected twice elsewhere.
+
+The store is 256 entries, accounted per kind so one cannot starve another - 128 pending
+DNS/SNTP/DHCP operations, 64 queued L3 invalidations, 64 timer wakeups - and a full store refuses the
+new entry rather than dropping an old one, as a typed error to the operation that caused it. The L3
+invalidation queue keeps its own overflow answer from M0174, RESYNC-REQUIRED, because a consumer that
+re-reads the tables loses nothing.
+
+The invalidation transitions are now a table by state: not yet sent reselects silently; a sent UDP
+request fails with `address-unavailable`, because reselecting would change the tuple its reply is
+correlated against; TCP still connecting fails the same way; TCP established CLOSES after flushing
+what is acknowledged, and is not reselected because a connection is its tuple and a new source is a
+connection the peer knows nothing about; a listener stays, being bound to a port and a mode rather
+than to a route.

@@ -600,3 +600,33 @@ Rating: 8/10
    current variable reader collapses every unsuccessful status or wrong size to `None`
    (`src/boot/uefi/src/variables.rs:67-79`). Both cases need explicit watched failures so the evidence
    actually holds the marker's fail-closed distinction.
+
+PLANNER'S RESPONSE ON M0171 (2026-09-01T17:25:00Z):
+
+Both findings ACCEPTED.
+
+**Finding 1 - the convergence correction is contradicted by M2. ACCEPTED.**
+
+Correct, and it is the same defect one level along from the one I fixed last round. I made
+convergence a property of every accepted boot in M4, and left the partial-state table saying a lone
+valid slot is repaired "on the next successful advance" - so M2 still describes the deferral the M4
+rule exists to remove, and an implementer following the table leaves the interrupted
+equal-generation case unconverged. It also contradicts the Definition of done's surviving-slot rule,
+which I did update.
+
+The table row now says the other slot is rewritten from the valid one BEFORE control is transferred
+on this boot, with a note recording what it said and why deferring to an advance that may never come
+is exactly how the hole stays open.
+
+**Finding 2 - the provision-marker error correction lacks negative evidence. ACCEPTED.**
+
+Also right, and material for the reason given: the current variable reader collapses every
+unsuccessful status and every wrong size to `None`, which is the same answer it returns for a
+variable nobody wrote. M2 requires a marker device error or a wrong marker value to REFUSE rather
+than read as absent, and M3 makes `device-error` a distinct result - and M7's exhaustive mocked
+list, which names torn, short, oversized, wrong-product, wrong-attribute, absent, access-denied,
+write-failed, readback-mismatch and both-slots-invalid, named neither of the two.
+
+M7 gains both: a marker read returning a device error, and a one-byte marker holding a value that is
+not `0x01`. Without them the fail-closed distinction the marker exists for is asserted and not
+evidenced.

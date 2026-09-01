@@ -783,12 +783,22 @@ pub fn disable_bus_master_for(key: abi::ClaimKey) {
 
 // Append one, and answer with its index. It stays for the life of the boot, which is the life of the
 // test kernel.
+//
+// EACH ONE GETS ITS OWN ADDRESS, WHICH IT DID NOT (2026-09-01). Every synthetic device was appended
+// at the same non-address `ff:1f.7`, so any lookup that resolves a BDF to an index - which is how a
+// fault names its endpoint - found the FIRST synthetic row rather than the caller's. A test
+// exercising that path therefore measured whichever device an earlier test had left behind, and the
+// first one written against it failed for that reason and not for the reason it was checking.
+// The bus stays `0xff`, which is the part that makes these unaddressable on a machine whose scan
+// walks bus 0; the device and function now come from the row's own index, so two synthetic devices
+// are as distinguishable as two real ones. `on_bus: false` is still what keeps config space out of
+// reach - the address was never what did that.
 #[cfg(test)]
 pub fn add_synthetic_device() -> usize {
 	let mut table = DEVICES.lock();
 	let index = table.len();
 	// ALLOC-OK: `#[cfg(test)]`, and a test that cannot allocate has already failed.
-	table.push(DeviceEntry { device_type: u16::MAX, transport: abi::TRANSPORT_PLAIN_PCI, vendor: 0xffff, product: 0xffff, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: 0x1f, func: 7, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false });
+	table.push(DeviceEntry { device_type: u16::MAX, transport: abi::TRANSPORT_PLAIN_PCI, vendor: 0xffff, product: 0xffff, bar_phys: 0, bar_len: 0, common_offset: 0, notify_offset: 0, notify_multiplier: 0, isr_offset: 0, device_offset: 0, device_len: 0, msix_cap: 0, msix_table_phys: 0, bus: 0xff, dev: (index & 0x1f) as u8, func: ((index >> 5) & 7) as u8, class: 0xff, subclass: 0xff, prog_if: 0xff, on_bus: false });
 	drop(table);
 	// ALLOC-OK: the claim slot for the row just appended, on the same `#[cfg(test)]` terms as the row
 	// itself - the two are one entry and a table with a device and no slot for it is worse than a

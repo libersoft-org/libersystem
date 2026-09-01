@@ -1122,3 +1122,15 @@ Current implementation rating: 6/10
 1. **The required real device-originated GICv3/ITS MSI delivery-and-teardown checkpoint remains missing.** The AArch64 oracle programs a RAM-backed stand-in MSI-X table and invokes `dispatch_msi` itself (`src/kernel/arch/aarch64/interrupts/tests.rs:19-53`); the profile gate explicitly says that no device raises the MSI (`src/tools/check-qemu-arch-profiles.sh:305-319,354-362`). This proves software allocation, dispatch and reuse, not a device-originated LPI through the ITS followed by teardown, so M3/M6 remain unmet (`docs/todo/P02M0151.md:94-103,143-154`).
 
 2. **The named AArch64 and RISC-V UEFI/no-DT regression profiles remain absent.** Every registered profile uses `UEFI=0`, no caller selects `LIBER_NO_DT_PROFILE=1`, and the gate acknowledges that the harness cannot produce the required positive no-DT boot (`src/tools/check-qemu-arch-profiles.sh:198-211,296-334,365-370`; `src/harness/test-kernel.sh:332`). The measured harness limitation explains the omission but does not supply either required regression profile or its definition-of-done evidence (`docs/todo/P02M0151.md:143-154,464-477`).
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-09-01T17:10:50Z):
+
+Current implementation rating: 6/10
+
+1. **The required real device-originated GICv3/ITS MSI delivery-and-teardown checkpoint remains absent.** The selected AArch64 oracle still programs a RAM-backed stand-in MSI-X table and invokes `dispatch_msi` itself (`src/kernel/arch/aarch64/interrupts/tests.rs:19-53`). The profile gate explicitly records that no device raises the MSI and that the device path is not proved (`src/tools/check-qemu-arch-profiles.sh:305-319,345-362`). This establishes controller allocation, synthetic dispatch and reuse, not the real device-to-ITS LPI followed by teardown required by M3/M6 (`docs/todo/P02M0151.md:94-103,143-154`).
+
+2. **The separately labelled AArch64 and RISC-V UEFI/no-DT regression profiles are still absent.** All registered rows are launched through the direct `UEFI=0` request (`src/tools/check-qemu-arch-profiles.sh:198-211,299-334,365-370`), while `LIBER_NO_DT_PROFILE` is merely forwarded by the build and no profile selects it (`src/harness/test-kernel.sh:332`). The gate itself says the positive no-DT boots cannot currently be produced (`src/tools/check-qemu-arch-profiles.sh:321-334`). That measured harness limitation does not satisfy M6 or the definition of done's required regression profiles (`docs/todo/P02M0151.md:143-154,464-477`).
+
+Focused verification: the FDT suite passed 87 tests, the `smpboot` suite passed 18 tests, and the `arch-surface` gate passed over 61 production architecture files. Those checks support the resolved parser, secondary-lifecycle and surface findings, but do not supply either missing profile-level proof above.

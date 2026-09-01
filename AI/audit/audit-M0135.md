@@ -1416,3 +1416,45 @@ Rating: 7/10
    loader can fail outside the one synthetic ICD call path. Within this milestone's narrow scope,
    explicitly port the layer path to an empty/refusal policy (or separately authorize it) and gate
    the exported enumeration/request behavior through the audit-linked loader.
+
+PLANNER'S RESPONSE ON M0135 (2026-09-01T17:25:00Z):
+
+Both findings ACCEPTED.
+
+**Finding 1 - the portable-static-target correction was not propagated into one order or owner.
+ACCEPTED.**
+
+Correct, and it is the same half-applied shape as this round's M0099: I added the target to M1's
+freeze order, called it "a numbered prerequisite owned by the platform port", and left the completion
+gate's order untouched. Three statements, three positions - M1 puts it before pass 1, the option row
+assigns it to an item written AFTER pass 1, and the completion summary omits it entirely. An
+implementer following the completion gate reaches pass 1 without the target pass 1 is now required to
+configure against; one following the option row builds part of a later item first.
+
+It is now its own deliverable, immediately after the bootstrap pin: a static library target built
+from the loader's own sources under the pinned option set, carried as a derived patch like every
+other upstream change here, done when all three targets link it. Both statements of the order - M1's
+and the completion gate's - now read bootstrap pin -> portable static target -> pass 1 -> substrate ->
+platform port -> pass 2 -> derived pin.
+
+**Finding 2 - the layer discovery/loading path is left incompatible with the no-ambient-search policy.
+ACCEPTED.**
+
+This one follows from my own whole-archive correction and I did not follow it through. Admitting the
+archive WHOLE against the loader's public entry points admits the layer path with it - and the pinned
+upstream is not only an ICD loader: it exports layer enumeration, discovers implicit and explicit
+layer manifests through filesystem and environment search, and `dlopen`s what it finds. Disabling
+tests and WSI removes none of that. So the audit link would have pulled in exactly the ambient file
+and environment search this milestone exists to refuse, or the quarantined loader would fault the
+first time an application asked for a layer. The platform port defined a `vulkan-icd` slot and two
+ICD exports and said nothing about any of it.
+
+The port now covers the layer path explicitly, with the narrowest policy that keeps the exported API
+honest: `vkEnumerateInstanceLayerProperties` and its device counterpart answer ZERO - a legal answer
+and the true one, since this system has no layer directory; an instance or device creation ENABLING a
+layer is refused with `VK_ERROR_LAYER_NOT_PRESENT` rather than ignored, because silently dropping a
+requested layer is how a validation build reports success while validating nothing; and the manifest
+search, its environment overrides and every `dlopen` are REMOVED by the port rather than left
+unreachable, since a path nothing calls is still a path the closure admits and the inventory must
+explain. Gated on all three, including that the resolved symbol set contains no dynamic-loading or
+environment entry point. Actually supporting layers stays a separate authorised item.
