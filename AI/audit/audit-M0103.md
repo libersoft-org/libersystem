@@ -1840,3 +1840,57 @@ The build-order paragraph states the 3D track as a branch rather than a chain an
 form was wrong; the canonical review's list is relabelled as a summary of the matrix rather than a
 second source for it, and gains the edges it was missing. All three now say one thing, which is what
 the previous round claimed for a different sentence in this same file and did not deliver.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-09-02T13:19:09Z):
+
+Rating: 6/10
+
+1. **The P02M0167 scheduler assessment is now an unjustified stale blocker.** The plan still says
+   the required executor matrix does not exist and qualifies evidence "until the matrix exists"
+   (`docs/todo/P02M0103.md:230-247`). It is registered and now covers the named graph,
+   result-precedence, seeded-cost and weighted guest-slot cases
+   (`check.sh:93-98`; `src/tools/check-verify-scheduler.sh:56-195`). The model supplies a non-zero
+   conservative seed to an unmeasured step
+   (`src/tools/verify-model/src/history.rs:442-465`;
+   `src/tools/verify-model/src/main.rs:1150-1164`), and the runner admits parallel steps by the sum of
+   their `STEPGUESTS` reservations (`verify.sh:895-897,941-983`). A fresh registered
+   `./check.sh --gate verify-scheduler` run passed every case, including seeded cost and the explicit
+   two-plus-one guest overlap. The independent P02M0167 medium-race restriction remains valid, but
+   the scheduler half no longer does; the plan continues to qualify otherwise valid evidence after
+   its prescribed proof has passed.
+
+2. **P02M0165 is still incorrectly declared met for the WSI dependency.** `a-wsi` hard-depends on
+   its stop/drain behavior (`docs/todo/P02M0103.md:163-166,826-832`), yet the assessment declares
+   P02M0165 met for everything this plan asks (`:252-258`). P02M0165 requires the
+   publish/crash/subscribe race and provider-withdraw-first behavior as registered, watched evidence
+   (`docs/todo/P02M0165.md:280-331`). Its cited host test reaches only the `Publications` state and
+   slot-transfer helpers (`src/user/libs/driver/binding/src/tests.rs:526-599`); production provider
+   handle closure and withdrawal announcement remain separate effects in `Catalogue::withdraw_binding`
+   and its binding-failure caller (`src/user/services/core/src/device_manager.rs:2294-2352,3716-3727`).
+   Removing either production effect leaves that gate green, directly invalidating WSI's required
+   dead-provider withdrawal and backing reacquisition. This prerequisite must block `a-wsi` closure
+   until its production proof exists.
+
+3. **The multi-surface WSI has no realizable service-wide wait-capacity contract.** The plan gives
+   every surface its own present queue/event stream (`docs/todo/P02M0103.md:848-863`) and requires up
+   to three service-side `PRODUCER_READY` waits per surface, but derives only a per-client limit of 85
+   presenting surfaces (`:1151-1158`). Its other limits are per connection, plus an additional
+   bounded per-task watcher (`:1228-1236,1329-1337`). Both one-shot `wait_any` and a persistent
+   WaitSet cap a service thread at 256 members, and WaitSets cannot contain WaitSets
+   (`src/abi/src/lib.rs:322-331`; `src/kernel/object/wait_set.rs:37-43,63-77`); DisplayService has one
+   wait loop (`src/user/services/core/src/display_service.rs:550-565`). Multiple individually valid
+   clients can therefore exceed the only wake set with completion endpoints, surface channels,
+   client/task watches and control handles. The plan specifies neither aggregate admission nor any
+   other fan-in that can preserve its required non-polling progress.
+
+4. **The acknowledged soft2d performance floor still never became an executable requirement.** The
+   pass-10 record says the floor remains open and blocks `c`, while also saying that record is not a
+   work item and authoritative obligations live in the sections it points to
+   (`docs/todo/P02M0103.md:2491-2497,2509-2511,2537-2541,2752-2757`). The actual 2D acceptance gate
+   only records a frame-budget measurement and supplies no threshold that can fail
+   (`:1811-1817`); the `c`, `d`, and aggregate 2D Done clauses likewise omit the floor
+   (`:2422-2431,2455-2458`). Thus the promised correction has no owning work item or pass/fail gate,
+   and those authoritative clauses can declare the 2D implementation complete at arbitrarily poor
+   performance.

@@ -443,7 +443,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// `mint_connection` and the `PROBE` tags below.
 		let mut probe_blocks: [u64; BOOT_BLOCK_TAGS.len()] = [0; BOOT_BLOCK_TAGS.len()];
 		let mut net_client: u64 = 0;
-		let mut gpu_client: u64 = 0;
 		let mut input_client: u64 = 0;
 		let mut usb_client: u64 = 0;
 		let mut usbq_client: u64 = 0;
@@ -669,15 +668,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
 					#[cfg(feature = "development")]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery, &mut dev);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery, &mut dev);
 					#[cfg(not(feature = "development"))]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut gpu_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery);
 					// NOT CLOSED: `Recovery` holds it, because rebinding a crashed driver means
 					// reading its artifact off the volume again. See `Recovery`.
 					send_blocking(bootstrap, b"NET", net_client);
-					send_blocking(bootstrap, b"GPU", gpu_client);
-					// THE TAG CARRIES A FACT, NOT A CHANNEL. AudioService subscribes for its provider
-					// now, so this program routes no audio channel - and the boot hand-off is read
+					// THE TAG CARRIES A FACT, NOT A CHANNEL - the display half, for the same reason
+					// as the audio one below and with the same shape (2026-09-02). DisplayService
+					// subscribes to the catalogue for its device now, so this program routes no
+					// display channel and holds no `gpu_client` slot. What travels behind the tag is
+					// whether this machine has a display driver bound, which the supervisor's driver
+					// status view reports and which only this program knows.
+					let display: [u8; 4] = [b'G', b'P', b'U', u8::from(catalogue.count_of(driver_protocol::provider::DISPLAY) > 0)];
+					send_blocking(bootstrap, &display, 0);
+					// AudioService subscribes for its provider too - and the boot hand-off is read
 					// POSITIONALLY at every hop, so dropping the message would shift every read
 					// after it. What travels behind the tag is the one thing the supervisor did with
 					// that handle: whether this machine has a sound driver bound at all, which its
@@ -919,7 +924,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, gpu_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -997,9 +1002,9 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 					Step::Online => {
 						state[nodes[at].index as usize] = STATE_ONLINE;
 						#[cfg(feature = "development")]
-						route_offers(&mut nodes[at], catalogue, name, storage, console_input, net_client, gpu_client, input_client, usb_client, usbq_client, usb_pointer, dev);
+						route_offers(&mut nodes[at], catalogue, name, storage, console_input, net_client, input_client, usb_client, usbq_client, usb_pointer, dev);
 						#[cfg(not(feature = "development"))]
-						route_offers(&mut nodes[at], catalogue, name, net_client, gpu_client, input_client, usb_client, usbq_client, usb_pointer);
+						route_offers(&mut nodes[at], catalogue, name, net_client, input_client, usb_client, usbq_client, usb_pointer);
 					}
 					// The same candidate, once more. The window and the attempt budget have already
 					// said there is room for it.
@@ -1167,7 +1172,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 // extra two told apart by the literal bytes `USBBUS` and `POINTER` in the messages that followed -
 // so what a capability was for was decided by parsing a string the driver chose.
 #[allow(clippy::too_many_arguments)]
-unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, net_client: &mut u64, gpu_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, net_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let _ = driver_name;
 		// PUBLISHED FIRST, ROUTED SECOND. Everything this binding offered enters the catalogue with
@@ -1177,9 +1182,14 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		if *net_client == 0 {
 			*net_client = catalogue.take_from(node.id, driver_protocol::provider::NET);
 		}
-		if *gpu_client == 0 {
-			*gpu_client = catalogue.take_from(node.id, driver_protocol::provider::DISPLAY);
-		}
+		// AND THE DISPLAY IS NOT ROUTED ANY MORE EITHER (2026-09-02). It was taken into a slot of
+		// this program's and handed down the boot chain to DisplayService - the same per-kind
+		// injection as the audio one below, and the reason a rebound GPU driver could not restore a
+		// picture: the slot was filled once and the replacement provider had nowhere to go.
+		// DisplayService now SUBSCRIBES, so the publication stays in the catalogue with its offered
+		// channel intact and `open` hands that channel to whichever consumer asks - at boot and
+		// after a rebind, down one path.
+		//
 		// AND AUDIO IS NOT ROUTED AT ALL ANY MORE, which is the point (2026-08-31).
 		//
 		// It was taken into a slot of this program's and handed down the boot chain to
@@ -2025,6 +2035,23 @@ struct Subscriber {
 // consumer that has gone is reaped at its first unsendable frame - so this bounds the LIVE ones.
 const MAX_SUBSCRIBERS: usize = MAX_CATALOGUE_CLIENTS;
 
+// THE TWO EFFECTS AN EMPTIED PUBLICATION OWES, as the library names them. See
+// `driver_binding::Withdrawn`: the loop and its order are the library's and are under test there;
+// what is here is the syscall and the send.
+impl driver_binding::Withdrawn<Provider> for Catalogue {
+	fn close_channel(&mut self, provider: &Provider) {
+		if provider.handle != 0 {
+			// SAFETY: the handle belongs to this catalogue and the slot it came from is empty.
+			unsafe { close(provider.handle) };
+		}
+	}
+
+	fn announce_gone(&mut self, provider: &Provider) {
+		// SAFETY: sends on subscriber channels this catalogue owns.
+		unsafe { self.announce(provider, false) };
+	}
+}
+
 impl Catalogue {
 	const fn new() -> Self {
 		Self { entries: [const { None }; MAX_PROVIDERS], generation: 0, subscribers: [const { None }; MAX_SUBSCRIBERS] }
@@ -2338,14 +2365,14 @@ impl Catalogue {
 			// longer exists, which is the stale-provider state the withdrawal exists to prevent, and
 			// nothing would have said so. The count the library returns is what this can be checked
 			// against, and checking it costs one comparison on a per-binding path.
-			let mut announced: usize = 0;
-			for provider in taken.iter().flatten() {
-				if provider.handle != 0 {
-					close(provider.handle);
-				}
-				self.announce(provider, false);
-				announced += 1;
-			}
+			// AND THE EFFECTS LOOP IS THE LIBRARY'S TOO (2026-09-02). The count comparison below
+			// catches a loop that stops VISITING a slot and nothing else: deleting the `close` or the
+			// `announce` from the body left every test in this tree green while a consumer held a
+			// channel whose server was gone, or a subscriber kept metadata for a publication that no
+			// longer exists - which is precisely M7's no-stale-provider and no-handle-leak rule. The
+			// order and the completeness are now `driver-binding`'s `apply_withdrawal`, driven by its
+			// own test; what is left here is the syscall and the send, neither of which is a choice.
+			let announced: usize = driver_binding::apply_withdrawal(&taken, self);
 			if announced != gone {
 				print(b"DeviceManager: a withdrawal emptied more slots than it announced; a subscriber is now holding a provider that is gone\n");
 			}
@@ -4193,7 +4220,7 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 			//
 			// It still does NOT disturb a running binding: moving the cursor changes which candidate
 			// the NEXT bind starts from and touches neither the record nor the live driver.
-			PolicyVerb::Select => match node.candidates.iter().position(|entry| entry.name == artifact.as_bytes()) {
+			PolicyVerb::Select => match candidate_position(node, artifact.as_bytes()) {
 				Some(at) => {
 					node.candidate = at;
 					node.preferred = Some(at);
@@ -4232,7 +4259,12 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				// Set rather than decremented: `may_try_again` allows another attempt while
 				// `attempt + 1 < MAX_AUTOMATIC_ATTEMPTS`, so leaving exactly one means starting from
 				// one below the bound whatever the counter happened to be.
-				node.attempt = MAX_AUTOMATIC_ATTEMPTS.saturating_sub(1);
+				//
+				// THE ARITHMETIC IS THE LIBRARY'S (2026-09-02) - see `driver_binding::one_more_attempt`.
+				// Both of the corrections recorded above were arithmetic mistakes in code no host
+				// test could reach; the rule is one place now, with a test that says "exactly one".
+				let granted = driver_binding::one_more_attempt(node.candidate, node.candidates.len(), node.preferred, MAX_AUTOMATIC_ATTEMPTS);
+				node.attempt = granted.attempt;
 				node.incident = Incident::open();
 				// AND THE CURSOR IS REWOUND WHEN THERE IS NOTHING LEFT TO TRY, which is the case this
 				// granted zero attempts in.
@@ -4254,9 +4286,7 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				// whole purpose is "try again". The preference lives in `node.preferred`, which both
 				// the stored-policy load and the live `select` verb set, so a retry consults the same
 				// field rather than inventing which entry was meant.
-				if node.candidate >= node.candidates.len() {
-					node.candidate = node.preferred.unwrap_or(0);
-				}
+				node.candidate = granted.candidate;
 				// AND THE ONE ATTEMPT IS THE WHOLE REQUEST, NOT ONE PER CANDIDATE (corrected
 				// 2026-09-01).
 				//
@@ -4410,6 +4440,21 @@ struct PolicyDecision {
 	remove: bool,
 }
 
+// WHICH CANDIDATE AN ARTIFACT NAMES ON THIS NODE, through the library's narrowing rule.
+//
+// The names are collected onto the stack because `driver_binding::selected_candidate` takes a slice
+// of them and a node's candidates are a slice of entries. A node's list is a FILTERED SUBSET of
+// `DRIVER_REGISTRY`, so the registry's own length bounds it - a compile-time constant, which is what
+// makes this allocation-free and gives it no failure path.
+fn candidate_position(node: &Node, artifact: &[u8]) -> Option<usize> {
+	let mut names: [&[u8]; DRIVER_REGISTRY.len()] = [b""; DRIVER_REGISTRY.len()];
+	let count = node.candidates.len().min(DRIVER_REGISTRY.len());
+	for (at, entry) in node.candidates.iter().take(count).enumerate() {
+		names[at] = entry.name;
+	}
+	driver_binding::selected_candidate(&names[..count], artifact)
+}
+
 // Decide what a verb does to this node, WITHOUT applying it.
 //
 // Separated so the decision can be read on its own: what a verb means is a question about the
@@ -4419,17 +4464,21 @@ fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -
 	let none = |outcome: PolicyOutcome| PolicyDecision { outcome, store: None, remove: false };
 	// BOOT-CRITICAL BINDINGS ARE OUT. Their policy would live on a volume that is not mounted when
 	// those bindings are made, which is a dependency the wrong way round.
-	if node.candidates.first().is_some_and(|entry| entry.boot_critical) {
+	let boot_critical: bool = node.candidates.first().is_some_and(|entry| entry.boot_critical);
+	if boot_critical {
 		return none(PolicyOutcome::Refused);
 	}
 	match verb {
 		PolicyVerb::Retry => {
+			// THE RULE IS THE LIBRARY'S (2026-09-02) - see `driver_binding::decide_retry`. Which
+			// states admit a retry is arithmetic about a binding's lifecycle, and it lived here,
+			// where no host test could reach it; what stays is the mapping onto this protocol's
+			// outcomes, which is a table and not a decision.
+			//
 			// QUARANTINE IS OUT OF REACH OF THIS ONE, for this boot. Its resources are charged and
 			// out of circulation precisely because nothing confirmed the device was quiet, and an
 			// operator saying so does not make it so.
-			if node.record.state == BindingState::Quarantined {
-				return none(PolicyOutcome::Quarantined);
-			}
+			//
 			// AND THERE HAS TO BE SOMETHING TO RETRY (added 2026-08-31).
 			//
 			// Quarantine was the only state this refused, so `retry` was accepted on a node that is
@@ -4444,11 +4493,13 @@ fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -
 			// `busy` is the answer for the rest - the same "not now, and here is why" the enable path
 			// gives - because the operator's next move is to look at the state rather than to try a
 			// different verb.
-			if !matches!(node.record.state, BindingState::Failed | BindingState::Backoff | BindingState::Unbound) {
-				return none(PolicyOutcome::Busy);
+			match driver_binding::decide_retry(node.record.state, boot_critical) {
+				// AN ACTION, NOT A STORED PREFERENCE. Nothing is written.
+				driver_binding::RetryVerdict::Grant => none(PolicyOutcome::Accepted),
+				driver_binding::RetryVerdict::Quarantined => none(PolicyOutcome::Quarantined),
+				driver_binding::RetryVerdict::Busy => none(PolicyOutcome::Busy),
+				driver_binding::RetryVerdict::Refused => none(PolicyOutcome::Refused),
 			}
-			// AN ACTION, NOT A STORED PREFERENCE. Nothing is written.
-			none(PolicyOutcome::Accepted)
 		}
 		PolicyVerb::Enable => {
 			// AN ENABLE WHILE A DISABLE'S TEARDOWN IS STILL IN FLIGHT IS BUSY. Cancelling the intent
@@ -4466,7 +4517,7 @@ fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -
 			// POLICY NARROWS AND NEVER WIDENS. An artifact the registry did not declare for THIS
 			// device is refused rather than obeyed - the whole point of bounding a preference by the
 			// candidate list is that an operator cannot name a driver the image never offered.
-			if !node.candidates.iter().any(|entry| entry.name == artifact.as_bytes()) {
+			if candidate_position(node, artifact.as_bytes()).is_none() {
 				return none(PolicyOutcome::NotACandidate);
 			}
 			// AND IT APPLIES AT THE NEXT BIND, never to the binding that is running: rebinding a

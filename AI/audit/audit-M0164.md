@@ -1386,3 +1386,74 @@ Current implementation rating: 4/10
    filesystem role. Merely publishing and reporting extra providers does not satisfy M2 or the
    definition of done's no-fixed-slot and format/origin/`RootSelection` routing requirements
    (`docs/todo/P02M0164.md:71-121,288-305`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-09-02T18:20:00Z):
+
+FINDING 1 - the production consumer migration remains audio-only: ACCEPTED, AND ONE MORE CONSUMER IS
+MIGRATED. Every claim in it was true when it was written. It is no longer audio-only: DisplayService
+subscribes to the display kind, DeviceManager's `gpu_client` slot and the DISPLAY take in
+`route_offers` are gone, ServiceManager keeps a fact rather than a handle, and the `GPU` role in the
+manifest is a `CATALOGUE` factory role. The full change is written out in this round's M0159 response
+and is not repeated here.
+
+WHY THE DISPLAY ONE AND NOT ANOTHER: it was the one another milestone was BLOCKED on. P02M0159's M4
+asks a rebound GPU driver to restore a picture, and a slot filled once at bring-up is exactly why it
+could not - so the same change closes that milestone's open half and this milestone's second consumer.
+
+WHAT IS STILL NOT DONE, PLAINLY. NetworkService (`NET`/`FRAMES`), InputService (`INPUT`/`INPUT2`/
+`KEYS`), the block consumers (four positional tags - see finding 2) and the USB consumers
+(`USB`/`USBBUS`) still take their devices from fixed slots. Each is the same shape as the display
+change - a `CATALOGUE` role, a subscription at the service's seam, the manager's slot and routing
+deleted, and the kernel harnesses that stand in for the supervisor updated - and each is boot-critical
+in its own way, which is why they are separate changes rather than one sweep in a round that also
+touched the kernel's claim publication order, the IOMMU drain and the verification scheduler. Doing
+all four here would have meant landing four unverified boot-path changes at once. `docs/todo/
+P02M0164.md` now carries the remaining list as a table under M3, so the next pass starts from it
+rather than from a search.
+
+FINDING 2 - block discovery and role assignment are still capped at four positional hand-off slots:
+ACCEPTED, AND NOT IMPLEMENTED THIS ROUND. The finding is correct in every particular:
+`BOOT_BLOCK_TAGS` is four, `boot_blocks` and `probe_blocks` are four-entry arrays, ServiceManager
+labels those positions FAT/ISO/UDF/USB, and StorageService probes the supplied four-entry set. A
+fifth matching root cannot be considered. That is contrary to the Definition of Done's "no fixed
+provider slot remains in DeviceManager" and to M2's format/origin/`RootSelection` routing.
+
+It is not done here because it is the boot chain that mounts the root volume, end to end:
+DeviceManager's hand-off protocol, ServiceManager's positional read, StorageService's probe and the
+`RootSelection` match. Landing a half-verified change to that path in the same round as the kernel
+claim, IOMMU and scheduler work would risk the one thing this system cannot afford to get wrong, and
+scaling that risk down is not mine to decide silently. It is stated here as outstanding rather than
+argued away, and it stays the largest open item in this milestone.
+
+VERIFICATION: reported at the end of this response set.
+
+VERIFICATION FOR THIS ROUND (2026-09-02T18:20:00Z), the same run behind every response in this set:
+
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot`: 239 passed, 0 failed. It carries this round's two new kernel tests
+  (`kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim`,
+  `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`), the boot test
+  that requires EVERY manifest service online, and the DisplayService and console harnesses that were
+  rewired onto the provider catalogue.
+- `driver-binding` host suite: 61 passed, 0 failed - including the withdrawal-effects recorder and
+  the operator-policy rules added this round.
+- `verify-model` host suite: 117 passed, 0 failed - including
+  `an_unmeasured_step_is_never_priced_at_zero` and the two new profile-row catalogue entries.
+- `verify-scheduler` gate: 21 assertions, all holding. The new guest-slot case was run against the
+  OLD condition first and produced the overcommit it is written for (`wide-start narrow wide-end`);
+  against the fix it produces `wide-start wide-end narrow`.
+- `qemu-virtio-iommu-x86_64`, on a freshly built image: every hostile case refused, a DHCP lease
+  through the enforcing controller, and the default machine "translated, nothing degraded, nothing
+  faulted, the display driver runs and a frame reached the screen" - which is the display migration
+  proved end to end on a real boot with a real virtio-gpu.
+- Host gates: `bootstrap-plan`, `declared-interfaces`, `gate-oracles`, `no-suppression`,
+  `milestone-index`, `source-hygiene`, `test-tags`, `verify-model-tests`, `build-order`,
+  `no-fixed-provider-slots`, `development-build` - all clean.
+- `milestone-index` was FAILING before this round (the index marked P02M0151 done while its M6 was
+  unchecked) and is clean now.
+
+WHAT WAS NOT RUN, AND WHY: the persistent development instance does not boot - `./dev.sh up` stalls
+during service bring-up, deterministically, before any of this round's code runs. It is measured and
+written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
+unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
+except the two new UEFI profile rows, which are gate rows rather than suite runs.

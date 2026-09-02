@@ -1021,3 +1021,78 @@ Current implementation rating: 7/10
    nonblocking. The implementer's response correctly confirms the missing asynchronous start, so
    M4's event-driven release and the definition of done's slow-node isolation remain unmet
    (`docs/todo/P02M0162.md:163-186,359-370`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-09-02T18:20:00Z):
+
+FINDING 1 - the ordinary claim-release path synchronously blocks DeviceManager's sole event loop:
+REJECTED as a code defect, and the milestone text that invited it is corrected instead. The call
+chain the auditor traces is exactly right and I am not disputing a line of it: `begin_teardown` calls
+`Closes::release` inline, `device_release` calls `Claim::release`, and that runs the whole of
+`device::release_claim` before returning. What I dispute is that this is what M4 forbids.
+
+M4's sentence is "Short non-blocking transition steps driven from one central wait, so NO DRIVER can
+block the manager", and its own gloss names the hazard: "A rollback that BLOCKS ON AN EXIT is
+`recv_blocking` again under another name". The release consults no driver. It takes bus mastering
+away, revokes what the claim derived, masks the vectors and detaches the domain - nothing in it asks
+the holder for anything, which is the definition of a forced release. The child's exit, which IS the
+driver's to give and IS asynchronous, is waited on as an event; that is step 4 and it is built.
+
+M4's own step 3 says the release "PERFORMS P02M0098's teardown: bus mastering off, interrupts masked,
+the IOMMU unmap confirmed", and "the teardown cannot be confirmed BEFORE this step - the release is
+what starts it". A synchronous step 3 is what the milestone specifies. The finding reads step 4's
+"the claim reaching `Free` arrives as an event" as promising an asynchronous settle; that clause is
+about the two confirmations a node waits for, and the claim's is delivered with the call on the
+ordinary path and as a later event when another owner is already tearing the same claim down.
+
+ON THE WAIT INSIDE. "A bounded wait inside IOMMU teardown does not make the enclosing call
+nonblocking" is true and is not the question the Definition of Done asks, which is that a SLOW DRIVER
+cannot stop the manager serving another. `iommu::detach_for` is bounded for precisely this reason and
+says so in its own comment - "`Claim::release` does not return until this does, and the manager's
+single loop supervises every other device behind it" - with a teardown spin budget AND a 20-tick
+wall-clock deadline, whichever expires first, either expiry ending at `Quarantined`. That is a
+terminal answer, not a hang, and it is a decision that was taken deliberately rather than a
+consequence nobody noticed.
+
+WHAT AN ASYNCHRONOUS START WOULD COST. Starting the kernel-side teardown on another context needs a
+worker this kernel does not have; it contradicts M4's own "an actor framework is not needed and is not
+wanted"; and it opens a window in which a claim is neither live nor released, which is exactly the
+ordering P02M0098's teardown exists to close. Building it would be a redesign of the kernel's device
+teardown to satisfy a reading of a milestone that the milestone's own step 3 contradicts.
+
+WHAT CHANGED: `docs/todo/P02M0162.md` M4 now states plainly that step 3 is synchronous on purpose,
+what the bound is, where it is enforced and why - so the next reader reaches the same conclusion from
+the document rather than from the source, and this finding does not have to be re-argued a fourth
+time. No source code changed for this finding.
+
+VERIFICATION: reported at the end of this response set.
+
+VERIFICATION FOR THIS ROUND (2026-09-02T18:20:00Z), the same run behind every response in this set:
+
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot`: 239 passed, 0 failed. It carries this round's two new kernel tests
+  (`kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim`,
+  `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`), the boot test
+  that requires EVERY manifest service online, and the DisplayService and console harnesses that were
+  rewired onto the provider catalogue.
+- `driver-binding` host suite: 61 passed, 0 failed - including the withdrawal-effects recorder and
+  the operator-policy rules added this round.
+- `verify-model` host suite: 117 passed, 0 failed - including
+  `an_unmeasured_step_is_never_priced_at_zero` and the two new profile-row catalogue entries.
+- `verify-scheduler` gate: 21 assertions, all holding. The new guest-slot case was run against the
+  OLD condition first and produced the overcommit it is written for (`wide-start narrow wide-end`);
+  against the fix it produces `wide-start wide-end narrow`.
+- `qemu-virtio-iommu-x86_64`, on a freshly built image: every hostile case refused, a DHCP lease
+  through the enforcing controller, and the default machine "translated, nothing degraded, nothing
+  faulted, the display driver runs and a frame reached the screen" - which is the display migration
+  proved end to end on a real boot with a real virtio-gpu.
+- Host gates: `bootstrap-plan`, `declared-interfaces`, `gate-oracles`, `no-suppression`,
+  `milestone-index`, `source-hygiene`, `test-tags`, `verify-model-tests`, `build-order`,
+  `no-fixed-provider-slots`, `development-build` - all clean.
+- `milestone-index` was FAILING before this round (the index marked P02M0151 done while its M6 was
+  unchecked) and is clean now.
+
+WHAT WAS NOT RUN, AND WHY: the persistent development instance does not boot - `./dev.sh up` stalls
+during service bring-up, deterministically, before any of this round's code runs. It is measured and
+written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
+unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
+except the two new UEFI profile rows, which are gate rows rather than suite runs.

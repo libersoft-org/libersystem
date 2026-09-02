@@ -567,7 +567,10 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/display_service.lsexe"
-providers = ["pix", "display-proto", "wire", "lsrt"]
+# `device-proto` and `ipc-client` because this service DISCOVERS its display: it holds a
+# provider-catalogue connection and subscribes to the display kind rather than being handed a driver
+# channel. `base-proto` comes with the catalogue's error type.
+providers = ["pix", "display-proto", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
 name = "dmesg"
@@ -1980,12 +1983,6 @@ state_scope = "session"
 dependencies = ["log_service", "device_manager", "process_service", "input_service"]
 
 [[services.roles]]
-tag = "GPU"
-kind = "device"
-provider = "device_manager"
-presence = "optional"
-
-[[services.roles]]
 tag = "FOCUS"
 kind = "client"
 provider = "input_service"
@@ -2017,6 +2014,25 @@ interface = "liber:display@1/display"
 tag = "DISPLAYCTL"
 kind = "privilege"
 provider = "kernel"
+presence = "optional"
+
+# THE PROVIDER CATALOGUE, WHICH IS HOW THIS SERVICE FINDS ITS DISPLAY.
+#
+# It used to be `GPU`: DeviceManager took the display provider into a slot of its own and routed the
+# driver's channel down the boot chain to here. That is the per-kind injection the catalogue replaces,
+# and it is why a GPU driver that crashed and rebound could not restore a picture - the slot was filled
+# once, at boot, and the replacement provider had nowhere to go. A subscription answers with what is
+# published now AND continues as a stream, so the same path carries the first device and the
+# replacement.
+#
+# LAST, like every addition to a role list: these are read POSITIONALLY from the generated
+# `BOOTSTRAP_ROLES`, so anything inserted in the middle shifts every read after it.
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "SERVE"
+interface = "liber:device@1/provider-catalogue"
 presence = "optional"
 
 [[services]]

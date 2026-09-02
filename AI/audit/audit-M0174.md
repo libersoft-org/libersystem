@@ -1023,3 +1023,21 @@ The reachability-first order therefore governs exactly what needs a default rout
 was frozen for, and the four link-local paths can be neither misrouted through a router nor blocked
 by an empty list. M6's one-line statement of the same rule points at this paragraph instead of
 repeating the collapsed version, so the two cannot drift apart again.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-09-02T13:02:07Z):
+
+Rating: 7/10
+
+1. **The accepted control-traffic correction still leaves M0174's own echo source and route
+   selection undefined.** M5 now correctly assigns protocol-defined on-link next hops to RS, DAD,
+   MLD and ND, and says only that off-link echo takes the first default router
+   (`docs/todo/P02M0174.md:298-324`). That chooses a next hop, but not one of the potentially multiple
+   usable source addresses and matching routes that M6 deliberately only enumerates; the same seam
+   says all candidate selection belongs to M0175 and that M0174 never silently picks for a caller
+   (`docs/todo/P02M0174.md:433-544`). M0174 nevertheless must originate and positively test global
+   echo before M0175 exists (`docs/todo/P02M0174.md:605-610`). With multiple prefixes or matching
+   routes, an implementation must therefore either invent selection policy inside M0174, violating
+   the frozen ownership boundary, or cannot construct the echo request. The correction needs a
+   deterministic internal-only source/route rule (or an explicit fixture-supplied choice) alongside
+   the now-complete next-hop rules; it does not require moving public transport selection into this
+   milestone.

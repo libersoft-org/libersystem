@@ -282,18 +282,22 @@ impl Service for Config {
 	}
 }
 
-// The one prefix `remove` will touch.
+// The reserved namespace: the one prefix `remove` will touch, and the one `set` refuses to anybody
+// but its owner.
 //
-// AND `set` DOES NOT CHECK IT, which is a hole and not a decision. This comment used to claim that
-// "a component holding `CAP_CONFIG` can neither write a policy record nor delete one" - true of
-// `remove`, which refuses every key outside this prefix, and NOT true of `set`, which accepts any
-// key from any client. So an ordinary `CAP_CONFIG` holder - and ServiceManager grants that
-// capability to several components - can overwrite DeviceManager's persistent device policy.
+// THE HOLE THIS COMMENT USED TO RECORD IS CLOSED. It said `set` checked nothing - true, and it was
+// the whole of DeviceManager's persistent device policy, writable by any of the several components
+// ServiceManager grants `CAP_CONFIG` to - and that it could not be fixed until ConfigService could
+// tell its callers apart. It can: `serve_multi_seeded` passes the channel a request arrived on, the
+// supervisor mints ONE serve root of its own for this, and `privileged` is that comparison. Both
+// verbs consult it now.
 //
-// It is not fixed here because ConfigService cannot currently tell its callers apart: every
-// connection is dispatched through the same `Config` value and `serve_multi` passes a per-connection
-// channel that is ignored. Making this prefix DeviceManager-only needs that identity first. Recorded
-// as the gap it is rather than left as a claim the code does not support.
+// AND IT IS ASKED OF THE RUNNING SERVICE, which is the part a comment cannot carry: the rule was
+// written twice here and was wrong both times, so
+// `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner` sends the same
+// well-formed policy write down an ordinary connection and down the owner's, and reads the record
+// back to say which answer was true. WRITING is what the prefix reserves - an ordinary connection
+// may still READ a stored policy, because seeing that a device is disabled is not disabling one.
 const DEVICE_POLICY_PREFIX: &str = "device.policy.";
 
 #[unsafe(no_mangle)]

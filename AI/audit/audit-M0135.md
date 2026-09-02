@@ -1683,3 +1683,25 @@ derived pin. The two "nothing starts before the bootstrap pin" statements - the 
 in the host gate - both now name the licensing policy alongside the inputs and say what each is
 there for. The `APPROVABLE` summary at the end, which is what a completion gate reads and which has
 now been the last place to learn about two separate additions, carries it too.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-09-02T13:19:09Z):
+
+Rating: 8/10
+
+1. **The new pre-pass-1 static-target "link" gate is either vacuous or circular.** Bootstrap inputs
+   provide only the headers and stubs needed to compile the pinned option set and explicitly are not
+   the final profile sysroot (`docs/todo/P02M0135.md:164-183`). Nevertheless the STATIC-TARGET pin
+   must record three target link results before pass 1 may start (`:197-203,301-302,766-788`), and the
+   portable deliverable is a STATIC LIBRARY target declared done when all three targets "link it"
+   (`:240-269`). Producing a static archive does not resolve its external symbols, so if "link"
+   means building that target, the three results prove no more than compilation and cannot establish
+   that the target is linkable. If it means a strict final/executable link with no unresolved
+   symbols, the plan assigns the providers needed for that link to the profile sysroot, foreign-ABI
+   substrate and platform port after pass 1, and reserves the strict converging link for pass 2
+   (`:315-418,622-660`). That interpretation requires later deliverables before the gate which
+   permits them to start. The freeze order repeats the same dependency
+   (`:903-911`). The correction therefore needs to distinguish a reproducible three-target archive
+   build before pass 1 from the resolved-link proof that can only occur in pass 2; the current
+   per-target "link results" are not a sound pre-pass-1 completion gate.

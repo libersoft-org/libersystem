@@ -123,7 +123,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 64] = [
+const GATES: [(&str, &str); 66] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -168,8 +168,12 @@ const GATES: [(&str, &str); 64] = [
 	// direct boot does not carry. Its subject is still the kernel - the delivery path it asserts on
 	// is the GIC's acknowledge handler and the teardown is the claim release.
 	("arch-profile-aarch64-gicv3-its-device-4", "kernel"),
+	// The single-node UEFI regression rows. Not discovery evidence and not a no-DT boot: what they
+	// carry is the loader path, and that a boot WITH a tree does not reach the static descriptor.
+	("arch-profile-aarch64-uefi-1", "kernel"),
 	("arch-profile-riscv64-aia-1", "kernel"),
 	("arch-profile-riscv64-aia-4", "kernel"),
+	("arch-profile-riscv64-uefi-1", "kernel"),
 	// The staged tree's provider chains, and the eight ways the check that reads them can be given
 	// input it cannot read. Its subject is what the build stages, so a userspace change selects it.
 	("staged-consistency", "userspace.build"),
@@ -429,7 +433,7 @@ const UMBRELLA_GATES: [&str; 2] = ["qemu-arch-profiles", "qemu-numa"];
 // NOT one step per profile with a `--jobs` of its own - that is the second scheduler M3.6 refuses.
 // Each is an ordinary serial step that boots its guests one at a time; what it gains is an identity
 // and a duration of its own.
-pub const PROFILE_ROW_GATES: [&str; 12] = [
+pub const PROFILE_ROW_GATES: [&str; 14] = [
 	"arch-profile-aarch64-gicv2-1",
 	"arch-profile-aarch64-gicv2-4",
 	"arch-profile-aarch64-gicv3-1",
@@ -437,8 +441,10 @@ pub const PROFILE_ROW_GATES: [&str; 12] = [
 	"arch-profile-aarch64-gicv3-its-1",
 	"arch-profile-aarch64-gicv3-its-4",
 	"arch-profile-aarch64-gicv3-its-device-4",
+	"arch-profile-aarch64-uefi-1",
 	"arch-profile-riscv64-aia-1",
 	"arch-profile-riscv64-aia-4",
+	"arch-profile-riscv64-uefi-1",
 	"numa-profile-x86_64",
 	"numa-profile-aarch64",
 	"numa-profile-riscv64",

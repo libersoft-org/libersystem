@@ -1094,7 +1094,9 @@ fn run_idle_hook() {
 	}
 }
 
-// Run ready threads on the current core until the run queue drains, then return.
+// Run ready threads on the current core until the run queue drains or the given ABSOLUTE TICK
+// DEADLINE passes, then return. Answers false when the deadline cut it short.
+//
 // Used by the bootstrap context to drive cooperative kernel threads to completion.
 // If the queue drains while threads are blocked with a deadline, spin until the
 // nearest PROGRESS deadline and wake them, so a timed wait completes; threads
@@ -1102,11 +1104,13 @@ fn run_idle_hook() {
 // only a PERIODIC deadline (a housekeeping tick, WAIT_PERIODIC) are left parked
 // and this returns - the caller's standing loop re-enters, and each entry's
 // check_deadlines wakes whatever housekeeping came due.
-pub fn run_until_idle() {
-	run_until_idle_until(NO_DEADLINE);
-}
-
-// The same, bounded by an ABSOLUTE TICK DEADLINE. Answers false when the deadline cut it short.
+//
+// THE UNBOUNDED WRAPPER IS NOW TEST-ONLY (2026-09-02). `run_until_idle()` is this with
+// `NO_DEADLINE`, and its last PRODUCTION caller was the console loop - whose housekeeping, the IOMMU
+// fault drain among it, was therefore unreachable on any machine with continuously runnable work.
+// A test drives a fixed amount of cooperative work to completion and wants exactly that, so the
+// wrapper stays for them and is compiled only into their build; production callers name the bound
+// they are running under.
 //
 // IT HAS TO BE RESPECTED IN BOTH HALVES OF THIS FUNCTION, and that is the whole reason it exists.
 // Capping the wait alone is not enough: the body is `while !run_queue.is_empty() { reschedule }` and
@@ -1117,6 +1121,11 @@ pub fn run_until_idle() {
 //
 // So: the drain checks the deadline BETWEEN reschedules, and the wait sleeps until whichever comes
 // first of the nearest progress deadline and this one.
+#[cfg(test)]
+pub fn run_until_idle() {
+	run_until_idle_until(NO_DEADLINE);
+}
+
 pub fn run_until_idle_until(outer: u64) -> bool {
 	let cpu = current_cpu_id();
 	// PUBLISHED, so the switch path can read it. See `CpuSched::drain_deadline` for why a local

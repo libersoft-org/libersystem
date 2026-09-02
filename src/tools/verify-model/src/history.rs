@@ -438,4 +438,28 @@ impl CostModel {
 		let fixed: f64 = pairs.iter().map(|pair| self.fixed_seconds.get(pair).copied().unwrap_or(0.0)).sum();
 		fixed + variable
 	}
+
+	// THE FLOOR UNDER A STEP NOBODY HAS TIMED YET, in seconds.
+	//
+	// M4's rule is that an unmeasured step is never started under a budget without a conservative
+	// SEED, "an unknown priced at zero is the cheapest thing in every plan and would always be
+	// picked first". The estimator produced exactly that zero and nobody noticed, because the
+	// arithmetic hides it: a GATE's catalogue key is `host`/`host` for every gate in this tree, that
+	// pair's fixed term is 0.0, and one key at the default 0.5 s rounds to `STEPCOST 0`. So the
+	// twelve QEMU profile rows and the two-guest concurrency gate - the most expensive items in any
+	// plan - were emitted as free work and admitted by `budget_select` without charging anything.
+	//
+	// The seed is taken from what this model has already MEASURED rather than invented: a step that
+	// starts guests is priced at the slowest boot the model knows, per slot it declares. That
+	// over-prices an x86_64 profile row by a lot, which is the direction a seed is supposed to err
+	// in - the run says INCOMPLETE and names what it skipped, and the first real measurement of that
+	// step replaces the seed for good. Everything else gets one second, because a step that runs at
+	// all is not free and a plan of zeros sorts on nothing.
+	pub fn seed_seconds(&self, guests: usize) -> f64 {
+		if guests == 0 {
+			return 1.0;
+		}
+		let slowest: f64 = self.fixed_seconds.iter().filter(|((_, environment), _)| environment != "host").map(|(_, seconds)| *seconds).fold(0.0, f64::max);
+		slowest.max(1.0) * guests as f64
+	}
 }

@@ -1079,3 +1079,97 @@ Current implementation rating: 8/10
    Thus a replacement provider may be published while no frame can reach it, contrary to M4 and the
    definition of done (`docs/todo/P02M0159.md:94-97,126-133`). The implementer's acceptance of this
    gap is accurate; leaving it for M0164 does not make this checked-off milestone requirement met.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-09-02T18:20:00Z):
+
+FINDING 1 - M4 still does not restore a usable display path after the GPU driver rebinds: ACCEPTED
+AND FIXED. Every part of the description checked out: `route_offers` was called only from the
+phase-two launch loop, it filled `gpu_client` only `if *client == 0`, DisplayService received that one
+handle at bootstrap and on close only cleared `state.scanout.gpu`, and `dev-gpu-restart` REPORTED the
+outcome instead of asserting it. The auditor is also right that my previous acceptance did not make
+the item met - a checked-off requirement whose consumer half cannot work is a milestone that says
+something untrue.
+
+WHAT CHANGED. DisplayService discovers its display instead of being handed one, which is the seam
+P02M0164 scopes and the only shape in which M4 is reachable.
+
+- `src/user/services/manifest.toml`: display_service's `GPU` role is replaced by a `CATALOGUE`
+  factory role on device_manager's `SERVE`, appended LAST because the bootstrap is read positionally.
+  Its `providers` list gains `device-proto`, `base-proto` and `ipc-client`, as AudioService's did.
+- `src/user/services/core/src/display_service.rs`: subscribes to `ProviderKind::Display` at bootstrap
+  and takes the provider the snapshot already carries - the catalogue registers a subscriber and sends
+  it everything published before it answers, so this is a poll and never a block, and a machine with
+  nothing published falls through to the boot framebuffer exactly as one with no GPU always did. The
+  subscription channel joins the `wait_any` set. On a live publication while the service has no GPU it
+  opens a connection and calls the new `adopt_scanout`, which re-runs the `FB` handshake, installs the
+  new scanout, marks every surface uninitialised and releases the old mapping only once the new one is
+  known good - then notifies the resize and repaints.
+- `release_scanout` replaces the peer-close arm's bare `state.scanout.gpu = 0`, which left the dead
+  channel handle open in this process for the life of the boot.
+- `src/user/services/core/src/device_manager.rs`: `gpu_client` and the DISPLAY take in `route_offers`
+  are gone. The `GPU` hand-off keeps its tag and carries a FACT - whether a display driver is bound -
+  exactly as `SND` does, because the supervisor's driver-status view is the only thing that ever used
+  it.
+- `src/user/services/core/src/service_manager.rs` and `service_manager/bootstrap.rs`: `gpu_client`
+  becomes `gpu_online`, and the display_service `GPU` role branch is gone.
+- The three kernel harnesses that stood in for the supervisor now answer the subscription instead of
+  sending `GPU`; `tests::serve_provider_catalogue` takes the kind rather than hardcoding `Audio`.
+- `src/harness/dev-gpu-restart.py`: `report_the_display` becomes `require_the_display` and FAILS if a
+  frame driven through the console after the rebind does not reach the display. Its header said in as
+  many words why it could not assert this; that reason is gone, and a check that reports what it was
+  built to prove is a check nobody fails.
+
+`docs/todo/P02M0159.md`: M4 records the driver half as it stood and the consumer half as it is now.
+
+VERIFICATION: reported at the end of this response set.
+
+ADDENDUM TO THE 2026-09-02T18:20:00Z RESPONSE - WHAT THE DEV CHECK COULD NOT BE RUN AGAINST:
+
+`dev-gpu-restart` now asserts the display rather than reporting it, and that assertion has NOT been
+exercised, because the persistent development instance does not come up: `./dev.sh up` stalls during
+service bring-up and never reaches a shell. Measured rather than assumed, and traced with temporary
+probes that were removed afterwards - ServiceManager reaches AudioService's `CATALOGUE` factory role
+with a live `device_manager` SERVE root and blocks inside `service_connect`, while DeviceManager is in
+its standing loop with that root live in its wait set and its `CONNECT_OP` arm never reached. It is
+deterministic, identical at one core and at four, and it happens BEFORE any of this round's code runs,
+on the audio subscription that has been in place since 2026-08-31.
+
+What it exposes is that nothing in this tree BOOTS the development configuration - `development-build`
+proves it compiles and `development-gate` inspects the built volume - so a boot defect in it is
+invisible to every check here. Written up under P02M0164's M3, where that seam belongs.
+
+The display path itself IS proved end to end on the shipping configuration, which is where this
+milestone's profile lives: `qemu-virtio-iommu-x86_64`'s default-machine case boots the enforcing
+machine and reports "the display driver runs and a frame reached the screen", with DisplayService
+reaching its device through the catalogue and no fixed slot anywhere in the path.
+
+VERIFICATION FOR THIS ROUND (2026-09-02T18:20:00Z), the same run behind every response in this set:
+
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot`: 239 passed, 0 failed. It carries this round's two new kernel tests
+  (`kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim`,
+  `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`), the boot test
+  that requires EVERY manifest service online, and the DisplayService and console harnesses that were
+  rewired onto the provider catalogue.
+- `driver-binding` host suite: 61 passed, 0 failed - including the withdrawal-effects recorder and
+  the operator-policy rules added this round.
+- `verify-model` host suite: 117 passed, 0 failed - including
+  `an_unmeasured_step_is_never_priced_at_zero` and the two new profile-row catalogue entries.
+- `verify-scheduler` gate: 21 assertions, all holding. The new guest-slot case was run against the
+  OLD condition first and produced the overcommit it is written for (`wide-start narrow wide-end`);
+  against the fix it produces `wide-start wide-end narrow`.
+- `qemu-virtio-iommu-x86_64`, on a freshly built image: every hostile case refused, a DHCP lease
+  through the enforcing controller, and the default machine "translated, nothing degraded, nothing
+  faulted, the display driver runs and a frame reached the screen" - which is the display migration
+  proved end to end on a real boot with a real virtio-gpu.
+- Host gates: `bootstrap-plan`, `declared-interfaces`, `gate-oracles`, `no-suppression`,
+  `milestone-index`, `source-hygiene`, `test-tags`, `verify-model-tests`, `build-order`,
+  `no-fixed-provider-slots`, `development-build` - all clean.
+- `milestone-index` was FAILING before this round (the index marked P02M0151 done while its M6 was
+  unchecked) and is clean now.
+
+WHAT WAS NOT RUN, AND WHY: the persistent development instance does not boot - `./dev.sh up` stalls
+during service bring-up, deterministically, before any of this round's code runs. It is measured and
+written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
+unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
+except the two new UEFI profile rows, which are gate rows rather than suite runs.

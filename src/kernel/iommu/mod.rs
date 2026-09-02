@@ -243,6 +243,13 @@ pub fn init() -> bool {
 			return false;
 		}
 		counts.resize(crate::device::count(), 0);
+		let mut ended = ENDED_FAULTS.lock();
+		ended.clear();
+		if ended.try_reserve_exact(crate::device::count()).is_err() {
+			crate::serial_println!("iommu: no room for the ended-binding fault counts - translation is refused rather than run with accounting it cannot keep");
+			return false;
+		}
+		ended.resize(crate::device::count(), 0);
 	}
 	match bring_up(index) {
 		Ok(controller) => {
@@ -591,10 +598,16 @@ pub fn quarantined_grants_for(index: u32) -> usize {
 pub fn faults_for(index: u32) -> u64 {
 	// THE LIVE DOMAIN, THEN THE RETAINED ONE, THEN THE RETAINED COUNT. The third is what answers
 	// after a CONFIRMED teardown, whose domain is destroyed on purpose - see `RETAINED_FAULTS`.
-	match domain_of(index).or_else(|| retained_domain_of(index)) {
+	let current = match domain_of(index).or_else(|| retained_domain_of(index)) {
 		Some(domain) => with(|controller| controller.iommu().faults_in(domain)).unwrap_or(0),
 		None => RETAINED_FAULTS.lock().get(index as usize).copied().unwrap_or(0),
-	}
+	};
+	// PLUS WHAT AN ENDED BINDING RAISED AFTER ITS DOMAIN STOPPED ANSWERING FOR IT. See
+	// `ENDED_FAULTS`: none of that is in the number above, by construction, so this is a sum and not
+	// a double count - and it is added rather than reported apart because the alternative was
+	// reporting nothing. A device this kernel is still holding faults against reads as a device with
+	// faults, whichever of its bindings raised them.
+	current.saturating_add(ENDED_FAULTS.lock().get(index as usize).copied().unwrap_or(0))
 }
 
 // DEVICES WHOSE DETACH WAS NOT CONFIRMED, AND THE DOMAIN THAT OUTLIVED THEM.
@@ -636,6 +649,29 @@ fn retained_domain_of(index: u32) -> Option<dma::DomainId> {
 // out while the domain still answers and read after it does not. Sized with `RETAINED`, at `init`,
 // for the reason stated there.
 static RETAINED_FAULTS: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+
+// AND THE FAULTS THAT ARRIVED AFTER THAT NUMBER WAS TAKEN, which is a different quantity and was
+// sharing its slot (added 2026-09-02).
+//
+// `RETAINED_FAULTS` is a COPY of one binding's final domain count, written once at detach. A fault
+// drained later and attributed to that ended binding was being added into the same slot, and two
+// things followed. While a REPLACEMENT binding is live, `faults_for` reads the replacement's domain
+// and never looks at the slot, so the old binding's late fault was invisible; and when the
+// replacement in turn detaches it ASSIGNS its own final count into that slot, so the invisible
+// number was then overwritten and reached binding accounting at no point at all. A security event
+// the drain had correctly attributed was dropped by the bookkeeping under it.
+//
+// So the carry is its own table: monotonic per device, written only by the drain, and read by
+// `faults_for` ON TOP of whatever the current binding's domain says. It is never assigned and no
+// teardown clears it, which is the whole difference - a count that a later binding's lifecycle can
+// reset is not a count of what an earlier one did.
+//
+// A fault the CURRENT binding raised does not come here: it is already in that binding's own domain,
+// which `faults_for` reads directly. Nor does one whose ended binding's domain is still RETAINED -
+// `Iommu::faults_in` sums a domain with its detached tails, so that fault is already answered for
+// and adding it here would count it twice. Both exclusions are made at the drain, where the domain
+// the fault names and the domain the device currently answers from are both in hand.
+static ENDED_FAULTS: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
 
 // What asking for an MSI vector found. THREE ANSWERS, because the two failures call for opposite
 // responses: an endpoint whose domain has no route is a live binding to disable, and one whose
@@ -1034,9 +1070,15 @@ static LAST_PERIODIC_DRAIN: core::sync::atomic::AtomicU64 = core::sync::atomic::
 // HERE, AND NOT IN THE TIMER INTERRUPT. `poll_faults` takes the controller's lock and then
 // `device`'s, and an interrupted context may hold either; the idle loop holds neither. It already
 // services TLB shootdowns and drains the serial ring for the same reason, and it is entered with
-// interrupts enabled. What it is NOT is a guarantee: a machine whose every core is busy does not
-// reach it, so this bounds the delay on any core that goes idle rather than promising a deadline.
-// That is a strict improvement on "never until teardown" and is written here as what it is.
+// interrupts enabled.
+//
+// AND IT IS A BOUND, NOT ONLY A BEST EFFORT (corrected 2026-09-02). This said "a machine whose every
+// core is busy does not reach it", and that was true of the caller it had: `main`'s loop drained the
+// run queue with NO deadline, so continuously runnable work kept cpu 0 inside the drain for ever and
+// this was not called at all - the honest sentence described a real hole rather than excusing one.
+// The caller now drains with a one-tick deadline checked BETWEEN reschedules, so cpu 0 arrives here
+// at least once per tick under any workload, which is the delay bound M5's containment needs and the
+// reason the rate limit below is a tick.
 pub fn service_faults_if_due() {
 	// ONE CORE EVER LOOKS, AND THAT IS THE FIRST TEST BECAUSE IT IS THE ONLY FREE ONE (measured
 	// 2026-09-01).
@@ -1138,12 +1180,22 @@ pub fn poll_faults_attributed_with(during_teardown: Option<(dma::EndpointId, dma
 			// never reached the number M4 exposes, so "the accounting outlives the domain" was true
 			// inside the crate and false at the seam a supervisor reads.
 			//
-			// So a fault whose generation is not this device's current binding is added to the
-			// retained count as it is drained. A LIVE binding's faults are not: they are already in
-			// its own domain, which `faults_for` reads directly, and adding them here would count
-			// them twice.
+			// So a fault whose generation is not this device's current binding is carried on the
+			// DEVICE, in `ENDED_FAULTS`. A LIVE binding's faults are not: they are already in its own
+			// domain, which `faults_for` reads directly, and adding them here would count them twice.
+			//
+			// AND NEITHER IS ONE WHOSE OWN DOMAIN IS STILL ANSWERING (corrected 2026-09-02). This
+			// charged the carry for every non-current fault, and an UNCONFIRMED detach keeps its
+			// domain precisely so its holdings stay readable - `faults_in` sums that domain with the
+			// tails this same drain just charged, so `faults_for` would have counted the fault once
+			// through the domain and once through the carry. The exclusion is the equality below:
+			// the carry takes exactly the faults no domain this device answers from will report.
+			//
+			// It went into `RETAINED_FAULTS` before this, whose slot a replacement's teardown assigns
+			// over. See `ENDED_FAULTS` for why that lost the number entirely.
 			if let Some((index, current)) = crate::device::binding_of_faulting_endpoint(bus, dev, func, event.generation.0)
-				&& !current && let Some(slot) = RETAINED_FAULTS.lock().get_mut(index)
+				&& !current && domain_of(index as u32).or_else(|| retained_domain_of(index as u32)) != Some(event.domain)
+				&& let Some(slot) = ENDED_FAULTS.lock().get_mut(index)
 			{
 				*slot = slot.saturating_add(1);
 			}

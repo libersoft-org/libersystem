@@ -402,17 +402,23 @@ fn display_service_restores_the_console_surface() {
 	let (focus_input, focus_display) = Channel::create();
 	let (kill_input, kill_display) = Channel::create();
 	let _display_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
-	send_cap(&boot_kernel, b"GPU", gpu_user, Rights::ALL).expect("gpu bootstrap");
 	send_cap(&boot_kernel, b"FOCUS", focus_display, Rights::ALL).expect("focus bootstrap");
 	send_cap(&boot_kernel, b"KILL", kill_display, Rights::ALL).expect("kill bootstrap");
 	let (display_admin, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("display admin bootstrap");
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
-	// The DisplayController capability is the last handoff. DisplayService tolerates handle 0
-	// (it takes no boot framebuffer and relies on the GPU scanout, which is what this test
-	// gives it) but it BLOCKS for the message, so a launcher that omits it wedges bring-up
-	// before the FB handshake below - which is what a positional bootstrap costs.
+	// The DisplayController capability. DisplayService tolerates handle 0 (it takes no boot
+	// framebuffer and relies on the GPU scanout, which is what this test gives it) but it BLOCKS for
+	// the message, so a launcher that omits it wedges bring-up before the FB handshake below - which
+	// is what a positional bootstrap costs.
 	boot_kernel.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new())).expect("display capability bootstrap");
+	// AND THE PROVIDER CATALOGUE LAST, WHICH IS HOW THIS SERVICE FINDS ITS SCANOUT. It is not handed
+	// a `GPU` channel any more - it subscribes to the display kind and opens a connection to what it
+	// finds - so this harness answers that conversation before the framebuffer handshake below.
+	let (catalogue_server, catalogue_client) = Channel::create();
+	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	sched::run_until_idle();
+	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 
 	// Answer the driver's FB handshake with a 4x4 B8G8R8X8 DMA scanout.
 	sched::run_until_idle();
@@ -1668,13 +1674,18 @@ fn the_console_answers_a_program_through_its_own_channel() {
 	let (focus_input, focus_display) = Channel::create();
 	let (kill_input, kill_display) = Channel::create();
 	let _display_service = spawn_dynamic_test_process(sched::root_domain(), display_elf, display_boot_user);
-	send_cap(&display_boot_kernel, b"GPU", gpu_user, Rights::ALL).expect("gpu bootstrap");
 	send_cap(&display_boot_kernel, b"FOCUS", focus_display, Rights::ALL).expect("focus bootstrap");
 	send_cap(&display_boot_kernel, b"KILL", kill_display, Rights::ALL).expect("kill bootstrap");
 	let (_display_admin, admin) = Channel::create();
 	send_cap(&display_boot_kernel, b"ADMIN", admin, Rights::ALL).expect("display admin bootstrap");
 	send_cap(&display_boot_kernel, b"SERVE", display_server, Rights::ALL).expect("serve bootstrap");
 	display_boot_kernel.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new())).expect("display capability bootstrap");
+	// AND THE PROVIDER CATALOGUE LAST - see the note on the other DisplayService harness in this
+	// file: this service discovers its scanout rather than being handed one.
+	let (display_catalogue_server, display_catalogue_client) = Channel::create();
+	send_cap(&display_boot_kernel, b"CATALOGUE", display_catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	sched::run_until_idle();
+	crate::tests::serve_provider_catalogue(&display_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 
 	// 160x64 B8G8R8X8: 20 columns by 4 rows at this font, which is a grid a query can be asked on.
 	const FB_W: u32 = 160;

@@ -122,6 +122,13 @@ DEVICE_MSI_ORACLE=""
 # direct boots, and one for the single CHECKPOINT row that needs what only a firmware boot carries.
 # See the device-MSI row below for the measurement that separates the two.
 PROFILE_UEFI=0
+# A LINE THIS PROFILE MUST NOT PRINT, empty for a profile that forbids nothing.
+#
+# The UEFI regression rows below are the only users and the reason it exists: what they have to show
+# is not only that the loader path boots, but that booting through firmware did NOT reach the static
+# no-DT descriptor. Both ports print a named line when they take it, so the absence of that line is
+# the assertion - a negative one, which no `want` string can express.
+PROFILE_FORBIDS=""
 MULTI_CORE_ORACLES="kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick kernel.kernel.a_shootdown_is_answered_by_every_other_core kernel.sched.scheduler_runs_across_cores"
 
 # One profile: boot it, then ask the boot what machine it was on.
@@ -240,6 +247,14 @@ run_profile() {
 		exit 1
 	}
 	echo "arch-profiles:     discovered: $(grep -a -m 1 -o "$want.*" "$log")"
+	if [[ -n "$PROFILE_FORBIDS" ]]; then
+		if grep -aq "$PROFILE_FORBIDS" "$log"; then
+			echo "arch-profiles: $arch $label printed a line this profile forbids: $PROFILE_FORBIDS" >&2
+			grep -a -m 5 "$PROFILE_FORBIDS" "$log" >&2
+			exit 1
+		fi
+		echo "arch-profiles:     and the static no-DT descriptor was NOT selected - this boot read a tree"
+	fi
 	timer_ticked "$log" || exit 1
 	# THE NAMED ORACLES, BY TEST ID. A profile that boots and counts its cores has shown that
 	# discovery worked; it has not shown that anything discovered can be USED. Each id below is a
@@ -357,20 +372,50 @@ run_profile aarch64 gicv3-its-device 4 "GICv3 from the device tree" GIC=3its
 PROFILE_UEFI=0
 DEVICE_MSI_ORACLE=""
 
-# THE UEFI / NO-DEVICE-TREE REGRESSION PROFILES ARE NOT REGISTERED HERE, AND THIS SAYS WHY
-# (2026-08-30). M6 asks for separate, labelled aarch64 and riscv64 UEFI/no-DT profiles and the
-# Definition of Done asks for them green; `LIBER_NO_DT_PROFILE=1` is the compile-time authorisation
-# for the static descriptor such a machine falls back to, and no caller in this tree sets it - so the
-# authorised profile is unreachable and the named refusal it guards is untestable.
+# THE UEFI SINGLE-NODE REGRESSION ROW, which M6 asks for by name and which this gate had stopped
+# running at all (restored 2026-09-02).
 #
-# Registering two rows here was tried and does not work, and the reason is the useful part: the
-# profile needs a machine that publishes NO device tree, and this harness cannot produce one. Booting
-# through firmware instead of directly does not do it - QEMU's `virt` gives the firmware a DTB and the
-# loader hands it on, so a `UEFI=1` boot still prints `aarch64: GICv2 from the device tree`, measured.
+# The eight discovery rows above are DIRECT boots, and making them so is what deleted this: before
+# them every aarch64 profile came in through firmware, so the loader path was covered by accident.
+# M6 asks for it to be covered on purpose - "keep the existing aarch64/riscv64 UEFI boots as separate
+# single-node regression profiles ... they prove the loader path still works, not that controller
+# discovery occurred" - and nothing was left proving it.
+#
+# WHAT IT PROVES AND WHAT IT DOES NOT. It proves the firmware entry still reaches a booted kernel
+# that discovers its controller, ticks, and passes this profile's oracles on one core. It does NOT
+# prove the no-DT descriptor works, and the `PROFILE_FORBIDS` line is there so it cannot be mistaken
+# for that: QEMU's `virt` hands the firmware a device tree and the loader passes it on, so this boot
+# HAS a tree and must be seen not to have taken the static descriptor. That is the half of the
+# Definition of Done a boot with a tree can carry - "their static QEMU descriptors cannot be selected
+# by a boot which has a DT" - asserted rather than assumed.
+#
+# The other half, a positive boot of a machine that publishes NO tree, is still blocked on a harness
+# capability. See the note below.
+MSI_ORACLE="$AARCH64_MSI"
+PROFILE_UEFI=1
+PROFILE_FORBIDS="authorises"
+run_profile aarch64 uefi 1 "GICv2 from the device tree" GIC=2
+PROFILE_FORBIDS=""
+PROFILE_UEFI=0
+
+# WHAT IS STILL NOT REGISTERED HERE, AND WHY (2026-08-30, narrowed 2026-09-02).
+#
+# The UEFI regression rows themselves ARE registered now - one per device-tree port, above - and they
+# carry the half of M6 a machine with a tree can carry: the loader path boots, discovers, ticks and
+# passes its oracles, and the static descriptor is seen NOT to have been selected.
+#
+# What is still missing is the POSITIVE no-DT boot: `LIBER_NO_DT_PROFILE=1` is the compile-time
+# authorisation for the static descriptor a treeless machine falls back to, and no caller in this
+# tree sets it, so the authorised path is unreachable and the descriptor it selects is unproved.
+# Registering a row for it was tried and does not work, and the reason is the useful part: it needs a
+# machine that publishes NO device tree, and this harness cannot produce one. Booting through
+# firmware does not do it - QEMU's `virt` gives the firmware a DTB and the loader hands it on, so a
+# `UEFI=1` boot still prints `aarch64: GICv2 from the device tree`, measured. That is exactly what
+# the rows above now assert rather than merely observe.
 #
 # What is missing is a way to withhold the tree: a QEMU machine that publishes none, or a loader
 # option that does not pass one on. That is a harness capability rather than a gate row, and it is
-# what this item is actually blocked on.
+# what remains of this item.
 
 # AND THE ITS PROFILE MUST HAVE USED ITS ITS. `GICv3 from the device tree` is the same line the
 # ITS-less profile prints, so on its own it would make the two profiles indistinguishable.
@@ -425,6 +470,15 @@ fi
 MSI_ORACLE=kernel.arch.riscv64.interrupts.imsic_msi_binds_and_dispatch_signals_the_driver
 run_profile riscv64 aia 1 "IMSIC S-mode files from the device tree"
 run_profile riscv64 aia 4 "IMSIC S-mode files from the device tree"
+
+# AND THE riscv64 SINGLE-NODE UEFI REGRESSION ROW. The aarch64 note above is the whole of the
+# reasoning; this is the same row on the other device-tree port, and the line it must not print is
+# riscv64's own no-DT authorisation.
+PROFILE_UEFI=1
+PROFILE_FORBIDS="authorises the named no-DT profile"
+run_profile riscv64 uefi 1 "IMSIC S-mode files from the device tree"
+PROFILE_FORBIDS=""
+PROFILE_UEFI=0
 
 if [[ -n "$ONLY" ]]; then
 	((RAN)) || fail "no profile is named '$ONLY' - this gate ran nothing, and saying it passed is the false green it exists against"

@@ -1332,3 +1332,90 @@ Focused verification: the portable DMA/virtio-IOMMU suite and protocol gate pass
 Those tests credit the corrected mapping, teardown, and detached-tail safety work, but no test queues
 a live hardware fault while keeping the BSP run queue continuously runnable or drives a late old-
 generation fault through the kernel snapshot seam while a replacement binding is live.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-09-02T18:20:00Z):
+
+FINDING 1 - live IOMMU faults can remain uncontained indefinitely, and the stated blocker is
+contradicted by `run_until_idle_until`: ACCEPTED, and the contradiction is real. My previous response
+argued the kernel had no non-interrupt context able to enforce a deadline. It has had one all along,
+in the same file the argument was made about: `sched::run_until_idle_until` takes an absolute tick
+bound and - this is the part that matters - checks it BETWEEN reschedules, which its own comment says
+is the whole reason it exists, because a thread that yields and requeues itself keeps the run queue
+non-empty for ever. The console loop called the unbounded wrapper, so on a machine with continuously
+runnable work cpu 0 never left the drain and `service_faults_if_due` was not reached at all. "It runs
+when cpu 0 settles" is a bound only if cpu 0 is allowed to settle.
+
+WHAT CHANGED.
+
+- `src/kernel/main.rs`: the console loop drains with `run_until_idle_until(ticks() + 1)` and keeps its
+  answer. One tick is the slice because `service_faults_if_due` already admits at most one drain per
+  tick across the machine, so a shorter slice would buy nothing.
+- The halt is now conditional on that answer. This is the part a naive bound would have got wrong: a
+  drain cut short leaves runnable threads on the queue, and `idle_halt` on top of them parks ready
+  work until the next interrupt - trading this defect for a worse one. When the drain settles the loop
+  halts exactly as before; when it was cut short it goes round instead, and the halting still happens
+  inside the scheduler's own deadline wait, so a settled machine does not spin.
+- `sched::run_until_idle()` had no production caller left. Rather than suppress the dead-code warning
+  it is now `#[cfg(test)]`: a test drives a fixed amount of cooperative work to completion and wants
+  exactly that, and production callers name the bound they run under.
+- The comments in both files that claimed the old guarantee are corrected rather than left standing -
+  `service_faults_if_due`'s "a machine whose every core is busy does not reach it" described a real
+  hole, and it is closed.
+
+FINDING 2 - an ended binding's late faults are invisible while a replacement runs and are then
+overwritten: ACCEPTED. Verified against the code: `faults_for` prefers `domain_of` and consults
+`RETAINED_FAULTS` only when no live or retained domain exists, and `detach_for_inner` ASSIGNS
+`faults_in(domain)` into that same slot. So the sequence is exactly as described - binding A detaches
+and its final count is copied in, A is rebound as B, A's late fault increments the slot nobody now
+reads, and B's teardown assigns over it. A fault the drain had correctly attributed reached no
+accounting at all.
+
+WHAT CHANGED. The two quantities are separated, because they were sharing a slot and are not the same
+thing. `RETAINED_FAULTS` stays what it is: a COPY of one binding's final domain count, written once at
+detach. A new `ENDED_FAULTS` table carries the faults that arrive after that copy was taken - one
+slot per device, sized at `init` beside the others, monotonic, written only by the drain, never
+assigned and never cleared by any later binding's lifecycle. `faults_for` returns the current
+binding's domain count (or the retained copy) PLUS that carry, so the number is visible while a
+replacement runs and survives the replacement's teardown.
+
+AND THE DOUBLE COUNT IT WOULD OTHERWISE HAVE INTRODUCED IS EXCLUDED AT THE DRAIN. An UNCONFIRMED
+detach keeps its domain precisely so its holdings stay readable, and `Iommu::faults_in` sums a domain
+with its detached tails - so a late fault for that binding is already answered for through the domain.
+The drain therefore charges the carry only when the domain the fault NAMES is not the domain the
+device currently answers from: `domain_of(index).or_else(retained_domain_of) != Some(event.domain)`.
+Both facts are in hand at that point, which is why the exclusion lives there and not in the reader.
+
+`docs/todo/P02M0153.md`: M5 and M4's counter bullet updated to say what is now true and why.
+
+VERIFICATION: reported at the end of this response set.
+
+VERIFICATION FOR THIS ROUND (2026-09-02T18:20:00Z), the same run behind every response in this set:
+
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot`: 239 passed, 0 failed. It carries this round's two new kernel tests
+  (`kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim`,
+  `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`), the boot test
+  that requires EVERY manifest service online, and the DisplayService and console harnesses that were
+  rewired onto the provider catalogue.
+- `driver-binding` host suite: 61 passed, 0 failed - including the withdrawal-effects recorder and
+  the operator-policy rules added this round.
+- `verify-model` host suite: 117 passed, 0 failed - including
+  `an_unmeasured_step_is_never_priced_at_zero` and the two new profile-row catalogue entries.
+- `verify-scheduler` gate: 21 assertions, all holding. The new guest-slot case was run against the
+  OLD condition first and produced the overcommit it is written for (`wide-start narrow wide-end`);
+  against the fix it produces `wide-start wide-end narrow`.
+- `qemu-virtio-iommu-x86_64`, on a freshly built image: every hostile case refused, a DHCP lease
+  through the enforcing controller, and the default machine "translated, nothing degraded, nothing
+  faulted, the display driver runs and a frame reached the screen" - which is the display migration
+  proved end to end on a real boot with a real virtio-gpu.
+- Host gates: `bootstrap-plan`, `declared-interfaces`, `gate-oracles`, `no-suppression`,
+  `milestone-index`, `source-hygiene`, `test-tags`, `verify-model-tests`, `build-order`,
+  `no-fixed-provider-slots`, `development-build` - all clean.
+- `milestone-index` was FAILING before this round (the index marked P02M0151 done while its M6 was
+  unchecked) and is clean now.
+
+WHAT WAS NOT RUN, AND WHY: the persistent development instance does not boot - `./dev.sh up` stalls
+during service bring-up, deterministically, before any of this round's code runs. It is measured and
+written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
+unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
+except the two new UEFI profile rows, which are gate rows rather than suite runs.

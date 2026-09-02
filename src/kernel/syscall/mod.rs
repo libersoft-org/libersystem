@@ -385,6 +385,20 @@ fn install_object(thread: &Thread, object: Arc<dyn KernelObject>, rights: Rights
 	}
 }
 
+// Install a capability that was MINTED EARLIER, for the create handlers whose object becomes
+// revocable before its handle exists.
+//
+// The difference from `install_object` is the ONE thing that matters here: `Capability::new` reads
+// the object's revocation generation when it runs, so a handler that registers its object as
+// claim-derived and mints afterwards snapshots a number a release in that gap has already moved.
+// Those handlers mint first and install through this. See `sys_dma_buffer_create`.
+fn install_capability(thread: &Thread, capability: Capability) -> i64 {
+	match thread.handles().lock().try_insert(capability) {
+		Some(handle) => handle.raw() as i64,
+		None => ERR_RESOURCE_EXHAUSTED,
+	}
+}
+
 // Look up a typed object handle on the calling thread's table and recover the
 // concrete `Arc<T>`, collapsing the `current_object` + downcast the handlers
 // repeat. The downcast cannot fail because lookup_typed already checked the type.
@@ -641,6 +655,21 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 	if !guard.record_dma_buffer(&object) {
 		return ERR_NO_MEMORY;
 	}
+	// AND THE CAPABILITY IS MINTED BEFORE THE ROW THAT MAKES IT REVOCABLE EXISTS (added 2026-09-02).
+	//
+	// `Capability::new` snapshots the object's revocation generation AT THE MOMENT IT RUNS, and
+	// minting it after the registration below read that number AFTER a release in the gap had
+	// already bumped it. The handle installed at the end therefore carried the POST-revocation
+	// generation, matched it at every lookup, and went on mapping and reading a buffer whose claim
+	// had ended - a claim-derived capability that outlived its claim, which is the one thing M3
+	// forbids. The registration was not the hole: it succeeded, correctly, against a claim that was
+	// still live, and the revocation then swept the row and revoked the object while this call was
+	// still between two of its own steps.
+	//
+	// Minting first makes the snapshot OLDER than any revocation this row can attract, so a release
+	// landing anywhere after this line leaves the capability born stale - which is exactly what a
+	// revoked capability is, and what every lookup already refuses.
+	let capability = Capability::new(object.clone() as alloc::sync::Arc<dyn KernelObject>, Rights::ALL);
 	// RECORDED AS DERIVED BEFORE THE HANDLE EXISTS, for the reason the MMIO capability is: a
 	// capability the revocation cannot reach outlives the claim that justified it, so a table that
 	// cannot grow is a refusal rather than a buffer nothing can revoke.
@@ -657,7 +686,7 @@ fn sys_dma_buffer_create(size: u64, device_handle: u64) -> i64 {
 			return ERR_RESOURCE_EXHAUSTED;
 		}
 	}
-	install_object(&thread, object, Rights::ALL)
+	install_capability(&thread, capability)
 }
 
 // Map a DmaBuffer into the caller's address space. One mapping per address space;
@@ -1172,20 +1201,22 @@ fn sys_device_claim(index: u64, privilege: u64, grant_ptr: u64) -> i64 {
 	let Some(memory) = DeviceMemory::for_claim(key, bar_phys, bar_len as usize) else {
 		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
 	};
+	// MINTED BEFORE THE ROW THAT MAKES IT REVOCABLE EXISTS - see `sys_dma_buffer_create` for why the
+	// order and not only the registration is the property. The MMIO capability keeps TRANSFER
+	// because DeviceManager is the one that hands it over, and it arrives at the driver WITHOUT it
+	// through the attenuating send. Minting it without TRANSFER outright would break the boot on the
+	// first try - the broker cannot move a capability it may not move.
+	let memory_capability = Capability::new(memory.clone() as alloc::sync::Arc<dyn KernelObject>, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER);
 	// RECORDED AS DERIVED BEFORE IT IS HANDED OUT. A capability the revocation cannot reach is
 	// exactly what this milestone exists to make impossible, so a table that cannot grow is a failed
 	// mint rather than a capability that outlives its claim.
-	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>))) {
+	if !device::register_derived(key, alloc::sync::Arc::downgrade(&(memory as alloc::sync::Arc<dyn KernelObject>))) {
 		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
 	}
 	let Some(claim) = Claim::create(key) else {
 		return abandon_claim(&thread, key, ERR_RESOURCE_EXHAUSTED);
 	};
-	// The MMIO capability keeps TRANSFER because DeviceManager is the one that hands it over, and it
-	// arrives at the driver WITHOUT it through the attenuating send. Minting it without TRANSFER
-	// outright would break the boot on the first try - the broker cannot move a capability it may
-	// not move.
-	let memory_handle = thread.handles().lock().insert_reserved(Capability::new(memory, Rights::READ | Rights::WRITE | Rights::MAP | Rights::TRANSFER));
+	let memory_handle = thread.handles().lock().insert_reserved(memory_capability);
 	// AND THE CLAIM HANDLE CARRIES NEITHER TRANSFER NOR DUPLICATE. That is what makes it stay: a
 	// claim handle that can be moved leaves this Domain, survives its killing, and holds the forced
 	// release off exactly when the machine most needs it. WAIT, because the terminal result of a
@@ -1607,6 +1638,11 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 		thread.handles().lock().release_reservation(1);
 		return ERR_RESOURCE_EXHAUSTED;
 	}
+	// MINTED BEFORE THE ROW THAT MAKES IT REVOCABLE EXISTS - see `sys_dma_buffer_create`. The
+	// interrupt's own revoked flag limits what a resurrected handle here could do, and "limited" is
+	// not the property M3 asks for: the same publication order is used on all three claim-derived
+	// mints so there is one rule rather than two that happen to differ in blast radius.
+	let interrupt_capability = Capability::new(interrupt.clone() as alloc::sync::Arc<dyn KernelObject>, Rights::ALL);
 	// RECORDED AS DERIVED BEFORE THE DEVICE IS ALLOWED TO RAISE IT. A vector the revocation cannot
 	// reach keeps delivering to a driver whose binding has ended, which is the interrupt half of the
 	// property this milestone is about; a table that cannot grow gives the vector back rather than
@@ -1664,7 +1700,7 @@ fn sys_device_msix_acquire(claim_handle: u64) -> i64 {
 		thread.handles().lock().release_reservation(1);
 		return ERR_ACCESS_DENIED;
 	}
-	thread.handles().lock().insert_reserved(Capability::new(interrupt, Rights::ALL)).raw() as i64
+	thread.handles().lock().insert_reserved(interrupt_capability).raw() as i64
 }
 
 // Acknowledge a serviced interrupt: clear the Interrupt's pending flag so the driver's

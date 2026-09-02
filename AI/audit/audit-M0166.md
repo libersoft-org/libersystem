@@ -1136,3 +1136,86 @@ Current implementation rating: 7/10
    (`src/user/libs/driver/binding/src/tests.rs:719-752`). The latest response explicitly accepts this
    gap as unmet; consequently the milestone's under-test `select`, one-shot `retry`, quarantine, and
    namespace-security requirements remain unproved (`docs/todo/P02M0166.md:239-251`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-09-02T18:20:00Z):
+
+FINDING 1 - the required production policy and reserved-namespace authority proofs remain absent:
+ACCEPTED, AND BOTH HALVES ARE NOW PROVED. The finding names two different absences and they needed
+different answers.
+
+THE NAMESPACE HALF WAS DIRECTLY TESTABLE AND NOBODY HAD ASKED. `kernel.volume_layout` already launches
+a real ConfigService from the volume through ProcessService and speaks its wire; what it never did was
+hold the OWNER's connection, so it could not ask the question the reserved prefix exists to answer.
+`start_config_service_with_owner` now delivers the `POLICYOWNER` pair as the supervisor does, and
+`kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner` sends the SAME
+well-formed `device.policy.0000:00:04.0` write down an ordinary `CAP_CONFIG` connection and down the
+owner's: refused with `Denied` on one, accepted on the other, with the record read back both times so
+the refusal is a statement about the stored state and not only about the reply. The removal an
+`enable` performs is asked the same way, including that a refused removal leaves the record in place.
+It also pins that an ordinary connection may still READ a stored policy - seeing that a device is
+disabled is not disabling one - so the rule cannot drift into "the namespace is invisible". This
+matters because the prefix rule was written twice in that file's history and was wrong both times.
+
+The comment above `DEVICE_POLICY_PREFIX` still recorded the hole as open ("it is not fixed here
+because ConfigService cannot currently tell its callers apart"). It is fixed; the comment now says so
+and names the test.
+
+THE `select`/`retry` HALF NEEDED THE DECISION MOVED. Those rules lived in `decide_policy` and
+`apply_policy`, in a `no_std` binary nobody can run on a host, and both have been WRONG - a retry
+after exhaustion once handed back the whole automatic budget because it subtracted from a counter
+`Step::NextCandidate` had already reset to zero, and a retry once rewound the cursor to the registry
+order rather than to the operator's stored choice. Each was found by reading. So:
+
+- `src/user/libs/driver/binding/src/lib.rs`: `decide_retry(state, boot_critical) -> RetryVerdict`
+  (Grant / Quarantined / Busy / Refused), `one_more_attempt(candidate, candidates, preferred, max)`
+  answering where the budget and the cursor land, and `selected_candidate(names, artifact)` for the
+  narrowing rule.
+- `src/user/services/core/src/device_manager.rs` calls all three. What stays there is the mapping onto
+  this protocol's outcomes and the effects on the node, neither of which is a decision. The candidate
+  names are collected onto a stack array bounded by `DRIVER_REGISTRY.len()`, since a node's list is a
+  filtered subset of the registry - no allocation and no failure path.
+- `an_operator_retry_grants_exactly_one_attempt_and_a_quarantine_refuses_it` drives every branch: the
+  three states that admit a retry, the quarantine refusal as its OWN answer rather than a busy one,
+  the boot-critical refusal outranking it, exactly one attempt from any counter value, the cursor
+  rewound only when exhausted and then to the operator's choice, a mid-list cursor left alone, an
+  empty candidate list not indexing past nothing, and a selection surviving the exhaustion that
+  follows it.
+
+WHAT THIS DOES NOT CLAIM. No registered test invokes DeviceManager's `apply_policy` itself; the
+production exercise of a policy VERB end to end is still `dev-gpu-restart`'s disable/enable. What has
+moved is the arithmetic - the part that was wrong twice - out of the binary and under test.
+
+`docs/todo/P02M0166.md`: both Definition-of-Done lines record what now proves them.
+
+VERIFICATION: reported at the end of this response set.
+
+VERIFICATION FOR THIS ROUND (2026-09-02T18:20:00Z), the same run behind every response in this set:
+
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot`: 239 passed, 0 failed. It carries this round's two new kernel tests
+  (`kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim`,
+  `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`), the boot test
+  that requires EVERY manifest service online, and the DisplayService and console harnesses that were
+  rewired onto the provider catalogue.
+- `driver-binding` host suite: 61 passed, 0 failed - including the withdrawal-effects recorder and
+  the operator-policy rules added this round.
+- `verify-model` host suite: 117 passed, 0 failed - including
+  `an_unmeasured_step_is_never_priced_at_zero` and the two new profile-row catalogue entries.
+- `verify-scheduler` gate: 21 assertions, all holding. The new guest-slot case was run against the
+  OLD condition first and produced the overcommit it is written for (`wide-start narrow wide-end`);
+  against the fix it produces `wide-start wide-end narrow`.
+- `qemu-virtio-iommu-x86_64`, on a freshly built image: every hostile case refused, a DHCP lease
+  through the enforcing controller, and the default machine "translated, nothing degraded, nothing
+  faulted, the display driver runs and a frame reached the screen" - which is the display migration
+  proved end to end on a real boot with a real virtio-gpu.
+- Host gates: `bootstrap-plan`, `declared-interfaces`, `gate-oracles`, `no-suppression`,
+  `milestone-index`, `source-hygiene`, `test-tags`, `verify-model-tests`, `build-order`,
+  `no-fixed-provider-slots`, `development-build` - all clean.
+- `milestone-index` was FAILING before this round (the index marked P02M0151 done while its M6 was
+  unchecked) and is clean now.
+
+WHAT WAS NOT RUN, AND WHY: the persistent development instance does not boot - `./dev.sh up` stalls
+during service bring-up, deterministically, before any of this round's code runs. It is measured and
+written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
+unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
+except the two new UEFI profile rows, which are gate rows rather than suite runs.

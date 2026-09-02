@@ -446,12 +446,25 @@ pub(crate) fn console_shell_loop() {
 				}
 			}
 		}
-		sched::run_until_idle();
-		// The system is settled: only no-deadline and periodic waits remain. HALT until
-		// the next timer tick or device interrupt instead of spinning - a spinning BSP
-		// floods KVM with the serial poll's port-I/O VM-exits (see run_until_idle) - and
-		// re-enter, which wakes whatever housekeeping (a display poll, a blink tick)
-		// came due in the meantime.
+		// BOUNDED, AND THE BOUND IS WHAT MAKES THE HOUSEKEEPING BELOW REACHABLE (added 2026-09-02).
+		//
+		// This called the unbounded `run_until_idle`, whose body is `while !run_queue.is_empty() {
+		// reschedule }`: a thread that yields and requeues itself keeps that queue non-empty for
+		// ever, so a CPU-bound workload never returned here and the IOMMU drain below - the ONE
+		// production path that services a fault while the binding that raised it is still running -
+		// was not reached at all. "It runs when cpu 0 settles" is a real bound only if cpu 0 is
+		// allowed to settle, and a busy machine is exactly the case where a faulting endpoint
+		// mastering the bus matters most.
+		//
+		// `run_until_idle_until` is the same drain with an ABSOLUTE TICK deadline that is checked
+		// BETWEEN reschedules, so the cap holds against that workload rather than only against a
+		// queue that empties. One tick is the slice, because `service_faults_if_due` admits one
+		// drain per tick across the whole machine and a shorter slice would buy nothing.
+		let settled: bool = sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		// Either the system settled - only no-deadline and periodic waits remain - or the slice ran
+		// out with work still ready. Both owe the machine the housekeeping below; only the first may
+		// halt, and the halt is what keeps a settled BSP from spinning and flooding KVM with the
+		// serial poll's port-I/O VM-exits (see run_until_idle).
 		arch::serial::drain_tx();
 		// AND THE IOMMU'S FAULT QUEUE IS SERVICED HERE, ON THE ONE CORE THAT REACHES THIS LOOP.
 		//
@@ -463,12 +476,20 @@ pub(crate) fn console_shell_loop() {
 		// it. A one-core system had no periodic drain either way.
 		//
 		// Here, both hold. Cpu 0 is the only core doing the work, so no other hart pays for the
-		// check, and cpu 0 actually arrives - once per settle, which is what bounds how long a fault
-		// raised by a live binding can sit in the controller's queue. It is beside `drain_tx` because
-		// it is the same kind of thing: work the settled BSP owes the rest of the machine before it
-		// halts.
+		// check, and cpu 0 actually arrives - AT LEAST ONCE PER TICK, whatever the machine is doing,
+		// which is what bounds how long a fault raised by a live binding can sit in the controller's
+		// queue. That bound is the drain slice above and not a settle: "once per settle" was the
+		// claim before it, and a settle is a thing a busy machine never does. It is beside
+		// `drain_tx` because it is the same kind of thing: work the BSP owes the rest of the machine
+		// before it goes back round.
 		crate::iommu::service_faults_if_due();
-		arch::idle_halt();
+		// AND THE HALT IS ONLY FOR A SETTLED MACHINE. A drain cut short by the deadline above left
+		// runnable threads on the queue, and halting on top of them would park work that is ready to
+		// run until the next interrupt - trading the defect this bound fixes for a worse one. The
+		// loop re-enters instead, which is the same thing it does after any other unfinished pass.
+		if settled {
+			arch::idle_halt();
+		}
 	}
 }
 

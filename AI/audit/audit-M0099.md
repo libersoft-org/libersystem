@@ -1821,3 +1821,35 @@ exactly this argument for P02M0162 - a prerequisite that describes instead of bl
 prerequisite - corrected the row the finding pointed at, and did not ask which other rows in the same
 table had the same defect. Two did. The matrix is now consistent: every row whose prerequisite is
 labelled COMPLETE while a required proof is missing says so and blocks closure.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-09-02T13:19:09Z):
+
+Rating: 7/10
+
+1. **The P02M0167 scheduler assessment is now an unjustified stale blocker.** The plan still says
+   the required `verify.sh` execution matrix does not exist and qualifies all evidence "until the
+   matrix exists" (`docs/todo/P02M0099.md:213-247`). It is registered and now covers the named graph,
+   result-precedence, seeded-cost and weighted guest-slot cases
+   (`check.sh:93-98`; `src/tools/check-verify-scheduler.sh:56-195`). The model supplies a non-zero
+   conservative seed to an unmeasured step
+   (`src/tools/verify-model/src/history.rs:442-465`;
+   `src/tools/verify-model/src/main.rs:1150-1164`), and the runner admits parallel steps by the sum of
+   their `STEPGUESTS` reservations (`verify.sh:895-897,941-983`). A fresh registered
+   `./check.sh --gate verify-scheduler` run passed every case, including seeded cost and the explicit
+   two-plus-one guest overlap. The separate P02M0167 medium-race restriction remains valid, but the
+   scheduler half no longer does; leaving it `UNSATISFIED` continues to qualify otherwise valid
+   evidence after the condition the plan itself prescribed has passed.
+
+2. **The accepted legacy-16550 correction was not carried into the plan's implementation/reference
+   table.** The architecture section and the item correctly say the legacy x86 path is NOT cheap and
+   is blocked on range-scoped revocable PIO authority, legacy fixed-IRQ routing/revocation, and atomic
+   kernel handoff/fallback; alternatively the first slice must be firmware-described MMIO and wait
+   for device identity (`docs/todo/P02M0099.md:417-431,763-777`). The table still labels the 16550
+   item `trivial`, supplies `anything` as its reference, and the table's conclusion still calls
+   16550 a cheap driver whose only first-step burden is the shared serial decision
+   (`:1196-1204,1241-1254`). Besides contradicting the corrected scope and scheduling cost,
+   `anything` identifies neither an implementation nor its permitted licence use, despite the
+   section's per-row rule (`:1123-1139`). An implementer following the table can still scope and
+   prioritise the exact path the accepted correction ruled out.

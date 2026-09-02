@@ -2235,6 +2235,39 @@ fn a_measured_step_cost_replaces_the_estimate_and_a_stale_one_does_not() {
 	assert!(history.get(&keys[0].display()).is_some(), "recording a step still records its keys");
 }
 
+// AN UNMEASURED STEP IS NEVER PRICED AT ZERO, WHICH IS WHAT `budget_select` SORTS ON.
+//
+// M4: "a step with no measured cost is not started under a budget without a conservative SEED - an
+// unknown priced at zero is the cheapest thing in every plan and would always be picked first". The
+// estimator produced exactly that zero for the most expensive items in the plan, and the arithmetic
+// is why nobody saw it: every GATE's catalogue key is `host`/`host`, that pair's fixed term is 0.0,
+// and one key at the default 0.5 s per key rounded to `STEPCOST 0`. So the twelve QEMU profile rows
+// and the two-guest concurrency gate were emitted as free work.
+#[test]
+fn an_unmeasured_step_is_never_priced_at_zero() {
+	let cost = crate::history::CostModel::default();
+	let history = crate::history::History::default();
+	// The shape a profile row actually has: one gate key, on the host pair, nobody has timed.
+	let gate_key = vec![crate::plan::PlanItemKey { check: String::from("gate.arch-profile-aarch64-gicv2-1"), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from("default") }];
+	let bare = cost.estimate(&history, &gate_key);
+	assert!(bare < 1.0, "the estimate alone is what rounded to zero - if this stops being true the seed below is no longer the thing under test, and this test has to say so");
+
+	// A step that starts a guest is seeded from what this model has already measured about booting
+	// one, per slot it declares - so the row is charged rather than admitted for nothing.
+	let one_guest = bare.max(cost.seed_seconds(1));
+	assert!(one_guest >= 100.0, "a step that boots a guest is seeded from the model's own measured boots, not from a host gate's per-key default");
+	let two_guests = bare.max(cost.seed_seconds(2));
+	assert!(two_guests > one_guest, "a step declaring two slots at once is seeded for both of them");
+
+	// And a host step that boots nothing is still not free: a plan of zeros sorts on nothing.
+	assert!(bare.max(cost.seed_seconds(0)) >= 1.0, "an unmeasured host step is priced at a second rather than at nothing");
+
+	// The seed is a FLOOR, not a replacement: a step whose own estimate is larger keeps it.
+	let guest_keys = alloc_keys();
+	let measured_shape = cost.estimate(&history, &guest_keys);
+	assert!(measured_shape.max(cost.seed_seconds(0)) > 1.0, "a step the model can price from its own keys keeps that price");
+}
+
 fn alloc_keys() -> Vec<crate::plan::PlanItemKey> {
 	vec![crate::plan::PlanItemKey { check: String::from("kernel.mem.frame.frame_alloc_distinct"), architecture: String::from("x86_64"), environment: crate::catalog::Environment::TestGuest, configuration: String::from("test") }]
 }

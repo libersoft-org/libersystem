@@ -1135,3 +1135,81 @@ Current implementation rating: 7/10
 1. **A release can revoke a newly derived object before its capability snapshot is minted, after which the syscall resurrects it as a valid handle.** `sys_dma_buffer_create` successfully registers the new buffer under the live claim and only afterwards calls `install_object` (`src/kernel/syscall/mod.rs:644-660`). A forced release in that gap removes the row, increments the object's revocation generation and marks the buffer orphaned (`src/kernel/device.rs:964-1004,1039-1043`), and may finish the claim `Free`. `install_object` then reaches `HandleTable::try_insert_object`, whose `Capability::new` snapshots the object's generation *at that later moment* (`src/kernel/syscall/mod.rs:378-385`; `src/kernel/object/handle/mod.rs:76-80,551-554`). The resulting capability therefore carries the post-revocation generation, passes the equality check used by every lookup (`src/kernel/object/handle/mod.rs:107-110,564-585`), and can still map/read/write the buffer and ask for its stored device address after the claim ended. The same publication ordering exists for MSI acquisition: registration and atomic hardware publication precede the final `Capability::new`/handle install (`src/kernel/syscall/mod.rs:1610-1667`), although the interrupt's separate revoked flag limits that instance's effects. The late-registration barrier does not cover this interleaving because registration already succeeded, and the current hostile-holder tests retain raw `Arc`s but never mint a capability after their release. This leaves M3's central requirement that every claim-derived capability die with the claim unresolved.
 
 Verification: the ABI suite passed all 28 tests and the portable DMA suite passed all 59 tests. These suites do not exercise the registration-to-capability-publication interleaving above.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-09-02T18:20:00Z):
+
+FINDING 1 - a release can revoke a newly derived object before its capability snapshot is minted:
+ACCEPTED, and it is the sharpest finding this milestone has had. Verified from the code rather than
+from the description: `ObjectHeader::generation` starts at 1 and `revoke()` increments it;
+`Capability::new` reads `object.header().generation()` AT THE MOMENT IT RUNS and stores it;
+`Capability::is_valid` compares the object's current generation against that stored one. So the
+interleaving is exactly as described - `register_derived` succeeds against a live claim, a release
+then sweeps the row and calls `header().revoke()`, and the `Capability::new` that follows snapshots
+the POST-revocation number and matches it at every lookup for ever. The buffer's frames are held by
+`mark_orphaned`, which bounds the damage and does not touch the property: M3 says every
+claim-derived capability dies with its claim, and this one did not.
+
+The auditor named `sys_dma_buffer_create` and `sys_device_msix_acquire`. The same publication order
+is in `sys_device_claim`'s MMIO mint, which was not named and has the same window, so all three are
+fixed rather than the two that were pointed at.
+
+WHAT CHANGED. The capability is minted BEFORE the registration that makes the object reachable by
+`revoke_derived`, and installed afterwards:
+
+- `src/kernel/syscall/mod.rs`, `sys_dma_buffer_create`: `Capability::new(object.clone(), ALL)` before
+  `register_derived`, installed through a new `install_capability` at the end.
+- `src/kernel/syscall/mod.rs`, `sys_device_claim`: `Capability::new(memory.clone(), READ|WRITE|MAP|
+  TRANSFER)` before `register_derived`, `insert_reserved` afterwards. The `register_derived` call now
+  consumes `memory` rather than cloning it, because the capability already holds its reference.
+- `src/kernel/syscall/mod.rs`, `sys_device_msix_acquire`: the same, before `register_derived`. The
+  interrupt's separate revoked flag limits what a resurrected handle there could do, and "limited" is
+  not the property M3 asks for; one rule across the three mints is worth more than two that happen to
+  differ in blast radius.
+- `install_capability` is a sibling of `install_object` for exactly these handlers, with the reason
+  written where a reader will find it.
+
+WHY MINTING FIRST IS SUFFICIENT AND NOT MERELY NARROWER. The snapshot is taken while the object is
+brand new and unreachable by any sweep - nothing but this syscall holds a reference until the row
+lands - so it is necessarily older than any revocation that row can attract. A release landing
+anywhere after that line leaves the capability BORN STALE, and every lookup already refuses a stale
+capability. There is no remaining window to narrow.
+
+TEST. `kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim` reproduces the
+interleaving exactly rather than racing for it: mint, register, release, install. It asserts the
+installed handle answers `HandleError::Revoked` - and, deliberately, that a capability minted from
+the same object AFTER the release resolves CLEAN. That second assertion is what makes the test
+sensitive to the ordering rather than to the release: without it, a regression that moved the mint
+back would leave the first assertion the only thing under test and it would have nothing to catch.
+
+VERIFICATION: reported at the end of this response set.
+
+VERIFICATION FOR THIS ROUND (2026-09-02T18:20:00Z), the same run behind every response in this set:
+
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot`: 239 passed, 0 failed. It carries this round's two new kernel tests
+  (`kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim`,
+  `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`), the boot test
+  that requires EVERY manifest service online, and the DisplayService and console harnesses that were
+  rewired onto the provider catalogue.
+- `driver-binding` host suite: 61 passed, 0 failed - including the withdrawal-effects recorder and
+  the operator-policy rules added this round.
+- `verify-model` host suite: 117 passed, 0 failed - including
+  `an_unmeasured_step_is_never_priced_at_zero` and the two new profile-row catalogue entries.
+- `verify-scheduler` gate: 21 assertions, all holding. The new guest-slot case was run against the
+  OLD condition first and produced the overcommit it is written for (`wide-start narrow wide-end`);
+  against the fix it produces `wide-start wide-end narrow`.
+- `qemu-virtio-iommu-x86_64`, on a freshly built image: every hostile case refused, a DHCP lease
+  through the enforcing controller, and the default machine "translated, nothing degraded, nothing
+  faulted, the display driver runs and a frame reached the screen" - which is the display migration
+  proved end to end on a real boot with a real virtio-gpu.
+- Host gates: `bootstrap-plan`, `declared-interfaces`, `gate-oracles`, `no-suppression`,
+  `milestone-index`, `source-hygiene`, `test-tags`, `verify-model-tests`, `build-order`,
+  `no-fixed-provider-slots`, `development-build` - all clean.
+- `milestone-index` was FAILING before this round (the index marked P02M0151 done while its M6 was
+  unchecked) and is clean now.
+
+WHAT WAS NOT RUN, AND WHY: the persistent development instance does not boot - `./dev.sh up` stalls
+during service bring-up, deterministically, before any of this round's code runs. It is measured and
+written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
+unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
+except the two new UEFI profile rows, which are gate rows rather than suite runs.

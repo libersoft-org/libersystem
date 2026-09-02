@@ -65,17 +65,64 @@ fn launch_volume_program(storage: &mut StorageHarness, process_client: &alloc::s
 }
 
 fn start_config_service(storage: &mut StorageHarness, process_client: &alloc::sync::Arc<object::channel::Channel>, correlation: u32) -> (alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>) {
+	let (client, _owner, process) = start_config_service_with_owner(storage, process_client, correlation);
+	(client, process)
+}
+
+// THE SAME, AND THE OWNER'S CONNECTION WITH IT.
+//
+// Authority over the reserved `device.policy.` namespace comes from WHICH CONNECTION a request
+// arrives on: the supervisor mints one serve root of its own and hands the client end to
+// DeviceManager, and `POLICYOWNER` is how the server learns which channel that is. A harness that
+// only ever holds an ordinary connection cannot ask the question the namespace exists to answer -
+// whether an ordinary `CAP_CONFIG` holder can write a device's stored policy - so this one holds
+// both ends of the distinction.
+fn start_config_service_with_owner(storage: &mut StorageHarness, process_client: &alloc::sync::Arc<object::channel::Channel>, correlation: u32) -> (alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::process::Process>) {
 	use object::channel::Channel;
 	use object::rights::Rights;
 
 	let (boot, process) = launch_volume_program(storage, process_client, "config_service", correlation);
 	let (server, client) = Channel::create();
+	let (owner_server, owner_client) = Channel::create();
 	let scope = storage.open_directory(b"vol://system/libexec/config_service");
 	send_cap(&boot, b"STORAGE", scope, Rights::ALL).expect("ConfigService directory scope bootstrap");
+	// BEFORE `SERVE`, because the service's bootstrap loop ends on `SERVE`.
+	send_cap(&boot, b"POLICYOWNER", owner_server, Rights::ALL).expect("ConfigService policy-owner bootstrap");
 	send_cap(&boot, b"SERVE", server, Rights::ALL).expect("ConfigService serve bootstrap");
 	let online = wait_message(storage, &boot, "ConfigService did not report online");
 	assert_eq!(&online.bytes[..], b"ConfigService: online", "ConfigService starts from libexec on the fresh volume");
-	(client, process)
+	(client, owner_client, process)
+}
+
+// A `config` request on the wire, built the way the service's generated dispatch reads it: opcode,
+// correlation, then the fields. Used by the reserved-namespace assertions below.
+fn config_set(correlation: u32, key: &[u8], value: &[u8]) -> alloc::vec::Vec<u8> {
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&3u16.to_le_bytes());
+	request.extend_from_slice(&correlation.to_le_bytes());
+	request.extend_from_slice(&(key.len() as u16).to_le_bytes());
+	request.extend_from_slice(key);
+	request.extend_from_slice(&(value.len() as u16).to_le_bytes());
+	request.extend_from_slice(value);
+	request
+}
+
+fn config_get(correlation: u32, key: &[u8]) -> alloc::vec::Vec<u8> {
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&1u16.to_le_bytes());
+	request.extend_from_slice(&correlation.to_le_bytes());
+	request.extend_from_slice(&(key.len() as u16).to_le_bytes());
+	request.extend_from_slice(key);
+	request
+}
+
+fn config_remove(correlation: u32, key: &[u8]) -> alloc::vec::Vec<u8> {
+	let mut request = alloc::vec::Vec::new();
+	request.extend_from_slice(&4u16.to_le_bytes());
+	request.extend_from_slice(&correlation.to_le_bytes());
+	request.extend_from_slice(&(key.len() as u16).to_le_bytes());
+	request.extend_from_slice(key);
+	request
 }
 
 fn start_log_service(storage: &mut StorageHarness, package: &pkg::Package<'static>) -> (alloc::sync::Arc<object::channel::Channel>, alloc::sync::Arc<object::channel::Channel>) {
@@ -206,6 +253,86 @@ fn existing_system_volume_preserves_owned_state_across_a_restart() {
 	let mut storage = storage.restart(storage_elf);
 	assert_eq!(storage.open(config_uri.as_bytes(), 0xd202), Some(marker.to_vec()), "an existing LiberFS mounts as-is rather than being reformatted");
 	assert_eq!(storage.open(hello_uri.as_bytes(), 0xd203), Some(expected_hello), "the volume's own files remain available after the restart");
+}
+
+tagged_test!(the_reserved_device_policy_namespace_answers_only_its_owner, [Config, Process, ProcessService, Service, Storage, VolumeLayout], id = "kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner", covers = ["services", "storage", "bin.config_service"]);
+// AN ORDINARY `CAP_CONFIG` HOLDER CANNOT WRITE A DEVICE'S STORED POLICY, ASKED OF THE LIVE SERVICE.
+//
+// The operator's `disable`, `enable` and `select` are stored in `device.policy.<bdf>`, and the
+// supervisor grants `CAP_CONFIG` to several components - so the whole of that policy's integrity is
+// one check inside ConfigService: authority over the reserved prefix comes from WHICH CONNECTION the
+// request arrived on, and only the seeded `POLICYOWNER` pair carries it. Nothing exercised it. The
+// prefix rule was written twice in this file's history and was WRONG both times - `set` checked
+// nothing at all while `remove` checked only the prefix and not the caller - and each was found by
+// reading rather than by a failing test.
+//
+// So this asks the running service, over its own wire, on both connections: the same well-formed
+// write, refused on one and accepted on the other, with the stored record read back to say which
+// answer was the true one.
+fn the_reserved_device_policy_namespace_answers_only_its_owner() {
+	use object::channel::Message;
+	const SYSTEM_CAPACITY: u64 = 64 * 1024 * 1024;
+	let (volume, package) = scenario_packages().expect("scenario packages");
+	let storage_elf = package.lookup(b"storage_service.lsexe").expect("storage service");
+	let mut storage = StorageHarness::start_system(storage_elf, b"BLOCK", volume, SYSTEM_CAPACITY);
+	let process_client = start_process_service(&mut storage, &package);
+	let (ordinary, owner, config_process) = start_config_service_with_owner(&mut storage, &process_client, 0xd350);
+
+	// A WELL-FORMED POLICY RECORD, in the shape DeviceManager actually stores: `disabled` under the
+	// device's bus address. Nothing about it is malformed - the refusal has to come from the
+	// connection it arrives on, not from the request.
+	let key = b"device.policy.0000:00:04.0";
+	ordinary.send(Message::new(config_set(1, key, b"disabled"), alloc::vec::Vec::new())).expect("ordinary set request");
+	let denied = wait_message(&mut storage, &ordinary, "ConfigService did not answer the ordinary set");
+	assert_eq!(le_u32(&denied.bytes, 0), 1);
+	assert_eq!(denied.bytes.get(4), Some(&0), "an ordinary CAP_CONFIG connection may not write the reserved device-policy namespace");
+	assert_eq!(denied.bytes.get(5), Some(&0), "and the refusal is Denied - a caller that cannot tell it from NotFound cannot report it");
+
+	// AND NOTHING WAS WRITTEN. A refusal that reported `Denied` and stored the record anyway would
+	// pass every assertion above.
+	ordinary.send(Message::new(config_get(2, key), alloc::vec::Vec::new())).expect("read-back request");
+	let absent = wait_message(&mut storage, &ordinary, "ConfigService did not answer the read-back");
+	assert_eq!(le_u32(&absent.bytes, 0), 2);
+	assert_eq!(absent.bytes.get(4), Some(&0), "the refused write left no record behind");
+
+	// THE OWNER'S CONNECTION WRITES THE SAME KEY. Same bytes, different channel, opposite answer -
+	// which is what makes the refusal above a statement about authority rather than about the key.
+	owner.send(Message::new(config_set(3, key, b"disabled"), alloc::vec::Vec::new())).expect("owner set request");
+	let stored = wait_message(&mut storage, &owner, "ConfigService did not answer the owner set");
+	assert_eq!(le_u32(&stored.bytes, 0), 3);
+	assert_eq!(stored.bytes.get(4), Some(&1), "the policy owner's connection writes the reserved namespace");
+
+	// AND AN ORDINARY READER MAY STILL READ IT. The namespace is reserved for WRITING: a component
+	// that can see a device is disabled is not a component that can disable one.
+	ordinary.send(Message::new(config_get(4, key), alloc::vec::Vec::new())).expect("ordinary read of a stored policy");
+	let readable = wait_message(&mut storage, &ordinary, "ConfigService did not answer the ordinary read");
+	assert_eq!(le_u32(&readable.bytes, 0), 4);
+	assert_eq!(readable.bytes.get(4), Some(&1), "the reserved namespace is readable by an ordinary connection");
+	let value_len = le_u16(&readable.bytes, 5) as usize;
+	assert_eq!(&readable.bytes[7..7 + value_len], b"disabled", "and it holds exactly what the owner stored");
+
+	// AN ORDINARY `enable` - which is a REMOVAL - IS REFUSED TOO, and the record survives it. This is
+	// the half that was written first and checked only the prefix: any `CAP_CONFIG` holder could
+	// erase a disable DeviceManager had stored, which is the same authority as setting one.
+	ordinary.send(Message::new(config_remove(5, key), alloc::vec::Vec::new())).expect("ordinary remove request");
+	let refused = wait_message(&mut storage, &ordinary, "ConfigService did not answer the ordinary remove");
+	assert_eq!(le_u32(&refused.bytes, 0), 5);
+	assert_eq!(refused.bytes.get(4), Some(&0), "an ordinary connection may not erase a stored device policy");
+	ordinary.send(Message::new(config_get(6, key), alloc::vec::Vec::new())).expect("post-remove read-back");
+	let survived = wait_message(&mut storage, &ordinary, "ConfigService did not answer the post-remove read");
+	assert_eq!(survived.bytes.get(4), Some(&1), "the refused removal left the stored policy in place");
+
+	// AND THE OWNER'S REMOVAL IS WHAT AN `enable` ACTUALLY IS: the record goes, so a device that was
+	// never disabled and one that was enabled again are the same device.
+	owner.send(Message::new(config_remove(7, key), alloc::vec::Vec::new())).expect("owner remove request");
+	let removed = wait_message(&mut storage, &owner, "ConfigService did not answer the owner remove");
+	assert_eq!(removed.bytes.get(4), Some(&1), "the policy owner's connection removes the record");
+	ordinary.send(Message::new(config_get(8, key), alloc::vec::Vec::new())).expect("final read-back");
+	let gone = wait_message(&mut storage, &ordinary, "ConfigService did not answer the final read");
+	assert_eq!(gone.bytes.get(4), Some(&0), "and the device is back to having no stored policy at all");
+
+	ordinary.send(Message::new(alloc::vec::Vec::new(), alloc::vec::Vec::new())).expect("ConfigService quit sentinel");
+	wait_terminated(&mut storage, &config_process, "ConfigService did not exit");
 }
 
 tagged_test!(fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state, [Component, Config, Drivers, Filesystem, Process, ProcessService, Service, Storage, VolumeLayout, VolumeScope], id = "kernel.volume_layout.fresh_seeded_system_volume_runs_each_layout_class_and_reopens_owned_state", covers = ["liberfs", "services", "storage"]);

@@ -1146,8 +1146,20 @@ fn run() -> Result<ExitCode, String> {
 				// arithmetic handed back as a prediction. A step has one duration; once it has been
 				// run under this model, that duration is the answer and the estimate is only the
 				// seed for a step nobody has timed yet.
+				//
+				// AND AN UNMEASURED STEP IS NEVER FREE (corrected 2026-09-02). The estimate is a
+				// floor away from zero for a gate: every gate key is `host`/`host`, whose fixed term
+				// is nothing and whose one key at the default per-key cost rounded to `STEPCOST 0` -
+				// so the profile rows and the concurrency gate, which boot QEMU, were priced as the
+				// cheapest work in the plan and admitted by any budget at all. `seed_seconds` is the
+				// conservative floor M4 asks for, and the round is UP: a sub-second estimate is a
+				// short step, not a free one.
 				let measured = history.step_seconds(&step.id, &model_hash);
-				println!("STEPCOST\t{index}\t{:.0}", measured.unwrap_or_else(|| cost.estimate(&history, &step.keys)));
+				let seconds: f64 = match measured {
+					Some(seconds) => seconds,
+					None => cost.estimate(&history, &step.keys).max(cost.seed_seconds(step.guests)),
+				};
+				println!("STEPCOST\t{index}\t{}", seconds.ceil() as u64);
 				// HOW MANY GUEST SLOTS THIS STEP NEEDS AT ONCE - see `Step::guests`. EMITTED FOR
 				// EVERY STEP, because the runner now classifies guest work by this number rather
 				// than by matching the command text, and a number the plan does not carry is a

@@ -12,11 +12,12 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use ipc_client::ChannelTransport;
 use pix::{Image, Rect, Target};
 use proto::codec::{Buffer, Handles};
 use proto::system::display::{self, Service};
 use proto::system::display_admin::{self, Service as AdminService};
-use proto::system::{DisplayEvent, Error, PixelFormat, PresentationStats, SurfaceInfo};
+use proto::system::{DisplayEvent, Error, PixelFormat, PresentationStats, ProviderInfo, ProviderKind, SurfaceInfo, provider_catalogue};
 use rt::*;
 
 const MAX_DIM: u32 = 8192;
@@ -372,6 +373,62 @@ impl DisplayState {
 		}
 	}
 
+	// THE DRIVER CHANNEL THIS SCANOUT CAME IN ON IS GIVEN BACK.
+	//
+	// The peer-close arm cleared the channel NUMBER and left the handle open, which is a handle this
+	// process holds for the rest of its life against a peer that has gone. The framebuffer mapping
+	// is deliberately left alone: the console keeps drawing into memory it already mapped, which is
+	// what it did before this path existed, and `adopt_scanout` is what releases it - when there is
+	// something to replace it with.
+	fn release_scanout(&mut self) {
+		if self.scanout.gpu != 0 {
+			unsafe { close(self.scanout.gpu) };
+			self.scanout.gpu = 0;
+		}
+	}
+
+	// PRESENT ON A REPLACEMENT PROVIDER, or answer false and change nothing.
+	//
+	// The whole of the post-rebind restore, in one method: the same `FB` handshake `init_scanout` performs at
+	// bootstrap, run against a connection the catalogue minted after a rebind, with the old mapping
+	// released only once the new one is known good. Every surface is marked uninitialised because
+	// each is copied into the scanout on its next present and the scanout it was last drawn against
+	// is gone.
+	fn adopt_scanout(&mut self, gpu: u64, buf: &mut [u8]) -> bool {
+		unsafe {
+			send_blocking(gpu, b"FB", 0);
+			let Received::Message { len, handle } = recv_blocking(gpu, buf) else { return false };
+			let fb_len: usize = core::mem::size_of::<Framebuffer>();
+			if handle == 0 || len < fb_len + 8 {
+				if handle != 0 {
+					close(handle);
+				}
+				return false;
+			}
+			let fb: Framebuffer = (buf.as_ptr() as *const Framebuffer).read_unaligned();
+			let width: u32 = read_u32(buf, fb_len);
+			let height: u32 = read_u32(buf, fb_len + 4);
+			let addr: i64 = dma_buffer_map(handle);
+			if sys_is_err(addr as u64) || !valid_scanout(&fb, width, height) {
+				if !sys_is_err(addr as u64) {
+					dma_buffer_unmap(handle);
+				}
+				close(handle);
+				return false;
+			}
+			let old: u64 = self.scanout.handle;
+			self.scanout = Scanout { gpu, handle, addr: addr as u64, fb, width, height };
+			for surface in &mut self.surfaces {
+				surface.initialized = false;
+			}
+			if old != 0 {
+				dma_buffer_unmap(old);
+				close(old);
+			}
+			true
+		}
+	}
+
 	fn handle_gpu_message(&mut self, msg: &[u8], handle: u64) -> bool {
 		if msg.len() >= 5 && &msg[..5] == b"FBNEW" && handle != 0 {
 			let fb_len: usize = core::mem::size_of::<Framebuffer>();
@@ -489,10 +546,6 @@ impl AdminService for AdminCall<'_> {
 pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 128] = [0; 128];
 	unsafe {
-		let gpu: u64 = match recv_blocking(bootstrap, &mut buf) {
-			Received::Message { len, handle } if len >= 3 && &buf[..3] == b"GPU" => handle,
-			_ => fail_bootstrap(bootstrap, b"gpu", b"driver channel not delivered"),
-		};
 		let focus_control: u64 = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } if len >= 5 && &buf[..5] == b"FOCUS" => handle,
 			_ => fail_bootstrap(bootstrap, b"focus", b"input focus channel not delivered"),
@@ -511,12 +564,115 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// boot framebuffer, which is the same degradation as a machine with no framebuffer at
 		// all rather than a failure to start.
 		let display_ctl: u64 = recv_tagged(bootstrap, &mut buf, b"DISPLAYCTL").unwrap_or(0);
+		// THE GPU IS DISCOVERED, NOT HANDED OVER (2026-09-02).
+		//
+		// This service used to be given the display driver's channel under `GPU`, taken by
+		// DeviceManager into a slot of its own and routed down the boot chain - the per-kind
+		// injection the provider catalogue exists to replace, and the reason a rebound GPU could not
+		// restore a picture: a
+		// slot is filled once, so a GPU driver that crashed and rebound published a replacement
+		// provider that had nowhere to go and no way to reach the service already running.
+		//
+		// What arrives now is a connection to the provider CATALOGUE, and this service asks it for
+		// the display kind. The subscription answers with what is published NOW and continues as a
+		// stream, so the device this service starts on and the device it recovers onto arrive down
+		// the same path.
+		//
+		// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
+		let catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"CATALOGUE").unwrap_or(0);
+		let providers: u64 = subscribe_to_displays(catalogue);
+		// THE SNAPSHOT IS ALREADY IN THE CHANNEL, which is what makes a subscription usable at
+		// bootstrap rather than only afterwards: the catalogue registers a subscriber and sends it
+		// everything published, in one step, before it answers. So the provider this machine has is
+		// readable here, without blocking, and a machine that has none falls through to the boot
+		// framebuffer exactly as one with no display driver always did.
+		let gpu: u64 = take_published_display(catalogue, providers, &mut buf);
 		let scanout: Scanout = init_scanout(gpu, display_ctl, &mut buf);
 		if !scanout.available() {
 			fail_bootstrap(bootstrap, b"display", b"no framebuffer available");
 		}
 		send_blocking(bootstrap, b"DisplayService: online", 0);
-		serve_display(service, admin, DisplayState::new(scanout, focus_control, kill_control));
+		serve_display(service, admin, catalogue, providers, DisplayState::new(scanout, focus_control, kill_control));
+	}
+}
+
+// SUBSCRIBE TO THE DISPLAY KIND, or answer zero.
+//
+// Zero is not a failure. A boot that granted no catalogue connection, or a catalogue that refuses
+// the subscription, is a system whose display cannot be replaced - which this service reports and
+// goes on serving whatever scanout it has, the same way it serves a machine with no GPU at all.
+unsafe fn subscribe_to_displays(catalogue: u64) -> u64 {
+	unsafe {
+		if catalogue == 0 {
+			print(b"DisplayService: no provider catalogue - this instance cannot follow a display that rebinds\n");
+			return 0;
+		}
+		let subscription: u64 = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Display).unwrap_or(0);
+		if subscription == 0 {
+			print(b"DisplayService: the catalogue refused a display subscription\n");
+		}
+		subscription
+	}
+}
+
+// OPEN A CONNECTION TO ONE PUBLISHED PROVIDER, or answer zero.
+//
+// The catalogue mints the pair and hands the driver the server end; what comes back is the client
+// end this service talks the driver's byte protocol over - the same channel `GPU` used to carry,
+// reached by asking instead of by being given.
+unsafe fn open_provider(catalogue: u64, info: &ProviderInfo) -> u64 {
+	unsafe {
+		if catalogue == 0 {
+			return 0;
+		}
+		match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(info) {
+			Some(Ok(handle)) => handle,
+			// A REFUSAL IS SAID. A kind that admits one consumer refuses the second ask, and a
+			// service that cannot tell that from "no device" cannot report either.
+			Some(Err(_)) => {
+				print(b"DisplayService: the catalogue refused a connection to the display provider it published\n");
+				0
+			}
+			None => {
+				print(b"DisplayService: the catalogue did not answer the connection it published\n");
+				0
+			}
+		}
+	}
+}
+
+// THE FIRST LIVE DISPLAY PROVIDER THE SUBSCRIPTION HAS ALREADY QUEUED, connected to.
+//
+// POLLED, NEVER BLOCKED. The snapshot is written into the subscription before `subscribe` answers,
+// so what is here is here; waiting for more would hang the boot of every machine whose display is
+// the loader's framebuffer and whose catalogue therefore has nothing to publish.
+//
+// It stops at the first provider it CONNECTS to rather than draining the channel: a frame this
+// function reads and drops is a publication the standing loop will never see, and a second display
+// is exactly the thing this milestone exists to stop dropping.
+unsafe fn take_published_display(catalogue: u64, providers: u64, buf: &mut [u8]) -> u64 {
+	unsafe {
+		if catalogue == 0 || providers == 0 {
+			return 0;
+		}
+		loop {
+			let PolledCaps::Message { len, handles } = try_recv_caps(providers, buf) else { return 0 };
+			for &handle in handles.as_slice() {
+				close(handle);
+			}
+			let mut frame_handles = wire::Handles::new();
+			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
+				print(b"DisplayService: a provider frame did not decode\n");
+				continue;
+			};
+			if !info.live {
+				continue;
+			}
+			let opened: u64 = open_provider(catalogue, &info);
+			if opened != 0 {
+				return opened;
+			}
+		}
 	}
 }
 
@@ -547,15 +703,18 @@ unsafe fn init_scanout(gpu: u64, display_ctl: u64, buf: &mut [u8]) -> Scanout {
 	}
 }
 
-unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
+unsafe fn serve_display(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut state: DisplayState) -> ! {
 	unsafe {
 		let mut clients: Vec<Client> = alloc::vec![Client { chan: root, task: 0 }];
 		let mut request: [u8; REQUEST_MAX] = [0; REQUEST_MAX];
 		let mut reply: [u8; REPLY_MAX] = [0; REPLY_MAX];
 		loop {
-			let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 3);
+			let mut waits: Vec<u64> = Vec::with_capacity(clients.len() + 4);
 			if state.scanout.gpu != 0 {
 				waits.push(state.scanout.gpu);
+			}
+			if providers != 0 {
+				waits.push(providers);
 			}
 			if state.kill_control != 0 {
 				waits.push(state.kill_control);
@@ -575,11 +734,62 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 							state.present_active_full();
 						}
 					}
-					Received::Closed => state.scanout.gpu = 0,
+					// THE DRIVER WENT AWAY, AND WHAT IT LEFT GOES WITH IT. This only cleared the
+					// channel number, so the dead handle stayed open in this process and the
+					// scanout kept pointing into a mapping of a buffer whose owner had gone. A
+					// replacement cannot be adopted on top of that, which is half of why M4's
+					// restore was unreachable.
+					Received::Closed => state.release_scanout(),
 				}
 				continue;
 			}
-			let kill_index: usize = gpu_first as usize;
+			// A PUBLICATION OR A WITHDRAWAL, AND THE ONLY ONE THAT MATTERS IS A DISPLAY ARRIVING
+			// WHILE THIS SERVICE HAS NONE.
+			//
+			// That is M4: a GPU driver crashes, DeviceManager rebinds it, the new binding publishes
+			// its provider, and the display path comes back without restarting the service or
+			// anything above it. A withdrawal needs nothing here - the driver channel closing is the
+			// authoritative signal and the arm above already handles it.
+			let providers_index: usize = gpu_first as usize;
+			let providers_present: bool = providers != 0;
+			if providers_present && ready as usize == providers_index {
+				match recv_blocking(providers, &mut request) {
+					Received::Message { len, handle } => {
+						if handle != 0 {
+							close(handle);
+						}
+						let mut frame_handles = wire::Handles::new();
+						match provider_catalogue::subscribe_read(&request[..len], &mut frame_handles) {
+							Some(info) if info.live && state.scanout.gpu == 0 => {
+								let opened: u64 = open_provider(catalogue, &info);
+								if opened == 0 {
+									print(b"DisplayService: a display provider is published and this service could not connect to it\n");
+								} else if state.adopt_scanout(opened, &mut request) {
+									print(b"DisplayService: a display provider was published and this service presents on it\n");
+									state.notify_resize();
+									state.present_active_full();
+								} else {
+									// A CONNECTION THAT CANNOT ANSWER THE FRAMEBUFFER HANDSHAKE IS
+									// GIVEN BACK, not held: a provider this service keeps and does
+									// not use is a channel the driver waits on forever.
+									close(opened);
+									print(b"DisplayService: a published display provider did not hand over a usable framebuffer\n");
+								}
+							}
+							Some(_) => {}
+							None => print(b"DisplayService: a provider frame did not decode\n"),
+						}
+					}
+					// THE SUBSCRIPTION ENDED. DeviceManager is gone or dropped it; this service keeps
+					// whatever scanout it has and stops expecting new ones.
+					Received::Closed => {
+						close(providers);
+						providers = 0;
+					}
+				}
+				continue;
+			}
+			let kill_index: usize = gpu_first as usize + providers_present as usize;
 			let kill_present: bool = state.kill_control != 0;
 			if kill_present && ready as usize == kill_index {
 				match recv_blocking(state.kill_control, &mut request) {
@@ -608,7 +818,7 @@ unsafe fn serve_display(root: u64, admin: u64, mut state: DisplayState) -> ! {
 				}
 				continue;
 			}
-			let admin_index: usize = gpu_first as usize + kill_present as usize;
+			let admin_index: usize = gpu_first as usize + providers_present as usize + kill_present as usize;
 			if ready as usize == admin_index {
 				match recv_caps_blocking(admin, &mut request) {
 					ReceivedCaps::Message { len, handles: caps } => {

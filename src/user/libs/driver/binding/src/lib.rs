@@ -605,6 +605,108 @@ pub fn withdraw_slots_into<T>(slots: &mut [Option<T>], binding: BindingId, id_of
 	Some(gone)
 }
 
+// WHAT AN OPERATOR'S `retry` MEANS ON A NODE IN THIS STATE, AND WHAT IT DOES TO THE CURSOR.
+//
+// Both halves lived in DeviceManager - `decide_policy` and `apply_policy` - where no host test can
+// reach them, and both are exactly the kind of arithmetic that has been wrong here twice: a retry
+// after exhaustion once handed back the WHOLE automatic budget because it subtracted from a counter
+// `Step::NextCandidate` had already reset to zero, and a retry once rewound to the registry order
+// rather than to the operator's stored choice. Each was found by reading. `select` and the one-shot
+// `retry` are required to be under test, and a decision that lives in a binary nobody can drive is
+// not.
+//
+// So the RULES are here and the effects on the node stay there: which states admit a retry, and
+// where the cursor and the budget end up when one is granted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RetryVerdict {
+	// An attempt has ended without a binding: `Failed`, `Backoff`, or `Unbound` with the candidates
+	// exhausted. Exactly one further attempt is opened.
+	Grant,
+	// OUT OF REACH FOR THIS BOOT. A quarantined node's resources are charged and out of circulation
+	// precisely because nothing confirmed the device was quiet, and an operator saying so does not
+	// make it so.
+	Quarantined,
+	// There is a binding in flight, running, stopping, waiting or deliberately off. "Not now, and
+	// here is why" - the operator's next move is to look at the state, not to try another verb.
+	Busy,
+	// A boot-critical binding takes no stored policy at all: it would live on a volume that is not
+	// mounted when those bindings are made.
+	Refused,
+}
+
+pub fn decide_retry(state: BindingState, boot_critical: bool) -> RetryVerdict {
+	if boot_critical {
+		return RetryVerdict::Refused;
+	}
+	match state {
+		BindingState::Quarantined => RetryVerdict::Quarantined,
+		BindingState::Failed | BindingState::Backoff | BindingState::Unbound => RetryVerdict::Grant,
+		_ => RetryVerdict::Busy,
+	}
+}
+
+// Where a granted retry leaves the attempt counter and the candidate cursor.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Retry {
+	// ONE BELOW THE BOUND, SET RATHER THAN DECREMENTED. `may_try_again` allows another attempt while
+	// `attempt + 1 < max`, so leaving exactly one means starting from one below the bound whatever
+	// the counter happened to hold - and on the case this verb exists for it holds ZERO, because
+	// advancing past the final candidate resets it.
+	pub attempt: u32,
+	// REWOUND ONLY WHEN THERE IS NOTHING LEFT TO TRY, and then to the operator's own choice where
+	// there is one. A cursor past the end is how a node records "every candidate has been tried",
+	// and a retry that left it there would ask the loop to start nothing at all.
+	pub candidate: usize,
+}
+
+pub fn one_more_attempt(candidate: usize, candidates: usize, preferred: Option<usize>, max_attempts: u32) -> Retry {
+	Retry { attempt: max_attempts.saturating_sub(1), candidate: if candidate >= candidates { preferred.unwrap_or(0) } else { candidate } }
+}
+
+// WHICH CANDIDATE AN OPERATOR'S `select` NAMES, or none.
+//
+// POLICY NARROWS AND NEVER WIDENS: an artifact the registry did not declare for THIS device is
+// refused rather than obeyed, which is the whole point of bounding a preference by the candidate
+// list. The caller supplies the names in registry order; the answer is the cursor position.
+pub fn selected_candidate(names: &[&[u8]], artifact: &[u8]) -> Option<usize> {
+	names.iter().position(|name| *name == artifact)
+}
+
+// THE TWO EFFECTS AN EMPTIED SLOT OWES, AS A TRAIT, so the ORDER and the COMPLETENESS of them are
+// something a test drives rather than something a reader checks.
+//
+// `withdraw_slots_into` answers WHICH publications a binding's end takes and hands them back; what
+// each one then owes is a channel closed and a withdrawal announced. Both of those lived in a loop
+// in DeviceManager, where no host test can reach them, and the count comparison beside it catches
+// only a loop that stops VISITING - delete the `close` or the `announce` from the body and every
+// test in this crate still passes while a consumer is left holding a channel whose server is gone,
+// or a subscriber keeps metadata for a publication that no longer exists. That is M7's
+// no-stale-provider and no-handle-leak rule, unproved.
+//
+// So the loop is here and its effects are named. The one order there is: the channel is closed
+// BEFORE the announcement, because a consumer told the provider is gone must not then find the
+// channel still open and use it. `Closes` is the same shape for the rollback, for the same reason.
+pub trait Withdrawn<T> {
+	// The channel this publication handed out, given back.
+	fn close_channel(&mut self, provider: &T);
+	// And everyone watching that kind is told.
+	fn announce_gone(&mut self, provider: &T);
+}
+
+// Give both effects to every slot the withdrawal emptied, and answer how many got them.
+//
+// The caller compares that against what `withdraw_slots_into` said it emptied: the two numbers
+// disagreeing is a subscriber left holding a provider that is gone.
+pub fn apply_withdrawal<T, W: Withdrawn<T>>(taken: &[Option<T>], effects: &mut W) -> usize {
+	let mut applied = 0;
+	for provider in taken.iter().flatten() {
+		effects.close_channel(provider);
+		effects.announce_gone(provider);
+		applied += 1;
+	}
+	applied
+}
+
 // WHAT A BINDING'S END TAKES WITH IT, AND WHAT A SUBSCRIBER MAY STILL REACH.
 //
 // The catalogue that answers subscribers lives in DeviceManager, holds channel handles and cannot be

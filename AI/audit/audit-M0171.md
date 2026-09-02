@@ -720,3 +720,9 @@ advance happens - and the second is still the one that distinguishes the case wh
 and M4 disagree.
 
 Nothing in this round's work on the sibling milestones touches this file. No plan change was made.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-09-02T13:03:47Z):
+
+Rating: 9/10
+
+No material unresolved issue was found in the updated plan.

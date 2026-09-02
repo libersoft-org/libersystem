@@ -848,3 +848,9 @@ So the loss is stated where a developer will meet it, the definition of done's "
 RISC-V boots keep working" is qualified with that one named exception rather than left as a claim the
 table contradicts, and P02M0173's side records that its flip is also what restores the network - with
 the post-transition admission fixture it already owns serving as the proof that it came back.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-09-02T13:02:07Z):
+
+Rating: 9/10
+
+No unresolved material findings.

@@ -1373,3 +1373,76 @@ Current implementation rating: 7/10
    response correctly accepts this as unmet, so M7's required no-stale-provider/no-handle-leak
    production race and watched-failure gate remain incomplete
    (`docs/todo/P02M0165.md:280-307,309-331`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-09-02T18:20:00Z):
+
+FINDING 1 - the named publish/crash/subscribe race stops before the production close-and-announce
+effects: ACCEPTED AND FIXED. The finding's sharpest sentence is the one that decides it: "Removing the
+production withdrawal call, close, or announcement would therefore leave all cited race tests green."
+I checked that rather than taking it: `withdraw_slots_into` is driven by the host test and answers
+which slots were emptied; the `announced != gone` comparison beside the production loop catches a loop
+that stops VISITING a slot and nothing else. Delete the `close` from that loop's body, or the
+`announce`, and the counts still agree - so a consumer would hold a channel whose server is gone, or a
+subscriber would keep metadata for a publication that no longer exists, and every test in this tree
+would pass. Those two states are M7's "no stale provider, no leaked handle", which makes this an
+unproved requirement rather than a stylistic gap.
+
+WHAT CHANGED. The loop and its ORDER move into the crate where they can be driven, following the
+pattern this milestone already uses twice - `Closes` for the rollback, `withdraw_slots_into` for the
+transfer:
+
+- `src/user/libs/driver/binding/src/lib.rs`: a `Withdrawn<T>` trait with `close_channel` and
+  `announce_gone`, and `apply_withdrawal(taken, effects)` which gives BOTH effects to every emptied
+  slot and answers how many got them. The order is fixed and stated: the channel is closed BEFORE the
+  announcement, because a consumer told its provider is gone must not then find the channel still
+  open and use it.
+- `src/user/services/core/src/device_manager.rs`: `Catalogue` implements `Withdrawn<Provider>` - a
+  `close` syscall and an `announce` send, neither of which is a decision - and `withdraw_binding` calls
+  `apply_withdrawal` instead of walking the array itself. The count comparison stays, now checking the
+  library's answer.
+- `src/user/libs/driver/binding/src/tests.rs`: the named race test drives `apply_withdrawal` against a
+  recorder. It asserts each emptied publication is closed exactly once and announced exactly once,
+  that the close precedes its own announcement (recorded as it happens, not compared afterwards), that
+  the other binding's live publication is neither closed nor announced, and that an EMPTY withdrawal
+  says nothing to anybody - a disappearance announced for a provider nobody published is its own
+  defect.
+
+WHAT THIS DOES NOT CLAIM. The test drives the production loop, not DeviceManager. The kernel test the
+finding names is still a local crash simulation and is unchanged; what has moved is the part where the
+defect would actually be, which is the same argument M3's note in this file already makes about a
+catalogue that cannot be built on a host.
+
+`docs/todo/P02M0165.md`: M7 records what is now driven and what the race row proved before.
+
+VERIFICATION: reported at the end of this response set.
+
+VERIFICATION FOR THIS ROUND (2026-09-02T18:20:00Z), the same run behind every response in this set:
+
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot`: 239 passed, 0 failed. It carries this round's two new kernel tests
+  (`kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim`,
+  `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`), the boot test
+  that requires EVERY manifest service online, and the DisplayService and console harnesses that were
+  rewired onto the provider catalogue.
+- `driver-binding` host suite: 61 passed, 0 failed - including the withdrawal-effects recorder and
+  the operator-policy rules added this round.
+- `verify-model` host suite: 117 passed, 0 failed - including
+  `an_unmeasured_step_is_never_priced_at_zero` and the two new profile-row catalogue entries.
+- `verify-scheduler` gate: 21 assertions, all holding. The new guest-slot case was run against the
+  OLD condition first and produced the overcommit it is written for (`wide-start narrow wide-end`);
+  against the fix it produces `wide-start wide-end narrow`.
+- `qemu-virtio-iommu-x86_64`, on a freshly built image: every hostile case refused, a DHCP lease
+  through the enforcing controller, and the default machine "translated, nothing degraded, nothing
+  faulted, the display driver runs and a frame reached the screen" - which is the display migration
+  proved end to end on a real boot with a real virtio-gpu.
+- Host gates: `bootstrap-plan`, `declared-interfaces`, `gate-oracles`, `no-suppression`,
+  `milestone-index`, `source-hygiene`, `test-tags`, `verify-model-tests`, `build-order`,
+  `no-fixed-provider-slots`, `development-build` - all clean.
+- `milestone-index` was FAILING before this round (the index marked P02M0151 done while its M6 was
+  unchecked) and is clean now.
+
+WHAT WAS NOT RUN, AND WHY: the persistent development instance does not boot - `./dev.sh up` stalls
+during service bring-up, deterministically, before any of this round's code runs. It is measured and
+written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
+unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
+except the two new UEFI profile rows, which are gate rows rather than suite runs.

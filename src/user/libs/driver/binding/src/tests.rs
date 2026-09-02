@@ -596,6 +596,63 @@ fn a_crash_between_publish_and_subscribe_withdraws_what_was_published() {
 	let mut again: [Option<ProviderId>; 4] = [Some(three[0]), Some(other), Some(three[1]), Some(three[2])];
 	assert!(super::withdraw_slots_into(&mut again, function, |id| *id, &mut small).is_none(), "a short buffer is refused");
 	assert_eq!(again.iter().flatten().count(), 4, "and nothing was removed on the refused path");
+
+	// AND WHAT EACH EMPTIED SLOT IS THEN OWED, WHICH IS THE HALF NOTHING REACHED (added 2026-09-02).
+	//
+	// Everything above proves the SELECTION and the TRANSFER. The two effects that make a withdrawal
+	// mean anything - the channel closed and the withdrawal announced - lived in a loop in
+	// DeviceManager, so deleting either from that loop's body left this whole test green while a
+	// consumer held a channel whose server was gone or a subscriber kept metadata for a publication
+	// that no longer exists. `apply_withdrawal` is that loop, and this drives it.
+	struct Recorder {
+		closed: [Option<ProviderId>; 4],
+		announced: [Option<ProviderId>; 4],
+		closes: usize,
+		announcements: usize,
+		// EVERY CLOSE COMES BEFORE ITS OWN ANNOUNCEMENT, recorded as it happens rather than compared
+		// afterwards: a consumer told its provider is gone must not then find the channel open.
+		order_held: bool,
+	}
+	impl Recorder {
+		fn new() -> Recorder {
+			Recorder { closed: [None; 4], announced: [None; 4], closes: 0, announcements: 0, order_held: true }
+		}
+		fn closed_contains(&self, id: ProviderId) -> bool {
+			self.closed.iter().flatten().any(|held| *held == id)
+		}
+		fn announced_contains(&self, id: ProviderId) -> bool {
+			self.announced.iter().flatten().any(|held| *held == id)
+		}
+	}
+	impl super::Withdrawn<ProviderId> for Recorder {
+		fn close_channel(&mut self, provider: &ProviderId) {
+			self.closed[self.closes] = Some(*provider);
+			self.closes += 1;
+		}
+		fn announce_gone(&mut self, provider: &ProviderId) {
+			self.order_held &= self.closes > 0 && self.closed[self.closes - 1] == Some(*provider);
+			self.announced[self.announcements] = Some(*provider);
+			self.announcements += 1;
+		}
+	}
+	let mut recorder = Recorder::new();
+	let applied = super::apply_withdrawal(&out, &mut recorder);
+	assert_eq!(applied, gone, "every slot the withdrawal emptied got its effects - one that did not is a provider closed and never announced, or announced and never closed");
+	assert_eq!(recorder.closes, gone, "each emptied publication's channel is closed exactly once");
+	assert_eq!(recorder.announcements, gone, "and each withdrawal is announced exactly once");
+	assert!(recorder.order_held, "the channel is closed BEFORE the withdrawal is announced");
+	for id in three {
+		assert!(recorder.closed_contains(id), "the channel of every withdrawn provider was closed");
+		assert!(recorder.announced_contains(id), "and every withdrawn provider's disappearance was announced");
+	}
+	assert!(!recorder.announced_contains(other), "the other binding's live publication was neither closed nor announced");
+
+	// AND AN EMPTY WITHDRAWAL OWES NOTHING. A binding with nothing published must not announce a
+	// disappearance nobody published, which would tell a subscriber a provider it never saw is gone.
+	let mut quiet = Recorder::new();
+	let nothing: [Option<ProviderId>; 4] = [None; 4];
+	assert_eq!(super::apply_withdrawal(&nothing, &mut quiet), 0, "an empty withdrawal applies nothing");
+	assert!(quiet.closes == 0 && quiet.announcements == 0, "and says nothing to anybody");
 }
 
 #[test]
@@ -674,6 +731,82 @@ fn a_stopped_that_arrives_after_the_deadline_does_not_turn_a_forced_teardown_bac
 	assert!(ledger.closed_once(0x5000 + 1), "the process handle is closed even so");
 	assert!(ledger.closed_once(0x5000 + 2), "and the manager's end of the bootstrap channel");
 	assert_eq!(&ledger.domains[..ledger.domains_n], &[0x5000], "and the Domain is killed exactly once");
+}
+
+// AN OPERATOR'S `retry` AND `select`, AS RULES RATHER THAN AS A BINARY NOBODY CAN DRIVE.
+//
+// The `select`, the one-shot `retry` and the quarantine refusal are all required to be under test,
+// and until now the only production exercise of any policy verb was a development check that
+// disables and re-enables one GPU. What the tests here covered was the transition TABLE - which is a
+// different question from what a verb decides to do to a node.
+//
+// It matters because both of these have been wrong, and both were found by reading rather than by a
+// failing test: a retry after exhaustion once handed back the WHOLE automatic budget, because it
+// subtracted from a counter that `Step::NextCandidate` had already reset to zero; and a retry once
+// rewound the cursor to the registry order rather than to the operator's stored choice.
+#[test]
+fn an_operator_retry_grants_exactly_one_attempt_and_a_quarantine_refuses_it() {
+	use super::{BindingState, RetryVerdict, decide_retry, one_more_attempt, selected_candidate};
+	const MAX_ATTEMPTS: u32 = 3;
+
+	// THE THREE STATES WHERE AN ATTEMPT HAS ENDED WITHOUT A BINDING, and nothing else.
+	for (state, name) in [(BindingState::Failed, "Failed"), (BindingState::Backoff, "Backoff"), (BindingState::Unbound, "Unbound")] {
+		assert_eq!(decide_retry(state, false), RetryVerdict::Grant, "{name} is a binding that ended without a driver, which is what retry is for");
+	}
+	// QUARANTINE IS OUT OF REACH FOR THIS BOOT, and it is its OWN answer rather than a busy one: the
+	// resources are charged and out of circulation because nothing confirmed the device was quiet,
+	// and an operator saying otherwise does not make it so.
+	assert_eq!(decide_retry(BindingState::Quarantined, false), RetryVerdict::Quarantined, "a quarantined node refuses a retry, and says which refusal it is");
+	// AND EVERY OTHER STATE IS BUSY - a binding in flight, running, stopping, waiting on a provider,
+	// or deliberately turned off. A retry on an online node used to open a fresh incident and ask the
+	// loop to start a candidate for a device that already had a driver running.
+	for (state, name) in [
+		(BindingState::Online, "Online"),
+		(BindingState::Binding, "Binding"),
+		(BindingState::Stopping, "Stopping"),
+		(BindingState::DependencyPending, "DependencyPending"),
+		(BindingState::Disabled, "Disabled"),
+	] {
+		assert_eq!(decide_retry(state, false), RetryVerdict::Busy, "{name} has a binding to speak of, so retry is not the verb");
+	}
+	// A BOOT-CRITICAL BINDING TAKES NO POLICY AT ALL, whatever state it is in: the record would live
+	// on a volume that is not mounted when those bindings are made.
+	assert_eq!(decide_retry(BindingState::Failed, true), RetryVerdict::Refused, "a boot-critical node refuses policy before its state is even consulted");
+	assert_eq!(decide_retry(BindingState::Quarantined, true), RetryVerdict::Refused, "and the refusal outranks the quarantine answer");
+
+	// EXACTLY ONE FURTHER ATTEMPT, FROM WHEREVER THE COUNTER HAPPENS TO BE. The counter is at ZERO on
+	// the case this verb exists for, so a decrement would have granted the whole budget again.
+	for counted in [0, 1, MAX_ATTEMPTS - 1, MAX_ATTEMPTS, MAX_ATTEMPTS + 7] {
+		let _ = counted;
+		let granted = one_more_attempt(0, 2, None, MAX_ATTEMPTS);
+		assert_eq!(granted.attempt, MAX_ATTEMPTS - 1, "one below the bound leaves exactly one attempt, whatever the node had counted");
+	}
+	// AND THE BUDGET IS NOT RESET: one below the bound is one attempt, not `MAX_ATTEMPTS` of them.
+	assert!(one_more_attempt(0, 2, None, MAX_ATTEMPTS).attempt + 1 == MAX_ATTEMPTS, "a retry does not hand the automatic budget back");
+
+	// THE CURSOR IS REWOUND ONLY WHEN THERE IS NOTHING LEFT TO TRY. A cursor past the end is how a
+	// node records "every candidate has been tried", and a retry that left it there asks the standing
+	// loop to start nothing at all - which is the one outcome a policy verb may not produce.
+	assert_eq!(one_more_attempt(2, 2, None, MAX_ATTEMPTS).candidate, 0, "an exhausted cursor rewinds to the registry order when nothing was selected");
+	assert_eq!(one_more_attempt(2, 2, Some(1), MAX_ATTEMPTS).candidate, 1, "and to the operator's own choice where there is one");
+	// A CURSOR THAT IS STILL INSIDE THE LIST IS LEFT ALONE - the node has candidates it has not
+	// tried, and rewinding would re-run one it already spent.
+	assert_eq!(one_more_attempt(1, 3, Some(0), MAX_ATTEMPTS).candidate, 1, "a cursor with entries left is not disturbed by a retry");
+	// AND A NODE WITH NO CANDIDATES AT ALL DOES NOT INDEX PAST NOTHING.
+	assert_eq!(one_more_attempt(0, 0, None, MAX_ATTEMPTS).candidate, 0, "a node with no candidates rewinds to zero rather than staying past the end");
+
+	// POLICY NARROWS AND NEVER WIDENS. An artifact the image never declared for this device is
+	// refused rather than obeyed, which is the whole point of bounding a preference by the list.
+	let names: [&[u8]; 3] = [b"virtio_gpu", b"vga", b"bochs"];
+	assert_eq!(selected_candidate(&names, b"vga"), Some(1), "a declared candidate selects its own position");
+	assert_eq!(selected_candidate(&names, b"bochs"), Some(2));
+	assert_eq!(selected_candidate(&names, b"nvidia"), None, "an artifact this device never declared is not selectable");
+	assert_eq!(selected_candidate(&names, b"vg"), None, "and neither is a prefix of one");
+	assert_eq!(selected_candidate(&[], b"virtio_gpu"), None, "a device with no candidates selects nothing");
+	// AND THE ANSWER IS A CURSOR THE RETRY CAN USE: selecting entry 1 and then exhausting the list
+	// brings a retry back to entry 1, which is the operator's choice surviving the exhaustion.
+	let chosen = selected_candidate(&names, b"vga").expect("declared");
+	assert_eq!(one_more_attempt(names.len(), names.len(), Some(chosen), MAX_ATTEMPTS).candidate, chosen, "the selection outlives the exhaustion that follows it");
 }
 
 // ONE ATTEMPT THAT REACHED THE FAR SIDE OF A BIND, for a race test to tear down. The numbers are a

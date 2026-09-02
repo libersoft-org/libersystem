@@ -1300,3 +1300,85 @@ Current implementation rating: 5/10
    rule that an unmeasured step needs a conservative seed and must never be treated as the cheapest
    zero-cost work, as well as the required scheduler test for that case
    (`docs/todo/P02M0167.md:420-424,430-451,643-649,674-676`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-09-02T18:20:00Z):
+
+FINDING 1 - `STEPGUESTS` is classified but not reserved, so `--jobs` can be exceeded: ACCEPTED AND
+FIXED, and the arithmetic is exactly as described. `while ((${#guest_pids[@]} >= JOBS))` counts ARRAY
+ENTRIES, one per background process, which equals the number of guests only while every step wants
+one. Under `--jobs 2` the two-guest concurrency gate occupies a single entry, the next one-guest
+profile reads the count as 1 and starts beside it: three guests under a bound of two, produced by the
+runner that exists to be the machine's only answer to that question. The step-level refusal above it
+catches a step that cannot fit ALONE and says nothing about what is already running.
+
+WHAT CHANGED in `verify.sh`: a parallel `guest_wants` array records each backgrounded step's declared
+count, `drain_guests` clears it, and a new `guests_in_flight` sums it. The capacity loop now waits
+until `in_flight + wants_guests <= JOBS`, so a two-slot step waits for two free slots and a one-slot
+step does not join it.
+
+AND THE GATE NOW SEES IT. The auditor is right that case 5 runs the two-slot step ALONE and therefore
+cannot expose the overcommit. `src/tools/check-verify-scheduler.sh` gains a case that OBSERVES the
+overlap instead of inferring it: the wide step brackets a sleep with two lines in a shared file and
+the narrow step writes one, and the assertion is the order. I ran it against the old condition to
+confirm it catches the defect - it produced `wide-start narrow wide-end`, three guests under a bound
+of two - and against the fix, which produces `wide-start wide-end narrow`.
+
+FINDING 2 - the newly separated profile steps are priced as free before they acquire history:
+ACCEPTED AND FIXED. Confirmed the whole chain: every gate's catalogue variant is `architecture:
+"host", environment: Host`, the `("host","host")` fixed term is 0.0, no `variable_seconds` entry
+exists for that pair so `default_variable` 0.5 applies, one key gives 0.5, and `{:.0}` rounds it to
+`0`. So all fourteen QEMU profile rows and `concurrent-selection` were emitted as `STEPCOST 0` and
+admitted by `budget_select` without charging anything - which is M4's own "an unknown priced at zero
+is the cheapest thing in every plan and would always be picked first", produced by the model.
+
+WHAT CHANGED. `CostModel::seed_seconds(guests)` is the conservative seed M4 asks for, taken from what
+this model has already MEASURED rather than invented: a step that starts guests is priced at the
+slowest boot in the model's fixed table, per slot it declares; everything else at one second, because
+a step that runs at all is not free and a plan of zeros sorts on nothing. The emitter uses
+`estimate(..).max(seed)` when there is no measurement, and rounds UP - a sub-second estimate is a
+short step, not a free one. The seed is a FLOOR: a step the model can price from its own keys keeps
+that price, and the first real measurement replaces the seed for good.
+
+That this over-prices an x86_64 profile row is the direction a seed is supposed to err in: the run
+says INCOMPLETE and names what it skipped, which is the honest outcome the plan already specifies.
+
+AND THE GATE'S CASE 4 ENCODED THE DEFECT, which the auditor is right about. It supplied `STEPCOST 0`
+and asserted a five-second budget RAN it. The runner cannot tell an unmeasured step from a genuinely
+instant one - what it owes is to charge whatever the plan says - so the case now supplies a step
+priced at its seed, requires it to be SKIPPED under a budget below that seed, and requires it to run
+once the budget covers it. The planner's half is asserted where it lives: a new verify-model unit test,
+`an_unmeasured_step_is_never_priced_at_zero`, which also pins that the bare estimate is what rounded
+to zero, so if that stops being true the test says the seed is no longer the thing under test.
+
+VERIFICATION: reported at the end of this response set.
+
+VERIFICATION FOR THIS ROUND (2026-09-02T18:20:00Z), the same run behind every response in this set:
+
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot`: 239 passed, 0 failed. It carries this round's two new kernel tests
+  (`kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim`,
+  `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`), the boot test
+  that requires EVERY manifest service online, and the DisplayService and console harnesses that were
+  rewired onto the provider catalogue.
+- `driver-binding` host suite: 61 passed, 0 failed - including the withdrawal-effects recorder and
+  the operator-policy rules added this round.
+- `verify-model` host suite: 117 passed, 0 failed - including
+  `an_unmeasured_step_is_never_priced_at_zero` and the two new profile-row catalogue entries.
+- `verify-scheduler` gate: 21 assertions, all holding. The new guest-slot case was run against the
+  OLD condition first and produced the overcommit it is written for (`wide-start narrow wide-end`);
+  against the fix it produces `wide-start wide-end narrow`.
+- `qemu-virtio-iommu-x86_64`, on a freshly built image: every hostile case refused, a DHCP lease
+  through the enforcing controller, and the default machine "translated, nothing degraded, nothing
+  faulted, the display driver runs and a frame reached the screen" - which is the display migration
+  proved end to end on a real boot with a real virtio-gpu.
+- Host gates: `bootstrap-plan`, `declared-interfaces`, `gate-oracles`, `no-suppression`,
+  `milestone-index`, `source-hygiene`, `test-tags`, `verify-model-tests`, `build-order`,
+  `no-fixed-provider-slots`, `development-build` - all clean.
+- `milestone-index` was FAILING before this round (the index marked P02M0151 done while its M6 was
+  unchecked) and is clean now.
+
+WHAT WAS NOT RUN, AND WHY: the persistent development instance does not boot - `./dev.sh up` stalls
+during service bring-up, deterministically, before any of this round's code runs. It is measured and
+written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
+unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
+except the two new UEFI profile rows, which are gate rows rather than suite runs.

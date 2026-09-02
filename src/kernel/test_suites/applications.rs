@@ -464,7 +464,7 @@ fn audiorec_records_a_capture_stream_and_never_publishes_a_failed_one() {
 	send_cap(&audio_boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
 	sched::run_until_idle();
 	assert_eq!(&audio_boot_kernel.recv().expect("AudioService online report").bytes[..], b"AudioService: online");
-	crate::tests::serve_provider_catalogue(&catalogue_server, snd_service).expect("the catalogue answered the subscription and the connection");
+	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Audio, snd_service).expect("the catalogue answered the subscription and the connection");
 	sched::run_until_idle();
 
 	// THE CAPTURE GRANT, WHICH IS NOT THE PLAYBACK ONE. `open-captures` is op 2 on `audio-admin`;

@@ -1318,3 +1318,62 @@ invalidations, 160 deadlines - in both places it is stated, and the item's headl
 Its gates: 128 established connections owing several timers each occupy 128 entries and no more with
 every deadline firing, and a connection re-arming while another of its own timers is already due is
 served for both without a second entry.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-09-02T13:02:07Z):
+
+Rating: 4/10
+
+1. **The five-retransmission SYN limit contradicts the plan's own RTO schedule and the base TCP open
+   requirement.** M2 starts an unmeasured connection at a 1-second RTO, doubles on each
+   retransmission, and closes a SYN after five retransmissions
+   (`docs/todo/P02M0175.md:321-368`). Even including the wait after the fifth retry, that schedule
+   lasts at most 63 seconds, whereas RFC 9293 requires the SYN retransmission threshold to permit at
+   least three minutes ([RFC 9293 section 3.8.3](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.3)).
+   This is not a performance refinement: a conforming slow or lossy peer is abandoned under one
+   third of the required open interval. The numeric profile and its handshake oracle therefore need
+   to agree on a limit that reaches the required duration.
+
+2. **The promised lost-final-ACK recovery has no TIME-WAIT state or lifetime and cannot be
+   implemented by retaining FIN in the retransmission queue.** M2 says the control block survives
+   until the closing handshake is acknowledged or the FIN retry limit expires, then requires a lost
+   final ACK to be answered when the peer retransmits FIN
+   (`docs/todo/P02M0175.md:300-310,381-385`). The final ACK is not itself acknowledged; after active
+   close, TCP retains the tuple in TIME-WAIT for 2 MSL, acknowledges a retransmitted remote FIN, and
+   restarts that timer ([RFC 9293 sections 3.6 and 3.10.7](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.6)).
+   The plan names only an unspecified "closing timer" in its scheduler discussion and gives no
+   TIME-WAIT transition, duration, timer restart, tuple-retention/accounting rule, or exact expiry
+   fixture (`docs/todo/P02M0175.md:621-643`). An implementation can therefore free the TCB as soon as
+   its own FIN is acknowledged and still claim to follow the stated queue rule, making the required
+   lost-final-ACK behavior impossible.
+
+3. **The DHCPNAK fixtures still require opposite outcomes for the same accepted message.** M8 says
+   REQUESTING, RENEWING and REBINDING admit an ACK or NAK in their stated server scope, but the
+   fixture list then says "a NAK in each phase" leaves the stored lease unchanged
+   (`docs/todo/P02M0175.md:727-758`). The immediately following special case correctly requires a
+   broadcast NAK answering a unicast renewal to be accepted and invalidate the lease
+   (`docs/todo/P02M0175.md:759-762`). The plan never separates invalid/foreign NAK fixtures from an
+   accepted NAK's state transition, so ignoring a valid NAK can satisfy the generic oracle while
+   retaining a lease the server rejected. State explicitly which rejected NAKs leave state unchanged
+   and that an accepted NAK clears any live lease and returns the client to the appropriate discovery
+   state.
+
+4. **The original accepted correction still defers `send`'s public completion semantics instead of
+   deciding them.** The first audit required the plan to choose exactly when `socket.send` reports
+   bytes accepted versus bytes acknowledged. M2 still repeats those alternatives as something the
+   implementation must define (`docs/todo/P02M0175.md:290-296`), while the existing public operation
+   already returns a byte count (`src/idl/network.lsidl:150-158`). With a newly queued,
+   backpressured sender, returning accepted bytes permits completion before delivery and returning
+   acknowledged bytes can keep the RPC open across retransmission; those are observably different
+   client contracts, buffer lifetimes and failure results. Leaving the choice to implementation is
+   an incomplete correction at the milestone's central transport seam.
+
+5. **M7's no-starvation scheduler omits timers from the frozen M0174 contract it claims to
+   consume.** M0174 supplies one aggregate L3 deadline over DAD, RS, ND retry, NUD, prefix, address,
+   router, RDNSS, PMTU and MLD timers (`docs/todo/P02M0174.md:335-342`). M0175 instead enumerates
+   only DHCP, ND, DAD, RA, PMTU and TCP, and sizes its fixed non-TCB owners from the same shortened
+   list (`docs/todo/P02M0175.md:597-635`). `ND` cannot implicitly cover the omissions when DAD and RA
+   are already listed separately and prefix/address/router/RDNSS/MLD expiry are independent state.
+   The plan can therefore satisfy its 160-entry arithmetic while starving state that its prerequisite
+   requires to advance. Treating M0174's already-aggregated next deadline as one explicit L3 owner
+   would preserve the frozen boundary and make the structural bound and no-starvation gate
+   implementable.

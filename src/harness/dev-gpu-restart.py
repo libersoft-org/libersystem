@@ -34,19 +34,20 @@
 #                        restart without one.
 #   it publishes again   the rebound binding republished the providers it declares, which is the
 #                        driver's own half of coming back.
+#   frames again         a frame driven through the console AFTER the rebind reaches the display.
+#                        This is M4's own sentence and it is now an assertion (2026-09-02).
 #   one boot             the guest never restarted, so none of the above is a reboot wearing a
 #                        rebind's name.
 #
-# WHAT THIS DELIBERATELY DOES NOT ASSERT, AND WHY IT WOULD BE WRONG TO. It does not require frames to
-# reach the display after the rebind, because in this tree they cannot: `route_offers` - the function
-# that hands a published provider to DisplayService - is called only from the phase-two bring-up loop
-# and never from the standing loop, and it fills each fixed consumer slot only `if *client == 0`. So
-# a driver rebound after bring-up publishes its provider into the catalogue and nothing routes it,
-# while DisplayService goes on holding the handle of the binding that ended. Asserting frames here
-# would be asserting the per-service catalogue migration that P02M0164 scopes and has not finished,
-# from a check belonging to a different milestone; asserting nothing about it would let a reader think
-# the whole path was proved. So the check REPORTS what the display did and pins only what the driver
-# and the kernel owe.
+# THE DISPLAY WAS REPORTED AND IS NOW ASSERTED. It could not be before, and the reason was exact:
+# `route_offers` - the function that handed a published provider to DisplayService - was called only
+# from the phase-two bring-up loop and filled each fixed consumer slot only `if *client == 0`, so a
+# driver rebound after bring-up published its provider into the catalogue and nothing routed it while
+# DisplayService went on holding the handle of a binding that had ended. There is no such slot now:
+# DisplayService subscribes to the display kind and adopts the replacement provider itself, which is
+# the seam the provider catalogue exists to be, and the restore this check is named for. A check
+# that reports what it was
+# built to prove is a check nobody fails, so this one fails.
 
 import json
 import os
@@ -149,12 +150,12 @@ def wait_state(state, what, timeout=SETTLE_TIMEOUT):
 	fail(f'{what}: the binding is {seen.get("state") if seen else "unreadable"} and not {state} after {timeout} s')
 
 
-# Make the console present frames and say what happened to them.
+# Make the console present frames and require that they land.
 #
-# Reported rather than asserted - see the header. `ConsoleService` latches one line per outcome, so
-# `a frame did NOT reach the display` appearing here for the first time is the consumer-side route
-# being dead, which is a known gap in another milestone and not this check's to fail on.
-def report_the_display(guest):
+# ASSERTED, not reported - see the header. `ConsoleService` latches one line per outcome, so
+# `a frame did NOT reach the display` appearing in this window is the consumer-side route being dead
+# after the rebind, which is exactly what M4 forbids.
+def require_the_display(guest):
 	mark = lab.serial_size()
 	for _ in range(3):
 		guest.type_text('\x03', False, 15)
@@ -163,10 +164,8 @@ def report_the_display(guest):
 	time.sleep(2)
 	said = lab.serial_since(mark)
 	if 'a frame did NOT reach the display' in said:
-		step('  frames were driven through the console after the rebind and did NOT reach the display')
-		step('    (the rebound provider is published and nothing routes it: `route_offers` runs only during bring-up)')
-	else:
-		step('  frames were driven through the console after the rebind and none was reported as refused')
+		fail('frames were driven through the console after the rebind and did NOT reach the display - the rebound provider was published and the display never adopted it')
+	step('  frames were driven through the console after the rebind and none was reported as refused')
 
 
 def main():
@@ -241,8 +240,8 @@ def main():
 		fail(f'the rebound binding publishes {after.get("providers")} provider(s) - it came back without offering what it declares')
 	step(f'  and it republished {after["providers"]} provider(s)')
 
-	# THE DISPLAY, REPORTED - see the header for why this is not an assertion.
-	report_the_display(guest)
+	# AND THE DISPLAY, WHICH IS M4'S OWN SENTENCE - see the header.
+	require_the_display(guest)
 
 	boot_at_end = lab.guest_boot()
 	if boot_at_end != boot_at_start:

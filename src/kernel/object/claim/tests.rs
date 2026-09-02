@@ -451,6 +451,51 @@ fn a_release_in_progress_refuses_a_late_derivation() {
 	device::release_claim(next).expect("released");
 }
 
+crate::tagged_test!(a_capability_minted_before_its_row_dies_with_its_claim, [Object, Kernel, Pci, Handle], id = "kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim", covers = ["kernel"]);
+fn a_capability_minted_before_its_row_dies_with_its_claim() {
+	// THE WINDOW BETWEEN A SUCCESSFUL REGISTRATION AND THE HANDLE IT WAS TAKEN FOR.
+	//
+	// `register_derived` refuses a key that is no longer the live claim, and that refusal is what
+	// the late-derivation test above pins. It does not cover this: a registration that SUCCEEDS,
+	// against a claim that is still live, followed by a release that revokes the object before the
+	// syscall has minted its capability. `Capability::new` reads the object's revocation generation
+	// when it runs, so a mint on the far side of that release snapshots the number the revocation
+	// had already moved to - and the resulting handle matches at every lookup and keeps working
+	// against a claim that has ended.
+	//
+	// The window is reproduced exactly rather than raced for: mint, register, release, install.
+	use crate::object::KernelObject;
+	use crate::object::device_memory::DeviceMemory;
+	use crate::object::handle::{Capability, HandleError, HandleTable};
+	use crate::object::rights::Rights;
+	let index = device::add_synthetic_device();
+	let key = device::claim(index).expect("claimed");
+	let memory = DeviceMemory::for_claim(key, 0xfeed_3000, 0x1000).expect("a device memory");
+	// THE ORDER THE SYSCALL USES: the capability is minted while the claim is live and the object
+	// has never been revoked, so its snapshot is older than anything the row below can attract.
+	let minted_first = Capability::new(memory.clone() as alloc::sync::Arc<dyn KernelObject>, Rights::READ | Rights::WRITE | Rights::MAP);
+	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(memory.clone() as alloc::sync::Arc<dyn KernelObject>))), "recorded as derived under a live claim");
+
+	// THE RELEASE LANDS IN THE GAP - the row is swept and the object revoked while the syscall that
+	// created it has not yet installed anything.
+	device::release_claim(key).expect("released");
+
+	let mut table = HandleTable::new();
+	let handle = table.insert(minted_first);
+	assert!(matches!(table.lookup(handle, Rights::READ), Err(HandleError::Revoked)), "a capability minted before the release refuses after it, however late its handle is installed");
+
+	// AND THE ORDER IS THE WHOLE OF THE PROPERTY, which is why the other order is asserted too: a
+	// capability to the SAME object minted after the revocation reads the generation the revocation
+	// moved to, matches it, and resolves clean. That is what this handler used to hand back, and a
+	// test that did not pin it could not tell the fix from the defect.
+	let minted_late = Capability::new(memory.clone() as alloc::sync::Arc<dyn KernelObject>, Rights::READ);
+	let late_handle = table.insert(minted_late);
+	assert!(table.lookup(late_handle, Rights::READ).is_ok(), "minting after the revocation resurrects the object - the reason the handlers mint first");
+
+	let _ = table.close(handle);
+	let _ = table.close(late_handle);
+}
+
 crate::tagged_test!(a_release_that_lands_mid_map_leaves_no_mapping_behind, [Object, Kernel, Pci, Paging], id = "kernel.object.claim.a_release_that_lands_mid_map_leaves_no_mapping_behind", covers = ["kernel"]);
 fn a_release_that_lands_mid_map_leaves_no_mapping_behind() {
 	// THE WINDOW BETWEEN RESERVING A MAPPING AND PUBLISHING IT, which is where a claim release could

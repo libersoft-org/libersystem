@@ -840,9 +840,26 @@ drain_guests() {
 	guest_labels=()
 	guest_indexes=()
 	guest_outfiles=()
+	guest_wants=()
+}
+
+# HOW MANY GUESTS THE BACKGROUNDED STEPS ARE HOLDING BETWEEN THEM.
+#
+# The capacity loop below counted ARRAY ENTRIES - one per background process - which is the same
+# number only while every step wants exactly one guest. `concurrent-selection` wants two and occupies
+# one entry, so under `--jobs 2` it left the count reading 1 and the next one-guest profile started
+# beside it: three guests on a machine whose one answer was two. The step-level refusal above catches
+# a step that cannot fit ALONE and says nothing about what is already running.
+guests_in_flight() {
+	local total=0 want
+	for want in "${guest_wants[@]}"; do
+		total=$((total + want))
+	done
+	echo "$total"
 }
 guest_indexes=()
 guest_outfiles=()
+guest_wants=()
 
 # The plan is read on fd 3, not on stdin.
 #
@@ -949,19 +966,24 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	fi
 	outfile="$(mktemp)"
 	if ((is_guest == 1 && JOBS > 1)); then
-		while ((${#guest_pids[@]} >= JOBS)); do
+		# ROOM FOR WHAT THIS STEP WANTS, NOT ROOM FOR ONE MORE PROCESS. See `guests_in_flight`: a
+		# step declaring two slots must wait until two are free, and a one-slot step must not start
+		# beside it just because the array holds a single entry.
+		while (($(guests_in_flight) + wants_guests > JOBS)); do
 			wait "${guest_pids[0]}" || true
 			record_one_step "${guest_indexes[0]}" "${guest_labels[0]}" "${guest_outfiles[0]}"
 			guest_pids=("${guest_pids[@]:1}")
 			guest_labels=("${guest_labels[@]:1}")
 			guest_indexes=("${guest_indexes[@]:1}")
 			guest_outfiles=("${guest_outfiles[@]:1}")
+			guest_wants=("${guest_wants[@]:1}")
 		done
 		run_one_step "$index" "$label" "$command" "$outfile" 3<&- &
 		guest_pids+=("$!")
 		guest_labels+=("$label")
 		guest_indexes+=("$index")
 		guest_outfiles+=("$outfile")
+		guest_wants+=("$wants_guests")
 	else
 		run_one_step "$index" "$label" "$command" "$outfile"
 		record_one_step "$index" "$label" "$outfile"

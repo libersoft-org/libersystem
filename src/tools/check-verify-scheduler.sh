@@ -101,19 +101,30 @@ check "the expensive step is skipped for the budget" 1 "$(grep -c 'SKIPPED (budg
 check "and the run reports FAIL, not INCOMPLETE" 0 "$(grep -c 'INCOMPLETE' "$out" || true)"
 check "with a non-zero exit" 1 "$rc"
 
-# 4. AN UNMEASURED COST IS NOT A FREE ONE. A step whose cost the model could not measure is priced
-#    at the estimate the plan carries, and a budget that cannot hold it does not start it.
+# 4. AN UNMEASURED COST IS NOT A FREE ONE, AND THE RUNNER CHARGES THE SEED IT IS GIVEN.
+#
+#    THIS CASE USED TO ENCODE THE DEFECT IT IS NAMED AFTER (corrected 2026-09-02). It supplied a
+#    step priced at `STEPCOST 0` and asserted that a five-second budget ran it - which is the
+#    "unknown priced at zero is the cheapest thing in every plan" that M4 forbids, written down as
+#    an expectation. The runner cannot tell an unmeasured step from a genuinely instant one; what it
+#    owes is to charge whatever the plan says and to refuse what will not fit. So the seeded step is
+#    priced ABOVE the budget here and must be skipped, and the planner's half - never emitting a
+#    zero for a step nobody has timed - is asserted where it lives, in `verify-model`'s own
+#    `an_unmeasured_step_is_never_priced_at_zero`.
 plan="$work/unmeasured"
 {
 	printf 'STATUS\tfull\tprepared\n'
-	step 0 0 "the unmeasured step" "true"
+	step 0 20 "the seeded step" "true"
 	step 1 9000 "the expensive one" "true"
 } >"$plan"
 rc=0
 run_plan "$plan" --budget 5 || rc=$?
-check "a zero-cost step is affordable" 1 "$(grep -c 'the unmeasured step' "$out" || true)"
-check "the expensive one is not" 1 "$(grep -c 'SKIPPED (budget): the expensive one' "$out" || true)"
+check "a step seeded above the budget is skipped, not treated as free" 1 "$(grep -c 'SKIPPED (budget): the seeded step' "$out" || true)"
+check "the expensive one is not started either" 1 "$(grep -c 'SKIPPED (budget): the expensive one' "$out" || true)"
 check "and a run that only skipped is INCOMPLETE" 1 "$(grep -c 'INCOMPLETE' "$out" || true)"
+rc=0
+run_plan "$plan" --budget 30 || rc=$?
+check "and it runs once the budget covers its seed" 1 "$(grep -c 'the seeded step' "$out" || true)"
 
 # 5. A STEP THAT WANTS MORE GUEST SLOTS THAN `--jobs` HAS IS REFUSED RATHER THAN TRIMMED.
 #    A gate whose subject is overlap and which runs one guest proves nothing and would report a pass.
@@ -154,8 +165,37 @@ run_plan "$plan" --jobs 2 || rc=$?
 check "the backgrounded guest's failure is recorded" 1 "$(grep -c 'FAILED: the guest that fails' "$out" || true)"
 check "and its dependent is blocked despite running in parallel" 1 "$(grep -c 'BLOCKED: the gate that reads it' "$out" || true)"
 
+# 7. THE SLOTS IN FLIGHT ARE SUMMED, NOT COUNTED.
+#
+#    Case 5 runs the two-slot step ALONE, so it cannot see this: the capacity loop counted background
+#    PROCESSES, one array entry per step, which equals the number of guests only while every step
+#    wants one. Under `--jobs 2` the two-guest step held a single entry, the next one-guest step read
+#    the count as 1 and started beside it - three guests under a bound of two, from the runner that
+#    exists to be the only answer to that question.
+#
+#    Overlap is observed rather than inferred: the wide step brackets a sleep with two lines in a
+#    shared file, and the narrow step writes one. Interleaving is the defect and ordering is the fix.
+plan="$work/oversubscribe"
+trace="$work/oversubscribe.trace"
+: >"$trace"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	printf 'STEP\t0\t0\tthe wide step\tsh -c "echo wide-start >> %s; sleep 2; echo wide-end >> %s"\t\n' "$trace" "$trace"
+	printf 'STEPID\t0\tid-0\n'
+	printf 'STEPCOST\t0\t1\n'
+	printf 'STEPGUESTS\t0\t2\n'
+	printf 'STEP\t1\t0\tthe narrow step\tsh -c "echo narrow >> %s"\t\n' "$trace"
+	printf 'STEPID\t1\tid-1\n'
+	printf 'STEPCOST\t1\t1\n'
+	printf 'STEPGUESTS\t1\t1\n'
+} >"$plan"
+rc=0
+run_plan "$plan" --jobs 2 || rc=$?
+check "both steps ran" 0 "$rc"
+check "the one-slot step waited for the two-slot step instead of joining it" "wide-start wide-end narrow" "$(tr '\n' ' ' <"$trace" | sed 's/ *$//')"
+
 if ((failed != 0)); then
 	echo "verify-scheduler: the shell scheduler did not behave as the milestone requires" >&2
 	exit 1
 fi
-echo "verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE, unmeasured costs and the guest-slot budget all hold"
+echo "verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE, seeded costs and the summed guest-slot bound all hold"

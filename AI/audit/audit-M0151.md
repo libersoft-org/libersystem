@@ -1449,3 +1449,85 @@ Focused verification: the FDT suite passed 87 tests, the secondary-start suite p
 the architecture-surface gate passed over 61 production files. These support the resolved parser,
 secondary-lifecycle, and architecture-contract findings; the current gate itself confirms that the
 two remaining positive profiles do not run.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-09-02T18:20:00Z):
+
+FINDING 1 - the separately labelled AArch64 and RISC-V UEFI/no-DT positive regression profiles remain
+unimplemented: ACCEPTED IN PART, AND THE PART THAT WAS BUILDABLE IS BUILT. The finding is right that
+M6's requirement and the Definition of Done are not satisfied by a note, and right that the gate says
+so in its own words. Where the previous rounds went wrong - mine included - is in treating the whole
+bullet as blocked by one missing harness capability. Reading it again:
+
+  "Keep the existing aarch64/riscv64 UEFI boots as separate single-node regression profiles labelled
+   `UEFI/no-DT`; they prove the loader path still works, not that controller discovery occurred."
+
+Four things are asked for: separate, single-node, labelled, and proving the LOADER PATH. All four are
+buildable on this harness today, and the `no-DT` in the label is a name for those profiles rather
+than a demand that the machine publish no tree. The genuinely blocked thing is a different sentence -
+the Definition of Done's "their static QEMU descriptors cannot be selected by a boot which has a DT" -
+and its POSITIVE half, a boot of a treeless machine, is what `LIBER_NO_DT_PROFILE` guards.
+
+So the rows were lost rather than impossible. Before this gate converted its profiles to DIRECT boots
+for discovery, every aarch64 and riscv64 profile came in through firmware and the loader path was
+covered by accident; the conversion was right and it deleted that coverage, and nothing replaced it.
+
+WHAT CHANGED.
+
+- `src/tools/check-qemu-arch-profiles.sh`: two new rows, `run_profile aarch64 uefi 1` and
+  `run_profile riscv64 uefi 1`, booted with `PROFILE_UEFI=1`. Each runs the profile's oracles on one
+  core and asserts the controller line, the timer, and the SMP outcome the same way every other row
+  does.
+- A new `PROFILE_FORBIDS` hook in `run_profile`: a line the profile must NOT print. Both ports print a
+  named line when they take the static no-DT descriptor, so its absence is the assertion - which is a
+  NEGATIVE property and no `want` string can express it. This is the Definition of Done's "cannot be
+  selected by a boot which has a DT", asserted rather than assumed, and it is the half a machine with
+  a tree can carry.
+- `check.sh`: `arch-profile-aarch64-uefi-1` and `arch-profile-riscv64-uefi-1` registered as gate rows.
+- `src/tools/verify-model/src/catalog.rs`: both added to `GATES` (64 -> 66) and to `PROFILE_ROW_GATES`
+  (12 -> 14), so the scheduler prices and schedules them like every other profile row.
+- The long "NOT REGISTERED HERE" note is narrowed to what is still missing rather than deleted: the
+  positive no-DT boot, and the harness capability it needs.
+- `docs/todo/P02M0151.md`: M6 rewritten to say which half is met and which is not; the status line
+  narrowed the same way.
+
+AND THE INDEX WAS MADE TO AGREE. `check-milestone-index` was failing before this round - `docs/todo/
+TODO.md` marked P02M0151 done while M6 was unchecked - which is a mismatch the previous round created
+by correcting the checkbox and not the index. The row is now open and says which item is open. The
+gate is clean.
+
+WHAT IS STILL NOT MET, PLAINLY: no caller sets `LIBER_NO_DT_PROFILE=1`, so the static descriptor a
+treeless machine falls back to is authorised by nothing and exercised by nothing. Producing a machine
+that publishes no tree is a harness capability, and it is what M6 remains open on.
+
+VERIFICATION: reported at the end of this response set.
+
+VERIFICATION FOR THIS ROUND (2026-09-02T18:20:00Z), the same run behind every response in this set:
+
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot`: 239 passed, 0 failed. It carries this round's two new kernel tests
+  (`kernel.object.claim.a_capability_minted_before_its_row_dies_with_its_claim`,
+  `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`), the boot test
+  that requires EVERY manifest service online, and the DisplayService and console harnesses that were
+  rewired onto the provider catalogue.
+- `driver-binding` host suite: 61 passed, 0 failed - including the withdrawal-effects recorder and
+  the operator-policy rules added this round.
+- `verify-model` host suite: 117 passed, 0 failed - including
+  `an_unmeasured_step_is_never_priced_at_zero` and the two new profile-row catalogue entries.
+- `verify-scheduler` gate: 21 assertions, all holding. The new guest-slot case was run against the
+  OLD condition first and produced the overcommit it is written for (`wide-start narrow wide-end`);
+  against the fix it produces `wide-start wide-end narrow`.
+- `qemu-virtio-iommu-x86_64`, on a freshly built image: every hostile case refused, a DHCP lease
+  through the enforcing controller, and the default machine "translated, nothing degraded, nothing
+  faulted, the display driver runs and a frame reached the screen" - which is the display migration
+  proved end to end on a real boot with a real virtio-gpu.
+- Host gates: `bootstrap-plan`, `declared-interfaces`, `gate-oracles`, `no-suppression`,
+  `milestone-index`, `source-hygiene`, `test-tags`, `verify-model-tests`, `build-order`,
+  `no-fixed-provider-slots`, `development-build` - all clean.
+- `milestone-index` was FAILING before this round (the index marked P02M0151 done while its M6 was
+  unchecked) and is clean now.
+
+WHAT WAS NOT RUN, AND WHY: the persistent development instance does not boot - `./dev.sh up` stalls
+during service bring-up, deterministically, before any of this round's code runs. It is measured and
+written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
+unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
+except the two new UEFI profile rows, which are gate rows rather than suite runs.

@@ -1558,3 +1558,34 @@ faces through the ordinary `font-catalogue` client, and its ONE privileged opera
 which needs the grant. A build in which it is absent is a build in which recovery cannot be issued,
 and that is stated as a gate rather than left implicit - which is the whole difference between an
 authority policy and a route.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-09-02T13:03:47Z):
+
+Rating: 6/10
+
+1. **The caller-funded `RESOLVE-INTO` correction does not produce the immutable, read-only backing
+   required by the shared font-resource contract.** The caller creates the `MemoryObject`, keeps its
+   original handle, and sends only an attenuated `MAP | WRITE | TRANSFER` duplicate to the catalogue
+   (`docs/todo/P02M0136.md:366-423`). `SYS_MEMORY_OBJECT_CREATE` gives that retained original
+   `Rights::ALL`, and `SYS_HANDLE_DUPLICATE` attenuates only the new handle; it neither removes rights
+   from the original nor revokes an existing writable mapping
+   (`src/kernel/syscall/mod.rs:585-595,2358-2369,2410-2422`). The plan nevertheless still calls the
+   result a read-only `MemoryObject` (`docs/todo/P02M0136.md:575-577,619-622`) and later requires an
+   immutable validated backing for the face (`:627-633`). No step closes every writable handle and
+   mapping, seals the object, or snapshots the returned bytes into library-owned immutable storage.
+   The caller can therefore change bytes after validation while identity, decoded data and cache
+   entries continue to describe the old contents. Freeze one realizable immutability transition and
+   gate post-validation mutation; attenuating the service's temporary copy does not attenuate the
+   backing retained by the caller.
+
+2. **The latest admin-route correction still omits the identifier that selects the admin serve
+   root.** The plan now names `FONTADMIN`, `CAP_FONTADMIN` and `lsfont`, but describes the provider only
+   as a “second serve endpoint” and says merely that the role's source is the font catalogue service
+   (`docs/todo/P02M0136.md:317-357`). In the manifest contract those are different fields: `provider`
+   names the service, while `source` must name one of that provider's concrete `serve-root` tags;
+   omission defaults to `SERVE`, and validation requires the named root to exist
+   (`src/tools/system-manifest/src/lib.rs:637-654,1019-1025,1105-1114`). Thus the proposed client row
+   either selects the ordinary `SERVE` root or leaves implementations to invent incompatible admin
+   tags, so ServiceManager still has no unambiguous endpoint to deliver to PermissionManager. Name the
+   admin `serve-root` tag and the `FONTADMIN` row's exact provider/source/interface tuple, then gate
+   that the ordinary and admin rows resolve to different roots.

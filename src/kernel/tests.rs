@@ -131,11 +131,11 @@ fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::s
 // handshake it speaks. Built from the shared crate rather than from a hand-written copy of the frame
 // layout: a second copy is how the harness and the service drift, and a harness that drifts reports
 // a driver broken when the protocol moved under it.
-// THE CATALOGUE HALF OF PROVIDER DISCOVERY, for the two suites that stand in for the supervisor
-// while AudioService comes up.
+// THE CATALOGUE HALF OF PROVIDER DISCOVERY, for the suites that stand in for the supervisor while a
+// service that DISCOVERS its device comes up - AudioService, and DisplayService since 2026-09-02.
 //
-// That service no longer RECEIVES its device. It is handed a `provider-catalogue` connection and
-// asks - `subscribe(audio)` for what is published and a stream of what appears later, then `open` on
+// Those services no longer RECEIVE a device. It is handed a `provider-catalogue` connection and
+// asks - `subscribe(kind)` for what is published and a stream of what appears later, then `open` on
 // one of them for a connection to serve. So a harness standing in for the supervisor has to answer
 // that conversation, and it answers through the GENERATED encoders for the reason `send_frame` uses
 // the driver protocol's own: a hand-written copy of a wire format is how a harness and a service
@@ -143,13 +143,13 @@ fn send_cap(channel: &object::channel::Channel, payload: &[u8], object: alloc::s
 //
 // One provider, published before the subscription arrives, which is the ordinary shape: the device
 // was bound during the boot and the service starts afterwards.
-fn serve_provider_catalogue(server: &object::channel::Channel, provider: alloc::sync::Arc<dyn object::KernelObject>) -> Result<(), &'static str> {
+fn serve_provider_catalogue(server: &object::channel::Channel, kind: device_proto::generated::liber::device::v1::ProviderKind, provider: alloc::sync::Arc<dyn object::KernelObject>) -> Result<(), &'static str> {
 	use device_proto::codec as wire;
 	use device_proto::generated::liber::device::v1 as device;
 	use object::channel::{Channel, Message};
 	use object::handle::Capability;
 	use object::rights::Rights;
-	let info = device::ProviderInfo { kind: device::ProviderKind::Audio, bus: 0, dev: 4, func: 0, binding_generation: 1, slot: 0, provider_generation: 1, live: true };
+	let info = device::ProviderInfo { kind, bus: 0, dev: 4, func: 0, binding_generation: 1, slot: 0, provider_generation: 1, live: true };
 
 	// 1. THE SUBSCRIPTION. The reply is the correlation number and one handle - the stream - and
 	//    nothing else; the client checks exactly that.
@@ -2878,7 +2878,7 @@ fn run_audio_service_scenario(scenario: AudioServiceScenario) {
 	// AND THEN IT ASKS. The report above is sent before the subscription, so the service is parked
 	// in its `subscribe` call by here - which is exactly the seam this proves: the device arrives
 	// because the service went looking for it.
-	serve_provider_catalogue(&catalogue_server, snd_service).expect("the catalogue answered the subscription and the connection");
+	serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Audio, snd_service).expect("the catalogue answered the subscription and the connection");
 	sched::run_until_idle();
 	match scenario {
 		AudioServiceScenario::ScopeAndMixing => {
@@ -5339,16 +5339,23 @@ impl ConsoleHarness {
 		let (focus, focus_display) = Channel::create();
 		let (kill_keep, kill_display) = Channel::create();
 		spawn_dynamic_test_process(sched::root_domain(), display_elf, display_boot_user);
-		send_cap(&display_boot, b"GPU", gpu_user, Rights::ALL).expect("gpu bootstrap");
 		send_cap(&display_boot, b"FOCUS", focus_display, Rights::ALL).expect("focus bootstrap");
 		send_cap(&display_boot, b"KILL", kill_display, Rights::ALL).expect("kill bootstrap");
 		let (display_admin_keep, display_admin) = Channel::create();
 		send_cap(&display_boot, b"ADMIN", display_admin, Rights::ALL).expect("display admin bootstrap");
 		send_cap(&display_boot, b"SERVE", display_server, Rights::ALL).expect("serve bootstrap");
 		display_boot.send(Message::new(b"DISPLAYCTL".to_vec(), alloc::vec::Vec::new())).expect("display capability bootstrap");
+		// THE PROVIDER CATALOGUE, LAST, AND IT IS HOW THIS SERVICE FINDS ITS SCANOUT. DisplayService
+		// is not handed a `GPU` channel any more - it subscribes to the display kind and opens a
+		// connection to what it finds - so this harness answers that conversation before the
+		// framebuffer handshake below, which is the order the service performs them in.
+		let (catalogue_server, catalogue_client) = Channel::create();
+		send_cap(&display_boot, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
 
 		let width: u32 = (cols * 8) as u32;
 		let height: u32 = (rows * 16) as u32;
+		sched::run_until_idle();
+		serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Display, gpu_user).expect("the catalogue answered the subscription and the connection");
 		sched::run_until_idle();
 		let fb_request = gpu.recv().expect("framebuffer request");
 		assert_eq!(&fb_request.bytes[..], b"FB", "DisplayService requests the scanout");
