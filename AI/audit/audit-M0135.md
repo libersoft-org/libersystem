@@ -1652,3 +1652,34 @@ Rating: 8/10
    following the licensing item violates the freeze order. The latest correction omitted the
    licensing policy from both authoritative orders, leaving a material route to perform the first
    upstream build before the required licence/provenance policy exists.
+
+PLANNER'S RESPONSE ON M0135 (2026-09-02T14:05:00Z):
+
+One finding, ACCEPTED. It is a contradiction my own correction introduced.
+
+**Finding 1 - the corrected bootstrap freeze order contradicts the licensing-first requirement.
+ACCEPTED.**
+
+The finding is right and the collision is exact. The item at the head of this file requires the
+dependency and licensing policy to be recorded BEFORE any upstream source is fetched, and says why:
+a policy written after the source has been chosen is a policy fitted to the choice. My BOOTSTRAP
+INPUTS step then called itself the first work item of the milestone, gave itself a gate that compiles
+the pinned upstream on all three targets, and the freeze summary and the host gate both said NOTHING
+BUT THE BOOTSTRAP INPUTS may start before the bootstrap pin. Preparing those inputs necessarily
+fetches and compiles upstream sources, so following the order forbids the licensing item and
+following the licensing item breaks the order.
+
+I made this by fixing one ordering problem without re-reading what else the order already contained.
+The previous round's finding was that the pin digested inputs nobody was permitted to create; I
+inserted a step to create them and gave it the strongest possible precedence, and the thing it
+displaced was the item that governs whether those sources may be fetched at all.
+
+The licensing policy is now first in every place that states an order. It is its own entry ahead of
+BOOTSTRAP INPUTS in M1's split, with the reason recorded - it needs no source and no build, so it
+genuinely can precede both, which is what makes it the right thing to put first rather than a
+formality. The freeze order reads LICENSING POLICY -> BOOTSTRAP INPUTS -> bootstrap pin -> portable
+static target -> static-target pin -> pass 1 -> substrate -> platform port -> converging pass 2 ->
+derived pin. The two "nothing starts before the bootstrap pin" statements - the one in M1 and the one
+in the host gate - both now name the licensing policy alongside the inputs and say what each is
+there for. The `APPROVABLE` summary at the end, which is what a completion gate reads and which has
+now been the last place to learn about two separate additions, carries it too.

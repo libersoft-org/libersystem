@@ -1117,3 +1117,22 @@ what the runner already assumes for anything that boots" - which was true only w
 inferred it from the command text. The classifier change and the declaration change together were
 inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
 showed it.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-09-02T12:08:00Z):
+
+Current implementation rating: 7/10
+
+1. **The required production policy and reserved-namespace authority proofs remain absent.** The
+   only production policy exercise still disables and re-enables the development GPU
+   (`src/harness/dev-gpu-restart.py:197-228`). No registered test invokes DeviceManager's production
+   `select` or `retry` decisions and effects (`src/user/services/core/src/device_manager.rs:4179-4277,4413-4479`),
+   proves the required `Quarantined` retry/future-policy behavior while state and held resources stay
+   unchanged, or attempts a well-formed `device.policy.*` write through an ordinary `CAP_CONFIG`
+   connection against ConfigService's live per-channel authority checks
+   (`src/user/services/core/src/config_service.rs:197-269,332-346`). The binding tests exercise the
+   transition-table helper rather than those production seams
+   (`src/user/libs/driver/binding/src/tests.rs:719-752`). The latest response explicitly accepts this
+   gap as unmet; consequently the milestone's under-test `select`, one-shot `retry`, quarantine, and
+   namespace-security requirements remain unproved (`docs/todo/P02M0166.md:239-251`).

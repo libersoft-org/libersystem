@@ -1269,3 +1269,34 @@ what the runner already assumes for anything that boots" - which was true only w
 inferred it from the command text. The classifier change and the declaration change together were
 inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
 showed it.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0167 (2026-09-02T12:08:00Z):
+
+Current implementation rating: 5/10
+
+1. **`STEPGUESTS` is classified but not actually reserved, so `--jobs` can still be exceeded.** The
+   planner correctly declares one slot for each profile row and two for `concurrent-selection`
+   (`src/tools/verify-model/src/commands.rs:244-253`). The runner only refuses a single step whose
+   requested count is greater than `JOBS`; once admitted, its capacity loop counts background
+   *processes* with `${#guest_pids[@]}` and never sums their `wants_guests` values
+   (`verify.sh:878-880,924-964`). Thus under `--jobs 2`, the two-guest concurrency gate occupies one
+   array entry and the next one-guest profile can start beside it, producing three guests under a
+   bound of two. The new scheduler test runs the two-slot step alone and therefore cannot expose the
+   overcommit (`src/tools/check-verify-scheduler.sh:118-145`). This contradicts the one-scheduler,
+   one-guest-bound requirements (`docs/todo/P02M0167.md:643-644,681-683`).
+
+2. **The newly separated profile steps are still priced as free before they acquire history.** Each
+   profile remains a `host/host` catalogue key; the fallback cost for that pair is zero fixed plus
+   the default 0.5 seconds per key (`src/tools/verify-model/src/history.rs:370-379,413-439`), and the
+   emitter rounds the one-key estimate to an integer with `{:.0}`
+   (`src/tools/verify-model/src/main.rs:1143-1150`). Lowering the current model for
+   `src/kernel/device.rs` consequently emits `STEPCOST 0` for all twelve QEMU profile rows and for
+   `concurrent-selection`. `budget_select` then sums those zeros and admits the expensive boots
+   without charging the budget (`verify.sh:685-709`). The new gate's purported unmeasured-cost case
+   encodes the same error: it supplies a zero-cost "unmeasured step" and explicitly requires it to
+   run under a five-second budget (`src/tools/check-verify-scheduler.sh:104-116`). This violates M4's
+   rule that an unmeasured step needs a conservative seed and must never be treated as the cheapest
+   zero-cost work, as well as the required scheduler test for that case
+   (`docs/todo/P02M0167.md:420-424,430-451,643-649,674-676`).

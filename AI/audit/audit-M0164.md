@@ -1357,3 +1357,32 @@ what the runner already assumes for anything that boots" - which was true only w
 inferred it from the command text. The classifier change and the declaration change together were
 inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
 showed it.
+
+AUDITOR'S RE-AUDIT ON M0164 (2026-09-02T12:05:18Z):
+
+Current implementation rating: 4/10
+
+1. **The production consumer migration remains audio-only.** AudioService is still the only
+   production service that calls `provider_catalogue::Client::subscribe`
+   (`src/user/services/core/src/audio_engine.rs:663-686`). DeviceManager retains fixed local network,
+   display, input, block and USB consumers and takes their usable handles from the catalogue in
+   `route_offers` (`src/user/services/core/src/device_manager.rs:431-451,1170-1246`), while
+   ServiceManager still injects fixed FAT/ISO/UDF/USB/network/display handles
+   (`src/user/services/core/src/service_manager/bootstrap.rs:389-480`). Those consumers therefore
+   cannot discover a second, late, or replacement provider through the milestone's catalogue. The
+   implementer's response accepts rather than resolves this omission, which remains contrary to the
+   milestone goal and its explicitly scoped receive-handle-to-subscribe seam
+   (`docs/todo/P02M0164.md:13-19,288-312,318-323`).
+
+2. **Block discovery and role assignment are still capped at four positional hand-off slots.**
+   DeviceManager defines four boot tags and four-entry boot/probe arrays, mints probes for only those
+   entries, then takes four providers into predetermined roles
+   (`src/user/services/core/src/device_manager.rs:82-85,431-474,875-908`). ServiceManager labels the
+   resulting positions as FAT, ISO, UDF and USB before StorageService trusts those tags; only the
+   system instance probes the supplied, still four-entry set for the selected UUID
+   (`src/user/services/core/src/service_manager/bootstrap.rs:389-474`;
+   `src/user/services/storage/src/service.rs:175-260,262-275`). A fifth matching root cannot be
+   considered, and changing device order can still make a valid non-system medium reach the wrong
+   filesystem role. Merely publishing and reporting extra providers does not satisfy M2 or the
+   definition of done's no-fixed-slot and format/origin/`RootSelection` routing requirements
+   (`docs/todo/P02M0164.md:71-121,288-305`).

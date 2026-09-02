@@ -1258,3 +1258,63 @@ Rating: 5/10
    caller operation that can receive that generic refusal. With more than 64 due TCP timers, the plan
    specifies neither coalescing/rescan nor a connection-level failure transition, so it cannot uphold
    its no-starvation guarantee within its own declared capacities.
+
+PLANNER'S RESPONSE ON M0175 (2026-09-02T14:05:00Z):
+
+Two findings, both ACCEPTED. The first is a defect in the correction I made last round.
+
+**Finding 1 - the RFC 8028 correction reverses the prerequisite's frozen reachability-first order.
+ACCEPTED.**
+
+Correct, and it is precise about the damage. M0174 orders routers by REACHABILITY first and
+advertised preference second, deliberately and with its own reasoning written down: preference-first
+would put an unreachable high-preference router ahead of a reachable lower-preference one. My
+correction then said to restrict the candidates to the advertiser set, "among them apply RFC 4191
+preference", and use M0174's enumeration only to break what survived - which rebuilds that order with
+the two keys swapped. An unreachable high-preference advertiser wins before reachability is
+consulted, and the two sides of a seam this pair of milestones spent several rounds freezing end up
+with different policies.
+
+The mistake is a specific one and I would rather name it than describe it: I treated M0174's
+enumeration as a TIE-BREAK because that is how the surrounding RFC 6724 text uses its other inputs,
+without noticing that this particular input is not a list to be re-sorted - it is already the answer
+to "which of these routers first", including the RFC 4191 key I was re-applying on top of it.
+
+The rule is now that the order is consumed WHOLE: restrict the candidate next hops to the advertisers
+M0174 returns for the chosen source's prefix, and take the FIRST of them in M0174's own order.
+Restricting is this milestone's decision, because that is the RFC 8028 policy; ordering is not, and
+saying so in one sentence removes the divergence rather than aligning two orderings that could drift
+again.
+
+M10's fixture is corrected with it, because it asserted the same inverted rule: it required the
+higher-preference advertiser to win without constraining reachability. It now runs twice - once where
+the two differ only in preference, so the higher wins, and once where the higher-preference advertiser
+is UNREACHABLE and the reachable lower-preference one must win anyway. The second case is the one
+that tells the new rule apart from the one it replaced, which the old fixture could not have done.
+
+**Finding 2 - the timer-store bound cannot cover the admitted TCP state and has no safe overflow
+outcome. ACCEPTED, and the second half is the sharper of the two.**
+
+Both halves check out. M4 permits 128 live TCBs and one connection can owe a retransmission, a
+persist probe, a handshake deadline and a closing timer at once, against a partition of 64 wakeups -
+so the bound is smaller than the state the same file has already admitted. And a timer coming due is
+AUTONOMOUS work for a connection admitted long ago: there is no caller in flight to hand a typed
+error to, so "a full partition refuses the new entry and the refusal reaches the operation that
+caused it" answers a question the timer partition never gets asked. The no-starvation promise in the
+sentence above it could not hold inside the milestone's own capacities.
+
+The fix is not a bigger number or an overflow rule. The timers stop being entries: ONE SCHEDULER
+DEADLINE PER OWNER, and what a connection owes is computed rather than queued - a TCB holds one entry
+carrying the EARLIEST of its deadlines, and when that fires it recomputes which of its timers were due
+and re-arms for the next. That is the standard shape and it is the one that makes the bound
+structural: at most one entry per TCB plus the fixed protocol owners - DHCP, ND, DAD, RA, PMTU - so
+128 plus a small constant, sized as 160.
+
+A partition that cannot overflow needs no overflow rule, which is why this replaces the refusal
+rather than adding a case to it, and the enforcement point moves to where a caller exists: a
+connection that cannot be given its one entry is a connection that is not admitted, which is M4's TCB
+budget refusing at admission. The store's total is corrected to 352 - 128 pending operations, 64 L3
+invalidations, 160 deadlines - in both places it is stated, and the item's headline figure with it.
+Its gates: 128 established connections owing several timers each occupy 128 entries and no more with
+every deadline firing, and a connection re-arming while another of its own timers is already due is
+served for both without a second entry.

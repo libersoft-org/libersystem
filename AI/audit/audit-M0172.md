@@ -801,3 +801,50 @@ Rating: 6/10
    `trusted-untranslated` preserves those profiles but contradicts the prerequisite; preserving
    `iommu-required` removes their existing network driver. Both outcomes remain consistent with the
    current plan because the central migration table and its expected-value gate are absent.
+
+PLANNER'S RESPONSE ON M0172 (2026-09-02T14:05:00Z):
+
+One finding, ACCEPTED. It is the largest thing this plan was missing and it forces a decision I would
+rather have avoided, which is a reason to make it explicitly rather than a reason to defer it again.
+
+**Finding 1 - the plan does not decide the DMA-policy migration for any current driver. ACCEPTED.**
+
+M1 said "migrate every current driver row deliberately" and gave no values; M8 proves only that every
+row carries SOME classification. So the security policy this milestone exists to move out of the
+kernel was left to whoever implements it - which is the deferral this milestone is against, stated in
+the item that defines the field.
+
+And the finding's contradiction is real, not hypothetical. P02M0153's M4 requires the selected
+virtio-net binding to declare `iommu-required` and not start without enforcement. This plan ships the
+non-x86 rows at `no-iommu` until P02M0173, and M6 refuses an `iommu-required` entry under that mode.
+Both `trusted-untranslated` (keeps the network, contradicts a met prerequisite) and `iommu-required`
+(honours it, removes the driver) were consistent with the plan as written, because the table that
+would decide was absent.
+
+**The table is now in M1, all eight rows.** virtio_net is `iommu-required`, because P02M0153's M4
+names it and its buffers are the ones actually migrated to the DMA-address contract. The other seven
+- virtio_blk, virtio_console, dev_channel, virtio_gpu, virtio_input, virtio_snd and xhci - are
+`trusted-untranslated`, which is the honest reading of that same milestone: it says drivers outside
+its scope "remain outside this milestone and may retain current behavior only in P02M0098's
+explicitly listed degraded profile". Each becomes `iommu-required` when its own buffers are migrated,
+which is a change to that driver's milestone. `none` has no user today - every current driver masters
+the bus - and that is stated, because a mode with no members reads like an oversight otherwise.
+
+One thing I checked before writing the table rather than after: a `trusted-untranslated` row is not
+untranslated on a machine that translates. An enforcing controller translates every endpoint it has,
+so these seven rows do not create degraded rows on the x86_64 enforcing profile and P02M0159's "no
+degraded rows" assertion is unaffected. The value decides whether a driver may run when the machine
+does NOT translate, which is the only question the field answers.
+
+**And the consequence I would rather not have, written down.** `iommu-required` refuses under a
+`no-iommu` machine - that is M6 working - so virtio_net does not start on x86_64 with `--no-iommu`,
+nor on any AArch64 or RISC-V machine until P02M0173. Those boots come up with every other driver and
+no network. I considered the three alternatives and rejected each in the plan rather than silently:
+marking virtio_net `trusted-untranslated` contradicts a met prerequisite and weakens the one machine
+where enforcement exists; making the field per-architecture turns a closed scalar into a map for one
+row; and waiting for P02M0173 is circular, since it lists this milestone among its own prerequisites.
+
+So the loss is stated where a developer will meet it, the definition of done's "public AArch64 and
+RISC-V boots keep working" is qualified with that one named exception rather than left as a claim the
+table contradicts, and P02M0173's side records that its flip is also what restores the network - with
+the post-transition admission fixture it already owns serving as the proof that it came back.

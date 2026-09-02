@@ -1427,3 +1427,25 @@ what the runner already assumes for anything that boots" - which was true only w
 inferred it from the command text. The classifier change and the declaration change together were
 inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
 showed it.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-09-02T11:59:59Z):
+
+Current implementation rating: 8/10
+
+1. **The separately labelled AArch64 and RISC-V UEFI/no-DT positive regression profiles remain
+   unimplemented.** The plan now records this honestly by leaving M6 unchecked, but its implementation
+   requirement and Definition of Done still require both compatibility boots
+   (`docs/todo/P02M0151.md:167-183,500-508`). The current profile gate explicitly says the rows are
+   not registered and that no caller selects `LIBER_NO_DT_PROFILE=1`
+   (`src/tools/check-qemu-arch-profiles.sh:360-373`); repository production references remain the two
+   architecture consumers plus compile-time forwarding in `test-kernel.sh`, with no selecting caller.
+   The sole firmware profile instead requires `GICv3 from the device tree`
+   (`src/tools/check-qemu-arch-profiles.sh:350-357`), so it cannot establish either no-DT path. The
+   measured QEMU/loader limitation explains the omission but does not satisfy the milestone.
+
+Focused verification: the FDT suite passed 87 tests, the secondary-start suite passed 18 tests, and
+the architecture-surface gate passed over 61 production files. These support the resolved parser,
+secondary-lifecycle, and architecture-contract findings; the current gate itself confirms that the
+two remaining positive profiles do not run.

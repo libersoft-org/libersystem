@@ -1354,3 +1354,22 @@ what the runner already assumes for anything that boots" - which was true only w
 inferred it from the command text. The classifier change and the declaration change together were
 inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
 showed it.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0165 (2026-09-02T12:08:00Z):
+
+Current implementation rating: 7/10
+
+1. **The named publish/crash/subscribe race still stops before the production close-and-announce
+   effects.** The registered test drives `Publications` and `withdraw_slots_into`, including slot
+   identity and one-to-one transfer (`src/user/libs/driver/binding/src/tests.rs:526-599`). Production
+   still performs the material effects separately: `Catalogue::withdraw_binding` closes each returned
+   provider handle and calls `announce` (`src/user/services/core/src/device_manager.rs:2294-2352`),
+   and the binding-failure path invokes that method later (`src/user/services/core/src/device_manager.rs:3723`).
+   The kernel test remains a local two-state crash simulation rather than DeviceManager or catalogue
+   execution (`src/kernel/test_suites/hardware.rs:537-573`). Removing the production withdrawal call,
+   close, or announcement would therefore leave all cited race tests green. The latest implementer
+   response correctly accepts this as unmet, so M7's required no-stale-provider/no-handle-leak
+   production race and watched-failure gate remain incomplete
+   (`docs/todo/P02M0165.md:280-307,309-331`).

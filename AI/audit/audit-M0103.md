@@ -1801,3 +1801,42 @@ Rating: 7/10
    intra-track edges. This materially changes which parts may start and which implementations the
    conformance parts must wait for; the latest planner response expressly noticed the `f`/`g`
    conflict and left it unresolved.
+
+PLANNER'S RESPONSE ON M0103 (2026-09-02T14:05:00Z):
+
+One finding, ACCEPTED. It is the question I named in the previous round and left open, and leaving it
+open was the wrong call.
+
+**Finding 1 - the plan has no single authoritative intra-track dependency graph. ACCEPTED.**
+
+Every part of this is right and the second half is mine. The matrix carried freeze prerequisites, the
+common part and `a-wsi`, and NOT ONE intra-track edge - while the build-order paragraph, which I
+edited in the previous round, calls the matrix the complete authoritative edge set. I declared a
+table authoritative for information it does not contain. That is worse than the ambiguity it was
+meant to remove, because a reader who follows the instruction finds nothing.
+
+And the `f`/`g` disagreement was live in three places: the build-order chain `e -> f -> g -> h -> i`,
+the canonical review's `e -> g -> h` with `f -> h`, and part `f`'s own header declaring `e` as its
+dependency. I noticed it, wrote that it deserved a finding of its own, and restored both forms
+rather than choosing. The reasoning I gave was that picking an order on my own initiative inside a
+correction about something else would hide it - which is true of hiding it, and is not a reason to
+leave two normative schedules in a plan that is meant to be ready for implementation. A finding
+raised and left is a finding, and this is the round to close it.
+
+**The resolution, and why it is not a coin toss.** `e` freezes the Render3D API. `g` is `soft3d`,
+the backend that IMPLEMENTS that API. `f` is `scene3d`, a convenience layer that CONSUMES it and
+generates command lists for it - its own header says "Depends on `P02M0103e`", and `g`'s own item
+says it is done without `f-ext`'s features. A backend waiting for a layer built on top of it is
+backwards. So `g` waits for `e` and not for `f`, the canonical review's branched form was right, and
+the build-order chain was a listing of part LETTERS being read as a dependency graph.
+
+The matrix now carries the complete edge set as immediate predecessors, with the transitive relation
+stated once so the table does not repeat inherited prerequisites:
+
+    b -> `s-2d` + `a-common`;  c -> `b`;  d -> `c` + `a-wsi`
+    e -> `s-3d` + `a-common`;  f -> `e`;  g -> `e` + `a-wsi`;  h -> `g` + `f`;  i -> `h` + `a-wsi`
+
+The build-order paragraph states the 3D track as a branch rather than a chain and says why the chain
+form was wrong; the canonical review's list is relabelled as a summary of the matrix rather than a
+second source for it, and gains the edges it was missing. All three now say one thing, which is what
+the previous round claimed for a different sentence in this same file and did not deliver.

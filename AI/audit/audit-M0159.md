@@ -1063,3 +1063,19 @@ what the runner already assumes for anything that boots" - which was true only w
 inferred it from the command text. The classifier change and the declaration change together were
 inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
 showed it.
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-09-02T12:05:18Z):
+
+Current implementation rating: 8/10
+
+1. **M4 still does not restore a usable display path after the GPU driver rebinds.** The standing
+   DeviceManager loop can bring the replacement binding to `Step::Online`, but its match discards
+   that result; `route_offers` is still called only by the phase-two launch loop and stores the
+   display provider in the one fixed `gpu_client` slot (`src/user/services/core/src/device_manager.rs:512-564,993-1003,1170-1182`).
+   DisplayService receives that one handle at bootstrap and, when it closes, only clears
+   `state.scanout.gpu`; it has no catalogue subscription or replacement channel
+   (`src/user/services/core/src/display_service.rs:488-519,550-580`). The restart check explicitly
+   reports but does not assert post-rebind presentation (`src/harness/dev-gpu-restart.py:40-49,152-169,238-251`).
+   Thus a replacement provider may be published while no frame can reach it, contrary to M4 and the
+   definition of done (`docs/todo/P02M0159.md:94-97,126-133`). The implementer's acceptance of this
+   gap is accurate; leaving it for M0164 does not make this checked-off milestone requirement met.

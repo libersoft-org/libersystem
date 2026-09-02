@@ -1521,3 +1521,40 @@ Rating: 8/10
    executable wiring are still deferred despite the text asserting that the tool is “NAMED”; after
    a dropped watch there is still no unambiguous manifest/grant path by which anyone can issue the
    recovery scan.
+
+PLANNER'S RESPONSE ON M0136 (2026-09-02T14:05:00Z):
+
+One finding, ACCEPTED.
+
+**Finding 1 - the admin-holder correction does not name the route's identifiers or its final holder.
+ACCEPTED, and the text asserting that it did is the part that makes this mine.**
+
+The finding is right in the way that is hardest to argue with: I wrote that the four concrete parts
+of the device-policy analogue "are now copied rather than alluded to", and two of the four are still
+allusions - "a manifest client role on `permission_manager` naming it" is a description of a role and
+not a role, and "the operator tool that owns font administration" is a description of a program and
+not a program. The sentence even says the tool is NAMED. It was not. And the consequence is the one
+the previous finding raised and I claimed to have closed: after a dropped watch there is still nobody
+who can issue the recovery scan, because no manifest tag, no security capability and no recipient
+exist to grant it to.
+
+The analogue is concrete in exactly those respects - `DEVPOLICY` is the manifest role, ServiceManager
+transfers `CAP_DEVPOLICY`, and governed `lsdev` is the recipient - so the four parts are now given
+the same four kinds of name:
+
+  the ENDPOINT    a second serve endpoint of the font catalogue, minted at its start beside the
+                    client one
+  the ROLE        the manifest client role `FONTADMIN` on `permission_manager`, with the catalogue
+                    as its source
+  the DELIVERY    ServiceManager passes that endpoint to PermissionManager during bootstrap, on the
+                    hop that already carries the device-policy one
+  the CAPABILITY  `CAP_FONTADMIN`, declared and tagged like `CAP_DEVPOLICY`, which is what
+                    PermissionManager mints and what a grant is checked against
+  the RECIPIENT   `lsfont`, the operator tool that owns font administration - the same relationship
+                    governed `lsdev` has to the device policy endpoint
+
+`lsfont` is now a deliverable of this milestone rather than an assumed tool: it lists the installed
+faces through the ordinary `font-catalogue` client, and its ONE privileged operation is `--rescan`,
+which needs the grant. A build in which it is absent is a build in which recovery cannot be issued,
+and that is stated as a gate rather than left implicit - which is the whole difference between an
+authority policy and a route.

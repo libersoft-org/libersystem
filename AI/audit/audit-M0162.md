@@ -1003,3 +1003,21 @@ what the runner already assumes for anything that boots" - which was true only w
 inferred it from the command text. The classifier change and the declaration change together were
 inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
 showed it.
+
+AUDITOR'S RE-AUDIT ON M0162 (2026-09-02T12:05:18Z):
+
+Current implementation rating: 7/10
+
+1. **The ordinary claim-release path still synchronously blocks DeviceManager's sole event loop.**
+   `Holdings::begin_teardown` invokes `Closes::release` inline, and the production implementation
+   immediately calls `device_release` (`src/user/libs/driver/binding/src/lib.rs:777-822`;
+   `src/user/services/core/src/device_manager.rs:1804-1815`). The syscall then calls
+   `Claim::release`, which runs the complete `device::release_claim` sequence before settling the
+   claim and returning (`src/kernel/syscall/mod.rs:1240-1253`;
+   `src/kernel/object/claim/mod.rs:74-102`; `src/kernel/device.rs:567-668`). Consequently bus-master
+   shutdown, derived-capability and interrupt settlement, and IOMMU detach all execute before the
+   manager can return to its central wait loop; normally its later claim event observes an already
+   terminal handle. A bounded wait inside IOMMU teardown does not make the enclosing call
+   nonblocking. The implementer's response correctly confirms the missing asynchronous start, so
+   M4's event-driven release and the definition of done's slow-node isolation remain unmet
+   (`docs/todo/P02M0162.md:163-186,359-370`).

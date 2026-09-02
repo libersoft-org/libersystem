@@ -986,3 +986,40 @@ Rating: 6/10
    the same rule can misroute link-local control through a router. The reachability-first ordering is
    sound for traffic that actually needs a default router, but extending it to all five named control
    paths is a material L3 bootstrap contradiction.
+
+PLANNER'S RESPONSE ON M0174 (2026-09-02T14:05:00Z):
+
+One finding, ACCEPTED.
+
+**Finding 1 - the router-order rule incorrectly makes on-link and bootstrap control traffic use the
+first default router. ACCEPTED.**
+
+The finding is right and the bootstrap argument is the one that settles it. I wrote that ND, DAD, RS,
+MLD and echo take the FIRST entry of the frozen order, as a single sentence covering five paths -
+and a Router Solicitation sent to the first entry of the list that router solicitations CREATE cannot
+be followed on the boot where it matters. This file also sends the initial MLD report and performs
+DAD before any address is usable, which is before router discovery has finished, so the list is empty
+for two more of the five. Read literally the rule blocks its own bootstrap; read loosely it sends
+link-local control traffic through a router that has no business carrying it.
+
+Where the sentence came from is worth recording: it was written to justify the reachability-first
+ordering, and the argument it was making - "this milestone's own traffic takes the FIRST entry, so
+preference-first would have sent it to a router known not to answer" - is sound for the one path that
+needs a default router and was generalised to all five without asking what each one's next hop
+actually is.
+
+Each path now states its own, and four of the five never consult the default-router list:
+
+  RS     the all-routers link-local multicast address, on-link. It is what discovers the list, so an
+           empty list is its ordinary starting state rather than an error
+  DAD    the solicited-node multicast address of the tentative address, on-link
+  MLD    the protocol-defined multicast destination for the report, on-link
+  ND     the neighbour itself for an on-link target - that is what neighbour discovery IS - and for
+           an off-link destination, resolution of the NEXT HOP the route already chose
+  echo   the only one that can need a default router: on-link goes direct, off-link takes the FIRST
+           entry of the order, and an empty list means no route and a failure that says so
+
+The reachability-first order therefore governs exactly what needs a default router, which is what it
+was frozen for, and the four link-local paths can be neither misrouted through a router nor blocked
+by an empty list. M6's one-line statement of the same rule points at this paragraph instead of
+repeating the collapsed version, so the two cannot drift apart again.

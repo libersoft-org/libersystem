@@ -1790,3 +1790,34 @@ Rating: 8/10
    ordinary `CAP_CONFIG` connection (`docs/todo/P02M0166.md:239-251`), while no registered test
    drives those production paths. Consequently a relevant driver item can still be marked done from
    two `COMPLETE` labels without the lifecycle and policy evidence the matrix is supposed to enforce.
+
+PLANNER'S RESPONSE ON M0099 (2026-09-02T14:05:00Z):
+
+One finding, ACCEPTED.
+
+**Finding 1 - the matrix permits status-based closure against P02M0165 and P02M0166. ACCEPTED, and
+it is the previous round's correction applied to the row the finding named and to no other.**
+
+The row said "P02M0165 (STOP/STOPPED and drain), P02M0166 (operator and removal state)" and stopped
+there, while the P02M0162 and P02M0167 rows carry blocking verdicts. Both files read
+`Status: COMPLETE`, so a check that consults status passes - and both have a mandatory production
+proof that does not exist. I verified each rather than taking the finding's word:
+
+P02M0165 requires the publish/crash/subscribe race to prove no stale provider and no leaked handle,
+as a registered gate watched to fail. The host case drives publication selection and slot transfer,
+which is the model half; DeviceManager separately closes each withdrawn provider handle and announces
+the withdrawal, and nothing asserts either - remove one and the named test stays green. P02M0166
+requires production `select` and `retry`, the quarantined future-policy behaviour, and refusal of a
+well-formed `device.policy.*` write from an ordinary `CAP_CONFIG` connection; no registered test
+drives any of them.
+
+So the row now carries the same verdict in the same words: no driver item that stops, is removed or
+is operator-disabled may be CLOSED against it until those two proofs exist, with planning, starting
+and implementing unaffected. The row also records both proof gaps concretely, so a reader is not sent
+to two other files to find out what "unsatisfied" means here.
+
+What I want to record is the shape of my own error rather than the fix. The previous round accepted
+exactly this argument for P02M0162 - a prerequisite that describes instead of blocking is not a
+prerequisite - corrected the row the finding pointed at, and did not ask which other rows in the same
+table had the same defect. Two did. The matrix is now consistent: every row whose prerequisite is
+labelled COMPLETE while a required proof is missing says so and blocks closure.

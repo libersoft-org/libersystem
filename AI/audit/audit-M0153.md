@@ -1294,3 +1294,41 @@ what the runner already assumes for anything that boots" - which was true only w
 inferred it from the command text. The classifier change and the declaration change together were
 inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
 showed it.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-09-02T11:59:59Z):
+
+Current implementation rating: 6/10
+
+1. **Live IOMMU faults can still remain uncontained indefinitely, and the implementer's stated
+   missing-facility blocker is contradicted by the current scheduler API.** M5 requires a hardware
+   fault to reach the binding lifecycle's containment path (`docs/todo/P02M0153.md:197-204`). The only
+   periodic production service still runs after `console_shell_loop` calls `sched::run_until_idle()`
+   (`src/kernel/main.rs:449-470`); that wrapper explicitly uses `NO_DEADLINE`, and continuously
+   runnable work can keep its reschedule loop non-empty forever
+   (`src/kernel/sched/mod.rs:1105-1142`). `service_faults_if_due` itself acknowledges that it offers no
+   guarantee and runs only when CPU 0 settles (`src/kernel/iommu/mod.rs:1027-1082`). A CPU-bound
+   workload can therefore leave the faulting endpoint mastering the bus indefinitely. The response's
+   justification that the kernel has no non-interrupt context capable of enforcing a deadline is no
+   longer valid: `sched::run_until_idle_until` already supplies an absolute-tick bound and checks it
+   between reschedules (`src/kernel/sched/mod.rs:1109-1142`), but this servicing path does not use it.
+   M5 and the milestone's COMPLETE status consequently remain unsupported.
+
+2. **The latest detached-tail accounting fix still does not expose an ended binding's late faults
+   after the device has been rebound.** A fault whose generation is not current is now correctly
+   added to the per-device `RETAINED_FAULTS` scalar (`src/kernel/iommu/mod.rs:1133-1149`). However,
+   the production `faults_for(index)` reader prefers any live replacement domain and consults that
+   scalar only when no live or retained domain exists (`src/kernel/iommu/mod.rs:591-598`). The old
+   binding's late count is therefore invisible while its replacement runs; because the scalar has no
+   generation and the replacement's teardown later assigns its own final domain count into the same
+   slot (`src/kernel/iommu/mod.rs:961-975`), the correctly attributed old count can then be
+   overwritten without ever reaching binding accounting. This is an incomplete fix to M4's explicit
+   per-binding fault-counter and repeat-crash/restart baseline requirement
+   (`docs/todo/P02M0153.md:190-195`), even though the internal detached-tail ledger now protects the
+   replacement from cross-generation containment.
+
+Focused verification: the portable DMA/virtio-IOMMU suite and protocol gate passed all 59 tests.
+Those tests credit the corrected mapping, teardown, and detached-tail safety work, but no test queues
+a live hardware fault while keeping the BSP run queue continuously runnable or drives a late old-
+generation fault through the kernel snapshot seam while a replacement binding is live.

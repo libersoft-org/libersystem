@@ -1125,3 +1125,13 @@ what the runner already assumes for anything that boots" - which was true only w
 inferred it from the command text. The classifier change and the declaration change together were
 inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
 showed it.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0098 (2026-09-02T12:07:04Z):
+
+Current implementation rating: 7/10
+
+1. **A release can revoke a newly derived object before its capability snapshot is minted, after which the syscall resurrects it as a valid handle.** `sys_dma_buffer_create` successfully registers the new buffer under the live claim and only afterwards calls `install_object` (`src/kernel/syscall/mod.rs:644-660`). A forced release in that gap removes the row, increments the object's revocation generation and marks the buffer orphaned (`src/kernel/device.rs:964-1004,1039-1043`), and may finish the claim `Free`. `install_object` then reaches `HandleTable::try_insert_object`, whose `Capability::new` snapshots the object's generation *at that later moment* (`src/kernel/syscall/mod.rs:378-385`; `src/kernel/object/handle/mod.rs:76-80,551-554`). The resulting capability therefore carries the post-revocation generation, passes the equality check used by every lookup (`src/kernel/object/handle/mod.rs:107-110,564-585`), and can still map/read/write the buffer and ask for its stored device address after the claim ended. The same publication ordering exists for MSI acquisition: registration and atomic hardware publication precede the final `Capability::new`/handle install (`src/kernel/syscall/mod.rs:1610-1667`), although the interrupt's separate revoked flag limits that instance's effects. The late-registration barrier does not cover this interleaving because registration already succeeded, and the current hostile-holder tests retain raw `Arc`s but never mint a capability after their release. This leaves M3's central requirement that every claim-derived capability die with the claim unresolved.
+
+Verification: the ABI suite passed all 28 tests and the portable DMA suite passed all 59 tests. These suites do not exercise the registration-to-capability-publication interleaving above.
