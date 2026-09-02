@@ -1633,3 +1633,22 @@ exit, in reverse of the observed constructor order and in reverse of the initial
 the provider DAG - a consumer's destructor before its provider's - and the crash case is widened to
 say which handlers AND destructors did not run. The note that a measured `.fini_array` makes building
 its runner a deliverable is stated the way the `.init_array` one already was.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-09-02T04:24:00Z):
+
+Rating: 8/10
+
+1. **The corrected bootstrap freeze order now contradicts the milestone's licensing-first
+   requirement.** The first item requires the dependency/licensing policy to be recorded before any
+   upstream source is fetched (`docs/todo/P02M0135.md:90-100`). The latest bootstrap correction then
+   calls authoring the cross files and bootstrap sysroot the first work item, requires its gate to
+   compile the pinned upstream on all three targets, and says nothing else may start before it is done
+   and frozen (`:156-187`). The controlling freeze summary is stricter still: “NOTHING BUT THE
+   BOOTSTRAP INPUTS” may start before the bootstrap pin (`:202-208`), and the host gate repeats that
+   rule (`:756-777`). Bootstrap preparation necessarily fetches/reads and compiles the upstream
+   sources, so following the freeze order forbids the licensing item that must precede that work;
+   following the licensing item violates the freeze order. The latest correction omitted the
+   licensing policy from both authoritative orders, leaving a material route to perform the first
+   upstream build before the required licence/provenance policy exists.

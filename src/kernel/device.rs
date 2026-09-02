@@ -372,6 +372,40 @@ pub fn claim_is_current(key: abi::ClaimKey) -> bool {
 	}
 }
 
+// A QUIESCE'S RELEASES, PERFORMED UNDER THE LOCK THAT PROVED THE CLAIM CURRENT.
+//
+// `SYS_DEVICE_QUIESCED` used to ask `claim_is_current`, drop the lock, and only then call
+// `release_msi_for_device` and `dma_buffer::release_for` - and both of those identify what they are
+// freeing by the DEVICE INDEX alone, because neither registry carries a generation. So the check and
+// the use were two steps with a gap: an old-generation caller could pass the check, pause, let a
+// forced release finish and a replacement claim start, and resume to free the REPLACEMENT's pending
+// MSI slot and its held frames. Revoking the old `DeviceMemory` does not stop it, because the
+// syscall already holds the resolved `Arc`.
+//
+// This is the same defect `finish_release` closed on the release path, and it is closed the same
+// way: a replacement cannot claim the device while `CLAIMS` is held, so between the proof and the
+// releases there is no second owner for either registry to find. The lock order is `CLAIMS` and then
+// each registry's own lock, which is the direction every other path already takes - the MSI registry
+// and the held-frame table never ask for a claim.
+//
+// Answers `None` for a claim that is not current, which is the caller's `ERR_ACCESS_DENIED`, and
+// otherwise the vector and frame counts it released.
+pub fn release_quiesced_if_current(key: abi::ClaimKey) -> Option<(usize, usize)> {
+	let claims = CLAIMS.lock();
+	let index = key.device_index as usize;
+	let current = claims.get(index).is_some_and(|slot| slot.state == ClaimState::Claimed && slot.generation == key.generation);
+	if !current {
+		return None;
+	}
+	// The DMA frames AND the MSI vectors. Both were held for the same reason - a request to stop is
+	// not proof of stopping - and this is the one claim that answers it, so a quiesce that released
+	// only half of them would leave the other half waiting for ever.
+	let vectors = crate::arch::interrupts::release_msi_for_device(key.device_index);
+	let frames = crate::object::dma_buffer::release_for(key.device_index);
+	drop(claims);
+	Some((vectors, frames))
+}
+
 // Take the device at `index`. The FIRST claim succeeds and any other is refused.
 //
 // The generation is minted here and it does not wrap: `checked_add` rather than `wrapping_add`, and

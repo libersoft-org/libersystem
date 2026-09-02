@@ -1332,25 +1332,33 @@ fn sys_device_quiesced(device_handle: u64) -> i64 {
 	// message queue, or in a process being torn down - could release the frames and vectors the
 	// CURRENT driver is still using. Nothing forged it; it simply became a statement about a
 	// different machine, and the generation is what tells the two apart.
-	if let Some(key) = memory.claim() {
-		if !device::claim_is_current(key) {
-			return ERR_ACCESS_DENIED;
-		}
-	}
-	match memory.device_index() {
-		Some(index) => {
-			// The DMA frames AND the MSI vectors. Both were held for the same reason - a request to
-			// stop is not proof of stopping - and this is the one claim that answers it, so a
-			// quiesce that released only half of them would leave the other half waiting forever.
-			let vectors = crate::arch::interrupts::release_msi_for_device(index);
+	// THE PROOF AND THE RELEASES ARE ONE STEP, AND THEY WERE TWO (fixed 2026-09-02).
+	//
+	// This asked `claim_is_current`, which takes the claim lock and drops it, and then called two
+	// release operations that identify what they free by the DEVICE INDEX alone. An old-generation
+	// caller could therefore pass the check, pause, let a forced release finish and a replacement
+	// claim start, and resume to free the replacement's pending MSI slot and its held frames - the
+	// cross-binding resource reuse this milestone exists to prevent, reached through the one syscall
+	// whose whole authority is "the holder has just reset THIS device". Revoking the old
+	// `DeviceMemory` does not stop it: the syscall already holds the resolved `Arc`.
+	//
+	// `device::release_quiesced_if_current` performs both under the lock that proved the claim
+	// current, so there is no window for a replacement to appear between them.
+	let Some(key) = memory.claim() else {
+		// A bare MMIO window is not a device-table entry, so nothing is keyed on it - and one with
+		// no claim has no binding whose reset this call could be attesting to.
+		return ERR_INVALID;
+	};
+	let index = key.device_index;
+	match device::release_quiesced_if_current(key) {
+		Some((vectors, frames)) => {
 			if vectors != 0 {
 				crate::serial_println!("irq: device {index} confirmed stopped - {vectors} masked MSI vector(s) released for re-use");
 			}
 			// The answer stays the FRAME count, which is what the syscall has always meant.
-			crate::object::dma_buffer::release_for(index) as i64
+			frames as i64
 		}
-		// A bare MMIO window is not a device-table entry, so nothing is keyed on it.
-		None => ERR_INVALID,
+		None => ERR_ACCESS_DENIED,
 	}
 }
 

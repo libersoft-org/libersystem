@@ -26,7 +26,6 @@ pub struct DeviceMemory {
 	// created for, and the frames of a driver that died holding one are not recycled until somebody
 	// proves that device has been stopped. Both ends of that are capabilities to this object, so
 	// the index it names belongs on it rather than in a number passed alongside.
-	index: Option<u32>,
 	// WHICH BINDING OF THAT DEVICE THIS CAPABILITY BELONGS TO, when it was minted under a claim.
 	//
 	// The index alone cannot answer it. A device is claimed, released and claimed again, and the
@@ -58,25 +57,12 @@ impl DeviceMemory {
 	// FALLIBLY, here and in `for_device`: `sys_device_acquire` mints them.
 	#[cfg(test)]
 	pub fn new(phys_base: u64, len: usize) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: None, claim: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
-	}
-
-	#[cfg(test)]
-	// The same, for entry `index` of the device table but under no claim - what the kernel's own
-	// bring-up suites mint, standing in for a DeviceManager on a device the booted system has
-	// already claimed. Nothing minted this way is revocable, because there is no binding to revoke.
-	pub fn for_device(index: u32, phys_base: u64, len: usize) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: Some(index), claim: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: None, phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
 	}
 
 	// The real one: minted under a claim, and stamped with it - what `SYS_DEVICE_CLAIM` hands out.
 	pub fn for_claim(key: abi::ClaimKey, phys_base: u64, len: usize) -> Option<Arc<Self>> {
-		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), index: Some(key.device_index), claim: Some(key), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
-	}
-
-	// The device-table entry this capability is for, if it is for one.
-	pub fn device_index(&self) -> Option<u32> {
-		self.index
+		crate::mem::heap::try_arc(Self { header: ObjectHeader::new(), claim: Some(key), phys_base, len, mapped_at: AtomicU64::new(0), mapped_in: SpinLock::new(None) })
 	}
 
 	// The binding this capability was derived from, if it was derived from one.

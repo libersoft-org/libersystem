@@ -1278,3 +1278,82 @@ Current implementation rating: 4/10
 1. **The production catalogue migration remains audio-only.** AudioService is the sole service that subscribes to the provider catalogue (`src/user/services/core/src/audio_engine.rs:679`). DeviceManager still owns fixed boot/probe block slots plus local network, GPU, input, and USB state, hands those objects directly to services, and constructs non-audio offers from those local fields (`src/user/services/core/src/device_manager.rs:431-474`, `677-693`, `1170-1243`). ServiceManager likewise still injects fixed FAT/ISO/UDF/USB/network/display objects (`src/user/services/core/src/bootstrap.rs:389-480`). This leaves the milestone's required block, network, display, input, and USB consumer migration incomplete (`docs/todo/P02M0164.md:306-322`).
 
 2. **Block-volume discovery is still capped at four positional slots instead of selecting by published metadata/content.** DeviceManager defines four boot-block tags and four boot/probe arrays (`src/user/services/core/src/device_manager.rs:82-85`, `431-444`), probes and takes only those four positions (`src/user/services/core/src/device_manager.rs:891-906`), and ServiceManager assigns filesystem roles from those positions before StorageService trusts the supplied tags (`src/user/services/core/src/bootstrap.rs:389-474`; `src/user/services/storage/src/service.rs:199-233`, `262-275`). A valid root volume beyond those slots, or one whose position does not match its content, is therefore not discovered as required by the milestone (`docs/todo/P02M0164.md:290-303`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-09-02T08:00:00Z):
+
+Two findings, both ACCEPTED and both unmet. They are the migration this milestone scopes.
+
+**Finding 1 - the production catalogue migration remains audio-only. ACCEPTED.**
+
+Re-confirmed rather than carried forward: AudioService is still the only service that subscribes,
+DeviceManager still owns fixed boot and probe block slots plus local network, GPU, input and USB
+state and hands those objects down, and ServiceManager still injects the fixed roles. The block,
+network, display, input and USB consumer migrations are all outstanding.
+
+(The finding cites `src/user/services/core/src/bootstrap.rs`; the file is
+`src/user/services/core/src/service_manager/bootstrap.rs`. The line ranges and the substance are
+right, and I am noting the path only so a later reader does not conclude the finding was checked
+against something that does not exist.)
+
+**Finding 2 - block-volume discovery is capped at four positional slots. ACCEPTED.**
+
+Also re-confirmed: four boot tags, four boot and probe arrays, probes minted for four positions, roles
+filled by lowest-BDF `Catalogue::take`, ServiceManager labelling those positions and StorageService
+trusting the labels. A valid root volume beyond the four, or one whose position does not match its
+content, is not discovered.
+
+The reason recorded before still holds and I re-checked it: selecting by content means identifying
+each medium's filesystem BEFORE the roles are handed out, and the code that can do that lives in
+StorageService, which does not exist at the moment ServiceManager assigns them. That is a
+bootstrap-ordering change across three components rather than a correction inside one.
+
+Nothing in this round touched either, and nothing should have: this round's work was five defect
+fixes in the claim, quiesce, IOMMU-attribution and verification paths, and the seam these two need is
+a change to how three services start. It is the next thing this milestone owes, and it is now the
+blocking item for M0159's M4 as well as for its own goal.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `dma` host suite | 59 passed |
+| `driver-binding` host suite | 60 passed |
+| `verify-model` host suite | 116 passed |
+| `check.sh --gate verify-scheduler` | **PASS - the new gate, 18 assertions** |
+| `verify-model`, `gate-oracles`, `no-suppression`, `source-hygiene`, `test-tags` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+No suite failed and no gate failed, on any architecture. The riscv64 benchmark that flaked in the
+previous round - `a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` - passed here,
+which is what its measured spread predicts rather than evidence about it either way.
+
+The enforcing IOMMU gate now names the case it was silently allowing to disappear:
+
+```
+qemu-virtio-iommu:   forced-release case PASSED
+```
+
+And the new scheduler gate reports what it proved:
+
+```
+verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE,
+unmeasured costs and the guest-slot budget all hold
+```
+
+ONE THING WAS FOUND BY THIS ROUND'S OWN WORK AND IS WORTH RECORDING. After declaring a guest slot on
+every step that boots one, the emitted plan still showed no `STEPGUESTS` line for the profile rows:
+the emitter wrote that field only for a step needing more than ONE, on the reasoning that "one is
+what the runner already assumes for anything that boots" - which was true only while the runner
+inferred it from the command text. The classifier change and the declaration change together were
+inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
+showed it.

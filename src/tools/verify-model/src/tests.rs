@@ -2343,9 +2343,21 @@ fn every_profile_row_is_a_step_of_its_own() {
 		let step = owned[0];
 		assert_eq!(step.keys.len(), 1, "{name} does not share its step with another key, because a shared step is a shared cost: {:?}", step.keys);
 		assert!(step.command.contains(name) && !step.command.contains(','), "{name} runs as its own command rather than as one name in a list: {}", step.command);
+		// AND THE SCHEDULER CAN SEE IT. A profile row boots QEMU, so it declares a guest slot; the
+		// runner classifies guest work by that declaration rather than by matching the command text,
+		// which is what puts these rows inside the one `--jobs` the definition of done requires them
+		// to be scheduled by. Without this the split gave them an identity and a cost and left them
+		// serial (added 2026-09-02).
+		assert_eq!(step.guests, 1, "{name} declares the one guest slot it needs, so `--jobs` schedules it");
 	}
 	// And the list agrees with what `check.sh` can actually run - a name here that is not a gate is a
 	// step nothing would execute.
+	// EVERY STEP THAT BOOTS A GUEST DECLARES IT, which is the property the runner now depends on: a
+	// step whose command starts a guest and declares none would be scheduled as host work and run
+	// outside the slot budget, which is the defect the classifier change closed.
+	for step in steps.iter().filter(|step| step.command.contains("./test.sh --arch ")) {
+		assert!(step.guests >= 1, "a step that boots the suite declares a guest slot: {}", step.command);
+	}
 	let known = crate::catalog::catalog_gate_names();
 	for name in crate::catalog::PROFILE_ROW_GATES {
 		assert!(known.contains(name), "{name} is named as a profile row and is not a registered gate");

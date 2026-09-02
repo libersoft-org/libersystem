@@ -1163,3 +1163,109 @@ Current implementation rating: 6/10
 1. **The accepted per-profile split fixes identity and cost, but profile rows are still outside the outer `--jobs` scheduler.** Each profile is now emitted as a separate step/key/cost, yet its command is `./check.sh --gate ...` with `guests: 0` (`src/tools/verify-model/src/commands.rs:237-249`). `verify.sh` classifies only literal `./test.sh --arch ...` commands as guest work, drains the guest pool before every other command, and executes these profile rows synchronously (`verify.sh:849-883`, `928-944`). The generated live plan confirms separate profile rows without `STEPGUESTS`, so they remain serial rather than participating in the accepted bounded-concurrency design required by the milestone (`docs/todo/P02M0167.md:361-371`, `643-649`). The new model test checks their separation, key, command, and name but not scheduler classification (`src/tools/verify-model/src/tests.rs:2326-2353`).
 
 2. **The required shell-scheduler execution matrix is still absent.** `verify.sh` always generates its own plan (`verify.sh:603-610`), and the Rust tests cover graph structure/profile emission rather than executing the shell scheduler (`src/tools/verify-model/src/tests.rs:2304-2353`). Consequently there is still no executable proof of the required shared-prerequisite deduplication, unmeasured-cost fallback, `FAIL` precedence over `INCOMPLETE`, and failed-descendant behavior (`docs/todo/P02M0167.md:674-676`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-09-02T08:00:00Z):
+
+Two findings, both ACCEPTED and both FIXED. The second has been owed for three rounds and it is the
+one that would have caught the first.
+
+**Finding 1 - the per-profile split fixes identity and cost, and the rows are still outside the outer
+`--jobs` scheduler. ACCEPTED.**
+
+Correct, and it is a half-finished correction of mine: I gave each profile its own step, key and cost
+and left it classified as host work, so the rows split out to be schedulable were the one thing the
+scheduler could not reach. The definition of done says each profile is its own step "scheduled by the
+one `--jobs`", and mine were drained behind the barrier and run alone.
+
+The cause is that `verify.sh` decided what guest work IS by matching the literal string
+`./test.sh --arch ` in the command. That is one way of booting a guest and not the only one: a
+profile row boots QEMU through `check.sh`. So the runner had one answer for steps whose command
+happened to match and another for steps that boot just as many guests.
+
+The model already says how many slots a step needs - `STEPGUESTS` exists for the gate whose subject
+is overlap - so the runner now reads that instead of the command text. Three changes together, and
+all three are needed: every profile row declares one slot; the kernel suites and the dev checks
+declare theirs, which the runner used to infer; and `STEPGUESTS` is emitted for EVERY step rather
+than only above one, because a number the plan does not carry is a number the runner reads as zero -
+that guard was written when "anything that boots" meant the string match, and it silently defeated
+the first two changes until I checked the emitted plan rather than the code.
+
+The model test asserts the classification now, which the previous one did not: each profile row
+declares exactly one guest slot, and every step whose command boots the suite declares one too.
+
+**Finding 2 - the shell-scheduler execution matrix is absent. ACCEPTED, and it now exists.**
+
+I have deferred this twice with the same reasoning - that landing a new step type beside a change to
+how steps are emitted would make a failure unattributable - and this round the argument reversed: I
+was changing the classifier, which is executor behaviour, and the matrix is what tests executor
+behaviour. Deferring again would have meant changing the scheduler for the third time in four days
+with nothing watching it.
+
+`verify.sh` takes a prepared plan through `LIBER_VERIFY_STEPS`, in the planner's own format. That is
+the whole seam: everything after the plan is read is the executor, and a prepared plan carries no
+`KEY` lines, so `record_one_step` files nothing against the verification history - the executor is
+driven over synthetic steps whose commands are `true` and `false`, and the tree's record is untouched.
+
+`tools/check-verify-scheduler.sh` is the gate, registered in `check.sh` and in the model. It drives
+the five cases the definition of done names, eighteen assertions in all:
+
+  - a failed step blocks its dependent AND its GRANDCHILD, while an unrelated step still runs - the
+    transitive suppression corrected on 2026-09-01;
+  - a prerequisite shared by two branches runs once and blocks both;
+  - `FAIL` outranks `INCOMPLETE`: a run that skipped for a budget and also failed reports failure and
+    exits non-zero, and does not print INCOMPLETE;
+  - an unmeasured cost is priced from the plan's estimate, so a budget starts what it can hold and
+    refuses what it cannot, and a run that only skipped IS INCOMPLETE;
+  - a step wanting more guest slots than `--jobs` has is refused rather than trimmed, and runs when
+    the slots exist;
+  - and the parallel case, which is both this round's classifier change and the barrier order from
+    2026-09-01 together: under `--jobs 2` a failing guest is backgrounded and the non-guest step that
+    reads it is still blocked.
+
+The last one is the case that has broken twice. It now fails a gate rather than an audit.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `dma` host suite | 59 passed |
+| `driver-binding` host suite | 60 passed |
+| `verify-model` host suite | 116 passed |
+| `check.sh --gate verify-scheduler` | **PASS - the new gate, 18 assertions** |
+| `verify-model`, `gate-oracles`, `no-suppression`, `source-hygiene`, `test-tags` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+No suite failed and no gate failed, on any architecture. The riscv64 benchmark that flaked in the
+previous round - `a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` - passed here,
+which is what its measured spread predicts rather than evidence about it either way.
+
+The enforcing IOMMU gate now names the case it was silently allowing to disappear:
+
+```
+qemu-virtio-iommu:   forced-release case PASSED
+```
+
+And the new scheduler gate reports what it proved:
+
+```
+verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE,
+unmeasured costs and the guest-slot budget all hold
+```
+
+ONE THING WAS FOUND BY THIS ROUND'S OWN WORK AND IS WORTH RECORDING. After declaring a guest slot on
+every step that boots one, the emitted plan still showed no `STEPGUESTS` line for the profile rows:
+the emitter wrote that field only for a step needing more than ONE, on the reasoning that "one is
+what the runner already assumes for anything that boots" - which was true only while the runner
+inferred it from the command text. The classifier change and the declaration change together were
+inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
+showed it.

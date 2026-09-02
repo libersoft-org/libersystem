@@ -1042,3 +1042,78 @@ AUDITOR'S RE-AUDIT ON M0166 (2026-09-02T03:51:29Z):
 Current implementation rating: 7/10
 
 1. **The required production policy and reserved-namespace authority proofs remain absent.** The production policy dev check covers only disabling and re-enabling a GPU (`src/user/services/core/src/catalog.rs:543-572`; `scripts/qemu/dev-gpu-restart.py:197-228`). It does not drive DeviceManager's production select/retry logic (`src/user/services/core/src/device_manager.rs:4413-4479`), prove quarantined-device retry/future-policy behavior, or prove that a well-formed `device.policy.*` write by an ordinary `CAP_CONFIG` holder is denied by ConfigService's authority checks (`src/user/services/core/src/config_service.rs:218-269`). Those are explicit milestone verification requirements (`docs/todo/P02M0166.md:239-251`), so the current lower-level model tests do not close the production security and state-transition gap.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-09-02T08:00:00Z):
+
+One finding, ACCEPTED and unmet.
+
+**Finding 1 - the production policy and reserved-namespace authority proofs remain absent. ACCEPTED.**
+
+Correct on every clause. The only production policy trace is the development GPU disable/enable
+sequence; no registered test drives production `select` or `retry`, the quarantined future-policy
+behaviour, or the refusal of a well-formed `device.policy.*` write from an ordinary `CAP_CONFIG`
+connection. The binding tests assert the state-table helper, which is a different thing.
+
+(The finding cites `src/user/services/core/src/catalog.rs` and `scripts/qemu/dev-gpu-restart.py`;
+the registration is in the verify-model catalogue and the check is `src/harness/dev-gpu-restart.py`.
+The substance is right and I am noting the paths only so a later reader does not conclude the finding
+was checked against files that do not exist.)
+
+What changed under this item since the last round is worth recording because it is what makes the one
+piece of evidence this item has meaningful at all: the teardown-confirmation defect fixed two rounds
+ago is what stopped the disable/enable sequence reaching `disabled`, so the dev check could not have
+completed even for the path it does cover. It can now. That does not make it the proof - it needs a
+running development instance, which is blocked on the boot-window problem recorded against M0159 -
+but the sequence it asserts is a sequence production can now perform.
+
+The rest is owed and unchanged. The policy decision is a pure function of the node's state, the verb
+and the registry entry, and belongs in `driver-binding` where a host test can drive it; the authority
+half needs a real ConfigService connection and belongs in a gate. Both are contained. Neither is a
+change to make in the same round as five defect fixes, one of which altered how every step in the
+verification is scheduled.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `dma` host suite | 59 passed |
+| `driver-binding` host suite | 60 passed |
+| `verify-model` host suite | 116 passed |
+| `check.sh --gate verify-scheduler` | **PASS - the new gate, 18 assertions** |
+| `verify-model`, `gate-oracles`, `no-suppression`, `source-hygiene`, `test-tags` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+No suite failed and no gate failed, on any architecture. The riscv64 benchmark that flaked in the
+previous round - `a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` - passed here,
+which is what its measured spread predicts rather than evidence about it either way.
+
+The enforcing IOMMU gate now names the case it was silently allowing to disappear:
+
+```
+qemu-virtio-iommu:   forced-release case PASSED
+```
+
+And the new scheduler gate reports what it proved:
+
+```
+verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE,
+unmeasured costs and the guest-slot budget all hold
+```
+
+ONE THING WAS FOUND BY THIS ROUND'S OWN WORK AND IS WORTH RECORDING. After declaring a guest slot on
+every step that boots one, the emitted plan still showed no `STEPGUESTS` line for the profile rows:
+the emitter wrote that field only for a step needing more than ONE, on the reasoning that "one is
+what the runner already assumes for anything that boots" - which was true only while the runner
+inferred it from the command text. The classifier change and the declaration change together were
+inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
+showed it.

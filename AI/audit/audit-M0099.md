@@ -1768,3 +1768,25 @@ reads, are two further typed refusals in which nothing outside the bytes actuall
 
 The pattern is worth naming because it is the one the last round was supposed to have ended: writing
 the ID down is not writing the assertion down, and an ID whose entry names two defects needs two.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-09-02T04:24:00Z):
+
+Rating: 8/10
+
+1. **The prerequisite matrix still permits status-based closure against P02M0165 and P02M0166 even
+   though their mandatory production proofs remain absent.** The row for items that stop, remove or
+   operator-disable a device names P02M0165/P02M0166 without the `UNSATISFIED` verdict that the same
+   matrix now correctly applies to P02M0162 and P02M0167
+   (`docs/todo/P02M0099.md:124-153,183-219`). Both prerequisite files still say `COMPLETE`.
+   P02M0165 requires its publish/crash/subscribe race to prove no stale provider or handle and to be
+   a registered watched-fail gate (`docs/todo/P02M0165.md:280-331`), but the current host case
+   exercises publication selection and slot transfer only
+   (`src/user/libs/driver/binding/src/tests.rs:526-599`); the production handle close and withdrawal
+   announcement remain separate, unasserted effects
+   (`src/user/services/core/src/device_manager.rs:2294-2352,3723`). P02M0166 likewise requires
+   production select/retry/quarantine behavior and refusal of a valid `device.policy.*` write from an
+   ordinary `CAP_CONFIG` connection (`docs/todo/P02M0166.md:239-251`), while no registered test
+   drives those production paths. Consequently a relevant driver item can still be marked done from
+   two `COMPLETE` labels without the lifecycle and policy evidence the matrix is supposed to enforce.

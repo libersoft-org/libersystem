@@ -654,21 +654,43 @@ fn a_tail_queued_by_an_ended_binding_is_not_charged_to_the_one_that_replaced_it(
 #[test]
 fn a_tail_record_is_bounded_and_gives_up_the_ones_that_attribute_nothing_first() {
 	// FIXED BOOKKEEPING. A machine that restarts one driver in a loop must not grow a record per
-	// restart, and the one it gives up must be one that no longer attributes anything.
+	// restart, and one that runs out of records must not silently give up one that is still
+	// protecting a replacement - which is what the first version of this bound did.
 	let (mut iommu, _) = iommu();
-	for index in 0..(MOST_DETACHED_TAILS as u32 + 4) {
+	// ONE RECORD PER ENDPOINT, so filling the bound needs that many DISTINCT endpoints - repeated
+	// revocations of one endpoint merge and cannot fill it at all.
+	for index in 0..(MOST_DETACHED_TAILS as u32) {
 		let domain = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(index as u64 + 1)).expect("a domain");
 		let endpoint = EndpointId(100 + index);
 		iommu.attach(domain, endpoint).expect("attached");
 		iommu.revoke_endpoint(domain, endpoint).expect("and ended");
 	}
-	assert!(iommu.detached_tails() <= MOST_DETACHED_TAILS, "the record is bounded however many bindings end");
-	// The most recent one still attributes: its tail is the one that can still be queued.
-	let last = EndpointId(100 + MOST_DETACHED_TAILS as u32 + 3);
+	assert_eq!(iommu.detached_tails(), MOST_DETACHED_TAILS, "the bound holds exactly");
+	assert!(iommu.attribution_is_complete(), "nothing has been given up yet");
+
+	// ONE MORE, WITH NOTHING DRAINED. There is no record that attributes nothing, so rather than
+	// evicting one that does - which hands its endpoint's queued tail back to the current-attachment
+	// path, the defect this whole mechanism closes - the ledger says it can no longer tell an ended
+	// binding's fault from a live one's, and stops taking containment decisions on generation.
+	let extra = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(99)).expect("a domain");
+	let overflowing = EndpointId(200);
+	iommu.attach(extra, overflowing).expect("attached");
+	iommu.revoke_endpoint(extra, overflowing).expect("and ended");
+	assert_eq!(iommu.detached_tails(), MOST_DETACHED_TAILS, "the list does not grow past its bound to hold it either");
+	assert!(!iommu.attribution_is_complete(), "and it says so rather than dropping a live attribution quietly");
+	assert_eq!(iommu.tails_overflowed(), 1, "counted, so a machine whose storm outlasted its bookkeeping is visible");
+
+	// AND THE FIRST RECORD IS STILL THERE AND STILL ATTRIBUTING - which is the assertion the old
+	// version of this test could not make, because the old rule had already evicted it.
 	let mut out = [event(0, 0, 0, Access::Read, Fault::NotMapped); 4];
-	iommu.backend_mut_for_test().queue_fault(event(last.0, 0, 0x4000, Access::Write, Fault::NotMapped));
+	iommu.backend_mut_for_test().queue_fault(event(100, 0, 0x4000, Access::Write, Fault::NotMapped));
 	assert_eq!(iommu.drain_faults(&mut out), 1);
-	assert_eq!(out[0].generation, Generation(MOST_DETACHED_TAILS as u64 + 4), "the newest ended binding still names itself");
+	assert_eq!(iommu.faults_in(DomainId(out[0].domain.0)), 1, "the oldest ended binding still owns its tail");
+	assert_eq!(out[0].generation, Generation(1), "and names itself, rather than resolving through whatever is attached now");
+
+	// The drain above ran the transport dry, which is the proof that clears both the tails and the
+	// lost attribution: nothing queued before it can still be in flight.
+	assert!(iommu.attribution_is_complete(), "a dry transport is what makes containment on generation trustworthy again");
 }
 
 #[test]
@@ -690,7 +712,8 @@ fn a_second_revocation_does_not_discard_the_tail_of_the_one_before_it() {
 	let second = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(2)).expect("a second domain");
 	iommu.attach(second, endpoint).expect("the second binding attaches");
 	iommu.revoke_endpoint(second, endpoint).expect("and ends too");
-	assert_eq!(iommu.detached_tails(), 2, "an undrained record is kept rather than being replaced by the binding after it");
+	assert_eq!(iommu.detached_tails(), 1, "one undrained record per endpoint: the second revocation MERGES rather than replacing the first or pushing beside it");
+	assert!(iommu.attribution_is_complete(), "and nothing was given up to make room, so containment on generation is still trustworthy");
 
 	// AND THE FRONT OF THE QUEUE IS THE FIRST BINDING'S. The backend reports whatever attachment it
 	// can see, which is neither of them by now; the record is what says whose it is.

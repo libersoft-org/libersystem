@@ -123,7 +123,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 63] = [
+const GATES: [(&str, &str); 64] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -226,6 +226,12 @@ const GATES: [(&str, &str); 63] = [
 	// Its subject is the documentation rather than any built thing, so it belongs to the harness -
 	// which also means every change selects it, and it costs milliseconds.
 	("milestone-index", "harness.tools"),
+	// The shell scheduler, driven over prepared plans: failed-descendant suppression, a shared
+	// prerequisite, FAIL over INCOMPLETE, an unmeasured cost against a budget, and the guest-slot
+	// reservation. Its subject is `verify-model` like the two below, because the plan format it is
+	// driven with is that model's output and a change to either is what can break it - and it reads
+	// no source and boots nothing, so it costs milliseconds.
+	("verify-scheduler", "verify-model"),
 	("verify-model", "verify-model"),
 	("verify-model-tests", "verify-model"),
 	// The 1 -> 4 handle migration's gate: building a capability list from ONE received

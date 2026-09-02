@@ -853,8 +853,17 @@ struct DetachedTail {
 }
 
 // HOW MANY ENDED BINDINGS KEEP A TAIL RECORD. Bounded because this is fixed bookkeeping in a kernel:
-// a machine that restarts one driver in a loop must not grow a list per restart. The oldest DRAINED
-// record goes first - it no longer attributes anything - and only then the oldest of the rest.
+// a machine that restarts one driver in a loop must not grow a list per restart.
+//
+// IT IS AT MOST ONE UNDRAINED RECORD PER ENDPOINT, which is what makes the bound a bound on DEVICES
+// rather than on restarts (2026-09-02). Repeated revocations of one endpoint used to push a record
+// each, so a driver restarting under a fault storm - where nothing ever drains, because the
+// transport never runs dry - could fill this list on its own and force the eviction of a record that
+// was still protecting a replacement. A second undrained revocation of the same endpoint now MERGES
+// into the record already there, keeping the OLDEST identity: the oldest ended binding's records are
+// what a FIFO reader meets first, so that is the identity the front of the queue has, and charging
+// the later ended binding's faults to it is the imprecision between two dead bindings this mechanism
+// already accepts rather than the cross-generation error it exists to prevent.
 const MOST_DETACHED_TAILS: usize = 8;
 
 // The kernel's side of the contract: it owns the addresses, the ordering and the ledger, and it
@@ -865,13 +874,21 @@ pub struct Iommu<B: Backend> {
 	mappings: BTreeMap<MappingId, Mapping>,
 	next_mapping: u64,
 	faults: FaultLog,
-	// See `DetachedTail`. In revocation order, so the oldest is at the front.
+	// See `DetachedTail`. In revocation order, so the oldest is at the front, and at most one
+	// undrained record per endpoint.
 	detached: Vec<DetachedTail>,
+	// THE LEDGER CANNOT CURRENTLY TELL AN ENDED BINDING'S FAULT FROM A LIVE ONE'S. Set when a tail
+	// record had to be given up while it was still attributing, cleared when the transport is next
+	// observed empty - which is the same proof that clears `drained`. While it is set, a caller is
+	// told not to take a cross-generation containment decision. See `remember_detached_tail`.
+	attribution_lost: bool,
+	// How many times that has happened this boot, for the report that says so.
+	tails_overflowed: u64,
 }
 
 impl<B: Backend> Iommu<B> {
 	pub fn new(backend: B, fault_capacity: usize) -> Self {
-		Self { backend, domains: BTreeMap::new(), mappings: BTreeMap::new(), next_mapping: 1, faults: FaultLog::new(fault_capacity), detached: Vec::new() }
+		Self { backend, domains: BTreeMap::new(), mappings: BTreeMap::new(), next_mapping: 1, faults: FaultLog::new(fault_capacity), detached: Vec::new(), attribution_lost: false, tails_overflowed: 0 }
 	}
 
 	pub fn backend(&self) -> &B {
@@ -1168,9 +1185,19 @@ impl<B: Backend> Iommu<B> {
 	// THAT ARE BOTH GONE, and it is deliberately preferred to the alternative, which is charging one
 	// of them to the live replacement and taking a healthy device off the bus.
 	fn remember_detached_tail(&mut self, endpoint: EndpointId, domain: DomainId, generation: Generation) {
+		// AN UNDRAINED RECORD FOR THIS ENDPOINT IS KEPT AS IT IS, and this revocation merges into it.
+		//
+		// Its identity is the OLDEST ended binding's, and that is the one the front of the queue
+		// belongs to - the records queued first are read first. Overwriting it with this binding's
+		// identity is the reversed-FIFO defect corrected on 2026-09-02; pushing a second record
+		// beside it is what let one endpoint's restarts fill the bound and force an undrained record
+		// out. Merging keeps one record per endpoint and keeps the identity that is correct for the
+		// events a reader will actually meet first.
+		if self.detached.iter().any(|tail| tail.endpoint == endpoint && !tail.drained) {
+			return;
+		}
 		// A DRAINED record for this endpoint has nothing left to attribute and its count is what a
-		// caller reads afterwards, so it is neither reused nor kept in the way: the new record goes
-		// behind it and the eviction rule below gives the drained one up first.
+		// caller reads afterwards, so it is reused rather than left in the way.
 		if let Some(existing) = self.detached.iter_mut().find(|tail| tail.endpoint == endpoint && tail.drained) {
 			existing.domain = domain;
 			existing.generation = generation;
@@ -1179,10 +1206,33 @@ impl<B: Backend> Iommu<B> {
 			return;
 		}
 		while self.detached.len() >= MOST_DETACHED_TAILS {
-			// The oldest record that attributes nothing any more, and only then the oldest of all:
-			// dropping a record that is still attributing is what re-opens the defect, so it is the
-			// last thing this gives up.
-			let at = self.detached.iter().position(|tail| tail.drained).unwrap_or(0);
+			// The oldest record that attributes nothing any more. With one record per endpoint this
+			// is the ordinary case: the list is bounded by endpoints whose tail has not been proved
+			// gone, and a machine reaches the bound only by revoking more distinct endpoints than
+			// this between two dry drains.
+			let Some(at) = self.detached.iter().position(|tail| tail.drained) else {
+				// AND IF THERE IS NO SUCH RECORD, NOTHING IS QUIETLY DROPPED (2026-09-02). Evicting
+				// an undrained record hands its endpoint's queued tail back to the current-attachment
+				// path, which is the cross-generation containment defect this whole mechanism exists
+				// to close - so the ledger says instead that it can no longer tell an ended
+				// binding's fault from a live one's, and STOPS TAKING CROSS-GENERATION CONTAINMENT
+				// DECISIONS until the transport is next observed empty.
+				//
+				// That is the conservative direction, and it is the same one every other choice here
+				// takes: withholding containment leaves a faulting device on the bus for longer,
+				// while acting on attribution known to be incomplete takes a HEALTHY device off it.
+				// It is counted and reported rather than silent, because a machine that reaches this
+				// is a machine whose fault storm has outlasted its bookkeeping and that is worth
+				// seeing.
+				self.attribution_lost = true;
+				self.tails_overflowed = self.tails_overflowed.saturating_add(1);
+				// AND THE LIST DOES NOT GROW PAST ITS BOUND TO HOLD THE NEW ONE EITHER. Breaking out
+				// of this loop and pushing anyway would trade a bounded ledger for an unbounded one,
+				// which is the other half of what the bound is for. The new binding gets no record;
+				// the flag above is what makes that safe, because no containment decision is taken
+				// on generation while it is set.
+				return;
+			};
 			self.detached.remove(at);
 		}
 		self.detached.push(DetachedTail { endpoint, domain, generation, faults: 0, drained: false });
@@ -1312,8 +1362,27 @@ impl<B: Backend> Iommu<B> {
 			for tail in self.detached.iter_mut() {
 				tail.drained = true;
 			}
+			// AND WHATEVER WAS LOST IS NO LONGER IN FLIGHT. The same proof: everything queued before
+			// this call has been read, so a record that had to be given up cannot still be shadowing
+			// an event nobody can attribute. Cross-generation containment resumes.
+			self.attribution_lost = false;
 		}
 		taken
+	}
+
+	// WHETHER A CROSS-GENERATION CONTAINMENT DECISION CAN BE TRUSTED RIGHT NOW.
+	//
+	// False once a tail record has been given up while it was still attributing, and true again when
+	// the transport is next observed empty. A caller that contains on generation must not do so while
+	// this answers false: the ledger cannot then distinguish an ended binding's queued fault from a
+	// live one's, and acting on it takes a healthy device off the bus. See `remember_detached_tail`.
+	pub fn attribution_is_complete(&self) -> bool {
+		!self.attribution_lost
+	}
+
+	// How many times a still-attributing tail record has been given up this boot.
+	pub fn tails_overflowed(&self) -> u64 {
+		self.tails_overflowed
 	}
 
 	// HOW MANY ENDED BINDINGS ARE STILL HOLDING A TAIL RECORD. See `DetachedTail` - the bound is the

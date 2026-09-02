@@ -90,6 +90,11 @@ declare -A GATES=(
 	# reading, which is why this is a gate rather than a review note.
 	["boot-harness"]="harness/harness-test.py"
 	["host-tests"]="tools/check-host-tests.sh"
+	# The shell scheduler `verify.sh` is, driven over plans written for it: failed-descendant
+	# suppression, a prerequisite shared by two branches, FAIL outranking INCOMPLETE, an unmeasured
+	# cost against a budget, and the guest-slot reservation. Everything it decides was unreachable by
+	# a test until this existed, which is why its ordering defects were found by reading.
+	["verify-scheduler"]="tools/check-verify-scheduler.sh"
 	["verify-model"]="cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- check"
 	["verify-model-tests"]="cargo test --quiet --manifest-path tools/verify-model/Cargo.toml"
 	["static-image"]="tools/check-static-injection.sh static"

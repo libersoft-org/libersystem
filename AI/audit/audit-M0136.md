@@ -1501,3 +1501,23 @@ published, unchanged or failed - re-arms a bounded delay, with a request inside 
 PUBLISH: one per published generation, counted as before. That is the churn bound, and it is what
 keeps a recovery scan available after a bad directory is corrected. Its gates gain the missing case -
 two scans of an unchanged directory, the second refused, the published generation unmoved by either.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-09-02T04:18:14Z):
+
+Rating: 8/10
+
+1. **The accepted admin-holder correction still does not name the route's identifiers or its final
+   holder.** The plan says the four concrete parts of the device-policy analogue have now been
+   copied, but its `ROLE` remains only “a manifest client role on `permission_manager` naming it” and
+   its `RECIPIENT` remains “the operator tool that owns font administration”
+   (`docs/todo/P02M0136.md:317-341`). No manifest tag/source, PermissionManager bootstrap/security
+   capability tag, or operator program name is supplied anywhere in the plan or repository. The
+   actual analogue is concrete in all of those respects: `DEVPOLICY` names the manifest role,
+   ServiceManager transfers `CAP_DEVPOLICY`, and governed `lsdev` is the recipient
+   (`src/user/services/manifest.toml:2240-2249`;
+   `src/user/services/core/src/service_manager/bootstrap.rs:1005-1016`;
+   `src/user/services/core/src/permission_manager.rs:219-228,324-354,1497-1499`). Thus the endpoint
+   and delivery concepts are now sound, but the prior finding's requested final holder and
+   executable wiring are still deferred despite the text asserting that the tool is “NAMED”; after
+   a dropped watch there is still no unambiguous manifest/grant path by which anyone can issue the
+   recovery scan.

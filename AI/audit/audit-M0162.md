@@ -926,3 +926,80 @@ Current implementation rating: 7/10
 Focused verification: `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline`
 passed all 60 tests, but its recording `Closes` does not execute the production syscall chain above.
 No guest run was started.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-09-02T08:00:00Z):
+
+One finding, ACCEPTED and unmet.
+
+**Finding 1 - ordinary claim teardown synchronously blocks DeviceManager's sole event loop.
+ACCEPTED.**
+
+The chain is confirmed again against the current line numbers and it is unchanged:
+`Holdings::begin_teardown` calls `Closes::release` inline, the production `Syscalls::release` enters
+`device_release`, and `SYS_DEVICE_RELEASE` runs the whole of `device::release_claim` before settling
+and returning. The manager cannot return to its central wait until bus-master shutdown, derived-
+capability revocation, vector settlement and IOMMU teardown have all finished, so the claim-ready
+machinery ordinarily observes a handle that is already terminal.
+
+One thing inside that sequence changed this round and it lengthens rather than shortens it, which I
+would rather say than leave to be noticed: `SYS_DEVICE_QUIESCED` now performs its currency proof and
+both of its resource releases under one hold of the claim lock, closing a cross-generation window the
+sibling M0098 audit found. That is a correctness fix inside a synchronous path, and the path was
+already synchronous end to end.
+
+What is missing is unchanged and specific: `SYS_DEVICE_RELEASE` would have to START the release and
+answer, with something else running the remaining steps and publishing `settled` when they finish,
+and this kernel has no thread to run them on. That is a kernel execution facility with its own
+lifetime, priority and failure questions - the same one the sibling M0153 finding needs for a bounded
+fault-servicing deadline - and it is not a correction inside this milestone.
+
+I am not offering a smaller substitute. Handing the release to a userspace worker inside
+DeviceManager moves the block rather than removing it, because the syscall still runs to completion.
+M4's short non-blocking transitions and the definition of done's "one slow node cannot stop service
+to another" are not met for the manager-initiated path.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `dma` host suite | 59 passed |
+| `driver-binding` host suite | 60 passed |
+| `verify-model` host suite | 116 passed |
+| `check.sh --gate verify-scheduler` | **PASS - the new gate, 18 assertions** |
+| `verify-model`, `gate-oracles`, `no-suppression`, `source-hygiene`, `test-tags` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+No suite failed and no gate failed, on any architecture. The riscv64 benchmark that flaked in the
+previous round - `a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` - passed here,
+which is what its measured spread predicts rather than evidence about it either way.
+
+The enforcing IOMMU gate now names the case it was silently allowing to disappear:
+
+```
+qemu-virtio-iommu:   forced-release case PASSED
+```
+
+And the new scheduler gate reports what it proved:
+
+```
+verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE,
+unmeasured costs and the guest-slot budget all hold
+```
+
+ONE THING WAS FOUND BY THIS ROUND'S OWN WORK AND IS WORTH RECORDING. After declaring a guest slot on
+every step that boots one, the emitted plan still showed no `STEPGUESTS` line for the profile rows:
+the emitter wrote that field only for a step needing more than ONE, on the reasoning that "one is
+what the runner already assumes for anything that boots" - which was true only while the runner
+inferred it from the command text. The classifier change and the declaration change together were
+inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
+showed it.

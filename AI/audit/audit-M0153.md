@@ -1195,3 +1195,102 @@ Current implementation rating: 6/10
 Focused verification: `cargo test --manifest-path src/dma/Cargo.toml --offline` passed all 59 tests.
 Those tests cover malformed-record dry detection and two undrained tails, but not undrained-tail
 eviction. No guest run was started.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-09-02T08:00:00Z):
+
+Two findings, both ACCEPTED. One is fixed; the other is the kernel facility this milestone has been
+waiting on for four rounds.
+
+**Finding 1 - live-fault containment has no bounded servicing guarantee. ACCEPTED, and unmet.**
+
+Unchanged and correctly stated. The only periodic production call is after the BSP's
+`run_until_idle`, that loop continues while its run queue is non-empty, and the service is gated to
+cpu 0 settling - so a CPU-bound workload on that core leaves a faulting endpoint mastering the bus.
+
+The reason it is still open is the same and I still hold it: the obvious place for a deadline is the
+timer interrupt, and that is the one place it must not go - `poll_faults_attributed_with` takes the
+controller's lock and then `device`'s, and an interrupted context may hold either. What a deadline
+needs is somewhere to run kernel work that is neither an interrupt nor a userspace thread, which this
+kernel does not have and which the sibling M0162 finding names from the other side.
+
+**Finding 2 - the revised bound can discard an attribution that is actively protecting a
+replacement. ACCEPTED, and FIXED.**
+
+The finding is right and its reachability argument is the part I had not thought through. The
+eviction preferred a DRAINED record and fell back to index zero, and under a malformed-record storm
+nothing ever becomes drained - the transport never runs dry - so repeated revocations could fill the
+list with live tails and then start giving them up. Once one is gone, its endpoint's queued fault
+resolves through the current attachment again and can contain a healthy replacement: the exact defect
+this mechanism exists to close, reached through its own capacity rule.
+
+Two changes, and the first is what makes the bound mean something. A second UNDRAINED revocation of
+the same endpoint now MERGES into the record already there, keeping the OLDEST identity - which is
+the one the front of a FIFO queue belongs to, and charging the later ended binding's faults to it is
+the imprecision between two dead bindings this mechanism already accepts. So the list holds at most
+one undrained record per ENDPOINT, and the auditor's reachable case - one driver restarting under a
+storm - can no longer fill it at all. The bound became a bound on devices rather than on restarts.
+
+The second is what happens when even that is exceeded, and it is not eviction. If there is no drained
+record to give up, the ledger says it can no longer tell an ended binding's fault from a live one's -
+`attribution_lost`, counted and reported - and the new record is NOT added either, because breaking
+out of the loop and pushing anyway would have traded a bounded ledger for an unbounded one. That flag
+is consumed where it matters: `poll_faults_attributed_with` withholds the cross-generation
+containment decision while it holds, saying so on the console, and the flag clears when the transport
+is next observed empty - the same proof that clears `drained`.
+
+I want to state the cost rather than let it read as free. Withholding containment leaves a faulting
+device on the bus for longer. Acting on attribution known to be incomplete takes a WORKING device off
+it. This mechanism has taken the second choice at every other decision point and takes it here.
+
+The capacity test is rewritten around what it could not previously assert. It fills the bound with
+distinct endpoints, adds one more with nothing drained, and requires: the list does not grow, the
+ledger reports incomplete attribution, the overflow is counted, and - the assertion the old rule made
+impossible - the OLDEST record is still there and still names itself when its endpoint faults. The
+merge case is asserted in the sibling test: two revocations of one endpoint leave one record, and
+attribution stays complete because nothing had to be given up.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `dma` host suite | 59 passed |
+| `driver-binding` host suite | 60 passed |
+| `verify-model` host suite | 116 passed |
+| `check.sh --gate verify-scheduler` | **PASS - the new gate, 18 assertions** |
+| `verify-model`, `gate-oracles`, `no-suppression`, `source-hygiene`, `test-tags` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+No suite failed and no gate failed, on any architecture. The riscv64 benchmark that flaked in the
+previous round - `a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` - passed here,
+which is what its measured spread predicts rather than evidence about it either way.
+
+The enforcing IOMMU gate now names the case it was silently allowing to disappear:
+
+```
+qemu-virtio-iommu:   forced-release case PASSED
+```
+
+And the new scheduler gate reports what it proved:
+
+```
+verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE,
+unmeasured costs and the guest-slot budget all hold
+```
+
+ONE THING WAS FOUND BY THIS ROUND'S OWN WORK AND IS WORTH RECORDING. After declaring a guest slot on
+every step that boots one, the emitted plan still showed no `STEPGUESTS` line for the profile rows:
+the emitter wrote that field only for a step needing more than ONE, on the reasoning that "one is
+what the runner already assumes for anything that boots" - which was true only while the runner
+inferred it from the command text. The classifier change and the declaration change together were
+inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
+showed it.

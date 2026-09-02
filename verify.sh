@@ -603,7 +603,22 @@ fi
 # Ask for the commands, and treat every way of not getting them as the same answer.
 steps_file="$(mktemp)"
 trap 'rm -f "$steps_file"' EXIT
-if ! printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- commands --stdin >"$steps_file"; then
+# A PREPARED PLAN, WHICH IS HOW THE EXECUTOR ITSELF IS TESTED (added 2026-09-02).
+#
+# Everything below this line is the executor - the blocker suppression, the guest barrier, the
+# `--jobs` reservation, the `FAIL`-over-`INCOMPLETE` arithmetic - and none of it was reachable by a
+# test, because the only way to reach it was to run a real plan over a real tree. So its one defect
+# class, an ordering one, could only be found by reading, and it was: three ordering corrections in
+# four days, none of which a registered test would have caught.
+#
+# The file is the planner's own format and nothing else changes. A prepared plan carries no `KEY`
+# lines, and `record_one_step` files nothing against the history for a step with no keys - so the
+# executor can be driven over synthetic steps whose commands are `true` and `false` without touching
+# the tree's record. See `tools/check-verify-scheduler.sh`, which is the only caller.
+if [[ -n "${LIBER_VERIFY_STEPS:-}" ]]; then
+	[[ -r "$LIBER_VERIFY_STEPS" ]] || die "LIBER_VERIFY_STEPS names a file this cannot read: $LIBER_VERIFY_STEPS"
+	cat "$LIBER_VERIFY_STEPS" >"$steps_file"
+elif ! printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- commands --stdin >"$steps_file"; then
 	planner_failed "the planner exited non-zero"
 fi
 [[ -s "$steps_file" ]] || planner_failed "the planner produced no output"
@@ -852,8 +867,17 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	# contend over now that every writable image is per-run. Everything else - a gate that boots one
 	# of its own, a conformance suite, a build - runs alone, because "how many QEMUs may run" must
 	# have exactly one answer on this machine and a gate's inner boot is not counted by this loop.
+	# WHAT COUNTS AS GUEST WORK IS DECLARED BY THE MODEL, NOT INFERRED FROM THE COMMAND TEXT
+	# (corrected 2026-09-02). This matched the literal string `./test.sh --arch `, which is one way of
+	# booting a guest and not the only one: a per-profile gate row boots QEMU through `check.sh` and
+	# was therefore classified as host work, drained behind the barrier and run alone - so the profile
+	# rows that were split out to be schedulable were the one thing the scheduler could not reach.
+	# `STEPGUESTS` is the model saying how many slots a step needs, it is already emitted for the gate
+	# whose subject is overlap, and reading it here is what gives "how many QEMUs may run" one answer
+	# for every step rather than one for the steps whose command happened to match.
+	wants_guests="${step_guests[$index]:-0}"
 	is_guest=0
-	[[ "$command" == *"./test.sh --arch "* ]] && is_guest=1
+	((wants_guests >= 1)) && is_guest=1
 	# THE BARRIER COMES BEFORE THE BLOCKER CHECK, AND THAT ORDER IS WHAT MAKES THE CHECK SOUND.
 	#
 	# It used to come after, and under `--jobs > 1` that made prerequisite suppression unsound for
@@ -905,7 +929,6 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	# hardcoded width, which is exactly what this runner exists to be the only one of. Refused rather
 	# than trimmed, because a gate about overlap that runs one guest proves nothing and would report
 	# a pass for it. INCOMPLETE is the honest outcome and never reads as green.
-	wants_guests="${step_guests[$index]:-0}"
 	if ((wants_guests > JOBS)); then
 		note "[$step/$count] SKIPPED (budget): $label - it starts $wants_guests guests at once and --jobs is $JOBS; run it with --jobs $wants_guests or more"
 		skipped+=("$label")

@@ -970,3 +970,19 @@ expiring with the address still valid and the survivor named; the SECOND expirin
 STILL VALID and the advertiser set EMPTY, which is the state the consumer's fallback is written for;
 and separately, the prefix's own valid lifetime expiring and the address going with it whether or not
 anything is still advertising.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-09-02T04:24:30Z):
+
+Rating: 6/10
+
+1. **The corrected router-order rule incorrectly makes on-link/bootstrap control traffic use the
+   first default router.** M5 says ND, DAD, RS, MLD, and echo use the first entry in the ordered
+   default-router list, and M6 repeats that these protocols use the internal default
+   (`docs/todo/P02M0174.md:270-301,508-513`). Router Solicitation is what discovers that list, while
+   the plan explicitly sends the initial MLD report and performs DAD before a usable address—and
+   therefore before router discovery—has completed (`docs/todo/P02M0174.md:134-151`). ND, DAD, RS,
+   and MLD also have direct on-link or protocol-defined multicast next hops rather than a default
+   router. Read literally, the list is empty at bootstrap so RS/DAD/MLD cannot be sent; once populated,
+   the same rule can misroute link-local control through a router. The reachability-first ordering is
+   sound for traffic that actually needs a default router, but extending it to all five named control
+   paths is a material L3 bootstrap contradiction.

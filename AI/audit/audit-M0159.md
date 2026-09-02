@@ -994,3 +994,72 @@ Current implementation rating: 8/10
    (`docs/todo/P02M0159.md:94-97,126-131`).
 
 Focused verification was by current production-path inspection; no guest run was started.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-09-02T08:00:00Z):
+
+One finding, ACCEPTED and unmet.
+
+**Finding 1 - M4 restores only the GPU binding, not a usable display path. ACCEPTED.**
+
+Re-confirmed against the current tree, including the part that changed since the last round: the
+standing loop now handles a rebound node reaching `Step::Online`, and it still does not call
+`route_offers`, which remains confined to the phase-two launch path and fills `gpu_client` only while
+it is zero. DisplayService still receives one positional `GPU` handle at bootstrap and clears it when
+that channel closes, with no subscription and no other replacement route. The restart check reports
+post-rebind presentation rather than asserting it, which is the check exposing the gap rather than
+hiding it.
+
+I measured two rounds ago why no DeviceManager-only change substitutes for the migration - the handle
+was given to DisplayService at bootstrap, positionally, and there is no channel on which a
+replacement could be delivered - and that has not changed. Re-routing inside the manager would fill a
+local and reach nobody, and would be strictly worse than today: the machine would hold a live
+provider nobody can reach while the catalogue reported the kind as taken.
+
+So M4's driver-and-kernel half is proved and its display half is not, which is what the check says.
+The consumer half is P02M0164's seam and is now blocking two milestones' items.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `dma` host suite | 59 passed |
+| `driver-binding` host suite | 60 passed |
+| `verify-model` host suite | 116 passed |
+| `check.sh --gate verify-scheduler` | **PASS - the new gate, 18 assertions** |
+| `verify-model`, `gate-oracles`, `no-suppression`, `source-hygiene`, `test-tags` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+No suite failed and no gate failed, on any architecture. The riscv64 benchmark that flaked in the
+previous round - `a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` - passed here,
+which is what its measured spread predicts rather than evidence about it either way.
+
+The enforcing IOMMU gate now names the case it was silently allowing to disappear:
+
+```
+qemu-virtio-iommu:   forced-release case PASSED
+```
+
+And the new scheduler gate reports what it proved:
+
+```
+verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE,
+unmeasured costs and the guest-slot budget all hold
+```
+
+ONE THING WAS FOUND BY THIS ROUND'S OWN WORK AND IS WORTH RECORDING. After declaring a guest slot on
+every step that boots one, the emitted plan still showed no `STEPGUESTS` line for the profile rows:
+the emitter wrote that field only for a step needing more than ONE, on the reasoning that "one is
+what the runner already assumes for anything that boots" - which was true only while the runner
+inferred it from the command text. The classifier change and the declaration change together were
+inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
+showed it.

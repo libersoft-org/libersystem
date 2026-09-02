@@ -1149,6 +1149,19 @@ pub fn poll_faults_attributed_with(during_teardown: Option<(dma::EndpointId, dma
 			}
 			let contained = match containment {
 				Containment::WhateverFaulted => crate::device::contain_faulting_endpoint(bus, dev, func),
+				// AND NOT ON A GENERATION THE LEDGER SAYS IT CANNOT TRUST (added 2026-09-02).
+				//
+				// A tail record given up while it was still attributing leaves its endpoint's queued
+				// faults resolving through whatever is attached NOW, which is how an ended binding's
+				// fault comes to contain a healthy replacement. The ledger reports that state rather
+				// than hiding it, and this is the decision that must not be taken while it holds:
+				// withholding containment leaves a faulting device on the bus for longer, and acting
+				// on attribution known to be incomplete takes a working one off it. The state clears
+				// when the transport is next seen empty, and the next drain contains what it should.
+				Containment::OnlyLiveBindings if !attribution_trustworthy() => {
+					crate::serial_println!("iommu:   containment withheld at {bus:02x}:{dev:02x}.{func} - a tail record was given up while it was still attributing, so this fault cannot be told from a replacement's");
+					None
+				}
 				Containment::OnlyLiveBindings => crate::device::contain_faulting_endpoint_of_a_live_binding(bus, dev, func, event.generation.0),
 			};
 			if let Some(index) = contained {
@@ -1227,6 +1240,15 @@ pub fn with<R>(f: impl FnOnce(&mut Controller) -> R) -> Option<R> {
 // it reaches the DURABLE record rather than only the returned buffer. See `Iommu::drain_faults_during`.
 fn drain_faults(out: &mut [dma::FaultEvent], during_teardown: Option<(dma::EndpointId, dma::DomainId, Generation)>) -> usize {
 	with(|controller| controller.iommu().drain_faults_during(out, during_teardown)).unwrap_or(0)
+}
+
+// WHETHER A CONTAINMENT DECISION TAKEN ON A FAULT'S GENERATION CAN BE BELIEVED RIGHT NOW.
+//
+// False while the ledger has had to give up a tail record that was still attributing - see
+// `Iommu::attribution_is_complete`. A machine with no controller has nothing to distrust and answers
+// true, which is also what keeps the untranslated path unchanged.
+fn attribution_trustworthy() -> bool {
+	with(|controller| controller.iommu().attribution_is_complete()).unwrap_or(true)
 }
 
 // The controller's state, for the boot report.

@@ -1033,3 +1033,95 @@ Current implementation rating: 6/10
 2. **The enforcing-IOMMU gate does not require the new hostile-holder DMA proof to run.** Its individually required success-marker list contains cases 1, 3, 5, 6 and 7, but omits `forced-release case PASSED` (`src/tools/check-qemu-virtio-iommu-x86_64.sh:141-150`), which is the marker emitted by `a_translated_address_stops_translating_when_its_claim_is_forced_to_end` (`src/kernel/iommu/tests.rs:338-398`). Rejecting `absent`/`skipped` output catches that test when it runs and declines, but deletion, deregistration or retagging produces neither string and leaves the gate green. The mandatory M9 proof can therefore disappear silently despite the gate's stated per-case rule and the Definition of Done's no-false-green requirement.
 
 Focused verification: all three production kernels built successfully; the portable DMA suite passed 59 tests and the driver-binding suite passed 60 tests. No QEMU run was started for this re-audit; the gate omission and the quiesce interleaving are directly established by the current control flow.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-09-02T08:00:00Z):
+
+Two findings, both ACCEPTED and both fixed.
+
+**Finding 1 - `SYS_DEVICE_QUIESCED` has a cross-generation check/use race. ACCEPTED, and it is the
+same defect I closed on the release path one round earlier, on the path I did not look at.**
+
+The trace is exact. The syscall resolved the `DeviceMemory`, asked `claim_is_current` - which takes
+the claim lock and drops it - and then called `release_msi_for_device(index)` and
+`dma_buffer::release_for(index)`, both of which identify what they free by the DEVICE INDEX alone
+because neither registry carries a generation. An old-generation caller can pass the check, pause,
+let a forced release finish and a replacement claim start, and resume to free the replacement's
+pending MSI slot and its held frames. Revoking the old object does not help: the syscall already
+holds the resolved `Arc`.
+
+What makes this worth stating beyond the fix is that it is the identical shape to the `finish_release`
+window: a currency proof and a resource release separated by a dropped lock. I fixed one instance and
+did not ask where else the pair occurred. It occurs in exactly one other place, and this is it.
+
+`device::release_quiesced_if_current(key)` now performs the proof AND both releases under one hold of
+`CLAIMS`, answering `None` for a claim that is not current - which is the caller's
+`ERR_ACCESS_DENIED` - and otherwise the vector and frame counts. A replacement cannot claim the
+device while that lock is held, so there is no second owner for either registry to find. The lock
+order is `CLAIMS` then each registry's own, which is the direction every other path takes: neither
+the MSI registry nor the held-frame table ever asks for a claim.
+
+Two consequences I am naming rather than leaving to be found. A `DeviceMemory` with a device index
+and NO claim now gets `ERR_INVALID` instead of releasing - and that is a tightening rather than a
+behaviour change in production, because the only constructor that makes one is `#[cfg(test)]`; a
+window that names no binding attests to no reset. And with the syscall keyed on the claim, the
+duplicated `index` field on `DeviceMemory` lost its last production reader, so the field, its
+accessor and the test-only constructor are gone and the one test that used them goes through
+`for_claim` - two places holding one value, removed by the change that made one of them redundant.
+
+**Finding 2 - the enforcing-IOMMU gate does not require the new hostile-holder DMA proof to run.
+ACCEPTED.**
+
+Correct, and the distinction it draws is the one that matters: rejecting `absent`/`skipped` catches
+the case that RUNS and declines, and says nothing about a case that stops being registered. Deleting
+the test, dropping its tag or renaming its marker produces neither string and left the gate green
+over M9's mandatory proof - the false green the gate's own per-case rule exists to prevent, in the
+one case that was added after that rule was written.
+
+`forced-release case PASSED` is now in the individually required list beside cases 1, 3, 5, 6 and 7,
+with the reasoning recorded where the next case will be added.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `dma` host suite | 59 passed |
+| `driver-binding` host suite | 60 passed |
+| `verify-model` host suite | 116 passed |
+| `check.sh --gate verify-scheduler` | **PASS - the new gate, 18 assertions** |
+| `verify-model`, `gate-oracles`, `no-suppression`, `source-hygiene`, `test-tags` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+No suite failed and no gate failed, on any architecture. The riscv64 benchmark that flaked in the
+previous round - `a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` - passed here,
+which is what its measured spread predicts rather than evidence about it either way.
+
+The enforcing IOMMU gate now names the case it was silently allowing to disappear:
+
+```
+qemu-virtio-iommu:   forced-release case PASSED
+```
+
+And the new scheduler gate reports what it proved:
+
+```
+verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE,
+unmeasured costs and the guest-slot budget all hold
+```
+
+ONE THING WAS FOUND BY THIS ROUND'S OWN WORK AND IS WORTH RECORDING. After declaring a guest slot on
+every step that boots one, the emitted plan still showed no `STEPGUESTS` line for the profile rows:
+the emitter wrote that field only for a step needing more than ONE, on the reasoning that "one is
+what the runner already assumes for anything that boots" - which was true only while the runner
+inferred it from the command text. The classifier change and the declaration change together were
+inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
+showed it.

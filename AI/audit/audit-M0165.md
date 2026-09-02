@@ -1277,3 +1277,80 @@ AUDITOR'S RE-AUDIT ON M0165 (2026-09-02T03:51:29Z):
 Current implementation rating: 7/10
 
 1. **The named publish/crash/subscribe race proof still stops before the production close-and-announce effects.** The host test exercises `Publications` selection and `withdraw_slots_into` transfer/identity behavior only (`src/user/libs/driver/binding/src/tests.rs:526-599`). In production, DeviceManager separately closes each withdrawn provider handle and announces the withdrawal (`src/user/services/core/src/device_manager.rs:2294-2352`), with the crash/failure path invoking that work at `src/user/services/core/src/device_manager.rs:3723`. Removing or breaking either production effect would leave the named test green, so it does not establish the milestone's required absence of stale providers/handle leaks across the race (`docs/todo/P02M0165.md:280-307`, `331`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-09-02T08:00:00Z):
+
+One finding, ACCEPTED and unmet.
+
+**Finding 1 - the publish/crash/subscribe race proof stops before the production close-and-announce
+effects. ACCEPTED.**
+
+Correct, and the finding now names the production call site precisely: DeviceManager closes each
+withdrawn provider handle and announces the withdrawal, and the crash path reaches that work from the
+teardown resolution. The host test drives `Publications` selection and `withdraw_slots_into`
+transfer and identity behaviour, which is the model half. Removing or breaking either production
+effect leaves the registered test green.
+
+What is worth adding is that the round before last removed the reason this could not have been
+noticed in production: teardown confirmations were being discarded, so every planned stop landed
+`Quarantined` and the crash path's close-and-announce work ran on a schedule nobody could observe.
+That is fixed, so the effects now happen when the milestone says they happen - and still nothing
+asserts them.
+
+The blocker is unchanged and I will not restate it as an excuse. The two effects are not pure state:
+they close kernel handles and send on a channel. Proving them at the seam means giving that pair the
+treatment `Holdings` already has - an effect trait the production path implements with syscalls and a
+test implements by recording - so the assertion can be "the withdrawal was announced and the handle
+was closed" rather than "the state table permits it". That is a contained change to one type.
+
+I did not make it in this round, and the reason is this round's shape rather than the change's size:
+the work here was five defect fixes across the claim, quiesce, IOMMU-attribution and verification
+paths, one of which changed how `verify.sh` schedules every step. Adding an effect seam to the
+binding library beside that would have made a failure in either hard to attribute. M7 stays unproved
+and this is the third round it has been owed, which I am recording rather than softening.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `dma` host suite | 59 passed |
+| `driver-binding` host suite | 60 passed |
+| `verify-model` host suite | 116 passed |
+| `check.sh --gate verify-scheduler` | **PASS - the new gate, 18 assertions** |
+| `verify-model`, `gate-oracles`, `no-suppression`, `source-hygiene`, `test-tags` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+No suite failed and no gate failed, on any architecture. The riscv64 benchmark that flaked in the
+previous round - `a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` - passed here,
+which is what its measured spread predicts rather than evidence about it either way.
+
+The enforcing IOMMU gate now names the case it was silently allowing to disappear:
+
+```
+qemu-virtio-iommu:   forced-release case PASSED
+```
+
+And the new scheduler gate reports what it proved:
+
+```
+verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE,
+unmeasured costs and the guest-slot budget all hold
+```
+
+ONE THING WAS FOUND BY THIS ROUND'S OWN WORK AND IS WORTH RECORDING. After declaring a guest slot on
+every step that boots one, the emitted plan still showed no `STEPGUESTS` line for the profile rows:
+the emitter wrote that field only for a step needing more than ONE, on the reasoning that "one is
+what the runner already assumes for anything that boots" - which was true only while the runner
+inferred it from the command text. The classifier change and the declaration change together were
+inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
+showed it.

@@ -245,7 +245,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str()) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1 && !crate::catalog::gate_is_profile_row(&gate_name(item))).collect();
 	for item in profile_rows.iter() {
 		let name = gate_name(item);
-		steps.push(Step { id: scoped_id("gate-profile", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} profile"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("one profile of a multi-profile gate: its own step, its own key and its own measured cost")), guests: 0 });
+		steps.push(Step { id: scoped_id("gate-profile", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} profile"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("one profile of a multi-profile gate: its own step, its own key, its own measured cost and its own guest slot")), guests: 1 });
 	}
 	for item in concurrent.iter() {
 		let name = gate_name(item);
@@ -299,7 +299,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 		} else {
 			(scoped_id("guest", architecture, &[String::from("all")]), format!("./test.sh --arch {architecture}"), None)
 		};
-		steps.push(Step { id, requires: build_ids.get(*architecture).cloned().into_iter().collect(), label: format!("kernel suite {architecture}"), command, keys: selected.clone(), note, guests: 0 });
+		steps.push(Step { id, requires: build_ids.get(*architecture).cloned().into_iter().collect(), label: format!("kernel suite {architecture}"), command, keys: selected.clone(), note, guests: 1 });
 	}
 
 	// The two guest steps that stand in for a target's tests, and they are steps like any other.
@@ -313,7 +313,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::GuestFallback) {
 		let architecture = item.key.architecture.as_str();
 		let (label, note) = if item.key.check == "guest.whole-suite" { (format!("kernel suite {architecture} (unenumerated)"), String::from("the model could not enumerate this target's tests, so the whole suite runs and is recorded against one aggregate key")) } else { (format!("boot check {architecture}"), String::from("this target is booted and no test selected it, so it runs a named boot check rather than everything or nothing")) };
-		steps.push(Step { id: scoped_id("guest", architecture, &[item.key.check.clone()]), requires: build_ids.get(architecture).cloned().into_iter().collect(), label, command: item.command.clone(), keys: vec![item.key.clone()], note: Some(note), guests: 0 });
+		steps.push(Step { id: scoped_id("guest", architecture, &[item.key.check.clone()]), requires: build_ids.get(architecture).cloned().into_iter().collect(), label, command: item.command.clone(), keys: vec![item.key.clone()], note: Some(note), guests: 1 });
 	}
 
 	// The gates that read what a guest wrote, after the guests wrote it. Every guest step emitted
@@ -328,7 +328,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// The development guest last: it needs an instance `./dev.sh up` left running, and qemu-run.sh
 	// refuses to combine DEV_PROFILE with TEST, so it can never share a boot with the suite above.
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::DevCheck) {
-		steps.push(Step { id: scoped_id("dev", &item.key.check, &[]), requires: Vec::new(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 0 });
+		steps.push(Step { id: scoped_id("dev", &item.key.check, &[]), requires: Vec::new(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 1 });
 	}
 
 	steps

@@ -1782,3 +1782,22 @@ class.
 The assessment now says the serial restriction answers the MEDIUM race and leaves this gap untouched,
 and that evidence accepted through any run of `verify.sh` - serial or not - is qualified until the
 matrix exists. That is a wider qualification than the previous wording and it is the accurate one.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-09-02T04:24:00Z):
+
+Rating: 7/10
+
+1. **The plan still has no single authoritative intra-track dependency graph.** The prerequisite
+   matrix groups `b, c` and `e, f, h` under identical freeze/common prerequisites and `g, i`
+   under another row, omitting every predecessor edge inside either track
+   (`docs/todo/P02M0103.md:112-143`), even though the build-order section calls the matrix the
+   complete authoritative edge set and gives the linear chains `b -> c -> d` and
+   `e -> f -> g -> h -> i` (`:340-352`). The canonical review instead freezes a branched 3D graph:
+   `e -> g -> h` together with `f -> h` (`:2536-2548`), while part `f` separately declares
+   `e` as its dependency (`:1962-1966`). Thus the live normative text disagrees over whether
+   `g` waits for `f`, and the purportedly complete matrix does not encode even the undisputed
+   intra-track edges. This materially changes which parts may start and which implementations the
+   conformance parts must wait for; the latest planner response expressly noticed the `f`/`g`
+   conflict and left it unresolved.

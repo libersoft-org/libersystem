@@ -1352,3 +1352,78 @@ Current implementation rating: 8/10
 1. **The required separately labelled AArch64 and RISC-V UEFI/no-DT positive regression profiles remain unimplemented.** The current plan now records the milestone honestly as incomplete and leaves M6 unchecked, but the implementation requirement itself is still unmet (`docs/todo/P02M0151.md:167-183,500-508`). The architecture-profile gate explicitly says those rows are not registered and that no caller selects the compile-time fallback authorization (`src/tools/check-qemu-arch-profiles.sh:360-373`); repository-wide production references still consist only of the two consumers and build-variable forwarding (`src/kernel/arch/aarch64/mod.rs:174`; `src/kernel/arch/riscv64/mod.rs:157`; `src/harness/test-kernel.sh:332`). The measured QEMU/loader limitation explains the missing evidence but does not satisfy M6 or the Definition of Done's two positive compatibility boots.
 
 Focused verification: the FDT suite passed 87 tests, the secondary-start model passed 18 tests, all three production kernels built, `arch-surface` passed across 61 production architecture files, and the architecture-profile script passes `bash -n`. No QEMU run was started; the current gate itself declares the two required profiles absent.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-09-02T08:00:00Z):
+
+One finding, ACCEPTED and unmet.
+
+**Finding 1 - the AArch64 and RISC-V UEFI/no-DT positive regression profiles remain unimplemented.
+ACCEPTED.**
+
+The finding is right and it is careful to separate the two things the previous round changed: the
+plan now records the milestone honestly - M6 unchecked, the status qualified - and the implementation
+requirement is still unmet. Recording a gap is not closing it, and I said as much when I made that
+change.
+
+Everything it checks is still true. The gate says in its own comment that the two rows are not
+registered; `LIBER_NO_DT_PROFILE` has build plumbing in `test-kernel.sh` and two consumers in the
+architecture code and no caller that selects it; and the firmware-booted ITS row requires
+`GICv3 from the device tree`, so it is a UEFI boot and emphatically not a no-DT one.
+
+What blocks it is unchanged and is not this milestone's code: QEMU's `virt` hands the firmware a
+device tree and the loader passes it on, so there is no way here to boot a machine that publishes
+none. Producing one needs a QEMU machine without a tree or a loader option that declines to pass one
+on. Both are harness capabilities, and I have measured the failure twice rather than argued it.
+
+I am not offering the negative check again, for the reason the earlier round settled: proving that an
+authorised static descriptor is not selected when a tree exists is a different sentence from either
+required regression boot, and a substitute that proves something else is worse than an admitted gap.
+
+Nothing changed in this round for this milestone. The one thing that could be wrong here and was -
+a checked box and a COMPLETE status with no evidence behind them - is already corrected.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch riscv64` | **367 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `dma` host suite | 59 passed |
+| `driver-binding` host suite | 60 passed |
+| `verify-model` host suite | 116 passed |
+| `check.sh --gate verify-scheduler` | **PASS - the new gate, 18 assertions** |
+| `verify-model`, `gate-oracles`, `no-suppression`, `source-hygiene`, `test-tags` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+No suite failed and no gate failed, on any architecture. The riscv64 benchmark that flaked in the
+previous round - `a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` - passed here,
+which is what its measured spread predicts rather than evidence about it either way.
+
+The enforcing IOMMU gate now names the case it was silently allowing to disappear:
+
+```
+qemu-virtio-iommu:   forced-release case PASSED
+```
+
+And the new scheduler gate reports what it proved:
+
+```
+verify-scheduler: failed-descendant suppression, shared prerequisites, FAIL over INCOMPLETE,
+unmeasured costs and the guest-slot budget all hold
+```
+
+ONE THING WAS FOUND BY THIS ROUND'S OWN WORK AND IS WORTH RECORDING. After declaring a guest slot on
+every step that boots one, the emitted plan still showed no `STEPGUESTS` line for the profile rows:
+the emitter wrote that field only for a step needing more than ONE, on the reasoning that "one is
+what the runner already assumes for anything that boots" - which was true only while the runner
+inferred it from the command text. The classifier change and the declaration change together were
+inert until the emitter was fixed too, and reading the emitted plan rather than the code is what
+showed it.

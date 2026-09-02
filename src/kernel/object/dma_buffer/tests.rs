@@ -96,8 +96,13 @@ fn a_dead_drivers_dma_frames_wait_for_its_device_to_be_reset() {
 
 	// 3. And they come back when - and only when - somebody proves the device has been stopped.
 	//    That claim is a capability: the holder of the device's own DeviceMemory.
-	let other = DeviceMemory::for_device(DEVICE + 1, 0x1000_0000, PAGE_SIZE as usize).expect("a test device memory");
-	assert_eq!(super::release_for(other.device_index().expect("a device-table entry")), 0, "resetting a different device releases nothing");
+	// THROUGH A CLAIM, because that is the only way a device-indexed window exists in production -
+	// `DeviceMemory::for_claim` is what `SYS_DEVICE_CLAIM` hands out, and the index it is keyed on is
+	// the claim's. The claimless constructor this used to call, and the separate index field behind
+	// it, went with the quiesce syscall's last production reader of them (2026-09-02).
+	let other_key = abi::ClaimKey { device_index: DEVICE + 1, _pad: 0, generation: 1 };
+	let other = DeviceMemory::for_claim(other_key, 0x1000_0000, PAGE_SIZE as usize).expect("a test device memory");
+	assert_eq!(super::release_for(other.claim().expect("it names a binding").device_index), 0, "resetting a different device releases nothing");
 	assert_eq!(super::held_frames_for_test(DEVICE), frames.len(), "still held");
 
 	let released = super::release_for(DEVICE);

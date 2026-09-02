@@ -1148,12 +1148,15 @@ fn run() -> Result<ExitCode, String> {
 				// seed for a step nobody has timed yet.
 				let measured = history.step_seconds(&step.id, &model_hash);
 				println!("STEPCOST\t{index}\t{:.0}", measured.unwrap_or_else(|| cost.estimate(&history, &step.keys)));
-				// HOW MANY GUEST SLOTS THIS STEP NEEDS AT ONCE - see `Step::guests`. Emitted only for
-				// a step that needs more than one, because one is what the runner already assumes for
-				// anything that boots and zero is what it assumes for everything else.
-				if step.guests > 1 {
-					println!("STEPGUESTS\t{index}\t{}", step.guests);
-				}
+				// HOW MANY GUEST SLOTS THIS STEP NEEDS AT ONCE - see `Step::guests`. EMITTED FOR
+				// EVERY STEP, because the runner now classifies guest work by this number rather
+				// than by matching the command text, and a number the plan does not carry is a
+				// number the runner reads as zero (corrected 2026-09-02). It used to be emitted only
+				// above one, on the reasoning that "one is what the runner already assumes for
+				// anything that boots" - which was true only while "anything that boots" meant a
+				// command containing `./test.sh --arch `, and it stopped being true the moment a
+				// gate row that boots QEMU through `check.sh` became its own step.
+				println!("STEPGUESTS\t{index}\t{}", step.guests);
 				for key in &step.keys {
 					println!("KEY\t{index}\t{}", key.display());
 				}

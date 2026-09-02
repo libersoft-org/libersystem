@@ -781,3 +781,23 @@ done requires all three rows flipped with their fixtures. I edited a plan outsid
 names, and I am flagging that rather than burying it: the finding is precisely that the contract has
 two sides and only one was written, so writing it on M0172's side again would have reproduced the
 defect. The edit is confined to recording the obligation P02M0172 already states.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-09-02T04:24:30Z):
+
+Rating: 6/10
+
+1. **The plan still does not decide the actual DMA-policy migration for any current driver.** M1
+   requires each existing driver row to be migrated “deliberately,” but supplies no per-entry values,
+   and M8 proves only that every row has some explicit classification
+   (`docs/todo/P02M0172.md:40-46,521-560`). The current manifest has eight driver entries spanning
+   virtio block, console/dev-channel, GPU, input, net, sound, and xHCI
+   (`src/user/services/manifest.toml:1411-1529,1571-1591`), whose `none` versus
+   `iommu-required` versus `trusted-untranslated` assignments are the security policy this milestone
+   exists to move out of the kernel. The omission exposes a concrete unresolved contradiction:
+   P02M0153 requires the selected virtio-net binding to declare `iommu-required`
+   (`docs/todo/P02M0153.md:184-193`), while this plan deliberately runs pre-P02M0173 non-x86 rows in
+   `no-iommu`, where such an entry is refused, yet claims public AArch64/RISC-V boots keep working
+   (`docs/todo/P02M0172.md:172-197,503-513,599-603`). Marking virtio-net
+   `trusted-untranslated` preserves those profiles but contradicts the prerequisite; preserving
+   `iommu-required` removes their existing network driver. Both outcomes remain consistent with the
+   current plan because the central migration table and its expected-value gate are absent.

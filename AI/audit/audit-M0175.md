@@ -1233,3 +1233,28 @@ its own, and adds the empty-set-with-valid-address fixture alongside a separate 
 M5's fallback clause now says that state is suppliable and was not, so a reader meeting the clause
 learns why it is there rather than assuming it always worked. M10's cases are unchanged - they
 already listed the empty-set fallback - and they are now reachable.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-09-02T04:24:30Z):
+
+Rating: 5/10
+
+1. **The RFC 8028 correction reverses the prerequisite's frozen reachability-first router order.**
+   M0174 orders routers by reachability first and advertised preference second, expressly to keep an
+   unreachable high-preference router behind a reachable lower-preference one
+   (`docs/todo/P02M0174.md:276-297`). M0175 instead says to apply RFC 4191 advertised preference
+   within the selected source prefix's advertiser set and use M0174's enumeration only to break what
+   survives (`docs/todo/P02M0175.md:466-479`); its fixture likewise requires the higher-preference
+   advertiser without constraining reachability (`docs/todo/P02M0175.md:756-760`). An unreachable
+   high-preference advertiser can therefore win before the reachability order is consulted, reopening
+   the exact selection defect M0174 corrected and giving the two sides of the frozen seam different
+   policies.
+
+2. **The timer-store bound cannot cover the already-admitted TCP state and has no safe overflow
+   outcome.** M7 promises that no deadline is starved, but reserves only 64 durable timer-wakeup
+   entries and says a full partition refuses the new entry with a typed error to the operation that
+   caused it (`docs/todo/P02M0175.md:588-607`). M4 permits 128 live TCBs, each of which may own
+   retransmission, persist, handshake, or closing timers (`docs/todo/P02M0175.md:285-425`). A timer
+   becoming due is autonomous work for an already-admitted connection, not a new
+   caller operation that can receive that generic refusal. With more than 64 due TCP timers, the plan
+   specifies neither coalescing/rescan nor a connection-level failure transition, so it cannot uphold
+   its no-starvation guarantee within its own declared capacities.

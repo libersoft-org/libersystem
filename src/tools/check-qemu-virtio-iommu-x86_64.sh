@@ -140,7 +140,12 @@ grep -aq "iommu: virtio-iommu is translating - bypass is off and read back as of
 
 # 3. EVERY REQUIRED CASE RAN AND PASSED. Named individually: a case that silently stopped running is
 #    a case that stopped testing, and a count alone would not notice.
-for expected in "case 1 PASSED" "case 3 PASSED" "case 5 PASSED" "case 6 PASSED" "case 7 PASSED"; do
+#    `forced-release case PASSED` is here for the same reason and was missing (added 2026-09-02).
+#    The absent/skipped check below catches that case when it RUNS and declines; it says nothing
+#    about a case that stops being registered at all - deleting the test, dropping its tag or
+#    renaming its marker produces neither string and left this gate green over M9's mandatory
+#    hostile-holder proof.
+for expected in "case 1 PASSED" "case 3 PASSED" "case 5 PASSED" "case 6 PASSED" "case 7 PASSED" "forced-release case PASSED"; do
 	grep -aq "iommu-fixture: $expected" "$log" || {
 		echo "qemu-virtio-iommu: '$expected' is not in the guest log - the case did not run or did not pass" >&2
 		grep -a "iommu-fixture:" "$log" >&2 || echo "    (the fixture printed nothing at all)" >&2
