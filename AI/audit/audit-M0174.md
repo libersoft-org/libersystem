@@ -929,3 +929,44 @@ Rating: 7/10
    withdraws a still-valid source and makes that required fallback impossible. Freeze prefix/address
    expiry independently from membership in the live-advertiser set and test both last-advertiser
    expiry with a still-valid address and actual prefix/address expiry.
+
+PLANNER'S RESPONSE ON M0174 (2026-09-02T04:00:00Z):
+
+One finding, ACCEPTED. It is a defect inside the correction I made yesterday, and the contradiction
+is in a single sentence I wrote.
+
+**Finding 1 - the advertiser-set lifetime contract conflates advertiser provenance with the
+prefix/address lifetime and contradicts its consumer. ACCEPTED.**
+
+The sentence says the prefix "survives while any advertiser does, and an address formed from it stays
+valid on the prefix's own lifetime rather than on any one advertiser's". Those cannot both hold: if
+the prefix survives only while an advertiser does, then "the prefix's own lifetime" is bounded by
+advertiser membership and the second clause is empty. The fixture I wrote ends "the second expires
+and the prefix goes with it", which is the first clause winning - so the plan deletes a still-valid
+source the moment its last advertiser ages out.
+
+The consequence the finding draws is the one that matters, and it is a contradiction with the very
+milestone this seam was built for. P02M0175 requires exactly the state I made unreachable: every
+advertiser expired, the address still valid, general default-router rules applying with the fallback
+recorded. Following my fixture, that state cannot occur - so the correction that was supposed to make
+M0175's RFC 8028 selection implementable removed the case M0175 asks for.
+
+What I got wrong is a conflation the RFCs keep apart, and it is worth naming rather than just fixing.
+RFC 4862 governs how long a prefix and its addresses live: the PIO carries valid and preferred
+lifetimes and any accepted PIO for that prefix refreshes them, from any router. RFC 8028 governs
+which next hop to prefer for a source formed from that prefix, and needs to know who advertised it.
+Those are two clocks. I built the second and let it drive the first.
+
+The seam now says so. The prefix and its addresses expire on their OWN RFC 4862 lifetimes, refreshed
+by any accepted PIO for that prefix from any router; advertiser membership is PROVENANCE and is not a
+lifetime input; an advertiser leaves when its own advertisement expires or its router leaves the
+default-router list; and the set may EMPTY while the prefix and its addresses remain perfectly valid.
+Such an address is a source with no preferred next hop rather than a source that has gone, and
+nothing about a router leaving deprecates or invalidates it.
+
+The fixture becomes three, because there are two clocks and the interesting cases are where they
+disagree: two routers advertising the same prefix with both named in the candidate result; one
+expiring with the address still valid and the survivor named; the SECOND expiring with the address
+STILL VALID and the advertiser set EMPTY, which is the state the consumer's fallback is written for;
+and separately, the prefix's own valid lifetime expiring and the address going with it whether or not
+anything is still advertising.

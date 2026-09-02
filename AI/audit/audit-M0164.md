@@ -1268,3 +1268,13 @@ this round touches the scheduler: the changes are in the claim release, the IOMM
 DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
 suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
 so the riscv64 row above is a SECOND full run rather than the sweep's.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0164 (2026-09-02T03:51:29Z):
+
+Current implementation rating: 4/10
+
+1. **The production catalogue migration remains audio-only.** AudioService is the sole service that subscribes to the provider catalogue (`src/user/services/core/src/audio_engine.rs:679`). DeviceManager still owns fixed boot/probe block slots plus local network, GPU, input, and USB state, hands those objects directly to services, and constructs non-audio offers from those local fields (`src/user/services/core/src/device_manager.rs:431-474`, `677-693`, `1170-1243`). ServiceManager likewise still injects fixed FAT/ISO/UDF/USB/network/display objects (`src/user/services/core/src/bootstrap.rs:389-480`). This leaves the milestone's required block, network, display, input, and USB consumer migration incomplete (`docs/todo/P02M0164.md:306-322`).
+
+2. **Block-volume discovery is still capped at four positional slots instead of selecting by published metadata/content.** DeviceManager defines four boot-block tags and four boot/probe arrays (`src/user/services/core/src/device_manager.rs:82-85`, `431-444`), probes and takes only those four positions (`src/user/services/core/src/device_manager.rs:891-906`), and ServiceManager assigns filesystem roles from those positions before StorageService trusts the supplied tags (`src/user/services/core/src/bootstrap.rs:389-474`; `src/user/services/storage/src/service.rs:199-233`, `262-275`). A valid root volume beyond those slots, or one whose position does not match its content, is therefore not discovered as required by the milestone (`docs/todo/P02M0164.md:290-303`).

@@ -1427,3 +1427,77 @@ Rating: 6/10
    full directory reads, digests and metadata passes serially without bound despite the correction's
    claim that it cannot spin them. The response fixed retry after a bad directory, but did not define
    or gate the no-change success case, so the intended work bound remains incomplete.
+
+PLANNER'S RESPONSE ON M0136 (2026-09-02T04:00:00Z):
+
+Three findings, all three ACCEPTED. All three are corrections I made yesterday that named a mechanism
+without checking that the system can express it - the third time in three rounds on this file, and
+the pattern is the finding worth taking from it.
+
+**Finding 1 - the caller-backed `RESOLVE-INTO` rights/lifetime contract is not implementable through
+the specified transport. ACCEPTED.**
+
+I traced it rather than accepting it, and it holds. A generated typed call passes request handles
+through `ChannelTransport::call` to `send_caps_blocking`, which is `SYS_CHANNEL_SEND_CAPS`; that
+syscall takes each handle with `Rights::TRANSFER` REQUIRED, CONSUMES it from the sender's table, and
+delivers it with its rights unchanged. So "the handle arrives with map and write and neither
+`RIGHT_DUPLICATE` nor `RIGHT_TRANSFER`" describes a handle the transport cannot carry, and the only
+attenuating primitive - the single-handle `SYS_CHANNEL_SEND_ATTENUATED` - is not what the typed
+transport uses. I replaced one unimplementable mechanism with another and called the accounting sound
+without checking the delivery.
+
+The attenuation moves to the caller, where a primitive already exists: `SYS_HANDLE_DUPLICATE` takes a
+rights mask and refuses anything the original does not hold, so it narrows and never widens. The
+caller creates the object - holding every right, and charged for it - duplicates a handle down to
+exactly `MAP | WRITE | TRANSFER`, and passes the COPY, keeping the original so the send consuming the
+copy costs it nothing.
+
+What that buys is now stated exactly rather than optimistically, including the part that is worse
+than the first version: no `RIGHT_DUPLICATE`, so the catalogue cannot make a second handle and keep
+it after closing the one it was given, which is what the retained-face gates actually rest on; map
+and write and no read, so a service filling a buffer cannot read what was in it. And `RIGHT_TRANSFER`
+IS present, because the transport consumes handles that way and nothing here can change it - so "the
+catalogue must not pass the object on" is a code obligation with a gate rather than a right it lacks.
+Written down, because a plan that claims a rights bit it cannot obtain is a plan whose security
+argument is decoration.
+
+I did not take the other route the finding implies - extending the typed transport to attenuate
+request handles - because that is a change to every generated client, owned by the IPC layer, and
+this is a font catalogue. That is the same reason I did not add an allocate-in-another-Domain syscall
+last round.
+
+**Finding 2 - the admin-holder correction names neither a deliverable endpoint path nor a final
+holder. ACCEPTED.**
+
+Correct, and the comparison it draws is exact: I cited the device-policy path as the analogue and
+then omitted all four things that make that path work. PermissionManager can mint a client only from
+an endpoint it has been given, and nothing gave it one - so "minted for the operator path alone" is
+an authority policy with no route behind it, and after a dropped watch there is no named party who
+can issue a recovery scan.
+
+The four are now copied rather than alluded to: the ENDPOINT is a second serve endpoint of the same
+service, minted at its start beside the client one; the ROLE is a manifest client role on
+`permission_manager` naming it, the way `DEVPOLICY` names DeviceManager's admin interface; the
+DELIVERY is ServiceManager passing that endpoint to PermissionManager during bootstrap, on the same
+hop that carries the device-policy one; and the RECIPIENT is the named operator tool that owns font
+administration, holding a declared security capability, which is what makes the grant governed rather
+than ambient. "No ordinary application holds it" describes who may not; the plan now also says who
+may.
+
+**Finding 3 - the revised RESCAN budget still permits an unbounded sequence of full scans. ACCEPTED,
+and this is the second correction to the same rule in two days.**
+
+The hole is exactly where the finding says. The generation advances only when a digest, a name or a
+face's metadata differs from what was published, so a valid scan of an UNCHANGED directory publishes
+nothing - and my rule spent an allowance only on a publication and re-armed a delay only after a
+FAILURE. An unchanged scan is neither, so it cost nothing and permitted the next one immediately:
+serial full directory reads, digests and metadata passes, which is the work this operation was moved
+off the client interface to bound.
+
+The two questions are now bounded separately, because conflating them is what produced a rule with a
+hole in it both times. HOW OFTEN A SCAN MAY RUN: at most one in flight, and every COMPLETED scan -
+published, unchanged or failed - re-arms a bounded delay, with a request inside it refused
+`try-again-at`. That is the work bound and it does not care what the scan found. HOW MANY MAY
+PUBLISH: one per published generation, counted as before. That is the churn bound, and it is what
+keeps a recovery scan available after a bad directory is corrected. Its gates gain the missing case -
+two scans of an unchanged directory, the second refused, the published generation unmoved by either.

@@ -1166,3 +1166,32 @@ this round touches the scheduler: the changes are in the claim release, the IOMM
 DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
 suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
 so the riscv64 row above is a SECOND full run rather than the sweep's.
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-09-02T03:45:31Z):
+
+Current implementation rating: 6/10
+
+1. **Live-fault containment still has no bounded servicing guarantee.** The only periodic production
+   call is still after the BSP's unbounded `sched::run_until_idle()` returns
+   (`src/kernel/main.rs:449-470`). That drain uses `NO_DEADLINE` and can keep rescheduling while the
+   run queue remains non-empty (`src/kernel/sched/mod.rs:1105-1142`), while
+   `service_faults_if_due` is gated to CPU 0 reaching that settled loop
+   (`src/kernel/iommu/mod.rs:1027-1083`). The response correctly leaves this unmet: a CPU-bound
+   workload can leave a faulting endpoint bus-mastering indefinitely, contrary to M5's live
+   fault-to-containment requirement (`docs/todo/P02M0153.md:197-204`).
+
+2. **The revised detached-tail bound can still discard an attribution that is actively protecting a
+   replacement.** `remember_detached_tail` caps the list at eight, but when all eight entries are
+   undrained it evicts index zero anyway (`src/dma/src/lib.rs:855-858,1181-1188`). This is reachable
+   under the fault-storm case: a malformed-filled transport can make each bounded poll consume raw
+   records yet return zero before reaching the old valid fault, so repeated revocations can retain
+   more than eight still-live tails. Once the oldest is evicted, the virtio backend resolves that
+   eventual old event through the endpoint's current attachment (`src/dma/src/virtio_iommu.rs:519-568`),
+   and the generic layer has no tail with which to restore its old generation
+   (`src/dma/src/lib.rs:1258-1295`). It can therefore again be charged to and contain a healthy
+   replacement. The new capacity test asserts only that the newest entry survives; it never queues a
+   fault for the undrained entry the bound discarded (`src/dma/src/tests.rs:654-672`).
+
+Focused verification: `cargo test --manifest-path src/dma/Cargo.toml --offline` passed all 59 tests.
+Those tests cover malformed-record dry detection and two undrained tails, but not undrained-tail
+eviction. No guest run was started.

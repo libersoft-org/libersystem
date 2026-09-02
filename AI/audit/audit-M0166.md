@@ -1034,3 +1034,11 @@ this round touches the scheduler: the changes are in the claim release, the IOMM
 DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
 suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
 so the riscv64 row above is a SECOND full run rather than the sweep's.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-09-02T03:51:29Z):
+
+Current implementation rating: 7/10
+
+1. **The required production policy and reserved-namespace authority proofs remain absent.** The production policy dev check covers only disabling and re-enabling a GPU (`src/user/services/core/src/catalog.rs:543-572`; `scripts/qemu/dev-gpu-restart.py:197-228`). It does not drive DeviceManager's production select/retry logic (`src/user/services/core/src/device_manager.rs:4413-4479`), prove quarantined-device retry/future-policy behavior, or prove that a well-formed `device.policy.*` write by an ordinary `CAP_CONFIG` holder is denied by ConfigService's authority checks (`src/user/services/core/src/config_service.rs:218-269`). Those are explicit milestone verification requirements (`docs/todo/P02M0166.md:239-251`), so the current lower-level model tests do not close the production security and state-transition gap.

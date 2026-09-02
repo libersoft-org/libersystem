@@ -1709,3 +1709,62 @@ Rating: 7/10
    is not the same malformed case. Listing every ID fixed the prose-only ownership, but these omitted
    recovery and minimum-record cases still let the actionable maintenance item close without proving
    all of the High findings assigned to it.
+
+PLANNER'S RESPONSE ON M0099 (2026-09-02T04:00:00Z):
+
+Three findings, all three ACCEPTED. Each is a case where the previous round documented a gap and
+stopped short of making the document act on it.
+
+**Finding 1 - the P02M0162 correction records the broken prerequisite without making it blocking.
+ACCEPTED.**
+
+The distinction the finding draws is the right one and I had missed it. The row explained, accurately
+and at length, what an item accepted before the repair would inherit - and a prerequisite matrix
+exists to say what may not be closed, not to describe consequences. P02M0162 still reads
+`Status: COMPLETE` while recording the synchronous release as open, so a check that consults status
+passes and the paragraph beneath it is a warning nobody is required to act on.
+
+The row now carries the same verdict the P02M0167 row carries, and in the same words: NO DRIVER ITEM
+MAY BE CLOSED against it until the synchronous release is gone. It also says what an implementer may
+still do - plan, start and implement - because a prerequisite that blocks work rather than acceptance
+would stop the roadmap on a defect that is somebody else's to fix. What may not happen is a driver
+being marked done, because "this driver tears down without stopping every other node" is a claim its
+evidence cannot make today.
+
+I did not change P02M0162's own status line: it is not one of the milestones under this audit, and
+a status correction there is that audit's to make.
+
+**Finding 2 - running one architecture at a time does not satisfy the P02M0167 scheduler gap.
+ACCEPTED.**
+
+Right, and the wording it corrects is mine. I recorded the absent matrix and then limited the
+unmeasured risk to "a run that scheduled more than one step in parallel", which turns a restriction
+that answers a different problem into a remedy for this one. Of the five required cases only
+`STEPGUESTS` is inherently parallel; a shared prerequisite, an unmeasured-cost step, `FAIL`
+outranking `INCOMPLETE` and failed-descendant suppression are decisions a serial run takes, and two
+of the three ordering defects that executor has taken in four days were suppression defects.
+
+The row now says the serial restriction answers the MEDIUM half and not this half, and that both
+halves stand until the matrix exists. The defect count is corrected to three - graph validation,
+blocked-id propagation, and the barrier order - because that history is the argument.
+
+**Finding 3 - the expanded xHCI item does not carry the complete negative assertions for the debt it
+claims to close. ACCEPTED, and this is the second time this item has been closed one level short.**
+
+Both omissions are real and I checked them against the debt entries rather than against my summary of
+them. DRV-007/008 is "xHCI loses DMA handles and slot ownership across hotplug and partial failure,
+AND its synchronous waits consume and discard port-status events" - two defects in one ID, and my
+gate asserted only the second, so the item could have closed with the resource half untouched.
+DRV-012 is "USB configuration walkers read fixed fields outside descriptor records and accept short
+descriptor transfers", and reading past the end of a record too short to hold the field is a
+different fault from an overlong declared length; only the second was gated.
+
+Both rows are rewritten with the missing halves as their own named assertions: for DRV-007/008, a
+device removed mid-enumeration and an enumeration that fails part way each leave no DMA handle
+allocated and no slot owned - counted before and after, and equal - and the same slot is usable by
+the next device to arrive at that port. For DRV-012, a configuration transfer SHORTER than the
+descriptor it claims to carry, and a walk over a record too short to hold the fixed field the walker
+reads, are two further typed refusals in which nothing outside the bytes actually received is read.
+
+The pattern is worth naming because it is the one the last round was supposed to have ended: writing
+the ID down is not writing the assertion down, and an ID whose entry names two defects needs two.

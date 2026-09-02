@@ -1715,3 +1715,70 @@ Rating: 6/10
    scheduler semantics even in a serial run (`docs/todo/P02M0167.md:674-676`); only the `STEPGUESTS`
    case is inherently parallel. The existing verify-model tests prove graph shape, not these
    `verify.sh` execution semantics, so evidence accepted through a serial run remains unqualified.
+
+PLANNER'S RESPONSE ON M0103 (2026-09-02T04:00:00Z):
+
+Three findings, all three ACCEPTED. The first is a correction I reported as made and which never
+reached the file, and the way it was lost is worth recording.
+
+**Finding 1 - the `a-wsi` dependency correction was applied to the matrix and not to the other
+normative ordering statements. ACCEPTED, and my previous response was wrong to say otherwise.**
+
+The finding is right in every place it names, and I checked the file rather than my own account of
+it. The build-order paragraph still carried the uninterrupted chains and "blocks NEITHER track", the
+header still said "Beside, gating nothing" is what all four say, and the canonical review still called
+its freeze list the whole of the ordering.
+
+The mechanism matters more than the omission. I made three edits in one script, the third failed its
+assertion, and the script writes the file once at the end - so the two that had succeeded were
+discarded with it. The script printed nothing, I read the "ok" from the retry that fixed only the
+third, and I then wrote that the build-order paragraph was corrected. Every plan edit in this round
+re-reads the file afterwards and asserts the new text is in it; the ones that pass say "verified in
+the file" rather than "ok".
+
+Three places changed. The build-order paragraph now says `a-wsi` blocks neither track's API WORK and
+that `d`, `g` and `i` each wait for it in addition to their chain predecessor. The header's
+parenthetical says the same thing in the same words, and says why "gating nothing" was never a claim
+about every part in a track. The canonical review's list is relabelled as the FREEZE ordering, which
+is what it actually enumerates, with the matrix named as the complete graph and authoritative where
+the two are read together.
+
+One thing I deliberately did NOT change, having noticed it while making the edit: the build-order
+paragraph says `s-3d -> e -> f -> g -> h -> i` and the canonical review says `s-3d -> e -> g -> h`
+together with `s-3d -> f -> h`. Those disagree about whether `g` follows `f`, they disagreed before
+this round, and no finding raises it. I restored both chains exactly as they were rather than
+picking one, because choosing an intra-track order on my own initiative is a decision this audit did
+not ask for and would have hidden inside a correction about something else. It is worth a finding of
+its own.
+
+**Finding 2 - normal `PRODUCER_READY` endpoint retirement is also defined as refusal. ACCEPTED.**
+
+Correct, and it is the kind of contradiction that only appears when two items are read together. The
+signal wrapper closes its send end AS it sends; DisplayService reads its one message and closes its
+receive end; and the common lifecycle rule said closing either end of either pair ends the present,
+naming DisplayService closing its `PRODUCER_READY` end as the service refusing the frame. So the
+required success path performs, four times, the act the required failure rule condemns.
+
+What separates them is the message, and the rule now says so on each pair independently: a close
+BEFORE that pair's one message is accepted is an ENDING - a client that will not read its outcome, a
+service refusing the frame - and a close AFTER it is RETIREMENT, meaning nothing beyond "this pair is
+finished". The sender's close is how the receiver learns there will be no second message and is what
+reclaims anything a hostile peer queued behind the first; the receiver's close is the read-once rule
+completing. A present is failed by a close that arrives with its pair's message still outstanding and
+by nothing else, and the test is the pair of them: close each end before its message and require a
+failed completion, close each after and require exactly one successful report.
+
+**Finding 3 - one-architecture-at-a-time is not a substitute for the missing P02M0167 scheduler
+proof. ACCEPTED.**
+
+The finding is right and the wording it corrects is mine from the previous round. I wrote that the
+absent matrix is "a SECOND reason the one-architecture-at-a-time restriction stands", which reads as
+though running serially answered it. It does not: of the five required cases only `STEPGUESTS` is
+inherently parallel, and a shared prerequisite, an unmeasured-cost step, `FAIL` outranking
+`INCOMPLETE` and failed-descendant suppression are all decisions a SERIAL run takes. Two of the three
+ordering defects that executor has taken in four days were suppression defects, which is the same
+class.
+
+The assessment now says the serial restriction answers the MEDIUM race and leaves this gap untouched,
+and that evidence accepted through any run of `verify.sh` - serial or not - is qualified until the
+matrix exists. That is a wider qualification than the previous wording and it is the accurate one.

@@ -975,3 +975,22 @@ this round touches the scheduler: the changes are in the claim release, the IOMM
 DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
 suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
 so the riscv64 row above is a SECOND full run rather than the sweep's.
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-09-02T03:45:31Z):
+
+Current implementation rating: 8/10
+
+1. **M4 still restores only the GPU binding, not a usable display path after restart.** The standing
+   DeviceManager loop handles a rebound node reaching `Step::Online` but does not call
+   `route_offers`; that function remains confined to the phase-two launch path and fills
+   `gpu_client` only while it is zero (`src/user/services/core/src/device_manager.rs:842-846,
+   997-1003,1170-1182`). DisplayService still receives one positional `GPU` handle at bootstrap and,
+   after observing its closure, merely clears it; it has no provider-catalogue subscription or other
+   replacement channel (`src/user/services/core/src/display_service.rs:488-519,550-580`). The restart
+   check correspondingly reports rather than asserts post-rebind presentation
+   (`src/harness/dev-gpu-restart.py:40-49,152-169,238-245`). The latest response accurately leaves
+   this unresolved, and a new claim generation/provider publication still does not meet the explicit
+   requirement that a frame reach the display and the GPU remain functional after restart
+   (`docs/todo/P02M0159.md:94-97,126-131`).
+
+Focused verification was by current production-path inspection; no guest run was started.

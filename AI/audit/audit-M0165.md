@@ -1269,3 +1269,11 @@ this round touches the scheduler: the changes are in the claim release, the IOMM
 DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
 suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
 so the riscv64 row above is a SECOND full run rather than the sweep's.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0165 (2026-09-02T03:51:29Z):
+
+Current implementation rating: 7/10
+
+1. **The named publish/crash/subscribe race proof still stops before the production close-and-announce effects.** The host test exercises `Publications` selection and `withdraw_slots_into` transfer/identity behavior only (`src/user/libs/driver/binding/src/tests.rs:526-599`). In production, DeviceManager separately closes each withdrawn provider handle and announces the withdrawal (`src/user/services/core/src/device_manager.rs:2294-2352`), with the crash/failure path invoking that work at `src/user/services/core/src/device_manager.rs:3723`. Removing or breaking either production effect would leave the named test green, so it does not establish the milestone's required absence of stale providers/handle leaks across the race (`docs/todo/P02M0165.md:280-307`, `331`).

@@ -1342,3 +1342,13 @@ this round touches the scheduler: the changes are in the claim release, the IOMM
 DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
 suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
 so the riscv64 row above is a SECOND full run rather than the sweep's.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-09-02T03:49:55Z):
+
+Current implementation rating: 8/10
+
+1. **The required separately labelled AArch64 and RISC-V UEFI/no-DT positive regression profiles remain unimplemented.** The current plan now records the milestone honestly as incomplete and leaves M6 unchecked, but the implementation requirement itself is still unmet (`docs/todo/P02M0151.md:167-183,500-508`). The architecture-profile gate explicitly says those rows are not registered and that no caller selects the compile-time fallback authorization (`src/tools/check-qemu-arch-profiles.sh:360-373`); repository-wide production references still consist only of the two consumers and build-variable forwarding (`src/kernel/arch/aarch64/mod.rs:174`; `src/kernel/arch/riscv64/mod.rs:157`; `src/harness/test-kernel.sh:332`). The measured QEMU/loader limitation explains the missing evidence but does not satisfy M6 or the Definition of Done's two positive compatibility boots.
+
+Focused verification: the FDT suite passed 87 tests, the secondary-start model passed 18 tests, all three production kernels built, `arch-surface` passed across 61 production architecture files, and the architecture-profile script passes `bash -n`. No QEMU run was started; the current gate itself declares the two required profiles absent.

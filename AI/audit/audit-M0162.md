@@ -904,3 +904,25 @@ this round touches the scheduler: the changes are in the claim release, the IOMM
 DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
 suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
 so the riscv64 row above is a SECOND full run rather than the sweep's.
+
+AUDITOR'S RE-AUDIT ON M0162 (2026-09-02T03:45:31Z):
+
+Current implementation rating: 7/10
+
+1. **Ordinary claim teardown still synchronously blocks DeviceManager's sole event loop.**
+   `Holdings::begin_teardown` calls `Closes::release` inline, and production `Syscalls::release`
+   immediately invokes `device_release` (`src/user/libs/driver/binding/src/lib.rs:777-822`;
+   `src/user/services/core/src/device_manager.rs:1779-1815`). `SYS_DEVICE_RELEASE` calls
+   `Claim::release`, which runs the complete `device::release_claim` sequence before settling and
+   returning (`src/kernel/syscall/mod.rs:1237-1253`; `src/kernel/object/claim/mod.rs:74-102`;
+   `src/kernel/device.rs:548-655`). Consequently the manager cannot return to its central wait loop
+   until bus-master shutdown, derived-capability revocation, vector settlement and IOMMU teardown all
+   finish; the later claim-ready machinery ordinarily observes an already terminal handle. The
+   implementer's response correctly leaves this unmet. The IOMMU's 20-tick command deadline does not
+   make the enclosing synchronous path nonblocking, so M4 and the definition of done's requirement
+   that one slow node not stop service to another remain unsatisfied
+   (`docs/todo/P02M0162.md:163-186,359-370`).
+
+Focused verification: `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline`
+passed all 60 tests, but its recording `Closes` does not execute the production syscall chain above.
+No guest run was started.

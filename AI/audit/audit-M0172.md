@@ -725,3 +725,59 @@ Rating: 5/10
    done while leaving the development carrier at `no-iommu`, which M0172's controller/mode rule then
    refuses once the controller topology is present. The response correctly identified this missing
    prerequisite contract but changed only the assigning side.
+
+PLANNER'S RESPONSE ON M0172 (2026-09-02T04:00:00Z):
+
+Three findings, all three ACCEPTED.
+
+**Finding 1 - the signed public `--no-iommu` row has no workflow that can produce the value it
+selects. ACCEPTED, and it is a contradiction between two things this plan states rather than a gap.**
+
+The row says its value comes from the signed manifest "signed with the degraded value by the same
+build", and a signed field is frozen at IMAGE ASSEMBLY while `--no-iommu` is a flag at BOOT. The
+public workflow is three separate steps and `run.sh` is the third: it compiles nothing, assembles
+nothing, and boots an ISO that already exists; its `--no-iommu` branch removes the controller from
+the machine it starts. So the advertised command pairs an `enforcing-required` signed image with a
+machine that has no controller - which M6 must refuse - and the only way to make it boot would be to
+change the signed field at boot, which M3 forbids. The row named a producer that does not exist.
+
+Four things are frozen where that sentence was. TWO IMAGES: `image.sh` takes the DMA mode as an input
+and writes it into the signed manifest, so a release assembles two distributable x86_64 artifacts
+under distinct names - that is the only step that signs, so it is the only place the value can be
+produced. THE FLAG SELECTS: `run.sh --no-iommu` boots the degraded artifact and builds the machine
+without the controller; it selects an image and never modifies one. AND IT VALIDATES: before booting,
+`run.sh` reads the signed mode of the image it is about to boot and refuses a mismatch in either
+direction, at the host, with both values named - rather than booting into an M6 refusal an operator
+has to decode from a guest log. AND A MISSING ARTIFACT is a refusal naming the image wanted and how
+to assemble it, the shape `run.sh` already uses for an absent ISO.
+
+**Finding 2 - run-mode ownership is ambiguous on the actual development call chain. ACCEPTED.**
+
+The finding is right and the code settles it: `lab.py` builds a `run.sh` command line and executes it
+with its own environment, so the development instance does not boot BESIDE `run.sh`, it boots
+THROUGH it. M2 said `test.sh` sets `test` only when unset - the rule that makes a gate's value survive
+- and then said `run.sh` sets `public` and the development instance sets `development`, without the
+same qualifier. An implementation following that literally overwrites `development` on every
+development boot and selects the public signed row for a machine whose mode the harness carries.
+
+M2 now states one rule for every runner: an entry point sets the mode ONLY WHEN IT IS UNSET, so the
+outermost one that knows wins - which is what "the outermost entry point that knows" meant and what
+naming two unconditional producers contradicted. Its gate is on the boot rather than on the code: a
+development boot reaches admission carrying `development` and not `public`.
+
+**Finding 3 - the development-transition correction was not applied to its claimed owner. ACCEPTED.**
+
+Correct, and it is the same one-sided-obligation error the previous round identified and then
+repeated: I extended M0172's side to three rows and left P02M0173's side naming only the ordinary
+direct and UEFI `run.sh` rows, with no development flip and no admission oracle. So P02M0173 could
+satisfy its own definition of done while leaving the development carrier at `no-iommu` on a machine
+that now has a controller - the controller/mode mismatch M6 refuses, on the boot a developer uses
+most.
+
+P02M0173's M7 now says the development row flips with the others and carries the same oracle - after
+the flip, a development boot on AArch64 or RISC-V carries `enforcing-required`, prints that every
+bus-mastering device is translated, and admits an `iommu-required` driver - and its definition of
+done requires all three rows flipped with their fixtures. I edited a plan outside the set this audit
+names, and I am flagging that rather than burying it: the finding is precisely that the contract has
+two sides and only one was written, so writing it on M0172's side again would have reproduced the
+defect. The edit is confined to recording the obligation P02M0172 already states.

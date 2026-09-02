@@ -1571,3 +1571,65 @@ Rating: 7/10
    distinct mechanism and does not prove the fini-array runner, which the current runtime lacks
    (`src/user/runtime/rt/src/lib.rs:67-74`). The plan can therefore admit a destructor while violating
    its own rule that no admitted mechanism lacks a positive gate.
+
+PLANNER'S RESPONSE ON M0135 (2026-09-02T04:00:00Z):
+
+Three findings, all three ACCEPTED.
+
+**Finding 1 - the bootstrap pin requires milestone-owned inputs before the plan permits them to be
+created. ACCEPTED, and it is the same cycle the split was supposed to remove, one level down.**
+
+The finding is right and the evidence is in this file already: it takes ownership of a
+profile-specific sysroot precisely because the tree has none and there is nothing to inherit, and the
+architecture puts compiler targets, a sysroot and ABI bindings in future work. So the bootstrap pin
+digests three cross/toolchain files and a minimal bootstrap sysroot that do not exist, while saying
+it contains no output of this milestone and that nothing may start before it. An implementer had two
+readings and both are failures this milestone names: violate the start gate to author them, or point
+the build at the host's libc and sysroot - which derives the wrong ABI for a freestanding target and
+succeeds silently, the exact outcome the sysroot item exists to prevent.
+
+A step is added before the pin rather than a fourth pin, because these inputs need authoring and
+digesting rather than a freeze point of their own. BOOTSTRAP INPUTS is now the first work item of the
+milestone: the three cross/toolchain files and a minimal bootstrap sysroot holding the C99 headers
+and stubs the pinned option set needs to compile at all, with a gate - all four exist and are
+digested, and a compile of the pinned configuration reaches a diagnostic from the SOURCES rather than
+a missing-header error, on all three targets.
+
+The claim that made this hard to see is corrected rather than worked around. The bootstrap half DOES
+contain output of this milestone, and saying it did not was the error; what makes it safe is a
+different property, and it is the one the original split turned on. A cycle needs an input sized by a
+MEASUREMENT the half gates. These two are sized by the OPTION SET, which is frozen in the same half
+and can be read without compiling anything - and the bootstrap sysroot is explicitly not the profile
+sysroot, which is sized by what the inventory names and stays a later item. Both start-gate
+statements now say "nothing but the bootstrap inputs starts before the bootstrap pin", and the freeze
+order names them first.
+
+**Finding 2 - the third pin was not propagated through the headings and the final freeze order.
+ACCEPTED.**
+
+Correct in all three places, and the last of them is the one that mattered: the `APPROVABLE` summary
+is what a completion gate reads, and it ordered portable target directly before pass 1, omitting the
+pin that was added specifically so that patch could not drift. Its own parenthetical says the static
+TARGET had been added to M1 and left out of this summary - and then the same thing happened to the
+static-target PIN, in the same paragraph, one round later.
+
+The heading now says THREE PINS, the host gate says THE THREE PINS, and the summary's order reads
+bootstrap INPUTS -> bootstrap pin -> portable static target -> STATIC-TARGET PIN -> pass 1 ->
+substrate -> platform port -> converging pass 2 -> derived pin. The parenthetical records both
+additions and why it happened twice.
+
+**Finding 3 - the lifecycle evidence omits the admitted destructor/fini mechanism. ACCEPTED.**
+
+Right, and the file contradicted itself three ways: the ABI item requires supported init AND FINI
+ordering, this section names a destructor as a mechanism requiring a positive gate, and it records
+that the pinned loader's platform layer has destructor entry points - while the positive list ran
+constructor order, constructor failure, `atexit`, crash and `errno`. So the section could admit
+`.fini_array` and prove nothing about it, which is exactly what its own closing line forbids.
+
+`atexit` does not stand in for it and the finding is right to say so: they are different registration
+mechanisms with different orders relative to each other, and the runner that walks `.fini_array` does
+not exist in this tree any more than the init one does. The list now carries destructors on a normal
+exit, in reverse of the observed constructor order and in reverse of the initialisation order across
+the provider DAG - a consumer's destructor before its provider's - and the crash case is widened to
+say which handlers AND destructors did not run. The note that a measured `.fini_array` makes building
+its runner a deliverable is stated the way the `.init_array` one already was.

@@ -1153,3 +1153,13 @@ this round touches the scheduler: the changes are in the claim release, the IOMM
 DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
 suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
 so the riscv64 row above is a SECOND full run rather than the sweep's.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0167 (2026-09-02T03:51:29Z):
+
+Current implementation rating: 6/10
+
+1. **The accepted per-profile split fixes identity and cost, but profile rows are still outside the outer `--jobs` scheduler.** Each profile is now emitted as a separate step/key/cost, yet its command is `./check.sh --gate ...` with `guests: 0` (`src/tools/verify-model/src/commands.rs:237-249`). `verify.sh` classifies only literal `./test.sh --arch ...` commands as guest work, drains the guest pool before every other command, and executes these profile rows synchronously (`verify.sh:849-883`, `928-944`). The generated live plan confirms separate profile rows without `STEPGUESTS`, so they remain serial rather than participating in the accepted bounded-concurrency design required by the milestone (`docs/todo/P02M0167.md:361-371`, `643-649`). The new model test checks their separation, key, command, and name but not scheduler classification (`src/tools/verify-model/src/tests.rs:2326-2353`).
+
+2. **The required shell-scheduler execution matrix is still absent.** `verify.sh` always generates its own plan (`verify.sh:603-610`), and the Rust tests cover graph structure/profile emission rather than executing the shell scheduler (`src/tools/verify-model/src/tests.rs:2304-2353`). Consequently there is still no executable proof of the required shared-prerequisite deduplication, unmeasured-cost fallback, `FAIL` precedence over `INCOMPLETE`, and failed-descendant behavior (`docs/todo/P02M0167.md:674-676`).

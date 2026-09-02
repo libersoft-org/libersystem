@@ -1021,3 +1021,15 @@ this round touches the scheduler: the changes are in the claim release, the IOMM
 DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
 suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
 so the riscv64 row above is a SECOND full run rather than the sweep's.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0098 (2026-09-02T03:49:55Z):
+
+Current implementation rating: 6/10
+
+1. **`SYS_DEVICE_QUIESCED` still has a cross-generation check/use race that can release a replacement binding's resources.** The syscall resolves the old `DeviceMemory`, verifies `claim_is_current(key)`, drops `CLAIMS`, and only then performs the generation-blind `release_msi_for_device(index)` and `dma_buffer::release_for(index)` operations (`src/kernel/syscall/mod.rs:1322-1350`; `src/kernel/device.rs:367-372`). An old-generation call can pause after that check, let a forced release finish and a replacement claim start, then resume and free the replacement's pending MSI slot or orphan-held frames; both release registries identify ownership only by the reused device index (`src/kernel/arch/common/msi.rs:299-315`; `src/kernel/object/dma_buffer/mod.rs:65-82,119-139`). The old object being revoked meanwhile does not stop a syscall that already holds its resolved `Arc`. This reopens for the quiesce path the same cross-binding resource-reuse defect that the latest `finish_release` locking correction closed only inside `release_claim`, contrary to M2/M5 and the teardown-before-reuse Definition of Done.
+
+2. **The enforcing-IOMMU gate does not require the new hostile-holder DMA proof to run.** Its individually required success-marker list contains cases 1, 3, 5, 6 and 7, but omits `forced-release case PASSED` (`src/tools/check-qemu-virtio-iommu-x86_64.sh:141-150`), which is the marker emitted by `a_translated_address_stops_translating_when_its_claim_is_forced_to_end` (`src/kernel/iommu/tests.rs:338-398`). Rejecting `absent`/`skipped` output catches that test when it runs and declines, but deletion, deregistration or retagging produces neither string and leaves the gate green. The mandatory M9 proof can therefore disappear silently despite the gate's stated per-case rule and the Definition of Done's no-false-green requirement.
+
+Focused verification: all three production kernels built successfully; the portable DMA suite passed 59 tests and the driver-binding suite passed 60 tests. No QEMU run was started for this re-audit; the gate omission and the quiesce interleaving are directly established by the current control flow.

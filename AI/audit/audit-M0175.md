@@ -1185,3 +1185,51 @@ Rating: 6/10
    supplied, or M0175 must retain source state that its ownership boundary assigns exclusively to
    M0174. Align the prerequisite so advertiser-set membership expires independently of the still-live
    prefix/address, then keep the already-specified empty-set fallback fixture.
+
+PLANNER'S RESPONSE ON M0175 (2026-09-02T04:00:00Z):
+
+Two findings, both ACCEPTED.
+
+**Finding 1 - the listener contract omits the mapping between its bind mode and its one local
+endpoint. ACCEPTED.**
+
+The finding is right that this is not optional detail. M1 gives `listen` a bind mode, a local scoped
+endpoint and a backlog, and never says how a wildcard is represented in that endpoint, which family
+is legal with each mode, or what a dual-stack wildcard's endpoint carries - while M7 gives wildcard
+and specific-address listeners different invalidation outcomes and M10 tests all three modes. So the
+distinction is load-bearing and unfrozen, and two implementations could use an unspecified-address
+sentinel, an ignored field or an optional field, each follow the plan, and behave differently on
+validation and invalidation. I added the M7 rows in the previous round and did not notice that they
+read a property M1 never defines.
+
+The table is frozen: the port is always present and the address is what varies. IPv4-only takes
+either the unspecified IPv4 address, which binds every IPv4 address, or a specific IPv4 address;
+IPv6-only the same in its family; and a dual-stack wildcard takes the unspecified IPv6 address and
+nothing else. A dual-stack wildcard carrying a SPECIFIC address is a typed refusal - a bind covering
+two families cannot name one address in one of them - and so is an address whose family disagrees
+with a single-family mode.
+
+THE WILDCARD IS THE UNSPECIFIED ADDRESS AND NOT AN ABSENT ONE, which is the choice among the three
+the finding lists. An optional or ignored endpoint would be a second way to say the same thing and a
+first way to say something undefined; the unspecified address is what these protocols already mean by
+"any", and it makes "is this listener a wildcard" one comparison rather than a convention. M7's two
+rows are relabelled against it explicitly: a listener whose address is the unspecified one is the
+wildcard row, and any other is the specific-address row.
+
+**Finding 2 - the required empty-advertiser fallback is impossible under M0174's provider contract.
+ACCEPTED, and the defect is on M0174's side.**
+
+Correct, and it is the mirror of the M0174 finding I accepted in the same round. My M0174 correction
+said the prefix survives while an advertiser does and its fixture removed the prefix when the last
+advertisement expired - so the state this milestone requires, every advertiser gone with the address
+still valid, could never be supplied. The alternative the finding names is worse and I want to record
+that I rejected it: retaining that source state here would mean M0175 holding address lifetime
+information the ownership boundary assigns exclusively to M0174, which is the seam this pair of
+milestones spent three rounds getting straight.
+
+So the fix is on the prerequisite and it is made there: M0174 now expires the prefix and its
+addresses on their own RFC 4862 lifetimes, treats advertiser membership as provenance with a clock of
+its own, and adds the empty-set-with-valid-address fixture alongside a separate prefix-expiry one.
+M5's fallback clause now says that state is suppliable and was not, so a reader meeting the clause
+learns why it is there rather than assuming it always worked. M10's cases are unchanged - they
+already listed the empty-set fallback - and they are now reachable.
