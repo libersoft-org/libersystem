@@ -1155,3 +1155,117 @@ Current implementation rating: 4/10
 2. **The `Releasing`-claim wake can prematurely time out unrelated in-flight handshakes.** A parked claim's `retry_at` is folded into `soonest` even while other handles are being supervised (`device_manager.rs:2634-2658`). Deadline expiry is a negative `ERR_TIMED_OUT` from `wait_any` (`src/user/runtime/rt/src/lib.rs:780-785`), but the negative-result branch checks only the in-flight nodes' own attempt deadlines; if none has expired, it treats the wake as an unperformable wait and queues `TimedOut` for every in-flight node (`device_manager.rs:2659-2689`). A short claim-poll deadline can therefore turn an unrelated healthy handshake into `HandshakeTimeout` and start its teardown (`device_manager.rs:3591-3599,3641-3660`), contrary to the bounded per-binding reconstruction/supervision contract.
 
 3. **The named publish/crash/subscribe race still has no production-side-effect assertion.** The host test drives slot selection and transfer, while DeviceManager separately closes each provider handle and announces its withdrawal (`src/user/libs/driver/binding/src/tests.rs:526-599`; `src/user/services/core/src/device_manager.rs:2235-2293`). Removing either production effect still leaves the registered helper test green. The latest response correctly labels this proof gap unmet, so M7's explicit no-stale-provider race and watched-failure definition of done remain unproved (`docs/todo/P02M0165.md:280-331`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-09-02T03:00:00Z):
+
+Three findings, all three ACCEPTED. The first is the most serious defect this milestone has had, and
+it had been live under every response I have written about planned stops.
+
+**Finding 1 - teardown confirmations are discarded, so no live-driver teardown can reach a confirmed
+landing. ACCEPTED, and FIXED.**
+
+I traced the whole path before believing it, and it is exactly as described. `advance` takes
+`node.binding` out before the rollback runs, so from that moment `Node::pop` computed
+`if self.binding.is_some() { self.id.generation } else { 0 }` and asked for ZERO. `BindingQueue::pop(0)`
+drains the queue and answers `None` - which is correct and documented behaviour for a node holding
+nothing. So the `while let Some(event) = node.pop()` loop in `advance` never ran a single iteration
+while a teardown existed, `teardown.pending.note` was never called, and `Pending` kept `exited: false`
+and `state: None`. `settle` then returns `None` until the deadline and `Settled::Unconfirmed` after
+it, which `resolve_teardown` lands as `Quarantined`.
+
+The scope of that is worth stating plainly rather than as a line number: EVERY teardown in this
+system that had to wait for its confirmations resolved as unconfirmed. An operator's disable, a
+dependency loss, a crash with attempts left - all three landed `Quarantined` instead of `Disabled`,
+`DependencyPending` and `Backoff`. The `Step::Resting` correction I made in the previous round is a
+decision taken AFTER `resolve_teardown` answers, so it was correct and unreachable: production never
+got to it.
+
+Nothing caught it for the reason I wrote down in the sibling M0159 response and did not follow up on:
+the kernel suite sends `STOP` at every shutdown and exits before any teardown confirms, so
+`resolve_teardown` completes zero times in a whole run. The helper tests drive `BindingQueue` and
+`Pending` separately, and each is correct on its own - the defect is only in the composition, which
+is exactly where nothing was looking.
+
+`Node::pop` now asks for `self.id.generation` when the node holds a binding OR a teardown. That is
+the right number for both: `node.id` is rebound only when the NEXT bind takes a claim, so while a
+teardown is outstanding it still names the binding that ended, which is what `pump` stamps its
+`Exited` and `ClaimSettled` events with.
+
+Two tests in `driver-binding` pin the composition, because that is where the two halves can be put
+together on a host: one pushes both confirmations, reads them the way a node holding a teardown now
+does, and requires `settle` to answer `Free` well before the deadline with both handles closed; the
+other reads the same queue with generation zero and requires exactly the failure that was happening -
+no confirmation, `None` until the deadline, then `Unconfirmed`. The second exists so that the
+behaviour a future reader meets is the RULE and not just a fixed call site.
+
+**Finding 2 - the `Releasing`-claim wake can prematurely time out unrelated handshakes. ACCEPTED,
+and FIXED. This one is a regression I introduced in the previous round.**
+
+The trace holds. I folded a parked node's `retry_at` into `soonest` so the loop would come round for
+the claim re-read - which is what that fix needed - and `wait_any` reports a deadline the same way it
+reports a wait it cannot perform: a negative result. The branch then looks for in-flight nodes whose
+OWN attempt deadline has passed, finds none (the wake was for the parked node), concludes the wait
+could not be performed at all, and times out EVERY node in flight. So the shortest backoff in the
+system could turn a healthy driver's handshake into `HandshakeTimeout` and start its teardown - a
+supervisor manufacturing the fault it exists to detect.
+
+The negative-result branch now knows the difference: a parked node whose `retry_at` has come due is a
+legitimate wake, and nothing is timed out for it. The `parked` deadline was already computed a few
+lines above for `soonest`, so the fix is that value being consulted rather than a new mechanism.
+
+**Finding 3 - the publish/crash/subscribe race has no production-side-effect assertion. ACCEPTED,
+and unmet.**
+
+Re-checked and correct: the host test drives slot selection and transfer, DeviceManager separately
+closes each provider handle and announces the withdrawal, and removing either production effect
+leaves the registered test green.
+
+The blocker is the same structural one I named last round and it is now the third round it has been
+owed, so I want to be precise about what would close it rather than repeat that it is owed. The two
+effects are not pure state - they close kernel handles and send on a channel - so proving them at the
+seam means giving that pair the treatment `Holdings` already has: an effect trait the production path
+implements with syscalls and a test implements by recording, so the assertion can be "the withdrawal
+was announced and the handle was closed" instead of "the state table permits it". That is a contained
+change to one type. It is not one to make in the same round as a fix to the teardown path it sits
+next to, and it is what M7 needs before it can be called proved.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `./test.sh --arch riscv64` | ****367 passed**, 0 failed (a second run - see below)** |
+| `dma` host suite | **59 passed** (57 + the two new tail cases) |
+| `driver-binding` host suite | **60 passed** (58 + the two new teardown-composition cases) |
+| `verify-model` host suite | **116 passed** (115 + the per-profile step case) |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows, including the firmware ITS device checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+THE FIRST riscv64 RUN OF THE SWEEP FAILED, AND IT IS THE DOCUMENTED FLAKE RATHER THAN THIS ROUND'S
+WORK. `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` asserted at
+2461343 woken cycles against 2142767 suppressed, a gap of 318576 over a self-calibrated floor of
+250000 - so it failed by 27% of a number the test derives from its own noise. I re-ran that one test
+four times on the same binary rather than assuming:
+
+```
+woken 2946843 (noise 302522), suppressed 2960432   PASS
+woken 2634433 (noise 855177), suppressed 2390843   PASS
+woken 1295185 (noise 228008), suppressed 2108696   PASS
+woken 1661823 (noise 738485), suppressed 2100216   PASS
+```
+
+The woken figure spans 1.30M to 2.95M - a factor of 2.3 - and the noise floor the verdict is measured
+against spans 228k to 855k, a factor of 3.7. The sweep's failing measurement sits inside that range.
+The test's own comment records the same flip on the same machine and the same kernel, and nothing in
+this round touches the scheduler: the changes are in the claim release, the IOMMU fault ledger,
+DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
+suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
+so the riscv64 row above is a SECOND full run rather than the sweep's.

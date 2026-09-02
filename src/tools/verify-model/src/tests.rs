@@ -2321,3 +2321,33 @@ fn the_real_plan_graph_validates() {
 	let steps = crate::commands::steps(&plan, &per_target, &model.registry);
 	assert!(crate::commands::validate(&steps).is_ok(), "the plan this tree actually emits has a usable dependency graph");
 }
+
+#[test]
+fn every_profile_row_is_a_step_of_its_own() {
+	// M3.6 AND THE DEFINITION OF DONE ASK FOR THIS, AND THE CATALOG SPLIT ALONE DID NOT GIVE IT.
+	//
+	// Each profile of a multi-profile gate has its own catalog entry, so it has its own KEY. Until
+	// 2026-09-02 `steps` then folded every ordinary pre-guest gate into ONE step with one id, one
+	// comma-separated command and all the keys - so twelve emulated profiles shared one identity and
+	// one duration divided evenly among them, which is exactly the merged cost the definition of
+	// done says must not survive into a cheapest-first run.
+	let model = model();
+	let plan = plan_for(&model, &["src/kernel/device.rs"]);
+	let per_target = std::collections::BTreeMap::new();
+	let steps = crate::commands::steps(&plan, &per_target, &model.registry);
+	let selected: Vec<&str> = crate::catalog::PROFILE_ROW_GATES.iter().copied().filter(|name| plan.items.iter().any(|item| item.key.check == format!("gate.{name}"))).collect();
+	assert!(selected.len() >= 9, "a kernel change selects the profile rows; this test is about how they are EMITTED, so it needs them selected: {selected:?}");
+	for name in &selected {
+		let owned: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.keys.iter().any(|key| key.check == format!("gate.{name}"))).collect();
+		assert_eq!(owned.len(), 1, "{name} is carried by exactly one step");
+		let step = owned[0];
+		assert_eq!(step.keys.len(), 1, "{name} does not share its step with another key, because a shared step is a shared cost: {:?}", step.keys);
+		assert!(step.command.contains(name) && !step.command.contains(','), "{name} runs as its own command rather than as one name in a list: {}", step.command);
+	}
+	// And the list agrees with what `check.sh` can actually run - a name here that is not a gate is a
+	// step nothing would execute.
+	let known = crate::catalog::catalog_gate_names();
+	for name in crate::catalog::PROFILE_ROW_GATES {
+		assert!(known.contains(name), "{name} is named as a profile row and is not a registered gate");
+	}
+}

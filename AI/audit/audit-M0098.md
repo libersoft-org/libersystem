@@ -931,3 +931,93 @@ Current implementation rating: 6/10
 2. **The regression test added for the latest rollback fix can still pass without exercising it.** `a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns` prints that no MSI vector was free and returns successfully (`src/kernel/object/claim/tests.rs:784-789`). This repeats the false-green shape just removed from the sibling forced-release test and conflicts with M9/Definition of Done's explicit rule that these tests cannot pass by finding nothing to test (`docs/todo/P02M0098.md:193-204,248-252`).
 
 Focused verification: the ABI suite passed 28 tests and the portable DMA suite passed 57 tests. The translated forced-release proof is registered indirectly by `qemu-virtio-iommu-x86_64`: its enforcing DMA run rejects every `iommu-fixture: absent` or `... skipped` line (`src/tools/check-qemu-virtio-iommu-x86_64.sh:152-159`), so that previously missing proof is credited. No guest run was started for this re-audit; the remaining MSI interleaving is not covered by either host suite.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-09-02T03:00:00Z):
+
+Two findings, both ACCEPTED and both fixed.
+
+**Finding 1 - publishing `Free` before returning the pending MSI slots lets the old release free a
+replacement's vector. ACCEPTED.**
+
+The window is real and the finding traces it correctly. `finish_release` published `ClaimState::Free`
+under `CLAIMS` and returned; `release_claim` then dropped that lock and called
+`release_msi_for_device(index)`, which frees every PENDING slot whose owner is that DEVICE INDEX and
+has no generation to check. So: a replacement claims the now-free device, acquires a vector,
+publishes it and closes it; `Interrupt::drop` retires that slot as pending against the same index;
+and the OLD release's scan then frees it. The vector re-enters circulation on the previous binding's
+quiescence while the replacement's device is live, which is the one thing the pending state exists to
+prevent and the order M5 states.
+
+The `disown()` correction from the previous round is a different window - it protects the acquiring
+syscall's own rollback - and the finding is right that it does not make this pair atomic.
+
+The fix closes the gap at its source rather than narrowing it: `finish_release` now publishes the
+terminal state and returns the vectors under ONE hold of the claim lock, and answers with the state.
+A replacement cannot claim the device while that lock is held, so there is no second owner for the
+scan to find and the generation-blindness of `release_for_device` stops being reachable.
+
+I checked the lock order before nesting rather than after: the order is `CLAIMS` then the registry's
+per-slot locks, and nothing in this tree goes the other way. `dispatch`, `retire`, `free`,
+`quarantine` and `release_for_device` all take a slot lock and never ask for a claim;
+`publish_msi_if_current` takes DEVICES then CLAIMS and then reaches the registry, which is the same
+direction. The serial line that reports how many vectors came back is emitted after the lock is
+dropped, so no console I/O happens underneath it.
+
+I considered the alternative - stamping each slot with the claim generation at acquire time and
+filtering on it - and rejected it as the larger change for the same property: it adds a parallel
+array to the registry and changes `acquire_msi` on three architecture backends and their tests, to
+express something the existing lock already expresses once the two steps are one.
+
+**Finding 2 - the regression test added for the rollback fix can still pass without exercising it.
+ACCEPTED.**
+
+Correct, and it is the same false-green shape I had just removed from
+`a_forced_release_takes_a_live_interrupt_away` - which makes it worse than an oversight, because the
+rule was in front of me when I wrote it. Both rollback tests printed a line and returned successfully
+when `acquire_msi` found no free vector.
+
+Both are now `expect`, with the reason written where the skip used to be: every port has a per-device
+MSI window with free slots at test time, so a refusal is a machine the case cannot run on and is a
+failure rather than a note. The finding named one test; I fixed both, because leaving the sibling
+with the escape is the inconsistency the definition of done's last line forbids.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `./test.sh --arch riscv64` | ****367 passed**, 0 failed (a second run - see below)** |
+| `dma` host suite | **59 passed** (57 + the two new tail cases) |
+| `driver-binding` host suite | **60 passed** (58 + the two new teardown-composition cases) |
+| `verify-model` host suite | **116 passed** (115 + the per-profile step case) |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows, including the firmware ITS device checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+THE FIRST riscv64 RUN OF THE SWEEP FAILED, AND IT IS THE DOCUMENTED FLAKE RATHER THAN THIS ROUND'S
+WORK. `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` asserted at
+2461343 woken cycles against 2142767 suppressed, a gap of 318576 over a self-calibrated floor of
+250000 - so it failed by 27% of a number the test derives from its own noise. I re-ran that one test
+four times on the same binary rather than assuming:
+
+```
+woken 2946843 (noise 302522), suppressed 2960432   PASS
+woken 2634433 (noise 855177), suppressed 2390843   PASS
+woken 1295185 (noise 228008), suppressed 2108696   PASS
+woken 1661823 (noise 738485), suppressed 2100216   PASS
+```
+
+The woken figure spans 1.30M to 2.95M - a factor of 2.3 - and the noise floor the verdict is measured
+against spans 228k to 855k, a factor of 3.7. The sweep's failing measurement sits inside that range.
+The test's own comment records the same flip on the same machine and the same kernel, and nothing in
+this round touches the scheduler: the changes are in the claim release, the IOMMU fault ledger,
+DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
+suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
+so the riscv64 row above is a SECOND full run rather than the sweep's.

@@ -515,12 +515,12 @@ fn a_rolled_back_msi_acquire_does_not_unbind_the_slots_next_owner() {
 	// suites use: `acquire_msi` programs entry 0 into it.
 	let table = frame::allocate().expect("a frame for the fake MSI-X table");
 	let owner: u32 = 41;
-	let Some(vector) = acquire_msi(table, 0, owner) else {
-		crate::serial_println!("    no MSI vector free on this machine - the rollback case is not exercised");
-		// SAFETY: allocated by this call and never mapped.
-		unsafe { frame::deallocate(table) };
-		return;
-	};
+	// NO SKIP HERE, ON THE SAME TERMS AS THE FORCED-RELEASE TEST (2026-09-02). This printed a line
+	// and returned successfully when no vector was free, which is the false green M9 and the
+	// definition of done forbid by name: a test that can pass by finding nothing to test. Every port
+	// has a per-device MSI window with free slots at test time, so a refusal here is a machine this
+	// case cannot be run on and is a failure rather than a note.
+	let vector = acquire_msi(table, 0, owner).expect("a free MSI vector - this case cannot be proved without one");
 	let first = Interrupt::new(vector).expect("an interrupt object");
 	assert!(bind_msi(vector, &first), "the first binder takes the slot");
 	assert!(is_bound(vector), "and the slot says so");
@@ -781,12 +781,12 @@ fn a_rollback_after_a_forced_release_frees_no_slot_it_no_longer_owns() {
 	use crate::object::interrupt::Interrupt;
 	let table = frame::allocate().expect("a frame for the fake MSI-X table");
 	let owner: u32 = 43;
-	let Some(vector) = acquire_msi(table, 0, owner) else {
-		crate::serial_println!("    no MSI vector free on this machine - the rollback case is not exercised");
-		// SAFETY: allocated by this call and never mapped.
-		unsafe { frame::deallocate(table) };
-		return;
-	};
+	// NO SKIP HERE, ON THE SAME TERMS AS THE FORCED-RELEASE TEST (2026-09-02). This printed a line
+	// and returned successfully when no vector was free, which is the false green M9 and the
+	// definition of done forbid by name: a test that can pass by finding nothing to test. Every port
+	// has a per-device MSI window with free slots at test time, so a refusal here is a machine this
+	// case cannot be run on and is a failure rather than a note.
+	let vector = acquire_msi(table, 0, owner).expect("a free MSI vector - this case cannot be proved without one");
 	let stale = Interrupt::new(vector).expect("an interrupt object");
 	assert!(bind_msi(vector, &stale), "the acquiring syscall takes the slot");
 

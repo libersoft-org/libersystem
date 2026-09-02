@@ -932,3 +932,105 @@ Current implementation rating: 4/10
 2. **`select` still skips a requested earlier or current candidate at the next bind.** `PolicyVerb::Select` writes the requested index to `node.candidate` (`device_manager.rs:4091-4112`). When the running candidate ends, `spend_candidate` preserves that cursor only if it is numerically after the candidate that ran; if the requested index is equal to or earlier than `node.spent`, it overwrites the selection with `ran + 1` (`device_manager.rs:3038-3055`). Thus, for a running fallback B, selecting A or B itself is ignored when B ends. The correction works only for a later-index selection, not for the milestone's promise that any declared selection takes effect at the next bind (`docs/todo/P02M0166.md:148-170,239-240`).
 
 3. **The required production policy and authority proofs remain absent.** The binding tests assert helper state-table properties, and the only production policy trace is the development GPU disable/enable script, which the teardown defect above prevents from reaching its expected state (`src/user/libs/driver/binding/src/tests.rs:719-752`; `src/harness/dev-gpu-restart.py:197-228`). No registered test drives production `select` or `retry`, the quarantined future-policy behavior, or denial of a well-formed `device.policy.*` write from an ordinary `CAP_CONFIG` connection. The latest response explicitly leaves this unmet, so the definition-of-done cases remain unproved (`docs/todo/P02M0166.md:239-251`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-09-02T03:00:00Z):
+
+Three findings, all three ACCEPTED. The first is the same root defect the sibling M0165 audit found,
+seen from this milestone's end, and it made the accepted correction from the previous round
+unreachable rather than wrong.
+
+**Finding 1 - the disable/enable correction is nonfunctional because the planned teardown cannot
+consume its confirmations. ACCEPTED, and FIXED.**
+
+Confirmed by walking it: after `STOPPED`, `advance` removes the live binding and installs a teardown;
+`pump` then queues `Exited` and `ClaimSettled` stamped with `node.id.generation`; and `Node::pop`
+asked for generation ZERO for any node without a binding, which `BindingQueue::pop(0)` answers by
+draining the queue and returning nothing. So `Pending` never saw a confirmation, the teardown ran to
+its deadline, and the node landed `Quarantined` rather than `Disabled`. The registered dev GPU
+sequence waits for `disabled` and then enables, so it could not have completed - and `Step::Resting`,
+which I added last round to fix the cursor decision AFTER that landing, was correct and never
+reached.
+
+`Node::pop` now asks for the binding's generation while a teardown is outstanding, which is the right
+number for it: `node.id` is rebound only when the next bind takes a claim. The full account is in the
+M0165 response, because that is where the finding names the mechanism; what matters here is that the
+disable/enable path this milestone owns is the one that could not complete, and it now can.
+
+**Finding 2 - `select` still skips a requested earlier or current candidate. ACCEPTED, and FIXED.**
+
+The finding is right and my correction was right only for the case I happened to test in my head.
+`spend_candidate` kept the cursor when it was numerically LATER than the entry that ran, on the
+reasoning that a cursor past `ran` must have been moved deliberately. That is true of a later
+selection and false of every other one: selecting the FIRST candidate, or the one that is running,
+leaves the cursor at or before `ran` - indistinguishable, by comparison alone, from a cursor that has
+not advanced yet. So `select` worked when it named a higher index and was silently discarded
+otherwise, which is not a contract anyone can use.
+
+A flag says what a comparison cannot. `PolicyVerb::Select` now sets `selection_pending`, `begin_bind`
+clears it when an attempt actually starts from that entry, and `spend_candidate` leaves the cursor
+alone while it is set. That is exactly "applies at the NEXT bind": one bind starts there and the
+selection is spent, so a selected candidate that then fails advances like any other.
+
+I want to name the case that rules out the simpler fix, because it is why this is a flag rather than
+a pin. Selecting the entry that is RUNNING is a legal request, and pinning the cursor on equality
+would honour it for ever: the entry fails, the cursor stays, `start_candidate` restarts it with a
+fresh budget, and the node loops on one candidate. Consumed-on-use gives the operator exactly the one
+re-attempt they asked for and then lets the ordinary machinery continue.
+
+**Finding 3 - the production policy and authority proofs remain absent. ACCEPTED, and unmet.**
+
+Correct on every clause, and the observation that ties it to finding 1 is the sharpest thing in this
+round's audits: the only production policy trace is the development GPU script, and the teardown
+defect prevented it from reaching its expected state - so the one piece of evidence this item had was
+evidence of a path that could not complete. That is now fixed, which makes the script able to prove
+what it claims for the first time; it does not make it the proof, because it needs a running
+development instance and that is blocked on the boot-window problem recorded against M0159.
+
+What is still owed is unchanged and I am not offering a substitute: no registered test drives
+production `select` or `retry`, the quarantined future-policy behaviour, or the refusal of a
+well-formed `device.policy.*` write from an ordinary `CAP_CONFIG` connection. The policy decision is
+a pure function of the node's state, the verb and the registry entry and belongs in `driver-binding`
+where a host test can drive it; the authority half needs a real ConfigService connection and belongs
+in a gate. Both are contained; neither is a change to make in the same round as the teardown fix
+beneath them.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `./test.sh --arch riscv64` | ****367 passed**, 0 failed (a second run - see below)** |
+| `dma` host suite | **59 passed** (57 + the two new tail cases) |
+| `driver-binding` host suite | **60 passed** (58 + the two new teardown-composition cases) |
+| `verify-model` host suite | **116 passed** (115 + the per-profile step case) |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows, including the firmware ITS device checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+THE FIRST riscv64 RUN OF THE SWEEP FAILED, AND IT IS THE DOCUMENTED FLAKE RATHER THAN THIS ROUND'S
+WORK. `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` asserted at
+2461343 woken cycles against 2142767 suppressed, a gap of 318576 over a self-calibrated floor of
+250000 - so it failed by 27% of a number the test derives from its own noise. I re-ran that one test
+four times on the same binary rather than assuming:
+
+```
+woken 2946843 (noise 302522), suppressed 2960432   PASS
+woken 2634433 (noise 855177), suppressed 2390843   PASS
+woken 1295185 (noise 228008), suppressed 2108696   PASS
+woken 1661823 (noise 738485), suppressed 2100216   PASS
+```
+
+The woken figure spans 1.30M to 2.95M - a factor of 2.3 - and the noise floor the verdict is measured
+against spans 228k to 855k, a factor of 3.7. The sweep's failing measurement sits inside that range.
+The test's own comment records the same flip on the same machine and the same kernel, and nothing in
+this round touches the scheduler: the changes are in the claim release, the IOMMU fault ledger,
+DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
+suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
+so the riscv64 row above is a SECOND full run rather than the sweep's.

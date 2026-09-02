@@ -170,6 +170,10 @@ impl Backend for Fake {
 		Ok(Confirmed::by_backend())
 	}
 
+	fn transport_was_emptied(&self) -> bool {
+		self.pending_faults.is_empty()
+	}
+
 	fn drain_faults(&mut self, out: &mut [FaultEvent]) -> usize {
 		let taken = out.len().min(self.pending_faults.len());
 		for (slot, event) in out.iter_mut().zip(self.pending_faults.drain(..taken)) {

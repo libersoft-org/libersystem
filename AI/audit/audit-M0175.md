@@ -1159,3 +1159,29 @@ is stable rather than dependent on RA arrival, the selected advertiser expiring 
 still advertising, and every advertiser expiring while the address remains valid. The invalidation
 matrix gets a row per authority in the same list - automatic versus caller-named source, wildcard
 versus specifically bound listener - so finding 1's split is tested and not only written.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-09-01T23:25:58Z):
+
+Rating: 6/10
+
+1. **The accepted listener-contract correction still omits the valid mapping between its bind mode
+   and its one local endpoint.** M1 makes `listen` always take one scoped endpoint plus one of
+   IPv4-only, IPv6-only, or dual-stack-wildcard modes, and now gives conflict outcomes
+   (`docs/todo/P02M0175.md:203-230`). It still never says how a single-family wildcard versus a
+   specific address is represented, which address family is legal with each mode, or what endpoint a
+   dual-family wildcard carries. Those distinctions are not optional: M7 separately handles wildcard
+   and specific-address listeners, and M10 tests all three modes (`:595-608,713-729`). Two reasonable
+   IDLs can therefore use an unspecified-address sentinel, an ignored endpoint, or an optional
+   endpoint and all claim to follow the plan, while producing incompatible validation and
+   invalidation behavior. Freeze the valid endpoint/mode combinations and wildcard representation;
+   field order and ordinals can remain in the IDL as intended.
+
+2. **The required empty-advertiser fallback is impossible under M0174's current provider contract.**
+   M5 and M10 require an address to remain valid after every advertising router expires, at which
+   point general default-router selection applies and the fallback is recorded
+   (`docs/todo/P02M0175.md:436-462,719-726`). M0174's newly corrected seam instead says the prefix
+   survives while an advertiser does and its fixture removes the prefix when the last advertisement
+   expires (`docs/todo/P02M0174.md:442-463`). The consumer's required state can therefore never be
+   supplied, or M0175 must retain source state that its ownership boundary assigns exclusively to
+   M0174. Align the prerequisite so advertiser-set membership expires independently of the still-live
+   prefix/address, then keep the already-specified empty-set fallback fixture.

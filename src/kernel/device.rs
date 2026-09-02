@@ -208,6 +208,23 @@ pub fn contain_faulting_endpoint_of_a_live_binding(bus: u8, dev: u8, func: u8, g
 	Some(index)
 }
 
+// THE DEVICE A FAULT'S ENDPOINT NAMES, AND WHETHER THE FAULT IS THIS DEVICE'S CURRENT BINDING'S.
+//
+// The IOMMU's drain has a BDF and a generation and needs both answers together: which row to charge,
+// and whether the charge belongs to the binding that is live now or to one that has ended. Asking
+// them separately would be two locks taken twice with a window between them, and the window is the
+// rebind this whole area exists to get right.
+//
+// `None` for a function this table does not describe. `Some((index, false))` is an ENDED binding's
+// fault - the claim moved on, or is not `Claimed` at all - which is what `RETAINED_FAULTS` is for.
+pub fn binding_of_faulting_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Option<(usize, bool)> {
+	let table = DEVICES.lock();
+	let claims = CLAIMS.lock();
+	let index = table.iter().position(|entry| entry.bus == bus && entry.dev == dev && entry.func == func)?;
+	let current = claims.get(index).is_some_and(|slot| slot.state == ClaimState::Claimed && slot.generation == generation);
+	Some((index, current))
+}
+
 pub fn count() -> usize {
 	DEVICES.lock().len()
 }
@@ -458,7 +475,27 @@ fn finish_release(index: usize, confirmed: bool) -> ClaimState {
 	}
 	slot.state = if confirmed { ClaimState::Free } else { ClaimState::Quarantined };
 	slot.release_deadline = 0;
-	slot.state
+	// AND THE VECTORS GO BACK UNDER THE SAME LOCK THAT PUBLISHED THE STATE (fixed 2026-09-02).
+	//
+	// This returned `Free` and the caller then called `release_msi_for_device` with the claim lock
+	// already dropped. `release_for_device` frees every PENDING slot whose owner is that DEVICE
+	// INDEX, and it has no generation - so the gap was reachable: a replacement claims the
+	// now-`Free` device, acquires a vector, publishes it and closes it, `Interrupt::drop` retires
+	// that slot as pending against the same index, and the OLD release's scan then frees it. The
+	// vector re-enters circulation on the old binding's quiescence while the replacement's device is
+	// live, which is the one thing the pending state exists to prevent and the order M5 states.
+	//
+	// Holding `CLAIMS` across it closes the gap at its source rather than narrowing it: a
+	// replacement cannot claim the device while this lock is held, so there is no second owner for
+	// the scan to find. The lock order is `CLAIMS` then the registry's per-slot locks, which is the
+	// order every other path already takes - nothing acquires a slot lock and then asks for a claim.
+	let released = if slot.state == ClaimState::Free { crate::arch::interrupts::release_msi_for_device(index as u32) } else { 0 };
+	let state = slot.state;
+	drop(claims);
+	if released != 0 {
+		crate::serial_println!("device: {index} released - {released} MSI vector(s) given back");
+	}
+	state
 }
 
 // WHAT A NEW MANAGER NEEDS TO KNOW ABOUT ONE DEVICE, in one read.
@@ -610,13 +647,11 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	// the slot becoming allocatable again. The rule this file states everywhere else is that an
 	// unconfirmed teardown keeps its resources charged and out of circulation, and a vector is one
 	// of them: a device that may still be translating may still be raising interrupts.
+	// THE TERMINAL STATE AND THE VECTORS, IN ONE STEP. `finish_release` returns them together and
+	// under one hold of the claim lock - see the comment there for the window that made two steps
+	// wrong.
 	let state = finish_release(index, confirmed);
-	if state == ClaimState::Free {
-		let vectors = crate::arch::interrupts::release_msi_for_device(index as u32);
-		if vectors != 0 {
-			crate::serial_println!("device: {index} released - {vectors} MSI vector(s) given back");
-		}
-	} else {
+	if state != ClaimState::Free {
 		crate::serial_println!("device: {index} did not confirm its teardown - its MSI vector(s) stay masked and held rather than given back");
 	}
 	// AND THE AUDIT RECORD GOES WITH IT. `admit` wrote the degraded row when this device was asking

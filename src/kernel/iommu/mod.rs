@@ -1128,6 +1128,25 @@ pub fn poll_faults_attributed_with(during_teardown: Option<(dma::EndpointId, dma
 			// mastering memory is a diagnostic where the milestone asks for containment: a device
 			// resolving addresses its own domain refuses is a device to stop, not to describe.
 			let (bus, dev, func) = ((event.endpoint.0 >> 8) as u8, ((event.endpoint.0 >> 3) & 0x1f) as u8, (event.endpoint.0 & 7) as u8);
+			// AN ENDED BINDING'S FAULT IS CHARGED WHERE A MANAGER CAN READ IT (added 2026-09-02).
+			//
+			// The ledger charges a tail to its `DetachedTail`, and `Iommu::faults_in` sums that with
+			// the domain's own - which is right and is not what a manager asks. It asks
+			// `iommu::faults_for(device)`, and after a confirmed teardown that answers from
+			// `RETAINED_FAULTS`, a scalar copied ONCE at detach time; after a rebind it answers from
+			// the replacement's domain. Either way a fault drained later reached the DMA ledger and
+			// never reached the number M4 exposes, so "the accounting outlives the domain" was true
+			// inside the crate and false at the seam a supervisor reads.
+			//
+			// So a fault whose generation is not this device's current binding is added to the
+			// retained count as it is drained. A LIVE binding's faults are not: they are already in
+			// its own domain, which `faults_for` reads directly, and adding them here would count
+			// them twice.
+			if let Some((index, current)) = crate::device::binding_of_faulting_endpoint(bus, dev, func, event.generation.0)
+				&& !current && let Some(slot) = RETAINED_FAULTS.lock().get_mut(index)
+			{
+				*slot = slot.saturating_add(1);
+			}
 			let contained = match containment {
 				Containment::WhateverFaulted => crate::device::contain_faulting_endpoint(bus, dev, func),
 				Containment::OnlyLiveBindings => crate::device::contain_faulting_endpoint_of_a_live_binding(bus, dev, func, event.generation.0),

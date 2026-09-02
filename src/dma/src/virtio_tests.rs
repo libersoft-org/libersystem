@@ -515,3 +515,35 @@ fn a_probe_property_that_runs_past_the_buffer_refuses_the_whole_answer() {
 	// And a zero type terminates the list, which is a COMPLETE answer with nothing in it.
 	assert_eq!(decode_probe(&[0, 0, 0, 0]), Ok(Vec::new()));
 }
+
+#[test]
+fn a_short_drain_over_malformed_records_does_not_claim_the_transport_is_empty() {
+	// THE COUNT IS NOT THE DRY SIGNAL, AND READING IT AS ONE LOST A BINDING'S ATTRIBUTION.
+	//
+	// A malformed record spends this call's budget and is not counted in what the drain returns, so
+	// a full transport can answer with a count smaller than the caller's buffer. The generic layer
+	// used exactly that comparison to decide a detached binding's queued tail was provably gone -
+	// after which the tail resolved through whatever was attached at drain time and could contain a
+	// replacement. `transport_was_emptied` is the backend saying what only the backend knows.
+	let mut wire = Wire::ok();
+	// Four records too short to decode, and one well-formed fault behind them.
+	for _ in 0..4 {
+		wire.events.push(alloc::vec![0u8; 8]);
+	}
+	let mut good = alloc::vec![0u8; FAULT_LEN];
+	good[0] = FAULT_R_MAPPING;
+	good[4..8].copy_from_slice(&(FAULT_F_WRITE | FAULT_F_ADDRESS).to_le_bytes());
+	good[8..12].copy_from_slice(&0x0100u32.to_le_bytes());
+	good[16..24].copy_from_slice(&0xDEAD_0000u64.to_le_bytes());
+	wire.events.push(good);
+
+	let mut iommu = backend(wire);
+	iommu.attach(DomainId(1), EndpointId(0x0100)).expect("attached");
+	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: None, access: Access::Read, reason: Fault::NotMapped }; 4];
+	assert_eq!(iommu.drain_faults(&mut out), 0, "four malformed records spend the whole budget and decode nothing");
+	assert!(!iommu.transport_was_emptied(), "the transport still holds the good record, and a short count must not be read as proof that it does not");
+
+	// The next call reads what was behind them, and only THEN is the transport empty.
+	assert_eq!(iommu.drain_faults(&mut out), 1, "the good record is read on the next call, which is what the per-call budget means");
+	assert!(iommu.transport_was_emptied(), "and now the transport has answered empty");
+}

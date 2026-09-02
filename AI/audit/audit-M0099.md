@@ -1675,3 +1675,37 @@ repeated failure into success without reading sense data), DRV-006 (BOT length a
 DRV-007/008 (port-status events) and DRV-012 (descriptor transfers). It closes with the rule stated
 as a rule rather than as a sentence the bullet can satisfy by containing it: any High USB debt not in
 that table is not covered by this item and needs its own named owner before that item can close.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-09-01T23:26:01Z):
+
+Rating: 7/10
+
+1. **The accepted P02M0162 correction records the broken prerequisite but still does not make it a
+   blocking acceptance condition.** The matrix continues to list the COMPLETE P02M0162 as part of
+   every driver's floor, then accurately explains that normal manager-initiated release is synchronous
+   and can block DeviceManager's sole event loop (`docs/todo/P02M0099.md:102-140`). P02M0162 itself
+   still has `Status: COMPLETE` while recording this as open and saying the required asynchronous
+   kernel worker is not built (`docs/todo/P02M0162.md:400-448`). M0099 neither marks this row
+   UNSATISFIED nor says that a driver cannot close; it instead describes what an item accepted before
+   the repair would inherit. The original defect is therefore documented but not corrected: the
+   status-based prerequisite check can still pass while the universally required nonblocking
+   lifecycle does not.
+
+2. **Running one architecture at a time does not satisfy the newly acknowledged P02M0167 scheduler
+   gap.** The row now records that the required shell-executor matrix is absent, but limits the
+   unmeasured risk to a run that scheduled more than one step in parallel and ends by prescribing
+   serial tri-architecture acceptance (`docs/todo/P02M0099.md:172-198`). P02M0167's required cases
+   also cover `FAIL` outranking `INCOMPLETE`, failed-descendant suppression, a shared prerequisite and
+   an unmeasured-cost step (`docs/todo/P02M0167.md:674-676`); those semantics apply in a serial run as
+   well. The verify-model tests exercise graph construction, not `verify.sh`'s executor. The accepted
+   correction therefore still leaves a path to accept evidence through the unproved scheduler.
+
+3. **The expanded xHCI item still does not carry the complete negative assertions for the debt it
+   claims to close.** Its DRV-007/008 gate checks one connect and one disconnect in a status window and
+   a bounded storm (`docs/todo/P02M0099.md:537-540`), while the authoritative debt also covers lost DMA
+   handles and slot ownership across hotplug and partial failure (`:1502-1503`). Its DRV-012 gate
+   checks an overlong transfer and a wrong descriptor type (`:541-543`), while the debt also names
+   configuration walkers reading fixed fields outside a short descriptor record (`:1508-1509`), which
+   is not the same malformed case. Listing every ID fixed the prose-only ownership, but these omitted
+   recovery and minimum-record cases still let the actionable maintenance item close without proving
+   all of the High findings assigned to it.

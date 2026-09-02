@@ -391,6 +391,8 @@ pub struct VirtioIommu<T: Transport> {
 	// as well as dropping them is what makes that visible: a machine whose fault queue is producing
 	// nothing but noise looks, from the events alone, exactly like one producing nothing at all.
 	dropped_faults: usize,
+	// Whether the last `drain_faults` saw the transport answer empty. See `Backend::transport_was_emptied`.
+	transport_emptied: bool,
 }
 
 impl<T: Transport> VirtioIommu<T> {
@@ -407,7 +409,7 @@ impl<T: Transport> VirtioIommu<T> {
 		if features & REQUIRED != REQUIRED {
 			return Err(Fault::Unconfirmed);
 		}
-		Ok(Self { transport, config, features, next_domain: config.domain_start.max(1), attached: Vec::new(), dropped_faults: 0 })
+		Ok(Self { transport, config, features, next_domain: config.domain_start.max(1), attached: Vec::new(), dropped_faults: 0, transport_emptied: false })
 	}
 
 	pub fn config(&self) -> &Config {
@@ -510,7 +512,15 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		Ok(Confirmed::by_backend())
 	}
 
+	fn transport_was_emptied(&self) -> bool {
+		self.transport_emptied
+	}
+
 	fn drain_faults(&mut self, out: &mut [FaultEvent]) -> usize {
+		// WHETHER THE TRANSPORT ANSWERED EMPTY, recorded rather than inferred from the count. A
+		// malformed record spends this call's budget and is not counted in what it returns, so the
+		// count cannot tell an empty transport from a full one - see `Backend::transport_was_emptied`.
+		self.transport_emptied = false;
 		// `written` is the BUDGET and `kept` is the ANSWER: a malformed record spends the first
 		// without advancing the second, so the caller is told how many events it may read and the
 		// loop cannot be held open by records that never decode.
@@ -521,6 +531,7 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		while written < out.len() {
 			let taken = self.transport.take_event(&mut raw);
 			if taken == 0 {
+				self.transport_emptied = true;
 				break;
 			}
 			// A malformed record is DROPPED and the drain continues: one bad event must not stop

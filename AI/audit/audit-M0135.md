@@ -1537,3 +1537,37 @@ The heading, the branch and the forbidden-mechanism clause now all range over th
 set, and the section says explicitly where pass 1 still sits: it is where the question is first
 asked and not where it is answered, and a mechanism that appears only at the converging link is
 admitted or forbidden on exactly the same terms as one pass 1 saw.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-09-01T23:24:26Z):
+
+Rating: 7/10
+
+1. **The bootstrap pin still requires milestone-owned inputs before the plan permits them to be
+   created.** The bootstrap half calls the three cross/toolchain files and minimal bootstrap sysroot
+   things that exist independently of this milestone, says it contains no milestone output, and says
+   nothing may start before it is frozen (`docs/todo/P02M0135.md:154-160,175-180`). The repository has
+   no such cross files or target sysroot, however, and the plan itself says the tree has none and that
+   M0135 owns the profile-specific sysroot (`:352-367`; `docs/CONCEPT_EN.md:1643`). Its sysroot work
+   item also appears after both inventory passes. Splitting the final profile sysroot from a minimal
+   bootstrap one removed the inventory-sizing cycle, but it did not give the bootstrap cross files
+   and headers a permitted preparation/freeze step. As written, an implementer must violate “nothing
+   starts” to author the pin's inputs or silently borrow a host sysroot, the exact failure this item
+   exists to prevent.
+
+2. **The third pin was not propagated through the authoritative headings and final freeze order.**
+   The body correctly adds a `STATIC-TARGET PIN` between the portable target and pass 1
+   (`docs/todo/P02M0135.md:146-183`), and the host gate enumerates all three parts (`:733-748`). But
+   the section heading still says “TWO PINS” (`:138`), the controlling gate still says “THE TWO PINS”
+   (`:729`), and the final `APPROVABLE` summary again orders portable target directly before pass 1,
+   omitting the static-target pin (`:852-856`). That last normative summary reintroduces precisely the
+   unpinned pre-pass-1 patch drift that the latest accepted finding was meant to close.
+
+3. **The lifecycle evidence still omits the admitted destructor/fini mechanism.** The plan requires
+   supported init *and fini* ordering across the provider DAG, explicitly treats a destructor as a
+   mechanism requiring a positive gate, and notes that the pinned loader has constructor and
+   destructor entries (`docs/todo/P02M0135.md:464-472,790-832`). The actual positive list observes
+   constructor order/failure, `atexit`, crash and `errno`, but never normal-exit `.fini_array`/
+   destructor execution or its reverse provider ordering (`:823-831`). `atexit` registration is a
+   distinct mechanism and does not prove the fini-array runner, which the current runtime lacks
+   (`src/user/runtime/rt/src/lib.rs:67-74`). The plan can therefore admit a destructor while violating
+   its own rule that no admitted mechanism lacks a positive gate.

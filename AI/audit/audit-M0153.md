@@ -1048,3 +1048,121 @@ Current implementation rating: 6/10
 3. **Faults drained after teardown still do not reach the production per-binding counter.** `detach_for_inner` performs one bounded post-revoke poll, copies `faults_in(old_domain)` into `RETAINED_FAULTS`, and may immediately destroy the domain (`src/kernel/iommu/mod.rs:944-998`). A tail beyond that poll is later charged to `DetachedTail.faults`, and `Iommu::faults_in(old_domain)` does sum it (`src/dma/src/lib.rs:1291-1294`), but `iommu::faults_for(device)` has lost the old device-to-domain association: with no replacement it returns the stale copied scalar, and with a replacement it returns only the replacement domain (`src/kernel/iommu/mod.rs:584-597`). Thus the response's claim that tail accounting outlives the domain is true inside the DMA ledger and false at the production snapshot seam, leaving M4's exact per-binding fault accounting/restart baseline incomplete (`docs/todo/P02M0153.md:184-195,245-260`).
 
 Focused verification: the portable DMA/virtio-IOMMU suite passed all 57 tests. Its tail tests cover one revoke/rebind followed by a clean short drain and only assert that the newest entry survives the capacity bound; they do not combine malformed records, a still-undrained repeated binding, or the kernel's retained-counter lookup. No guest run was started for this re-audit.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-09-02T03:00:00Z):
+
+Three findings, all three ACCEPTED. Two are defects in the detached-tail mechanism I added last
+round, and one of them is an argument I wrote backwards.
+
+**Finding 1 - live-fault containment has no bounded servicing guarantee. ACCEPTED, and unmet.**
+
+Unchanged and correctly stated: the only periodic production call is after the BSP's
+`run_until_idle`, that loop continues while its run queue is non-empty, and the service is gated to
+cpu 0 settling. A CPU-bound workload on that core leaves a faulting endpoint mastering the bus.
+
+The reason I am not closing it is the same and I still hold it: the obvious place for a deadline is
+the timer interrupt, and that is the one place this must not go - `poll_faults_attributed_with` takes
+the controller's lock and then `device`'s, and an interrupted context may hold either. A `try_lock`
+variant would not deadlock and would not be a guarantee either. What a deadline needs is somewhere to
+run kernel work that is neither an interrupt nor a userspace thread, which this kernel does not have
+and which the sibling M0162 finding names from the other side.
+
+**Finding 2 - the detached-tail fix can declare the queue dry, or overwrite an old generation while
+its records are still queued. ACCEPTED on both counts, and both FIXED.**
+
+The first half is a mistake about what a count means. `VirtioIommu::drain_faults` spends its per-call
+budget on malformed records and returns only what DECODED, and the generic layer read
+`taken < out.len()` as proof that the transport had answered empty. Four undecodable records and a
+buffer of four therefore return zero with the old binding's valid fault still queued - and every tail
+was marked drained, after which that fault resolved through whatever was attached at drain time and
+could contain the replacement. The exact failure the mechanism was added to prevent, reached through
+its own dry test.
+
+Only the backend knows whether the transport ran dry, so the backend now says so: `Backend` gains
+`transport_was_emptied`, `VirtioIommu` sets it when `take_event` answers zero, the `Fake` answers from
+its own queue, and the default is FALSE - the conservative answer, so a backend that does not
+implement it never lets a tail stop attributing. `drain_faults_during` asks it instead of comparing
+counts.
+
+The second half is worse than a mistake about a mechanism: the reasoning I wrote is inverted. The
+comment said "an older tail cannot still be queued behind a newer one - the queue is FIFO, so the
+newer binding's tail is what a reader meets first". FIFO is first in, first OUT: the older binding's
+records were queued first and are read first, so the older tail is in FRONT. Replacing an undrained
+record therefore discarded the attribution for records that had not been read yet, and they were then
+charged to the binding that came after them.
+
+Records now accumulate in revocation order and a fault is attributed to the OLDEST undrained record
+for its endpoint, which is FIFO-correct for the front of the queue. A drained record for the same
+endpoint is still reused, because it has nothing left to attribute. What this cannot do is find the
+boundary between two ended bindings' tails - nothing in a record says which binding queued it - so a
+second ended binding's faults may be charged to the first. That is an imprecision between two
+bindings that are both GONE, and it is deliberately preferred to the alternative, which is charging
+one of them to the live replacement and taking a healthy device off the bus. It is written in the
+code as a trade rather than left to be discovered.
+
+Two tests, and each drives the path the existing ones did not. In `virtio_tests`: four malformed
+records ahead of a good one, a drain that returns zero, and the assertion that
+`transport_was_emptied` is FALSE - then the next call reads the good record and only then is it true.
+In `tests`: two revocations of one endpoint with nothing drained in between, the assertion that both
+records are kept, and a queued fault that must come back carrying the FIRST binding's domain and
+generation.
+
+**Finding 3 - faults drained after teardown do not reach the production per-binding counter.
+ACCEPTED, and FIXED.**
+
+The finding is precise and the distinction it draws is the one my previous response blurred. The
+ledger charges a tail to its `DetachedTail` and `Iommu::faults_in` sums that with the domain's own,
+which is true - and it is not what a manager reads. A manager reads `iommu::faults_for(device)`,
+which after a confirmed teardown answers from `RETAINED_FAULTS`, a scalar copied ONCE at detach time,
+and after a rebind answers from the replacement's domain. Either way a fault drained later reached
+the crate and never reached the number M4 exposes. "The accounting outlives the domain" was true
+inside the ledger and false at the seam, which is exactly what I claimed and did not check.
+
+The drain now charges it where a manager can read it. `device::binding_of_faulting_endpoint` answers
+which device row a fault's endpoint names AND whether the fault belongs to that device's CURRENT
+binding, both under one pair of locks - two questions in one step, because asking them separately
+reopens the rebind window this area exists to get right. A fault whose generation is not the current
+binding's is added to that device's retained count as it is drained; a live binding's faults are not,
+because they are already in its own domain, which `faults_for` reads directly, and counting them here
+would count them twice.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `./test.sh --arch riscv64` | ****367 passed**, 0 failed (a second run - see below)** |
+| `dma` host suite | **59 passed** (57 + the two new tail cases) |
+| `driver-binding` host suite | **60 passed** (58 + the two new teardown-composition cases) |
+| `verify-model` host suite | **116 passed** (115 + the per-profile step case) |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows, including the firmware ITS device checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+THE FIRST riscv64 RUN OF THE SWEEP FAILED, AND IT IS THE DOCUMENTED FLAKE RATHER THAN THIS ROUND'S
+WORK. `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` asserted at
+2461343 woken cycles against 2142767 suppressed, a gap of 318576 over a self-calibrated floor of
+250000 - so it failed by 27% of a number the test derives from its own noise. I re-ran that one test
+four times on the same binary rather than assuming:
+
+```
+woken 2946843 (noise 302522), suppressed 2960432   PASS
+woken 2634433 (noise 855177), suppressed 2390843   PASS
+woken 1295185 (noise 228008), suppressed 2108696   PASS
+woken 1661823 (noise 738485), suppressed 2100216   PASS
+```
+
+The woken figure spans 1.30M to 2.95M - a factor of 2.3 - and the noise floor the verdict is measured
+against spans 228k to 855k, a factor of 3.7. The sweep's failing measurement sits inside that range.
+The test's own comment records the same flip on the same machine and the same kernel, and nothing in
+this round touches the scheduler: the changes are in the claim release, the IOMMU fault ledger,
+DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
+suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
+so the riscv64 row above is a SECOND full run rather than the sweep's.

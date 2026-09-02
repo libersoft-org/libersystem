@@ -1174,3 +1174,97 @@ Current implementation rating: 4/10
 2. **Block-volume discovery is still capped at four and assigns roles by BDF position instead of the required format/origin/root decision.** DeviceManager defines four boot tags, four role handles, and four probe handles, mints probes for only four catalogue entries, then fills the roles through global lowest-BDF `Catalogue::take` (`src/user/services/core/src/device_manager.rs:82-85,431-474,868-908`). ServiceManager labels positions as FAT/ISO/UDF and StorageService trusts those tags; only the system instance probes the supplied set for the selected UUID (`src/user/services/core/src/service_manager/bootstrap.rs:389-474`; `src/user/services/storage/src/service.rs:175-275`). A matching system volume outside the four-probe set is invisible, and the non-system roles are not selected by filesystem format. M2 and the required all-`RootSelection`/either-order integration cases therefore remain incomplete (`docs/todo/P02M0164.md:71-121,288-305`).
 
 3. **Closed subscription streams consume slots until another event of the same kind happens.** `Catalogue::subscribe_stream` allocates from an eight-entry `subscribers` array, but subscription producer handles are not included in DeviceManager's wait set and there is no explicit close/reap path for them (`src/user/services/core/src/device_manager.rs:582-624,1975-2041`). A dead subscriber is removed only when `announce` next tries to send a publication or withdrawal of that kind, or when the whole manager stops (`src/user/services/core/src/device_manager.rs:2044-2073`). With a stable provider set, repeated consumer exits/restarts therefore leave dead entries counted as live and the ninth subscription is refused, contradicting M3's served late-subscription mechanism. The focused `driver-binding` (58 tests), `system-manifest` (15 tests), and `no-fixed-provider-slots` gate pass, but none drives subscription closure or slot reuse.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-09-02T03:00:00Z):
+
+Three findings, all three ACCEPTED. The third is a defect and is fixed; the first two are the
+migration this milestone scopes and has not finished.
+
+**Finding 1 - the production catalogue migration is one consumer deep. ACCEPTED, and unmet.**
+
+Re-confirmed against the current tree rather than carried forward: AudioService is the only consumer
+that subscribes, DeviceManager still owns fixed boot-block arrays and one network/display/input/USB
+slot each and hands them down through its bootstrap handoff, `route_offers` still has only its
+phase-two call site, and ServiceManager still injects the fixed block, network and display roles.
+
+The finding names the M0159 display-restart failure as a concrete result, and that is right. I
+measured last round that no DeviceManager-only change can fix it - the handle was given to
+DisplayService at bootstrap, positionally, and there is no channel on which a replacement could be
+delivered - so the seam this milestone names is not one option among several, it is the only shape
+that works. It stays owed, and it is now blocking two other milestones' items rather than one.
+
+**Finding 2 - block-volume discovery is capped at four and assigns roles by BDF position. ACCEPTED,
+and unmet.**
+
+Also re-confirmed: four boot tags, four role handles, four probe handles, probes minted for four
+catalogue entries, roles filled by global lowest-BDF `Catalogue::take`, ServiceManager labelling
+positions as FAT/ISO/UDF and StorageService trusting those tags. A matching system volume outside the
+four-probe set is invisible and the non-system roles are not selected by format.
+
+The reason recorded before still holds and I re-checked it: selecting by content means identifying
+each medium's filesystem BEFORE the roles are handed out, and the code that can do that lives in
+StorageService, which does not exist at the moment ServiceManager assigns them. That is a
+bootstrap-ordering change across three components. It is owed.
+
+**Finding 3 - closed subscription streams consume slots until another event of the same kind
+happens. ACCEPTED, and FIXED.**
+
+This one is new and it is right. `Catalogue::subscribe_stream` allocates from an eight-entry array
+and a subscriber was forgotten only when `announce` next FAILED to send it a publication or a
+withdrawal of its own kind. On a machine whose provider set is stable - which is every machine after
+bring-up - nothing announces again, so a consumer that exits leaves its slot occupied for the life of
+the boot. Eight consumer restarts and the ninth subscription is refused with every provider still
+present: the late-subscriber contract failing for a reason that has nothing to do with how many
+consumers there are.
+
+`reap_dead_subscribers` closes and frees every slot whose consumer has gone, and it is called when
+`subscribe_stream` finds the array full. The probe is a non-blocking RECEIVE on the producer end:
+nothing on the other side ever sends, so a live consumer answers `Empty` and a gone one answers
+`Closed` - the same fact `announce` learns from a failed send, without needing something to announce.
+
+Two choices in that are deliberate. It reaps on demand rather than every pass, because the count only
+matters when a slot is wanted and probing eight endpoints on every turn of the standing loop would
+pay for it on every heartbeat instead. And it does not put the producer ends in the wait set, which
+the finding offers: that notices sooner and costs eight wait entries permanently, which is the more
+expensive answer to a question nobody asks until the array is full.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `./test.sh --arch riscv64` | ****367 passed**, 0 failed (a second run - see below)** |
+| `dma` host suite | **59 passed** (57 + the two new tail cases) |
+| `driver-binding` host suite | **60 passed** (58 + the two new teardown-composition cases) |
+| `verify-model` host suite | **116 passed** (115 + the per-profile step case) |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows, including the firmware ITS device checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+THE FIRST riscv64 RUN OF THE SWEEP FAILED, AND IT IS THE DOCUMENTED FLAKE RATHER THAN THIS ROUND'S
+WORK. `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` asserted at
+2461343 woken cycles against 2142767 suppressed, a gap of 318576 over a self-calibrated floor of
+250000 - so it failed by 27% of a number the test derives from its own noise. I re-ran that one test
+four times on the same binary rather than assuming:
+
+```
+woken 2946843 (noise 302522), suppressed 2960432   PASS
+woken 2634433 (noise 855177), suppressed 2390843   PASS
+woken 1295185 (noise 228008), suppressed 2108696   PASS
+woken 1661823 (noise 738485), suppressed 2100216   PASS
+```
+
+The woken figure spans 1.30M to 2.95M - a factor of 2.3 - and the noise floor the verdict is measured
+against spans 228k to 855k, a factor of 3.7. The sweep's failing measurement sits inside that range.
+The test's own comment records the same flip on the same machine and the same kernel, and nothing in
+this round touches the scheduler: the changes are in the claim release, the IOMMU fault ledger,
+DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
+suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
+so the riscv64 row above is a SECOND full run rather than the sweep's.

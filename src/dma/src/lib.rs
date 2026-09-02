@@ -271,6 +271,21 @@ pub trait Backend {
 	// CALLER'S BUFFER on purpose: a flooding device must not be able to decide how much the kernel
 	// allocates.
 	fn drain_faults(&mut self, out: &mut [FaultEvent]) -> usize;
+
+	// WHETHER THE LAST `drain_faults` EMPTIED THE TRANSPORT.
+	//
+	// A count smaller than the caller's buffer is NOT that answer, and reading it as one was a
+	// defect (2026-09-02): a backend may spend its per-call budget on records it could not decode
+	// and return a smaller count with the transport still full. `Iommu::drain_faults_during` uses
+	// this to decide when a detached binding's queued tail is provably gone, and getting it wrong
+	// re-opens the cross-generation attribution this whole mechanism exists to close.
+	//
+	// The default is FALSE, which is the conservative answer: a backend that does not implement it
+	// never lets a tail record stop attributing, which costs accounting precision between two ended
+	// bindings and never charges a live one.
+	fn transport_was_emptied(&self) -> bool {
+		false
+	}
 	// Whether this backend can enforce all three directions. A backend that cannot must not be used
 	// for an enforcing profile - mapping everything read-write would silently drop half the claim.
 	fn enforces_directions(&self) -> bool;
@@ -1137,11 +1152,26 @@ impl<B: Backend> Iommu<B> {
 
 	// KEEP WHAT AN ENDING BINDING WAS, so a fault it queued cannot be charged to the next one.
 	//
-	// One record per endpoint: a second revocation of the same endpoint replaces the first, because
-	// an older tail cannot still be queued behind a newer one - the queue is FIFO, so the newer
-	// binding's tail is what a reader meets first and the older one has necessarily been read.
+	// A SECOND REVOCATION DOES NOT REPLACE AN UNDRAINED FIRST, AND THE ARGUMENT THAT SAID IT COULD
+	// WAS BACKWARDS (fixed 2026-09-02). It read: "an older tail cannot still be queued behind a
+	// newer one - the queue is FIFO, so the newer binding's tail is what a reader meets first."
+	// FIFO means first IN, first OUT: the older binding's records were queued first and are what a
+	// reader meets first. The older tail is in FRONT of the newer one, not behind it. So replacing
+	// an undrained record discarded the attribution for records that had not been read yet, and
+	// they were then charged to the binding that came after them.
+	//
+	// Records accumulate instead, oldest first, and a fault is attributed to the OLDEST undrained
+	// record for its endpoint - which is FIFO-correct for the front of the queue and is the
+	// conservative answer for the rest. What it cannot do is find the boundary between two ended
+	// bindings' tails: nothing in a record says which binding queued it, so a second ended binding's
+	// faults may be charged to the first. That is an accounting imprecision BETWEEN TWO BINDINGS
+	// THAT ARE BOTH GONE, and it is deliberately preferred to the alternative, which is charging one
+	// of them to the live replacement and taking a healthy device off the bus.
 	fn remember_detached_tail(&mut self, endpoint: EndpointId, domain: DomainId, generation: Generation) {
-		if let Some(existing) = self.detached.iter_mut().find(|tail| tail.endpoint == endpoint) {
+		// A DRAINED record for this endpoint has nothing left to attribute and its count is what a
+		// caller reads afterwards, so it is neither reused nor kept in the way: the new record goes
+		// behind it and the eviction rule below gives the drained one up first.
+		if let Some(existing) = self.detached.iter_mut().find(|tail| tail.endpoint == endpoint && tail.drained) {
 			existing.domain = domain;
 			existing.generation = generation;
 			existing.faults = 0;
@@ -1234,6 +1264,9 @@ impl<B: Backend> Iommu<B> {
 			// wrong: a record queued by an old binding and read after the endpoint was rebound came
 			// out carrying the replacement's domain and generation, satisfied the cross-generation
 			// check, and had the replacement's bus mastering taken away for it.
+			// THE OLDEST UNDRAINED RECORD FOR THIS ENDPOINT, because the queue is FIFO and the
+			// oldest ended binding's records are the ones in front. `detached` is in revocation
+			// order, so the first match IS the oldest - see `remember_detached_tail`.
 			if let Some(tail) = self.detached.iter_mut().find(|tail| !tail.drained && tail.endpoint == event.endpoint) {
 				event.domain = tail.domain;
 				event.generation = tail.generation;
@@ -1261,14 +1294,21 @@ impl<B: Backend> Iommu<B> {
 			}
 			self.faults.record(*event);
 		}
-		// THE TAIL IS OVER WHEN THE QUEUE RUNS DRY, and that is the only proof available.
+		// THE TAIL IS OVER WHEN THE TRANSPORT RUNS DRY, and only the backend can say that.
 		//
-		// `drain_faults` fills the buffer while the transport has records; taking fewer than the
-		// buffer holds means it answered empty, so everything queued before this call has now been
-		// read and no record still in flight can belong to a binding that ended before it. The
-		// records stay - their counts are the per-binding accounting - but they stop attributing, so
-		// a replacement that genuinely faults is charged to itself from here on.
-		if taken < out.len() {
+		// This asked whether `taken < out.len()`, on the reasoning that a short count means the
+		// transport answered empty. It does not (fixed 2026-09-02): a malformed record spends the
+		// per-call budget and is NOT counted in what the drain returns, so eight undecodable records
+		// return zero with the transport still holding the old binding's valid fault - and every
+		// tail was marked drained, after which that fault resolved through the replacement's
+		// attachment and could contain it. A short count is consistent with an empty transport and
+		// does not prove one; `transport_was_emptied` is the backend saying so.
+		//
+		// Once it is true, everything queued before this call has been read, so no record still in
+		// flight can belong to a binding that ended before it. The records stay - their counts are
+		// the per-binding accounting - but they stop attributing, so a replacement that genuinely
+		// faults is charged to itself from here on.
+		if self.backend.transport_was_emptied() {
 			for tail in self.detached.iter_mut() {
 				tail.drained = true;
 			}

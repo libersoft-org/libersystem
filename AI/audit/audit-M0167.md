@@ -1058,3 +1058,98 @@ Current implementation rating: 6/10
 1. **Profile catalogue entries are still merged back into one serial step, so the claimed split does not provide independent scheduling or measurement.** The catalogue and `check.sh` define individual arch and NUMA profile gates, but `commands::steps` places every ordinary pre-guest gate into one `Step` with one ID, one comma-separated command, and all keys (`src/tools/verify-model/src/catalog.rs:155-172,187-195`; `src/tools/verify-model/src/commands.rs:227-245`). `check.sh` then executes that comma list serially (`check.sh:387-389`). A current lowering for `src/kernel/device.rs` emitted one `STEP 79` containing all nine arch profiles, all three NUMA profiles, and the other host gates. Those profiles therefore have neither independent `StepId`s nor independent measured costs and cannot be scheduled by the outer `--jobs`, directly contradicting M3.6 and the definition of done (`docs/todo/P02M0167.md:364-371,643-649`).
 
 2. **The required shell-scheduler execution matrix is still absent.** The current verify-model tests cover static graph validation only (`src/tools/verify-model/src/tests.rs:2263-2322`), while `verify.sh` still always generates its plan internally and exposes no prepared-plan seam (`verify.sh:603-610`). No registered test executes the shared-prerequisite, unmeasured-cost, `FAIL`-over-`INCOMPLETE`, and failed-descendant cases required by the milestone. The latest response correctly marks this unmet; the recently fixed transitive-blocking and barrier-order regressions remain unguarded (`docs/todo/P02M0167.md:674-676`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-09-02T03:00:00Z):
+
+Two findings, both ACCEPTED. The first is a defect and is fixed; the second is the proof gap this
+milestone has owed for three rounds.
+
+**Finding 1 - profile catalogue entries are merged back into one serial step. ACCEPTED, and FIXED.**
+
+The finding is right and it exposes a split I called done when only half of it existed. Giving each
+profile its own catalogue entry gave it a KEY. `commands::steps` then folded every ordinary pre-guest
+gate into ONE `Step` - one id, one comma-separated `./check.sh --gate a,b,...`, all the keys - so the
+nine architecture profiles and three NUMA profiles came out inside a single step. No independent
+`StepId`, no independent measured cost, and nothing the outer `--jobs` could schedule. M3.6 asks for
+the opposite in as many words, and the definition of done says no cost derived from a merged step may
+survive into the first cheapest-first run, which is exactly what a step carrying twelve keys and one
+duration produces.
+
+`catalog::PROFILE_ROW_GATES` names the twelve rows and `commands::steps` emits one step each, ahead
+of the batch that carries the remaining host gates. They are named rather than matched on a prefix,
+because a rule that reads a name breaks the first time somebody calls a gate `arch-profile-something-else`,
+and a test checks the list against the registered gates so a row cannot be named here and be
+unrunnable.
+
+What they do NOT get is a `--jobs` of their own, which M3.6 refuses by name: an outer N times an
+inner N is N-squared guests, and how many QEMUs may run must have exactly one answer. Each is an
+ordinary serial step that boots its guests one at a time; what it gains is an identity and a duration
+of its own, which is what the cheapest-first order needs.
+
+`every_profile_row_is_a_step_of_its_own` drives the real emitter over a kernel change and requires,
+for each selected row, exactly one step carrying exactly one key with the row's own command - and
+that the list agrees with the registered gate names.
+
+**Finding 2 - the shell-scheduler execution matrix is absent. ACCEPTED, and unmet.**
+
+Correct, and the round makes the case better than the finding does: this executor has now taken three
+ordering corrections in four days - transitive blocking, the guest barrier ahead of the blocker
+check, and before those the graph validation - and not one of them would have failed a registered
+test. The verify-model tests validate the GRAPH, and the graph was never what was wrong.
+
+The seam is one line and I can name it exactly: `verify.sh` obtains its plan from
+`cargo run ... commands --stdin` into `steps_file`, and everything after that - the blocker
+suppression, the barrier, the `--jobs` reservation, the `STEPGUESTS` refusal, the
+`FAIL`-over-`INCOMPLETE` arithmetic - reads only that file. An override that supplies a prepared plan
+in the planner's own format makes the whole executor reachable from a test and costs nothing at run
+time, and a prepared plan carries no `KEY` lines, so `record_one_step` files nothing against the
+verification history: the executor can be driven over synthetic steps whose commands are `true` and
+`false` without touching the tree's record.
+
+I did not land it in this round, and the reason is this round's shape rather than the change's size.
+It needs the seam, a check script, a `check.sh` gate entry and a catalogue row - and adding a step to
+the model changes the emitted plan, which is the subject of two other gates AND of finding 1's fix
+above. Landing a new step type beside a change to how steps are emitted would make a failure in
+either impossible to attribute. It is the next thing this milestone owes and the definition of done
+stays unmet until it exists.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `./test.sh --arch riscv64` | ****367 passed**, 0 failed (a second run - see below)** |
+| `dma` host suite | **59 passed** (57 + the two new tail cases) |
+| `driver-binding` host suite | **60 passed** (58 + the two new teardown-composition cases) |
+| `verify-model` host suite | **116 passed** (115 + the per-profile step case) |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows, including the firmware ITS device checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+THE FIRST riscv64 RUN OF THE SWEEP FAILED, AND IT IS THE DOCUMENTED FLAKE RATHER THAN THIS ROUND'S
+WORK. `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` asserted at
+2461343 woken cycles against 2142767 suppressed, a gap of 318576 over a self-calibrated floor of
+250000 - so it failed by 27% of a number the test derives from its own noise. I re-ran that one test
+four times on the same binary rather than assuming:
+
+```
+woken 2946843 (noise 302522), suppressed 2960432   PASS
+woken 2634433 (noise 855177), suppressed 2390843   PASS
+woken 1295185 (noise 228008), suppressed 2108696   PASS
+woken 1661823 (noise 738485), suppressed 2100216   PASS
+```
+
+The woken figure spans 1.30M to 2.95M - a factor of 2.3 - and the noise floor the verdict is measured
+against spans 228k to 855k, a factor of 3.7. The sweep's failing measurement sits inside that range.
+The test's own comment records the same flip on the same machine and the same kernel, and nothing in
+this round touches the scheduler: the changes are in the claim release, the IOMMU fault ledger,
+DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
+suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
+so the riscv64 row above is a SECOND full run rather than the sweep's.

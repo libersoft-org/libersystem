@@ -1383,3 +1383,47 @@ client interface in the first place. Its gates are stated: a failed ceiling leav
 generation unchanged and does not consume the allowance, a corrected directory then scans
 successfully, a scan inside the delay is refused with `try-again-at`, and an ordinary
 `font-catalogue` holder is refused the admin interface entirely.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-09-01T23:24:26Z):
+
+Rating: 6/10
+
+1. **The caller-backed `RESOLVE-INTO` rights/lifetime contract is not implementable through the
+   specified LSIDL transport.** The plan requires the catalogue to receive the caller's
+   `MemoryObject` with map+write but without `RIGHT_TRANSFER` or `RIGHT_DUPLICATE`, close that handle
+   before replying, and leave the caller owning the resolved bytes
+   (`docs/todo/P02M0136.md:333-360`). Generated typed clients currently pass request handles through
+   `ChannelTransport::call` to `send_caps_blocking`; that path invokes `SYS_CHANNEL_SEND_CAPS`, which
+   requires `RIGHT_TRANSFER`, consumes the sender handle, and delivers the capability with its rights
+   unchanged (`src/user/libs/ipc/ipc-client/src/lib.rs:36-48`;
+   `src/user/runtime/rt/src/lib.rs:2524-2532,2726-2743`;
+   `src/kernel/syscall/mod.rs:2756-2809`). The only attenuation primitive is the separate single-handle
+   `send_blocking_attenuated`, which the typed transport does not use. Thus an ordinary generated call
+   either gives the catalogue `TRANSFER` and spends the caller's only handle, or needs an unowned
+   duplicate-and-retain plus attenuated-request mechanism. The accounting correction is sound, but
+   its stated authority and retained-result gates still have no protocol path that can satisfy them.
+
+2. **The accepted admin-holder correction names neither a deliverable endpoint path nor a final
+   holder, and expressly excludes the routes its claimed analogue uses.** The plan says
+   PermissionManager mints `font-catalogue-admin` for “the operator path” while providing no factory
+   rule, manifest role or application grant (`docs/todo/P02M0136.md:300-310`). PermissionManager can
+   mint a client only from an endpoint it receives, and the cited device-policy path is concrete in
+   exactly the ways this correction omits: a `DEVPOLICY` manifest client role names DeviceManager's
+   admin interface, ServiceManager passes that endpoint to PermissionManager, the security
+   capability/tag is declared, and governed `lsdev` is the recipient
+   (`src/user/services/manifest.toml:2240-2249`;
+   `src/user/services/core/src/service_manager/bootstrap.rs:1005-1016`;
+   `src/user/services/core/src/permission_manager.rs:219-228,324-365,1497-1499`). With no corresponding
+   source/tag/bootstrap delivery and no operator tool grant, PermissionManager has nothing to mint
+   and no named operator can issue recovery after a dropped watch. “No ordinary application holds
+   it” is an authority policy, not a realizable recovery route.
+
+3. **The revised RESCAN budget still permits an unbounded sequence of full scans.** Catalogue scans
+   advance the generation only when names, digests or metadata differ from the published index
+   (`docs/todo/P02M0136.md:252-255`). The new rule consumes an allowance only when a scan publishes a
+   new generation, while only a *failed* scan gets delayed backoff (`:284-299`). A valid scan of an
+   unchanged directory is neither a publication nor the invalid/over-ceiling failure described by
+   the plan, so it consumes no allowance and re-arms no delay. The admin caller can therefore request
+   full directory reads, digests and metadata passes serially without bound despite the correction's
+   claim that it cannot spin them. The response fixed retry after a bad directory, but did not define
+   or gate the no-change success case, so the intended work bound remains incomplete.

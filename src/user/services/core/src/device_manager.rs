@@ -1521,6 +1521,10 @@ struct Node {
 	// online. Advancing from there stepped over the operator's choice before anything had tried it.
 	// See `spend_candidate`.
 	spent: Option<usize>,
+	// AN OPERATOR'S SELECTION HAS BEEN MADE AND NOT YET STARTED FROM. See `spend_candidate`, which
+	// leaves the cursor alone while this is set, and `begin_bind`, which clears it when an attempt
+	// starts. One bind, which is what "applies at the next bind" means.
+	selection_pending: bool,
 	// THE OPERATOR'S CHOICE, IF THERE IS ONE - an index into `candidates`.
 	//
 	// The cursor above is where the next bind STARTS; this is where it starts BY PREFERENCE. They are
@@ -1660,7 +1664,7 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, running: None, spent: None, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, disabled_by_policy: false }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, disabled_by_policy: false }
 	}
 
 	// Queue one event for this node.
@@ -1668,14 +1672,30 @@ impl Node {
 		self.queue.push(event)
 	}
 
-	// Take the oldest event about the binding this node is holding now. A node with no binding has
-	// nothing an event could be about, which the queue answers by draining.
+	// Take the oldest event about the binding this node is holding now. A node holding neither a
+	// binding nor a teardown has nothing an event could be about, which the queue answers by
+	// draining.
 	//
 	// THE IDENTITY IS WHAT SAYS WHICH GENERATION, not a copy of the number inside the binding. Two
 	// places holding one value is two places that agree until somebody updates one of them, and the
 	// one that would have been missed is the one a stale event is filtered against.
+	//
+	// A TEARDOWN IS STILL HOLDING A BINDING'S WORTH OF STATE, AND THIS ASKED FOR GENERATION ZERO
+	// (fixed 2026-09-02). The rollback TAKES `binding` out of the node before it runs, so from the
+	// moment a teardown exists this answered 0 - and `BindingQueue::pop(0)` drains the queue and
+	// returns None. Its two confirmations are pushed by `pump` as ordinary events carrying
+	// `id.generation`, so they were dropped on the way in and `Pending::note` never saw them: every
+	// teardown that had to WAIT ran to its deadline and settled `Unconfirmed`, which lands
+	// `Quarantined`. That is every planned stop in the system - an operator's disable, a dependency
+	// loss, a crash with attempts left - resolved as an unconfirmed teardown, and the reason nothing
+	// caught it is that the suites send `STOP` at shutdown and exit before any teardown confirms.
+	//
+	// The generation is right for the teardown too: `node.id` is rebound only when the NEXT bind
+	// takes a claim, so while a teardown is outstanding it still names the binding that ended, which
+	// is exactly what its confirmations carry.
 	fn pop(&mut self) -> Option<BindingEvent> {
-		let generation: u64 = if self.binding.is_some() { self.id.generation } else { 0 };
+		let holds_a_binding: bool = self.binding.is_some() || self.teardown.is_some();
+		let generation: u64 = if holds_a_binding { self.id.generation } else { 0 };
 		self.queue.pop(generation)
 	}
 
@@ -2015,6 +2035,24 @@ impl Catalogue {
 	// the caller closes the endpoint rather than serving a stream nothing will ever write to.
 	unsafe fn subscribe_stream(&mut self, kind: u16, producer: u64) -> bool {
 		unsafe {
+			// DEAD SUBSCRIPTIONS ARE REAPED BEFORE ONE IS REFUSED (added 2026-09-02).
+			//
+			// A subscriber was forgotten only when `announce` next FAILED to send it something, and
+			// that needs a publication or a withdrawal of its own kind. On a machine whose provider
+			// set is stable - which is every machine after bring-up - nothing ever announces again,
+			// so a consumer that exits leaves its slot occupied for the life of the boot. Eight
+			// consumer restarts and the ninth subscription is refused with every provider still
+			// there, which is the late-subscriber contract failing for a reason that has nothing to
+			// do with how many consumers there are.
+			//
+			// Reaped HERE rather than every pass: the count only matters when a slot is wanted, and
+			// probing eight endpoints on every turn of the standing loop would pay for it on every
+			// heartbeat instead. Putting the producer ends in the wait set would notice sooner and
+			// costs eight wait entries permanently, which is the more expensive answer to a question
+			// nobody asks until the array is full.
+			if self.subscribers.iter().all(Option::is_some) {
+				self.reap_dead_subscribers();
+			}
 			let Some(slot) = self.subscribers.iter().position(Option::is_none) else {
 				print(b"DeviceManager: the provider catalogue has as many subscribers as it will hold; refusing another\n");
 				// The endpoint goes back rather than being held by a subscription that does not
@@ -2038,6 +2076,27 @@ impl Catalogue {
 			}
 			self.subscribers[slot] = Some(subscriber);
 			true
+		}
+	}
+
+	// EVERY SUBSCRIPTION WHOSE CONSUMER HAS GONE, CLOSED AND FORGOTTEN.
+	//
+	// The probe is a non-blocking RECEIVE on the producer end, which is not a channel this service
+	// ever reads for content: nothing is on the other side that sends, so a live consumer answers
+	// `Empty` and a gone one answers `Closed`. That is the same fact `announce` learns from a failed
+	// send, without needing something to announce.
+	unsafe fn reap_dead_subscribers(&mut self) {
+		unsafe {
+			let mut buf: [u8; 1] = [0; 1];
+			for slot in 0..MAX_SUBSCRIBERS {
+				let Some(subscriber) = self.subscribers[slot].as_ref() else { continue };
+				if matches!(try_recv_caps(subscriber.producer, &mut buf), PolledCaps::Closed)
+					&& let Some(dead) = self.subscribers[slot].take()
+				{
+					close(dead.producer);
+					print(b"DeviceManager: a provider subscription whose consumer has gone is closed and its slot given back\n");
+				}
+			}
 		}
 	}
 
@@ -2678,7 +2737,17 @@ unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, catalogue: &mut Catalo
 			// perform - a handle without the WAIT right, or a set the kernel refused. Reporting no
 			// progress here would spin; the honest answer is to time out everything in flight,
 			// because a manager that cannot wait cannot supervise.
-			if !timed_out {
+			//
+			// UNLESS A PARKED NODE'S RE-READ CAME DUE, WHICH IS A LEGITIMATE WAKE (fixed 2026-09-02).
+			// The claim re-read added its `retry_at` to `soonest` so the loop would come round for
+			// it - correctly - and `wait_any` reports a deadline the same way it reports a refusal:
+			// a negative result. So the shortest backoff in the system started waking this branch,
+			// finding no node whose OWN attempt deadline had passed, concluding the wait could not
+			// be performed, and timing out every healthy handshake in flight. A supervisor turning
+			// its own poll into a driver's `HandshakeTimeout` is worse than the wait it was added to
+			// perform.
+			let parked_due: bool = parked.is_some_and(|due| due <= now);
+			if !timed_out && !parked_due {
 				for (at, node) in nodes.iter_mut().enumerate() {
 					if at < in_flight_from || !node.in_flight() {
 						continue;
@@ -3047,8 +3116,24 @@ unsafe fn may_try_again(incident: &Incident, attempt: u32) -> bool {
 // `start_candidate` advances for itself.
 fn spend_candidate(node: &mut Node) {
 	let ran: usize = node.spent.take().unwrap_or(node.candidate);
-	// A cursor already PAST what ran is a cursor somebody moved on purpose, and it stays where it
-	// was put. Anything at or before it advances, which is what "this entry is spent" means.
+	// AN UNSTARTED SELECTION IS NEVER SPENT BY SOMETHING ELSE ENDING (fixed 2026-09-02).
+	//
+	// This compared the cursor with the entry that ran and kept it only when it was numerically
+	// LATER, on the reasoning that a cursor past what ran must have been moved on purpose. That is
+	// true of a later selection and false of every other one: an operator selecting the FIRST
+	// candidate, or the one that is running, leaves a cursor at or before `ran`, which looked
+	// exactly like a cursor that had not advanced yet - so `select` worked only when it happened to
+	// name a higher index, which is not a contract anybody can use.
+	//
+	// A flag says what a comparison cannot. `PolicyVerb::Select` sets it, `begin_bind` clears it
+	// when an attempt actually starts from that entry, and while it is set the cursor is left where
+	// the operator put it. That is exactly "applies at the NEXT bind": one bind starts there and the
+	// selection is spent, so a selected candidate that then fails advances like any other and cannot
+	// hold the node in a loop on one entry.
+	if node.selection_pending {
+		node.attempt = 0;
+		return;
+	}
 	if node.candidate <= ran {
 		node.candidate = ran + 1;
 	}
@@ -3179,6 +3264,9 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// being released.
 		node.retry_at = 0;
 		node.waiting_for_claim = false;
+		// AND AN OPERATOR'S SELECTION IS SPENT BY THE BIND IT ASKED FOR. From here the entry this
+		// attempt is on is an ordinary candidate: if it fails, the cursor advances like any other.
+		node.selection_pending = false;
 		let mut txn = Attempt::new();
 		if !node.record.move_to(BindingState::Binding, None) {
 			print(b"DeviceManager: refusing an illegal transition into binding for ");
@@ -4109,6 +4197,9 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				Some(at) => {
 					node.candidate = at;
 					node.preferred = Some(at);
+					// AND IT SURVIVES THE END OF WHATEVER IS RUNNING - see `spend_candidate`. The
+					// cursor alone could not say it had been moved on purpose.
+					node.selection_pending = true;
 				}
 				// Unreachable through the served verb, which validated it; a caller that reaches
 				// here with an unknown artifact changes nothing rather than silently rewinding.

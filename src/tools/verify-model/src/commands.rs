@@ -234,7 +234,19 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// which is the same shape `GATES_AFTER_A_GUEST` already has for a different reason.
 	let concurrent: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::gate_concurrent_guests(&gate_name(item)) > 1).collect();
 	let after_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str())).collect();
-	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str()) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1).collect();
+	// A PROFILE ROW IS ITS OWN STEP, and this is where the catalog's split becomes a schedule.
+	//
+	// Giving each profile a catalog entry gave it a KEY; folding it into the batch below took away
+	// the id and the duration that make the key useful, so twelve emulated profiles were one step
+	// with one measured cost divided evenly among them. M3.6 asks for the opposite and the
+	// definition of done says no cost derived from a merged step may survive - see
+	// `catalog::PROFILE_ROW_GATES` (fixed 2026-09-02).
+	let profile_rows: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::gate_is_profile_row(&gate_name(item))).collect();
+	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str()) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1 && !crate::catalog::gate_is_profile_row(&gate_name(item))).collect();
+	for item in profile_rows.iter() {
+		let name = gate_name(item);
+		steps.push(Step { id: scoped_id("gate-profile", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} profile"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("one profile of a multi-profile gate: its own step, its own key and its own measured cost")), guests: 0 });
+	}
 	for item in concurrent.iter() {
 		let name = gate_name(item);
 		let guests = crate::catalog::gate_concurrent_guests(&name);

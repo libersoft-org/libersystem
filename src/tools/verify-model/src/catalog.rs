@@ -407,6 +407,42 @@ pub fn judging_universes(catalog: &Catalog, component: &str) -> Vec<crate::shado
 // type; paying for it twice in a sweep does not.
 const UMBRELLA_GATES: [&str; 2] = ["qemu-arch-profiles", "qemu-numa"];
 
+// THE ROWS OF THOSE UMBRELLAS, WHICH MUST EACH BE A STEP OF THEIR OWN.
+//
+// M3.6 and the definition of done both say each profile of a profile gate is its own step with its
+// own key, "and no cost derived from a merged step survives into the first cheapest-first run".
+// Splitting them in the CATALOG achieved neither on its own: `commands::steps` folds every ordinary
+// pre-guest gate into one `Step` with one id, one comma-separated `check.sh --gate a,b,...` and all
+// the keys, so twelve emulated profiles came out as part of one step - no independent id, no
+// independent measured cost, and nothing the outer `--jobs` could schedule (fixed 2026-09-02).
+//
+// They are named here rather than matched on a prefix: a rule that reads a name is a rule that breaks
+// the first time somebody calls a gate `arch-profile-something-else`, and this list is checked
+// against `GATES` by a test.
+//
+// NOT one step per profile with a `--jobs` of its own - that is the second scheduler M3.6 refuses.
+// Each is an ordinary serial step that boots its guests one at a time; what it gains is an identity
+// and a duration of its own.
+pub const PROFILE_ROW_GATES: [&str; 12] = [
+	"arch-profile-aarch64-gicv2-1",
+	"arch-profile-aarch64-gicv2-4",
+	"arch-profile-aarch64-gicv3-1",
+	"arch-profile-aarch64-gicv3-4",
+	"arch-profile-aarch64-gicv3-its-1",
+	"arch-profile-aarch64-gicv3-its-4",
+	"arch-profile-aarch64-gicv3-its-device-4",
+	"arch-profile-riscv64-aia-1",
+	"arch-profile-riscv64-aia-4",
+	"numa-profile-x86_64",
+	"numa-profile-aarch64",
+	"numa-profile-riscv64",
+];
+
+// Whether this gate is one profile row of a multi-profile gate. See `PROFILE_ROW_GATES`.
+pub fn gate_is_profile_row(name: &str) -> bool {
+	PROFILE_ROW_GATES.contains(&name)
+}
+
 // HOW MANY GUESTS A GATE STARTS AT THE SAME TIME.
 //
 // One for a gate that boots nothing or boots serially - which is every other gate in this tree,

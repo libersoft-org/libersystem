@@ -1266,3 +1266,79 @@ Current implementation rating: 8/10
 1. **The required AArch64 and RISC-V UEFI/no-DT regression profiles remain absent while M6 and the milestone are marked complete.** The gate now has a valid firmware-backed GICv3/ITS device-MSI checkpoint, but it explicitly says the two no-DT profiles are not registered and no caller selects `LIBER_NO_DT_PROFILE=1` (`src/tools/check-qemu-arch-profiles.sh:350-373`; the only build plumbing is `src/harness/test-kernel.sh:325-332`). Its registered firmware row still requires `GICv3 from the device tree`, so it is not either no-DT regression (`src/tools/check-qemu-arch-profiles.sh:350-357`). This leaves M6 and the Definition of Done's separately labelled compatibility boots unmet (`docs/todo/P02M0151.md:157-170,480-491`); the measured loader limitation explains the gap but does not justify the checked/COMPLETE status.
 
 Focused verification: the FDT suite passed 87 tests, the `smpboot` suite passed 18 tests, `arch-surface` passed over 61 production architecture files, and both architecture-profile scripts pass `bash -n`. The new device-originated ITS checkpoint is credited: the hardware test succeeds only after a real virtio-sound interrupt and then revokes/releases its vector, while the gate requires both the GIC acknowledge-path LPI line and the teardown line from that firmware row (`src/kernel/arch/aarch64/gic.rs:355-376`; `src/kernel/test_suites/hardware.rs:820-840`; `src/tools/check-qemu-arch-profiles.sh:401-420`). No QEMU run was started for this re-audit.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-09-02T03:00:00Z):
+
+One finding, ACCEPTED. The work it names cannot be built here; what could be wrong and was is the
+status this file claimed while it was missing.
+
+**Finding 1 - the AArch64 and RISC-V UEFI/no-DT regression profiles are absent while M6 and the
+milestone are marked complete. ACCEPTED.**
+
+Every clause checks out. The gate says in its own comment that the two no-DT profiles are not
+registered, `LIBER_NO_DT_PROFILE` has build plumbing in `test-kernel.sh` and no caller anywhere, and
+the firmware-booted row I added last round requires `GICv3 from the device tree` - so it is a UEFI
+boot and is emphatically not a no-DT one. I want to be explicit that I do not read the new row as
+covering this item, because it would be easy to: it satisfies M3's device-MSI checkpoint and it is a
+firmware boot, and those two facts together look like the UEFI half of M6 until you notice that what
+M6 asks for is a machine with NO DEVICE TREE, which that row proves it has.
+
+The blocker is measured twice and is not this milestone's code: QEMU's `virt` hands the firmware a
+device tree and the loader passes it on, so there is no way here to boot a machine that publishes
+none. Producing one needs a QEMU machine without a tree or a loader option that declines to pass one
+on, and both are harness capabilities rather than gate rows. I am not offering the negative check
+again - proving that an authorised static descriptor is not selected when a tree exists is a
+different sentence from either required regression boot, and a substitute that proves something else
+is worse than an admitted gap.
+
+What I HAVE changed is the plan, because the finding's real point is the one about status. M6 was
+`[x]` on the strength of "all eight profiles boot DIRECT and pass every named assertion", which is
+true of the eight it registers and is not all of what M6 asks. The item is now unchecked and says
+precisely what is met - the nine registered rows, including the firmware ITS checkpoint - and what is
+not, with the measurement that blocks it and the capability that would unblock it. The Status line at
+the top of the file says COMPLETE EXCEPT M6's NO-DT REGRESSION PROFILES rather than COMPLETE.
+
+That is a smaller change than it reads as, and it is the honest one: a blocked item is not a met one,
+and this file's own rules refuse a checked box with no evidence behind it everywhere else. Recording
+it as complete was the defect available to fix here.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `./test.sh --arch riscv64` | ****367 passed**, 0 failed (a second run - see below)** |
+| `dma` host suite | **59 passed** (57 + the two new tail cases) |
+| `driver-binding` host suite | **60 passed** (58 + the two new teardown-composition cases) |
+| `verify-model` host suite | **116 passed** (115 + the per-profile step case) |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows, including the firmware ITS device checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+THE FIRST riscv64 RUN OF THE SWEEP FAILED, AND IT IS THE DOCUMENTED FLAKE RATHER THAN THIS ROUND'S
+WORK. `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` asserted at
+2461343 woken cycles against 2142767 suppressed, a gap of 318576 over a self-calibrated floor of
+250000 - so it failed by 27% of a number the test derives from its own noise. I re-ran that one test
+four times on the same binary rather than assuming:
+
+```
+woken 2946843 (noise 302522), suppressed 2960432   PASS
+woken 2634433 (noise 855177), suppressed 2390843   PASS
+woken 1295185 (noise 228008), suppressed 2108696   PASS
+woken 1661823 (noise 738485), suppressed 2100216   PASS
+```
+
+The woken figure spans 1.30M to 2.95M - a factor of 2.3 - and the noise floor the verdict is measured
+against spans 228k to 855k, a factor of 3.7. The sweep's failing measurement sits inside that range.
+The test's own comment records the same flip on the same machine and the same kernel, and nothing in
+this round touches the scheduler: the changes are in the claim release, the IOMMU fault ledger,
+DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
+suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
+so the riscv64 row above is a SECOND full run rather than the sweep's.

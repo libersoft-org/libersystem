@@ -913,3 +913,19 @@ The fixture the finding asks for is added and is stated as three steps rather th
 interesting part is the middle: two routers advertise the same prefix and the candidate result names
 BOTH; one advertisement expires and the address stays valid with the survivor still named; the second
 expires and the prefix goes with it.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-09-01T23:25:58Z):
+
+Rating: 7/10
+
+1. **The new advertiser-set lifetime contract still conflates advertiser provenance with the
+   prefix/address lifetime and contradicts its consumer.** M5 already gives an autoconfigured address
+   its own validated PIO lifetime and the RFC 4862 update rule (`docs/todo/P02M0174.md:249-264`). The
+   new M6 seam says advertiser entries expire independently and the address follows the prefix's own
+   lifetime, but also says the prefix survives only with an advertiser and requires the prefix to go
+   away when the last advertisement expires (`:442-463`). M0175 requires the opposite reachable
+   state: every advertiser expired while the address is still valid, followed by recorded fallback
+   to the general router rules (`docs/todo/P02M0175.md:449-452,719-726`). Following M0174's fixture
+   withdraws a still-valid source and makes that required fallback impossible. Freeze prefix/address
+   expiry independently from membership in the live-advertiser set and test both last-advertiser
+   expiry with a still-valid address and actual prefix/address expiry.

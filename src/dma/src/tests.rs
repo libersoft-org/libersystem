@@ -670,3 +670,35 @@ fn a_tail_record_is_bounded_and_gives_up_the_ones_that_attribute_nothing_first()
 	assert_eq!(iommu.drain_faults(&mut out), 1);
 	assert_eq!(out[0].generation, Generation(MOST_DETACHED_TAILS as u64 + 4), "the newest ended binding still names itself");
 }
+
+#[test]
+fn a_second_revocation_does_not_discard_the_tail_of_the_one_before_it() {
+	// FIFO MEANS THE OLDER TAIL IS IN FRONT, WHICH THE FIRST VERSION HAD BACKWARDS.
+	//
+	// `remember_detached_tail` replaced an existing record for the same endpoint, on the reasoning
+	// that "an older tail cannot still be queued behind a newer one - the queue is FIFO, so the
+	// newer binding's tail is what a reader meets first". First in, first out: the OLDER binding's
+	// records were queued first and are read first, so they are in front. Replacing the record threw
+	// away the attribution for events that had not been read yet, and they were then charged to the
+	// binding that came after them.
+	let (mut iommu, first) = iommu();
+	let endpoint = EndpointId(7);
+	iommu.attach(first, endpoint).expect("the first binding attaches");
+	iommu.revoke_endpoint(first, endpoint).expect("and ends");
+
+	// A SECOND BINDING ON THE SAME ENDPOINT, ending before anything drained the first one's tail.
+	let second = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(2)).expect("a second domain");
+	iommu.attach(second, endpoint).expect("the second binding attaches");
+	iommu.revoke_endpoint(second, endpoint).expect("and ends too");
+	assert_eq!(iommu.detached_tails(), 2, "an undrained record is kept rather than being replaced by the binding after it");
+
+	// AND THE FRONT OF THE QUEUE IS THE FIRST BINDING'S. The backend reports whatever attachment it
+	// can see, which is neither of them by now; the record is what says whose it is.
+	iommu.backend_mut_for_test().queue_fault(event(7, 0, 0x2000, Access::Write, Fault::NotMapped));
+	let mut out = [event(0, 0, 0, Access::Read, Fault::NotMapped); 4];
+	assert_eq!(iommu.drain_faults(&mut out), 1);
+	assert_eq!(out[0].domain, first, "the oldest undrained record is what a FIFO reader meets first");
+	assert_eq!(out[0].generation, Generation(1));
+	assert_eq!(iommu.faults_in(first), 1, "charged to the binding whose tail it is");
+	assert_eq!(iommu.faults_in(second), 0, "and not to the one that ended after it");
+}

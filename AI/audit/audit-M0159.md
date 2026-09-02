@@ -905,3 +905,73 @@ AUDITOR'S RE-AUDIT ON M0159 (2026-09-01T22:46:17Z):
 Current implementation rating: 8/10
 
 1. **M4 still restores only the GPU binding, not a usable display path after restart.** The standing DeviceManager loop can rebind and republish the GPU, but it does not route `Step::Online`; `route_offers` is called only inside the initial phase-two loop and fills the one `gpu_client` slot only while it is zero (`src/user/services/core/src/device_manager.rs:520-565,980-1003,1170-1182`). DisplayService reads the injected `GPU` handle once at bootstrap and merely clears it when that binding's channel closes; it has no catalogue subscription or replacement path (`src/user/services/core/src/display_service.rs:488-519,550-580`). The controlled check accurately exposes the gap by deliberately reporting, rather than asserting, presentation after rebind (`src/harness/dev-gpu-restart.py:40-49,152-169,238-245`). A new claim generation and provider publication therefore do not meet M4 and the definition of done's explicit requirement that the GPU present a frame and remain functional after restart (`docs/todo/P02M0159.md:94-97,126-131`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-09-02T03:00:00Z):
+
+One finding, ACCEPTED and unmet.
+
+**Finding 1 - M4 restores only the GPU binding, not a usable display path. ACCEPTED.**
+
+Re-confirmed against the current tree: the standing loop does not route `Step::Online`, `route_offers`
+has only its phase-two call site and fills `gpu_client` only while it is zero, and DisplayService
+reads the injected `GPU` handle once at bootstrap and clears it when that channel closes without any
+path to a replacement. The check reports post-rebind presentation rather than asserting it, which the
+finding correctly reads as the check exposing the gap rather than hiding it.
+
+Nothing in this round changed that, and nothing in this round should have. What DID change is
+adjacent and worth recording here, because it affects what the check can prove at all: the sibling
+M0165 audit found that teardown confirmations were being discarded, so every planned stop landed
+`Quarantined` instead of its intended state. The dev GPU restart check waits for `disabled` after a
+disable and then enables - so until this round it could not have reached its second step even on the
+driver-and-kernel half it does assert. That is fixed. The check's DRIVER half is now able to complete;
+its DISPLAY half still cannot, for the reason the finding gives.
+
+The consumer half remains P02M0164's migration and I measured last round why no DeviceManager-only
+change can substitute for it: the handle was handed to DisplayService at bootstrap, positionally, and
+there is no channel on which a replacement could be delivered. Re-routing inside the manager would
+fill a local and reach nobody - strictly worse than today, because the machine would then hold a live
+provider nobody can reach while the catalogue reported the kind as taken.
+
+So M4 stays unmet on its consumer half, and the definition of done's "presents a frame and survives a
+restart" is proved for the restart and not for the frame.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `./test.sh --arch riscv64` | ****367 passed**, 0 failed (a second run - see below)** |
+| `dma` host suite | **59 passed** (57 + the two new tail cases) |
+| `driver-binding` host suite | **60 passed** (58 + the two new teardown-composition cases) |
+| `verify-model` host suite | **116 passed** (115 + the per-profile step case) |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows, including the firmware ITS device checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+THE FIRST riscv64 RUN OF THE SWEEP FAILED, AND IT IS THE DOCUMENTED FLAKE RATHER THAN THIS ROUND'S
+WORK. `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` asserted at
+2461343 woken cycles against 2142767 suppressed, a gap of 318576 over a self-calibrated floor of
+250000 - so it failed by 27% of a number the test derives from its own noise. I re-ran that one test
+four times on the same binary rather than assuming:
+
+```
+woken 2946843 (noise 302522), suppressed 2960432   PASS
+woken 2634433 (noise 855177), suppressed 2390843   PASS
+woken 1295185 (noise 228008), suppressed 2108696   PASS
+woken 1661823 (noise 738485), suppressed 2100216   PASS
+```
+
+The woken figure spans 1.30M to 2.95M - a factor of 2.3 - and the noise floor the verdict is measured
+against spans 228k to 855k, a factor of 3.7. The sweep's failing measurement sits inside that range.
+The test's own comment records the same flip on the same machine and the same kernel, and nothing in
+this round touches the scheduler: the changes are in the claim release, the IOMMU fault ledger,
+DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
+suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
+so the riscv64 row above is a SECOND full run rather than the sweep's.

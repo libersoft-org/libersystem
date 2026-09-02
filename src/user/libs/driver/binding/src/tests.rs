@@ -1212,3 +1212,67 @@ fn exactly_one_terminal_frame_ends_a_handshake_whichever_of_the_two_it_is() {
 		assert_eq!(state.accepts_terminal_frame(), state.may_move_to(BindingState::Online), "{:?} disagrees with the table about whether its handshake is still open", core::str::from_utf8(state.name()));
 	}
 }
+
+// A TEARDOWN'S CONFIRMATIONS TRAVEL THROUGH THE SAME QUEUE ITS BINDING'S EVENTS DID, and the
+// generation the reader asks for is what decides whether they arrive.
+//
+// This is the composition that failed in production for as long as `Step::Resting` and the planned
+// landings existed, and neither half's own tests could see it: the queue was asked for the right
+// generation in every test that had one, and `Pending` was fed events by hand. DeviceManager takes
+// the binding OUT of the node before the rollback runs, and its reader then asked for generation 0 -
+// which this queue answers by draining and returning None, exactly as it is specified to. So
+// `note` was never called, `settle` had neither confirmation, and every teardown that had to WAIT
+// ran to its deadline and answered `Unconfirmed`. Every planned stop in the system landed
+// `Quarantined`: an operator's disable, a dependency loss, and a crash with attempts left.
+//
+// The rule this pins: while a teardown is outstanding, the reader is still holding a binding's worth
+// of state and must ask for THAT binding's generation.
+struct CountingCloses(u32);
+impl Closes for CountingCloses {
+	fn kill(&mut self, _process: u64) {}
+	fn close(&mut self, _handle: u64) {
+		self.0 += 1;
+	}
+	fn kill_domain(&mut self, _domain: u64) {}
+	fn release(&mut self, _claim: u64) -> Option<u32> {
+		None
+	}
+}
+
+#[test]
+fn a_teardowns_confirmations_reach_it_when_the_reader_asks_for_the_binding_it_is_about() {
+	const GENERATION: u64 = 7;
+	let mut queue = BindingQueue::new();
+	let mut pending = Pending { process: 11, claim: 12, domain: 0, exited: false, state: None };
+	assert!(queue.push(BindingEvent::Exited { generation: GENERATION }));
+	assert!(queue.push(BindingEvent::ClaimSettled { generation: GENERATION, state: CLAIM_FREE }));
+
+	// THE READER THAT HAS TAKEN THE BINDING OUT still asks for the generation the teardown is about.
+	while let Some(event) = queue.pop(GENERATION) {
+		pending.note(event);
+	}
+	let mut closes = CountingCloses(0);
+	assert_eq!(pending.settle(&mut closes, 0, 1_000), Some(Settled::Free), "both confirmations arrived, so the teardown settles Free well before its deadline");
+	assert_eq!(closes.0, 2, "and the process and claim handles it was holding are closed exactly once each");
+}
+
+#[test]
+fn a_reader_that_asks_for_generation_zero_loses_a_teardowns_confirmations() {
+	// THE DEFECT, PINNED AS A PROPERTY OF THE QUEUE rather than of the caller that had it. Nothing
+	// here is wrong: a node holding NOTHING has no generation to ask for and its queue drains, which
+	// is what keeps a dead binding's last events from reaching the next one. What must never happen
+	// is a reader that IS holding something asking with this number - so the behaviour is asserted
+	// here, where a future reader meets it beside the test above.
+	const GENERATION: u64 = 7;
+	let mut queue = BindingQueue::new();
+	let mut pending = Pending { process: 11, claim: 12, domain: 0, exited: false, state: None };
+	assert!(queue.push(BindingEvent::Exited { generation: GENERATION }));
+	assert!(queue.push(BindingEvent::ClaimSettled { generation: GENERATION, state: CLAIM_FREE }));
+	while let Some(event) = queue.pop(0) {
+		pending.note(event);
+	}
+	assert!(!pending.exited && pending.state.is_none(), "generation zero drains the queue, which is what it is for");
+	let mut closes = CountingCloses(0);
+	assert_eq!(pending.settle(&mut closes, 0, 1_000), None, "and with no confirmation the teardown can only wait");
+	assert_eq!(pending.settle(&mut closes, 1_000, 1_000), Some(Settled::Unconfirmed), "until its deadline, where it lands Quarantined - which is what the whole system did");
+}

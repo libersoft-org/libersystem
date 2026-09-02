@@ -678,3 +678,9 @@ the third fixture could not reach. The third deletes one slot on an ADVANCING bo
 deletes one slot and boots the SAME generation, where no advance happens at all. That is precisely
 the state an interrupted advance leaves behind, so a fixture that only watched an advancing boot
 proved nothing about it - which is how the table and M4 could disagree for as long as they did.
+
+AUDITOR'S RE-AUDIT OF PLAN M0171 (2026-09-01T23:25:58Z):
+
+Rating: 9/10
+
+No material unresolved findings.

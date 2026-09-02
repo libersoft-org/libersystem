@@ -1683,3 +1683,35 @@ unmeasured-cost step, `FAIL` outranking `INCOMPLETE`, failed-descendant suppress
 `STEPGUESTS` reservation, and none exists. The assessment now carries it as a SECOND reason the
 restriction stands, with the observation that makes it concrete - two ordering corrections in three
 days, neither of which a registered test would have caught.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-09-01T23:26:01Z):
+
+Rating: 6/10
+
+1. **The accepted `a-wsi` dependency correction was applied to the matrix but not to the other
+   normative ordering statements.** The matrix correctly makes `d` depend on `s-2d + a-common +
+   a-wsi` and `g`/`i` depend on `s-3d + a-common + a-wsi`
+   (`docs/todo/P02M0103.md:105-136`). The header still says “Beside, gating nothing” is what all four
+   dependency descriptions say (`:38-45`); the build-order section still gives the uninterrupted
+   `s-2d -> b -> c -> d` and `s-3d -> e -> f -> g -> h -> i` chains and says `a-wsi` blocks neither
+   track (`:322-334`); and the canonical review calls its stale list the whole ordering while omitting
+   those WSI edges (`:2472-2476,2490-2495`). The planner response specifically claimed the build-order
+   paragraph was corrected. It was not, leaving mutually incompatible schedules in the current plan.
+
+2. **Normal `PRODUCER_READY` endpoint retirement is also defined as refusal/failure.** The signal
+   wrapper closes its send endpoint as it sends (`docs/todo/P02M0103.md:964-978`), and DisplayService
+   must process one accepted `PRODUCER_READY` and close its receive endpoint (`:992-1002`). The common
+   lifecycle rule then says closing either end ends the present and specifically classifies
+   DisplayService closing the `PRODUCER_READY` side as refusal and failed completion (`:1047-1054`).
+   The plan does not distinguish peer closure before the one message from ordinary closure after that
+   message was accepted, so following the required success path also triggers the required failure
+   path.
+
+3. **One-architecture-at-a-time is not a substitute for the missing P02M0167 scheduler proof.** M0103
+   makes P02M0167 a prerequisite for any accepted evidence, acknowledges that the required
+   shell-executor matrix does not exist, and treats this as a second reason the serial-architecture
+   restriction stands (`docs/todo/P02M0103.md:146,180-209`). But shared-branch handling,
+   unmeasured-cost steps, `FAIL` over `INCOMPLETE`, and failed-descendant suppression are required
+   scheduler semantics even in a serial run (`docs/todo/P02M0167.md:674-676`); only the `STEPGUESTS`
+   case is inherently parallel. The existing verify-model tests prove graph shape, not these
+   `verify.sh` execution semantics, so evidence accepted through a serial run remains unqualified.

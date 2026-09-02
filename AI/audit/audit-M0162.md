@@ -830,3 +830,77 @@ AUDITOR'S RE-AUDIT ON M0162 (2026-09-01T22:46:17Z):
 Current implementation rating: 7/10
 
 1. **Ordinary claim teardown still synchronously blocks DeviceManager's sole event loop.** `Holdings::begin_teardown` calls `Closes::release` inline, and the production implementation immediately invokes `device_release` (`src/user/libs/driver/binding/src/lib.rs:787-822`; `src/user/services/core/src/device_manager.rs:1762-1773,1782-1795`). The syscall calls `Claim::release`, which completes the full `device::release_claim` sequence before publishing the terminal state and returning (`src/kernel/syscall/mod.rs:1247-1253`; `src/kernel/object/claim/mod.rs:74-102`; `src/kernel/device.rs:511-630`). The 20-tick limit applies only to the virtio-IOMMU command wait inside that sequence, not to the complete release or its caller (`src/kernel/iommu/mod.rs:880-900`; `src/kernel/iommu/virtqueue.rs:37-59`). Thus the retained claim handle is ordinarily already terminal before the manager can wait for a later claim event, and one teardown can still delay supervision of every other node. The absent kernel execution facility explains the gap but does not satisfy M4's short, nonblocking transitions or node-independence requirement (`docs/todo/P02M0162.md:163-186,359-370`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-09-02T03:00:00Z):
+
+One finding, ACCEPTED and unmet.
+
+**Finding 1 - ordinary claim teardown synchronously blocks DeviceManager's sole event loop.
+ACCEPTED.**
+
+The chain is confirmed once more against the current line numbers, and it is unchanged:
+`Holdings::begin_teardown` calls `Closes::release` inline, the production `Syscalls::release` enters
+`device_release`, and `SYS_DEVICE_RELEASE` runs the whole of `device::release_claim` before
+publishing the terminal state and returning. The 20-tick deadline bounds the virtio-IOMMU command
+wait inside that sequence and nothing above it.
+
+One thing in that sequence changed this round and it is worth saying which, because it makes the
+synchronous section slightly longer rather than shorter: `finish_release` now returns the device's
+MSI vectors under the same hold of the claim lock that publishes the terminal state, closing a window
+where a replacement could claim the device between the two steps (the sibling M0098 finding). That is
+a correctness fix inside the release, and it does not touch this finding: the release was already
+synchronous end to end, and it still is.
+
+The asynchronous half remains built and consumed - `ClaimInfo::settled` defines the claim handle's
+readiness and the standing loop waits on it, which is what makes a FORCED teardown non-blocking
+today. What is missing is one specific thing: `SYS_DEVICE_RELEASE` would have to START the release
+and answer, with something else running the remaining steps and publishing `settled` when they
+finish, and this kernel has no thread to run them on. That is a kernel execution facility with its
+own lifetime, priority and failure questions, it is the same one the sibling M0153 finding needs for
+a bounded fault-servicing deadline, and building it is not a correction inside this milestone.
+
+I am not offering a smaller substitute, for the reason recorded before: handing the release to a
+userspace worker inside DeviceManager moves the block rather than removing it, because the syscall
+still runs to completion. M4's short non-blocking transitions and the definition of done's "one slow
+node cannot stop service to another" are not met for the manager-initiated path.
+
+## Verification for this round
+
+Every source change was made before the run started and nothing under `src/` was touched while it was
+in flight.
+
+| what | result |
+| --- | --- |
+| `./build.sh` x86_64 / riscv64 / aarch64 | 0, 0, 0 |
+| `./test.sh --arch x86_64` | **376 passed**, 0 failed |
+| `./test.sh --arch aarch64` | **364 passed**, 0 failed |
+| `./test.sh --arch riscv64` | ****367 passed**, 0 failed (a second run - see below)** |
+| `dma` host suite | **59 passed** (57 + the two new tail cases) |
+| `driver-binding` host suite | **60 passed** (58 + the two new teardown-composition cases) |
+| `verify-model` host suite | **116 passed** (115 + the per-profile step case) |
+| `check.sh --gate verify-model` | PASS |
+| `check.sh --gate qemu-arch-profiles` | PASS - all nine rows, including the firmware ITS device checkpoint |
+| `check.sh --gate qemu-virtio-iommu-x86_64` | PASS, on a freshly built image |
+| `check.sh --gate capability-trace` | PASS |
+| `check.sh --gate signed-boot` | PASS, after its paired `--kernel-on-volume` rebuild |
+
+THE FIRST riscv64 RUN OF THE SWEEP FAILED, AND IT IS THE DOCUMENTED FLAKE RATHER THAN THIS ROUND'S
+WORK. `kernel.sched.a_remote_spawn_wakes_a_halted_core_without_waiting_for_the_tick` asserted at
+2461343 woken cycles against 2142767 suppressed, a gap of 318576 over a self-calibrated floor of
+250000 - so it failed by 27% of a number the test derives from its own noise. I re-ran that one test
+four times on the same binary rather than assuming:
+
+```
+woken 2946843 (noise 302522), suppressed 2960432   PASS
+woken 2634433 (noise 855177), suppressed 2390843   PASS
+woken 1295185 (noise 228008), suppressed 2108696   PASS
+woken 1661823 (noise 738485), suppressed 2100216   PASS
+```
+
+The woken figure spans 1.30M to 2.95M - a factor of 2.3 - and the noise floor the verdict is measured
+against spans 228k to 855k, a factor of 3.7. The sweep's failing measurement sits inside that range.
+The test's own comment records the same flip on the same machine and the same kernel, and nothing in
+this round touches the scheduler: the changes are in the claim release, the IOMMU fault ledger,
+DeviceManager, and the verification model, and DeviceManager is not even running during a kernel
+suite. Because `test.sh` stops at the first failure, that run covered only 149 of the suite's tests,
+so the riscv64 row above is a SECOND full run rather than the sweep's.

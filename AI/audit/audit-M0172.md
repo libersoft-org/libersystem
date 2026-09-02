@@ -690,3 +690,38 @@ exist. Stating them as a pair is what makes a flip without the topology fail its
 pass quietly - which is the same shape the public rows already had and the reason they were safe.
 
 M8's fixture list is corrected to three rows and says which one was missing and why.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-09-01T23:25:58Z):
+
+Rating: 5/10
+
+1. **The signed public `--no-iommu` row has no build/image workflow that can produce the value it
+   selects.** The matrix makes the runtime flag select a UEFI image whose signed manifest contains
+   `no-iommu`, and says the public run/image path produces that value and the matching topology
+   together (`docs/todo/P02M0172.md:117-125,251-257`). In the current public workflow, however,
+   image construction is a separate prior step and `run.sh` only boots an existing ISO; its
+   `--no-iommu` branch merely removes the controller at runtime (`run.sh:46-54,142-145,168-196`).
+   The plan adds neither a degraded-image build input/artifact nor a check that the supplied image's
+   signed mode matches the selected topology. Thus the advertised command can pair an
+   `enforcing-required` signed image with no controller and must refuse under M6, while changing the
+   signed field at boot would violate M3. Freeze how the two signed image modes are produced and how
+   `run.sh --no-iommu` selects or validates the matching artifact.
+
+2. **Run-mode ownership is ambiguous on the actual development call chain.** M2 says the outermost
+   knowledgeable entry point sets the mode, that `test.sh` preserves a gate's pre-set value, but then
+   says both that `run.sh` sets `public` and the development instance sets `development`
+   (`docs/todo/P02M0172.md:75-92`). The development instance invokes `run.sh` with its environment
+   (`src/harness/lab.py:196-202,1137-1161`), so an implementation that follows the unqualified
+   `run.sh` instruction overwrites `development` and selects the public signed row. State the same
+   preserve-an-existing-value rule for this call chain, or otherwise make one of these two entry
+   points the sole producer, and gate the handoff.
+
+3. **The latest accepted development-transition correction still was not applied to its claimed
+   owner.** M0172 now says P02M0173 is not complete until it flips all three non-x86 rows, including
+   development, and assigns that milestone the post-transition fixture
+   (`docs/todo/P02M0172.md:148-185,529-539`). P02M0173 itself still requires only the ordinary direct
+   and UEFI `run.sh` rows and has no development-mode flip or admission oracle
+   (`docs/todo/P02M0173.md:160-176,178-188`). Consequently P02M0173 can satisfy its own Definition of
+   done while leaving the development carrier at `no-iommu`, which M0172's controller/mode rule then
+   refuses once the controller topology is present. The response correctly identified this missing
+   prerequisite contract but changed only the assigning side.
