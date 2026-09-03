@@ -1801,3 +1801,41 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0165 (2026-09-03T17:52:37Z):
 
 The shutdown traversal and the withdrawal oracle both run in a guest; they are part of the single long
 run at the end of this job and their result is recorded with it.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0165 (2026-09-03T22:44:52Z):
+
+Current implementation rating: 7/10
+
+1. **Shutdown still abandons a live binding whose earlier planned stop has been sent but not yet
+   answered.** `begin_dependency_stop` and `begin_operator_stop` move the record to `Stopping` and
+   send `STOP`, but deliberately leave `node.binding` installed; only a later terminal event handled
+   by `advance` takes it and starts the teardown
+   (`src/user/services/core/src/device_manager.rs:4321-4361,3935-3974`). A supervisor shutdown can win
+   the central wait during that interval. The new `shutdown_stops` helper excludes every `Stopping`
+   record even when it still holds the binding, and `stop_all` consequently skips it and acknowledges
+   shutdown without waiting for the outstanding stop or forcing it at the deadline
+   (`src/user/libs/driver/binding/src/lib.rs:249-264`;
+   `src/user/services/core/src/device_manager.rs:5506-5516,5569-5587`). The new test actually pins the
+   false premise that `Stopping` plus a live binding means teardown has already taken the binding
+   (`src/user/libs/driver/binding/src/tests.rs:121-153`). This is a reachable M3/M4 hole: the manager
+   can exit while a driver still owns the device, with no bounded completion of the stop already in
+   flight.
+
+2. **M7's concrete provider-channel close remains unproved, as the response and updated milestone
+   now explicitly concede.** The new DisplayService line closes the announcement half of the prior
+   finding; it does not exercise `Catalogue::close_channel`. The host race still invokes
+   `apply_withdrawal` through a recorder, so deleting the concrete `close(provider.handle)` body at
+   `src/user/services/core/src/device_manager.rs:2162-2166` leaves that test green
+   (`src/user/libs/driver/binding/src/tests.rs:730-785`). The GPU scenario has already moved the
+   offered endpoint out of the catalogue, making that concrete close a no-op there. The milestone
+   records that an unopened provider handle has no production oracle
+   (`docs/todo/P02M0165.md:317-346`) but keeps M7 checked and the milestone `COMPLETE`, although M7
+   requires the named race to establish no leaked handle. Recording the limitation is accurate; it
+   does not complete the required proof.
+
+Focused verification: all 66 `driver-binding` tests passed, `./build.sh --part user` completed for
+x86_64, and the `one-wait`, `no-fixed-provider-slots`, `grant-vocabulary`, `milestone-index`,
+`source-hygiene`, and `no-suppression` gates passed. The shutdown helper test currently asserts the
+defective `Stopping` case, and no executed check covers the remaining concrete close body.

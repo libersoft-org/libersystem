@@ -1626,3 +1626,50 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0166 (2026-09-03T17:52:37Z):
     ./build.sh --part user                                                          built (x86_64)
     ./check.sh --gate one-wait,no-fixed-provider-slots                              passed
     ./check.sh --gate source-hygiene,no-suppression,milestone-index                 clean
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0166 (2026-09-03T22:44:52Z):
+
+Current implementation rating: 6/10
+
+1. **Disabling a node in `Backoff` leaves its retry deadline armed and can turn the standing loop
+   into a permanent busy loop.** Direct disable is an expressly supported `Backoff -> Disabled`
+   transition (`docs/todo/P02M0166.md:48-55`), but the direct arm changes only the record and leaves
+   `node.retry_at` intact (`src/user/services/core/src/device_manager.rs:4372-4410`). The standing
+   loop includes every nonzero retry deadline in its global `soonest` value without checking the
+   state, while only a `Backoff` node clears a due retry
+   (`src/user/services/core/src/device_manager.rs:497-525`). Once the disabled node's deadline is in
+   the past, `wait_any` keeps returning the deadline result and the loop immediately continues
+   (`src/user/services/core/src/device_manager.rs:655-706`); nothing can clear that stale value. A
+   valid operator disable can therefore make DeviceManager consume the scheduler continuously and
+   starve its service work.
+
+2. **An idempotent `enable` corrupts a dependency-loss stop that is already in flight.** A lost
+   requirement records `DependencyLost`, enters `Stopping`, sends `STOP`, and retains the binding
+   until the answer arrives (`src/user/services/core/src/device_manager.rs:4306-4338`).
+   `decide_policy` rejects `enable` only for an operator-disable stop, so it accepts this state
+   (`src/user/services/core/src/device_manager.rs:4763-4773`); `apply_policy` then unconditionally
+   overwrites the intent with `Fault` before its illegal `Stopping -> Unbound` transition fails
+   (`src/user/services/core/src/device_manager.rs:4413-4447`). A valid `STOPPED` from the driver is
+   consequently rejected because the receive path admits it only when the intent is not `Fault`
+   (`src/user/services/core/src/device_manager.rs:3064-3075`). Instead of merely removing an absent
+   disable preference, `enable` converts an unrelated planned dependency stop into a crash/fault
+   path, losing its required `DependencyPending` landing.
+
+3. **Incident persistence marks an explicitly refused write as durable and never retries it.** The
+   generated ConfigService client returns `Option<Result<(), Error>>`, and `Config::set` now correctly
+   restores its in-memory tree and returns `Error::Io` when write-through fails
+   (`src/user/libs/protocol/config-proto/src/generated/liber/config/v1.rs:473-504`;
+   `src/user/services/core/src/config_service.rs:244-271`). `persist_incidents`, however, retries only
+   when that call returns outer `None`; every `Some(Err(_))` falls through to
+   `node.incident_stored = true` (`src/user/services/core/src/device_manager.rs:4889-4978`). The sole
+   surviving snapshot then exists in neither ConfigService memory nor storage, and the node will not
+   attempt the write again. If DeviceManager dies, M5's required post-manager diagnostic snapshot is
+   lost (`docs/todo/P02M0166.md:244-253,349`).
+
+Focused verification: all 66 `driver-binding` tests passed, `./build.sh --part user` completed for
+x86_64, and the `one-wait`, `no-fixed-provider-slots`, `grant-vocabulary`, `milestone-index`,
+`source-hygiene`, and `no-suppression` gates passed. The newly added helper-sequence test does not
+execute these production state/effect compositions, so those passing checks do not contradict the
+three defects above.
