@@ -153,9 +153,21 @@ impl History {
 		if let Some(id) = step_id.filter(|id| !id.is_empty()) {
 			let entry = self.steps.entry(id.to_string()).or_default();
 			entry.last_run = now();
-			entry.last_seconds = step_seconds;
 			entry.runs += 1;
 			entry.model_hash = model_hash.to_string();
+			// A STEP THAT DID NOT RUN IS NOT A MEASUREMENT OF WHAT RUNNING COSTS - the same rule
+			// the fixed-term overshoot below already states, applied to the number the SCHEDULER
+			// orders on (fixed 2026-09-03).
+			//
+			// The duration was stored unconditionally and `step_seconds` reads it back with no
+			// status check, so a step that failed at its first instruction became the measured cost
+			// of the successful future step with that id: a two-second failure prices a ten-minute
+			// boot, and cheapest-first then puts it in front of everything. The freshness above is
+			// still recorded - the step really did run at that time - and only the COST is withheld,
+			// so the estimate stands until a run finishes.
+			if passed && step_seconds > 0.0 {
+				entry.last_seconds = step_seconds;
+			}
 		}
 		if keys.is_empty() {
 			return;
@@ -214,6 +226,21 @@ impl History {
 		// `check.sh` call could each have been a step - `check.sh --gate <one>` is a command - so
 		// their share is one duration divided by how they happened to be batched.
 		let divided = keys.len() > 1 && keys.iter().any(|key| key.environment == crate::catalog::Environment::Host);
+		// AND A FAILED MERGED STEP RECORDS NOTHING PER KEY (fixed 2026-09-03).
+		//
+		// `check.sh` runs its gates in order and STOPS at the first failure, so stamping every key
+		// of a merged step as having run and failed is a claim about members that never started -
+		// measured 2026-08-28, `capability-trace` refused as the fifth of forty-five and all
+		// forty-five were recorded. `discard-divided-costs` repairs exactly this, and could only be
+		// invoked by hand while every failed merged run recreated it. The repair belongs where the
+		// record is written: a member that did not run is not stale, it is unknown, and the honest
+		// answer is to file nothing for it.
+		//
+		// A step with ONE key is different and keeps its record: there is no member that could have
+		// been skipped, so its failure is evidence about the thing it names.
+		if !passed && keys.len() > 1 {
+			return;
+		}
 		for key in keys {
 			self.record_with(&key.display(), passed, share, model_hash, divided);
 		}

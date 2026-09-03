@@ -526,7 +526,16 @@ fn a_release_that_lands_mid_map_leaves_no_mapping_behind() {
 	assert!(crate::arch::paging::translate(base).is_some(), "the entries are installed, which is the state the release has to survive");
 
 	// THE RELEASE ARRIVES HERE, one instruction before the commit.
-	device::release_claim(key).expect("released");
+	//
+	// AND WHAT IT PUBLISHES IS THE PROPERTY, NOT ONLY WHAT THE COMMIT DOES AFTERWARDS (2026-09-03).
+	// The sweep meets the reservation sentinel with the page table entries above ALREADY INSTALLED,
+	// and it can neither find them nor remove them - the builder is the only thing that can. A
+	// release that answered `Free` there handed the device to the next claimant across an interval
+	// in which the previous holder's virtual address still reached the BAR. An unconfirmed teardown
+	// is the honest answer and `Quarantined` is what this system does with one.
+	let state = device::release_claim(key).expect("released");
+	assert_eq!(state, device::ClaimState::Quarantined, "a release that could not confirm the mapping was gone does not publish the device as free");
+	assert_eq!(device::claim_state(index), Some(device::ClaimState::Quarantined), "and the claim stays out of circulation for the rest of the boot");
 
 	// AND THE COMMIT IS REFUSED, which is the fix. Publishing here would leave a mapping no sweep
 	// will ever visit.
@@ -538,6 +547,48 @@ fn a_release_that_lands_mid_map_leaves_no_mapping_behind() {
 	// AND THE OBJECT IS TERMINAL: a second attempt cannot reserve it again, so a holder cannot simply
 	// call map once more after the claim is gone.
 	assert!(!memory.claim_mapping(), "a revoked device memory is never mappable again");
+}
+
+crate::tagged_test!(a_mapping_the_sweep_cannot_reach_keeps_the_claim_out_of_free, [Object, Kernel, Pci, Paging], id = "kernel.object.claim.a_mapping_the_sweep_cannot_reach_keeps_the_claim_out_of_free", covers = ["kernel"]);
+fn a_mapping_the_sweep_cannot_reach_keeps_the_claim_out_of_free() {
+	// A LIVE MAPPING THE DERIVED SWEEP ANSWERS `true` FOR, which is the second half of the same
+	// race the reservation test covers.
+	//
+	// `revoke_derived` reaches each derived object through a WEAK reference and counts every row
+	// whose object is already gone as quiet. That is the ordinary case - a driver that closed its
+	// handle - and it is ALSO the case where the last `Arc` is being dropped right now:
+	// `Weak::upgrade` fails as soon as the strong count reaches zero, which is before
+	// `DeviceMemory::drop` has unmapped anything or flushed any other core. The claim went `Free`
+	// and the unmap happened afterwards.
+	//
+	// Reproduced without racing a destructor, because the observable state is the same one: a
+	// committed mapping the sweep cannot reach. The object is simply not registered, so the sweep
+	// finds no row at all - exactly what it finds when a row's object has just gone - and the only
+	// thing that can keep the claim out of `Free` is the device's own count of outstanding MMIO
+	// work.
+	use crate::object::device_memory::DeviceMemory;
+	let index = device::add_synthetic_device();
+	let key = device::claim(index).expect("claimed");
+	let memory = DeviceMemory::for_claim(key, 0xfeed_2000, 0x1000).expect("a device memory");
+
+	let space = crate::sched::kernel_as();
+	let base = space.alloc_vrange(crate::mem::frame::PAGE_SIZE);
+	assert_ne!(base, 0, "a virtual range for the mapping");
+	assert!(memory.claim_mapping(), "the reservation is taken");
+	let flags = crate::arch::paging::PRESENT | crate::arch::paging::WRITABLE | crate::arch::paging::NO_CACHE | crate::arch::paging::NO_EXECUTE;
+	space.map(base, memory.aligned_phys_base(), flags);
+	assert!(memory.commit_mapping(base, space.clone()), "the mapping is published, which is what the device's count is raised at");
+
+	// THE SWEEP HAS NOTHING TO FIND, and that is not the same as nothing being mapped.
+	let state = device::release_claim(key).expect("released");
+	assert_eq!(state, device::ClaimState::Quarantined, "a device with a mapping of its registers still standing is not published free");
+	assert!(crate::arch::paging::translate(base).is_some(), "and the mapping really was still installed while that decision was made");
+
+	// The object's own teardown then runs and takes it down, which is what a real destructor would
+	// have been doing while the sweep looked.
+	drop(memory);
+	assert!(crate::arch::paging::translate(base).is_none(), "the teardown removes the mapping");
+	assert_eq!(device::claim_state(index), Some(device::ClaimState::Quarantined), "and a teardown that finished after the release does not un-quarantine the device");
 }
 
 crate::tagged_test!(a_rolled_back_msi_acquire_does_not_unbind_the_slots_next_owner, [Object, Kernel, Interrupt], id = "kernel.object.claim.a_rolled_back_msi_acquire_does_not_unbind_the_slots_next_owner", covers = ["kernel"]);

@@ -18,7 +18,7 @@ const EVERY_STATE: [BindingState; 9] = [
 
 // The table, written out a second time and independently, so this test disagrees with the
 // implementation rather than restating it.
-const LEGAL: [(BindingState, BindingState); 26] = [
+const LEGAL: [(BindingState, BindingState); 28] = [
 	(BindingState::Unbound, BindingState::Binding),
 	(BindingState::Binding, BindingState::Online),
 	(BindingState::Binding, BindingState::Backoff),
@@ -50,6 +50,11 @@ const LEGAL: [(BindingState, BindingState); 26] = [
 	(BindingState::Failed, BindingState::Disabled),
 	(BindingState::DependencyPending, BindingState::Disabled),
 	(BindingState::Disabled, BindingState::Unbound),
+	// A PERMANENT FAILURE THAT HAPPENS BEFORE ANY ATTEMPT. No candidate artifact is on the volume,
+	// or the one selected does not declare this build's driver protocol and is refused before the
+	// claim. Neither is a driver that ran, and without these edges neither could be recorded at all.
+	(BindingState::Unbound, BindingState::Failed),
+	(BindingState::DependencyPending, BindingState::Failed),
 ];
 
 #[test]
@@ -60,6 +65,69 @@ fn exactly_the_table_is_legal_and_nothing_else_is() {
 			assert_eq!(from.may_move_to(to), expected, "{:?} -> {:?}", core::str::from_utf8(from.name()), core::str::from_utf8(to.name()));
 		}
 	}
+}
+
+#[test]
+fn a_node_that_never_got_to_attempt_anything_still_records_why() {
+	// THE TWO PRE-ATTEMPT FAILURES, which are the ones this table used to have no destination for.
+	//
+	// `Failed` was reachable only from a state a driver had run in, so recording "every candidate
+	// artifact is missing" or "this artifact does not speak our protocol" attempted an edge that did
+	// not exist. The move was refused, its answer was discarded, and the served record stayed
+	// `Unbound` with no cause - which is the one thing an operator needs to tell a packaging fault
+	// from a device nothing has tried yet.
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Failed, Some(FailureCause::DriverMissing)), "a node with nothing on the volume to try records that");
+	assert!(record.state == BindingState::Failed, "a pre-attempt failure is terminal");
+	assert!(record.failure == Some(FailureCause::DriverMissing), "and the cause with it");
+
+	let mut parked = BindingRecord::new();
+	assert!(parked.move_to(BindingState::DependencyPending, None));
+	assert!(parked.move_to(BindingState::Failed, Some(FailureCause::ProtocolMismatch)), "the same for a node whose requirements had just arrived");
+	assert!(parked.failure == Some(FailureCause::ProtocolMismatch), "and the cause with it");
+
+	// AND IT IS STILL NOT A WAY INTO `Failed` FROM A RUNNING BINDING. `Online -> Failed` would
+	// bypass the teardown, which is the reason the edge is absent.
+	assert!(!BindingState::Online.may_move_to(BindingState::Failed), "a driver that came up fails through its teardown, never directly");
+}
+
+#[test]
+fn a_disable_uses_the_teardown_wherever_there_is_one_to_use() {
+	use crate::{DisableAction, disable_action};
+	// THE THREE CASES, AND THE TWO THAT WERE MISSING.
+	//
+	// A disable that only relabels the record leaves whatever the node was holding attached to it:
+	// a live process and a claimed device for a binding past its claim, and an unresolved teardown
+	// for one already stopping. Both are reachable - `begin_bind` installs the binding while the
+	// node is still `Binding`, and an operator can disable a device that is already being torn down
+	// - and both used to take the direct move.
+	assert_eq!(disable_action(BindingState::Online, true, false), DisableAction::StopTheBinding, "a running driver is asked to stop");
+	assert_eq!(disable_action(BindingState::Binding, true, false), DisableAction::StopTheBinding, "and so is one that has taken the device but not reported ready");
+	assert_eq!(disable_action(BindingState::Binding, false, false), DisableAction::RecordItDirectly, "before the claim there is nothing to give back");
+	assert_eq!(disable_action(BindingState::Stopping, true, true), DisableAction::RelandTheTeardown, "a teardown under way is the one that completes");
+	// A SECOND DISABLE DOES NOT QUEUE A SECOND TEARDOWN, whatever state the record says: what the
+	// node HOLDS is the question, and a teardown in flight answers it.
+	assert_eq!(disable_action(BindingState::Online, true, true), DisableAction::RelandTheTeardown);
+	for &state in [BindingState::Unbound, BindingState::Backoff, BindingState::Failed, BindingState::DependencyPending].iter() {
+		assert!(disable_action(state, false, false) == DisableAction::RecordItDirectly, "{:?} holds nothing", core::str::from_utf8(state.name()));
+		assert!(state.may_move_to(BindingState::Disabled), "{:?} has the edge that direct move needs", core::str::from_utf8(state.name()));
+	}
+	// AND WHERE A RELANDED TEARDOWN GOES. `Stopping -> Disabled` is the edge, and the intent is what
+	// selects it.
+	assert!(crate::StopIntent::OperatorDisable.confirmed_lands_at(true) == Some(BindingState::Disabled), "an operator's stop lands disabled");
+	assert!(BindingState::Stopping.may_move_to(BindingState::Disabled));
+}
+
+#[test]
+fn an_operators_one_attempt_is_not_turned_back_into_the_automatic_budget() {
+	use crate::budget_after_nothing_ran;
+	// A GRANTED RETRY IS `MAX - 1` WITH A FLAG, so any code that "resets the counter because nothing
+	// ran" hands the operator the whole budget the grant exists to withhold. Three places reach this
+	// - a missing artifact, a candidate that could not be started, and a parked node whose
+	// requirement has arrived - and the third was doing the reset unconditionally.
+	assert_eq!(budget_after_nothing_ran(false, 2), 0, "with no operator grant, nothing having run means the automatic budget starts again");
+	assert_eq!(budget_after_nothing_ran(true, 2), 2, "with one, the counter it was set to is kept");
+	assert_eq!(budget_after_nothing_ran(true, 0), 0, "and it is the counter that is kept, not a floor");
 }
 
 #[test]

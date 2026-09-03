@@ -1896,3 +1896,34 @@ PLAN CHANGES (`docs/todo/P02M0099.md`):
   device identity for the firmware-described MMIO alternative - and points at the item;
 - the conclusion gains a paragraph stating that `16550`'s cost is the shared serial decision PLUS one
   of those two blockers, and the "cheap drivers" sentence no longer carries that claim.
+
+AUDITOR'S RE-AUDIT OF PLAN M0099 (2026-09-03T03:29:08Z):
+
+Rating: 6/10
+
+1. **The prerequisite assessment's stated conditions for eventual driver acceptance are incomplete.**
+   The matrix treats P02M0098 as the ordinary claim/rollback floor, gives P02M0153 no unsatisfied
+   verdict on the DMA row, and makes the universal P02M0162 row block specifically until synchronous
+   release is removed (`docs/todo/P02M0099.md:102-156`; it later calls P02M0098 the completed
+   foundation at `:1550-1553`). Current code violates material contracts in all three prerequisites:
+   forced P02M0098 release can publish `Free` while an MMIO mapping is live or its teardown is still
+   running (`AI/audit/audit-M0098.md:1219-1244`); P02M0153 can leave faults raised during bring-up
+   unserviced and can attribute a live replacement's continuing faults to an old undrained tail
+   (`AI/audit/audit-M0153.md:1425-1452`); and P02M0162 still loses two permanent pre-bind failures and
+   lets duplicate terminal frames mutate the candidate cursor (`AI/audit/audit-M0162.md:1100-1126`).
+   Removing the one P02M0162 condition named here, or consulting the prerequisites' `COMPLETE`
+   labels, would therefore still let an item be accepted against broken claim, DMA-containment, and
+   binding-state contracts. The relevant rows must remain unsatisfied for these current failures too;
+   naming only the historical blocker makes the matrix stale by construction.
+
+2. **The rewritten P02M0167 row still overstates the scheduler proof and understates what remains.**
+   It says the registered matrix covers every required case, that ordering is specified and asserted,
+   and that only clean-tree invocation remains (`docs/todo/P02M0099.md:213-240`). The current
+   implementation re-audit establishes otherwise: the gate is also red on the dirty-worktree path it
+   is intended to exercise; the scheduler sorts by an unseeded estimate, merges independently runnable
+   guest gates into a falsely cheap host step, and treats `--budget 0` as unlimited; and failed or
+   partly unexecuted merged steps still contaminate both cost history and per-key freshness
+   (`AI/audit/audit-M0167.md:1414-1447`). Those are direct P02M0167 M4 properties, not merely an
+   unattended-run wrapper problem. Consequently this roadmap cannot treat the scheduler half as built
+   or qualify acceptance only for the medium race; evidence remains unreliable until those execution,
+   budgeting, and history semantics are actually enforced and proved.

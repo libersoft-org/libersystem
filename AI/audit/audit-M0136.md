@@ -1641,3 +1641,33 @@ PLAN CHANGES:
   says what omitting `source` would do, since that is the mistake that passes every existing check;
 - a GATE line: the ordinary `font-catalogue` row and the `FONTADMIN` row resolve to DIFFERENT serve
   roots of the same provider, asserted rather than assumed.
+
+AUDITOR'S RE-AUDIT OF PLAN M0136 (2026-09-03T03:28:57Z):
+
+Rating: 6/10
+
+1. **The `RESOLVE-INFO`/`RESOLVE-INTO` generation check does not bind the returned bytes to the
+   published face identity.** The plan says a replacement between the two calls changes the identity
+   and generation, so a stale `RESOLVE-INTO` is refused (`docs/todo/P02M0136.md:486-491`). That is
+   not necessarily true: the generation changes only after the catalogue processes a `volume.watch`
+   hint and completes a rescan (`:242-258`), and the plan explicitly acknowledges that watch events
+   can be dropped. Because the catalogue retains metadata rather than face bytes (`:675-684`), an
+   `INTO` accepted under the still-current old generation can read replacement bytes before the watch
+   is handled, or indefinitely after a dropped hint, and return them under the old content identity.
+   A client can then reuse decoded data or glyph-cache entries for different bytes under the same
+   identity and generation. Require the bytes used by `RESOLVE-INTO` to come from a stable snapshot
+   whose digest is checked against the published identity before the reply, with a typed refusal and
+   rescan on mismatch. Gate a replacement after INFO but before watch processing, including the
+   dropped-watch case.
+
+2. **Runtime replacement bypasses the metadata truth oracle while the plan claims that it cannot.**
+   Catalogue metadata is a checked-in declaration and its only semantic check is the later parser
+   gate over every *staged* face (`docs/todo/P02M0136.md:524-544`). At runtime the catalogue accepts a
+   face and sidecar when their digests agree and the declared fields fit closed vocabularies
+   (`:546-550`), then republishes changes discovered through the writable destination (`:242-258`).
+   A runtime replacement can therefore carry a digest-consistent but false family, style, axes, face
+   index, or format declaration; hashing proves association, not truth. It never passed the staged
+   parser gate, yet it can steer fallback and resolution, contrary to the assertion that a runtime
+   drop cannot smuggle metadata past review. Either admit runtime replacements only from artifacts
+   already checked by the profiled parser, or validate the declaration before publication. A
+   mismatching runtime replacement must leave the previous generation current in a regression gate.

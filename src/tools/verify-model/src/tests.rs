@@ -1622,7 +1622,12 @@ fn the_build_evidence_producer_runs_on_the_architectures_the_plan_builds() {
 	// that they shared a variable, so the assertion is on the text of the script rather than on a
 	// property that would still hold if it went back to sharing.
 	const VERIFY: &str = include_str!("../../../../verify.sh");
-	assert!(VERIFY.contains("-- built --stdin"), "verify.sh asks the planner which architectures to BUILD on");
+	// The candidate arguments sit between the tool and its subcommand, so the assertion is on the
+	// subcommand and its input rather than on the whole invocation - see the note at the top of the
+	// shadow block: every question in that path is asked of ONE model, and when a candidate is given
+	// that model is the candidate.
+	assert!(VERIFY.contains("built --stdin"), "verify.sh asks the planner which architectures to BUILD on");
+	assert!(VERIFY.contains(r#"-- "${candidate_arg[@]}" built --stdin"#), "and it asks the CANDIDATE when there is one, or the run executes the active model's wider selection and compares it against the narrower one");
 	assert!(VERIFY.contains("for build_arch in $build_targets; do"), "and the build-evidence producer loops over that set rather than the booted one");
 	assert!(VERIFY.contains("for target in $targets; do"), "while the guest shadow keeps the booted set");
 }
@@ -2141,6 +2146,50 @@ fn five_different_changes_are_five_pieces_of_evidence_even_when_the_decision_is_
 	}
 	let distinct = log.distinct_evidence_for_pair("kernel.mem", "candidate-hash", crate::shadow::Universe::TestGuest, None);
 	assert_eq!(distinct, 5, "five different changes producing one decision must count as five pieces of evidence, or a frozen-subsystem candidate can never reach the threshold it is graded against");
+}
+
+#[test]
+fn five_real_changes_through_the_real_planner_reach_the_threshold() {
+	// THE SAME PROPERTY, DRIVEN THROUGH THE PRODUCTION PATH (2026-09-03).
+	//
+	// The fixture above hands `distinct_evidence_for_pair` five digests written by hand, so it
+	// proves the COUNTING and says nothing about whether the planner can produce five distinct
+	// digests for one subsystem - which is the thing the milestone doubted, and the reason it asks
+	// for a planner test rather than a unit one. This runs real paths through `Planner` and takes
+	// the digests from `component_scopes`, which is the function `shadow` records with.
+	//
+	// A MULTI-FILE SUBSYSTEM FIRST. Five different files of `src/kernel/mem`, each a real file with
+	// real content: the plan's decision about the component is the same every time, and the digests
+	// differ because the CHANGES differ.
+	let model = model();
+	let files = ["src/kernel/mem/mod.rs", "src/kernel/mem/tlb.rs", "src/kernel/mem/vapool.rs", "src/kernel/mem/frame/mod.rs", "src/kernel/mem/heap/mod.rs"];
+	let mut digests: BTreeSet<String> = BTreeSet::new();
+	let mut decisions: BTreeSet<String> = BTreeSet::new();
+	for path in files {
+		let plan = plan_for(&model, &[path]);
+		let scopes = crate::shadow::component_scopes(&model.repo_root, &plan, &std::collections::BTreeMap::new(), &model.registry);
+		let (component, scope) = scopes.iter().find(|(component, _)| component.starts_with("kernel")).expect("a kernel component owns src/kernel/mem");
+		assert!(!scope.changed_digest.is_empty(), "{path} produced no change digest, so no evidence about it could ever be distinct");
+		digests.insert(scope.changed_digest.clone());
+		decisions.insert(keys(&plan).into_iter().collect::<Vec<_>>().join(","));
+		let _ = component;
+	}
+	assert_eq!(digests.len(), 5, "five real changes to one subsystem must produce five distinct digests, or the threshold is unreachable by construction");
+	assert_eq!(decisions.len(), 1, "and they must be the SAME decision, or this fixture is not the deadlock it is about");
+
+	// AND A SINGLE-FILE SUBSYSTEM, which is the case the cheap answer gets wrong: five edits to one
+	// file share one path set, so a digest over paths alone would give one piece of evidence for all
+	// five. The KIND is part of the tuple, and five kinds of change to one path are five changes.
+	let one_file = "src/kernel/elf.rs";
+	let mut single: BTreeSet<String> = BTreeSet::new();
+	for kind in ["modified", "added", "deleted", "renamed", "copied"] {
+		let explicit: std::collections::BTreeMap<String, String> = [(String::from(one_file), String::from(kind))].into_iter().collect();
+		let plan = plan_for(&model, &[one_file]);
+		let scopes = crate::shadow::component_scopes(&model.repo_root, &plan, &explicit, &model.registry);
+		let scope = scopes.values().find(|scope| !scope.changed_digest.is_empty()).expect("the one file's component has a digest");
+		single.insert(scope.changed_digest.clone());
+	}
+	assert_eq!(single.len(), 5, "a single-file subsystem's five kinds of change are five changes, or its risk class can never be narrowed");
 }
 
 #[test]

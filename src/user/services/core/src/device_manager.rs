@@ -452,8 +452,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// A connection to each block provider for whoever has to CHOOSE among them - see
 		// `mint_connection` and the `PROBE` tags below.
 		let mut probe_blocks: Vec<u64> = Vec::new();
-		let mut usb_client: u64 = 0;
-		let mut usbq_client: u64 = 0;
 		let mut raw_keys: u64 = 0;
 		// What a post-`Online` restart needs, filled in by phase two. See `Recovery`.
 		let mut recovery: Recovery = Recovery::none();
@@ -710,9 +708,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
 					#[cfg(feature = "development")]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut usb_client, &mut usbq_client, &mut raw_keys, &mut recovery, &mut dev);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut raw_keys, &mut recovery, &mut dev);
 					#[cfg(not(feature = "development"))]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut usb_client, &mut usbq_client, &mut raw_keys, &mut recovery);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut raw_keys, &mut recovery);
 					// NOT CLOSED: `Recovery` holds it, because rebinding a crashed driver means
 					// reading its artifact off the volume again. See `Recovery`.
 					// THE TAG CARRIES A FACT, NOT A CHANNEL - the network half, the same shape as the
@@ -742,8 +740,34 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// of the two it used to hold and keeps no count of them.
 					let pointers: [u8; 6] = [b'I', b'N', b'P', b'U', b'T', u8::from(catalogue.count_of(driver_protocol::provider::INPUT) > 0)];
 					send_blocking(bootstrap, &pointers, 0);
-					send_blocking(bootstrap, b"USB", usb_client);
-					send_blocking(bootstrap, b"USBBUS", usbq_client);
+					// THE USB CONTROLLER'S OWN PROVIDERS, MINTED HERE RATHER THAN LATCHED WHEN THEY
+					// WERE PUBLISHED (2026-09-03).
+					//
+					// These were two singleton locals - `usb_client` and `usbq_client` - filled by a
+					// hand-written route the first time an xHCI binding reported, with `take_from`
+					// MOVING each offered channel out of the catalogue and `if *slot == 0` closing
+					// every later one. So a second controller, and the replacement providers of a
+					// controller that rebound, had nowhere to go and were not reachable through the
+					// catalogue either: the entry was still there and its handle was gone.
+					//
+					// The publications stay in the catalogue now and a connection is MINTED for the
+					// consumer at the moment the hand-off is made, which is the same thing the block
+					// probes do. Which providers are the USB controller's is a question about the
+					// catalogue rather than a driver name: a `block` provider published by a binding
+					// that also publishes `usb-bus` is a USB volume, and that is the origin rule M2
+					// states - the manager knows which controller published a provider, the medium
+					// cannot say.
+					//
+					// The count travels beside the connection, so a machine with a second controller
+					// says so instead of being described by the one variable that used to exist.
+					let usb_volumes: Vec<usize> = catalogue.slots_published_beside(driver_protocol::provider::BLOCK, driver_protocol::provider::USB_BUS);
+					let usb_buses: Vec<usize> = catalogue.slots_of_kind(driver_protocol::provider::USB_BUS);
+					let usb_volume: u64 = usb_volumes.first().map_or(0, |slot| mint_connection(&mut catalogue, &nodes, *slot));
+					let usb_bus: u64 = usb_buses.first().map_or(0, |slot| mint_connection(&mut catalogue, &nodes, *slot));
+					let usb: [u8; 4] = [b'U', b'S', b'B', usb_volumes.len().min(u8::MAX as usize) as u8];
+					send_blocking(bootstrap, &usb, usb_volume);
+					let usbbus: [u8; 7] = [b'U', b'S', b'B', b'B', b'U', b'S', usb_buses.len().min(u8::MAX as usize) as u8];
+					send_blocking(bootstrap, &usbbus, usb_bus);
 					// the xhci driver's pointer-event channel (a USB pointing device;
 					// InputService folds it alongside the virtio pointer's).
 					let usb_pointers: [u8; 7] = [b'I', b'N', b'P', b'U', b'T', b'2', u8::from(catalogue.count_of(driver_protocol::provider::POINTER) > 0)];
@@ -987,7 +1011,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], usb_client: &mut u64, usbq_client: &mut u64, raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -1065,9 +1089,9 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 					Step::Online => {
 						state[nodes[at].index as usize] = STATE_ONLINE;
 						#[cfg(feature = "development")]
-						route_offers(&mut nodes[at], catalogue, name, storage, console_input, usb_client, usbq_client, dev);
+						route_offers(&mut nodes[at], catalogue, name, storage, console_input, dev);
 						#[cfg(not(feature = "development"))]
-						route_offers(&mut nodes[at], catalogue, name, usb_client, usbq_client);
+						route_offers(&mut nodes[at], name);
 					}
 					// The same candidate, once more. The window and the attempt budget have already
 					// said there is room for it.
@@ -1161,8 +1185,13 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 				// precisely so an operator can tell a packaging fault from a driver that ran and
 				// failed. Recorded here rather than at each miss, because "this one is not there" is
 				// only a failure of the NODE once there is nothing else to try.
-				if missing && node.record.state == BindingState::Unbound {
-					node.record.move_to(BindingState::Failed, Some(FailureCause::DriverMissing));
+				// AND THE MOVE'S ANSWER IS READ. It was discarded, and the transition it attempts -
+				// `Unbound -> Failed` - was not in the table at all, so the record stayed `Unbound`
+				// with no cause: the one state that says a packaging fault happened here was the one
+				// that could not be reached. The edge exists now; reading the answer is what stops
+				// the next reader from having to find that out again.
+				if missing && matches!(node.record.state, BindingState::Unbound | BindingState::DependencyPending) && !node.record.move_to(BindingState::Failed, Some(FailureCause::DriverMissing)) {
+					print(b"DeviceManager: a device whose every candidate artifact is missing could not be recorded as failed\n");
 				}
 				return;
 			}
@@ -1190,9 +1219,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 				// is missing opened three attempts on the second. Nothing ran, so the operator's one
 				// attempt is not spent; what must not happen is it turning back into the automatic
 				// budget it was set one below.
-				if !node.retry_once {
-					node.attempt = 0;
-				}
+				node.attempt = driver_binding::budget_after_nothing_ran(node.retry_once, node.attempt);
 				continue;
 			};
 			let elf: &[u8] = core::slice::from_raw_parts(mapped as *const u8, size);
@@ -1222,9 +1249,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 			// STARTED does not spend an operator's one attempt, and must not restore the automatic
 			// budget either. The flag itself is consumed where an attempt actually ends - the two
 			// `Step::NextCandidate` handlers - and when a bind comes online.
-			if !node.retry_once {
-				node.attempt = 0;
-			}
+			node.attempt = driver_binding::budget_after_nothing_ran(node.retry_once, node.attempt);
 		}
 	}
 }
@@ -1235,7 +1260,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 // extra two told apart by the literal bytes `USBBUS` and `POINTER` in the messages that followed -
 // so what a capability was for was decided by parsing a string the driver chose.
 #[allow(clippy::too_many_arguments)]
-unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, usb_client: &mut u64, usbq_client: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn route_offers(node: &mut Node, #[cfg(feature = "development")] catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let _ = driver_name;
 		// PUBLISHED FIRST, ROUTED SECOND. Everything this binding offered enters the catalogue with
@@ -1297,17 +1322,14 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		}
 		// The pointer flavour of virtio_input offers an INPUT provider; the keyboard flavour offers
 		// none, so an absent one is a state rather than a failure.
-		// The xHCI driver offers up to three: the USB stick's block service (absent when no
-		// mass-storage device is attached), its bus query channel for the `lsusb` inventory, and a
-		// pointer-event channel for a USB pointing device. All three arrived in ONE handshake and
-		// were held unpublished until its `READY`, so a controller that died between them published
-		// nothing.
-		if *usb_client == 0 {
-			*usb_client = catalogue.take_from(node.id, driver_protocol::provider::BLOCK);
-		}
-		if *usbq_client == 0 {
-			*usbq_client = catalogue.take_from(node.id, driver_protocol::provider::USB_BUS);
-		}
+		// AND THE USB CONTROLLER'S PROVIDERS ARE NOT ROUTED HERE ANY MORE EITHER (2026-09-03).
+		//
+		// Its block service and its `usb-bus` query channel were taken into two singleton locals of
+		// this program's the first time an xHCI binding reported, which is the last hand-written
+		// route this milestone had left and the last pair of fixed slots. Both publications now stay
+		// in the catalogue with their offered channels intact, and the phase-two hand-off mints a
+		// connection for the consumer that needs one - so a second controller's providers, and the
+		// replacements a rebound controller publishes, are reachable rather than closed.
 		// ANYTHING STILL HELD IS A PROVIDER NOBODY ROUTES, and it is closed rather than leaked: a
 		// handle this service keeps forever is a channel the driver waits on forever.
 		node.offers.close_all();
@@ -2301,6 +2323,13 @@ impl Catalogue {
 	// inside `route_offers` and is therefore origin-scoped by construction. It is not: where a call
 	// SITS says nothing about what it SELECTS, and this one selected from the whole catalogue. The
 	// binding is what makes origin a rule rather than a likelihood, so it is passed in.
+	// THE LAST ROUTE THIS TAKES, and it is not a shipping one (2026-09-03).
+	//
+	// Every consumer of a published provider now subscribes or is handed a minted connection, so the
+	// only caller left is the development channel's raw byte pipe - which is not a provider anybody
+	// opens: it is the wire an agent this program starts speaks over, and it belongs to that agent
+	// alone. A shipping image has no such driver, so this method is not compiled into one.
+	#[cfg(feature = "development")]
 	fn take_from(&mut self, binding: BindingId, kind: u16) -> u64 {
 		let Some(slot) = self.entries.iter().position(|entry| entry.as_ref().is_some_and(|held| held.kind == kind && held.handle != 0 && held.binding_is(binding))) else {
 			return 0;
@@ -2461,6 +2490,27 @@ impl Catalogue {
 
 	// How many providers of `kind` are published. The answer a subscriber wants, and the one the
 	// four fixed locals could only give up to four.
+	// EVERY SLOT HOLDING A PROVIDER OF `kind`, in slot order.
+	fn slots_of_kind(&self, kind: u16) -> Vec<usize> {
+		(0..MAX_PROVIDERS).filter(|slot| self.entries[*slot].as_ref().is_some_and(|provider| provider.kind == kind && provider.handle != 0)).collect()
+	}
+
+	// EVERY SLOT HOLDING A PROVIDER OF `kind` WHOSE BINDING ALSO PUBLISHES `beside`.
+	//
+	// This is the ORIGIN rule, asked of the catalogue rather than written into a route: a `block`
+	// provider published by a binding that also publishes `usb-bus` is a USB volume, and no FAT BPB
+	// can say that. The manager knows which controller published which provider, which is exactly
+	// why M2 puts origin here and not in the medium.
+	fn slots_published_beside(&self, kind: u16, beside: u16) -> Vec<usize> {
+		self.slots_of_kind(kind)
+			.into_iter()
+			.filter(|slot| {
+				let Some(provider) = self.entries[*slot].as_ref() else { return false };
+				self.entries.iter().any(|entry| entry.as_ref().is_some_and(|other| other.kind == beside && other.binding_is(provider.id.binding)))
+			})
+			.collect()
+	}
+
 	fn count_of(&self, kind: u16) -> usize {
 		self.entries.iter().filter(|entry| entry.as_ref().is_some_and(|provider| provider.kind == kind)).count()
 	}
@@ -3332,7 +3382,12 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 				print(b"DeviceManager: ");
 				print_driver_name(driver_name);
 				print(b" does not declare this build's driver protocol; refusing before the claim\n");
-				node.record.move_to(BindingState::Failed, Some(FailureCause::ProtocolMismatch));
+				// The refusal happens BEFORE the node enters `Binding` - that is the whole point of
+				// reading the note here - so this is a pre-attempt terminal failure and the table
+				// has an edge for it. The answer is read for the same reason as above.
+				if !node.record.move_to(BindingState::Failed, Some(FailureCause::ProtocolMismatch)) {
+					print(b"DeviceManager: a candidate refused for its protocol note could not be recorded as failed\n");
+				}
 				return BindStart::CandidateFailed;
 			}
 		}
@@ -3677,9 +3732,18 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// `Step::Online` a second time. The handshake ends in one `READY` or one `FAILED`;
 					// a driver that sends another is not making a transition, and the refusal the
 					// table already computes is the answer - it just had to be read.
+					// AND REFUSING IT CHANGES NOTHING, WHICH `Step::Again` IS NOT (2026-09-03).
+					//
+					// `Again` means "this candidate may be tried again", and every caller acts on
+					// it: phase one calls `begin_bind`, phase two and the standing loop call
+					// `start_candidate`. On a node that is already `Online` that bind is illegal, and
+					// `start_candidate` reads each refusal as a candidate that failed and advances
+					// the cursor - so a duplicate frame, which must change nothing, could exhaust the
+					// list a later recovery would have chosen from. The rest of the queue is drained
+					// instead, which is what "idempotent" means for an event that carries no fact.
 					if !node.record.state.accepts_terminal_frame() || !node.record.move_to(BindingState::Online, None) {
 						print(b"DeviceManager: a second terminal frame on a binding that is already past its handshake - refused\n");
-						return Step::Again;
+						continue;
 					}
 					// THE BRING-UP INCIDENT IS SPENT AND A NEW ONE STARTS AT `Online`.
 					//
@@ -3721,9 +3785,11 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// `READY` then `FAILED` on one generation took an online binding apart on the
 					// strength of a frame the handshake had already ended. It is a second terminal
 					// frame and it is refused like the other one.
+					// The same on this side of the choice, and for the same reason: see the `READY`
+					// arm above.
 					if !node.record.state.accepts_terminal_frame() {
 						print(b"DeviceManager: a second terminal frame on a binding that is already past its handshake - refused\n");
-						return Step::Again;
+						continue;
 					}
 					// A DRIVER THAT SAID WHY. Retryability is read off the code rather than decided
 					// again here: `device-not-responding` and `out-of-memory` are the two a second
@@ -3910,12 +3976,21 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 		// not been applied, and reporting otherwise would be a preference an operator believes is
 		// stored and is not.
 		if self.config != 0 {
-			let key = policy_key(node.id);
+			let key = match decision.slot {
+				PolicySlot::Disable => policy_key(node.id),
+				PolicySlot::Select => select_key(node.id),
+			};
 			let mut client = proto::system::config::Client::new(ChannelTransport { chan: self.config });
+			// AND THE ANSWER INSIDE THE ANSWER IS READ (2026-09-03). These generated methods return
+			// `Option<Result<(), Error>>`: the outer says whether the call was made at all, and the
+			// inner says whether the service accepted it. Testing only `is_some()` read a refusal -
+			// a denied namespace, a volume that could not be written - as a successful store, so an
+			// operator was told `accepted` for a preference that was never kept and the live effect
+			// was applied on top of it. `not-stored` is the protocol's word for exactly this.
 			let written = if decision.remove {
-				client.remove(&key).is_some()
+				matches!(client.remove(&key), Some(Ok(())))
 			} else if let Some(value) = decision.store.clone() {
-				client.set(&proto::system::ConfigEntry { key: key.clone(), value }).is_some()
+				matches!(client.set(&proto::system::ConfigEntry { key: key.clone(), value }), Some(Ok(())))
 			} else {
 				true
 			};
@@ -4025,7 +4100,13 @@ unsafe fn settle_dependencies(nodes: &mut [Node], catalogue: &mut Catalogue) -> 
 				// also exactly what the operator's retry does, which is what the comment above always
 				// claimed this shared with it.
 				BindingState::DependencyPending if met => {
-					node.attempt = 0;
+					// AN OPERATOR'S ONE ATTEMPT IS NOT TURNED BACK INTO THE AUTOMATIC BUDGET HERE
+					// (2026-09-03). A granted retry starts at `MAX_AUTOMATIC_ATTEMPTS - 1` with
+					// `retry_once` set, and a requirement that was missing parks it - so an
+					// unconditional reset handed the operator the whole budget the grant exists to
+					// withhold, and a retryable failure after that bind could take `Step::Again`
+					// repeatedly. The same rule the missing-artifact advance uses.
+					node.attempt = driver_binding::budget_after_nothing_ran(node.retry_once, node.attempt);
 					node.retry_at = 0;
 					node.restart_requested = true;
 					print(b"DeviceManager: ");
@@ -4208,20 +4289,39 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				// boot - see `load_stored_policy` and the check in `begin_bind`.
 				node.disabled_by_policy = true;
 				node.stop_intent = driver_binding::StopIntent::OperatorDisable;
-				// A RUNNING BINDING IS STOPPED, NOT RELABELLED.
+				// A RUNNING BINDING IS STOPPED, NOT RELABELLED - AND `Online` IS NOT THE ONLY ONE
+				// THAT IS RUNNING (2026-09-03).
 				//
-				// This tried `Online -> Disabled` directly. The table refuses that - the path is
-				// `Online -> Stopping -> Disabled`, because `Stopping` is what "there is a teardown
-				// to run" means - and nothing sent `STOP`, withdrew the providers or enqueued
-				// anything. So the refusal was silent, the loop went back to heartbeats, and the
-				// driver an operator had just disabled stayed online. The stop the shutdown path
-				// performs is the same stop this verb needs.
-				if node.record.state == BindingState::Online {
-					begin_operator_stop(node, catalogue);
-					return;
-				}
-				if !node.record.move_to(BindingState::Disabled, None) {
-					print(b"DeviceManager: the operator's disable is queued behind this binding's teardown\n");
+				// This asked only about `Online` and moved everything else straight to `Disabled`.
+				// Two reachable states are neither running-and-online nor holding nothing.
+				// A node in `Binding` past `begin_bind`'s commit has a live process and a claimed
+				// device on `node.binding`, so the direct move left both attached to a record that
+				// says the device is disabled, with no `STOP` sent. And a teardown already under way
+				// took the same direct move - legal, as `Stopping -> Disabled` is the edge for a
+				// teardown that CONFIRMED - before either confirmation had arrived, after which an
+				// unconfirmed resolution could no longer quarantine an already-`Disabled` record.
+				//
+				// The three cases are the library's, where a test can drive them - see
+				// `driver_binding::disable_action`.
+				match driver_binding::disable_action(node.record.state, node.binding.is_some(), node.teardown.is_some()) {
+					driver_binding::DisableAction::RelandTheTeardown => {
+						// THE TEARDOWN IN FLIGHT IS THE ONE THAT COMPLETES, and what changes is
+						// where it lands. Queueing a second would be two teardowns for one binding.
+						if let Some(teardown) = node.teardown.as_mut() {
+							teardown.intent = driver_binding::StopIntent::OperatorDisable;
+							teardown.landed = driver_binding::StopIntent::OperatorDisable.confirmed_lands_at(true);
+							// It is not a retry any more: an operator asked for this device to stay
+							// down, so nothing rebinds when the teardown answers.
+							teardown.retrying = false;
+						}
+						print(b"DeviceManager: an operator's disable replaced the intent of a teardown already under way; it lands disabled\n");
+					}
+					driver_binding::DisableAction::StopTheBinding => begin_operator_stop(node, catalogue),
+					driver_binding::DisableAction::RecordItDirectly => {
+						if !node.record.move_to(BindingState::Disabled, None) {
+							print(b"DeviceManager: the operator's disable could not be recorded on this binding\n");
+						}
+					}
 				}
 			}
 			// ENABLE GOES TO `Unbound`, which is what INVITES the bind an enable is asking for.
@@ -4495,6 +4595,22 @@ struct PolicyDecision {
 	// operation and the reason `ConfigService` grew one.
 	store: Option<alloc::string::String>,
 	remove: bool,
+	// WHICH RECORD, because `disable` and `select` are two independent preferences (2026-09-03).
+	//
+	// Both used to write the one `device.policy.<bdf>` scalar, so each overwrote the other: a
+	// selection made while a device was disabled dropped the disable at the next load, a disable
+	// after a selection dropped the preference, and `enable` - which removes the disable - took any
+	// selection stored in the same slot with it. The contract says both persist independently, and
+	// `apply_policy`'s own comment promises a selection outlives a later disable.
+	slot: PolicySlot,
+}
+
+// The two records a device's policy has. Both live under the reserved prefix `remove` is restricted
+// to, so no new authority is needed for the second.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PolicySlot {
+	Disable,
+	Select,
 }
 
 // WHICH CANDIDATE AN ARTIFACT NAMES ON THIS NODE, through the library's narrowing rule.
@@ -4518,7 +4634,7 @@ fn candidate_position(node: &Node, artifact: &[u8]) -> Option<usize> {
 // binding's state, and what it costs is a question about ConfigService.
 fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -> PolicyDecision {
 	use proto::system::{PolicyOutcome, PolicyVerb};
-	let none = |outcome: PolicyOutcome| PolicyDecision { outcome, store: None, remove: false };
+	let none = |outcome: PolicyOutcome| PolicyDecision { outcome, store: None, remove: false, slot: PolicySlot::Disable };
 	// BOOT-CRITICAL BINDINGS ARE OUT. Their policy would live on a volume that is not mounted when
 	// those bindings are made, which is a dependency the wrong way round.
 	let boot_critical: bool = node.candidates.first().is_some_and(|entry| entry.boot_critical);
@@ -4567,9 +4683,9 @@ fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -
 			}
 			// NOT A THIRD STORED STATE: the REMOVAL of the disable record, so a device that was
 			// never disabled and one that was enabled again are the same device.
-			PolicyDecision { outcome: PolicyOutcome::Accepted, store: None, remove: true }
+			PolicyDecision { outcome: PolicyOutcome::Accepted, store: None, remove: true, slot: PolicySlot::Disable }
 		}
-		PolicyVerb::Disable => PolicyDecision { outcome: PolicyOutcome::Accepted, store: Some(alloc::string::String::from("disabled")), remove: false },
+		PolicyVerb::Disable => PolicyDecision { outcome: PolicyOutcome::Accepted, store: Some(alloc::string::String::from("disabled")), remove: false, slot: PolicySlot::Disable },
 		PolicyVerb::Select => {
 			// POLICY NARROWS AND NEVER WIDENS. An artifact the registry did not declare for THIS
 			// device is refused rather than obeyed - the whole point of bounding a preference by the
@@ -4582,7 +4698,7 @@ fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -
 			// nobody chose. The operator who wants that has `disable` followed by `enable`.
 			let mut record = alloc::string::String::from("select=");
 			record.push_str(artifact);
-			PolicyDecision { outcome: PolicyOutcome::Accepted, store: Some(record), remove: false }
+			PolicyDecision { outcome: PolicyOutcome::Accepted, store: Some(record), remove: false, slot: PolicySlot::Select }
 		}
 	}
 }
@@ -4603,8 +4719,14 @@ unsafe fn load_stored_policy(nodes: &mut [Node], config: u64) {
 			return;
 		}
 		for node in nodes.iter_mut() {
-			let key = policy_key(node.id);
 			let mut client = proto::system::config::Client::new(ChannelTransport { chan: config });
+			// TWO RECORDS, READ INDEPENDENTLY, because they are written independently: a device can
+			// be disabled AND have a preferred driver, and reading one key could only ever restore
+			// whichever verb was used last.
+			if let Some(Ok(entry)) = client.get(&select_key(node.id)) {
+				apply_stored_selection(node, entry.as_bytes());
+			}
+			let key = policy_key(node.id);
 			let Some(Ok(entry)) = client.get(&key) else { continue };
 			let value = entry.as_bytes();
 			if value == b"disabled" {
@@ -4626,23 +4748,42 @@ unsafe fn load_stored_policy(nodes: &mut [Node], config: u64) {
 				}
 				continue;
 			}
-			let Some(wanted) = value.strip_prefix(b"select=") else { continue };
-			match node.candidates.iter().position(|entry| entry.name == wanted) {
-				Some(at) => {
-					node.candidate = at;
-					// AND IT SURVIVES A REWIND. `Retry` after exhaustion resets the cursor, and
-					// without the preference recorded beside it that reset handed the operator the
-					// registry order instead of their stored choice.
-					node.preferred = Some(at);
-					print(b"DeviceManager: ");
-					print_driver_name(wanted);
-					print(b" is the stored choice for this device and is tried first\n");
-				}
-				None => {
-					print(b"DeviceManager: the stored choice ");
-					print_driver_name(wanted);
-					print(b" is not a candidate this image declares for that device any more; it is STALE and the registry order applies\n");
-				}
+		}
+	}
+}
+
+// RESTORE ONE STORED SELECTION, which is the same operation the live verb performs.
+//
+// Its own function because the two paths must not be able to drift: `apply_policy`'s `Select` and
+// this set the same three fields, and the one that was missing here - `selection_pending` - is the
+// one that decides whether the cursor survives the end of whatever is running.
+unsafe fn apply_stored_selection(node: &mut Node, value: &[u8]) {
+	unsafe {
+		let Some(wanted) = value.strip_prefix(b"select=") else { return };
+		match node.candidates.iter().position(|entry| entry.name == wanted) {
+			Some(at) => {
+				node.candidate = at;
+				// AND IT SURVIVES A REWIND. `Retry` after exhaustion resets the cursor, and
+				// without the preference recorded beside it that reset handed the operator the
+				// registry order instead of their stored choice.
+				node.preferred = Some(at);
+				// AND IT IS FLAGGED AS DELIBERATE, exactly as the live verb flags it (2026-09-03).
+				//
+				// `spend_candidate` advances the cursor past the entry that just ended, and this
+				// flag is the only thing that stops it advancing past a cursor an operator had
+				// just placed. Stored policy arrives AFTER driver bring-up, so a stored choice
+				// naming the running candidate - or one before it while a fallback runs - was
+				// advanced past when that binding ended instead of being tried next: the stored
+				// and live paths disagreed about the one thing they are supposed to share.
+				node.selection_pending = true;
+				print(b"DeviceManager: ");
+				print_driver_name(wanted);
+				print(b" is the stored choice for this device and is tried first\n");
+			}
+			None => {
+				print(b"DeviceManager: the stored choice ");
+				print_driver_name(wanted);
+				print(b" is not a candidate this image declares for that device any more; it is STALE and the registry order applies\n");
 			}
 		}
 	}
@@ -4812,6 +4953,14 @@ fn incident_key(id: BindingId) -> alloc::string::String {
 
 // The config key one device's policy lives under. The BDF, because that is the device's identity -
 // a row number would name whatever the table happened to hold this boot.
+// The device's stored SELECTION, which is a different preference from its disable and outlives it.
+// Under the same reserved prefix, so the same authority rule covers both.
+fn select_key(id: BindingId) -> alloc::string::String {
+	let mut key = policy_key(id);
+	key.push_str(".select");
+	key
+}
+
 fn policy_key(id: BindingId) -> alloc::string::String {
 	let mut key = alloc::string::String::from_utf8_lossy(DEVICE_POLICY_PREFIX).into_owned();
 	let mut number = [0u8; 20];

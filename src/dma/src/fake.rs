@@ -49,6 +49,10 @@ pub struct Fake {
 	injected: Vec<(Injection, Fault)>,
 	pending_faults: Vec<FaultEvent>,
 	directions: bool,
+	// What this fake's transport claims it can hold at once, for the tests that drive the bound on
+	// a detached tail. `None` is the default and means "cannot say", which is what an ordinary
+	// backend answers.
+	fault_queue_capacity: Option<u64>,
 }
 
 impl Default for Fake {
@@ -59,7 +63,14 @@ impl Default for Fake {
 
 impl Fake {
 	pub fn new() -> Self {
-		Self { next_domain: 1, installed: BTreeMap::new(), attached: Vec::new(), calls: Vec::new(), injected: Vec::new(), pending_faults: Vec::new(), directions: true }
+		Self { next_domain: 1, installed: BTreeMap::new(), attached: Vec::new(), calls: Vec::new(), injected: Vec::new(), pending_faults: Vec::new(), directions: true, fault_queue_capacity: None }
+	}
+
+	// State what this fake's transport can hold at once, so the bound on a detached tail is
+	// reachable by a test.
+	pub fn with_fault_queue_capacity(mut self, most: u64) -> Self {
+		self.fault_queue_capacity = Some(most);
+		self
 	}
 
 	// Refuse the next call of this kind with this fault, once.
@@ -172,6 +183,10 @@ impl Backend for Fake {
 
 	fn transport_was_emptied(&self) -> bool {
 		self.pending_faults.is_empty()
+	}
+
+	fn fault_queue_capacity(&self) -> Option<u64> {
+		self.fault_queue_capacity
 	}
 
 	fn drain_faults(&mut self, out: &mut [FaultEvent]) -> usize {

@@ -324,6 +324,18 @@ struct ClaimSlot {
 	// that held the claim DIES, the last close starts the release before any new manager exists to
 	// supply one.
 	release_deadline: u64,
+	// MAPPINGS OF THIS DEVICE'S REGISTERS THAT ARE INSTALLED, OR WHOSE TEARDOWN IS RUNNING.
+	//
+	// Raised where a mapping becomes real - `DeviceMemory::commit_mapping` - and lowered where its
+	// teardown has finished, flush and all. A release waits for it, for the reason `settled_vectors`
+	// waits for a live MSI slot: the sweep reaches a derived object through a WEAK reference, and
+	// `Weak::upgrade` fails as soon as the last strong count reaches zero, which is BEFORE `Drop`
+	// runs the unmap and the cross-core flush. Counted from the commit, the fact is standing before
+	// the race can start.
+	mmio_live: u32,
+	// MMIO teardowns of this device that could NOT confirm their cross-core flush. A `Drop` has no
+	// caller to refuse, so this is where such a failure is kept until a release can read it.
+	mmio_unconfirmed: u32,
 }
 
 // How long a teardown has to confirm before the device is quarantined.
@@ -343,7 +355,7 @@ fn reset_claims(len: usize) {
 	let mut claims = CLAIMS.lock();
 	claims.clear();
 	// ALLOC-OK: sized once at boot from the table just built.
-	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0 });
+	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0 });
 }
 
 // What state the device at `index` is in, or None if the index names no device.
@@ -605,6 +617,10 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	});
 	// What this device had ALREADY stranded before the release began. See the comparison below.
 	let quarantined_before = crate::arch::interrupts::msi_quarantined_for_device(index as u32);
+	// AND THE SAME QUESTION FOR ITS MMIO WINDOWS. A teardown that could not confirm its cross-core
+	// flush inside a `Drop` has no caller to refuse; it is counted, and the comparison after the
+	// sweep separates what an earlier binding stranded from what this release did.
+	let mmio_unconfirmed_before = unconfirmed_mmio(index);
 	// 2. Everything the claim minted stops working, without the holder's cooperation - and every
 	//    interrupt it derived is unbound HERE rather than whenever its last reference goes.
 	//
@@ -649,7 +665,20 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 	if !none_stranded_here {
 		crate::serial_println!("device: {index} quarantined an MSI slot while it was being released - its interrupt teardown was not confirmed");
 	}
-	let derived_quiet = derived_quiet && vectors_settled && none_stranded_here;
+	// AND A MAPPING OF THE REGISTERS IS THE OTHER HALF OF THE SAME RACE (added 2026-09-03).
+	//
+	// `revoke_derived` answers `true` for every row whose object is already gone, and that includes
+	// the row whose last `Arc` is being dropped right now: `Weak::upgrade` fails as soon as the
+	// strong count reaches zero, which is BEFORE `DeviceMemory::drop` has unmapped anything or
+	// flushed any other core. The interrupt half of this was closed by asking the MSI registry what
+	// it still holds live; the MMIO half is asked of the claim's own count, raised at the commit
+	// that made the mapping real. A device with no mapped window answers on the first read.
+	let mmio_settled = settled_mmio(index);
+	let none_unconfirmed_here = unconfirmed_mmio(index) <= mmio_unconfirmed_before;
+	if !none_unconfirmed_here {
+		crate::serial_println!("device: {index} could not confirm the cross-core flush of one of its MMIO windows while it was being released");
+	}
+	let derived_quiet = derived_quiet && vectors_settled && none_stranded_here && mmio_settled && none_unconfirmed_here;
 	// 4. AND ONLY NOW THE TRANSLATION, which is the other step that can fail to CONFIRM.
 	//    `detach_for` reports a detach it could not confirm and leaves the pages quarantined; the
 	//    claim goes the same way, because a device whose mappings may still be live is not a device
@@ -742,6 +771,52 @@ pub fn mmio_capability_dropped(key: abi::ClaimKey) {
 		return;
 	}
 	bus_master(entry, false);
+}
+
+// A MAPPING OF THIS DEVICE'S REGISTERS IS NOW INSTALLED. See `ClaimSlot::mmio_live`.
+//
+// Not gated on the generation, and deliberately: this counts WORK IN FLIGHT rather than authority.
+// A mapping built under a key that has since gone stale is still a mapping whose teardown has to
+// finish before the device is handed on, and refusing to count it is how the fact goes missing at
+// exactly the moment it matters.
+pub fn mmio_mapping_installed(key: abi::ClaimKey) {
+	if let Some(slot) = CLAIMS.lock().get_mut(key.device_index as usize) {
+		slot.mmio_live = slot.mmio_live.saturating_add(1);
+	}
+}
+
+// That mapping is gone, and whether its cross-core flush confirmed.
+pub fn mmio_mapping_torn_down(key: abi::ClaimKey, confirmed: bool) {
+	if let Some(slot) = CLAIMS.lock().get_mut(key.device_index as usize) {
+		slot.mmio_live = slot.mmio_live.saturating_sub(1);
+		if !confirmed {
+			slot.mmio_unconfirmed = slot.mmio_unconfirmed.saturating_add(1);
+		}
+	}
+}
+
+// How many MMIO teardowns of this device have failed to confirm, ever. Compared before and after a
+// sweep, exactly as the MSI quarantine count is: what an EARLIER binding stranded must not make
+// every later claim of the device unreleasable, and what THIS release stranded is charged to it.
+fn unconfirmed_mmio(index: usize) -> u32 {
+	CLAIMS.lock().get(index).map_or(0, |slot| slot.mmio_unconfirmed)
+}
+
+// WAIT FOR THIS DEVICE'S MMIO MAPPINGS TO BE TORN DOWN, and answer whether they were.
+//
+// The same bound and the same argument as `settled_vectors`: every teardown this release is
+// responsible for has either already run - the sweep called `teardown_mapping` - or is running
+// inside a concurrent `Arc::drop` a few instructions away. A device that never mapped its registers
+// answers `true` on the first read.
+fn settled_mmio(index: usize) -> bool {
+	for _ in 0..VECTOR_SETTLE_SPINS {
+		if CLAIMS.lock().get(index).is_none_or(|slot| slot.mmio_live == 0) {
+			return true;
+		}
+		core::hint::spin_loop();
+	}
+	crate::serial_println!("device: {index} still has a live mapping of its registers after its derived capabilities were swept - its MMIO teardown is not confirmed");
+	false
 }
 
 // MAKE THIS BINDING'S VECTOR DELIVERABLE, OR REFUSE - the publication step, done under the claim.
@@ -872,7 +947,7 @@ pub fn add_synthetic_device() -> usize {
 	// ALLOC-OK: the claim slot for the row just appended, on the same `#[cfg(test)]` terms as the row
 	// itself - the two are one entry and a table with a device and no slot for it is worse than a
 	// test that could not allocate.
-	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0 });
+	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0 });
 	index
 }
 
@@ -962,41 +1037,30 @@ pub fn register_derived(key: abi::ClaimKey, object: alloc::sync::Weak<dyn crate:
 // address it has been using faults instead of reaching the BAR.
 // Returns whether every interrupt this key derived CONFIRMED its teardown. See `revoke_effects_of`.
 fn revoke_derived(key: abi::ClaimKey) -> bool {
-	// TAKEN OUT UNDER THE LOCK AND RELEASED BEFORE THE WORK, because tearing a mapping down takes
-	// the address space's own locks and calling into them from under this one would be a lock order
-	// nothing else in the kernel uses.
-	let mut taken: Vec<alloc::sync::Weak<dyn crate::object::KernelObject>> = Vec::new();
-	{
-		let mut derived = DERIVED.lock();
-		let mut kept: Vec<Derived> = Vec::new();
-		// ALLOC-OK: bounded by the table being swept, on a binding transition.
-		if kept.try_reserve(derived.len()).is_err() || taken.try_reserve(derived.len()).is_err() {
-			// A SWEEP THAT CANNOT ALLOCATE STILL REVOKES. Falling back to the slower shape - one
-			// pass, in place - costs time on a path that runs once per binding and keeps the
-			// property, which is the thing that must not depend on a heap.
-			let mut quiet = true;
-			for row in derived.iter() {
-				if row.key == key {
-					if let Some(object) = row.object.upgrade() {
-						object.header().revoke();
-						quiet &= revoke_effects_of(&object);
-					}
-				}
-			}
-			derived.retain(|row| row.key != key);
-			return quiet;
-		}
-		for row in derived.drain(..) {
-			if row.key == key {
-				taken.push(row.object);
-			} else {
-				kept.push(row);
-			}
-		}
-		*derived = kept;
-	}
+	// ONE ROW AT A TIME, TAKEN OUT UNDER THE LOCK AND WORKED ON WITH THE LOCK RELEASED.
+	//
+	// Tearing a mapping down takes the address space's own locks, and the Arc dropped at the end of
+	// each iteration can run `DeviceMemory::drop`, which takes `DEVICES` and then `CLAIMS`. Doing
+	// either from under `DERIVED` is a lock order this file does not use anywhere else and inverts
+	// the one `register_derived` does - it takes `CLAIMS` and then `DERIVED` - so a sweep holding
+	// `DERIVED` while a destructor waits for `CLAIMS` deadlocks against a registration on another
+	// core. The previous shape collected the rows into two vectors first, which avoided that on the
+	// ordinary path and reintroduced it exactly on the allocation-failure fallback, where the work
+	// was done with the lock still held.
+	//
+	// `swap_remove` needs no allocation at all, so the fallback and its `try_reserve` are gone with
+	// it: there is one path, it holds `DERIVED` only long enough to take a row out, and the order of
+	// the remaining rows does not matter to anything.
 	let mut quiet = true;
-	for weak in taken {
+	loop {
+		let taken = {
+			let mut derived = DERIVED.lock();
+			match derived.iter().position(|row| row.key == key) {
+				Some(at) => Some(derived.swap_remove(at).object),
+				None => None,
+			}
+		};
+		let Some(weak) = taken else { break };
 		if let Some(object) = weak.upgrade() {
 			object.header().revoke();
 			quiet &= revoke_effects_of(&object);

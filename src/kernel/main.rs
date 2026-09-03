@@ -887,6 +887,16 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		// listening. The drain is asked for a slice; the loop below asks for the rest, a slice at a
 		// time, and looks in between.
 		sched::run_until_idle_until(settle_slice(deadline));
+		// AND THE FAULT QUEUE IS SERVICED DURING BRING-UP TOO (added 2026-09-03).
+		//
+		// The one-tick bound this drain gives a live fault was written into the CONSOLE loop, which
+		// is entered only after userspace has come up. Everything before it - drivers binding,
+		// services starting, a recovery round - ran through the two drains in this function and
+		// serviced nothing, so a protected endpoint that faulted while it was starting kept
+		// mastering the bus for the whole boot window rather than for at most a tick. The call is
+		// gated to cpu 0 and to one drain per tick, so putting it where the BSP already returns
+		// costs a register read per slice and closes the window this bound was for.
+		crate::iommu::service_faults_if_due();
 		if crash_seen(crash_rx, koid) {
 			serial_println!("recovery: SystemManager (koid {}) faulted - starting a recovery SystemManager (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
 			continue;
@@ -921,6 +931,9 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 			// A slice is what makes this a poll. It costs one extra look every `SETTLE_SLICE` ticks
 			// and it is the difference between a readiness check and a formality.
 			sched::run_until_idle_until(settle_slice(deadline));
+			// The same, on the slice this loop polls with: bring-up is where a driver first
+			// programs its device, so it is where a fault first arrives.
+			crate::iommu::service_faults_if_due();
 			while let Ok(message) = reports.recv() {
 				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
 			}

@@ -1466,3 +1466,39 @@ removes four fixed owners, and the two were checked against each other rather th
 TIME-WAIT TCB holds the entry it already had, so the partition's bound is unchanged and 160 still
 clears 128 + 2 with room. The "closing timer" the scheduler paragraph already mentioned as one of the
 things a connection can owe is now a state this file defines rather than a name it used in passing.
+
+AUDITOR'S RE-AUDIT OF PLAN M0175 (2026-09-03T03:32:40Z):
+
+Rating: 6/10
+
+1. **The corrected aggregate scheduler has no owner for DNS or SNTP request deadlines.** M6
+   requires a DNS tuple to retire when its query expires and preserves a distinct timeout error
+   (`docs/todo/P02M0175.md:621-658`), while M8 gives each SNTP request live correlation state
+   (`docs/todo/P02M0175.md:773-805`); the Definition of done requires late replies to all internal
+   UDP operations to match nothing after completion or expiry (`docs/todo/P02M0175.md:972-975`). M7
+   accounts for pending DNS/SNTP/DHCP operations, but its corrected scheduler covers only per-TCB
+   TCP plus exactly two fixed owners, DHCP and M0174's L3 aggregate
+   (`docs/todo/P02M0175.md:666-725`). With no scheduler owner or other wakeup contract for DNS/SNTP,
+   those operations cannot reliably expire, free their tuple/budget state, or deliver the required
+   timeout. Add bounded deadline ownership for the pending internal operations and include it in the
+   structural capacity/oracle.
+
+2. **The corrected SYN schedule still contradicts the frozen 60-second RTO ceiling.** The profile
+   caps every RTO at 60 seconds (`docs/todo/P02M0175.md:363-376`), but the SYN correction derives
+   seven retransmissions from uncapped 64- and 128-second waits and calls the total 255 seconds
+   (`docs/todo/P02M0175.md:422-439`). Under the stated cap, those intervals are
+   `1+2+4+8+16+32+60`, followed by another 60-second wait, for 183 seconds. Seven retransmissions
+   still satisfy the required minimum of 180 seconds, but the plan now specifies two incompatible
+   schedules; implementing its written arithmetic would violate the cap, while the duration-only
+   SYN oracle would accept the 255-second version. Freeze and test the single capped schedule rather
+   than retaining the uncapped derivation.
+
+3. **The TIME-WAIT correction leaves simultaneous close undefined and contradicts its required
+   state.** M2 assigns TIME-WAIT to the singular side that sent the first FIN and says the passive
+   side never enters it (`docs/todo/P02M0175.md:336-361`). With crossed FINs, neither endpoint can
+   observe a global "first" sender: both locally initiate close and both must retain the tuple.
+   [RFC 9293 section 3.6, Figure 13](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.6) moves
+   both peers through CLOSING into TIME-WAIT. The plan defines neither that transition nor a
+   simultaneous-close fixture, so a conforming implementation of its prose can release one or both
+   TCBs early. Define the crossed-FIN state path and verify that both endpoints retain their TCB and
+   scheduler entry for 2 MSL.

@@ -126,6 +126,20 @@ impl DeviceMemory {
 			*self.mapped_in.lock() = None;
 			return false;
 		}
+		// AND THE DEVICE IS TOLD IT HAS A LIVE MAPPING, which is what a release waits for.
+		//
+		// A sweep reaches this object through a WEAK reference, and `Weak::upgrade` fails as soon as
+		// the last strong count reaches zero - which is BEFORE `Drop` has run the teardown. So a row
+		// whose destructor was running was counted quiet, the claim went `Free`, and the unmap and
+		// the cross-core flush happened afterwards with nobody waiting for them. The count is taken
+		// HERE, where the mapping becomes real, so it is already standing whichever way the object
+		// later dies: the sweep upgrades it and tears it down, or a concurrent drop does, and either
+		// way the release sees an outstanding mapping until the teardown has finished.
+		//
+		// Exactly the shape `settled_vectors` uses for interrupts, for exactly the same race.
+		if let Some(key) = self.claim {
+			crate::device::mmio_mapping_installed(key);
+		}
 		true
 	}
 
@@ -176,11 +190,29 @@ impl DeviceMemory {
 		// had never been mapped, which is how an in-flight commit could publish past the sweep. The
 		// tombstone is terminal and says which of the two happened.
 		let base = self.mapped_at.swap(Self::REVOKED, Ordering::AcqRel);
-		if base == 0 || base == Self::RESERVED || base == Self::REVOKED {
-			// NOTHING TO UNMAP HERE, AND THAT IS NOT THE SAME AS NOTHING TO DO. `RESERVED` means a
-			// map syscall is between its claim and its commit: the tombstone this just wrote is what
-			// makes that commit fail, and the syscall unmaps its own work.
+		if base == 0 || base == Self::REVOKED {
+			// Nothing was ever installed through this object, or a previous teardown already took it
+			// down and answered for it. Either way this call has nothing to confirm.
 			return true;
+		}
+		if base == Self::RESERVED {
+			// A MAP SYSCALL IS BETWEEN ITS CLAIM AND ITS COMMIT, AND THAT IS NOT A CONFIRMATION
+			// (corrected 2026-09-03).
+			//
+			// This answered `true`, on the reasoning that the tombstone makes the commit fail and
+			// the syscall unmaps its own work. Both halves are true and the conclusion was not: the
+			// syscall installs every page table entry BEFORE it attempts the commit, so at this
+			// instant a live mapping of the device's registers exists and the builder has not yet
+			// been told to take it down. Answering `true` let `finish_release` publish `Free` over
+			// exactly that interval, and the next claimant could be given a device whose previous
+			// holder still had its BAR mapped.
+			//
+			// The honest answer is the one this whole file gives everywhere else: a teardown that
+			// could not confirm leaves the claim `Quarantined`. The builder still removes its own
+			// work - nothing else can, because this sweep found nothing to unmap - and the device is
+			// not handed to anybody while that is outstanding.
+			crate::serial_println!("device: a claim ended while a map of its registers was being built - the mapping is the builder's to remove and this teardown cannot confirm it");
+			return false;
 		}
 		let space = self.mapped_in.lock().take();
 		for i in 0..self.pages() {
@@ -222,10 +254,26 @@ impl DeviceMemory {
 		// is retained is the RANGE, not the access.
 		if !crate::mem::tlb::shootdown() {
 			crate::serial_println!("device: a revoked MMIO window could not confirm its cross-core flush - the virtual range is retained rather than reused, and the claim is not free");
+			// CHARGED TO THE DEVICE, NOT ONLY RETURNED TO THIS CALLER. A `Drop` has no caller to
+			// refuse, so an unconfirmed flush inside a destructor used to be lost entirely; the
+			// count is where a release reads it whichever path ran the teardown.
+			self.teardown_finished(false);
 			return false;
 		}
 		crate::syscall::free_vrange(space.as_deref(), base, self.pages() as u64 * PAGE_SIZE);
+		self.teardown_finished(true);
 		true
+	}
+
+	// The mapping this object had is gone, and whether its cross-core flush confirmed.
+	//
+	// One place, because both exits of the teardown owe it and a release is waiting on the count:
+	// giving it back before the flush would let the wait pass while another core could still
+	// translate the BAR.
+	fn teardown_finished(&self, confirmed: bool) {
+		if let Some(key) = self.claim {
+			crate::device::mmio_mapping_torn_down(key, confirmed);
+		}
 	}
 }
 

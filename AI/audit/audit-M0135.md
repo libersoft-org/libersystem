@@ -1734,3 +1734,19 @@ obtained:
   and archive reproducibly, with the reason and a pointer to the pin;
 - the freeze order names both, so the summary the completion gate reads carries the distinction
   rather than the word that created it.
+
+AUDITOR'S RE-AUDIT OF PLAN M0135 (2026-09-03T03:29:08Z):
+
+Rating: 8/10
+
+1. **The accepted archive-versus-link correction was not propagated into the lockfile contract or
+   the authoritative host gate.** The portable-target item now correctly requires reproducible
+   compilation and archiving before pass 1 (`docs/todo/P02M0135.md:285-290`), but the STATIC-TARGET
+   pin's field list still carries “three per-target link results” (`:322-323`). More importantly, the
+   Done gate still freezes that pin “after the target links” and again requires three link results
+   (`:787-798`). These are the same pre-pass-1 requirements the latest response accepted as either
+   vacuous (if “link” means merely creating the archive) or circular (if it means a resolved link that
+   needs the substrate, profile sysroot and platform port built later). Because the stale language is
+   in the pin schema and completion gate, correcting the option prose and freeze-order narrative did
+   not resolve the finding. Both clauses must require the reproducible per-target archive digests and
+   build diagnostics promised by the response, leaving the strict resolved-link proof in pass 2.

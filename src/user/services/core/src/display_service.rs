@@ -88,11 +88,22 @@ struct DisplayState {
 	console: u64,
 	active: u64,
 	stats: PerfStats,
+	// REPORT THE NEXT PRESENT, because a scanout was just adopted.
+	//
+	// P02M0159's M4 asks for a frame reaching the display AFTER a driver restart, and nothing in the
+	// guest could say so: ConsoleService latches one line per outcome for the whole boot, so a
+	// present that lands after a rebind repeats an outcome already reported and prints nothing - and
+	// once the console is taken, a service's `print` goes to its VT rather than to the serial log a
+	// harness reads. The truth lives here, in the process that owns the scanout and performs the
+	// copy, and it is per ADOPTION rather than per boot: one line for the first present through each
+	// provider this service adopts, written to the debug port so it reaches the serial log whatever
+	// owns the console.
+	report_present: bool,
 }
 
 impl DisplayState {
 	fn new(scanout: Scanout, focus_control: u64, kill_control: u64) -> DisplayState {
-		DisplayState { scanout, surfaces: Vec::new(), events: Vec::new(), focus_control, kill_control, console: 0, active: 0, stats: PerfStats::default() }
+		DisplayState { scanout, surfaces: Vec::new(), events: Vec::new(), focus_control, kill_control, console: 0, active: 0, stats: PerfStats::default(), report_present: true }
 	}
 
 	fn surface_index(&self, chan: u64) -> Option<usize> {
@@ -177,6 +188,16 @@ impl DisplayState {
 		self.stats.blit_ns = self.stats.blit_ns.saturating_add(blit_ns);
 		self.stats.flush_ns = self.stats.flush_ns.saturating_add(flush_ns);
 		self.stats.max_present_ns = self.stats.max_present_ns.max(total_ns);
+		// ONE LINE PER ADOPTED PROVIDER, AND TO THE DEBUG PORT. Presenting is a hot path, so this is
+		// latched; it goes through `debug_write` rather than `print` because `print` follows stdout
+		// to a VT once the console is taken, and a line the serial log never carries cannot be
+		// evidence for anything. See `DisplayState::report_present`.
+		if self.report_present {
+			self.report_present = false;
+			unsafe {
+				debug_write(if result.is_ok() { b"DisplayService: a frame reached the display through the provider it adopted\n".as_slice() } else { b"DisplayService: a frame did NOT reach the display through the provider it adopted\n".as_slice() });
+			}
+		}
 		result
 	}
 
@@ -418,6 +439,9 @@ impl DisplayState {
 			}
 			let old: u64 = self.scanout.handle;
 			self.scanout = Scanout { gpu, handle, addr: addr as u64, fb, width, height };
+			// THE NEXT PRESENT IS THE EVIDENCE THIS ADOPTION WORKED, so it is reported - see
+			// `DisplayState::report_present`.
+			self.report_present = true;
 			for surface in &mut self.surfaces {
 				surface.initialized = false;
 			}

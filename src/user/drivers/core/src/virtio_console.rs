@@ -28,10 +28,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// when the manager asks this driver to stop, so the kernel may reclaim the frames and masked
 		// vectors this binding was holding. It used to go out of scope with the `match` and the stop
 		// path had nothing to name.
-		let (ok, queue_capability) = match &tx {
-			Some(q) => (write_console(q, BANNER), q.capability),
-			None => (false, 0),
+		// AND THE CAPABILITY IS THE DEVICE'S, NOT THE QUEUE'S (2026-09-03). `Queue::capability` IS
+		// this device's capability - every queue of a device carries the same one - so taking it
+		// from the transmit queue and falling back to zero when that queue could not be set up threw
+		// away a capability the driver still holds. The receive queue may already own DMA on that
+		// path, and `finish_stop` skips `device_quiesced` for zero and sends `STOPPED` regardless:
+		// a clean stop with nothing behind it.
+		let ok: bool = match &tx {
+			Some(q) => write_console(q, BANNER),
+			None => false,
 		};
+		let queue_capability: u64 = device.capability;
 		let mut line = [0u8; 64];
 		let n = common::describe(&mut line, b"virtio-console", &device, if ok { b"tx ok" } else { b"tx failed" });
 		let report: &[u8] = &line[..n];

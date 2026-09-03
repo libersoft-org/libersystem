@@ -196,10 +196,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// HOW MANY FOLLOW IS IN THIS MESSAGE, one byte after the selection. A producer that
 			// carries no count sends no probes, and reading ahead for a sentinel would eat the role
 			// after it - the kernel's own fixtures send `BLOCK` and then `SERVE`.
-			let mut probes: [u64; 4] = [0; 4];
-			let mut probe_count: usize = 0;
-			let expected: usize = if len >= 5 + 24 + 1 { (buf[5 + 24] as usize).min(probes.len()) } else { 0 };
-			while probe_count < expected {
+			// AS MANY AS THE MESSAGE SAID, NOT AS MANY AS A FIXED ARRAY HOLDS (2026-09-03). This
+			// kept four, which is a number of DISKS compiled into the receiver of a hand-off whose
+			// sender carries its own count - and the loader's chosen root volume can only be matched
+			// on a provider this instance was given a connection to, so a fifth disk put the system
+			// volume out of reach exactly as bus order used to. The count is one byte on the wire,
+			// which is the bound; every announced message is read whether or not it carries a
+			// handle, because the roles that follow are read from the same channel and stopping
+			// early would take the next one for a probe.
+			let mut probes: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+			let expected: usize = if len >= 5 + 24 + 1 { buf[5 + 24] as usize } else { 0 };
+			for _ in 0..expected {
 				let Received::Message { len, handle } = (unsafe { recv_blocking(bootstrap, &mut buf) }) else { break };
 				if len < 5 || &buf[..5] != b"PROBE" {
 					if handle != 0 {
@@ -207,11 +214,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					}
 					break;
 				}
-				if handle != 0 {
-					probes[probe_count] = handle;
-					probe_count += 1;
+				if handle == 0 {
+					continue;
 				}
+				if probes.try_reserve(1).is_err() {
+					unsafe {
+						print(b"StorageService: no room to hold another block probe connection; it is closed and this instance chooses among the ones it has\n");
+						close(handle);
+					}
+					continue;
+				}
+				probes.push(handle);
 			}
+			let probe_count: usize = probes.len();
 			// NOTHING CHOSEN PROMOTES NOTHING, and that is a rule about the KIND before it is one
 			// about the uuid.
 			//

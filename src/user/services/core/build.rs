@@ -95,6 +95,15 @@ fn generate_driver_registry(manifest: &Manifest) {
 	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst DRIVER_REGISTRY: [Entry; {count}] = [\n{entries}];\n// The sum of every `provides` bound this image's registry declares. See build.rs.\nconst MAX_PROVIDERS: usize = {};\n", declared.max(1));
 	write_generated("driver_registry.rs", &generated);
 
+	// THE SAME NUMBER, FOR THE SUPERVISOR THAT RECEIVES WHAT THE MANAGER PUBLISHES.
+	//
+	// ServiceManager is its own binary and cannot see DeviceManager's `MAX_PROVIDERS`, so it held a
+	// four-element probe array - a count of disks compiled into the receiving side of a hand-off
+	// whose SENDING side carries its own count. A machine with a fifth block provider had that
+	// provider's probe connection closed, and the loader-selected root volume cannot be found on a
+	// disk nobody probes. One computation above, emitted twice.
+	write_generated("provider_bound.rs", &format!("// @generated from services/manifest.toml by build.rs - do not edit.\n// The sum of every `provides` bound this image's registry declares. See build.rs.\nconst MOST_PROVIDERS: usize = {};\n", declared.max(1)));
+
 	// The names alone, for ServiceManager's status view.
 	//
 	// It held a `[(&'static [u8], bool); 6]` literal - six driver names written in Rust, with an

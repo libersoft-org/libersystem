@@ -242,7 +242,20 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 	// definition of done says no cost derived from a merged step may survive - see
 	// `catalog::PROFILE_ROW_GATES` (fixed 2026-09-02).
 	let profile_rows: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::gate_is_profile_row(&gate_name(item))).collect();
-	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str()) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1 && !crate::catalog::gate_is_profile_row(&gate_name(item))).collect();
+	// AND A GATE THAT BOOTS ONE GUEST GETS ITS OWN STEP TOO (2026-09-03).
+	//
+	// The split above caught the gate that boots TWO and the sixteen profile rows, and left every
+	// gate that boots exactly one in the batch of cheap host gates - `implementation-mutations`,
+	// `qemu-virtio-iommu-x86_64`, `smp-core-cap` and five more. That step is emitted under
+	// `STEPGUESTS 0`, so the one `--jobs` bound did not count them and a machine at its slot limit
+	// started one more; and the batch has one cost for fifty members, so a budget could admit hours
+	// of guest work against a host-key estimate and not one of them was ever separately timed.
+	let booting: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| crate::catalog::gate_boots_a_guest(&gate_name(item)) && !crate::catalog::gate_is_profile_row(&gate_name(item)) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1).collect();
+	for item in booting.iter() {
+		let name = gate_name(item);
+		steps.push(Step { id: scoped_id("gate-guest", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate (boots a guest)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("this gate boots a guest of its own: its own step, its own key, its own measured cost and its own guest slot")), guests: 1 });
+	}
+	let before_guest: Vec<&crate::plan::PlanItem> = gate_items.iter().copied().filter(|item| !crate::catalog::GATES_AFTER_A_GUEST.contains(&gate_name(item).as_str()) && crate::catalog::gate_concurrent_guests(&gate_name(item)) <= 1 && !crate::catalog::gate_is_profile_row(&gate_name(item)) && !crate::catalog::gate_boots_a_guest(&gate_name(item))).collect();
 	for item in profile_rows.iter() {
 		let name = gate_name(item);
 		steps.push(Step { id: scoped_id("gate-profile", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} profile"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(String::from("one profile of a multi-profile gate: its own step, its own key, its own measured cost and its own guest slot")), guests: 1 });

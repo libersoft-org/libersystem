@@ -62,6 +62,18 @@ pub struct Wire {
 }
 
 impl Transport for Wire {
+	// THE EVENT RING'S OWN SIZE, which is what bounds how many fault records can be outstanding on
+	// this side at once - and therefore how long an ended binding's tail may keep attributing an
+	// endpoint's faults to it. See `dma::Backend::fault_queue_capacity`.
+	//
+	// The ring is the generous end of the answer: this transport keeps ONE event buffer outstanding
+	// at a time, so what the ledger can actually be holding is smaller. Erring high protects a
+	// replacement for longer, which is the direction to err in - the alternative charges a live
+	// binding for its predecessor's queue.
+	fn event_capacity(&self) -> Option<u64> {
+		Some(self.events.size() as u64)
+	}
+
 	fn request(&mut self, request: &[u8], tail: &mut [u8], status_at: usize) -> Result<(), Fault> {
 		if request.len() > 2048 || tail.len() > 2048 {
 			return Err(Fault::Malformed);

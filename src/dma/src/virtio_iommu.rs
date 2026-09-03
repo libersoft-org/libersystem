@@ -352,6 +352,16 @@ pub fn decode_fault(bytes: &[u8], generation: Generation, domain: DomainId) -> R
 
 // The seam between the codec above and a virtqueue. One method wide on purpose.
 pub trait Transport {
+	// HOW MANY EVENT RECORDS THIS TRANSPORT CAN BE HOLDING AT ONCE, when it can say.
+	//
+	// Read by `Backend::fault_queue_capacity`, which bounds how long an ended binding's tail may go
+	// on attributing an endpoint's faults to it - see `DetachedTail`. `None` is the honest answer
+	// for a transport with no way to ask, and it keeps the unbounded behaviour rather than inventing
+	// a number.
+	fn event_capacity(&self) -> Option<u64> {
+		None
+	}
+
 	// Hand the device a request and place what it writes in `answer`. Returns only once the device
 	// has answered - which for this device means the operation has TAKEN EFFECT, not been accepted.
 	//
@@ -514,6 +524,10 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 
 	fn transport_was_emptied(&self) -> bool {
 		self.transport_emptied
+	}
+
+	fn fault_queue_capacity(&self) -> Option<u64> {
+		self.transport.event_capacity()
 	}
 
 	fn drain_faults(&mut self, out: &mut [FaultEvent]) -> usize {

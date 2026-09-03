@@ -76,6 +76,7 @@ impl BindingState {
 	// is one nobody can debug.
 	//
 	// | from | to | on |
+	// | `Unbound` | `Failed` | nothing could be attempted: no artifact on the volume, or one that does not speak this protocol |
 	// | `Unbound` | `Binding` | a driver is selected and the transaction opens |
 	// | `Binding` | `Online` | `READY` arrives with the current generation |
 	// | `Binding` | `Backoff` | the transaction failed BEFORE the claim was taken, attempts left |
@@ -109,6 +110,21 @@ impl BindingState {
 		matches!(
 			(self, to),
 			(BindingState::Unbound, BindingState::Binding)
+				// A FAILURE THAT HAPPENS BEFORE ANY ATTEMPT IS STILL THIS NODE'S FAILURE.
+				//
+				// The table had `Failed` reachable only from `Binding`, `Stopping` and `Backoff` -
+				// from a driver that RAN - and two permanent pre-bind failures are neither: every
+				// candidate artifact missing from the volume, and an artifact that does not declare
+				// this build's driver protocol, which is refused BEFORE the claim precisely so a
+				// device is never handed to it. Both were recorded by attempting this transition and
+				// discarding the refusal, so the served record stayed `Unbound` with no cause and an
+				// operator could not tell a packaging fault from a device nothing had tried.
+				//
+				// From `DependencyPending` too: a node that has just learnt its requirements are
+				// satisfied is still in that state when the artifact is read and its protocol note
+				// checked.
+				| (BindingState::Unbound, BindingState::Failed)
+				| (BindingState::DependencyPending, BindingState::Failed)
 				| (BindingState::Binding, BindingState::Online)
 				| (BindingState::Binding, BindingState::Backoff)
 				| (BindingState::Binding, BindingState::Failed)
@@ -198,6 +214,48 @@ impl StopIntent {
 			StopIntent::Shutdown => b"the machine is going down",
 		}
 	}
+}
+
+// WHAT AN OPERATOR'S DISABLE DOES TO A NODE.
+//
+// The state alone cannot answer it, which is why this takes two more facts. `Binding` spans both
+// sides of the claim - before it, the transaction holds nothing and the record can simply say
+// `Disabled`; after it, there is a live process and a claimed device, and relabelling the record
+// would leave both attached to a node reported disabled. And a teardown that is ALREADY under way is
+// the one that completes: a second disable replaces where it lands rather than starting another.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DisableAction {
+	// A teardown is in flight. Replace its intent and its landing; start nothing.
+	RelandTheTeardown,
+	// The binding holds the device. It goes through the teardown like any other stop.
+	StopTheBinding,
+	// Nothing is held, so there is nothing to give back and the record moves straight there.
+	RecordItDirectly,
+}
+
+pub fn disable_action(state: BindingState, holds_the_device: bool, teardown_in_flight: bool) -> DisableAction {
+	if teardown_in_flight || state == BindingState::Stopping {
+		return DisableAction::RelandTheTeardown;
+	}
+	match state {
+		BindingState::Online => DisableAction::StopTheBinding,
+		// The half of `Binding` the table's two rows are about: `Binding -> Disabled` before the
+		// claim, `Binding -> Stopping` after it.
+		BindingState::Binding if holds_the_device => DisableAction::StopTheBinding,
+		_ => DisableAction::RecordItDirectly,
+	}
+}
+
+// WHAT AN ATTEMPT BUDGET IS AFTER SOMETHING THAT DID NOT SPEND ONE.
+//
+// A candidate whose artifact was missing, and a node parked on a requirement that has since arrived,
+// both leave the node without having run anything - so the automatic budget starts again. An
+// OPERATOR'S single granted attempt is the exception and it is the whole reason this is a function:
+// that grant is expressed as `attempt = MAX - 1` with a flag beside it, so resetting the counter
+// hands the operator the entire automatic budget they were deliberately not given. The flag is spent
+// where an attempt actually ends, not here.
+pub fn budget_after_nothing_ran(retry_once: bool, attempt: u32) -> u32 {
+	if retry_once { attempt } else { 0 }
 }
 
 // WHY A BINDING IS NOT UP.

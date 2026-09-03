@@ -73,7 +73,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => {
 				let mut line = [0u8; 64];
 				let n = common::describe_state(&mut line, b"virtio-blk", &device, b"DEGRADED", b"no request queue");
-				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0, 0)
+				// THE DEVICE CAPABILITY IS WHAT THIS HOLDS, AND IT IS WHAT A STOP HAS TO NAME
+				// (2026-09-03). Passing zero made `finish_stop` skip `device_quiesced` and send
+				// `STOPPED` anyway - a clean stop with no kernel attestation behind it, on a driver
+				// that really does hold the device. The capability exists from `bringup`; there was
+				// never a path here without one.
+				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0, device.capability)
 			}
 		};
 		let ok: bool = verify_archive(&queue);
@@ -89,7 +94,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			None => {
 				let mut line = [0u8; 64];
 				let n = common::describe_state(&mut line, b"virtio-blk", &device, b"DEGRADED", b"no channel");
-				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0, 0)
+				// A QUEUE WAS CREATED BEFORE THIS BRANCH, so this stand owns DMA as well as the
+				// device - the one case where answering a stop without `device_quiesced` leaves the
+				// kernel holding frames it could have taken back. See the branch above.
+				common::online_and_stand(bootstrap, &bind, &line[..n], 0, 0, device.capability)
 			}
 		};
 		let mut line = [0u8; 64];
@@ -255,10 +263,21 @@ unsafe fn serve_blocks(bootstrap: u64, bind: &common::Bind, queue: &Queue, blk_s
 				// THE FLUSH IS WHAT `STOPPED` CERTIFIES, and this path used to exit without it: the
 				// helper answered the stop the instant it read one, so a disk with writes still in
 				// its device's cache reported that everything it had accepted was finished.
-				if common::stop_requested() && has_flush {
-					flush_request(&queue, virt, phys);
+				// AND THE FLUSH'S ANSWER IS PART OF THE CERTIFICATE (2026-09-03). It was discarded,
+				// so a device that could not carry the request, never completed it, or completed it
+				// with a status other than `BLK_S_OK` still reported a clean stop - and writes this
+				// driver had ACCEPTED were left in the device's cache while DeviceManager recorded a
+				// planned stop that says they were not. `STOPPED` is a certificate about exactly
+				// that, so a flush that did not happen is a certificate this must not make.
+				let flushed: bool = if common::stop_requested() && has_flush { flush_request(&queue, virt, phys) } else { true };
+				if !flushed {
+					print(b"driver.virtio-blk: the device did not complete the flush this stop requires - no clean stop is claimed for it\n");
 				}
-				common::finish_stop(bootstrap, bind, queue.capability, common::quiesce_virtio());
+				// The reset happens either way - a device that is going away stops mastering the bus
+				// whatever its cache did - and it is computed BEFORE the conjunction so short
+				// circuiting cannot skip it.
+				let quiet: bool = common::quiesce_virtio();
+				common::finish_stop(bootstrap, bind, queue.capability, quiet && flushed);
 				exit();
 			};
 			// THE ENDPOINT THAT HAS WORK, and every reply goes back on it. It was one fixed handle,

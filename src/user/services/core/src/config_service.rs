@@ -114,11 +114,19 @@ impl Config {
 	}
 
 	// Write the whole tree through to the volume (the write-through of every SET).
-	// Best-effort: with no volume the tree is in-memory by design, and a failed
-	// write (a read-only test volume) keeps serving the in-memory value.
-	fn persist(&self) {
+	//
+	// ANSWERS WHETHER THE BYTES REACHED THE VOLUME (2026-09-03). This was best-effort and silent, so
+	// `set` returned `Ok(())` for a write that never landed - and a device policy an operator was
+	// told had been stored was gone at the next boot. The in-memory tree is still updated either
+	// way, because the live effect is real and a caller that has already been given it must not be
+	// told the request failed outright; what changes is that the CALLER is told the record is not
+	// durable, which is the one thing only this service knows.
+	//
+	// With no volume at all the tree is in-memory BY DESIGN - that is what a test fixture and the
+	// pre-mount boot both are - so that case is a success and not a silent failure.
+	fn persist(&self) -> bool {
 		if self.volume == 0 {
-			return;
+			return true;
 		}
 		let mut bytes: Vec<u8> = Vec::new();
 		bytes.extend_from_slice(TREE_MAGIC);
@@ -131,7 +139,7 @@ impl Config {
 		}
 		let data: proto::codec::Buffer = match unsafe { make_buffer(&bytes) } {
 			Some(b) => b,
-			None => return,
+			None => return false,
 		};
 		let mut client = volume::Client::new(ChannelTransport { chan: self.volume });
 		let tree_path = tree_path();
@@ -139,7 +147,7 @@ impl Config {
 		let artifact_directory = owner_directory.rsplit_once('/').map(|(directory, _)| directory).expect("manifest config-tree artifact parent");
 		let _ = client.mkdir(artifact_directory);
 		let _ = client.mkdir(owner_directory);
-		let _ = client.write(tree_path, &data);
+		matches!(client.write(tree_path, &data), Some(Ok(_)))
 	}
 }
 
@@ -237,8 +245,12 @@ impl Service for Config {
 			Some(e) => e.value = entry.value,
 			None => self.entries.push(entry),
 		}
-		// Write-through: the set survives a service restart and a reboot.
-		self.persist();
+		// Write-through: the set survives a service restart and a reboot - and when it does not,
+		// the caller is told rather than left believing it does.
+		if !self.persist() {
+			unsafe { print(b"ConfigService: the tree could not be written through to its volume - the value is served from memory and will not survive a restart\n") };
+			return Err(Error::Io);
+		}
 		Ok(())
 	}
 
@@ -263,8 +275,9 @@ impl Service for Config {
 		self.entries.retain(|entry| entry.key != key);
 		// A KEY THAT WAS NOT THERE IS NOT AN ERROR. `enable` on a device nobody disabled must
 		// succeed: the caller is asking for a state, and the state is already what they asked for.
-		if self.entries.len() != before {
-			self.persist();
+		if self.entries.len() != before && !self.persist() {
+			unsafe { print(b"ConfigService: a removal could not be written through to its volume - the key is gone from memory and will come back at the next restart\n") };
+			return Err(Error::Io);
 		}
 		Ok(())
 	}

@@ -155,6 +155,12 @@ impl VirtQueue {
 	}
 
 	// The physical address of the scratch frame, and its direct-map alias.
+	// How many descriptors this ring has. Read by the event queue's transport to say how many fault
+	// records can be outstanding at once - see `Transport::event_capacity`.
+	pub fn size(&self) -> u16 {
+		self.size
+	}
+
 	pub fn scratch_physical(&self) -> u64 {
 		self.scratch
 	}

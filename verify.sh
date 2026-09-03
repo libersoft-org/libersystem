@@ -105,7 +105,12 @@ JOBS=1
 # prices is a whole prerequisite-closed branch, so a budget cannot spend its time building and then
 # decline to test. `--sweep`, `--release` and `--shadow` refuse it outright - each of those means
 # "all of it", and a bounded version of "all of it" is a contradiction with a number attached.
+# ZERO IS A BUDGET, AND "NO BUDGET" IS THE ABSENCE OF ONE (2026-09-03). The parser accepts
+# `--budget 0` and every use of it was guarded by `BUDGET > 0`, so the one number that means "start
+# nothing" meant "start everything" - the opposite of what a budget is, and the case the definition
+# of done names by asking what happens when nothing fits. The flag being GIVEN is its own fact.
 BUDGET=0
+BUDGET_SET=0
 paths=""
 range=""
 action=run
@@ -168,6 +173,7 @@ while [[ $# -gt 0 ]]; do
 	--budget)
 		BUDGET="${2:?--budget needs a number of seconds}"
 		[[ "$BUDGET" =~ ^[0-9]+$ ]] || die "--budget takes a whole number of seconds, not '$BUDGET'"
+		BUDGET_SET=1
 		shift 2
 		;;
 	--jobs)
@@ -258,7 +264,7 @@ planner_failed() {
 # THE THREE THAT MEAN "ALL OF IT" REFUSE A BUDGET. `--sweep`, `--release` and `--shadow` each assert
 # that everything ran; a bounded version of that is a contradiction with a number attached, and the
 # refusal is louder than a note nobody reads.
-if ((BUDGET > 0)); then
+if ((BUDGET_SET == 1)); then
 	case "$mode" in
 	sweep | release) die "--budget cannot be combined with --$mode: that mode's whole claim is that everything ran" ;;
 	esac
@@ -338,8 +344,18 @@ esac
 # rename. The corpus calls the same function.
 case "$mode" in
 for-change)
-	changed="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- changes)" || planner_failed "the planner could not read what changed"
-	[[ -n "$changed" ]] || die "--for-change: the working tree is clean (use --for PATH, or --release)"
+	# A PREPARED PLAN IS ABOUT THE EXECUTOR AND NOT ABOUT THE TREE (2026-09-03).
+	#
+	# `LIBER_VERIFY_STEPS` hands this script the steps to run, so there is no change set to read and
+	# a clean tree is not a reason to refuse: `./check.sh --gate verify-scheduler` drives the
+	# executor over synthetic plans and got "the working tree is clean" for every one of its cases,
+	# which is why that gate could only ever pass over a DIRTY tree - and a checkout is clean.
+	if [[ -n "${LIBER_VERIFY_STEPS:-}" ]]; then
+		changed=""
+	else
+		changed="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- changes)" || planner_failed "the planner could not read what changed"
+		[[ -n "$changed" ]] || die "--for-change: the working tree is clean (use --for PATH, or --release)"
+	fi
 	;;
 for)
 	changed="$(printf '%s\n' "$paths" | tr ',' '\n' | grep -v '^$')"
@@ -379,15 +395,26 @@ if [[ "$action" == shadow ]]; then
 	# does not close the race: an ordinary edit to a `.rs` file changes what the sweep is testing and
 	# leaves the model's identity untouched, so a tree edited during a multi-hour emulated run passed
 	# the check. What has to hold still is the thing being tested.
+	# EVERY QUESTION IS ASKED OF ONE MODEL, AND WHEN A CANDIDATE IS GIVEN THAT MODEL IS THE
+	# CANDIDATE (2026-09-03).
+	#
+	# `--candidate` reached only the final `shadow` comparisons. Everything that DECIDED what to run
+	# - the booted and built targets, the guest selection, the scoped host and dev lists, the grouped
+	# build steps - was asked of the ACTIVE model, so for a genuine narrowing the run executed the
+	# active model's wider selection and then compared it against the candidate's narrower one.
+	# `compare_exec` correctly reads the difference as execution the candidate did not select and
+	# refuses to record a `shadow_exec` sample, which is precisely the evidence a narrowing needs and
+	# the one thing this route existed to produce. The tree digest below is the exception and stays
+	# candidate-free: it is a fact about the FILES, which no overlay changes.
 	source_before="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)" || planner_failed "could not digest the tree"
-	model_before="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
-	targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- booted --stdin)" || planner_failed "the planner could not name the targets"
+	model_before="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" model-hash)"
+	targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" booted --stdin)" || planner_failed "the planner could not name the targets"
 	[[ -n "$targets" ]] || planner_failed "the plan named no target to sweep"
 	# THE BUILT SET, WHICH IS NOT THE BOOTED SET. A change that boots one target still has to compile
 	# on the other two, and the build-evidence producer below asks a question about BUILDS - so it
 	# loops over this and the guest shadow keeps `targets`. The two must not merge back: the plan
 	# carries both fields because they answer different questions.
-	build_targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- built --stdin)" || planner_failed "the planner could not name the build targets"
+	build_targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" built --stdin)" || planner_failed "the planner could not name the build targets"
 	[[ -n "$build_targets" ]] || planner_failed "the plan named no target to build"
 	note "shadow: full sweep on ${targets//$'\n'/ }, compared against a selection that is not run"
 	note "        pinned to source $source_before"
@@ -403,7 +430,7 @@ if [[ "$action" == shadow ]]; then
 		# One target's worth of second boot, which is why it is a flag rather than the default.
 		scoped_arg=()
 		if [[ "${shadow_exec:-0}" == "1" ]]; then
-			selection="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- guest-selection --stdin --arch "$target")" || planner_failed "the planner could not name the guest selection"
+			selection="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" guest-selection --stdin --arch "$target")" || planner_failed "the planner could not name the guest selection"
 			if [[ -n "$selection" ]]; then
 				note "shadow-exec: running the selection on $target first (${selection//$'\n'/,})"
 				scoped_capture="$(mktemp)"
@@ -462,7 +489,7 @@ if [[ "$action" == shadow ]]; then
 		host_scoped_total=0
 		# The selection's own keys, lowered the same way the sweep lowers them - `commands` is what
 		# both read, so the two sides cannot drift.
-		host_scoped_ids="$(printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- host-checks --stdin --scoped))" || planner_failed "the planner could not list the scoped host checks"
+		host_scoped_ids="$(printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" host-checks --stdin --scoped))" || planner_failed "the planner could not list the scoped host checks"
 		while IFS=$'\t' read -r id arch env config command; do
 			[[ -n "$id" ]] || continue
 			host_scoped_total=$((host_scoped_total + 1))
@@ -485,7 +512,7 @@ if [[ "$action" == shadow ]]; then
 	# those are ordinary components, not development curiosities.
 	dev_log="$BUILD_DIR/logs/verify-dev-shadow.txt"
 	: >"$dev_log"
-	dev_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- dev-checks)" || planner_failed "the planner could not list the dev-guest checks"
+	dev_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" dev-checks)" || planner_failed "the planner could not list the dev-guest checks"
 	dev_total=0
 	while IFS=$'\t' read -r id arch env config command; do
 		[[ -n "$id" ]] || continue
@@ -503,7 +530,7 @@ if [[ "$action" == shadow ]]; then
 		dev_scoped_log="$BUILD_DIR/logs/verify-dev-scoped.txt"
 		: >"$dev_scoped_log"
 		dev_scoped_total=0
-		dev_scoped_ids="$(printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- dev-checks --stdin --scoped))" || planner_failed "the planner could not list the scoped dev checks"
+		dev_scoped_ids="$(printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" dev-checks --stdin --scoped))" || planner_failed "the planner could not list the scoped dev checks"
 		while IFS=$'\t' read -r id arch env config command; do
 			[[ -n "$id" ]] || continue
 			dev_scoped_total=$((dev_scoped_total + 1))
@@ -534,7 +561,7 @@ if [[ "$action" == shadow ]]; then
 	for build_arch in $build_targets; do
 		build_log="$BUILD_DIR/logs/verify-build-shadow-$build_arch.txt"
 		: >"$build_log"
-		build_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- build-checks)" || planner_failed "the planner could not list the build checks"
+		build_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" build-checks)" || planner_failed "the planner could not list the build checks"
 		build_total=0
 		while IFS=$'\t' read -r id arch env config command; do
 			[[ -n "$id" ]] || continue
@@ -562,7 +589,7 @@ if [[ "$action" == shadow ]]; then
 		# executable, it is not wider than the selection, and the two agree.
 		build_exec=no
 		if [[ "${shadow_exec:-0}" == "1" ]]; then
-			build_steps="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- build-steps --stdin)" || planner_failed "the planner could not lower the build steps"
+			build_steps="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" build-steps --stdin)" || planner_failed "the planner could not lower the build steps"
 			build_exec=ok
 			while IFS=$'\t' read -r label command keys; do
 				[[ -n "$command" ]] || continue
@@ -588,7 +615,7 @@ if [[ "$action" == shadow ]]; then
 	done
 
 	source_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)"
-	model_after="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- model-hash)"
+	model_after="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" model-hash)"
 	if [[ "$source_before" != "$source_after" || "$model_before" != "$model_after" ]]; then
 		die "the tree moved while the sweep ran, so the comparison judged two different systems and is void.
     source: $source_before -> $source_after
@@ -747,7 +774,7 @@ done
 
 BUDGET_TOTAL=0
 affordable=""
-if ((BUDGET > 0)); then
+if ((BUDGET_SET == 1)); then
 	selection="$(budget_select "$BUDGET")"
 	BUDGET_TOTAL="${selection%% *}"
 	affordable="${selection#* }"
@@ -873,7 +900,7 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	# EVERY SKIPPED STEP IS PRINTED. A selector that quietly trims its own scope is the defect
 	# P02M0156 is named after, and a budget is that defect with a flag on it unless it says what it
 	# did not run.
-	if ((BUDGET > 0)) && [[ " $affordable " != *" $index "* ]]; then
+	if ((BUDGET_SET == 1)) && [[ " $affordable " != *" $index "* ]]; then
 		note "[$step/$count] SKIPPED (budget): $label - $keys key(s)"
 		skipped+=("$label")
 		continue
@@ -1040,6 +1067,17 @@ note "all $count step(s) passed"
 # This will fail runs that used to pass, and that is the point: nothing is TRUSTED yet, so the honest
 # answer for most changes today IS "scoped, unproven". `./verify.sh --shadow` produces the evidence
 # and `./verify.sh --allow-shadow` says it is not needed this time.
+# AND A PREPARED PLAN JUDGES NOTHING, because it says nothing about the tree (2026-09-03).
+#
+# The steps came from a file rather than from the planner, over a change set that does not exist, so
+# a trust level computed here is a verdict about a run that verified nothing - and it was reached:
+# the scheduler gate's last case checks the executor's exit status, and this block exited 5 (STALE)
+# over the caller's own working tree, on facts the gate has no relationship to. A run driven by
+# `LIBER_VERIFY_STEPS` ends with the executor's own result, which is the only thing it measured.
+if [[ -n "${LIBER_VERIFY_STEPS:-}" ]]; then
+	note "prepared plan: the executor ran it; no trust level is claimed, because this run says nothing about the tree"
+	exit 0
+fi
 level_line="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- level --stdin 2>/dev/null || true)"
 level="${level_line%%$'\t'*}"
 case "$level" in

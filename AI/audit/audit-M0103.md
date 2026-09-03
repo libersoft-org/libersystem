@@ -1966,3 +1966,49 @@ scene and by how much. `c` and `d` and the aggregate 2D clause all carry it, the
 says the measurement must MEET the floor, and the review-record row is ticked with what resolved it.
 The first measurement setting the number is not circular and the plan says why: what a
 lower-only floor prevents is a regression and a "complete" claim at arbitrary performance.
+
+AUDITOR'S RE-AUDIT OF PLAN M0103 (2026-09-03T03:29:08Z):
+
+Rating: 5/10
+
+1. **The per-surface completion correction is incompatible with the still-normative consuming
+   endpoint lifecycle.** The completion wrapper owns and closes its send handle on signal, the
+   receiver processes one message and closes its endpoint, and successful completion retires all four
+   ends (`docs/todo/P02M0103.md:1031-1069,1114-1153`). The later correction instead creates only one
+   `PRODUCER_READY` pair and one `PRESENT_DONE` pair per surface, each reusable for up to
+   `max_images` messages (`:1180-1215`). The first successful present therefore destroys the only
+   endpoints later presents need. The unpropagated test and accounting text still pins depth 1 and
+   charges four endpoints per in-flight frame, twelve endpoints per surface and six queued messages
+   (`:1233-1258`), while the prerequisite summary still says two pairs per present (`:274-277`). This
+   is not just stale arithmetic: the two protocol lifecycles are mutually exclusive, so the proposed
+   multi-present surface cannot be implemented from the current authoritative rules.
+
+2. **P02M0165 is still unjustifiably declared met for `a-wsi`.** The plan says the extracted
+   `apply_withdrawal` recorder proves the production handle close and withdrawal announcement and
+   would fail if either effect disappeared (`docs/todo/P02M0103.md:256-266`). It proves only the
+   generic close-before-announce callback loop. It does not execute `Catalogue`'s production close
+   syscall, its announcement send, or DeviceManager's production call to that loop; emptying or
+   bypassing any of those still leaves the cited test green
+   (`AI/audit/audit-M0165.md:1514-1523`). Those are precisely the effects `a-wsi` needs before it can
+   safely reacquire a display provider after withdrawal. Its P02M0165 prerequisite therefore remains
+   unsatisfied.
+
+3. **The P02M0167 assessment mistakes several unmet scheduler contracts for one invocation defect.**
+   The plan says the matrix covers the required cases, ordering is specified and asserted, and only
+   clean-tree unattended execution remains (`docs/todo/P02M0103.md:230-251`). The current
+   implementation re-audit finds the gate red in dirty mode too, but more importantly finds that
+   sorting ignores the conservative seed, independently runnable guest gates are merged and
+   materially underpriced, `--budget 0` means unlimited, and failed or unexecuted members poison cost
+   and freshness history (`AI/audit/audit-M0167.md:1414-1447`). These are the M4 cost, budget and
+   failure-history requirements the claimed matrix is supposed to establish. Since every accepted
+   part relies on this evidence path, the scheduler half remains substantively unsatisfied in
+   addition to the separate medium race.
+
+4. **The new soft2d “floor” still permits the first implementation to complete at arbitrary speed.**
+   Each threshold is chosen only after the first tiled rasterizer measures itself, and that same
+   measurement is then frozen as the threshold (`docs/todo/P02M0103.md:1877-1907`); `c` closes by
+   meeting those values (`:2512-2519`). However slow the initial implementation is, it can select a
+   budget equal to its result and pass. The lower-only rule prevents later regression but does not
+   satisfy the stated reason for this gate—preventing the first `c` from being declared complete at
+   any performance. The response's rejection of circularity is therefore unjustified; an acceptance
+   ceiling must be fixed independently of the implementation being accepted.

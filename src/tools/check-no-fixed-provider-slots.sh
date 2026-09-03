@@ -82,6 +82,30 @@ if ! printf '%s\n' "$code" | grep -q "b'B', b'L', b'O', b'C', b'K', b'S'"; then
 	fail=1
 fi
 
+# AND A PER-KIND SINGLETON IS THE SAME DEFECT WITHOUT THE NUMBER (2026-09-03).
+#
+# `usb_client` and `usbq_client` were two locals filled by a hand-written route the first time an
+# xHCI binding reported, with `take_from` MOVING the offered channel out of the catalogue and
+# `if *slot == 0` closing every later one - so a second controller, and the replacement providers of
+# a controller that rebound, had nowhere to go and were not reachable through the catalogue either.
+# The numbered-local rule above did not see them because they carry no number, which is the only
+# thing that made them look different from `block2_client`.
+if offenders="$(printf '%s\n' "$code" | grep -nE '\b(let|&mut)[[:space:]]+(mut[[:space:]]+)?(usb|usbq|gpu|net|snd|audio|input|pointer|display)_client\b')"; then
+	echo "provider-slots: a per-kind provider local is back in DeviceManager:" >&2
+	printf '%s\n' "$offenders" >&2
+	echo "    One slot per kind is the fixed-slot defect with the number left off: the second" >&2
+	echo "    provider of that kind is closed and the first is unreachable through the catalogue." >&2
+	echo "    Publish it and mint a connection for the consumer, or let the consumer subscribe." >&2
+	fail=1
+fi
+# AND WHICH PROVIDERS ARE A USB CONTROLLER'S IS ASKED OF THE CATALOGUE, not written into a route.
+if ! printf '%s\n' "$code" | grep -q 'slots_published_beside('; then
+	echo "provider-slots: nothing asks the catalogue which providers a USB controller published" >&2
+	echo "    A 'block' provider published by a binding that also publishes 'usb-bus' is a USB" >&2
+	echo "    volume - that is the origin rule. A driver name in a branch is the hand-written route." >&2
+	fail=1
+fi
+
 ((fail == 0)) || exit 1
 slots="$(printf '%s\n' "$code" | grep -c 'catalogue.take(' || true)"
 echo "provider-slots: no numbered provider local or block tag in DeviceManager, the hand-off carries its own count, and every route goes through the catalogue ($slots take site(s))"

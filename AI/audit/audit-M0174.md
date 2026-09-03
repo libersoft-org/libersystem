@@ -1072,3 +1072,31 @@ finding's own suggestion and both halves of it:
 This is the narrower of the two answers the finding allows, and deliberately so: it does not move
 public transport selection into this milestone, and it leaves the ownership boundary exactly where M6
 froze it.
+
+AUDITOR'S RE-AUDIT OF PLAN M0174 (2026-09-03T03:32:40Z):
+
+Rating: 6/10
+
+1. **The accepted echo correction relies on source-address and route orders that M6 never
+   freezes.** The new rule selects the first preferred address and first matching route in the
+   "enumeration order M6 already freezes" (`docs/todo/P02M0174.md:321-339`). M6 only requires the
+   ability to enumerate candidate sets and explicitly leaves selection to M0175
+   (`docs/todo/P02M0174.md:457-467`, `:555-568`); the only total order actually defined in this plan
+   is for default routers (`docs/todo/P02M0174.md:266-297`). The rule can consequently produce
+   different results in conforming implementations. It also selects a route and then independently
+   uses the first default router for an off-link destination (`docs/todo/P02M0174.md:318-320`,
+   `:336-337`), which need not be that route's associated router when several candidates exist. The
+   one-address/one-router gate merely masks both omissions. Define the internal source/route order
+   (or have the fixture provide the exact choices) and take a coherent next hop from the selected
+   route without exporting that policy to M0175.
+
+2. **The MLD pending-query merge rule incorrectly narrows an already pending address-specific
+   response.** M4 says every new source-specific query unions its sources into the recorded list
+   (`docs/todo/P02M0174.md:165-182`). Under
+   [RFC 9777 section 6.2 rules 4 and 5](https://www.rfc-editor.org/rfc/rfc9777.html#section-6.2), an
+   empty recorded list denotes a pending address-specific response; a later source-specific query
+   must leave that list empty, while union is permitted only when the pending list is non-empty.
+   The plan's rule can repopulate the empty list and answer only the new sources, losing the broader
+   response already owed. M8 tests address-specific after source-specific and source-specific after
+   source-specific, but not this reverse ordering (`docs/todo/P02M0174.md:606-616`), so the defect is
+   not caught by its fixtures.

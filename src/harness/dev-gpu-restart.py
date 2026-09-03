@@ -148,32 +148,44 @@ def wait_state(state, what, timeout=SETTLE_TIMEOUT):
 	fail(f'{what}: the binding is {seen.get("state") if seen else "unreadable"} and not {state} after {timeout} s')
 
 
-# Drive frames through the console after the rebind and require the console to survive it.
+# Drive frames through the console after the rebind and require one to REACH the display.
 #
-# WHAT THIS CAN AND CANNOT SEE, said plainly rather than left for a reader to assume. ConsoleService
-# latches one line per outcome, and after the boot those lines do not reach the SERIAL log at all:
-# once it has taken the console a service's `print` goes to its VT, and the serial line carries the
-# shell's session. So the absence of `a frame did NOT reach the display` in this window proves
-# nothing, and a check that treated it as proof would be an assertion that cannot fail - which is
-# worse than a report, because it reads as evidence.
+# WHAT THIS USED TO BE ABLE TO SEE, AND WHY IT WAS NOT ENOUGH. ConsoleService latches one line per
+# outcome for the whole boot, and after boot its `print` follows stdout to a VT rather than to the
+# serial log - so `a frame did NOT reach the display` cannot appear in this window, its absence
+# proved nothing, and the only assertion left was that the shell still answered a prompt. A live
+# prompt does not establish that DisplayService adopted the rebound provider or that a present
+# reached its scanout, which is exactly what M4 asks for.
 #
-# What IS asserted here: the line, IF it appears, is a failure; and the console must still answer a
-# prompt after the frames were driven, so a rebind that took the display path down with it is caught.
-# The frame-level proof lives on the two boots that can see it - the kernel suite's console test and
-# `qemu-virtio-iommu-x86_64`'s default machine, both of which report a frame reaching the display
-# with DisplayService on a catalogue-opened provider. Making it provable HERE needs a surface the
-# guest does not expose over serial after boot: DisplayService's presentation stats, or a capture of
-# the framebuffer through the instance's own monitor.
-def exercise_the_display(guest):
-	mark = lab.serial_size()
+# DisplayService says it now, from the process that owns the scanout and performs the copy: one line
+# for the first present through each provider it ADOPTS, written to the debug port so it reaches the
+# serial log whatever owns the console. Per adoption rather than per boot, so the line the cold boot
+# printed cannot stand in for this one - the window below starts after the enable.
+#
+# It is also what proves the withdrawal's production effects ran. The rebind can only be adopted
+# once DisplayService's old provider channel has closed, and that close is DeviceManager's - the
+# `close_channel` half of `driver_binding::apply_withdrawal`, performed on the catalogue's own
+# handle. A withdrawal that emptied that call leaves the old channel open, `release_scanout` never
+# runs, the replacement is refused adoption because a scanout is still held, and this line never
+# arrives.
+PRESENTED = 'DisplayService: a frame reached the display through the provider it adopted'
+NOT_PRESENTED = 'DisplayService: a frame did NOT reach the display through the provider it adopted'
+
+
+def exercise_the_display(guest, mark):
 	for _ in range(3):
 		guest.type_text('\x03', False, 15)
 		guest.wait_prompt(5)
 		guest.type_text('clear', True, 15)
 	time.sleep(2)
 	said = lab.serial_since(mark)
+	if NOT_PRESENTED in said:
+		fail('DisplayService adopted the rebound provider and its first present through it did not reach the display')
 	if 'a frame did NOT reach the display' in said:
 		fail('frames were driven through the console after the rebind and did NOT reach the display - the rebound provider was published and the display never adopted it')
+	if PRESENTED not in said:
+		fail('no frame reached the display through a provider adopted after the rebind - DisplayService either never adopted the generation-2 provider or never presented on it')
+	step('  a frame reached the display through the provider adopted after the rebind')
 	guest.type_text('\x03', False, 15)
 	if not guest.wait_prompt(15):
 		fail('the console stopped answering after frames were driven through it, so the rebind took the display path down with it')
@@ -268,8 +280,9 @@ def main():
 		fail(f'the rebound binding publishes {after.get("providers")} provider(s) - it came back without offering what it declares')
 	step(f'  and it republished {after["providers"]} provider(s)')
 
-	# AND THE DISPLAY - see the note on the function for what this can and cannot see.
-	exercise_the_display(guest)
+	# AND THE DISPLAY, over the window that starts at the enable: the adoption line has to be this
+	# rebind's, not the one the cold boot printed.
+	exercise_the_display(guest, rebind_mark)
 
 	boot_at_end = lab.guest_boot()
 	if boot_at_end != boot_at_start:

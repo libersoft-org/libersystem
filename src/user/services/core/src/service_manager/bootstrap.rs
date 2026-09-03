@@ -85,7 +85,7 @@ impl Kept {
 // locals - a block device's channel, the console-input privilege, the bytes a memory volume is
 // sized with. Threading fifty named variables through here would be the ladder again with one more
 // level of indirection.
-pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, external: &mut dyn FnMut(&Role) -> Option<(alloc::vec::Vec<u8>, u64)>, follow: &mut dyn FnMut(&Role) -> [u64; 4]) -> bool {
+pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, external: &mut dyn FnMut(&Role) -> Option<(alloc::vec::Vec<u8>, u64)>, follow: &mut dyn FnMut(&Role) -> [u64; MOST_PROVIDERS]) -> bool {
 	unsafe {
 		for (slot, role) in ROLES[index].iter().enumerate() {
 			// THE CALLER GETS FIRST REFUSAL ON EVERY ROLE, not only the kinds the plan cannot
@@ -303,8 +303,27 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 						close(handle);
 					}
 				}
-				b"USB" => *block5_client = handle,
-				b"USBBUS" => *usbq_client = handle,
+				// THE COUNT TRAVELS WITH THE CONNECTION, and `USBBUS` is matched FIRST because
+				// `USB` is a prefix of it - the same rule `INPUT2` and `INPUT` already follow.
+				//
+				// DeviceManager holds no USB slot any more: the controller's publications stay in
+				// its catalogue and it MINTS a connection for this supervisor at the hand-off. What
+				// arrives is one connection and how many providers of that kind the machine has, so
+				// a second controller is reported rather than described by a variable that does not
+				// exist. This supervisor has one declared consumer for each, which is why it keeps
+				// one - the rest are reachable through the catalogue by whoever subscribes.
+				_ if tag.starts_with(b"USBBUS") => {
+					*usbq_client = handle;
+					if tag.len() > 6 && tag[6] > 1 {
+						print(b"ServiceManager: this machine has more than one USB bus provider; the inventory is served from the first and the rest stay published\n");
+					}
+				}
+				_ if tag.starts_with(b"USB") => {
+					*block5_client = handle;
+					if tag.len() > 3 && tag[3] > 1 {
+						print(b"ServiceManager: this machine has more than one USB volume provider; the usb mount uses the first and the rest stay published\n");
+					}
+				}
 
 				b"KEYS" => *raw_keys = handle,
 				_ => {
@@ -331,7 +350,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut [u64; 4], policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
+pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut [u64; MOST_PROVIDERS], policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -419,8 +438,11 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			let session_root: u64 = kept.end_of(b"session_service", CAP_SERVE);
 			// Read BEFORE either closure borrows the array: one wants the count, the other takes the
 			// handles, and a closure holding a reference alongside would be two borrows of one thing.
-			let probe_handles: [u64; 4] = core::mem::take(probe_blocks);
-			let probe_count: u8 = probe_handles.iter().filter(|handle| **handle != 0).count() as u8;
+			let probe_handles: [u64; MOST_PROVIDERS] = core::mem::take(probe_blocks);
+			// SATURATED AT WHAT ONE BYTE OF THE HAND-OFF CAN CARRY. The count travels in the `BLOCK`
+			// message as a single byte, so a machine with more providers than that says the number
+			// it can say rather than wrapping it to a smaller one.
+			let probe_count: u8 = probe_handles.iter().filter(|handle| **handle != 0).count().min(u8::MAX as usize) as u8;
 			let (fat, iso, udf, usb): (u64, u64, u64, u64) = (*block2_client, *block3_client, *block4_client, *block5_client);
 			let block: u64 = *block_client;
 			let keys: u64 = *raw_keys;
@@ -614,9 +636,9 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			// THE PROBE CONNECTIONS, for the one instance whose job is to choose among the disks.
 			// Every other role answers with none. TAKEN, not duplicated: these were minted for this
 			// consumer and nobody else holds them.
-			let mut follow = |role: &Role| -> [u64; 4] {
+			let mut follow = |role: &Role| -> [u64; MOST_PROVIDERS] {
 				if name != b"storage_service" || role.tag != b"BLOCK" {
-					return [0; 4];
+					return [0; MOST_PROVIDERS];
 				}
 				probe_handles
 			};

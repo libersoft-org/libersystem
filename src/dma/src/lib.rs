@@ -286,6 +286,24 @@ pub trait Backend {
 	fn transport_was_emptied(&self) -> bool {
 		false
 	}
+
+	// HOW MANY FAULT RECORDS THE TRANSPORT CAN BE HOLDING AT ONCE, when the backend can say.
+	//
+	// `DetachedTail` attributes an ended binding's queued faults to that binding until the transport
+	// is next seen EMPTY, and a replacement that faults continuously never lets it be seen empty -
+	// so an endpoint rebound under a fault storm had every one of the REPLACEMENT'S faults charged
+	// to its dead predecessor, for ever, and never reached the cross-generation containment that
+	// decision exists to perform. A finite tail cannot explain an unbounded stream, and this is the
+	// number that says how finite: past this many records for one endpoint, the queue this binding
+	// left behind has certainly been read.
+	//
+	// `None` is the conservative answer for a backend that cannot ask its transport, and it keeps
+	// the old behaviour - attribute until the queue runs dry. What it costs is stated rather than
+	// hidden: a transport whose DEVICE buffers more records than it can hand over at once can still
+	// out-run the bound, so this is a bound on the ledger's exposure and not a proof about hardware.
+	fn fault_queue_capacity(&self) -> Option<u64> {
+		None
+	}
 	// Whether this backend can enforce all three directions. A backend that cannot must not be used
 	// for an enforcing profile - mapping everything read-write would silently drop half the claim.
 	fn enforces_directions(&self) -> bool;
@@ -850,6 +868,13 @@ struct DetachedTail {
 	// Once the queue runs dry, everything queued before now has been read - so the tail is over and
 	// the record stops attributing, while its count stays for the accounting.
 	drained: bool,
+	// HOW MANY RECORDS THIS TAIL HAS ATTRIBUTED SINCE THE REVOCATION THAT SET IT.
+	//
+	// Separate from `faults`, which is the per-binding accounting and accumulates across a merge.
+	// This one is the bound's own counter and is reset at every revocation, because what it is
+	// compared against - `Backend::fault_queue_capacity` - is a statement about what the transport
+	// can be holding AT ONE MOMENT.
+	attributed: u64,
 }
 
 // HOW MANY ENDED BINDINGS KEEP A TAIL RECORD. Bounded because this is fixed bookkeeping in a kernel:
@@ -1193,7 +1218,11 @@ impl<B: Backend> Iommu<B> {
 		// beside it is what let one endpoint's restarts fill the bound and force an undrained record
 		// out. Merging keeps one record per endpoint and keeps the identity that is correct for the
 		// events a reader will actually meet first.
-		if self.detached.iter().any(|tail| tail.endpoint == endpoint && !tail.drained) {
+		if let Some(existing) = self.detached.iter_mut().find(|tail| tail.endpoint == endpoint && !tail.drained) {
+			// THE IDENTITY IS KEPT AND THE BOUND'S COUNTER IS NOT. What the bound measures is how
+			// much of the transport's possible backlog this tail has already accounted for, and a
+			// second revocation is a second moment at which the queue could be full.
+			existing.attributed = 0;
 			return;
 		}
 		// A DRAINED record for this endpoint has nothing left to attribute and its count is what a
@@ -1203,6 +1232,7 @@ impl<B: Backend> Iommu<B> {
 			existing.generation = generation;
 			existing.faults = 0;
 			existing.drained = false;
+			existing.attributed = 0;
 			return;
 		}
 		while self.detached.len() >= MOST_DETACHED_TAILS {
@@ -1235,7 +1265,7 @@ impl<B: Backend> Iommu<B> {
 			};
 			self.detached.remove(at);
 		}
-		self.detached.push(DetachedTail { endpoint, domain, generation, faults: 0, drained: false });
+		self.detached.push(DetachedTail { endpoint, domain, generation, faults: 0, drained: false, attributed: 0 });
 	}
 
 	// REBIND. The binding's generation moves, so every mapping made under the old one is stale by
@@ -1317,13 +1347,30 @@ impl<B: Backend> Iommu<B> {
 			// THE OLDEST UNDRAINED RECORD FOR THIS ENDPOINT, because the queue is FIFO and the
 			// oldest ended binding's records are the ones in front. `detached` is in revocation
 			// order, so the first match IS the oldest - see `remember_detached_tail`.
+			// AND THE TAIL IS FINITE, WHICH IS WHAT KEEPS IT FROM SHADOWING A LIVE REPLACEMENT FOR
+			// EVER (added 2026-09-03).
+			//
+			// The record stopped attributing only when the transport was next observed EMPTY, and a
+			// rebound endpoint whose replacement faults continuously never lets that be observed:
+			// every one of the replacement's faults came out carrying the dead binding's generation,
+			// failed the current-generation comparison, and no live binding was ever contained. The
+			// ended binding queued a FINITE number of records - at most what the transport can hold
+			// - so once this tail has been charged with more than that, the records now arriving
+			// cannot be its; they are the endpoint's, faulting now, and they are attributed and
+			// contained as such.
+			let bound = self.backend.fault_queue_capacity();
 			if let Some(tail) = self.detached.iter_mut().find(|tail| !tail.drained && tail.endpoint == event.endpoint) {
-				event.domain = tail.domain;
-				event.generation = tail.generation;
-				// CHARGED TO THE BINDING THAT RAISED IT, and to a counter that outlives its domain.
-				tail.faults = tail.faults.saturating_add(1);
-				self.faults.record(*event);
-				continue;
+				if bound.is_some_and(|most| tail.attributed >= most) {
+					tail.drained = true;
+				} else {
+					event.domain = tail.domain;
+					event.generation = tail.generation;
+					// CHARGED TO THE BINDING THAT RAISED IT, and to a counter that outlives its domain.
+					tail.faults = tail.faults.saturating_add(1);
+					tail.attributed = tail.attributed.saturating_add(1);
+					self.faults.record(*event);
+					continue;
+				}
 			}
 			if let Some(state) = self.domains.get(&event.domain) {
 				event.generation = state.generation;

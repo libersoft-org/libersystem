@@ -959,6 +959,33 @@ impl Log {
 	pub fn clean_architectures_seen(&self, component: &str, model_hash: &str, universe: Universe) -> BTreeSet<String> {
 		self.clean_architectures_for_pair(component, model_hash, universe, None)
 	}
+
+	// THE CHANGE GROUPS THIS COMPONENT'S CLEAN EVIDENCE WAS MADE OVER.
+	//
+	// `risk_class.required_groups` is a bar about what the edits WERE - "allocator and page-table
+	// changes", "capability, channel, handle and domain" - and `Scope::groups` is what records it
+	// per component per record. Unioned over clean records only, for the reason
+	// `clean_architectures_seen` filters: a comparison that found a fault is not evidence that the
+	// group it touched is covered.
+	pub fn groups_seen(&self, component: &str, model_hash: &str, universe: Universe) -> BTreeSet<String> {
+		let mut seen: BTreeSet<String> = BTreeSet::new();
+		for record in self.records.iter().filter(|record| record.universe == universe && record.model_hash == model_hash && record.verdict == "Consistent") {
+			if let Some(scope) = record.component_scopes.get(component) {
+				seen.extend(scope.groups.iter().cloned());
+			}
+		}
+		seen
+	}
+
+	// WHETHER ANY CLEAN RECORD BEHIND THIS COMPONENT WAS MADE OVER A CHANGE THAT TOUCHED `component`.
+	//
+	// `risk_class.abi_unchanged` is the one field of the four that reads as a sentence - "shadow-clean
+	// plus the ABI unchanged" - and what makes it checkable is that a record names the components its
+	// change set touched. Evidence gathered while the boundary itself was moving is not evidence that
+	// narrowing the checking of that boundary is safe.
+	pub fn evidence_touched(&self, component: &str, model_hash: &str, universe: Universe, touched: &str) -> bool {
+		self.records.iter().filter(|record| record.universe == universe && record.model_hash == model_hash && record.verdict == "Consistent").any(|record| record.component_scopes.contains_key(component) && record.changed_components.iter().any(|name| name == touched))
+	}
 }
 
 // A digest of every source file a build reads, so "did the tree move under us" is answered by

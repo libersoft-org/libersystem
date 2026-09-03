@@ -1124,7 +1124,20 @@ fn sys_device_memory_map(handle: u64) -> i64 {
 		for i in 0..pages {
 			space.unmap(base + i as u64 * PAGE_SIZE);
 		}
-		free_vrange(Some(&space), base, len);
+		// AND THE SAME RULE THE COMMITTED TEARDOWN FOLLOWS: A RANGE THAT COULD NOT BE FLUSHED IS NOT
+		// GIVEN BACK (added 2026-09-03).
+		//
+		// `AddressSpace::unmap` clears the entry and invalidates THIS core's translation buffer and
+		// nothing else's, so handing the range back here could hand a virtual address another core
+		// still translates to a device BAR to whatever is mapped there next. `teardown_mapping`
+		// already refuses to free a range on those terms; this rollback was freeing one on no terms
+		// at all. Losing an address range is a cost and reusing one a live core can still translate
+		// is a correctness failure, which is the same choice `frame::retire` makes.
+		if crate::mem::tlb::shootdown() {
+			free_vrange(Some(&space), base, len);
+		} else {
+			crate::serial_println!("device: a half-built MMIO mapping could not confirm its cross-core flush - the virtual range is retained rather than reused");
+		}
 		return ERR_INVALID;
 	}
 	(base + device.page_offset()) as i64

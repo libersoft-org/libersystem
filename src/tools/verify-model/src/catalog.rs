@@ -467,6 +467,27 @@ pub const PROFILE_ROW_GATES: [&str; 16] = [
 	"numa-profile-riscv64",
 ];
 
+// GATES THAT START A GUEST, declared for the same reason `PROFILE_ROW_GATES` is: the scheduler has
+// to price and account for them, and nothing in a gate's name says whether it boots.
+//
+// A guest-booting gate merged into the batch of cheap host gates is TWO defects at once. It is
+// emitted under `STEPGUESTS 0`, so the one `--jobs` bound - the only answer on this machine to how
+// many guests may run at once - does not count it, and a machine at its slot limit starts one more;
+// and it has no cost of its own, so a step announcing a few seconds of host checks can spend an hour
+// booting QEMU, and no member of the batch is ever separately timed. Both are the exact cases M4
+// asks for: cheapest-first over truthful costs, and one authority for guest concurrency.
+//
+// `capability-trace` is NOT here: it reads a log a guest run produced and boots nothing itself,
+// which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
+// here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
+// its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 8] = ["implementation-mutations", "perf-anchor", "qemu-arch-profiles", "qemu-numa", "qemu-virtio-iommu-x86_64", "secure-boot", "signed-boot", "smp-core-cap"];
+
+// Whether this gate boots a guest of its own and therefore needs one of the runner's slots.
+pub fn gate_boots_a_guest(gate: &str) -> bool {
+	GATES_THAT_BOOT_A_GUEST.contains(&gate)
+}
+
 // Whether this gate is one profile row of a multi-profile gate. See `PROFILE_ROW_GATES`.
 pub fn gate_is_profile_row(name: &str) -> bool {
 	PROFILE_ROW_GATES.contains(&name)

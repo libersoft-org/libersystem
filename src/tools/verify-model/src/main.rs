@@ -503,8 +503,16 @@ fn run() -> Result<ExitCode, String> {
 			// tree to be asked about afterwards, carries its own classes of change onward instead of
 			// arriving with an empty scope that covers everything.
 			for change in &changes {
-				let path = change.origin.as_deref().unwrap_or(change.path.as_str());
-				let _ = path;
+				// BOTH SIDES OF A RENAME, which is what `changes::paths` has always answered and
+				// what this command printed half of (fixed 2026-09-03). The origin was computed
+				// here, discarded on the next line, and only the destination was written - so
+				// moving code out of a component into an unrelated path, or into `docs/`, did not
+				// select the component that LOST the file. `verify.sh` consumes this output
+				// directly, so the production change boundary was the narrower one while the
+				// regression tests, which call `changes::paths`, saw the wider one and passed.
+				if let Some(origin) = change.origin.as_deref() {
+					println!("{}\t{}", format!("{:?}", change.kind).to_lowercase(), origin);
+				}
 				println!("{}\t{}", format!("{:?}", change.kind).to_lowercase(), change.path);
 			}
 			Ok(ExitCode::SUCCESS)
@@ -976,23 +984,89 @@ fn run() -> Result<ExitCode, String> {
 			{
 				let log = verify_model::shadow::Log::load(&repo_root);
 				let store = verify_model::trust::Store::load(&repo_root);
+				let universe = verify_model::shadow::Universe::TestGuest;
+				// WHAT THIS CANDIDATE NARROWS, COMPUTED FROM THE TWO MODELS (2026-09-03).
+				//
+				// The loop below walked `candidate.covers` - the kernel-test overlay - and nothing
+				// else. `covers` DEFAULTS TO EMPTY and the candidate carries a complete replacement
+				// registry, so a narrowing made through OWNERSHIP, an escalation rule or the graph
+				// visited no entry at all and reached the write path with neither bar applied. The
+				// question is about coverage, so it is asked of coverage: for every component, which
+				// checks cover it now and which cover it under the candidate. A component that loses
+				// one has to have earned that.
+				let narrowed_model = Model::load_with_candidate(&repo_root, Some(&candidate))?;
+				let covering = |model: &Model| -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+					let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+					for check in &model.catalog.checks {
+						for component in &check.covers {
+							out.entry(component.clone()).or_default().insert(check.id.clone());
+						}
+					}
+					out
+				};
+				let (before, after) = (covering(&model), covering(&narrowed_model));
+				let mut losing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+				for (component, checks) in &before {
+					let kept = after.get(component);
+					if checks.iter().any(|check| kept.is_none_or(|kept| !kept.contains(check))) {
+						losing.insert(component.clone());
+					}
+				}
 				let mut short: Vec<String> = Vec::new();
-				for (id, narrowed) in &candidate.covers {
-					let Some(check) = model.catalog.checks.iter().find(|check| &check.id == id) else { continue };
-					for lost in check.covers.iter().filter(|component| !narrowed.contains(component)) {
-						if short.iter().any(|line| line.starts_with(&format!("{lost}:"))) {
-							continue;
-						}
-						// The universe a kernel test is judged in. A narrowing of a guest test is
-						// answered by guest evidence; asking for host evidence about it would be a
-						// bar nothing could ever meet.
-						if let Err(why) = store.evaluate(lost, &candidate.expected_hash, verify_model::shadow::Universe::TestGuest, &log) {
-							short.push(format!("{lost}: {why}"));
-						}
+				for lost in &losing {
+					// The universe a kernel test is judged in. A narrowing of a guest test is
+					// answered by guest evidence; asking for host evidence about it would be a
+					// bar nothing could ever meet.
+					if let Err(why) = store.evaluate(lost, &candidate.expected_hash, universe, &log) {
+						short.push(format!("{lost}: {why}"));
 					}
 				}
 				if !short.is_empty() {
 					return Err(format!("this candidate narrows coverage of component(s) that have not earned it under its own model hash, so activating it would take away checking nothing has shown to be spare:\n    {}\n  Gather the evidence under {} first; nothing was written.", short.join("\n    "), candidate.expected_hash));
+				}
+				// AND THE SUBSYSTEM'S OWN BAR, WHICH IS THE STRICTER OF THE TWO (2026-09-03).
+				//
+				// `Store::evaluate` is the GENERAL threshold. The definition of done asks for both:
+				// "`trust.rs`'s threshold AND that subsystem's `risk_class.evidence`". The four
+				// fields those rows were split into - required targets, distinct changes, required
+				// change groups, the ABI - were only ever checked against each other for internal
+				// consistency by `self_check_failures`, so a narrowing of `src/kernel/mem` or
+				// `src/kernel/syscall` needed nothing more than the general bar it is explicitly
+				// stronger than.
+				let ownership = model.ownership();
+				let abi_component: Option<String> = match ownership.owner("src/abi") {
+					verify_model::ownership::Owner::Component { component, .. } => Some(component),
+					_ => None,
+				};
+				let mut unmet: Vec<String> = Vec::new();
+				for risk in &model.registry.risk_classes {
+					let verify_model::ownership::Owner::Component { component, .. } = ownership.owner(&risk.path) else { continue };
+					if !losing.contains(&component) {
+						continue;
+					}
+					let seen = log.clean_architectures_seen(&component, &candidate.expected_hash, universe);
+					let missing: Vec<&str> = risk.targets.iter().filter(|target| !seen.contains(*target)).map(|target| target.as_str()).collect();
+					if !missing.is_empty() {
+						unmet.push(format!("{}: `{}` requires clean evidence on {} and has none on {}", component, risk.path, risk.targets.join(", "), missing.join(", ")));
+					}
+					let distinct = log.distinct_evidence_for(&component, &candidate.expected_hash, universe);
+					if distinct < risk.distinct_changes {
+						unmet.push(format!("{}: `{}` requires {} distinct changes and has {distinct}", component, risk.path, risk.distinct_changes));
+					}
+					let groups = log.groups_seen(&component, &candidate.expected_hash, universe);
+					let absent: Vec<&str> = risk.required_groups.iter().filter(|group| !groups.contains(*group)).map(|group| group.as_str()).collect();
+					if !absent.is_empty() {
+						unmet.push(format!("{}: `{}` requires evidence over change group(s) {} and has none over {}", component, risk.path, risk.required_groups.join(", "), absent.join(", ")));
+					}
+					if risk.abi_unchanged
+						&& let Some(abi) = abi_component.as_deref()
+						&& log.evidence_touched(&component, &candidate.expected_hash, universe, abi)
+					{
+						unmet.push(format!("{}: `{}` requires the ABI unchanged, and its evidence was gathered over changes that touched `{abi}`", component, risk.path));
+					}
+				}
+				if !unmet.is_empty() {
+					return Err(format!("this candidate narrows a subsystem whose risk class asks for more than the general threshold, and that bar is not met:\n    {}\n  Gather the evidence under {} first; nothing was written.", unmet.join("\n    "), candidate.expected_hash));
 				}
 			}
 			let previous = candidate.materialise(&repo_root, &sources)?;
@@ -1117,13 +1191,21 @@ fn run() -> Result<ExitCode, String> {
 			}
 			ordered.sort_by(|left, right| {
 				let (dl, dr) = (layers.get(&left.id).copied().unwrap_or(0), layers.get(&right.id).copied().unwrap_or(0));
-				// The same number the STEPCOST line will carry: measured where it has been measured.
-				let cl = history.step_seconds(&left.id, &model_hash).unwrap_or_else(|| cost.estimate(&history, &left.keys));
-				let cr = history.step_seconds(&right.id, &model_hash).unwrap_or_else(|| cost.estimate(&history, &right.keys));
+				// THE SAME NUMBER THE `STEPCOST` LINE WILL CARRY, SEED AND ALL (fixed 2026-09-03).
+				//
+				// The emitter applies `seed_seconds` - the conservative floor for a step nobody has
+				// timed - and this comparator did not, so the plan ORDERED on one number and
+				// PRINTED another. Every gate key is `host`/`host`, whose fixed term is nothing, so
+				// an unmeasured profile row or concurrency gate sorted as the cheapest work in the
+				// plan while printing a cost of hundreds of seconds beside it: cheapest-first put
+				// the guest boots in front of the one-second host suites they were supposed to
+				// follow.
+				let cl = step_cost(&history, &cost, left, &model_hash);
+				let cr = step_cost(&history, &cost, right, &model_hash);
 				dl.cmp(&dr).then(cl.partial_cmp(&cr).unwrap_or(std::cmp::Ordering::Equal)).then(left.id.cmp(&right.id))
 			});
 			for (index, step) in ordered.into_iter().enumerate() {
-				println!("STEP\t{}\t{}\t{}\t{}\t{}", index, step.keys.len(), step.label, step.command, step.note.unwrap_or_default());
+				println!("STEP\t{}\t{}\t{}\t{}\t{}", index, step.keys.len(), step.label, step.command, step.note.clone().unwrap_or_default());
 				// ITS OWN LINE, not a seventh field. The runner reads a STEP line into six names and
 				// puts everything after the fifth tab into the last one, so a field appended there
 				// would be glued onto the note. A new marker is skipped by a reader that does not
@@ -1154,12 +1236,7 @@ fn run() -> Result<ExitCode, String> {
 				// cheapest work in the plan and admitted by any budget at all. `seed_seconds` is the
 				// conservative floor M4 asks for, and the round is UP: a sub-second estimate is a
 				// short step, not a free one.
-				let measured = history.step_seconds(&step.id, &model_hash);
-				let seconds: f64 = match measured {
-					Some(seconds) => seconds,
-					None => cost.estimate(&history, &step.keys).max(cost.seed_seconds(step.guests)),
-				};
-				println!("STEPCOST\t{index}\t{}", seconds.ceil() as u64);
+				println!("STEPCOST\t{index}\t{}", step_cost(&history, &cost, &step, &model_hash).ceil() as u64);
 				// HOW MANY GUEST SLOTS THIS STEP NEEDS AT ONCE - see `Step::guests`. EMITTED FOR
 				// EVERY STEP, because the runner now classifies guest work by this number rather
 				// than by matching the command text, and a number the plan does not carry is a
@@ -1287,6 +1364,19 @@ fn join_or_none(items: &[String]) -> String {
 // Split out so a shadow record can say whether the model that made the comparison was consistent at
 // the time. A comparison produced by a model failing its own checks is not evidence about the tree,
 // and the record could not say which it was.
+// WHAT A STEP IS EXPECTED TO COST, in one place because two callers need the SAME answer.
+//
+// The plan orders on it and prints it, and those were two expressions: the printed one applied the
+// conservative floor for an unmeasured step and the ordering one did not, so the cheapest-first
+// order disagreed with the costs printed beside it. Measured if it has been measured under this
+// model; otherwise the estimate over its keys, never below the floor its guest count implies.
+fn step_cost(history: &verify_model::history::History, cost: &verify_model::history::CostModel, step: &verify_model::commands::Step, model_hash: &str) -> f64 {
+	match history.step_seconds(&step.id, model_hash) {
+		Some(seconds) => seconds,
+		None => cost.estimate(history, &step.keys).max(cost.seed_seconds(step.guests)),
+	}
+}
+
 fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 	let mut failures = Vec::new();
 

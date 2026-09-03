@@ -127,6 +127,10 @@ include!(concat!(env!("OUT_DIR"), "/manifest.rs"));
 include!(concat!(env!("OUT_DIR"), "/role_tags.rs"));
 // The driver names, from the same manifest rows DeviceManager binds from. See `build.rs`.
 include!(concat!(env!("OUT_DIR"), "/driver_names.rs"));
+// How many providers this image's registry allows to exist at once - the bound DeviceManager's
+// catalogue is sized by, so the receiving side of the block hand-off is bounded by the same number
+// rather than by a count of disks written here. See `build.rs`.
+include!(concat!(env!("OUT_DIR"), "/provider_bound.rs"));
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -528,7 +532,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// instance's client end minted when that instance bootstraps.
 	let mut block5_client: u64 = 0;
 	// ONE PROBE CONNECTION PER BLOCK PROVIDER, from DeviceManager - see `mint_connection`.
-	let mut probe_blocks: [u64; 4] = [0; 4];
+	//
+	// SIZED BY THE REGISTRY'S OWN BOUND, NOT BY A NUMBER OF DISKS (2026-09-03). This was four,
+	// matching the four volumes this supervisor declares - but the two are different questions: the
+	// volumes are what the manifest names, and the probes are how many block providers the machine
+	// HAS. A fifth had its probe closed here, and the instance that matches the loader's root uuid
+	// can only match it on a disk it was given a connection to, so the paired volume at a later bus
+	// address was unreachable again - the exact defect the probe hand-off exists to remove.
+	let mut probe_blocks: [u64; MOST_PROVIDERS] = [0; MOST_PROVIDERS];
 	// WHETHER A SOUND DRIVER IS BOUND, said by DeviceManager rather than inferred from a handle this
 	// supervisor no longer holds. See the driver status view below.
 	let mut snd_online: bool = false;

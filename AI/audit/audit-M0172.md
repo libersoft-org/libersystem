@@ -866,3 +866,25 @@ was invalidated by the corrections made elsewhere in this round. Two of those co
 checked against this file specifically, because they move contracts other plans consume - P02M0174's
 internal-only source/route rule for its own echo, and P02M0175's single aggregated L3 timer owner -
 and neither touches anything this plan relies on.
+
+AUDITOR'S RE-AUDIT OF PLAN M0172 (2026-09-03T03:32:40Z):
+
+Rating: 7/10
+
+1. **The later M0151 no-device-tree UEFI gate implementation makes the rejected carrier finding
+   live again.** The plan requires every boot, including every gate row, to carry a DMA-mode record
+   and makes absence fatal (`docs/todo/P02M0172.md:281-346`, `:641-648`). It assigns non-x86 UEFI
+   test/development boots the `fw_cfg` carrier, but the only defined way those kernels learn the
+   `fw_cfg` MMIO base is from the device tree (`docs/todo/P02M0172.md:482-508`,
+   `src/kernel/arch/aarch64/boot.rs:527-554`, `src/kernel/arch/riscv64/boot.rs:239-254`), and the
+   common reader returns no file when that base is zero
+   (`src/kernel/arch/common/fwcfg/mod.rs:148-152`). M0151 now registers positive AArch64 and RISC-V
+   UEFI gate rows whose purpose-built loaders deliberately withhold the firmware tree
+   (`src/tools/check-qemu-arch-profiles.sh:421-488`,
+   `src/boot/loader/src/arch/aarch64/mod.rs:36-45`,
+   `src/boot/loader/src/arch/riscv64/mod.rs:69-80`). Therefore the planner's earlier rejection on
+   the premise that no caller sets `LIBER_NO_DT_PROFILE` (`AI/audit/audit-M0172.md:507-545`) is no
+   longer true. As written, M0172 either breaks these registered rows through mandatory refusal or
+   cannot meet its every-boot carrier rule. The plan needs an early carrier/handoff for both no-DT
+   UEFI rows and a fixture for that path; the ordinary AArch64 UEFI fixture, which explicitly relies
+   on firmware passing a tree (`docs/todo/P02M0172.md:579-596`), does not exercise it.

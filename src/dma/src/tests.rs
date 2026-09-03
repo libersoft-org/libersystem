@@ -652,6 +652,73 @@ fn a_tail_queued_by_an_ended_binding_is_not_charged_to_the_one_that_replaced_it(
 }
 
 #[test]
+fn a_faulting_replacement_is_not_hidden_behind_its_predecessors_tail_for_ever() {
+	// A LIVE BINDING THAT FAULTS CONTINUOUSLY, ON AN ENDPOINT WHOSE PREDECESSOR'S TAIL WAS NEVER
+	// PROVED DRAINED.
+	//
+	// The tail stopped attributing only when the transport was next observed EMPTY, and a
+	// replacement faulting harder than the drain reads never lets that be observed: every one of its
+	// own faults came out carrying the dead binding's domain and generation, failed the
+	// cross-generation comparison the kernel contains on, and no live binding was ever taken off the
+	// bus. The ended binding queued a FINITE number of records, so a stream that outlasts what the
+	// transport can hold is not that binding's.
+	//
+	// Three records is a whole transport's worth for this fixture, so the fourth is the replacement
+	// answering for itself.
+	let mut iommu = Iommu::new(Fake::new().with_fault_queue_capacity(3), 8);
+	let first = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(1)).expect("a domain");
+	let endpoint = EndpointId(9);
+	iommu.attach(first, endpoint).expect("the first binding attaches");
+	iommu.revoke_endpoint(first, endpoint).expect("and its binding ends");
+	iommu.destroy_domain(first).expect("its domain is destroyed with it");
+	let second = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(2)).expect("a second domain");
+	iommu.attach(second, endpoint).expect("the replacement attaches");
+
+	// THE STORM. More queued than any drain reads, so the transport is never observed empty - which
+	// is the state that used to make the misattribution permanent.
+	for _ in 0..6 {
+		iommu.backend_mut_for_test().queue_fault(event(9, second.0, 0x2000, Access::Write, Fault::NotMapped));
+	}
+	let mut out = [event(0, 0, 0, Access::Read, Fault::NotMapped); 1];
+	for _ in 0..3 {
+		assert_eq!(iommu.drain_faults(&mut out), 1);
+		assert_eq!(out[0].domain, first, "while the tail can still explain it, the record is the ended binding's");
+		assert_eq!(out[0].generation, Generation(1));
+	}
+	assert_eq!(iommu.faults_in(first), 3, "the ended binding is charged with a transport's worth and no more");
+
+	// AND THE ONE PAST THE BOUND IS THE LIVE BINDING'S OWN.
+	assert_eq!(iommu.drain_faults(&mut out), 1);
+	assert_eq!(out[0].domain, second, "past what the predecessor could have queued, the endpoint is faulting now");
+	assert_eq!(out[0].generation, Generation(2), "so the containment decision meets the generation that is actually live");
+	assert_eq!(iommu.faults_in(second), 1, "and the accounting follows the attribution");
+	assert_eq!(iommu.faults_in(first), 3, "while the ended binding's count stays where the bound left it");
+}
+
+#[test]
+fn a_backend_that_cannot_state_its_transports_bound_keeps_attributing_to_the_tail() {
+	// THE CONSERVATIVE DEFAULT, KEPT. `fault_queue_capacity` answers `None` for a backend with no
+	// way to ask its transport, and the bound above must not be invented for one: charging a live
+	// binding for its predecessor's queue is the error that disables a healthy device.
+	let (mut iommu, first) = iommu();
+	let endpoint = EndpointId(11);
+	iommu.attach(first, endpoint).expect("the first binding attaches");
+	iommu.revoke_endpoint(first, endpoint).expect("and its binding ends");
+	iommu.destroy_domain(first).expect("its domain is destroyed with it");
+	let second = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(2)).expect("a second domain");
+	iommu.attach(second, endpoint).expect("the replacement attaches");
+	for _ in 0..8 {
+		iommu.backend_mut_for_test().queue_fault(event(11, second.0, 0x2000, Access::Write, Fault::NotMapped));
+	}
+	let mut out = [event(0, 0, 0, Access::Read, Fault::NotMapped); 1];
+	for _ in 0..6 {
+		assert_eq!(iommu.drain_faults(&mut out), 1);
+		assert_eq!(out[0].domain, first, "with no stated bound the tail goes on attributing until the queue runs dry");
+	}
+	assert_eq!(iommu.faults_in(second), 0, "and the replacement is charged with nothing it did not answer for");
+}
+
+#[test]
 fn a_tail_record_is_bounded_and_gives_up_the_ones_that_attribute_nothing_first() {
 	// FIXED BOOKKEEPING. A machine that restarts one driver in a loop must not grow a record per
 	// restart, and one that runs out of records must not silently give up one that is still
