@@ -1790,3 +1790,22 @@ The gate is rewritten to assert what can actually happen: the refusal is reporte
 withdrawn at a new generation, `LIST` no longer offers it, fallback no longer selects it, and no
 client can resolve the old identity to the new bytes - which is the capture the rule exists to
 prevent. The digest-at-`INTO` correction this finding confirms is unchanged.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0136 (2026-09-03T17:31:49Z):
+
+Current plan rating: 8/10
+
+1. **The corrected withdrawal rule conflicts with the surviving atomic ceiling rule, leaving the
+   runtime replacement contract and one required gate impossible.** The latest correction correctly
+   says that a published face whose replacement must be rejected—including a record past the
+   metadata-size ceiling—is withdrawn at a new generation, because the catalogue retains no old
+   bytes that it could continue serving (`docs/todo/P02M0136.md:604-637`). The ceiling section still
+   says that *any* rescan exceeding a ceiling publishes nothing, leaves the previous generation
+   current and served, and specifically requires a 257-byte replacement record to preserve that old
+   generation unchanged (`docs/todo/P02M0136.md:684-698`; the earlier recovery description repeats
+   the unchanged-generation rule at `:284-290`). Those outcomes cannot both occur. Once the writer
+   has overwritten the face, `RESOLVE-INTO`'s required digest check rejects the new bytes under the
+   old identity, which is the exact reason the latest response changed rejected replacements to
+   withdrawal. Align the ceiling rule and its one-past runtime gate with the withdrawal rule for an
+   invalid replacement of an already-published face; retaining an unchanged generation is sound only
+   where every face in that generation still has identity-matching bytes available.

@@ -172,10 +172,13 @@ def wait_state(state, what, timeout=SETTLE_TIMEOUT):
 # leaves this gate green, and the comment claiming otherwise was the third round of an assertion this
 # harness cannot make.
 PRESENTED = 'DisplayService: a frame reached the display through the provider it adopted'
+# The withdrawal half of a publication, said by the SUBSCRIBER rather than by the manager - a line
+# the manager prints would prove it reached its own send and no further.
+WITHDRAWN = 'DisplayService: a display provider was withdrawn and this service was told'
 NOT_PRESENTED = 'DisplayService: a frame did NOT reach the display through the provider it adopted'
 
 
-def exercise_the_display(guest, mark):
+def exercise_the_display(guest, mark, generation):
 	for _ in range(3):
 		guest.type_text('\x03', False, 15)
 		guest.wait_prompt(5)
@@ -196,12 +199,20 @@ def exercise_the_display(guest, mark):
 	# AND THE DRIVER IS STILL THERE, which M4 asks for in the same sentence as the frame (added
 	# 2026-09-03). A driver that served the framebuffer handshake, presented once and then exited
 	# satisfies every line above: the state was read BEFORE the frames were driven, and a present
-	# that reaches no provider is not reported. The binding is re-read afterwards, on the same claim
-	# generation, so "it came back" means it is still up rather than that it once was.
+	# that reaches no provider is not reported.
+	#
+	# AND IT IS THE BINDING THE ENABLE CREATED, WHICH THE RE-READ DID NOT SAY (fixed 2026-09-03).
+	# The comment claimed the re-read was "on the same claim generation" and the code asked only
+	# whether SOME binding was `online`. The generation-2 binding may die during the frames and an
+	# automatic recovery bind to generation 3 satisfies that read - and generation 3 emits its own
+	# adoption and present lines, so every check above passes too. What M4 asks is that the binding
+	# the commanded restart produced survived the frame, so that generation is what this compares.
 	after = gpu_binding()
 	if after.get('state') != 'online':
 		fail(f'the rebound binding is {after.get("state")} after the display was exercised - a frame reaching the display is only half of what M4 asks for')
-	step(f'  and the rebound binding is still online on claim generation {after.get("generation")}')
+	if after.get('generation') != generation:
+		fail(f'the device is online on claim generation {after.get("generation")}, not on {generation} which the enable created - the commanded rebind died during the frames and something else took the device')
+	step(f'  and the binding the enable created is still online on claim generation {after.get("generation")}')
 
 
 def main():
@@ -263,6 +274,21 @@ def main():
 		fail(f'a clean planned stop was recorded as an incident on this binding:\n{incident}')
 	step('  and it is not recorded as an incident')
 
+	# AND THE WITHDRAWAL REACHED THE SUBSCRIBER, which is the second of the two effects an emptied
+	# publication owes and had no oracle at all until now (added 2026-09-03).
+	#
+	# `Catalogue::announce_gone` sends a `live: false` frame to every subscriber of the kind. The
+	# host race test drives the ORDER of those two effects through a recorder and cannot fail if the
+	# send itself is removed; this is the production path, end to end - the operator's disable
+	# withdraws the binding's providers, the manager announces it, and the service that subscribed to
+	# `Display` says it was told. What the service does NOT do is release its scanout on the frame:
+	# the driver's channel closing is the authoritative signal for a driver that has gone, and the
+	# adoption below is what proves the replacement is picked up.
+	told = lab.serial_since(mark)
+	if WITHDRAWN not in told:
+		fail(f'the display provider was withdrawn and no subscriber was told - the announcement half of a withdrawal reached nobody:\n{told}')
+	step('  and the withdrawal was announced to the service subscribed to the kind')
+
 	# THE REBIND. `enable` lifts the stored disable and asks for one attempt; the driver has to
 	# acquire the device again, which under enforcement means a fresh domain and a fresh attach.
 	rebind_mark = lab.serial_size()
@@ -294,7 +320,21 @@ def main():
 
 	# AND THE DISPLAY, over the window that starts at the enable: the adoption line has to be this
 	# rebind's, not the one the cold boot printed.
-	exercise_the_display(guest, rebind_mark)
+	exercise_the_display(guest, rebind_mark, after['generation'])
+
+	# AND THE FAULT-FREE WINDOW COVERS THE FRAMES TOO, WHICH IT DID NOT (fixed 2026-09-03).
+	#
+	# The serial snapshot above was taken and judged BEFORE the display was exercised and never read
+	# again, so a fault raised by the first presentation through the rebound provider - which is
+	# precisely the DMA the new domain and the new attach were built for - passed unseen. The claim
+	# this milestone records is that no `iommu: FAULT` appears anywhere in the window; the window
+	# ends where the exercise does, so it is read again from the same mark.
+	whole = lab.serial_since(mark)
+	if 'iommu: FAULT' in whole:
+		fail(f'the device faulted during the restart or the presentation that followed it:\n{whole}')
+	if 'KERNEL PANIC' in whole:
+		fail(f'the guest panicked during the restart or the presentation that followed it:\n{whole}')
+	step('  and no fault or panic appeared anywhere from the disable to the end of the frames')
 
 	boot_at_end = lab.guest_boot()
 	if boot_at_end != boot_at_start:

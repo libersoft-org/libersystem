@@ -2202,8 +2202,32 @@ fn a_candidate_that_narrows_only_the_registry_is_still_a_narrowing() {
 	let owned = model.registry.ownership.first().expect("this tree declares ownership rules").clone();
 	let block = format!("[[ownership]]\npath = \"{}\"\ncomponent = \"{}\"\n", owned.path, owned.component);
 	assert!(text.contains(&block), "the fixture has to find the rule it is about");
-	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &narrowed_from(text.replace(&block, "")), &ownership);
+	let without_the_block = narrowed_from(text.replace(&block, ""));
+	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &without_the_block, &ownership, &crate::ownership::Ownership::new(&without_the_block, &model.crates));
 	assert!(losing.contains(&owned.component), "a component that owns fewer paths has lost coverage: {losing:?}");
+
+	// AND A RULE THAT IS STILL THERE, OVERRIDDEN BY A LONGER ONE (added 2026-09-03). Both lookups
+	// resolve by longest prefix, so ADDING a rule narrows without removing anything: the owner keeps
+	// every path it declared and stops owning the files under the new one. The set comparison could
+	// not see it, and neither could a comparison of target lists.
+	let deeper = format!("{}overridden-subtree/", if owned.path.ends_with('/') { owned.path.clone() } else { format!("{}/", owned.path) });
+	// Whoever answers for that path TODAY is who loses it - the declared rule, or a crate directory
+	// underneath it that is a longer match still. The fixture asks the resolver rather than assuming.
+	let crate::ownership::Owner::Component { component: displaced, .. } = ownership.owner(&deeper) else { panic!("a path under a declared rule is owned by somebody") };
+	let override_block = format!("{block}\n[[ownership]]\npath = \"{deeper}\"\ncomponent = \"a-component-this-registry-does-not-otherwise-name\"\n");
+	let with_override = narrowed_from(text.replace(&block, &override_block));
+	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &with_override, &ownership, &crate::ownership::Ownership::new(&with_override, &model.crates));
+	assert!(losing.contains(&displaced), "a longer rule takes a subtree away from the component that owned it: {losing:?}");
+
+	// AND A COMPONENT THAT NO LONGER SELECTS EVERYTHING, which is the widest narrowing this registry
+	// can express: its changes drop from the FULL suite to the ordinary scoped closure, and not one
+	// ownership rule, edge or architecture row moves.
+	let escalates = model.registry.selects_everything.first().expect("this tree declares an escalation").clone();
+	let escalation_block = format!("[[selects_everything]]\ncomponent = \"{}\"\nreason = \"{}\"\n", escalates.component, escalates.reason);
+	assert!(text.contains(&escalation_block), "the fixture has to find the escalation it is about");
+	let without_escalation = narrowed_from(text.replace(&escalation_block, ""));
+	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &without_escalation, &ownership, &crate::ownership::Ownership::new(&without_escalation, &model.crates));
+	assert!(losing.contains(&escalates.component), "a component that stops selecting everything has lost every check its closure does not reach: {losing:?}");
 
 	// AND A PATH BUILT OR BOOTED ON FEWER TARGETS. Same checks, fewer machines.
 	let arch = model.registry.architecture.iter().find(|rule| rule.boot.len() > 1).expect("this tree declares a multi-target path").clone();
@@ -2211,12 +2235,23 @@ fn a_candidate_that_narrows_only_the_registry_is_still_a_narrowing() {
 	let narrower_arch = format!("path = \"{}\"\nbuild = [{}]\nboot = [{}]", arch.path, arch.build.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", "), quoted[0]);
 	let wider_arch = format!("path = \"{}\"\nbuild = [{}]\nboot = [{}]", arch.path, arch.build.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", "), quoted.join(", "));
 	assert!(text.contains(&wider_arch), "the fixture has to find the target list it is about");
-	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &narrowed_from(text.replace(&wider_arch, &narrower_arch)), &ownership);
+	let narrowed_targets = narrowed_from(text.replace(&wider_arch, &narrower_arch));
+	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &narrowed_targets, &ownership, &crate::ownership::Ownership::new(&narrowed_targets, &model.crates));
 	assert!(!losing.is_empty(), "a path booted on fewer targets has lost coverage");
+
+	// AND AN ARCHITECTURE ROW THAT IS STILL THERE, OVERRIDDEN BY A LONGER ONE. `architecture_rule`
+	// takes the longest match too, so a deeper row with one target narrows every path beneath it
+	// while the row this used to iterate keeps its whole list.
+	let deeper_arch = format!("{}overridden-subtree/", if arch.path.ends_with('/') { arch.path.clone() } else { format!("{}/", arch.path) });
+	let with_deeper = format!("{wider_arch}\n\n[[architecture]]\npath = \"{deeper_arch}\"\nbuild = [{}]\nboot = [{}]", quoted[0], quoted[0]);
+	let deeper_targets = narrowed_from(text.replace(&wider_arch, &with_deeper));
+	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &deeper_targets, &ownership, &crate::ownership::Ownership::new(&deeper_targets, &model.crates));
+	let crate::ownership::Owner::Component { component: fewer_machines, .. } = ownership.owner(&deeper_arch) else { panic!("a path under a declared architecture row is owned by somebody") };
+	assert!(losing.contains(&fewer_machines), "a longer architecture row takes machines away from a subtree the retained one still names: {losing:?}");
 
 	// AND AN IDENTICAL REGISTRY TAKES NOTHING AWAY, which is what stops this refusing every
 	// candidate that only touches the kernel tests' `covers`.
-	assert!(crate::candidate::components_losing_registry_coverage(&model.registry, &model.registry, &ownership).is_empty(), "a registry that did not change narrows nothing");
+	assert!(crate::candidate::components_losing_registry_coverage(&model.registry, &model.registry, &ownership, &ownership).is_empty(), "a registry that did not change narrows nothing");
 }
 
 #[test]

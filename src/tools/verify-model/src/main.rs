@@ -1025,7 +1025,7 @@ fn run() -> Result<ExitCode, String> {
 				// The comparison is `candidate::components_losing_registry_coverage`, where a test
 				// can drive it: inline here it could only be exercised by activating a candidate,
 				// which is the thing it gates.
-				losing.extend(verify_model::candidate::components_losing_registry_coverage(&model.registry, &narrowed_model.registry, &model.ownership()));
+				losing.extend(verify_model::candidate::components_losing_registry_coverage(&model.registry, &narrowed_model.registry, &model.ownership(), &narrowed_model.ownership()));
 				let mut short: Vec<String> = Vec::new();
 				for lost in &losing {
 					// The universe a kernel test is judged in. A narrowing of a guest test is

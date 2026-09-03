@@ -811,6 +811,19 @@ unsafe fn serve_display(root: u64, admin: u64, catalogue: u64, mut providers: u6
 									print(b"DisplayService: a published display provider did not hand over a usable framebuffer\n");
 								}
 							}
+							// A WITHDRAWAL, WHICH THIS SERVICE ACTS ON BY SAYING SO AND NOTHING
+							// MORE - and now it says so (2026-09-03).
+							//
+							// The arm was silent, and silence is the same as the announcement never
+							// arriving: `Catalogue::announce_gone` could be emptied and nothing in
+							// any suite would notice, so the second of M7's two production effects
+							// had no oracle at all. It is a LINE and not a state change on purpose:
+							// the scanout is released when the driver's channel closes, which is the
+							// authoritative signal for a driver that has actually gone, and a
+							// withdrawal frame is a manager saying the publication is over.
+							Some(info) if !info.live => {
+								print(b"DisplayService: a display provider was withdrawn and this service was told\n");
+							}
 							Some(_) => {}
 							None => print(b"DisplayService: a provider frame did not decode\n"),
 						}

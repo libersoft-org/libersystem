@@ -1429,3 +1429,48 @@ Focused verification: the latest latch fix is present and the restart harness co
 passes for the enforcing-profile gate. The false-positive follows from the deterministic ordering of
 the serial snapshot and the unqualified final binding read, so a guest run is not needed to establish
 it.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0159 (2026-09-03T17:52:37Z):
+
+1. **The controlled-restart oracle is not pinned to the replacement binding or to the full exercise
+   window** - ACCEPTED, both halves, and the first one had a comment claiming the opposite of what
+   the code did.
+
+   THE GENERATION. `exercise_the_display` read the binding again at the end and required only
+   `state == online`. Its comment said the re-read was "on the same claim generation", and nothing
+   compared anything: the harness knew the generation the enable produced and never handed it to the
+   function that needed it. The substitution the finding describes is real and is not exotic - the
+   generation-2 binding can die during the frames and the standing loop's automatic recovery binds
+   generation 3, which acquires the device, publishes, is adopted by DisplayService and presents. So
+   every line above the final read passes on a binding nobody commanded, and the final read passes
+   too. What M4 asks is that the driver is still there after the frame, and "there" means the binding
+   the commanded restart produced.
+
+   CODE. `exercise_the_display` takes the generation as a parameter; `main` passes
+   `after['generation']`, the value the post-enable read reported and already compared against the
+   pre-disable one. The final check requires `state == online` AND that generation, and its failure
+   message names both numbers so a run that hits it says which binding answered.
+
+   THE WINDOW. Also accepted, and it is the more serious of the two. `window = serial_since(mark)`
+   was taken and judged BEFORE the display was exercised and the log was never read again, so the
+   fault-free claim covered the teardown and the rebind and stopped exactly where the interesting DMA
+   begins: the first presentation through the rebound provider is what the new domain and the new
+   attach exist for. A fault raised there passed unseen, while the milestone records the claimed
+   result as no `iommu: FAULT` anywhere in the window.
+
+   CODE. After `exercise_the_display` returns, the log is read again from the SAME mark - the whole
+   window from the disable to the end of the frames - and `iommu: FAULT` and `KERNEL PANIC` are both
+   refused over it, with a step line saying so. The earlier read is kept: it is what makes a failure
+   attributable to the restart rather than to the frames.
+
+   A third change landed in the same file for P02M0165's benefit and is recorded there rather than
+   here: the harness now asserts that the withdrawal of the display provider was ANNOUNCED to the
+   subscriber, over the disable window.
+
+## Verification for this round (2026-09-03T17:52:37Z)
+
+    python3 -c "import ast; ast.parse(...)"        src/harness/dev-gpu-restart.py parses
+    ./check.sh --gate source-hygiene                clean (--current)
+
+The guest run this harness performs needs a running development instance and is part of the single
+long run at the end of this job; its result is recorded with that run.

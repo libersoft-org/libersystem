@@ -2070,3 +2070,30 @@ precisely why the rule this file added makes a row satisfied by an EMPTY LIST ra
 sentence claiming completeness. The row and the list entry now record entries and explicitly do not
 claim to have named the last one, and both rounds' repairs are listed so the row's claim rests on
 what was fixed rather than on an assertion.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0099 (2026-09-03T17:34:12Z):
+
+Current plan rating: 7/10
+
+1. **The P02M0167 blocker list still treats an incomplete candidate-activation repair as
+   discharged.** The plan's rule says a prerequisite defect is added to the blocker list and a row
+   is satisfied only when that list is empty, yet the list leaves only the medium race open and
+   records registry-driven candidate narrowing among the discharged defects
+   (`docs/todo/P02M0099.md:230-246,267-273,299-307`). The accepted helper does not compare the plans
+   selected by the two registries; it compares only removed exact ownership rows, removed exact
+   edges, and reduced target sets on existing exact architecture rows
+   (`src/tools/verify-model/src/candidate.rs:65-102`). Deleting a `selects_everything` row is therefore
+   invisible even though it changes the affected component from a FULL plan to a scoped plan
+   (`src/tools/verify-model/src/plan.rs:206-243`). Adding a longer ownership or architecture prefix is
+   invisible as well: all old exact rows remain, but longest-prefix resolution lets the new row
+   replace the old owner or target set for a subtree
+   (`src/tools/verify-model/src/ownership.rs:44-83`; `src/tools/verify-model/src/plan.rs:589-603`). In
+   each case `losing` can remain empty, so both evidence bars are skipped before materialisation
+   (`src/tools/verify-model/src/main.rs:1028-1085`). The claimed test covers only deletion of one
+   ownership block and reduction of one existing architecture row, not these narrowing forms
+   (`src/tools/verify-model/src/tests.rs:2180-2220`). Thus the planner's factual rejection remains
+   unjustified and this evidence prerequisite is not discharged for driver acceptance.
+
+Focused verification: `cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline
+a_candidate_that_narrows_only_the_registry_is_still_a_narrowing` passes its one existing test; that
+test does not exercise any of the bypasses above.

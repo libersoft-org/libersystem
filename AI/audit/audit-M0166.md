@@ -1577,3 +1577,52 @@ Current implementation rating: 8/10
    state and resources. Those are explicit definition-of-done behaviours, not optional harness
    expansion (`docs/todo/P02M0166.md:265-281`). The two most recent persistence fixes are present and
    correct, but they do not resolve this previously acknowledged verification gap.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0166 (2026-09-03T17:52:37Z):
+
+1. **The milestone's required policy-behaviour proof remains incomplete** - ACCEPTED. The distinction
+   the finding draws is the right one and it is not the one the previous rounds acted on: every RULE
+   had a test and none of the three BEHAVIOURS did. Each of the three is two or three rules meeting,
+   and every one of them has been wrong at the seam rather than inside a rule - the cursor comparison
+   a `select` relied on worked only when the operator named a higher index, and the park that follows
+   a granted retry reset the counter the retry had just set. A test per rule cannot fail on either.
+
+   CODE. The last piece of that composition still inside DeviceManager was `spend_candidate`'s
+   decision, which is what makes a selection SURVIVE the end of whatever was running. It is
+   `driver_binding::cursor_after_an_attempt(ran, cursor, selection_pending)` now, in the crate where
+   the other three policy rules already live, and `spend_candidate` calls it. Nothing else moved: the
+   verbs' remaining effects are field writes whose arithmetic already comes from this crate.
+
+   TEST. `a_selection_and_a_granted_attempt_survive_the_sequences_that_used_to_spend_them` in
+   `src/user/libs/driver/binding/src/tests.rs`, one test walking all three sequences the definition
+   of done names:
+
+   - A live `select`: entry 0 is running, the operator selects entry 1, the record is asserted still
+     `Online` - `select` is not in the disable path at all - and when the running binding ends the
+     cursor is required to be the operator's entry rather than the one after what ran. Then the flag
+     is cleared, as `begin_bind` clears it, and the cursor is required to advance - which is what
+     stops a selection holding the node in a loop on one candidate.
+   - A retry through a still-missing requirement: `decide_retry` grants it from `Failed`,
+     `one_more_attempt` rewinds to the operator's choice and sets the counter one below the bound,
+     the record takes `Failed -> DependencyPending` because the bind found the requirement missing,
+     and `budget_after_nothing_ran` is required to leave exactly one attempt. The two edges out of
+     `DependencyPending` are asserted too - to `Binding`, and NOT to `Unbound`.
+   - Policy on a quarantined node: `decide_retry` answers `Quarantined` rather than `Busy`, a
+     selection is recorded like any other, `disable_action` answers `RecordItDirectly`, and every
+     edge that direct move would need is asserted ABSENT from the table - so the state and everything
+     charged against it stand for the boot. The two halves are separate assertions, as the definition
+     of done asks, because they fail separately.
+
+   WHAT THIS DOES NOT CLAIM. It does not execute DeviceManager's `apply_policy`, and nothing in a
+   host suite can: it is a `no_std` binary whose every arm calls syscalls and the catalogue. The
+   remaining exposure is a verb that stops calling a rule, which is the same exposure every previous
+   extraction in this milestone leaves and which the boot's own `disable`/`enable` check partly
+   covers. What has changed is that the compositions themselves - the three the definition of done
+   names, and the seams where all of the historical defects were - are now in one place and driven.
+
+## Verification for this round (2026-09-03T17:52:37Z)
+
+    cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline   66 passed
+    ./build.sh --part user                                                          built (x86_64)
+    ./check.sh --gate one-wait,no-fixed-provider-slots                              passed
+    ./check.sh --gate source-hygiene,no-suppression,milestone-index                 clean

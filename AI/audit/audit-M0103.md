@@ -2209,3 +2209,27 @@ ACCEPTED that the row overstated the evidence path and kept calling the medium r
 outstanding condition. It now records the second round's three defects and their repair, and keeps
 the rule rather than the count: an evidence prerequisite records the conditions it knows and does not
 claim to have named the last one.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0103 (2026-09-03T17:34:12Z):
+
+Current plan rating: 8/10
+
+1. **The latest P02M0167 rejection still overstates the candidate evidence repair.** The plan now
+   records registry-driven narrowing as repaired (`docs/todo/P02M0103.md:258-268`), but the helper
+   compares only removed exact ownership rows, removed exact edges, and reduced target sets on
+   existing exact architecture rows (`src/tools/verify-model/src/candidate.rs:65-102`). It entirely
+   misses deletion of a `selects_everything` row, which changes a component from a FULL plan to its
+   scoped closure (`src/tools/verify-model/src/plan.rs:206-243`). It also misses a newly added longer
+   ownership or architecture prefix: the old exact rows remain unchanged while longest-prefix
+   resolution lets the added rule narrow a subtree's owner or targets
+   (`src/tools/verify-model/src/ownership.rs:44-83`; `src/tools/verify-model/src/plan.rs:589-603`). Any
+   of these candidates can therefore leave `losing` empty and bypass both activation evidence bars
+   (`src/tools/verify-model/src/main.rs:1028-1085`). The regression test exercises only ownership-row
+   deletion and target reduction on an existing architecture row, not the remaining paths
+   (`src/tools/verify-model/src/tests.rs:2180-2220`). This is independent of the acknowledged medium
+   race and materially leaves the P02M0167 evidence prerequisite less trustworthy than the current
+   plan says it is.
+
+Focused verification: `cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline
+a_candidate_that_narrows_only_the_registry_is_still_a_narrowing` passes its one existing test; that
+test does not exercise any of the bypasses above.

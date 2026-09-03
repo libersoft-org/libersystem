@@ -1346,9 +1346,15 @@ impl<B: Backend> Iommu<B> {
 	// asks for the binding generation in the RECORD, and two answers that disagree is not one of
 	// them. The caller supplies what it knows and the correction happens before the event is kept.
 	//
-	// Applied ONLY to an event whose endpoint matches and whose domain the backend could not resolve:
-	// a fault from another endpoint keeps its own attribution, and a resolved one is never overwritten
-	// by a guess.
+	// Applied to an event whose ENDPOINT matches, resolved domain or not - a fault from another
+	// endpoint keeps its own attribution. It cannot be restricted to unresolved ones, and the comment
+	// that said it was described a design this is not (corrected 2026-09-03): the backend resolves
+	// `event.domain` from its CURRENT attachment table, so once the endpoint is rebound every one of
+	// the predecessor's queued records comes out already carrying the replacement's domain. Refusing
+	// to overwrite a resolved one would make the tail record apply to exactly the case it does not
+	// exist for.
+	//
+	// What the resolution DOES decide is the COST - see the window below.
 	pub fn drain_faults_during(&mut self, out: &mut [FaultEvent], teardown: Option<(EndpointId, DomainId, Generation)>) -> usize {
 		let taken = self.backend.drain_faults(out);
 		for event in out.iter_mut().take(taken) {
@@ -1372,16 +1378,39 @@ impl<B: Backend> Iommu<B> {
 			// rather than a fact about the transport - see `Backend::fault_queue_capacity`, which no
 			// transport in this tree can answer. Past it, the records arriving are treated as the
 			// endpoint's own: attributed to the live binding, and contained as such.
+			// AND THE WINDOW IS SPENT ONLY ON THE RECORDS THAT NEEDED A GUESS (2026-09-03).
+			//
+			// `attributed` counted every record the tail rewrote, and most of them are not ambiguous
+			// at all: while the endpoint is still DETACHED the backend can resolve it to no domain,
+			// so `DomainId(0)` arrives and the ONLY binding such a record can belong to is the one
+			// that ended - there is no replacement yet to charge it to. Spending the policy bound on
+			// those meant an ordinary teardown that queued more than `MOST_TAIL_ATTRIBUTIONS` faults
+			// and was drained before the rebind exhausted the window on records that were exact, and
+			// then attributed the REST - the genuinely ambiguous ones - to a live binding.
+			//
+			// The bound is a trade-off about a guess, so it is charged where the guess is made: a
+			// record whose endpoint the backend resolved to a live domain is one the replacement
+			// could have raised, and that is the case `MOST_TAIL_ATTRIBUTIONS` bounds. It does not
+			// make the attribution exact - nothing available here can, see the constant - but it
+			// stops the window being consumed by records that never needed it.
 			let bound = Some(self.backend.fault_queue_capacity().unwrap_or(MOST_TAIL_ATTRIBUTIONS));
+			let resolved_live: bool = self.domains.contains_key(&event.domain);
 			if let Some(tail) = self.detached.iter_mut().find(|tail| !tail.drained && tail.endpoint == event.endpoint) {
-				if bound.is_some_and(|most| tail.attributed >= most) {
+				// A RESOLUTION TO THE TAIL'S OWN DOMAIN IS NOT A GUESS EITHER. `revoke_endpoint`
+				// asks the backend to detach and a refused detach leaves the endpoint attached to
+				// the domain that is ending, which is still in `domains` until it is destroyed - so
+				// the record resolves, and to the only binding it can be.
+				let ambiguous: bool = resolved_live && event.domain != tail.domain;
+				if ambiguous && bound.is_some_and(|most| tail.attributed >= most) {
 					tail.drained = true;
 				} else {
 					event.domain = tail.domain;
 					event.generation = tail.generation;
 					// CHARGED TO THE BINDING THAT RAISED IT, and to a counter that outlives its domain.
 					tail.faults = tail.faults.saturating_add(1);
-					tail.attributed = tail.attributed.saturating_add(1);
+					if ambiguous {
+						tail.attributed = tail.attributed.saturating_add(1);
+					}
 					self.faults.record(*event);
 					continue;
 				}

@@ -118,6 +118,42 @@ fn a_node_that_never_got_to_attempt_anything_still_records_why() {
 }
 
 #[test]
+fn a_shutdown_asks_everything_that_still_holds_a_device_and_not_only_what_is_online() {
+	use crate::shutdown_stops;
+	// THE SAME TRAP AS THE DISABLE BELOW, IN THE OTHER PLACE THAT WALKS THE ACTIVE SET.
+	//
+	// `stop_all` asked whether the record was `Online`. A crash recovery starts a bind from the
+	// standing loop and returns to the central wait with the node in `Binding`, its process spawned,
+	// its device claimed and its channel open - and a shutdown arriving there was answered by
+	// skipping that node entirely. No `STOP`, no bounded wait, no forced teardown; the manager then
+	// acknowledged the shutdown and exited leaving the driver running.
+	assert!(shutdown_stops(BindingState::Online, true), "a running driver is asked to stop");
+	assert!(shutdown_stops(BindingState::Binding, true), "and so is one that has taken the device but not reported ready");
+	assert!(!shutdown_stops(BindingState::Binding, false), "before the claim there is nothing to ask and nothing to give back");
+	assert!(BindingState::Binding.may_move_to(BindingState::Stopping), "and the edge that stop needs exists from there");
+	// EVERYTHING ELSE HOLDS NOTHING. A node whose teardown is already in flight is included by that
+	// rule rather than by one of its own: `advance` takes the binding out of the node when it starts
+	// the teardown, so there is no device left for a shutdown to ask about.
+	for &state in [
+		BindingState::Unbound,
+		BindingState::Backoff,
+		BindingState::Failed,
+		BindingState::DependencyPending,
+		BindingState::Stopping,
+		BindingState::Quarantined,
+		BindingState::Disabled,
+	]
+	.iter()
+	{
+		assert!(!shutdown_stops(state, false), "{:?} holds no device", core::str::from_utf8(state.name()));
+	}
+	assert!(!shutdown_stops(BindingState::Stopping, true), "a teardown already under way is the one that completes");
+	// AND A SHUTDOWN DESCRIBES NO NEXT STATE, which is what makes this a traversal rather than a
+	// transition table: there is no manager left to read one.
+	assert!(crate::StopIntent::Shutdown.confirmed_lands_at(true).is_none());
+}
+
+#[test]
 fn a_disable_uses_the_teardown_wherever_there_is_one_to_use() {
 	use crate::{DisableAction, disable_action};
 	// THE THREE CASES, AND THE TWO THAT WERE MISSING.
@@ -825,6 +861,85 @@ fn a_stopped_that_arrives_after_the_deadline_does_not_turn_a_forced_teardown_bac
 	assert!(ledger.closed_once(0x5000 + 1), "the process handle is closed even so");
 	assert!(ledger.closed_once(0x5000 + 2), "and the manager's end of the bootstrap channel");
 	assert_eq!(&ledger.domains[..ledger.domains_n], &[0x5000], "and the Domain is killed exactly once");
+}
+
+// THE THREE BEHAVIOURS THE DEFINITION OF DONE ASKS FOR, COMPOSED RATHER THAN CHECKED ONE RULE AT A
+// TIME.
+//
+// The test below drives each rule on its own, and that is not the same claim: what the milestone
+// asks is that a live `select` SURVIVES until the next bind, that a retry through a still-missing
+// requirement lands with EXACTLY ONE attempt, and that policy on a quarantined node changes nothing.
+// Each of those is a sequence of two or three rules meeting, and every one of them has been wrong at
+// a seam rather than inside a rule: the cursor comparison `select` relied on worked only for a
+// higher index, and the park that follows a retry reset the counter the retry had just set.
+#[test]
+fn a_selection_and_a_granted_attempt_survive_the_sequences_that_used_to_spend_them() {
+	use super::{BindingState, RetryVerdict, budget_after_nothing_ran, cursor_after_an_attempt, decide_retry, one_more_attempt, selected_candidate};
+	const MAX_ATTEMPTS: u32 = 3;
+	let names: [&[u8]; 3] = [b"virtio_gpu", b"vga", b"bochs"];
+
+	// A LIVE `select` LEAVES THE RUNNING BINDING RUNNING AND TAKES EFFECT AT THE NEXT BIND.
+	//
+	// Entry 0 is running; the operator selects entry 1, which moves the cursor and raises the flag.
+	// Nothing about the record changes - `select` is not in the disable path at all - and when the
+	// running binding ends, the cursor stays where the operator put it instead of advancing past
+	// what ran. That is the whole of "at the next bind", and the comparison this replaced advanced
+	// past a selection of entry 0 or of the entry that was running.
+	let chosen = selected_candidate(&names, b"vga").expect("a declared candidate");
+	let (running, mut cursor, mut pending) = (0usize, chosen, true);
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Binding, None));
+	assert!(record.move_to(BindingState::Online, None));
+	assert!(record.state == BindingState::Online, "a selection does not disturb the binding that is running");
+	cursor = cursor_after_an_attempt(running, cursor, pending);
+	assert_eq!(cursor, chosen, "the entry the operator chose is where the next bind starts, not the one after what ran");
+
+	// AND IT IS SPENT BY THE BIND IT ASKED FOR, NOT BY THE ONE AFTER IT. `begin_bind` clears the
+	// flag when an attempt starts from that entry, so if THAT attempt fails the list advances like
+	// any other - a selection that held the cursor for ever would loop the node on one candidate.
+	pending = false;
+	cursor = cursor_after_an_attempt(chosen, cursor, pending);
+	assert_eq!(cursor, chosen + 1, "once the selected candidate has had its bind, the cursor advances like any other");
+
+	// A RETRY THROUGH A STILL-MISSING REQUIREMENT LANDS IN `DependencyPending` WITH EXACTLY ONE
+	// ATTEMPT.
+	//
+	// The node has exhausted its list and is `Failed`. The retry is granted, sets the counter one
+	// below the bound and rewinds the cursor to the operator's choice; the bind it asks for finds a
+	// requirement missing and parks. NOTHING RAN, so the budget rule applies - and it is the seam
+	// that was wrong: an unconditional reset there turned the operator's single attempt into the
+	// whole automatic budget, which is three.
+	let mut exhausted = BindingRecord::new();
+	assert!(exhausted.move_to(BindingState::Binding, None));
+	assert!(exhausted.move_to(BindingState::Failed, Some(FailureCause::DriverMissing)));
+	assert_eq!(decide_retry(exhausted.state, false), RetryVerdict::Grant, "a failed binding is what retry is for");
+	let granted = one_more_attempt(names.len(), names.len(), Some(chosen), MAX_ATTEMPTS);
+	assert_eq!(granted.candidate, chosen, "the rewind goes to the operator's choice");
+	assert!(exhausted.move_to(BindingState::DependencyPending, None), "the bind the retry asked for finds the requirement missing and parks");
+	let after_the_park = budget_after_nothing_ran(true, granted.attempt);
+	assert_eq!(after_the_park, MAX_ATTEMPTS - 1, "the park did not give the automatic budget back");
+	assert_eq!(MAX_ATTEMPTS - after_the_park, 1, "so exactly one attempt is left, which is what the operator asked for");
+	// AND THE REQUIREMENT ARRIVING IS THE ONLY WAY OUT, onto the one edge the table leaves open.
+	assert!(BindingState::DependencyPending.may_move_to(BindingState::Binding));
+	assert!(!BindingState::DependencyPending.may_move_to(BindingState::Unbound), "a node waiting for a provider does not go back to where a bind begins");
+
+	// AND ON A QUARANTINED NODE, THE TWO HALVES SEPARATELY. `retry` is refused with that reason -
+	// not with a generic busy - and the other three verbs change neither the state nor anything the
+	// node is holding, because a quarantine exists exactly where nothing confirmed the device quiet.
+	assert_eq!(decide_retry(BindingState::Quarantined, false), RetryVerdict::Quarantined, "and it says which refusal it is");
+	let mut quarantined = BindingRecord::new();
+	assert!(quarantined.move_to(BindingState::Binding, None));
+	assert!(quarantined.move_to(BindingState::Stopping, None));
+	assert!(quarantined.move_to(BindingState::Quarantined, None));
+	// A `select` on it is a cursor move and nothing else, and `disable`/`enable` reach the record
+	// through `disable_action`, which answers `RecordItDirectly` - onto an edge the table does not
+	// have, so the move is refused and the state stands.
+	let held = cursor_after_an_attempt(0, chosen, true);
+	assert_eq!(held, chosen, "a selection is recorded on a quarantined node like any other");
+	assert_eq!(crate::disable_action(BindingState::Quarantined, false, false), crate::DisableAction::RecordItDirectly);
+	assert!(!BindingState::Quarantined.may_move_to(BindingState::Disabled), "and there is no edge out of quarantine for it to take");
+	assert!(!BindingState::Quarantined.may_move_to(BindingState::Unbound), "nor one for an enable");
+	assert!(quarantined.state == BindingState::Quarantined, "so the state and everything charged against it stand for this boot");
 }
 
 // AN OPERATOR'S `retry` AND `select`, AS RULES RATHER THAN AS A BINARY NOBODY CAN DRIVE.

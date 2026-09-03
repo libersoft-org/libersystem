@@ -62,7 +62,7 @@ pub struct Candidate {
 //
 // Its own function so it can be driven by a test: the comparison that used to live inline in the
 // activation path could only be exercised by activating a candidate, which is the thing it gates.
-pub fn components_losing_registry_coverage(active: &crate::registry::Registry, narrowed: &crate::registry::Registry, ownership: &crate::ownership::Ownership) -> std::collections::BTreeSet<String> {
+pub fn components_losing_registry_coverage(active: &crate::registry::Registry, narrowed: &crate::registry::Registry, ownership: &crate::ownership::Ownership, narrowed_ownership: &crate::ownership::Ownership) -> std::collections::BTreeSet<String> {
 	let mut losing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
 	// A COMPONENT THAT OWNS FEWER PATHS IS REACHED BY FEWER CHANGES.
@@ -81,6 +81,43 @@ pub fn components_losing_registry_coverage(active: &crate::registry::Registry, n
 		}
 	}
 
+	// AND A RULE THAT IS STILL THERE CAN BE OVERRIDDEN BY A LONGER ONE (added 2026-09-03).
+	//
+	// Both lookups resolve by LONGEST PREFIX, so a candidate narrows a component's reach without
+	// removing or shortening anything of its own: keep `src/kernel/` -> `kernel` and ADD
+	// `src/kernel/mem/` -> something else, and `kernel` still owns every path it declared while
+	// every file under `mem` stops seeding it. The set comparisons above cannot see that - both
+	// registries contain `src/kernel/`, so nothing was lost by their reading - and neither bar ran.
+	//
+	// Asking the resolver instead of comparing rule texts. The path where the change shows is the
+	// path of whichever rule is new or moved, so every rule path in EITHER registry is probed and
+	// the two answers compared; a component that owned a probe path before and does not after has
+	// lost it, whatever shape the edit took. `non_code` competes by length like any other rule, so a
+	// path claimed back as documentation is the same loss and is caught by the same comparison.
+	let mut probes: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+	for registry in [active, narrowed] {
+		probes.extend(registry.ownership.iter().map(|rule| rule.path.as_str()));
+		probes.extend(registry.non_code.iter().map(|rule| rule.path.as_str()));
+	}
+	for path in &probes {
+		let crate::ownership::Owner::Component { component, .. } = ownership.owner(path) else { continue };
+		let kept = matches!(narrowed_ownership.owner(path), crate::ownership::Owner::Component { component: after, .. } if after == component);
+		if !kept {
+			losing.insert(component);
+		}
+	}
+
+	// A COMPONENT THAT NO LONGER SELECTS EVERYTHING IS THE LARGEST NARROWING THIS REGISTRY CAN
+	// EXPRESS, AND IT WAS INVISIBLE (added 2026-09-03).
+	//
+	// A `[[selects_everything]]` row makes any change to its component plan the FULL suite; deleting
+	// it drops that component to the ordinary scoped closure - every gate, conformance suite and
+	// profile the closure does not reach stops running for it. No ownership rule, edge or
+	// architecture row moves, so `losing` stayed empty and a candidate could take the whole suite
+	// away from the packager or the loader with no evidence asked for at all.
+	let escalating = |registry: &crate::registry::Registry| -> std::collections::BTreeSet<String> { registry.selects_everything.iter().map(|rule| rule.component.clone()).collect() };
+	losing.extend(escalating(active).difference(&escalating(narrowed)).cloned());
+
 	// AN EDGE THAT IS GONE IS AN ESCALATION THAT NO LONGER HAPPENS, and what loses coverage is the
 	// component the edge REACHED - the one a change to `from` used to pull in.
 	let edge_set = |registry: &crate::registry::Registry| -> std::collections::BTreeSet<(String, String, String)> { registry.edges.iter().map(|edge| (edge.from.clone(), edge.to.clone(), edge.kind.clone())).collect() };
@@ -90,11 +127,34 @@ pub fn components_losing_registry_coverage(active: &crate::registry::Registry, n
 
 	// A PATH BUILT OR BOOTED ON FEWER TARGETS IS CHECKED ON FEWER MACHINES, and the component that
 	// loses it is whoever owns that path.
-	let targets = |registry: &crate::registry::Registry| -> std::collections::BTreeMap<String, (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>)> { registry.architecture.iter().map(|rule| (rule.path.clone(), (rule.build.iter().cloned().collect(), rule.boot.iter().cloned().collect()))).collect() };
-	let (arch_before, arch_after) = (targets(active), targets(narrowed));
-	for (path, (build, boot)) in &arch_before {
-		let kept = arch_after.get(path);
-		let narrower = kept.is_none_or(|(after_build, after_boot)| build.iter().any(|target| !after_build.contains(target)) || boot.iter().any(|target| !after_boot.contains(target)));
+	//
+	// RESOLVED, NOT COMPARED RULE BY RULE (corrected 2026-09-03) - the same longest-prefix trap as
+	// the ownership block above. `Planner::architecture_rule` takes the LONGEST matching row, so
+	// adding `src/kernel/mem/` with one target beside a retained `src/kernel/` with four narrows
+	// every path under `mem` while leaving the row this loop iterates untouched: the new path is in
+	// no `before` map, the old row's targets are identical, and nothing was reported lost. Every
+	// architecture path in EITHER registry is probed and the effective answer compared.
+	let effective = |registry: &crate::registry::Registry, path: &str| -> Option<(std::collections::BTreeSet<String>, std::collections::BTreeSet<String>)> {
+		let mut best: Option<(usize, &crate::registry::ArchitectureRule)> = None;
+		for rule in &registry.architecture {
+			if let Some(len) = crate::registry::prefix_match(&rule.path, path)
+				&& best.is_none_or(|(best_len, _)| len > best_len)
+			{
+				best = Some((len, rule));
+			}
+		}
+		best.map(|(_, rule)| (rule.build.iter().cloned().collect(), rule.boot.iter().cloned().collect()))
+	};
+	let mut arch_probes: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+	for registry in [active, narrowed] {
+		arch_probes.extend(registry.architecture.iter().map(|rule| rule.path.as_str()));
+	}
+	for path in &arch_probes {
+		let Some((build, boot)) = effective(active, path) else { continue };
+		let after = effective(narrowed, path);
+		// A path with no row at all falls back to every architecture, which is wider rather than
+		// narrower - so only a row that ANSWERS with fewer targets is a loss.
+		let narrower = after.is_some_and(|(after_build, after_boot)| build.iter().any(|target| !after_build.contains(target)) || boot.iter().any(|target| !after_boot.contains(target)));
 		if narrower && let crate::ownership::Owner::Component { component, .. } = ownership.owner(path) {
 			losing.insert(component);
 		}

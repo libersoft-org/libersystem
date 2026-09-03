@@ -1709,3 +1709,69 @@ DMA/virtio-IOMMU suite passed all 62 tests, `virtio-iommu-protocol` passed with 
 the ABI suite passed all 28 tests, and the driver-binding suite passed all 64 tests. These passing
 tests include the deliberately heuristic fallback above and therefore do not resolve this finding.
 No source code or milestone plan was modified.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0153 (2026-09-03T17:52:37Z):
+
+1. **The fixed 64-event detached-tail window can assign a fault to the wrong binding** - ACCEPTED IN
+   PART, and the part accepted is not the part the finding leads with.
+
+   REJECTED: that a fixed policy bound as such fails M4/M5. The finding's own first sentence is the
+   reason it cannot be met the way it asks. The production transport returns no usable
+   queue-capacity bound because there is none to return - a driver that posts one event buffer at a
+   time cannot see how many records the device is holding behind it, and the device may wait for a
+   buffer or drop the event rather than hand them over. Nothing in a fault record says which binding
+   raised it, and the backend resolves `event.domain` from its CURRENT attachment table, so after a
+   rebind every one of the predecessor's queued records arrives carrying the replacement's domain.
+   Given those three facts there is no exact answer available to this layer at all, and the finding
+   proposes none. What M4 asks for is this backend's fault counter in the per-binding accounting, and
+   what M5 asks for is that a fault is recorded with its binding generation and translated into the
+   generic fault event the lifecycle consumes, with bounded work under a storm. All three are done.
+   A requirement that attribution be EXACT across a rebind on a transport that cannot express it
+   would be a requirement no implementation could meet, and the milestone does not state one.
+
+   The only design that removes the guess is to refuse to re-attach the endpoint until the transport
+   has been observed empty, which makes every record unambiguous by construction. It is not adopted:
+   it puts a device's replacement binding behind a queue that a faulting device never lets run dry,
+   turning a bounded misattribution into an unbounded refusal to rebind, and it is a change to the
+   claim and quiesce path rather than to this ledger. Named here so the next round does not have to
+   rediscover that it was considered.
+
+   ACCEPTED: what the window was being SPENT on, which is a real defect inside the policy and is the
+   half of this finding that names a concrete wrong outcome. `attributed` counted every record the
+   tail rewrote. Most of them need no guess at all: while the endpoint is still detached the backend
+   resolves it to no domain, the record arrives as `DomainId(0)`, and the only binding it can belong
+   to is the one that ended - there is no replacement yet to charge it to. So a teardown whose queue
+   outran `MOST_TAIL_ATTRIBUTIONS` before it was read exhausted the whole bound on records that were
+   EXACT, and then handed the genuinely ambiguous ones that followed to the live binding. That is the
+   first of the two error directions the finding names, reached without any of the uncertainty the
+   constant exists for.
+
+   CODE. `Iommu::drain_faults_during` (`src/dma/src/lib.rs`) now computes whether a record is
+   ambiguous before consulting the bound: ambiguous means the backend resolved its endpoint to a
+   domain that is live AND is not the tail's own. A resolution to no domain is the detached window
+   and is exact; a resolution to the tail's own domain is a refused detach, which is also exact,
+   because the only binding that endpoint can then be attached to is the one that is ending. The
+   rewrite still applies in every case - it must, or the tail record would not apply to the rebound
+   endpoint it exists for - and only `tail.attributed` is now conditional. The stale comment above
+   the loop, which claimed the rewrite applied only to records the backend could not resolve, is
+   corrected: it described a design this is not, and it is what makes the code read as contradicting
+   itself.
+
+   TEST. `the_window_a_guess_is_bounded_by_is_not_spent_on_records_that_needed_no_guess` in
+   `src/dma/src/tests.rs`. `MOST_TAIL_ATTRIBUTIONS + 8` records are raised with the endpoint detached
+   and every one of them is required to be the ended binding's; the replacement then attaches and
+   raises `MOST_TAIL_ATTRIBUTIONS + 1` more, of which the window covers the first and the last is
+   required to be the live binding's on the live generation. Everything is queued before anything is
+   drained, so the transport is never observed empty until the end - the other way a tail closes,
+   which would otherwise end it before the ambiguous half began. Verified to discriminate: with the
+   ambiguity test forced true the run fails at record 64 with `left: DomainId(0)`.
+
+   The window itself stays where it is and stays a policy. Both error directions remain written down
+   at the constant, and the accounting imprecision between two bindings that are both gone remains
+   deliberately preferred to charging one of them to a live replacement.
+
+## Verification for this round (2026-09-03T17:52:37Z)
+
+    cargo test --manifest-path src/dma/Cargo.toml --offline    63 passed (62 before, 1 added)
+    ./check.sh --gate virtio-iommu-protocol                    63 test(s) - contract, fake backend, codec
+    ./check.sh --gate source-hygiene,no-suppression            clean

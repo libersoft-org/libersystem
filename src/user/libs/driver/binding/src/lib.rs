@@ -246,6 +246,45 @@ pub fn disable_action(state: BindingState, holds_the_device: bool, teardown_in_f
 	}
 }
 
+// WHETHER A SHUTDOWN HAS TO ASK THIS NODE TO STOP.
+//
+// The same question `disable_action` answers, with the same trap and one fewer outcome: there is no
+// state to land in, because the manager is going away. `stop_all` asked only whether the record was
+// `Online`, and `Binding` past `begin_bind`'s commit is a live process holding a claimed device -
+// the standing loop starts one on every crash recovery and then returns to the central wait, where
+// a shutdown arrives like any other message. Such a node was skipped in silence: no `STOP`, no
+// bounded wait for an answer, no forced teardown - and the manager acknowledged the shutdown and
+// exited leaving the driver running on a device nothing would take back this boot.
+//
+// A teardown already in flight is not asked again. `advance` TAKES the binding out of the node when
+// it starts one, so this is a fact about the same handle rather than a second rule: what a shutdown
+// can still stop is what still holds the device.
+pub fn shutdown_stops(state: BindingState, holds_the_device: bool) -> bool {
+	holds_the_device && matches!(state, BindingState::Online | BindingState::Binding)
+}
+
+// WHERE THE CANDIDATE CURSOR GOES WHEN AN ATTEMPT ENDS.
+//
+// The rule that makes an operator's `select` mean "at the next bind" rather than "at some bind":
+// while a selection is pending the cursor is left where the operator put it, and every other ending
+// advances past whatever ran. `begin_bind` clears the flag when an attempt actually starts from that
+// entry, so exactly one bind starts there and a selected candidate that then fails advances like any
+// other - which is what stops a selection holding the node in a loop on one entry.
+//
+// `ran` is the entry the attempt that just ended was on, which is not always the cursor: a `select`
+// during a binding moves the cursor while an earlier entry is still running.
+//
+// Its own function so a test can drive it (2026-09-03). It lived inline in DeviceManager, in a
+// `no_std` binary no host test can run, and the property the definition of done asks for - a live
+// selection surviving until the next bind - was only ever asserted by reading it. The comparison it
+// replaced was wrong for two of the three cases an operator can ask for.
+pub fn cursor_after_an_attempt(ran: usize, cursor: usize, selection_pending: bool) -> usize {
+	if selection_pending {
+		return cursor;
+	}
+	if cursor <= ran { ran + 1 } else { cursor }
+}
+
 // WHAT AN ATTEMPT BUDGET IS AFTER SOMETHING THAT DID NOT SPEND ONE.
 //
 // A candidate whose artifact was missing, and a node parked on a requirement that has since arrived,

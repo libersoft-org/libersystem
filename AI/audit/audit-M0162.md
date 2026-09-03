@@ -1316,3 +1316,67 @@ Focused verification: `cargo test --manifest-path src/user/libs/driver/binding/C
 passes all 64 tests. The `one-wait`, `no-fixed-provider-slots`, `virtio-iommu-protocol`,
 `driver-protocol-note`, and `source-hygiene` gates also pass; none drives either stateful sequence
 above.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0162 (2026-09-03T17:52:37Z):
+
+1. **A binding revived after a dependency returns keeps the old planned-stop intent, so its next
+   genuine crash bypasses the recovery budget** - ACCEPTED. The sequence is exactly as described and
+   was traced end to end before the change.
+
+   `stop_nodes_that_lost_a_dependency` stores `DependencyLost` on the node. The requirement returns,
+   `settle_dependencies` sets `restart_requested`, the standing loop starts a candidate, the driver
+   reports `READY`, and that arm resets `attempt`, `incident` and `retry_once` - it does not touch
+   `stop_intent`, and the only place in the file that puts it back to `Fault` is the operator
+   `Enable` path. So the revived binding runs its whole life carrying the intent of a stop that
+   completed. A crash after that reads `planned = stop_intent != Fault` as true, skips
+   `may_try_again` and `cause.retryable()` entirely, and takes `give_up_with` under `DependencyLost`,
+   whose confirmed landing is `DependencyPending` regardless of attempts. The requirement is present,
+   so the next `settle_dependencies` pass sets `restart_requested` again and
+   `budget_after_nothing_ran` puts the counter back to zero. That is a crash loop with no backoff
+   and no ceiling, on the central post-`Online` lifecycle this milestone owns.
+
+   Worth recording because it makes the defect visible in the logs rather than only in the states:
+   `planned_stop` and `planned` are computed from different facts, so such a crash was recorded as an
+   incident (correctly - no `STOPPED` frame arrived) while the state machine treated it as a planned
+   stop. The two surfaces disagreed about the same event.
+
+   CODE. The intent is cleared where a bind attempt begins - `begin_bind`
+   (`src/user/services/core/src/device_manager.rs`), beside the two other clears of what the previous
+   life left behind, `retry_at` and `selection_pending`, and before the record enters `Binding`. A
+   bind starting is the proof that no stop is outstanding: the previous one ran, its teardown landed,
+   and this node has been asked to come back. Placed there rather than at `READY` deliberately, and
+   the reason is in the comment: a handshake that FAILS has to be judged a fault too, so a bind that
+   reached `Binding` and then reported `FAILED` belongs in `Backoff` and not in the state the
+   previous stop's intent names. The operator `Enable` reset is left where it is - it lifts the
+   stored desire as well, and it runs before any bind.
+
+2. **The corrected pre-bind failure recording still produces a false cause for a mixed candidate
+   list** - ACCEPTED. The flag's own comment reads "whether the LAST thing that went wrong was a
+   missing artifact"; the code only ever set it, so any earlier absent candidate made it true for the
+   rest of the traversal. On `[missing artifact, protocol-mismatched artifact]` the second candidate
+   correctly records `ProtocolMismatch` inside `begin_bind` and returns `CandidateFailed`, and the
+   exhaustion arm then calls `record_failure(DriverMissing)` over it - which succeeds, because
+   `record_failure` restates the cause without a transition on a record that is already `Failed`.
+   The served record therefore names the artifact that WAS read and says it is absent. That is the
+   one question M3's cause exists to answer, answered wrongly.
+
+   CODE. `start_candidate` clears `missing` in the arm where `begin_bind` failed for a reason of its
+   own, which is the arm that reaches exhaustion carrying a cause. Nothing else changes: the
+   missing-artifact arm still sets it, and exhaustion after a genuinely absent final candidate still
+   records `driver-missing`. A candidate refused by the illegal-transition guard, which records no
+   cause, now leaves the previous cause standing rather than overwriting it with a false one.
+
+   The finding is right that the new `record_failure` test does not cover this: it drives the four
+   origin states independently and never traverses a list. The traversal is `start_candidate`'s, in
+   the `no_std` binary, so what closes it here is the flag being correct by the rule its own comment
+   states rather than a new host test over a production loop no host can run.
+
+## Verification for this round (2026-09-03T17:52:37Z)
+
+    cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline   66 passed
+    ./build.sh --part user                                                          built (x86_64)
+    ./check.sh --gate one-wait,no-fixed-provider-slots,driver-protocol-note         passed
+    ./check.sh --gate source-hygiene,no-suppression,milestone-index                 clean
+
+The boot this change is on the critical path of is covered by the single long run at the end of this
+job; its result is recorded with that run.

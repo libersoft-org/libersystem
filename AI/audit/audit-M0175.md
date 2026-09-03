@@ -1644,3 +1644,43 @@ the lower address bytes compared unsigned over the sixteen octets; the ROUTE is 
 first, then the lower address bytes of the router it names, then the lower prefix bytes. Both are
 total on any set of distinct candidates, which is what the gate needs - two runs on one machine choose
 identically, and so do two implementations of this file.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0175 (2026-09-03T17:31:32Z):
+
+Current plan rating: 6/10
+
+1. **The replacement source/route tie-break is neither consistent with P02M0174 nor total.** The
+   latest correction orders equal-prefix routes by the router's address bytes
+   (`docs/todo/P02M0175.md:567-582`). P02M0174, however, deliberately freezes router order as
+   reachability first, advertised preference second, and address only third, and says P02M0175
+   consumes that order (`docs/todo/P02M0174.md:311-340`). The new rule can therefore choose an
+   unreachable lower-address router over a reachable higher-address one outside the separate RFC
+   8028 advertiser path. It also cannot order all of the records M1 defines: a `DIRECT` route has no
+   router address, and two otherwise equal routes or scoped source addresses on different interface
+   identities remain distinct candidates with identical listed keys
+   (`docs/todo/P02M0175.md:178-200`). Thus insertion order can still decide the result despite the
+   correction's claim of a total, cross-implementation deterministic order; M10 has no generic
+   direct-route or interface-distinct tie fixture that would expose this.
+
+2. **The accepted per-family runtime correction still names decisions instead of making them.** M7
+   asks for “explicit per-family enable/profile configuration and stated readiness criteria” but
+   supplies neither the profile values/configuration surface nor the readiness states and
+   transitions (`docs/todo/P02M0175.md:737-748`). It specifies only that an IPv6-only profile skips
+   DHCPv4 and the static-v4 fallback. It does not decide when IPv4 or IPv6 becomes usable, what the
+   service reports while a configured family has no valid address/route, or how the IPv4-only and
+   dual-stack profiles treat the existing DHCP timeout and static fallback. The current service has
+   only the MTU/cache knobs and blocks on DHCP before reporting online
+   (`src/user/services/core/src/network_service.rs:91-105,156-181`), so these answers cannot be
+   inherited. M10's three-profile matrix therefore still lacks a concrete configuration and
+   readiness oracle for the event-driven redesign accepted from the original audit.
+
+3. **The new public `backlog` parameter still has no contract.** M1 says `listen` takes a backlog,
+   while M4 merely instructs the implementer to “add ... an accept-backlog policy” beside a hard
+   limit of 32 unaccepted connections per listener and 64 service-wide
+   (`docs/todo/P02M0175.md:228-264,501-520`). The plan never states the allowed backlog values, how a
+   requested value relates to the hard per-listener cap, or what happens to a new handshake when the
+   caller-selected backlog rather than the global budget is full. The existing IDL has no backlog
+   from which those semantics could be retained (`src/idl/network.lsidl:124-134`). Consequently two
+   implementations can reject, clamp, or ignore the same request and take different wire actions on
+   overflow while both pass M10's aggregate flood check. This leaves the original accepted inbound
+   backlog-policy correction incomplete at a newly introduced public operation.

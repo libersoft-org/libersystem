@@ -974,3 +974,9 @@ Its gates are stated with it: the two x86_64 development invocations boot throug
 and reach admission carrying `enforcing-required` and `no-iommu` respectively, each from the file its
 runner staged; a UEFI boot with the file absent refuses; and a signed public medium with the file
 present refuses as two producers.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0172 (2026-09-03T17:34:03Z):
+
+Current plan rating: 6/10
+
+1. **The new UEFI `LSDM` input conflicts with the signed DMA-mode producer already required on every selected signed manifest.** The correction gives test/development UEFI boots a harness-provenance `LSDM` file and requires the loader to turn it into the `BootInfo` field, while M3 still requires *every selected signed manifest* to carry and latch a DMA mode (`docs/todo/P02M0172.md:357-375,482-577`). These are not disjoint media in the current system: every x86_64 shipping and test ISO gets `etc/boot.manifest2` (`src/harness/mkimage.sh:228-242,261-294,383-429`), every non-x86 per-run ESP gets one (`src/harness/qemu-run.sh:624-698`), and every system volume does too (`src/tools/mkpackages/src/main.rs:238-258`). Thus a test/development UEFI boot necessarily presents both the signed value and the new harness record. The plan's own two-producer rule must refuse it—even when equal—and the same-image x86_64 gate cannot make default and `--no-iommu` disjoint by changing the signed value. Conversely, ignoring the signed value when `LSDM` appears would let a public medium with an injected file take the very precedence path the plan says must refuse. Freeze one non-conflicting producer/manifest-compatibility rule for test and development media and gate it against the signed media those paths actually boot; the accepted host-to-loader conduit alone did not make the rows implementable.

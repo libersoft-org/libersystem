@@ -1251,6 +1251,17 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 			// It could not even be opened - the claim refused, the spawn refused. `begin_bind` has
 			// already put the node where the table says that belongs, so the only question left is
 			// whether there is another candidate to try.
+			//
+			// AND THIS CANDIDATE'S CAUSE IS NOT A MISSING ARTIFACT, WHICH THE FLAG WAS NEVER CLEARED
+			// TO SAY (2026-09-03). The flag's own comment reads "whether the LAST thing that went
+			// wrong was a missing artifact"; it was only ever set, so any earlier absent candidate
+			// made it true for the rest of the traversal. On the ordinary mixed list - one artifact
+			// the volume does not have, then one it has whose protocol note this build does not
+			// speak - `begin_bind` correctly recorded `protocol-mismatch`, and the exhaustion arm
+			// below then overwrote it with `driver-missing` against a record whose `driver_name`
+			// names the artifact that WAS read. An operator was told the file is absent about a file
+			// this manager opened, which is the one question M3's cause exists to answer.
+			missing = false;
 			node.candidate += 1;
 			// The same rule as the missing-artifact advance above: a candidate that could not be
 			// STARTED does not spend an operator's one attempt, and must not restore the automatic
@@ -3294,13 +3305,12 @@ fn spend_candidate(node: &mut Node) {
 	// the operator put it. That is exactly "applies at the NEXT bind": one bind starts there and the
 	// selection is spent, so a selected candidate that then fails advances like any other and cannot
 	// hold the node in a loop on one entry.
-	if node.selection_pending {
-		node.attempt = 0;
-		return;
-	}
-	if node.candidate <= ran {
-		node.candidate = ran + 1;
-	}
+	// THE RULE IS THE LIBRARY'S (2026-09-03) - see `driver_binding::cursor_after_an_attempt`. It is
+	// the composition the definition of done asks to be under test: `select` moves the cursor and
+	// sets the flag, this is what makes the move SURVIVE the end of whatever was running, and
+	// `begin_bind` clearing the flag is what spends it. All three lived in a binary no host test can
+	// run, and both of the corrections recorded above were found by reading rather than by a failure.
+	node.candidate = driver_binding::cursor_after_an_attempt(ran, node.candidate, node.selection_pending);
 	node.attempt = 0;
 }
 
@@ -3438,6 +3448,26 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// AND AN OPERATOR'S SELECTION IS SPENT BY THE BIND IT ASKED FOR. From here the entry this
 		// attempt is on is an ordinary candidate: if it fails, the cursor advances like any other.
 		node.selection_pending = false;
+		// AND SO IS THE INTENT OF THE STOP THAT CAME BEFORE IT (2026-09-03).
+		//
+		// `stop_intent` says why the CURRENT stop was asked for, and a bind starting is the proof
+		// that no stop is outstanding: the previous one ran, its teardown landed, and this node has
+		// been asked to come back. Only the operator's `enable` ever put it back to `Fault`, so
+		// every OTHER way out of a planned stop carried the intent into the next binding's whole
+		// life - and `advance` reads `stop_intent != Fault` as "planned", which is never retried.
+		//
+		// The reachable case is a dependency: losing a requirement stores `DependencyLost`, the
+		// requirement returns, `settle_dependencies` asks for a bind and `READY` resets the attempt
+		// counter and the incident - and then a genuine crash an hour later was judged a PLANNED
+		// stop. It skipped the retry decision, landed at `DependencyPending` whatever the attempts
+		// said, and the standing loop - finding the requirement present - started it again with the
+		// budget reset. A crash loop with no backoff and no ceiling, which is the one outcome M0162
+		// exists to bound.
+		//
+		// Here rather than at `READY`, because a handshake that FAILS has to be judged as a fault
+		// too: a bind that got as far as `Binding` and then reported `FAILED` belongs in `Backoff`,
+		// not in the state the previous stop's intent names.
+		node.stop_intent = driver_binding::StopIntent::Fault;
 		let mut txn = Attempt::new();
 		if !node.record.move_to(BindingState::Binding, None) {
 			print(b"DeviceManager: refusing an illegal transition into binding for ");
@@ -5474,7 +5504,13 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 		// sort happened to leave them.
 		order.sort_by_key(|&at| (core::cmp::Reverse(depth[at]), at));
 		for at in order {
-			if nodes[at].record.state != BindingState::Online {
+			// WHAT STILL HOLDS THE DEVICE IS WHAT A SHUTDOWN HAS TO ASK, AND `Online` IS NOT ALL OF
+			// IT (2026-09-03). See `driver_binding::shutdown_stops`, where a test can drive it -
+			// the same trap the operator's disable was corrected for, in the one other place that
+			// walks the active set. A node in `Binding` past `begin_bind`'s commit was skipped in
+			// silence, and this program then acknowledged the shutdown and exited with that
+			// driver's process still running on a device it still holds.
+			if !driver_binding::shutdown_stops(nodes[at].record.state, nodes[at].binding.is_some()) {
 				continue;
 			}
 			let Some(binding) = &nodes[at].binding else { continue };

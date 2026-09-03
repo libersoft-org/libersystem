@@ -1892,3 +1892,76 @@ Current implementation rating: 6/10
 
 Focused verification: the 64 `driver-binding` tests and 15 `system-manifest` tests passed, as did the
 `no-fixed-provider-slots` and `one-wait` gates. Those checks do not exercise either remaining route.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0164 (2026-09-03T17:52:37Z):
+
+Both findings are ACCEPTED as accurate, and both remain OPEN. This response says what was done, what
+was not, and why the second answer is a decision rather than an omission.
+
+1. **The non-system block roles are still assigned by bus position rather than by the required
+   format/origin decision** - ACCEPTED, and this is the milestone's own open item rather than a new
+   defect. Re-read against the tree: DeviceManager still takes every block provider in lowest-BDF
+   order, ServiceManager still holds positions two, three and four as `FATBLOCK`, `ISOBLOCK` and
+   `UDFBLOCK`, and StorageService still trusts the tag it is given. A checked mount refuses a wrong
+   medium and cannot reassign it, so an ISO disk at a lower bus address than a FAT medium leaves both
+   volumes absent. The milestone records M2 and its either-order profile as open and the status line
+   at the top says so.
+
+   NOT BUILT THIS ROUND, deliberately, and the reason is the plan's own: *"Building the routing
+   without the profile is how this item would be marked done for the third time without the property
+   it names."* The routing and the second-disk-order profile are one item because a routing change is
+   a no-op on every machine this tree currently boots - the disks are presented in exactly the order
+   the positional assignment expects - so a mistake in it shows up as a volume silently not mounting
+   on a machine nobody runs. Building them together needs iteration against guest boots, and this job
+   has one long run at its end. Landing a boot-path rework of storage role routing that cannot be
+   exercised until after the last edit is how the tree ends the job broken with no budget to repair
+   it. It stays named.
+
+   ONE THING FOUND WHILE SIZING IT, recorded so the implementation does not have to rediscover it.
+   The routing design says the system instance "reports the format per provider index", and the two
+   lists that index would have to agree about are built in DIFFERENT orders today: `probe_blocks`
+   iterates `catalogue.entries` in SLOT order, which is publication order, while `boot_blocks` is
+   filled by `Catalogue::take`, which picks the lowest bus address each time. Slots are assigned as
+   drivers report `READY`, so a disk at a higher BDF whose driver finishes first takes a lower slot
+   and the two orders diverge. Nothing is wrong today - the probes are matched by uuid and are order
+   independent - but the moment a format table is indexed by provider position, that alignment
+   becomes load-bearing. Not changed now: a re-ordering with no consumer is a change nothing can
+   check.
+
+2. **The USB volume and USB-bus consumers still receive one fixed, one-shot connection instead of
+   subscribing** - ACCEPTED, and likewise the milestone's own open item. DeviceManager opens each
+   result list's `first()` entry and sends it once; ServiceManager injects one handle into
+   `usb_storage` and grants the other through PermissionManager; neither consumer subscribes, so a
+   second controller and a replacement publication are unreachable to them.
+
+   ONE CORRECTION TO THE FINDING, which the plan had stated too broadly and which has now been
+   narrowed in `docs/todo/P02M0164.md`. "Nothing in any suite asserts that `vol://usb` mounted" is
+   not true. `kernel.hardware` reads `vol://usb/hello.txt` off the seeded stick and compares the
+   bytes against the volume package, and `kernel.boot` requires `StorageService: online (vol://usb)`
+   in the boot's report set. What neither does is exercise the ROUTE: the hardware test spawns its
+   own StorageService instance and hands it the block channel directly, and the boot report is
+   printed by an instance that has touched no media, because the mount is lazy and the instance is
+   handed a deliberately dead stand-in channel when no xHCI driver bound. So the finding's conclusion
+   holds and its premise did not: the missing oracle is narrow and nameable - on the machine that HAS
+   the stick, the USB volume is served through the channel the boot routed - rather than an absence
+   of any coverage. The plan says that now, with both existing tests named and what each cannot fail
+   on.
+
+   NOT BUILT THIS ROUND, for the same reason as M2 and stated in the plan for this item too: the
+   subscription and its assertion are one item, because a subscription written against no oracle
+   would run on every boot and a mistake in it would be as silent as the positional route it
+   replaced.
+
+WHAT THIS MILESTONE'S STATUS IS. Unchanged and correct: `OPEN (2026-09-03) - two named items, both in
+M2/M7 and both with their own gate missing.` Neither finding is closed by this round and neither is
+claimed to be. The next step for this milestone is the profile and the oracle, in that order, because
+each is what its half of the work is written against.
+
+## Verification for this round (2026-09-03T17:52:37Z)
+
+    ./check.sh --gate no-fixed-provider-slots    1 take site(s), the hand-off carries its own count
+    ./check.sh --gate one-wait                   passed
+    ./check.sh --gate milestone-index            clean
+
+No source file was changed for this milestone. The only edit is to `docs/todo/P02M0164.md`, correcting
+the over-broad oracle claim in M7's paragraph.

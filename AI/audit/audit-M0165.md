@@ -1712,3 +1712,92 @@ Current implementation rating: 6/10
 Focused verification: all 64 `driver-binding` tests and 15 `system-manifest` tests passed, as did the
 `no-fixed-provider-slots`, `one-wait`, and `milestone-index` gates. None covers the two newly identified
 state-sequence defects or the admitted production-effects gap.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0165 (2026-09-03T17:52:37Z):
+
+1. **A dependency-stop intent survives the successful rebind and misclassifies every later genuine
+   fault as another planned stop** - ACCEPTED. This is the same defect P02M0162's first finding
+   names, reached from this milestone's side; the code change is one, made in `begin_bind`, and the
+   full trace is written up in the response appended to `audit-M0162.md` rather than repeated here.
+
+   What it means for THIS milestone is the part that response does not say. M2 and the definition of
+   done require a confirmed fault teardown to land in `Backoff` or `Failed`; a node carrying
+   `DependencyLost` from a stop that already completed landed at `DependencyPending` instead, and
+   because the requirement was by then present, the standing loop restarted it immediately with the
+   budget reset. The fault-recovery path this milestone owns was reachable only for a node that had
+   never lost a dependency.
+
+   CODE. `stop_intent` is cleared where a bind attempt begins, before the record enters `Binding`, so
+   the intent describes the stop that was asked for and nothing later. Placed there rather than at
+   `READY` because a handshake that FAILS has to be judged a fault too.
+
+2. **Shutdown skips a live driver whose bind handshake is still in progress** - ACCEPTED, and the
+   proof that it is reachable is in this same file's history: the operator's disable was corrected
+   for exactly this on 2026-09-03 - *"A node in `Binding` past `begin_bind`'s commit has a live
+   process and a claimed device on `node.binding`, so the direct move left both attached to a record
+   that says the device is disabled, with no `STOP` sent."* `stop_all` is the other place that walks
+   the active set and it was not corrected with it: it skipped every record that was not `Online`,
+   so the same node was passed over in silence during a shutdown - no `STOP`, no bounded wait for an
+   answer, no forced teardown - after which DeviceManager acknowledged the shutdown and exited with
+   that driver's process still running on a device it still holds. That is M3's clean-stop contract
+   and M4's traversal of the active driver set, both unmet for a node the standing loop creates on
+   every crash recovery and then waits on alongside the supervisor channel.
+
+   CODE. `driver_binding::shutdown_stops(state, holds_the_device)` in
+   `src/user/libs/driver/binding/src/lib.rs`, and `stop_all` asks it instead of comparing the record
+   with `Online`. The rule is the library's for the same reason `disable_action` is: it is where a
+   test can drive it. `Binding -> Stopping` is already a legal edge, so the body below needs no
+   change - the node enters `Stopping`, is asked to stop, is waited for within its own teardown
+   reserve, and is forced with `Wedged` if it does not answer, exactly as an `Online` node is. A
+   teardown already in flight is not asked again and that falls out of the same rule rather than
+   needing one of its own: `advance` TAKES the binding out of the node when it starts a teardown, so
+   there is no device left for a shutdown to ask about.
+
+   TEST. `a_shutdown_asks_everything_that_still_holds_a_device_and_not_only_what_is_online` in
+   `src/user/libs/driver/binding/src/tests.rs`, beside the disable test it mirrors: the two states
+   that hold a device are asked, `Binding` before the claim is not, every other state holds nothing,
+   the `Binding -> Stopping` edge is asserted to exist, and `Shutdown.confirmed_lands_at` is asserted
+   to describe no next state - which is what makes this a traversal rather than a transition table.
+
+3. **M7's production withdrawal effects remain unproved** - ACCEPTED IN PART. One of the two effects
+   now has a production oracle; the other cannot have one from outside the manager, and what it
+   actually does is smaller than the item claimed. Both are now written down in the milestone rather
+   than left as a concession in an audit.
+
+   THE ANNOUNCEMENT - accepted and closed. The finding is right that the race test drives
+   `apply_withdrawal` through a recorder and cannot fail if the manager's send is deleted. That half
+   crosses a process boundary and is therefore observable: DisplayService's subscription arm handled
+   a `live: false` frame with an empty match arm, which is indistinguishable from the announcement
+   never arriving. It now prints one line when it is told a display provider was withdrawn - a line
+   and not a state change, because the scanout is released when the driver's channel closes, which is
+   the authoritative signal for a driver that has actually gone and which the arm above already
+   handles. `dev-gpu-restart` asserts that line over the window of the operator's disable. This is
+   the production path end to end: the disable withdraws the binding's providers, the manager
+   announces the withdrawal to every subscriber of the kind, and the service that subscribed says it
+   was told. Emptying `announce_gone` now fails a gate.
+
+   THE CLOSE - accepted, and it gets a correction rather than an oracle. The finding says opening the
+   initial provider moves its handle out of the catalogue so the close is a no-op, and that is right
+   for a provider that HAS been opened: the first consumer is given the driver's offered endpoint,
+   moved rather than duplicated because duplicating it would share the driver's reply queue. Every
+   later connection is minted, and the driver holds the server end of those. So the manager's close
+   is reached for a provider nobody opened - a real handle that would otherwise be held for the life
+   of the boot - and it is a no-op otherwise. That is the whole of the effect, it is smaller than "no
+   leaked channel" reads as, and there is no oracle for it: a handle DeviceManager did not close is
+   not visible from outside DeviceManager. It is recorded in M7 as what it is rather than claimed.
+
+   REJECTED, narrowly: that DisplayService ignoring withdrawal frames is a defect. It is a decision
+   with a reason stated where the code is - for a driver that has gone, the channel closing is the
+   authoritative signal and arrives whether or not a manager announces anything; a service that
+   released its scanout on a frame instead would depend on the weaker of the two signals. What was
+   wrong is that it was SILENT about the frame, and that is fixed above.
+
+## Verification for this round (2026-09-03T17:52:37Z)
+
+    cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline   66 passed (64 before, 2 added)
+    ./build.sh --part user                                                          built (x86_64)
+    ./check.sh --gate one-wait,no-fixed-provider-slots                              passed
+    ./check.sh --gate source-hygiene,no-suppression,milestone-index                 clean
+
+The shutdown traversal and the withdrawal oracle both run in a guest; they are part of the single long
+run at the end of this job and their result is recorded with it.

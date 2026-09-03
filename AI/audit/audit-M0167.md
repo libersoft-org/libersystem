@@ -1722,3 +1722,71 @@ Current implementation rating: 6/10
    architecture row—not the stated edge case, `selects_everything`, or prefix overrides
    (`src/tools/verify-model/src/tests.rs:2180-2220`). This leaves the milestone's central activation
    safety requirement incomplete (`docs/todo/P02M0167.md:696-710`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0167 (2026-09-03T17:52:37Z):
+
+1. **Registry-only activation can still bypass both evidence bars** - ACCEPTED, all three cases, and
+   the finding identifies the shape of the mistake correctly: the accepted correction compared
+   REMOVALS, and three ways to take coverage away without removing anything went straight past it.
+   An empty `losing` asks for no evidence at all, so each of them reached the write path with neither
+   the general trust threshold nor the subsystem risk row applied.
+
+   Verified against the tree before changing anything:
+
+   - `selects_everything` was read by nothing in the helper. A row there makes any change to its
+     component plan the FULL suite; deleting it drops that component to the ordinary scoped closure,
+     which is the largest narrowing this registry can express, and not one ownership rule, edge or
+     architecture row moves while it happens.
+   - `Ownership::owner` resolves by longest prefix over non-code rules, ownership rules, crate
+     directories and binary source files. Adding a deeper ownership rule beside a retained broader
+     one leaves the broader component's declared path set identical - so the set comparison saw
+     nothing lost - while every file under the new prefix stops seeding it.
+   - `Planner::architecture_rule` resolves by longest prefix too, and the old loop iterated the
+     ACTIVE registry's rule paths and looked each up by exact key in the narrowed one. A new deeper
+     row is in neither map's iteration and the retained row's target lists are byte-identical, so a
+     subtree could stop being built and booted on two machines with nothing reported.
+
+   CODE, in `components_losing_registry_coverage`
+   (`src/tools/verify-model/src/candidate.rs`). The rule now asks the RESOLVER instead of diffing
+   rule texts, which is what makes it robust to the shape of the edit rather than to the three shapes
+   that were thought of:
+
+   - Every ownership and non-code path in EITHER registry is probed. Each is resolved under both
+     models and a component that owned a probe path before and does not after is inserted. This
+     subsumes the removal case the old set comparison covered, catches the deeper-rule override, and
+     catches a path claimed back as documentation by the same comparison, because `non_code` competes
+     by length like any other rule. The function takes the narrowed model's `Ownership` as a second
+     argument; `main.rs` passes `narrowed_model.ownership()`, which it already has in scope.
+   - Every architecture path in EITHER registry is probed and the effective longest-prefix answer
+     compared. A path that stops having any row falls back to every architecture, which is wider
+     rather than narrower, so only a row that ANSWERS with fewer targets counts.
+   - The `selects_everything` component sets are differenced directly.
+
+   The three original comparisons are kept rather than replaced: the edge comparison is not
+   expressible as a resolution, and the ownership set comparison is the cheap answer for the common
+   case. The old comparisons cannot report a narrowing the resolver misses, and the resolver cannot
+   miss one they report.
+
+   TEST. `a_candidate_that_narrows_only_the_registry_is_still_a_narrowing` in
+   `src/tools/verify-model/src/tests.rs` gains three cases beside its two, all driven over the REAL
+   registry with one-line edits to its text:
+
+   - a deeper ownership rule added beside a retained one, asserting that whoever answers for that
+     path today is reported losing - the fixture asks the resolver who that is rather than assuming
+     it is the declared rule's component, because a crate directory underneath it can be a longer
+     match still;
+   - a deeper architecture row with one target added beside a retained multi-target one, asserting
+     the owner of that path is reported losing;
+   - a `selects_everything` row deleted, asserting its component is reported losing.
+
+   Each of the three leaves every input the old comparisons read byte-identical, so each fails
+   without this change. The identical-registry case is kept: a registry that did not change still
+   narrows nothing.
+
+   The claimed regression test the finding describes is the one that covered only the two removal
+   cases; it is not replaced, it is extended.
+
+## Verification for this round (2026-09-03T17:52:37Z)
+
+    cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline   121 passed
+    ./check.sh --gate source-hygiene,no-suppression,milestone-index          clean

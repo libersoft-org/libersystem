@@ -696,6 +696,59 @@ fn a_faulting_replacement_is_not_hidden_behind_its_predecessors_tail_for_ever() 
 }
 
 #[test]
+fn the_window_a_guess_is_bounded_by_is_not_spent_on_records_that_needed_no_guess() {
+	// WHAT THE BOUND IS ABOUT IS AMBIGUITY, AND IT WAS BEING CHARGED FOR CERTAINTY (2026-09-03).
+	//
+	// `attributed` counted every record the tail rewrote. While the endpoint is still DETACHED the
+	// backend can resolve it to no domain at all, so the record arrives as `DomainId(0)` and the
+	// only binding it can belong to is the one that ended - there is no replacement yet to charge
+	// it to. Spending the policy window on those meant a teardown whose queue outran
+	// `MOST_TAIL_ATTRIBUTIONS` before it was read exhausted the whole bound on records that were
+	// EXACT, and then handed the genuinely ambiguous ones that follow to a live binding: the error
+	// direction the constant names, reached without any of the uncertainty it exists for.
+	//
+	// Everything is queued before anything is drained, deliberately: the transport is never observed
+	// EMPTY until the last record, which is the other way a tail ends and would otherwise close this
+	// one before the ambiguous half begins.
+	let (mut iommu, first) = iommu();
+	let endpoint = EndpointId(12);
+	iommu.attach(first, endpoint).expect("the first binding attaches");
+	iommu.revoke_endpoint(first, endpoint).expect("and its binding ends");
+
+	// THE UNAMBIGUOUS HALF, raised while nothing was attached - more than the window, deliberately.
+	let certain: u64 = crate::MOST_TAIL_ATTRIBUTIONS + 8;
+	for _ in 0..certain {
+		iommu.backend_mut_for_test().queue_fault(event(12, 0, 0x2000, Access::Write, Fault::NotMapped));
+	}
+	// AND THE AMBIGUOUS HALF, which is what the window is for: the replacement is attached and these
+	// resolve to it, so each one may be the predecessor's tail or the replacement faulting now.
+	iommu.destroy_domain(first).expect("the ended binding's domain is destroyed with it");
+	let second = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(2)).expect("a second domain");
+	iommu.attach(second, endpoint).expect("the replacement attaches");
+	for _ in 0..crate::MOST_TAIL_ATTRIBUTIONS + 1 {
+		iommu.backend_mut_for_test().queue_fault(event(12, second.0, 0x2000, Access::Write, Fault::NotMapped));
+	}
+
+	let mut out = [event(0, 0, 0, Access::Read, Fault::NotMapped); 1];
+	for at in 0..certain {
+		assert_eq!(iommu.drain_faults(&mut out), 1);
+		assert_eq!(out[0].domain, first, "record {at} was raised with the endpoint detached and can only be the ended binding's");
+		assert_eq!(out[0].generation, Generation(1));
+	}
+	assert_eq!(iommu.faults_in(first), certain, "every one of them is charged to it, past the window and all");
+
+	// AND THE WINDOW IS STILL WHOLE FOR THE ONES THAT ACTUALLY NEEDED IT.
+	for at in 0..crate::MOST_TAIL_ATTRIBUTIONS {
+		assert_eq!(iommu.drain_faults(&mut out), 1);
+		assert_eq!(out[0].domain, first, "ambiguous record {at} is inside the stated window and is read as the tail's");
+	}
+	assert_eq!(iommu.drain_faults(&mut out), 1);
+	assert_eq!(out[0].domain, second, "past it the endpoint answers for itself, on the generation that is live");
+	assert_eq!(out[0].generation, Generation(2), "so the containment decision meets the generation that is actually live");
+	assert_eq!(iommu.faults_in(second), 1, "and the accounting follows the attribution");
+}
+
+#[test]
 fn a_backend_that_cannot_state_its_transports_bound_falls_back_to_the_stated_policy() {
 	// THE DEFAULT IS THE POLICY, NOT "FOR EVER" (corrected 2026-09-03). `fault_queue_capacity`
 	// answers `None` for every transport in this tree, because a driver that posts one event buffer
