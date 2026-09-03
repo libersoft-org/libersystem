@@ -1171,3 +1171,17 @@ finding names is not host-drivable, which is why the table and its edges are whe
 
 Changed: `src/user/libs/driver/binding/src/lib.rs`, `src/user/libs/driver/binding/src/tests.rs`,
 `src/user/services/core/src/device_manager.rs`.
+
+## Verification for this round (2026-09-03T05:40:51Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 379 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` (over a fresh `./image.sh`, run solo): passed - the
+  enforcing profile, the five hostile cases, real DHCP through the controller, the default machine
+  translated with a frame on the screen, and `--no-iommu` saying so.
+- `./check.sh --gate capability-trace,bootstrap-plan,staged-consistency,no-fixed-provider-slots,one-wait,verify-scheduler,milestone-index,test-tags,gate-oracles,no-suppression,source-hygiene,virtio-iommu-protocol,driver-protocol-note,capability-model,volume-layout,development-gate,development-build`:
+  all passed.
+- `cargo test` for `src/dma` (61), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (118): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
+  presentation assertion.

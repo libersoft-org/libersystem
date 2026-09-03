@@ -90,8 +90,9 @@ struct DisplayState {
 	stats: PerfStats,
 	// REPORT THE NEXT PRESENT, because a scanout was just adopted.
 	//
-	// P02M0159's M4 asks for a frame reaching the display AFTER a driver restart, and nothing in the
-	// guest could say so: ConsoleService latches one line per outcome for the whole boot, so a
+	// A frame reaching the display AFTER a driver restart is what the enforcing profile has to show,
+	// and nothing in the guest could say so: ConsoleService latches one line per outcome for the
+	// whole boot, so a
 	// present that lands after a rebind repeats an outcome already reported and prints nothing - and
 	// once the console is taken, a service's `print` goes to its VT rather than to the serial log a
 	// harness reads. The truth lives here, in the process that owns the scanout and performs the

@@ -762,8 +762,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// says so instead of being described by the one variable that used to exist.
 					let usb_volumes: Vec<usize> = catalogue.slots_published_beside(driver_protocol::provider::BLOCK, driver_protocol::provider::USB_BUS);
 					let usb_buses: Vec<usize> = catalogue.slots_of_kind(driver_protocol::provider::USB_BUS);
-					let usb_volume: u64 = usb_volumes.first().map_or(0, |slot| mint_connection(&mut catalogue, &nodes, *slot));
-					let usb_bus: u64 = usb_buses.first().map_or(0, |slot| mint_connection(&mut catalogue, &nodes, *slot));
+					let usb_volume: u64 = usb_volumes.first().map_or(0, |slot| connect_to_provider(&mut catalogue, &nodes, *slot));
+					let usb_bus: u64 = usb_buses.first().map_or(0, |slot| connect_to_provider(&mut catalogue, &nodes, *slot));
 					let usb: [u8; 4] = [b'U', b'S', b'B', usb_volumes.len().min(u8::MAX as usize) as u8];
 					send_blocking(bootstrap, &usb, usb_volume);
 					let usbbus: [u8; 7] = [b'U', b'S', b'B', b'B', b'U', b'S', usb_buses.len().min(u8::MAX as usize) as u8];
@@ -2001,6 +2001,29 @@ struct Provider {
 	// on the first client that ever connected. See `Catalogue::take`, `mint_connection`,
 	// `Devices::open` and `Catalogue::disconnected`.
 	consumers: u16,
+}
+
+// A CONNECTION TO THE PROVIDER IN `slot`, by the rule `Devices::open` states: the OFFERED channel is
+// the first connection, and a later consumer gets a minted one.
+//
+// The order is not a preference. A publication carries the endpoint the driver made itself, and a
+// driver that declares it serves one consumer is refused a second - so handing that consumer a
+// minted endpoint while the offered one sat unused would spend the declaration on a channel nobody
+// serves, and a driver whose service loop does not accept `CONNECT` at all would close it. The entry
+// stays in the catalogue either way, which is the difference from the routing this replaced: what
+// moves is the HANDLE, and a later consumer reaches the same provider through `open`.
+unsafe fn connect_to_provider(catalogue: &mut Catalogue, nodes: &[Node], slot: usize) -> u64 {
+	unsafe {
+		if let Some(held) = catalogue.entries[slot].as_mut()
+			&& held.handle != 0
+		{
+			let offered = held.handle;
+			held.handle = 0;
+			held.consumers = held.consumers.saturating_add(1);
+			return offered;
+		}
+		mint_connection(catalogue, nodes, slot)
+	}
 }
 
 // ONE MORE CONNECTION TO THE PROVIDER IN `slot`, minted through the same `CONNECT` the served

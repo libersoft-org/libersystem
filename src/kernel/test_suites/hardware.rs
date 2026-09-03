@@ -781,7 +781,18 @@ fn virtio_snd_driver_captures_a_period_from_the_device() {
 	// THE SAME HANDSHAKE DEVICEMANAGER SENDS: one `BIND` naming the device and the two resources
 	// that follow, each saying which kind it is.
 	send_bind(&kernel_ep, &info, key.generation, 2).expect("the BIND should send");
-	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory"), Rights::ALL).expect("the DEVICE resource should send");
+	// RECORDED AS DERIVED, WHICH IS WHAT THE CLAIM'S SWEEP WALKS (2026-09-03).
+	//
+	// Same reason as the `revoke` at the end of this test, one capability along: this harness mints
+	// the device memory by hand, the way `sys_device_claim` does, and the syscall REGISTERS what it
+	// mints so that ending the claim can reach it. Skipping that leaves the driver holding a live
+	// mapping of the device's registers that the release cannot find - and the release is then right
+	// to answer `Quarantined`, because a mapping nothing tore down is exactly what an unconfirmed
+	// teardown is. Registering it is what production does and is stronger than tearing the mapping
+	// down by hand here: the release performs the revocation itself, which is the thing under test.
+	let device_memory = DeviceMemory::for_claim(key, bar_phys, bar_len as usize).expect("a test device memory");
+	assert!(device::register_derived(key, alloc::sync::Arc::downgrade(&(device_memory.clone() as alloc::sync::Arc<dyn object::KernelObject>))), "the device memory is recorded as derived from this claim");
+	send_resource(&kernel_ep, driver_protocol::ResourceKind::Device, key.generation, device_memory, Rights::ALL).expect("the DEVICE resource should send");
 	// CLONED, so this harness keeps a reference of its own. It is the one that gives the vector back
 	// at the end - see the teardown below - and a test that handed away its only `Arc` could not.
 	// The kernel's own acquire path does the same: the syscall keeps one while the handle table gets

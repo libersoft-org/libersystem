@@ -1694,3 +1694,33 @@ Changed: `src/user/services/core/src/device_manager.rs`, `src/user/services/core
 `src/user/services/core/src/service_manager/bootstrap.rs`, `src/user/services/core/build.rs`,
 `src/user/services/storage/src/service.rs`, `src/tools/check-no-fixed-provider-slots.sh`,
 `docs/todo/P02M0164.md`.
+
+## Verification for this round (2026-09-03T05:40:51Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 379 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` (over a fresh `./image.sh`, run solo): passed - the
+  enforcing profile, the five hostile cases, real DHCP through the controller, the default machine
+  translated with a frame on the screen, and `--no-iommu` saying so.
+- `./check.sh --gate capability-trace,bootstrap-plan,staged-consistency,no-fixed-provider-slots,one-wait,verify-scheduler,milestone-index,test-tags,gate-oracles,no-suppression,source-hygiene,virtio-iommu-protocol,driver-protocol-note,capability-model,volume-layout,development-gate,development-build`:
+  all passed.
+- `cargo test` for `src/dma` (61), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (118): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
+  presentation assertion.
+
+CORRECTION TO THE RESPONSE ABOVE (2026-09-03T05:41:02Z) - HOW THE FIRST CONNECTION IS MADE:
+
+The response says the hand-off MINTS a connection for the USB consumers. It mints only when it has
+to, and the difference matters: `Devices::open` states that the OFFERED channel - the endpoint the
+driver made itself and published with - IS the first connection, and a later consumer gets a minted
+one. Minting unconditionally spends a driver's declared single-consumer allowance on a channel nobody
+serves, and the xHCI driver's service loop does not accept a `CONNECT` frame at all, so its endpoint
+would have been closed and `lsusb` would have been handed a channel with no server. Caught by
+reading the driver after the first version was written; `connect_to_provider` now follows `open`'s
+rule, which is the rule the whole per-consumer factory already had.
+
+What that changes about the finding is nothing: the ENTRY stays in the catalogue either way - only
+the handle moves - so a later consumer reaches the same provider through `open`, a second
+controller's providers are published rather than closed, and DeviceManager holds no slot. What it
+takes away is a hazard the fix would otherwise have introduced.

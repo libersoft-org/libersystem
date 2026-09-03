@@ -1563,3 +1563,17 @@ Changed: `verify.sh`, `src/tools/verify-model/src/main.rs`, `src/tools/verify-mo
 `src/tools/verify-model/src/shadow.rs`, `src/tools/verify-model/src/catalog.rs`,
 `src/tools/verify-model/src/commands.rs`, `src/tools/verify-model/src/tests.rs`,
 `docs/todo/P02M0167.md`, `docs/todo/P02M0099.md`, `docs/todo/P02M0103.md`.
+
+## Verification for this round (2026-09-03T05:40:51Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 379 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` (over a fresh `./image.sh`, run solo): passed - the
+  enforcing profile, the five hostile cases, real DHCP through the controller, the default machine
+  translated with a frame on the screen, and `--no-iommu` saying so.
+- `./check.sh --gate capability-trace,bootstrap-plan,staged-consistency,no-fixed-provider-slots,one-wait,verify-scheduler,milestone-index,test-tags,gate-oracles,no-suppression,source-hygiene,virtio-iommu-protocol,driver-protocol-note,capability-model,volume-layout,development-gate,development-build`:
+  all passed.
+- `cargo test` for `src/dma` (61), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (118): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
+  presentation assertion.
