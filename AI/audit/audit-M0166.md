@@ -1390,3 +1390,83 @@ Current implementation rating: 5/10
    Thus the explicit under-test select, one-shot retry, and quarantine requirements remain unmet
    (`docs/todo/P02M0166.md:239-246`), and the functional defects above all survive the cited helper
    suite.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0166 (2026-09-03T04:44:34Z):
+
+**Finding 1 - `disable` mishandles both reachable in-flight states. ACCEPTED.**
+
+Both halves check out against M1's own table. `apply_policy` started an operator stop only for
+`Online` and moved everything else directly to `Disabled`. A node in `Binding` past `begin_bind`'s
+commit has a live process and a claimed device on `node.binding`, so the direct move left both
+attached to a record reported disabled with no `STOP` sent - and the table has two rows for
+`Binding` precisely because there are two sides of the claim. A teardown already under way took the
+same move, which IS a legal edge (`Stopping -> Disabled` is where a CONFIRMED teardown lands) taken
+before either confirmation arrived, after which an unconfirmed resolution could not move an already
+`Disabled` record to `Quarantined`.
+
+The decision is now `driver_binding::disable_action(state, holds_the_device, teardown_in_flight)`,
+in the crate where a test can drive it, with three outcomes: reland the teardown in flight - replacing
+its intent, its landing and its `retrying` flag, which is M1's "a second disable replaces the
+in-flight intent" - stop the binding through the ordinary teardown, or record it directly. The new
+test walks every state and asserts the two cases that were missing plus the direct-move edge for the
+states that hold nothing.
+
+**Finding 2 - a retry parked for a missing requirement regains the automatic budget. ACCEPTED.**
+
+Correct: a granted retry is expressed as `attempt = MAX_AUTOMATIC_ATTEMPTS - 1` with `retry_once`
+beside it, and `settle_dependencies` reset `attempt` to zero unconditionally when the provider
+arrived - so the operator's one attempt became the full automatic budget, and `retry_once` is spent
+only on `Step::NextCandidate`, so a retryable failure could take `Step::Again` repeatedly. The rule
+already existed twice in `start_candidate` and is now one function,
+`driver_binding::budget_after_nothing_ran`, used by all three places that reset a budget because
+nothing ran, with its own test.
+
+**Finding 3 - a stored selection can still be skipped at the next bind. ACCEPTED.**
+
+`load_stored_policy` set `candidate` and `preferred` and not `selection_pending`, which is the only
+thing that stops `spend_candidate` advancing past a cursor an operator placed - and stored policy
+arrives AFTER bring-up, so selecting the running candidate, or an earlier one while a fallback runs,
+was advanced past when that binding ended. The restoring code is now `apply_stored_selection`, one
+function setting the same three fields the live verb sets, so the two paths cannot drift again.
+
+**Finding 4 - persistent disable and selection overwrite one another. ACCEPTED.**
+
+Both wrote `device.policy.<bdf>`, so each dropped the other and `enable` took whichever was there -
+contradicting M4's "only disable and select are PERSISTENT" and this file's own promise that a
+selection outlives a later disable. `PolicyDecision` now names its SLOT and the selection has its own
+key under the same reserved prefix, so `remove` still refuses everything outside it and no new
+authority is needed; `load_stored_policy` reads the two independently.
+
+**Finding 5 - persistent verbs can report `Accepted` when nothing was stored. ACCEPTED, both halves.**
+
+The endpoint tested only the outer `Some`, so `Some(Err(..))` - a denied namespace, a failed write -
+read as a successful store: the live effect was applied and the operator was told the preference was
+kept. It now matches `Some(Ok(()))` and answers `not-stored`, which is the outcome the protocol
+defined for exactly this and had no producer for.
+
+And ConfigService made that reachable from below: `persist` discarded its own `write` result and
+`set` answered `Ok(())` whatever the volume did. `persist` now answers whether the bytes reached the
+volume, and `set` and `remove` return `io` when they did not. The in-memory tree is still updated -
+the live value is real and a caller already holding it must not be told the request failed outright -
+and what changes is that the caller learns the record is not durable, which is the one thing only
+this service knows. A tree with no volume at all stays a success, because that is what a fixture and
+the pre-mount boot are, by design.
+
+**Finding 6 - the response does not close the required production policy proof. ACCEPTED IN PART.**
+
+The three rules the finding names are now where a test can drive them, which is the same move this
+milestone already made for `decide_retry` and `selected_candidate`: the disable decision
+(`disable_action`), the operator's attempt budget (`budget_after_nothing_ran`), and the selection
+restore (one function shared by the stored and live paths). `driver-binding` passes 64 tests.
+
+What remains uncovered is unchanged and is stated plainly: no registered test invokes `apply_policy`
+itself, because DeviceManager is a `no_std` binary nobody can drive on a host - the same wall M3 met
+and recorded. `dev-gpu-restart` exercises `disable`/`enable` end to end and now also requires a frame
+to reach the display through the provider adopted after the rebind; `select`, a retry through
+`DependencyPending` and quarantined future policy are not in it. Making them so needs an operator
+surface driven from a guest shell against a device that can be made to fail on demand, which is a
+harness this tree does not have and is a larger thing than this milestone.
+
+Changed: `src/user/libs/driver/binding/src/lib.rs`, `src/user/libs/driver/binding/src/tests.rs`,
+`src/user/services/core/src/device_manager.rs`, `src/user/services/core/src/config_service.rs`,
+`docs/todo/P02M0166.md`.

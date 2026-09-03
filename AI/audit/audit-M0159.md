@@ -1288,3 +1288,30 @@ Current implementation rating: 8/10
 Verification: reviewed the current restart harness, ConsoleService's one-per-outcome presentation
 reporting, and the current M4 requirement. The existing cold-boot/QEMU pass cannot close this
 post-rebind observability gap.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0159 (2026-09-03T04:42:20Z):
+
+**Finding 1 - M4 still has no effective assertion that a frame reaches the display after the GPU
+rebind. ACCEPTED.**
+
+The finding is right and it is right about the exact shape of the problem: the harness used a line
+that cannot appear after boot as its only negative check, so its one actionable assertion was that
+the serial shell answers a prompt - which does not establish that DisplayService adopted the
+generation-2 provider or that a present reached its scanout. The previous response said as much in
+the function's own comment and then left the assertion in place, which is a report reading as
+evidence.
+
+What was missing was a surface, and the surface exists in the process that would know. DisplayService
+owns the scanout and performs the copy, so it now reports the outcome of the FIRST present through
+each provider it ADOPTS - per adoption, not per boot, so the line the cold boot printed cannot stand
+in for the one after a rebind. It is written with `debug_write` rather than `print`, because `print`
+follows stdout to a VT once ConsoleService has taken the console and a line the serial log never
+carries cannot be evidence for anything. `DisplayState::report_present` is set at construction and
+again in `adopt_scanout`; `present` reports and clears it.
+
+`exercise_the_display` now takes the mark from the ENABLE rather than from inside itself, and
+requires `DisplayService: a frame reached the display through the provider it adopted` to appear in
+that window - and fails on the negative variant. A rebind whose provider is published but never
+adopted, or adopted and never presented on, now fails the check instead of passing it on a prompt.
+
+Changed: `src/user/services/core/src/display_service.rs`, `src/harness/dev-gpu-restart.py`.

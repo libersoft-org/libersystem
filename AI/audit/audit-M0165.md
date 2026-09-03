@@ -1521,3 +1521,52 @@ Current implementation rating: 6/10
    audit identified: M7 requires the named race to establish no leaked provider channel and no stale
    subscriber metadata, not only that a generic recorder received two callbacks
    (`docs/todo/P02M0165.md:280-314`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0165 (2026-09-03T04:43:57Z):
+
+**Finding 1 - `virtio_blk` certifies a clean stop even when its required flush failed. ACCEPTED.**
+
+Verified: `flush_request` returns false when the queue cannot carry the request, when the device does
+not complete it, and when the status is not `BLK_S_OK`, and the planned-stop path discarded all
+three. `STOPPED` is a certificate that the device is quiet and its accepted work is flushed, so
+issuing one on the strength of a successful RESET is a certificate about the wrong fact.
+
+The answer is kept and carried: `quiet && flushed` is what `finish_stop` is given. The reset is
+computed first so short-circuiting cannot skip it - a device that is going away stops mastering the
+bus whatever its cache did - and the driver prints which of the two failed. A stop that does not
+answer is what the manager's deadline is for, and the forced path is then the honest outcome, which
+is what M3 asks for.
+
+**Finding 2 - the degraded stands still pass device handle `0`. ACCEPTED.**
+
+Correct, and the previous response's reasoning was wrong on the facts: `Queue::capability` IS the
+device's capability - every queue of a device carries the same one - so there was never a path here
+without one. `virtio_blk`'s two degraded stands and `virtio_console`'s transmit-queue failure now
+pass `device.capability`, which `bringup` established. `finish_stop` skips `device_quiesced` for zero
+and sends `STOPPED` regardless, so what those three paths were making was a clean stop with no kernel
+attestation behind it - on the "no channel" branch with a queue, and therefore DMA, already created.
+
+**Finding 3 - the publish/crash/subscribe production-effects proof is still incomplete. ACCEPTED IN
+PART, and what is not covered is named rather than promised.**
+
+ACCEPTED for `close_channel` and for the production CALL. Both are now covered by an executable,
+registered check rather than by a count comparison. DisplayService reports the outcome of the first
+present through each provider it ADOPTS, to the debug port so the line reaches the serial log after
+boot, and `dev-gpu-restart` requires that line in the window that starts at the enable. That closes
+the loop the finding describes: the replacement can only be adopted once DisplayService's old
+provider channel has closed, and that close is DeviceManager's - the `close_channel` half of
+`apply_withdrawal`, performed on the catalogue's own handle. Empty it and the old channel stays open,
+`release_scanout` never runs, the replacement is refused adoption because a scanout is still held,
+and the line never arrives. The same run therefore exercises the production call to the effects loop.
+
+NOT COVERED, AND WHY IT CANNOT BE HERE: `announce_gone`. Its whole body is one `send` on subscriber
+channels, and no consumer in this tree changes observable state on a withdrawal FRAME - every one of
+them reacts to its provider channel closing, which is the other half of the same withdrawal. So there
+is nothing downstream for any gate to distinguish, and building a consumer in order to test a send
+would be inventing the observer rather than finding one. The count comparison in `withdraw_binding`
+still bounds the loop above it, and `driver_binding::apply_withdrawal` still owns the order and the
+completeness with its own test. This is stated as a gap in the evidence rather than closed by a test
+that would not fail.
+
+Changed: `src/user/drivers/core/src/virtio_blk.rs`, `src/user/drivers/core/src/virtio_console.rs`,
+`src/user/services/core/src/display_service.rs`, `src/harness/dev-gpu-restart.py`.

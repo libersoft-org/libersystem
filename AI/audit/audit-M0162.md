@@ -1128,3 +1128,46 @@ Current implementation rating: 6/10
 Verification: `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline` passed
 all 61 tests. Those tests validate the state table but do not execute DeviceManager's above control
 flow, which is why both defects remain compatible with the green suite.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0162 (2026-09-03T04:42:39Z):
+
+**Finding 1 - two permanent pre-bind failures are recorded through illegal transitions. ACCEPTED.**
+
+Verified against the table and both call sites. `Unbound -> Failed` is not an edge, and both places
+attempt it and discard the answer: `start_candidate` when every candidate artifact is missing from
+the volume, and `begin_bind` when the selected artifact does not declare this build's driver
+protocol - which is refused BEFORE the node enters `Binding`, deliberately, because that is the whole
+point of reading the note there. So the served record stayed `Unbound` with no cause, and
+`driver-missing` and `protocol-mismatch` - the two causes M1 names so an operator can tell a
+packaging fault from a driver that ran and failed - were unreachable.
+
+The table was missing a destination, not the sites a rule. `Unbound -> Failed` and
+`DependencyPending -> Failed` are now edges, with the reason written where the rest of the table is:
+a failure that happens before any attempt is installed is still this node's failure, and it is
+reachable from `DependencyPending` too because a node whose requirements have just been satisfied is
+still in that state when its artifact is read. `Online -> Failed` is still absent and a new test says
+so: a driver that came up fails through its teardown.
+
+Both call sites now READ the answer and print if it is refused, which is what would have surfaced
+this without an audit.
+
+**Finding 2 - rejecting a second terminal frame is returned to callers as a retry. ACCEPTED.**
+
+`Step::Again` means "this candidate may be tried again" and every caller acts on it - phase one calls
+`begin_bind`, phase two and the standing loop call `start_candidate` - so a duplicate `READY` or
+`FAILED` on a node that is already `Online` started an illegal bind, whose refusal `start_candidate`
+reads as a candidate that failed, advancing the cursor. The live binding survives, and the recovery
+list an M3-conformant event "must change nothing" about has been mutated or exhausted.
+
+Both branches now `continue` instead: the frame carries no fact, so nothing changes and the rest of
+the node's queue is drained. That is what idempotent means for an event that was refused, and it
+needs no new state.
+
+VERIFICATION: `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline` passes
+all 64 tests, including the widened table check (28 legal edges, exhaustively compared against
+`may_move_to`) and the new
+`a_node_that_never_got_to_attempt_anything_still_records_why`. The DeviceManager control flow the
+finding names is not host-drivable, which is why the table and its edges are where the rule lives.
+
+Changed: `src/user/libs/driver/binding/src/lib.rs`, `src/user/libs/driver/binding/src/tests.rs`,
+`src/user/services/core/src/device_manager.rs`.

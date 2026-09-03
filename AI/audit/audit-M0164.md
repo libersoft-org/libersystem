@@ -1628,3 +1628,69 @@ Verification: the `system-manifest` host suite passed all 15 tests, and `check-n
 and `check-one-wait` passed. The fixed-slot gate scans DeviceManager's numbered block-tag/count shape;
 it does not inspect ServiceManager/StorageService's four-element arrays or reject the two USB singleton
 routes, so those passes do not exercise either finding.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-09-03T04:43:34Z):
+
+**Finding 1 - the dynamic block-provider count stops at DeviceManager; discovery and role assignment
+remain capped at four and positional downstream. ACCEPTED IN PART.**
+
+ACCEPTED - THE CAP. Both readers of the probe hand-off held a four-element array while the SENDER
+carries its own count: ServiceManager closed the fifth probe, and StorageService clamped the
+announced count to what it could hold. So on a machine with five block providers the paired volume at
+a later bus address is unreachable again - which is the defect M2 exists to remove, at five instead
+of one, and it is not made better by the number being on the receiving side. The supervisor's array
+is now sized by `MOST_PROVIDERS`, the registry's own bound, emitted by `build.rs` beside the bound
+DeviceManager's catalogue already uses (one computation, two emissions, because ServiceManager is its
+own binary and cannot see the other). StorageService keeps as many probes as the message announces
+and reads every announced message whether or not it can hold the handle - the roles that follow come
+off the same channel, and stopping early would take the next one for a probe.
+
+REJECTED - "role assignment stays positional rather than selected from format/origin". This describes
+a rule the milestone resolved differently and wrote down. M2's own conclusion, under BUILT
+2026-08-27, is that for four identical virtio-blk disks the ORIGIN is the BDF - "they run the same
+driver, their formats do not differ, and a FAT BPB cannot tell a removable medium from a USB stick" -
+and that `Catalogue::take` picking the lowest bus:dev:fn among un-routed providers "is the whole of
+the routing change". The DoD's own contrast is with ARRIVAL ORDER, and bus order is not arrival
+order: it is fixed by a boot scan that enumerates the bus once. Format still does the work format can
+do, in the place M2 puts it - each StorageService instance mounts through a CHECKED mount
+(`Iso9660::mount_checked`, `Udf::mount_checked`, and `MountError::NotUdf` is a refusal, not a
+coercion), so a mismatched medium fails to mount rather than being served as the wrong volume. The
+uuid decides the system volume across every probe, which is the case the finding's own paragraph
+about the fifth provider is about, and that half is accepted above.
+
+**Finding 2 - the USB providers still use fixed DeviceManager slots and hand-written boot routing.
+ACCEPTED, and the manager's half is done.**
+
+The finding is right that "one slot per kind" does not satisfy this milestone, and right about the
+consequence: `take_from` MOVES the offered channel out of the catalogue and `if *slot == 0` closed
+every later one, so a second controller's providers, and the replacements a controller publishes when
+it rebinds, had nowhere to go and were not reachable through the catalogue either - the entry was
+still there and its handle was gone. That is the fixed-slot defect with the number left off.
+
+`usb_client` and `usbq_client` are gone from DeviceManager, and so is the branch in `route_offers`
+that filled them. Both publications stay in the catalogue with their offered channels intact, and the
+phase-two hand-off MINTS a connection at the moment it sends - the same thing the block probes
+already do. Which providers are the USB controller's is asked of the CATALOGUE rather than written
+into a route: `slots_published_beside(BLOCK, USB_BUS)` answers "a block provider published by a
+binding that also publishes usb-bus", which is M2's origin rule stated as a query - the manager knows
+which controller published which provider and the medium cannot say. The count travels beside the
+connection, so a machine with a second controller is reported rather than described by a variable
+that does not exist. `check-no-fixed-provider-slots` now refuses a per-kind local coming back -
+the numbered-local rule could not see these two, which is the only thing that made them look
+different from `block2_client` - and requires that origin query to still be asked.
+
+WHAT IS NOT DONE, NAMED RATHER THAN CLAIMED. Neither consumer SUBSCRIBES yet. The USB volume is
+mounted by a StorageService instance that is handed its block channel, and the bus-query channel
+reaches a TOOL through PermissionManager's grant table. For the first, subscribing needs a
+`CATALOGUE` role on that instance plus the controller's address to select on - `provider-info`
+already carries `bus`, `dev` and `func`, which is what makes the selection expressible at all. For
+the second it needs PermissionManager to hold a subscription and open a provider per grant, which is
+a change inside the grant path. Each is one more change; both are recorded in the milestone under M6
+rather than left in an audit. What this round removes is the part the definition of done names
+literally - the fixed slots and the hand-written route in DeviceManager - and the reachability of a
+replacement provider, which is what those slots were destroying.
+
+Changed: `src/user/services/core/src/device_manager.rs`, `src/user/services/core/src/service_manager.rs`,
+`src/user/services/core/src/service_manager/bootstrap.rs`, `src/user/services/core/build.rs`,
+`src/user/services/storage/src/service.rs`, `src/tools/check-no-fixed-provider-slots.sh`,
+`docs/todo/P02M0164.md`.

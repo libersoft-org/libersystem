@@ -1245,3 +1245,56 @@ Current implementation rating: 7/10
 
 Verification: the current source, the complete audit exchange, and the claim/MMIO lifecycle tests
 were inspected. No source code was modified.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0098 (2026-09-03T04:41:37Z):
+
+**Finding 1 - a forced release can publish `Free` while a mapping is live or its teardown is still
+running. ACCEPTED, both halves, and they are two different races with two different fixes.**
+
+THE RESERVATION HALF. `SYS_DEVICE_MEMORY_MAP` installs every page table entry BEFORE it attempts the
+commit, and `teardown_mapping` answered `true` for the `RESERVED` sentinel on the reasoning that the
+tombstone makes that commit fail and the builder unmaps its own work. Both halves of that reasoning
+are true and the conclusion was not: at the instant the sweep looks, a live mapping of the device's
+registers exists and the builder has not yet been told to remove it, so answering `true` let
+`finish_release` publish `Free` over exactly that interval - and the next claimant could be handed a
+device whose previous holder still had its BAR mapped. It now answers `false` and says so on the
+console, which is the rule this milestone states everywhere else: a teardown that could not confirm
+leaves the claim `Quarantined` and the device out of circulation. The builder still removes its own
+entries, because nothing else can.
+
+THE DESTRUCTOR HALF. The finding is right that `Weak::upgrade` fails as soon as the strong count
+reaches zero, which is BEFORE `DeviceMemory::drop` has unmapped anything or flushed any other core,
+and right that the drop discarded a failed confirmation. This is the same race the interrupt side was
+fixed for on 2026-08-31, and it is answered the same way: by asking a fact that was established
+BEFORE the race could start. `ClaimSlot` carries `mmio_live`, raised at `commit_mapping` - where the
+mapping becomes real - and lowered at the END of `teardown_mapping`, after the shootdown and the
+range have been dealt with; `mmio_unconfirmed` counts a teardown whose cross-core flush failed,
+wherever it ran. `release_claim` reads both exactly as it already reads the MSI registry:
+`settled_mmio` waits with the same bound and the same argument as `settled_vectors` (every teardown
+this release owns has run or is a few instructions away inside a concurrent `Arc::drop`), and the
+unconfirmed count is compared before and after the sweep so an EARLIER binding's failure does not
+make every later claim unreleasable while THIS release's is charged to it.
+
+THE ROLLBACK. Accepted and fixed: the commit-failure path unmapped its pages and handed the virtual
+range straight back, with no cross-core shootdown, while `teardown_mapping` two files away refuses to
+free a range it could not flush. It now follows the same rule and retains the range when the flush
+cannot be confirmed.
+
+AND ONE THING THE FIX REQUIRED. Adding a `CLAIMS` acquisition to the teardown path made an existing
+lock-order inversion reachable: `revoke_derived`'s allocation-failure fallback did its work with
+`DERIVED` HELD, and the `Arc` dropped at the end of each iteration takes `DEVICES` then `CLAIMS`,
+while `register_derived` takes `CLAIMS` then `DERIVED`. The function now takes one row out under the
+lock with `swap_remove` and does the work with the lock released, which needs no allocation at all -
+so the fallback and its `try_reserve` are gone and there is one path.
+
+TESTS. `a_release_that_lands_mid_map_leaves_no_mapping_behind` now asserts the STATE the release
+publishes - `Quarantined`, not `Free` - which is the ordering the finding says the old assertion was
+too late to prove. A new test,
+`kernel.object.claim.a_mapping_the_sweep_cannot_reach_keeps_the_claim_out_of_free`, commits a real
+mapping the sweep cannot reach and requires the release to refuse `Free` while the page table entry
+is still installed, then drops the object and requires the late teardown not to un-quarantine the
+device. The observable state is identical to the destructor race and it is reproduced without racing
+one.
+
+Changed: `src/kernel/object/device_memory.rs`, `src/kernel/device.rs`, `src/kernel/syscall/mod.rs`,
+`src/kernel/object/claim/tests.rs`.

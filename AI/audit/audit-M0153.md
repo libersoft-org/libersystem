@@ -1455,3 +1455,63 @@ Verification: `cargo test --manifest-path src/dma/Cargo.toml --offline` passed a
 `./check.sh --gate virtio-iommu-protocol` passed. Those tests validate the corrected codec, bounded
 raw-event work, mapping lifecycle and ordinary dry-tail case; they do not exercise either production
 gap above. No source code was modified.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0153 (2026-09-03T04:42:02Z):
+
+**Finding 1 - the one-tick live-fault bound starts only after userspace has come up. ACCEPTED.**
+
+Correct as stated. The bound was written into `console_shell_loop`, which is entered after the boot
+has settled, and `supervise` drives the whole of bring-up through two `run_until_idle_until` slices
+that serviced nothing - so a protected endpoint that faulted while it was starting kept mastering the
+bus until `dma_policy::report`, which is after `supervise` returns. The claim that live faults are
+serviced at least once per tick under any load was true of the shell and not of the boot.
+
+`crate::iommu::service_faults_if_due()` is now called after both drains in `supervise`. It is the same
+call, with the same two guards it already had - cpu 0 only, one drain per tick across the machine -
+so what it costs on the boot path is a register read per slice, and what it buys is the bound holding
+from the first driver bind rather than from the first shell prompt. Bring-up is where a driver first
+programs its device, which is where a fault first arrives.
+
+Changed: `src/kernel/main.rs`.
+
+**Finding 2 - an old undrained tail can indefinitely hide every fault raised by a replacement
+binding. ACCEPTED.**
+
+The execution is real and the file's own comment names the conditions for it: a driver restarting
+under a fault storm, "where nothing ever drains, because the transport never runs dry". A tail stopped
+attributing only when `transport_was_emptied` came back true, and a replacement that faults
+continuously never lets that be observed - so every one of the REPLACEMENT's faults came out carrying
+the dead binding's domain and generation, failed the cross-generation comparison in
+`poll_faults_attributed_with`, and no live binding was ever contained. M4's per-binding accounting is
+wrong for the same reason and in the same direction.
+
+The correction is that the tail is FINITE and now says so. An ended binding queued at most what the
+transport can hold, so once a tail has been charged with more records than that, the ones now
+arriving cannot be its. `Backend::fault_queue_capacity` is how a backend states that number,
+defaulting to `None` - the conservative answer, which keeps the old behaviour for a backend that
+cannot ask its transport rather than inventing a bound. `VirtioIommu` answers it from a new
+`Transport::event_capacity`, and the kernel's `Wire` answers that from its event ring's size.
+
+WHAT THIS BOUND IS AND IS NOT, said in the code rather than implied. The ring is the generous end of
+the answer - that transport keeps one event buffer outstanding at a time, so what the ledger can be
+holding is smaller - and erring high protects a replacement for longer, which is the direction to err
+in. It is a bound on the LEDGER's exposure and not a proof about the device: a controller that
+buffers more records internally than it can hand over at once can still out-run it. That is stated at
+`fault_queue_capacity` rather than left for the next reader to discover, and it is strictly better
+than "for ever", which is what the rule was.
+
+Two tests, both driven through the queue and the rebind rather than by handing an answer to the
+containment helper:
+`a_faulting_replacement_is_not_hidden_behind_its_predecessors_tail_for_ever` queues more than any
+drain reads so the transport is never seen empty, and requires the records past the stated bound to
+carry the LIVE binding's domain and generation - which is what the containment decision compares
+against; `a_backend_that_cannot_state_its_transports_bound_keeps_attributing_to_the_tail` requires the
+conservative default to be unchanged, because charging a live binding for its predecessor's queue is
+the error that disables a healthy device.
+
+VERIFICATION: `cargo test --manifest-path src/dma/Cargo.toml --offline` passes all 61 tests (59
+before, plus the two above).
+
+Changed: `src/dma/src/lib.rs`, `src/dma/src/virtio_iommu.rs`, `src/dma/src/fake.rs`,
+`src/dma/src/tests.rs`, `src/kernel/iommu/mod.rs`, `src/kernel/iommu/virtqueue.rs`,
+`src/kernel/main.rs`.

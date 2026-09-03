@@ -1454,3 +1454,112 @@ Current implementation rating: 5/10
    tests call `changes::paths` directly and therefore bypass the broken CLI serialization
    (`src/tools/verify-model/src/tests.rs:893-918`). This contradicts M5's required change identity in
    which a rename contributes both its origin and destination (`docs/todo/P02M0167.md:547-557`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0167 (2026-09-03T04:45:17Z):
+
+**Finding 1 - the candidate `--shadow-exec` route executes the active model's selection. ACCEPTED.**
+
+Verified line by line: `--candidate` reached the four `shadow` comparisons and nothing else. The
+booted and built target queries, the guest selection, the scoped host and dev lists and the grouped
+build steps were all asked of the ACTIVE model, so for a genuine narrowing the run executed the wider
+selection and then compared it against the narrower one - and `compare_exec` is right to read the
+difference as execution the candidate did not select, which is why no `shadow_exec` sample could ever
+be recorded for one. The route existed and could not produce the thing it exists for.
+
+Every planner invocation in the shadow path now takes `"${candidate_arg[@]}"`, so one model answers
+every question and when a candidate is given that model is the candidate. `source-digest` is the
+deliberate exception and says so: it is a fact about the FILES, which no overlay changes.
+
+AND THE PROOF THE ITEM ASKS FOR IS NOW A PLANNER TEST.
+`five_real_changes_through_the_real_planner_reach_the_threshold` runs five real files of
+`src/kernel/mem` through `Planner` and takes their scopes from `shadow::component_scopes` - the
+function the recorder itself uses - asserting five distinct digests and ONE decision, which is the
+deadlock the field exists to break. The single-file case the item also requires is `src/kernel/elf.rs`
+under five kinds of change, because the kind is part of the tuple and five edits to one file share
+one path set.
+
+**Finding 2 - candidate activation does not enforce the subsystem risk bar, and a registry-only
+narrowing bypasses even the generic one. ACCEPTED, both halves.**
+
+The second half is the more serious and is exactly as described: the loop walked `candidate.covers`,
+which DEFAULTS TO EMPTY, while the candidate carries a complete replacement registry - so a narrowing
+through ownership, an escalation rule or the graph visited no entry and reached the write path with
+no bar at all. The question is about coverage, so it is now asked of coverage: the checks covering
+each component are computed under the active model and again under `Model::load_with_candidate`, and
+any component that LOSES one must pass `Store::evaluate` under the candidate's own hash.
+
+The subsystem bar is applied on top, which is what the definition of done means by "both". For each
+risk class whose owning path belongs to a narrowed component: every architecture in `targets` must
+appear in the clean architectures seen, `distinct_changes` must be met by the distinct evidence,
+every name in `required_groups` must appear in the groups those clean records were made over
+(`Scope::groups`, which had a producer and no consumer), and `abi_unchanged` refuses evidence
+gathered over changes that touched the ABI component. Two new `Log` readers, `groups_seen` and
+`evidence_touched`, both filtered to `Consistent` records for the same reason
+`clean_architectures_seen` is: a comparison that found a fault is not evidence about what it touched.
+
+**Finding 3 - M4 neither orders nor budgets separately schedulable work by a truthful cost.
+ACCEPTED, all three parts.**
+
+THE COMPARATOR. Confirmed: the emitter applied `seed_seconds` and the comparator did not, so the plan
+ordered on one number and printed another - and since every gate key is `host`/`host` with no fixed
+term, an unmeasured gate sorted as the cheapest work in the plan while printing hundreds of seconds
+beside it. There is now one `step_cost` used by both.
+
+THE MERGED GUEST GATES. Confirmed and worse than the ordering: a gate that boots ONE guest stayed in
+the batch emitted under `STEPGUESTS 0`, so the one `--jobs` bound did not count it and a machine at
+its slot limit started one more. `GATES_THAT_BOOT_A_GUEST` declares the eight - the same shape
+`PROFILE_ROW_GATES` already had, and declared for the same reason: nothing in a gate's name says
+whether it boots - and each becomes its own step with its own key, its own measured cost and one
+guest slot. `capability-trace` is deliberately not among them and the list says why: it reads a log a
+guest produced and boots nothing, which is what `GATES_AFTER_A_GUEST` is for.
+
+`--budget 0`. Confirmed: the parser accepted it and every use was guarded by `BUDGET > 0`, so the one
+value meaning "start nothing" meant the opposite. The flag being GIVEN is now its own fact
+(`BUDGET_SET`), and a zero budget starts nothing whose closure costs anything and says what the
+minimum would have been.
+
+**Finding 4 - failed steps contaminate cost history and per-key freshness. ACCEPTED, both.**
+
+`record_step_id` stored a failed step's wall time as the step's measured cost and `step_seconds` read
+it back with no status check, so a two-second failure priced a ten-minute boot for every later run.
+The duration is now recorded only for a step that passed and took time - the same rule the fixed-term
+overshoot two paragraphs below already states, and the freshness is still recorded, because the step
+really did run.
+
+And a failed MERGED step now records nothing per key. `check.sh` stops at its first failing member, so
+stamping all of them is a claim about members that never started - the case
+`discard-divided-costs` repairs by hand while every failed merged run recreated it. A member that did
+not run is not stale, it is unknown. A one-key step keeps its record: nothing could have been skipped
+inside it.
+
+**Finding 5 - the registered scheduler proof is not hermetic. ACCEPTED, and it was worse than the
+finding says.**
+
+The finding measures a dirty tree, where case 7 alone fails on the trust verdict's exit 5. On a CLEAN
+tree the gate fails EVERY case: `verify.sh` with no selector defaults to `--for-change`, which exits
+on "the working tree is clean" before it reads the prepared plan. So every green run of this gate,
+the auditor's and mine, has been over a dirty tree - and a checkout is clean.
+
+Both are one cause: a prepared plan is about the EXECUTOR and not about the tree, and the script was
+treating it as an ordinary run around the edges. `LIBER_VERIFY_STEPS` now means no change set is read
+and no trust level is claimed - the run ends with the executor's own result, which is the only thing
+it measured. The gate passes with `changed=""`, which is precisely the clean-tree path.
+
+**Finding 6 - the production change boundary drops the origin of a rename. ACCEPTED.**
+
+Confirmed by reading: the `changes` command computed the origin and discarded it on the next line
+(`let _ = path;`), printing only the destination, while `changes::paths` - which the regression tests
+call - answers with both. `verify.sh` consumes the command, so moving code out of a component into an
+unrelated or documentation path did not select the component that lost the file. It now prints both,
+which is what M5's change identity requires and what the tested function already did.
+
+VERIFICATION: `cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline` passes all 118
+tests; `./check.sh --gate verify-scheduler` passes all twenty-one assertions, now over a run that
+reads no change set; `./check.sh --gate no-fixed-provider-slots` passes. One existing test asserted
+the literal text `-- built --stdin` in `verify.sh` and now asserts the subcommand plus the candidate
+form, which is the stronger statement.
+
+Changed: `verify.sh`, `src/tools/verify-model/src/main.rs`, `src/tools/verify-model/src/history.rs`,
+`src/tools/verify-model/src/shadow.rs`, `src/tools/verify-model/src/catalog.rs`,
+`src/tools/verify-model/src/commands.rs`, `src/tools/verify-model/src/tests.rs`,
+`docs/todo/P02M0167.md`, `docs/todo/P02M0099.md`, `docs/todo/P02M0103.md`.
