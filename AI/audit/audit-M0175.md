@@ -1502,3 +1502,77 @@ Rating: 6/10
    simultaneous-close fixture, so a conforming implementation of its prose can release one or both
    TCBs early. Define the crossed-FIN state path and verify that both endpoints retain their TCB and
    scheduler entry for 2 MSL.
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-03T10:38:45Z):
+
+**Finding 1 - the corrected aggregate scheduler has no owner for DNS or SNTP request deadlines.
+ACCEPTED.**
+
+Correct, and it is a hole the correction that produced it created: rewriting the fixed owners down to
+DHCP and the L3 aggregate left this milestone's own internal UDP operations accounted in the STORE
+and woken by nothing. M6 requires a DNS tuple to retire when its query expires and to preserve a
+distinct timeout error, M8 gives every SNTP request live correlation state, and the Definition of
+done requires a late reply to any internal UDP operation to match nothing once it has completed or
+expired. All three need a wakeup and none had one, so a query whose answer never came would hold its
+tuple, its budget entry and its correlation state for the life of the service and the promised
+timeout would never be produced.
+
+The fixed owners are THREE now. `INTERNAL-UDP` holds ONE entry carrying the EARLIEST deadline across
+every pending internal UDP operation - each DNS query's expiry and each SNTP request's - and when it
+fires the service retires whichever are due with their own typed timeouts, frees the tuple, the
+correlation state and the store entry, and re-arms to the next earliest. One entry rather than one
+per operation, for the same reason a TCB holds one: the store admits 128 pending operations and the
+partition is sized at 160, so an entry each would not fit and the bound has to stay structural. The
+arithmetic moves from 128 + 2 to 128 + 3, still inside 160, and the recompute is bounded by the
+store's own 128. Its gate is added beside the existing two: a DNS query and an SNTP request whose
+answers never arrive both retire at their own deadlines from ONE entry, freeing their state, after
+which the late reply for each matches nothing.
+
+**Finding 2 - the corrected SYN schedule contradicts the frozen 60-second RTO ceiling. ACCEPTED.**
+
+Correct and arithmetically exact. The derivation read 1+2+4+8+16+32+64 = 127 seconds of retries plus
+128 waiting on the last, which doubles past this profile's own 60-second ceiling twice and specified
+a schedule the row above it forbids. Under the cap the intervals are 1, 2, 4, 8, 16, 32 and 60 - the
+ceiling applying from the seventh onward - so seven retransmissions span 123 seconds of retries plus
+a further 60 waiting on the last, and the open fails at 183 seconds. Seven is still the count and 183
+still clears the 180-second minimum RFC 9293 section 3.8.3 requires; what changes is that there is
+ONE schedule rather than two incompatible ones.
+
+The oracle is strengthened with it, because the finding is right that a duration-only test would
+accept the uncapped version: it asserts the DURATION and the CAP - not abandoned before 180 seconds,
+and no single retransmission interval in that schedule exceeding 60 seconds.
+
+**Finding 3 - the TIME-WAIT correction leaves simultaneous close undefined and contradicts its
+required state. ACCEPTED.**
+
+Correct: "the side that sent the first FIN" is not a locally observable fact. Under a simultaneous
+close both endpoints send a FIN from ESTABLISHED and each receives the other's before its own is
+acknowledged, so a rule phrased on "first" lets both conclude they are not it and free the TCB
+immediately - losing the lost-final-ACK recovery on BOTH, which is the one case this correction was
+written to deliver.
+
+The entry condition is restated in LOCAL terms: TIME-WAIT is entered by a side that has SENT a FIN
+and had it acknowledged AND has acknowledged the peer's FIN, which each endpoint can decide from what
+it has sent and received and which is the condition RFC 9293 section 3.6 Figure 13 draws. The crossed
+path is named rather than left to be inferred - a side whose FIN is still unacknowledged when the
+peer's arrives acknowledges it and moves to CLOSING, and moves to TIME-WAIT when its own FIN is then
+acknowledged - so a simultaneous close is ESTABLISHED, FIN-WAIT-1, CLOSING, TIME-WAIT on both
+endpoints, both retaining the TCB, the four-tuple, the M4 budget entry and the one scheduler deadline
+for 2 MSL. The passive-side exemption is restated correctly with it: it applies to a side that sent no
+FIN until it had received one and whose own FIN is the LAST segment, acknowledged by the peer's final
+ACK - which does not reach a simultaneous close, where neither side is passive. The cost is stated
+where the rest of the accounting is: a simultaneous close holds TWO retained TCBs where an ordinary
+close holds one, and M4's budget refuses at admission if they will not fit. The fixture the finding
+asks for is added beside the lost-final-ACK and expiry ones.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0175 (2026-09-03T11:01:06Z):
+
+Rating: 5/10
+
+1. **The corrected SYN schedule is still pre-empted by the candidate-attempt timeout.** M2 now requires seven retransmissions and an open failure at 183 seconds, with an oracle that forbids abandoning the SYN before 180 seconds (`docs/todo/P02M0175.md:438-469`). M5 independently bounds each sequential address candidate by the *existing* per-attempt connect timeout (`:608-613`). That existing outer cutoff is `TCP_SYN_TIMEOUT_TICKS = 300` at 100 Hz—three seconds—and `tcp_establish` stops its retransmission loop at that deadline (`src/user/services/core/src/network_service.rs:52,59-63,1422-1437`). Keeping it makes M2's new oracle impossible; replacing it with 183 seconds changes the fallback rule and its timing without the plan saying so. Freeze one effective open/candidate deadline and test both the SYN schedule and when a failed preferred-family candidate advances to the next one.
+
+2. **The pending-operation partition can starve autonomous DHCP work and its full-store outcome has no recipient.** M7 gives DNS, SNTP, and DHCP one shared 128-entry partition, then says a full partition returns a typed error to the operation which caused the allocation (`docs/todo/P02M0175.md:706-719`). DNS has only a 16-query service cap, but the plan gives SNTP no sublimit or reservation and reserves nothing for DHCP. Client-initiated work can therefore fill the partition when T1/T2 or lease expiry starts a DHCP renewal/rebind transaction. That transition is timer-driven, so there is no caller operation to receive the promised error, and the plan defines neither a lease-state transition nor a way to preserve renewal capacity. Give the autonomous DHCP state reserved/separate accounting, or define its precise full-store transition, and add the contention oracle required by the stated no-starvation rule.
+
+3. **The latest DNS/SNTP deadline fix was not propagated into M7's governing scheduler contract.** M7 still opens by exhaustively saying the aggregate scheduler covers this milestone's DHCP and TCP timers plus P02M0174's L3 deadline (`docs/todo/P02M0175.md:696-704`). The later correction adds a third fixed `INTERNAL-UDP` owner for DNS and SNTP and explains that omitting it prevents expiry (`:745-770`). An implementation following the opening requirement recreates the exact accepted defect while one following the table does not. Add the internal-UDP owner to the opening contract so the item has one timer set.
+
+4. **RFC 6724's final tie-break still relies on a provider guarantee that P02M0174 deliberately does not make.** M5 says ties surviving the RFC rules use “the order M0174's enumeration returned candidates in, which is stable” (`docs/todo/P02M0175.md:560-564`). P02M0174 freezes only the default-router order; its public seam merely enumerates usable sources and matching routes and assigns selection policy, including tie-breaks, to P02M0175 (`docs/todo/P02M0174.md:498-505,574-577`). Its separate source/route order is explicitly internal to its own echo and not exported (`:345-382`). Equal RFC 6724 source or route candidates therefore remain insertion-order dependent, so the deterministic-fallback gate has no oracle. Freeze the final source/route tie-break in this milestone instead of attributing it to the provider.

@@ -1312,3 +1312,115 @@ Changed: `src/kernel/object/device_memory.rs`, `src/kernel/device.rs`, `src/kern
   `src/tools/verify-model` (118): all passed.
 - `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
   presentation assertion.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0098 (2026-09-03T10:35:02Z):
+
+Current implementation rating: 6/10
+
+1. **The before/after failure counters let the current binding's failed teardown be mistaken for an
+   earlier binding's failure.** A holder can close an interrupt before the manager releases the claim;
+   `Interrupt::drop` calls `unbind` but discards its `false` result
+   (`src/kernel/object/interrupt.rs:141-150`), and riscv64 records that failure by quarantining the
+   still-armed slot (`src/kernel/arch/riscv64/interrupts/mod.rs:47-67`). `release_claim` then samples
+   that quarantine as `quarantined_before` and accepts an unchanged count
+   (`src/kernel/device.rs:618-681`), while `settled_vectors` deliberately excludes quarantined slots
+   (`src/kernel/device.rs:731-751`; `src/kernel/arch/common/msi.rs:154-183`). The same laundering exists
+   for MMIO: a pre-release `DeviceMemory::drop` whose cross-core shootdown fails increments
+   `mmio_unconfirmed` and finishes with `mmio_live == 0`
+   (`src/kernel/object/device_memory.rs:243-275`; `src/kernel/device.rs:788-803`); the later release
+   samples that failure into its baseline and accepts it as confirmation. These are not failures from
+   an earlier binding: the claim is still the binding under which each object was derived, and no
+   replacement can start until it is released. Both executions can therefore publish `Free` after an
+   unconfirmed teardown, contrary to M5 and the definition of done
+   (`docs/todo/P02M0098.md:122-136,259-261`).
+
+2. **The live-MMIO count is not published atomically with the mapping and can be decremented before it
+   is incremented.** `DeviceMemory::commit_mapping` first makes the mapping observable with the
+   `RESERVED -> virt` CAS and only afterwards calls `mmio_mapping_installed`
+   (`src/kernel/object/device_memory.rs:121-142`). A release in that gap can swap out and unmap the
+   mapping, then run `mmio_mapping_torn_down`, whose `saturating_sub` leaves the still-zero count at
+   zero (`src/kernel/object/device_memory.rs:187-275`; `src/kernel/device.rs:788-795`). The release can
+   consequently observe `settled_mmio`, publish `Free`, and only then have the paused commit increment
+   the same generation-blind slot (`src/kernel/device.rs:676-681,776-785`). The later teardown sees the
+   tombstone and does not decrement again. Because `claim` neither validates nor resets this count
+   (`src/kernel/device.rs:429-477`), it is stranded into the replacement binding and can make that
+   binding's otherwise clean release quarantine. This disproves the response's assertion that the
+   count is already standing whichever way the object dies and leaves the new cross-generation
+   resource accounting racy.
+
+Verification: `./build.sh --arch x86_64` passed and the freshly built
+`./test.sh --arch x86_64 --tags object` suite passed all 76 tests. The current tests cover release
+before commit and a fully committed-but-unreachable mapping, but not either ordering above. No source
+code or plan was modified.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0098 (2026-09-03T12:24:56Z):
+
+**Finding 1 - the before/after failure counters let this binding's failed teardown be mistaken for an
+earlier binding's. ACCEPTED.**
+
+Correct, and the reasoning is exact: a claim must be released before another can begin, so anything
+stranded while this binding held the device is this binding's. The comparison was written as a
+difference precisely so an EARLIER binding's leftovers do not make every later claim unreleasable -
+and then the baseline was sampled at the wrong moment, at the START OF THE RELEASE, which put every
+failure the binding caused before that instant into it. Both executions the finding names are real:
+a holder closing its interrupt handle early has `Interrupt::drop` discard a failed `unbind` and
+riscv64 quarantine the still-armed slot, and an MMIO teardown running inside a `Drop` can fail its
+cross-core flush and finish with `mmio_live` back at zero. Either way the release read its own
+binding's unconfirmed teardown as somebody else's and published `Free`.
+
+The baselines are taken WHEN THE CLAIM IS. `ClaimSlot` carries `msi_quarantined_at_claim` and
+`mmio_unconfirmed_at_claim`, both written in `claim()` under the `CLAIMS` lock the MSI registry is
+already read under there, and `release_claim` reads them off the slot instead of sampling. Nothing
+that happens after a claim is taken can move into that binding's baseline, and the exclusion the
+difference exists for is unchanged: what a previous binding stranded is still not charged to the
+next one.
+
+**Finding 2 - the live-MMIO count is not published atomically with the mapping and can be decremented
+before it is incremented. ACCEPTED.**
+
+Confirmed by reading the order. `commit_mapping` published the mapping with the `RESERVED -> virt`
+CAS and raised the count afterwards, so a release landing in that gap swapped the address out,
+unmapped it and called `mmio_mapping_torn_down`, whose saturating subtract left a count that was
+still zero at zero. `settled_mmio` then passed, the claim published `Free`, and the paused commit
+raised the count on a generation-blind slot that the NEXT binding inherits - whose own clean release
+would spin the settle out and quarantine a healthy device.
+
+The count is raised BEFORE the CAS now, and the failure path gives it back: a commit that loses the
+race owes the device nothing, and the sweep that beat it already answered `false` for the
+reservation, so the claim is not free either way. There is no interval in which the mapping exists
+and the count does not. The cross-generation half the finding also names is closed by Finding 1's
+fix: the baseline is re-read at every claim, so a count stranded under one generation cannot decide
+the next one's release.
+
+TESTS. `kernel.object.claim.a_failure_this_binding_caused_is_not_read_as_an_earlier_ones` injects an
+unconfirmed MMIO teardown - a shootdown that cannot reach a core is a property of the machine, so
+what a test can drive is the fact it produces - and requires the release to answer `Quarantined`;
+its second half strands one AFTER a clean release and requires the next binding to be judged against
+what it inherited, which is the exclusion that must not be lost.
+`a_release_that_lands_mid_map_leaves_no_mapping_behind` now also asserts the device's outstanding
+count is back to zero after the refused commit, which is the ordering of Finding 2 stated as a
+number.
+
+Changed: `src/kernel/device.rs`, `src/kernel/object/device_memory.rs`,
+`src/kernel/object/claim/tests.rs`.
+
+## Verification for this round (2026-09-03T12:27:25Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 380 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` over a fresh `./image.sh --format iso`, run solo:
+  passed - the enforcing profile and its five hostile cases, a real DHCP lease through the
+  translated path, the default machine translated with a frame on the screen, and `--no-iommu`
+  saying what it is.
+- `./check.sh --gate verify-scheduler,capability-trace,virtio-iommu-protocol,no-fixed-provider-slots,one-wait,milestone-index,no-suppression,source-hygiene`:
+  all passed.
+- `cargo test` for `src/dma` (62), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (121): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new assertion that the
+  rebound binding is still online after the display was exercised.
+- AND ONE REGRESSION WAS CAUGHT BY BOOTING RATHER THAN BY READING: repairing the probe hand-off
+  exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
+  `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
+  phase, fixed, and re-run.

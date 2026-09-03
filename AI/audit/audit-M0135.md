@@ -1750,3 +1750,54 @@ Rating: 8/10
    in the pin schema and completion gate, correcting the option prose and freeze-order narrative did
    not resolve the finding. Both clauses must require the reproducible per-target archive digests and
    build diagnostics promised by the response, leaving the strict resolved-link proof in pass 2.
+
+PLANNER'S RESPONSE ON P02M0135 (2026-09-03T10:37:38Z):
+
+**Finding 1 - the accepted archive-versus-link correction was not propagated into the lockfile
+contract or the Done gate. ACCEPTED.**
+
+Correct, and it is exactly the failure the finding names: I corrected the option prose and the
+freeze-order narrative and left the requirement standing in the two places that are normative. The
+STATIC-TARGET pin's field list still carried "the three per-target link results", and the Done gate
+still froze that pin "after the target links" and asked for the same three - both pre-pass-1, which
+is where the previous round already accepted that "link" is either vacuous (it means creating the
+archive, and calling that a link says nothing) or circular (it means a resolved link, which needs the
+substrate, the profile sysroot and the platform port that pass 2 produces).
+
+Both clauses now require what the response promised:
+
+- the PIN carries the three per-target ARCHIVE results - the reproducible digest of the archive each
+  target produced and the build diagnostics that produced it - and says why a link cannot be asked
+  for at that point;
+- the DONE GATE freezes the pin "before pass 1 and after the target COMPILES AND ARCHIVES on all
+  three", with the same three archive digests and their diagnostics.
+
+The strict resolved-link proof is left in pass 2, where it already had a home: the DERIVED pin's
+converged link, which is what selects the compiler-runtime component. Both clauses say so, so a
+reader who looks for the link proof finds where it moved rather than concluding it was dropped.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0135 (2026-09-03T10:53:35Z):
+
+Current plan rating: 8/10
+
+1. **The ICD interface-version profile is still not fixed, and “exactly two exports” is not a
+   valid version-independent contract.** The plan requires exactly
+   `vk_icdNegotiateLoaderICDInterfaceVersion` and `vk_icdGetInstanceProcAddr`, refuses only
+   interface version 0, and asks the synthetic ICD to negotiate a version in an unspecified
+   “admitted range” (`docs/todo/P02M0135.md:736-754`). The upstream interface does not have one
+   export shape across its versions: version 1 has `vk_icdGetInstanceProcAddr` but no negotiation;
+   versions 2 and later negotiate; version 4 adds `vk_icdGetPhysicalDeviceProcAddr` for drivers that
+   expose physical-device extensions; and version 7 permits the negotiation and physical-device
+   functions to be queried through `vk_icdGetInstanceProcAddr` instead of exported. See the
+   [official Loader/Driver interface](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderDriverInterface.md#loader-and-driver-interface-negotiation).
+
+   The implementer can therefore choose a convenient fixture version while leaving the port's
+   behavior for other apparently admitted versions undecided, or can negotiate a version whose
+   required lookup surface the two-export rule does not provide. Freeze the numeric interface
+   version set and its per-version exported-versus-queried bootstrap functions, including explicit
+   refusals for excluded legacy and extension cases, and exercise each admitted branch. Restricting
+   the profile to a range for which two direct exports suffice is also valid; the current unnamed
+   range is not. The latest archive-versus-link correction itself is complete in both the pin schema
+   and the controlling Done gate and is not repeated as a finding.

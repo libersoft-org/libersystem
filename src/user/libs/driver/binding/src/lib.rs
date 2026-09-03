@@ -384,6 +384,27 @@ impl BindingRecord {
 		};
 		true
 	}
+
+	// RECORD A TERMINAL FAILURE, from wherever the node is.
+	//
+	// `move_to(Failed, ..)` is the whole of it for a node that is not there yet, and it is not the
+	// whole of what production needs (added 2026-09-03). A candidate can be started from `Failed` -
+	// an operator retry, or a `select` that moved the cursor - and reach a pre-attempt refusal, and
+	// the table has no `Failed -> Failed` edge, deliberately: a state with an edge to itself is a
+	// state a duplicate event moves. So the attempt was refused, the refusal was logged, and the
+	// node kept the PREVIOUS candidate's cause - which reads as a device that failed for a reason
+	// nothing in this attempt found.
+	//
+	// The state is already right in that case and only the cause is stale, so the cause is restated
+	// without a transition. Answers false only where neither is possible - a node that is running,
+	// quarantined or operator-disabled - which the caller logs, exactly as it logs a refused move.
+	pub fn record_failure(&mut self, cause: FailureCause) -> bool {
+		if self.state == BindingState::Failed {
+			self.failure = Some(cause);
+			return true;
+		}
+		self.move_to(BindingState::Failed, Some(cause))
+	}
 }
 
 #[cfg(test)]

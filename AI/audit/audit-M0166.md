@@ -1484,3 +1484,80 @@ Changed: `src/user/libs/driver/binding/src/lib.rs`, `src/user/libs/driver/bindin
   `src/tools/verify-model` (118): all passed.
 - `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
   presentation assertion.
+
+AUDITOR'S RE-AUDIT ON P02M0166 (2026-09-03T10:33:45Z):
+
+Current implementation rating: 7/10
+
+1. **A failed policy write is reported as `not-stored`, but the rejected policy remains active in
+   ConfigService's in-memory tree.** `Config::set` changes `entries` before calling `persist`, and
+   `Config::remove` deletes from `entries` before that call; neither operation rolls the mutation
+   back when persistence returns `Error::Io` (`src/user/services/core/src/config_service.rs:226-280`).
+   `PolicyView::apply` now correctly withholds the immediate node effect and returns `NotStored` for
+   that inner error (`src/user/services/core/src/device_manager.rs:3988-4028`), but a later
+   DeviceManager instance can load the rejected value from the still-running ConfigService. A failed
+   `select` can therefore take effect at that next bind, and a failed `disable` or `enable` can likewise
+   appear after a manager restart, despite the protocol promising that `not-stored` leaves the binding
+   unchanged (`src/idl/device.lsidl:213-215`). The response explicitly retaining the failed mutation in
+   memory does not close the original atomicity finding; it only postpones the unintended effect.
+
+2. **Splitting disable and selection into independent records left the `stored` endpoint reading only
+   the disable slot.** The accepted correction created `select_key(node.id)`, and load/apply use it,
+   but `PolicyView::stored` still fetches only `policy_key(node.id)`
+   (`src/user/services/core/src/device_manager.rs:4045-4058`). Consequently a successfully persisted
+   selection is reported as empty, and where both records exist the selection is omitted. That makes
+   the correction to the former shared-slot defect incomplete and contradicts the endpoint contract
+   that an operator can inspect the preference before reboot (`src/idl/device.lsidl:255-259`).
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0166 (2026-09-03T12:26:48Z):
+
+**Finding 1 - a failed policy write is reported as `not-stored` while the rejected value stays live
+in ConfigService's tree. ACCEPTED.**
+
+Correct, and it is the original atomicity finding rather than a new one: I moved the reporting and
+left the mutation. `set` changed `entries` before calling `persist` and `remove` deleted from them
+before it, and neither rolled back on `Error::Io` - so an operator told `not-stored` was overruled by
+the record they had been refused, at the next load or the next manager restart. The protocol says
+`not-stored` leaves the binding unchanged, and postponing the effect is not leaving it unchanged.
+
+Both operations are atomic against the write-through now: `set` remembers the previous value (or its
+absence) and restores it when `persist` fails, `remove` puts the entry back, and the message says the
+value was REFUSED rather than served from memory. A tree with no volume at all is still a success,
+because that is what a fixture and the pre-mount boot are, by design.
+
+**Finding 2 - splitting disable and selection left the `stored` endpoint reading only the disable
+slot. ACCEPTED.**
+
+Confirmed: `load_stored_policy` and `apply` were both moved to the two keys and `stored` was not, so
+a successfully persisted SELECTION - the preference an operator most wants to see before a reboot
+applies it - reported as nothing stored, and a device carrying both reported half of what it would
+restore. The endpoint's contract is what is stored for the device, not what is under one of its keys.
+
+It reads both. One record answers as itself, so an operator reading a single preference sees exactly
+what was written; two answer as the two values they are, separated by a space and in load order - the
+disable first, because it decides whether the selection is reached at all.
+
+VERIFICATION: `./test.sh --arch x86_64` passes 380, which boots ConfigService and the policy path;
+`cargo test` for `driver-binding` passes 64.
+
+Changed: `src/user/services/core/src/config_service.rs`,
+`src/user/services/core/src/device_manager.rs`.
+
+## Verification for this round (2026-09-03T12:27:25Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 380 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` over a fresh `./image.sh --format iso`, run solo:
+  passed - the enforcing profile and its five hostile cases, a real DHCP lease through the
+  translated path, the default machine translated with a frame on the screen, and `--no-iommu`
+  saying what it is.
+- `./check.sh --gate verify-scheduler,capability-trace,virtio-iommu-protocol,no-fixed-provider-slots,one-wait,milestone-index,no-suppression,source-hygiene`:
+  all passed.
+- `cargo test` for `src/dma` (62), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (121): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new assertion that the
+  rebound binding is still online after the display was exercised.
+- AND ONE REGRESSION WAS CAUGHT BY BOOTING RATHER THAN BY READING: repairing the probe hand-off
+  exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
+  `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
+  phase, fixed, and re-run.

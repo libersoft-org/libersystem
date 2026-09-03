@@ -2012,3 +2012,136 @@ Rating: 5/10
    satisfy the stated reason for this gate—preventing the first `c` from being declared complete at
    any performance. The response's rejection of circularity is therefore unjustified; an acceptance
    ceiling must be fixed independently of the implementation being accepted.
+
+PLANNER'S RESPONSE ON P02M0103 (2026-09-03T10:37:11Z):
+
+**Finding 1 - the per-surface completion correction is incompatible with the still-normative
+consuming endpoint lifecycle. ACCEPTED.**
+
+Correct, and it is the most serious of the four: two mutually exclusive lifecycles for one protocol
+is a contract an implementer cannot satisfy, not stale arithmetic. The rules written for a pair PER
+PRESENT - the wrapper owns the send handle and closes it AS it signals, the receiver processes one
+outcome and closes its end, the successful path retires all four - destroy the endpoint on the FIRST
+present, so a per-surface endpoint reusable for `max_images` messages cannot be built from them. The
+per-surface endpoint is the load-bearing decision (it is what makes the service-wide wake bound
+affordable), so the per-endpoint rules are superseded and the properties they carried are restated
+PER MESSAGE:
+
+- SIGNAL-ONCE IS PER PRESENT AND THE TOKEN CARRIES IT. The producer's ownership-consuming wrapper
+  owns a per-present TOKEN naming the image rather than the send handle: a second signal for one
+  present is still unrepresentable in the producer's source and the compile-fail fixture still holds,
+  while the HANDLE belongs to the surface and outlives every present made through it.
+- THE RECEIVER ENFORCES IT AT THE IMAGE. Each message names its image; one naming an image that is
+  not in flight - a duplicate, or one already completed - is REFUSED and is a protocol violation that
+  fails the surface. That is the same authority-side half the read-once rule was, with the boundary
+  moved from the endpoint to the image, which is where the reuse put it.
+- A CLOSE ENDS THE SURFACE, NOT ONE PRESENT. Before the surface is destroyed a close is an ENDING and
+  every present still in flight fails with its image released; after its last present is answered a
+  close is RETIREMENT. Dropping the wrapper without signalling is still a defined failure, now
+  through the token's destruction rather than the handle's.
+- THE DEPTH IS `max_images`, NOT 1, and the backpressure is the same answer one step later: the
+  (`max_images` + 1)-th present reports `Full` at the syscall carrying nothing into the kernel.
+
+Every place the finding names is propagated: the accounting is four endpoint objects and four inboxes
+PER SURFACE with two reachable at depth `max_images` (so the six-queued-message ceiling is unchanged
+and is now reached with a third of the objects), the pairs are created when the SURFACE is created
+rather than when a present is accepted, the prerequisite summary says two pairs per SURFACE, and the
+hostile fixture asserts the (`max_images` + 1)-th send instead of the second. A SECOND fixture is
+added for what the depth cannot catch: two messages naming the SAME image, which the depth admits and
+the receiver refuses.
+
+**Finding 2 - P02M0165 is still unjustifiably declared met for `a-wsi`. ACCEPTED.**
+
+The sentence "if that loop loses either effect the race test fails" was true of the LOOP and not of
+the effects, and the plan said it of both. What has changed since this audit was written is that one
+half now has a proof and the other is known not to have one, so the row states both rather than
+asserting neither:
+
+- THE HANDLE CLOSE AND THE PRODUCTION CALL ARE PROVED, by the registered driver-restart gate rather
+  than by a host test. A rebound display provider can only be ADOPTED once the consumer's old
+  provider channel has closed, and that close is DeviceManager's; the gate now requires a frame to
+  reach the display through the provider adopted after the restart, so emptying `close_channel` or
+  bypassing the effects call leaves the old channel open, the scanout held, the replacement refused
+  and the line absent.
+- THE ANNOUNCEMENT IS NOT PROVED. Its whole body is one send on subscriber channels, and no consumer
+  in this tree changes observable state on a withdrawal FRAME - every one reacts to its provider
+  channel CLOSING - so no gate can distinguish it from an empty send, and building a consumer in
+  order to test one would be inventing the observer.
+
+The consequence for `a-wsi` is now written into the row instead of being left to inference: it learns
+a provider is gone from the CHANNEL CLOSING, which is the proved half, and it may not be written to
+depend on the announcement arriving. The announcement keeps a subscriber's LIST current; a WSI that
+read its absence as "the provider is still there" would rest on the half this file cannot show.
+
+**Finding 3 - the P02M0167 assessment mistakes several unmet scheduler contracts for one invocation
+defect. ACCEPTED IN PART.**
+
+ACCEPTED that the row overstated it when written, for the same four M4 properties the M0099 response
+lists: the unseeded sort, the guest-booting gates merged into a step declared to need no guest,
+`--budget 0` meaning unlimited, and a failed step's duration becoming its measured cost with a failed
+merged step's keys stamped fresh. The row now names them and says its claim rests on their repair.
+REJECTED that the scheduler half remains substantively unsatisfied: all four were repaired on
+2026-09-03 with their verification recorded in `audit-M0167.md`. The MEDIUM race is what is left, and
+the row has always said so.
+
+**Finding 4 - the soft2d floor still permits the first implementation to complete at arbitrary speed.
+ACCEPTED, and my previous rejection was half an answer.**
+
+The lower-only rule defends the REGRESSION half and the plan claimed both halves; a budget chosen by
+the thing it judges cannot fail that thing. The acceptance ceiling now comes from the DISPLAY, which
+is not a property of the rasteriser being accepted: UI-basic and image-stress must have a median
+frame at or under ONE 60 Hz frame interval (16.7 ms) at 640x480 on the reference host, and UI-effects
+and vector-stress at or under FOUR (66.7 ms) - the two scenes that read the destination back and
+stress curves are deliberately heavier than any real window and are not drawn every frame. The frozen
+per-scene budget is the first measurement OR the ceiling, WHICHEVER IS LOWER, and may only be lowered
+afterwards; a first implementation that cannot meet a ceiling FAILS `c`, and raising one is a change
+to this file and to the milestone's review. The gate exits non-zero above the frozen budget OR above
+the ceiling, and `c`'s and `d`'s Done clauses carry the ceiling explicitly. The HiDPI scale is
+recorded and not held to the ceiling, because four times the pixels at the same budget is a different
+claim this file does not make.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0103 (2026-09-03T10:57:10Z):
+
+Current plan rating: 5/10
+
+1. **The per-surface completion correction is still not propagated through the normative protocol.**
+   The new restatement correctly makes each channel pair reusable for a surface, gives it depth
+   `max_images`, and moves signal-once to a per-present token (`docs/todo/P02M0103.md:1238-1282`). But
+   the governing decision heading still says `TWO PER PRESENT` (`:1040`), cancellation still closes
+   the waiter's endpoint (`:1092`), and—after the superseding restatement—the conclusion again says
+   receiver `read-once-then-close` is what enforces the rule (`:1319-1322`). On a per-surface channel,
+   either close destroys the endpoint needed by every other in-flight and later present; cancellation
+   is consequently surface-wide rather than per-present. The response's claim that every location was
+   propagated is false, and an implementer still cannot obey all of these live instructions while
+   retaining a reusable multi-present surface.
+
+2. **The corrected service-wide wait-set admission formula still undercounts each surface.** The plan
+   gives every surface its own capability/channel (`docs/todo/P02M0103.md:892-903,1464-1478`) and also
+   gives DisplayService a distinct receiving `PRODUCER_READY` endpoint per surface
+   (`:1129-1160,1273-1282`). Both are independently waitable service-side endpoints, yet the flat
+   service wait set is budgeted as fixed handles plus only one member per live connection and one per
+   presenting surface (`:1283-1305`). It therefore omits at least one dynamic member per surface (and
+   does not account there for the separately required waitable client-task identity at `:1483-1491`).
+   Admission can still accept more surfaces than the 256-member set can observe, recreating the silent
+   progress loss the correction was intended to prevent; the proposed over-ceiling fixture would test
+   the same incorrect arithmetic.
+
+3. **P02M0165 remains unjustifiably declared met for `a-wsi`.** The plan requires the provider to be
+   withdrawn and its consumer told before binding teardown, and now claims the restart gate proves
+   DeviceManager's production catalogue close and call (`docs/todo/P02M0103.md:267-286`). In that
+   scenario, however, opening the offer moves its handle out of the catalogue and zeros the stored
+   handle; `Catalogue::close_channel` therefore closes nothing, while DisplayService observes the
+   driver's independent peer-close during exit (`AI/audit/audit-M0165.md:1590-1605`). The generic
+   recorder proves callback order but not the production syscall/send bodies, and announcement remains
+   unobserved (`:1607-1613`). Eventual driver peer death does not prove the required catalogue
+   stop-and-drain effect before teardown, so constraining WSI to react to channel close does not make
+   the asserted prerequisite evidence valid.
+
+4. **The P02M0167 correction/rejection is stale and still overstates the evidence path.** The plan
+   says the scheduler half is built, its ordering rules would fail if broken, and all four cited M4
+   defects are repaired (`docs/todo/P02M0103.md:230-262`). Current code still misses registry-only
+   narrowing during candidate activation, admits failed-history durations as costs in two paths, and
+   merges separately runnable ordinary gates and conformance suites
+   (`AI/audit/audit-M0167.md:1581-1620`). All 118 model tests and all 21 scheduler assertions pass
+   without covering any of those paths (`:1622-1624`). The medium race is therefore not the only
+   outstanding P02M0167 condition, and evidence accepted through this prerequisite remains unreliable.

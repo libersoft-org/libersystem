@@ -265,16 +265,30 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 		let guests = crate::catalog::gate_concurrent_guests(&name);
 		steps.push(Step { id: scoped_id("gate-concurrent", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate ({guests} guests at once)"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: Some(format!("this gate's subject is overlap: it starts {guests} guests at the same time, so it needs that many of the runner's slots")), guests });
 	}
-	if !before_guest.is_empty() {
-		let names: Vec<String> = before_guest.iter().map(|item| gate_name(item)).collect();
-		steps.push(Step { id: scoped_id("gate", "host", &names), requires: Vec::new(), label: format!("{} gate(s)", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: before_guest.iter().map(|item| item.key.clone()).collect(), note: None, guests: 0 });
+	// ONE STEP PER GATE, BECAUSE ONE GATE IS ONE SEPARATELY SCHEDULABLE UNIT (corrected 2026-09-03).
+	//
+	// These were batched into a single comma-list `check.sh --gate a,b,c` on the reasoning that
+	// `check.sh` takes a list. It does, and that is a property of the RUNNER rather than of the
+	// work: `check.sh --gate <one>` is a command, so every member is independently runnable, and
+	// merged they shared one `StepId`, one duration and one budget decision. M4 asks for every
+	// separately schedulable unit to be separately timed and for the plan to be ordered
+	// cheapest-first, and neither is expressible over a batch - the cheap ones cannot go first,
+	// nothing measures any of them, and a budget admits all fifty or none.
+	//
+	// The split that already existed for profile rows and guest-booting gates is the same split;
+	// what was left was the assumption that the cheap ones are too cheap to be worth an id.
+	for item in before_guest.iter() {
+		let name = gate_name(item);
+		steps.push(Step { id: scoped_id("gate", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} gate"), command: format!("./check.sh --gate {name}"), keys: vec![item.key.clone()], note: None, guests: 0 });
 	}
 	let gates_after_guest: Vec<&crate::plan::PlanItem> = after_guest;
 	let conformance_items: Vec<&crate::plan::PlanItem> = plan.items.iter().filter(|item| item.kind == CheckKind::Conformance).collect();
-	if !conformance_items.is_empty() {
-		let names: Vec<&str> = conformance_items.iter().map(|item| item.key.check.strip_prefix("conformance.").unwrap_or(&item.key.check)).collect();
-		let format_names: Vec<String> = names.iter().map(|name| (*name).to_string()).collect();
-		steps.push(Step { id: scoped_id("conformance", "host", &format_names), requires: Vec::new(), label: format!("{} conformance suite(s)", names.len()), command: format!("./check.sh --conformance {}", names.join(",")), keys: conformance_items.iter().map(|item| item.key.clone()).collect(), note: None, guests: 0 });
+	// AND ONE STEP PER CONFORMANCE SUITE, for the reason above and with the same shape:
+	// `check.sh --conformance <one>` is a command, so a suite is a unit the scheduler can order,
+	// time and admit on its own.
+	for item in conformance_items.iter() {
+		let name = item.key.check.strip_prefix("conformance.").unwrap_or(&item.key.check).to_string();
+		steps.push(Step { id: scoped_id("conformance", "host", &[name.clone()]), requires: Vec::new(), label: format!("{name} conformance suite"), command: format!("./check.sh --conformance {name}"), keys: vec![item.key.clone()], note: None, guests: 0 });
 	}
 
 	// One boot per architecture, whatever the selection inside it.

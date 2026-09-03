@@ -89,6 +89,32 @@ fn a_node_that_never_got_to_attempt_anything_still_records_why() {
 	// AND IT IS STILL NOT A WAY INTO `Failed` FROM A RUNNING BINDING. `Online -> Failed` would
 	// bypass the teardown, which is the reason the edge is absent.
 	assert!(!BindingState::Online.may_move_to(BindingState::Failed), "a driver that came up fails through its teardown, never directly");
+
+	// AND THE ORIGINS PRODUCTION ACTUALLY STARTS A CANDIDATE FROM (added 2026-09-03). A candidate is
+	// started from an expired `Backoff` and from an operator retry out of `Failed`, and both can
+	// reach a pre-attempt refusal - a selected artifact that is not on the volume, a note that does
+	// not declare this build's protocol. `record_failure` is what covers all four origins.
+	let mut backed_off = BindingRecord::new();
+	assert!(backed_off.move_to(BindingState::Binding, None));
+	assert!(backed_off.move_to(BindingState::Backoff, Some(FailureCause::SpawnFailed)));
+	assert!(backed_off.record_failure(FailureCause::DriverMissing), "a node whose backoff expired onto a missing artifact is recorded, not left parked");
+	assert!(backed_off.state == BindingState::Failed, "and it leaves Backoff, where nothing would ever wake it again");
+	assert!(backed_off.failure == Some(FailureCause::DriverMissing));
+
+	// FROM `Failed` THE STATE IS ALREADY RIGHT AND ONLY THE CAUSE IS STALE. `Failed -> Failed` is
+	// deliberately absent - a state with an edge to itself is one a duplicate event moves - so the
+	// cause is restated without a transition.
+	let mut already = BindingRecord::new();
+	assert!(already.record_failure(FailureCause::SpawnFailed));
+	assert!(already.record_failure(FailureCause::ProtocolMismatch), "a fallback candidate refused for its note replaces the cause");
+	assert!(already.failure == Some(FailureCause::ProtocolMismatch), "and the node does not keep the previous candidate's reason");
+	assert!(!BindingState::Failed.may_move_to(BindingState::Failed), "which is not a self-edge in the table");
+
+	// AND A RUNNING BINDING IS REFUSED, which the caller logs.
+	let mut online = BindingRecord::new();
+	assert!(online.move_to(BindingState::Binding, None));
+	assert!(online.move_to(BindingState::Online, None));
+	assert!(!online.record_failure(FailureCause::DriverMissing), "a driver that is running does not become Failed without its teardown");
 }
 
 #[test]

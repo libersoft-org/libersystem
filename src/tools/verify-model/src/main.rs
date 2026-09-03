@@ -1012,6 +1012,20 @@ fn run() -> Result<ExitCode, String> {
 						losing.insert(component.clone());
 					}
 				}
+				// AND THE REGISTRY NARROWS WITHOUT TOUCHING A SINGLE `covers` LIST (corrected
+				// 2026-09-03). Comparing the two catalogues' `(check, covers)` pairs sees a
+				// narrowing made through the kernel tests' overlay and nothing else, while the
+				// PLAN's width is decided by three more things the candidate replaces wholesale:
+				// which paths a component owns, which escalation edges reach it, and which targets a
+				// path is built and booted on. A candidate that removes an edge, shortens an
+				// ownership prefix or drops a target changes what a change SELECTS while leaving
+				// every `covers` list identical - so `losing` was empty and activation reached the
+				// write path with neither bar applied, which is the bypass this check exists for.
+				//
+				// The comparison is `candidate::components_losing_registry_coverage`, where a test
+				// can drive it: inline here it could only be exercised by activating a candidate,
+				// which is the thing it gates.
+				losing.extend(verify_model::candidate::components_losing_registry_coverage(&model.registry, &narrowed_model.registry, &model.ownership()));
 				let mut short: Vec<String> = Vec::new();
 				for lost in &losing {
 					// The universe a kernel test is judged in. A narrowing of a guest test is
@@ -1264,8 +1278,8 @@ fn run() -> Result<ExitCode, String> {
 			let history = verify_model::history::History::load(&repo_root)?;
 			let model_cost = verify_model::history::CostModel::default();
 			let selected: Vec<verify_model::plan::PlanItemKey> = plan.items.iter().map(|item| item.key.clone()).collect();
-			let scoped = model_cost.estimate(&history, &selected);
-			let whole = model_cost.estimate(&history, &universe(&model));
+			let scoped = model_cost.estimate(&history, &selected, None);
+			let whole = model_cost.estimate(&history, &universe(&model), None);
 			emit(&plan, json, explain, quiet, &model)?;
 			if !json && !quiet && !plan.nothing_to_do {
 				let share = if whole > 0.0 { scoped / whole * 100.0 } else { 100.0 };
@@ -1373,7 +1387,7 @@ fn join_or_none(items: &[String]) -> String {
 fn step_cost(history: &verify_model::history::History, cost: &verify_model::history::CostModel, step: &verify_model::commands::Step, model_hash: &str) -> f64 {
 	match history.step_seconds(&step.id, model_hash) {
 		Some(seconds) => seconds,
-		None => cost.estimate(history, &step.keys).max(cost.seed_seconds(step.guests)),
+		None => cost.estimate(history, &step.keys, Some(model_hash)).max(cost.seed_seconds(step.guests)),
 	}
 }
 

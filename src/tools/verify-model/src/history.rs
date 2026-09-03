@@ -154,7 +154,19 @@ impl History {
 			let entry = self.steps.entry(id.to_string()).or_default();
 			entry.last_run = now();
 			entry.runs += 1;
-			entry.model_hash = model_hash.to_string();
+			// AND A FAILURE UNDER A NEW MODEL DOES NOT RELABEL THE OLD MODEL'S DURATION AS THIS
+			// ONE'S (corrected 2026-09-03). The hash was overwritten unconditionally while the
+			// duration was kept, so a success under model A followed by a FAILURE under model B left
+			// A's seconds stamped with B - and `step_seconds`, which filters on the hash precisely
+			// to refuse a duration measured over a different plan, then accepted it. A measurement
+			// belongs to the model it was taken under; a run that records no measurement must not
+			// move it to another.
+			if passed && step_seconds > 0.0 {
+				entry.model_hash = model_hash.to_string();
+			} else if entry.model_hash != model_hash {
+				entry.last_seconds = 0.0;
+				entry.model_hash = model_hash.to_string();
+			}
 			// A STEP THAT DID NOT RUN IS NOT A MEASUREMENT OF WHAT RUNNING COSTS - the same rule
 			// the fixed-term overshoot below already states, applied to the number the SCHEDULER
 			// orders on (fixed 2026-09-03).
@@ -241,6 +253,14 @@ impl History {
 		if !passed && keys.len() > 1 {
 			return;
 		}
+		// AND A FAILED SINGLE-KEY STEP RECORDS ITS FRESHNESS AND NOT ITS COST (corrected
+		// 2026-09-03). The merged guard above is about members that never started; this is the
+		// other half of the same rule, and it was missing: a one-key step that failed at its first
+		// instruction wrote its partial duration into that key's record, and `CostModel::estimate`
+		// reads any positive undivided duration without asking whether the run PASSED - so an
+		// otherwise unmeasured key was priced from an early failure, which is the number the
+		// cheapest-first order then trusts.
+		let share = if passed { share } else { 0.0 };
 		for key in keys {
 			self.record_with(&key.display(), passed, share, model_hash, divided);
 		}
@@ -437,7 +457,12 @@ impl CostModel {
 	// The fixed term is charged ONCE per (architecture, environment) pair that appears, which is the
 	// whole point: two hundred selected kernel tests are one boot. Charging it per item would make
 	// every estimate proportional to the count again and reproduce the error being corrected.
-	pub fn estimate(&self, history: &History, items: &[PlanItemKey]) -> f64 {
+	// `model_hash` is `Some` wherever the number PRICES something - a step's cost, a budget - and
+	// `None` where two estimates are only compared with each other, because a filter applied to both
+	// sides of a ratio cancels. A per-key duration measured over a different plan is not a
+	// measurement of what that key costs now, which is the rule `step_seconds` has always applied to
+	// the per-STEP number and nothing applied to this one.
+	pub fn estimate(&self, history: &History, items: &[PlanItemKey], model_hash: Option<&str>) -> f64 {
 		let mut pairs: std::collections::BTreeSet<(String, String)> = std::collections::BTreeSet::new();
 		let mut variable = 0.0;
 		for key in items {
@@ -454,7 +479,13 @@ impl CostModel {
 				// marker is only worth recording if something reads it. A divided entry falls back
 				// to the measured per-test cost for its own target, which is a worse estimate of one
 				// key and a much better one than a number that describes a batch.
-				Some(record) if record.last_seconds > 0.0 && !record.cost_was_divided => record.last_seconds,
+				// AND NOT ONE A FAILED RUN LEFT BEHIND, OR ONE MEASURED UNDER ANOTHER MODEL
+				// (added 2026-09-03). `record_step_id` no longer writes a failed step's share, and
+				// this is the reader's half of the same rule: a record already on disk from before
+				// that fix, or one whose duration was measured over a different plan, is not a
+				// measurement of what this key costs now. `step_seconds` has always filtered the
+				// per-STEP number on both; the per-KEY number was read on neither.
+				Some(record) if record.last_seconds > 0.0 && !record.cost_was_divided && record.last_status == "passed" && model_hash.is_none_or(|hash| record.model_hash == hash) => record.last_seconds,
 				// The aggregate is not one test. Seeded from what the source declares, because the
 				// target it stands for is the one whose tests could not be counted.
 				_ if key.check == "guest.whole-suite" && self.whole_suite_tests > 0 => per_test * self.whole_suite_tests as f64,

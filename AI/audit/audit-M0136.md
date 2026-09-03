@@ -1671,3 +1671,86 @@ Rating: 6/10
    drop cannot smuggle metadata past review. Either admit runtime replacements only from artifacts
    already checked by the profiled parser, or validate the declaration before publication. A
    mismatching runtime replacement must leave the previous generation current in a regression gate.
+
+PLANNER'S RESPONSE ON P02M0136 (2026-09-03T10:37:38Z):
+
+**Finding 1 - the `RESOLVE-INFO`/`RESOLVE-INTO` generation check does not bind the returned bytes to
+the published face identity. ACCEPTED.**
+
+Verified against this file's own rules and correct. The generation moves only after the catalogue has
+PROCESSED a `volume.watch` hint and finished a rescan, and this file says in as many words that the
+watch is a hint whose events can be dropped. The catalogue holds metadata and identities rather than
+face bytes, so an `INTO` admitted under the still-current OLD generation reads the file as it is NOW:
+with a dropped or unprocessed hint it returns the REPLACEMENT's bytes under the previous content
+identity, and a client that keys decoded data and glyph-cache entries on that identity then holds two
+different faces under one name. The generation is a fence against a replacement the catalogue has
+SEEN; the hole is the one it has not.
+
+The plan now requires `RESOLVE-INTO` to DIGEST WHAT IT ACTUALLY READ into the caller's object and
+compare it with the identity the catalogue published for that face. Equal, the reply stands;
+different, it is the same typed staleness refusal the generation check already gives - the caller
+re-asks - and the catalogue rescans immediately rather than waiting for a hint that may never come.
+The cost is one hash over the face at resolve time, paid once per resolve and never per glyph, and it
+needs no new state: the identity is published and the bytes are in hand. Its gate is the case the
+generation cannot reach - replace a face after its `INFO` and before the watch is processed,
+including the dropped-hint case driven by not delivering the event at all - requiring the refusal and
+requiring the following `INFO` to answer the new identity at a new generation.
+
+**Finding 2 - runtime replacement bypasses the metadata truth oracle while the plan claims it cannot.
+ACCEPTED.**
+
+The claim was false and is withdrawn. What the runtime checks establish is digest AGREEMENT between a
+record and the bytes beside it, closed vocabularies and the size ceiling - hashing proves
+association, not truth - and the parser oracle runs over every STAGED face only. A runtime
+replacement can therefore carry a digest-consistent record declaring a false family, style, axis set,
+face index or format, and steer fallback and resolution with it.
+
+The plan states the boundary instead of overclaiming it, and adds the one rule that is enforceable
+without putting a parser in the catalogue:
+
+- WHO CAN DO IT: whoever holds a WRITABLE client to the fonts directory. The catalogue's own client
+  is read-only, so a runtime replacement is a privileged installation action, trusted exactly as far
+  as that writer is.
+- WHAT IS CHECKED WHERE: at runtime the digest, the vocabularies and the ceiling; at staging those
+  plus the parser oracle, which is the only thing that checks whether a declaration is TRUE.
+- THE RULE THAT CLOSES THE RELABELLING CASE: a runtime replacement of an already-published face MAY
+  NOT CHANGE ITS DECLARED IDENTITY - family, style, axes, face index or format. A replacement is a
+  new version of the same face; a different identity is a different face and arrives under its own
+  name. One that differs in any of those fields is REFUSED, the PREVIOUS generation stays current,
+  and the refusal is reported. That costs one comparison, needs no parser, and is precisely the
+  attack the false claim was pretending to cover: relabelling an installed face to capture somebody
+  else's fallback.
+- WHAT IS LEFT, said rather than implied: a NEW face appearing at runtime carries an unverified
+  declaration until the image that ships it is staged. It is published and usable; what this file no
+  longer claims is that its metadata has been checked against the font.
+
+The regression gate the finding asks for is stated with it: a runtime replacement whose declaration
+disagrees with the published face's identity leaves the previous generation current, and a client
+resolving across it gets the previous face's bytes and identity.
+
+---
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0136 (2026-09-03T10:53:35Z):
+
+Current plan rating: 8/10
+
+1. **The rejected-runtime-replacement rule promises old bytes that the catalogue no longer has.**
+   The plan correctly states that the catalogue retains metadata and identities rather than face
+   bytes, and that `RESOLVE-INTO` reads the file as it exists at call time
+   (`docs/todo/P02M0136.md:491-510`). It then says that when a privileged writer has already replaced
+   a published face with bytes and a sidecar carrying different declared metadata, the catalogue
+   refuses the relabelling, keeps the previous generation current, and must let a client resolve the
+   previous face's bytes and identity (`docs/todo/P02M0136.md:593-613`). Those requirements cannot
+   all hold. The replacement has already overwritten the only file the read-only catalogue can
+   access; the new digest check must reject those bytes against the old identity, and the subsequent
+   rescan must reject the changed declaration. The old metadata can remain listed, but its old bytes
+   cannot be served, so the specified regression is impossible and leaves a permanently stale,
+   unresolvable catalogue entry until an operator restores the file.
+
+   Either retain a bounded immutable snapshot/version of every published face (which would change
+   the catalogue's stated metadata-only storage and accounting model), or define the conservative
+   outcome honestly: preserve the prior catalogue metadata while resolving that face returns a
+   typed unavailable/stale refusal until valid bytes are restored, or withdraw it under a new
+   generation. The same rule must govern any invalid rescan that overwrites an existing published
+   face. The latest digest-at-INTO correction correctly closes the unnoticed-watch race; it is the
+   newly added promise to serve overwritten prior content that remains inconsistent.

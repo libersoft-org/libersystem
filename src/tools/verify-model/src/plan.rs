@@ -391,8 +391,8 @@ impl<'a> Planner<'a> {
 				if cost.fixed_seconds.get(&(architecture.clone(), environment.as_str().to_string())).copied().unwrap_or(0.0) <= 0.0 {
 					continue;
 				}
-				let scoped_cost = cost.estimate(history, &mine);
-				let whole_cost = cost.estimate(history, &whole.iter().map(|item| item.key.clone()).collect::<Vec<_>>());
+				let scoped_cost = cost.estimate(history, &mine, None);
+				let whole_cost = cost.estimate(history, &whole.iter().map(|item| item.key.clone()).collect::<Vec<_>>(), None);
 				if whole_cost > 0.0 && scoped_cost / whole_cost > 0.9 {
 					warnings.push(format!("the {architecture} {} selection costs an estimated {scoped_cost:.0} s against {whole_cost:.0} s for all {} of its keys, so it takes all of them", environment.as_str(), whole.len()));
 					widened.extend(whole);

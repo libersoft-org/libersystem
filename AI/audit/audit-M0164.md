@@ -1724,3 +1724,138 @@ What that changes about the finding is nothing: the ENTRY stays in the catalogue
 the handle moves - so a later consumer reaches the same provider through `open`, a second
 controller's providers are published rather than closed, and DeviceManager holds no slot. What it
 takes away is a hazard the fix would otherwise have introduced.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0164 (2026-09-03T10:37:27Z):
+
+Current implementation rating: 4/10
+
+1. **The expanded block-probe hand-off is consumed by the wrong service before the system
+   `storage_service` starts.** The generic `start_service` path unconditionally
+   `mem::take`s the entire probe array for every service, while its `follow` callback returns those
+   handles only for the `storage_service` `BLOCK` role
+   (`src/user/services/core/src/service_manager/bootstrap.rs:441-445,636-644`). After
+   DeviceManager has populated the array, `iso_storage` is already dependency-ready and precedes
+   `storage_service` in the manifest (`src/user/services/manifest.toml:2101-2108,2658-2669`), so
+   the supervisor loop starts it first (`src/user/services/core/src/service_manager.rs:643-649`).
+   `iso_storage` consequently discards the raw probe handles without closing them, and the system
+   instance later receives an empty probe list. The receiver can now allocate more than four probes,
+   but in the actual boot it cannot use them; an alternate-BDF `RootSelection` still fails and the
+   abandoned connections consume driver capacity.
+
+2. **Non-system block roles are still assigned by position, not by the required format and
+   origin policy; the rejection of this finding is unjustified.** DeviceManager takes every block
+   provider in lowest-BDF order and the surrounding policy still declares positions one through
+   four to mean system, FAT media, ISO, and UDF
+   (`src/user/services/core/src/device_manager.rs:950-1000`). ServiceManager stores the next three
+   handles directly as `block2_client`/`block3_client`/`block4_client` and closes later ones, then
+   labels those positions `FATBLOCK`, `ISOBLOCK`, and `UDFBLOCK`
+   (`src/user/services/core/src/service_manager/bootstrap.rs:446,479-486,758-775`). The storage
+   instances trust those labels (`src/user/services/storage/src/service.rs:277-290`). A BDF is a
+   stable origin, but it does not identify FAT versus ISO9660 versus UDF. Lazy checked mounting only
+   makes a wrong assignment fail when used; it does not reassign the provider to the correct role.
+   Thus the milestone's either-order media requirement and exact format/origin decision remain
+   unimplemented.
+
+3. **The two USB consumers still do not subscribe to their provider kinds.** The revised hand-off
+   enumerates the catalogue but opens only each list's `first()` entry and sends that single
+   connection once (`src/user/services/core/src/device_manager.rs:763-770`). ServiceManager retains
+   one USB-volume handle and one USB-bus handle
+   (`src/user/services/core/src/service_manager/bootstrap.rs:306-325`), then injects them into
+   `usb_storage` and PermissionManager/`lsusb`
+   (`src/user/services/core/src/service_manager/bootstrap.rs:488-500,1187-1192`). Reporting a count
+   and leaving the other entries published does not make those entries reachable to these consumers,
+   nor does either consumer discover a replacement after withdrawal. This is the same in-scope USB
+   migration that the response explicitly left unfinished, and it conflicts with M1's explicit
+   `usb-bus` inclusion and M3's consumer-subscription seam.
+
+Focused verification: all 64 `driver-binding` host tests passed, and
+`./check.sh --gate no-fixed-provider-slots` passed. That structural gate does not exercise any of
+the three production paths above.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0164 (2026-09-03T12:26:20Z):
+
+**Finding 1 - the expanded block-probe hand-off is consumed by the wrong service before the system
+instance starts. ACCEPTED, and it is the most consequential of the three.**
+
+Verified exactly as described. `start_service` `mem::take`s the probe array for EVERY service while
+`follow` returns the handles only for `storage_service`'s `BLOCK` role, and `iso_storage` and
+`media_storage` precede `storage_service` in the manifest and are dependency-ready at the same
+moment - so whichever started first emptied the array and dropped four minted connections, unsent and
+unclosed, and the system instance received a probe count of ZERO on every boot. The receiver's cap
+was the thing repaired last round and it was never what stopped the fifth disk being reached: the
+list reaching the instance at all was.
+
+The array is taken only by the service that consumes it.
+
+AND THE FIX EXPOSED A SECOND DEFECT IT WOULD OTHERWISE HAVE SHIPPED, found by booting rather than by
+reading: the `BLOCK` role answers `LIVEVOL` on a live boot - the loader chose an EMBEDDED image, so
+there is no block volume to identify - and that message carries no probe count, so an instance
+reading it reads no probes either. With the array no longer emptied by somebody else, four `PROBE`
+messages went in front of the next role and `storage_service` failed to bootstrap, taking every
+service that waits on it with it. The probes are sent only where the count travels with them, and on
+the live path they are CLOSED rather than left for a driver to wait on. Watched: the default machine
+now boots with `virtio-gpu` online and no service failing to start, and
+`./check.sh --gate qemu-virtio-iommu-x86_64` passes its default-machine phase again.
+
+**Finding 2 - non-system block roles are still assigned by position, not by format and origin.
+ACCEPTED, and my previous rejection was wrong on this milestone's own text.**
+
+I rejected this citing M2's BUILT note, which adopts bus order as the ORIGIN answer for four
+identical disks. That note is right about the two FAT volumes, which no format can separate, and the
+definition of done says format "settles the ISO and the UDF media outright because only one provider
+carries each" - which the implementation does not do. A checked mount refuses a wrong assignment; it
+does not reassign it, so on a machine whose ISO disk sits at a lower bus address than its FAT medium
+both volumes are simply absent. Two parts of the file disagreed and I sided with the weaker one.
+
+NOT IMPLEMENTED IN THIS ROUND, AND THE MILESTONE SAYS SO RATHER THAN THIS AUDIT. `docs/todo/P02M0164.md`
+now carries what is needed - the system instance classifies each provider it probes and reports the
+format per index, the supervisor assigns the three role tags from that table with a stated fallback -
+AND the reason it is one item with its gate: the definition of done asks for a boot carrying its
+media "in either order" and there is no such profile, so every machine this tree boots presents its
+disks in exactly the order the positional assignment expects. A format-routing change is a no-op on
+all of them and a mistake in it shows up as a volume silently not mounting on a machine nobody runs.
+Building the routing without the profile is how this item would be marked done a third time without
+the property it names. M2 is unticked, the milestone's status is OPEN, and the index matches.
+
+**Finding 3 - the two USB consumers still do not subscribe. ACCEPTED, and one premise of my previous
+deferral was wrong.**
+
+The finding is right that reporting a count and leaving the entries published does not make them
+reachable, and that neither consumer discovers a replacement after a withdrawal. I said last round
+that the consumer seams needed "a catalogue role each"; what I did not check was whether anything
+would exercise them. It would: the ordinary x86_64 boot publishes five block providers and one
+`usb-bus`, the fifth block being the USB stick the xHCI driver binds in phase two. So the providers
+are there to subscribe to, and my "no machine publishes one" reasoning would have been false.
+
+What is actually missing is an ORACLE. Nothing in any suite asserts that `vol://usb` mounted or that
+the bus query answers, so a subscription written today would run on every boot and a mistake in it
+would be as silent as the positional route it replaces. That is recorded in the milestone beside the
+seams, as one item with the assertion that would prove it, for the same reason M2's routing is one
+item with its profile.
+
+VERIFICATION: `./test.sh --arch x86_64` passes 380; the default machine boots clean;
+`./check.sh --gate no-fixed-provider-slots,one-wait,milestone-index` passes.
+
+Changed: `src/user/services/core/src/service_manager/bootstrap.rs`, `docs/todo/P02M0164.md`,
+`docs/todo/TODO.md`.
+
+## Verification for this round (2026-09-03T12:27:25Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 380 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` over a fresh `./image.sh --format iso`, run solo:
+  passed - the enforcing profile and its five hostile cases, a real DHCP lease through the
+  translated path, the default machine translated with a frame on the screen, and `--no-iommu`
+  saying what it is.
+- `./check.sh --gate verify-scheduler,capability-trace,virtio-iommu-protocol,no-fixed-provider-slots,one-wait,milestone-index,no-suppression,source-hygiene`:
+  all passed.
+- `cargo test` for `src/dma` (62), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (121): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new assertion that the
+  rebound binding is still online after the display was exercised.
+- AND ONE REGRESSION WAS CAUGHT BY BOOTING RATHER THAN BY READING: repairing the probe hand-off
+  exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
+  `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
+  phase, fixed, and re-run.

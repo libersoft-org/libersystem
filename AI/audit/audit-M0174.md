@@ -1100,3 +1100,72 @@ Rating: 6/10
    response already owed. M8 tests address-specific after source-specific and source-specific after
    source-specific, but not this reverse ordering (`docs/todo/P02M0174.md:606-616`), so the defect is
    not caught by its fixtures.
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-03T10:38:21Z):
+
+**Finding 1 - the echo correction relies on source-address and route orders M6 never freezes.
+ACCEPTED, both halves.**
+
+Verified against the file. M6 freezes the ability to ENUMERATE candidates and leaves selection to
+P02M0175; the only total order this plan actually defines is the default-router list's, and I wrote
+"the first in the enumeration order M6 already freezes" for the source and the route as well. That
+named nothing for two of the three, so two conforming implementations could originate an echo from
+different sources over different routes - and the sentence claiming the rule "adds no policy because
+the order is frozen for other reasons" was resting on an order that does not exist.
+
+The rule now carries its own order, stated in full and mechanical on purpose, so no policy is
+invented and none escapes:
+
+- the SOURCE, among this interface's PREFERRED addresses whose scope matches the destination's,
+  ordered by the address BYTES ASCENDING, lowest taken; an empty set fails with "no usable source"
+  rather than borrowing another scope;
+- the ROUTE, among the routes whose prefix contains the destination, ordered by PREFIX LENGTH
+  DESCENDING - which is what a routing table means rather than a policy about it - then by the frozen
+  default-router order of the router each names, then by prefix bytes ascending.
+
+The second half of the finding is accepted with it and is the more serious: the rule selected a route
+and then SEPARATELY took the first entry of the default-router list, which need not be the router
+that route names once there is more than one candidate. THE NEXT HOP NOW COMES FROM THE ROUTE THAT
+WAS CHOSEN - the destination itself for an on-link route, that route's router otherwise - and the
+default-router order is consulted only THROUGH the route ordering, never beside it, so the two cannot
+disagree. None of this is exported: it is not reachable by a caller, no part of the public transport
+seam consults it, and P02M0175's selection neither inherits it nor has to agree with it.
+
+AND THE ORDER GETS ITS OWN PROOF, because the finding is right that the one-address/one-router gate
+masks it. The rule is a pure function of the tables, so `service-logic` drives it directly: two
+preferred global addresses and two matching routes with different prefix lengths and different
+routers, asserting the chosen source, route and next hop - and the same set inserted in the opposite
+order, asserting the SAME three answers. That is what "total" means and it is what a single candidate
+cannot show.
+
+**Finding 2 - the MLD pending-query merge rule incorrectly narrows an already pending
+address-specific response. ACCEPTED.**
+
+Correct, and it is rule 5 applied where rule 4 governs. An empty recorded list denotes a pending
+ADDRESS-SPECIFIC response - a report about the whole address, broader than any source list - and a
+later source-specific query must leave it empty, merging only the timer; union is for a list that is
+already non-empty. The plan said a source-specific query UNIONS its sources unconditionally, which
+repopulates the empty list and answers only the new sources, dropping the broader response already
+owed.
+
+The rule is now stated in three cases: an EMPTY list stays empty and only the timer merges; a
+NON-EMPTY list is unioned with a source-specific query's sources; an address-specific query CLEARS
+the list in either case, because the response it asks for subsumes every source list.
+
+And the missing fixture is added, since the finding is right that none of the four existing timer
+cases catches it: a SOURCE-specific query arriving while an ADDRESS-specific response is pending -
+the reverse of the ordering already tested - requiring the list to stay EMPTY and the response to
+remain the address-specific one. An implementation that unions into an empty list passes all four
+older cases and fails this one.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0174 (2026-09-03T10:57:05Z):
+
+Rating: 6/10
+
+1. **The accepted echo-route correction leaves the old, contradictory next-hop rule normative.** M5 still says that an off-link echo takes the first default-router entry (`docs/todo/P02M0174.md:332-334`). The newly added rule instead selects a matching route and requires the next hop to come from that route, explicitly saying the default-router order is consulted only through route ordering and never independently (`:358-368`). With multiple routes, those commands can select different routers—the exact defect the planner said it corrected. Remove or qualify the stale first-router sentence so the host test has one oracle.
+
+2. **Outgoing MLD messages still have no required IPv6 envelope.** The plan correctly validates received Queries for a link-local source, Hop Limit 1, and a Router Alert option and separately defines the pre-DAD/report source (`docs/todo/P02M0174.md:119-151`), but it never requires reports or v1 compatibility messages emitted by the host to use Hop Limit 1 and carry the Router Alert hop-by-hop option. RFC 9777 requires those properties on all MLDv2 messages and routers discard reports which fail them; the same protocol invariant applies to the v1 messages used by this plan's compatibility mode. A syntactically correct membership record without that envelope can therefore be ignored before it repairs snooping state, defeating M4's purpose. Add the transmit invariant and a captured-packet oracle for the initial, post-DAD, v2 query-response, and v1 report/done paths. ([RFC 9777](https://www.rfc-editor.org/rfc/rfc9777.html))
+
+Finding 1's stale rule also remains in the earlier router-order rationale, which still says ND, DAD, RS, MLD, and echo all take the first router (`docs/todo/P02M0174.md:294-300`) immediately before the correction explains why four of those paths must never consult that list (`:312-331`). Both stale clauses must be removed or qualified for the corrected five-path table to be unambiguous.
+
+Finding 2's missing transmit invariant also includes the source after the one immediate post-DAD re-report: later v2 responses/state changes and v1 Report/Done messages are never required to use the interface's valid link-local address. The complete envelope is source `::` only while no valid link-local address exists, otherwise a valid link-local source, plus Hop Limit 1 and Router Alert on every emitted MLD message.

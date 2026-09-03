@@ -1329,3 +1329,72 @@ Changed: `src/user/services/core/src/display_service.rs`, `src/harness/dev-gpu-r
   `src/tools/verify-model` (118): all passed.
 - `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
   presentation assertion.
+
+AUDITOR'S RE-AUDIT ON P02M0159 (2026-09-03T10:28:09Z):
+
+Current implementation rating: 8/10
+
+1. **The new post-rebind presentation oracle can still report success after the replacement GPU has
+   already gone away.** `adopt_scanout` arms `report_present`, but `release_scanout` clears only the
+   GPU handle and leaves that latch armed; a later client present with no GPU then succeeds without
+   sending anything because `flush` returns `Ok(())` when `scanout.gpu == 0`, and that result emits
+   the exact success line the harness requires
+   (`src/user/services/core/src/display_service.rs:192-202,360-363,405-410,419-445`). Thus a rebound
+   driver that serves the framebuffer handshake and closes before the first client present can still
+   satisfy `PRESENTED` when the harness types `clear`. The harness checks the binding was online
+   before exercising the display but never checks it again afterwards
+   (`src/harness/dev-gpu-restart.py:175-192,256-289`), so it can also pass after a genuine present
+   followed by an immediate driver exit. Both paths contradict M4's explicit requirement that the
+   frame reach the display **and the driver still be there afterwards**
+   (`docs/todo/P02M0159.md:94-97`). The implementer's claimed assertion is therefore an incomplete
+   fix, despite the reported passing run.
+
+Focused verification: the restart harness parses and the shell gate passes `bash -n`; the defect is
+in the deterministic latch/return-value and final-state control flow above, so no guest run was
+needed to establish it.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0159 (2026-09-03T12:25:52Z):
+
+**Finding 1 - the post-rebind presentation oracle can report success after the replacement GPU has
+gone away. ACCEPTED, both halves.**
+
+Verified against the code and correct. `release_scanout` clears the GPU handle and left
+`report_present` armed, and `flush` answers `Ok(())` without sending anything when
+`scanout.gpu == 0` - so a present that reached no driver at all produced the exact line the harness
+requires. A rebound driver that served the framebuffer handshake and then closed would satisfy it.
+And the harness read the binding's state BEFORE exercising the display and never again, so a genuine
+present followed by an immediate exit passed too. M4 asks for the frame AND the driver still being
+there, and neither half was actually asserted.
+
+Two changes, one per half:
+
+- `release_scanout` clears the latch. An adoption arms it and the first present through the adopted
+  provider answers it; a provider that went away before that present has nothing to report, and
+  leaving it armed is what let the next present - which reaches nothing - answer for it.
+- The report is emitted only when `scanout.gpu != 0`, so a present that went nowhere cannot be
+  called a frame that arrived whatever `flush` returned.
+- The harness re-reads the binding AFTER driving frames and requires it still `online`, and prints
+  the claim generation it is still online on.
+
+Run: `./dev.sh up` then `src/harness/dev-gpu-restart.py` passes, including the new final assertion.
+
+Changed: `src/user/services/core/src/display_service.rs`, `src/harness/dev-gpu-restart.py`.
+
+## Verification for this round (2026-09-03T12:27:25Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 380 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` over a fresh `./image.sh --format iso`, run solo:
+  passed - the enforcing profile and its five hostile cases, a real DHCP lease through the
+  translated path, the default machine translated with a frame on the screen, and `--no-iommu`
+  saying what it is.
+- `./check.sh --gate verify-scheduler,capability-trace,virtio-iommu-protocol,no-fixed-provider-slots,one-wait,milestone-index,no-suppression,source-hygiene`:
+  all passed.
+- `cargo test` for `src/dma` (62), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (121): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new assertion that the
+  rebound binding is still online after the display was exercised.
+- AND ONE REGRESSION WAS CAUGHT BY BOOTING RATHER THAN BY READING: repairing the probe hand-off
+  exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
+  `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
+  phase, fixed, and re-run.

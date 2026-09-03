@@ -1190,7 +1190,14 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 				// with no cause: the one state that says a packaging fault happened here was the one
 				// that could not be reached. The edge exists now; reading the answer is what stops
 				// the next reader from having to find that out again.
-				if missing && matches!(node.record.state, BindingState::Unbound | BindingState::DependencyPending) && !node.record.move_to(BindingState::Failed, Some(FailureCause::DriverMissing)) {
+				// FROM WHEREVER THE ATTEMPT STARTED, not only from the two states a fresh node is in
+				// (corrected 2026-09-03). The standing loop starts a candidate from an expired
+				// `Backoff` and from an operator retry out of `Failed`, and a `select` can move the
+				// cursor to a candidate whose artifact is not on the volume - so the guard that
+				// admitted only `Unbound` and `DependencyPending` left the `Backoff` node parked
+				// with its `retry_at` already cleared, which is a node nothing will ever wake, and
+				// the `Failed` node carrying the previous candidate's cause.
+				if missing && !node.record.record_failure(FailureCause::DriverMissing) {
 					print(b"DeviceManager: a device whose every candidate artifact is missing could not be recorded as failed\n");
 				}
 				return;
@@ -3406,9 +3413,11 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 				print_driver_name(driver_name);
 				print(b" does not declare this build's driver protocol; refusing before the claim\n");
 				// The refusal happens BEFORE the node enters `Binding` - that is the whole point of
-				// reading the note here - so this is a pre-attempt terminal failure and the table
-				// has an edge for it. The answer is read for the same reason as above.
-				if !node.record.move_to(BindingState::Failed, Some(FailureCause::ProtocolMismatch)) {
+				// reading the note here - so this is a pre-attempt terminal failure, and it is
+				// recorded from wherever the attempt started: a fallback candidate reached after one
+				// has already failed would otherwise attempt the forbidden `Failed -> Failed`, log
+				// the refusal and keep the earlier cause (corrected 2026-09-03).
+				if !node.record.record_failure(FailureCause::ProtocolMismatch) {
 					print(b"DeviceManager: a candidate refused for its protocol note could not be recorded as failed\n");
 				}
 				return BindStart::CandidateFailed;
@@ -4049,13 +4058,37 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 		if self.config == 0 {
 			return Ok(alloc::string::String::new());
 		}
-		let key = policy_key(node.id);
-		match proto::system::config::Client::new(ChannelTransport { chan: self.config }).get(&key) {
-			// A DEVICE WITH NO RECORD ANSWERS EMPTY, not an error: "nothing is stored" is a fact an
-			// operator asked for, and an error would read as "the question could not be answered".
-			Some(Ok(value)) => Ok(value),
-			_ => Ok(alloc::string::String::new()),
-		}
+		// BOTH RECORDS, BECAUSE THERE ARE TWO (corrected 2026-09-03). Splitting `disable` and
+		// `select` into independent slots left this reading only the disable one, so a stored
+		// SELECTION - the preference an operator most wants to check before a reboot applies it -
+		// reported as nothing stored, and a device carrying both reported only half of what it
+		// would restore. The endpoint's contract is what is stored for this device, not what is
+		// stored under one of its keys.
+		let mut client = proto::system::config::Client::new(ChannelTransport { chan: self.config });
+		// A DEVICE WITH NO RECORD ANSWERS EMPTY, not an error: "nothing is stored" is a fact an
+		// operator asked for, and an error would read as "the question could not be answered".
+		let disabled: Option<alloc::string::String> = match client.get(&policy_key(node.id)) {
+			Some(Ok(value)) if !value.is_empty() => Some(value),
+			_ => None,
+		};
+		let selected: Option<alloc::string::String> = match client.get(&select_key(node.id)) {
+			Some(Ok(value)) if !value.is_empty() => Some(value),
+			_ => None,
+		};
+		// TWO RECORDS ARE REPORTED AS THE TWO VALUES THEY ARE, separated by a space and in the order
+		// they are loaded in - the disable first, because it decides whether the selection is
+		// reached at all. One record answers as itself, so an operator reading a single preference
+		// sees exactly what was written.
+		Ok(match (disabled, selected) {
+			(Some(disabled), Some(selected)) => {
+				let mut both = disabled;
+				both.push(' ');
+				both.push_str(&selected);
+				both
+			}
+			(Some(one), None) | (None, Some(one)) => one,
+			(None, None) => alloc::string::String::new(),
+		})
 	}
 }
 

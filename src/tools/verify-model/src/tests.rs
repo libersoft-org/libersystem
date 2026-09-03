@@ -1461,16 +1461,16 @@ fn the_cost_escalation_measures_seconds_and_not_keys() {
 	// 20 tests 587 s, 226 tests 2600 s) puts the real startup cost at 461 s against 9.44 s per test,
 	// and with those the same selection is 650 s against 2349 s. Scoping pays, which is what the
 	// selection dimension exists for.
-	let few = cost.estimate(&history, &key("riscv64", crate::catalog::Environment::TestGuest, 20));
-	let many = cost.estimate(&history, &key("riscv64", crate::catalog::Environment::TestGuest, 200));
+	let few = cost.estimate(&history, &key("riscv64", crate::catalog::Environment::TestGuest, 20), None);
+	let many = cost.estimate(&history, &key("riscv64", crate::catalog::Environment::TestGuest, 200), None);
 	let emulated = few / many;
 	assert!(emulated < 0.9, "20 of 200 riscv64 guest keys cost {few:.0} s against {many:.0} s - a ratio of {emulated:.3} widens every scoped run to the whole suite");
 	assert!(emulated > 0.2, "and the boot is still real: {emulated:.3} must stay well above the no-boot case below, or the model has stopped amortising it");
 
 	// The same counts on the host, where there is no boot: twenty checks cost a tenth of two
 	// hundred, and widening would be pure extra work.
-	let few = cost.estimate(&history, &key("host", crate::catalog::Environment::Host, 20));
-	let many = cost.estimate(&history, &key("host", crate::catalog::Environment::Host, 200));
+	let few = cost.estimate(&history, &key("host", crate::catalog::Environment::Host, 20), None);
+	let many = cost.estimate(&history, &key("host", crate::catalog::Environment::Host, 200), None);
 	let native = few / many;
 	assert!(native < 0.2, "20 of 200 host keys cost {few:.0} s against {many:.0} s - there is nothing to amortise");
 	// The two ratios are what the whole rule is about: same key counts, costs that differ by a
@@ -2149,6 +2149,105 @@ fn five_different_changes_are_five_pieces_of_evidence_even_when_the_decision_is_
 }
 
 #[test]
+fn every_separately_runnable_check_is_its_own_step() {
+	// M4 ASKS FOR EVERY SEPARATELY SCHEDULABLE UNIT TO BE SEPARATELY TIMED, and the batches were
+	// the last place that was not true. Ordinary gates were lowered into one comma-list
+	// `check.sh --gate a,b,c` and every conformance suite into a second step, on the reasoning that
+	// `check.sh` takes a list - which is a property of the runner and not of the work. Merged, they
+	// shared one `StepId`, one measured duration and one budget decision: the cheap ones could not
+	// be ordered first, none of them was ever timed, and `--budget` admitted all of them or none.
+	let model = model();
+	let plan = plan_for(&model, &["src/kernel/mem/mod.rs"]);
+	let per_target: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+	let steps = crate::commands::steps(&plan, &per_target, &model.registry);
+
+	let gates: Vec<&crate::commands::Step> = steps.iter().filter(|step| step.command.contains("--gate ")).collect();
+	assert!(!gates.is_empty(), "a kernel change selects gates, or this fixture proves nothing");
+	for step in &gates {
+		assert!(!step.command.contains(','), "a gate step names one gate, not a batch: {}", step.command);
+		assert_eq!(step.keys.len(), 1, "and it discharges one key, which is what makes its duration a measurement of it: {}", step.command);
+	}
+	let ids: std::collections::BTreeSet<&String> = gates.iter().map(|step| &step.id).collect();
+	assert_eq!(ids.len(), gates.len(), "each gate carries its own StepId, or two of them share a cost that describes neither");
+
+	// AND THE SAME FOR CONFORMANCE SUITES, which were the second batch.
+	for step in steps.iter().filter(|step| step.command.contains("--conformance ")) {
+		assert!(!step.command.contains(','), "a conformance step names one suite: {}", step.command);
+		assert_eq!(step.keys.len(), 1, "and discharges one key: {}", step.command);
+	}
+}
+
+#[test]
+fn a_candidate_that_narrows_only_the_registry_is_still_a_narrowing() {
+	// THE BYPASS THE EVIDENCE BARS EXISTED TO CLOSE.
+	//
+	// Activation derived what a candidate takes away by comparing the two catalogues' `covers`
+	// lists, which is the kernel tests' half of the overlay. A candidate carries a COMPLETE
+	// replacement registry, and three things in it decide how wide a change's plan is without
+	// touching any `covers` list: which paths a component owns, which escalation edges reach it, and
+	// which targets a path is built and booted on. Narrow any of those and the old check found
+	// nothing to guard, so neither the general trust bar nor the subsystem risk row was applied.
+	//
+	// Driven over the real registry against three one-line narrowings of it, because the rule is a
+	// comparison of two registries and needs no plan to be run.
+	let model = model();
+	let ownership = model.ownership();
+	let text = &model.registry.registry_text;
+	let dir = model.repo_root.join("src/tools/verify-model/model");
+	let narrowed_from = |replacement: String| crate::registry::Registry::load_with(&dir, Some(&replacement)).expect("the narrowed registry parses");
+
+	// AN OWNERSHIP RULE THAT IS GONE. The component that owned that path is reached by fewer
+	// changes, whatever any check says it covers. The whole block goes, because a table with its
+	// fields removed is not a registry that parses.
+	let owned = model.registry.ownership.first().expect("this tree declares ownership rules").clone();
+	let block = format!("[[ownership]]\npath = \"{}\"\ncomponent = \"{}\"\n", owned.path, owned.component);
+	assert!(text.contains(&block), "the fixture has to find the rule it is about");
+	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &narrowed_from(text.replace(&block, "")), &ownership);
+	assert!(losing.contains(&owned.component), "a component that owns fewer paths has lost coverage: {losing:?}");
+
+	// AND A PATH BUILT OR BOOTED ON FEWER TARGETS. Same checks, fewer machines.
+	let arch = model.registry.architecture.iter().find(|rule| rule.boot.len() > 1).expect("this tree declares a multi-target path").clone();
+	let quoted: Vec<String> = arch.boot.iter().map(|target| format!("\"{target}\"")).collect();
+	let narrower_arch = format!("path = \"{}\"\nbuild = [{}]\nboot = [{}]", arch.path, arch.build.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", "), quoted[0]);
+	let wider_arch = format!("path = \"{}\"\nbuild = [{}]\nboot = [{}]", arch.path, arch.build.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", "), quoted.join(", "));
+	assert!(text.contains(&wider_arch), "the fixture has to find the target list it is about");
+	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &narrowed_from(text.replace(&wider_arch, &narrower_arch)), &ownership);
+	assert!(!losing.is_empty(), "a path booted on fewer targets has lost coverage");
+
+	// AND AN IDENTICAL REGISTRY TAKES NOTHING AWAY, which is what stops this refusing every
+	// candidate that only touches the kernel tests' `covers`.
+	assert!(crate::candidate::components_losing_registry_coverage(&model.registry, &model.registry, &ownership).is_empty(), "a registry that did not change narrows nothing");
+}
+
+#[test]
+fn a_failed_run_never_becomes_a_cost_however_the_models_are_ordered() {
+	// TWO SEQUENCES, AND THE FIRST FIX CAUGHT NEITHER.
+	//
+	// A step's duration is filtered on the model it was measured under, because a duration measured
+	// over a different plan is not a duration for this one. `record_step_id` withheld a FAILED run's
+	// seconds and then overwrote the model hash anyway - so a success under model A followed by a
+	// failure under model B left A's duration wearing B's label, and the filter that exists to
+	// refuse exactly that accepted it.
+	let mut history = crate::history::History { schema: crate::history::SCHEMA, entries: Default::default(), fixed_overshoot: Default::default(), steps: Default::default() };
+	let cost = crate::history::CostModel::default();
+	let keys = vec![crate::plan::PlanItemKey { check: String::from("gate.one"), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from("default") }];
+	history.record_step_id(Some("step-a"), &keys, true, 120.0, "model-a", &cost);
+	assert_eq!(history.step_seconds("step-a", "model-a"), Some(120.0), "a passing run under this model is a measurement");
+	history.record_step_id(Some("step-a"), &keys, false, 2.0, "model-b", &cost);
+	assert_eq!(history.step_seconds("step-a", "model-b"), None, "a failure under a second model does not relabel the first model's duration as this one's");
+	assert_eq!(history.step_seconds("step-a", "model-a"), None, "and the run really did happen, so the stale measurement is not kept under the old label either");
+
+	// AND A FAILED SINGLE-KEY STEP DOES NOT PRICE ITS KEY. The merged guard covers members that
+	// never started; a one-key step has no such member and wrote its partial duration straight into
+	// the key record, which `estimate` reads.
+	let mut priced = crate::history::History { schema: crate::history::SCHEMA, entries: Default::default(), fixed_overshoot: Default::default(), steps: Default::default() };
+	priced.record_step_id(Some("step-b"), &keys, false, 3.0, "model-a", &cost);
+	let after_failure = cost.estimate(&priced, &keys, Some("model-a"));
+	let unmeasured = cost.estimate(&crate::history::History { schema: crate::history::SCHEMA, entries: Default::default(), fixed_overshoot: Default::default(), steps: Default::default() }, &keys, Some("model-a"));
+	assert_eq!(after_failure, unmeasured, "a step that failed at its first instruction is not what running that key costs");
+}
+
+#[test]
 fn five_real_changes_through_the_real_planner_reach_the_threshold() {
 	// THE SAME PROPERTY, DRIVEN THROUGH THE PRODUCTION PATH (2026-09-03).
 	//
@@ -2298,7 +2397,7 @@ fn an_unmeasured_step_is_never_priced_at_zero() {
 	let history = crate::history::History::default();
 	// The shape a profile row actually has: one gate key, on the host pair, nobody has timed.
 	let gate_key = vec![crate::plan::PlanItemKey { check: String::from("gate.arch-profile-aarch64-gicv2-1"), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from("default") }];
-	let bare = cost.estimate(&history, &gate_key);
+	let bare = cost.estimate(&history, &gate_key, None);
 	assert!(bare < 1.0, "the estimate alone is what rounded to zero - if this stops being true the seed below is no longer the thing under test, and this test has to say so");
 
 	// A step that starts a guest is seeded from what this model has already measured about booting
@@ -2313,7 +2412,7 @@ fn an_unmeasured_step_is_never_priced_at_zero() {
 
 	// The seed is a FLOOR, not a replacement: a step whose own estimate is larger keeps it.
 	let guest_keys = alloc_keys();
-	let measured_shape = cost.estimate(&history, &guest_keys);
+	let measured_shape = cost.estimate(&history, &guest_keys, None);
 	assert!(measured_shape.max(cost.seed_seconds(0)) > 1.0, "a step the model can price from its own keys keeps that price");
 }
 

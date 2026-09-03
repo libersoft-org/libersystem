@@ -438,7 +438,36 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			let session_root: u64 = kept.end_of(b"session_service", CAP_SERVE);
 			// Read BEFORE either closure borrows the array: one wants the count, the other takes the
 			// handles, and a closure holding a reference alongside would be two borrows of one thing.
-			let probe_handles: [u64; MOST_PROVIDERS] = core::mem::take(probe_blocks);
+			//
+			// AND TAKEN ONLY BY THE SERVICE THAT CONSUMES THEM (corrected 2026-09-03). This ran for
+			// EVERY service, while `follow` hands the handles back only for `storage_service`'s
+			// `BLOCK` role - so whichever service started first after DeviceManager populated the
+			// array emptied it and dropped every probe on the floor, unsent and unclosed. That is
+			// not hypothetical ordering: `iso_storage` and `media_storage` precede `storage_service`
+			// in the manifest and are dependency-ready at the same moment, so the system instance
+			// received a probe count of ZERO on every boot and the volume the loader chose could
+			// only ever be found at the first bus address - which is the defect the probe hand-off
+			// exists to remove.
+			// AND ONLY WHERE THE COUNT TRAVELS WITH THEM. The `BLOCK` role answers `LIVEVOL` on a
+			// live boot - the loader chose an EMBEDDED image and there is no block volume to
+			// identify - and that message carries no probe count, so an instance reading it reads no
+			// probes either. Sending them anyway puts four messages in front of the next role and
+			// the bootstrap desyncs, which is what happened the moment the array stopped being
+			// emptied by whichever service started first. They are minted connections, so on that
+			// path they are CLOSED rather than left for a driver to wait on.
+			let probe_handles: [u64; MOST_PROVIDERS] = if name == b"storage_service" {
+				let taken = core::mem::take(probe_blocks);
+				if live_volume != 0 {
+					for handle in taken.iter().filter(|handle| **handle != 0) {
+						close(*handle);
+					}
+					[0; MOST_PROVIDERS]
+				} else {
+					taken
+				}
+			} else {
+				[0; MOST_PROVIDERS]
+			};
 			// SATURATED AT WHAT ONE BYTE OF THE HAND-OFF CAN CARRY. The count travels in the `BLOCK`
 			// message as a single byte, so a machine with more providers than that says the number
 			// it can say rather than wrapping it to a smaller one.

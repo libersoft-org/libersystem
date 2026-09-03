@@ -62,17 +62,17 @@ pub struct Wire {
 }
 
 impl Transport for Wire {
-	// THE EVENT RING'S OWN SIZE, which is what bounds how many fault records can be outstanding on
-	// this side at once - and therefore how long an ended binding's tail may keep attributing an
-	// endpoint's faults to it. See `dma::Backend::fault_queue_capacity`.
+	// THIS TRANSPORT CANNOT SAY, AND SAYING SO IS THE ANSWER (corrected 2026-09-03).
 	//
-	// The ring is the generous end of the answer: this transport keeps ONE event buffer outstanding
-	// at a time, so what the ledger can actually be holding is smaller. Erring high protects a
-	// replacement for longer, which is the direction to err in - the alternative charges a live
-	// binding for its predecessor's queue.
-	fn event_capacity(&self) -> Option<u64> {
-		Some(self.events.size() as u64)
-	}
+	// It answered with the event RING SIZE, on the reasoning that the ring bounds what can be in
+	// flight. It bounds something else: this transport keeps ONE event buffer outstanding at a time,
+	// and virtio permits a device with no available buffer to WAIT for one or to drop the event - so
+	// how many records an ended binding left behind is not a function of the ring at all, and a
+	// number that looks derived is worse than one that is admitted to be a policy. The ledger's
+	// `MOST_TAIL_ATTRIBUTIONS` is where that policy is written down.
+	//
+	// `event_capacity` stays on the trait for a transport that genuinely knows - one that posts a
+	// ring of buffers and treats "no buffer available" as an answer rather than a gap.
 
 	fn request(&mut self, request: &[u8], tail: &mut [u8], status_at: usize) -> Result<(), Fault> {
 		if request.len() > 2048 || tail.len() > 2048 {
@@ -132,8 +132,12 @@ impl Transport for Wire {
 	// without writing anything had the driver decode a stale report as a fresh fault. The descriptor
 	// id was not looked at either, so a completion for something else was read as this buffer coming
 	// back.
-	fn take_event(&mut self, out: &mut [u8]) -> usize {
-		let Some((id, written)) = self.events.poll_used() else { return 0 };
+	fn take_event(&mut self, out: &mut [u8]) -> Option<usize> {
+		// NOTHING COMPLETED IS THE ONE ANSWER THAT MEANS EMPTY. Every other zero below is a
+		// completion this side could not read, and answering both with the same number told the
+		// ledger the queue had run dry when it had not - which is what clears a detached tail and
+		// lets an ended binding's fault resolve through its replacement (corrected 2026-09-03).
+		let Some((id, written)) = self.events.poll_used() else { return None };
 		let expected = self.event_descriptor.take();
 		// The buffer goes back either way: a completion this side cannot account for still means the
 		// device has one fewer buffer to write into, and a fault queue with none is a fault queue.
@@ -150,14 +154,16 @@ impl Transport for Wire {
 		if expected.map(u32::from) != Some(id) {
 			crate::serial_println!("iommu: the device completed descriptor {id} on the event queue and the fault buffer is on {expected:?} - the report is not read");
 			hand_back(self);
-			return 0;
+			return Some(0);
 		}
 		let len = out.len().min(dma::virtio_iommu::FAULT_LEN).min(written as usize);
 		// SAFETY: the event buffer is this module's own frame, and the length is bounded above by
 		// both the caller's buffer and the record size the device was given.
 		unsafe { core::ptr::copy_nonoverlapping(self.event_buffer as *const u8, out.as_mut_ptr(), len) };
 		hand_back(self);
-		len
+		// A ZERO-LENGTH COMPLETION IS `Some(0)` AND NOT `None`: the device moved the used index and
+		// wrote nothing, which is a device to disbelieve rather than an empty queue.
+		Some(len)
 	}
 }
 
@@ -261,7 +267,7 @@ pub fn init() -> bool {
 			crate::serial_println!("iommu: no room for the ended-binding fault counts - translation is refused rather than run with accounting it cannot keep");
 			return false;
 		}
-		ended.resize(crate::device::count(), 0);
+		ended.resize(crate::device::count(), (0, 0));
 	}
 	match bring_up(index) {
 		Ok(controller) => {
@@ -607,19 +613,26 @@ pub fn quarantined_grants_for(index: u32) -> usize {
 // a driver that crashes, is rebound and faults again adds to the same number as the device beside it.
 // The count lives with the DOMAIN, which is the binding, so a retained domain still answers for the
 // binding that left it behind.
-pub fn faults_for(index: u32) -> u64 {
+pub fn faults_for(index: u32, generation: u64) -> u64 {
+	// THE BINDING THE CALLER IS ASKING ABOUT, AND NOT THE DEVICE (corrected 2026-09-03).
+	//
+	// This took an index alone and added a per-device carry to whatever domain the device answers
+	// from now, so a LIVE binding's snapshot included an ended binding's late faults - under an ABI
+	// field that says "this binding" in as many words - and the ended binding's own number became
+	// unreadable the moment a replacement claimed the device. The generation is what separates them
+	// and every caller has one: it is on the claim the snapshot is about.
+	//
 	// THE LIVE DOMAIN, THEN THE RETAINED ONE, THEN THE RETAINED COUNT. The third is what answers
 	// after a CONFIRMED teardown, whose domain is destroyed on purpose - see `RETAINED_FAULTS`.
 	let current = match domain_of(index).or_else(|| retained_domain_of(index)) {
 		Some(domain) => with(|controller| controller.iommu().faults_in(domain)).unwrap_or(0),
 		None => RETAINED_FAULTS.lock().get(index as usize).copied().unwrap_or(0),
 	};
-	// PLUS WHAT AN ENDED BINDING RAISED AFTER ITS DOMAIN STOPPED ANSWERING FOR IT. See
-	// `ENDED_FAULTS`: none of that is in the number above, by construction, so this is a sum and not
-	// a double count - and it is added rather than reported apart because the alternative was
-	// reporting nothing. A device this kernel is still holding faults against reads as a device with
-	// faults, whichever of its bindings raised them.
-	current.saturating_add(ENDED_FAULTS.lock().get(index as usize).copied().unwrap_or(0))
+	// PLUS WHAT THIS BINDING RAISED AFTER ITS DOMAIN STOPPED ANSWERING FOR IT, and only if the carry
+	// is this binding's. See `ENDED_FAULTS`: none of that is in the number above, by construction, so
+	// this is a sum and not a double count.
+	let carried = ENDED_FAULTS.lock().get(index as usize).copied().filter(|(stamped, _)| *stamped == generation).map_or(0, |(_, count)| count);
+	current.saturating_add(carried)
 }
 
 // DEVICES WHOSE DETACH WAS NOT CONFIRMED, AND THE DOMAIN THAT OUTLIVED THEM.
@@ -683,7 +696,15 @@ static RETAINED_FAULTS: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
 // `Iommu::faults_in` sums a domain with its detached tails, so that fault is already answered for
 // and adding it here would count it twice. Both exclusions are made at the drain, where the domain
 // the fault names and the domain the device currently answers from are both in hand.
-static ENDED_FAULTS: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
+// AND IT IS STAMPED WITH THE BINDING THAT RAISED IT (corrected 2026-09-03).
+//
+// The slot was a bare count per DEVICE and `faults_for` added it to whatever binding was live, so
+// while binding B ran, late faults raised by ended binding A appeared in B's snapshot - under an ABI
+// field whose own contract says "this binding" - and A's number could not be read at all once B had
+// claimed. One slot is still enough: at most one ended binding is answered for at a time, because a
+// device is claimed, released and only then claimed again. The stamp is what makes the slot say
+// WHICH, so a live binding is never handed somebody else's faults and an ended one keeps its own.
+static ENDED_FAULTS: SpinLock<Vec<(u64, u64)>> = SpinLock::new(Vec::new());
 
 // What asking for an MSI vector found. THREE ANSWERS, because the two failures call for opposite
 // responses: an endpoint whose domain has no route is a live binding to disable, and one whose
@@ -1209,7 +1230,13 @@ pub fn poll_faults_attributed_with(during_teardown: Option<(dma::EndpointId, dma
 				&& !current && domain_of(index as u32).or_else(|| retained_domain_of(index as u32)) != Some(event.domain)
 				&& let Some(slot) = ENDED_FAULTS.lock().get_mut(index)
 			{
-				*slot = slot.saturating_add(1);
+				// A CARRY FOR A DIFFERENT BINDING IS NOT THIS ONE'S. The slot starts again rather
+				// than accumulating across two ended bindings, which is what made it a per-device
+				// total wearing a per-binding name.
+				if slot.0 != event.generation.0 {
+					*slot = (event.generation.0, 0);
+				}
+				slot.1 = slot.1.saturating_add(1);
 			}
 			let contained = match containment {
 				Containment::WhateverFaulted => crate::device::contain_faulting_endpoint(bus, dev, func),

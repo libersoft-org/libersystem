@@ -48,15 +48,61 @@ impl Transport for Wire {
 		Ok(())
 	}
 
-	fn take_event(&mut self, out: &mut [u8]) -> usize {
+	fn take_event(&mut self, out: &mut [u8]) -> Option<usize> {
 		if self.events.is_empty() {
-			return 0;
+			return None;
 		}
 		let event = self.events.remove(0);
 		let len = event.len().min(out.len());
 		out[..len].copy_from_slice(&event[..len]);
-		len
+		Some(len)
 	}
+}
+
+// A COMPLETION THAT YIELDS NO RECORD IS NOT AN EMPTY TRANSPORT.
+//
+// `take_event` used to answer `0` for three different things: nothing completed, a descriptor id
+// this side is not waiting on, and a device that moved the used index without writing anything. The
+// drain read every zero as "the transport ran dry", which is what marks every detached tail drained
+// and clears the lost-attribution protection - so ONE malformed completion in front of an older
+// valid fault erased the evidence that the fault belonged to an ended binding, and it could then be
+// resolved through the replacement's attachment and contain a healthy device.
+//
+// The answers are separated at the wire: `None` is nothing there, `Some(0)` is a completion that
+// could not be read.
+#[test]
+fn a_completion_that_yields_no_record_does_not_prove_the_transport_is_empty() {
+	struct OneBadThenNothing {
+		handed: bool,
+	}
+	impl Transport for OneBadThenNothing {
+		fn request(&mut self, _bytes: &[u8], answer: &mut [u8], status_at: usize) -> Result<(), Fault> {
+			if status_at < answer.len() {
+				answer[status_at] = S_OK;
+			}
+			Ok(())
+		}
+		// ONE completion the driver cannot account for - a zero-length write - and then genuine
+		// silence. The first must not be read as the second.
+		fn take_event(&mut self, _out: &mut [u8]) -> Option<usize> {
+			if self.handed {
+				return None;
+			}
+			self.handed = true;
+			Some(0)
+		}
+	}
+
+	let config = Config::parse(&config_bytes()).expect("a valid config");
+	let features = negotiate(REQUIRED | F_BYPASS_CONFIG).expect("negotiated");
+	let mut backend = VirtioIommu::new(OneBadThenNothing { handed: false }, config, features).expect("a backend");
+	let mut out = [FaultEvent { endpoint: EndpointId(0), domain: DomainId(0), generation: Generation(0), address: None, access: Access::Read, reason: Fault::NotMapped }; 4];
+	// The bad completion spends a slot of the budget and yields nothing to read.
+	assert_eq!(backend.drain_faults(&mut out[..1]), 0, "a completion that yielded no record is not an event");
+	assert!(!backend.transport_was_emptied(), "and it is not proof that the queue ran dry either");
+	// A second drain reaches the genuine silence behind it, which IS that proof.
+	assert_eq!(backend.drain_faults(&mut out), 0);
+	assert!(backend.transport_was_emptied(), "nothing completed is the one answer that means empty");
 }
 
 // A CONTROLLER THAT SUPPLIES NOTHING BUT MALFORMED EVENTS CANNOT HOLD ONE DRAIN OPEN.
@@ -83,12 +129,12 @@ fn a_controller_supplying_only_malformed_events_cannot_hold_a_drain_open() {
 		// NEVER EMPTY AND NEVER VALID. One byte is shorter than any fault record, so it can never
 		// decode - which is what makes this the storm the bound exists for rather than a queue of
 		// events somebody has to read.
-		fn take_event(&mut self, out: &mut [u8]) -> usize {
+		fn take_event(&mut self, out: &mut [u8]) -> Option<usize> {
 			if out.is_empty() {
-				return 0;
+				return None;
 			}
 			out[0] = 0xff;
-			1
+			Some(1)
 		}
 	}
 

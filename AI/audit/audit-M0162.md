@@ -1185,3 +1185,94 @@ Changed: `src/user/libs/driver/binding/src/lib.rs`, `src/user/libs/driver/bindin
   `src/tools/verify-model` (118): all passed.
 - `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
   presentation assertion.
+
+AUDITOR'S RE-AUDIT ON P02M0162 (2026-09-03T10:28:09Z):
+
+Current implementation rating: 8/10
+
+1. **The pre-bind-failure fix covers only the two states in its new test, not all production origins
+   of a candidate attempt.** `start_candidate` records exhausted missing artifacts only while the
+   record is `Unbound` or `DependencyPending`; from `Backoff` it returns without leaving that state,
+   and from `Failed` it retains the preceding candidate's cause
+   (`src/user/services/core/src/device_manager.rs:1175-1196`). Both origins are real: the standing
+   loop starts candidates from an expired `Backoff` and from an operator retry
+   (`src/user/services/core/src/device_manager.rs:519-539`), and a live `select` can move the next-bind
+   cursor to another registry candidate without establishing that its artifact is on the volume
+   (`src/user/services/core/src/device_manager.rs:4386-4410`). In the `Backoff` case the loop clears
+   `retry_at` before calling `start_candidate`, so a missing selected artifact can leave the node
+   parked in `Backoff` with no deadline or event that will retry it. The protocol-note branch has the
+   parallel `Failed`-origin defect: after one candidate fails, a mismatched fallback attempts the
+   forbidden self-transition `Failed -> Failed`, logs the refusal, and leaves the old failure cause
+   (`src/user/services/core/src/device_manager.rs:3402-3415`). The new host test constructs only fresh
+   `Unbound` and `DependencyPending` records
+   (`src/user/libs/driver/binding/src/tests.rs:70-87`), so its green result does not cover either
+   production path.
+
+   The correction also did not update M3's normative transition table: it still omits the newly
+   permitted `Unbound -> Failed` and `DependencyPending -> Failed` edges while stating that every
+   transition absent from that table is refused (`docs/todo/P02M0162.md:96-129`), whereas code and
+   its `LEGAL` test now permit both (`src/user/libs/driver/binding/src/lib.rs:109-128`;
+   `src/user/libs/driver/binding/src/tests.rs:53-67`). That makes the response's claim that the table
+   now contains the new destinations incomplete as well.
+
+Focused verification: `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline`
+passed all 64 tests. Those tests do not execute `start_candidate` or `begin_bind`, which is why the
+production-origin gaps above remain compatible with the passing suite. The earlier synchronous
+release rejection is not repeated: the current M4 text expressly makes the bounded kernel release
+step synchronous and reserves event-driven waiting for driver exit/otherwise-outstanding claim
+settlement.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0162 (2026-09-03T12:25:52Z):
+
+**Finding 1 - the pre-bind-failure fix covers only the two states in its new test. ACCEPTED, and the
+`Backoff` case is the serious one.**
+
+All four origins check out against the standing loop. A candidate is started from an expired
+`Backoff` - and that path clears `retry_at` BEFORE calling, so a node whose selected artifact is
+missing was left in `Backoff` with no deadline and no event that would ever wake it - and from
+`Failed` on an operator retry, where the guard skipped the record and the node kept the PREVIOUS
+candidate's cause. The protocol-note branch has the same `Failed` origin, where it attempted the
+forbidden `Failed -> Failed`, logged the refusal and left the stale cause.
+
+`BindingRecord::record_failure` is the one call both sites use now. It moves to `Failed` where the
+table allows - which includes `Backoff -> Failed`, an edge that already existed and was not being
+used - and where the node is ALREADY `Failed` it replaces the cause without a transition, because
+the state is right and only the cause is stale. There is deliberately still no `Failed -> Failed`
+row: a state with an edge to itself is one a duplicate event moves, which is the property the whole
+table rests on. It answers false for a node that is running, quarantined or disabled, which the
+caller logs like any other refusal.
+
+The host test now walks the origins production actually starts a candidate from: a node whose backoff
+expired onto a missing artifact reaches `Failed` and LEAVES `Backoff`; a fallback candidate refused
+for its note replaces the cause rather than keeping the first one's; and a running binding is
+refused.
+
+**And the normative table. ACCEPTED.** M3 states that every transition absent from its table is
+refused, and the table did not have the two edges the code and its `LEGAL` test now permit. Both rows
+are in it, with the reason, and a paragraph beneath states the `Failed`-origin rule and why there is
+no self-edge - so a reader of the milestone and a reader of `may_move_to` now see the same graph.
+
+VERIFICATION: `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline` passes
+all 64 tests; the x86_64 suite passes 380.
+
+Changed: `src/user/libs/driver/binding/src/lib.rs`, `src/user/libs/driver/binding/src/tests.rs`,
+`src/user/services/core/src/device_manager.rs`, `docs/todo/P02M0162.md`.
+
+## Verification for this round (2026-09-03T12:27:25Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 380 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` over a fresh `./image.sh --format iso`, run solo:
+  passed - the enforcing profile and its five hostile cases, a real DHCP lease through the
+  translated path, the default machine translated with a frame on the screen, and `--no-iommu`
+  saying what it is.
+- `./check.sh --gate verify-scheduler,capability-trace,virtio-iommu-protocol,no-fixed-provider-slots,one-wait,milestone-index,no-suppression,source-hygiene`:
+  all passed.
+- `cargo test` for `src/dma` (62), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (121): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new assertion that the
+  rebound binding is still online after the display was exercised.
+- AND ONE REGRESSION WAS CAUGHT BY BOOTING RATHER THAN BY READING: repairing the probe hand-off
+  exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
+  `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
+  phase, fixed, and re-run.

@@ -540,6 +540,12 @@ fn a_release_that_lands_mid_map_leaves_no_mapping_behind() {
 	// AND THE COMMIT IS REFUSED, which is the fix. Publishing here would leave a mapping no sweep
 	// will ever visit.
 	assert!(!memory.commit_mapping(base, space.clone()), "a claim that ended while the mapping was being built does not get to publish it");
+	// AND THE REFUSED COMMIT LEFT NOTHING BEHIND ON THE DEVICE'S COUNT. The commit raises the
+	// outstanding-mapping count BEFORE the swap that publishes the mapping - which is what stops a
+	// release passing through the gap between the two - so the failure path owes it back. A count
+	// left standing here is inherited by the NEXT binding of this device and makes its clean release
+	// spin out and quarantine it.
+	assert_eq!(device::mmio_live_for_test(index), 0, "a commit that was refused gave its outstanding-mapping count back");
 	// The builder takes its own work down, because nothing else can: the sweep had nothing to find.
 	space.unmap(base);
 	space.free_vrange(base, crate::mem::frame::PAGE_SIZE);
@@ -547,6 +553,36 @@ fn a_release_that_lands_mid_map_leaves_no_mapping_behind() {
 	// AND THE OBJECT IS TERMINAL: a second attempt cannot reserve it again, so a holder cannot simply
 	// call map once more after the claim is gone.
 	assert!(!memory.claim_mapping(), "a revoked device memory is never mappable again");
+}
+
+crate::tagged_test!(a_failure_this_binding_caused_is_not_read_as_an_earlier_ones, [Object, Kernel, Pci], id = "kernel.object.claim.a_failure_this_binding_caused_is_not_read_as_an_earlier_ones", covers = ["kernel"]);
+fn a_failure_this_binding_caused_is_not_read_as_an_earlier_ones() {
+	// THE BASELINE IS TAKEN WHEN THE CLAIM IS, NOT WHEN THE RELEASE IS.
+	//
+	// The counters a release compares against are monotonic and per DEVICE, so a release subtracts
+	// what an earlier binding left behind. Sampling that baseline at release time put every failure
+	// THIS binding caused before the release started into it: a holder that closes its interrupt
+	// handle early has `Interrupt::drop` discard a failed unbind and the architecture quarantine the
+	// still-armed slot, and an MMIO teardown running inside a `Drop` can fail its cross-core flush.
+	// A claim must be released before another can begin, so both of those are this binding's - and
+	// both were read as somebody else's and published `Free`.
+	//
+	// The failure is injected rather than raced: a shootdown that cannot reach a core is a property
+	// of the machine, so what a test can drive is the fact it produces.
+	let index = device::add_synthetic_device();
+	let key = device::claim(index).expect("claimed");
+	device::strand_mmio_for_test(index);
+	assert_eq!(device::release_claim(key), Ok(device::ClaimState::Quarantined), "a teardown this binding could not confirm is charged to this binding");
+
+	// AND THE EXCLUSION IT EXISTS FOR STILL HOLDS. What an EARLIER binding stranded must not make
+	// every later claim of the device unreleasable - that is the whole reason the comparison is a
+	// difference rather than a total.
+	let other = device::add_synthetic_device();
+	let first = device::claim(other).expect("claimed");
+	assert_eq!(device::release_claim(first), Ok(device::ClaimState::Free), "a binding that stranded nothing is free");
+	device::strand_mmio_for_test(other);
+	let second = device::claim(other).expect("claimed again");
+	assert_eq!(device::release_claim(second), Ok(device::ClaimState::Free), "and the next binding is judged against what it inherited, not against zero");
 }
 
 crate::tagged_test!(a_mapping_the_sweep_cannot_reach_keeps_the_claim_out_of_free, [Object, Kernel, Pci, Paging], id = "kernel.object.claim.a_mapping_the_sweep_cannot_reach_keeps_the_claim_out_of_free", covers = ["kernel"]);

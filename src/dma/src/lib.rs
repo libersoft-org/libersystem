@@ -297,10 +297,10 @@ pub trait Backend {
 	// number that says how finite: past this many records for one endpoint, the queue this binding
 	// left behind has certainly been read.
 	//
-	// `None` is the conservative answer for a backend that cannot ask its transport, and it keeps
-	// the old behaviour - attribute until the queue runs dry. What it costs is stated rather than
-	// hidden: a transport whose DEVICE buffers more records than it can hand over at once can still
-	// out-run the bound, so this is a bound on the ledger's exposure and not a proof about hardware.
+	// `None` means the ledger's own stated policy applies - see `MOST_TAIL_ATTRIBUTIONS` - and it is
+	// what every transport in this tree answers, because none of them can see how many records a
+	// device is holding behind the one buffer they post. A backend that genuinely knows may say so
+	// and its number is used instead.
 	fn fault_queue_capacity(&self) -> Option<u64> {
 		None
 	}
@@ -877,6 +877,20 @@ struct DetachedTail {
 	attributed: u64,
 }
 
+// HOW MANY RECORDS ONE ENDED BINDING'S TAIL MAY ATTRIBUTE BEFORE IT STOPS.
+//
+// A POLICY, STATED AS ONE (corrected 2026-09-03). The ledger cannot tell an ended binding's queued
+// fault from a live replacement's - nothing in a record says which binding raised it - so the
+// conservative window has to be finite or a faulting replacement is never contained, and wide enough
+// that an ordinary teardown's tail fits inside it or a healthy replacement is charged for its
+// predecessor. NO TRANSPORT IN THIS TREE CAN SUPPLY THE NUMBER: a driver that posts one event buffer
+// at a time cannot see how many records a device is holding behind it, and the device may wait for a
+// buffer or drop the event rather than hand them over. The first version had the virtio backend
+// answer with its event RING SIZE, which bounds something else entirely and read as a derivation.
+// So this is a trade-off written down, and both directions it errs in are named: too small charges a
+// replacement for its predecessor's queue, too large delays containment of a storm.
+const MOST_TAIL_ATTRIBUTIONS: u64 = 64;
+
 // HOW MANY ENDED BINDINGS KEEP A TAIL RECORD. Bounded because this is fixed bookkeeping in a kernel:
 // a machine that restarts one driver in a loop must not grow a list per restart.
 //
@@ -1354,11 +1368,11 @@ impl<B: Backend> Iommu<B> {
 			// rebound endpoint whose replacement faults continuously never lets that be observed:
 			// every one of the replacement's faults came out carrying the dead binding's generation,
 			// failed the current-generation comparison, and no live binding was ever contained. The
-			// ended binding queued a FINITE number of records - at most what the transport can hold
-			// - so once this tail has been charged with more than that, the records now arriving
-			// cannot be its; they are the endpoint's, faulting now, and they are attributed and
-			// contained as such.
-			let bound = self.backend.fault_queue_capacity();
+			// window has to close, and where it closes is the POLICY at `MOST_TAIL_ATTRIBUTIONS`
+			// rather than a fact about the transport - see `Backend::fault_queue_capacity`, which no
+			// transport in this tree can answer. Past it, the records arriving are treated as the
+			// endpoint's own: attributed to the live binding, and contained as such.
+			let bound = Some(self.backend.fault_queue_capacity().unwrap_or(MOST_TAIL_ATTRIBUTIONS));
 			if let Some(tail) = self.detached.iter_mut().find(|tail| !tail.drained && tail.endpoint == event.endpoint) {
 				if bound.is_some_and(|most| tail.attributed >= most) {
 					tail.drained = true;

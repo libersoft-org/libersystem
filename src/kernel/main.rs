@@ -758,6 +758,28 @@ fn settle_slice(deadline: u64) -> u64 {
 	core::cmp::min(deadline, arch::apic::ticks().saturating_add(SETTLE_SLICE))
 }
 
+// DRIVE A SLICE, SERVICING THE FAULT QUEUE ONCE PER TICK INSIDE IT.
+//
+// The bring-up drains used to call `run_until_idle_until(settle_slice(..))` and service faults after
+// it returned, which is once per SLICE - ten ticks - and M5's bound is once per TICK under any load.
+// A continuously runnable workload keeps the scheduler inside one slice for the whole of it, so the
+// bound the console loop already holds did not hold during bring-up, which is exactly when a driver
+// first programs its device.
+//
+// The slice is unchanged as the READINESS cadence - the caller still asks its question every ten
+// ticks - and what changes is that the drain inside it is now a tick at a time with the drain of the
+// controller's queue between them. A pass that settles halts rather than spinning the rest of the
+// slice out, which is what the console loop does and for the same reason.
+fn drive_slice(bound: u64) {
+	while arch::apic::ticks() < bound {
+		let settled: bool = sched::run_until_idle_until(arch::apic::ticks().saturating_add(1));
+		crate::iommu::service_faults_if_due();
+		if settled {
+			arch::idle_halt();
+		}
+	}
+}
+
 // Drain the crash-notify channel and report whether the process `koid` faulted.
 // Each record fault::notify_crash sends is [koid u64 LE][kind u64 LE].
 fn crash_seen(crash_rx: &object::channel::Channel, koid: u64) -> bool {
@@ -886,17 +908,17 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 		// be reached either - the boot would end having never once asked whether a shell was
 		// listening. The drain is asked for a slice; the loop below asks for the rest, a slice at a
 		// time, and looks in between.
-		sched::run_until_idle_until(settle_slice(deadline));
-		// AND THE FAULT QUEUE IS SERVICED DURING BRING-UP TOO (added 2026-09-03).
+		// AND THE FAULT QUEUE IS SERVICED DURING BRING-UP TOO (added 2026-09-03, made per-tick
+		// 2026-09-03).
 		//
 		// The one-tick bound this drain gives a live fault was written into the CONSOLE loop, which
 		// is entered only after userspace has come up. Everything before it - drivers binding,
 		// services starting, a recovery round - ran through the two drains in this function and
 		// serviced nothing, so a protected endpoint that faulted while it was starting kept
-		// mastering the bus for the whole boot window rather than for at most a tick. The call is
-		// gated to cpu 0 and to one drain per tick, so putting it where the BSP already returns
-		// costs a register read per slice and closes the window this bound was for.
-		crate::iommu::service_faults_if_due();
+		// mastering the bus for the whole boot window rather than for at most a tick. Servicing
+		// AFTER the slice made that "once per ten ticks", which is not the bound M5 states; see
+		// `drive_slice`.
+		drive_slice(settle_slice(deadline));
 		if crash_seen(crash_rx, koid) {
 			serial_println!("recovery: SystemManager (koid {}) faulted - starting a recovery SystemManager (attempt {} of {})", koid, attempt + 1, max_restarts + 1);
 			continue;
@@ -930,10 +952,9 @@ fn supervise(crash_rx: &object::channel::Channel, max_restarts: u32, window_tick
 			//
 			// A slice is what makes this a poll. It costs one extra look every `SETTLE_SLICE` ticks
 			// and it is the difference between a readiness check and a formality.
-			sched::run_until_idle_until(settle_slice(deadline));
 			// The same, on the slice this loop polls with: bring-up is where a driver first
 			// programs its device, so it is where a fault first arrives.
-			crate::iommu::service_faults_if_due();
+			drive_slice(settle_slice(deadline));
 			while let Ok(message) = reports.recv() {
 				serial_println!("userspace: {}", core::str::from_utf8(&message.bytes).unwrap_or("<bad>"));
 			}

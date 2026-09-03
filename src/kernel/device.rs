@@ -336,6 +336,20 @@ struct ClaimSlot {
 	// MMIO teardowns of this device that could NOT confirm their cross-core flush. A `Drop` has no
 	// caller to refuse, so this is where such a failure is kept until a release can read it.
 	mmio_unconfirmed: u32,
+	// WHAT THIS DEVICE HAD ALREADY STRANDED WHEN THIS BINDING TOOK IT.
+	//
+	// The two counters a release compares against are MONOTONIC and per DEVICE, so a release has to
+	// subtract what an earlier binding left behind. It used to sample that baseline AT RELEASE TIME,
+	// and that is exactly the wrong moment: a claim must be released before another can begin, so
+	// anything stranded while THIS binding held the device - a holder closing its interrupt handle
+	// before the manager releases, an MMIO teardown running inside a `Drop` and failing its
+	// cross-core flush - was already in the baseline and read as somebody else's failure. The
+	// binding's own unconfirmed teardown was laundered into a clean release.
+	//
+	// Sampled at `claim` instead, where the number genuinely means "before this binding". Nothing
+	// that happens after it can move into it.
+	msi_quarantined_at_claim: usize,
+	mmio_unconfirmed_at_claim: u32,
 }
 
 // How long a teardown has to confirm before the device is quarantined.
@@ -355,7 +369,7 @@ fn reset_claims(len: usize) {
 	let mut claims = CLAIMS.lock();
 	claims.clear();
 	// ALLOC-OK: sized once at boot from the table just built.
-	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0 });
+	claims.resize_with(len, || ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0 });
 }
 
 // What state the device at `index` is in, or None if the index names no device.
@@ -474,6 +488,11 @@ pub fn claim(index: usize) -> Result<abi::ClaimKey, ClaimError> {
 	bus_master(entry, true);
 	slot.state = ClaimState::Claimed;
 	slot.generation = generation;
+	// THE BASELINES THIS BINDING WILL BE JUDGED AGAINST, taken here and not at the release. See
+	// `ClaimSlot::msi_quarantined_at_claim`. `CLAIMS` is held and the MSI registry is taken under it,
+	// which is the order `finish_release` already uses.
+	slot.msi_quarantined_at_claim = crate::arch::interrupts::msi_quarantined_for_device(index as u32);
+	slot.mmio_unconfirmed_at_claim = slot.mmio_unconfirmed;
 	Ok(abi::ClaimKey { device_index: index as u32, _pad: 0, generation })
 }
 
@@ -572,7 +591,7 @@ pub fn snapshot(index: usize) -> Option<abi::DeviceClaimSnapshot> {
 	// space may ever be reused. See `DeviceClaimSnapshot`.
 	let iommu_quarantined = crate::iommu::quarantined_grants_for(index as u32) as u32;
 	// AND WHAT ITS ENDPOINT ASKED FOR AND WAS REFUSED. See `DeviceClaimSnapshot::iommu_faults`.
-	let iommu_faults = crate::iommu::faults_for(index as u32);
+	let iommu_faults = crate::iommu::faults_for(index as u32, slot.generation);
 	Some(abi::DeviceClaimSnapshot { state: slot.state as u32, _pad0: 0, generation: slot.generation, release_deadline: slot.release_deadline, mmio_windows, irq_vectors, iommu_grants, iommu_quarantined, iommu_faults })
 }
 
@@ -615,12 +634,16 @@ pub fn release_claim(key: abi::ClaimKey) -> Result<ClaimState, ClaimError> {
 		bus_master(entry, false);
 		msix_off(entry);
 	});
-	// What this device had ALREADY stranded before the release began. See the comparison below.
-	let quarantined_before = crate::arch::interrupts::msi_quarantined_for_device(index as u32);
-	// AND THE SAME QUESTION FOR ITS MMIO WINDOWS. A teardown that could not confirm its cross-core
-	// flush inside a `Drop` has no caller to refuse; it is counted, and the comparison after the
-	// sweep separates what an earlier binding stranded from what this release did.
-	let mmio_unconfirmed_before = unconfirmed_mmio(index);
+	// WHAT THIS DEVICE HAD ALREADY STRANDED WHEN THIS BINDING TOOK IT - read off the slot, where
+	// `claim` recorded it, rather than sampled here (corrected 2026-09-03).
+	//
+	// Sampling at this point put every failure THIS BINDING caused before the release started into
+	// the baseline: a holder that closes its interrupt handle early has `Interrupt::drop` discard a
+	// failed `unbind`, riscv64 quarantines the still-armed slot, and the comparison then read that
+	// as an earlier binding's problem. The same laundering applied to an MMIO teardown that ran in a
+	// `Drop` and could not confirm its flush. A claim must be released before another begins, so
+	// anything stranded while this binding held the device is this binding's.
+	let (quarantined_before, mmio_unconfirmed_before) = CLAIMS.lock().get(index).map_or((0, 0), |slot| (slot.msi_quarantined_at_claim, slot.mmio_unconfirmed_at_claim));
 	// 2. Everything the claim minted stops working, without the holder's cooperation - and every
 	//    interrupt it derived is unbound HERE rather than whenever its last reference goes.
 	//
@@ -795,6 +818,23 @@ pub fn mmio_mapping_torn_down(key: abi::ClaimKey, confirmed: bool) {
 	}
 }
 
+// The two counters a test needs to see, and the one injection it needs to make.
+//
+// A failed cross-core shootdown cannot be produced on demand from a test - it is a property of the
+// machine - so the fact it PRODUCES is injected instead, which is the same shape
+// `exhaust_generations_of` uses for a generation ceiling nothing can reach in a run.
+#[cfg(test)]
+pub fn mmio_live_for_test(index: usize) -> u32 {
+	CLAIMS.lock().get(index).map_or(0, |slot| slot.mmio_live)
+}
+
+#[cfg(test)]
+pub fn strand_mmio_for_test(index: usize) {
+	if let Some(slot) = CLAIMS.lock().get_mut(index) {
+		slot.mmio_unconfirmed = slot.mmio_unconfirmed.saturating_add(1);
+	}
+}
+
 // How many MMIO teardowns of this device have failed to confirm, ever. Compared before and after a
 // sweep, exactly as the MSI quarantine count is: what an EARLIER binding stranded must not make
 // every later claim of the device unreleasable, and what THIS release stranded is charged to it.
@@ -947,7 +987,7 @@ pub fn add_synthetic_device() -> usize {
 	// ALLOC-OK: the claim slot for the row just appended, on the same `#[cfg(test)]` terms as the row
 	// itself - the two are one entry and a table with a device and no slot for it is worse than a
 	// test that could not allocate.
-	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0 });
+	CLAIMS.lock().push(ClaimSlot { state: ClaimState::Free, generation: 0, retired: false, release_deadline: 0, mmio_live: 0, mmio_unconfirmed: 0, msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0 });
 	index
 }
 

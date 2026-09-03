@@ -193,7 +193,10 @@ impl DisplayState {
 		// latched; it goes through `debug_write` rather than `print` because `print` follows stdout
 		// to a VT once the console is taken, and a line the serial log never carries cannot be
 		// evidence for anything. See `DisplayState::report_present`.
-		if self.report_present {
+		// AND ONLY FOR A PRESENT THAT REACHED A PROVIDER. `flush` answers `Ok(())` without sending
+		// anything when there is no scanout to send to, so reporting on the result alone would call
+		// a present that went nowhere a frame that arrived (corrected 2026-09-03).
+		if self.report_present && self.scanout.gpu != 0 {
 			self.report_present = false;
 			unsafe {
 				debug_write(if result.is_ok() { b"DisplayService: a frame reached the display through the provider it adopted\n".as_slice() } else { b"DisplayService: a frame did NOT reach the display through the provider it adopted\n".as_slice() });
@@ -407,6 +410,13 @@ impl DisplayState {
 			unsafe { close(self.scanout.gpu) };
 			self.scanout.gpu = 0;
 		}
+		// AND THE PENDING REPORT GOES WITH IT (corrected 2026-09-03). The latch is armed by an
+		// adoption and answered by the first present through the adopted provider; a provider that
+		// went away before that present has nothing to report, and leaving the latch armed let the
+		// NEXT present - which reaches no driver at all, because `flush` returns early with no
+		// scanout - emit the line that says a frame reached the display. A gate reading that line
+		// would pass on a driver that did the framebuffer handshake and then died.
+		self.report_present = false;
 	}
 
 	// PRESENT ON A REPLACEMENT PROVIDER, or answer false and change nothing.

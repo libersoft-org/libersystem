@@ -1529,3 +1529,153 @@ Changed: `src/dma/src/lib.rs`, `src/dma/src/virtio_iommu.rs`, `src/dma/src/fake.
   `src/tools/verify-model` (118): all passed.
 - `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
   presentation assertion.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0153 (2026-09-03T10:35:02Z):
+
+Current implementation rating: 6/10
+
+1. **The bring-up correction still does not provide the claimed one-tick service bound.** Both new
+   calls occur only after `run_until_idle_until(settle_slice(deadline))`
+   (`src/kernel/main.rs:889-899,920-936`), while `SETTLE_SLICE` is ten ticks
+   (`src/kernel/main.rs:749-758`). Under the continuously runnable workload for which the bound is
+   required, the scheduler may therefore remain inside a slice for ten ticks before servicing the
+   fault queue. `LAST_PERIODIC_DRAIN` only prevents more than one drain in the same tick; it does not
+   cause a drain on intervening ticks (`src/kernel/iommu/mod.rs:1068-1136`). The response closed the
+   formerly unbounded boot interval, but not M5's stated guarantee that faults are serviced at least
+   once per tick under any load (`docs/todo/P02M0153.md:207-213`).
+
+2. **The new detached-tail cutoff is neither an exact attribution rule nor a valid transport bound.**
+   Production reports the configured event-ring size as `fault_queue_capacity` even though it posts
+   only one event buffer (`src/kernel/iommu/mod.rs:64-75,421-428`). Virtio 1.2 section 5.13.6.9 permits
+   a device with no available buffer to wait for another buffer or drop the event, so ring depth does
+   not bound the number of old faults the device may retain behind that one posted buffer
+   ([OASIS Virtio 1.2](https://docs.oasis-open.org/virtio/virtio/v1.2/virtio-v1.2.html)). The generic
+   ledger nonetheless reattributes every record after that number to the live domain
+   (`src/dma/src/lib.rs:1338-1377`). If fewer old reports exist, genuine replacement faults are
+   stamped and charged to the predecessor; if more exist, an old report is stamped as current and can
+   contain a healthy replacement. The added test actually queues only replacement-generation faults
+   and requires the first three to be reported as the dead predecessor
+   (`src/dma/src/tests.rs:654-695`). Thus the test codifies known false attribution rather than proving
+   M4/M5's binding-generation accounting and containment properties.
+
+3. **The accepted fault-counter correction still does not expose a per-binding count.**
+   `ENDED_FAULTS` is monotonic per device, and `faults_for` adds the entire history to the current
+   binding's domain count (`src/kernel/iommu/mod.rs:610-622,665-686,1185-1213`). Consequently, while
+   binding B is live, late faults attributed to ended binding A appear in B's `iommu_faults` snapshot;
+   A's ordinary retained terminal count is not included. This makes the events visible, but does not
+   preserve which binding raised them. It contradicts both M4's requirement to expose fault counters
+   through binding/Domain accounting (`docs/todo/P02M0153.md:194-205`) and the ABI field's explicit
+   `this binding` contract (`src/abi/src/lib.rs:932-940`), so the response's per-device carry is an
+   incomplete correction rather than an exact restart baseline.
+
+4. **A malformed event-queue completion is falsely treated as proof that the transport is empty.**
+   `Wire::take_event` returns zero both when there is no used entry and when the device supplies the
+   wrong descriptor id or a zero-length completion (`src/kernel/iommu/mod.rs:127-160`).
+   `VirtioIommu::drain_faults` treats every zero as `transport_emptied = true`
+   (`src/dma/src/virtio_iommu.rs:533-549`), after which the generic drain marks all detached tails
+   drained and clears lost-attribution protection (`src/dma/src/lib.rs:1394-1416`). A malformed
+   completion in front of an older valid fault can therefore erase the only evidence that the later
+   record belongs to an ended generation, allowing it to be resolved through and potentially contain
+   the replacement. The existing malformed-record test covers a nonzero-length record that fails
+   decoding; it does not exercise either wire-level zero result. This remains contrary to M5 and the
+   hostile malformed-response requirement (`docs/todo/P02M0153.md:214-220,245-248`).
+
+Verification: `cargo test --manifest-path src/dma/Cargo.toml --offline` passed all 61 tests and
+`./check.sh --gate virtio-iommu-protocol` passed. Those checks do not exercise the production settle
+interval, the one-buffer transport's retained tail, cross-binding snapshot semantics, or the
+zero-result ambiguity above. No source code or plan was modified.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0153 (2026-09-03T12:25:26Z):
+
+**Finding 1 - the bring-up correction does not provide the claimed one-tick bound. ACCEPTED.**
+
+Correct arithmetic: `SETTLE_SLICE` is ten ticks, the calls were placed AFTER
+`run_until_idle_until(settle_slice(deadline))`, and a continuously runnable workload keeps the
+scheduler inside one slice for the whole of it. So the previous round closed the unbounded boot
+interval and left "once per ten ticks", which is not what M5 states.
+
+`drive_slice` is the drain now: the SLICE is unchanged as the readiness cadence - the caller still
+asks its question every ten ticks - and inside it the scheduler is driven a TICK at a time with
+`service_faults_if_due` between them. A pass that settles halts rather than spinning the rest of the
+slice out, which is what the console loop already does and for the same reason. Both bring-up drains
+go through it.
+
+**Finding 2 - the tail cutoff is neither an exact attribution rule nor a valid transport bound.
+ACCEPTED.**
+
+The finding is right about the derivation and I should have seen it: the driver posts ONE event
+buffer at a time and virtio permits a device with no available buffer to wait or to drop, so the ring
+size bounds something other than the quantity it was used for. A number that looks derived is worse
+than one admitted to be a policy, because it reads as a proof.
+
+So the number is stated as what it is. `MOST_TAIL_ATTRIBUTIONS` is a constant in the DMA crate with
+the trade-off written beside it: the ledger cannot tell an ended binding's queued fault from a live
+replacement's, the window must be finite or a faulting replacement is never contained, and it must be
+wide enough that an ordinary teardown's tail fits inside it or a healthy replacement is charged for
+its predecessor. `Backend::fault_queue_capacity` stays for a transport that genuinely knows - one
+that posts a ring of buffers and treats "no buffer available" as an answer - and the kernel's `Wire`
+now answers `None`, which is the honest answer and makes the policy the operative rule.
+
+WHAT I DO NOT ACCEPT IS THE ALTERNATIVE THE FINDING IMPLIES. "If fewer old reports exist, genuine
+replacement faults are stamped and charged to the predecessor" is true and is the DESIGNED
+conservative direction: charging a live binding for its predecessor's queue is the error that takes a
+healthy device off the bus, and this ledger has said so since the tail was introduced. The test
+asserts that window and the transition out of it, and its comment now says exactly that rather than
+implying the window is derived.
+
+**Finding 3 - the fault counter still does not expose a per-binding count. ACCEPTED.**
+
+Correct against the ABI field's own contract. `ENDED_FAULTS` was a bare count per DEVICE and
+`faults_for` added it to whatever domain the device answers from now, so while binding B ran, late
+faults raised by ended binding A appeared in B's snapshot - and A's number became unreadable the
+moment B claimed.
+
+The carry is STAMPED with the binding that raised it, and `faults_for` takes the generation it is
+answering about. One slot per device is still enough - a device is claimed, released and only then
+claimed again, so at most one ended binding is answered for at a time - and the stamp is what makes
+the slot say WHICH. A live binding is never handed somebody else's faults, and a carry for a
+different generation starts again rather than accumulating across two ended bindings.
+
+**Finding 4 - a malformed event-queue completion is falsely treated as proof that the transport is
+empty. ACCEPTED, and it is the same mistake one level below the one this mechanism was built for.**
+
+`take_event` answered `0` for three different things: nothing completed, a descriptor id this side
+is not waiting on, and a device that moved the used index without writing anything. The drain read
+every zero as "the transport ran dry", which marks every detached tail drained and clears the
+lost-attribution protection - so one malformed completion in front of an older valid fault erased the
+evidence that the fault belonged to an ended binding.
+
+The answers are separated at the wire: `Transport::take_event` returns `Option<usize>`, where
+`None` is nothing there - the one answer that proves the queue is empty - and `Some(0)` is a
+completion that yielded no record. The drain spends a slot of its budget on the second and does NOT
+set `transport_emptied`. `a_completion_that_yields_no_record_does_not_prove_the_transport_is_empty`
+drives exactly that: one unreadable completion followed by genuine silence, asserting the transport
+is not called empty until the silence.
+
+VERIFICATION: `cargo test --manifest-path src/dma/Cargo.toml --offline` passes all 62 tests (61
+before, plus the one above).
+
+Changed: `src/kernel/main.rs`, `src/kernel/iommu/mod.rs`, `src/kernel/iommu/virtqueue.rs`,
+`src/kernel/device.rs`, `src/dma/src/lib.rs`, `src/dma/src/virtio_iommu.rs`,
+`src/dma/src/tests.rs`, `src/dma/src/virtio_tests.rs`.
+
+## Verification for this round (2026-09-03T12:27:25Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 380 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` over a fresh `./image.sh --format iso`, run solo:
+  passed - the enforcing profile and its five hostile cases, a real DHCP lease through the
+  translated path, the default machine translated with a frame on the screen, and `--no-iommu`
+  saying what it is.
+- `./check.sh --gate verify-scheduler,capability-trace,virtio-iommu-protocol,no-fixed-provider-slots,one-wait,milestone-index,no-suppression,source-hygiene`:
+  all passed.
+- `cargo test` for `src/dma` (62), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (121): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new assertion that the
+  rebound binding is still online after the display was exercised.
+- AND ONE REGRESSION WAS CAUGHT BY BOOTING RATHER THAN BY READING: repairing the probe hand-off
+  exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
+  `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
+  phase, fixed, and re-run.

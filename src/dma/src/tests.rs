@@ -696,10 +696,13 @@ fn a_faulting_replacement_is_not_hidden_behind_its_predecessors_tail_for_ever() 
 }
 
 #[test]
-fn a_backend_that_cannot_state_its_transports_bound_keeps_attributing_to_the_tail() {
-	// THE CONSERVATIVE DEFAULT, KEPT. `fault_queue_capacity` answers `None` for a backend with no
-	// way to ask its transport, and the bound above must not be invented for one: charging a live
-	// binding for its predecessor's queue is the error that disables a healthy device.
+fn a_backend_that_cannot_state_its_transports_bound_falls_back_to_the_stated_policy() {
+	// THE DEFAULT IS THE POLICY, NOT "FOR EVER" (corrected 2026-09-03). `fault_queue_capacity`
+	// answers `None` for every transport in this tree, because a driver that posts one event buffer
+	// at a time cannot see what the device is holding behind it - so if `None` meant unbounded, the
+	// bound would apply to nothing that ships. `MOST_TAIL_ATTRIBUTIONS` is what applies, and the
+	// window it opens is wide: a healthy replacement is not charged for its predecessor's queue
+	// until well past any ordinary teardown's tail.
 	let (mut iommu, first) = iommu();
 	let endpoint = EndpointId(11);
 	iommu.attach(first, endpoint).expect("the first binding attaches");
@@ -707,15 +710,20 @@ fn a_backend_that_cannot_state_its_transports_bound_keeps_attributing_to_the_tai
 	iommu.destroy_domain(first).expect("its domain is destroyed with it");
 	let second = iommu.create_domain(0x1_0000, 0x10_0000, Vec::new(), Generation(2)).expect("a second domain");
 	iommu.attach(second, endpoint).expect("the replacement attaches");
-	for _ in 0..8 {
+	let queued: u64 = crate::MOST_TAIL_ATTRIBUTIONS + 4;
+	for _ in 0..queued {
 		iommu.backend_mut_for_test().queue_fault(event(11, second.0, 0x2000, Access::Write, Fault::NotMapped));
 	}
 	let mut out = [event(0, 0, 0, Access::Read, Fault::NotMapped); 1];
-	for _ in 0..6 {
+	for _ in 0..crate::MOST_TAIL_ATTRIBUTIONS {
 		assert_eq!(iommu.drain_faults(&mut out), 1);
-		assert_eq!(out[0].domain, first, "with no stated bound the tail goes on attributing until the queue runs dry");
+		assert_eq!(out[0].domain, first, "inside the stated window the record is the ended binding's");
 	}
-	assert_eq!(iommu.faults_in(second), 0, "and the replacement is charged with nothing it did not answer for");
+	assert_eq!(iommu.faults_in(first), crate::MOST_TAIL_ATTRIBUTIONS, "the predecessor is charged with the whole window and no more");
+	assert_eq!(iommu.faults_in(second), 0, "and nothing before it reached the replacement");
+	assert_eq!(iommu.drain_faults(&mut out), 1);
+	assert_eq!(out[0].domain, second, "past the window the endpoint answers for itself");
+	assert_eq!(out[0].generation, Generation(2), "so the containment decision meets the generation that is actually live");
 }
 
 #[test]

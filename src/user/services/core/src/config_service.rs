@@ -241,14 +241,31 @@ impl Service for Config {
 		if self.is_sealed() {
 			return Err(Error::Denied);
 		}
+		// ATOMIC AGAINST THE WRITE-THROUGH, WHICH "TELL THE CALLER" WAS NOT (corrected 2026-09-03).
+		//
+		// The mutation was applied, the write-through was attempted, and a failure was REPORTED
+		// while the value stayed in the tree - so a caller told `not-stored` was still overruled by
+		// the record it had been refused: DeviceManager withholds the live effect and answers
+		// `not-stored`, and the next manager to load policy reads the value anyway. A rejected write
+		// has to leave the tree as it found it, which is what `not-stored` says happened.
+		let previous: Option<String> = self.entries.iter().find(|e| e.key == entry.key).map(|e| e.value.clone());
+		let key = entry.key.clone();
 		match self.entries.iter_mut().find(|e| e.key == entry.key) {
 			Some(e) => e.value = entry.value,
 			None => self.entries.push(entry),
 		}
 		// Write-through: the set survives a service restart and a reboot - and when it does not,
-		// the caller is told rather than left believing it does.
+		// the caller is told AND the value is put back.
 		if !self.persist() {
-			unsafe { print(b"ConfigService: the tree could not be written through to its volume - the value is served from memory and will not survive a restart\n") };
+			match previous {
+				Some(value) => {
+					if let Some(e) = self.entries.iter_mut().find(|e| e.key == key) {
+						e.value = value;
+					}
+				}
+				None => self.entries.retain(|e| e.key != key),
+			}
+			unsafe { print(b"ConfigService: the tree could not be written through to its volume - the value is refused rather than served from memory\n") };
 			return Err(Error::Io);
 		}
 		Ok(())
@@ -271,12 +288,18 @@ impl Service for Config {
 		if !self.privileged || self.is_sealed() {
 			return Err(Error::Denied);
 		}
-		let before = self.entries.len();
+		// THE SAME ATOMICITY AS `set`. A removal that could not be written through is a removal that
+		// did not happen, so the entry goes back rather than being reported gone and returning at
+		// the next restart.
+		let removed: Option<ConfigEntry> = self.entries.iter().find(|entry| entry.key == key).cloned();
 		self.entries.retain(|entry| entry.key != key);
 		// A KEY THAT WAS NOT THERE IS NOT AN ERROR. `enable` on a device nobody disabled must
 		// succeed: the caller is asking for a state, and the state is already what they asked for.
-		if self.entries.len() != before && !self.persist() {
-			unsafe { print(b"ConfigService: a removal could not be written through to its volume - the key is gone from memory and will come back at the next restart\n") };
+		if let Some(entry) = removed
+			&& !self.persist()
+		{
+			self.entries.push(entry);
+			unsafe { print(b"ConfigService: a removal could not be written through to its volume - the key is refused rather than removed from memory alone\n") };
 			return Err(Error::Io);
 		}
 		Ok(())

@@ -888,3 +888,52 @@ Rating: 7/10
    cannot meet its every-boot carrier rule. The plan needs an early carrier/handoff for both no-DT
    UEFI rows and a fixture for that path; the ordinary AArch64 UEFI fixture, which explicitly relies
    on firmware passing a tree (`docs/todo/P02M0172.md:579-596`), does not exercise it.
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-03T10:38:00Z):
+
+**Finding 1 - the later M0151 no-device-tree UEFI gate implementation makes the rejected carrier
+finding live again. ACCEPTED.**
+
+Verified end to end, and the finding is right about why the earlier rejection expired. That rejection
+rested on no caller setting `LIBER_NO_DT_PROFILE`, which was true when it was written and stopped
+being true when the profile was built: `src/tools/check-qemu-arch-profiles.sh` now builds a
+purpose-built loader with that variable for AArch64 and RISC-V, runs both rows with `PROFILE_UEFI=1`,
+and both are registered gates (`arch-profile-aarch64-no-dt-1`, `arch-profile-riscv64-no-dt-1`). On
+those two ports the kernel learns the `fw_cfg` MMIO base from the DEVICE TREE and from nothing else -
+`src/fdt` parses it into the struct `boot.rs` reads - and the common reader answers "no file" for a
+zero base. So with absence fatal on every path, this milestone as written would either refuse two
+registered gate rows or fail its own every-boot rule.
+
+THE CARRIER IS THE ONE M3 ALREADY DEFINES. A UEFI boot is the one path where the LOADER constructs
+`BootInfo` before the kernel runs - which is the whole reason M3 gives for the direct-boot carrier
+existing separately - so the field is available at exactly the moment admission needs it and the
+loader is the producer. The plan therefore assigns UEFI test and development boots the `BootInfo`
+extension with `harness` provenance, and `signed` provenance is the same field written by a loader
+that verified a manifest. That is not a new mechanism: M3 requires the field and the provenance enum
+already, and the public UEFI path was always going to carry its value through it.
+
+WHAT DOES NOT CHANGE: `fw_cfg` remains the x86_64 DIRECT-boot carrier and the device-tree property
+remains the AArch64/RISC-V DIRECT-boot carrier, exactly as M3 states them; the harness keeps writing
+the development profile scalar through `fw_cfg` for the unrelated purpose it already serves.
+
+AND THE PRECEDENCE RULE COLLAPSES INTO THE ONE-PRODUCER RULE. "The SIGNED one wins" existed because a
+UEFI boot could present a signed field and a harness carrier; signed and harness are two PROVENANCES
+of one field now, so there is no winner to pick. A boot presenting BOTH a `BootInfo` field and a
+direct carrier's record is still two producers and still refuses, equal values included - which is
+the rule this file wanted, without a precedence order for an attacker to compose media against.
+
+THE FIXTURE MOVES TO THE PATH THAT DOUBTS IT. The previous text ran the UEFI producer/consumer pair on
+aarch64 because the `fw_cfg` decision was doubted on that port - and the doubt was right, so a UEFI
+row that HAS a tree hides the defect rather than testing it. The fixture is now the treeless row: both
+no-device-tree UEFI gate rows carry a `harness` record in the `BootInfo` field and reach the
+admission decision their architecture's matrix row gives, and the same rows with the field ABSENT
+refuse the boot. The ordinary AArch64 UEFI row keeps its producer/consumer pair and is no longer the
+only UEFI evidence. P02M0151 is named in Dependencies as the owner of those rows and of the loader
+option that produces them, with the note that the loader building them is the `harness` producer for
+their field - one loader source with one option set, so no second implementation is needed.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0172 (2026-09-03T10:57:05Z):
+
+Rating: 7/10
+
+1. **The replacement UEFI carrier still has no path by which the host-selected harness value reaches the loader.** The latest correction moves test/development UEFI boots from `fw_cfg` to a `BootInfo` field and calls the loader the producer (`docs/todo/P02M0172.md:482-503`), but it never defines an input from the outer harness to that loader. `LIBER_RUN_MODE` exists only on the host and chooses materially different values for the same x86_64 development path—default versus `--no-iommu` (`:120-145,161-165`)—while the plan expressly says run mode does not reach the kernel and only decides on the host which value is written (`:281-305`). A loader cannot infer that runtime choice from the image or guest topology, and the removed `fw_cfg` record was the only stated runtime conduit. The purpose-built treeless loaders can be compiled for a gate, but that does not define the ordinary test/development UEFI producer or distinguish the two development invocations. Specify the trusted host-to-loader input which carries the already-selected DMA value before the loader fills `BootInfo`, and gate both values through the same UEFI image/path; otherwise the every-boot, absence-fatal matrix remains unimplementable on these rows.

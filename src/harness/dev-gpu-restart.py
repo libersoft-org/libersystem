@@ -162,12 +162,15 @@ def wait_state(state, what, timeout=SETTLE_TIMEOUT):
 # serial log whatever owns the console. Per adoption rather than per boot, so the line the cold boot
 # printed cannot stand in for this one - the window below starts after the enable.
 #
-# It is also what proves the withdrawal's production effects ran. The rebind can only be adopted
-# once DisplayService's old provider channel has closed, and that close is DeviceManager's - the
-# `close_channel` half of `driver_binding::apply_withdrawal`, performed on the catalogue's own
-# handle. A withdrawal that emptied that call leaves the old channel open, `release_scanout` never
-# runs, the replacement is refused adoption because a scanout is still held, and this line never
-# arrives.
+# WHAT IT DOES NOT PROVE, corrected 2026-09-03. This said the line also exercises DeviceManager's
+# `Catalogue::close_channel`, on the reasoning that the replacement can only be adopted once the old
+# provider channel has closed. The close is real and the adoption does depend on it - but it is not
+# the CATALOGUE's close: DisplayService took the offered channel through `open`, which MOVES the
+# handle out of the entry and leaves the stored one zero, so `close_channel` has nothing to close for
+# this provider and is a no-op on this path. What ends the old channel is the driver process exiting
+# and its peer closing, which DisplayService already handles. Emptying the catalogue's close body
+# leaves this gate green, and the comment claiming otherwise was the third round of an assertion this
+# harness cannot make.
 PRESENTED = 'DisplayService: a frame reached the display through the provider it adopted'
 NOT_PRESENTED = 'DisplayService: a frame did NOT reach the display through the provider it adopted'
 
@@ -190,6 +193,15 @@ def exercise_the_display(guest, mark):
 	if not guest.wait_prompt(15):
 		fail('the console stopped answering after frames were driven through it, so the rebind took the display path down with it')
 	step('  frames were driven through the console after the rebind and it is still serving')
+	# AND THE DRIVER IS STILL THERE, which M4 asks for in the same sentence as the frame (added
+	# 2026-09-03). A driver that served the framebuffer handshake, presented once and then exited
+	# satisfies every line above: the state was read BEFORE the frames were driven, and a present
+	# that reaches no provider is not reported. The binding is re-read afterwards, on the same claim
+	# generation, so "it came back" means it is still up rather than that it once was.
+	after = gpu_binding()
+	if after.get('state') != 'online':
+		fail(f'the rebound binding is {after.get("state")} after the display was exercised - a frame reaching the display is only half of what M4 asks for')
+	step(f'  and the rebound binding is still online on claim generation {after.get("generation")}')
 
 
 def main():

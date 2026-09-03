@@ -51,6 +51,57 @@ pub struct Candidate {
 	pub covers: BTreeMap<String, Vec<String>>,
 }
 
+// WHICH COMPONENTS A CANDIDATE TAKES COVERAGE AWAY FROM, from the REGISTRY half of the overlay.
+//
+// The kernel tests' `covers` lists are the visible half and were the only half activation looked at,
+// while the plan's width is decided by three things the candidate replaces wholesale: which paths a
+// component owns, which escalation edges reach it, and which targets a path is built and booted on.
+// A candidate that removes an edge, shortens an ownership prefix or drops a target narrows what a
+// change SELECTS while leaving every `covers` list identical - so the check that guards activation
+// saw nothing to guard and let the write through with no evidence at all.
+//
+// Its own function so it can be driven by a test: the comparison that used to live inline in the
+// activation path could only be exercised by activating a candidate, which is the thing it gates.
+pub fn components_losing_registry_coverage(active: &crate::registry::Registry, narrowed: &crate::registry::Registry, ownership: &crate::ownership::Ownership) -> std::collections::BTreeSet<String> {
+	let mut losing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+
+	// A COMPONENT THAT OWNS FEWER PATHS IS REACHED BY FEWER CHANGES.
+	let owner_paths = |registry: &crate::registry::Registry| -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+		let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+		for rule in &registry.ownership {
+			out.entry(rule.component.clone()).or_default().insert(rule.path.clone());
+		}
+		out
+	};
+	let (owned_before, owned_after) = (owner_paths(active), owner_paths(narrowed));
+	for (component, paths) in &owned_before {
+		let kept = owned_after.get(component);
+		if paths.iter().any(|path| kept.is_none_or(|kept| !kept.contains(path))) {
+			losing.insert(component.clone());
+		}
+	}
+
+	// AN EDGE THAT IS GONE IS AN ESCALATION THAT NO LONGER HAPPENS, and what loses coverage is the
+	// component the edge REACHED - the one a change to `from` used to pull in.
+	let edge_set = |registry: &crate::registry::Registry| -> std::collections::BTreeSet<(String, String, String)> { registry.edges.iter().map(|edge| (edge.from.clone(), edge.to.clone(), edge.kind.clone())).collect() };
+	for edge in edge_set(active).difference(&edge_set(narrowed)) {
+		losing.insert(edge.1.clone());
+	}
+
+	// A PATH BUILT OR BOOTED ON FEWER TARGETS IS CHECKED ON FEWER MACHINES, and the component that
+	// loses it is whoever owns that path.
+	let targets = |registry: &crate::registry::Registry| -> std::collections::BTreeMap<String, (std::collections::BTreeSet<String>, std::collections::BTreeSet<String>)> { registry.architecture.iter().map(|rule| (rule.path.clone(), (rule.build.iter().cloned().collect(), rule.boot.iter().cloned().collect()))).collect() };
+	let (arch_before, arch_after) = (targets(active), targets(narrowed));
+	for (path, (build, boot)) in &arch_before {
+		let kept = arch_after.get(path);
+		let narrower = kept.is_none_or(|(after_build, after_boot)| build.iter().any(|target| !after_build.contains(target)) || boot.iter().any(|target| !after_boot.contains(target)));
+		if narrower && let crate::ownership::Owner::Component { component, .. } = ownership.owner(path) {
+			losing.insert(component);
+		}
+	}
+	losing
+}
+
 pub fn digest_of(bytes: &[u8]) -> String {
 	let mut hasher = Sha256::new();
 	hasher.update(bytes);

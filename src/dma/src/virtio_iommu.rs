@@ -355,9 +355,12 @@ pub trait Transport {
 	// HOW MANY EVENT RECORDS THIS TRANSPORT CAN BE HOLDING AT ONCE, when it can say.
 	//
 	// Read by `Backend::fault_queue_capacity`, which bounds how long an ended binding's tail may go
-	// on attributing an endpoint's faults to it - see `DetachedTail`. `None` is the honest answer
-	// for a transport with no way to ask, and it keeps the unbounded behaviour rather than inventing
-	// a number.
+	// on attributing an endpoint's faults to it - see `DetachedTail`. `None` is the honest answer for
+	// a transport with no way to ask, and every transport in this tree answers it: a driver that
+	// posts ONE event buffer at a time cannot see how many records the device is holding behind it,
+	// and the device may wait for a buffer or drop the event rather than hand them over. A ring size
+	// is not that number, and answering with one is a derivation that reads as a proof (corrected
+	// 2026-09-03). The ledger applies its stated policy bound instead.
 	fn event_capacity(&self) -> Option<u64> {
 		None
 	}
@@ -372,7 +375,16 @@ pub trait Transport {
 	// every successful probe.
 	fn request(&mut self, request: &[u8], answer: &mut [u8], status_at: usize) -> Result<(), Fault>;
 	// Take one raw event off the event queue, if there is one. Returns how many bytes were written.
-	fn take_event(&mut self, out: &mut [u8]) -> usize;
+	// Take one raw event off the event queue.
+	//
+	// `None` means THE TRANSPORT HAD NOTHING - the one answer that proves the queue is empty, which
+	// is what `Backend::transport_was_emptied` reports and what lets a detached tail stop
+	// attributing. `Some(0)` is a COMPLETION THAT YIELDED NO RECORD: a descriptor id this side is
+	// not waiting on, or a zero-length write. That is a device the driver could not read, not a
+	// device with nothing to say, and collapsing the two into `0` was how a malformed completion in
+	// front of an older valid fault erased the only evidence that the fault belonged to an ended
+	// binding (corrected 2026-09-03).
+	fn take_event(&mut self, out: &mut [u8]) -> Option<usize>;
 }
 
 // The backend itself: the contract's operations, in this device's words.
@@ -543,11 +555,21 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		let mut dropped = 0usize;
 		let mut raw = [0u8; FAULT_LEN];
 		while written < out.len() {
-			let taken = self.transport.take_event(&mut raw);
-			if taken == 0 {
-				self.transport_emptied = true;
-				break;
-			}
+			let taken = match self.transport.take_event(&mut raw) {
+				// NOTHING THERE. This is the only answer that proves the transport ran dry.
+				None => {
+					self.transport_emptied = true;
+					break;
+				}
+				// A COMPLETION THAT YIELDED NO RECORD. It spends the budget like any other
+				// malformed one and proves nothing about what is queued behind it.
+				Some(0) => {
+					dropped += 1;
+					written += 1;
+					continue;
+				}
+				Some(taken) => taken,
+			};
 			// A malformed record is DROPPED and the drain continues: one bad event must not stop
 			// the kernel reading the good ones behind it.
 			//

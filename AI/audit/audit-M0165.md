@@ -1584,3 +1584,84 @@ Changed: `src/user/drivers/core/src/virtio_blk.rs`, `src/user/drivers/core/src/v
   `src/tools/verify-model` (118): all passed.
 - `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
   presentation assertion.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0165 (2026-09-03T10:37:27Z):
+
+Current implementation rating: 8/10
+
+1. **The claimed production-effects proof is still incomplete, and the new GPU assertion does not
+   exercise production `Catalogue::close_channel` as claimed.** DisplayService opens the initial
+   offered provider, which moves its handle out of the catalogue and sets the stored handle to zero
+   (`src/user/services/core/src/device_manager.rs:4548-4566`; allocation at
+   `src/user/services/core/src/display_service.rs:608-615,648-665`). On withdrawal,
+   `Catalogue::close_channel` closes only a nonzero stored handle, so this production call is a
+   no-op for the provider used by the GPU scenario
+   (`src/user/services/core/src/device_manager.rs:2143-2149`). DisplayService instead releases the
+   old scanout when its driver peer closes during driver exit
+   (`src/user/services/core/src/display_service.rs:753-768`). Consequently the post-rebind
+   presentation assertion in `src/harness/dev-gpu-restart.py:165-170,283-285` can remain green if
+   the catalogue close body is empty, contrary to the response and harness commentary.
+
+   The host `Recorder` test proves that generic `apply_withdrawal` invokes two trait callbacks in
+   order, but it cannot prove the syscall/send bodies of DeviceManager's production trait
+   implementation (`src/user/libs/driver/binding/src/tests.rs:668-723`). The response also concedes
+   that no production subscriber observes `announce_gone`; DisplayService explicitly ignores
+   withdrawal frames (`src/user/services/core/src/display_service.rs:771-805`). The M7 named-race
+   proof therefore still does not establish the required production channel-close and stale-metadata
+   effects. The flush-result and degraded-path capability corrections were verified and are not
+   repeated as findings.
+
+Focused verification: all 64 `driver-binding` host tests passed, and
+`./check.sh --gate no-fixed-provider-slots` passed.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0165 (2026-09-03T12:26:48Z):
+
+**Finding 1 - the new GPU assertion does not exercise production `Catalogue::close_channel`.
+ACCEPTED. My claim was wrong and this is the third round of the same overclaim.**
+
+Verified: DisplayService opens the initial offered provider, and `open` MOVES the handle out of the
+entry and leaves the stored one zero - so on withdrawal `close_channel` finds nothing to close and
+is a no-op for exactly the provider the GPU scenario uses. What ends the old channel is the driver
+process exiting and its peer closing, which DisplayService already handles in the arm that calls
+`release_scanout`. Emptying the catalogue's close body leaves the restart gate green, and I asserted
+the opposite in both the response and the harness comment.
+
+The harness comment now says what the line does and does not prove, in the same paragraph that
+explains why the line exists at all. No code change: `close_channel` is correct as written - it
+closes the handles the catalogue still HOLDS, which is every provider nobody took - and the defect
+was the claim, not the call.
+
+WHAT THAT LEAVES, STATED PLAINLY RATHER THAN CLAIMED AWAY. The M7 named-race proof establishes the
+generic `apply_withdrawal` loop - order, completeness, one-to-one and the empty case, against a
+recorder - and the count comparison in `withdraw_binding` bounds what that loop visited. It does not
+establish either production trait body, and neither can be established by anything this tree can run:
+`close_channel` is a no-op for any provider a consumer took, and `announce_gone` has no downstream
+consumer that changes observable state - DisplayService ignores withdrawal frames and reacts to its
+channel closing. Building a consumer in order to test a send would be inventing the observer.
+
+So M7's requirement is met for the LOOP and unmet for the two effects, and the milestone should carry
+that rather than a third assertion that reads as evidence. The flush-result and degraded-capability
+corrections this finding confirms are unchanged.
+
+Changed: `src/harness/dev-gpu-restart.py` (the comment only).
+
+## Verification for this round (2026-09-03T12:27:25Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 380 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` over a fresh `./image.sh --format iso`, run solo:
+  passed - the enforcing profile and its five hostile cases, a real DHCP lease through the
+  translated path, the default machine translated with a frame on the screen, and `--no-iommu`
+  saying what it is.
+- `./check.sh --gate verify-scheduler,capability-trace,virtio-iommu-protocol,no-fixed-provider-slots,one-wait,milestone-index,no-suppression,source-hygiene`:
+  all passed.
+- `cargo test` for `src/dma` (62), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (121): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new assertion that the
+  rebound binding is still online after the display was exercised.
+- AND ONE REGRESSION WAS CAUGHT BY BOOTING RATHER THAN BY READING: repairing the probe hand-off
+  exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
+  `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
+  phase, fixed, and re-run.

@@ -120,26 +120,43 @@ impl DeviceMemory {
 	// sweep that set the tombstone had nothing to find.
 	pub fn commit_mapping(&self, virt: u64, space: Arc<AddressSpace>) -> bool {
 		*self.mapped_in.lock() = Some(space);
+		// THE COUNT IS RAISED BEFORE THE MAPPING BECOMES OBSERVABLE, NOT AFTER (corrected
+		// 2026-09-03).
+		//
+		// The CAS below is what publishes the mapping to every other core, and the count was raised
+		// after it. A release landing in that gap swapped the address out, unmapped it and called
+		// `mmio_mapping_torn_down`, whose saturating subtract left a count that was still ZERO at
+		// zero - so `settled_mmio` passed, the claim published `Free`, and only then did this call
+		// raise the count on a slot the next binding would inherit. That binding's own clean release
+		// then spun out and quarantined a healthy device.
+		//
+		// Raised first, the count is standing before anything can observe the mapping, and the
+		// failure path below gives it back. There is no interval in which the mapping exists and the
+		// count does not.
+		if let Some(key) = self.claim {
+			crate::device::mmio_mapping_installed(key);
+		}
 		if self.mapped_at.compare_exchange(Self::RESERVED, virt, Ordering::AcqRel, Ordering::Acquire).is_err() {
 			// The space record is dropped with it, so a later teardown cannot reach into an address
 			// space for a mapping this call is about to remove itself.
 			*self.mapped_in.lock() = None;
+			// AND THE COUNT GOES BACK. This mapping was never published, so it owes the device
+			// nothing - and the sweep that beat it here answered `false` for the reservation, so the
+			// claim is already not free.
+			if let Some(key) = self.claim {
+				crate::device::mmio_mapping_torn_down(key, true);
+			}
 			return false;
 		}
-		// AND THE DEVICE IS TOLD IT HAS A LIVE MAPPING, which is what a release waits for.
-		//
-		// A sweep reaches this object through a WEAK reference, and `Weak::upgrade` fails as soon as
-		// the last strong count reaches zero - which is BEFORE `Drop` has run the teardown. So a row
-		// whose destructor was running was counted quiet, the claim went `Free`, and the unmap and
-		// the cross-core flush happened afterwards with nobody waiting for them. The count is taken
-		// HERE, where the mapping becomes real, so it is already standing whichever way the object
-		// later dies: the sweep upgrades it and tears it down, or a concurrent drop does, and either
-		// way the release sees an outstanding mapping until the teardown has finished.
+		// WHY THE COUNT EXISTS AT ALL: a sweep reaches this object through a WEAK reference, and
+		// `Weak::upgrade` fails as soon as the last strong count reaches zero - which is BEFORE
+		// `Drop` has run the teardown. So a row whose destructor was running was counted quiet, the
+		// claim went `Free`, and the unmap and the cross-core flush happened afterwards with nobody
+		// waiting for them. Raised above, the count is standing whichever way the object later dies:
+		// the sweep upgrades it and tears it down, or a concurrent drop does, and either way the
+		// release sees an outstanding mapping until the teardown has finished.
 		//
 		// Exactly the shape `settled_vectors` uses for interrupts, for exactly the same race.
-		if let Some(key) = self.claim {
-			crate::device::mmio_mapping_installed(key);
-		}
 		true
 	}
 

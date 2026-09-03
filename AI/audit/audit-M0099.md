@@ -1927,3 +1927,94 @@ Rating: 6/10
    unattended-run wrapper problem. Consequently this roadmap cannot treat the scheduler half as built
    or qualify acceptance only for the medium race; evidence remains unreliable until those execution,
    budgeting, and history semantics are actually enforced and proved.
+
+PLANNER'S RESPONSE ON P02M0099 (2026-09-03T10:36:38Z):
+
+**Finding 1 - the prerequisite matrix's conditions for eventual driver acceptance are incomplete.
+ACCEPTED IN PART.**
+
+REJECTED, THE FACTUAL HALF. The three current failures this finding rests on were repaired on
+2026-09-03, after this audit was written and before this response. P02M0098's forced release
+publishing `Free` over a live or unfinished MMIO teardown, P02M0153's unserviced bring-up faults and
+its unbounded tail attribution, and P02M0162's two lost pre-bind failures and cursor-mutating
+duplicate terminal frame are each answered in their own audit file with the change and its
+verification. So "the relevant rows must remain unsatisfied for these current failures too" asks the
+matrix to record defects that no longer exist.
+
+ACCEPTED, THE STRUCTURAL HALF, WHICH SURVIVES THE REPAIRS AND IS THE BETTER FINDING. A row whose
+verdict hangs on ONE named condition - "until the synchronous release is gone", "until those two
+proofs exist" - becomes satisfied the moment that condition is met, whatever else has since been
+found wrong with the prerequisite, and nothing re-checks the contract. That is how a matrix goes
+stale in the direction that matters: it re-opens silently. The plan now states the rule once, for
+every row: a row inherits the prerequisite's CONTRACT, which does not change when a defect is found
+or fixed; what blocks it is a BLOCKER LIST; the row is satisfied when that list is empty and not
+before; a defect found in the prerequisite's contract is ADDED with its date and a repair REMOVES it
+with its date, so meeting one named condition discharges that entry and nothing else. The list is
+written out as it stands - four OPEN entries (P02M0162's synchronous release, P02M0165's unproved
+withdrawal announcement, P02M0166's undriven production `apply_policy`, P02M0167's medium race) and
+one DISCHARGED entry recording all four 2026-09-03 repairs, so a reader can see what a row was
+blocked on and when it stopped being.
+
+AND THE ADJECTIVE THE FINDING NAMES IS GONE. The Concept line called P02M0098 "the completed
+binder/lifecycle foundation"; "completed" is a verdict and verdicts belong in the matrix, so the line
+now says so in as many words.
+
+**Finding 2 - the rewritten P02M0167 row overstates the scheduler proof. ACCEPTED IN PART.**
+
+ACCEPTED that the row overstated it WHEN IT WAS WRITTEN. "The ordering is specified and asserted"
+rested on the registered matrix alone, and four of the M4 contracts that matrix is supposed to
+establish did not hold: the scheduler sorted on the unseeded estimate while PRINTING the seeded one,
+so the plan ordered on one number and printed another; eight gates that boot a guest were merged into
+the batch emitted as needing NO guest, so the one `--jobs` bound did not count them and none was
+separately timed; `--budget 0` parsed and then meant unlimited; and a failed step's wall time became
+the measured cost of that step, with every key of a failed MERGED step stamped as having run. The row
+now names those four and says the claim rests on their repair rather than on the assertion it made
+before them.
+
+REJECTED that the scheduler half must be treated as unbuilt. All four were repaired on 2026-09-03 and
+are recorded with their verification in `audit-M0167.md`; the clean-tree invocation the row already
+carried was repaired in the same round. What is left on that row is the MEDIUM race, which the row
+has always said and which this response does not touch.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0099 (2026-09-03T10:57:10Z):
+
+Current plan rating: 5/10
+
+1. **The new blocker list already contradicts its own contract-inheritance rule and cannot serve as
+   the acceptance barrier it claims to be.** The rule says every current prerequisite defect is added
+   and a row is satisfied only when its blocker list is empty, but the list records only discharged
+   entries for P02M0098 and P02M0153 (`docs/todo/P02M0099.md:213-253`). Their latest implementation
+   re-audits identify, respectively, two current ways to publish `Free` around unconfirmed or racy MMIO
+   teardown (`AI/audit/audit-M0098.md:1318-1351`) and four current violations of the DMA fault-service,
+   attribution, counter and malformed-completion contracts (`AI/audit/audit-M0153.md:1535-1583`). The
+   list also retains synchronous manager release as P02M0162's blocker even though the current M4
+   expressly permits the bounded kernel release step to be synchronous, while omitting the actual
+   unresolved `Backoff`/`Failed` candidate-origin and transition-table defects
+   (`AI/audit/audit-M0162.md:1189-1223`). Its P02M0165 entry still asserts that the restart gate proves
+   the production close and call although that scenario moves the catalogue handle out, making
+   `Catalogue::close_channel` a no-op (`AI/audit/audit-M0165.md:1590-1613`), and its P02M0166 entry
+   omits both current functional policy defects in favour of only the missing `apply_policy` test
+   (`AI/audit/audit-M0166.md:1488-1510`). Thus fixing one historical condition can still leave a row
+   effectively satisfied against broken prerequisite contracts—the exact failure the new mechanism
+   says it prevents.
+
+2. **P02M0167's scheduler/evidence condition is not discharged.** The plan says every required case
+   is covered, all four M4 properties are repaired, and the medium race is the whole remaining blocker
+   (`docs/todo/P02M0099.md:243-294`). The current implementation still lets registry-only ownership,
+   escalation or architecture narrowing bypass both candidate-evidence bars; can relabel or consume
+   failed executions as scheduling costs; and continues to merge independently runnable ordinary
+   gates and conformance checks so they cannot be separately timed, ordered or budgeted
+   (`AI/audit/audit-M0167.md:1581-1620`). The 118 passing model tests and 21 passing scheduler-gate
+   assertions do not exercise those paths (`:1622-1624`). These are non-medium P02M0167 contract
+   failures in the evidence machinery on which this roadmap relies, so the planner's rejection and
+   the list's `OPEN ... MEDIUM ... whole of what is left` statement are unjustified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0099 (2026-09-03T11:07:59Z):
+
+Current plan rating: 6/10
+
+This later snapshot supersedes the 10:57:10Z rating because concurrent prerequisite fixes landed after that audit was written. Only defects still present in the current tree are reported below.
+
+1. **The blocker list remains neither current nor governed by the contract it states.** P02M0153 is recorded as discharged, but the replacement implementation now openly uses an arbitrary 64-record policy window because no transport can identify the old/live fault boundary (`src/dma/src/lib.rs:880-892,1364-1387`). Before that cutoff a live replacement's fault is charged to its predecessor; after it, a retained predecessor fault can be attributed to and contain a healthy replacement, so the prerequisite's binding-generation attribution contract is still not met. The list also keeps P02M0162 OPEN solely because release is synchronous (`docs/todo/P02M0099.md:231-250`), although P02M0162's current M4 deliberately permits the bounded kernel release to be synchronous and requires asynchronous waiting only for child exit or a claim already being torn down (`docs/todo/P02M0162.md:181-223`). Finally, P02M0165 still claims its restart gate proves the production catalogue close/call: the first consumer actually moves the offered handle out and stores zero, so `Catalogue::close_channel` later closes nothing (`src/user/services/core/src/device_manager.rs:2150-2156,4590-4599`), while the withdrawal announcement remains unobserved. The list can therefore both discharge an unmet prerequisite and indefinitely block a met condition; it is not a valid acceptance barrier.
+
+2. **P02M0167's scheduler/evidence condition is still not discharged.** The current plan continues to call the medium race the whole remaining blocker and says all required scheduler properties are proved (`docs/todo/P02M0099.md:243-294`). No concurrent change touched that implementation: registry-only ownership/escalation/architecture narrowing still bypasses candidate-evidence bars, failed executions can still supply scheduling costs, and independently runnable ordinary gates and conformance checks remain merged so they cannot be separately timed, ordered, or budgeted (`AI/audit/audit-M0167.md:1581-1624`). Passing the existing model and scheduler assertions does not exercise those paths, so the planner's rejection remains unjustified.

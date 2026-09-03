@@ -1577,3 +1577,127 @@ Changed: `verify.sh`, `src/tools/verify-model/src/main.rs`, `src/tools/verify-mo
   `src/tools/verify-model` (118): all passed.
 - `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new post-rebind
   presentation assertion.
+
+AUDITOR'S RE-AUDIT ON P02M0167 (2026-09-03T10:37:00Z):
+
+Current implementation rating: 5/10
+
+1. **Candidate activation still misses registry-only narrowing, so both evidence bars remain
+   bypassable.** The accepted fix derives `losing` solely by comparing the direct `(check.id,
+   check.covers)` pairs in the two catalogues (`src/tools/verify-model/src/main.rs:997-1014`), and
+   both `Store::evaluate` and the subsystem risk loop are restricted to that set
+   (`src/tools/verify-model/src/main.rs:1015-1025,1042-1045`). Registry ownership, escalation and
+   architecture policy independently determine the plan's width
+   (`src/tools/verify-model/src/plan.rs:206-243,266-291`). A candidate can therefore remove an
+   escalation, narrow an ownership prefix, or reduce a path's build/boot targets without changing
+   any check's direct `covers` list; `losing` is empty and activation reaches materialisation without
+   either bar. The new test invokes `Store::evaluate` directly and does not exercise activation with
+   a registry-only candidate (`src/tools/verify-model/src/tests.rs:2324-2343`). This leaves the
+   original registry-only bypass unresolved and violates the activation requirement
+   (`docs/todo/P02M0167.md:698-700,706-710`).
+
+2. **Failed executions can still become scheduling cost measurements.** `record_step_id` always
+   overwrites a `StepRecord`'s `model_hash` but retains `last_seconds` on failure
+   (`src/tools/verify-model/src/history.rs:152-170`). A success under model A followed by a failure
+   under model B therefore relabels A's duration as a valid B measurement, which `step_seconds`
+   accepts (`src/tools/verify-model/src/history.rs:410-417`). Independently, a failed one-key step
+   passes the merged-failure guard, writes its partial duration into the key record, and
+   `CostModel::estimate` consumes any positive undivided duration without checking `last_status` or
+   its model hash (`src/tools/verify-model/src/history.rs:229-263,440-463`). An otherwise unmeasured
+   step can thus still be priced from an early failure. The regression test checks cross-hash lookup
+   before recording a failure under the second hash and misses both sequences
+   (`src/tools/verify-model/src/tests.rs:2266-2285`), so the response's failed-cost correction is
+   incomplete.
+
+3. **Ordinary gates and conformance checks remain merged even though each is independently
+   runnable.** Lowering still batches every non-profile, non-booting pre-guest gate into one
+   comma-list `check.sh` step and all conformance suites into a second step
+   (`src/tools/verify-model/src/commands.rs:216-277`). Only profile and guest-booting gates were
+   split. The remaining units share one `StepId` and one duration and cannot be cheapest-first
+   ordered or admitted independently by `--budget`. The new emission test covers profile rows, not
+   these two batches (`src/tools/verify-model/src/tests.rs:2407-2447`). This is an incomplete fix to
+   the accepted M4 finding and still contradicts the explicit requirement that every separately
+   schedulable unit be separately timed (`docs/todo/P02M0167.md:390-416,691-695`).
+
+Verification: all 118 `verify-model` unit tests and all 21 `verify-scheduler` assertions pass. They
+do not cover the registry-only activation path, either failed-cost sequence, or independent lowering
+of ordinary gates/conformance suites above. No source code or plan was modified.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0167 (2026-09-03T12:27:11Z):
+
+**Finding 1 - candidate activation still misses registry-only narrowing. ACCEPTED.**
+
+Correct: I derived what a candidate takes away by comparing the two catalogues' `(check, covers)`
+pairs, which is the kernel tests' half of the overlay, and a candidate carries a COMPLETE replacement
+registry. Three things in it decide how wide a change's plan is without touching any `covers` list -
+which paths a component owns, which escalation edges reach it, and which targets a path is built and
+booted on - so a candidate that removes an edge, shortens an ownership prefix or drops a target left
+`losing` empty and reached the write path with neither bar applied. That is the original bypass, one
+layer along.
+
+`candidate::components_losing_registry_coverage` compares all three directly: a component that owns
+fewer paths, the component an removed edge no longer REACHES, and the owner of a path built or booted
+on fewer targets. Its results join the catalogue comparison, so both bars see the same set. It is its
+own function so a test can drive it - inline in the activation path it could only be exercised by
+activating a candidate, which is the thing it gates - and
+`a_candidate_that_narrows_only_the_registry_is_still_a_narrowing` drives the real registry against
+three one-line narrowings of it, plus the identity case that must take nothing away.
+
+**Finding 2 - failed executions can still become scheduling cost measurements. ACCEPTED, both
+sequences.**
+
+The cross-model one is exact: the hash was overwritten unconditionally while the duration was kept,
+so a success under model A followed by a failure under model B left A's seconds wearing B's label -
+and `step_seconds` filters on the hash precisely to refuse a duration measured over a different plan.
+It now moves the hash only with a measurement, and a run that records none under a DIFFERENT hash
+clears the stale seconds rather than relabelling them.
+
+The single-key one is the merged guard's missing half: a one-key step has no member that could have
+been skipped, so it passed the guard and wrote its partial duration into the key record, which
+`CostModel::estimate` reads. A failed step's share is no longer written, and the reader was given the
+same rule the per-step number always had - a record whose `last_status` is not `passed`, or whose
+model hash is not the one being priced, is not a measurement of what that key costs. `estimate` takes
+the hash as an `Option`, `Some` wherever the number prices something and `None` where two estimates
+are only compared with each other, because a filter applied to both sides of a ratio cancels.
+
+`a_failed_run_never_becomes_a_cost_however_the_models_are_ordered` drives both sequences.
+
+**Finding 3 - ordinary gates and conformance checks remain merged. ACCEPTED.**
+
+Right, and the reasoning I had was about the RUNNER rather than the work: `check.sh` takes a list, so
+they were lowered as one. `check.sh --gate <one>` is a command, so each is independently runnable,
+and merged they shared one `StepId`, one duration and one budget decision - the cheap ones could not
+be ordered first, none was ever timed, and `--budget` admitted all of them or none. That is the M4
+requirement the split for profile rows and guest-booting gates already served; what was left was the
+assumption that the cheap ones are too cheap to be worth an id.
+
+One step per gate and one per conformance suite, each with its own id, key and measured cost.
+`every_separately_runnable_check_is_its_own_step` asserts that a real plan's gate and conformance
+steps name one check each, discharge one key each, and carry distinct ids.
+
+VERIFICATION: `cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline` passes all
+121 tests (118 before, plus the three above); `./check.sh --gate verify-scheduler` passes all
+twenty-one assertions.
+
+Changed: `src/tools/verify-model/src/main.rs`, `src/tools/verify-model/src/candidate.rs`,
+`src/tools/verify-model/src/history.rs`, `src/tools/verify-model/src/commands.rs`,
+`src/tools/verify-model/src/plan.rs`, `src/tools/verify-model/src/tests.rs`.
+
+## Verification for this round (2026-09-03T12:27:25Z)
+
+- `./build.sh --arch x86_64`, `--arch aarch64` and `--arch riscv64`: all three build.
+- `./test.sh --arch x86_64`: 380 passed.
+- `./check.sh --gate qemu-virtio-iommu-x86_64` over a fresh `./image.sh --format iso`, run solo:
+  passed - the enforcing profile and its five hostile cases, a real DHCP lease through the
+  translated path, the default machine translated with a frame on the screen, and `--no-iommu`
+  saying what it is.
+- `./check.sh --gate verify-scheduler,capability-trace,virtio-iommu-protocol,no-fixed-provider-slots,one-wait,milestone-index,no-suppression,source-hygiene`:
+  all passed.
+- `cargo test` for `src/dma` (62), `src/user/libs/driver/binding` (64) and
+  `src/tools/verify-model` (121): all passed.
+- `./dev.sh up` then `src/harness/dev-gpu-restart.py`: passed, including the new assertion that the
+  rebound binding is still online after the display was exercised.
+- AND ONE REGRESSION WAS CAUGHT BY BOOTING RATHER THAN BY READING: repairing the probe hand-off
+  exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
+  `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
+  phase, fixed, and re-run.
