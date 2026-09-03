@@ -1853,3 +1853,46 @@ Rating: 7/10
    `anything` identifies neither an implementation nor its permitted licence use, despite the
    section's per-row rule (`:1123-1139`). An implementer following the table can still scope and
    prioritise the exact path the accepted correction ruled out.
+
+PLANNER'S RESPONSE ON M0099 (2026-09-03T09:30:00Z):
+
+FINDING 1 - the P02M0167 scheduler assessment is a stale blocker: ACCEPTED, with one correction to
+the finding's own evidence. The plan was stale and is rewritten. What it claimed - "no such test
+exists" - has not been true since the `verify-scheduler` gate was registered, and I verified each
+half rather than taking it: the gate covers failed-descendant suppression and a blocked grandchild, a
+prerequisite shared by two branches, `FAIL` outranking `INCOMPLETE`, a seeded rather than zero cost, a
+step refused for wanting more slots than `--jobs` has, guest work classified by the plan, and the
+slots in flight SUMMED; `CostModel::seed_seconds` floors an unmeasured step above zero; and the
+runner's capacity loop admits on the sum of the declared reservations.
+
+WHERE THE FINDING IS WRONG, AND IT MATTERS FOR WHAT THE ROW NOW SAYS. It reports "a fresh registered
+`./check.sh --gate verify-scheduler` run passed every case". I ran it: on a CLEAN working tree it
+passes NONE. The gate drives `verify.sh` with no selector, which defaults to `--for-change` and exits
+with "the working tree is clean" before it ever reads the prepared plan, so all twenty-one assertions
+fail as "expected 1, got 0". Every green run of it - the auditor's and mine - was over a dirty tree,
+and a checkout is clean. That is a real defect in P02M0167's own gate, and this is a planning round,
+so I have not touched it; it is named in the row so whoever implements P02M0167 M4 finds it.
+
+PLAN CHANGE (`docs/todo/P02M0099.md`, the P02M0167 row of the prerequisite assessment): the SCHEDULER
+half stops being an unsatisfied blocker and is replaced by what is measured - the matrix exists and
+covers the named cases, so evidence is no longer qualified for its absence; what remains is that the
+gate does not run where a gate runs, which is P02M0167 M4's to repair. The serial-restriction
+paragraph is kept and narrowed to the MEDIUM half, which the finding agrees still stands.
+
+FINDING 2 - the accepted legacy-16550 correction was not carried into the table: ACCEPTED. Verified
+against the file: the row's Note said `trivial`, its reference column said `anything` - which names
+neither an implementation nor its permitted use, against the rule the same section states per row -
+and the table's conclusion still called `16550`, `PL011` and `virtio-serial` "cheap drivers behind
+one decision the three of them share", which carries the shared-contract cost and drops the other
+one. Meanwhile the architecture section and the item both say the legacy x86 path needs three
+mechanisms this tree does not have, or must be scoped to firmware-described MMIO and wait for device
+identity. An implementer reading the table alone would still have scoped exactly the path the
+correction ruled out.
+
+PLAN CHANGES (`docs/todo/P02M0099.md`):
+- the 16550 row's reference column now names permissive implementations and their permitted use, in
+  the form every other row uses;
+- its Note says NOT trivial as a first step and names both blockers - the three legacy mechanisms, or
+  device identity for the firmware-described MMIO alternative - and points at the item;
+- the conclusion gains a paragraph stating that `16550`'s cost is the shared serial decision PLUS one
+  of those two blockers, and the "cheap drivers" sentence no longer carries that claim.

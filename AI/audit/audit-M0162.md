@@ -1096,3 +1096,35 @@ during service bring-up, deterministically, before any of this round's code runs
 written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
 unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
 except the two new UEFI profile rows, which are gate rows rather than suite runs.
+
+AUDITOR'S RE-AUDIT ON M0162 (2026-09-03T03:06:02Z):
+
+Current implementation rating: 6/10
+
+1. **Two permanent pre-bind failures are still recorded through illegal transitions, so the required
+   state and cause are lost.** `BindingState` permits `Unbound -> Binding -> Failed`, but not
+   `Unbound -> Failed` (`src/user/libs/driver/binding/src/lib.rs:74-132`). When every candidate artifact
+   is missing, `start_candidate` attempts exactly that forbidden transition and ignores `move_to`'s
+   `false` result (`src/user/services/core/src/device_manager.rs:1151-1167`), leaving the externally
+   served record `Unbound` without `driver-missing`. Likewise, `begin_bind` tests the protocol note
+   before moving the node to `Binding`, then attempts `Unbound -> Failed` for a missing/stale note and
+   ignores the refusal (`src/user/services/core/src/device_manager.rs:3313-3359`). A boot driver can
+   then disappear without a retained node; a volume-driver candidate list can be exhausted while its
+   record remains `Unbound` with no `protocol-mismatch`. This is the same fault-path class M3 requires
+   the state/cause table and logged refusals to prevent (`docs/todo/P02M0162.md:96-141,128-129`).
+
+2. **Rejecting a second terminal frame is not idempotent because it is returned to callers as a
+   retry.** Both the duplicate `READY` and duplicate `FAILED` branches correctly refuse the state
+   transition but return `Step::Again` (`src/user/services/core/src/device_manager.rs:3667-3683,
+   3714-3727`). `Step::Again` means retry everywhere else: phase one calls `begin_bind` again, while
+   phase two and the standing loop call `start_candidate` (`src/user/services/core/src/device_manager.rs:
+   898-918,1061-1077,547-553`). On an already-`Online` node that bind is illegal; `start_candidate`
+   interprets each refusal as a failed candidate and advances the cursor through the list
+   (`src/user/services/core/src/device_manager.rs:1200-1227`). The live binding is not torn down, but
+   later recovery/fallback selection has been mutated or exhausted by an event M3 says must change
+   nothing (`docs/todo/P02M0162.md:96-102,128-129`). The host test covers only the
+   `accepts_terminal_frame` predicate, not this production caller effect.
+
+Verification: `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline` passed
+all 61 tests. Those tests validate the state table but do not execute DeviceManager's above control
+flow, which is why both defects remain compatible with the green suite.

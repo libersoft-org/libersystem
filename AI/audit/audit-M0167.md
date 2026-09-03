@@ -1382,3 +1382,75 @@ during service bring-up, deterministically, before any of this round's code runs
 written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
 unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
 except the two new UEFI profile rows, which are gate rows rather than suite runs.
+
+AUDITOR'S RE-AUDIT ON M0167 (2026-09-03T03:12:09Z):
+
+Current implementation rating: 5/10
+
+1. **The candidate `--shadow-exec` route executes the active model's selection, not the candidate's,
+   so a real narrowing cannot earn its required execution sample.** `--candidate` is passed only to
+   the final comparison/recording commands. The boot/build target queries and the scoped guest,
+   host, dev, and grouped-build selections omit `candidate_arg` (`verify.sh:384-390,406,465,506,565`),
+   while the comparison receives it (`verify.sh:424,478,519,587`). For a genuine narrowing, the
+   active selection therefore contains keys outside the candidate's selected set, and
+   `compare_exec` correctly rejects those as extra execution rather than recording
+   `shadow_exec=true` (`src/tools/verify-model/src/shadow.rs:283-318`). The only five-change test still
+   constructs five `shadow::Record`s with hand-written `tree-{index}`/`changed-{index}` digests and
+   never runs a file change through `Planner` or a candidate
+   (`src/tools/verify-model/src/tests.rs:2113-2143`). The operational route and the exact real-planner
+   proof required by M5 therefore remain absent (`docs/todo/P02M0167.md:556-557,650-651`).
+
+2. **Candidate activation still does not enforce the subsystem risk bar, and a registry-only
+   narrowing can bypass even the generic trust bar.** The four parsed risk fields are only checked
+   for static consistency (`src/tools/verify-model/src/main.rs:1293-1318`); activation never checks
+   the risk row's required targets, distinct-change threshold, required change groups, or ABI flag.
+   Instead it calls the generic `Store::evaluate` only for components removed by entries in
+   `candidate.covers` (`src/tools/verify-model/src/main.rs:976-997`). Because the candidate carries a
+   complete replacement registry and `covers` defaults to empty, it can narrow selection through
+   ownership, escalation, or graph changes with no `covers` loss for that loop to visit. Base and
+   result-hash checks establish candidate identity, not evidence, so such a candidate reaches the
+   write path without either bar M5 requires (`docs/todo/P02M0167.md:559-570,652-653,660-661`).
+
+3. **M4 still neither orders nor budgets separately schedulable work by a truthful cost.** The
+   emitter applies the new conservative seed only when printing `STEPCOST`; its sort comparator uses
+   the unseeded estimate (`src/tools/verify-model/src/main.rs:1118-1124,1157-1162`). A current lowering
+   for `src/kernel/device.rs` consequently orders `concurrent-selection` and all profile boots before
+   one-second host suites even while printing costs of 1264/632 seconds for those boots. More
+   broadly, `commands::steps` still merges every other pre-guest gate and every conformance suite
+   (`src/tools/verify-model/src/commands.rs:216-265`): the current plan puts 50 gates, including
+   guest-booting `implementation-mutations`, `qemu-virtio-iommu-x86_64`, and `smp-core-cap`, in one
+   `STEPGUESTS 0`, `STEPCOST 25` step. Thus a budget can admit hours of guest work for a host-key
+   estimate, and those independently runnable gates still have no independent measured cost. Also,
+   explicit `--budget 0` is accepted by the parser but all budget behavior is guarded by
+   `BUDGET > 0`, so it means unlimited rather than "start nothing" (`verify.sh:108,168-170,750-755,
+   876`). These violate the cheapest-first, conservative-unknown, separately-timed, and nothing-fits
+   budget requirements (`docs/todo/P02M0167.md:387-395,420-424,445-458,648-649`).
+
+4. **Failed steps still contaminate both cost history and per-key freshness.** `record_step_id`
+   unconditionally stores a failed step's wall time in `History.steps`, and `step_seconds` later uses
+   it without a status check (`src/tools/verify-model/src/history.rs:152-159,383-390`). A fast failure
+   therefore becomes the measured cost of a successful future step. The same function stamps every
+   planned key failed/recent (`history.rs:210-237`), even though a merged `check.sh` command stops at
+   its first failing member and later members never ran. `discard-divided-costs` can repair old
+   entries only when manually invoked; ongoing failed merged executions immediately recreate the
+   false records. This is the exact failure-cost and failed-merged-freshness case M4 requires the
+   scheduler to avoid (`docs/todo/P02M0167.md:400-415,453-458`).
+
+5. **The registered scheduler proof is not hermetic in the dirty-worktree mode it is meant to test.**
+   `check-verify-scheduler.sh` invokes prepared keyless plans through `verify.sh` without
+   `--allow-shadow` (`src/tools/check-verify-scheduler.sh:22-31`). On the current dirty tree, all
+   scheduler assertions through the final guest-slot case execute, but `verify.sh` then performs its
+   unrelated trust/freshness judgement and exits 5 (`STALE`), so case 7 reports `both steps ran -
+   expected '0', got '5'` (`check-verify-scheduler.sh:178-195`). Consequently
+   `./check.sh --gate verify-scheduler` is currently red even though the slot trace itself is ordered
+   correctly, leaving the required standing execution matrix unable to prove the scheduler during a
+   normal change (`docs/todo/P02M0167.md:674-683`).
+
+6. **The production change boundary again drops the origin of a rename.** The shared parser correctly
+   retains both paths, but the `changes` command computes the origin path, discards it, and prints only
+   the destination (`src/tools/verify-model/src/main.rs:498-509`). `verify.sh` consumes that command's
+   output directly, so moving code out of a component into an unrelated or documentation path can omit
+   the component that lost the file from both selection and its per-component evidence. The regression
+   tests call `changes::paths` directly and therefore bypass the broken CLI serialization
+   (`src/tools/verify-model/src/tests.rs:893-918`). This contradicts M5's required change identity in
+   which a rename contributes both its origin and destination (`docs/todo/P02M0167.md:547-557`).

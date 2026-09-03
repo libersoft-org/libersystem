@@ -1419,3 +1419,39 @@ during service bring-up, deterministically, before any of this round's code runs
 written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
 unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
 except the two new UEFI profile rows, which are gate rows rather than suite runs.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0153 (2026-09-03T03:05:41Z):
+
+Current implementation rating: 7/10
+
+1. **The new one-tick live-fault bound starts only after userspace has already come up.** The sole
+   production call to `service_faults_if_due` is in `console_shell_loop`
+   (`src/kernel/main.rs:449-485`). Before that loop is entered, `supervise` drives driver and service
+   bring-up through repeated bounded scheduler slices (`src/kernel/main.rs:834-986`, especially
+   `889` and `923`) but never services the IOMMU event queue; its installed idle hook only pumps the
+   console. The next drain is `dma_policy::report`, after `supervise` returns
+   (`src/kernel/main.rs:1066-1104`). A protected virtio-net binding can therefore raise a fault while
+   it is starting and continue bus mastering for the whole boot/recovery window rather than at most
+   one tick. Bounding the post-boot console loop fixed the continuously-runnable-shell case, but the
+   response's broader claim that live faults are serviced at least once per tick under any load is
+   incomplete, leaving M5's live fault-to-containment requirement unmet.
+
+2. **An old undrained tail can indefinitely hide every fault raised by a replacement binding.** A
+   second revocation of the same endpoint deliberately merges with the oldest undrained tail
+   (`src/dma/src/lib.rs:1187-1197`), and every later event for that endpoint is stamped with that old
+   domain/generation until the *entire transport* is observed empty
+   (`src/dma/src/lib.rs:1308-1369`). If the endpoint is rebound before the old finite tail is drained
+   and the replacement keeps producing faults, the queue need never report empty: the replacement's
+   own events continue to be attributed to its predecessor, fail the current-generation comparison,
+   and never trigger live-binding containment (`src/kernel/iommu/mod.rs:1202-1218`). This is not only
+   the documented accounting imprecision between two ended bindings; a faulting *live replacement*
+   can sustain it. It violates M5's binding-generation attribution/containment and fault-storm
+   requirements and M4's exact per-binding fault accounting. The current tail tests terminate with
+   a dry queue and therefore do not cover this execution.
+
+Verification: `cargo test --manifest-path src/dma/Cargo.toml --offline` passed all 59 tests, and
+`./check.sh --gate virtio-iommu-protocol` passed. Those tests validate the corrected codec, bounded
+raw-event work, mapping lifecycle and ordinary dry-tail case; they do not exercise either production
+gap above. No source code was modified.

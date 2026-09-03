@@ -1591,3 +1591,40 @@ VERIFICATION FOR THIS ROUND (2026-09-03T02:30:00Z):
   `milestone-index`, `no-fixed-provider-slots`, `grant-vocabulary`, `one-wait`, `gate-oracles`,
   `test-tags`, `development-build`, `development-gate` - all clean. The tree was returned to the
   shipping configuration afterwards.
+
+AUDITOR'S RE-AUDIT ON M0164 (2026-09-03T03:06:02Z):
+
+Current implementation rating: 5/10
+
+1. **The dynamic block-provider count stops at DeviceManager; discovery and role assignment remain
+   capped at four and positional downstream.** DeviceManager now sends every phase-one block and
+   probe with a count, but its own current implementation still chooses them by ascending BDF
+   (`src/user/services/core/src/device_manager.rs:926-976`). ServiceManager keeps
+   `probe_blocks: [u64; 4]`, retains only three providers after the first, and explicitly closes every
+   later provider and probe (`src/user/services/core/src/service_manager.rs:517-531`;
+   `src/user/services/core/src/service_manager/bootstrap.rs:716-769`). It then assigns positions two,
+   three, and four directly to `FATBLOCK`, `ISOBLOCK`, and `UDFBLOCK` rather than selecting them from
+   format/origin (`src/user/services/core/src/service_manager/bootstrap.rs:422-465`). StorageService
+   has the same four-probe cap, so a fifth provider containing the loader-selected root UUID cannot be
+   considered (`src/user/services/storage/src/service.rs:188-233`). Thus the implementer's statement
+   that role assignment already uses format/origin/`RootSelection` is incorrect: UUID selection applies
+   only to the candidates that survive the four-slot cap, while the media format roles stay positional.
+   Although BDF ordering is deterministic rather than completion order, moving the count out of
+   DeviceManager did not complete M2 or the end-to-end no-fixed-count/role
+   requirements (`docs/todo/P02M0164.md:71-121,321-327,348-371`).
+
+2. **The USB providers still use the fixed DeviceManager slots and hand-written boot routing this
+   milestone requires removed.** `usb_client` and `usbq_client` remain singleton locals; `route_offers`
+   takes the first `block` and `usb-bus` offers into them, and the manager sends them under fixed `USB`
+   and `USBBUS` tags (`src/user/services/core/src/device_manager.rs:441-456,700-751,1232-1313`). The
+   implementer's response acknowledges these are left, but the milestone expressly includes
+   `usb-bus` so no hand-written route survives, requires services to subscribe at the old injection
+   seam, and says no fixed provider slot remains in DeviceManager (`docs/todo/P02M0164.md:35-46,
+   182-208,348-351,382-390`). Calling them “one slot per kind” does not satisfy that requirement; an
+   additional or replacement USB provider still cannot reach the StorageService/tool through the
+   catalogue path.
+
+Verification: the `system-manifest` host suite passed all 15 tests, and `check-no-fixed-provider-slots`
+and `check-one-wait` passed. The fixed-slot gate scans DeviceManager's numbered block-tag/count shape;
+it does not inspect ServiceManager/StorageService's four-element arrays or reject the two USB singleton
+routes, so those passes do not exercise either finding.

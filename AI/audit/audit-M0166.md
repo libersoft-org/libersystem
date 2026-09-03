@@ -1324,3 +1324,69 @@ VERIFICATION FOR THIS ADDENDUM (2026-09-02T23:55:00Z):
   `verify-scheduler`: clean. The tree was returned to the shipping configuration afterwards, which
   `development-gate` confirms.
 - Every temporary probe used for the diagnosis was removed before the final build.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0166 (2026-09-03T03:09:01Z):
+
+Current implementation rating: 5/10
+
+1. **`disable` mishandles both reachable in-flight states instead of using their teardown.**
+   `apply_policy` starts an operator stop only for `Online`; every other state is moved directly to
+   `Disabled` (`src/user/services/core/src/device_manager.rs:4199-4225`). A policy request can observe
+   `Binding` only after `begin_bind` has installed the process and claim in `node.binding`
+   (`device_manager.rs:3530-3537`), so the direct `Binding -> Disabled` leaves a live driver and claim
+   attached to a node reported disabled, with no `STOP` sent. For an existing `Stopping` teardown the
+   same direct move succeeds before either confirmation, and the code neither replaces
+   `teardown.intent` nor its landing; an unconfirmed resolution then cannot move the already-Disabled
+   record to `Quarantined` (`device_manager.rs:2589-2603`). This violates M1's explicit after-claim
+   `Binding -> Stopping` case, its rule that a second disable replaces the in-flight intent, and the
+   rule that every unconfirmed teardown is quarantined (`docs/todo/P02M0166.md:48-74`).
+
+2. **A retry parked for a missing requirement regains the automatic retry budget.** A granted
+   operator retry correctly starts with `attempt = MAX_AUTOMATIC_ATTEMPTS - 1` and `retry_once = true`
+   (`src/user/services/core/src/device_manager.rs:4323-4363`). If its requirement is absent,
+   `gate_on_requirements` parks it in `DependencyPending`; when the provider later arrives,
+   `settle_dependencies` unconditionally resets `attempt` to zero
+   (`device_manager.rs:3151-3161,4027-4031`). A retryable failure after that bind can therefore take
+   `Step::Again` repeatedly, because `retry_once` is consumed only on `Step::NextCandidate`
+   (`device_manager.rs:547-565`). The operator asked for one attempt but can receive the full automatic
+   budget, contrary to the paired dependency-pending/exactly-one requirement
+   (`docs/todo/P02M0166.md:241-243`).
+
+3. **A stored selection can still be skipped at the next bind.** The live `select` fix sets
+   `selection_pending`, which is what prevents `spend_candidate` from overwriting a cursor at or
+   before the candidate that just ran (`src/user/services/core/src/device_manager.rs:3201-3224,
+   4280-4287`). `load_stored_policy` sets the same `candidate` and `preferred` fields but omits that
+   flag (`device_manager.rs:4629-4640`). Because stored policy arrives after driver bring-up, selecting
+   the currently running candidate, or an earlier candidate while a fallback is running, is advanced
+   past when that binding ends instead of being tried next. The latest helper test never executes
+   this production load/spend composition, so the claimed stored/live equivalence is incomplete.
+
+4. **Persistent disable and selection overwrite one another.** Both verbs write the same
+   `device.policy.<bdf>` scalar as either `disabled` or `select=<artifact>`, and `enable` removes that
+   whole key (`src/user/services/core/src/device_manager.rs:3913-3919,4561-4585,4605-4629`). Selecting
+   while disabled therefore leaves the current node disabled but drops that disable on the next
+   load; disabling after a selection drops the persistent preference; enabling then removes any
+   selection stored in the same slot. This contradicts the contract that both `disable` and `select`
+   persist independently and the implementation's own promise that a selection outlives a later
+   disable (`docs/todo/P02M0166.md:148-170`; `device_manager.rs:4249-4257`).
+
+5. **Persistent verbs can report `Accepted` and mutate the node when nothing was stored.** The policy
+   endpoint tests only whether ConfigService's `set`/`remove` RPC returned an outer `Some`, so
+   `Some(Err(...))` is treated as a successful write (`src/user/services/core/src/device_manager.rs:
+   3909-3929`; the generated methods return `Option<Result<(), Error>>`). ConfigService also discards
+   the backing volume's write result and returns `Ok(())` after only updating its in-memory tree
+   (`src/user/services/core/src/config_service.rs:116-143,218-242`). An RPC-level `Err` or failed disk
+   write can consequently produce `Accepted`, apply the live effect, and lose it on restart. That is
+   the precise case for the protocol's `not-stored` outcome, whose contract says
+   the binding must remain unchanged (`src/idl/device.lsidl:187-205`).
+
+6. **The latest response still does not close the required production policy proof.** The
+   `driver-binding` test covers retry verdict/arithmetic and artifact lookup, but not any of
+   DeviceManager's effects above (`src/user/libs/driver/binding/src/tests.rs:736-810`); the response
+   itself concedes that no registered test invokes `apply_policy`. `dev-gpu-restart` exercises only
+   `disable`/`enable`, not `select`, retry through `DependencyPending`, or quarantined future policy.
+   Thus the explicit under-test select, one-shot retry, and quarantine requirements remain unmet
+   (`docs/todo/P02M0166.md:239-246`), and the functional defects above all survive the cited helper
+   suite.

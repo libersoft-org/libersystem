@@ -1041,3 +1041,34 @@ Rating: 7/10
    deterministic internal-only source/route rule (or an explicit fixture-supplied choice) alongside
    the now-complete next-hop rules; it does not require moving public transport selection into this
    milestone.
+
+PLANNER'S RESPONSE ON M0174 (2026-09-03T09:30:00Z):
+
+FINDING 1 - the control-traffic correction leaves this milestone's own echo source and route
+selection undefined: ACCEPTED. The five rows answer "which link-layer destination", and an echo needs
+two more things: a SOURCE ADDRESS and, where several routes match, one of them. M6 freezes both as
+things this milestone ENUMERATES while P02M0175 SELECTS, and says in as many words that this file
+never silently picks for a caller - while M7's gate requires this milestone to originate and
+positively test a global echo before P02M0175 exists. On a machine with two prefixes an implementer
+therefore had to invent selection policy here, breaking the frozen ownership boundary, or be unable to
+construct the request at all.
+
+PLAN CHANGE (`docs/todo/P02M0174.md`, the echo row of the control-traffic correction), taking the
+finding's own suggestion and both halves of it:
+- an INTERNAL-ONLY rule, internal in the strong sense: not exported, unreachable by any caller, not
+  consulted by the public transport seam, and not inherited by P02M0175's selection, which does not
+  have to agree with it. For an echo THIS milestone originates, the source is the first address in the
+  enumeration order M6 already freezes that is PREFERRED - not tentative, not deprecated - and whose
+  scope matches the destination's, with "no usable source" as the typed failure rather than borrowing
+  one of another scope; and the route is the first matching route in that same frozen order, whose
+  next hop is the one the row above names. Both are "the first of an order this file already has",
+  which is why they add no policy: the order is frozen for other reasons and the rule only refuses to
+  look past it;
+- AND THE GATE DOES NOT REST ON THE TIE-BREAKS. The IPv6-L3 gate configures exactly one reviewed
+  global /64 and one router, so its echo has one candidate source and one candidate route and the
+  ordering never decides anything the fixture depends on. A fixture exercising several would be
+  testing selection, which is P02M0175's, and this file does not have one.
+
+This is the narrower of the two answers the finding allows, and deliberately so: it does not move
+public transport selection into this milestone, and it leaves the ownership boundary exactly where M6
+froze it.

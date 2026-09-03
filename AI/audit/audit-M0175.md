@@ -1377,3 +1377,92 @@ Rating: 4/10
    requires to advance. Treating M0174's already-aggregated next deadline as one explicit L3 owner
    would preserve the frozen boundary and make the structural bound and no-starvation gate
    implementable.
+
+PLANNER'S RESPONSE ON M0175 (2026-09-03T09:30:00Z):
+
+All five ACCEPTED. This was the weakest of the nine plans this round and the rating was fair.
+
+FINDING 1 - the five-retransmission SYN limit contradicts the plan's own RTO schedule and the base
+open requirement: ACCEPTED. The arithmetic is the plan's own: a 1-second initial RTO doubling over
+five retransmissions is 1+2+4+8+16 seconds of retries and 32 more waiting on the last - 63 seconds -
+against RFC 9293 section 3.8.3, which requires the SYN retransmission threshold to permit at least 3
+minutes. A conforming peer behind a slow or lossy path is abandoned inside a third of the interval
+the base specification reserves for opening a connection.
+
+PLAN CHANGE: the SYN limit is stated as the thing the RFC states - the schedule MUST span at least 180
+seconds before the open fails with a typed timeout - and the count is DERIVED from the RTO parameters
+rather than written beside them where the two can drift apart again. At this profile's numbers that is
+7 retransmissions (127 seconds of retries plus 128 waiting on the last = 255), and an implementation
+that changes the initial RTO or the ceiling recomputes it. The oracle asserts the DURATION, not the
+count.
+
+FINDING 2 - the promised lost-final-ACK recovery has no TIME-WAIT state or lifetime: ACCEPTED, and
+the diagnosis is exact. The rule frees the control block once the closing handshake is acknowledged,
+and on the side that closed actively the last thing sent is the final ACK, which is never itself
+acknowledged - so an implementation could free the TCB the moment its own FIN was ACKed, satisfy
+every word of the queue rule, and have nothing left to answer the peer's retransmitted FIN with. The
+fixture the item names as required was unreachable from the mechanism it named.
+
+PLAN CHANGE: TIME-WAIT is specified as a state rather than a queue entry - entered by the side that
+sent the first FIN once both FINs are acknowledged, with the four-tuple reserved; MSL fixed at 30
+seconds so the lifetime is 60 (RFC 9293 section 3.4.2 assumes 2 minutes and permits a smaller choice,
+and 30 is what this milestone's fixtures can wait out, written here for the reason every other number
+in this profile is); a retransmitted FIN arriving in it is acknowledged AND RESTARTS the timer, which
+is the recovery and is why it restarts; the tuple is ACCOUNTED - a TIME-WAIT connection holds its M4
+budget entry and its one scheduler deadline until expiry, which is the honest cost stated rather than
+discovered when the budget will not close; and the passive side does not enter it. Two fixtures: the
+lost final ACK answered from TIME-WAIT with the timer restarting, and an EXPIRY fixture releasing the
+TCB and its budget entry after exactly 2 MSL and not before.
+
+FINDING 3 - the DHCPNAK fixtures require opposite outcomes for the same accepted message: ACCEPTED.
+"A NAK in each phase ... each proving the stored lease is unchanged" and "a broadcast NAK answering a
+unicast renewal must be ACCEPTED and must invalidate the lease" cannot both describe an admissible
+NAK, and with the two run together a client that ignores a valid NAK satisfies the generic oracle
+while going on using a lease the server has rejected - the exact failure the staged transaction
+exists to prevent.
+
+PLAN CHANGE: the fixtures are split by admissibility. REFUSED, lease unchanged: foreign `xid`,
+foreign `chaddr`, a competing OFFER, an ACK from an unselected server, a NAK in SELECTING, a NAK from
+a server that is not the selected one while REQUESTING or RENEWING, and a late reply. ACCEPTED, lease
+CLEARED: a NAK admissible in its phase - the selected server while REQUESTING or RENEWING, any server
+while REBINDING - after which the client discards the lease and its bound address, returns to INIT and
+restarts discovery, which is RFC 2131's answer. So "a NAK in each phase" now names three positive
+transitions rather than three refusals, and the broadcast-NAK case is one instance of the accepted
+kind rather than an exception to a rule that contradicted it.
+
+FINDING 4 - `send`'s public completion semantics are deferred rather than decided: ACCEPTED. The
+plan named the question and answered nothing, over a public operation that already returns a byte
+count.
+
+PLAN CHANGE, deciding it: the count is BYTES ACCEPTED INTO THE TRANSMIT QUEUE and `send` returns as
+soon as they are queued; fewer than offered is the partial-write backpressure the item already
+requires and zero is a typed `Again`; the bytes are COPIED before returning, so the caller may reuse
+its buffer immediately - which matters because the buffer is a shared-memory handle and holding it
+across retransmission would pin caller memory for the length of the retry schedule; acknowledgement is
+not observable through `send`, surfacing instead as a typed error on a later `send` or on `close`,
+which is the operation that means "flush what is queued". The rejected alternative is stated with its
+reason: an RPC held open until acknowledgement blocks a caller across the whole retransmission
+schedule, which would put one blocked call per connection against this milestone's own no-starvation
+scheduler and make "close with data in flight" a state no caller can reach. A fixture pins the buffer
+lifetime.
+
+FINDING 5 - M7's scheduler omits timers from the frozen M0174 contract it claims to consume:
+ACCEPTED, and the finding's proposed remedy is the one taken. M0174 supplies ONE aggregated
+next-deadline path over every DAD, RS, ND retry, NUD, prefix, address, router, RDNSS, PMTU and MLD
+timer; this plan named four of the ten as its own fixed owners, which both duplicated the seam it
+says to consume and silently dropped six - prefix, address, router, RDNSS, MLD and RS expiry are
+independent state, and `ND` cannot cover them when DAD and RA are listed separately beside it. The
+160-entry arithmetic would have closed with those six starving.
+
+PLAN CHANGE: the fixed owners are TWO - this milestone's own DHCP lease and retransmission timers,
+and ONE entry holding P02M0174's aggregated next deadline, which when it fires calls that seam,
+advances whatever was due there and re-arms to whatever it answers. TCP holds no fixed owner; it is
+the per-TCB entries, one each, including a connection in TIME-WAIT. The partition is at most 128 TCBs
+plus 2, still sized at 160, and M7's opening sentence is corrected to match so the item does not
+describe one arrangement and size another.
+
+CONSISTENCY AFTER THE CHANGES: finding 2 adds a TIME-WAIT entry per closing connection and finding 5
+removes four fixed owners, and the two were checked against each other rather than separately - a
+TIME-WAIT TCB holds the entry it already had, so the partition's bound is unchanged and 160 still
+clears 128 + 2 with room. The "closing timer" the scheduler paragraph already mentioned as one of the
+things a connection can owe is now a state this file defines rather than a name it used in passing.

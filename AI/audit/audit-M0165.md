@@ -1483,3 +1483,41 @@ VERIFICATION FOR THIS ADDENDUM (2026-09-02T23:55:00Z):
   `verify-scheduler`: clean. The tree was returned to the shipping configuration afterwards, which
   `development-gate` confirms.
 - Every temporary probe used for the diagnosis was removed before the final build.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0165 (2026-09-03T03:09:01Z):
+
+Current implementation rating: 6/10
+
+1. **`virtio_blk` certifies a clean stop even when its required flush failed.**
+   `flush_request` returns `false` when the queue cannot carry the request, the device does not
+   complete it, or the device status is not `BLK_S_OK`
+   (`src/user/drivers/core/src/virtio_blk.rs:160-170`; `src/user/drivers/core/src/virtio.rs:375-428`).
+   The planned-stop path discards that result, then resets the device and calls `finish_stop`, which
+   emits `STOPPED` whenever the reset succeeds (`virtio_blk.rs:254-262`;
+   `src/user/drivers/core/src/common.rs:824-836`). Thus accepted writes can remain unflushed while
+   DeviceManager records a clean planned stop. M3 requires the flush before `STOPPED`, and says a
+   forced path must never claim a clean flush (`docs/todo/P02M0165.md:128-147`).
+
+2. **The earlier `device_quiesced` correction still omits the kernel attestation on live degraded
+   paths.** Both degraded `virtio_blk` stands pass device handle `0`, including the `no channel`
+   branch after a queue (and its real device capability) was successfully created
+   (`src/user/drivers/core/src/virtio_blk.rs:68-93`). `virtio_console` likewise passes `0` whenever
+   its transmit queue setup fails, even though the device capability exists and its receive queue
+   may already own DMA (`src/user/drivers/core/src/virtio_console.rs:22-38`). The shared stop path
+   still resets the remembered virtio transport, but `finish_stop` skips `device_quiesced` for zero
+   and nevertheless sends `STOPPED` (`src/user/drivers/core/src/common.rs:451-454,824-836`). The
+   implementer's claim that these paths have no usable capability is therefore incorrect; M3's
+   reset/`device_quiesced`/`STOPPED` sequence and M5's honest resource release remain incomplete.
+
+3. **The publish/crash/subscribe production-effects proof remains incomplete after the latest
+   extraction.** The named test now drives `apply_withdrawal` with a recorder and correctly proves
+   its generic close-before-announce loop (`src/user/libs/driver/binding/src/tests.rs:600-655`). It
+   still does not drive `Catalogue`'s production `close` syscall, its `announce` send, or the
+   production call to that loop (`src/user/services/core/src/device_manager.rs:2098-2112,2379-2441`).
+   Emptying either production trait method, or bypassing the effects call while returning the
+   withdrawal count, leaves the cited recorder test green. This is the exact material gap the prior
+   audit identified: M7 requires the named race to establish no leaked provider channel and no stale
+   subscriber metadata, not only that a generic recorder received two callbacks
+   (`docs/todo/P02M0165.md:280-314`).

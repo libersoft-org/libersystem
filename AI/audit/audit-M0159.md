@@ -1266,3 +1266,25 @@ VERIFICATION FOR THIS ADDENDUM (2026-09-02T23:55:00Z):
   `verify-scheduler`: clean. The tree was returned to the shipping configuration afterwards, which
   `development-gate` confirms.
 - Every temporary probe used for the diagnosis was removed before the final build.
+
+AUDITOR'S RE-AUDIT ON M0159 (2026-09-03T03:06:02Z):
+
+Current implementation rating: 8/10
+
+1. **M4 still has no effective assertion that a frame reaches the display after the GPU rebind.**
+   The milestone requires `virtio-gpu` to bind, present, and survive a restart, specifically rejecting
+   evidence that establishes only an online driver or a cold bring-up (`docs/todo/P02M0159.md:94-97`).
+   The replacement-provider path is now implemented, but `exercise_the_display` explicitly records
+   that `a frame did NOT reach the display` cannot appear on the serial log after boot and therefore
+   that its absence proves nothing (`src/harness/dev-gpu-restart.py:151-166`). The function nevertheless
+   uses that unobservable line as its only negative presentation check; its actionable assertion is
+   only that the serial shell returns a prompt after `clear` (`src/harness/dev-gpu-restart.py:167-180`).
+   A live serial prompt does not establish that DisplayService adopted the generation-2 provider or
+   that a present reached its scanout. The cited kernel/default-profile checks prove frames on separate
+   cold boots, before any driver restart. Consequently the reported passing `dev-gpu-restart` can still
+   pass when post-rebind presentation is broken, and the implementer's claim that M4 is exercised is
+   incomplete.
+
+Verification: reviewed the current restart harness, ConsoleService's one-per-outcome presentation
+reporting, and the current M4 requirement. The existing cold-boot/QEMU pass cannot close this
+post-rebind observability gap.

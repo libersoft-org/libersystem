@@ -1589,3 +1589,55 @@ Rating: 6/10
    tags, so ServiceManager still has no unambiguous endpoint to deliver to PermissionManager. Name the
    admin `serve-root` tag and the `FONTADMIN` row's exact provider/source/interface tuple, then gate
    that the ordinary and admin rows resolve to different roots.
+
+PLANNER'S RESPONSE ON M0136 (2026-09-03T09:30:00Z):
+
+FINDING 1 - the caller-funded RESOLVE-INTO does not produce the immutable read-only backing the
+shared font-resource contract requires: ACCEPTED, and every mechanical claim in it checks out.
+`SYS_MEMORY_OBJECT_CREATE` installs the creator's handle with `Rights::ALL`; `HandleTable::duplicate`
+narrows only the NEW handle and neither removes rights from the original nor revokes an existing
+mapping; and this kernel has no seal for a `MemoryObject` - I looked, there is one for a ConfigService
+connection and nothing for memory. So after RESOLVE-INTO the caller holds a writable handle to the
+bytes, and attenuating the catalogue's temporary copy does not change that. Two clauses called the
+result "a read-only MemoryObject" and a third required "an immutable validated backing"; none of the
+three was obtainable, which is the decoration this file refuses elsewhere.
+
+PLAN CHANGES, freezing ONE realizable immutability transition rather than inventing a kernel
+authority this milestone does not own:
+- the RESOLVE row states plainly that the result is NOT a read-only object and why, from the three
+  syscall facts above;
+- immutability is located where it can be obtained: the transport buffer is the caller's and is only
+  that - not the face's backing, and nothing derived may point into it - while the FONT LIBRARY, in
+  the client's own address space, TAKES OWNERSHIP by copying the validated bytes into library-owned
+  storage before parsing, and every decoded structure references that copy. It is named as what it is:
+  an in-process ownership rule enforced by the library's API taking the bytes rather than borrowing
+  them, not a right the kernel withholds;
+- IDENTITY IS THE CATALOGUE'S. RESOLVE-INFO answers the identity and generation for the face the
+  catalogue read from the FILE; a client rewriting its own buffer has changed nothing about what that
+  identity names, and "two loads of the same bytes are one face" is the catalogue's statement, not a
+  digest a client computes over memory it can write;
+- the two "read-only MemoryObject" clauses and the shared-contract clause are corrected to match;
+- what is left undefended is named rather than papered over: a client can corrupt its OWN parse by
+  writing between RESOLVE-INTO and the library taking ownership. That is a caller harming itself
+  inside its own Domain, no other client or cache is affected, and this system does not undertake to
+  prevent it anywhere else either;
+- a gate: writing the transport buffer after the library has taken ownership leaves the decoded data,
+  identity and cache entries unchanged.
+
+FINDING 2 - the admin-route correction omits the identifier that selects the admin serve root:
+ACCEPTED. Verified against the manifest contract: `provider` names the SERVICE and `source` names one
+of that provider's `serve-root` TAGS; an empty `source` defaults to `SERVE`; and validation refuses a
+source the provider does not offer. The plan said "its source is the font catalogue service", which
+gives one answer for two different fields - so the row as described selects the ORDINARY root, which
+validates cleanly and mints the operator capability from the wrong endpoint.
+
+PLAN CHANGES:
+- the ENDPOINT line names the tag: a second `serve-root` role ON the font catalogue, tagged `ADMIN`,
+  because a client row selects a root by tag and "a second serve endpoint" is a description;
+- the ROLE line gives the exact tuple - `tag = "FONTADMIN"`, `kind = "client"`,
+  `provider = "font_catalogue"`, `source = "ADMIN"`, `interface` the `font-catalogue-admin` interface
+  - and states the precedent it copies: `STORAGE_ADMIN` is a client of StorageService's `ADMIN` root
+  and not of its `SERVE` root, the two granting different authority over the same volume. It also
+  says what omitting `source` would do, since that is the mistake that passes every existing check;
+- a GATE line: the ordinary `font-catalogue` row and the `FONTADMIN` row resolve to DIFFERENT serve
+  roots of the same provider, asserted rather than assumed.

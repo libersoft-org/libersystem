@@ -1606,3 +1606,21 @@ VERIFICATION FOR THIS ROUND (2026-09-03T02:30:00Z):
   `milestone-index`, `no-fixed-provider-slots`, `grant-vocabulary`, `one-wait`, `gate-oracles`,
   `test-tags`, `development-build`, `development-gate` - all clean. The tree was returned to the
   shipping configuration afterwards.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0151 (2026-09-03T03:05:41Z):
+
+Current implementation rating: 10/10
+
+No unresolved material issue was found. The current code supports the latest response's substantive
+claims: each discovery row remains a direct boot; the two ordinary UEFI rows explicitly reject the
+static fallback; each no-device-tree row builds a private loader which withholds the DTB and passes
+the matching compile-time authorization to the kernel; and both kernel DT locators suppress their
+low-memory fallback scan only for that named profile. The standalone row registrations and model
+catalogue entries are present, and the RISC-V loader conversion reads the configured
+`CARGO_TARGET_DIR` rather than a shared output.
+
+Verification: `cargo test --manifest-path src/fdt/Cargo.toml --offline` passed all 87 tests; the
+profile, loader-build, kernel-test and QEMU runner scripts pass `bash -n`; and all four UEFI/no-DT
+rows are independently registered in `check.sh`. No source code was modified.

@@ -1213,3 +1213,35 @@ during service bring-up, deterministically, before any of this round's code runs
 written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
 unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
 except the two new UEFI profile rows, which are gate rows rather than suite runs.
+
+---
+
+AUDITOR'S RE-AUDIT ON M0098 (2026-09-03T03:05:41Z):
+
+Current implementation rating: 7/10
+
+1. **A forced release can publish `Free` while an MMIO mapping is still live or its teardown is still
+   in progress.** `DeviceMemory::teardown_mapping` swaps `RESERVED` to `REVOKED` and immediately
+   reports success (`src/kernel/object/device_memory.rs:173-183`), but `RESERVED` does not mean that
+   no mapping exists: `SYS_DEVICE_MEMORY_MAP` installs all PTEs before attempting the commit
+   (`src/kernel/syscall/mod.rs:1110-1128`). The existing regression test demonstrates the bad
+   interval directly: it installs a present PTE, calls `device::release_claim` and lets that release
+   complete, and only afterwards observes the rejected commit and removes the PTE
+   (`src/kernel/object/claim/tests.rs:523-537`). Thus the tombstone prevents publication of a mapping
+   after release, but it does not make release synchronous with removal of mapping work already
+   installed; during that interval the raw virtual address still reaches the BAR while the claim can
+   already be reclaimed. The builder's rollback also frees the range without the cross-core TLB
+   shootdown used by committed teardown, so another core may retain the translation after the PTE is
+   cleared.
+
+   The weak derived-object ledger has the same missing completion handoff: once another thread has
+   dropped the last strong `Arc`, `Weak::upgrade` can fail while `DeviceMemory::drop` is still running,
+   and `revoke_derived` treats that row as quiet (`src/kernel/device.rs:964-1005`) even though the
+   destructor has not yet finished its unmap/shootdown and discards a failed confirmation
+   (`src/kernel/object/device_memory.rs:234-255`). Both paths violate the milestone's requirement that
+   raw MMIO access be gone, and any unconfirmed teardown keep the claim out of `Free`, before forced
+   release returns (`docs/todo/P02M0098.md:246-261`). The current test's final no-mapping assertion is
+   too late to prove that ordering; it first permits the release to finish with the mapping present.
+
+Verification: the current source, the complete audit exchange, and the claim/MMIO lifecycle tests
+were inspected. No source code was modified.

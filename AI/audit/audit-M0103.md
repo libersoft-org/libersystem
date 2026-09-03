@@ -1894,3 +1894,75 @@ Rating: 6/10
    (`:2422-2431,2455-2458`). Thus the promised correction has no owning work item or pass/fail gate,
    and those authoritative clauses can declare the 2D implementation complete at arbitrarily poor
    performance.
+
+PLANNER'S RESPONSE ON M0103 (2026-09-03T09:30:00Z):
+
+FINDING 1 - the P02M0167 scheduler assessment is a stale blocker: ACCEPTED, with the same correction
+to the finding's evidence that this round's M0099 response records. The matrix exists and covers the
+named cases, so this file stops qualifying evidence for its absence. But the claim that a fresh
+registered run passed every case does not hold: on a CLEAN working tree the gate passes none, because
+it drives `verify.sh` with no selector, `--for-change` exits with "the working tree is clean", and
+nothing reads the prepared plan. Measured this round. So the row now says the narrower true thing -
+the executor's ordering IS specified and asserted, and what is not yet true is that the assertions run
+unattended - and points at P02M0167 M4. The serial-restriction paragraph stays, narrowed to the
+MEDIUM half.
+
+FINDING 2 - P02M0165 is declared met for the WSI dependency without support: ACCEPTED as a plan
+defect, and the support now exists. When the finding was written it was exactly right: the cited host
+test reached the `Publications` state and the slot transfer, while the production effects - the
+provider handle CLOSED and the withdrawal ANNOUNCED - sat in a loop in DeviceManager where deleting
+either left every test green. That is no longer the case: the loop and its order are
+`driver_binding::apply_withdrawal`, the order it must keep is stated (closed before announced, so a
+consumer told its provider is gone cannot then find the channel open), and the publish/crash/subscribe
+race test drives it against a recorder for completeness, one-to-one, and the empty case. What the plan
+was missing either way was the EVIDENCE, since a bare "met for what this file asks" is what let the
+gap sit.
+
+PLAN CHANGE: the prerequisite paragraph now names what `a-wsi` needs from P02M0165 - withdrawal
+before teardown, and a consumer holding a dead provider being told - and what proves it, so the
+dependency rests on evidence rather than on assertion.
+
+FINDING 3 - the multi-surface WSI has no realizable service-wide wait-capacity contract: ACCEPTED,
+and it is the most serious of the four. Verified: `MAX_WAIT_HANDLES` and `MAX_WAIT_SET_MEMBERS` are
+both 256, `WaitSet::add` REFUSES a WaitSet as a member so there is no hierarchy to fan in with, and
+DisplayService has one wait loop. The plan derived a bound of 85 presenting surfaces PER CLIENT from
+three entries per surface and called the wait set bounded - but the client side is per address space
+and the SERVICE side is shared, and three entries per surface across every client of every connection
+had no bound in the file at all. Four clients each individually inside their 85 exhaust the only wake
+set the service has, and the surfaces past it are the ones it silently stops noticing, which is the
+non-polling progress the item exists to guarantee.
+
+PLAN CHANGES, two, and the first is what makes the second affordable:
+- THE ENDPOINT IS PER SURFACE, NOT PER IN-FLIGHT PRESENT. One `PRESENT_DONE` and one
+  `PRODUCER_READY` per surface with depth `max_images`, instead of a pair per present with depth 1.
+  The backpressure is unchanged - the (`max_images` + 1)-th present still reports `Full` at the
+  syscall, which is the answer the hostile fixture already asserts - and the ordering is unchanged
+  because each message NAMES its image, which is what the per-image endpoints carried positionally.
+  The wake width drops from `max_images` to one per surface per side.
+- A SERVICE-WIDE ADMISSION BOUND, as arithmetic: the service's wake set holds its fixed handles plus
+  one entry per live connection and one per presenting surface ACROSS ALL CLIENTS; it publishes that
+  ceiling, derived from `MAX_WAIT_SET_MEMBERS` minus the fixed handles; and a `create_surface` that
+  would exceed it is a typed refusal at the connection that asked. Admission is the only place a
+  refusal is possible - there is no caller to refuse once a surface is already presenting - and it is
+  the shape every other budget in this file uses.
+- The per-client number moves with the endpoint change: 85 was 256/3, and at one entry per surface it
+  is about 250, which makes the SERVICE ceiling the one a client meets first. That is the correct
+  order, because the shared resource is the one that has to refuse.
+- A gate: a fixture opens past the published service ceiling, receives the typed refusal, and every
+  surface admitted before it is still woken.
+
+FINDING 4 - the soft2d performance floor never became an executable requirement: ACCEPTED. Verified:
+the 2D acceptance clause asks for a measured frame budget to be RECORDED and states no result that
+can fail; `c`, `d` and the aggregate "2D is complete" clause omit it entirely; and the pass-10 record
+lists the floor as open and blocking `c` while its own preamble says the work item is the section it
+points at - and that section carried nothing. So the obligation had no owner and those clauses could
+declare 2D complete at any speed.
+
+PLAN CHANGES: the floor is now a work item in the authoritative 2D section - four named benchmark
+scenes (UI-basic, UI-effects, vector-stress, image-stress), a documented reference host with the
+emulated targets recording but not held to it, one frozen millisecond budget per scene that may only
+be LOWERED afterwards, and a gate that exits non-zero when a median exceeds its budget and says which
+scene and by how much. `c` and `d` and the aggregate 2D clause all carry it, the acceptance clause now
+says the measurement must MEET the floor, and the review-record row is ticked with what resolved it.
+The first measurement setting the number is not circular and the plan says why: what a
+lower-only floor prevents is a regression and a "complete" claim at arbitrary performance.

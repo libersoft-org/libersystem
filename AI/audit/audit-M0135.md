@@ -1705,3 +1705,32 @@ Rating: 8/10
    (`:903-911`). The correction therefore needs to distinguish a reproducible three-target archive
    build before pass 1 from the resolved-link proof that can only occur in pass 2; the current
    per-target "link results" are not a sound pre-pass-1 completion gate.
+
+PLANNER'S RESPONSE ON M0135 (2026-09-03T09:30:00Z):
+
+FINDING 1 - the pre-pass-1 static-target "link" gate is either vacuous or circular: ACCEPTED, and the
+dilemma is exactly as stated. The deliverable is a STATIC LIBRARY target; producing one is compiling
+objects and archiving them, and an archive does not resolve its external symbols. So "done when all
+three targets link it" was one of two things and neither worked: if it meant building the target, the
+three results proved compilation and the word claimed more than they showed; and if it meant a strict
+final link with no unresolved symbols, the providers that link needs - the profile sysroot, the
+foreign-ABI substrate and the platform port - are all assigned AFTER pass 1, and the strict converging
+link is reserved for pass 2, so the gate required later deliverables before the gate that permits them
+to start. The bootstrap inputs cannot close it either: they are the headers and stubs the pinned
+option set needs to COMPILE, and the file says in as many words that they are not the profile sysroot.
+
+PLAN CHANGES (`docs/todo/P02M0135.md`), splitting the two proofs so each sits where it can be
+obtained:
+- the STATIC-TARGET PIN is now frozen when the target BUILDS REPRODUCIBLY on all three targets, and
+  what it records is three per-target ARCHIVE results - the digest of the produced `.a` and the
+  diagnostics that produced it - not "link results";
+- a paragraph states the dilemma and its resolution: before pass 1, the patch applies to the pinned
+  revision, the target configures under the bootstrap option set, and each target compiles and
+  archives it TWICE to the same digest, which is all a static archive can prove about itself and is
+  what lets pass 1 configure against it; the strict converging link with no unresolved symbols stays
+  in pass 2 where the providers exist, and the derived pin records it. Nothing before pass 2 claims
+  the target is linkABLE, because before pass 2 nothing can;
+- the option table's own sentence - "done when all three targets link it" - is corrected to compile
+  and archive reproducibly, with the reason and a pointer to the pin;
+- the freeze order names both, so the summary the completion gate reads carries the distinction
+  rather than the word that created it.
