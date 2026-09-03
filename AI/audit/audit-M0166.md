@@ -1219,3 +1219,108 @@ during service bring-up, deterministically, before any of this round's code runs
 written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
 unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
 except the two new UEFI profile rows, which are gate rows rather than suite runs.
+
+ADDENDUM (2026-09-02T21:40:00Z) - A POLICY GAP THAT ONLY BECAME VISIBLE WHEN THE DEV INSTANCE BOOTED:
+
+The response above says the production exercise of a policy VERB is still `dev-gpu-restart`'s
+disable/enable. It is not, today: that check now runs - the development instance boots again - and
+its disable is REFUSED. `lsdev --disable` in that guest reports "this boot granted no device-policy
+authority", so no operator verb can be driven there at all.
+
+Measured before writing it down, so the next pass starts from a fact: the supervisor mints the
+operator endpoint (`policy_admin` live), `service_connect` on it succeeds (`policy_conn` live), and
+PermissionManager holds the resulting client (`caps.take(CAP_DEVPOLICY)` non-zero). The launched
+program receives 0 under that tag. So the loss is inside the grant - `grant_handle`'s duplicate for
+`Capability::DevicePolicy` - or in the launch path not asking for it. `lsdev`'s READ half works in
+the same guest through the same launch, which is what makes this the capability rather than the
+launch mechanism.
+
+It is added to the Definition of Done as its own line rather than folded into the existing one,
+because it fails separately: the namespace authority proved this round is about who may WRITE a
+stored policy, and this is about whether an operator's tool is handed the endpoint at all.
+
+VERIFICATION FOR THIS ADDENDUM (2026-09-02T21:40:00Z):
+
+- The development instance reaches an attached shell in 95 s, twice, on the final tree: DisplayService
+  online, PermissionManager online, ConsoleService online, and `ConsoleService: a frame reached the
+  display`. Before the fix it stalled at the same point on every attempt, at one core and at four.
+- `one-wait`: clean on the fixed tree, and watched to FAIL with the defect reintroduced - it named the
+  literal wait and its line.
+- x86_64 kernel suite, same scope as the round above: 239 passed, 0 failed.
+- `qemu-virtio-iommu-x86_64` on a freshly built image: unchanged, including "the display driver runs
+  and a frame reached the screen".
+- `verify-model`: 117 passed with the new gate row (`GATES` 66 -> 67).
+- `no-suppression`, `source-hygiene`, `bootstrap-plan`, `milestone-index`, `no-fixed-provider-slots`,
+  `declared-interfaces`, `development-build`, `development-gate`: clean. The tree was returned to the
+  shipping configuration afterwards, which `development-gate` confirms.
+- Every temporary probe used for the diagnosis was removed; `no-suppression` and `source-hygiene` were
+  re-run after that removal.
+
+SECOND ADDENDUM (2026-09-02T23:55:00Z) - THE POLICY GAP IS CLOSED, AND IT WAS TWO DEFECTS:
+
+The addendum above recorded that `lsdev --disable` reports no device-policy authority and named where
+the loss had to be. It was there, and there was a second one behind it. Both are fixed and the
+operator path now runs end to end on a live machine.
+
+1. THE GRANT WAS NEVER SENT. PermissionManager delivers a launch's capabilities by walking
+   `VOCABULARY`, and `Capability::DevicePolicy` was not in that array. So the grant table's row for
+   `lsdev` - which has listed `DevicePolicy` since these verbs were built - could not deliver it: the
+   loop went straight from `Device` to `Config`, and `lsdev` reads its grants POSITIONALLY, so it took
+   the configuration client under the policy tag and answered "this boot granted no device-policy
+   authority". Every operator verb in the system was unreachable, on every machine.
+
+   `Capability::Session` was missing the same way, and that one the file had already NOTICED: a
+   comment on the `lico` row says "`VOCABULARY` does not list `Capability::Session`, so the loop never
+   sends it ... it waits for the vocabulary to be fixed". `kill` holds that grant and could end
+   nothing. Both are in the array now - `DevicePolicy` between `Device` and `Config`, because that is
+   the order `lsdev` reads them in, since this list is a delivery ORDER as well as a set.
+
+2. THE STOP NEVER COMPLETED. With the grant delivered, `--disable` was accepted and the node then sat
+   in `Stopping` for as long as it was watched - measured, `state=stopping, resources=2`, minutes on
+   end - so the device could never be enabled again. DeviceManager's standing loop drains a bound
+   driver's channel only for a node in `Online`, and a disable moves the node to `Stopping` and THEN
+   asks the driver to stop: from the moment the question is asked, nothing reads the answer. The
+   `STOPPED` frame sat unread for ever, no rollback ran, and the claim's resources stayed charged.
+
+   The loop already carries this exact correction one state earlier - "A node that is already `Online`
+   is not in the bring-up wait set ... so nothing was reading its channel, and its `PONG` sat there
+   unread" - and the same mistake was one state along. The drain is gated on there BEING a binding
+   now; only the heartbeat is gated on `Online`. `beat.supervised()` gated it too and must not: a
+   driver answering `STOPPED` is answering whether or not anything asks it for a heartbeat.
+
+WHAT IT MEANS FOR THIS MILESTONE: until 2026-09-02 no operator disable had ever completed anywhere.
+The verbs were implemented, their decisions were correct, and the two mechanisms that carry a verb
+from a tool to a device - the grant and the answer - were each broken in a way that nothing in the
+tree could see.
+
+PROVED BY `dev-gpu-restart` ON THE ENFORCING MACHINE: the disable is accepted, the node reaches
+`disabled`, `lsdev --incident` says nothing has gone wrong on that binding, the enable is accepted,
+and `virtio_gpu` returns ONLINE ON CLAIM GENERATION 2 with its provider republished - no
+`iommu: FAULT` anywhere in the window and one boot throughout. `dev-gpu-restart: passed`.
+
+AND A GATE FOR THE FIRST: `grant-vocabulary` (`src/tools/check-grant-vocabulary.sh`) compares the
+array the grant loop walks against the `Capability` enum the IDL generates, and refuses a capability
+that is declared and not deliverable, one that is delivered and not declared, a repeat, and a length
+that has drifted from the contents. Watched to fail with `DevicePolicy` removed again. Registered in
+`check.sh` and the model catalogue (`GATES` 67 -> 68), subject `services`.
+
+The second's guard is `dev-gpu-restart` itself: it is the only thing in this tree that drives an
+operator verb to completion, and it now asserts every step of it through `lsdev` rather than through
+a console line the serial log stopped carrying after boot.
+
+VERIFICATION FOR THIS ADDENDUM (2026-09-02T23:55:00Z):
+
+- `dev-gpu-restart: passed` on the enforcing development machine, twice, on the final tree: disable
+  accepted, node `disabled`, no incident, enable accepted, `virtio_gpu` online again on CLAIM
+  GENERATION 2 with its provider republished, no `iommu: FAULT`, one boot throughout.
+- `grant-vocabulary`: clean, and watched to FAIL with `DevicePolicy` removed from the array again.
+- x86_64 kernel suite, same scope as this round: 239 passed, 0 failed. Four pinned permission-audit
+  summaries were updated with the two capabilities the vocabulary had been missing - a probe granted
+  neither now reports them denied, which is what those assertions exist to show.
+- `qemu-virtio-iommu-x86_64` on a freshly built image: unchanged, including the default machine's
+  display frame.
+- `one-wait`, `no-suppression`, `source-hygiene`, `bootstrap-plan`, `milestone-index`,
+  `no-fixed-provider-slots`, `declared-interfaces`, `development-build`, `development-gate`,
+  `verify-scheduler`: clean. The tree was returned to the shipping configuration afterwards, which
+  `development-gate` confirms.
+- Every temporary probe used for the diagnosis was removed before the final build.

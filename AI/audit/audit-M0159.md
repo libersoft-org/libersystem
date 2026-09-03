@@ -1173,3 +1173,96 @@ during service bring-up, deterministically, before any of this round's code runs
 written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
 unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
 except the two new UEFI profile rows, which are gate rows rather than suite runs.
+
+SECOND ADDENDUM (2026-09-02T21:40:00Z) - THE DEV CHECK NOW RUNS, AND WHERE IT STOPS:
+
+The development instance boots again - the deadlock was DeviceManager's, is written up in this
+round's M0164 response, and is now guarded by the `one-wait` gate. `dev-gpu-restart` therefore RUNS
+for the first time in this work, and it gets as far as: the guest is the translated machine,
+`virtio_gpu` is online at device 9 with claim generation 1, and then the disable is refused -
+`lsdev --disable` reports that this boot granted the launched program no device-policy authority.
+
+So the assertion I changed from a report into a failure is still not exercised: the check stops
+BEFORE the rebind it exists to drive. What blocks it is a grant, not a display: measured, the
+supervisor mints the operator endpoint, `service_connect` on it succeeds, and PermissionManager holds
+the resulting client - so the loss is between the manager holding it and the launched program
+receiving it. The read half of the same tool works in that guest, which is what makes it this
+capability rather than the launch. Recorded against the operator-policy milestone, which owns it.
+
+What IS proved for this item, on two independent boots: the shipping default machine under the
+enforcing profile - "the display driver runs and a frame reached the screen" - and now the
+development instance, where DisplayService comes up through the catalogue and ConsoleService reports
+a frame reaching the display. The restart half waits on that grant.
+
+VERIFICATION FOR THIS ADDENDUM (2026-09-02T21:40:00Z):
+
+- The development instance reaches an attached shell in 95 s, twice, on the final tree: DisplayService
+  online, PermissionManager online, ConsoleService online, and `ConsoleService: a frame reached the
+  display`. Before the fix it stalled at the same point on every attempt, at one core and at four.
+- `one-wait`: clean on the fixed tree, and watched to FAIL with the defect reintroduced - it named the
+  literal wait and its line.
+- x86_64 kernel suite, same scope as the round above: 239 passed, 0 failed.
+- `qemu-virtio-iommu-x86_64` on a freshly built image: unchanged, including "the display driver runs
+  and a frame reached the screen".
+- `verify-model`: 117 passed with the new gate row (`GATES` 66 -> 67).
+- `no-suppression`, `source-hygiene`, `bootstrap-plan`, `milestone-index`, `no-fixed-provider-slots`,
+  `declared-interfaces`, `development-build`, `development-gate`: clean. The tree was returned to the
+  shipping configuration afterwards, which `development-gate` confirms.
+- Every temporary probe used for the diagnosis was removed; `no-suppression` and `source-hygiene` were
+  re-run after that removal.
+
+THIRD ADDENDUM (2026-09-02T23:55:00Z) - `dev-gpu-restart` PASSES:
+
+The addendum above said the assertion was not exercised and named the grant that blocked it. That
+grant is fixed, a second defect behind it is fixed, and the check now runs to the end:
+
+    dev-gpu-restart: the guest is the translated machine
+    dev-gpu-restart: virtio_gpu is online at device 9, claim generation 1
+    dev-gpu-restart:   the stop completed and the node is disabled
+    dev-gpu-restart:   and it is not recorded as an incident
+    dev-gpu-restart:   virtio_gpu is online again on claim generation 2
+    dev-gpu-restart:   and it republished 1 provider(s)
+    dev-gpu-restart:   frames were driven through the console after the rebind and it is still serving
+    dev-gpu-restart: one boot throughout
+    dev-gpu-restart: passed
+
+A NEW CLAIM GENERATION IS WHAT MAKES IT A REBIND, and it is 2. So M4's restart is executed on the
+enforcing machine through the operator's own verbs, with the display service reaching its device
+through the catalogue on both sides of it.
+
+WHAT THE CHECK ASSERTS AND HOW IT READS IT (corrected this round). It waited for DeviceManager's
+`stopped cleanly` and `driver.virtio-gpu: online (` lines on the SERIAL log, and after the boot those
+lines do not arrive there: once ConsoleService has taken the console a service's `print` goes to its
+VT, and the serial line carries the shell's session. Measured - the disable is accepted, the node
+reaches `disabled`, and the serial log gains nothing at all. A check that waits sixty seconds for a
+line that cannot appear reports a working mechanism as broken, so both waits moved onto `lsdev`: the
+node's STATE, its CLAIM GENERATION and its INCIDENT record, which are the operator's own surfaces and
+better evidence than a console string. The kernel's own lines - `iommu: FAULT`, `KERNEL PANIC` - do
+reach the serial log and are still read from it.
+
+AND THE DISPLAY STEP IS HONEST ABOUT WHAT IT CAN SEE, which is a correction to what I did in the
+round above. I turned it from a report into an assertion on the absence of `a frame did NOT reach the
+display` - and that line cannot appear on serial after boot either, so the assertion could not fail.
+An assertion that cannot fail is worse than a report, because it reads as evidence. It now fails IF
+the line appears, requires the console to still answer a prompt after frames are driven through it,
+and says in as many words that the frame-level proof lives on the two boots that can see it - the
+kernel suite's console test and `qemu-virtio-iommu-x86_64`'s default machine, both of which report a
+frame reaching the display with DisplayService on a catalogue-opened provider - and what surface
+would make it provable here.
+
+VERIFICATION FOR THIS ADDENDUM (2026-09-02T23:55:00Z):
+
+- `dev-gpu-restart: passed` on the enforcing development machine, twice, on the final tree: disable
+  accepted, node `disabled`, no incident, enable accepted, `virtio_gpu` online again on CLAIM
+  GENERATION 2 with its provider republished, no `iommu: FAULT`, one boot throughout.
+- `grant-vocabulary`: clean, and watched to FAIL with `DevicePolicy` removed from the array again.
+- x86_64 kernel suite, same scope as this round: 239 passed, 0 failed. Four pinned permission-audit
+  summaries were updated with the two capabilities the vocabulary had been missing - a probe granted
+  neither now reports them denied, which is what those assertions exist to show.
+- `qemu-virtio-iommu-x86_64` on a freshly built image: unchanged, including the default machine's
+  display frame.
+- `one-wait`, `no-suppression`, `source-hygiene`, `bootstrap-plan`, `milestone-index`,
+  `no-fixed-provider-slots`, `declared-interfaces`, `development-build`, `development-gate`,
+  `verify-scheduler`: clean. The tree was returned to the shipping configuration afterwards, which
+  `development-gate` confirms.
+- Every temporary probe used for the diagnosis was removed before the final build.

@@ -123,7 +123,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 66] = [
+const GATES: [(&str, &str); 70] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -174,6 +174,10 @@ const GATES: [(&str, &str); 66] = [
 	("arch-profile-riscv64-aia-1", "kernel"),
 	("arch-profile-riscv64-aia-4", "kernel"),
 	("arch-profile-riscv64-uefi-1", "kernel"),
+	// The positive no-device-tree rows: a loader built to withhold the firmware's tree, so the
+	// kernel selects the static descriptor its named profile authorises.
+	("arch-profile-aarch64-no-dt-1", "kernel"),
+	("arch-profile-riscv64-no-dt-1", "kernel"),
 	// The staged tree's provider chains, and the eight ways the check that reads them can be given
 	// input it cannot read. Its subject is what the build stages, so a userspace change selects it.
 	("staged-consistency", "userspace.build"),
@@ -316,6 +320,17 @@ const GATES: [(&str, &str); 66] = [
 	// depended on which driver finished first. Its subject is the crate that holds the manager, so a
 	// change to it selects the gate - and it reads source, so it costs milliseconds.
 	("no-fixed-provider-slots", "services"),
+	// One wait in DeviceManager, built rather than written at the call site. A second wait in front
+	// of the one wait deadlocked the development configuration on the first catalogue connection,
+	// and nothing boots that configuration to have noticed. Same subject and same cost as the gate
+	// above: it reads the manager's source.
+	("one-wait", "services"),
+	// Every capability the security IDL declares is one PermissionManager's grant loop walks. Two
+	// were missing and both were silent: the manager reported success having sent nothing, and the
+	// launched program read the NEXT capability under the missing one's tag. Its subject is the
+	// crate that holds the manager; it reads source and the generated model, so it costs
+	// milliseconds.
+	("grant-vocabulary", "services"),
 	// Two gates over one subject: generated or compiled artifacts below `src`, in the working tree and anywhere
 	// in reachable history. They were Justfile recipes that nothing called and nothing selected;
 	// moving them into `check.sh` is what makes a change to the tree able to select them, and this
@@ -433,7 +448,7 @@ const UMBRELLA_GATES: [&str; 2] = ["qemu-arch-profiles", "qemu-numa"];
 // NOT one step per profile with a `--jobs` of its own - that is the second scheduler M3.6 refuses.
 // Each is an ordinary serial step that boots its guests one at a time; what it gains is an identity
 // and a duration of its own.
-pub const PROFILE_ROW_GATES: [&str; 14] = [
+pub const PROFILE_ROW_GATES: [&str; 16] = [
 	"arch-profile-aarch64-gicv2-1",
 	"arch-profile-aarch64-gicv2-4",
 	"arch-profile-aarch64-gicv3-1",
@@ -445,6 +460,8 @@ pub const PROFILE_ROW_GATES: [&str; 14] = [
 	"arch-profile-riscv64-aia-1",
 	"arch-profile-riscv64-aia-4",
 	"arch-profile-riscv64-uefi-1",
+	"arch-profile-aarch64-no-dt-1",
+	"arch-profile-riscv64-no-dt-1",
 	"numa-profile-x86_64",
 	"numa-profile-aarch64",
 	"numa-profile-riscv64",

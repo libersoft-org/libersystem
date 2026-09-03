@@ -122,6 +122,16 @@ DEVICE_MSI_ORACLE=""
 # direct boots, and one for the single CHECKPOINT row that needs what only a firmware boot carries.
 # See the device-MSI row below for the measurement that separates the two.
 PROFILE_UEFI=0
+# A PROFILE THAT BOOTS ITS OWN LOADER, empty for one that boots the ordinary build.
+#
+# The no-device-tree rows need a loader that declines to pass the firmware's tree on, and that is a
+# COMPILE-TIME profile - see the loader's `withholds_device_tree`. Building it over the ordinary
+# loader would leave a tree that no other boot can use if this gate died in the middle, so the row
+# builds its own into a scratch target directory and hands `qemu-run.sh` the path through
+# `LOADER_EFI`, which every architecture already honours. Nothing shared is touched, and the image
+# key covers the loader, so no cached medium is reused across the two shapes.
+PROFILE_LOADER=""
+
 # A LINE THIS PROFILE MUST NOT PRINT, empty for a profile that forbids nothing.
 #
 # The UEFI regression rows below are the only users and the reason it exists: what they have to show
@@ -226,12 +236,22 @@ run_profile() {
 	# `PSCI_NONE`, and no secondary ever started. That is fixed - the conduit is read from where the
 	# tree IS - and a four-core direct profile now brings up four cores, so the profiles boot the way
 	# the milestone names: the controller AND the bring-up read from the tree in front of them.
+	# THE PROFILE'S OWN LOADER AND THE MATCHING KERNEL AUTHORISATION, both or neither.
+	#
+	# `LIBER_NO_DT_PROFILE` is one name on two sides: the loader withholds the tree and the kernel
+	# authorises the static descriptor its absence selects. A loader that withholds it against a
+	# kernel that has not authorised one is a machine that panics by design, so the row passes the
+	# same variable to both builds.
+	local -a profile_env=()
+	if [[ -n "$PROFILE_LOADER" ]]; then
+		profile_env=("LOADER_EFI=$PROFILE_LOADER" "LIBER_NO_DT_PROFILE=1")
+	fi
 	local -a request=()
 	if [[ -n "$selection" ]]; then
-		request=(env "UEFI=$PROFILE_UEFI" "TEST_SELECTION=$selection" "$@" ./test.sh --arch "$arch" --smp "$cores")
+		request=(env "UEFI=$PROFILE_UEFI" "${profile_env[@]}" "TEST_SELECTION=$selection" "$@" ./test.sh --arch "$arch" --smp "$cores")
 		echo "arch-profiles:     asking for $(tr ',' ' ' <<<"$selection" | wc -w) named test(s)$([[ "$PROFILE_UEFI" == 1 ]] && echo " (through firmware)")"
 	else
-		request=(env "UEFI=$PROFILE_UEFI" "$@" ./test.sh --arch "$arch" --tags smoke --smp "$cores")
+		request=(env "UEFI=$PROFILE_UEFI" "${profile_env[@]}" "$@" ./test.sh --arch "$arch" --tags smoke --smp "$cores")
 	fi
 	if ! "${request[@]}" >"$out" 2>&1; then
 		echo "arch-profiles: the integration suite failed on $arch $label at $cores core(s)" >&2
@@ -397,6 +417,75 @@ PROFILE_FORBIDS="authorises"
 run_profile aarch64 uefi 1 "GICv2 from the device tree" GIC=2
 PROFILE_FORBIDS=""
 PROFILE_UEFI=0
+
+# BUILD THE NO-DEVICE-TREE LOADER FOR ONE ARCHITECTURE, into a directory of its own.
+#
+# `LIBER_NO_DT_PROFILE=1` is what makes the loader decline to pass the firmware's device tree on, and
+# it is compile-time - so this is a second loader, not a reconfiguration of the one every other boot
+# uses. It goes in the gate's own work directory with its own `CARGO_TARGET_DIR`, so a failure here
+# leaves the tree exactly as it found it. Answers the path to the built EFI binary.
+build_no_dt_loader() {
+	local arch="$1"
+	local triple
+	case "$arch" in
+	aarch64) triple=aarch64-unknown-uefi ;;
+	riscv64) triple=riscv64gc-unknown-none-elf ;;
+	*) fail "no no-DT loader shape for $arch" ;;
+	esac
+	local out="$work/no-dt-loader-$arch"
+	mkdir -p "$out"
+	# TO STDERR, because this function's STDOUT is its answer: the path to the built loader. A
+	# progress line on the same stream becomes part of the path, and the runner then reports a loader
+	# that is not there - which is what happened the first time this ran.
+	echo "arch-profiles: building the no-device-tree loader for $arch" >&2
+	case "$arch" in
+	aarch64)
+		(cd src/boot/loader && CARGO_TARGET_DIR="$out" LIBER_NO_DT_PROFILE=1 cargo build --target "$triple" >/dev/null 2>&1) || fail "the no-DT loader did not build for $arch"
+		;;
+	riscv64)
+		(cd src && CARGO_TARGET_DIR="$out" LIBER_NO_DT_PROFILE=1 tools/build-loader-riscv64.sh >/dev/null 2>&1) || fail "the no-DT loader did not build for $arch"
+		;;
+	esac
+	local efi="$out/$triple/debug/libersystem-loader.efi"
+	[[ -f "$efi" ]] || fail "the no-DT loader built for $arch and left no EFI binary at $efi"
+	echo "$efi"
+}
+
+# THE POSITIVE NO-DEVICE-TREE ROWS, one per device-tree port.
+#
+# M6 asks for the static descriptor a treeless machine falls back to to be SELECTED by a named
+# profile and by nothing else, and until now no caller set `LIBER_NO_DT_PROFILE` - so the authorised
+# path was unreachable and the descriptor it selects was unproved. The note that used to stand here
+# said the blocker was a harness capability, and it named the two ways out: a QEMU machine that
+# publishes no tree, or a LOADER OPTION THAT DECLINES TO PASS ONE ON. The second is ours, and it is
+# built now.
+#
+# WHAT THE ROW PROVES: the kernel is handed a `BootInfo` whose `dtb` is zero, recognises it as the
+# named profile, says so in its own words, and boots far enough to tick and pass this profile's
+# oracles. That is the descriptor being selected BY A PROFILE, which is the half a boot with a tree
+# cannot show - and the rows above prove the other half, that a boot WITH a tree does not reach it.
+for no_dt_arch in aarch64 riscv64; do
+	if [[ -n "$ONLY" && "$ONLY" != "$no_dt_arch:no-dt:1" ]]; then
+		continue
+	fi
+	case "$no_dt_arch" in
+	aarch64)
+		MSI_ORACLE="$AARCH64_MSI"
+		# THE CONTROLLER LINE, which on this profile NAMES THE STATIC DESCRIPTOR and says there was
+		# no tree - so passing is the descriptor having been selected, not merely a boot that came up.
+		no_dt_want="GICv2 from qemu-virt-gicv2 (no device tree)"
+		;;
+	riscv64)
+		MSI_ORACLE=kernel.arch.riscv64.interrupts.imsic_msi_binds_and_dispatch_signals_the_driver
+		no_dt_want="no device tree, and this build authorises the named no-DT profile"
+		;;
+	esac
+	PROFILE_LOADER="$(build_no_dt_loader "$no_dt_arch")"
+	PROFILE_UEFI=1
+	run_profile "$no_dt_arch" no-dt 1 "$no_dt_want"
+	PROFILE_UEFI=0
+	PROFILE_LOADER=""
+done
 
 # WHAT IS STILL NOT REGISTERED HERE, AND WHY (2026-08-30, narrowed 2026-09-02).
 #

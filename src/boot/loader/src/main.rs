@@ -561,6 +561,31 @@ static mut PAIRED_UUID: Option<[u8; 16]> = None;
 // afterwards can decide differently from the loader that already decided.
 static mut ROOT_SELECTION: bootproto::RootSelection = bootproto::RootSelection { kind: bootproto::ROOT_NONE, module: 0, uuid: [0; 16] };
 
+// WHETHER THIS LOADER WITHHOLDS THE DEVICE TREE FROM THE KERNEL.
+//
+// The named no-device-tree regression profile needs a machine the kernel sees as having no tree, and
+// this harness cannot produce one: QEMU's `virt` publishes a DTB to the firmware and the firmware
+// publishes it in its configuration table, on both device-tree ports. There are exactly two ways to
+// get one - a QEMU machine that publishes none, or a LOADER THAT DECLINES TO PASS ONE ON - and this
+// is the second.
+//
+// COMPILE-TIME, FOR THE REASON THE KERNEL'S OWN AUTHORISATION IS. A boot with no tree has no way to
+// name itself, because the machine description IS the tree; so the profile is compiled in on both
+// sides and the harness that boots it is what sets the variable. The two halves are deliberately the
+// SAME name: a loader that withholds the tree and a kernel that has not authorised its static
+// descriptor is a machine that panics, and the panic says so - which is the correct outcome for a
+// mismatched pair and is what the kernel's refusal exists for.
+//
+// The ordinary loader is untouched: nothing in the shipping build sets this, `find_dtb` answers what
+// the firmware published, and the kernel is handed it.
+//
+// THE DEVICE-TREE PORTS ONLY, because x86_64 has no tree to withhold - it reads ACPI - so the option
+// would be a knob with nothing behind it there, and an unused one at that.
+#[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+pub(crate) fn withholds_device_tree() -> bool {
+	option_env!("LIBER_NO_DT_PROFILE").is_some_and(|value| value == "1")
+}
+
 // What the loader chose, for the hand-off.
 pub(crate) fn root_selection() -> bootproto::RootSelection {
 	unsafe { ROOT_SELECTION }

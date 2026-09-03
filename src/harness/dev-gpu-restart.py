@@ -21,25 +21,35 @@
 #   translated first     the machine is the enforcing one, from the boot's own isolation summary.
 #                        Everything below is about a translated device or it is about nothing.
 #   online, generation G the driver holds a claim before the restart.
-#   disable             `DeviceManager` says the stop was CLEAN, and `lsdev --incident` then says
-#                        nothing has gone wrong on that binding - which is the P02M0165 claim that a
+#   disable              the verb is ACCEPTED and the node reaches `disabled`, and `lsdev --incident`
+#                        then says nothing has gone wrong on that binding - which is the claim that a
 #                        planned stop is not a crash, made about a real device and asked of the
 #                        surface an operator reads. Nothing else in this tree executes it: the kernel
 #                        suite exits before any teardown confirms.
-#   enable              a SECOND `driver.virtio-gpu: online (` and a NEW claim generation. A new
-#                        generation is what makes this a rebind rather than a node that never left.
+#   enable               the verb is ACCEPTED, the node returns to `online`, and its claim generation
+#                        has MOVED. A new generation is what makes this a rebind rather than a node
+#                        that never left.
+
 #   no fault            no `iommu: FAULT` anywhere in the window: the teardown and the fresh attach
 #                        did not leave the device reaching memory it no longer owns, which is the
 #                        whole reason a restart under enforcement is a different question from a
 #                        restart without one.
 #   it publishes again   the rebound binding republished the providers it declares, which is the
 #                        driver's own half of coming back.
-#   frames again         a frame driven through the console AFTER the rebind reaches the display.
-#                        This is M4's own sentence and it is now an assertion (2026-09-02).
+#   the display          frames are driven through the console after the rebind and it is still
+#                        serving. What this can and cannot see is written on the function.
 #   one boot             the guest never restarted, so none of the above is a reboot wearing a
 #                        rebind's name.
 #
-# THE DISPLAY WAS REPORTED AND IS NOW ASSERTED. It could not be before, and the reason was exact:
+# ASKED OF `lsdev` AND NOT OF THE SERIAL LOG (corrected 2026-09-02). Both of those used to wait for a
+# DeviceManager line on serial, and after the boot no such line arrives there: once ConsoleService has
+# taken the console a service's `print` goes to its VT, and the serial line carries the shell's
+# session. Measured - the disable is accepted, the node reaches `disabled`, and the serial log gains
+# nothing at all. A check that waits sixty seconds for a line that cannot appear reports a working
+# mechanism as broken. The kernel's own lines - `iommu: FAULT`, `KERNEL PANIC` - DO reach the serial
+# log, and those are still read from it.
+#
+# THE DISPLAY'S CONSUMER SIDE IS NO LONGER THE GAP IT WAS. The reason it used to be was exact:
 # `route_offers` - the function that handed a published provider to DisplayService - was called only
 # from the phase-two bring-up loop and filled each fixed consumer slot only `if *client == 0`, so a
 # driver rebound after bring-up published its provider into the catalogue and nothing routed it while
@@ -62,7 +72,6 @@ import lab
 
 # The driver artifact, as the registry names it and as `lsdev` reports it.
 ARTIFACT = 'virtio_gpu'
-ONLINE_LINE = 'driver.virtio-gpu: online ('
 CHILD_TIMEOUT = 180
 SETTLE_TIMEOUT = 60
 
@@ -128,17 +137,6 @@ def gpu_binding():
 
 
 # Wait for `needle` to appear in the serial log after `mark`, and answer the text that arrived.
-def wait_for(mark, needle, what, timeout=SETTLE_TIMEOUT):
-	deadline = time.monotonic() + timeout
-	while time.monotonic() < deadline:
-		text = lab.serial_since(mark)
-		if needle in text:
-			return text
-		time.sleep(0.3)
-	fail(f'{what}: the guest never printed {needle!r} within {timeout} s. It printed:\n{lab.serial_since(mark)}')
-
-
-# Wait for a binding to reach `state`, and answer the record.
 def wait_state(state, what, timeout=SETTLE_TIMEOUT):
 	deadline = time.monotonic() + timeout
 	seen = None
@@ -150,12 +148,23 @@ def wait_state(state, what, timeout=SETTLE_TIMEOUT):
 	fail(f'{what}: the binding is {seen.get("state") if seen else "unreadable"} and not {state} after {timeout} s')
 
 
-# Make the console present frames and require that they land.
+# Drive frames through the console after the rebind and require the console to survive it.
 #
-# ASSERTED, not reported - see the header. `ConsoleService` latches one line per outcome, so
-# `a frame did NOT reach the display` appearing in this window is the consumer-side route being dead
-# after the rebind, which is exactly what M4 forbids.
-def require_the_display(guest):
+# WHAT THIS CAN AND CANNOT SEE, said plainly rather than left for a reader to assume. ConsoleService
+# latches one line per outcome, and after the boot those lines do not reach the SERIAL log at all:
+# once it has taken the console a service's `print` goes to its VT, and the serial line carries the
+# shell's session. So the absence of `a frame did NOT reach the display` in this window proves
+# nothing, and a check that treated it as proof would be an assertion that cannot fail - which is
+# worse than a report, because it reads as evidence.
+#
+# What IS asserted here: the line, IF it appears, is a failure; and the console must still answer a
+# prompt after the frames were driven, so a rebind that took the display path down with it is caught.
+# The frame-level proof lives on the two boots that can see it - the kernel suite's console test and
+# `qemu-virtio-iommu-x86_64`'s default machine, both of which report a frame reaching the display
+# with DisplayService on a catalogue-opened provider. Making it provable HERE needs a surface the
+# guest does not expose over serial after boot: DisplayService's presentation stats, or a capture of
+# the framebuffer through the instance's own monitor.
+def exercise_the_display(guest):
 	mark = lab.serial_size()
 	for _ in range(3):
 		guest.type_text('\x03', False, 15)
@@ -165,7 +174,10 @@ def require_the_display(guest):
 	said = lab.serial_since(mark)
 	if 'a frame did NOT reach the display' in said:
 		fail('frames were driven through the console after the rebind and did NOT reach the display - the rebound provider was published and the display never adopted it')
-	step('  frames were driven through the console after the rebind and none was reported as refused')
+	guest.type_text('\x03', False, 15)
+	if not guest.wait_prompt(15):
+		fail('the console stopped answering after frames were driven through it, so the rebind took the display path down with it')
+	step('  frames were driven through the console after the rebind and it is still serving')
 
 
 def main():
@@ -194,14 +206,26 @@ def main():
 	guest = lab.LabGuest(SETTLE_TIMEOUT)
 
 	# THE STOP. Through the operator's own verb, so what is proved is the path an operator has.
+	#
+	# ASKED OF `lsdev` AND NOT OF THE SERIAL LOG (corrected 2026-09-02). This waited for
+	# DeviceManager's `stopped cleanly` line to appear on serial, and after the boot that line does
+	# not arrive there: once ConsoleService has taken the console, a service's `print` goes to its VT
+	# and the serial line carries the shell's session. Measured - the disable is accepted, the node
+	# reaches `disabled`, and nothing at all is written to the serial log. A check that waits sixty
+	# seconds for a line that cannot appear reports the mechanism broken when it worked.
+	#
+	# What replaces it is stronger rather than weaker: the operator's own surfaces. The node reaching
+	# `disabled` is the stop having completed, `--incident` below is DeviceManager's judgement of
+	# whether it was clean, and a restart would have landed the node ONLINE rather than `disabled` -
+	# so the state that used to be one of three assertions is now the whole of them, and each is a
+	# fact an operator can read rather than a string in a log.
 	mark = lab.serial_size()
 	step(f'disabling device {index}')
 	answered = guest_run('lsdev', '--disable', str(index))
-	wait_for(mark, 'stopped cleanly', 'the planned stop')
+	if 'accepted' not in answered:
+		fail(f'the disable was not accepted:\n{answered}')
 	stopped = wait_state('disabled', 'after the disable')
-	if 'restarting' in lab.serial_since(mark):
-		fail(f'the disable was answered with a RESTART: {lab.serial_since(mark)}')
-	step(f'  it stopped cleanly and the node is {stopped.get("state")} ({answered.strip().splitlines()[-1] if answered.strip() else "no output"})')
+	step(f'  the stop completed and the node is {stopped.get("state")} ({answered.strip().splitlines()[-1] if answered.strip() else "no output"})')
 
 	# AND A CLEAN STOP IS NOT AN INCIDENT, asked of the surface an operator actually reads.
 	#
@@ -219,8 +243,12 @@ def main():
 	# acquire the device again, which under enforcement means a fresh domain and a fresh attach.
 	rebind_mark = lab.serial_size()
 	step(f'enabling device {index}')
-	guest_run('lsdev', '--enable', str(index))
-	wait_for(rebind_mark, ONLINE_LINE, 'the rebind')
+	enabled = guest_run('lsdev', '--enable', str(index))
+	if 'accepted' not in enabled:
+		fail(f'the enable was not accepted:\n{enabled}')
+	# THE STATE, NOT THE LINE - see the note on the disable above. `online` at a NEW claim generation
+	# is what a rebind IS, and the generation check below is what makes it one rather than a node
+	# that never left.
 	after = wait_state('online', 'after the enable')
 	if after['generation'] == generation:
 		fail(f'the binding came back on claim generation {after["generation"]}, the same one it had - nothing was re-acquired, so this is not a rebind')
@@ -240,8 +268,8 @@ def main():
 		fail(f'the rebound binding publishes {after.get("providers")} provider(s) - it came back without offering what it declares')
 	step(f'  and it republished {after["providers"]} provider(s)')
 
-	# AND THE DISPLAY, WHICH IS M4'S OWN SENTENCE - see the header.
-	require_the_display(guest)
+	# AND THE DISPLAY - see the note on the function for what this can and cannot see.
+	exercise_the_display(guest)
 
 	boot_at_end = lab.guest_boot()
 	if boot_at_end != boot_at_start:

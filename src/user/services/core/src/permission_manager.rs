@@ -123,11 +123,26 @@ const DENY_REPLY: &[u8] = b"DENY";
 // So the fix is two changes and not one: the manager has to HOLD a session client to grant, and the
 // grant loop's failure path has to close the task it prepared. Until both, this list stays as it is
 // and `kill`'s hang is the lesser fault.
-const VOCABULARY: [Capability; 21] = [
+const VOCABULARY: [Capability; 23] = [
 	Capability::Storage,
 	Capability::Log,
 	Capability::Network,
 	Capability::Device,
+	// THE OPERATOR'S WRITE, AND IT WAS NOT IN THIS LIST AT ALL (added 2026-09-02).
+	//
+	// This array is what the grant loop WALKS - `for &cap in VOCABULARY.iter()` - so a capability
+	// missing from it is one no manifest row can actually deliver, however plainly the row grants it.
+	// `lsdev` has held `DevicePolicy` since the operator verbs were built and never once received
+	// it: the loop skipped straight from `DEVICE` to `CONFIG`, and `lsdev` - which reads its grants
+	// positionally - took the configuration client under the policy tag, answered "this boot granted
+	// no device-policy authority", and every operator verb in the system was unreachable. Nothing
+	// caught it because the only thing that drives one is a development check, and the development
+	// instance would not boot.
+	//
+	// IT GOES BETWEEN `Device` AND `Config` because that is the order `lsdev` reads them in. This
+	// list is a delivery ORDER as well as a set, and its one constraint is that it agrees with every
+	// granted tool's receive sequence.
+	Capability::DevicePolicy,
 	Capability::Config,
 	Capability::Time,
 	Capability::Audio,
@@ -137,6 +152,11 @@ const VOCABULARY: [Capability; 21] = [
 	Capability::Process,
 	Capability::Permission,
 	Capability::Supervisor,
+	// AND `Session`, WHICH WAS MISSING FOR THE SAME REASON. `kill` is granted it by its row and read
+	// it with `unwrap_or(0)`, so it did not hang - it simply never had a SessionService client and
+	// could not kill anything. Position is free here: `kill` is granted this and nothing else, so it
+	// receives exactly one message whatever order this list is in.
+	Capability::Session,
 	Capability::Volumes,
 	Capability::Services,
 	Capability::Usb,
@@ -237,11 +257,12 @@ fn manifest_for(component: &[u8]) -> Option<Manifest> {
 		// so an association or a command-bar line can launch something without lending it anything.
 		// `Process` would be raw process creation, and is deliberately not here.
 		//
-		// `Session` IS NOT HERE, and the reason is a defect in the grant loop rather than a policy:
-		// `VOCABULARY` does not list `Capability::Session`, so the loop never sends it - and a tool
-		// that waits for the tag blocks on a message nobody will send. `kill` has the same grant and
-		// the same problem. Granting it here would hang the manager at launch; it waits for the
-		// vocabulary to be fixed.
+		// `Session` IS NOT HERE, and it is now a POLICY question rather than a blocked one. The
+		// reason it used to be blocked was a defect in the grant loop - `VOCABULARY` did not list
+		// `Capability::Session`, so the loop never sent it and a tool that waits for the tag would
+		// block on a message nobody will send. The vocabulary lists it now, and `check-grant-
+		// vocabulary` keeps it listed. Whether a command bar should be able to end a session is a
+		// decision for whoever needs it; nothing technical stops it any more.
 		b"lico" => Some(granted("lico", alloc::vec![Capability::Volumes, Capability::AppAssets, Capability::Permission])),
 		b"imgconv" => Some(granted("imgconv", alloc::vec![Capability::Volumes])),
 		// A CONVERSION IS NOT A PLAYBACK. `audioconv` holds the volume bundle and nothing else - no

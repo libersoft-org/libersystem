@@ -1531,3 +1531,78 @@ during service bring-up, deterministically, before any of this round's code runs
 written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
 unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
 except the two new UEFI profile rows, which are gate rows rather than suite runs.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0151 (2026-09-03T02:30:00Z):
+
+THE LAST OPEN ITEM IS CLOSED. My previous response accepted finding 1 in part, built the two
+single-node UEFI regression rows, and left the POSITIVE no-device-tree boot open with the reason I
+had been giving for several rounds: "a harness capability rather than a gate row". That reason was
+wrong, and the item's own sentence says why. It names TWO ways to present the kernel with a treeless
+machine - "a QEMU machine that publishes none, or A LOADER OPTION THAT DECLINES TO PASS ONE ON" - and
+the second is ours. I had been reading the first as the only one.
+
+WHAT CHANGED, in three places, because the profile turned out to have three halves and only one of
+them existed:
+
+1. THE LOADER DECLINES TO PASS THE TREE ON. `crate::withholds_device_tree()`, compiled in under
+   `LIBER_NO_DT_PROFILE` - deliberately the SAME name the kernel's authorisation already used, so the
+   profile is one variable on both sides and a mismatched pair panics by design, which is what the
+   kernel's refusal exists for. Both device-tree ports zero the `dtb` they hand over and say so. The
+   loader gained a `build.rs` emitting `cargo:rerun-if-env-changed`, because `option_env!` is read at
+   compile time and cargo does not rebuild for a variable it was never told about. x86_64 has no tree
+   to withhold, so the function is not compiled there at all.
+
+2. AND THE KERNEL STOPS GOING LOOKING. This is the part I would not have found by reading: with the
+   pointer withheld, the boot STILL printed `GICv2 from the device tree` - and its own banner said
+   `DTB 0x0`. `dtb::locate` falls back, for a boot path that published no pointer, to a fixed address
+   and then a scan of low DRAM, and QEMU had left a perfectly good tree there. The profile was a
+   no-op. Both ports now consult `boot_profile_authorises_no_dt()` BEFORE those fallbacks: the named
+   profile means this machine has no tree, and looking for one is the kernel disagreeing with the
+   profile it was built for.
+
+3. AND THE ROWS. `arch-profile-aarch64-no-dt-1` and `arch-profile-riscv64-no-dt-1` build that loader
+   into a directory of their own and hand the runner its path through `LOADER_EFI`, which every
+   architecture already honours - so nothing shared is touched and a failure leaves the tree as it
+   found it. Registered in `check.sh` and in the model catalogue (`GATES` 68 -> 70,
+   `PROFILE_ROW_GATES` 14 -> 16).
+
+WHAT THEY PROVE, in their own output:
+
+    arch-profiles:     discovered: GICv2 from qemu-virt-gicv2 (no device tree) - distributor 0x8000000+0x10000, ...
+    arch-profiles:     discovered: no device tree, and this build authorises the named no-DT profile - using the qemu-virt-aia descriptor, which makes no discovery claim
+
+Each then delivers timer interrupts and acquires, delivers, binds and releases an MSI on that
+controller. So the static descriptor is SELECTED BY A NAMED PROFILE and the machine works on it,
+which is the half a boot with a tree cannot show - and the four rows above them prove the other half,
+that a boot WITH a tree does not reach it.
+
+TWO THINGS THE WORK FOUND AND FIXED ON THE WAY, both of which had been reporting success:
+
+- `build-loader-riscv64.sh` read its ELF from a HARDCODED path while cargo wrote to
+  `CARGO_TARGET_DIR`, so a build into another directory converted whatever was already at the fixed
+  path and reported success having produced the PREVIOUS loader. It honours the variable now.
+- The gate's loader-building helper echoed its progress on STDOUT, which is where it returns the
+  path, so the runner was handed a path with a sentence in front of it. Progress goes to stderr.
+
+M6 is checked, the status line says COMPLETE, and `docs/todo/TODO.md` marks the milestone done -
+`check-milestone-index` agrees with all three.
+
+VERIFICATION FOR THIS ROUND (2026-09-03T02:30:00Z):
+
+- The four new profile rows, all passing, on freshly built aarch64 and riscv64 trees:
+  `arch-profile-aarch64-no-dt-1` and `arch-profile-riscv64-no-dt-1` each select the STATIC descriptor
+  under the named profile, tick, and acquire/deliver/release an MSI on it;
+  `arch-profile-aarch64-uefi-1` and `arch-profile-riscv64-uefi-1` boot through firmware, discover from
+  the tree, and are required NOT to have taken the static descriptor.
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot,storage,filesystem,input,mouse`: 241 passed, 0 failed. That covers the boot test
+  which requires EVERY manifest service online, so the network, input and block hand-off changes are
+  exercised end to end.
+- `qemu-virtio-iommu-x86_64` on a freshly built image: unchanged, including the default machine's
+  "the display driver runs and a frame reached the screen" with four disks and a NIC.
+- `dev-gpu-restart: passed` on the development instance, with the same disable/enable/rebind chain.
+- `verify-model`: 117 passed (`GATES` 70, `PROFILE_ROW_GATES` 16).
+- Host gates: `no-suppression`, `source-hygiene`, `bootstrap-plan`, `declared-interfaces`,
+  `milestone-index`, `no-fixed-provider-slots`, `grant-vocabulary`, `one-wait`, `gate-oracles`,
+  `test-tags`, `development-build`, `development-gate` - all clean. The tree was returned to the
+  shipping configuration afterwards.

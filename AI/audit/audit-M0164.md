@@ -1457,3 +1457,137 @@ during service bring-up, deterministically, before any of this round's code runs
 written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
 unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
 except the two new UEFI profile rows, which are gate rows rather than suite runs.
+
+ADDENDUM TO THE 2026-09-02T18:20:00Z RESPONSE (2026-09-02T21:40:00Z) - THE DEVELOPMENT-CONFIGURATION
+DEADLOCK, FOUND AND FIXED:
+
+The response above reported that `./dev.sh up` stalls and said it happened on a path this round did
+not touch. That was right about the path and WRONG about one detail I stated with more confidence
+than the evidence carried: I said DeviceManager "never sees the CONNECT", and the probe behind that
+claim was in `serve_policy_once`, not `serve_catalogue_once` - two functions with the same three-line
+CONNECT arm, and I matched the wrong one. The conclusion happened to survive; the reasoning did not,
+and it is corrected here rather than left standing.
+
+WHAT IT ACTUALLY WAS. DeviceManager's standing loop opened with a development-only SECOND wait:
+
+    #[cfg(feature = "development")]
+    if dev.bootstrap != 0 && wait_any(&[bootstrap, dev.bootstrap], 0) == 1 { dev.supervise(...); continue; }
+
+Every pass parked there before reaching the one wait the loop builds - and that set contains the
+supervisor's channel and the agent's, and NOT the catalogue root. So from the moment the agent
+existed, this program answered two parties and no others. AudioService's `CATALOGUE` role is minted
+by the supervisor BEFORE the service reports online, so the supervisor blocked in `service_connect`
+waiting for a reply that could only be sent after a message the supervisor was itself blocked from
+sending. Measured with probes rather than reasoned about: the standing loop ran exactly twice and
+stopped, with the catalogue root live and in its wait set the whole time.
+
+THE FIX IS THE RULE THIS FILE ALREADY STATES - "One wait, so a catalogue query cannot delay a
+supervisor message and a supervisor message cannot delay a query". A second wait in front of the one
+wait is not one wait. The agent's bootstrap now goes into the built set before the policy root, so
+`at == 1` still names the catalogue root and every later index is computed rather than written down,
+and it is dispatched by its index. `WAITING_MAX` gained the one slot that needs.
+
+MEASURED AFTER: the development instance reaches an attached shell in 95 s, with DisplayService,
+PermissionManager and ConsoleService online and `ConsoleService: a frame reached the display` - which
+is this milestone's display seam working in that configuration as well as in the shipping one.
+
+AND A GATE, because the reason this was invisible is that NOTHING BOOTS THE DEVELOPMENT
+CONFIGURATION: `development-build` proves it compiles, `development-gate` inspects the built volume,
+and neither starts a guest. A booting gate would have to build that configuration, which is the state
+`development-gate` exists to refuse in the tree - so what guards it is `one-wait`
+(`src/tools/check-one-wait.sh`), a source gate that refuses the SHAPE the defect had: a wait in
+DeviceManager is over a set the program BUILT, never over an array literal at the call site, and
+every party it answers - supervisor, catalogue, policy, development agent - must be in that set. It
+was watched to fail with the defect reintroduced and passes on the fixed tree. Registered in
+`check.sh` and in the model's catalogue (`GATES` 66 -> 67), subject `services`, so a change to the
+manager selects it.
+
+VERIFICATION FOR THIS ADDENDUM (2026-09-02T21:40:00Z):
+
+- The development instance reaches an attached shell in 95 s, twice, on the final tree: DisplayService
+  online, PermissionManager online, ConsoleService online, and `ConsoleService: a frame reached the
+  display`. Before the fix it stalled at the same point on every attempt, at one core and at four.
+- `one-wait`: clean on the fixed tree, and watched to FAIL with the defect reintroduced - it named the
+  literal wait and its line.
+- x86_64 kernel suite, same scope as the round above: 239 passed, 0 failed.
+- `qemu-virtio-iommu-x86_64` on a freshly built image: unchanged, including "the display driver runs
+  and a frame reached the screen".
+- `verify-model`: 117 passed with the new gate row (`GATES` 66 -> 67).
+- `no-suppression`, `source-hygiene`, `bootstrap-plan`, `milestone-index`, `no-fixed-provider-slots`,
+  `declared-interfaces`, `development-build`, `development-gate`: clean. The tree was returned to the
+  shipping configuration afterwards, which `development-gate` confirms.
+- Every temporary probe used for the diagnosis was removed; `no-suppression` and `source-hygiene` were
+  re-run after that removal.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON M0164 (2026-09-03T02:30:00Z):
+
+FINDING 1 - the production consumer migration remains audio-only: NOW ANSWERED FOR FOUR OF THE SIX
+CONSUMERS THE FINDING NAMES, and the two that are left are named rather than implied.
+
+    | consumer          | how it reaches its device                              |
+    | AudioService      | subscribes (`audio`)      - 2026-08-31                 |
+    | DisplayService    | subscribes (`display`)    - 2026-09-02                 |
+    | NetworkService    | subscribes (`net`)        - 2026-09-02                 |
+    | InputService      | subscribes (`input`, `pointer`) - 2026-09-02           |
+    | the USB pair      | still `USB` and `USBBUS`  - the one thing left          |
+
+`net_client`, `gpu_client`, `input_client` and `usb_pointer` are gone from DeviceManager. Each tag
+they travelled under carries a FACT now - whether this machine has a driver of that kind bound -
+because the supervisor's driver-status view is the only thing that ever used those handles. Each
+service reads a `CATALOGUE` factory role, subscribes to the kind it needs and opens a connection to
+what it finds; a machine with none of that kind is the state a zero handle used to be and is refused
+or tolerated exactly where it was before. The kernel harnesses that stand in for the supervisor
+answer those conversations now, including `serve_provider_catalogue_empty` for a kind a machine has
+nothing of - which InputService asks about whether or not there is a USB pointing device.
+
+WHAT IS LEFT, AND WHY IT IS LEFT. `USB` is the USB stick's block provider, consumed by a
+StorageService instance whose volume role is decided by M2's probe; `USBBUS` is the bus-query channel
+`lsusb` reads, which reaches a TOOL through PermissionManager's grant table - so migrating it means
+the manager minting a catalogue connection per launch, a change inside the grant path where this
+round already fixed two defects. Neither is a COUNT, which is what finding 2 was about: they are one
+slot per kind, the shape every migrated consumer had before its turn.
+
+FINDING 2 - block discovery and role assignment are capped at four positional hand-off slots:
+ACCEPTED AND FIXED for the part that was a number compiled into the manager, which is what the
+Definition of Done's first line is about.
+
+`BOOT_BLOCK_TAGS: [&[u8]; 4]` - `BLOCK`, `BLOCK2`, `BLOCK3`, `BLOCK4` - with a four-entry array
+behind two of them was a count of disks written into DeviceManager: a fifth had nowhere to go however
+many the registry allowed a driver to publish, and the extras were reported and unmounted by
+arithmetic rather than by policy. The count TRAVELS now. The online report carries the first provider
+as it always did, a `BLOCKS` message says how many follow, and then that many providers and that many
+probe connections; both arrays are grown rather than declared, and the bound is `MAX_PROVIDERS`,
+which `build.rs` sums from every `provides` the manifest declares - the registry's number, reaching
+the wire without this file holding an opinion about it. ServiceManager reads the count and takes
+exactly that many, placing them in the volumes the manifest declares and CLOSING and SAYING anything
+past that rather than silently keeping a channel its driver waits on.
+
+AND THE GATE THAT REQUIRED THE DEFECT NOW REFUSES IT. `check-no-fixed-provider-slots` REQUIRED
+`BOOT_BLOCK_TAGS` to exist, on the reasoning that one named list is better than four variables and a
+`send` each. It is - and it was still a four compiled into the manager. The rule is inverted: no
+numbered block tag may appear, and the hand-off must carry its own count.
+
+WHAT IS NOT CLAIMED. The ROLE assignment - which volume is the system one, which is FAT media and
+which is the FAT USB stick - is unchanged: it is M2's format/origin/`RootSelection` probe, it already
+decides by those three inputs and never by arrival order, and this round did not touch it. What
+changed is that the number of providers reaching it is the machine's rather than this program's.
+
+VERIFICATION FOR THIS ROUND (2026-09-03T02:30:00Z):
+
+- The four new profile rows, all passing, on freshly built aarch64 and riscv64 trees:
+  `arch-profile-aarch64-no-dt-1` and `arch-profile-riscv64-no-dt-1` each select the STATIC descriptor
+  under the named profile, tick, and acquire/deliver/release an MSI on it;
+  `arch-profile-aarch64-uefi-1` and `arch-profile-riscv64-uefi-1` boot through firmware, discover from
+  the tree, and are required NOT to have taken the static descriptor.
+- x86_64 kernel suite, scoped to what changed - `object,dma,display,console,service,syscall,drivers,
+  volume-layout,boot,storage,filesystem,input,mouse`: 241 passed, 0 failed. That covers the boot test
+  which requires EVERY manifest service online, so the network, input and block hand-off changes are
+  exercised end to end.
+- `qemu-virtio-iommu-x86_64` on a freshly built image: unchanged, including the default machine's
+  "the display driver runs and a frame reached the screen" with four disks and a NIC.
+- `dev-gpu-restart: passed` on the development instance, with the same disable/enable/rebind chain.
+- `verify-model`: 117 passed (`GATES` 70, `PROFILE_ROW_GATES` 16).
+- Host gates: `no-suppression`, `source-hygiene`, `bootstrap-plan`, `declared-interfaces`,
+  `milestone-index`, `no-fixed-provider-slots`, `grant-vocabulary`, `one-wait`, `gate-oracles`,
+  `test-tags`, `development-build`, `development-gate` - all clean. The tree was returned to the
+  shipping configuration afterwards.

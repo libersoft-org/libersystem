@@ -139,6 +139,14 @@ declare -A GATES=(
 	# declaration rots: it is read by people, who believe it.
 	["declared-interfaces"]="tools/check-declared-interfaces.py"
 	["no-fixed-provider-slots"]="tools/check-no-fixed-provider-slots.sh"
+	# DeviceManager watched the development agent in a SECOND wait in front of its one wait, and that
+	# set had no catalogue root in it - so the development configuration deadlocked on the first
+	# service to ask the catalogue for a connection, and nothing boots that configuration to notice.
+	["one-wait"]="tools/check-one-wait.sh"
+	# A capability the grant loop never walks is one no manifest row can deliver. `lsdev` held
+	# `DevicePolicy` from the day the operator verbs were built and received the CONFIG client under
+	# its tag, so every operator verb was unreachable; `kill` had the same hole and could end nothing.
+	["grant-vocabulary"]="tools/check-grant-vocabulary.sh"
 	["smp-core-cap"]="tools/check-smp-core-cap.sh"
 	# The line addressed to a tool appears only where a tool is reading it. Two boots, and the
 	# ABSENCE on an interactive profile is half of what it proves.
@@ -163,6 +171,11 @@ declare -A GATES=(
 	["arch-profile-riscv64-aia-1"]="tools/check-qemu-arch-profiles.sh --only riscv64:aia:1"
 	["arch-profile-riscv64-aia-4"]="tools/check-qemu-arch-profiles.sh --only riscv64:aia:4"
 	["arch-profile-riscv64-uefi-1"]="tools/check-qemu-arch-profiles.sh --only riscv64:uefi:1"
+	# THE POSITIVE NO-DEVICE-TREE ROWS. Each builds a loader that declines to pass the firmware's tree
+	# on, so the kernel is handed a machine with none and selects the static descriptor its named
+	# profile authorises - the half a boot WITH a tree cannot show.
+	["arch-profile-aarch64-no-dt-1"]="tools/check-qemu-arch-profiles.sh --only aarch64:no-dt:1"
+	["arch-profile-riscv64-no-dt-1"]="tools/check-qemu-arch-profiles.sh --only riscv64:no-dt:1"
 	# THE THREE NUMA PROFILES, ONE STEP EACH, for the reason directly above.
 	#
 	# `qemu-numa` boots x86_64 under KVM and then aarch64 and riscv64 under emulation, and as one

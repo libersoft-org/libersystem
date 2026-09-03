@@ -5,6 +5,8 @@ name = "loader"
 edition = "2024"
 description = "LiberSystem UEFI boot loader (x86_64, aarch64 and riscv64 EFI application)"
 
+build = "build.rs"
+
 [[bin]]
 name = "libersystem-loader"
 path = "src/main.rs"

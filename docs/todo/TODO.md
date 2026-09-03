@@ -224,7 +224,7 @@ or preventing further development of `v1`.
 - [x] [P02M0148 - `shutdown` tears the system down and then does not stop the machine](P02M0148.md)
 - [x] [P02M0149 - A provider was rebuilt, its consumer was not, and only the packager noticed](P02M0149.md)
 - [x] [P02M0150 - A digest beside a payload is not a boot trust chain](P02M0150.md)
-- [ ] [P02M0151 - The architecture boundary contains no panic-shaped compatibility contract](P02M0151.md) - one item open: M6's POSITIVE no-device-tree boot, which needs a QEMU machine that publishes no tree or a loader option that declines to pass one on. Everything else is closed, including the two single-node UEFI regression rows and the device-originated ITS checkpoint
+- [x] [P02M0151 - The architecture boundary contains no panic-shaped compatibility contract](P02M0151.md)
 - [x] [P02M0152 - Memory has a topology, not one global distance](P02M0152.md)
 - [x] [P02M0153 - Virtio-IOMMU confines the first x86_64 QEMU endpoints](P02M0153.md)
 - [x] [P02M0154 - The capability transfer rules have a machine-checked bounded model](P02M0154.md)

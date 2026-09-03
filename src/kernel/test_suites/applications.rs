@@ -897,9 +897,18 @@ fn permission_manager_enforces_static_and_dynamic_probe_policy() {
 	let result = permission_scenario_result(PermissionCohort::Base).expect("the permission probe scenario should run");
 	assert!(!result.expected.is_empty(), "the granted file should not be empty");
 	assert_eq!(result.probe_read, result.expected, "the sandboxed component read its one granted file through the storage grant");
-	assert_eq!(result.probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
+	// AND THE VOCABULARY IS THE WHOLE VOCABULARY, which is what these summaries pin (2026-09-02).
+	//
+	// `device-policy` and `session` were missing from `VOCABULARY` - the array PermissionManager
+	// WALKS to deliver a launch's grants - so no manifest row could deliver either, however plainly
+	// it granted them: `lsdev` received the configuration client under the policy tag and reported no
+	// operator authority, and `kill` had no session client at all. Both are in the array now, and
+	// both appear in every summary below as `deny` for probes whose manifests ask for neither -
+	// which is exactly what these assertions are for. A capability that stops being enumerated stops
+	// being denied out loud, and the summary is the only place that shows it.
+	assert_eq!(result.probe_summary.as_slice(), b"storage=grant log=grant network=deny device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "sandbox_probe was granted exactly its manifest - storage and log - and denied every other capability in the vocabulary");
 	assert_eq!(result.request_read.as_slice(), b"storage denied", "request_probe's undeclared storage request was refused by the headless policy default");
-	assert_eq!(result.request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny storage=deny(dynamic)", "request_probe's static grants and dynamic denial were recorded independently");
+	assert_eq!(result.request_summary.as_slice(), b"storage=deny log=grant network=deny device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny storage=deny(dynamic)", "request_probe's static grants and dynamic denial were recorded independently");
 }
 
 tagged_test!(permission_manager_runs_tools_with_minimal_grants, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_runs_tools_with_minimal_grants", covers = ["bin.permission_manager", "kernel", "services"]);
@@ -914,10 +923,10 @@ fn permission_manager_runs_tools_with_minimal_grants() {
 	assert_eq!(result.date_read[16], b':', "date separates the minute and second");
 	assert_eq!(result.date_read[19], b'Z', "date reports UTC");
 	assert_eq!(result.date_read[20], b'\n', "date ended its stdout line");
-	assert_eq!(result.date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "date received only its time grant");
+	assert_eq!(result.date_summary.as_slice(), b"storage=deny log=deny network=deny device=deny device-policy=deny config=deny time=grant audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "date received only its time grant");
 	assert_eq!(result.cat_read, result.expected, "cat printed its file through the storage grant");
 	assert_eq!(result.ip_read.as_slice(), b"net0: 10.0.2.15  mac 52:54:00:12:34:56  mtu 1500  gateway 10.0.2.2\n", "ip rendered state from its typed NetworkService grant");
-	assert_eq!(result.ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "ip received only its network grant");
+	assert_eq!(result.ip_summary.as_slice(), b"storage=deny log=deny network=grant device=deny device-policy=deny config=deny time=deny audio=deny input=deny graph=deny resource=deny process=deny permission=deny supervisor=deny session=deny volumes=deny services=deny usb=deny display=deny input-keys=deny audio-stream=deny audio-capture=deny app-assets=deny", "ip received only its network grant");
 }
 
 tagged_test!(permission_manager_mints_scoped_application_grants, [Service, Process, PermissionService], id = "kernel.applications.permission_manager_mints_scoped_application_grants", covers = ["bin.permission_manager", "kernel", "services"]);

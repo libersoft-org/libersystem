@@ -227,7 +227,7 @@ pub(super) unsafe fn launch_from_volume(process_client: u64, name: &[u8], bootst
 // pointer-event channel (a USB pointing device). Kept for bootstrapping NetworkService,
 // ConsoleService, AudioService, InputService, the usb StorageService instance and
 // PermissionManager's `usb` grant against the drivers.
-pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_frames: &mut u64, gpu_online: &mut bool, snd_online: &mut bool, input_raw: &mut u64, block5_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, buf: &mut [u8]) {
+pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_online: &mut bool, gpu_online: &mut bool, snd_online: &mut bool, input_online: &mut bool, block5_client: &mut u64, usbq_client: &mut u64, usb_pointer_online: &mut bool, raw_keys: &mut u64, buf: &mut [u8]) {
 	unsafe {
 		if dm_control == 0 {
 			return;
@@ -256,7 +256,15 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 			let Received::Message { len, handle } = recv_blocking(dm_control, buf) else { break };
 			let tag: &[u8] = &buf[..len.min(buf.len())];
 			match tag {
-				b"NET" => *net_frames = handle,
+				// THE TAG CARRIES A FACT, NOT A CHANNEL - the network half (2026-09-02). NetworkService
+				// subscribes to the provider catalogue for its NIC now, so DeviceManager routes no
+				// frame channel and this supervisor keeps no slot for one.
+				_ if tag.starts_with(b"NET") => {
+					*net_online = tag.len() > 3 && tag[3] != 0;
+					if handle != 0 {
+						close(handle);
+					}
+				}
 				// THE TAG CARRIES A FACT, NOT A CHANNEL - the display half (2026-09-02). DisplayService
 				// subscribes to the provider catalogue for its device now, so DeviceManager routes no
 				// display channel and this supervisor keeps no slot for one. What travels behind the
@@ -278,10 +286,26 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 						close(handle);
 					}
 				}
-				b"INPUT" => *input_raw = handle,
+				// THE TAG CARRIES A FACT, NOT A CHANNEL - the pointer half (2026-09-02). InputService
+				// subscribes to the provider catalogue for its pointing devices now, so DeviceManager
+				// routes neither of the two channels it used to and this supervisor keeps no slot for
+				// them. `INPUT2` is matched by the same prefix rule, before this one's, because
+				// `INPUT` is a prefix of it.
+				_ if tag.starts_with(b"INPUT2") => {
+					*usb_pointer_online = tag.len() > 6 && tag[6] != 0;
+					if handle != 0 {
+						close(handle);
+					}
+				}
+				_ if tag.starts_with(b"INPUT") => {
+					*input_online = tag.len() > 5 && tag[5] != 0;
+					if handle != 0 {
+						close(handle);
+					}
+				}
 				b"USB" => *block5_client = handle,
 				b"USBBUS" => *usbq_client = handle,
-				b"INPUT2" => *usb_pointer = handle,
+
 				b"KEYS" => *raw_keys = handle,
 				_ => {
 					// A capability under a tag this build has no slot for is not silently kept: it
@@ -307,7 +331,7 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut [u64; 4], policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_frames: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, input_raw: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
+pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut [u64; 4], policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -398,8 +422,8 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			let probe_handles: [u64; 4] = core::mem::take(probe_blocks);
 			let probe_count: u8 = probe_handles.iter().filter(|handle| **handle != 0).count() as u8;
 			let (fat, iso, udf, usb): (u64, u64, u64, u64) = (*block2_client, *block3_client, *block4_client, *block5_client);
-			let (block, frames): (u64, u64) = (*block_client, *net_frames);
-			let (pointer, pointer2, keys): (u64, u64, u64) = (*input_raw, *usb_pointer, *raw_keys);
+			let block: u64 = *block_client;
+			let keys: u64 = *raw_keys;
 			let (storage_root, storage_adm): (u64, u64) = (*storage_client, *storage_admin);
 			let pointer_forward: u64 = *pointer_console;
 			let mut external = |role: &Role| -> Option<(alloc::vec::Vec<u8>, u64)> {
@@ -482,9 +506,6 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 					message.push(probe_count);
 					return Some((message, block));
 				}
-				if name == b"network_service" && role.tag == b"FRAMES" {
-					return Some((role.tag.to_vec(), frames));
-				}
 				// A PRIVILEGE IS THE KERNEL'S, HANDED ON. Duplicated rather than transferred,
 				// because this supervisor keeps its own copy for whoever needs one next.
 				//
@@ -503,16 +524,8 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				// THE RAW EVENT CHANNELS COME FROM DRIVERS, routed up by DeviceManager. A zero handle
 				// is an absent pointer source, and InputService serves an empty stream rather than
 				// refusing to start.
-				if name == b"input_service" {
-					if role.tag == b"INPUT" {
-						return Some((role.tag.to_vec(), pointer));
-					}
-					if role.tag == b"INPUT2" {
-						return Some((role.tag.to_vec(), pointer2));
-					}
-					if role.tag == b"KEYS" {
-						return Some((role.tag.to_vec(), keys));
-					}
+				if name == b"input_service" && role.tag == b"KEYS" {
+					return Some((role.tag.to_vec(), keys));
 				}
 				// CONFIGSERVICE GETS A CLIENT SCOPED TO ONE DIRECTORY, minted from StorageService's
 				// admin endpoint rather than duplicated from its public root. The plan can say the
@@ -707,21 +720,52 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				// driver channels arrive later, in DeviceManager's phase 2, once the volume they
 				// load from is mounted (driven right after StorageService comes up, below).
 				if name == b"device_manager" {
-					if let Received::Message { handle: block2, .. } = recv_blocking(manager_side, buf) {
-						*block2_client = block2;
+					// HOW MANY BLOCK PROVIDERS THIS MACHINE HAS, CARRIED RATHER THAN ASSUMED
+					// (2026-09-02). DeviceManager used to send three follow-ups and four probes
+					// whatever the machine had, because both sides held the same compiled-in four.
+					// It now says how many, and this reads exactly that many.
+					let mut published: usize = 0;
+					if let Received::Message { len, handle } = recv_blocking(manager_side, buf) {
+						if handle != 0 {
+							close(handle);
+						}
+						if len >= 7 && &buf[..6] == b"BLOCKS" {
+							published = buf[6] as usize;
+						}
 					}
-					if let Received::Message { handle: block3, .. } = recv_blocking(manager_side, buf) {
-						*block3_client = block3;
-					}
-					if let Received::Message { handle: block4, .. } = recv_blocking(manager_side, buf) {
-						*block4_client = block4;
+					// The first arrived with the online report; the rest follow. This supervisor has
+					// three more volumes declared to give them to - the media, ISO and UDF instances
+					// the manifest names - and a provider past that is CLOSED and SAID rather than
+					// silently kept: a handle nobody serves is a channel its driver waits on for
+					// ever.
+					for at in 0..published.saturating_sub(1) {
+						let Received::Message { handle, .. } = recv_blocking(manager_side, buf) else { break };
+						match at {
+							0 => *block2_client = handle,
+							1 => *block3_client = handle,
+							2 => *block4_client = handle,
+							_ => {
+								if handle != 0 {
+									close(handle);
+								}
+								print(b"ServiceManager: this machine has more block providers than there are volumes declared for them; the extra one is published and unmounted\n");
+							}
+						}
 					}
 					// AND ONE PROBE CONNECTION PER BLOCK PROVIDER, in the same order. These are
 					// minted connections rather than the roles' own channels, so the instance that
-					// probes them competes with nobody for a reply.
-					for slot in probe_blocks.iter_mut() {
-						if let Received::Message { handle: probe, .. } = recv_blocking(manager_side, buf) {
-							*slot = probe;
+					// probes them competes with nobody for a reply. The array is what the system
+					// instance is handed; a machine with more providers than it holds probes the
+					// ones it can and the rest are closed.
+					for at in 0..published {
+						let Received::Message { handle: probe, .. } = recv_blocking(manager_side, buf) else { break };
+						match probe_blocks.get_mut(at) {
+							Some(slot) => *slot = probe,
+							None => {
+								if probe != 0 {
+									close(probe);
+								}
+							}
 						}
 					}
 				}

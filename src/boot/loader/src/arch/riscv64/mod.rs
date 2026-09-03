@@ -71,8 +71,14 @@ pub fn hand_off(bs: *mut BootServices, image_handle: Handle, system_table: *mut 
 	// firmware exposes none, and treats hart 0 as the boot hart if the protocol is
 	// absent.
 	let hartid = boot_hartid(bs);
-	let dtb = find_dtb(system_table);
-	serial::write_str(if dtb != 0 { "loader: device tree found\n" } else { "loader: no device-tree table (kernel will scan)\n" });
+	// AND THE NAMED PROFILE IS WHERE IT IS WITHHELD - see `crate::withholds_device_tree`, and the
+	// aarch64 port, which does the same at the same point.
+	let dtb = if crate::withholds_device_tree() { 0 } else { find_dtb(system_table) };
+	if crate::withholds_device_tree() {
+		serial::write_str("loader: the no-device-tree profile is compiled in - the firmware's device tree is NOT passed to the kernel\n");
+	} else {
+		serial::write_str(if dtb != 0 { "loader: device tree found\n" } else { "loader: no device-tree table (kernel will scan)\n" });
+	}
 
 	// Build a BootInfo carrying the DTB pointer and the GOP framebuffer, so the kernel
 	// draws its earliest boot log to the display pixel-by-pixel (QEMU virt has no VGA;

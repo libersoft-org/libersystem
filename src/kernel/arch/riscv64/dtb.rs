@@ -47,6 +47,15 @@ unsafe fn locate(hint: u64) -> Option<u64> {
 		crate::serial_println!("dtb: the boot path published a device tree at {hint:#x} and there is no FDT header there - this kernel will not go looking for another one");
 		return None;
 	}
+	// AND THE NAMED NO-DEVICE-TREE PROFILE DOES NOT GO LOOKING - the same rule aarch64's reader
+	// carries, and for the same measured reason (added 2026-09-02). The loader on that profile is
+	// built to WITHHOLD the firmware's tree so this kernel meets a machine with none; QEMU has left
+	// one in low DRAM, and a scan that finds it makes the profile a no-op and the static descriptor
+	// it exists to exercise unreachable.
+	if super::boot_profile_authorises_no_dt() {
+		crate::serial_println!("dtb: the named no-device-tree profile is compiled in - this kernel does not go looking for a tree the loader withheld");
+		return None;
+	}
 	let mut base = SCAN_START;
 	while base < SCAN_END {
 		if unsafe { at(base) }.is_valid() {

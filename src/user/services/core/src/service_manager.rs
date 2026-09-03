@@ -537,7 +537,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// with the phase-2 driver channels and granted to the `lsusb` command through
 	// PermissionManager.
 	let mut usbq_client: u64 = 0;
-	let mut net_frames: u64 = 0;
+	// WHETHER THIS MACHINE HAS A NETWORK DRIVER BOUND, not a channel to it - see the `NET` tag in
+	// `drive_runtime_drivers`, and `gpu_online` and `snd_online` beside it for the same shape.
+	let mut net_online: bool = false;
 	let mut net_client: u64 = 0;
 	// WHETHER THIS MACHINE HAS A DISPLAY DRIVER BOUND, not a channel to it. DisplayService reaches
 	// its device through the provider catalogue now, so nothing here routes one - see the `GPU` tag
@@ -545,7 +547,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut gpu_online: bool = false;
 	let mut display_client: u64 = 0;
 	let mut display_admin: u64 = 0;
-	let mut input_raw: u64 = 0;
+	// WHETHER THIS MACHINE HAS POINTING DEVICES BOUND, not channels to them - see the `INPUT` and
+	// `INPUT2` tags in `drive_runtime_drivers`.
+	let mut input_online: bool = false;
+	let mut usb_pointer_online: bool = false;
 	let mut raw_keys: u64 = 0;
 	let mut input_client: u64 = 0;
 	let mut input_admin: u64 = 0;
@@ -553,7 +558,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut input_kill: u64 = 0;
 	// The xhci driver's pointer-event channel (a USB pointing device), folded by
 	// InputService alongside the virtio pointer's raw channel.
-	let mut usb_pointer: u64 = 0;
 	// The console end of the InputService -> ConsoleService pointer-forward channel,
 	// minted when InputService bootstraps and handed to ConsoleService when it bootstraps
 	// (InputService is a declared dependency of ConsoleService, so it starts first).
@@ -631,7 +635,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Absent && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_frames, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut input_raw, &mut usb_pointer, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
 				// bring-up waits for the report, but it is the honest name for the window between
 				// a process existing and a service answering, and it is what a later non-blocking
@@ -723,7 +727,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// on process_service, so come up later), so their driver channels are ready.
 				if MANIFEST[i].name == b"storage_service" && started == State::Ready {
 					if let Some(dm) = index_of(b"device_manager") {
-						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_frames, &mut gpu_online, &mut snd_online, &mut input_raw, &mut block5_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut buf) };
+						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_online, &mut gpu_online, &mut snd_online, &mut input_online, &mut block5_client, &mut usbq_client, &mut usb_pointer_online, &mut raw_keys, &mut buf) };
 					}
 					// LogService starts before StorageService, so its volume client (the
 					// on-disk journal) is delivered late, like its config client: minted
@@ -806,10 +810,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		.map(|name| {
 			let online = match *name {
 				b"driver.virtio_blk" => block_client != 0,
-				b"driver.virtio_net" => net_frames != 0,
+				b"driver.virtio_net" => net_online,
 				b"driver.virtio_gpu" => gpu_online,
 				b"driver.virtio_snd" => snd_online,
-				b"driver.virtio_input" => input_raw != 0,
+				b"driver.virtio_input" => input_online,
 				b"driver.xhci" => block5_client != 0,
 				_ => false,
 			};

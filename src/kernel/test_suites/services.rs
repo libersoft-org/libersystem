@@ -113,15 +113,21 @@ fn input_service_streams_pointer_events() {
 	let (_forward_drain, forward_input) = Channel::create();
 	let _input_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
-	send_cap(&boot_kernel, b"INPUT", raw_consumer, Rights::ALL).expect("input raw bootstrap");
-	// no USB pointer in this scenario: the second raw channel is absent (handle 0).
-	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new())).expect("input2 raw bootstrap");
 	send_cap(&boot_kernel, b"FORWARD", forward_input, Rights::ALL).expect("forward raw bootstrap");
 	send_cap(&boot_kernel, b"KEYS", key_consumer, Rights::ALL).expect("key raw bootstrap");
 	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
 	boot_kernel.send(Message::new(b"KILL".to_vec(), alloc::vec::Vec::new())).expect("kill bootstrap");
 	let (_admin_peer, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("input admin bootstrap");
+	// THE PROVIDER CATALOGUE, LAST, AND IT IS HOW THIS SERVICE FINDS ITS POINTERS. It is not handed
+	// `INPUT`/`INPUT2` channels any more - it subscribes to the input and pointer kinds - so this
+	// harness answers both conversations: one with the raw pointer this scenario has, and one empty,
+	// because it has no USB pointing device.
+	let (catalogue_server, catalogue_client) = Channel::create();
+	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	sched::run_until_idle();
+	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, raw_consumer).expect("the catalogue answered the pointer subscription");
+	crate::tests::serve_provider_catalogue_empty(&catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
 
 	// Inject two normalized pointer events as the driver would. The grid is COLS = 80
 	// x ROWS = 50 over the 0..0x10000 normalized span, so col = (x * 80) / 0x10000 and
@@ -198,14 +204,18 @@ fn input_service_streams_keys_only_with_display_focus() {
 	let (kill_display, kill_input) = Channel::create();
 	let _input_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
 	send_cap(&boot_kernel, b"SERVE", service_server, Rights::ALL).expect("serve bootstrap");
-	send_cap(&boot_kernel, b"INPUT", pointer_b, Rights::ALL).expect("pointer bootstrap");
-	boot_kernel.send(Message::new(b"INPUT2".to_vec(), alloc::vec::Vec::new())).expect("second pointer bootstrap");
 	send_cap(&boot_kernel, b"FORWARD", forward_b, Rights::ALL).expect("forward bootstrap");
 	send_cap(&boot_kernel, b"KEYS", keys_input, Rights::ALL).expect("keys bootstrap");
 	send_cap(&boot_kernel, b"FOCUS", focus_input, Rights::ALL).expect("focus bootstrap");
 	send_cap(&boot_kernel, b"KILL", kill_input, Rights::ALL).expect("kill bootstrap");
 	let (input_admin, admin) = Channel::create();
 	send_cap(&boot_kernel, b"ADMIN", admin, Rights::ALL).expect("input admin bootstrap");
+	// THE PROVIDER CATALOGUE, LAST - see the other InputService harness in this file.
+	let (pointer_catalogue_server, pointer_catalogue_client) = Channel::create();
+	send_cap(&boot_kernel, b"CATALOGUE", pointer_catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	sched::run_until_idle();
+	crate::tests::serve_provider_catalogue(&pointer_catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Input, pointer_b).expect("the catalogue answered the pointer subscription");
+	crate::tests::serve_provider_catalogue_empty(&pointer_catalogue_server).expect("the catalogue answered the usb-pointer subscription with nothing");
 	sched::run_until_idle();
 	let online = boot_kernel.recv().expect("InputService online report");
 	assert_eq!(&online.bytes[..], b"InputService: online");
@@ -692,11 +702,17 @@ fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	let (frames_kernel, frames_user) = Channel::create();
 	let (_serve_kernel, serve_user) = Channel::create();
 	let _network_service = spawn_dynamic_test_process(sched::root_domain(), service_elf, boot_user);
-	send_cap(&boot_kernel, b"FRAMES", frames_user, Rights::ALL).expect("frames bootstrap");
 	// no config tree serves this scenario: CONFIG with no handle tells the service
 	// to fall back to its compiled-in defaults (the neighbor-cache size).
 	boot_kernel.send(Message::new(b"CONFIG".to_vec(), alloc::vec::Vec::new())).expect("config bootstrap");
 	send_cap(&boot_kernel, b"SERVE", serve_user, Rights::ALL).expect("serve bootstrap");
+	// THE PROVIDER CATALOGUE, LAST, AND IT IS HOW THIS SERVICE FINDS ITS NIC. It is not handed a
+	// `FRAMES` channel any more - it subscribes to the network kind and opens a connection to what it
+	// finds - so this harness answers that conversation. See `serve_provider_catalogue`.
+	let (catalogue_server, catalogue_client) = Channel::create();
+	send_cap(&boot_kernel, b"CATALOGUE", catalogue_client, Rights::SEND | Rights::RECEIVE | Rights::WAIT | Rights::TRANSFER).expect("the catalogue channel");
+	sched::run_until_idle();
+	crate::tests::serve_provider_catalogue(&catalogue_server, device_proto::generated::liber::device::v1::ProviderKind::Net, frames_user).expect("the catalogue answered the subscription and the connection");
 	// Pre-queue the whole bind conversation (the kernel test thread cannot answer
 	// mid-wait): the MAC lead-in, the OFFER and the clock-carrying ACK the handshake
 	// will consume in order, and the ARP reply that teaches the service the server's

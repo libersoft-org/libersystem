@@ -187,6 +187,41 @@ fn serve_provider_catalogue(server: &object::channel::Channel, kind: device_prot
 	Ok(())
 }
 
+// THE SAME CONVERSATION FOR A KIND THIS MACHINE HAS NOTHING OF: a subscription, answered, with an
+// empty snapshot behind it.
+//
+// A service that asks for two kinds - InputService asks for `input` and for `pointer` - blocks on the
+// second `subscribe` until something answers it, whether or not the machine has one. Answering with a
+// stream and no frames is what "there is nothing of that kind here" looks like on this interface, and
+// it is the state a zero handle used to be.
+fn serve_provider_catalogue_empty(server: &object::channel::Channel) -> Result<(), &'static str> {
+	use object::channel::{Channel, Message};
+	use object::handle::Capability;
+	use object::rights::Rights;
+	// WAITED FOR, NOT ASSUMED TO BE THERE. This is the SECOND subscription a service makes, and the
+	// service has to be let run between the first one's reply and this request - `recv` here answers
+	// "nothing yet" rather than blocking, so asking once reads the gap rather than the message.
+	let mut request = None;
+	for _ in 0..64 {
+		if let Ok(message) = server.recv() {
+			request = Some(message);
+			break;
+		}
+		sched::run_until_idle();
+	}
+	let request = request.ok_or("no subscribe request")?;
+	let corr = subscribe_correlation(&request.bytes).ok_or("the subscribe request did not decode")?;
+	let (stream_server, stream_client) = Channel::create();
+	let mut reply = alloc::vec::Vec::new();
+	reply.extend_from_slice(&corr.to_le_bytes());
+	server.send(Message::new(reply, alloc::vec![Capability::new(stream_client, Rights::ALL)])).map_err(|_| "the subscribe reply was refused")?;
+	// The sender stays alive for the life of the test: a stream whose sender is dropped CLOSES, and a
+	// service would read that as the catalogue going away rather than as an empty kind.
+	core::mem::forget(stream_server);
+	sched::run_until_idle();
+	Ok(())
+}
+
 // The correlation number every request on this interface carries, behind its opcode. Read rather
 // than assumed, because a client numbers its own calls and a harness answering with the wrong number
 // is a client that hangs.

@@ -26,7 +26,7 @@ use rt::*;
 
 use crate::net::{DHCP_ACK, DHCP_NAK, DHCP_OFFER, Event, Ipv4Addr, MacAddr, NEIGH_MAX, SockEntry, SockEntryState, Stack, TCP_SEGMENT_OVERHEAD};
 use proto::codec::{Buffer, Handles};
-use proto::system::{Chunk, Endpoint, Error, HopStatus, Ipv4Addr as WireIp, Neighbor, NetCapacity, NetInfo, PingReply, PingStatus, SockInfo, SockState, TcpRequest, TraceHop, config, listener, network, socket};
+use proto::system::{Chunk, Endpoint, Error, HopStatus, Ipv4Addr as WireIp, Neighbor, NetCapacity, NetInfo, PingReply, PingStatus, ProviderKind, SockInfo, SockState, TcpRequest, TraceHop, config, listener, network, provider_catalogue, socket};
 
 // Static addressing for the QEMU user-mode (SLIRP) network: the guest is
 // 10.0.2.15/24, the gateway/host is 10.0.2.2, and the DNS relay is 10.0.2.3. A DHCP
@@ -114,12 +114,30 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    config tree serves this boot - a test scenario), and the client channel
 		//    the shell reaches us on (the `ip` / `ping` / `nslookup` control
 		//    protocol).
-		let frames: u64 = recv_tagged(bootstrap, &mut buf, b"FRAMES").unwrap_or_else(|| fail_bootstrap(bootstrap, b"frames", b"driver frame channel not delivered"));
 		let config: u64 = match recv_blocking(bootstrap, &mut buf) {
 			Received::Message { len, handle } if len >= 6 && &buf[..6] == b"CONFIG" => handle,
 			_ => fail_bootstrap(bootstrap, b"config", b"config client not delivered"),
 		};
 		let client: u64 = recv_tagged(bootstrap, &mut buf, b"SERVE").unwrap_or_else(|| fail_bootstrap(bootstrap, b"serve", b"missing serve channel"));
+		// THE NIC IS DISCOVERED, NOT HANDED OVER.
+		//
+		// This service used to be given the network driver's frame channel under `FRAMES`, taken by
+		// DeviceManager into a slot of its own and routed down the boot chain - the per-kind
+		// injection the provider catalogue replaces. What arrives now is a connection to the
+		// CATALOGUE, and this service asks it for the network kind: a NIC bound after this service
+		// started reaches it, and a machine with two of them has a second entry to offer rather than
+		// a slot that is already full.
+		//
+		// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
+		let catalogue: u64 = recv_tagged(bootstrap, &mut buf, b"CATALOGUE").unwrap_or(0);
+		// THE SNAPSHOT IS ALREADY IN THE CHANNEL when `subscribe` answers - the catalogue registers a
+		// subscriber and sends it everything published in one step - so this is a poll and never a
+		// block. A machine with no NIC published has none, which is the same state a zero `FRAMES`
+		// handle used to be and is refused the same way below.
+		let frames: u64 = take_published_nic(catalogue);
+		if frames == 0 {
+			fail_bootstrap(bootstrap, b"frames", b"no network provider to serve");
+		}
 		// 2. the frame-mover driver leads with our NIC's MAC and the link's MTU over
 		//    the frame channel (it owns the device; we own the protocol), so we can
 		//    build the stack - its neighbor-cache sized by the config tree's
@@ -166,6 +184,57 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 
 // Send a built frame to the driver to transmit. A zero-length frame (the stack
 // produced no reply) sends nothing.
+// THE FIRST LIVE NETWORK PROVIDER THE SUBSCRIPTION HAS ALREADY QUEUED, connected to.
+//
+// POLLED, NEVER BLOCKED, and it stops at the first provider it CONNECTS to rather than draining the
+// channel: a frame this function reads and drops is a publication nothing will see again. Zero for a
+// boot that granted no catalogue connection or a machine with no NIC, which the caller refuses.
+unsafe fn take_published_nic(catalogue: u64) -> u64 {
+	unsafe {
+		if catalogue == 0 {
+			print(b"NetworkService: no provider catalogue - this instance has no way to find a NIC\n");
+			return 0;
+		}
+		let providers: u64 = match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(&ProviderKind::Net) {
+			Some(subscription) => subscription,
+			None => {
+				print(b"NetworkService: the catalogue refused a network subscription\n");
+				return 0;
+			}
+		};
+		let mut buf: [u8; 256] = [0; 256];
+		let mut opened: u64 = 0;
+		loop {
+			let PolledCaps::Message { len, handles } = try_recv_caps(providers, &mut buf) else { break };
+			for &handle in handles.as_slice() {
+				close(handle);
+			}
+			let mut frame_handles = wire::Handles::new();
+			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
+				print(b"NetworkService: a provider frame did not decode\n");
+				continue;
+			};
+			if !info.live {
+				continue;
+			}
+			match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) {
+				Some(Ok(handle)) => {
+					opened = handle;
+					break;
+				}
+				Some(Err(_)) => print(b"NetworkService: the catalogue refused a connection to the network provider it published\n"),
+				None => print(b"NetworkService: the catalogue did not answer the connection it published\n"),
+			}
+		}
+		// THE SUBSCRIPTION IS GIVEN BACK. This service takes one NIC at bootstrap and does not follow
+		// a replacement - its whole stack is built on the link it opened - so holding the stream open
+		// would be a handle nothing reads and a slot the catalogue could not give to a consumer that
+		// does follow one.
+		close(providers);
+		opened
+	}
+}
+
 unsafe fn send_frame(frames: u64, frame: &[u8]) {
 	unsafe {
 		if !frame.is_empty() {

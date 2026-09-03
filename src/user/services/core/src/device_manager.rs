@@ -79,10 +79,20 @@ unsafe fn report_boot_window() {
 	}
 }
 
-// THE BLOCK TAGS THE BOOT HAND-OFF CARRIES, in the order ServiceManager reads them: the system
-// volume, then the read-only FAT media, ISO9660 and UDF volumes. A property of that wire, named
-// here so the number is one list rather than four variables and a `send` each.
-const BOOT_BLOCK_TAGS: [&[u8]; 4] = [b"BLOCK", b"BLOCK2", b"BLOCK3", b"BLOCK4"];
+// HOW MANY BLOCK PROVIDERS THE BOOT HAND-OFF CARRIES IS THE MACHINE'S NUMBER, NOT THIS PROGRAM'S
+// (2026-09-02).
+//
+// It was `BOOT_BLOCK_TAGS: [&[u8]; 4]` - `BLOCK`, `BLOCK2`, `BLOCK3`, `BLOCK4` - with a four-entry
+// array behind each of two of them, and that four was a count of disks compiled into the manager: a
+// fifth had nowhere to go however many the registry allowed a driver to publish, and the extra ones
+// were reported and left unmounted by arithmetic rather than by policy. The Definition of Done says
+// no fixed provider slot remains here and that the number of providers of a kind is bounded by what
+// the registry allows and by nothing compiled in.
+//
+// So the count TRAVELS. The report carries the first provider as it always did, a `BLOCKS` message
+// says how many follow, and then that many providers and that many probe connections. The bound is
+// `MAX_PROVIDERS`, which `build.rs` sums from every `provides` the manifest declares - the registry's
+// number, reaching the wire without this file holding an opinion about it.
 
 // EVERY NUMBER THAT BOUNDS A BIND, IN ONE PLACE.
 //
@@ -438,15 +448,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// volumes. The CATALOGUE has no such number - it holds `MAX_PROVIDERS` of any kind - so a
 		// fifth disk is published, counted and REPORTED rather than silently dropped into a variable
 		// that does not exist.
-		let mut boot_blocks: [u64; BOOT_BLOCK_TAGS.len()] = [0; BOOT_BLOCK_TAGS.len()];
+		let mut boot_blocks: Vec<u64> = Vec::new();
 		// A connection to each block provider for whoever has to CHOOSE among them - see
 		// `mint_connection` and the `PROBE` tags below.
-		let mut probe_blocks: [u64; BOOT_BLOCK_TAGS.len()] = [0; BOOT_BLOCK_TAGS.len()];
-		let mut net_client: u64 = 0;
-		let mut input_client: u64 = 0;
+		let mut probe_blocks: Vec<u64> = Vec::new();
 		let mut usb_client: u64 = 0;
 		let mut usbq_client: u64 = 0;
-		let mut usb_pointer: u64 = 0;
 		let mut raw_keys: u64 = 0;
 		// What a post-`Online` restart needs, filled in by phase two. See `Recovery`.
 		let mut recovery: Recovery = Recovery::none();
@@ -462,14 +469,19 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    report itself carries one handle; each `BLOCK2`/`BLOCK3`/`BLOCK4` handle is 0
 		//    when that disk is absent). The net / gpu / snd / input driver channels follow in
 		//    phase 2, once the volume they load from is mounted.
-		send_blocking(bootstrap, b"DeviceManager: online", boot_blocks[0]);
-		for (at, tag) in BOOT_BLOCK_TAGS.iter().enumerate().skip(1) {
-			send_blocking(bootstrap, tag, boot_blocks[at]);
+		send_blocking(bootstrap, b"DeviceManager: online", boot_blocks.first().copied().unwrap_or(0));
+		// AND HOW MANY THERE ARE, BEFORE THEY ARRIVE. A reader that knows the count reads exactly
+		// that many and never one more, whatever this machine turns out to have - which is what
+		// replaced the four tags. See `BOOT_BLOCK_TAGS`'s note above, which is where the four was.
+		let published: [u8; 7] = [b'B', b'L', b'O', b'C', b'K', b'S', boot_blocks.len().min(u8::MAX as usize) as u8];
+		send_blocking(bootstrap, &published, 0);
+		for &block in boot_blocks.iter().skip(1) {
+			send_blocking(bootstrap, b"BLOCK", block);
 		}
 		// AND THE PROBE CONNECTIONS, in the same order and under their own tags. A zero handle is a
 		// disk this machine does not have, and the tag travels anyway so the reader's positions do
 		// not shift - the same rule every other hand-off in this chain follows.
-		for probe in probe_blocks {
+		for &probe in probe_blocks.iter() {
 			send_blocking(bootstrap, b"PROBE", probe);
 		}
 
@@ -478,14 +490,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		//    from vol://system/drivers/ and hand their channels up) or asks us to stop (which
 		//    also drops the driver channels, so the drivers shut down with us).
 		loop {
-			// The development agent's bootstrap is watched alongside ServiceManager's. Its
-			// closing is how this program learns the agent died, and answering that is this
-			// program's job because this program is what started it.
-			#[cfg(feature = "development")]
-			if dev.bootstrap != 0 && wait_any(&[bootstrap, dev.bootstrap], 0) == 1 {
-				dev.supervise(&mut buf);
-				continue;
-			}
 			// THE WATCHDOG RUNS ON EVERY PASS OF THIS LOOP, and the wait comes back for it.
 			//
 			// A driver that stopped answering is torn down through the same machinery a crashed one
@@ -578,12 +582,42 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// child's exit and its claim's settling exactly as one stopped during bring-up does, and
 			// this is the loop those nodes live in - so the handles go into the same one wait rather
 			// than being polled beside it.
-			const WAITING_MAX: usize = MAX_CATALOGUE_CLIENTS * 2 + 3 + MAX_NODES_IN_FLIGHT * 2;
+			// The three roots are the supervisor's channel, the catalogue's and the policy
+			// endpoint's; the fourth slot is the development agent's bootstrap, which a shipping
+			// build never fills and which costs one `u64` to leave room for.
+			const WAITING_MAX: usize = MAX_CATALOGUE_CLIENTS * 2 + 4 + MAX_NODES_IN_FLIGHT * 2;
 			let mut waiting: [u64; WAITING_MAX] = [0; WAITING_MAX];
 			let mut waiting_count: usize = 1;
 			waiting[0] = bootstrap;
 			if catalogue_service != 0 {
 				waiting[waiting_count] = catalogue_service;
+				waiting_count += 1;
+			}
+			// THE DEVELOPMENT AGENT'S BOOTSTRAP GOES IN THE ONE WAIT, AND THAT IS THE WHOLE FIX
+			// (corrected 2026-09-02).
+			//
+			// It used to be watched by a SECOND, NARROWER wait at the top of this loop -
+			// `wait_any(&[bootstrap, dev.bootstrap], 0)` - which every pass parked in before it
+			// reached the wait below. That set does not contain the catalogue root, so from the
+			// moment the agent existed this program answered the supervisor and the agent and
+			// NOTHING ELSE: a consumer asking the catalogue for a connection waited for a reply that
+			// could only be sent after a message the supervisor was itself blocked from sending. The
+			// development configuration deadlocked on the first service to ask - AudioService, whose
+			// `CATALOGUE` role is minted by the supervisor before the service reports online - and
+			// with it every service behind that one. Measured: the loop ran twice and stopped.
+			//
+			// The rule this file already states is the fix: "One wait, so a catalogue query cannot
+			// delay a supervisor message and a supervisor message cannot delay a query." A second
+			// wait in front of the one wait is not one wait. The agent's handle is a handle like any
+			// other and belongs in the set with them.
+			//
+			// It goes here, before the policy root, so `at == 1` still names the catalogue root and
+			// every index after it is computed from `waiting_count` rather than written down.
+			#[cfg(feature = "development")]
+			let dev_at: usize = waiting_count;
+			#[cfg(feature = "development")]
+			if dev.bootstrap != 0 {
+				waiting[waiting_count] = dev.bootstrap;
 				waiting_count += 1;
 			}
 			let policy_at: usize = waiting_count;
@@ -649,6 +683,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// is still there, and a `false` from a MINTED connection retires it. The two
 					// roots are not retired: they are this program's service registrations, not
 					// per-client connections, and there is no next client without them.
+					// THE AGENT'S OWN HANDLE, ANSWERED WHERE IT IS WAITED ON. Its closing is how this
+					// program learns the agent died, and answering that is this program's job because
+					// this program is what started it.
+					#[cfg(feature = "development")]
+					if dev.bootstrap != 0 && at == dev_at {
+						dev.supervise(&mut buf);
+						continue;
+					}
 					if policy_service != 0 && (at == policy_at || (at >= policy_clients_at && at < policy_clients_at + policy_clients.live().len())) {
 						let is_root: bool = at == policy_at;
 						if !serve_policy_once(waiting[at], is_root, &mut policy_clients, &mut nodes, &mut catalogue, policy_config, &mut buf) && !is_root {
@@ -668,12 +710,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			match recv_blocking(bootstrap, &mut buf) {
 				Received::Message { len, handle } if len >= 7 && &buf[..7] == b"DRIVERS" => {
 					#[cfg(feature = "development")]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery, &mut dev);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut usb_client, &mut usbq_client, &mut raw_keys, &mut recovery, &mut dev);
 					#[cfg(not(feature = "development"))]
-					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut net_client, &mut input_client, &mut usb_client, &mut usbq_client, &mut usb_pointer, &mut raw_keys, &mut recovery);
+					launch_volume_drivers(handle, &mut catalogue, &mut nodes, power, console_input, device_privilege, &mut buf, &mut usb_client, &mut usbq_client, &mut raw_keys, &mut recovery);
 					// NOT CLOSED: `Recovery` holds it, because rebinding a crashed driver means
 					// reading its artifact off the volume again. See `Recovery`.
-					send_blocking(bootstrap, b"NET", net_client);
+					// THE TAG CARRIES A FACT, NOT A CHANNEL - the network half, the same shape as the
+					// display and audio ones below. NetworkService subscribes to the catalogue for
+					// its NIC now, so this program routes no frame channel and holds no slot for
+					// one; what travels behind the tag is whether this machine has a network driver
+					// bound, which the supervisor's driver status view reports.
+					let net: [u8; 4] = [b'N', b'E', b'T', u8::from(catalogue.count_of(driver_protocol::provider::NET) > 0)];
+					send_blocking(bootstrap, &net, 0);
 					// THE TAG CARRIES A FACT, NOT A CHANNEL - the display half, for the same reason
 					// as the audio one below and with the same shape (2026-09-02). DisplayService
 					// subscribes to the catalogue for its device now, so this program routes no
@@ -689,12 +737,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					// driver status view reports and which only this program knows.
 					let audio: [u8; 4] = [b'S', b'N', b'D', u8::from(catalogue.count_of(driver_protocol::provider::AUDIO) > 0)];
 					send_blocking(bootstrap, &audio, 0);
-					send_blocking(bootstrap, b"INPUT", input_client);
+					// THE TAG CARRIES A FACT, NOT A CHANNEL - the pointer half. InputService subscribes
+					// to the catalogue for its pointing devices now, so this program routes neither
+					// of the two it used to hold and keeps no count of them.
+					let pointers: [u8; 6] = [b'I', b'N', b'P', b'U', b'T', u8::from(catalogue.count_of(driver_protocol::provider::INPUT) > 0)];
+					send_blocking(bootstrap, &pointers, 0);
 					send_blocking(bootstrap, b"USB", usb_client);
 					send_blocking(bootstrap, b"USBBUS", usbq_client);
 					// the xhci driver's pointer-event channel (a USB pointing device;
 					// InputService folds it alongside the virtio pointer's).
-					send_blocking(bootstrap, b"INPUT2", usb_pointer);
+					let usb_pointers: [u8; 7] = [b'I', b'N', b'P', b'U', b'T', b'2', u8::from(catalogue.count_of(driver_protocol::provider::POINTER) > 0)];
+					send_blocking(bootstrap, &usb_pointers, 0);
 					send_blocking(bootstrap, b"KEYS", raw_keys);
 				}
 				// The development agent's launcher, delivered once PermissionManager is up.
@@ -757,7 +810,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 // device's MMIO capability and info. Each disk's block-read service channel is routed up
 // (system / media / iso / udf, in discovery order). The non-bootstrap drivers are skipped
 // here - they load from the volume in phase 2, once it is mounted.
-unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], boot_blocks: &mut [u64; BOOT_BLOCK_TAGS.len()], probe_blocks: &mut [u64; BOOT_BLOCK_TAGS.len()]) {
+unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], boot_blocks: &mut Vec<u64>, probe_blocks: &mut Vec<u64>) {
 	unsafe {
 		let count: u64 = device_count();
 		// ONE NODE PER BOOT-CRITICAL DEVICE, and they come up TOGETHER. Four disks used to be bound
@@ -893,24 +946,34 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 		// which is the failure the whole per-consumer factory exists to prevent; these are fresh
 		// connections through `CONNECT`, so the instance that probes them competes with nobody.
 		// Taken first because `take` moves the offered channel and this asks the same binding.
-		for (at, slot) in probe_blocks.iter_mut().enumerate() {
-			let Some(found) = catalogue.entries.iter().enumerate().filter(|(_, entry)| entry.as_ref().is_some_and(|held| held.kind == driver_protocol::provider::BLOCK)).map(|(index, _)| index).nth(at) else {
+		// ONE PER PROVIDER THIS MACHINE HAS, not one per slot this program declared. The list grows
+		// to whatever the catalogue holds, which `MAX_PROVIDERS` already bounds.
+		let block_entries: Vec<usize> = catalogue.entries.iter().enumerate().filter(|(_, entry)| entry.as_ref().is_some_and(|held| held.kind == driver_protocol::provider::BLOCK)).map(|(index, _)| index).collect();
+		for found in block_entries {
+			let minted = mint_connection(catalogue, nodes, found);
+			// ALLOC-OK: one per block provider, and the catalogue that holds them is bounded.
+			if probe_blocks.try_reserve(1).is_err() {
+				print(b"DeviceManager: no room to record a probe connection for a block provider; it is published and unprobed\n");
+				close(minted);
 				break;
-			};
-			*slot = mint_connection(catalogue, nodes, found);
+			}
+			probe_blocks.push(minted);
 		}
 		// GLOBAL ON PURPOSE, unlike the takes in `route_offers`: this caller is choosing AMONG every
 		// block provider the boot found, by bus address, which is what `take` is for. See `take_from`
 		// for the other case, where one driver's own offers are being routed.
-		for slot in boot_blocks.iter_mut() {
-			*slot = catalogue.take(driver_protocol::provider::BLOCK);
-		}
-		// A DISK THE WIRE HAS NO TAG FOR IS SAID, not dropped. It is published in the catalogue and
-		// answerable through the provider interface; what it does not have is a mount, because the
-		// boot hand-off names four volumes.
-		let left = catalogue.count_of(driver_protocol::provider::BLOCK).saturating_sub(BOOT_BLOCK_TAGS.len());
-		if left > 0 {
-			print(b"DeviceManager: this machine has more block providers than the boot hand-off has volumes for; the extra ones are published and unmounted\n");
+		loop {
+			let taken = catalogue.take(driver_protocol::provider::BLOCK);
+			if taken == 0 {
+				break;
+			}
+			// ALLOC-OK: one per block provider, bounded by the catalogue that holds them.
+			if boot_blocks.try_reserve(1).is_err() {
+				print(b"DeviceManager: no room to record a block provider for the hand-off; it stays published and unmounted\n");
+				close(taken);
+				break;
+			}
+			boot_blocks.push(taken);
 		}
 	}
 }
@@ -924,7 +987,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 // merged raw-key consumer fed by every keyboard driver.
 // Tracks each device's state and prints a summary.
 #[allow(clippy::too_many_arguments)]
-unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], net_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: &mut Vec<Node>, power: u64, console_input: u64, device_privilege: u64, buf: &mut [u8], usb_client: &mut u64, usbq_client: &mut u64, raw_keys: &mut u64, recovery: &mut Recovery, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let (key_producer, key_consumer): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -1002,9 +1065,9 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 					Step::Online => {
 						state[nodes[at].index as usize] = STATE_ONLINE;
 						#[cfg(feature = "development")]
-						route_offers(&mut nodes[at], catalogue, name, storage, console_input, net_client, input_client, usb_client, usbq_client, usb_pointer, dev);
+						route_offers(&mut nodes[at], catalogue, name, storage, console_input, usb_client, usbq_client, dev);
 						#[cfg(not(feature = "development"))]
-						route_offers(&mut nodes[at], catalogue, name, net_client, input_client, usb_client, usbq_client, usb_pointer);
+						route_offers(&mut nodes[at], catalogue, name, usb_client, usbq_client);
 					}
 					// The same candidate, once more. The window and the attempt budget have already
 					// said there is room for it.
@@ -1172,16 +1235,16 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 // extra two told apart by the literal bytes `USBBUS` and `POINTER` in the messages that followed -
 // so what a capability was for was decided by parsing a string the driver chose.
 #[allow(clippy::too_many_arguments)]
-unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, net_client: &mut u64, input_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, usb_pointer: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
+unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: &[u8], #[cfg(feature = "development")] storage: u64, #[cfg(feature = "development")] console_input: u64, usb_client: &mut u64, usbq_client: &mut u64, #[cfg(feature = "development")] dev: &mut DevAgent) {
 	unsafe {
 		let _ = driver_name;
 		// PUBLISHED FIRST, ROUTED SECOND. Everything this binding offered enters the catalogue with
 		// an identity this service minted; what follows takes from the catalogue rather than from
 		// the driver's own message, so a provider that nothing routes is still a provider the
 		// machine has - and is withdrawn with its binding rather than leaked.
-		if *net_client == 0 {
-			*net_client = catalogue.take_from(node.id, driver_protocol::provider::NET);
-		}
+		// AND THE NIC IS NOT ROUTED ANY MORE EITHER (2026-09-02). NetworkService subscribes, so the
+		// publication stays in the catalogue with its offered channel intact and `open` hands that
+		// channel to the consumer that asks for it.
 		// AND THE DISPLAY IS NOT ROUTED ANY MORE EITHER (2026-09-02). It was taken into a slot of
 		// this program's and handed down the boot chain to DisplayService - the same per-kind
 		// injection as the audio one below, and the reason a rebound GPU driver could not restore a
@@ -1234,9 +1297,6 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		}
 		// The pointer flavour of virtio_input offers an INPUT provider; the keyboard flavour offers
 		// none, so an absent one is a state rather than a failure.
-		if *input_client == 0 {
-			*input_client = catalogue.take_from(node.id, driver_protocol::provider::INPUT);
-		}
 		// The xHCI driver offers up to three: the USB stick's block service (absent when no
 		// mass-storage device is attached), its bus query channel for the `lsusb` inventory, and a
 		// pointer-event channel for a USB pointing device. All three arrived in ONE handshake and
@@ -1247,9 +1307,6 @@ unsafe fn route_offers(node: &mut Node, catalogue: &mut Catalogue, driver_name: 
 		}
 		if *usbq_client == 0 {
 			*usbq_client = catalogue.take_from(node.id, driver_protocol::provider::USB_BUS);
-		}
-		if *usb_pointer == 0 {
-			*usb_pointer = catalogue.take_from(node.id, driver_protocol::provider::POINTER);
 		}
 		// ANYTHING STILL HELD IS A PROVIDER NOBODY ROUTES, and it is closed rather than leaked: a
 		// handle this service keeps forever is a channel the driver waits on forever.
@@ -5302,9 +5359,6 @@ unsafe fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 		let now: u64 = clock();
 		let mut soonest: u64 = 0;
 		for node in nodes.iter_mut() {
-			if !node.beat.supervised() || node.record.state != BindingState::Online {
-				continue;
-			}
 			// THE ANSWER IS READ WHERE THE QUESTION IS ASKED.
 			//
 			// A node that is already `Online` is not in the bring-up wait set - that set is for
@@ -5312,7 +5366,26 @@ unsafe fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 			// unread while the manager decided it had not answered. Every driver in the machine was
 			// declared wedged at sequence 1, which is the shape of a supervisor listening on the
 			// wrong end rather than of a driver that stopped.
-			drain_channel(node, buf);
+			//
+			// AND THE DRAIN IS NOT GATED ON `Online`, WHICH IT WAS - the same mistake, one state
+			// along (fixed 2026-09-02). An operator's disable moves the node to `Stopping` and THEN
+			// asks the driver to stop, so from the moment the question is asked the node is no
+			// longer `Online` and nothing read its channel again. The `STOPPED` frame the driver
+			// sends in answer sat there unread for ever: the node stayed `Stopping`, no rollback
+			// ran, the claim's resources stayed charged, and the device could never be enabled
+			// again. Measured on a live machine - `state=stopping, resources=2` for as long as it
+			// was watched - and it means no operator disable had ever completed. `beat.supervised()`
+			// gated it too, and for the same reason it must not: a driver that answers `STOPPED` is
+			// answering whether or not anything is asking it for a heartbeat.
+			//
+			// So the CHANNEL is read whenever there is a binding to read from, and only the
+			// HEARTBEAT below is gated on the state that heartbeats belong to.
+			if node.binding.is_some() {
+				drain_channel(node, buf);
+			}
+			if !node.beat.supervised() || node.record.state != BindingState::Online {
+				continue;
+			}
 			let Some(binding) = &node.binding else { continue };
 			let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
 			match node.beat.tick(now) {

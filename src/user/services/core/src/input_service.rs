@@ -23,11 +23,12 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use ipc_client::ChannelTransport;
 use keys::KeyState;
 use proto::codec::Handles;
 use proto::system::input;
 use proto::system::input_admin::{self, Service as AdminService};
-use proto::system::{Error, KeyEvent, PointerEvent};
+use proto::system::{Error, KeyEvent, PointerEvent, ProviderKind, provider_catalogue};
 use rt::*;
 
 // The default text-cell grid the normalized pointer position maps onto: the boot
@@ -196,6 +197,55 @@ impl input::Service for Input {
 
 // Map a raw normalized pointer event to a text-cell PointerEvent, or None if it is
 // too short. The x/y axes (0..=NORM_MAX) scale onto the COLS x ROWS grid.
+// THE FIRST LIVE PROVIDER OF ONE KIND THE SUBSCRIPTION HAS ALREADY QUEUED, connected to.
+//
+// POLLED, NEVER BLOCKED: the catalogue registers a subscriber and sends it everything published in
+// one step, so what is here is here, and waiting for more would hang the boot of every machine that
+// has no pointing device of that kind. Zero for a boot that granted no catalogue connection, for a
+// catalogue that refuses the subscription, and for a machine with nothing of that kind published -
+// all three of which are the state a zero handle used to be, and none of which is a failure.
+//
+// The subscription is CLOSED before returning. This service takes what exists at bootstrap and does
+// not follow a replacement, so an open stream would be a handle nothing reads and a subscriber slot
+// the catalogue could not give to a consumer that does.
+unsafe fn take_published_pointer(catalogue: u64, kind: &ProviderKind) -> u64 {
+	unsafe {
+		if catalogue == 0 {
+			return 0;
+		}
+		let Some(providers) = provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).subscribe(kind) else {
+			print(b"InputService: the catalogue refused a pointer subscription\n");
+			return 0;
+		};
+		let mut buf: [u8; 256] = [0; 256];
+		let mut opened: u64 = 0;
+		loop {
+			let PolledCaps::Message { len, handles } = try_recv_caps(providers, &mut buf) else { break };
+			for &handle in handles.as_slice() {
+				close(handle);
+			}
+			let mut frame_handles = wire::Handles::new();
+			let Some(info) = provider_catalogue::subscribe_read(&buf[..len], &mut frame_handles) else {
+				print(b"InputService: a provider frame did not decode\n");
+				continue;
+			};
+			if !info.live {
+				continue;
+			}
+			match provider_catalogue::Client::new(ChannelTransport { chan: catalogue }).open(&info) {
+				Some(Ok(handle)) => {
+					opened = handle;
+					break;
+				}
+				Some(Err(_)) => print(b"InputService: the catalogue refused a connection to a pointer provider it published\n"),
+				None => print(b"InputService: the catalogue did not answer the connection it published\n"),
+			}
+		}
+		close(providers);
+		opened
+	}
+}
+
 fn map_event(raw: &[u8]) -> Option<PointerEvent> {
 	if raw.len() < RAW_LEN {
 		return None;
@@ -216,14 +266,6 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	//    pointer drivers feed us ("INPUT" = the virtio pointer, "INPUT2" = the xhci
 	//    driver's USB pointer; a handle is 0 when that source is absent).
 	let service: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"SERVE") }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"serve", b"missing serve channel") });
-	let raw: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"INPUT" => handle,
-		_ => unsafe { fail_bootstrap(bootstrap, b"input", b"pointer channel not delivered") },
-	};
-	let raw2: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
-		Received::Message { len, handle } if len >= 6 && &buf[..6] == b"INPUT2" => handle,
-		_ => unsafe { fail_bootstrap(bootstrap, b"input2", b"usb pointer channel not delivered") },
-	};
 	// ConsoleService's pointer sink: we forward every raw event to it so it can drive
 	// selection, scrollback, and mouse reports (handle 0 = no console this boot).
 	let forward: u64 = match unsafe { recv_blocking(bootstrap, &mut buf) } {
@@ -246,6 +288,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"ADMIN" => handle,
 		_ => 0,
 	};
+	// THE POINTERS ARE DISCOVERED, NOT HANDED OVER.
+	//
+	// They used to arrive as `INPUT` and `INPUT2` - two slots in DeviceManager, one for the virtio
+	// pointer and one for the xHCI driver's USB pointer - which is both the per-kind injection the
+	// provider catalogue replaces AND a count of pointing devices compiled into the manager. This
+	// service asks the catalogue for the input and pointer kinds and takes what it finds: a machine
+	// with neither has neither, which is the state a pair of zero handles used to be.
+	//
+	// LAST IN THE ROLE LIST, because the bootstrap is read POSITIONALLY at every hop.
+	let catalogue: u64 = unsafe { recv_tagged(bootstrap, &mut buf, b"CATALOGUE") }.unwrap_or(0);
+	let raw: u64 = unsafe { take_published_pointer(catalogue, &ProviderKind::Input) };
+	let raw2: u64 = unsafe { take_published_pointer(catalogue, &ProviderKind::Pointer) };
 
 	// 2. report in to the supervisor that started us.
 	unsafe {

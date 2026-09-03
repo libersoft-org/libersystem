@@ -21,7 +21,14 @@ cd "$(dirname "$0")/../boot/loader"
 RUSTFLAGS="-C relocation-model=pic -C link-arg=-pie -C link-arg=-T$PWD/riscv64-pe.ld" \
 	cargo build --target riscv64gc-unknown-none-elf
 
-out="../../../.build/cargo/loader/riscv64gc-unknown-none-elf/debug/libersystem-loader"
+# WHERE CARGO ACTUALLY PUT IT, which is not always the tree's own directory.
+#
+# This was the fixed path alone, so a build with `CARGO_TARGET_DIR` set wrote its ELF somewhere else
+# and this went on reading - and CONVERTING - whatever was already at the fixed path. It reported
+# success having produced the previous loader, which is the worst of the three possible answers. The
+# profile gate builds a second loader into a directory of its own, and that is the caller that found
+# it.
+out="${CARGO_TARGET_DIR:-../../../.build/cargo/loader}/riscv64gc-unknown-none-elf/debug/libersystem-loader"
 
 # READ THE ELF, THEN LOOK AT IT - not `llvm-readelf | awk ... || true`.
 #

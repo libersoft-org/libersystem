@@ -52,6 +52,23 @@ unsafe fn locate(hint: u64) -> Option<u64> {
 		crate::serial_println!("dtb: the boot path published a device tree at {hint:#x} and there is no FDT header there - this kernel will not go looking for another one");
 		return None;
 	}
+	// AND THE NAMED NO-DEVICE-TREE PROFILE DOES NOT GO LOOKING (added 2026-09-02).
+	//
+	// The fallbacks below exist for a boot path that published no pointer - the fixed address this
+	// tree's runner loads a dumped tree at, and a scan of low DRAM. On the named profile they are the
+	// opposite of what is wanted: the loader was built to WITHHOLD the firmware's tree so this kernel
+	// is presented with a machine that has none, and QEMU has left a perfectly valid tree lying in
+	// low DRAM for the scan to find. Finding it makes the profile a no-op - measured, the boot went
+	// on to print `GICv2 from the device tree` with `DTB 0x0` in its own banner - and the static
+	// descriptor the profile exists to exercise is never selected.
+	//
+	// So the profile is consulted BEFORE the fallbacks. It is the same compile-time name the loader's
+	// withholding uses and the same one that authorises the descriptor, so the three halves of the
+	// profile cannot disagree.
+	if super::boot_profile_authorises_no_dt() {
+		crate::serial_println!("dtb: the named no-device-tree profile is compiled in - this kernel does not go looking for a tree the loader withheld");
+		return None;
+	}
 	if unsafe { at(QEMU_DTB_ADDR) }.is_valid() {
 		return Some(QEMU_DTB_ADDR);
 	}

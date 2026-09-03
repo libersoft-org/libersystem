@@ -1446,3 +1446,40 @@ during service bring-up, deterministically, before any of this round's code runs
 written up under P02M0164's M3; it blocks `dev-gpu-restart`, whose new assertion is therefore
 unexercised. aarch64 and riscv64 were not run this round: nothing here is architecture-specific
 except the two new UEFI profile rows, which are gate rows rather than suite runs.
+
+ADDENDUM (2026-09-02T23:55:00Z) - THE PLANNED STOP IS NOW EXECUTED, NOT ONLY MODELLED:
+
+This round's response moved the withdrawal's effects into the library so a host test drives them. The
+other half of M7's claim - that a planned stop is not recorded as a crash - was proved by the
+transition table and by nothing that had ever run one to completion. This file says why: the kernel
+suite sends `STOP` at every shutdown and the machine exits before any teardown confirms, so the arm
+that decides how an answered stop is classified was never reached.
+
+It is reached now. `dev-gpu-restart` disables a live `virtio_gpu` through the operator's own verb on
+the enforcing machine, the node reaches `disabled`, and `lsdev --incident` answers "nothing has gone
+wrong on this binding" - the surface an operator actually reads, about a real device.
+
+It could not have run before, for a reason that belongs to this milestone's subject as much as to the
+policy one: the answer was never read. DeviceManager's standing loop drained a bound driver's channel
+only while its node was `Online`, and a disable moves the node to `Stopping` BEFORE it asks the driver
+to stop - so the `STOPPED` frame that makes a stop planned rather than a crash sat in the channel for
+ever. The node stayed `Stopping`, no rollback ran, and the resources stayed charged. Fixed by gating
+the drain on there being a BINDING rather than on the state; see this round's M0166 response for the
+measurement and the fix.
+
+VERIFICATION FOR THIS ADDENDUM (2026-09-02T23:55:00Z):
+
+- `dev-gpu-restart: passed` on the enforcing development machine, twice, on the final tree: disable
+  accepted, node `disabled`, no incident, enable accepted, `virtio_gpu` online again on CLAIM
+  GENERATION 2 with its provider republished, no `iommu: FAULT`, one boot throughout.
+- `grant-vocabulary`: clean, and watched to FAIL with `DevicePolicy` removed from the array again.
+- x86_64 kernel suite, same scope as this round: 239 passed, 0 failed. Four pinned permission-audit
+  summaries were updated with the two capabilities the vocabulary had been missing - a probe granted
+  neither now reports them denied, which is what those assertions exist to show.
+- `qemu-virtio-iommu-x86_64` on a freshly built image: unchanged, including the default machine's
+  display frame.
+- `one-wait`, `no-suppression`, `source-hygiene`, `bootstrap-plan`, `milestone-index`,
+  `no-fixed-provider-slots`, `declared-interfaces`, `development-build`, `development-gate`,
+  `verify-scheduler`: clean. The tree was returned to the shipping configuration afterwards, which
+  `development-gate` confirms.
+- Every temporary probe used for the diagnosis was removed before the final build.

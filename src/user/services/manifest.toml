@@ -678,7 +678,9 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/input_service.lsexe"
-providers = ["keys", "input-proto", "wire", "lsrt"]
+# `device-proto`, `base-proto` and `ipc-client` because this service DISCOVERS its pointing devices:
+# it holds a provider-catalogue connection and asks for the input and pointer kinds.
+providers = ["keys", "input-proto", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
 name = "ip"
@@ -849,7 +851,9 @@ role = "service"
 linkage = "dynamic"
 stage = "volume"
 destination = "libexec/network_service.lsexe"
-providers = ["network-proto", "base-proto", "ipc-client", "wire", "lsrt"]
+# `device-proto` because this service DISCOVERS its NIC: it holds a provider-catalogue connection and
+# subscribes to the network kind rather than being handed a frame channel.
+providers = ["network-proto", "device-proto", "base-proto", "ipc-client", "wire", "lsrt"]
 
 [[programs]]
 name = "nslookup"
@@ -2050,18 +2054,6 @@ provider = "self"
 interface = "liber:input@1/input"
 
 [[services.roles]]
-tag = "INPUT"
-kind = "device"
-provider = "device_manager"
-presence = "optional"
-
-[[services.roles]]
-tag = "INPUT2"
-kind = "device"
-provider = "device_manager"
-presence = "optional"
-
-[[services.roles]]
 tag = "FORWARD"
 kind = "serve-root"
 provider = "self"
@@ -2087,6 +2079,24 @@ tag = "ADMIN"
 kind = "serve-root"
 provider = "self"
 interface = "liber:input@1/input-admin"
+
+# THE PROVIDER CATALOGUE, WHICH IS HOW THIS SERVICE FINDS ITS POINTERS.
+#
+# It used to be `INPUT` and `INPUT2`: DeviceManager took the pointer providers into two slots of its
+# own - one for the virtio pointer, one for the xHCI driver's USB pointer - and routed them down the
+# boot chain. That is the per-kind injection the catalogue replaces, and the two slots were also a
+# COUNT compiled into the manager: a third pointing device had nowhere to go. This service asks the
+# catalogue for the input and pointer kinds instead, and takes what it finds.
+#
+# LAST, like every addition to a role list: these are read POSITIONALLY from the generated
+# `BOOTSTRAP_ROLES`, so anything inserted in the middle shifts every read after it.
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "SERVE"
+interface = "liber:device@1/provider-catalogue"
+presence = "optional"
 
 [[services]]
 name = "iso_storage"
@@ -2154,12 +2164,6 @@ state_scope = "external"
 dependencies = ["log_service", "device_manager", "process_service", "config_service"]
 
 [[services.roles]]
-tag = "FRAMES"
-kind = "device"
-provider = "device_manager"
-presence = "optional"
-
-[[services.roles]]
 tag = "CONFIG"
 kind = "client"
 provider = "config_service"
@@ -2170,6 +2174,24 @@ tag = "SERVE"
 kind = "serve-root"
 provider = "self"
 interface = "liber:network@1/network"
+
+# THE PROVIDER CATALOGUE, WHICH IS HOW THIS SERVICE FINDS ITS NIC.
+#
+# It used to be `FRAMES`: DeviceManager took the network provider into a slot of its own and routed
+# the driver's frame channel down the boot chain to here. That is the per-kind injection the
+# catalogue replaces - a service reaches a device by SUBSCRIBING to the kind it needs, so a NIC bound
+# after this service started is one it can still connect to, and a second one is an entry rather than
+# a full slot.
+#
+# LAST, like every addition to a role list: these are read POSITIONALLY from the generated
+# `BOOTSTRAP_ROLES`, so anything inserted in the middle shifts every read after it.
+[[services.roles]]
+tag = "CATALOGUE"
+kind = "factory"
+provider = "device_manager"
+source = "SERVE"
+interface = "liber:device@1/provider-catalogue"
+presence = "optional"
 
 [[services]]
 name = "permission_manager"
