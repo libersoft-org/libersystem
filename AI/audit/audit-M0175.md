@@ -1684,3 +1684,98 @@ Current plan rating: 6/10
    implementations can reject, clamp, or ignore the same request and take different wire actions on
    overflow while both pass M10's aggregate flood check. This leaves the original accepted inbound
    backlog-policy correction incomplete at a newly introduced public operation.
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-03T22:33:55Z):
+
+1. **The replacement source/route tie-break is neither consistent with P02M0174 nor total** -
+   ACCEPTED, both halves, and the first half is a finding I rejected on 2026-09-03 and should not
+   have.
+
+   THE INCONSISTENCY. P02M0174's paragraph freezing reachability, then advertised preference, then
+   ascending link-local address is followed immediately by "which entry a caller's traffic uses is
+   P02M0175's, and it consumes this order as its final RFC 6724 tie-break". That is an export. What I
+   read instead was that milestone's control-traffic paragraph, which says its own echo takes its
+   choice through that ordering - a different sentence answering a different question - and from it
+   concluded that the order was internal and not inherited here. On that reading I froze an address
+   comparison of this file's own, which can choose an UNREACHABLE lower-address router ahead of a
+   reachable higher-address one, and which disagrees with the RFC 8028 subset three rows below that
+   consumes P02M0174's order whole. One seam cannot have two orders, and the one I wrote is the wrong
+   one for the reason P02M0174 puts reachability first.
+
+   THE TOTALITY. Also correct, and independently so. A `DIRECT` route names no router, so a key
+   reading "the router the route names" is undefined for it; and two candidates equal in every listed
+   key but sitting on different INTERFACE IDENTITIES stayed distinct records with identical keys, so
+   insertion order still decided - which is what the correction claimed to have removed.
+
+   PLAN CHANGE. The tie-break is restated:
+
+     SOURCE   the lower address bytes, unsigned over sixteen octets; then the lower interface
+                identity - the `u32` index, then the `u64` generation
+     ROUTE    the longer prefix first; then DIRECT before VIA, because an on-link destination needs
+                no router at all; then, for two VIA routes, the EARLIER ROUTER IN P02M0174'S FROZEN
+                ORDER; then the lower prefix bytes; then the lower interface identity
+
+   The interface identity is last on purpose: two records equal through it are the same record, since
+   a route is a prefix, a length, an interface identity and a next hop, and a source is an address and
+   an interface identity. That is what makes both orders total on distinct candidates rather than
+   asserted to be. The generic rule and the RFC 8028 subset now apply one order, and the subset reads
+   as it always should have - restrict the candidates, then order them the one way.
+
+   M10 gains the three cases the keys exist for: two equal-prefix VIA routes whose routers differ only
+   in reachability, where the reachable one wins however the addresses compare; a DIRECT and a VIA
+   route to one prefix, where DIRECT wins; and two routes identical but for their interface identity,
+   where the same one wins twice running.
+
+2. **The accepted per-family runtime correction still names decisions instead of making them** -
+   ACCEPTED. M7 asked for explicit per-family enable/profile configuration and stated readiness
+   criteria and the item supplied one sentence about what an IPv6-only profile does with DHCPv4.
+   Nothing could be inherited: the service has two knobs, `net.arp-cache` and `net.mtu`, and it blocks
+   on the DHCP transaction before printing `NetworkService: online` - which is the shape M7 exists to
+   replace, so it is not a default to fall back on. M10's three-profile matrix had no configuration to
+   set and no readiness oracle to read.
+
+   PLAN CHANGE, as values: one ConfigService key `net.families` with exactly three values - `ipv4`,
+   `ipv6`, `dual` - read where the two existing knobs are, defaulting to `dual` when absent or
+   unparseable, and deliberately NOT two independent enable flags, which would be four states one of
+   which nobody wants. It is re-read on a change notification: disabling a family tears down its
+   addresses, routes and DNS servers and closes its sockets, enabling one starts its configuration
+   from scratch, and the other family's sockets are untouched - which is this item's own last
+   sentence, now with a mechanism. Four per-family states reported by `capacity`: `Disabled`,
+   `Configuring`, `Ready` and `Failed`, with `Ready` requiring BOTH a non-tentative unicast address
+   and a route covering that family's default destination, because an address with no route cannot
+   send and a route with no source cannot fill in a header. The service reports `online` and begins
+   serving with every configured family still `Configuring` - that is the whole of "start serving
+   IMMEDIATELY", and readiness is a fact a caller reads rather than a gate on the service answering. A
+   send on a family that is not `Ready` gets a typed refusal naming that state: it does not block and
+   does not queue, because a queue there is an unbounded store keyed by nothing. And the DHCP timeout
+   and static-v4 fallback are stated for all three profiles rather than one - unchanged for `ipv4` and
+   `dual`, absent under `ipv6`.
+
+   M10's matrix sets the key to each value and asserts which families reach `Ready`, which stay
+   `Disabled`, that `online` precedes any family being `Ready`, and that a send on a disabled family
+   is refused with that state named.
+
+3. **The new public `backlog` parameter still has no contract** - ACCEPTED. `listen` takes a backlog
+   in M1 and M4 said only "add an accept-backlog policy" beside two numbers that are the SERVICE's
+   budgets rather than an answer about the caller's value. The IDL has no backlog at all, confirmed,
+   so there is nothing to retain and two implementations could reject, clamp or ignore the same
+   request and take different wire actions on overflow while both passed M10's flood check.
+
+   PLAN CHANGE, in M4: the value is a `u16`; zero is a typed refusal at `listen`, because a listener
+   that may hold no accepted connection cannot work and silently promoting it would give the value a
+   second meaning; the effective backlog is `min(requested, 32)` - CLAMPED rather than refused, so a
+   portable caller need not guess a number this file chose and may change - and `listen` returns the
+   effective value so the caller learns what it got; the service-wide 64 still applies and is checked
+   first. Overflow is ONE wire action: a completed handshake that cannot be published, for either
+   reason, is DROPPED with its TCB released and nothing sent - not a RST, which tells a scanner the
+   port is closed and tells a legitimate peer to give up, where a silent drop lets its own
+   retransmission find the queue drained a moment later, which is what a backlog is for. The two
+   causes are counted separately in `capacity` so an operator can tell a slow listener from a full
+   machine.
+
+   M10's flood check gains the two cases that separate them: a listener at its own effective backlog
+   with the service-wide count well under 64, and the service-wide 64 reached across several listeners
+   each under its own - in both, existing accepted connections are untouched and the counter that
+   moved is the one named.
+
+No source code was modified.

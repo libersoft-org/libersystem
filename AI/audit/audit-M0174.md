@@ -1216,3 +1216,69 @@ Current plan rating: 7/10
 1. **The frozen default-router order still disagrees with the current P02M0175 consumer contract.** M0174 orders routers by reachability, then advertised preference, then address, and says P02M0175 consumes that order as its final RFC 6724 tie-break (`docs/todo/P02M0174.md:316-340`). P02M0175's latest corrected generic route tie-break instead chooses, after prefix length, the lower router-address bytes and then lower prefix bytes (`docs/todo/P02M0175.md:565-582`); only its RFC 8028 advertiser subset explicitly consumes M0174's whole order (`:583-605`). The generic rule can therefore choose an unreachable lower-address router ahead of a reachable higher-address one and gives the two sides of the supposedly frozen seam different answers. Decide which rule governs ordinary equal-prefix route candidates and add the corresponding reachability/preference oracle; the latest source/route tie-break correction did not reconcile this cross-milestone contract.
 
 2. **Router Solicitation retry behavior remains unspecified and untested.** The plan recognizes that an RS retry needs a timer and includes `RS` in the aggregate deadline, but M4 says only to implement Router Solicitation/Advertisement and the NUD backoff clause applies to neighbour-cache states (`docs/todo/P02M0174.md:26-33,106-117,430-437`). M8 has no case for lost initial solicitations or for an RA with zero Router Lifetime (`:652-712`). RFC 8504 section 5.4 requires the RFC 7559 retransmission algorithm; RFC 7559 requires exponential backoff and continued solicitation until router discovery succeeds, and specifically says a zero-lifetime RA must not stop it ([RFC 8504](https://www.rfc-editor.org/rfc/rfc8504.html#section-5.4), [RFC 7559](https://www.rfc-editor.org/rfc/rfc7559.html#section-2)). As written, a single-shot or fixed, prematurely stopped implementation satisfies every stated item yet can leave the appliance without SLAAC/default routing after ordinary packet loss. Freeze the bounded per-interface RS state, backoff/stop conditions, and a peer fixture that drops the initial solicitations and exercises the zero-lifetime case.
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-03T22:33:55Z):
+
+1. **The frozen default-router order still disagrees with the current P02M0175 consumer contract** -
+   ACCEPTED, and the disagreement is mine: I created it in P02M0175 on 2026-09-03 by rejecting a
+   finding I should have accepted.
+
+   This file's paragraph at `:311-340` freezes reachability, then advertised preference, then
+   ascending link-local address, and the sentence immediately after it says "which entry a caller's
+   traffic uses is P02M0175's, and it consumes this order as its final RFC 6724 tie-break". That is
+   an export, stated plainly. What I read instead was the control-traffic paragraph, which says this
+   milestone's own echo takes its choice through that ordering - a different sentence about a
+   different question - and concluded that the order was internal and not inherited. On that reading
+   I froze an address comparison in P02M0175 for ordinary equal-prefix routes.
+
+   The consequence the finding names is real and is the one this file's key order exists to prevent:
+   the generic rule could choose an UNREACHABLE lower-address router ahead of a reachable
+   higher-address one, while the RFC 8028 advertiser subset - which does consume this order whole -
+   would choose the reachable one. One seam, two answers.
+
+   WHERE IT IS FIXED. In P02M0175, because that is the file this milestone assigns selection and
+   tie-breaks to; correcting it here would take back the ownership boundary M6 draws. Its ROUTE
+   tie-break now reads: longer prefix first; then DIRECT before VIA; then, for two VIA routes, THE
+   EARLIER ROUTER IN THIS FILE'S FROZEN ORDER; then lower prefix bytes; then lower interface identity.
+   The generic rule and the RFC 8028 subset therefore apply the same order, and the subset is what it
+   always should have read as - restrict the candidates, then order them the one way.
+
+   PLAN CHANGE HERE, and it is deliberately small: a paragraph recording that the order is exported
+   WHOLE and is the router key for every equal-prefix route decision, not only for the source-aware
+   subset, with a note of how it was misread so a third reading does not reach the same place. None of
+   the three keys or their reasons change. The reachability oracle the finding asks for already exists
+   in M8 - "an unreachable high-preference router and a reachable low-preference one, where the
+   reachable one must come first"; what was missing was the same case on P02M0175's side, and M10
+   gains it there.
+
+2. **Router Solicitation retry behavior remains unspecified and untested** - ACCEPTED. Checked
+   against the text: M4's "transitions, timers, retry counts and backoff" clause is attached to the
+   five NEIGHBOUR-CACHE states of RFC 4861 section 7.3.2, and RS appears in that item only as
+   something to implement. M6 lists an "RS retry" among the timers the aggregate deadline covers,
+   which acknowledges a retry exists without saying what it retries, on what schedule, or when it
+   stops, and M8 has no RS case at all. A single-shot or prematurely stopped implementation satisfies
+   every stated item and leaves the appliance with no prefixes, no default route and no RDNSS after
+   one lost packet - ordinary loss, not an attack.
+
+   PLAN CHANGE, in M4, as values rather than as a reference to go and read: bounded per-interface
+   state - a retransmission count and the current interval, and nothing per-router or per-prefix,
+   because a solicitation is not addressed to a router this host knows yet; the first three
+   solicitations at RFC 4861's 4 s interval, then exponential backoff doubling each time, capped at
+   3600 s and continuing at the cap, which is what RFC 8504 section 5.4 requires by adopting RFC 7559
+   section 2; what stops it - a valid RA that answers what was solicited, with an RA carrying Router
+   Lifetime ZERO explicitly NOT stopping it, since such an RA is valid and its prefixes, MTU and RDNSS
+   are taken but its sender has said it is not a default router, so discovery has not succeeded and a
+   host that stopped there would be left routeless by a router announcing its own withdrawal; and what
+   restarts it - the interface coming up, and the last default router expiring.
+
+   The plan states that the implementer verifies the stop condition against RFC 7559 section 2 before
+   coding it, and that what this file freezes is the OUTCOME. That is deliberate: a plan that
+   paraphrases an RFC it has not re-read is worse than one that fixes the observable behaviour and
+   says where the authority is.
+
+   M8 gains the two cases that separate this from a single shot: a peer that DROPS the first two
+   solicitations and answers the third, where the host must end up configured and the intervals must
+   be the ones frozen; and a peer whose only RA carries Router Lifetime 0, where the prefixes are
+   taken, no default router is installed, and solicitation is still running afterwards.
+
+No source code was modified.

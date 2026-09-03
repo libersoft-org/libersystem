@@ -1380,3 +1380,40 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0162 (2026-09-03T17:52:37Z):
 
 The boot this change is on the critical path of is covered by the single long run at the end of this
 job; its result is recorded with that run.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0162 (2026-09-03T22:34:21Z):
+
+Current implementation rating: 7/10
+
+1. **The attempted fix for a fresh post-`Online` recovery incident still starts its deadline too
+   early.** `Incident::open` creates an absolute `now + slice` deadline
+   (`src/user/services/core/src/device_manager.rs:157-170`), but the `READY` arm opens it immediately
+   when the driver becomes healthy (`:3810-3818`). A later exit consults that stored deadline before
+   starting any recovery (`:3952-3956`). Once the driver has remained online longer than the slice,
+   `may_try_again` rejects the first retryable crash because there is no time for its backoff
+   (`:3262-3265`), so the node goes directly to `Failed`. M5 instead says the deadline covers the
+   bind-or-recovery attempt chain and starts with the next incident, explicitly requiring a driver
+   that crashes an hour later to receive a fresh window (`docs/todo/P02M0162.md:351-355`). The host
+   test named `a_recovery_long_after_the_boot_is_not_born_already_expired` checks the arithmetic with
+   `now` already set to the recovery time; it does not exercise the production sequence that calls
+   the arithmetic at `READY`. Resetting `attempt` there was correct, but opening the recovery window
+   there is an incomplete correction of the original post-online finding.
+
+2. **Automatic attempt and time budgets restart for every fallback candidate, contrary to M5's
+   per-node attempt chain.** When one candidate is spent, `spend_candidate` unconditionally sets
+   `node.attempt = 0` (`src/user/services/core/src/device_manager.rs:3292-3315`); both the phase-two
+   and standing-loop `Step::NextCandidate` arms then start the following candidate automatically
+   (`:1102-1119`, `:552-562`). Because `begin_bind` opens a new incident whenever that reset counter
+   is zero (`:3392-3397`), a candidate that exhausts three retryable attempts can be followed by
+   another candidate with three more attempts and a new absolute window. The same reset is explicit
+   on pre-bind candidate failure through `budget_after_nothing_ran` (`:1213-1230`, `:1251-1270`).
+   M5 specifies at most three automatic attempts per node and one absolute deadline across every
+   attempt in that node's bind/recovery chain (`docs/todo/P02M0162.md:244-269`), not a fresh budget per
+   registry candidate. The operator's one-shot flag has tests for crossing a candidate boundary;
+   the automatic multi-candidate path does not.
+
+Focused verification: all 66 `driver-binding` tests and all 15 `system-manifest` tests passed. The
+`one-wait`, `no-fixed-provider-slots`, and `milestone-index` gates also passed. These checks do not
+drive either production timing/candidate sequence above. The QEMU matrix was not repeated.

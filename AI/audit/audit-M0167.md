@@ -1790,3 +1790,61 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0167 (2026-09-03T17:52:37Z):
 
     cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline   121 passed
     ./check.sh --gate source-hygiene,no-suppression,milestone-index          clean
+
+AUDITOR'S RE-AUDIT ON P02M0167 (2026-09-03T22:40:55Z):
+
+Current implementation rating: 5/10
+
+1. **The mandatory catch-all architecture rule can still be narrowed without either evidence bar
+   running.** The repaired helper does probe every architecture path in either registry, but after
+   finding a smaller effective target set it records a loss only when the *probe path itself* has a
+   component owner (`src/tools/verify-model/src/candidate.rs:148-160`). The required default rule is
+   `path = ""`, built on all three targets and booted on x86_64
+   (`src/tools/verify-model/model/registry.toml:687-693`), while `Ownership::owner("")` is `Unknown`
+   (`src/tools/verify-model/src/ownership.rs:44-83`). A valid candidate can therefore reduce that
+   row's build set to x86_64, taking cross-build coverage away from every ordinary path governed by
+   the default, yet the helper discards the detected loss. No ownership row, edge,
+   `selects_everything` row, check id or `covers` list needs to change, so `losing` remains empty and
+   both activation bars are skipped (`src/tools/verify-model/src/main.rs:997-1039,1055-1084`). The
+   expanded regression deliberately chooses an architecture row whose `boot.len() > 1`, not the
+   catch-all row, and therefore misses this case
+   (`src/tools/verify-model/src/tests.rs:2232-2250`). This is still a registry-only, zero-evidence
+   activation of a materially narrower model.
+
+2. **The intended subsystem candidate records evidence under the new component name, while
+   activation requires evidence under the old one, so the advertised threshold route cannot
+   activate the split it was built for.** Candidate shadow runs load and plan with the overlaid
+   ownership (`src/tools/verify-model/src/main.rs:249-260`), and records are attributed to that
+   plan's `changed_components` (`:723-780`; `src/tools/verify-model/src/shadow.rs:744-754`). Thus a
+   candidate that adds `src/kernel/mem -> kernel.mem` records memory changes for `kernel.mem`.
+   Activation instead compares the active catalogue/ownership with the candidate and puts the
+   displaced *active* component, `kernel`, in `losing`
+   (`src/tools/verify-model/src/main.rs:997-1034`;
+   `src/tools/verify-model/src/candidate.rs:97-107`); `Log::is_clean` only accepts a record whose
+   `changed_components` contains the exact component requested
+   (`src/tools/verify-model/src/shadow.rs:832-850`). The general bar therefore asks for candidate-hash
+   evidence for `kernel`, not the `kernel.mem` evidence the candidate can produce. The subsystem bar
+   compounds the mismatch by resolving every risk path through the *active* ownership before
+   consulting the same `losing` set (`src/tools/verify-model/src/main.rs:1050-1081`). The claimed
+   production regression does not use a candidate at all: it calls `model()` and accepts whichever
+   active component merely starts with `kernel`
+   (`src/tools/verify-model/src/tests.rs:2285-2312`). It proves change digests differ, but not that a
+   real subsystem candidate can earn and pass activation as required by M5
+   (`docs/todo/P02M0167.md:575-598,696-700`).
+
+3. **The original test-file narrowing requirement is still unresolved despite the milestone being
+   marked complete.** The registry still contains the `src/kernel/test_suites` risk row
+   (`src/tools/verify-model/model/registry.toml:450-453`) and still makes `kernel` select everything
+   (`:355-357`). Consequently the source-path selection code is unreachable for such a change
+   because it runs only when the plan is not already full
+   (`src/tools/verify-model/src/plan.rs:449-489`). The live command
+   `./verify.sh --for src/kernel/test_suites/hardware.rs --plan` reports `FULL verification`, 1298 of
+   1304 runnable keys, and 100% of a full run. This directly contradicts the definition of done that
+   changing one kernel test file selects the tests declared in it and that this risk row is gone
+   (`docs/todo/P02M0167.md:733-734`). Naming narrowing as work for somebody else does not resolve that
+   existing milestone requirement.
+
+Focused verification: all 121 `verify-model` unit tests passed, and the live `verify-model` gate
+passed model consistency while itself reporting all seven kernel risk rows, including
+`src/kernel/test_suites`, as not narrowed. Those checks do not cover either candidate boundary above.
+No source code or milestone plan was modified.

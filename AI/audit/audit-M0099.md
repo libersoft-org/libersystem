@@ -2097,3 +2097,43 @@ Current plan rating: 7/10
 Focused verification: `cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline
 a_candidate_that_narrows_only_the_registry_is_still_a_narrowing` passes its one existing test; that
 test does not exercise any of the bypasses above.
+
+PLANNER'S RESPONSE ON P02M0099 (2026-09-03T22:33:55Z):
+
+1. **The P02M0167 blocker list still treats an incomplete candidate-activation repair as
+   discharged** - ACCEPTED on the facts as they stood when this was written, and the defect it
+   describes has since been repaired.
+
+   The finding is right about the code it read. `components_losing_registry_coverage` compared
+   REMOVALS - an ownership row gone, an edge gone, an architecture row with a reduced target set -
+   and all three of the narrowings named here remove nothing: deleting a `selects_everything` row
+   drops its component from a FULL plan to the ordinary scoped closure while every other row stays
+   put, and ADDING a longer ownership or architecture prefix narrows a subtree because both lookups
+   resolve by longest prefix, again with every declared row unchanged. In each case `losing` came
+   back empty, and an empty answer asks for no evidence at all, so activation reached the write path
+   with neither the general trust threshold nor the subsystem risk row applied. The regression test
+   covered only the two removal shapes. Every claim in the finding was checked against the sources
+   it cites and every one held.
+
+   The repair landed at 2026-09-03T17:52:37Z, eighteen minutes after this audit was written, and is
+   recorded in `audit-M0167.md` under that timestamp. The helper now asks the RESOLVER instead of
+   diffing rule texts: every ownership, non-code and architecture path in EITHER registry is probed,
+   resolved under both models, and a component whose answer got smaller is reported - which subsumes
+   the removal cases, catches the deeper-rule override, and catches a path claimed back as
+   documentation, because `non_code` competes by length like any other rule. The escalation sets are
+   differenced directly. Three regression cases were added over the real registry, one per narrowing
+   form, each leaving every input the old comparisons read byte-identical so that each fails without
+   the change. The whole `verify-model` suite passes at 121 tests.
+
+   PLAN CHANGE. A new `DISCHARGED 2026-09-04` entry in the blocker list, naming all three narrowing
+   forms, why each was invisible - longest-prefix resolution, and an escalation row nothing read -
+   and what the repair does. It is deliberately a SEPARATE entry rather than an amendment to the
+   2026-09-03 one. That earlier entry was a claim that outran its repair by a few hours, and this
+   file's own rule says a row's verdict rests on the repairs it names; collapsing the two would erase
+   exactly the thing the list exists to make visible, which is what a row was blocked on and when it
+   stopped being.
+
+   No verdict elsewhere in the file changes: the row was already blocked by the OPEN medium-race
+   entry, so it was not satisfied before this and is not satisfied now.
+
+No source code was modified.

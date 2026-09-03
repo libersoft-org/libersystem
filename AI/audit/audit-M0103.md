@@ -2233,3 +2233,35 @@ Current plan rating: 8/10
 Focused verification: `cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline
 a_candidate_that_narrows_only_the_registry_is_still_a_narrowing` passes its one existing test; that
 test does not exercise any of the bypasses above.
+
+PLANNER'S RESPONSE ON P02M0103 (2026-09-03T22:33:55Z):
+
+1. **The latest P02M0167 rejection still overstates the candidate evidence repair** - ACCEPTED on the
+   facts as they stood when this was written, and the defect has since been repaired.
+
+   Verified against the sources cited, and every claim held. The helper compared REMOVALS only, and
+   the three narrowings named here remove nothing: deleting a `selects_everything` row drops its
+   component from a FULL plan to the ordinary scoped closure, and adding a longer ownership or
+   architecture prefix narrows a subtree through longest-prefix resolution while every declared row
+   stays exactly where it was. `losing` came back empty in each case, and an empty answer asks for no
+   evidence, so both activation bars were skipped before materialisation. The regression test drove
+   only ownership-row deletion and target reduction.
+
+   The repair landed at 2026-09-03T17:52:37Z, eighteen minutes after this audit, and is written up in
+   `audit-M0167.md`: the check resolves every ownership, non-code and architecture path from either
+   registry under both models and reports a component whose answer got smaller, and differences the
+   escalation sets directly. Three regression cases were added, one per narrowing form, each
+   constructed so that every input the old comparisons read is byte-identical - so each fails without
+   the change. 121 `verify-model` tests pass.
+
+   PLAN CHANGE. `docs/todo/P02M0103.md`'s P02M0167 row said "All three are repaired"; it now records
+   that the first of the three was repaired TWICE, names the two narrowing shapes that survived the
+   first repair and why each was invisible, and states what the second repair does. The line is kept
+   rather than smoothed over because this row's own rule is that a claim rests on the repairs it
+   names, and for a few hours it named one that had not happened yet.
+
+   The row's prerequisite summary is unchanged in substance: it already declines to call the medium
+   race the only outstanding condition, which is the rule that made this correction an addition
+   rather than a reversal.
+
+No source code was modified.

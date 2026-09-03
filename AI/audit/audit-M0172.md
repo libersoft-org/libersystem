@@ -980,3 +980,57 @@ AUDITOR'S RE-AUDIT OF PLAN P02M0172 (2026-09-03T17:34:03Z):
 Current plan rating: 6/10
 
 1. **The new UEFI `LSDM` input conflicts with the signed DMA-mode producer already required on every selected signed manifest.** The correction gives test/development UEFI boots a harness-provenance `LSDM` file and requires the loader to turn it into the `BootInfo` field, while M3 still requires *every selected signed manifest* to carry and latch a DMA mode (`docs/todo/P02M0172.md:357-375,482-577`). These are not disjoint media in the current system: every x86_64 shipping and test ISO gets `etc/boot.manifest2` (`src/harness/mkimage.sh:228-242,261-294,383-429`), every non-x86 per-run ESP gets one (`src/harness/qemu-run.sh:624-698`), and every system volume does too (`src/tools/mkpackages/src/main.rs:238-258`). Thus a test/development UEFI boot necessarily presents both the signed value and the new harness record. The plan's own two-producer rule must refuse it—even when equal—and the same-image x86_64 gate cannot make default and `--no-iommu` disjoint by changing the signed value. Conversely, ignoring the signed value when `LSDM` appears would let a public medium with an injected file take the very precedence path the plan says must refuse. Freeze one non-conflicting producer/manifest-compatibility rule for test and development media and gate it against the signed media those paths actually boot; the accepted host-to-loader conduit alone did not make the rows implementable.
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-03T22:33:55Z):
+
+1. **The new UEFI `LSDM` input conflicts with the signed DMA-mode producer already required on every
+   selected signed manifest** - ACCEPTED. The finding is correct on every point and the conflict is
+   mine, introduced by the carrier this file added on 2026-09-03.
+
+   The factual premise was checked in the tree rather than taken on trust: `mkimage.sh` copies
+   `etc/boot.manifest2` into the ISO it builds, `qemu-run.sh` writes one onto every per-run ESP, and
+   `mkpackages` writes one onto the system volume and onto the boot-medium fallback. So there is no
+   such thing in this tree as a UEFI boot without a signed manifest, and the row I wrote reads as
+   though "signed medium" and "test or development medium" were disjoint. With M3 requiring EVERY
+   selected signed manifest to carry a DMA mode, a development UEFI boot presents the manifest's
+   value AND the `LSDM` record, which is two producers - and the rule refuses on exactly the rows the
+   carrier was added to enable.
+
+   The finding's second half is what makes this a contradiction rather than a tuning problem: the two
+   x86_64 development invocations boot the SAME image and differ only by a host flag, so no choice of
+   signed value can tell them apart. And its third half is the trap in the other direction, which I
+   also accept: making `LSDM` win when present would give a planted file precedence over signed
+   policy, which is the one thing this milestone may not do.
+
+   I checked whether `source_kind` could carry the distinction, since it is already signed and
+   validated. It cannot: it separates the system volume, the live image and the boot medium - where a
+   manifest came from, not what kind of build it is.
+
+   PLAN CHANGE, in `docs/todo/P02M0172.md`, one rule in two places. The manifest field becomes
+   OPTIONAL, and its absence is what admits the `LSDM` carrier:
+
+     - a manifest that CARRIES the field asserts the machine's DMA mode, and M3's equality latch
+       applies across every selected manifest that carries one;
+     - a manifest that does NOT carry it asserts nothing; test and development media are BUILT
+       without it, which is a build-time decision recorded inside a signed artifact;
+     - if ANY selected manifest carries the field, that is the producer and an `LSDM` record present
+       REFUSES;
+     - if NONE carries it, `LSDM` is the producer and its absence REFUSES - absence stays fatal on
+       every path;
+     - a selected set that MIXES the two refuses, because the latch has nothing to compare against.
+
+   Why this is not a downgrade path, which is the only question that matters about it and is stated
+   in the plan: both the PRESENCE and the ABSENCE of the field are covered by the signature. An
+   attacker cannot strip the field from a shipping medium's manifest nor add one to a test medium's
+   without the signing key, and with the key they own the boot regardless. So a shipping medium always
+   has a producer that outranks any planted file, and planting one refuses instead of downgrading -
+   which is what the previous version of the row wanted and could not deliver.
+
+   M3's latch sentence is corrected in place rather than left to be read against the new rule, and its
+   gates are restated: the two x86_64 development invocations boot the same UEFI image, whose manifest
+   carries no field, and reach admission with `enforcing-required` and `no-iommu` from the file each
+   runner staged; a UEFI boot with neither field nor file refuses; a shipping medium whose manifest
+   carries the field, with the file planted beside it, refuses as two producers; and a mixed selected
+   set refuses. M8's mixed-mode fixture gains the mixed-presence case beside the differing-value one.
+
+No source code was modified.

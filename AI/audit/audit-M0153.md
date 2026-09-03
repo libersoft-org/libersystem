@@ -1775,3 +1775,26 @@ IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0153 (2026-09-03T17:52:37Z):
     cargo test --manifest-path src/dma/Cargo.toml --offline    63 passed (62 before, 1 added)
     ./check.sh --gate virtio-iommu-protocol                    63 test(s) - contract, fake backend, codec
     ./check.sh --gate source-hygiene,no-suppression            clean
+
+AUDITOR'S RE-AUDIT ON P02M0153 (2026-09-03T22:35:00Z):
+
+Current implementation rating: 9/10
+
+1. **The hostile half of the QEMU gate still does not use M2's dedicated fixture.** The gate adds
+   the IOMMU and two EDU functions to the ordinary test machine through `QEMU_EXTRA` and
+   `./test.sh` (`src/tools/check-qemu-virtio-iommu-x86_64.sh:113-122`). Test mode still builds that
+   machine with the ordinary virtio-net device, virtio-serial/virtconsole, xHCI and USB devices,
+   optional system/media virtio-blk devices, a PCIe-to-PCI bridge and test device, and virtio-sound
+   (`src/harness/qemu-run.sh:1054-1072,1112-1190,1206-1232`). That directly contradicts M2's
+   requirement that this first topology contain only the firmware SATA function, IOMMU, EDU and
+   virtio-net and not inherit optional DMA devices from the ordinary harness
+   (`docs/todo/P02M0153.md:148-162`). It is material to the boundary proof: the kernel's bypass-off
+   transition explicitly quiesces every non-controller endpoint, so those inherited bus masters are
+   participants in the security-sensitive transition rather than harmless logging or harness
+   infrastructure. The hostile cases passing on this larger, different topology therefore does not
+   implement or prove the controlled first fixture the milestone specifies.
+
+Focused verification: the current DMA suite passed all 63 tests, the `virtio-iommu-protocol` gate
+passed the same 63 tests, the ABI suite passed all 28 tests, and `source-hygiene` passed. The full
+QEMU gate correctly refused to use the currently stale shipping ISO at its freshness preflight, so
+no stale guest result was treated as evidence. No source code or milestone plan was modified.

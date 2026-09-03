@@ -1809,3 +1809,54 @@ Current plan rating: 8/10
    withdrawal. Align the ceiling rule and its one-past runtime gate with the withdrawal rule for an
    invalid replacement of an already-published face; retaining an unchanged generation is sound only
    where every face in that generation still has identity-matching bytes available.
+
+PLANNER'S RESPONSE ON P02M0136 (2026-09-03T22:33:55Z):
+
+1. **The corrected withdrawal rule conflicts with the surviving atomic ceiling rule** - ACCEPTED. The
+   contradiction is real, it is mine from the 2026-09-03 round, and the 257-byte record is named
+   explicitly on both sides with opposite outcomes.
+
+   M2's corrected rule says any rescan that finds a published face's bytes changed in a way the
+   catalogue must reject - digest mismatch, declaration outside the vocabulary, OR a record past the
+   size ceiling - withdraws that publication at a new generation. The ceilings section still said any
+   rescan exceeding a ceiling publishes nothing, the previous generation stays current and stays
+   served, and required a gate in which a 257-byte replacement record leaves that generation
+   unchanged. The finding's reasoning for which one is right is the same one M2 gives: once the
+   privileged writer has overwritten the file the catalogue holds no bytes of its own, so
+   `RESOLVE-INTO` digests what it reads against the published identity and refuses it. An entry that
+   can never be resolved is not being "served", so the old sentence was promising something the
+   storage model cannot do - which is exactly why the withdrawal rule was written in the first place.
+
+   The finding's closing sentence is also the right generalisation and is adopted verbatim in
+   substance: retaining an unchanged generation is sound only where every face in that generation
+   still has identity-matching bytes available.
+
+   PLAN CHANGE, in `docs/todo/P02M0136.md`. The ceiling rule is restated as an ORDERED rule that is
+   still atomic - one generation switch, or none:
+
+     1. mark every ALREADY-PUBLISHED face whose bytes changed and whose replacement must be rejected
+        for any reason; call it W. Every face in W names bytes this catalogue can no longer serve,
+        whatever happens next;
+     2. if the rescan's admissible set - previous faces, minus W, plus what it accepted - fits all
+        three ceilings, publish it as a new generation and report what was rejected;
+     3. if it does not fit, publish the previous generation MINUS W: nothing new is added, only what
+        cannot be served is withdrawn, and the report names which ceiling was exceeded. When W is
+        empty this is exactly the old rule and the generation does not advance.
+
+   This keeps the conservative property the old rule was written for and makes it true rather than
+   asserted: step 3 removes only faces the writer itself overwrote, so a bad drop into the directory
+   still cannot take away a font whose bytes are still there, and a client's view still cannot become
+   partial because there is one switch either way.
+
+   The runtime one-past gate is split into three, because the two outcomes differ and the single old
+   gate encoded the wrong one for the case that matters: 65 NEW faces and a NEW 257-byte record both
+   leave the previous generation unchanged with the failure reported; a REPLACEMENT of a published
+   face whose record becomes 257 bytes withdraws that face at a new generation with every other face
+   carried over. The third is the one an attacker reaches.
+
+   The recovery paragraph at `:284-290`, which repeats the unchanged-generation rule, now carries the
+   same exception and states that the allowance counts against the generation in the withdrawal case
+   too - so the recovery operation is not locked out by it, which is the defect that paragraph was
+   itself corrected for on 2026-09-02.
+
+No source code was modified.

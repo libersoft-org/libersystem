@@ -1965,3 +1965,37 @@ each is what its half of the work is written against.
 
 No source file was changed for this milestone. The only edit is to `docs/todo/P02M0164.md`, correcting
 the over-broad oracle claim in M7's paragraph.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0164 (2026-09-03T22:34:21Z):
+
+Current implementation rating: 6/10
+
+1. **The accepted format/origin routing item remains unimplemented.** DeviceManager still takes
+   block providers in lowest-BDF order and describes their positions as system, FAT media, ISO and
+   UDF (`src/user/services/core/src/device_manager.rs:950-1000`). ServiceManager assigns positions
+   two through four to `block2_client`, `block3_client` and `block4_client`, then labels them
+   `FATBLOCK`, `ISOBLOCK` and `UDFBLOCK`
+   (`src/user/services/core/src/service_manager/bootstrap.rs:787-805,508-515`); StorageService trusts
+   those labels (`src/user/services/storage/src/service.rs:277-290`). A checked mount only rejects a
+   mismatched filesystem and cannot route that provider to the correct instance. Thus reordered FAT,
+   ISO and UDF providers still leave volumes absent, and the required swapped-order QEMU profile is
+   still missing. This is the open M2/definition-of-done requirement recorded in the current plan
+   (`docs/todo/P02M0164.md:137-161,439-450`).
+
+2. **The accepted USB consumer migration and its route oracle remain unimplemented.** DeviceManager
+   selects only each catalogue result's `first()` USB block/USB-bus provider and sends those two
+   connections once (`src/user/services/core/src/device_manager.rs:743-770`). ServiceManager stores
+   them in `block5_client` and `usbq_client`, injects the former into `usb_storage`, and grants the
+   latter once through PermissionManager
+   (`src/user/services/core/src/service_manager/bootstrap.rs:306-325,475-529,1216-1221`). Neither
+   consumer subscribes, so a second controller and a replacement publication after withdrawal remain
+   unreachable. Existing `kernel.hardware` coverage directly injects `USBBLOCK` into a separately
+   spawned StorageService (`src/kernel/test_suites/hardware.rs:272-307`), while the ordinary boot's
+   lazy `online (vol://usb)` report does not read the routed medium. Neither is the in-scope oracle
+   required by the current plan (`docs/todo/P02M0164.md:257-287`).
+
+Focused verification: all 66 `driver-binding` tests and all 15 `system-manifest` tests passed. The
+`no-fixed-provider-slots`, `one-wait`, and `milestone-index` gates also passed, but none exercises the
+two still-open routes. The QEMU matrix was not repeated.
