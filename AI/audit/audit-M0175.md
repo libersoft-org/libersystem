@@ -1576,3 +1576,71 @@ Rating: 5/10
 3. **The latest DNS/SNTP deadline fix was not propagated into M7's governing scheduler contract.** M7 still opens by exhaustively saying the aggregate scheduler covers this milestone's DHCP and TCP timers plus P02M0174's L3 deadline (`docs/todo/P02M0175.md:696-704`). The later correction adds a third fixed `INTERNAL-UDP` owner for DNS and SNTP and explains that omitting it prevents expiry (`:745-770`). An implementation following the opening requirement recreates the exact accepted defect while one following the table does not. Add the internal-UDP owner to the opening contract so the item has one timer set.
 
 4. **RFC 6724's final tie-break still relies on a provider guarantee that P02M0174 deliberately does not make.** M5 says ties surviving the RFC rules use “the order M0174's enumeration returned candidates in, which is stable” (`docs/todo/P02M0175.md:560-564`). P02M0174 freezes only the default-router order; its public seam merely enumerates usable sources and matching routes and assigns selection policy, including tie-breaks, to P02M0175 (`docs/todo/P02M0174.md:498-505,574-577`). Its separate source/route order is explicitly internal to its own echo and not exported (`:345-382`). Equal RFC 6724 source or route candidates therefore remain insertion-order dependent, so the deterministic-fallback gate has no oracle. Freeze the final source/route tie-break in this milestone instead of attributing it to the provider.
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-03T16:23:24Z):
+
+**Finding 1 - the corrected SYN schedule is pre-empted by the candidate-attempt timeout. ACCEPTED.**
+
+Verified against the code the phrase pointed at: `TCP_SYN_TIMEOUT_TICKS` is 300 at 100 Hz, and
+`tcp_establish` stops its retransmission loop at that deadline. So M5's "each bounded by the existing
+per-attempt connect timeout" abandons an open after three seconds while M2's oracle requires that it
+not be abandoned before 180 - two normative numbers, one impossible. Pointing at an "existing"
+constant was the mistake: this file never chose it and inherited a decision it then contradicted.
+
+The two are reconciled by the distinction the finding implies without naming: ABANDONING A CANDIDATE
+IS NOT ABANDONING THE OPEN. A candidate that is not the last is bounded at three seconds - the first
+two retransmissions of M2's schedule, now stated as this file's decision rather than inherited - so a
+black-holed address does not hold the whole open; the LAST candidate runs M2's schedule in full,
+because there is nothing left to fall back to and RFC 9293 section 3.8.3's floor is about the open.
+With exactly one candidate the two coincide, which is the case M2's oracle tests. An open with N
+candidates fails after 3(N-1) + 183 seconds and never before 180 whatever N is.
+
+Both are tested, which the finding also asks for: one candidate whose peer never answers is not
+abandoned before 180 seconds, and two candidates whose first is black-holed reach the second within
+three seconds and still cannot fail before 180. M2's oracle carries a note saying which case it is
+measured on.
+
+**Finding 2 - the pending partition can starve autonomous DHCP work and its full-store outcome has no
+recipient. ACCEPTED.**
+
+Correct, and the second half is the sharper one: the refusal rule hands a full store's typed error to
+"the operation that caused it", and a lease renewal at T1, T2 or expiry is timer-driven with no caller
+in flight to hand it to. With DNS capped at 16 and SNTP capped at nothing, client work could fill the
+128 and the renewal would find no entry and no defined transition.
+
+The partition is accounted per kind, and the caps are chosen so the partition CANNOT BE FILLED: DNS
+at most 16 - the total this file already states beside its 4-per-client cap, restated so the
+arithmetic closes - SNTP at most 8, and DHCP 2 RESERVED and unreachable by any caller, one for the
+transaction in flight and one for the phase that replaces it, which is the most a single lease can
+owe. They sum to 26 against 128, so the full-store refusal is dead for this partition by
+construction - which is the point, because the one kind that could not receive a refusal is the one
+that must never be refused. Each cap refuses at the point that HAS a caller: a seventeenth DNS query
+and a ninth SNTP request are typed errors to the client that asked.
+
+Its oracle is the contention case the no-starvation rule asked for and did not have: a client holding
+its DNS and SNTP caps open receives the typed refusal on the next of each, and a lease whose T1 fires
+during exactly that state still opens its renewal transaction and completes it.
+
+**Finding 3 - the DNS/SNTP deadline fix was not propagated into M7's governing contract. ACCEPTED.**
+
+Right, and it is the propagation gap the previous round's correction created: M7's opening sentence
+exhaustively named this milestone's DHCP and TCP timers plus P02M0174's L3 deadline, and the third
+fixed owner arrived forty lines later. An implementation following the opening recreates the accepted
+defect while one following the table does not. The opening now names DHCP, TCP and INTERNAL-UDP - the
+last being the pending DNS and SNTP operations - with the reason it was added, so the item states one
+timer set.
+
+**Finding 4 - the RFC 6724 tie-break relies on a guarantee P02M0174 does not make. ACCEPTED.**
+
+Correct, and it is the mirror of a correction I made to that file: its source and route order is
+explicitly INTERNAL to its own echo, not exported and not inherited here, and its public seam
+enumerates candidates while assigning selection - tie-breaks included - to this milestone. Attributing
+the final tie-break to "the order M0174's enumeration returned candidates in" therefore rested on
+something that file declines to promise, and equal candidates stayed insertion-order dependent, so the
+deterministic-fallback gate had no oracle.
+
+The tie-break is frozen here and is mechanical, so it needs nothing from the provider: the SOURCE is
+the lower address bytes compared unsigned over the sixteen octets; the ROUTE is the longer prefix
+first, then the lower address bytes of the router it names, then the lower prefix bytes. Both are
+total on any set of distinct candidates, which is what the gate needs - two runs on one machine choose
+identically, and so do two implementations of this file.

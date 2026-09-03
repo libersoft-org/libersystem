@@ -1701,3 +1701,24 @@ Changed: `src/tools/verify-model/src/main.rs`, `src/tools/verify-model/src/candi
   exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
   `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
   phase, fixed, and re-run.
+
+AUDITOR'S RE-AUDIT ON P02M0167 (2026-09-03T14:35:08Z):
+
+Current implementation rating: 6/10
+
+1. **Registry-only activation can still bypass both evidence bars.** The accepted correction compares
+   removed exact ownership rules, removed edges, and reduced target sets on existing exact
+   architecture paths (`src/tools/verify-model/src/candidate.rs:65-102`), but those are not all the
+   registry inputs that can narrow a plan. In particular, deleting a `[[selects_everything]]` row
+   changes its component from a FULL plan to the ordinary scoped closure
+   (`src/tools/verify-model/src/plan.rs:206-243`; `src/tools/verify-model/model/registry.toml:319-385`)
+   and is completely invisible to the helper. Adding a longer ownership or architecture prefix can
+   likewise override a retained broader rule and narrow a subtree without removing or reducing any
+   exact active entry, because both lookups use longest-prefix resolution
+   (`src/tools/verify-model/src/ownership.rs:44-83`; `src/tools/verify-model/src/plan.rs:589-603`). In
+   each case `losing` can remain empty, so neither the general trust threshold nor the subsystem risk
+   threshold runs before materialisation (`src/tools/verify-model/src/main.rs:1028-1085`). The claimed
+   regression test covers only deletion of an ownership block and reduction of an existing
+   architecture row—not the stated edge case, `selects_everything`, or prefix overrides
+   (`src/tools/verify-model/src/tests.rs:2180-2220`). This leaves the milestone's central activation
+   safety requirement incomplete (`docs/todo/P02M0167.md:696-710`).

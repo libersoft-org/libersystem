@@ -1665,3 +1665,50 @@ Changed: `src/harness/dev-gpu-restart.py` (the comment only).
   exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
   `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
   phase, fixed, and re-run.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0165 (2026-09-03T14:33:04Z):
+
+Current implementation rating: 6/10
+
+1. **A dependency-stop intent survives the successful rebind and misclassifies every later genuine
+   fault as another planned stop.** Losing a requirement sets `node.stop_intent` to
+   `DependencyLost` (`src/user/services/core/src/device_manager.rs:4224-4282`). When the requirement
+   returns, `settle_dependencies` requests a new bind, and `READY` resets the attempt/incident state,
+   but neither path restores the intent to `Fault`
+   (`src/user/services/core/src/device_manager.rs:3754-3802,4158-4167`). The only restoration in the
+   file is the unrelated operator `Enable` path. A subsequent crash, exit or hang therefore satisfies
+   `stop_intent != Fault`, skips the retry/backoff decision, and builds its teardown with
+   `DependencyLost` (`src/user/services/core/src/device_manager.rs:3922-3939`), whose confirmed
+   landing is always `DependencyPending`
+   (`src/user/libs/driver/binding/src/lib.rs:193-206`). With the requirement actually present, the
+   standing loop immediately starts it again. This bypasses the bounded fault-recovery budget and can
+   repeat indefinitely, contradicting M2 and the Definition of Done's required Backoff/Failed outcome
+   for confirmed fault teardowns.
+
+2. **Shutdown skips a live driver whose bind handshake is still in progress.** A standing-loop
+   recovery installs the claim, process and channel on `node.binding` while the record remains
+   `Binding` (`src/user/services/core/src/device_manager.rs:3365-3366,3490-3505,3526-3539,3617-3625`),
+   then waits for that binding alongside the supervisor channel
+   (`src/user/services/core/src/device_manager.rs:523-655`). Thus a shutdown can be received in this
+   state. `stop_all`, however, processes only records equal to `Online` and silently skips every
+   `Binding` record (`src/user/services/core/src/device_manager.rs:5451-5480`), after which
+   DeviceManager acknowledges shutdown and exits. The skipped live driver receives no `STOP`, is not
+   withdrawn through the planned path, and gets no bounded acknowledgement wait. This violates M3's
+   clean-stop contract and M4's requirement to traverse the active driver set during shutdown.
+
+3. **M7's production withdrawal effects remain unproved, as the latest response now concedes.** The
+   host race test drives `apply_withdrawal` only through a recorder
+   (`src/user/libs/driver/binding/src/tests.rs:694-749`); it cannot fail if DeviceManager's concrete
+   `close_channel` syscall body or `announce_gone` send is removed
+   (`src/user/services/core/src/device_manager.rs:2147-2161`). The GPU restart is not that proof:
+   opening the initial provider moves its handle out of the catalogue, so the catalogue close is a
+   no-op and the driver's peer closure releases DisplayService's scanout; DisplayService also ignores
+   withdrawal frames (`src/user/services/core/src/display_service.rs:772-814`). Therefore the named
+   publish/crash/subscribe race still does not establish M7's production no-leaked-channel and
+   no-stale-subscriber effects, despite M7 remaining checked and the milestone remaining `COMPLETE`.
+
+Focused verification: all 64 `driver-binding` tests and 15 `system-manifest` tests passed, as did the
+`no-fixed-provider-slots`, `one-wait`, and `milestone-index` gates. None covers the two newly identified
+state-sequence defects or the admitted production-effects gap.

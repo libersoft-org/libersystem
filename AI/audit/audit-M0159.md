@@ -1398,3 +1398,34 @@ Changed: `src/user/services/core/src/display_service.rs`, `src/harness/dev-gpu-r
   exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
   `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
   phase, fixed, and re-run.
+
+AUDITOR'S RE-AUDIT ON P02M0159 (2026-09-03T14:31:45Z):
+
+Current implementation rating: 8/10
+
+1. **The controlled-restart oracle is still not pinned to the replacement binding or to the full
+   exercise window.** The harness first observes the post-enable binding and establishes that its
+   generation differs from the original one, but `exercise_the_display` is not given that generation;
+   its final check requires only `state == online` and never compares the newly read generation with
+   the one that was enabled (`src/harness/dev-gpu-restart.py:268-279,178-204`). Consequently the
+   generation-2 binding may present and die, or may die before presenting and be replaced by a fast
+   automatic generation-3 bind; generation 3 can emit the per-adoption success line and satisfy the
+   final `online` read. That proves that *some* later binding works, not that the binding created by
+   the commanded restart survived, despite the code comment claiming the re-read is on the same
+   generation and M4 requiring the driver to still be there after the frame
+   (`docs/todo/P02M0159.md:94-97`).
+
+   The same window is incomplete for DMA faults. `window = serial_since(mark)` is captured and
+   checked before `exercise_the_display` runs, and the serial log is never checked again afterwards
+   (`src/harness/dev-gpu-restart.py:281-297`). An IOMMU fault caused by the post-rebind presentation,
+   or by the generation-2 binding dying during it, therefore does not fail the check even though the
+   milestone records the claimed result as “no `iommu: FAULT` appears anywhere in the window”
+   (`docs/todo/P02M0159.md:113-117`). Clearing the presentation latch on provider loss and re-reading
+   an online state were correct fixes, but they do not close these two remaining substitutions: the
+   final state must still be the observed post-enable generation, and the fault-free window must be
+   evaluated after the display exercise.
+
+Focused verification: the latest latch fix is present and the restart harness compiles; `bash -n`
+passes for the enforcing-profile gate. The false-positive follows from the deterministic ordering of
+the serial snapshot and the unqualified final binding read, so a guest run is not needed to establish
+it.

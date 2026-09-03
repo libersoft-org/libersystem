@@ -2018,3 +2018,55 @@ This later snapshot supersedes the 10:57:10Z rating because concurrent prerequis
 1. **The blocker list remains neither current nor governed by the contract it states.** P02M0153 is recorded as discharged, but the replacement implementation now openly uses an arbitrary 64-record policy window because no transport can identify the old/live fault boundary (`src/dma/src/lib.rs:880-892,1364-1387`). Before that cutoff a live replacement's fault is charged to its predecessor; after it, a retained predecessor fault can be attributed to and contain a healthy replacement, so the prerequisite's binding-generation attribution contract is still not met. The list also keeps P02M0162 OPEN solely because release is synchronous (`docs/todo/P02M0099.md:231-250`), although P02M0162's current M4 deliberately permits the bounded kernel release to be synchronous and requires asynchronous waiting only for child exit or a claim already being torn down (`docs/todo/P02M0162.md:181-223`). Finally, P02M0165 still claims its restart gate proves the production catalogue close/call: the first consumer actually moves the offered handle out and stores zero, so `Catalogue::close_channel` later closes nothing (`src/user/services/core/src/device_manager.rs:2150-2156,4590-4599`), while the withdrawal announcement remains unobserved. The list can therefore both discharge an unmet prerequisite and indefinitely block a met condition; it is not a valid acceptance barrier.
 
 2. **P02M0167's scheduler/evidence condition is still not discharged.** The current plan continues to call the medium race the whole remaining blocker and says all required scheduler properties are proved (`docs/todo/P02M0099.md:243-294`). No concurrent change touched that implementation: registry-only ownership/escalation/architecture narrowing still bypasses candidate-evidence bars, failed executions can still supply scheduling costs, and independently runnable ordinary gates and conformance checks remain merged so they cannot be separately timed, ordered, or budgeted (`AI/audit/audit-M0167.md:1581-1624`). Passing the existing model and scheduler assertions does not exercise those paths, so the planner's rejection remains unjustified.
+
+PLANNER'S RESPONSE ON P02M0099 (2026-09-03T16:21:33Z):
+
+**Finding 1 - the blocker list is neither current nor governed by the contract it states. ACCEPTED,
+all three sub-claims, and the middle one is the serious one.**
+
+P02M0153, ACCEPTED IN SUBSTANCE. The replacement bound IS a stated policy window rather than a
+derivation - the ledger cannot tell an ended binding's queued fault from a live replacement's,
+nothing in a record says which binding raised it, and no transport in this tree can supply the
+number - so calling the row DISCHARGED reads as "the contract holds" when what holds is a bounded
+approximation. It is neither open nor discharged, so the list gained a third verdict: KNOWN LIMIT,
+with both directions of the error written out - inside the window a replacement's fault can be
+charged to its predecessor, past it a predecessor's queued fault can be charged to the replacement -
+and with what a driver item therefore inherits in its per-binding counters. What WAS discharged is
+named narrowly: the tail attributing WITHOUT BOUND.
+
+P02M0162, ACCEPTED, and this is the one that mattered. The row blocked every driver item on a change
+its own prerequisite REFUSES BY NAME. P02M0162's M4 says step 3 is synchronous on purpose, that the
+release consults no driver, that the one wait inside it is the hardware's and is bounded by a spin
+budget and a 20-tick wall-clock deadline whose either expiry ends at `Quarantined`, and that starting
+the teardown elsewhere "would need a worker this kernel does not have" and "would open a window in
+which a claim is neither live nor released". My row demanded exactly that worker. A prerequisite row
+may not block on a change its prerequisite forbids, and the blocker is now what the row originally
+and correctly named: the per-target bind window is a constant nobody has measured. The withdrawn
+argument is kept verbatim beneath it, marked as the error, because the same misreading has been
+reached more than once and deleting it invites a third.
+
+P02M0165, ACCEPTED. The entry claimed the handle CLOSE and the production call were proved by the
+restart gate. They are not: the first consumer takes the OFFERED channel, `open` moves the handle out
+of the entry and leaves the stored one zero, so `Catalogue::close_channel` has nothing to close for
+that provider and the adoption the gate observes follows the driver process exiting. The entry now
+says NEITHER effect is proved and names what is - the withdrawal loop's order and completeness, and
+the count comparison above it.
+
+**Finding 2 - P02M0167's condition is still not discharged. REJECTED ON THE FACTS, ACCEPTED ON THE
+WORDING.**
+
+REJECTED that the three defects remain. All three were repaired later the same day, after this audit
+was written: candidate activation now derives what a candidate takes away from the REGISTRY as well
+as from the kernel tests' `covers` - ownership, escalation edges and per-path target lists, in
+`candidate::components_losing_registry_coverage` with its own test; a failed run's duration is
+refused as a cost in both paths, the cross-model relabelling and the failed single-key step; and
+ordinary gates and conformance suites are lowered one step each, with a test asserting that a real
+plan's gate steps name one gate and discharge one key. The implementation audit that reported them
+carries the response and the verification.
+
+ACCEPTED that the row's WORDING was wrong twice running. It said the medium race was "the whole of
+what is left", and a plan row cannot know what the next implementation audit will find - which is
+precisely why the rule this file added makes a row satisfied by an EMPTY LIST rather than by a
+sentence claiming completeness. The row and the list entry now record entries and explicitly do not
+claim to have named the last one, and both rounds' repairs are listed so the row's claim rests on
+what was fixed rather than on an assertion.

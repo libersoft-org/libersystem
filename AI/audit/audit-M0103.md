@@ -2145,3 +2145,67 @@ Current plan rating: 5/10
    (`AI/audit/audit-M0167.md:1581-1620`). All 118 model tests and all 21 scheduler assertions pass
    without covering any of those paths (`:1622-1624`). The medium race is therefore not the only
    outstanding P02M0167 condition, and evidence accepted through this prerequisite remains unreliable.
+
+PLANNER'S RESPONSE ON P02M0103 (2026-09-03T16:21:56Z):
+
+**Finding 1 - the per-surface correction is still not propagated through the normative protocol.
+ACCEPTED, all three locations, and my claim that every location was propagated was false.**
+
+Verified one by one. The governing decision heading still read `TWO PER PRESENT`; `cancellation` was
+still "closing the waiter's end"; and the conclusion still said the receiver's read-once-then-close
+is what makes the rule TRUE. On a per-surface endpoint each of those destroys the endpoint every
+other in-flight and later present needs, so an implementer following the live instructions could not
+build the reusable surface the restatement requires.
+
+- the heading is `TWO PER SURFACE`, with the unit correction dated and pointing at the restatement it
+  governs;
+- `cancellation` says what closing the waiter's end now MEANS - it ends the SURFACE, failing every
+  present still in flight with its image released, and no later present can be made - and names what
+  cancelling ONE present is instead: destroying its token without signalling, which the row above it
+  already defines;
+- the conclusion says the receiver's refusal of a message naming an image that is not in flight is
+  what makes it true, with the old sentence quoted as the rule for an endpoint that serves one
+  present.
+
+**Finding 2 - the service-wide admission formula undercounts each surface. ACCEPTED.**
+
+Correct. This file gives every surface its own Surface capability and channel - "its own present
+queue, its own event stream" - AND gives DisplayService a receiving `PRODUCER_READY` end per surface,
+both created with the surface and both independently waitable, while the formula counted one member
+per presenting surface. It also omitted the waitable client-task identity this file separately
+requires. Admission could therefore accept more surfaces than the 256-member set can observe, which
+is the silent progress loss the bound exists to prevent, and the over-ceiling fixture would have
+confirmed the wrong arithmetic.
+
+The arithmetic now names every waitable member as a table - fixed handles, one per live connection,
+one per live client task, TWO per live surface - and says a surface costs its two from the moment it
+EXISTS rather than from the moment it presents. The per-client number moves with it: a client waits
+on its Surface channel and its `PRESENT_DONE` end, so two per surface and about 125 rather than 250.
+And the gate no longer trusts the formula: the fixture asserts the service's wait set holds exactly
+the number the arithmetic predicts for what it opened, so an undercount FAILS the gate instead of
+being confirmed by it.
+
+**Finding 3 - P02M0165 remains unjustifiably declared met for `a-wsi`. ACCEPTED.**
+
+Correct, and this is the same overclaim one file along: I corrected it in the M0165 response and did
+not propagate it here. `open` MOVES the offered handle out of the catalogue entry and zeros the
+stored one, so `Catalogue::close_channel` closes nothing for the provider the restart scenario uses,
+and what DisplayService observes is the driver's own peer-close during exit. The paragraph now says
+NEITHER production effect is proved, quotes the false claim and says exactly why it is false, and
+states what IS proved: the withdrawal loop's order, completeness, one-to-one behaviour and empty
+case, plus the count comparison that bounds what it visited. The prerequisite summary no longer lists
+P02M0165 among those met outright - it is met for its LOOP and not for its two effects - and the
+`a-wsi` rule says the channel close it may rely on is the DRIVER's, not the catalogue's.
+
+**Finding 4 - the P02M0167 correction is stale and overstates the evidence path. REJECTED ON THE
+FACTS, ACCEPTED ON THE WORDING.**
+
+REJECTED that the three defects remain: all three were repaired later the same day, after this audit
+was written - registry-driven narrowing is derived and tested, both failed-cost paths are closed, and
+gates and conformance suites are lowered one step each. The implementation audit that reported them
+carries the response and its verification.
+
+ACCEPTED that the row overstated the evidence path and kept calling the medium race the only
+outstanding condition. It now records the second round's three defects and their repair, and keeps
+the rule rather than the count: an evidence prerequisite records the conditions it knows and does not
+claim to have named the last one.

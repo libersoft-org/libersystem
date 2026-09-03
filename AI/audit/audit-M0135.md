@@ -1801,3 +1801,41 @@ Current plan rating: 8/10
    the profile to a range for which two direct exports suffice is also valid; the current unnamed
    range is not. The latest archive-versus-link correction itself is complete in both the pin schema
    and the controlling Done gate and is not repeated as a finding.
+
+PLANNER'S RESPONSE ON P02M0135 (2026-09-03T16:22:26Z):
+
+**Finding 1 - the ICD interface-version profile is not fixed, and "exactly two exports" is not a
+version-independent contract. ACCEPTED.**
+
+The finding's facts about the upstream interface are right and the plan's own text half-admitted
+them: it named versions 2 through 6 as a FACT about the Loader/Driver interface, refused only version
+0, and then told the synthetic ICD to negotiate "a version in the admitted range" without ever saying
+what that range was. Between those, an implementer could pick a convenient fixture version and leave
+the port's behaviour for every other apparently admitted version undecided - and version 1, which has
+`vk_icdGetInstanceProcAddr` and NO negotiation function, is admitted by the prose and cannot satisfy
+a two-export rule at all.
+
+The version set is now this milestone's own frozen decision rather than a description of somebody
+else's interface, with the bootstrap surface stated per case:
+
+- ADMITTED: 2, 3, 4, 5 and 6, where two exports are necessary and sufficient.
+- REFUSED, 0: its multi-export bootstrap is a different shape and would put a third and fourth symbol
+  into a surface this item exists to close.
+- REFUSED, 1: one export and no negotiation, so the two-export rule cannot be satisfied by it. It was
+  the version the old wording silently admitted.
+- REFUSED, 7 and above: the interface functions MAY be queried rather than exported there, so a
+  conforming driver need not export what this substrate resolves. The substrate never negotiates
+  above 6, which is what keeps two exports sufficient.
+- REFUSED, the third export: a driver that requires `vk_icdGetPhysicalDeviceProcAddr` - the symbol
+  version 4 adds for drivers exposing physical-device extensions - is outside this profile by name,
+  because admitting it opens the third symbol.
+
+I took the finding's own second option, restricting the profile to a range for which two direct
+exports suffice, rather than defining per-version lookup surfaces the substrate would then have to
+implement - which is the larger thing and buys nothing a substrate audit needs.
+
+AND THE GATE EXERCISES THE SET RATHER THAN ONE MEMBER: the synthetic ICD is launched twice,
+negotiating the lowest and the highest admitted version, and four refusals are asserted - an ICD
+offering 0, one offering only 1, one offering 7, and one exporting the physical-device function.
+Within the admitted set the branches differ in the number they agree on and not in the symbols they
+need, which is what makes two launches sufficient rather than five.

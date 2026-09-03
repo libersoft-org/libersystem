@@ -1754,3 +1754,39 @@ Current plan rating: 8/10
    generation. The same rule must govern any invalid rescan that overwrites an existing published
    face. The latest digest-at-INTO correction correctly closes the unnoticed-watch race; it is the
    newly added promise to serve overwritten prior content that remains inconsistent.
+
+PLANNER'S RESPONSE ON P02M0136 (2026-09-03T16:22:26Z):
+
+**Finding 1 - the rejected-runtime-replacement rule promises old bytes the catalogue no longer has.
+ACCEPTED. The inconsistency is mine, from the round that added the rule.**
+
+Correct on every step. The catalogue holds metadata and identities and NOT face bytes; the privileged
+writer has already overwritten the only file it can read; and `RESOLVE-INTO` digests what it read
+against the published identity, so it would refuse those bytes rather than serve them. "The previous
+generation stays current" plus "a client resolving across it gets the previous face's bytes and
+identity" therefore specified a gate that cannot pass, and left a permanently stale entry that
+nothing could resolve until an operator restored the file.
+
+I did not take the snapshot option the finding offers first: retaining an immutable copy of every
+published face would undo the metadata-only storage model and the three ceilings that rest on it,
+which is a redesign of the accounting this milestone spends a section fixing. The conservative
+outcome is stated instead, and it is the stronger of the finding's two:
+
+THE PUBLICATION IS WITHDRAWN AT A NEW GENERATION and the replacement is not published either. The
+identity that was published no longer names bytes this catalogue can serve, so the name leaves `LIST`
+and leaves fallback rather than remaining as an entry that can never be resolved; a client holding
+the old generation gets the ordinary stale refusal and re-asks, and one asking by name finds no such
+face. The reasoning for preferring withdrawal over a permanent typed-unavailable entry is written
+into the plan: a privileged writer can already DELETE the file, so denial is inherent in this trust
+model and costs nothing new, while CAPTURE is what must not happen - and withdrawal prevents it
+without leaving a trap that fallback would keep selecting.
+
+AND THE SAME OUTCOME GOVERNS EVERY REJECTED RESCAN, which the finding also asks for: a sidecar whose
+digest no longer matches, a declaration outside the closed vocabularies, a record past the size
+ceiling. The reason differs and the state it leaves does not - the identity names bytes that cannot
+be served - so there is one outcome rather than one per rejection.
+
+The gate is rewritten to assert what can actually happen: the refusal is reported, the face is
+withdrawn at a new generation, `LIST` no longer offers it, fallback no longer selects it, and no
+client can resolve the old identity to the new bytes - which is the capture the rule exists to
+prevent. The digest-at-`INTO` correction this finding confirms is unchanged.

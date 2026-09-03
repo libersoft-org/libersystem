@@ -1561,3 +1561,19 @@ Changed: `src/user/services/core/src/config_service.rs`,
   exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
   `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
   phase, fixed, and re-run.
+
+AUDITOR'S RE-AUDIT ON P02M0166 (2026-09-03T14:35:08Z):
+
+Current implementation rating: 8/10
+
+1. **The milestone's required policy-behaviour proof remains incomplete.** The latest response still
+   concedes that no registered test invokes DeviceManager's `apply_policy`; the sole end-to-end guest
+   check exercises only `disable` and `enable`. The added `driver-binding` test verifies extracted
+   decisions and arithmetic, but never composes those rules with the production node effects
+   (`src/user/libs/driver/binding/src/tests.rs:830-904`; `src/user/services/core/src/device_manager.rs:
+   3997-4037`). Consequently there is still no implementation-level test that a live `select` survives
+   until the next bind, that a retry through a still-missing requirement lands in
+   `DependencyPending` with exactly one attempt, or that policy on a quarantined node preserves its
+   state and resources. Those are explicit definition-of-done behaviours, not optional harness
+   expansion (`docs/todo/P02M0166.md:265-281`). The two most recent persistence fixes are present and
+   correct, but they do not resolve this previously acknowledged verification gap.

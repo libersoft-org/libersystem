@@ -1679,3 +1679,33 @@ Changed: `src/kernel/main.rs`, `src/kernel/iommu/mod.rs`, `src/kernel/iommu/virt
   exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
   `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
   phase, fixed, and re-run.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0153 (2026-09-03T14:29:59Z):
+
+Current implementation rating: 7/10
+
+1. **The fixed 64-event detached-tail window is still a guess that can assign a fault to the wrong
+   binding, so treating the previous finding as an accepted policy does not satisfy M4/M5.** The
+   production transport expressly returns no usable queue-capacity bound
+   (`src/kernel/iommu/mod.rs:64-75`; `src/dma/src/virtio_iommu.rs:353-365`), yet
+   `drain_faults_during` rewrites the first `MOST_TAIL_ATTRIBUTIONS` records for an endpoint to the
+   predecessor and every later record to the live attachment solely because the count crossed 64
+   (`src/dma/src/lib.rs:880-892,1352-1406`). If the predecessor left more than 64 reports, an old
+   report is stamped with the replacement generation and the periodic path may disable a healthy
+   replacement. If it left fewer, genuine replacement faults inside the remainder of the window are
+   charged to the predecessor and do not trigger live-binding containment. The production backend
+   cannot distinguish those executions, and the new generation stamp on `ENDED_FAULTS` can only
+   preserve the guessed attribution, not correct it. The fallback test makes the gap explicit by
+   queueing only replacement-domain faults and requiring the first 64 to be recorded as the ended
+   binding (`src/dma/src/tests.rs:698-727`). This remains contrary to M4's per-binding fault
+   accounting and M5's binding-generation attribution and containment requirements
+   (`docs/todo/P02M0153.md:194-220`).
+
+Verification: the complete milestone and audit history were checked against the current DMA ledger,
+virtio-IOMMU transport, kernel fault-service and claim-snapshot paths. The portable
+DMA/virtio-IOMMU suite passed all 62 tests, `virtio-iommu-protocol` passed with the same 62 tests,
+the ABI suite passed all 28 tests, and the driver-binding suite passed all 64 tests. These passing
+tests include the deliberately heuristic fallback above and therefore do not resolve this finding.
+No source code or milestone plan was modified.

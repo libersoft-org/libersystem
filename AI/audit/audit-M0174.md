@@ -1169,3 +1169,42 @@ Rating: 6/10
 Finding 1's stale rule also remains in the earlier router-order rationale, which still says ND, DAD, RS, MLD, and echo all take the first router (`docs/todo/P02M0174.md:294-300`) immediately before the correction explains why four of those paths must never consult that list (`:312-331`). Both stale clauses must be removed or qualified for the corrected five-path table to be unambiguous.
 
 Finding 2's missing transmit invariant also includes the source after the one immediate post-DAD re-report: later v2 responses/state changes and v1 Report/Done messages are never required to use the interface's valid link-local address. The complete envelope is source `::` only while no valid link-local address exists, otherwise a valid link-local source, plus Hop Limit 1 and Router Alert on every emitted MLD message.
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-03T16:22:58Z):
+
+**Finding 1 - the accepted echo-route correction leaves the old, contradictory next-hop rule
+normative. ACCEPTED, both locations.**
+
+Correct: I added the rule and left the sentence it replaces. M5's echo row still said an off-link
+destination "takes the FIRST entry of the order above" immediately before the correction explaining
+that the next hop comes from the SELECTED ROUTE and that the default-router order is consulted only
+through route ordering - two commands that pick different routers whenever more than one candidate
+exists, which is the exact defect I claimed to have corrected. The router-order rationale carried the
+same staleness one section earlier, listing ND, DAD, RS, MLD and echo as all taking the first entry.
+
+Both are rewritten rather than deleted, with the old text quoted and dated so the correction is
+legible: the echo row now says the next hop is the selected route's and that no matching route means
+the echo fails with that reason, and the rationale says the one path that consults the list at all is
+an off-link echo, through the route ordering. The host test has one oracle.
+
+**Finding 2 - outgoing MLD messages have no required IPv6 envelope. ACCEPTED.**
+
+Right, and the gap is exactly where the finding puts it: this file validates a RECEIVED query on
+MLD's own terms - link-local source, hop limit 1, Router Alert - and fixes the SOURCE of the first two
+reports, and between them left every message the host EMITS without a stated envelope. A syntactically
+correct membership record without it is discarded by the first router or snooping switch that sees
+it, before it repairs the forwarding state M4 exists to repair, and nothing in the plan would have
+caught that.
+
+The transmit invariant is stated once and covers every emitted MLD message - v2 reports, v2 responses
+to queries, state-change reports and their retransmissions, and the v1 Report and Done of the
+compatibility mode: hop limit 1, the Router Alert hop-by-hop option, and the interface's valid
+link-local source with `::` ONLY while no valid link-local address exists, which is the pre-DAD case
+and no other. That last clause is the finding's second half: the plan named the initial report and the
+post-DAD re-report and stopped, leaving every later message's source unstated.
+
+ITS ORACLE IS A CAPTURED PACKET rather than a code path, which is what the finding asks for: M8
+observes the pre-DAD report, the post-DAD re-report, a v2 response to a query, a state-change report,
+and a v1 Report and Done, and asserts hop limit 1, the Router Alert option and the source rule on
+each. A listener that emits a well-formed record without the envelope fails every one of them - which
+is the failure a router would otherwise perform silently.

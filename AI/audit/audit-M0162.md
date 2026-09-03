@@ -1276,3 +1276,43 @@ Changed: `src/user/libs/driver/binding/src/lib.rs`, `src/user/libs/driver/bindin
   exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
   `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
   phase, fixed, and re-run.
+
+AUDITOR'S RE-AUDIT ON P02M0162 (2026-09-03T14:31:45Z):
+
+Current implementation rating: 6/10
+
+1. **A binding revived after a dependency returns keeps the old planned-stop intent, so its next
+   genuine crash bypasses M0162's recovery budget.** Dependency loss stores
+   `StopIntent::DependencyLost` on the node (`src/user/services/core/src/device_manager.rs:4276-4282`).
+   When the provider returns, `settle_dependencies` requests a new bind, and `READY` resets the
+   incident and attempt counter, but neither path restores `stop_intent` to `Fault`
+   (`device_manager.rs:4158-4174,3780-3802`); the only such reset is in the operator `Enable` path
+   (`:4383-4417`). If that successfully rebound driver later exits or crashes, `advance` therefore
+   classifies the failure as a *planned* stop and calls `give_up_with` under `DependencyLost`
+   (`:3918-3931`). Its confirmed teardown lands at `DependencyPending` regardless of attempts
+   (`src/user/libs/driver/binding/src/lib.rs:193-206`), and because the dependency is already present,
+   the next catalogue pass immediately requests another bind with the attempt budget reset. Repeated
+   crashes can thus cycle without the required 100/200 ms backoffs or three-attempt ceiling. This is
+   a regression in the central post-`Online` lifecycle: the definition of done requires a crash to
+   recover through `Backoff`, exhaust into `Failed`, or quarantine on an unconfirmed teardown
+   (`docs/todo/P02M0162.md:245-269,396-408`).
+
+2. **The corrected pre-bind failure recording still produces a false cause for a mixed candidate
+   list.** `start_candidate` keeps one sticky `missing` boolean for the entire traversal and, at
+   exhaustion, records `DriverMissing` whenever *any* earlier candidate was absent
+   (`src/user/services/core/src/device_manager.rs:1175-1203,1213-1230`). A later candidate whose ELF
+   exists but has an incompatible protocol correctly records `ProtocolMismatch` and returns
+   `CandidateFailed` (`:3409-3423`); `start_candidate` then advances and, at exhaustion, overwrites
+   that cause with `DriverMissing` because the earlier flag is still set (`:1232-1260`). For the
+   concrete ordering `[missing artifact, protocol-mismatched artifact]`, the served record names the
+   last artifact (`Node::driver_name` falls back to the final candidate at exhaustion,
+   `:1798-1809`) while claiming that artifact is missing, even though it was successfully read. M3's
+   point is precisely that the state and cause tell an operator why the binding failed
+   (`docs/todo/P02M0162.md:96-101,133-155,404-405`). The new `record_failure` test exercises the four
+   origin states independently; it does not traverse a mixed production candidate list, so its green
+   result does not cover this overwrite.
+
+Focused verification: `cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline`
+passes all 64 tests. The `one-wait`, `no-fixed-provider-slots`, `virtio-iommu-protocol`,
+`driver-protocol-note`, and `source-hygiene` gates also pass; none drives either stateful sequence
+above.

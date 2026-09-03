@@ -1859,3 +1859,36 @@ Changed: `src/user/services/core/src/service_manager/bootstrap.rs`, `docs/todo/P
   exposed that the `LIVEVOL` path carries no probe count, so the probes desynced
   `storage_service`'s bootstrap on the default machine. Found in the gate's own default-machine
   phase, fixed, and re-run.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0164 (2026-09-03T14:33:04Z):
+
+Current implementation rating: 6/10
+
+1. **The non-system block roles are still assigned by bus position rather than by the required
+   format/origin decision.** DeviceManager still takes every block provider in lowest-BDF order and
+   its policy comment assigns the first four positions to system, FAT, ISO and UDF
+   (`src/user/services/core/src/device_manager.rs:950-1000`). ServiceManager retains positions two,
+   three and four as `block2_client`/`block3_client`/`block4_client`, labels them `FATBLOCK`,
+   `ISOBLOCK` and `UDFBLOCK`, and StorageService trusts those labels
+   (`src/user/services/core/src/service_manager/bootstrap.rs:475-515,787-805`;
+   `src/user/services/storage/src/service.rs:277-290`). A checked mount can reject a wrong medium but
+   cannot route it to the right instance. Consequently an ISO and FAT medium presented in the other
+   order are still left unmounted. The latest response correctly withdrew the earlier rejection and
+   the milestone now records M2 and its either-order profile as open
+   (`docs/todo/P02M0164.md:77-161,427-438`); the implementation has not yet supplied either part.
+
+2. **The USB volume and USB-bus consumers still receive one fixed, one-shot connection instead of
+   subscribing.** DeviceManager queries the catalogue but opens only each result list's `first()`
+   entry and sends it once (`src/user/services/core/src/device_manager.rs:743-770`). ServiceManager
+   stores those two handles in `block5_client` and `usbq_client`, injects the first into
+   `usb_storage`, and later grants the second through PermissionManager
+   (`src/user/services/core/src/service_manager/bootstrap.rs:306-325,522-529,1216-1221`). Neither the
+   USB StorageService instance nor PermissionManager subscribes to `Block`/`UsbBus`, so another
+   controller and a replacement publication remain unreachable to the actual consumers. The current
+   plan expressly leaves this consumer-side migration and its oracle open
+   (`docs/todo/P02M0164.md:257-275`).
+
+Focused verification: the 64 `driver-binding` tests and 15 `system-manifest` tests passed, as did the
+`no-fixed-provider-slots` and `one-wait` gates. Those checks do not exercise either remaining route.

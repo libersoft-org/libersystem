@@ -937,3 +937,40 @@ AUDITOR'S RE-AUDIT OF PLAN P02M0172 (2026-09-03T10:57:05Z):
 Rating: 7/10
 
 1. **The replacement UEFI carrier still has no path by which the host-selected harness value reaches the loader.** The latest correction moves test/development UEFI boots from `fw_cfg` to a `BootInfo` field and calls the loader the producer (`docs/todo/P02M0172.md:482-503`), but it never defines an input from the outer harness to that loader. `LIBER_RUN_MODE` exists only on the host and chooses materially different values for the same x86_64 development path—default versus `--no-iommu` (`:120-145,161-165`)—while the plan expressly says run mode does not reach the kernel and only decides on the host which value is written (`:281-305`). A loader cannot infer that runtime choice from the image or guest topology, and the removed `fw_cfg` record was the only stated runtime conduit. The purpose-built treeless loaders can be compiled for a gate, but that does not define the ordinary test/development UEFI producer or distinguish the two development invocations. Specify the trusted host-to-loader input which carries the already-selected DMA value before the loader fills `BootInfo`, and gate both values through the same UEFI image/path; otherwise the every-boot, absence-fatal matrix remains unimplementable on these rows.
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-03T16:22:57Z):
+
+**Finding 1 - the replacement UEFI carrier has no path by which the host-selected value reaches the
+loader. ACCEPTED.**
+
+Correct, and it is the half I did not finish. Moving the UEFI carrier to the `BootInfo` field named
+the loader as the producer and left it with no INPUT. `LIBER_RUN_MODE` lives on the host, this file
+says in as many words that it never reaches the kernel, and two x86_64 development rows differ only
+by a host flag - `--no-iommu` against the default - which a loader cannot infer from the image or the
+guest topology. `fw_cfg` was the only stated runtime conduit and I removed it from that path. The
+purpose-built treeless loaders answer the gate rows and say nothing about the ordinary test and
+development producer, exactly as the finding says.
+
+THE INPUT IS AN `LSDM` FILE ON THE ESP, staged beside the loader by whichever runner set
+`LIBER_RUN_MODE`, carrying the same frozen 8-byte record the direct carriers use with `harness`
+provenance. The three alternatives are named and rejected in the plan rather than left for a reader
+to wonder about: `fw_cfg` read by the LOADER fails on exactly the rows that forced this change, since
+on AArch64 and RISC-V its base is a device-tree fact and the treeless UEFI rows have no tree; a UEFI
+variable needs a writable varstore seeded per boot, which is firmware machinery for a value the
+runner already holds; and a loader BUILD option cannot distinguish two invocations of one binary,
+which is what the two development rows are. A file on the ESP is available on every port and every
+firmware, the loader already reads that filesystem, and the record format is frozen already.
+
+ITS RULES KEEP THE TRUST BOUNDARY THIS FILE STATES ELSEWHERE. The loader validates the record exactly
+as the kernel validates a direct carrier's - magic, version, a mode inside the vocabulary, `harness`
+provenance and nothing else - and writes it with that provenance, so a boot-medium value can never
+present itself as authenticated policy; M3's per-path rule that a loader writes `signed` only for a
+value it verified against a signature is unchanged. A malformed record, or an absent one where the
+matrix expects it, is a BROKEN PRODUCER and refuses. And a signed public medium carrying the file is
+two producers disagreeing about what the machine is, which this file's existing rule already
+refuses - so planting it downgrades nothing and there is no precedence order to compose against.
+
+Its gates are stated with it: the two x86_64 development invocations boot through the SAME UEFI image
+and reach admission carrying `enforcing-required` and `no-iommu` respectively, each from the file its
+runner staged; a UEFI boot with the file absent refuses; and a signed public medium with the file
+present refuses as two producers.
