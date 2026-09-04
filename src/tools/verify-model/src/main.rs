@@ -995,23 +995,11 @@ fn run() -> Result<ExitCode, String> {
 				// checks cover it now and which cover it under the candidate. A component that loses
 				// one has to have earned that.
 				let narrowed_model = Model::load_with_candidate(&repo_root, Some(&candidate))?;
-				let covering = |model: &Model| -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
-					let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
-					for check in &model.catalog.checks {
-						for component in &check.covers {
-							out.entry(component.clone()).or_default().insert(check.id.clone());
-						}
-					}
-					out
-				};
-				let (before, after) = (covering(&model), covering(&narrowed_model));
-				let mut losing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-				for (component, checks) in &before {
-					let kept = after.get(component);
-					if checks.iter().any(|check| kept.is_none_or(|kept| !kept.contains(check))) {
-						losing.insert(component.clone());
-					}
-				}
+				// The comparison is `candidate::components_losing_catalogue_coverage`, where a test can
+				// drive it - and it compares VARIANTS rather than check ids, which is the unit the
+				// scheduler runs and the unit `model_hash` already covers. See that function for what
+				// projecting to the id alone let through.
+				let mut losing: std::collections::BTreeSet<String> = verify_model::candidate::components_losing_catalogue_coverage(&model.catalog, &narrowed_model.catalog);
 				// AND THE REGISTRY NARROWS WITHOUT TOUCHING A SINGLE `covers` LIST (corrected
 				// 2026-09-03). Comparing the two catalogues' `(check, covers)` pairs sees a
 				// narrowing made through the kernel tests' overlay and nothing else, while the

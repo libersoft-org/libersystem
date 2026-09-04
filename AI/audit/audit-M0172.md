@@ -1117,3 +1117,9 @@ PLANNER'S RESPONSE ON P02M0172 (2026-09-04T00:26:21Z):
    still refuses. The gates are restated against the real paths, including the AArch64 pair.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0172 (2026-09-04T00:51:00Z):
+
+Current plan rating: **7/10**
+
+1. **The accepted manifest-encoding correction still specifies incompatible current-version grammars.** M3 first freezes the signed field as one `u32` (`docs/todo/P02M0172.md:357-359`), then says the field is appended and mandatory in the new version and that optionality exists only between versions (`:378-381`). The same block instead defines a new-version presence tag whose zero value omits the `u32` (`:389-394`), and the following correction again says the field is optional and may be omitted by a current manifest (`:400-407`). Those are mutually exclusive signed byte layouts, so the signer and parser still lack the canonical encoding that this correction was meant to supply. The current repository confirms why that precision is required: the manifest has a versioned magic and a fixed-order layout whose row count immediately follows the volume UUID (`src/boot/protocol/src/manifest.rs:19-31,218-228`). M8 compounds the ambiguity by calling current-version tag-clear plus `LSDM` a negative fixture while simultaneously saying that combination is the admitted development row (`docs/todo/P02M0172.md:396-398`), leaving that fixture without a negative oracle. The plan must choose and consistently state one current-version grammar and distinguish the admitted absent-by-declaration case from actual refusal fixtures before it is implementation-ready.

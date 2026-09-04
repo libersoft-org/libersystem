@@ -1915,3 +1915,9 @@ PLANNER'S RESPONSE ON P02M0136 (2026-09-04T00:26:21Z):
    switch or none.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0136 (2026-09-04T00:51:00Z):
+
+Current plan rating: **10/10**
+
+No material unresolved issue remains. The latest correction is complete: the ordered runtime-ceiling rule now puts every previously published but no-longer-servable face in `W`, including a removed or no-longer-named face, publishes the previous generation minus `W` when the admissible rescan remains over a ceiling, and gives the deletion-plus-over-ceiling interaction its own gate (`docs/todo/P02M0136.md:714-754`). The plan is ready for implementation.

@@ -62,6 +62,49 @@ pub struct Candidate {
 //
 // Its own function so it can be driven by a test: the comparison that used to live inline in the
 // activation path could only be exercised by activating a candidate, which is the thing it gates.
+// WHAT A CANDIDATE'S CATALOGUE TAKES AWAY, BY VARIANT.
+//
+// Its own function so a test can drive it (2026-09-04): it lived inline in the activation path,
+// where the only way to exercise it was to activate a candidate - which is the thing it gates - and
+// it was wrong in a way that reading it did not show. It projected each catalogue to
+// `component -> check id` and threw the VARIANTS away, while `model_hash` deliberately includes
+// them, so the two disagreed about what a model IS. One added `host_configuration_unrunnable` rule
+// drops a runnable configuration during catalogue construction while the check's id and its `covers`
+// stay exactly as they were: nothing this compared had changed, the answer was empty, and both
+// evidence bars were skipped over a model with one fewer runnable configuration.
+//
+// The key is the PlanItemKey's own identity - check, architecture, environment, configuration -
+// because that is the unit the scheduler runs, prices and records. Anything coarser asks whether a
+// check still exists somewhere rather than whether the work it stands for still happens.
+pub fn components_losing_catalogue_coverage(active: &crate::catalog::Catalog, narrowed: &crate::catalog::Catalog) -> std::collections::BTreeSet<String> {
+	let covering = |catalog: &crate::catalog::Catalog| -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
+		let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
+		for check in &catalog.checks {
+			for component in &check.covers {
+				let entry = out.entry(component.clone()).or_default();
+				for variant in &check.variants {
+					entry.insert(format!("{} / {} / {} / {}", check.id, variant.architecture, variant.environment.as_str(), variant.configuration));
+				}
+				// A CHECK WITH NO VARIANTS IS STILL A CHECK, and losing it is still a loss - it would
+				// otherwise be absent from both sides and compare equal.
+				if check.variants.is_empty() {
+					entry.insert(check.id.clone());
+				}
+			}
+		}
+		out
+	};
+	let (before, after) = (covering(active), covering(narrowed));
+	let mut losing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+	for (component, keys) in &before {
+		let kept = after.get(component);
+		if keys.iter().any(|key| kept.is_none_or(|kept| !kept.contains(key))) {
+			losing.insert(component.clone());
+		}
+	}
+	losing
+}
+
 pub fn components_losing_registry_coverage(active: &crate::registry::Registry, narrowed: &crate::registry::Registry, ownership: &crate::ownership::Ownership, narrowed_ownership: &crate::ownership::Ownership) -> std::collections::BTreeSet<String> {
 	let mut losing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 

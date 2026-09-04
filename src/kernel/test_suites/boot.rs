@@ -105,6 +105,29 @@ fn init_package_starts_system_manager() {
 	// memory volumes (ram and tmp). They NAME THEMSELVES now, so this asserts the set that came up
 	// rather than a count of identical strings - seven anonymous reports could be the same volume
 	// mounted seven times and this suite could not have told the difference.
+	// THE USB VOLUME'S REPORT, WHICH IS STRONGER ON THE TARGET WHERE THE ROUTE WORKS.
+	//
+	// The supervisor tags a provider it actually routed and the instance repeats it, so ` routed`
+	// distinguishes a served stick from the closed stand-in handed over when no controller published
+	// one - and both used to produce the identical line, which is why asserting it proved only that
+	// the instance had started.
+	//
+	// AND ON AARCH64 IT IS NOT ROUTED, WHICH THIS FOUND ON ITS FIRST RUN (2026-09-04). That machine
+	// carries five boot block devices where x86_64 carries four, so the supervisor - which declares
+	// volumes for four - closes the fifth and says `more block providers than there are volumes
+	// declared for them`, and it publishes no `usb-bus` provider at all where x86_64 publishes one.
+	// The stick is present and the driver sees it: `driver.xhci: online (00:06.0, 4 device(s))
+	// (keyboard) (pointer) (storage)`. So the route is genuinely missing there rather than untested,
+	// and this asserts what holds per target instead of asserting nothing anywhere. It is recorded
+	// in the milestone as a defect the oracle found, not as a target this test excuses.
+	// The exception is AARCH64 ALONE, not "everything that is not x86_64" - riscv64 publishes its
+	// `usb-bus` provider and routes the volume exactly as x86_64 does, which its own first green run
+	// showed. Keying the exception wider than the defect would have hidden a working route behind a
+	// broken one.
+	#[cfg(not(target_arch = "aarch64"))]
+	const USB_VOLUME_REPORT: &[u8] = b"StorageService: online (vol://usb) routed";
+	#[cfg(target_arch = "aarch64")]
+	const USB_VOLUME_REPORT: &[u8] = b"StorageService: online (vol://usb)";
 	let online_reports: [&[u8]; 23] = [
 		b"LogService: online",
 		b"DeviceManager: online",
@@ -112,7 +135,16 @@ fn init_package_starts_system_manager() {
 		b"StorageService: online (vol://media)",
 		b"StorageService: online (vol://iso)",
 		b"StorageService: online (vol://udf)",
-		b"StorageService: online (vol://usb)",
+		// AND THIS ONE SAYS ITS CHANNEL WAS ROUTED, WHICH THE BARE LINE COULD NOT (added 2026-09-04).
+		//
+		// M7's route is DeviceManager publishing the xHCI driver's block provider and the supervisor
+		// handing it to this instance. When no controller published one, the supervisor hands over a
+		// stand-in whose far end is already closed - so the instance answers "not there" instead of
+		// waiting - and BOTH cases produced the identical `online (vol://usb)`. Asserting that line
+		// therefore proved the instance had started and nothing about the route: a boot that lost
+		// the stick entirely passed it. The suffix is present only for a provider the boot actually
+		// routed.
+		USB_VOLUME_REPORT,
 		b"StorageService: online (vol://ram)",
 		b"StorageService: online (vol://tmp)",
 		b"ProcessService: online",

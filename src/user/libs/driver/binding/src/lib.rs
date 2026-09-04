@@ -280,11 +280,21 @@ pub enum ShutdownStep {
 	// duplicate frame is one the protocol says changes nothing - but WAIT for the one outstanding
 	// and force it at the deadline like any other, which is the half that was missing.
 	WaitForTheStopAlreadySent,
+	// The binding is gone and its TEARDOWN is still running: the process has not been seen to exit,
+	// or the claim has not settled, or neither. Nothing to ask and nothing to force - what is owed
+	// is the WAIT, because until both confirmations arrive nobody can say whether the device came
+	// back `Free` or has to be quarantined, and a shutdown that exits first has answered a question
+	// it never asked (added 2026-09-04).
+	WaitForTheTeardownToSettle,
 }
 
-pub fn shutdown_step(state: BindingState, holds_the_device: bool) -> ShutdownStep {
+pub fn shutdown_step(state: BindingState, holds_the_device: bool, teardown_in_flight: bool) -> ShutdownStep {
 	if !holds_the_device {
-		return ShutdownStep::Nothing;
+		// A TEARDOWN IN FLIGHT IS NOT NOTHING, WHICH IS WHAT THIS USED TO ANSWER. `advance` takes
+		// the binding out of the node when it starts one, so such a node holds no device and was
+		// skipped - and the outcome M3 asks a shutdown to classify is precisely what that teardown
+		// is about to produce.
+		return if teardown_in_flight { ShutdownStep::WaitForTheTeardownToSettle } else { ShutdownStep::Nothing };
 	}
 	match state {
 		BindingState::Online | BindingState::Binding => ShutdownStep::AskItToStop,
@@ -294,8 +304,8 @@ pub fn shutdown_step(state: BindingState, holds_the_device: bool) -> ShutdownSte
 }
 
 // Whether a shutdown has anything to do with this node at all.
-pub fn shutdown_stops(state: BindingState, holds_the_device: bool) -> bool {
-	shutdown_step(state, holds_the_device) != ShutdownStep::Nothing
+pub fn shutdown_stops(state: BindingState, holds_the_device: bool, teardown_in_flight: bool) -> bool {
+	shutdown_step(state, holds_the_device, teardown_in_flight) != ShutdownStep::Nothing
 }
 
 // WHERE THE CANDIDATE CURSOR GOES WHEN AN ATTEMPT ENDS.

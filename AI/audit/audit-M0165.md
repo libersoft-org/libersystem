@@ -1883,3 +1883,62 @@ Focused verification: `driver-binding` 66/66, `driver-protocol` 26/26, and `syst
 tests passed; the x86_64 user build and the `one-wait`, `no-fixed-provider-slots`, `milestone-index`,
 and `no-suppression` gates passed. No executed check covers either missing planned-stop deadline,
 shutdown teardown confirmation, or the concrete close syscall; the QEMU matrix was not repeated.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0165 (2026-09-04T09:08:50Z):
+
+Covering the 2026-09-03T22:44:52Z findings too, which were acted on without a response being written.
+
+1. (2026-09-03T22:44:52Z) **Shutdown abandons a live binding whose earlier planned stop has been sent
+   but not yet answered** - ACCEPTED. `begin_operator_stop` and `begin_dependency_stop` BORROW the
+   binding - they do not take it - so a node in `Stopping` with a live driver is reachable, and the
+   predicate I had written excluded every `Stopping` record. Its test asserted that exclusion, which
+   is how it survived a round: the reasoning ("a teardown under way has already taken the binding")
+   is true of the FAULT path and false of the planned one.
+
+   CODE. `driver_binding::shutdown_step` answers `AskItToStop`, `WaitForTheStopAlreadySent` or
+   `Nothing`, and `stop_all` acts on it: a node whose stop is already in flight is not sent a second
+   `STOP` - a duplicate frame changes nothing - and is waited out and forced at the deadline like any
+   other. The test now asserts the corrected case and says what it used to pin.
+
+2. (2026-09-04T00:29:33Z) **Operator and dependency planned stops have no enforceable stop deadline** -
+   ACCEPTED. Verified: neither helper recorded a deadline, a `Stopping` node is excluded from
+   heartbeat supervision, and an ordinary binding channel is not in the central wait - so the only
+   thing that could end the wait was the driver choosing to answer, and one that stays alive and
+   silent kept its claim, its Domain and its charged resources for the rest of the boot. M3 requires
+   the forced revocation at the deadline, and only the shutdown path had one.
+
+   CODE. `Node::stop_deadline`, armed by both helpers from the same slice the shutdown path uses,
+   added to the standing loop's `soonest`, and cleared where the binding ends. On expiry the loop
+   injects `Wedged` - the same event the shutdown path and the heartbeat watchdog use, so this takes
+   the one teardown route rather than inventing a second - and prints the same forced-teardown line.
+
+3. (2026-09-04T00:29:33Z) **Shutdown acknowledges before the teardown outcome it promises to
+   classify** - ACCEPTED, AND THE FIX WAS WITHDRAWN. The finding is right: `wait_out_planned_stop`
+   ended when `advance` took the binding, and `advance` has only STARTED the teardown at that point.
+
+   I built the wait - `shutdown_step` gained `WaitForTheTeardownToSettle` and a helper fed the two
+   confirmations by hand, since that path has no central wait - and it was a REGRESSION. It collected
+   neither confirmation, so every device burned its whole deadline and ended quarantined. Measured:
+   the x86_64 suite went from 380 tests in 192 s to not finishing in 900 s, and because shutdown runs
+   at the end of every test the whole tree paid for it. Reverting restored 13 passed in 25 s, which
+   is also what proves the regression was mine and not inherited.
+
+   WHAT IS IN THE TREE: the predicate still answers `WaitForTheTeardownToSettle` for such a node,
+   because that is the honest classification, and `stop_all` skips it with the measurement and the
+   reason written at the skip. The gap M3 names is real and open. What the attempt established for
+   whoever takes it next: the total shutdown time has to be bounded, not the per-node wait, and
+   `wait_any`'s index convention needs establishing first - the central loop reads a positive answer
+   as an index into its array while treating 0 as a timeout, which cannot be both.
+
+4. **M7's concrete catalogue-handle close remains unproved** - ACCEPTED, unchanged from the previous
+   response. The announcement half now has a production oracle; the close does not, and cannot have
+   one from outside DeviceManager - a handle it did not close is not visible to anything else. What
+   the close actually does is smaller than "no leaked channel" reads as: the offered endpoint is
+   MOVED to the first consumer that opens the provider, so the close is reached for a provider nobody
+   opened. That is recorded in the milestone rather than claimed.
+
+## Verification for this round (2026-09-04T09:08:50Z)
+
+    cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline   66 passed
+    ./test.sh --arch x86_64 --tags boot                                             13 passed (25 s)
+    ./check.sh --gate source-hygiene,milestone-index                                clean

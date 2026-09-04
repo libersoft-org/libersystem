@@ -1821,3 +1821,57 @@ Focused verification: all 63 DMA tests and the `virtio-iommu-protocol` gate pass
 passed all 28 tests, the driver-binding suite passed all 66 tests, and `source-hygiene` passed. The
 full QEMU gate stopped at its stale-image preflight, so no stale guest run was treated as evidence.
 No source code or milestone plan was modified.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0153 (2026-09-04T09:08:50Z):
+
+This response covers the 2026-09-03T22:35:00Z finding as well, which was repaired but never written
+up - the fix landed and the next task arrived before the response did.
+
+1. (2026-09-03T22:35:00Z) **The hostile half of the QEMU gate does not use M2's dedicated fixture** -
+   ACCEPTED. The gate added the controller and two EDU functions to the ORDINARY test machine, which
+   carries a virtio-serial console, an xHCI controller with a hub, a keyboard, a tablet and a USB
+   stick, three more virtio-blk media disks, a PCIe-to-PCI bridge with a device behind it, and a
+   virtio-sound card. M2 says to keep this a dedicated fixture and not to inherit optional DMA
+   devices from the ordinary harness, and the reason is not tidiness: the transition the gate exists
+   to prove QUIESCES every non-controller endpoint before turning bypass off, so each of those bus
+   masters was a participant in the security-sensitive step. The bridge is named in M2 in the
+   opposite sense too - the fixture refuses a bridge alias rather than generalizing to it, and the
+   ordinary machine supplies one.
+
+   CODE. `DMA_FIXTURE=1` in `qemu-run.sh` omits exactly those - console, USB, media disks, bridge and
+   sound - and keeps the firmware boot medium, the system volume and virtio-net. Omission only: a run
+   without the flag builds the machine it always built.
+
+2. (2026-09-04T00:22:59Z) **The `DMA_FIXTURE` correction still does not build M2's named enforcing
+   profile** - ACCEPTED IN PART, and the part accepted is the one that mattered most.
+
+   ACCEPTED: the profile flags. Verified in the runner: `./test.sh` reaches it with `TEST=1`, which
+   selects `iommu=0` - so the machine stayed plain `q35` with no `default-bus-bypass-iommu=off`, and
+   `qemu_virtio_opts` built every endpoint WITHOUT `iommu_platform=on`. The controller then arrived
+   through `QEMU_EXTRA`, which is appended last, behind the endpoints it is supposed to translate.
+   So the hostile cases were being refused on a machine that permitted bus bypass by devices that had
+   not been told their addresses are translated. That is not M2's profile and the finding is right
+   that it makes the boundary proof a different one.
+
+   CODE. The gate sets `IOMMU=1`, which is the runner's documented way for "a gate that owns its own
+   profile" to say so: it puts the controller in front of the endpoints, marks each of them with
+   `iommu_platform=on`, and - added here - selects `q35,default-bus-bypass-iommu=off`. `QEMU_EXTRA`
+   is reduced to the two `edu` functions, since the controller is no longer bolted on behind them.
+
+   REJECTED: that the system-volume `virtio-blk` endpoint must also go. It is not an optional DMA
+   device inherited from the ordinary harness, which is what M2's sentence forbids - it is what the
+   guest mounts as `vol://system`, and this phase boots the TEST medium, which carries `volume.pkg`
+   (a factory archive) and NOT `system-volume.img`. Checked in `mkimage.sh`: the embedded volume goes
+   on the SHIPPING medium, which is what the gate's later traffic phase boots. So on this phase there
+   is no other source for the system volume, and dropping the disk would leave a guest that cannot
+   run the suite at all rather than a narrower fixture. M2's list describes a fixture booting a
+   medium that carries its own volume; that is the traffic phase's machine, not this one. Recorded
+   here rather than silently kept.
+
+## Verification for this round (2026-09-04T09:08:50Z)
+
+    bash -n on both changed scripts                 clean
+    ./check.sh --gate source-hygiene                clean (--current)
+
+The gate itself boots a guest and is part of the single long run at the end of this job; its result is
+recorded with that run.

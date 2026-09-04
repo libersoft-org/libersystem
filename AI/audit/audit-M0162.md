@@ -1440,3 +1440,52 @@ Current implementation rating: 8/10
 Focused verification: all 66 driver-binding tests and all 15 system-manifest tests passed. The
 `source-hygiene` and `no-suppression` gates passed. Those host checks do not exercise the production
 multi-candidate exhaustion sequence. No source code or milestone plan was modified.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0162 (2026-09-04T09:08:50Z):
+
+This covers the 2026-09-03T22:34:21Z findings too, which were repaired without a response being
+written.
+
+1. (2026-09-03T22:34:21Z) **The attempted fix for a fresh post-`Online` recovery incident starts its
+   deadline too early** - ACCEPTED. `Incident::open` is an absolute `now + slice` deadline and the
+   `READY` arm opened one the moment the driver came up, so a window meant for a recovery was spent
+   seconds later while the driver was healthy. A crash an hour on consulted it, `may_try_again` found
+   no room for a backoff, and the node went straight to `Failed` - the outcome M5 names as the one it
+   must not produce. Opening it at `READY` had only moved the expiry.
+
+   CODE. The recovery window opens where the recovery starts: the arm of `advance` that ends a
+   binding whose record is `Online`. Gated on `Online` and not on the window having expired, because
+   those are different questions - a bind attempt failing after its chain's window ran out MUST end
+   the chain, and reopening there would make the absolute deadline unreachable.
+
+2. **Automatic attempt and time budgets restart for every fallback candidate** - ACCEPTED, both
+   halves, and I rejected one of them a day earlier on an argument that does not hold.
+
+   THE WINDOW. The first repair kept `spend_candidate`'s reset and asked instead whether a window was
+   still LIVE. That fails at exactly the boundary it was written for: the window that ENDED the
+   previous candidate is by definition expired, so the next candidate opened another one anyway. The
+   finding says this in as many words and it is right. Traced to confirm the sequence is reachable: a
+   teardown landing in `Failed` answers `Step::NextCandidate`, both loop handlers advance the cursor,
+   and `spend_candidate` zeroed the counter - so three candidates meant nine attempts and three
+   absolute windows, which is the boot-time multiplication both bounds exist to prevent.
+
+   THE ATTEMPTS. I rejected this on 2026-09-03 with the argument that a fallback list whose second
+   entry inherits an exhausted counter has one usable entry. That argument is wrong and checking it
+   is what shows why: a candidate that could not RUN - artifact missing, protocol note refused, claim
+   held elsewhere - spends no attempt, because `budget_after_nothing_ran` already decides that, and
+   those are the failures a fallback list exists for. A candidate that ran and crashed three times is
+   a node whose automatic budget is spent, and M5 gives the operator's `retry` as the way on. M5 is
+   explicit and is per NODE - "at most 3 AUTOMATIC bind attempts per node per boot", one absolute
+   deadline "across every attempt on a node" - and my reading substituted a different contract.
+
+   CODE. `spend_candidate` no longer resets `node.attempt`, and `begin_bind` opens a window on the
+   chain-start test again (`attempt == 0`), which is now correct precisely because nothing resets the
+   counter at a candidate boundary. `Incident::is_live` was added for the first repair and is
+   removed with it. Both budgets are per node across candidates, as M5 states them.
+
+## Verification for this round (2026-09-04T09:08:50Z)
+
+    cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline   66 passed
+    ./build.sh --arch x86_64                                                        built
+    ./test.sh --arch x86_64 --tags boot                                             13 passed (26 s)
+    ./check.sh --gate source-hygiene,milestone-index                                clean

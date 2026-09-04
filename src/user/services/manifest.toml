@@ -2098,6 +2098,50 @@ source = "SERVE"
 interface = "liber:device@1/provider-catalogue"
 presence = "optional"
 
+# THE SYSTEM INSTANCE STARTS BEFORE THE THREE VOLUME INSTANCES, AND THE DEPENDENCY IS WHAT SAYS SO
+# (2026-09-04).
+#
+# It is the only component that may read a filesystem and the only one holding a probe connection to
+# every block provider, so it is what classifies them - and `media_storage`, `iso_storage` and
+# `udf_storage` choose their disk from that classification. Started after it, its table arrives too
+# late: measured on the swapped-disk profile, the first two fell back to bus position, each claimed a
+# disk of the wrong format, and the third then asked for a handle already given away - a role
+# hand-off MOVES the channel - so `udf_storage` received no `UDFBLOCK` at all and exited. The failure
+# reads as `udf_storage: FAILED to start`, which names the last instance rather than the order that
+# caused it.
+#
+# AND THE POSITION IN THIS FILE IS NOT WHAT ORDERS THEM, which the first attempt at this assumed.
+# The generator emits `MANIFEST` sorted by NAME, so `iso_storage` and `media_storage` precede
+# `storage_service` however this file is arranged - moving the block changed nothing and the measured
+# failure was identical. The three volume instances therefore DECLARE the dependency, which is true
+# of them anyway: each needs an answer only the system instance can produce.
+[[services]]
+name = "storage_service"
+program = "storage_service"
+restart = "escalate"
+state_class = "durable"
+state_scope = "external"
+state_storage = "vol://system"
+dependencies = ["log_service", "device_manager"]
+
+[[services.roles]]
+tag = "BLOCK"
+kind = "device"
+provider = "device_manager"
+
+[[services.roles]]
+tag = "ADMIN"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume-admin"
+
+[[services.roles]]
+tag = "SERVE"
+kind = "serve-root"
+provider = "self"
+interface = "liber:storage@1/volume"
+
+
 [[services]]
 name = "iso_storage"
 program = "storage_service"
@@ -2105,7 +2149,7 @@ restart = "escalate"
 state_class = "durable"
 state_scope = "external"
 state_storage = "vol://iso"
-dependencies = ["log_service", "device_manager"]
+dependencies = ["log_service", "device_manager", "storage_service"]
 
 [[services.roles]]
 tag = "ISOBLOCK"
@@ -2141,7 +2185,7 @@ restart = "escalate"
 state_class = "durable"
 state_scope = "external"
 state_storage = "vol://media"
-dependencies = ["log_service", "device_manager"]
+dependencies = ["log_service", "device_manager", "storage_service"]
 
 [[services.roles]]
 tag = "FATBLOCK"
@@ -2656,33 +2700,6 @@ kind = "payload"
 provider = "service_manager"
 
 [[services]]
-name = "storage_service"
-program = "storage_service"
-restart = "escalate"
-state_class = "durable"
-state_scope = "external"
-state_storage = "vol://system"
-dependencies = ["log_service", "device_manager"]
-
-[[services.roles]]
-tag = "BLOCK"
-kind = "device"
-provider = "device_manager"
-
-[[services.roles]]
-tag = "ADMIN"
-kind = "serve-root"
-provider = "self"
-interface = "liber:storage@1/volume-admin"
-
-[[services.roles]]
-tag = "SERVE"
-kind = "serve-root"
-provider = "self"
-interface = "liber:storage@1/volume"
-
-
-[[services]]
 name = "system_graph_service"
 program = "system_graph_service"
 restart = "transparent"
@@ -2767,7 +2784,7 @@ restart = "escalate"
 state_class = "durable"
 state_scope = "external"
 state_storage = "vol://udf"
-dependencies = ["log_service", "device_manager"]
+dependencies = ["log_service", "device_manager", "storage_service"]
 
 [[services.roles]]
 tag = "UDFBLOCK"

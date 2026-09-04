@@ -127,8 +127,19 @@ trap 'rm -rf "$work"' EXIT
 #
 # `DMA_FIXTURE=1` omits exactly those and keeps the firmware boot medium, the system volume and
 # virtio-net, which is the list M2 gives.
+# AND `IOMMU=1` RATHER THAN A CONTROLLER BOLTED ON THROUGH `QEMU_EXTRA` (corrected 2026-09-04).
+#
+# `./test.sh` reaches the runner with `TEST=1`, which selects the UNTRANSLATED profile: the machine
+# stays plain `q35` with bus bypass allowed by default, and every endpoint is built without
+# `iommu_platform=on` - so the endpoints were not told their addresses are translated and the
+# controller arrived through `QEMU_EXTRA`, which is appended AFTER them, in a machine that permitted
+# bypass anyway. The hostile cases were being refused on a profile that is not M2's.
+#
+# `IOMMU` is the documented way for "a gate that owns its own profile" to say so. It puts the
+# controller in front of the endpoints it translates, marks each of them, and turns the machine's
+# bypass default off - so only the two `edu` functions remain for `QEMU_EXTRA` to add.
 echo "qemu-virtio-iommu: booting the enforcing profile on M2's dedicated fixture"
-DMA_FIXTURE=1 QEMU_EXTRA="-device virtio-iommu-pci,boot-bypass=on -device edu -device edu" \
+IOMMU=1 DMA_FIXTURE=1 QEMU_EXTRA="-device edu -device edu" \
 	./test.sh --arch x86_64 --tags dma >"$work/run.log" 2>&1 || {
 	echo "qemu-virtio-iommu: the dma suite failed under the enforcing profile" >&2
 	tail -20 "$work/run.log" >&2

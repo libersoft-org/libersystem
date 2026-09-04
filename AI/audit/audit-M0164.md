@@ -2034,3 +2034,77 @@ Focused verification: `driver-binding` 66/66, `driver-protocol` 26/26, and `syst
 tests passed; the x86_64 user build and the `one-wait`, `no-fixed-provider-slots`, `milestone-index`,
 and `no-suppression` gates passed. None exercises these two deliberately open routes; the QEMU matrix
 was not repeated.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0164 (2026-09-04T09:08:50Z):
+
+Both findings ACCEPTED, as in the three previous rounds. What is different is that M2 is now BUILT
+and proved, and M7's oracle - the stated prerequisite for its subscription - is built and passes. The
+milestone goes from two open items to one.
+
+1. **M2's format/origin routing and its adverse-order oracle remain unimplemented** - ACCEPTED and
+   NOW DONE.
+
+   CODE. The system StorageService instance classifies every provider it probes - LiberFS, then
+   ISO9660, then UDF, then FAT, each through that codec's own `mount_checked`, so "not this format"
+   is an answer rather than an inference from a failed read. The table rides up behind a NUL in its
+   online report: a second message would force the supervisor to know whether to expect one before it
+   could read the report, and every service that sends none would have to be told apart from one whose
+   table has not arrived. ServiceManager assigns `FATBLOCK`, `ISOBLOCK` and `UDFBLOCK` from it,
+   falling back to bus position and SAYING SO. FAT needs no origin among the boot providers: the USB
+   stick binds in phase two and arrives separately, so the only FAT candidate here is the media
+   volume.
+
+   THE PROFILE, WHICH IS PART OF THE ITEM. `MEDIA_ORDER=swapped` presents the three media disks as
+   UDF, ISO, FAT - the order in which position says the wrong thing. Measured: both orders pass
+   `--tags boot`, 13 tests, with the three volumes served in each.
+
+   AND IT CAUGHT THREE THINGS BUILDING THE ROUTING ALONE WOULD NOT HAVE, which is the argument for
+   the profile made concrete:
+
+   - the two lists this routing indexes one by the other were in DIFFERENT orders. Probe connections
+     were built by walking catalogue SLOTS - publication order, since slots fill as drivers report
+     `READY` - while the role hand-off takes the lowest bus address each time. Harmless until
+     something indexed one by the other, which is what M2 does;
+   - the volume instances were starting BEFORE the system instance, so the first two got no table,
+     fell back to position and each claimed a disk of the wrong format - after which the third asked
+     for a handle already given away, since a role hand-off MOVES the channel. Its role is
+     `presence = "optional"`, so it was skipped in silence and the instance exited. The failure reads
+     `udf_storage: FAILED to start`, naming the last instance rather than the order;
+   - and the PLAN was wrong about what orders them. It said the system instance starting first "is
+     manifest order and nothing else". The generator emits `MANIFEST` sorted by NAME, so
+     `iso_storage` and `media_storage` precede `storage_service` however the file is arranged -
+     moving the block changed nothing and the measured failure was identical. The three volume
+     instances now DECLARE the dependency, which is what the start loop reads and is true of them
+     anyway.
+
+   None of the three is visible in the ordinary disk order, which is what the plan meant by a routing
+   change being a no-op on every machine this tree boots.
+
+2. **M7's USB consumers and boot-route oracle remain one-shot** - ACCEPTED. The ORACLE is built; the
+   subscription is not, and is now the milestone's one remaining item.
+
+   CODE. A routed provider and the stand-in were indistinguishable: when no controller published one
+   the supervisor hands over a channel whose far end it has already closed - so the instance answers
+   "not there" instead of waiting - and BOTH produced the identical
+   `StorageService: online (vol://usb)`. The boot's assertion on that line proved the instance had
+   started and nothing about the route; a boot that lost the stick entirely passed it. The supervisor
+   tags a routed provider `USBBLOCK*`, the instance repeats it as ` routed`, and `kernel.boot` asserts
+   the routed form. The suffix has exactly one producer, gated on a non-zero handle. Measured:
+   `--tags boot` passes on the machine that has the stick.
+
+   NOT BUILT: the subscription itself. The USB instance needs a `CATALOGUE` role and a `Block`
+   subscription filtered by the controller's address, and the swap belongs in `serve_volume`'s
+   waitset - one more registration and one more branch, with `FatBacking` already remounting lazily
+   so adoption is closing the old channel and clearing the mount. PermissionManager's half is a
+   subscription held across its grant table. Stopped here deliberately: that waitset serves all seven
+   StorageService instances, a mistake in it is a volume that stops answering, and I would find it
+   only in the final long run - which is the trade I got wrong in P02M0165 earlier today, where a
+   shutdown change that could not be iterated on cost a full revert. The plan records the remaining
+   half with its shape and its oracle in front of it.
+
+## Verification for this round (2026-09-04T09:08:50Z)
+
+    ./test.sh --arch x86_64 --tags boot                    13 passed (25 s)
+    MEDIA_ORDER=swapped ./test.sh --arch x86_64 --tags boot 13 passed (23 s)
+    ./test.sh --arch x86_64 --tags storage                  51 passed (125 s)
+    ./check.sh --gate milestone-index,source-hygiene         clean

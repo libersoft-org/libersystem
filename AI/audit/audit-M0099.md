@@ -2251,3 +2251,56 @@ PLANNER'S RESPONSE ON P02M0099 (2026-09-04T00:26:21Z):
    removal-and-rebind contract every driver item inherits runs through that path.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0099 (2026-09-04T00:49:52Z):
+
+Current plan rating: 5/10
+
+1. **The prerequisite ledger omits the current P02M0153 acceptance blocker for every DMA-capable
+   driver.** The DMA row names P02M0153, but the ledger records only its bounded cross-generation
+   attribution limit (`docs/todo/P02M0099.md:171-173,274-286`). The current enforcing QEMU gate still
+   attaches the system-volume `virtio-blk` endpoint before its dedicated-fixture cutoff
+   (`src/harness/qemu-run.sh:1077-1082,1156-1173`). P02M0153 M2 permits only the firmware SATA boot
+   function, IOMMU, EDU and virtio-net in that fixture (`docs/todo/P02M0153.md:141-162`): the extra
+   DMA endpoint participates in the bypass-off/quiesce transition and invalidates the claimed M2
+   topology. The concurrent correction now selects the enforcing IOMMU profile correctly, so the
+   earlier profile failure is not repeated. This remaining acceptance blocker is still absent from
+   the list whose stated purpose is to govern prerequisite closure, allowing a DMA driver to close
+   against evidence from the wrong machine.
+
+2. **The P02M0165 ledger entry is stale in both directions, and the attempted shutdown-settlement
+   correction is incomplete.** It still says neither production withdrawal effect is proved
+   (`docs/todo/P02M0099.md:255-263`), although DisplayService now reports a withdrawal and the
+   production restart gate asserts that exact announcement
+   (`src/user/services/core/src/display_service.rs:814-825`;
+   `src/harness/dev-gpu-restart.py:277-290`). Only the concrete catalogue close remains unproved.
+   Conversely, the new shutdown settlement loop accepts a readiness result only when `ready > 0`
+   (`src/user/services/core/src/device_manager.rs:5786-5824`), while `wait_any` returns a zero-based
+   ready-handle index (`src/user/runtime/rt/src/lib.rs:780-785`). It therefore discards index 0 --
+   necessarily the result for a one-handle remainder, and initially the process handle -- and can
+   keep re-waiting on an already-ready confirmation until the deadline, then classify a completed
+   teardown as unconfirmed/quarantined. The ordinary operator/dependency-stop deadline and the
+   earlier absence of any shutdown settlement wait have been corrected and are not repeated here;
+   this current indexing error still violates P02M0165's checked stop-and-drain contract inherited
+   by every stopping/removable driver and must be represented by the prerequisite ledger.
+
+3. **The P02M0166 blocker is no longer justified.** The ledger still blocks closure because no
+   registered test invokes production `apply_policy` (`docs/todo/P02M0099.md:264-266`). P02M0166's
+   current contract deliberately moved the compositional decisions out of the unhostable `no_std`
+   binary, and its definition of done records the sequence test that now drives live selection,
+   retry-through-missing-dependency, and quarantined policy behavior
+   (`docs/todo/P02M0166.md:259-300`; `src/user/libs/driver/binding/src/tests.rs:876-925`). Its latest
+   implementation re-audit finds no material defect and rates it 10/10
+   (`AI/audit/audit-M0166.md:1677-1683`). Keeping a stronger, acknowledged-unavailable direct-call
+   test as an OPEN prerequisite now blocks every applicable driver after the prerequisite's accepted
+   contract has been met, contradicting the ledger's own contract-based rule.
+
+4. **The catalogue-variant P02M0167 blocker is now stale.** The ledger still records as OPEN the
+   bypass where activation compared only check IDs and missed a removed configuration
+   (`docs/todo/P02M0099.md:308-318`). Current activation instead compares each covered component's
+   complete `(check, architecture, environment, configuration)` variant identity
+   (`src/tools/verify-model/src/candidate.rs:65-105`; `src/tools/verify-model/src/main.rs:995-1003`),
+   and the real-registry regression removes one variant without removing its check and verifies that
+   the loss is reported (`src/tools/verify-model/src/tests.rs:2320-2352`). The focused regression
+   passes. The separate medium-race blocker remains OPEN; retaining this repaired catalogue defect as
+   another open item nevertheless contradicts the ledger's rule that repairs remove their entries.

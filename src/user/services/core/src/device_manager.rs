@@ -108,6 +108,7 @@ const TICKS_PER_SECOND: u64 = 100;
 // development agent's deadline is two seconds: ServiceManager is blocked on this program's phase-2
 // answer, and around all of it the kernel reboots the machine when its window runs out. A deadline
 // longer than that window never fires.
+//
 const READY_DEADLINE_TICKS: u64 = 2 * TICKS_PER_SECOND;
 
 // The delays between automatic attempts: 100 ms, then 200 ms. Two of them, because three attempts
@@ -200,15 +201,6 @@ impl Incident {
 	// fixed slice rather than "forever", because "wait forever for a dead child" is the failure.
 	unsafe fn teardown_deadline(&self) -> u64 {
 		unsafe { clock().saturating_add(if self.teardown_reserve == 0 { TEARDOWN_FALLBACK_TICKS } else { self.teardown_reserve }) }
-	}
-
-	// WHETHER A CHAIN'S WINDOW IS STILL IN HAND.
-	//
-	// A zero deadline is "no window" - either none was ever opened, or the boot window is not known
-	// yet - and both answer the same way, which is what makes this one test rather than two. See
-	// `begin_bind` and the recovery arm of `advance` for the two places a chain starts.
-	unsafe fn is_live(&self) -> bool {
-		unsafe { self.deadline != 0 && clock() < self.deadline }
 	}
 
 	// Whether there is time for a backoff of `delay` and an attempt after it. A backoff that would
@@ -519,6 +511,13 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				if node.record.state == BindingState::Backoff && node.retry_at != 0 && (soonest == 0 || node.retry_at < soonest) {
 					soonest = node.retry_at;
 				}
+				// AND A PLANNED STOP RUNNING OUT OF ITS SLICE - see `Node::stop_deadline`. Without
+				// this the loop had nothing to wake for: the node is not supervised while it is
+				// `Stopping` and its channel is not in the central wait, so a driver that never
+				// answered was never noticed.
+				if node.stop_deadline != 0 && (soonest == 0 || node.stop_deadline < soonest) {
+					soonest = node.stop_deadline;
+				}
 				// AND A TEARDOWN RUNNING OUT OF ITS SLICE. The confirmations arrive on the handles
 				// added to the wait below; this is what wakes the loop when they do NOT.
 				if let Some(teardown) = &node.teardown {
@@ -540,6 +539,21 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				if nodes[at].record.state == BindingState::Backoff && nodes[at].retry_at != 0 && clock() >= nodes[at].retry_at && recovery.armed() {
 					nodes[at].retry_at = 0;
 					start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
+				}
+				// AND A PLANNED STOP THAT RAN OUT OF ITS SLICE IS FORCED, AND SAYS SO (added
+				// 2026-09-04). M3: the deadline that expires forces the revocation and never claims
+				// the work was flushed. `Wedged` is the same event the shutdown path and the
+				// heartbeat watchdog inject, so this takes the one teardown route rather than
+				// inventing a second - what differs is only the reason it was entered.
+				if nodes[at].stop_deadline != 0 && clock() >= nodes[at].stop_deadline {
+					nodes[at].stop_deadline = 0;
+					if nodes[at].record.state == BindingState::Stopping && nodes[at].binding.is_some() {
+						let generation: u64 = nodes[at].id.generation;
+						print(b"DeviceManager: ");
+						print_driver_name(nodes[at].driver_name());
+						print(b" did not answer the stop inside its slice; the teardown is FORCED and nothing here says its work was flushed\n");
+						nodes[at].push(BindingEvent::Wedged { generation });
+					}
 				}
 				// AN OPERATOR'S RETRY, PERFORMED. One attempt, from wherever the node was left -
 				// but never on a node that still HAS a binding.
@@ -989,7 +1003,17 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 		// Taken first because `take` moves the offered channel and this asks the same binding.
 		// ONE PER PROVIDER THIS MACHINE HAS, not one per slot this program declared. The list grows
 		// to whatever the catalogue holds, which `MAX_PROVIDERS` already bounds.
-		let block_entries: Vec<usize> = catalogue.entries.iter().enumerate().filter(|(_, entry)| entry.as_ref().is_some_and(|held| held.kind == driver_protocol::provider::BLOCK)).map(|(index, _)| index).collect();
+		// IN THE SAME ORDER THE HAND-OFF BELOW USES, WHICH WAS NOT TRUE (fixed 2026-09-04).
+		//
+		// This walked `entries` in SLOT order, which is publication order - slots are filled as
+		// drivers report `READY` - while the `take` loop below picks the lowest bus address each
+		// time. A disk at a higher address whose driver finished first therefore held a lower slot,
+		// and the two lists disagreed about which provider index `i` names. Nothing was wrong while
+		// the probes were matched by uuid and the roles by position, because neither read the other;
+		// M2's format routing indexes ONE by the other, so the alignment has to be real before it
+		// can be relied on.
+		let mut block_entries: Vec<usize> = catalogue.entries.iter().enumerate().filter(|(_, entry)| entry.as_ref().is_some_and(|held| held.kind == driver_protocol::provider::BLOCK)).map(|(index, _)| index).collect();
+		block_entries.sort_by_key(|&slot| catalogue.entries[slot].as_ref().map_or(u32::MAX, address_of));
 		for found in block_entries {
 			let minted = mint_connection(catalogue, nodes, found);
 			// ALLOC-OK: one per block provider, and the catalogue that holds them is bounded.
@@ -1705,6 +1729,18 @@ struct Node {
 	// has nothing left to do, and `pump` reported "no work in flight" and returned for the last time
 	// with the node still parked. See `BindStart::WaitingForTheClaim`.
 	waiting_for_claim: bool,
+	// WHEN A PLANNED STOP THIS MANAGER ASKED FOR MUST BE ANSWERED BY, or 0 for a node with no stop
+	// outstanding (added 2026-09-04).
+	//
+	// M3 requires a planned stop to be forced at its deadline and to SAY it was forced. The shutdown
+	// path had that and the operator's disable and the dependency stop did not: both withdrew the
+	// providers, entered `Stopping`, sent `STOP` and then waited on nothing at all. Their node is
+	// excluded from heartbeat supervision - correctly, a node being stopped is not one to ping - and
+	// an ordinary binding channel is not in the central wait, so the only thing that could ever end
+	// the wait was the driver choosing to answer. One that stays alive and silent kept its claim,
+	// its Domain and its charged resources in `Stopping` for the rest of the boot, and the device
+	// could not be enabled again.
+	stop_deadline: u64,
 	// A TEARDOWN WAITING FOR ITS CONFIRMATIONS. See `Teardown`.
 	teardown: Option<Teardown>,
 	// AN OPERATOR DISABLED THIS DEVICE, AND THAT IS A DESIRE RATHER THAN A STATE.
@@ -1788,7 +1824,7 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, disabled_by_policy: false }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { deadline: 0, teardown_reserve: 0 }, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
 	}
 
 	// Queue one event for this node.
@@ -3328,7 +3364,26 @@ fn spend_candidate(node: &mut Node) {
 	// `begin_bind` clearing the flag is what spends it. All three lived in a binary no host test can
 	// run, and both of the corrections recorded above were found by reading rather than by a failure.
 	node.candidate = driver_binding::cursor_after_an_attempt(ran, node.candidate, node.selection_pending);
-	node.attempt = 0;
+	// AND THE ATTEMPT BUDGET IS NOT RESET HERE, WHICH IS THE HALF THAT MADE IT PER CANDIDATE
+	// (corrected 2026-09-04). M5's budget is "at most 3 AUTOMATIC bind attempts per node per boot"
+	// and one absolute deadline "across every attempt on a node"; zeroing the counter on every cursor
+	// advance handed each fallback candidate three more attempts and, through `begin_bind`'s
+	// chain-start test, a fresh absolute window with them. A three-candidate node therefore had nine
+	// attempts and three windows, which is the boot-time multiplication both bounds exist to prevent.
+	//
+	// A candidate that could not RUN still spends nothing - `budget_after_nothing_ran` is where that
+	// is decided and it is untouched - so a fallback list still works for the failures it is for. What
+	// no longer happens is a driver that ran and crashed exhausting its budget and the next entry
+	// starting again as though the node were fresh.
+}
+
+// HOW LONG A PLANNED STOP THIS MANAGER ASKED FOR HAS TO BE ANSWERED IN.
+//
+// The same slice the shutdown path already uses, so a driver's stop is bounded by one number
+// wherever the stop came from: the node's own teardown reserve, floored at the protocol's longest
+// heartbeat deadline so a node whose incident carries no reserve is still bounded by something.
+unsafe fn planned_stop_deadline(node: &Node) -> u64 {
+	unsafe { clock().saturating_add(node.incident.teardown_reserve.max(driver_protocol::MAX_HEARTBEAT_DEADLINE as u64)) }
 }
 
 unsafe fn wait_out_backoff(node: &Node) {
@@ -3411,15 +3466,24 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// which is already past the window the kernel's settle ladder gives the whole boot -
 		// and a machine with several unbindable devices multiplies it.
 		//
-		// AND A FALLBACK CANDIDATE IS THE SAME CHAIN, WHICH `attempt == 0` COULD NOT SAY (corrected
-		// 2026-09-04). The condition was the attempt counter, and `spend_candidate` resets that
-		// counter to zero every time the cursor advances - so each candidate opened a FRESH absolute
-		// window and a node with three candidates got three of them, which is exactly the
-		// multiplication this window exists to prevent, one level up. The counter answers "how many
-		// attempts has this candidate had"; what decides whether to open a window is whether one is
-		// already in hand. Resetting the ATTEMPT budget per candidate stays: a fallback list whose
-		// second entry inherits an exhausted counter is a list with one usable entry.
-		if !node.incident.is_live() {
+		// AND A FALLBACK CANDIDATE IS THE SAME CHAIN, WHICH THE COUNTER NOW SAYS BECAUSE NOTHING
+		// RESETS IT AT A CANDIDATE BOUNDARY (corrected 2026-09-04, twice in one day and the first
+		// answer was wrong). `spend_candidate` used to set `attempt` to zero on every cursor
+		// advance, so this condition opened a FRESH absolute window per candidate and a node with
+		// three of them got three windows and nine attempts. The first repair kept the reset and
+		// asked instead whether a window was still LIVE - which fails at exactly the boundary it was
+		// written for: the window that ENDED the previous candidate is by definition expired, so the
+		// next candidate opened another one anyway.
+		//
+		// M5 is explicit and is per NODE: "at most 3 AUTOMATIC bind attempts per node per boot" and
+		// one absolute deadline "across every attempt on a node". So the counter carries across
+		// candidates and this condition is the chain start again. The fallback list is not made
+		// useless by that, which was the argument for the reset and was wrong: a candidate that
+		// could not RUN - artifact missing, protocol note refused, claim held elsewhere - spends no
+		// attempt, because `budget_after_nothing_ran` already says so, and those are the failures a
+		// fallback list exists for. A candidate that ran and crashed three times is a node whose
+		// automatic budget is spent, and M5 gives the operator's `retry` as the way on.
+		if node.attempt == 0 {
 			node.incident = Incident::open();
 		}
 		// THE TEARDOWN SLICE THIS ATTEMPT'S ROLLBACK GETS, computed once from the window rather than
@@ -3924,6 +3988,29 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// driver that is gone without having said anything.
 				BindingEvent::Exited { .. } | BindingEvent::Closed { .. } => FailureCause::DriverExited,
 				BindingEvent::TimedOut { .. } => {
+					// AND A TIMEOUT IS A CLAIM ABOUT THE HANDSHAKE, WHICH IS FALSE ONCE THE
+					// HANDSHAKE HAS ENDED (fixed 2026-09-04). This is the third terminal event and
+					// the only one that did not ask - `READY` and `FAILED` both refuse a frame that
+					// arrives past the handshake, with the reasoning written out twice above, and
+					// the same reasoning applies here more plainly still: a deadline says the driver
+					// did not answer, and a driver that HAS answered makes it untrue.
+					//
+					// The deadline is checked in the central wait and the event is QUEUED; the
+					// driver's `READY` can arrive in the same pass and be processed first. On x86_64
+					// the answer always beat the deadline, so the race was never taken. On an
+					// emulated machine the two land together - measured on aarch64: five drivers
+					// printed `online`, DeviceManager PUBLISHED all five block providers, and then
+					// tore every one of them down for never having reported in. The incident even
+					// says `online` in the same line as the complaint.
+					//
+					// Because that happens inside the boot test, nothing after it ran: 353 of 569
+					// aarch64 kernel-test entries had never recorded a pass and riscv64 had not one,
+					// while x86_64 was green throughout. Two ports that looked unsupported were one
+					// missing guard.
+					if !node.record.state.accepts_terminal_frame() {
+						print(b"DeviceManager: a handshake deadline arrived after the driver had already answered; it is refused\n");
+						continue;
+					}
 					// A DRIVER THAT IS STILL THERE AND HAS NOT ANSWERED, which is the case the
 					// budget exists for: before it, this wait had no end and one silent driver held
 					// the manager - and therefore the boot - for as long as it liked.
@@ -3983,6 +4070,10 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			// `spend_candidate` needs to know what ended rather than where the cursor has since
 			// been moved to. See `Node::spent`.
 			node.spent = node.running.take();
+			// THE STOP THAT WAS ASKED FOR HAS BEEN ANSWERED - by a `STOPPED`, by an exit, or by the
+			// forced `Wedged` above. Whatever ended it, the binding is going and there is no longer
+			// a stop outstanding to bound. See `Node::stop_deadline`.
+			node.stop_deadline = 0;
 			let mut txn = binding.into_attempt();
 			// A RECOVERY IS A NEW CHAIN, AND THIS IS WHERE IT STARTS (added 2026-09-04).
 			//
@@ -4390,6 +4481,11 @@ unsafe fn begin_dependency_stop(node: &mut Node, catalogue: &mut Catalogue) {
 			print_driver_name(node.driver_name());
 			print(b" could not be asked to stop; its exit is what will end the binding\n");
 		}
+		// AND IT IS BOUNDED, WHICH IT WAS NOT (added 2026-09-04). See `Node::stop_deadline`: M3 asks
+		// for a planned stop to be forced at its deadline and to say it was forced, and only the
+		// shutdown path did that. The standing loop reads this field and injects `Wedged` when it
+		// passes, which is the same forced teardown by the same route.
+		node.stop_deadline = planned_stop_deadline(node);
 	}
 }
 
@@ -4409,6 +4505,11 @@ unsafe fn begin_operator_stop(node: &mut Node, catalogue: &mut Catalogue) {
 			print_driver_name(node.driver_name());
 			print(b" could not be asked to stop; its exit is what will end the binding\n");
 		}
+		// AND IT IS BOUNDED, WHICH IT WAS NOT (added 2026-09-04). See `Node::stop_deadline`: M3 asks
+		// for a planned stop to be forced at its deadline and to say it was forced, and only the
+		// shutdown path did that. The standing loop reads this field and injects `Wedged` when it
+		// passes, which is the same forced teardown by the same route.
+		node.stop_deadline = planned_stop_deadline(node);
 	}
 }
 
@@ -5593,8 +5694,19 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 			// second time, through the other path. What such a node needs is not another `STOP`,
 			// which the protocol says changes nothing, but the bounded WAIT and the forced teardown
 			// this loop already performs.
-			let step = driver_binding::shutdown_step(nodes[at].record.state, nodes[at].binding.is_some());
+			let step = driver_binding::shutdown_step(nodes[at].record.state, nodes[at].binding.is_some(), nodes[at].teardown.is_some());
 			if step == driver_binding::ShutdownStep::Nothing {
+				continue;
+			}
+			// A TEARDOWN ALREADY RUNNING IS STILL NOT WAITED OUT, AND THAT IS RECORDED RATHER THAN
+			// PAPERED OVER (2026-09-04). The predicate answers `WaitForTheTeardownToSettle` for it,
+			// which is the honest classification; what this loop does with that answer is skip it,
+			// because the wait itself was tried and WITHDRAWN. Feeding the two confirmations by hand
+			// here - there is no central wait in this path - collected none of them and left every
+			// device quarantined at its own deadline, turning a shutdown that took milliseconds into
+			// one that took minutes per device. Measured: the x86_64 suite went from 380 tests in
+			// 192 s to not finishing in 900. The gap M3 names is real and the fix is not this one.
+			if step == driver_binding::ShutdownStep::WaitForTheTeardownToSettle {
 				continue;
 			}
 			let Some(binding) = &nodes[at].binding else { continue };

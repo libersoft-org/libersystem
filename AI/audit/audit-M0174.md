@@ -1343,3 +1343,38 @@ it replaces.
    after a valid nonzero-lifetime RA that installed nothing.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0174 (2026-09-04T00:47:54Z):
+
+1. **The accepted RS correction still does not freeze RFC 3315's subsequent-timeout formula.** M4
+   says the first timeout is `IRT` with a factor in `[-0.1,+0.1)`, then describes every later timeout
+   only as “twice the previous one with fresh randomization of the same width”
+   (`docs/todo/P02M0174.md:127-136`). RFC 3315 section 14 is exact: subsequent
+   `RT = 2*RTprev + RAND*RTprev`, whose band is `1.9..2.1 * RTprev`; applying the stated 10% factor
+   to “twice the previous one” instead gives `1.8..2.2 * RTprev`. M8 merely asks for the band “the
+   algorithm gives” (`:161-164`), so it does not disambiguate the two. The plan names the right RFC
+   but its promised concrete specification and oracle still permit different schedules; state the
+   formula (and the already-correct `MRT + RAND*MRT` cap) directly. See
+   [RFC 3315 section 14](https://www.rfc-editor.org/rfc/rfc3315.html#section-14).
+
+2. **The internal echo route order is still not total for a route this plan creates.** M5 installs
+   on-link routes (`docs/todo/P02M0174.md:352-355`) and later says such a route has no router and uses
+   the destination itself as next hop (`:456-466`), but its purported total route order compares
+   equal-length routes by “the router each names”. That key is undefined for a DIRECT route. The host
+   oracle uses two routes with different routers (`:473-478`), so it cannot expose a same-prefix
+   DIRECT/VIA tie. This is the same totality hole P02M0175 has now corrected in its public order; the
+   internal-only order needs an explicit DIRECT/VIA key and a corresponding case.
+
+3. **Central remotely driven state is called bounded without freezing the capacities its gates
+   need.** The default-router list promises only “at least two” entries and no maximum
+   (`docs/todo/P02M0174.md:364-367`), even though P02M0175 declares 8 and says that number “matches
+   P02M0174” (`docs/todo/P02M0175.md:80-88`). Likewise, remotely populated ND/cache state, the PMTU
+   cache, the invalidation queue, and pending-resolution queues have no numeric capacity (or exact
+   capacity oracle) despite flood, exhaustion, refusal, and resync requirements
+   (`docs/todo/P02M0174.md:91-99,172-175,490-533,717-727,772-777`). These maxima decide admission,
+   memory use, and when observable refusal/resync occurs; leaving them to implementation makes the
+   bounded-host claim and cross-milestone router seam produce different valid implementations.
+
+**Current plan rating: 6/10.** The latest router-order export and RS stop/restart outcomes are
+correctly reconciled, but the RS timing oracle remains ambiguous, the internal route order is not
+total, and central resource bounds remain uninstantiated.

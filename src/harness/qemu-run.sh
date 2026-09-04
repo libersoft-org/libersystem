@@ -1051,8 +1051,18 @@ qemu_run_x86_64() {
 	virtio_opts="$(IOMMU="$iommu" qemu_virtio_opts disable-legacy=on)"
 	virtio_plain="$(IOMMU="$iommu" qemu_virtio_opts)"
 
+	# AND THE MACHINE REFUSES BUS BYPASS WHEN THERE IS A CONTROLLER TO BYPASS (added 2026-09-04).
+	#
+	# `default-bus-bypass-iommu=off` is the q35 property that stops a device being placed outside the
+	# controller's reach by default. Without it the profile has an IOMMU that a device need not be
+	# behind, which is not the machine an isolation claim is about - and the hostile fixture was
+	# booting exactly that: the gate added the controller through `QEMU_EXTRA` while the machine
+	# stayed plain `q35` and every endpoint was built WITHOUT `iommu_platform=on`, so the cases it
+	# refused were refused on a topology the milestone does not describe.
+	local machine="q35"
+	[[ "$iommu" == "1" ]] && machine="q35,default-bus-bypass-iommu=off"
 	local qemu_args=(
-		-machine q35
+		-machine "$machine"
 		-m "${MEM:-4G}"
 		-drive "if=pflash,format=raw,readonly=on,file=$ovmf_code"
 		-drive "if=pflash,format=raw,file=$ovmf_vars"
@@ -1207,9 +1217,27 @@ qemu_run_x86_64() {
 
 		# Keep media disks after USB in PCI discovery order, matching the historical
 		# runner and the volume/device inventory expected by the boot chain.
-		[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "$virtio_opts" readonly
-		[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "$virtio_opts" readonly
-		[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "$virtio_opts" readonly
+		#
+		# AND `MEDIA_ORDER=swapped` PRESENTS THEM THE OTHER WAY ROUND, which is the profile M2's
+		# format routing is written against (added 2026-09-04). Every machine this tree boots
+		# presents FAT, then ISO, then UDF - exactly the order the positional assignment expected -
+		# so a routing change is a NO-OP on all of them and a mistake in it would show up as a volume
+		# silently not mounting on a machine nobody runs. The plan says so in as many words: building
+		# the routing without the profile is how this item gets marked done for the third time
+		# without the property it names.
+		#
+		# The three images are the same; only the bus addresses they take differ. That is the whole
+		# fixture, and it is the whole point: position now says the wrong thing, so format has to
+		# decide.
+		if [[ "${MEDIA_ORDER:-}" == "swapped" ]]; then
+			[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "$virtio_opts" readonly
+			[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "$virtio_opts" readonly
+			[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "$virtio_opts" readonly
+		else
+			[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "$virtio_opts" readonly
+			[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "$virtio_opts" readonly
+			[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "$virtio_opts" readonly
+		fi
 	fi
 
 	# Display backends: parse DISPLAYS env for vnc/spice.

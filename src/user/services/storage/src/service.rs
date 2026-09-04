@@ -163,6 +163,12 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut buf: [u8; 256] = [0u8; 256];
 	// 1. volume backing: the legacy ramdisk archive (read-only, kernel test) or the
 	//    virtio-blk disk mounted as a writable LiberFS (real boot).
+	// M2'S FORMAT TABLE, filled by the system instance's arm below and appended to its online report.
+	// Empty for every other instance, which is what makes the report unchanged for them.
+	let mut block_formats: Vec<u8> = Vec::new();
+	// Whether this instance's block channel was ROUTED from a live provider - see the `USBBLOCK*`
+	// arm. Only the USB instance can answer anything but `false`.
+	let mut routed: bool = false;
 	let mut vol: Volume = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
@@ -251,6 +257,37 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// volume is not the first block device - that handle is one of these probes. Closing all
 			// of them closed the block channel of the filesystem about to be mounted.
 			let serving: u64 = mounted.as_ref().map_or(0, |&(_, chan)| chan);
+			// M2'S NARROWING HALF, ANSWERED BEFORE THE PROBES ARE GIVEN BACK (added 2026-09-04).
+			//
+			// The non-system roles were assigned by BUS POSITION - the second block provider was
+			// `FATBLOCK`, the third `ISOBLOCK`, the fourth `UDFBLOCK` - and a checked mount can
+			// refuse a wrong medium but cannot REASSIGN it, so a machine whose ISO disc sits at a
+			// lower address than its FAT medium left both volumes absent. M2's answer is that format
+			// NARROWS: it settles the ISO and the UDF outright, because only one provider carries
+			// each, and leaves the two FAT volumes to ORIGIN, which is the supervisor's half.
+			//
+			// This is the only component that may read a filesystem and it already holds a
+			// connection to every block provider, so it is the only place the question can be asked.
+			// The answer travels as a table indexed by provider - the same order the hand-off used,
+			// which is now the same order the roles are taken in.
+			//
+			// ALLOC-OK: one byte per block provider, bounded by the count the hand-off announced.
+			//
+			// IT RIDES BEHIND THE ONLINE REPORT rather than in a message of its own, which is a
+			// decision about ORDERING and not about bytes: a second message means the supervisor has
+			// to know whether to expect one before it can read the report, and every service that
+			// sends no table would have to be told apart from one whose table has not arrived yet.
+			// Appending it after a NUL keeps the report the single message it has always been - the
+			// log line is the text before the NUL, unchanged - and a reader that does not look past
+			// it behaves exactly as it did.
+			if block_formats.try_reserve(probe_count).is_ok() {
+				for probe in probes[..probe_count].iter() {
+					// The one being served is known without asking: it is the volume just mounted.
+					block_formats.push(if *probe == serving && serving != 0 { FORMAT_LIBERFS } else { unsafe { classify_block(*probe) } });
+				}
+			} else {
+				unsafe { print(b"StorageService: no room to classify the block providers; the supervisor falls back to bus order and says so\n") };
+			}
 			for probe in probes[..probe_count].iter() {
 				if *probe != serving {
 					unsafe { close(*probe) };
@@ -287,6 +324,17 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// the place to learn it is a read of `vol://iso` or `vol://udf`.
 		Received::Message { len, handle } if len >= 8 && &buf[..8] == b"ISOBLOCK" => Volume::new(alloc::boxed::Box::new(IsoFs { chan: handle, fs: None })),
 		Received::Message { len, handle } if len >= 8 && &buf[..8] == b"UDFBLOCK" => Volume::new(alloc::boxed::Box::new(UdfFs { chan: handle, fs: None })),
+		// THE TAG SAYS WHETHER THE CHANNEL WAS ROUTED OR IS A STAND-IN, and the report repeats it
+		// (added 2026-09-04). `USBBLOCK*` is a provider the boot actually routed from the xHCI
+		// driver; a bare `USBBLOCK` is the closed stand-in the supervisor hands over when no
+		// controller published one, which exists so this instance answers "not there" instead of
+		// waiting. Both mount lazily and both used to report the identical line, so the boot's
+		// assertion on it could not tell a served volume from an absent one - which is the gap M7's
+		// route has to be checkable against.
+		Received::Message { len, handle } if handle != 0 && len >= 9 && &buf[..9] == b"USBBLOCK*" => {
+			routed = true;
+			Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None }))
+		}
 		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"USBBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None })),
 		// The two memory volumes. They carry no handle - there is no block device to hand over,
 		// which is the whole point - and the capacity follows the tag as a decimal byte count.
@@ -340,6 +388,18 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		report.extend_from_slice(b"StorageService: online (vol://");
 		report.extend_from_slice(vol.name());
 		report.push(b')');
+		// AND WHETHER THE BLOCK CHANNEL WAS ROUTED, for the one instance where a stand-in and a real
+		// provider are otherwise indistinguishable - see the `USBBLOCK*` arm.
+		if routed {
+			report.extend_from_slice(b" routed");
+		}
+		// AND M2'S FORMAT TABLE BEHIND A NUL, for the one instance that has one - see where it is
+		// built. The text before the NUL is the report exactly as it was, so every reader that does
+		// not look past it is unaffected.
+		if !block_formats.is_empty() && report.try_reserve(block_formats.len() + 1).is_ok() {
+			report.push(0);
+			report.extend_from_slice(&block_formats);
+		}
 		send_blocking(bootstrap, &report, 0);
 	}
 	serve_volume(&mut vol, service, admin);
@@ -3671,6 +3731,47 @@ unsafe fn read_blocks_chunked(chan: u64, sectors_per_block: u64, index: u64, cou
 // just been closed and the first read through it failed: the non-positional selection worked and
 // the volume it selected was unusable. The handle travels with the filesystem so the caller can
 // close the ones it is NOT keeping, which is the only set it ever meant to close.
+// WHAT IS ON A BLOCK PROVIDER, ASKED OF THE MEDIUM RATHER THAN OF ITS POSITION.
+//
+// M2: format NARROWS and origin separates what format leaves tied. This is the narrowing half - the
+// only component that may read a filesystem is this one, and the system instance already holds a
+// probe connection to every block provider, so it is the one place that can answer.
+//
+// The order is deliberate and is not arbitrary: LiberFS first because it is the only one with a uuid
+// and the only one this system writes, then ISO9660 and UDF which are the two that format settles
+// OUTRIGHT because only one provider carries each, then FAT last because it is the one that cannot
+// separate `vol://media` from `vol://usb` - two FAT volumes are told apart by ORIGIN, which is the
+// supervisor's half of M2 and not this function's.
+//
+// Every one of these is a `mount_checked`, so "not this format" is an answer the codec gives rather
+// than one inferred from a failure to read.
+const FORMAT_UNKNOWN: u8 = 0;
+const FORMAT_LIBERFS: u8 = 1;
+const FORMAT_ISO9660: u8 = 2;
+const FORMAT_UDF: u8 = 3;
+const FORMAT_FAT: u8 = 4;
+
+unsafe fn classify_block(chan: u64) -> u8 {
+	unsafe {
+		if chan == 0 {
+			return FORMAT_UNKNOWN;
+		}
+		if mount_system_volume(chan).is_some() {
+			return FORMAT_LIBERFS;
+		}
+		if Iso9660::mount_checked(IsoBlockDevice { chan }).is_ok() {
+			return FORMAT_ISO9660;
+		}
+		if Udf::mount_checked(UdfBlockDevice { chan }).is_ok() {
+			return FORMAT_UDF;
+		}
+		if FatFs::mount_checked(FatBlockDevice { chan }).is_ok() {
+			return FORMAT_FAT;
+		}
+		FORMAT_UNKNOWN
+	}
+}
+
 unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Option<(LiberFs<ChannelBlockDevice>, u64)> {
 	unsafe {
 		let first = mount_system_volume(primary);

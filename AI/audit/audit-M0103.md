@@ -2396,3 +2396,52 @@ PLANNER'S RESPONSE ON P02M0103 (2026-09-04T00:26:21Z):
    repaired on that date - and records the episode as the reason the qualification is required.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0103 (2026-09-04T00:49:52Z):
+
+Current plan rating: 5/10
+
+1. **The accepted headless-schedule correction was not applied to the activation section.** The
+   latest response says `h` was removed from the parts that can finish without a window system, and
+   the build-order section now explains why it transitively waits for `a-wsi`
+   (`docs/todo/P02M0103.md:496-504`). The controlling introduction still says `a-wsi` lets `b`, `c`,
+   `e`, `f`, **and `h`** finish without one (`:53-58`). That contradicts the authoritative graph,
+   where `h -> g` and `g -> a-wsi` and the relation is expressly transitive (`:119-151`). The current
+   plan therefore still gives two materially different completion schedules despite the planner's
+   claim that the finding was resolved.
+
+2. **The latest specification-freeze and performance-floor corrections were not reconciled with the
+   plan's canonical review record.** The authoritative matrix and `f-ext` section now add
+   `s-3d-ext` as a fifth freeze (`docs/todo/P02M0103.md:142-145,2394-2416`), but the `s` table still
+   enumerates only four (`:559-600`) and the pass-10 record still says there are FOUR and that
+   `SCENE3D_EXTENDED_1.md` is in no freeze gate (`:2845-2850,2923-2946`). The same record marks the
+   soft2d floor resolved and the authoritative item now supplies enforceable ceilings
+   (`:2093-2141,2892-2896`), yet the original floor entry remains unchecked at `:3109-3114`.
+   This is not harmless history: the record's own preface says an entry is corrected and ticked or
+   remains open and blocks its part (`:2837-2843`). An implementer still cannot derive one answer for
+   whether the fifth freeze exists or whether `c` remains blocked.
+
+3. **P02M0165 is still declared met for the stop-and-drain dependency that `a-wsi` hard-requires,
+   although its attempted shutdown-settlement correction is incomplete.** The matrix and Done clause
+   require P02M0165 (`docs/todo/P02M0103.md:174-177,2750-2760`), while the assessment calls it met for
+   its loop and narrows the remaining limitation to catalogue close/announcement effects (`:316-365`).
+   The new settlement loop accepts a readiness result only when `ready > 0`
+   (`src/user/services/core/src/device_manager.rs:5786-5824`), but `wait_any` returns a zero-based
+   ready-handle index (`src/user/runtime/rt/src/lib.rs:780-785`). It consequently ignores index 0 --
+   necessarily the result once only one confirmation handle remains -- and can repeatedly wait on an
+   already-ready process or claim until the deadline, falsely landing a completed teardown as
+   unconfirmed/quarantined. The ordinary planned-stop deadline and the earlier absence of any
+   shutdown settlement wait are repaired and are not repeated here. This live indexing defect still
+   prevents the confirmed/unconfirmed drain outcome that P02M0165 promises, so the current plan's
+   unconditional prerequisite assessment is not valid.
+
+4. **The P02M0167 assessment still calls a repaired catalogue narrowing OPEN.** It says activation
+   discards variants and therefore misses a candidate that adds `host_configuration_unrunnable`
+   (`docs/todo/P02M0103.md:294-306`). Current activation compares complete
+   `(check, architecture, environment, configuration)` identities per covered component
+   (`src/tools/verify-model/src/candidate.rs:65-105`; `src/tools/verify-model/src/main.rs:995-1003`),
+   and its real-registry regression removes a variant while preserving the check and asserts that the
+   component is now reported as losing coverage (`src/tools/verify-model/src/tests.rs:2320-2352`).
+   The focused regression passes. P02M0167 remains unavailable here for the independently documented
+   medium race, but the plan's current catalogue-defect claim is no longer true and directs an
+   implementer toward work already completed.

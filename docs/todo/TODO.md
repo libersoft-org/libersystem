@@ -250,6 +250,7 @@ or preventing further development of `v1`.
 - [ ] [P02M0174 - IPv6 at layer three: addressing, ICMPv6 and neighbour discovery](P02M0174.md)
 - [ ] [P02M0175 - Dual-stack transports, DNS and NetworkService](P02M0175.md)
 - [ ] [P02M0176 - Audit unsafe boundaries in the kernel and userspace before changing them](P02M0176.md)
+- [ ] [P02M0177 - A change is verified in proportion to itself, and integration bugs are catchable without a guest](P02M0177.md)
 
 ### Definition of done (phase 2)
 

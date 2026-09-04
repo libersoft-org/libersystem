@@ -350,7 +350,16 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 // LogService one so its `log` command can query the journal. Once a service reports
 // in, the supervisor records a structured "online" event in the journal.
 #[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut [u64; MOST_PROVIDERS], policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
+// WHAT THE SYSTEM STORAGE INSTANCE REPORTS ABOUT EACH BLOCK PROVIDER.
+//
+// The same four values it writes, and it is the producer: this supervisor may not read a filesystem
+// and does not try to. `0` is "could not be classified", which is a real answer on a disk this build
+// does not recognise and is why the fallback below exists at all.
+const FORMAT_ISO9660: u8 = 2;
+const FORMAT_UDF: u8 = 3;
+const FORMAT_FAT: u8 = 4;
+
+pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut [u64; MOST_PROVIDERS], block_formats: &mut Vec<u8>, policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -472,7 +481,43 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			// message as a single byte, so a machine with more providers than that says the number
 			// it can say rather than wrapping it to a smaller one.
 			let probe_count: u8 = probe_handles.iter().filter(|handle| **handle != 0).count().min(u8::MAX as usize) as u8;
-			let (fat, iso, udf, usb): (u64, u64, u64, u64) = (*block2_client, *block3_client, *block4_client, *block5_client);
+			// M2: WHICH DISK IS WHICH IS DECIDED BY WHAT IS ON IT, NOT BY WHERE IT SITS (2026-09-04).
+			//
+			// These three were `block2_client`, `block3_client` and `block4_client` - the second,
+			// third and fourth block provider by bus address - and the volume instances trusted the
+			// label. A checked mount refuses a wrong medium but cannot REASSIGN it, so a machine
+			// whose ISO disc sits at a lower address than its FAT medium left BOTH volumes absent:
+			// the media instance found ISO9660 where it wanted FAT and the ISO instance the reverse,
+			// and each simply failed to mount.
+			//
+			// The system instance classified every provider it probed and sent the answer up with
+			// its report; `block_formats[i]` is what is on provider `i`, in the same order these
+			// handles arrived. Format settles the ISO and the UDF outright because only one provider
+			// carries each. FAT is not settled by format - the USB stick is FAT too - but it does
+			// not need to be here: the stick is bound in phase two and arrives as `block5_client`,
+			// so the only FAT candidate among the BOOT providers is the media volume.
+			//
+			// WHERE A PROVIDER COULD NOT BE CLASSIFIED THE POSITION IS USED AND SAID. A silent
+			// fallback would be the old behaviour wearing a new name, and the whole point of this
+			// item is that a wrong assignment is visible.
+			let positional: [u64; 3] = [*block2_client, *block3_client, *block4_client];
+			let by_format = |want: u8, position: usize| -> u64 {
+				// Index 0 of the table is the system volume, which is `block_client` and is not one
+				// of these three; the three arrived as providers 1, 2 and 3.
+				for (at, handle) in positional.iter().enumerate() {
+					if block_formats.get(at + 1).copied() == Some(want) {
+						return *handle;
+					}
+				}
+				if !block_formats.is_empty() {
+					print(
+						b"ServiceManager: no block provider carries the format this volume wants; falling back to its bus position
+",
+					);
+				}
+				positional[position]
+			};
+			let (fat, iso, udf, usb): (u64, u64, u64, u64) = (by_format(FORMAT_FAT, 0), by_format(FORMAT_ISO9660, 1), by_format(FORMAT_UDF, 2), *block5_client);
 			let block: u64 = *block_client;
 			let keys: u64 = *raw_keys;
 			let (storage_root, storage_adm): (u64, u64) = (*storage_client, *storage_admin);
@@ -521,7 +566,16 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				// absent device and a dead one are the same answer to a caller, which is the point.
 				if name == b"usb_storage" && role.tag == b"USBBLOCK" {
 					if usb != 0 {
-						return Some((role.tag.to_vec(), usb));
+						// A ROUTED PROVIDER SAYS SO IN THE TAG, so the instance's own report can
+						// tell the two apart (added 2026-09-04). Both cases hand over a channel and
+						// both used to produce the identical `online (vol://usb)` line, which is why
+						// the boot's assertion on that line proved only that the instance started -
+						// a stand-in whose far end is already closed satisfies it exactly as well as
+						// a stick does. One byte after the tag is the difference, and it is the
+						// difference M7's route is about.
+						let mut tag: alloc::vec::Vec<u8> = role.tag.to_vec();
+						tag.push(b'*');
+						return Some((tag, usb));
 					}
 					let (dead_server, dead_client): (u64, u64) = channel()?;
 					close(dead_server);
@@ -749,9 +803,19 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				if name == b"device_manager" {
 					*block_client = handle;
 				}
+				// M2'S FORMAT TABLE, WHICH RIDES BEHIND A NUL IN THE SYSTEM INSTANCE'S REPORT
+				// (added 2026-09-04). The text is the report; anything after the NUL is one byte per
+				// block provider, in the order the hand-off used - which is now the order the roles
+				// are taken in. Every other service sends no NUL and this finds nothing, which is
+				// why the relay below is unchanged for them.
+				let text: usize = buf[..len].iter().position(|byte| *byte == 0).unwrap_or(len);
+				if name == b"storage_service" && text < len {
+					block_formats.clear();
+					block_formats.extend_from_slice(&buf[text + 1..len]);
+				}
 				// Relay the service's own report up to SystemManager, in start order, and
 				// keep its report channel as the control channel used to stop it later.
-				send_blocking(up, &buf[..len], 0);
+				send_blocking(up, &buf[..text], 0);
 				*control = manager_side;
 				// Record the lifecycle event in the journal (LogService is up by now).
 				emit_event(*log_client, name, b"online");

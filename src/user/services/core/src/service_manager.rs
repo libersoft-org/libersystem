@@ -540,6 +540,10 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// can only match it on a disk it was given a connection to, so the paired volume at a later bus
 	// address was unreachable again - the exact defect the probe hand-off exists to remove.
 	let mut probe_blocks: [u64; MOST_PROVIDERS] = [0; MOST_PROVIDERS];
+	// M2'S FORMAT TABLE, one byte per block provider in the order the hand-off used. Filled from the
+	// system StorageService instance's own report - it is the only component that may read a
+	// filesystem - and read by the three volume roles below instead of their bus positions.
+	let mut block_formats: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
 	// WHETHER A SOUND DRIVER IS BOUND, said by DeviceManager rather than inferred from a handle this
 	// supervisor no longer holds. See the driver status view below.
 	let mut snd_online: bool = false;
@@ -646,7 +650,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while i < N {
 			if state[i] == State::Absent && deps_satisfied(MANIFEST[i].deps, &state) {
 				let mut proc_handle: u64 = 0;
-				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, &mut block_formats, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 				// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
 				// bring-up waits for the report, but it is the honest name for the window between
 				// a process existing and a service answering, and it is what a later non-blocking

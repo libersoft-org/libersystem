@@ -2317,6 +2317,35 @@ fn a_candidate_that_narrows_only_the_registry_is_still_a_narrowing() {
 	assert!(losing.contains(&successor), "a split is graded on the name its own evidence carries: {losing:?}");
 	assert!(!losing.contains(&displaced), "and not on the displaced name, which no run against this candidate can record: {losing:?}");
 
+	// AND A VARIANT LOST FROM A CHECK THAT KEEPS ITS ID AND ITS `covers` (added 2026-09-04). This is
+	// the CATALOGUE's own bypass and it is not the registry helper's to catch: activation projected
+	// each catalogue to `component -> check id` while `model_hash` includes every variant, so one
+	// added `host_configuration_unrunnable` rule dropped a runnable configuration during catalogue
+	// construction and nothing the comparison looked at had changed. `losing` was empty and both
+	// evidence bars were skipped over a model with one fewer runnable configuration.
+	let staged = crate::staged_components(&model.manifest, &model.crates, &model.graph);
+	let variants = |catalog: &crate::catalog::Catalog| -> usize { catalog.checks.iter().map(|check| check.variants.len()).sum() };
+	// The fixture is SEARCHED FOR rather than hard-coded: a pair that removes a variant and no check
+	// is a property of this tree's graph, and a hard-coded one silently stops testing anything the
+	// day a rule beside it makes it a no-op.
+	let mut found: Option<(String, String, crate::catalog::Catalog)> = None;
+	'search: for configuration in model.registry.configurations.iter().map(|entry| entry.name.clone()) {
+		for reach in ["lico", "wire", "cli", "proto", "term", "rt"] {
+			let with_rule = format!("{text}\n[[host_configuration_unrunnable]]\nconfiguration = \"{configuration}\"\nwhen_static_reach = \"{reach}\"\nreason = \"a fixture: one lost variant, no lost check\"\n");
+			let Ok(narrowed_registry) = crate::registry::Registry::load_with(&dir, Some(&with_rule)) else { continue };
+			let after = crate::catalog::Catalog::build(&model.crates, &narrowed_registry, &model.graph, &staged, &model.kernel_tests.tests);
+			if variants(&after) < variants(&model.catalog) && after.checks.len() == model.catalog.checks.len() {
+				found = Some((configuration, reach.to_string(), after));
+				break 'search;
+			}
+		}
+	}
+	let (configuration, reach, after) = found.expect("some configuration and static reach removes a runnable variant without removing a check");
+	let losing = crate::candidate::components_losing_catalogue_coverage(&model.catalog, &after);
+	assert!(!losing.is_empty(), "a candidate that makes `{configuration}` unrunnable for anything reaching `{reach}` removes runnable work, and the component it belonged to has lost coverage: {} variants -> {}", variants(&model.catalog), variants(&after));
+	// AND AN IDENTICAL CATALOGUE TAKES NOTHING AWAY, so this cannot pass by reporting everything.
+	assert!(crate::candidate::components_losing_catalogue_coverage(&model.catalog, &model.catalog).is_empty(), "a catalogue that did not change narrows nothing");
+
 	// AND AN IDENTICAL REGISTRY TAKES NOTHING AWAY, which is what stops this refusing every
 	// candidate that only touches the kernel tests' `covers`.
 	assert!(crate::candidate::components_losing_registry_coverage(&model.registry, &model.registry, &ownership, &ownership).is_empty(), "a registry that did not change narrows nothing");

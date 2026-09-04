@@ -1889,3 +1889,66 @@ Focused verification: all 122 `verify-model` tests passed and the live `verify-m
 model consistency. The gate also reports the retained `src/kernel/test_suites` risk row as not
 narrowed. Those checks do not exercise a variant-only candidate narrowing. No source code or
 milestone plan was modified.
+
+IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0167 (2026-09-04T09:08:50Z):
+
+Covering the 2026-09-03T22:40:55Z findings too, which were repaired without a response being written.
+
+1. (2026-09-03T22:40:55Z) **Registry-only activation can still bypass both evidence bars** - ACCEPTED,
+   all three shapes: a deleted `selects_everything` row, and an ADDED longer ownership or architecture
+   prefix, none of which removes anything the old comparison read. Repaired by asking the resolver
+   instead of diffing rule texts, with a regression case per shape.
+
+2. (2026-09-03T22:40:55Z) **The candidate records evidence under the new component name while
+   activation requires the old one** - ACCEPTED, and this was a defect my own previous repair
+   introduced: inserting the displaced component turned a bypass into a bar nothing could meet, so
+   M5's advertised subsystem-split route could not complete at all. The narrowing is the displaced
+   component's; the evidence for it is filed under whoever owns the paths under the candidate, so
+   that is the name graded. The risk bar resolves the path under both models and grades whichever
+   name is actually reported lost.
+
+3. (2026-09-04T00:26:46Z) **The catch-all architecture rule can still be narrowed without either bar**
+   - ACCEPTED. `path = ""` owns nothing, so a narrowing of the row that governs every ordinary
+   cross-build was detected at that probe and then discarded for want of a component. Repaired by
+   asking the architecture question at every path either resolver decides by - `Ownership::rule_paths`
+   - so the loss lands on the components actually built on fewer machines and an unowned probe can go
+   on being skipped. Regression case included; verified to fail without the change.
+
+4. (2026-09-04T00:26:46Z) **Candidate activation still has a zero-evidence narrowing path because its
+   catalogue comparison discards variants** - ACCEPTED. Verified: activation projected each catalogue
+   to `component -> check id` while `model_hash` deliberately includes every variant, so the two
+   disagreed about what a model IS. One added `host_configuration_unrunnable` rule drops a runnable
+   configuration during catalogue construction with the check's id and `covers` untouched.
+
+   CODE. The projection is by VARIANT - check, architecture, environment, configuration, which is the
+   unit the scheduler runs, prices and records - and it moved out of the activation path into
+   `candidate::components_losing_catalogue_coverage`, where a test can drive it; inline it could only
+   be exercised by activating a candidate, which is the thing it gates. A check with no variants is
+   still keyed by its id so it cannot vanish from both sides and compare equal.
+
+   TEST. A case that adds such a rule over the real registry and requires the loss to be reported.
+   The fixture pair is SEARCHED FOR rather than hard-coded - a pair that removes a variant and no
+   check is a property of this tree's graph, and a hard-coded one stops testing anything the day a
+   rule beside it makes it a no-op. Verified to discriminate: with the projection put back to check
+   ids the case fails, reporting 1304 variants against 1303.
+
+5. (2026-09-04T00:26:46Z) **The test-file narrowing correction is only partial** - ACCEPTED, and the
+   milestone records it rather than claiming otherwise. Splitting `kernel.tests` out took a one-file
+   change from 100% of a full run to 66% and made the source-path block reachable at all, and a
+   planner test now asserts the declared-tests selection - which did not exist, every fixture having
+   passed an empty `source_paths`. What is NOT delivered is selection limited to those tests, and the
+   reason is checked rather than asserted: every kernel test declares `covers = ["kernel"]` and so
+   does `build.kernel`, so the reverse closure that fetches the build the change needs also fetches
+   every test naming that component. Narrowing further means the model can tell a check that BUILDS a
+   component from one that TESTS it, which `covers` cannot express - a change to the selection
+   relation, and the same "narrowing the kernel is where a selector is most likely to be wrong" that
+   `selects_everything = kernel` defers. The `src/kernel/test_suites` risk row is therefore RESTORED,
+   with its evidence text corrected: it said it would go once `covers` was on every test, `covers` has
+   been on every test for some time, and the row could still not go - so the condition it named was
+   the wrong one.
+
+## Verification for this round (2026-09-04T09:08:50Z)
+
+    cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline   122 passed
+    ./check.sh --gate verify-model,undeclared-edge,duplicate-edge,component-oracles   passed
+    ./check.sh --gate milestone-index,source-hygiene,no-suppression                   clean

@@ -1877,3 +1877,49 @@ have been about a state or an outcome.
    they are the two ways two implementations can differ here.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0175 (2026-09-04T00:47:54Z):
+
+1. **The latest backlog response fixed only the admission-timing part of its finding; the public
+   result and observability contradictions remain.** M1 still says `listen` returns the listener
+   channel (`docs/todo/P02M0175.md:228-261`), while M4 independently says it returns the effective
+   backlog (`:526-535`); the plan defines no result carrying both. M4 also says per-listener and
+   service-wide exhaustion move separate counters (`:536-560`), but its exhaustive `capacity`
+   additions still provide only one generic budget-refusal counter plus an unrelated datagram-drop
+   counter (`:579-585`). The two M10 exhaustion cases therefore still cannot observe the distinction
+   they require. Both subparts were in the preceding audit finding
+   (`AI/audit/audit-M0175.md:1787`) but were omitted from the planner's accepted response.
+
+2. **SYN-time backlog admission has no frozen reservation rule, so concurrent handshakes can exceed
+   the accepted backlog.** The correction checks the established-but-unaccepted backlog when a SYN
+   arrives and forbids discarding a connection after its handshake completes
+   (`docs/todo/P02M0175.md:508-517,539-558`). With an effective backlog of one, two SYNs can both see
+   zero established entries and receive SYN-ACKs before either final ACK arrives; both must then be
+   retained, exceeding the promised limit. “Where the budgets are already charged” does not say that
+   a backlog slot is reserved per admitted half-open TCB, how that reservation is reported, or when it
+   is released on expiry, reset, or accept. Freeze that reservation/accounting transition and add a
+   concurrent-half-open oracle; the existing test starts with an already-full queue and cannot catch
+   the race (`:562-567`).
+
+3. **The accepted family-state corrections were added to M10 but not applied to M7's normative
+   table.** M7 still defines IPv6 `Failed` after solicitation reaches its maximum interval, requires a
+   route covering the default destination for `Ready`, and refuses every send on a family that is not
+   `Ready` with the family state (`docs/todo/P02M0175.md:882-901`). The latest response accepted the
+   opposite three rules: IPv6 remains `Configuring` during P02M0174's indefinite solicitation,
+   `Ready` needs a non-tentative address plus any route, and only `Disabled` is a family-wide veto.
+   M10 now requires those corrected outcomes for a zero-lifetime RA and a late positive RA
+   (`:907-915`), making the tests contradict the governing table. As written, the zero-lifetime case
+   cannot both become `Ready` and send on-link, and the late-RA recovery starts from a terminal state
+   the response said to remove.
+
+4. **The fetch terminal is contradictory at the exact body bound.** One clause says only a body that
+   exceeds `MAX_FETCH_BODY_BYTES` is truncated (`docs/todo/P02M0175.md:101-111`), but the numeric rule
+   says a body *reaching* 256 KiB ends `TRUNCATED` (`:143-168`). A peer-declared body of exactly
+   256 KiB therefore satisfies both `COMPLETE` (“ended where the peer said”) and `TRUNCATED`
+   (“reached the bound”). Freeze exact-bound completion versus evidence of an over-bound byte and add
+   the boundary pair, otherwise clients cannot trust the three-way terminal the public API adds.
+
+**Current plan rating: 5/10.** Several latest fixes are present (notably SYN-time refusal and
+startup-only family configuration), but the omitted backlog subcontracts and stale family-state table
+still make their required public and QEMU oracles impossible, with two additional boundary races left
+undefined.
