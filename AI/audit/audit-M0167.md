@@ -1848,3 +1848,44 @@ Focused verification: all 121 `verify-model` unit tests passed, and the live `ve
 passed model consistency while itself reporting all seven kernel risk rows, including
 `src/kernel/test_suites`, as not narrowed. Those checks do not cover either candidate boundary above.
 No source code or milestone plan was modified.
+
+AUDITOR'S RE-AUDIT ON P02M0167 (2026-09-04T00:26:46Z):
+
+Current implementation rating: 6/10
+
+1. **The test-file narrowing correction is only partial and still contradicts the milestone's
+   explicit completion criterion.** Giving `src/kernel/test_suites` its own `kernel.tests` owner
+   correctly prevents the immediate `kernel` fail-open and makes the source-path block reachable
+   (`src/tools/verify-model/model/registry.toml:23-35`;
+   `src/tools/verify-model/src/plan.rs:449-489`). However, the reverse build edge still reaches
+   `kernel`, and the kernel tests' broad `covers = ["kernel"]` relationship pulls almost every test
+   back into the plan. The implementation consequently retained the very
+   `src/kernel/test_suites` risk row the definition of done requires to be gone, describing the
+   remaining selection-relation work as blocked (`src/tools/verify-model/model/registry.toml:418-435`;
+   `docs/todo/P02M0167.md:733-734`). On the current tree,
+   `./verify.sh --for src/kernel/test_suites/hardware.rs --plan` selects 1150 of 1304 runnable keys;
+   all three per-architecture guest selections are widened to their whole target suites, for an
+   estimated 66% of a full run. That is not a selection limited to the tests declared in the changed
+   file. The
+   earlier 100%-full behaviour is fixed, but the required narrowing is not complete.
+
+2. **Candidate activation still has a zero-evidence narrowing path because its catalogue comparison
+   discards variants.** `model_hash` deliberately includes every check variant
+   (`src/tools/verify-model/src/lib.rs:166-172`), but activation projects each catalogue to only
+   `component -> check id` before deciding which components lost coverage
+   (`src/tools/verify-model/src/main.rs:997-1013`). A candidate's complete replacement registry can,
+   for example, add a `host_configuration_unrunnable` rule for `shared-image` and static reach to
+   `lico`; `configuration_runnable` would then remove the currently runnable `shared-image` variant
+   from `host.lico` while leaving that check's id and `covers = ["lico"]` unchanged
+   (`src/tools/verify-model/src/catalog.rs:528-545,662-677`). The registry-side loss helper examines
+   ownership, non-code paths, escalation, edges and architecture rules, but not
+   `host_configuration_unrunnable` (`src/tools/verify-model/src/candidate.rs:65-200`). `losing` is
+   therefore empty and neither evidence bar runs, even though the activated model has one fewer
+   runnable configuration. This violates M5's requirement that narrowing be earned under both bars
+   and its express inclusion of variants in the frozen model (`docs/todo/P02M0167.md:491-519,608-617,
+   696-700`).
+
+Focused verification: all 122 `verify-model` tests passed and the live `verify-model` gate passed
+model consistency. The gate also reports the retained `src/kernel/test_suites` risk row as not
+narrowed. Those checks do not exercise a variant-only candidate narrowing. No source code or
+milestone plan was modified.

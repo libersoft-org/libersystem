@@ -2324,3 +2324,75 @@ Current plan rating: 5/10
    as a fault rather than landing at `DependencyPending`, directly corrupting the provider-removal and
    reacquisition path on which `a-wsi` relies. This prerequisite must remain unsatisfied or be narrowed
    to an independently proved contract; the current blanket `met` conclusion is unsupported.
+
+PLANNER'S RESPONSE ON P02M0103 (2026-09-04T00:26:21Z):
+
+1. **The latest P02M0167 response still overstates candidate-activation coverage** - ACCEPTED IN
+   PART. The catch-all half was correct when written and was repaired on 2026-09-03 (the probe set
+   now covers every path either resolver decides by, with a regression case). The CATALOGUE half is
+   correct and open: activation compares each check's id and `covers` and discards its variants, and
+   the registry helper never reads `host_configuration_unrunnable`, so one valid added rule can
+   suppress a single configuration of one check with both bars skipped. Verified in `catalog.rs`.
+
+   PLAN CHANGE. The P02M0167 row records both - what is closed and what is not - and explicitly stops
+   claiming the prerequisite is sound. It states only what its own rule permits: the conditions it
+   knows, without claiming to have named the last one.
+
+2. **The authoritative dependency graph contradicts the promised headless 3D schedule** - ACCEPTED,
+   and it is an ordering error rather than a wording one. The matrix gives `h` the prerequisites `g`
+   AND `f`, gives `g` the prerequisite `a-wsi`, and states in as many words that the relation is
+   TRANSITIVE. So `h` cannot complete without a window system, while the build-order paragraph listed
+   it among the parts that "can be finished with no window system at all".
+
+   PLAN CHANGE. `h` is removed from that list, with the reason: what a part PRESENTS does not decide
+   when it may finish - its prerequisites do, and a conformance suite needs the implementation it
+   tests, which presents. The matrix is authoritative and is unchanged.
+
+3. **The unresolved backend submission/completion contract is attached to the wrong specification
+   freeze** - ACCEPTED. The item defines the API needed by `render3d`, `soft3d`, a future
+   asynchronous GPU backend and readback, and names nothing 2D; filing it under pass 10's row `b`
+   made it a freeze prerequisite of `s-2d`, which blocks the 2D profile on a 3D API shape, while
+   `s-3d` could freeze and release Render3D WITHOUT the asynchronous contract the item says must be
+   fixed before implementation. Both consequences are wrong and they are one mistake.
+
+   PLAN CHANGE. The question moves from row `b` to a new `e / g` row in pass 10's open list, so
+   `s-3d`'s Done clause incorporates it and `s-2d`'s no longer does. The rule is stated with it: the
+   row a question is filed under is the freeze it gates.
+
+4. **`f-ext` has neither an entry in the supposedly complete dependency matrix nor a
+   pre-implementation freeze** - ACCEPTED, both halves. The matrix calls itself the complete edge set
+   and did not contain the part at all. And this file's governing rule is that a normative
+   specification is frozen before the part that implements it; `s` defined four freeze points, none
+   covering `SCENE3D_EXTENDED_1.md`, and `s-3d`'s Done clause names the CORE profile and puts the
+   Extended document outside it - so the part could be approved and started with its own normative
+   profile still mutable.
+
+   PLAN CHANGE. `f-ext` gains a matrix row (`f` AND `g` AND `s-3d-ext`), and `s-3d-ext` is added as a
+   FIFTH freeze point with its own Done clause, gating `f-ext` and nothing else so an optional part
+   stays optional. The `s` heading is corrected from four to five. This is the same omission `s-wsi`
+   was added for on 2026-09-01, which is said there.
+
+5. **The plan grants cross-phase approval to `a-wsi` contrary to its controlling roadmap** - ACCEPTED.
+   The activation list named `a-wsi` and claimed `docs/todo/TODO.md` "carries the same correction";
+   that file's P02M0103 line permits exactly `s`, `a-common` and `b`+`c` and does not name it.
+
+   PLAN CHANGE. The entry is WITHDRAWN rather than the roadmap widened to match a claim made here -
+   the roadmap decides scope, and two documents cannot give different answers about whether WSI
+   implementation may begin before the desktop phase. `a-wsi` remains Phase 4 and `d`, `g` and `i`
+   remain gated on it.
+
+6. **P02M0166 is not currently met for the removal/rebind state that `a-wsi` declares as a hard
+   prerequisite** - ACCEPTED. The defect is exactly as described and was repaired on 2026-09-03:
+   `enable` refused only the operator's stop, so an enable on a node stopping for a lost dependency
+   was accepted and cleared the intent, after which the driver's own `STOPPED` was refused as
+   unsolicited and a planned stop became a fault with no `DependencyPending` landing. The refusal now
+   covers every planned stop in flight.
+
+   The finding's other half stands regardless of the repair, and that is what the plan change is
+   about: a blanket "met" was written for a prerequisite whose contract had a live hole, in a matrix
+   whose own heading says a prerequisite is met by CONTRACT and not by a status line.
+
+   PLAN CHANGE. The summary sentence now names WHAT P02M0166 is met for - removal and rebind, as
+   repaired on that date - and records the episode as the reason the qualification is required.
+
+No source code was modified.

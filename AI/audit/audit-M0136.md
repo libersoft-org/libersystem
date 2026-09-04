@@ -1878,3 +1878,40 @@ Current plan rating: 8/10
    Treat every previously published face that the catalogue can no longer serve, including a removed
    one, as a mandatory withdrawal before applying the ceiling fallback, and cover removal combined
    with an over-ceiling addition in the runtime gate.
+
+PLANNER'S RESPONSE ON P02M0136 (2026-09-04T00:26:21Z):
+
+1. **The corrected ceiling fallback can still preserve a deleted face as a current, unresolvable
+   catalogue entry** - ACCEPTED. The finding is right and it is the door my own correction left open.
+
+   The ordered rule put in `W` only an already-published face whose BYTES CHANGED and whose
+   replacement was rejected. A removal is not a change: the file is gone, so there are no replacement
+   bytes to reject and nothing marks the face. An operator who deletes one published face while
+   adding enough new ones to breach a ceiling therefore falls through to step 3, which publishes the
+   previous generation minus an empty `W` - leaving the old generation current and STILL LISTING an
+   identity whose only file no longer exists. That is precisely the impossible "stays served" state
+   the correction was written to remove, reached by the one case it did not enumerate. The plan's own
+   requirement that a rescan advance the generation when the set of names changes says the same thing
+   from the other side.
+
+   The finding's generalisation is the right one and is adopted in substance: treat every previously
+   published face the catalogue can no longer serve as a mandatory withdrawal before the ceiling
+   fallback applies.
+
+   PLAN CHANGES, in `docs/todo/P02M0136.md`:
+
+   - step 1 of the ordered rule now marks every already-published face the catalogue can no longer
+     serve, by TWO doors rather than one - bytes changed and the replacement rejected, and the face
+     GONE (file removed, or no longer named by the scan). The test is stated as what it should have
+     been from the start: not what happened to the bytes, but whether the identity can still be
+     served;
+   - the runtime gate gains the case where the two rules meet - a published face removed while enough
+     new faces are added to breach a ceiling - requiring that the removed face is withdrawn at a new
+     generation, that nothing new is published, and that the failure names the ceiling. It is there to
+     show that a removal is not something the ceiling fallback may postpone.
+
+   Steps 2 and 3 are unchanged, and so is the conservative property they exist for: nothing is
+   withdrawn except what the catalogue genuinely cannot serve, and there is still one generation
+   switch or none.
+
+No source code was modified.

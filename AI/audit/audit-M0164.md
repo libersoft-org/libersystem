@@ -1999,3 +1999,38 @@ Current implementation rating: 6/10
 Focused verification: all 66 `driver-binding` tests and all 15 `system-manifest` tests passed. The
 `no-fixed-provider-slots`, `one-wait`, and `milestone-index` gates also passed, but none exercises the
 two still-open routes. The QEMU matrix was not repeated.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0164 (2026-09-04T00:29:33Z):
+
+Current implementation rating: 6/10
+
+1. **M2's format/origin routing and its adverse-order oracle remain unimplemented.** DeviceManager
+   still enumerates all boot block providers and then consumes them by lowest BDF
+   (`src/user/services/core/src/device_manager.rs:967-1018`). ServiceManager assigns the second,
+   third, and fourth handles directly to `block2_client`, `block3_client`, and `block4_client`, then
+   labels those positions `FATBLOCK`, `ISOBLOCK`, and `UDFBLOCK`
+   (`src/user/services/core/src/service_manager/bootstrap.rs:787-821,508-515`). StorageService trusts
+   the label and only attempts that format (`src/user/services/storage/src/service.rs:277-290`), so a
+   checked-mount rejection cannot reroute a swapped ISO/UDF/FAT provider. The only x86_64 harness
+   topology still attaches FAT, ISO, and UDF in that fixed order
+   (`src/harness/qemu-run.sh:1208-1212`); there is no required second disk-order profile. This is the
+   material open M2/definition-of-done item at `docs/todo/P02M0164.md:137-161,439-450`.
+
+2. **M7's USB consumers and boot-route oracle remain one-shot.** DeviceManager finds every USB block
+   and bus provider but opens only each list's `first()` and sends those two handles once
+   (`src/user/services/core/src/device_manager.rs:760-787`). `usb_storage` still has only a direct
+   `USBBLOCK` device role, and PermissionManager still receives and retains one `USBBUS` handle
+   (`src/user/services/manifest.toml:2382-2386,2825-2844`;
+   `src/user/services/core/src/permission_manager.rs:410-418,1550-1561`). Neither is a catalogue
+   subscriber, so another controller or a replacement publication cannot reach the consumer. The
+   hardware test injects `USBBLOCK` directly into a separately spawned StorageService
+   (`src/kernel/test_suites/hardware.rs:272-307`), while the ordinary boot assertion checks only the
+   lazy online report (`src/kernel/test_suites/boot.rs:104-117`); neither proves the routed seam named
+   by `docs/todo/P02M0164.md:257-287`.
+
+Focused verification: `driver-binding` 66/66, `driver-protocol` 26/26, and `system-manifest` 15/15
+tests passed; the x86_64 user build and the `one-wait`, `no-fixed-provider-slots`, `milestone-index`,
+and `no-suppression` gates passed. None exercises these two deliberately open routes; the QEMU matrix
+was not repeated.

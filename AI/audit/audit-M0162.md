@@ -1417,3 +1417,26 @@ Current implementation rating: 7/10
 Focused verification: all 66 `driver-binding` tests and all 15 `system-manifest` tests passed. The
 `one-wait`, `no-fixed-provider-slots`, and `milestone-index` gates also passed. These checks do not
 drive either production timing/candidate sequence above. The QEMU matrix was not repeated.
+
+AUDITOR'S RE-AUDIT ON P02M0162 (2026-09-04T00:22:59Z):
+
+Current implementation rating: 8/10
+
+1. **The fallback-budget correction still restarts both limits at a candidate boundary.** It was
+   correct to stop opening the recovery window at `READY` and instead open it when an `Online`
+   binding actually ends (`src/user/services/core/src/device_manager.rs:3836-3853,3987-4002`). But
+   `spend_candidate` still resets `node.attempt` to zero (`:3309-3331`), explicitly granting the
+   next fallback candidate another three automatic attempts. The new time-window guard is also not
+   persistent across exhaustion: `Incident::is_live` becomes false as soon as the absolute deadline
+   expires (`:205-212`), after which the next fallback's `begin_bind` opens a fresh incident
+   (`:3409-3423`). A candidate can therefore consume three attempts and its whole window, then hand
+   the node to another candidate with three more attempts and another full window. M5 instead caps
+   the automatic budget at three attempts per node and one absolute deadline across every attempt in
+   that bind/recovery chain (`docs/todo/P02M0162.md:244-269,351-355`). The current comments' decision
+   to retain a per-candidate attempt budget is an unjustified rejection of that explicit contract,
+   while using expiry as proof that no incident exists makes the purported shared time budget
+   reopen precisely when it is spent.
+
+Focused verification: all 66 driver-binding tests and all 15 system-manifest tests passed. The
+`source-hygiene` and `no-suppression` gates passed. Those host checks do not exercise the production
+multi-candidate exhaustion sequence. No source code or milestone plan was modified.

@@ -1798,3 +1798,26 @@ Focused verification: the current DMA suite passed all 63 tests, the `virtio-iom
 passed the same 63 tests, the ABI suite passed all 28 tests, and `source-hygiene` passed. The full
 QEMU gate correctly refused to use the currently stale shipping ISO at its freshness preflight, so
 no stale guest result was treated as evidence. No source code or milestone plan was modified.
+
+AUDITOR'S RE-AUDIT ON P02M0153 (2026-09-04T00:22:59Z):
+
+Current implementation rating: 8/10
+
+1. **The `DMA_FIXTURE` correction still does not build M2's named enforcing profile.** The gate sets
+   only `DMA_FIXTURE=1` and adds the controller and EDU functions through `QEMU_EXTRA`
+   (`src/tools/check-qemu-virtio-iommu-x86_64.sh:130-132`). Its `./test.sh` path reaches the runner
+   with `TEST=1` (`src/harness/test-kernel.sh:395-400`), so `qemu-run.sh` selects `iommu=0`, leaves
+   the machine as plain `q35`, and constructs the endpoint options without `iommu_platform=on`
+   (`src/harness/qemu-run.sh:448-465,1038-1065`). The hostile boot therefore neither sets M2's
+   required `default-bus-bypass-iommu=off` machine property nor marks its virtio-net endpoint for
+   translated DMA. In addition, the fixture cutoff occurs after a system-volume virtio-blk endpoint
+   has already been attached (`:1067-1072,1144-1163`), despite M2 limiting this controlled topology
+   to the firmware SATA function, IOMMU, EDU and virtio-net (`docs/todo/P02M0153.md:148-162`). The
+   patch removes the ordinary console/USB/media/bridge/sound devices, but this remaining endpoint
+   and the missing profile flags still make the security-sensitive bypass transition a different
+   topology/profile from the one the milestone requires.
+
+Focused verification: all 63 DMA tests and the `virtio-iommu-protocol` gate passed; the ABI suite
+passed all 28 tests, the driver-binding suite passed all 66 tests, and `source-hygiene` passed. The
+full QEMU gate stopped at its stale-image preflight, so no stale guest run was treated as evidence.
+No source code or milestone plan was modified.

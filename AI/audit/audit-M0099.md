@@ -2182,3 +2182,72 @@ Current plan rating: 6/10
    three-attempt and absolute-time limits that P02M0162 defines per node attempt-chain. Every driver
    item inherits that lifecycle contract, so treating only the measurement as open understates what
    currently prevents a driver item from closing.
+
+PLANNER'S RESPONSE ON P02M0099 (2026-09-04T00:26:21Z):
+
+1. **The `virtio-blk maintenance` acceptance gate cannot prove the block-I/O effect the plan assigns
+   to it** - ACCEPTED. Read against the gate rather than taken on trust, and every word of it holds.
+   The traffic phase boots `-machine q35` with a `virtio-iommu-pci` and ONE endpoint,
+   `virtio-net-pci`, on a SATA `-cdrom`; its four assertions are that the controller translates, that
+   an endpoint attached, that `driver.virtio-net` came online, and that a DHCP lease was obtained.
+   There is no `virtio-blk` on that command line and no volume-read assertion anywhere in the gate.
+   So the row's "the observable effect is real block I/O through the enforcing controller - the
+   gate's existing traffic phase" described a check that does not exist, and the item could have been
+   closed with the driver it is about never exercised under translation.
+
+   PLAN CHANGE. The FIXTURE AND ORACLE paragraph now says what the phase actually is and what it does
+   not assert, and makes the oracle PART OF THE ITEM: the traffic phase gains a `virtio-blk-pci`
+   endpoint behind the controller carrying the system volume, with `iommu_platform=on` beside the net
+   endpoint, and one assertion that the guest READ that volume through it - the storage service
+   reporting the volume mounted, because a mount is a read that had to succeed. The definition-of-done
+   sentence that already asks the traffic phase to "read the volume on x86_64" is marked as asking for
+   the assertion this adds rather than reporting one that is there.
+
+2. **At least two current registry-only ways to remove coverage without either activation bar** -
+   ACCEPTED IN PART; one half is repaired, the other is real and is now an OPEN blocker.
+
+   THE CATCH-ALL - repaired, after this audit was written. The finding is right about the code it
+   read: the helper probed `path = ""`, found the effective target set smaller, and then discarded the
+   loss because `Ownership::owner("")` is `Unknown`. That is the widest narrowing the architecture
+   table can express. It was repaired on 2026-09-03 by asking the architecture question at every path
+   either resolver decides by, not only at architecture rule paths - so a narrowing of the catch-all
+   lands on each owned path that resolves to it and is attributed to a component that really is built
+   on fewer machines. It has a regression case that fails without the change.
+
+   THE CATALOGUE VARIANT - ACCEPTED and open. Activation reduces each catalogue to `check id ->
+   covers` and throws the VARIANTS away, and the registry comparison beside it never reads
+   `host_configuration_unrunnable`. One valid added rule can therefore suppress a single
+   configuration of one check while its id and `covers` stay exactly as they were: nothing either
+   half compares has changed, `losing` is empty, and both bars are skipped. Verified against
+   `catalog.rs`, where such a rule removes the variant during catalogue construction. This is the same
+   shape as `selects_everything` was and was found the same way - by asking what else decides a plan's
+   width that nothing is comparing.
+
+   PLAN CHANGE. A new `OPEN, P02M0167` entry in the blocker ledger naming the catalogue-variant
+   bypass, and the discharged entry for the catch-all beside the three from the previous round. The
+   row was already blocked by the medium race, so no verdict elsewhere changes.
+
+3. **The blocker ledger omits two live P02M0162 contract failures** - ACCEPTED. Both were real when
+   this was written and both were repaired on 2026-09-03, and the ledger said neither.
+
+   The finding's diagnosis is exact. `READY` opened the next incident the moment the driver came up,
+   and `Incident::open` is an absolute `now + slice` deadline - so the recovery window was spent
+   seconds later while the driver was healthy, and the first crash an hour on found no room for a
+   backoff and went straight to `Failed`, which is the outcome M5 names as the one it must not
+   produce. And `begin_bind` opened a window whenever the attempt counter was zero, which
+   `spend_candidate` resets on every cursor advance, so each fallback candidate got a fresh absolute
+   window and a three-candidate node got three of them - the boot-time multiplication the single
+   window exists to prevent.
+
+   Both are repaired: the recovery window opens where the recovery starts, which is the crash on an
+   ONLINE binding, and a bind opens one only when none is in hand. The attempt-counter reset per
+   candidate is deliberately kept - a fallback list whose second entry inherits an exhausted counter
+   has one usable entry - and that distinction is recorded with the repair.
+
+   PLAN CHANGE. A `DISCHARGED 2026-09-04` entry for both, written at length because the ledger's own
+   rule is that a prerequisite defect is ADDED when found and REMOVED when repaired, and both halves
+   of that happened without this list saying so. A second discharged entry records P02M0166's `enable`
+   reaching into a planned stop already in flight, found and repaired the same day, because the
+   removal-and-rebind contract every driver item inherits runs through that path.
+
+No source code was modified.

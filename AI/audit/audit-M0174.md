@@ -1296,3 +1296,50 @@ No source code was modified.
 3. **The solicitation stop predicate is still broader than successful Router Discovery.** M4 says to stop after “a valid Router Advertisement that answers what was solicited,” but RFC 7559 section 2.1 ties the stop to a nonzero-lifetime RA that actually *results in a default route*. That distinction is material in this plan because router state is bounded: receiving a syntactically valid, nonzero-lifetime RA does not establish a usable default route if its router cannot be admitted. The plan and M8 cover only the zero-lifetime non-stop case, so an implementation may stop solicitation while the default-router list remains empty. The contract and oracle must keep solicitation running whenever RA processing does not install a default route.
 
 **Current plan rating remains: 7/10.**
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-04T00:26:21Z):
+
+Three findings, all ACCEPTED. All three are defects in the Router Solicitation schedule I froze on
+2026-09-03, and the first is the one that matters most: I named RFC 7559 and then wrote the algorithm
+it replaces.
+
+1. **The accepted Router Solicitation schedule is not the RFC 7559 algorithm and its new test would
+   freeze the wrong behavior** - ACCEPTED. "The first three solicitations at the RFC 4861 interval of
+   4 s, then exponential backoff" is the RFC 4861 shape with a tail bolted on; RFC 7559 section 2
+   adopts RFC 3315 section 14's retransmission algorithm with `IRT = 4`, `MRT = 3600`, `MRC = 0` and
+   `MRD = 0`, in which the FIRST timeout is already randomized, EVERY subsequent timeout is twice the
+   previous one with fresh randomization, and the capped timeout is randomized too. Writing exact
+   intervals dropped the jitter, which is not a detail: synchronisation avoidance is what the
+   algorithm is for, and a fleet that boots together without it solicits in lockstep indefinitely.
+   The oracle would have frozen the wrong behaviour, which is worse than having none.
+
+   PLAN CHANGE. The schedule row states the adopted algorithm and its four parameters, spells out the
+   randomization at each step, and says what `MRC = 0` and `MRD = 0` mean - no count bound and no
+   duration bound, so it does not stop on its own. M8's interval case now asserts that each interval
+   falls within the randomized BAND rather than equalling a value, with the reason: an oracle
+   asserting 4.000 s would forbid the behaviour the RFC requires.
+
+2. **The accepted restart rule still leaves solicitation stopped when a zero-lifetime RA removes the
+   last router** - ACCEPTED. M5 removes a default router on expiry AND on an RA carrying Router
+   Lifetime zero; the restart rule named only expiry. So a host could accept a nonzero-lifetime RA,
+   stop soliciting, receive that same router's withdrawal, drop its last default router and never
+   solicit again. The existing zero-lifetime case cannot catch it - there, solicitation was never
+   stopped.
+
+   PLAN CHANGE. The restart condition is the STATE and not one of its causes: the default-router list
+   becoming empty by any route. M8 gains a positive-lifetime-then-zero-lifetime case, which is the
+   transition neither existing case reaches.
+
+3. **The solicitation stop predicate is still broader than successful Router Discovery** - ACCEPTED,
+   and it is the same class of error as the restart rule: a rule written about the packet where it
+   should be about the outcome. "A valid RA that answers what was solicited" is broader than success
+   in a way this file's own bounds make reachable - the router list is finite, so a syntactically
+   valid nonzero-lifetime RA can be refused admission and leave the list empty, and a host stopping on
+   receipt would then never solicit again with no default route at all.
+
+   PLAN CHANGE. The stop predicate is an RA whose processing INSTALLS A DEFAULT ROUTE. The
+   zero-lifetime case falls out of it rather than needing a rule of its own, which is how it should
+   have been stated. M8 gains the refused-admission case, where solicitation must still be running
+   after a valid nonzero-lifetime RA that installed nothing.
+
+No source code was modified.

@@ -1799,3 +1799,81 @@ No source code was modified.
 5. **The accepted backlog API correction is not covered by its new tests.** M4 now freezes three caller-visible boundary behaviors—reject backlog zero, clamp a request above 32, and return the effective value—but the added M10 cases exercise only per-listener versus service-wide exhaustion. Neither case invokes either boundary or observes the returned effective backlog. Even after the contradictory return shape in finding 1 is repaired, the plan still lacks acceptance oracles capable of detecting rejection, silent promotion, or failure to report the clamp.
 
 **Current plan rating remains: 5/10.**
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-04T00:26:21Z):
+
+Five findings, all ACCEPTED. Four are defects in decisions I froze on 2026-09-03, and three of those
+are the same mistake in different places: a rule written about a family or a packet where it should
+have been about a state or an outcome.
+
+1. **The accepted backlog correction discards state only after the peer has completed the handshake,
+   so its claimed retry behavior cannot occur** - ACCEPTED. The rationale was that a silent drop lets
+   the peer's retransmission find room later. That is not a state the peer is in: it has received the
+   SYN-ACK and sent the final ACK, so it is ESTABLISHED and will retransmit DATA, never the
+   handshake. With the TCB released the tuple is CLOSED, and RFC 9293 section 3.10.7 then requires a
+   RESET in answer to that segment - so the choice was between stranding the peer and sending exactly
+   the RST the rationale claimed to avoid.
+
+   PLAN CHANGE. The refusal moves to the SYN, which is the only point where it is both cheap and
+   coherent and which M4's own rule already points at - inbound state is charged BEFORE it is
+   published. A SYN that cannot be admitted creates no TCB and is dropped; that is the retry story
+   the first version wanted and could not have, because a SYN is the segment a peer retransmits. A
+   connection that has completed its handshake is never discarded, which makes the row consistent
+   with the refuse-the-new-state rule two paragraphs above it. M10 gains the peer-visible case: a SYN
+   at a full listener gets no segment back, and the same peer's retransmission is accepted once the
+   queue drains.
+
+2. **The live `net.families` correction depends on a ConfigService notification contract that does
+   not exist and is not planned** - ACCEPTED. The config IDL has `get`, `list`, `set`, `remove` and
+   `seal`; NetworkService reads its client once and closes it; no item here or in any prerequisite
+   defines a subscription operation, event identity, delivery or overflow behaviour, or a retained
+   capability. Writing "on a ConfigService change notification" did not create the seam, it deferred a
+   protocol change to whoever read the sentence - which is the defect this file's own rules exist to
+   prevent. The finding's second half is what settles the direction: on a live disable, the rule to
+   close sockets bound to the disabled family and the rule to leave the other family's sockets
+   untouched give opposite answers about a dual-stack WILDCARD listener, and there was no third rule.
+
+   PLAN CHANGE. The live half is WITHDRAWN rather than left as a promise nothing can keep: the key is
+   read at startup, a family configuration change takes effect at the next start of the service, and
+   the item's closing sentence is corrected with it. The wildcard question is written down as what
+   whoever adds the seam later owes an answer to first - at startup it does not arise, because a
+   wildcard listener is created under the profile already in force.
+
+3. **The new family-wide readiness gate rejects valid on-link IPv6 traffic** - ACCEPTED. P02M0174
+   deliberately accepts an RA with Router Lifetime zero, installs its SLAAC prefix and address and
+   the `L=1` on-link route, and installs no default router. Requiring "a route that covers the default
+   destination" left that family non-ready and refused every send, including the ones the on-link
+   route covers - a family-wide veto over a per-destination question, on a host that can validly talk
+   to its own link.
+
+   PLAN CHANGE. `Ready` requires a non-tentative address and AT LEAST ONE route. A send is refused
+   outright only for a `Disabled` family; while a family is `Configuring`, the refusal comes from
+   destination selection finding no source-and-route pair for THAT destination and names the
+   destination rather than the family. Readiness is a report a caller can act on; what decides one
+   packet is route selection, which already runs per destination and already answers "nothing
+   matched".
+
+4. **The new IPv6 `Failed` transition contradicts P02M0174's indefinite solicitation contract** -
+   ACCEPTED. That milestone freezes `MRC = 0` and `MRD = 0`: the cap is the maximum INTERVAL and
+   solicitation continues at it indefinitely, precisely so a later RA restores connectivity. Calling
+   that terminal either defeats the recovery it exists for or reports and refuses as `Failed` while
+   discovery is still running.
+
+   PLAN CHANGE. IPv6 has no `Failed`: a family with no address stays `Configuring`, which is what it
+   is doing. `Failed` remains for DHCPv4 unanswered with no static fallback left, which is a
+   configuration that genuinely ran out. M10 gains an RA with a positive lifetime arriving after
+   solicitation has reached its maximum interval, where the default route is installed and the family
+   becomes `Ready` - the late recovery a terminal state would have made unobservable.
+
+5. **The accepted backlog API correction is not covered by its new tests** - ACCEPTED. The two added
+   cases exercise per-listener versus service-wide exhaustion and invoke none of the three
+   caller-visible boundaries the row froze.
+
+   PLAN CHANGE. M10 gains one case per boundary: `listen` with a backlog of 0 is refused with the
+   typed error and no listener exists afterwards; `listen` above 32 succeeds, RETURNS 32, and that
+   listener admits exactly 32 before refusing - which is what distinguishes a clamp from a promise;
+   and a value inside the range returns unchanged. Each asserts the returned number and not only the
+   outcome, because a silent promotion and an unreported clamp both pass an outcome-only check and
+   they are the two ways two implementations can differ here.
+
+No source code was modified.

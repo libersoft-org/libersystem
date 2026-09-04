@@ -1839,3 +1839,47 @@ Focused verification: all 66 `driver-binding` tests passed, `./build.sh --part u
 x86_64, and the `one-wait`, `no-fixed-provider-slots`, `grant-vocabulary`, `milestone-index`,
 `source-hygiene`, and `no-suppression` gates passed. The shutdown helper test currently asserts the
 defective `Stopping` case, and no executed check covers the remaining concrete close body.
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0165 (2026-09-04T00:29:33Z):
+
+Current implementation rating: 5/10
+
+1. **Operator and dependency planned stops still have no enforceable stop deadline.** Both helpers
+   withdraw providers, enter `Stopping`, and send `STOP`, but record no deadline and start no bounded
+   waiter (`src/user/services/core/src/device_manager.rs:4369-4412`). In the standing loop, the only
+   scheduled deadlines are heartbeat, `Backoff`, and an already-created `Teardown`
+   (`src/user/services/core/src/device_manager.rs:499-529`); a `Stopping` binding is excluded from
+   heartbeat scheduling (`:5731-5735`), and ordinary binding channels are absent from the central wait
+   set (`:593-671`). Consequently a driver which stays alive and never answers the operator/dependency
+   `STOP` can retain its binding in `Stopping` indefinitely; the new shutdown helper bounds it only if
+   a separate shutdown later arrives. That violates M3's required forced revocation at the planned
+   stop deadline (`docs/todo/P02M0165.md:128-147`). The 66-test host suite has no production-path case
+   for this timeout.
+
+2. **Shutdown still acknowledges before the teardown outcome it promises to classify.** The corrected
+   `shutdown_step` now properly includes `Stopping` plus a live binding, but
+   `wait_out_planned_stop` stops as soon as `advance` takes that binding
+   (`src/user/services/core/src/device_manager.rs:5653-5687`). That same `advance` has only begun a
+   teardown and deliberately leaves the node `Stopping` until process-exit and claim-settlement both
+   arrive (`:3976-4025`); `stop_all` never revisits it, and its caller immediately reports
+   `DeviceManager: stopped` and exits (`:829-846`). A teardown already in flight at shutdown is also
+   skipped because it has no `node.binding`. Thus shutdown cannot observe `Free` versus
+   `Unconfirmed`, cannot take M3's required `Quarantined`/report branch, and cannot substantiate the
+   plan's claimed clean shutdown (`docs/todo/P02M0165.md:135-169`). The latest helper test proves only
+   which binding receives/waits for `STOP`, not teardown completion.
+
+3. **M7's concrete catalogue-handle close remains unproved.** The production effect is still the
+   `close(provider.handle)` syscall in `Catalogue::close_channel`
+   (`src/user/services/core/src/device_manager.rs:2175-2188`), while the host race invokes
+   `apply_withdrawal` only against a recorder (`src/user/libs/driver/binding/src/tests.rs:740-795`).
+   Deleting the concrete syscall body therefore still leaves that test green; the GPU production
+   scenario exercises the announcement after its offered handle has already moved out. The plan now
+   accurately records this limitation (`docs/todo/P02M0165.md:317-346`), but M7 and the milestone
+   remain checked/complete despite the named race's explicit no-leaked-handle proof obligation.
+
+Focused verification: `driver-binding` 66/66, `driver-protocol` 26/26, and `system-manifest` 15/15
+tests passed; the x86_64 user build and the `one-wait`, `no-fixed-provider-slots`, `milestone-index`,
+and `no-suppression` gates passed. No executed check covers either missing planned-stop deadline,
+shutdown teardown confirmation, or the concrete close syscall; the QEMU matrix was not repeated.

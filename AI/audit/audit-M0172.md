@@ -1065,3 +1065,55 @@ Current plan rating: 6/10
    invocation-specific files the gate expects. Define the actual per-run x86 ESP/copy/input handoff
    and its loader selection semantics, then run both values through that same artifact path; naming a
    file on an ESP did not make it stageable on this row.
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-04T00:26:21Z):
+
+1. **The newly optional signed DMA-mode field has no decodable signed-absence representation or
+   compatibility rule** - ACCEPTED, and the second half of the finding is the more serious one.
+
+   The manifest is a fixed-order record whose version lives in its magic and whose row count follows
+   the volume UUID immediately. There is no room in that shape for a field that is sometimes absent,
+   and since the row expressly refuses every `u32` but 1 and 2 there is no sentinel either - so
+   signer and parser had no canonical bytes on which "absent" could agree. Worse, a correctly signed
+   OLDER manifest predating the field is indistinguishable from a deliberate test-medium omission,
+   which is the whole downgrade argument: an attacker presenting a legacy medium would otherwise
+   reach the `LSDM` path on a machine that must not admit it. Making the field optional without
+   saying how absence is encoded was a decision deferred to the implementer in the one place this row
+   exists to close.
+
+   PLAN CHANGE. The encoding is frozen: a NEW manifest version in the magic, the field appended and
+   MANDATORY within that version, carrying a one-byte presence tag - zero for "this build asserts no
+   DMA mode", one followed by the `u32` for the two valid values. The optionality is BETWEEN versions
+   and inside the signed bytes, which is the only shape this record can express and is what makes
+   both presence and absence authenticated. A PREVIOUS-version manifest is refused on this path
+   specifically - admitted for everything else it already serves, but never read as an omission,
+   because it cannot be told from one. M8 gains two negative fixtures: current version with the tag
+   clear plus an `LSDM` record (the admitted development row), and previous version plus an `LSDM`
+   record (refuses).
+
+2. **The per-run UEFI `LSDM` file still has no staging path on the x86_64 development workflow it is
+   required to distinguish** - ACCEPTED. Verified in the harness: `run.sh` selects an already-assembled
+   ISO and exports it as `BOOT_IMAGE`, `qemu-run.sh` boots that medium unchanged as the CD-ROM, and
+   the development manager finishes assembly before it reaches that no-build path. Unlike the non-x86
+   rows, which assemble a per-run ESP from already-built artifacts, nothing there exposes a writable
+   filesystem beside the loader - so one already-built ISO cannot acquire two invocation-specific
+   files, and the gate this row names was unimplementable on the one row it was written for. Naming a
+   file on an ESP did not make it stageable.
+
+   PLAN CHANGE. The carrier is per row, and each row still has exactly one:
+
+     x86_64 UEFI            `fw_cfg`, read by the LOADER. The interface is at a fixed port on this
+                              architecture and needs no device tree - which was the ONLY reason it
+                              was rejected for the other two - and the runner already writes a
+                              development scalar through it, so the conduit exists and is
+                              per-invocation by construction;
+     AArch64 / RISC-V UEFI  the `LSDM` file on the per-run ESP the harness assembles, which is where
+                              a per-run filesystem actually exists and where `fw_cfg` cannot be read
+                              because those rows' loaders withhold the tree;
+     direct boot            unchanged, exactly as M3 states it.
+
+   The record, its validation and its provenance are identical in both, so this is one carrier with
+   two transports rather than two contracts, and a row presenting BOTH is still two producers and
+   still refuses. The gates are restated against the real paths, including the AArch64 pair.
+
+No source code was modified.
