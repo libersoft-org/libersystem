@@ -20,6 +20,20 @@ schema = 1
 # exactly what the architecture policy needs. A path matching nothing is UNKNOWN, and unknown reach
 # selects everything.
 
+# The kernel's own test bodies are a declared subtree like the arch trees above, and for the same
+# reason: `kernel` selects everything, deliberately, so while these files resolved to it a change to
+# ONE test file planned the whole suite - `verify.sh --for src/kernel/test_suites/hardware.rs`
+# measured 1298 of 1304 keys, 100% of a full run. The planner has known how to select the tests
+# declared in a file since `Declaration` gained its source paths; the block that does it runs only
+# when the plan is not already full, so it could never be reached for the one input it is about.
+#
+# The synthesised `kernel -> kernel.tests` edge is what keeps this honest: the reverse closure from a
+# change here arrives at the crate, so the kernel is still rebuilt and every target that boots still
+# boots. What stops being everything is which tests run inside that boot.
+[[ownership]]
+path = "src/kernel/test_suites"
+component = "kernel.tests"
+
 [[ownership]]
 path = "src/kernel/arch/x86_64"
 component = "kernel.arch.x86_64"
@@ -401,6 +415,25 @@ reason = "stamped into every artifact through cargo:rustc-env"
 # The driver crate needed the same treatment and did not need a rule: `[[bin]]` entries already make
 # every driver its own component, so a keyboard change reaches `bin.usb_hid` and boots one target.
 
+# RESTORED, WITH THE CONDITION IT ACTUALLY WAITS ON (2026-09-04). The row's own text said it
+# disappears "once `covers` is on every test"; `covers` has been on every test for some time and the
+# row could still not go, so the condition was misidentified. Splitting `kernel.tests` out of the
+# `kernel` crate above took a one-test-file change from 100% of a full run to 66% and made the
+# declared-tests block reachable at all - it is gated on the plan not already being full - but it did
+# not make the declared tests the ONLY ones selected, and that is what the row is about.
+#
+# What is left is not discovery. The reverse closure from a change here reaches `kernel` because the
+# kernel is BUILT from these files, and `build.kernel` and every kernel test both declare `covers =
+# kernel` - so reaching that component selects the build the change needs AND every test that names
+# it. Narrowing to the declared tests means the model can tell a check that BUILDS a component from
+# one that TESTS it, which `covers` alone cannot express. That is a change to the selection relation
+# itself, and it is the same "narrowing the kernel is where a selector is most likely to be wrong"
+# that `selects_everything = kernel` exists to defer.
+[[risk_class]]
+path = "src/kernel/test_suites"
+class = "narrowable"
+evidence = "a test file reaches the tests in it; blocked on `covers` being unable to separate a check that builds a component from one that tests it, not on discovery"
+
 [[risk_class]]
 path = "src/kernel/mem"
 class = "foundational"
@@ -446,11 +479,6 @@ evidence = "shadow-clean for loader changes; the loader is exercised by a nameab
 path = "src/kernel/smp"
 class = "narrowable"
 evidence = "shadow-clean for core-bring-up changes"
-
-[[risk_class]]
-path = "src/kernel/test_suites"
-class = "narrowable"
-evidence = "a test file reaches the tests in it; once `covers` is on every test this is derivable rather than declarable, and this row disappears"
 
 # ---------------------------------------------------------------------------------------------
 # Declared edges

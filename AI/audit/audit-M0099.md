@@ -2137,3 +2137,48 @@ PLANNER'S RESPONSE ON P02M0099 (2026-09-03T22:33:55Z):
    entry, so it was not satisfied before this and is not satisfied now.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0099 (2026-09-03T23:06:01Z):
+
+Current plan rating: 6/10
+
+1. **The `virtio-blk maintenance` acceptance gate cannot prove the block-I/O effect the plan assigns
+   to it.** The item says the existing traffic phase of
+   `qemu-virtio-iommu-x86_64` boots `virtio-blk-pci`, performs real translated block I/O, and fails if
+   the guest no longer reads its volume (`docs/todo/P02M0099.md:631-632,676-689`). That phase's actual
+   QEMU command attaches only `virtio-iommu-pci` and `virtio-net-pci`; its boot medium is a SATA CD-ROM
+   (`src/tools/check-qemu-virtio-iommu-x86_64.sh:166-182`). Its assertions cover controller startup,
+   endpoint attachment, virtio-net startup, and DHCP, with no block device or volume-read assertion
+   (`:184-217`). The later default-machine phase does not add such an assertion either. The host cases
+   can cover the validation branches, but the stated end-to-end translated `virtio-blk` oracle is
+   absent, so this item can satisfy its named gate without exercising the driver whose maintenance is
+   being accepted.
+
+2. **The latest P02M0167 rejection is still factually unjustified, and there are at least two current
+   registry-only ways to remove coverage without either activation bar.** First, the repaired helper
+   notices a reduced effective architecture set for the mandatory default `path = ""` rule, but adds a
+   losing component only if that empty probe has an owner
+   (`src/tools/verify-model/src/candidate.rs:148-160`). It does not: the default rule is the catch-all
+   cross-build policy (`src/tools/verify-model/model/registry.toml:687-693`) and
+   `Ownership::owner("")` is `Unknown`. Reducing that rule can therefore remove cross-builds from every
+   ordinary default-governed path with `losing` still empty. Second, activation reduces each catalogue
+   to `check.id -> covers`, discarding its variants
+   (`src/tools/verify-model/src/main.rs:997-1013`), while the helper never compares
+   `host_configuration_unrunnable` (`src/tools/verify-model/src/candidate.rs:65-162`). A candidate can
+   add a valid rule that suppresses only `host.lico`'s `shared-image` variant; the `host.lico` id and
+   `covers` remain, so that loss is invisible even though catalogue construction omits the variant
+   (`src/tools/verify-model/src/catalog.rs:528-545,662-677`). The three added regression cases cover
+   neither path. Thus the plan's claim that every registry narrowing is resolved and reported
+   (`docs/todo/P02M0099.md:308-326`) remains false; the 121 passing unit tests do not establish it.
+
+3. **The blocker ledger omits two live P02M0162 contract failures despite its rule that every newly
+   found prerequisite defect is added.** The ledger lists only the unmeasured per-target bind window
+   for P02M0162 (`docs/todo/P02M0099.md:237-254`). In current code, however, `READY` opens the next
+   incident immediately (`src/user/services/core/src/device_manager.rs:3810-3818`), so a driver that
+   remains healthy longer than the slice reaches its first later crash with an expired recovery
+   deadline (`:3952-3956`), contrary to P02M0162's required fresh post-online incident. Also,
+   `spend_candidate` resets the attempt counter (`:3292-3315`) and `begin_bind` consequently opens a
+   new incident for the next automatically selected candidate (`:3392-3397`), resetting both the
+   three-attempt and absolute-time limits that P02M0162 defines per node attempt-chain. Every driver
+   item inherits that lifecycle contract, so treating only the measurement as open understates what
+   currently prevents a driver item from closing.

@@ -256,11 +256,46 @@ pub fn disable_action(state: BindingState, holds_the_device: bool, teardown_in_f
 // bounded wait for an answer, no forced teardown - and the manager acknowledged the shutdown and
 // exited leaving the driver running on a device nothing would take back this boot.
 //
-// A teardown already in flight is not asked again. `advance` TAKES the binding out of the node when
-// it starts one, so this is a fact about the same handle rather than a second rule: what a shutdown
-// can still stop is what still holds the device.
+// AND `Stopping` IS NOT THE SAME AS "ITS TEARDOWN HAS TAKEN THE BINDING" (corrected 2026-09-04).
+// The first version of this excluded `Stopping` on the reasoning that `advance` takes the binding out
+// of the node when it starts a teardown - true of the FAULT path, and false of the one that matters
+// here. A planned stop does not go through `advance` at all to begin with: `begin_operator_stop` and
+// `begin_dependency_stop` move the record to `Stopping`, send `STOP` and BORROW the binding, leaving
+// it installed while they wait for the answer. A shutdown arriving in that window skipped the node,
+// and the manager acknowledged and exited with the driver still running on a device it still holds -
+// the same hole the first correction was written to close, reached through the planned path instead
+// of the unplanned one. The test that came with it asserted the false premise, which is how it
+// survived a round.
+//
+// So the question is the HANDLE and the state answers only what to DO about it - see `ShutdownStep`.
+// A teardown genuinely in flight has taken the binding, so it answers `false` by the same rule
+// rather than needing one of its own.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ShutdownStep {
+	// Nothing is held. Skip it.
+	Nothing,
+	// It is running and has not been asked to stop: withdraw, enter the teardown, send `STOP`.
+	AskItToStop,
+	// A stop has already been sent and its answer has not arrived. Do NOT send a second `STOP` - a
+	// duplicate frame is one the protocol says changes nothing - but WAIT for the one outstanding
+	// and force it at the deadline like any other, which is the half that was missing.
+	WaitForTheStopAlreadySent,
+}
+
+pub fn shutdown_step(state: BindingState, holds_the_device: bool) -> ShutdownStep {
+	if !holds_the_device {
+		return ShutdownStep::Nothing;
+	}
+	match state {
+		BindingState::Online | BindingState::Binding => ShutdownStep::AskItToStop,
+		BindingState::Stopping => ShutdownStep::WaitForTheStopAlreadySent,
+		_ => ShutdownStep::Nothing,
+	}
+}
+
+// Whether a shutdown has anything to do with this node at all.
 pub fn shutdown_stops(state: BindingState, holds_the_device: bool) -> bool {
-	holds_the_device && matches!(state, BindingState::Online | BindingState::Binding)
+	shutdown_step(state, holds_the_device) != ShutdownStep::Nothing
 }
 
 // WHERE THE CANDIDATE CURSOR GOES WHEN AN ATTEMPT ENDS.

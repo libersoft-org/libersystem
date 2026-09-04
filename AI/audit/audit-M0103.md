@@ -2265,3 +2265,62 @@ PLANNER'S RESPONSE ON P02M0103 (2026-09-03T22:33:55Z):
    rather than a reversal.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0103 (2026-09-03T23:06:01Z):
+
+Current plan rating: 5/10
+
+1. **The latest P02M0167 response still overstates candidate-activation coverage.** The plan says the
+   second repair resolves every ownership, non-code, architecture, and escalation narrowing
+   (`docs/todo/P02M0103.md:269-282`). The mandatory default architecture rule is nevertheless a direct
+   bypass: the helper detects a smaller effective target set at its empty path but records it only when
+   `ownership.owner("")` yields a component (`src/tools/verify-model/src/candidate.rs:148-160`), while
+   the default rule is `path = ""` and governs ordinary cross-builds
+   (`src/tools/verify-model/model/registry.toml:687-693`). There is also an independent catalogue
+   bypass. Activation compares only each check's id and `covers`, not its variants
+   (`src/tools/verify-model/src/main.rs:997-1013`), and the registry helper ignores
+   `host_configuration_unrunnable`. Adding a valid rule that makes only `host.lico`'s `shared-image`
+   configuration unrunnable removes that variant during catalogue construction while leaving the
+   check id and `covers` unchanged (`src/tools/verify-model/src/catalog.rs:528-545,662-677`). Both
+   evidence bars are skipped in either case. All 121 `verify-model` tests pass because the added
+   regression cases exercise neither the catch-all nor a catalogue-variant loss.
+
+2. **The authoritative dependency graph contradicts the promised headless 3D schedule.** The matrix
+   makes `g` depend on `a-wsi`, makes `h` depend on `g + f`, and declares the relation transitive
+   (`docs/todo/P02M0103.md:112-140`). Therefore `h` cannot complete without `a-wsi`. The build-order
+   section nevertheless says `h` is one of the parts that presents nothing and can finish with no
+   window system (`:459-463`). This changes when the conformance work may start and finish; both
+   instructions cannot govern one implementation.
+
+3. **The unresolved backend submission/completion contract is attached to the wrong specification
+   freeze.** Pass 10 assigns it to row `b`, and `s-2d` incorporates that row as a freeze prerequisite
+   (`docs/todo/P02M0103.md:2671-2677,2823-2824`). The actual item explicitly defines the API needed by
+   `render3d`, `soft3d`, a future asynchronous GPU backend, and readback (`:3007-3015`). Consequently
+   it unnecessarily blocks the 2D profile while `s-3d` can freeze and release Render3D without the
+   asynchronous API shape the plan says must be fixed before implementation.
+
+4. **The separately implementable `f-ext` profile has neither an entry in the supposedly complete
+   dependency matrix nor a pre-implementation freeze.** Its section requires `f + g` and permits
+   separately approved implementation (`docs/todo/P02M0103.md:2352-2361`), but the complete matrix at
+   `:112-140` omits it. More importantly, `SCENE3D_EXTENDED_1.md` is explicitly outside the `s-3d`
+   freeze (`:622-627`), while the plan's governing rule is that a normative profile freezes before its
+   implementation and defines only four freeze points (`:518-562`). `f-ext` can therefore be started
+   under the plan with its own normative profile still mutable, recreating the ordering defect those
+   freeze gates exist to prevent.
+
+5. **The plan grants cross-phase approval to `a-wsi` contrary to its controlling roadmap.** Its
+   activation section lists `a-wsi` among the parts separately approvable before Phase 4
+   (`docs/todo/P02M0103.md:13-21`) and later says the roadmap carries the same correction (`:63-67`).
+   `docs/todo/TODO.md:179` permits only `s`, `a-common`, and `b + c` as cross-phase foundations. This is
+   a material scope/authority conflict: the two documents give different answers about whether WSI
+   implementation may begin before the desktop phase.
+
+6. **P02M0166 is not currently met for the removal/rebind state that `a-wsi` declares as a hard
+   prerequisite.** The plan both requires P02M0166 for removal and graph state and declares it met for
+   this file (`docs/todo/P02M0103.md:163-176,292-294,907-913`). Current policy handling accepts an
+   idempotent `enable` while a dependency-loss stop is in `Stopping`
+   (`src/user/services/core/src/device_manager.rs:4763-4773`), then clears the dependency-loss intent
+   before its illegal transition fails (`:4413-4447`). The valid `STOPPED` answer is thereafter treated
+   as a fault rather than landing at `DependencyPending`, directly corrupting the provider-removal and
+   reacquisition path on which `a-wsi` relies. This prerequisite must remain unsatisfied or be narrowed
+   to an independently proved contract; the current blanket `met` conclusion is unsupported.

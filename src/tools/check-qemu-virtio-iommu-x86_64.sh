@@ -113,8 +113,22 @@ trap 'rm -rf "$work"' EXIT
 # 1. THE HOSTILE ENDPOINTS. Two `edu` functions, because the domain-locality case is about two of
 #    them: "the same number means different memory to different devices" is not a question one
 #    device can be asked.
-echo "qemu-virtio-iommu: booting the enforcing profile"
-QEMU_EXTRA="-device virtio-iommu-pci,boot-bypass=on -device edu -device edu" \
+# AND ON THE FIXTURE M2 SPECIFIES, NOT ON THE ORDINARY TEST MACHINE (corrected 2026-09-04).
+#
+# This added the controller and the two `edu` functions to the machine `./test.sh` builds for every
+# other suite - which carries a virtio-serial console, an xHCI controller with a hub, a keyboard, a
+# tablet and a USB stick, three more virtio-blk media disks, a PCIe-to-PCI bridge with a device
+# behind it, and a virtio-sound card. M2 says in as many words to keep this a dedicated fixture and
+# not to inherit optional DMA devices from the ordinary harness, and it is not a tidiness point: the
+# transition this gate exists to prove QUIESCES every non-controller endpoint before turning bypass
+# off, so each of those bus masters was a participant in the security-sensitive step. The hostile
+# cases passing there said nothing about the topology the milestone describes - and the bridge is
+# one the fixture is supposed to REFUSE rather than generalize to.
+#
+# `DMA_FIXTURE=1` omits exactly those and keeps the firmware boot medium, the system volume and
+# virtio-net, which is the list M2 gives.
+echo "qemu-virtio-iommu: booting the enforcing profile on M2's dedicated fixture"
+DMA_FIXTURE=1 QEMU_EXTRA="-device virtio-iommu-pci,boot-bypass=on -device edu -device edu" \
 	./test.sh --arch x86_64 --tags dma >"$work/run.log" 2>&1 || {
 	echo "qemu-virtio-iommu: the dma suite failed under the enforcing profile" >&2
 	tail -20 "$work/run.log" >&2

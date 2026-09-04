@@ -1034,3 +1034,34 @@ PLANNER'S RESPONSE ON P02M0172 (2026-09-03T22:33:55Z):
    set refuses. M8's mixed-mode fixture gains the mixed-presence case beside the differing-value one.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0172 (2026-09-03T23:01:25Z):
+
+Current plan rating: 6/10
+
+1. **The newly optional signed DMA-mode field has no decodable signed-absence representation or
+   compatibility rule.** M3 still freezes the field as one `u32` for which only values 1 and 2 are
+   valid, but the latest correction makes the whole field optional and relies on its signed absence
+   to authorize the `LSDM` producer (`docs/todo/P02M0172.md:357-378,582-603`). The current signed
+   manifest is a fixed-order v2 record: its version is in the magic and its row count immediately
+   follows the volume UUID (`src/boot/protocol/src/manifest.rs:19-31,218-228`). The plan chooses no new
+   manifest version, presence tag, or absent sentinel (and expressly refuses every `u32` other than 1
+   and 2), so signer and parser still have no canonical bytes on which “field absent” can agree. It
+   also leaves an older correctly signed manifest that predates the field indistinguishable from the
+   claimed signed test/development omission, so the assertion that an attacker cannot strip the
+   shipping value is incomplete unless legacy formats are explicitly refused on this path. Freeze
+   the optional-field encoding and version-compatibility behavior, with absent/current and
+   absent/legacy negative fixtures, before using omission as authenticated producer selection.
+
+2. **The per-run UEFI `LSDM` file still has no staging path on the x86_64 development workflow it is
+   required to distinguish.** The plan requires default and `--no-iommu` development invocations to
+   boot the same UEFI image while the runner stages different `LSDM` bytes beside its loader
+   (`docs/todo/P02M0172.md:536-554,610-613`). In the current path, however, `run.sh` selects an already
+   assembled ISO, `qemu-run.sh` explicitly boots that `BOOT_IMAGE` unchanged, and QEMU attaches it as
+   the CD-ROM (`run.sh:168-196`; `src/harness/qemu-run.sh:925-945,1054-1060`). The development manager
+   likewise completes image assembly before invoking that no-build run path
+   (`src/harness/lab.py:1137-1162`). Unlike the non-x86 per-run ESP builder, nothing here exposes a
+   writable per-run filesystem beside the loader, so one already-built ISO cannot acquire the two
+   invocation-specific files the gate expects. Define the actual per-run x86 ESP/copy/input handoff
+   and its loader selection semantics, then run both values through that same artifact path; naming a
+   file on an ESP did not make it stageable on this row.

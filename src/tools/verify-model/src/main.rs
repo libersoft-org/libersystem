@@ -1048,16 +1048,30 @@ fn run() -> Result<ExitCode, String> {
 				// `src/kernel/syscall` needed nothing more than the general bar it is explicitly
 				// stronger than.
 				let ownership = model.ownership();
+				let narrowed_ownership = narrowed_model.ownership();
 				let abi_component: Option<String> = match ownership.owner("src/abi") {
 					verify_model::ownership::Owner::Component { component, .. } => Some(component),
 					_ => None,
 				};
 				let mut unmet: Vec<String> = Vec::new();
 				for risk in &model.registry.risk_classes {
-					let verify_model::ownership::Owner::Component { component, .. } = ownership.owner(&risk.path) else { continue };
-					if !losing.contains(&component) {
+					// WHICHEVER NAME ANSWERS FOR THIS PATH IS THE ONE GRADED (corrected 2026-09-04).
+					// This resolved the risk path through the ACTIVE ownership only, so a candidate
+					// that splits a subsystem out - the case M5's route exists for - put the
+					// successor in `losing` and this loop looked for the displaced name, found it
+					// absent, and skipped the stricter of the two bars entirely. The path is
+					// resolved under both models and the name that is actually reported lost is the
+					// one whose evidence is graded.
+					let named: Vec<String> = [ownership.owner(&risk.path), narrowed_ownership.owner(&risk.path)]
+						.into_iter()
+						.filter_map(|owner| match owner {
+							verify_model::ownership::Owner::Component { component, .. } => Some(component),
+							_ => None,
+						})
+						.collect();
+					let Some(component) = named.into_iter().find(|name| losing.contains(name)) else {
 						continue;
-					}
+					};
 					let seen = log.clean_architectures_seen(&component, &candidate.expected_hash, universe);
 					let missing: Vec<&str> = risk.targets.iter().filter(|target| !seen.contains(*target)).map(|target| target.as_str()).collect();
 					if !missing.is_empty() {

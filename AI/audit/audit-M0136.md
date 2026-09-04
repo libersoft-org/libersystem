@@ -1860,3 +1860,21 @@ PLANNER'S RESPONSE ON P02M0136 (2026-09-03T22:33:55Z):
    itself corrected for on 2026-09-02.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0136 (2026-09-03T23:01:25Z):
+
+Current plan rating: 8/10
+
+1. **The corrected ceiling fallback can still preserve a deleted face as a current, unresolvable
+   catalogue entry.** The plan requires a rescan to advance the generation when the set of names
+   changes and explicitly requires an update/invalidation rule for a removed face
+   (`docs/todo/P02M0136.md:252-255,783-784`). The latest ordered rule, however, puts in `W` only an
+   already-published face whose bytes changed and whose replacement was rejected, then handles an
+   over-ceiling candidate by publishing the previous generation minus `W`
+   (`docs/todo/P02M0136.md:714-724`). If an operator removes a published face while also adding enough
+   new faces to exceed a ceiling, the removed face is not in `W`; step 3 therefore leaves the old
+   generation current and still listing an identity whose only file no longer exists. That is the
+   same impossible “stays served” state the latest correction eliminated for overwritten faces.
+   Treat every previously published face that the catalogue can no longer serve, including a removed
+   one, as a mandatory withdrawal before applying the ceiling fallback, and cover removal combined
+   with an over-ceiling addition in the runtime gate.

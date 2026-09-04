@@ -202,6 +202,15 @@ impl Incident {
 		unsafe { clock().saturating_add(if self.teardown_reserve == 0 { TEARDOWN_FALLBACK_TICKS } else { self.teardown_reserve }) }
 	}
 
+	// WHETHER A CHAIN'S WINDOW IS STILL IN HAND.
+	//
+	// A zero deadline is "no window" - either none was ever opened, or the boot window is not known
+	// yet - and both answer the same way, which is what makes this one test rather than two. See
+	// `begin_bind` and the recovery arm of `advance` for the two places a chain starts.
+	unsafe fn is_live(&self) -> bool {
+		unsafe { self.deadline != 0 && clock() < self.deadline }
+	}
+
 	// Whether there is time for a backoff of `delay` and an attempt after it. A backoff that would
 	// end after the deadline is not entered at all: the node goes straight to its verdict rather
 	// than sleeping through the last of its budget and waking up to be told it is out.
@@ -499,7 +508,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// rather than sleeping on it, so without this the wait could park past the moment it
 			// became due and the retry would land whenever something unrelated next arrived.
 			for node in nodes.iter() {
-				if node.retry_at != 0 && (soonest == 0 || node.retry_at < soonest) {
+				// AND ONLY WHERE SOMETHING WILL ACT ON IT (corrected 2026-09-04). This woke for any
+				// nonzero `retry_at` whatever state the node was in, while the arm below clears and
+				// acts on one only for a node in `Backoff`. An operator's disable on a backing-off
+				// node is a supported `Backoff -> Disabled` move that changes the record and leaves
+				// the deadline behind, so from the moment it passed, `wait_any` returned the timeout
+				// immediately, every pass, for ever - nothing could clear it - and DeviceManager
+				// spun instead of serving. A wake condition that does not match the action it wakes
+				// for is a busy loop waiting for the right state to happen.
+				if node.record.state == BindingState::Backoff && node.retry_at != 0 && (soonest == 0 || node.retry_at < soonest) {
 					soonest = node.retry_at;
 				}
 				// AND A TEARDOWN RUNNING OUT OF ITS SLICE. The confirmations arrive on the handles
@@ -3389,11 +3406,20 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			print(b" is disabled in stored policy; this bind does not start\n");
 			return BindStart::CandidateFailed;
 		}
-		if node.attempt == 0 {
-			// ONE WINDOW FOR THE WHOLE CHAIN OF ATTEMPTS, opened on the first and not per attempt.
-			// Three attempts of two seconds plus their backoffs is 6.3 seconds for ONE device,
-			// which is already past the window the kernel's settle ladder gives the whole boot -
-			// and a machine with several unbindable devices multiplies it.
+		// ONE WINDOW FOR THE WHOLE CHAIN OF ATTEMPTS, opened on the first and not per attempt.
+		// Three attempts of two seconds plus their backoffs is 6.3 seconds for ONE device,
+		// which is already past the window the kernel's settle ladder gives the whole boot -
+		// and a machine with several unbindable devices multiplies it.
+		//
+		// AND A FALLBACK CANDIDATE IS THE SAME CHAIN, WHICH `attempt == 0` COULD NOT SAY (corrected
+		// 2026-09-04). The condition was the attempt counter, and `spend_candidate` resets that
+		// counter to zero every time the cursor advances - so each candidate opened a FRESH absolute
+		// window and a node with three candidates got three of them, which is exactly the
+		// multiplication this window exists to prevent, one level up. The counter answers "how many
+		// attempts has this candidate had"; what decides whether to open a window is whether one is
+		// already in hand. Resetting the ATTEMPT budget per candidate stays: a fallback list whose
+		// second entry inherits an exhausted counter is a list with one usable entry.
+		if !node.incident.is_live() {
 			node.incident = Incident::open();
 		}
 		// THE TEARDOWN SLICE THIS ATTEMPT'S ROLLBACK GETS, computed once from the window rather than
@@ -3807,15 +3833,24 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 						print(b"DeviceManager: a second terminal frame on a binding that is already past its handshake - refused\n");
 						continue;
 					}
-					// THE BRING-UP INCIDENT IS SPENT AND A NEW ONE STARTS AT `Online`.
+					// THE BRING-UP INCIDENT IS SPENT AND A NEW ONE STARTS WHEN THE RECOVERY DOES.
 					//
 					// Neither counter was reset here, so a crash an hour later was judged against the
 					// incident opened for the ORIGINAL bring-up: expired, so recovery was declared
 					// spent before it began - or, if it had not expired, charged with whatever
 					// attempts the bring-up had already used. A driver that came up is a driver whose
 					// bring-up succeeded, and what follows is a different incident.
+					//
+					// AND OPENING THAT INCIDENT HERE ONLY MOVED THE EXPIRY (corrected 2026-09-04).
+					// `Incident::open` is an ABSOLUTE `now + slice` deadline, so a window opened at
+					// `READY` is spent a few seconds later while the driver is still healthy - and a
+					// crash an hour after that consulted it, found no room for a backoff, and went
+					// straight to `Failed` without one attempt. That is the same defect the paragraph
+					// above describes, one moment along. A recovery chain's window belongs where the
+					// chain starts, which is the crash; the arm in `advance` that ends an ONLINE
+					// binding opens it. Here the counter is reset and the window is simply left to
+					// expire, because nothing reads it while a node is online.
 					node.attempt = 0;
-					node.incident = Incident::open();
 					// AND THE OPERATOR'S ONE ATTEMPT SUCCEEDED, so there is nothing left to spend.
 					// A flag left set here would stop the FIRST later crash from trying the next
 					// candidate, long after the request that set it was answered.
@@ -3949,6 +3984,22 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			// been moved to. See `Node::spent`.
 			node.spent = node.running.take();
 			let mut txn = binding.into_attempt();
+			// A RECOVERY IS A NEW CHAIN, AND THIS IS WHERE IT STARTS (added 2026-09-04).
+			//
+			// M5: "the deadline covers ONE bind or recovery attempt-chain and starts again with the
+			// next incident". A binding that was ONLINE and has just ended is the beginning of a
+			// recovery, and until now it was judged against whatever window was last opened - the
+			// bring-up's, or `READY`'s, both long expired for a driver that ran for any length of
+			// time. So `may_try_again` refused the first retryable crash for lack of room to back
+			// off, and a healthy driver's first fault ended the device for the boot.
+			//
+			// Gated on `Online` and not on the window being expired, because those are different
+			// questions: a bind attempt that fails after its chain's window ran out MUST end the
+			// chain, and reopening there would make the absolute deadline unreachable. What starts a
+			// new chain is a binding that had come up.
+			if node.record.state == BindingState::Online {
+				node.incident = Incident::open();
+			}
 			// A PLANNED STOP IS NEVER RETRIED, whatever the cause reads as: the whole point of
 			// asking a driver to stop is that it stays stopped.
 			let planned: bool = node.stop_intent != driver_binding::StopIntent::Fault;
@@ -4407,6 +4458,14 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 						if !node.record.move_to(BindingState::Disabled, None) {
 							print(b"DeviceManager: the operator's disable could not be recorded on this binding\n");
 						}
+						// AND A BACKOFF THAT WILL NEVER BE ACTED ON IS CLEARED WITH IT (2026-09-04).
+						// `Backoff -> Disabled` is one of the moves this arm makes, and the deadline
+						// the node was waiting out belongs to an attempt that is not going to
+						// happen. The standing loop no longer WAKES for a deadline on a node that is
+						// not in `Backoff` - that is the invariant, and it is where the busy loop
+						// was fixed - but leaving a stale time on a disabled node is a fact that is
+						// no longer true, and `lsdev` reads these fields.
+						node.retry_at = 0;
 					}
 				}
 			}
@@ -4764,7 +4823,16 @@ fn decide_policy(node: &Node, verb: proto::system::PolicyVerb, artifact: &str) -
 			// AN ENABLE WHILE A DISABLE'S TEARDOWN IS STILL IN FLIGHT IS BUSY. Cancelling the intent
 			// would mean a device that was never observed to be disabled at all, which is worse to
 			// explain than a refusal that says why.
-			if node.record.state == BindingState::Stopping && node.stop_intent == driver_binding::StopIntent::OperatorDisable {
+			// AND THAT IS TRUE OF EVERY PLANNED STOP, NOT ONLY THE OPERATOR'S (corrected 2026-09-04).
+			// This asked for `OperatorDisable` alone, so an `enable` on a node stopping because a
+			// dependency went away was ACCEPTED - and `apply_policy` then overwrote the intent with
+			// `Fault` before its `Stopping -> Unbound` move failed, which is an edge the table does
+			// not have. The damage is done by then: `drain_channel` admits a `STOPPED` frame only
+			// while the intent is not `Fault`, so the driver's correct answer to a stop this manager
+			// asked for was REFUSED as unsolicited, and a planned dependency stop was converted into
+			// a fault path that loses its `DependencyPending` landing. What the verb may remove is a
+			// stored disable; it may not reach into a teardown that is already running.
+			if node.record.state == BindingState::Stopping && node.stop_intent != driver_binding::StopIntent::Fault {
 				return none(PolicyOutcome::Busy);
 			}
 			// NOT A THIRD STORED STATE: the REMOVAL of the disable record, so a device that was
@@ -4959,7 +5027,14 @@ fn persist_incidents(nodes: &mut [Node], config: u64) {
 			}
 			let key = incident_key(node.id);
 			let mut client = proto::system::config::Client::new(ChannelTransport { chan: config });
-			if client.set(&proto::system::ConfigEntry { key, value }).is_none() {
+			// A REFUSED WRITE IS NOT A WRITE, AND THIS COUNTED IT AS ONE (corrected 2026-09-04).
+			// The generated client answers `Option<Result<(), Error>>`: the outer `None` is "the call
+			// did not happen", and `Some(Err(_))` is ConfigService saying it would not or could not
+			// store this. Only the first was retried; the second fell through to the flag below, so
+			// a report that exists in neither the service's memory nor its storage was marked
+			// durable and never attempted again. If this manager then dies, M5's post-mortem
+			// snapshot is gone - which is the one thing persisting it is for.
+			if !matches!(client.set(&proto::system::ConfigEntry { key, value }), Some(Ok(()))) {
 				continue;
 			}
 			// AND NOTHING WRITES A ROW MAP ANY MORE (removed 2026-08-31).
@@ -5505,16 +5580,32 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 		order.sort_by_key(|&at| (core::cmp::Reverse(depth[at]), at));
 		for at in order {
 			// WHAT STILL HOLDS THE DEVICE IS WHAT A SHUTDOWN HAS TO ASK, AND `Online` IS NOT ALL OF
-			// IT (2026-09-03). See `driver_binding::shutdown_stops`, where a test can drive it -
+			// IT (2026-09-03). See `driver_binding::shutdown_step`, where a test can drive it -
 			// the same trap the operator's disable was corrected for, in the one other place that
 			// walks the active set. A node in `Binding` past `begin_bind`'s commit was skipped in
 			// silence, and this program then acknowledged the shutdown and exited with that
 			// driver's process still running on a device it still holds.
-			if !driver_binding::shutdown_stops(nodes[at].record.state, nodes[at].binding.is_some()) {
+			//
+			// AND SO WAS A NODE WHOSE PLANNED STOP IS ALREADY IN FLIGHT (corrected 2026-09-04). A
+			// dependency stop and an operator's disable move the record to `Stopping`, send `STOP`
+			// and leave the binding INSTALLED while they wait for the answer - they borrow it, they
+			// do not take it - so a shutdown arriving in that window skipped a live driver for the
+			// second time, through the other path. What such a node needs is not another `STOP`,
+			// which the protocol says changes nothing, but the bounded WAIT and the forced teardown
+			// this loop already performs.
+			let step = driver_binding::shutdown_step(nodes[at].record.state, nodes[at].binding.is_some());
+			if step == driver_binding::ShutdownStep::Nothing {
 				continue;
 			}
 			let Some(binding) = &nodes[at].binding else { continue };
 			let (channel, generation): (u64, u64) = (binding.channel, nodes[at].id.generation);
+			if step == driver_binding::ShutdownStep::WaitForTheStopAlreadySent {
+				// THE INTENT THAT IS ALREADY THERE IS THE ONE THAT ASKED, and it stays: overwriting
+				// it would relabel a dependency stop or an operator's disable as a shutdown, and the
+				// `STOPPED` frame this is waiting for is admitted against it.
+				wait_out_planned_stop(&mut nodes[at], channel, generation, buf, catalogue);
+				continue;
+			}
 			nodes[at].stop_intent = intent;
 			// THE PROVIDER IS WITHDRAWN AND NEW CONNECTIONS REFUSED FIRST, so nothing arrives
 			// during the drain. A driver asked to finish while work keeps being handed to it is a
@@ -5548,42 +5639,58 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 			// A DEADLINE THAT EXPIRES FORCES THE REVOCATION AND SAYS IT WAS FORCED - never that a
 			// clean flush happened. The slice is the teardown reserve this node's incident already
 			// carries, so a stop is bounded by the same budget everything else on this node is.
-			let deadline: u64 = clock().saturating_add(nodes[at].incident.teardown_reserve.max(driver_protocol::MAX_HEARTBEAT_DEADLINE as u64));
-			// WHAT THE WAIT IS FOR IS "THE DRIVER REACTED", AND THAT IS NOT THE SAME AS "THE
-			// TEARDOWN FINISHED" (2026-08-31, and this half was got wrong first).
-			//
-			// The original condition was `state != Online`, which worked because the node was left
-			// `Online`: any reaction moved it out and ended the wait. Putting the node into
-			// `Stopping` above breaks that reading, and the obvious replacement - wait while it is
-			// `Stopping` - is a DIFFERENT wait: a node stays `Stopping` while its teardown runs, so
-			// that version waited for the teardown to complete and reported a FORCED stop against
-			// every driver whose teardown outlived the slice. Measured: it turned an ordinary
-			// shutdown into `did not answer the stop inside its slice` for a driver that had
-			// answered.
-			//
-			// The reaction is the binding ENDING. A driver that answers `STOPPED` and one that exits
-			// both give their binding up, and `advance` takes it in both cases; a driver that is
-			// still there and silent keeps it. So the wait ends when the node leaves `Stopping` OR
-			// when its binding is gone, and the forced branch below fires only for the one case that
-			// is actually a failure to answer - still `Stopping`, still holding its binding.
-			while clock() < deadline {
-				drain_channel(&mut nodes[at], buf);
-				if nodes[at].queue.is_empty() {
-					wait(channel, deadline);
-					continue;
-				}
-				let _ = advance(&mut nodes[at], name, catalogue);
-				if nodes[at].record.state != BindingState::Stopping || nodes[at].binding.is_none() {
-					break;
-				}
+			wait_out_planned_stop(&mut nodes[at], channel, generation, buf, catalogue);
+		}
+	}
+}
+
+// WAIT FOR A `STOP` THAT HAS BEEN SENT, AND FORCE THE TEARDOWN IF IT IS NOT ANSWERED.
+//
+// Its own function because a shutdown reaches it two ways (2026-09-04): a node this shutdown asked
+// itself, and a node whose planned stop was already in flight when the shutdown arrived. The second
+// must NOT be sent a second `STOP` - a duplicate frame is one the protocol says changes nothing -
+// and it must not be skipped either, which is what it was.
+unsafe fn wait_out_planned_stop(node: &mut Node, channel: u64, generation: u64, buf: &mut [u8], catalogue: &mut Catalogue) {
+	unsafe {
+		let name: &[u8] = node.driver_name();
+		// A DEADLINE THAT EXPIRES FORCES THE REVOCATION AND SAYS IT WAS FORCED - never that a
+		// clean flush happened. The slice is the teardown reserve this node's incident already
+		// carries, so a stop is bounded by the same budget everything else on this node is.
+		let deadline: u64 = clock().saturating_add(node.incident.teardown_reserve.max(driver_protocol::MAX_HEARTBEAT_DEADLINE as u64));
+		// WHAT THE WAIT IS FOR IS "THE DRIVER REACTED", AND THAT IS NOT THE SAME AS "THE
+		// TEARDOWN FINISHED" (2026-08-31, and this half was got wrong first).
+		//
+		// The original condition was `state != Online`, which worked because the node was left
+		// `Online`: any reaction moved it out and ended the wait. Putting the node into
+		// `Stopping` first breaks that reading, and the obvious replacement - wait while it is
+		// `Stopping` - is a DIFFERENT wait: a node stays `Stopping` while its teardown runs, so
+		// that version waited for the teardown to complete and reported a FORCED stop against
+		// every driver whose teardown outlived the slice. Measured: it turned an ordinary
+		// shutdown into `did not answer the stop inside its slice` for a driver that had
+		// answered.
+		//
+		// The reaction is the binding ENDING. A driver that answers `STOPPED` and one that exits
+		// both give their binding up, and `advance` takes it in both cases; a driver that is
+		// still there and silent keeps it. So the wait ends when the node leaves `Stopping` OR
+		// when its binding is gone, and the forced branch below fires only for the one case that
+		// is actually a failure to answer - still `Stopping`, still holding its binding.
+		while clock() < deadline {
+			drain_channel(node, buf);
+			if node.queue.is_empty() {
+				wait(channel, deadline);
+				continue;
 			}
-			if nodes[at].record.state == BindingState::Stopping && nodes[at].binding.is_some() {
-				print(b"DeviceManager: ");
-				print(name);
-				print(b" did not answer the stop inside its slice; the teardown is FORCED and nothing here says its work was flushed\n");
-				nodes[at].push(BindingEvent::Wedged { generation });
-				let _ = advance(&mut nodes[at], name, catalogue);
+			let _ = advance(node, name, catalogue);
+			if node.record.state != BindingState::Stopping || node.binding.is_none() {
+				break;
 			}
+		}
+		if node.record.state == BindingState::Stopping && node.binding.is_some() {
+			print(b"DeviceManager: ");
+			print(name);
+			print(b" did not answer the stop inside its slice; the teardown is FORCED and nothing here says its work was flushed\n");
+			node.push(BindingEvent::Wedged { generation });
+			let _ = advance(node, name, catalogue);
 		}
 	}
 }

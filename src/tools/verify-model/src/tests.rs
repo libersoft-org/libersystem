@@ -1866,6 +1866,32 @@ fn permission_kernel_test(id: &str, covers: &[&str]) -> KernelTest {
 	KernelTest { source_paths: Vec::new(), name: id.rsplit('.').next().expect("an id has a last segment").to_string(), id: id.to_string(), covers: covers.iter().map(|item| (*item).to_string()).collect(), architectures: crate::registry::ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()).collect() }
 }
 
+#[test]
+fn changing_one_test_file_selects_the_tests_declared_in_it() {
+	// THE MECHANISM THE REGISTRY ROW HAS PROMISED ALL ALONG, AND NOTHING DROVE (added 2026-09-04).
+	// `Declaration` gained `source_paths` so that "the tests in this file" is a question the model
+	// can be asked, and every fixture in this file passed an EMPTY list - so the block that answers
+	// it had no test at all, on top of being unreachable in production while `src/kernel/test_suites`
+	// resolved to a component that selects everything. The ownership split fixed the second half;
+	// this is the first.
+	let here = "src/kernel/test_suites/hardware.rs";
+	let elsewhere = "src/kernel/test_suites/boot.rs";
+	let declared = KernelTest { source_paths: vec![String::from(here)], name: String::from("declared_here"), id: String::from("kernel.declared_here"), architectures: vec![String::from("x86_64")], covers: vec![String::from("liberfs")] };
+	let other = KernelTest { source_paths: vec![String::from(elsewhere)], name: String::from("declared_elsewhere"), id: String::from("kernel.declared_elsewhere"), architectures: vec![String::from("x86_64")], covers: vec![String::from("liberfs")] };
+	// `covers` deliberately names a component this change does NOT reach, so the only thing that can
+	// put the test in the plan is the declaration - which is the property being asserted.
+	let model = model_with_suite(vec![declared, other]);
+	let plan = plan_for(&model, &[here]);
+	let selected = keys(&plan);
+	assert!(selected.iter().any(|key| key.contains("kernel.declared_here")), "the test this file declares is selected: {selected:?}");
+	assert!(!selected.iter().any(|key| key.contains("kernel.declared_elsewhere")), "and the one another file declares is not - that is the difference between selecting the tests in it and selecting the whole kernel: {selected:?}");
+	assert!(plan.items.iter().any(|item| item.reason == "a changed file declares this test"), "and it is in the plan for that reason rather than by reach");
+
+	// AND NOT NOTHING, which is the other half of the row's own sentence. A change to a test file
+	// still rebuilds the kernel, because the kernel is built from it.
+	assert!(selected.iter().any(|key| key.starts_with("build.kernel")), "the kernel is still rebuilt: {selected:?}");
+}
+
 // A model whose kernel suite is exactly what this test writes down.
 fn model_with_suite(tests: Vec<KernelTest>) -> Model {
 	let mut model = model();
@@ -2214,10 +2240,18 @@ fn a_candidate_that_narrows_only_the_registry_is_still_a_narrowing() {
 	// Whoever answers for that path TODAY is who loses it - the declared rule, or a crate directory
 	// underneath it that is a longer match still. The fixture asks the resolver rather than assuming.
 	let crate::ownership::Owner::Component { component: displaced, .. } = ownership.owner(&deeper) else { panic!("a path under a declared rule is owned by somebody") };
-	let override_block = format!("{block}\n[[ownership]]\npath = \"{deeper}\"\ncomponent = \"a-component-this-registry-does-not-otherwise-name\"\n");
+	let taking_over = "a-component-this-registry-does-not-otherwise-name";
+	let override_block = format!("{block}\n[[ownership]]\npath = \"{deeper}\"\ncomponent = \"{taking_over}\"\n");
 	let with_override = narrowed_from(text.replace(&block, &override_block));
 	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &with_override, &ownership, &crate::ownership::Ownership::new(&with_override, &model.crates));
-	assert!(losing.contains(&displaced), "a longer rule takes a subtree away from the component that owned it: {losing:?}");
+	// THE NAME REPORTED IS THE ONE THAT OWNS THE SUBTREE NOW (corrected 2026-09-04). This asserted
+	// the DISPLACED component, and that is what made the bar unsatisfiable: a candidate's evidence
+	// for those paths is recorded against whoever owns them under the candidate, so asking for the
+	// displaced name under the candidate's own hash asks for a record that cannot exist. The
+	// narrowing is still the displaced component's; the evidence that answers for it is the
+	// successor's. See the split case below, which is this same shape stated deliberately.
+	assert!(losing.contains(taking_over), "a longer rule takes a subtree away, and the evidence for it is filed under whoever took it: {losing:?}");
+	assert!(!losing.contains(&displaced), "asking for the displaced name would ask for a record no run against this candidate can write: {losing:?}");
 
 	// AND A COMPONENT THAT NO LONGER SELECTS EVERYTHING, which is the widest narrowing this registry
 	// can express: its changes drop from the FULL suite to the ordinary scoped closure, and not one
@@ -2248,6 +2282,40 @@ fn a_candidate_that_narrows_only_the_registry_is_still_a_narrowing() {
 	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &deeper_targets, &ownership, &crate::ownership::Ownership::new(&deeper_targets, &model.crates));
 	let crate::ownership::Owner::Component { component: fewer_machines, .. } = ownership.owner(&deeper_arch) else { panic!("a path under a declared architecture row is owned by somebody") };
 	assert!(losing.contains(&fewer_machines), "a longer architecture row takes machines away from a subtree the retained one still names: {losing:?}");
+
+	// AND THE CATCH-ALL ROW, WHICH OWNS NOTHING AND GOVERNS EVERYTHING (added 2026-09-04). The
+	// mandatory default is `path = ""`; `Ownership::owner("")` is `Unknown`, so a narrowing of it was
+	// detected at that probe and thrown away for want of a component to attribute it to. It is the
+	// widest narrowing the architecture table can express - every ordinary source file is built on
+	// fewer machines - and it reached activation with `losing` empty.
+	let default_row = model.registry.architecture.iter().find(|rule| rule.path.is_empty()).expect("the registry declares a catch-all architecture row");
+	let wide_default = format!("path = \"\"\nbuild = [{}]", default_row.build.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", "));
+	let narrow_default = format!("path = \"\"\nbuild = [\"{}\"]", default_row.build.first().expect("the default row builds on at least one target"));
+	assert!(text.contains(&wide_default), "the fixture has to find the catch-all row it is about");
+	let narrowed_default = narrowed_from(text.replace(&wide_default, &narrow_default));
+	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &narrowed_default, &ownership, &crate::ownership::Ownership::new(&narrowed_default, &model.crates));
+	assert!(!losing.is_empty(), "narrowing the row that governs every ordinary path takes coverage from somebody");
+	// And it is attributed to components that are REALLY governed by it, not to a placeholder: pick
+	// one owned path whose effective row is the default and require its owner to be named.
+	let governed = ownership.rule_paths().into_iter().find(|path| !path.is_empty() && !model.registry.architecture.iter().any(|rule| !rule.path.is_empty() && crate::registry::prefix_match(&rule.path, path).is_some()) && matches!(ownership.owner(path), crate::ownership::Owner::Component { .. })).expect("some owned path is governed by the catch-all row");
+	let crate::ownership::Owner::Component { component: governed_by_default, .. } = ownership.owner(governed) else { panic!("just filtered for it") };
+	assert!(losing.contains(&governed_by_default), "a component the catch-all governs is checked on fewer machines: {losing:?}");
+
+	// AND A SUBSYSTEM SPLIT NAMES THE SUCCESSOR, WHICH IS THE ONLY NAME ITS EVIDENCE CAN CARRY
+	// (added 2026-09-04). This is M5's advertised route and it could not complete: a candidate's
+	// shadow runs plan with the OVERLAID ownership, so changes under the split path are recorded
+	// against the new component, while activation asked `Store::evaluate` for the displaced one
+	// under the candidate's own hash - a record that no run against that candidate can write. The
+	// bar was unsatisfiable rather than absent, which is fail-safe and still means the route is
+	// dead.
+	let split_under = model.registry.risk_classes.iter().map(|risk| risk.path.clone()).find(|path| path.starts_with("src/kernel/") && matches!(ownership.owner(path), crate::ownership::Owner::Component { .. })).expect("this tree declares a kernel subsystem risk row");
+	let crate::ownership::Owner::Component { component: displaced, .. } = ownership.owner(&split_under) else { panic!("just filtered for it") };
+	let successor = format!("{displaced}.split");
+	let split_rule = format!("[[ownership]]\npath = \"{split_under}\"\ncomponent = \"{successor}\"\n\n[[ownership]]");
+	let split_registry = narrowed_from(text.replacen("[[ownership]]", &split_rule, 1));
+	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &split_registry, &ownership, &crate::ownership::Ownership::new(&split_registry, &model.crates));
+	assert!(losing.contains(&successor), "a split is graded on the name its own evidence carries: {losing:?}");
+	assert!(!losing.contains(&displaced), "and not on the displaced name, which no run against this candidate can record: {losing:?}");
 
 	// AND AN IDENTICAL REGISTRY TAKES NOTHING AWAY, which is what stops this refusing every
 	// candidate that only touches the kernel tests' `covers`.

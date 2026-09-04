@@ -119,7 +119,7 @@ fn a_node_that_never_got_to_attempt_anything_still_records_why() {
 
 #[test]
 fn a_shutdown_asks_everything_that_still_holds_a_device_and_not_only_what_is_online() {
-	use crate::shutdown_stops;
+	use crate::{ShutdownStep, shutdown_step, shutdown_stops};
 	// THE SAME TRAP AS THE DISABLE BELOW, IN THE OTHER PLACE THAT WALKS THE ACTIVE SET.
 	//
 	// `stop_all` asked whether the record was `Online`. A crash recovery starts a bind from the
@@ -131,9 +131,7 @@ fn a_shutdown_asks_everything_that_still_holds_a_device_and_not_only_what_is_onl
 	assert!(shutdown_stops(BindingState::Binding, true), "and so is one that has taken the device but not reported ready");
 	assert!(!shutdown_stops(BindingState::Binding, false), "before the claim there is nothing to ask and nothing to give back");
 	assert!(BindingState::Binding.may_move_to(BindingState::Stopping), "and the edge that stop needs exists from there");
-	// EVERYTHING ELSE HOLDS NOTHING. A node whose teardown is already in flight is included by that
-	// rule rather than by one of its own: `advance` takes the binding out of the node when it starts
-	// the teardown, so there is no device left for a shutdown to ask about.
+	// EVERYTHING ELSE HOLDS NOTHING.
 	for &state in [
 		BindingState::Unbound,
 		BindingState::Backoff,
@@ -147,7 +145,19 @@ fn a_shutdown_asks_everything_that_still_holds_a_device_and_not_only_what_is_onl
 	{
 		assert!(!shutdown_stops(state, false), "{:?} holds no device", core::str::from_utf8(state.name()));
 	}
-	assert!(!shutdown_stops(BindingState::Stopping, true), "a teardown already under way is the one that completes");
+	// AND A PLANNED STOP ALREADY IN FLIGHT IS NEITHER SKIPPED NOR ASKED AGAIN (corrected
+	// 2026-09-04). This test used to assert `!shutdown_stops(Stopping, true)` with the reasoning
+	// that a teardown under way has already taken the binding. That is true of the FAULT path and
+	// false of the planned one, which is the path this case is about: `begin_operator_stop` and
+	// `begin_dependency_stop` move the record to `Stopping`, send `STOP` and BORROW the binding,
+	// leaving it installed while they wait. So the assertion pinned the very premise that let a
+	// shutdown walk past a live driver, and it survived a round because it read as obvious.
+	assert!(shutdown_stops(BindingState::Stopping, true), "a stop that was sent and not yet answered still holds the device");
+	assert_eq!(shutdown_step(BindingState::Stopping, true), ShutdownStep::WaitForTheStopAlreadySent, "so the shutdown waits for the answer instead of sending a second STOP");
+	assert_eq!(shutdown_step(BindingState::Online, true), ShutdownStep::AskItToStop);
+	assert_eq!(shutdown_step(BindingState::Binding, true), ShutdownStep::AskItToStop);
+	assert_eq!(shutdown_step(BindingState::Stopping, false), ShutdownStep::Nothing, "once the teardown has taken the binding there is nothing left to wait for here");
+	assert_eq!(shutdown_step(BindingState::Quarantined, true), ShutdownStep::Nothing, "a device nothing confirmed quiet is not asked to stop again");
 	// AND A SHUTDOWN DESCRIBES NO NEXT STATE, which is what makes this a traversal rather than a
 	// transition table: there is no manager left to read one.
 	assert!(crate::StopIntent::Shutdown.confirmed_lands_at(true).is_none());

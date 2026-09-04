@@ -1282,3 +1282,17 @@ PLANNER'S RESPONSE ON P02M0174 (2026-09-03T22:33:55Z):
    taken, no default router is installed, and solicitation is still running afterwards.
 
 No source code was modified.
+
+## AUDITOR'S RE-AUDIT OF PLAN P02M0174 (2026-09-03T22:56:48Z):
+
+1. **The accepted Router Solicitation schedule is not the RFC 7559 algorithm and its new test would freeze the wrong behavior.** M4 says that the first three solicitations use an exact 4-second interval and that doubling starts only afterwards; M8 then requires those intervals. RFC 7559 section 2 instead adopts the RFC 3315 section 14 retransmission algorithm with `IRT=4`, `MRT=3600`, `MRC=0`, and `MRD=0`: the first timeout is randomized around 4 seconds, every subsequent timeout doubles the previous timeout with fresh jitter, and the capped timeout is also randomized. The omitted jitter and delayed backoff defeat the mandatory synchronization-avoidance behavior while the plan claims RFC 7559 conformance. The schedule and its test oracle must match the adopted algorithm. See [RFC 7559 section 2](https://www.rfc-editor.org/rfc/rfc7559.html#section-2) and [RFC 3315 section 14](https://www.rfc-editor.org/rfc/rfc3315.html#section-14).
+
+2. **The accepted restart rule still leaves solicitation stopped when a zero-lifetime RA removes the last router.** M5 correctly removes a default router both on expiry and on receipt of an RA with Router Lifetime zero, but M4 restarts solicitation only when the last router *expires*. A host can therefore accept a nonzero-lifetime RA and stop solicitation, then receive that router's withdrawal, remove its last default router, and never restart. The new zero-lifetime test covers only the different case where solicitation is already running, so it cannot catch this transition. The restart condition must cover the default-router list becoming empty through either removal path, with a positive-lifetime-then-zero-lifetime test.
+
+**Current plan rating: 7/10.** The prior route-order contradiction is resolved, but the newly added loss-resilient Router Solicitation contract is materially incorrect in both its retransmission schedule and one last-router removal transition.
+
+### Final verification addendum (2026-09-03T23:10:37Z)
+
+3. **The solicitation stop predicate is still broader than successful Router Discovery.** M4 says to stop after “a valid Router Advertisement that answers what was solicited,” but RFC 7559 section 2.1 ties the stop to a nonzero-lifetime RA that actually *results in a default route*. That distinction is material in this plan because router state is bounded: receiving a syntactically valid, nonzero-lifetime RA does not establish a usable default route if its router cannot be admitted. The plan and M8 cover only the zero-lifetime non-stop case, so an implementation may stop solicitation while the default-router list remains empty. The contract and oracle must keep solicitation running whenever RA processing does not install a default route.
+
+**Current plan rating remains: 7/10.**

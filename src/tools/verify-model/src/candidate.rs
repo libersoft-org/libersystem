@@ -99,11 +99,34 @@ pub fn components_losing_registry_coverage(active: &crate::registry::Registry, n
 		probes.extend(registry.ownership.iter().map(|rule| rule.path.as_str()));
 		probes.extend(registry.non_code.iter().map(|rule| rule.path.as_str()));
 	}
+	//
+	// AND WHAT IS ASKED FOR IS THE SUCCESSOR'S EVIDENCE, NOT THE DISPLACED COMPONENT'S (corrected
+	// 2026-09-04). Inserting the displaced name turned a bypass into a bar nothing could ever meet,
+	// which is fail-safe and still wrong: it made M5's advertised route - split a subsystem out of
+	// `kernel`, gather evidence for it, activate - impossible. A candidate's shadow runs PLAN with
+	// the overlaid ownership, so a change under `src/kernel/mem` on a candidate that adds
+	// `src/kernel/mem -> kernel.mem` is recorded against `kernel.mem`; activation then asked
+	// `Store::evaluate` for `kernel` under the candidate's own hash, and no run under that hash can
+	// ever produce a `kernel` record for those paths. The narrowing is the displaced component's and
+	// the EVIDENCE for it is filed under whoever owns the paths now, so that is the name to grade.
+	//
+	// It is not a free pass: the records are graded under the CANDIDATE's model hash, which only a
+	// shadow run against that candidate can write, so a successor that was trusted under the active
+	// model still starts from nothing here. Where there is no successor - the paths become
+	// documentation - the displaced name is the only one there is, and it is asked for. Where they
+	// become UNOWNED the plan fails open to the full suite, which is wider rather than narrower, so
+	// it is not a narrowing at all.
 	for path in &probes {
 		let crate::ownership::Owner::Component { component, .. } = ownership.owner(path) else { continue };
-		let kept = matches!(narrowed_ownership.owner(path), crate::ownership::Owner::Component { component: after, .. } if after == component);
-		if !kept {
-			losing.insert(component);
+		match narrowed_ownership.owner(path) {
+			crate::ownership::Owner::Component { component: after, .. } if after != component => {
+				losing.insert(after);
+			}
+			crate::ownership::Owner::Component { .. } => {}
+			crate::ownership::Owner::NonCode { .. } => {
+				losing.insert(component);
+			}
+			crate::ownership::Owner::Unknown => {}
 		}
 	}
 
@@ -145,10 +168,25 @@ pub fn components_losing_registry_coverage(active: &crate::registry::Registry, n
 		}
 		best.map(|(_, rule)| (rule.build.iter().cloned().collect(), rule.boot.iter().cloned().collect()))
 	};
+	// AND THE PROBE SET IS NOT ONLY THE ARCHITECTURE ROWS, BECAUSE THE WIDEST ROW OWNS NOTHING
+	// (corrected 2026-09-04). The mandatory catch-all is `path = ""` - it is what governs every
+	// ordinary source file - and `Ownership::owner("")` is `Unknown`, so narrowing its build set
+	// was DETECTED at that probe and then discarded for want of a component to attribute it to. A
+	// candidate could therefore take cross-build coverage away from the whole tree with `losing`
+	// empty and both bars skipped, which is the same zero-evidence activation this function exists
+	// to stop, through the one row that reaches furthest.
+	//
+	// The fix is not to invent an owner for `""`. It is to ask the architecture question where the
+	// OWNERS are: every path either resolver decides by, plus the architecture rows themselves. A
+	// narrowing of the catch-all then shows up at each owned path that resolves to it, attributed to
+	// the component that is actually checked on fewer machines - and a probe with no owner can go on
+	// being skipped, because by then it has been counted everywhere it matters.
 	let mut arch_probes: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
 	for registry in [active, narrowed] {
 		arch_probes.extend(registry.architecture.iter().map(|rule| rule.path.as_str()));
 	}
+	arch_probes.extend(ownership.rule_paths());
+	arch_probes.extend(narrowed_ownership.rule_paths());
 	for path in &arch_probes {
 		let Some((build, boot)) = effective(active, path) else { continue };
 		let after = effective(narrowed, path);

@@ -41,6 +41,20 @@ impl<'a> Ownership<'a> {
 		Ownership { registry, crate_dirs, binaries }
 	}
 
+	// EVERY PATH THIS RESOLVER DECIDES BY, which is what a caller has to probe to see a resolution
+	// change (added 2026-09-04). `owner` answers by longest prefix over four lists, so the places an
+	// answer can change are exactly the paths in those lists - a caller comparing two models has to
+	// ask at each of them, and comparing rule TEXTS instead is the trap this whole comparison was
+	// corrected for twice.
+	pub fn rule_paths(&self) -> Vec<&str> {
+		let mut out: Vec<&str> = Vec::new();
+		out.extend(self.registry.non_code.iter().map(|rule| rule.path.as_str()));
+		out.extend(self.registry.ownership.iter().map(|rule| rule.path.as_str()));
+		out.extend(self.crate_dirs.iter().map(|(dir, _)| dir.as_str()));
+		out.extend(self.binaries.iter().map(|(file, _)| file.as_str()));
+		out
+	}
+
 	pub fn owner(&self, path: &str) -> Owner {
 		let path = path.trim_start_matches("./");
 		let mut best_len: Option<usize> = None;

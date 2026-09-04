@@ -1143,51 +1143,74 @@ qemu_run_x86_64() {
 	fi
 	qemu_attach_virtio_net qemu_args vnet0 "$hostfwd" "$virtio_opts"
 
+	# THE DEDICATED DMA FIXTURE STOPS HERE, AND EVERY BUS MASTER BELOW IS WHY IT HAS TO EXIST
+	# (added 2026-09-04). `DMA_FIXTURE=1` is the enforcing-IOMMU gate's machine: the firmware boot
+	# medium, the system volume, virtio-net, the controller, and whatever `QEMU_EXTRA` adds - which
+	# for that gate is the IOMMU and two `edu` functions.
+	#
+	# It exists because the gate used to add those three to the ORDINARY test machine, which brings
+	# a virtio-serial console, an xHCI controller with a hub, a keyboard, a tablet and a USB stick,
+	# three more virtio-blk media disks, a PCIe-to-PCI bridge with a device behind it, and a
+	# virtio-sound card. Every one of them is a bus master, and the transition the gate is about
+	# QUIESCES every non-controller endpoint before it turns bypass off - so those devices were not
+	# bystanders, they were participants in the security-sensitive step, and the hostile cases were
+	# passing on a topology the milestone does not describe. The bridge is named there too, in the
+	# opposite sense: the fixture refuses a bridge alias rather than generalizing to it, and the
+	# ordinary machine supplies one.
+	#
+	# Omission only. Nothing here changes what the ordinary machine is, so a run without the flag
+	# gets exactly the machine it got before.
+	local dma_fixture="${DMA_FIXTURE:-0}"
+
 	# virtio-serial + virtconsole: mirrors a second console to a file.
 	#
 	# PER RUN, for the reason `qemu_attach_virt_interactive` gives about the same file: one name per
 	# mode is a capture two guests of one architecture write, and a capture two guests write
 	# describes neither. Nothing outside this script looks it up by name; the sweep removes the ones
 	# whose run is gone.
-	local vcon_out="$QEMU_BUILD_DIR/virtio-console${artifact_suffix}.$$.out"
-	scratch_sweep "$QEMU_BUILD_DIR/virtio-console${artifact_suffix}" .out
-	qemu_args+=(
-		-device "virtio-serial-pci,$virtio_opts"
-		-device virtconsole,chardev=vcon
-		-chardev "file,id=vcon,path=$vcon_out"
-	)
+	if [[ "$dma_fixture" != "1" ]]; then
+		local vcon_out="$QEMU_BUILD_DIR/virtio-console${artifact_suffix}.$$.out"
+		scratch_sweep "$QEMU_BUILD_DIR/virtio-console${artifact_suffix}" .out
+		qemu_args+=(
+			-device "virtio-serial-pci,$virtio_opts"
+			-device virtconsole,chardev=vcon
+			-chardev "file,id=vcon,path=$vcon_out"
+		)
+	fi
 
 	# xHCI USB host controller + hub with keyboard, tablet, and optional storage.
-	qemu_prepare_usb_image "$artifact_suffix"
-	local usb_storage_id=""
-	if [[ "${TEST:-0}" == "1" || -z "${USB_HOST:-}" ]]; then
-		usb_storage_id="vusb"
-		# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
-		#
-		# The other three fixture media are attached `readonly=on` and can be shared; this one is not, so
-		# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
-		# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
-		# system disk already takes, and `scratch_sweep` inside it is the cleanup.
-		usb_run_disk="$(qemu_run_disk "$USB_DISK")" || {
-			# A COPY THAT FAILED IS A RUN THAT CANNOT BE ISOLATED, AND IT FAILS (2026-08-31).
+	if [[ "$dma_fixture" != "1" ]]; then
+		qemu_prepare_usb_image "$artifact_suffix"
+		local usb_storage_id=""
+		if [[ "${TEST:-0}" == "1" || -z "${USB_HOST:-}" ]]; then
+			usb_storage_id="vusb"
+			# THE USB FIXTURE IS ATTACHED WRITABLE, so this run gets its own copy.
 			#
-			# This fell back to attaching the shared template WRITABLE - the exact arrangement the three
-			# lines above exist to remove, reinstated by a defensive `||` on the one path where it matters.
-			# So a full disk, a permission problem or any other copy failure silently turned isolation off,
-			# and two guests of one architecture wrote into one fixture again. There is no degraded form of
-			# "this run has its own copy": either it does or the run is not the thing that was asked for.
-			echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
-			exit 1
-		}
-		qemu_args+=(-drive "file=$usb_run_disk,if=none,id=vusb,format=raw")
-	fi
-	qemu_attach_xhci qemu_args "$usb_storage_id"
+			# The other three fixture media are attached `readonly=on` and can be shared; this one is not, so
+			# two runs of one architecture wrote into the same file - and the stray-guest guard even exempted
+			# `usb-media*.img` as though it were read-only. `qemu_run_disk` is the same per-run copy the
+			# system disk already takes, and `scratch_sweep` inside it is the cleanup.
+			usb_run_disk="$(qemu_run_disk "$USB_DISK")" || {
+				# A COPY THAT FAILED IS A RUN THAT CANNOT BE ISOLATED, AND IT FAILS (2026-08-31).
+				#
+				# This fell back to attaching the shared template WRITABLE - the exact arrangement the three
+				# lines above exist to remove, reinstated by a defensive `||` on the one path where it matters.
+				# So a full disk, a permission problem or any other copy failure silently turned isolation off,
+				# and two guests of one architecture wrote into one fixture again. There is no degraded form of
+				# "this run has its own copy": either it does or the run is not the thing that was asked for.
+				echo "qemu-run: could not make this run's private copy of $USB_DISK - refusing to attach the shared template writable" >&2
+				exit 1
+			}
+			qemu_args+=(-drive "file=$usb_run_disk,if=none,id=vusb,format=raw")
+		fi
+		qemu_attach_xhci qemu_args "$usb_storage_id"
 
-	# Keep media disks after USB in PCI discovery order, matching the historical
-	# runner and the volume/device inventory expected by the boot chain.
-	[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "$virtio_opts" readonly
-	[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "$virtio_opts" readonly
-	[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "$virtio_opts" readonly
+		# Keep media disks after USB in PCI discovery order, matching the historical
+		# runner and the volume/device inventory expected by the boot chain.
+		[[ -f "$FAT_DISK" ]] && qemu_attach_virtio_blk qemu_args "$FAT_DISK" vmedia "$virtio_opts" readonly
+		[[ -f "$ISO_DISK" ]] && qemu_attach_virtio_blk qemu_args "$ISO_DISK" viso "$virtio_opts" readonly
+		[[ -f "$UDF_DISK" ]] && qemu_attach_virtio_blk qemu_args "$UDF_DISK" vudf "$virtio_opts" readonly
+	fi
 
 	# Display backends: parse DISPLAYS env for vnc/spice.
 	qemu_parse_displays qemu-run
@@ -1207,17 +1230,23 @@ qemu_run_x86_64() {
 		# The development channel is present in the cold test configuration too: the same
 		# second port on every target is what lets a scenario runner drive a boot over
 		# identical framing, including where the persistent profile does not exist.
-		qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-x86_64-test.$$.sock" "$virtio_opts"
+		[[ "$dma_fixture" == "1" ]] || qemu_attach_dev_channel qemu_args "$QEMU_BUILD_DIR/dev-channel-x86_64-test.$$.sock" "$virtio_opts"
 		# A BRIDGE WITH SOMETHING BEHIND IT, so the PCI walk has a second bus to find. The x86
 		# enumeration followed no bridges and the q35 default topology puts everything on bus 0,
 		# so recursive enumeration could be written and never executed - it is the topology, not
 		# the code, that decided the test passed. `pci-testdev` is inert: nothing in this kernel
 		# binds it, so what it proves is exactly that the walk reached a bus firmware did not
 		# place on the root.
-		qemu_args+=(
-			-device "pcie-pci-bridge,id=liberbr,bus=pcie.0,addr=0x1c"
-			-device "pci-testdev,bus=liberbr,addr=0x1"
-		)
+		# AND THE FIXTURE REFUSES THE BRIDGE BY NAME. M2 says the first topology contains
+		# direct-root-port endpoints only and that a bridge alias is refused rather than
+		# generalized inside it, so the one machine that must not have this is the one the
+		# enforcing gate boots.
+		if [[ "$dma_fixture" != "1" ]]; then
+			qemu_args+=(
+				-device "pcie-pci-bridge,id=liberbr,bus=pcie.0,addr=0x1c"
+				-device "pci-testdev,bus=liberbr,addr=0x1"
+			)
+		fi
 		# A SOUND DEVICE THE SUITE CAN RECORD FROM. The audio path used to be tested against no
 		# device at all - AudioService reporting not-found is a real case and it is the only one that
 		# ran - so playback was exercised nowhere and capture could not be exercised at all.
@@ -1227,8 +1256,10 @@ qemu_run_x86_64() {
 		# the whole inverted used-ring path run exactly as they would with a microphone. What it
 		# cannot prove is the sample values, which is why the recording test asserts that what it got
 		# IS silence - a path returning stale playback data or uninitialised memory fails that.
-		qemu_append_audio qemu_args
-		qemu_args+=(-device "virtio-sound-pci,audiodev=snd0")
+		if [[ "$dma_fixture" != "1" ]]; then
+			qemu_append_audio qemu_args
+			qemu_args+=(-device "virtio-sound-pci,audiodev=snd0")
+		fi
 		qemu_args+=(-no-reboot -device isa-debug-exit,iobase=0xf4,iosize=0x04)
 		timing_event qemu start
 		set +e
