@@ -730,3 +730,82 @@ Rating: 7/10
 2. **The new working-tree digest is not bound to the proposed revision and can therefore attest bytes that were never committed or tested as that revision.** Consider `HEAD` containing O, the index containing staged bytes A, and the working tree containing later bytes B. The inner tier hashes and tests B. Committing records A while leaving B on disk; the merge tier again hashes and tests B, matches the handoff, and—under the plan's explicit acceptance of index/worktree disagreement—can claim completion for proposed revision A even though neither tier tested A (`docs/todo/P02M0177.md:311-349`, `:355-360`, `:466-470`). Ignoring the index is valid for identifying the inner snapshot, but merge must additionally prove that the named proposed commit's tree equals that snapshot, or execute from a clean checkout/materialization of it. The partial-stage A/B case must be refused while an ordinary commit of the tested bytes remains accepted.
 
    The concrete enumeration is also not commit-stable for valid dirty deletions and renames as written. `git ls-files -c` lists cached paths that are already absent from disk, yet the plan says every enumerated path contributes bytes and an executable bit read from disk and that committing does not change the listing (`docs/todo/P02M0177.md:311-339`). Before a deletion or unstaged rename is committed, the old missing path is still enumerated; afterward it disappears. The cited `test-preflight` precedent explicitly filters nonexistent paths (`src/harness/test-preflight.sh:163-174`). The identity must define NUL-safe existing-entry/absence normalization and prove that a dirty deletion or rename followed by committing exactly that effective tree preserves identity, separately from the already listed tests that reject an intervening deletion or rename.
+
+PLANNER'S RESPONSE ON P02M0177 (2026-09-04T20:52:10Z):
+
+Two findings, BOTH ACCEPTED. Each is the same class of fault as the round before it - a rule stated
+where a structure was needed - and this round the structure is available in both cases.
+
+1. **M1 and M2 describe incompatible seams, and the mutation gate proves placement rather than use**
+   - ACCEPTED, both halves.
+
+   The contradiction is real and it is mine: M1 says the reducer includes "the state transition and
+   the effects", M2 says it is the admission and the arms carry the effects. Two descriptions of one
+   boundary are satisfiable by host-testing a predicate and leaving the transition to the test, which
+   is precisely the arrangement M1 was written to forbid.
+
+   PLAN CHANGE. The seam is stated ONCE, in M1, as DECISION / EFFECT: the reducer decides admission,
+   the resulting state, and the `FailureCause`; the arms carry publication, printing, supervision,
+   teardown and spawning. This costs nothing to arrange - `BindingState`, `BindingEvent`,
+   `FailureCause` and the transition table are ALREADY in `driver-binding`, so the seam moves no type
+   and adds no dependency. The effects stay in `advance` because they are syscalls and catalogue
+   writes, and hoisting them into a host-testable shell is a redesign of the service. M1's regression
+   is restated against that seam: `READY` then the stale `TimedOut` THROUGH the reducer, asserting
+   the record is still `Online` with no cause - a transition, not a predicate reading. M2 now refers
+   to that reducer instead of describing a second one.
+
+   The second half is the sharper of the two and it is correct. `let _ = reduce(..)` above the old
+   `match event` keeps every textual property I asked for - before the match, not inside an arm, no
+   arm-local predicate - and the stale `TimedOut` walks into its teardown arm exactly as before. A
+   check that a call APPEARS is not a check that its answer is obeyed, and I had written the former
+   while claiming the latter.
+
+   PLAN CHANGE. The reducer's result is made UNIGNORABLE rather than merely required: the popped
+   event is consumed by the reducer and the `match` is performed over what the reducer RETURNS, with
+   the admitted event living only inside the admitted variant. Ignoring the result then leaves no
+   `event` to match on and does not compile; inverting it asks the refusing variant - which carries
+   no event - to produce one, and does not compile either. Both dangerous mutations become
+   unrepresentable instead of forbidden.
+
+   What stays unenforced is that `advance` calls the reducer at all: deleting the dispatch and
+   matching the popped event directly compiles cleanly and merely leaves the reducer unreferenced -
+   which last round's answer wrongly believed was a build failure, and the plan now says so in the
+   same place. That residual is the source check's job, which gained a third assertion (the `match`
+   scrutinee is the binding the dispatch produced) and a fourth mutant (the result bound to `_`).
+
+2. **The working-tree digest is not bound to the proposed revision, and the enumeration is not
+   commit-stable for deletions and renames** - ACCEPTED, both halves, and the first is a hole I
+   opened last round.
+
+   The A/B walkthrough holds exactly as written: `HEAD` at O, index at A, worktree at B, both tiers
+   hash and test B, the commit records A, and merge attests A on evidence produced against B. My own
+   acceptance case - "an index/working-tree disagreement is accepted" - is what let it through.
+   Ignoring the index correctly identifies the bytes a run CONSUMED, and that is all it does; it
+   never claimed anything about the revision those bytes are proposed as, and I treated it as though
+   it had.
+
+   PLAN CHANGE. Merge takes the proposed revision as well as the handoff and computes THE SAME
+   canonical digest over that commit's tree (`git ls-tree -r -z`, same fields), requiring all three
+   to agree: the inner snapshot, merge's own snapshot, and the commit's tree. An ordinary commit of
+   the tested bytes passes; the A/B partial stage is refused with the disagreement named. The test
+   list now carries the index case on BOTH sides, because what decides it is not the disagreement but
+   which bytes the commit ends up holding - which is the distinction the previous round missed.
+
+   The second half is correct too. `git ls-files -c` lists cached paths already gone from disk, so
+   "every enumerated path contributes its bytes" is undefined for a dirty deletion, and after the
+   deletion is committed the path stops being listed - the identity moving across a commit of exactly
+   the tested tree, which is the one thing it must not do. An unstaged rename is that twice. The
+   `test-preflight` precedent I cited does filter nonexistent paths, and I cited it without carrying
+   that part across.
+
+   PLAN CHANGE. A path ABSENT FROM DISK CONTRIBUTES NOTHING - it is not in the effective tree, which
+   is the subject - so a dirty deletion and a dirty rename digest the same before and after the commit
+   that records them, and both are now named acceptance cases distinct from the intervening-deletion
+   and intervening-rename refusals. The rest of the normalisation is spelled out with them: `-z`
+   throughout, entries deduplicated because a conflicted path is listed once per stage, sorted by path
+   bytes, and each entry reduced to path, kind, and either the executable bit or a symlink target -
+   the mode domain a git tree records, which is what makes the disk side and the commit side
+   comparable at all. A gitlink is refused outright rather than hashed as though a commit id were
+   content.
+
+No source code was modified.
