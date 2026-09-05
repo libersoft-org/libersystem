@@ -646,117 +646,115 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut drill_perm: u64 = 0;
 	loop {
 		let mut progress: bool = false;
-		let mut i: usize = 0;
-		while i < N {
-			if state[i] == State::Absent && deps_satisfied(MANIFEST[i].deps, &state) {
-				let mut proc_handle: u64 = 0;
-				let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, &mut block_formats, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
-				// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
-				// bring-up waits for the report, but it is the honest name for the window between
-				// a process existing and a service answering, and it is what a later non-blocking
-				// bring-up would sit in.
-				//
-				// THE EPOCH OF THE INSTANCE THESE RECORDS ARE ABOUT, which is the one just started
-				// and not the one in `procs[i]`. That slot still holds the PREVIOUS instance here -
-				// zero on a first start - so both records carried epoch 0 and the identity M2 added
-				// to tell instances apart was absent from the first two entries of every service's
-				// history.
-				let epoch: u64 = unsafe { epoch_of(proc_handle) };
-				lifecycle.record(i, state[i], State::Starting, epoch, Reason::Started);
-				state[i] = State::Starting;
-				lifecycle.record(i, State::Starting, started, epoch, why);
-				state[i] = started;
-				procs[i] = proc_handle;
-				progress = true;
-				// THE OPERATOR ENDPOINT IS MINTED THE MOMENT DEVICEMANAGER CAN ANSWER, which is
-				// here and not after the bring-up loop: PermissionManager starts near the END of
-				// that loop and is the only thing allowed to hand this connection on, so an endpoint
-				// created afterwards would have nobody to give it to.
-				if MANIFEST[i].name == b"device_manager" && started == State::Ready && policy_admin_server == 0 {
-					unsafe {
-						match channel() {
-							Some((server, client)) => {
-								if send_blocking(channels[i], b"POLICY", client) {
-									policy_admin_server = server;
-								} else {
-									close(server);
-								}
+		let mut cursor: usize = 0;
+		while let Some(i) = service_logic::service_lifecycle::next_startable(cursor, N, |i| state[i] == State::Absent, |i| MANIFEST[i].deps, |dep| index_of(dep).is_some_and(|idx| state[idx] == State::Ready)) {
+			cursor = i + 1;
+			let mut proc_handle: u64 = 0;
+			let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, &mut block_formats, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+			// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
+			// bring-up waits for the report, but it is the honest name for the window between
+			// a process existing and a service answering, and it is what a later non-blocking
+			// bring-up would sit in.
+			//
+			// THE EPOCH OF THE INSTANCE THESE RECORDS ARE ABOUT, which is the one just started
+			// and not the one in `procs[i]`. That slot still holds the PREVIOUS instance here -
+			// zero on a first start - so both records carried epoch 0 and the identity M2 added
+			// to tell instances apart was absent from the first two entries of every service's
+			// history.
+			let epoch: u64 = unsafe { epoch_of(proc_handle) };
+			lifecycle.record(i, state[i], State::Starting, epoch, Reason::Started);
+			state[i] = State::Starting;
+			lifecycle.record(i, State::Starting, started, epoch, why);
+			state[i] = started;
+			procs[i] = proc_handle;
+			progress = true;
+			// THE OPERATOR ENDPOINT IS MINTED THE MOMENT DEVICEMANAGER CAN ANSWER, which is
+			// here and not after the bring-up loop: PermissionManager starts near the END of
+			// that loop and is the only thing allowed to hand this connection on, so an endpoint
+			// created afterwards would have nobody to give it to.
+			if MANIFEST[i].name == b"device_manager" && started == State::Ready && policy_admin_server == 0 {
+				unsafe {
+					match channel() {
+						Some((server, client)) => {
+							if send_blocking(channels[i], b"POLICY", client) {
+								policy_admin_server = server;
+							} else {
+								close(server);
 							}
-							None => print(b"ServiceManager: no channel for the device policy endpoint; the operator verbs are unreachable this boot\n"),
 						}
-					}
-				}
-				// A SERVICE THAT DID NOT START SAYS SO, on the console, by name.
-				//
-				// It was silent: the boot printed every service that came up and nothing at all
-				// for one that did not, so a failed PermissionManager showed as a gap between two
-				// lines nobody counts - and the first visible symptom was the shell never
-				// appearing, four services later. The journal had the event; the console, which is
-				// what a person is watching while a machine boots, did not.
-				if started == State::Failed {
-					unsafe {
-						print(b"ServiceManager: ");
-						print(MANIFEST[i].name);
-						print(b": FAILED to start\n");
-						if !failure_reason[i].is_empty() {
-							print(b"ServiceManager: ");
-							print(MANIFEST[i].name);
-							print(b": ");
-							print(failure_reason[i].as_bytes());
-							print(b"\n");
-						}
-					}
-				}
-				if MANIFEST[i].name == b"process_service" && started == State::Ready {
-					broker_process = unsafe { service_connect(process_client) }.unwrap_or(0);
-				}
-				if MANIFEST[i].name == b"storage_service" && started == State::Ready {
-					broker_storage_admin = storage_admin;
-				}
-				if MANIFEST[i].name == b"permission_manager" && started == State::Ready && selftest {
-					drill_perm = unsafe { service_connect(perm_client) }.unwrap_or(0);
-				}
-				// The development agent launches through PermissionManager like anything else,
-				// so it needs a client of it - and cannot have been given one when it started,
-				// because it starts with the drivers and PermissionManager comes up later. It
-				// is delivered here on DeviceManager's control channel, the same late hand-off
-				// LogService's journal uses below, and DeviceManager passes it on to the agent.
-				// Ignored entirely by a boot that has no agent.
-				if MANIFEST[i].name == b"permission_manager" && started == State::Ready {
-					if let Some(dm) = index_of(b"device_manager") {
-						let launcher: u64 = unsafe { service_connect(perm_client) }.unwrap_or(0);
-						if launcher != 0 {
-							unsafe { send_blocking(channels[dm], b"DEVPERM", launcher) };
-						}
-						// The other end of the pair ProcessService already holds. Sending it now
-						// connects the two without either having had to wait for the other.
-						if registry_far != 0 {
-							unsafe { send_blocking(channels[dm], b"DEVREG", registry_far) };
-							registry_far = 0;
-						}
-					}
-				}
-				// Once the system StorageService is up, drive DeviceManager's phase
-				// 2 - it now loads the non-bootstrap drivers from the volume, which is only
-				// mountable now. This runs before the driver-consuming services (which depend
-				// on process_service, so come up later), so their driver channels are ready.
-				if MANIFEST[i].name == b"storage_service" && started == State::Ready {
-					if let Some(dm) = index_of(b"device_manager") {
-						unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_online, &mut gpu_online, &mut snd_online, &mut input_online, &mut block5_client, &mut usbq_client, &mut usb_pointer_online, &mut raw_keys, &mut buf) };
-					}
-					// LogService starts before StorageService, so its volume client (the
-					// on-disk journal) is delivered late, like its config client: minted
-					// from the freshly mounted system volume and sent on LogService's
-					// control channel.
-					if let Some(lg) = index_of(b"log_service") {
-						let journal: u64 = unsafe { open_storage_directory(storage_admin, "vol://system/log") };
-						if journal != 0 {
-							unsafe { send_blocking(channels[lg], b"STORAGE", journal) };
-						}
+						None => print(b"ServiceManager: no channel for the device policy endpoint; the operator verbs are unreachable this boot\n"),
 					}
 				}
 			}
-			i += 1;
+			// A SERVICE THAT DID NOT START SAYS SO, on the console, by name.
+			//
+			// It was silent: the boot printed every service that came up and nothing at all
+			// for one that did not, so a failed PermissionManager showed as a gap between two
+			// lines nobody counts - and the first visible symptom was the shell never
+			// appearing, four services later. The journal had the event; the console, which is
+			// what a person is watching while a machine boots, did not.
+			if started == State::Failed {
+				unsafe {
+					print(b"ServiceManager: ");
+					print(MANIFEST[i].name);
+					print(b": FAILED to start\n");
+					if !failure_reason[i].is_empty() {
+						print(b"ServiceManager: ");
+						print(MANIFEST[i].name);
+						print(b": ");
+						print(failure_reason[i].as_bytes());
+						print(b"\n");
+					}
+				}
+			}
+			if MANIFEST[i].name == b"process_service" && started == State::Ready {
+				broker_process = unsafe { service_connect(process_client) }.unwrap_or(0);
+			}
+			if MANIFEST[i].name == b"storage_service" && started == State::Ready {
+				broker_storage_admin = storage_admin;
+			}
+			if MANIFEST[i].name == b"permission_manager" && started == State::Ready && selftest {
+				drill_perm = unsafe { service_connect(perm_client) }.unwrap_or(0);
+			}
+			// The development agent launches through PermissionManager like anything else,
+			// so it needs a client of it - and cannot have been given one when it started,
+			// because it starts with the drivers and PermissionManager comes up later. It
+			// is delivered here on DeviceManager's control channel, the same late hand-off
+			// LogService's journal uses below, and DeviceManager passes it on to the agent.
+			// Ignored entirely by a boot that has no agent.
+			if MANIFEST[i].name == b"permission_manager" && started == State::Ready {
+				if let Some(dm) = index_of(b"device_manager") {
+					let launcher: u64 = unsafe { service_connect(perm_client) }.unwrap_or(0);
+					if launcher != 0 {
+						unsafe { send_blocking(channels[dm], b"DEVPERM", launcher) };
+					}
+					// The other end of the pair ProcessService already holds. Sending it now
+					// connects the two without either having had to wait for the other.
+					if registry_far != 0 {
+						unsafe { send_blocking(channels[dm], b"DEVREG", registry_far) };
+						registry_far = 0;
+					}
+				}
+			}
+			// Once the system StorageService is up, drive DeviceManager's phase
+			// 2 - it now loads the non-bootstrap drivers from the volume, which is only
+			// mountable now. This runs before the driver-consuming services (which depend
+			// on process_service, so come up later), so their driver channels are ready.
+			if MANIFEST[i].name == b"storage_service" && started == State::Ready {
+				if let Some(dm) = index_of(b"device_manager") {
+					unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_online, &mut gpu_online, &mut snd_online, &mut input_online, &mut block5_client, &mut usbq_client, &mut usb_pointer_online, &mut raw_keys, &mut buf) };
+				}
+				// LogService starts before StorageService, so its volume client (the
+				// on-disk journal) is delivered late, like its config client: minted
+				// from the freshly mounted system volume and sent on LogService's
+				// control channel.
+				if let Some(lg) = index_of(b"log_service") {
+					let journal: u64 = unsafe { open_storage_directory(storage_admin, "vol://system/log") };
+					if journal != 0 {
+						unsafe { send_blocking(channels[lg], b"STORAGE", journal) };
+					}
+				}
+			}
 		}
 		if !progress {
 			break;
@@ -1088,17 +1086,6 @@ fn all_settled(state: &[State; N]) -> bool {
 			return false;
 		}
 		i += 1;
-	}
-	true
-}
-
-// Whether every dependency in `deps` is in the Running state.
-fn deps_satisfied(deps: &[&[u8]], state: &[State; N]) -> bool {
-	for &dep in deps {
-		match index_of(dep) {
-			Some(idx) if state[idx] == State::Ready => {}
-			_ => return false,
-		}
 	}
 	true
 }

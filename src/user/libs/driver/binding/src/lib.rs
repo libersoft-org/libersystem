@@ -559,6 +559,43 @@ impl BindingEvent {
 	}
 }
 
+// The normal event path has one decision before any publication or teardown effects.
+// Generation filtering remains the queue's job; teardown confirmations are redirected first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EventDecision {
+	Refused,
+	Admitted { event: BindingEvent, next_state: Option<BindingState>, cause: Option<FailureCause>, planned_stop: bool },
+}
+
+pub fn reduce_event(state: BindingState, event: BindingEvent) -> EventDecision {
+	let (next_state, cause, planned_stop) = match event {
+		BindingEvent::Ready { .. } => {
+			if !state.accepts_terminal_frame() {
+				return EventDecision::Refused;
+			}
+			(Some(BindingState::Online), None, false)
+		}
+		BindingEvent::Failed { code, .. } => {
+			if !state.accepts_terminal_frame() {
+				return EventDecision::Refused;
+			}
+			(Some(BindingState::Stopping), Some(FailureCause::DriverReported(code)), false)
+		}
+		BindingEvent::TimedOut { .. } => {
+			if !state.accepts_terminal_frame() {
+				return EventDecision::Refused;
+			}
+			(Some(BindingState::Stopping), Some(FailureCause::HandshakeTimeout), false)
+		}
+		BindingEvent::Stopped { .. } => (state.may_move_to(BindingState::Stopping).then_some(BindingState::Stopping), Some(FailureCause::Stopped), true),
+		BindingEvent::Exited { .. } | BindingEvent::Closed { .. } => (state.may_move_to(BindingState::Stopping).then_some(BindingState::Stopping), Some(FailureCause::DriverExited), false),
+		BindingEvent::Wedged { .. } => (state.may_move_to(BindingState::Stopping).then_some(BindingState::Stopping), Some(FailureCause::Hung), false),
+		BindingEvent::Offered { .. } | BindingEvent::Withdrawn { .. } | BindingEvent::Disconnected { .. } | BindingEvent::Ponged { .. } => (None, None, false),
+		BindingEvent::ClaimSettled { .. } => return EventDecision::Refused,
+	};
+	EventDecision::Admitted { event, next_state, cause, planned_stop }
+}
+
 // A DEVICE NODE'S QUEUE, NOT A BINDING'S.
 //
 // A binding is not the thing that outlives its own events. A queue owned by a binding has nowhere
@@ -708,6 +745,27 @@ impl ProviderId {
 	pub fn belongs_to(self, binding: BindingId) -> bool {
 		self.binding == binding
 	}
+}
+
+// These are the two production derivations: probing sorts a complete slot list, while
+// handing off a role selects the lowest remaining address one connection at a time.
+pub fn sort_probe_slots<T>(slots: &mut [usize], entries: &[Option<T>], id_of: impl Fn(&T) -> ProviderId) {
+	slots.sort_unstable_by_key(|&slot| (entries[slot].as_ref().map(|entry| provider_address(id_of(entry))), slot));
+}
+
+pub fn next_handoff_slot<T>(entries: &[Option<T>], eligible: impl Fn(&T) -> bool, id_of: impl Fn(&T) -> ProviderId) -> Option<usize> {
+	let mut best = None;
+	for (slot, entry) in entries.iter().enumerate() {
+		let Some(entry) = entry.as_ref().filter(|entry| eligible(entry)) else { continue };
+		if best.is_none_or(|previous: usize| entries[previous].as_ref().is_some_and(|held| provider_address(id_of(entry)) < provider_address(id_of(held)))) {
+			best = Some(slot);
+		}
+	}
+	best
+}
+
+fn provider_address(id: ProviderId) -> (u8, u8, u8) {
+	(id.binding.bus, id.binding.dev, id.binding.func)
 }
 
 // THE WITHDRAWAL ITSELF, over any slot array, so the model and the production catalogue run ONE

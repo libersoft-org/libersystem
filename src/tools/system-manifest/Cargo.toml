@@ -23,3 +23,6 @@ path = "src/main.rs"
 # `build-std`'s `core` and `compiler_builtins` too, where a warning is not ours to answer.
 [lints.rust]
 warnings = "deny"
+
+[dev-dependencies]
+service-logic = { path = "../../user/services/logic" }

@@ -35,8 +35,12 @@ trap 'rm -rf "$work"' EXIT
 # make this gate cost a full bring-up to read one line.
 boot_with() {
 	local profile="$1" out="$2"
-	DEV_PROFILE=1 LIBER_BOOT_PROFILE="$profile" SERIAL="file:$out" QEMU_TIMEOUT=60 \
-		timeout 90 src/harness/qemu-run.sh x86_64 "$KERNEL" >/dev/null 2>&1 || true
+	local verdict=perf-plain
+	[[ "$profile" != development-trace ]] || verdict=perf-trace
+	# This direct harness boot assembles its own fresh loader and ISO. Keep the image and
+	# its receipts private too: merge may be booting the checked shipping ISO concurrently.
+	DEV_PROFILE=1 LIBER_BOOT_PROFILE="$profile" LIBER_IMAGE_OUTPUT="$work/$profile.iso" SERIAL="file:$out" \
+		src/tools/guest-verdict.py "$verdict" "$out" -- src/harness/qemu-run.sh x86_64 "$KERNEL"
 }
 
 trace="$work/trace.log"

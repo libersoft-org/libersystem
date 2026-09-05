@@ -168,11 +168,6 @@ if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then
 	printf '%s\ttest_driver\tstart\n' "$(date +%s%N)" >>"$LIBER_TIMING_LOG"
 fi
 
-TEST_ARGS=(test "${TARGET_ARGS[@]}")
-if [[ "$BUILD_ONLY" == "1" ]]; then
-	TEST_ARGS+=(--no-run)
-fi
-
 # A per-TEST watchdog, because the per-suite one cannot tell a slow run from a stopped one.
 #
 # `--timeout` bounds the whole suite, so a run that stops dead on test 83 of 228 burns the entire
@@ -220,60 +215,62 @@ progress_count() {
 # Two changes, both about the watchdog only ever affecting the run that started it: it waits for the
 # guest to EXIST and remembers its pid, and it exits when its parent is gone as well as when its
 # stall mark is removed. A watchdog whose run has already ended has nothing left to watch.
-(
-	last=-1
-	quiet=0
-	parent=$$
-	while sleep 30; do
-		[[ -f "$STALL_MARK" ]] || break
-		kill -0 "$parent" 2>/dev/null || break
-		now="$(progress_count)"
-		if [[ "$now" != "$last" ]]; then
-			last="$now"
-			quiet=0
-		else
-			quiet=$((quiet + 30))
-		fi
-		if ((quiet >= STALL)); then
-			stuck="$(grep -h -E '^[[:alnum:]_]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | tail -1 | sed -E 's/\.\.\..*$//' || true)"
-			printf '%s\t%s\n' "${stuck:-unknown}" "$quiet" >"$STALL_MARK.hit"
-			# By pid, and only a guest this shell is an ancestor of - `pgrep` matches every QEMU on
-			# the machine, so ancestry is what makes the victim ours.
-			#
-			# COLLECTED WHOLE, then chosen from. This pipeline used to end in `head -n 1` inside a
-			# command substitution: with more than one candidate, `head` closes the pipe, the loop
-			# upstream dies of SIGPIPE, `pipefail` makes that the pipeline's status, and `set -e`
-			# ends the WATCHER - at the exact moment it was about to kill the guest, and after it
-			# had already written its `.hit` file. The stall bound then silently collapsed back to
-			# the suite timeout, and the run was classified by a mark left by a watchdog that never
-			# acted. `check-source-hygiene.sh` names this shape, and this was the tree's own
-			# outstanding violation of it.
-			candidates=()
-			while read -r pid; do
-				walk="$pid"
-				while [[ -n "$walk" && "$walk" != "1" ]]; do
-					if [[ "$walk" == "$parent" ]]; then
-						candidates+=("$pid")
-						break
-					fi
-					walk="$(ps -o ppid= -p "$walk" 2>/dev/null | tr -d ' ')"
-				done
-			done < <(pgrep -f "qemu-system-$ARCH" 2>/dev/null || true)
-			if ((${#candidates[@]} == 1)); then
-				kill "${candidates[0]}" 2>/dev/null || true
-			elif ((${#candidates[@]} == 0)); then
-				echo "test-kernel: stalled for ${quiet}s and no guest of this run is running - nothing to stop" >&2
+if [[ "$BUILD_ONLY" != "1" ]]; then
+	(
+		last=-1
+		quiet=0
+		parent=$$
+		while sleep 30; do
+			[[ -f "$STALL_MARK" ]] || break
+			kill -0 "$parent" 2>/dev/null || break
+			now="$(progress_count)"
+			if [[ "$now" != "$last" ]]; then
+				last="$now"
+				quiet=0
 			else
-				# Ambiguous ownership is stated rather than resolved by picking the first. One run
-				# owns one guest; more than one means the assumption this watchdog acts on is wrong,
-				# and killing an arbitrary member of the set is how it would take down the wrong one.
-				echo "test-kernel: stalled for ${quiet}s but this run has ${#candidates[@]} guests (${candidates[*]}) - refusing to guess which to stop" >&2
+				quiet=$((quiet + 30))
 			fi
-			break
-		fi
-	done
-) &
-STALL_WATCHER=$!
+			if ((quiet >= STALL)); then
+				stuck="$(grep -h -E '^[[:alnum:]_]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" 2>/dev/null | tail -1 | sed -E 's/\.\.\..*$//' || true)"
+				printf '%s\t%s\n' "${stuck:-unknown}" "$quiet" >"$STALL_MARK.hit"
+				# By pid, and only a guest this shell is an ancestor of - `pgrep` matches every QEMU on
+				# the machine, so ancestry is what makes the victim ours.
+				#
+				# COLLECTED WHOLE, then chosen from. This pipeline used to end in `head -n 1` inside a
+				# command substitution: with more than one candidate, `head` closes the pipe, the loop
+				# upstream dies of SIGPIPE, `pipefail` makes that the pipeline's status, and `set -e`
+				# ends the WATCHER - at the exact moment it was about to kill the guest, and after it
+				# had already written its `.hit` file. The stall bound then silently collapsed back to
+				# the suite timeout, and the run was classified by a mark left by a watchdog that never
+				# acted. `check-source-hygiene.sh` names this shape, and this was the tree's own
+				# outstanding violation of it.
+				candidates=()
+				while read -r pid; do
+					walk="$pid"
+					while [[ -n "$walk" && "$walk" != "1" ]]; do
+						if [[ "$walk" == "$parent" ]]; then
+							candidates+=("$pid")
+							break
+						fi
+						walk="$(ps -o ppid= -p "$walk" 2>/dev/null | tr -d ' ')"
+					done
+				done < <(pgrep -f "qemu-system-$ARCH" 2>/dev/null || true)
+				if ((${#candidates[@]} == 1)); then
+					kill "${candidates[0]}" 2>/dev/null || true
+				elif ((${#candidates[@]} == 0)); then
+					echo "test-kernel: stalled for ${quiet}s and no guest of this run is running - nothing to stop" >&2
+				else
+					# Ambiguous ownership is stated rather than resolved by picking the first. One run
+					# owns one guest; more than one means the assumption this watchdog acts on is wrong,
+					# and killing an arbitrary member of the set is how it would take down the wrong one.
+					echo "test-kernel: stalled for ${quiet}s but this run has ${#candidates[@]} guests (${candidates[*]}) - refusing to guess which to stop" >&2
+				fi
+				break
+			fi
+		done
+	) &
+	STALL_WATCHER=$!
+fi
 
 # THE COMPILER'S OWN STACK, RAISED, because the test build of this kernel overflows the default.
 #
@@ -372,6 +369,16 @@ PYEOF
 # The staged copy is this run's, and it goes when the run does.
 trap 'rm -f "$STAGED_TEST_KERNEL" "$REPO_ROOT/.build/state/kernel-test-$ARCH.$$.json"' EXIT
 
+# Inventory discovery needs only the descriptor-bearing executable in Cargo's target directory.
+# Build-only never starts the watchdog or runner: a cold inventory needs no volume or medium.
+if [[ "$BUILD_ONLY" == "1" ]]; then
+	if [[ -n "${LIBER_TIMING_LOG:-}" ]]; then printf '%s\ttest_driver\tend\n' "$(date +%s%N)" >>"$LIBER_TIMING_LOG"; fi
+	if [[ "$VERBOSE" == "1" ]]; then print_full_logs; fi
+	rm -f "$STALL_MARK"
+	echo "[test-$ARCH] BUILD PASS ($((SECONDS - START_SECONDS))s); logs: $RUN_LOG"
+	exit 0
+fi
+
 set +e
 (
 	cd "$ROOT/kernel"
@@ -443,10 +450,6 @@ wrong_kernel_diagnosis() {
 
 if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
-	if [[ "$BUILD_ONLY" == "1" ]]; then
-		echo "[test-$ARCH] BUILD TIMEOUT after $LIMIT" >&2
-		exit 124
-	fi
 	last="$(grep -h -E '^[[:alnum:]_]+\.\.\.' "$RUN_LOG" "$GUEST_LOG" | tail -1 | sed -E 's/\.\.\..*$//' || true)"
 	[[ -n "$last" ]] || last="unknown"
 	echo "[test-$ARCH] TIMEOUT after $LIMIT; last test: $last" >&2
@@ -460,15 +463,6 @@ if [[ "$status" -eq 124 || "$status" -eq 137 ]]; then
 	# the guest log was read closely enough to notice which kernel had booted.
 	if [[ "$last" == "unknown" ]]; then wrong_kernel_diagnosis; fi
 	exit 124
-fi
-if [[ "$BUILD_ONLY" == "1" ]]; then
-	if [[ "$status" -eq 0 ]]; then
-		echo "[test-$ARCH] BUILD PASS (${elapsed}s); logs: $RUN_LOG"
-	else
-		if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi
-		echo "[test-$ARCH] BUILD FAIL (exit $status, ${elapsed}s); logs: $RUN_LOG" >&2
-	fi
-	exit "$status"
 fi
 if [[ "$status" -eq 0 ]] && ! grep -hEq '^test suite complete: [0-9]+ passed' "$RUN_LOG" "$GUEST_LOG"; then
 	if [[ "$VERBOSE" != "1" ]]; then print_failure_logs; fi

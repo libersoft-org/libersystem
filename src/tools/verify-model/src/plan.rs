@@ -17,7 +17,7 @@ use crate::catalog::{Catalog, Check, CheckKind, Environment, Variant};
 use crate::graph::{Edge, Graph};
 use crate::ownership::{Owner, Ownership};
 use crate::registry::{ARCHITECTURES, Registry, prefix_match};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 // The unit of work, and the key every history is stored under.
@@ -28,7 +28,7 @@ use std::collections::{BTreeMap, BTreeSet};
 // planner chose the dev guest; and all three still lose the configuration, which is not academic
 // here - `proto` must be host-tested under default features AND under `shared-image`, because
 // those two builds do not contain the same dependencies.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct PlanItemKey {
 	pub check: String,
 	pub architecture: String,
@@ -42,7 +42,7 @@ impl PlanItemKey {
 	}
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PlanItem {
 	#[serde(flatten)]
 	pub key: PlanItemKey,
@@ -51,7 +51,7 @@ pub struct PlanItem {
 	pub reason: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PathVerdict {
 	pub path: String,
 	pub outcome: String,
@@ -117,7 +117,7 @@ fn digest(text: &str) -> u64 {
 	hash
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Plan {
 	// Whether this is the whole thing. Recorded rather than inferred from the item count, because
 	// "everything happened to be selected" and "the selector gave up and asked for everything" are

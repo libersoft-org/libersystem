@@ -653,17 +653,17 @@ fn an_unconfirmed_teardown_ignores_the_intent_entirely() {
 
 #[test]
 fn a_ready_that_arrives_after_the_deadline_does_not_undo_the_timeout() {
-	// ONCE THE FORCED PATH HAS BEEN ENTERED THE OUTCOME IS DECIDED. The alternative is a report that
-	// says a driver came up when the manager had already torn it down - and by then its claim is
-	// released and its process signalled, so "it is up" would be a claim about nothing.
 	let mut record = BindingRecord::new();
 	assert!(record.move_to(BindingState::Binding, None));
-	assert!(record.move_to(BindingState::Stopping, Some(FailureCause::HandshakeTimeout)));
-	assert!(record.move_to(BindingState::Backoff, Some(FailureCause::HandshakeTimeout)));
-	// The late `READY`. The table has no edge from `Backoff` to `Online`, so it is refused by the
-	// same rule every other illegal transition is - not by a special case somebody remembered.
-	assert!(!record.move_to(BindingState::Online, None), "a late READY is late, and late is not up");
-	assert!(record.state == BindingState::Backoff);
+	let timeout = BindingEvent::TimedOut { generation: 31 };
+	let ready = BindingEvent::Ready { generation: 31 };
+	let decision = reduce_event(record.state, timeout);
+	assert!(decision == EventDecision::Admitted { event: timeout, next_state: Some(BindingState::Stopping), cause: Some(FailureCause::HandshakeTimeout), planned_stop: false });
+	let EventDecision::Admitted { next_state: Some(next), cause, .. } = decision else { panic!("timeout must end this attempt") };
+	assert!(record.move_to(next, cause));
+	assert!(reduce_event(record.state, ready) == EventDecision::Refused);
+	assert!(record.state == BindingState::Stopping);
+	assert!(record.failure == Some(FailureCause::HandshakeTimeout));
 	// AND WHAT THE TIMED-OUT ATTEMPT HELD IS GONE, which is the half a state comparison cannot make.
 	// The table refusing the late `READY` says nothing about the device, the child or the handles -
 	// and "at most one claim owner, no leaked process, handle or counter" is what M7 asks after each
@@ -1636,4 +1636,56 @@ fn a_reader_that_asks_for_generation_zero_loses_a_teardowns_confirmations() {
 	let mut closes = CountingCloses(0);
 	assert_eq!(pending.settle(&mut closes, 0, 1_000), None, "and with no confirmation the teardown can only wait");
 	assert_eq!(pending.settle(&mut closes, 1_000, 1_000), Some(Settled::Unconfirmed), "until its deadline, where it lands Quarantined - which is what the whole system did");
+}
+
+// P02M0177: the queue already generated the timeout before READY was consumed.
+// check-driver-event-dispatch.py restores the missing timeout guard in a source copy
+// and requires this exact regression to fail (the defect repaired by ad3e28c7).
+#[test]
+fn a_queued_timeout_cannot_disconnect_an_already_ready_driver() {
+	let ready = BindingEvent::Ready { generation: 31 };
+	let timeout = BindingEvent::TimedOut { generation: 31 };
+	let mut record = BindingRecord::new();
+	assert!(record.move_to(BindingState::Binding, None));
+	let decision = reduce_event(record.state, ready);
+	assert!(decision == EventDecision::Admitted { event: ready, next_state: Some(BindingState::Online), cause: None, planned_stop: false });
+	let EventDecision::Admitted { next_state: Some(next), cause, .. } = decision else { panic!("READY must come online") };
+	assert!(record.move_to(next, cause));
+	assert!(reduce_event(record.state, timeout) == EventDecision::Refused);
+	assert!(record.state == BindingState::Online);
+	assert!(record.failure.is_none());
+}
+
+#[test]
+fn ending_events_keep_their_causes_and_only_stopped_is_a_clean_stop() {
+	let code = DriverFailureCode::DeviceNotResponding;
+	for (event, cause, planned_stop) in [
+		(BindingEvent::Failed { generation: 31, code }, FailureCause::DriverReported(code), false),
+		(BindingEvent::Stopped { generation: 31 }, FailureCause::Stopped, true),
+		(BindingEvent::Exited { generation: 31 }, FailureCause::DriverExited, false),
+		(BindingEvent::Closed { generation: 31 }, FailureCause::DriverExited, false),
+		(BindingEvent::TimedOut { generation: 31 }, FailureCause::HandshakeTimeout, false),
+		(BindingEvent::Wedged { generation: 31 }, FailureCause::Hung, false),
+	] {
+		assert!(reduce_event(BindingState::Binding, event) == EventDecision::Admitted { event, next_state: Some(BindingState::Stopping), cause: Some(cause), planned_stop });
+	}
+	assert!(reduce_event(BindingState::Stopping, BindingEvent::Stopped { generation: 31 }) == EventDecision::Admitted { event: BindingEvent::Stopped { generation: 31 }, next_state: None, cause: Some(FailureCause::Stopped), planned_stop: true });
+}
+
+#[test]
+fn disk_probes_and_role_handoff_name_the_same_provider_at_every_index() {
+	// Publication order differs from bus order; two children on one controller also
+	// prove that equal bus addresses retain their publication-slot tie break.
+	let provider = |bus, dev, slot| ProviderId::new(BindingId::new(bus, dev, 0, 31), slot, 7);
+	let mut entries = [Some((provider(1, 8, 0), true)), Some((provider(0, 6, 1), true)), None, Some((provider(0, 2, 3), true)), Some((provider(0, 6, 4), true))];
+	let mut probes = [0, 1, 3, 4];
+	sort_probe_slots(&mut probes, &entries, |entry| entry.0);
+	assert_eq!(probes, [3, 1, 4, 0]);
+	for probe_slot in probes {
+		let handoff_slot = next_handoff_slot(&entries, |entry| entry.1, |entry| entry.0).expect("each probe has a role connection");
+		assert!(entries[probe_slot].unwrap().0 == entries[handoff_slot].unwrap().0);
+		entries[handoff_slot].as_mut().unwrap().1 = false;
+	}
+	assert_eq!(next_handoff_slot(&entries, |entry| entry.1, |entry| entry.0), None);
+	// The gate removes the production probe sort and requires this test to fail.
 }

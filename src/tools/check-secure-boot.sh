@@ -42,20 +42,34 @@ done
 [[ -f "$OVMF_VARS_TEMPLATE" ]] || fail "no OVMF variable template at $OVMF_VARS_TEMPLATE"
 [[ -f "$LOADER" ]] || fail "no loader at $LOADER - run ./build.sh --arch x86_64 --part loader"
 
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+# signed-boot can rebuild this path with another trust profile. Acquire only while its
+# producer lock is held; signing and every later medium read use this run's immutable copy.
+mkdir -p .build/state
+(
+	flock 9
+	cp "$LOADER" "$work/loader.efi"
+) 9>.build/state/kernel-test-build.lock
+LOADER="$work/loader.efi"
+
 # THE TEST CERTIFICATE, GENERATED ONCE AND CACHED. It is a test key: it is generated here rather
 # than committed, so nothing in this repository is a key-shaped file somebody could mistake for one
 # that matters, and it never leaves `.build`.
 mkdir -p "$SECDIR"
-if [[ ! -f "$SECDIR/test-pk.pem" || ! -f "$SECDIR/test-pk.key" ]]; then
-	openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
-		-subj "/CN=LiberSystem test platform key/" \
-		-keyout "$SECDIR/test-pk.key" -out "$SECDIR/test-pk.pem" >/dev/null 2>&1 ||
-		fail "could not generate the test platform key"
-	echo "secure-boot: generated a test platform key in $SECDIR"
-fi
+(
+	flock 9
+	if [[ ! -f "$SECDIR/test-pk.pem" || ! -f "$SECDIR/test-pk.key" ]]; then
+		openssl req -new -x509 -newkey rsa:2048 -nodes -sha256 -days 3650 \
+			-subj "/CN=LiberSystem test platform key/" \
+			-keyout "$SECDIR/test-pk.key" -out "$SECDIR/test-pk.pem" >/dev/null 2>&1 ||
+			fail "could not generate the test platform key"
+		echo "secure-boot: generated a test platform key in $SECDIR"
+	fi
+) 9>"$SECDIR/key.lock"
 
 # SIGNED AFTER ITS BYTES ARE FINAL, and checked back by a different tool than the one that signed.
-signed="$SECDIR/loader-signed.efi"
+signed="$work/loader-signed.efi"
 sbsign --key "$SECDIR/test-pk.key" --cert "$SECDIR/test-pk.pem" --output "$signed" "$LOADER" >/dev/null 2>&1 ||
 	fail "sbsign could not sign the loader"
 sbverify --cert "$SECDIR/test-pk.pem" "$signed" >/dev/null 2>&1 ||
@@ -64,16 +78,13 @@ echo "secure-boot: the loader is signed and the signature verifies independently
 
 # THE VARIABLE STORE IS A PRIVATE COPY. The distribution template is never written: a gate that
 # enrols into it changes what every other boot on this machine trusts.
-vars="$SECDIR/vars-enrolled.fd"
+vars="$work/vars-enrolled.fd"
 virt-fw-vars --input "$OVMF_VARS_TEMPLATE" --output "$vars" \
 	--set-pk "$OWNER_GUID" "$SECDIR/test-pk.pem" \
 	--add-kek "$OWNER_GUID" "$SECDIR/test-pk.pem" \
 	--add-db "$OWNER_GUID" "$SECDIR/test-pk.pem" \
 	--secure-boot >/dev/null 2>&1 || fail "virt-fw-vars could not enrol the test key"
 echo "secure-boot: enrolled PK/KEK/db into a private variable store"
-
-work="$(mktemp -d)"
-trap 'rm -rf "$work"' EXIT
 
 # One medium, with whichever loader it was given.
 #
@@ -88,15 +99,15 @@ medium_with() {
 }
 
 boot() {
-	local efi="$1" log="$2" store="$work/vars.$$.fd"
+	local efi="$1" log="$2" verdict="$3" store="$work/vars.$$.fd"
 	cp "$vars" "$store"
-	timeout 120 qemu-system-x86_64 \
+	src/tools/guest-verdict.py "$verdict" "$log" -- qemu-system-x86_64 \
 		-machine q35,smm=on -m 2G -display none -no-reboot \
 		-global driver=cfi.pflash01,property=secure,value=on \
 		-drive "if=pflash,format=raw,unit=0,readonly=on,file=$OVMF_SECBOOT" \
 		-drive "if=pflash,format=raw,unit=1,file=$store" \
 		-drive "format=raw,file=$efi" \
-		-serial "file:$log" >/dev/null 2>&1 || true
+		-serial "file:$log" || return 1
 	rm -f "$store"
 }
 
@@ -109,7 +120,7 @@ chmod u+w "$esp"
 signed_medium="$work/signed.img"
 medium_with "$signed" "$signed_medium"
 signed_log="$work/signed.log"
-boot "$signed_medium" "$signed_log"
+boot "$signed_medium" "$signed_log" secure-signed
 
 grep -aq "loader: firmware SecureBoot=1 SetupMode=0 (enforcing)" "$signed_log" || {
 	echo "secure-boot: the guest did not report enforcing firmware" >&2
@@ -125,7 +136,7 @@ echo "secure-boot: a signed loader runs and reports SecureBoot=1 SetupMode=0"
 unsigned_medium="$work/unsigned.img"
 medium_with "$LOADER" "$unsigned_medium"
 unsigned_log="$work/unsigned.log"
-boot "$unsigned_medium" "$unsigned_log"
+boot "$unsigned_medium" "$unsigned_log" secure-unsigned
 
 if grep -aq "loader: TEST TRUST\|loader: release trust" "$unsigned_log"; then
 	echo "secure-boot: an UNSIGNED loader ran under enforcing firmware" >&2
@@ -143,7 +154,7 @@ printf '\x01' | dd of="$altered" bs=1 seek=$((size / 2)) count=1 conv=notrunc st
 altered_medium="$work/altered.img"
 medium_with "$altered" "$altered_medium"
 altered_log="$work/altered.log"
-boot "$altered_medium" "$altered_log"
+boot "$altered_medium" "$altered_log" secure-altered-loader
 if grep -aq "loader: TEST TRUST\|loader: release trust" "$altered_log"; then
 	echo "secure-boot: a bit-modified signed loader ran under enforcing firmware" >&2
 	sed -n '1,30p' "$altered_log" >&2
@@ -160,7 +171,7 @@ mcopy -i "$both" ::/etc/boot.manifest2 "$work/manifest2" || fail "the medium car
 printf '\x01' | dd of="$work/manifest2" bs=1 seek=40 count=1 conv=notrunc status=none
 mcopy -o -i "$both" "$work/manifest2" ::/etc/boot.manifest2
 both_log="$work/both.log"
-boot "$both" "$both_log"
+boot "$both" "$both_log" secure-altered-manifest
 if grep -aq "loader: kernel loaded" "$both_log"; then
 	echo "secure-boot: a signed loader with an altered manifest still loaded a kernel" >&2
 	sed -n '1,30p' "$both_log" >&2

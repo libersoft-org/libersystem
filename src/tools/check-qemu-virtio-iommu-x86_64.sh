@@ -195,7 +195,7 @@ fi
 echo "qemu-virtio-iommu: booting the shipping image with an ordinary virtio-net endpoint behind the controller"
 traffic="$work/traffic.log"
 cp "$OVMF_VARS" "$work/vars.fd"
-timeout 300 qemu-system-x86_64 \
+src/tools/guest-verdict.py iommu-traffic "$traffic" -- qemu-system-x86_64 \
 	-machine q35,default-bus-bypass-iommu=off \
 	-m 2G -smp 4 -display none -no-reboot \
 	-drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE" \
@@ -204,7 +204,7 @@ timeout 300 qemu-system-x86_64 \
 	-device virtio-iommu-pci,boot-bypass=on \
 	-netdev user,id=n0 \
 	-device virtio-net-pci,netdev=n0,disable-legacy=on,iommu_platform=on \
-	-serial "file:$traffic" >/dev/null 2>&1 || true
+	-serial "file:$traffic"
 
 grep -aq "iommu: virtio-iommu is translating" "$traffic" || fail "the shipping boot did not bring the controller up"
 grep -aq "iommu: .* attached to domain" "$traffic" || {
@@ -248,13 +248,13 @@ echo "qemu-virtio-iommu:   a DHCP lease was obtained through the enforcing contr
 #    developer does, with no flags, and asks the boot what machine it is.
 echo "qemu-virtio-iommu: booting the DEFAULT machine, the way an ordinary run does"
 default_log="$work/default.log"
-timeout 120 ./run.sh --smp 4 --serial "file:$default_log" >/dev/null 2>&1 || true
+src/tools/guest-verdict.py iommu-default "$default_log" -- ./run.sh --smp 4 --serial "file:$default_log"
 [[ -s "$default_log" ]] || fail "the default run produced no serial output"
 # AND IT DID NOT DIE AFTER SAYING SO.
 #
-# `|| true` is not optional here - an ordinary run does not exit, so the timeout is what ends it -
-# but it also swallowed every way the guest could fail. A boot that printed all the lines below and
-# panicked ten seconds later passed this phase. The greps that follow assert the absence of degraded
+# The watcher preserves the whole 120-second observation, and checks process exits as well as
+# serial failures. A boot that printed all the lines below and panicked ten seconds later once
+# passed this phase. The greps that follow assert the absence of degraded
 # rows and of faults; these assert the absence of the boot ending badly, which is the same kind of
 # check and was the one missing.
 survived_the_boot() {
@@ -373,7 +373,7 @@ echo "qemu-virtio-iommu:   the default machine is translated, nothing is degrade
 # is every one whose firmware offers no IOMMU.
 echo "qemu-virtio-iommu: booting --no-iommu, the machine without one"
 plain_log="$work/plain.log"
-timeout 120 ./run.sh --no-iommu --smp 4 --serial "file:$plain_log" >/dev/null 2>&1 || true
+src/tools/guest-verdict.py iommu-plain "$plain_log" -- ./run.sh --no-iommu --smp 4 --serial "file:$plain_log"
 [[ -s "$plain_log" ]] || fail "the --no-iommu run produced no serial output"
 survived_the_boot "$plain_log" "--no-iommu"
 grep -aq "iommu: no virtio-iommu on this machine" "$plain_log" || fail "--no-iommu still put a controller in the machine"

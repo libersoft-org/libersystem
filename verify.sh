@@ -44,25 +44,28 @@ suite_result_log() {
 
 help() {
 	usage_and_exit <<EOF
-usage: verify.sh [--for-change | --for PATH[,PATH...] | --for-range A..B | --release | --sweep]
+usage: verify.sh [--for-change | --for PATH[,PATH...] | --for-range A..B | --merge FILE | --release | --sweep]
                  [--jobs N] [--plan] [--explain] [--json] [--shadow] [--allow-shadow] [--candidate FILE]
                  [--catalog] [--model-hash] [--age] [--trust]
 
-Works out what a change needs verified and runs exactly that. With no arguments: --for-change.
+With no arguments, run the inner share of the working-tree change and write a merge handoff.
+Commit exactly the tested content, then complete verification with --merge FILE.
 
   --for-change     everything the working tree says was changed (the default)
   --for PATH       plan for these paths instead of asking git
   --for-range A..B plan for the paths a commit range touched
+  --merge FILE     complete an inner handoff at HEAD; no budget, two guest slots by default
   --release        the release gate: build all, check all, boot all three, no optimisation applied
   --sweep          the whole suite on every target at one immutable revision, in a git worktree
   --shadow         run the FULL suite and compare it against what this change would have scoped
   --shadow-exec    the same, but RUN the selection first and compare the two runs (one target)
-  --allow-shadow   accept a scoped run with no shadow evidence (exit 0 instead of 4); --dev is an alias
+  --allow-shadow   accept evidence without shadow trust; inner still exits 6 (--dev is an alias)
   --candidate FILE plan the shadow comparison against a FROZEN narrowing and record it under that
                    candidate's model hash. The run that happens is unchanged and still full; what
                    the candidate changes is which selection the comparison is graded against, which
                    is how a narrowing earns the evidence its activation demands.
-  --jobs N         how many guests may boot at once (default 1; parallelism is opted into)
+  --jobs N         guest slots (inner default 1, merge default 2; explicit values override either)
+  --budget N       estimated seconds the inner run may start, including prerequisites
   --plan           print the plan and run nothing
   --explain        print why every item is in the plan
   --json           the plan as JSON, for anything that is not a person
@@ -76,6 +79,7 @@ examples:
   ./verify.sh --plan                       # what would run
   ./verify.sh --for src/user/libs/audio/flac --explain
   ./verify.sh --for-range HEAD~3..HEAD --plan
+  ./verify.sh --merge .build/state/verify-tiers/RUN/handoff.json
   ./verify.sh --release
 
 The plan is per PlanItemKey - (check, architecture, environment, configuration) - and the run
@@ -87,18 +91,15 @@ EOF
 }
 
 mode=for-change
-# HOW MANY GUESTS MAY RUN AT ONCE, and the default is ONE.
-#
-# Parallelism is opted into, because the failure mode of getting it wrong is a green that means
-# nothing and the failure mode of not using it is a slow run. The machine has a hundred cores and
-# used one; what changed is that asking for more stopped being dangerous - every writable image a
-# guest touches is now this run's own copy, the fixtures it reads are attached read-only, and each
-# consumer reads the logs its own run named.
+# Inner starts with one guest slot; merge uses two unless the caller supplies --jobs.
+# Writable media and producer acquisitions remain private to each overlapping run.
 #
 # THIS IS THE ONLY SCHEDULER. `--release` and `--sweep` are flat by design - they consult no model
 # and read no plan, because they are what runs when the thing that makes choices is broken - so they
 # take no limiter and run one architecture at a time instead.
 JOBS=1
+JOBS_EXPLICIT=0
+merge_file=""
 # A CEILING ON WHAT THIS RUN MAY START, in ESTIMATED seconds. Zero means no ceiling.
 #
 # Not a timeout: it decides what to start and never kills a step that overran its estimate. What it
@@ -133,6 +134,12 @@ while [[ $# -gt 0 ]]; do
 		[[ $# -ge 2 ]] || die "--for-range needs a range like A..B"
 		mode=for-range
 		range="$2"
+		shift 2
+		;;
+	--merge)
+		[[ $# -ge 2 ]] || die "--merge needs an inner handoff file"
+		merge_file="$2"
+		mode=merge
 		shift 2
 		;;
 	--release)
@@ -179,6 +186,7 @@ while [[ $# -gt 0 ]]; do
 	--jobs)
 		JOBS="${2:?--jobs needs a number}"
 		[[ "$JOBS" =~ ^[1-9][0-9]*$ ]] || die "--jobs takes a positive whole number, not '$JOBS'"
+		JOBS_EXPLICIT=1
 		shift 2
 		;;
 	--plan)
@@ -213,6 +221,12 @@ while [[ $# -gt 0 ]]; do
 	*) die "unexpected argument '$1' (try --help)" ;;
 	esac
 done
+
+if [[ -n "$merge_file" ]]; then
+	[[ "$mode" == merge && -z "$paths" && -z "$range" ]] || die "--merge cannot be combined with another change or flat mode"
+	[[ "$action" == run && ${#candidate_arg[@]} == 0 ]] || die "--merge completes its handoff; display and shadow modes are separate entry points"
+	((JOBS_EXPLICIT == 1)) || JOBS=2
+fi
 
 # The canonical FULL path: build everything, check everything, boot every target.
 #
@@ -266,7 +280,7 @@ planner_failed() {
 # refusal is louder than a note nobody reads.
 if ((BUDGET_SET == 1)); then
 	case "$mode" in
-	sweep | release) die "--budget cannot be combined with --$mode: that mode's whole claim is that everything ran" ;;
+	sweep | release | merge) die "--budget cannot be combined with --$mode: that mode's whole claim is that everything ran" ;;
 	esac
 	[[ "$action" == shadow ]] && die "--budget cannot be combined with --shadow: a shadow compares a scoped run against the FULL suite, and a bounded full suite is not one"
 fi
@@ -343,6 +357,10 @@ esac
 # One parser now, in `verify-model`, over the machine-readable formats, returning BOTH sides of a
 # rename. The corpus calls the same function.
 case "$mode" in
+merge)
+	# The tier model reads the pinned commit delta after validating the handoff.
+	changed=""
+	;;
 for-change)
 	# A PREPARED PLAN IS ABOUT THE EXECUTOR AND NOT ABOUT THE TREE (2026-09-03).
 	#
@@ -630,6 +648,10 @@ fi
 # Ask for the commands, and treat every way of not getting them as the same answer.
 steps_file="$(mktemp)"
 trap 'rm -f "$steps_file"' EXIT
+tier_mode=""
+tier_state=""
+tier_outcomes=""
+tier_handoff=""
 # A PREPARED PLAN, WHICH IS HOW THE EXECUTOR ITSELF IS TESTED (added 2026-09-02).
 #
 # Everything below this line is the executor - the blocker suppression, the guest barrier, the
@@ -645,8 +667,30 @@ trap 'rm -f "$steps_file"' EXIT
 if [[ -n "${LIBER_VERIFY_STEPS:-}" ]]; then
 	[[ -r "$LIBER_VERIFY_STEPS" ]] || die "LIBER_VERIFY_STEPS names a file this cannot read: $LIBER_VERIFY_STEPS"
 	cat "$LIBER_VERIFY_STEPS" >"$steps_file"
-elif ! printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- commands --stdin >"$steps_file"; then
-	planner_failed "the planner exited non-zero"
+else
+	mkdir -p "$BUILD_DIR/state/verify-tiers"
+	tier_run="$(mktemp -d "$BUILD_DIR/state/verify-tiers/run.XXXXXX")"
+	tier_state="$tier_run/state.json"
+	tier_outcomes="$tier_run/outcomes.tsv"
+	tier_handoff="$tier_run/handoff.json"
+	: >"$tier_outcomes"
+	if [[ "$mode" == merge ]]; then
+		tier_mode=merge
+		cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-merge-prepare --handoff "$merge_file" --state "$tier_state" >"$tier_run/inventory.tsv" || planner_failed "merge refused its handoff"
+		while IFS=$'\t' read -r marker architecture; do
+			[[ "$marker" == TARGET ]] || planner_failed "unrecognized inventory preparation output"
+			case "$architecture" in
+			x86_64 | aarch64 | riscv64) ;;
+			*) planner_failed "unknown inventory target '$architecture'" ;;
+			esac
+			note "merge inventory: $architecture"
+			"$SRC_DIR/harness/test-kernel.sh" "$architecture" --build-only || die "merge inventory did not build for $architecture"
+		done <"$tier_run/inventory.tsv"
+		cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-merge-commands --state "$tier_state" >"$steps_file" || planner_failed "merge could not reconcile its refreshed inventory"
+	else
+		tier_mode=inner
+		printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-inner --state "$tier_state" --stdin >"$steps_file" || planner_failed "the inner tier could not produce its partition"
+	fi
 fi
 [[ -s "$steps_file" ]] || planner_failed "the planner produced no output"
 grep -q $'^STATUS\t' "$steps_file" || planner_failed "the planner's output has no STATUS line"
@@ -659,7 +703,7 @@ nothing-to-do)
 	# An empty plan is only ever legitimate for this one reason, and it is named rather than
 	# implied. "Nothing selected" for any other reason is escalated by the planner itself.
 	note "nothing to verify: $status_detail"
-	exit 0
+	[[ -n "$tier_mode" ]] || exit 0
 	;;
 full)
 	note "FULL: $status_detail"
@@ -673,7 +717,7 @@ scoped)
 esac
 
 count="$(grep -c $'^STEP\t' "$steps_file" || true)"
-((count > 0)) || planner_failed "a $status plan with no steps"
+((count > 0)) || [[ -n "$tier_mode" ]] || planner_failed "a $status plan with no steps"
 note "$count step(s)"
 
 # WHICH STEPS A BUDGET CAN AFFORD, decided before anything starts.
@@ -849,6 +893,10 @@ record_one_step() {
 	keys_file="$(mktemp)"
 	awk -v want="$index" -F'\t' '$1 == "KEY" && $2 == want { print $3 }' "$steps_file" >"$keys_file"
 	if [[ -s "$keys_file" ]]; then
+		if [[ -n "$tier_outcomes" ]]; then
+			# The handoff's evidence is recorded before the best-effort mutable history.
+			awk -v outcome="${outcome#--}" '{ print outcome "\t" $0 }' "$keys_file" >>"$tier_outcomes"
+		fi
 		(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- record --step-id "${step_ids[$index]:-}" --keys-file "$keys_file" "$outcome" --seconds "$seconds") || note "        (the run happened; recording it did not)"
 	fi
 	rm -f "$keys_file" "$outfile"
@@ -1045,6 +1093,14 @@ if ((${#skipped[@]} > 0)); then
 fi
 note "all $count step(s) passed"
 
+if [[ "$tier_mode" == inner ]]; then
+	cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-inner-finish --state "$tier_state" --outcomes "$tier_outcomes" --handoff "$tier_handoff" || planner_failed "the inner snapshot or its evidence changed; no usable handoff was produced"
+	note "inner handoff: $tier_handoff"
+	printf 'verify.sh: after committing exactly the tested content, run: ./verify.sh --merge %q\n' "$tier_handoff"
+elif [[ "$tier_mode" == merge ]]; then
+	cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-merge-finish --state "$tier_state" --outcomes "$tier_outcomes" || planner_failed "merge could not account for every obligation at the pinned revision"
+fi
+
 # What that green is WORTH, said before anything else.
 #
 # The design's rule is that a scoped answer is not believed because it is plausible: until a
@@ -1078,11 +1134,14 @@ if [[ -n "${LIBER_VERIFY_STEPS:-}" ]]; then
 	note "prepared plan: the executor ran it; no trust level is claimed, because this run says nothing about the tree"
 	exit 0
 fi
-level_line="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- level --stdin 2>/dev/null || true)"
+level_line="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- tier-level --state "$tier_state")" || planner_failed "the tier's evidence level could not be judged"
 level="${level_line%%$'\t'*}"
 case "$level" in
 FULL)
 	note "verification level: FULL - everything ran, this stands on its own"
+	;;
+INCOMPLETE)
+	note "inner share passed; revision verification is still owed by the person proposing the change"
 	;;
 TRUSTED)
 	note "verification level: TRUSTED - every changed component has shadow evidence under this model"
@@ -1106,7 +1165,7 @@ SHADOW)
 	fi
 	;;
 *)
-	note "verification level: unknown - the planner could not judge it, so treat this as scoped-only"
+	planner_failed "unknown tier evidence level '$level'"
 	;;
 esac
 
@@ -1122,3 +1181,9 @@ if [[ -n "$stale" ]]; then
 	note "age: $stale"
 	note "     ./verify.sh --age  to see them, ./verify.sh --sweep  to clear them at one revision"
 fi
+
+if [[ "$tier_mode" == inner ]]; then
+	note "INCOMPLETE: merge is required even when the deferred set is empty"
+	exit 6
+fi
+note "merge completed at the pinned revision"

@@ -143,6 +143,8 @@ declare -A GATES=(
 	# set had no catalogue root in it - so the development configuration deadlocked on the first
 	# service to ask the catalogue for a connection, and nothing boots that configuration to notice.
 	["one-wait"]="tools/check-one-wait.sh"
+	["driver-event-dispatch"]="python3 tools/check-driver-event-dispatch.py"
+	["guest-verdict"]="python3 tools/check-guest-verdict.py"
 	# A capability the grant loop never walks is one no manifest row can deliver. `lsdev` held
 	# `DevicePolicy` from the day the operator verbs were built and received the CONFIG client under
 	# its tag, so every operator verb was unreachable; `kill` had the same hole and could end nothing.

@@ -26,6 +26,7 @@
 #
 # The artifact is written to .build/boot/<product-slug>.{iso,img}; its path is
 # printed to stdout (progress goes to stderr) so callers can capture it.
+# For `iso` only, LIBER_IMAGE_OUTPUT gives an internal guest its own image and receipts.
 
 set -euo pipefail
 
@@ -114,6 +115,15 @@ ensure_dir() {
 
 stamp_epoch() {
 	touch -d "@$SOURCE_DATE_EPOCH" "$@"
+}
+
+# FAT timestamps belong to the image's copy. Touching Cargo's loader output makes its next
+# build relink, changing the PE timestamp/debug identity and invalidating other image receipts.
+stage_loader() {
+	local out="$1"
+	CANDIDATES+=("$out")
+	cp "$LOADER_EFI" "$out"
+	stamp_epoch "$out"
 }
 
 # The tool identities this image's bytes depend on. Two builders with different mtools, xorriso or
@@ -404,8 +414,10 @@ make_iso() {
 	truncate -s "${total}M" "$efi_img"
 	mformat -i "$efi_img" -N "${MTOOLS_FAT_SERIAL#0x}" ::
 	mmd -i "$efi_img" ::/EFI ::/EFI/BOOT
-	stamp_epoch "$LOADER_EFI" "$staged"
-	mcopy -i "$efi_img" "$LOADER_EFI" ::/EFI/BOOT/BOOTX64.EFI
+	local staged_loader="$BUILD/loader.$$.efi"
+	stage_loader "$staged_loader"
+	stamp_epoch "$staged"
+	mcopy -i "$efi_img" "$staged_loader" ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i "$efi_img" "$staged" ::/kernel
 	# The TEST medium carries the bootstrap set as FILES, the same way the disk image's ESP does
 	# and the same way the system volume does. It needs its own copy because it carries the factory
@@ -498,8 +510,10 @@ make_img() {
 
 	mformat -i "$esp" -N "${MTOOLS_FAT_SERIAL#0x}" ::
 	mmd -i "$esp" ::/EFI ::/EFI/BOOT
-	stamp_epoch "$LOADER_EFI" "$staged"
-	mcopy -i "$esp" "$LOADER_EFI" ::/EFI/BOOT/BOOTX64.EFI
+	local staged_loader="$BUILD/loader.$$.efi"
+	stage_loader "$staged_loader"
+	stamp_epoch "$staged"
+	mcopy -i "$esp" "$staged_loader" ::/EFI/BOOT/BOOTX64.EFI
 	mcopy -i "$esp" "$staged" ::/kernel
 	# The bootstrap set as FILES, not as a packaged archive.
 	#
@@ -554,7 +568,7 @@ flock 9
 
 case "$cmd" in
 iso)
-	output="$BUILD/$SLUG.iso"
+	output="${LIBER_IMAGE_OUTPUT:-$BUILD/$SLUG.iso}"
 	mode_input="iso"
 	;;
 testiso)
@@ -678,8 +692,8 @@ fi
 # two runs of the SAME selection want the same file and want it built once. Two generations are two
 # files, and replacing one is not something that can happen to the other.
 #
-# The shipping ISO and the raw image keep their plain names: they are what a person installs, one
-# artifact per tree, and nothing races them.
+# Shipping outputs keep their plain names. Internal non-test guests can opt into their own ISO
+# path, so assembling their private loader cannot replace the installable image or its receipts.
 if [[ "$cmd" == testiso ]]; then
 	output="$BUILD/$SLUG-test.$key.iso"
 fi

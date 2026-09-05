@@ -194,6 +194,34 @@ run_plan "$plan" --jobs 2 || rc=$?
 check "both steps ran" 0 "$rc"
 check "the one-slot step waited for the two-slot step instead of joining it" "wide-start wide-end narrow" "$(tr '\n' ' ' <"$trace" | sed 's/ *$//')"
 
+# The normal merge parser supplies two slots without an explicit --jobs. The prepared steps
+# exercise the same scheduler while making no claim about a commit or an actual guest verdict.
+plan="$work/merge-default"
+trace="$work/merge-default.trace"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	for index in 0 1; do
+		printf 'STEP\t%s\t0\tport %s\tsh -c "echo start-%s >> %s; sleep 1; echo end-%s >> %s"\t\n' "$index" "$index" "$index" "$trace" "$index" "$trace"
+		printf 'STEPID\t%s\tid-%s\nSTEPCOST\t%s\t1\nSTEPGUESTS\t%s\t1\n' "$index" "$index" "$index" "$index"
+	done
+} >"$plan"
+rc=0
+run_plan "$plan" --merge "$work/handoff" || rc=$?
+check "merge starts both guest steps with its default slots" 0 "$rc"
+check "both starts precede either end under the merge default" 2 "$(head -2 "$trace" | grep -c '^start-' || true)"
+: >"$trace"
+rc=0
+run_plan "$plan" --merge "$work/handoff" --jobs 1 || rc=$?
+check "an explicit one-slot merge remains serial" "start-0 end-0 start-1 end-1" "$(tr '\n' ' ' <"$trace" | sed 's/ *$//')"
+for budget in 0 1; do
+	: >"$trace"
+	rc=0
+	run_plan "$plan" --merge "$work/handoff" --budget "$budget" || rc=$?
+	check "merge rejects budget $budget before starting work" 1 "$rc"
+	check "the budget refusal names the incompatible mode" 1 "$(grep -c -- '--budget cannot be combined with --merge' "$out" || true)"
+	check "budget $budget starts no guest" 0 "$(wc -c <"$trace")"
+done
+
 if ((failed != 0)); then
 	echo "verify-scheduler: the shell scheduler did not behave as the milestone requires" >&2
 	exit 1

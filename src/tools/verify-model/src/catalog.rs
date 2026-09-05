@@ -17,10 +17,10 @@
 use crate::crates::Crate;
 use crate::graph::Graph;
 use crate::registry::{ARCHITECTURES, Registry};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CheckKind {
 	Build,
@@ -42,7 +42,7 @@ pub enum CheckKind {
 	GuestFallback,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum Environment {
 	#[serde(rename = "host")]
 	Host,
@@ -74,14 +74,14 @@ impl Environment {
 }
 
 // One runnable thing. `architecture` is "host" for work that is not per target.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Variant {
 	pub architecture: String,
 	pub environment: Environment,
 	pub configuration: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Check {
 	pub id: String,
 	pub kind: CheckKind,
@@ -123,7 +123,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 70] = [
+const GATES: [(&str, &str); 72] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -325,6 +325,8 @@ const GATES: [(&str, &str); 70] = [
 	// and nothing boots that configuration to have noticed. Same subject and same cost as the gate
 	// above: it reads the manager's source.
 	("one-wait", "services"),
+	("driver-event-dispatch", "services"),
+	("guest-verdict", "harness.tools"),
 	// Every capability the security IDL declares is one PermissionManager's grant loop walks. Two
 	// were missing and both were silent: the manager reported success having sent nothing, and the
 	// launched program read the NEXT capability under the missing one's tag. Its subject is the

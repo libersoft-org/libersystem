@@ -87,7 +87,9 @@ fn kernel_anchor() -> PathBuf {
 // Both packages now go to `.build/boot` for every architecture. They used to land in the
 // kernel's OUT_DIR for aarch64 and riscv64 because the kernel embedded them; it no longer does.
 fn boot_dir() -> PathBuf {
-	let dir = repo_root().join(".build/boot");
+	// Refusal fixtures need a private volume and bootstrap fallback, without replacing the
+	// ordinary artifacts a concurrently scheduled guest is about to read.
+	let dir = env::args().find_map(|arg| arg.strip_prefix("--output-dir=").map(PathBuf::from)).unwrap_or_else(|| repo_root().join(".build/boot"));
 	let _ = fs::create_dir_all(&dir);
 	dir
 }

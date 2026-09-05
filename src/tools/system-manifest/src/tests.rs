@@ -472,3 +472,53 @@ fn a_heartbeat_deadline_of_zero_or_past_the_ceiling_is_refused() {
 	let past = driver("heartbeat-deadline = 101\n");
 	assert!(errors(&past).contains("can opt out"), "{}", errors(&past));
 }
+
+#[test]
+fn generated_volume_services_wait_for_storage_despite_name_order() {
+	let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+	let manifest = Manifest::load_workspace(&workspace).expect("the production manifest must validate");
+	fn startup(manifest: &Manifest) -> Vec<String> {
+		// Read the generator's actual emitted rows, including its sorted names and deps.
+		let generated = service_manifest_source(manifest);
+		let rows = generated
+			.lines()
+			.filter_map(|line| {
+				let line = line.trim().strip_prefix("Service { name: b\"")?;
+				let name = line.split('"').next().unwrap().to_owned();
+				let dependencies = line.split("deps: &[").nth(1).unwrap().split("] },").next().unwrap();
+				let dependencies = dependencies.split("b\"").skip(1).map(|part| part.split('"').next().unwrap().to_owned()).collect::<Vec<_>>();
+				Some((name, dependencies))
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(rows.len(), manifest.services.len());
+		assert!(rows.windows(2).all(|rows| rows[0].0 < rows[1].0), "the generator is name-sorted, not topologically sorted");
+		let dependencies = rows.iter().map(|(_, deps)| deps.iter().map(|name| name.as_bytes()).collect::<Vec<_>>()).collect::<Vec<_>>();
+		let mut order = Vec::new();
+		loop {
+			let before = order.len();
+			let mut cursor = 0;
+			while let Some(index) = service_logic::service_lifecycle::next_startable(cursor, rows.len(), |index| !order.contains(&rows[index].0), |index| &dependencies[index], |dep| order.iter().any(|name: &String| name.as_bytes() == dep)) {
+				cursor = index + 1;
+				order.push(rows[index].0.clone());
+			}
+			if before == order.len() {
+				break;
+			}
+		}
+		assert_eq!(order.len(), rows.len(), "the dependency scheduler must reach every service");
+		order
+	}
+	let follows_storage = |order: &[String], volume: &str| order.iter().position(|name| name == volume).unwrap() > order.iter().position(|name| name == "storage_service").unwrap();
+	let order = startup(&manifest);
+	for volume in ["iso_storage", "media_storage", "udf_storage"] {
+		assert!(follows_storage(&order, volume), "{volume} started before storage_service");
+	}
+	// Restore the missing edges fixed by ad3e28c7; the already-correct scheduler
+	// cannot infer an undeclared dependency from a service's name or its program.
+	let mut negative = manifest.clone();
+	for service in negative.services.values_mut().filter(|service| ["iso_storage", "media_storage", "udf_storage"].contains(&service.name.as_str())) {
+		service.dependencies.retain(|dependency| dependency.as_str() != "storage_service");
+	}
+	let negative_order = startup(&negative);
+	assert!(!["iso_storage", "media_storage", "udf_storage"].iter().all(|volume| follows_storage(&negative_order, volume)), "removing the dependencies must fail the same startup-order oracle");
+}

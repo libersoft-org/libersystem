@@ -58,6 +58,11 @@ fn main() -> ExitCode {
 
 fn run() -> Result<ExitCode, String> {
 	let arguments: Vec<String> = env::args().skip(1).collect();
+	if arguments.first().is_some_and(|name| name.starts_with("tier-") || matches!(name.as_str(), "effective-tree" | "source-model-hash")) {
+		verify_model::tier::run(&find_repo_root()?, &arguments, emit_steps)?;
+		return Ok(ExitCode::SUCCESS);
+	}
+
 	let mut command = String::from("plan");
 	let mut paths: Vec<String> = Vec::new();
 	let mut component: Option<String> = None;
@@ -1175,97 +1180,7 @@ fn run() -> Result<ExitCode, String> {
 			// are emitted separately rather than crammed into the STEP line because a kernel-suite
 			// step carries two hundred of them, and a line the runner has to split on two different
 			// separators is a line somebody will parse wrong.
-			let cost = verify_model::history::CostModel { whole_suite_tests: model.kernel_tests.declared_ids, ..verify_model::history::CostModel::default() };
-			let history = verify_model::history::History::load(&model.repo_root).unwrap_or_default();
-			let model_hash = model.model_hash();
-			// CHEAPEST FIRST, AMONG THE STEPS WHOSE PREREQUISITES ARE MET.
-			//
-			// A plan that is going to fail runs its cheapest evidence last, which is minutes of
-			// waiting for news that a two-second host suite already had. Ordering by cost alone
-			// would emit a guest before the build it cannot start without, so the sort is by LAYER
-			// first - how deep in the dependency graph a step sits - and by cost inside a layer.
-			//
-			// The id breaks ties, so the emission is stable: a plan that reorders itself between two
-			// identical runs is one nobody can diff.
-			let mut ordered = verify_model::commands::steps(&plan, &per_target, &model.registry);
-			// VALIDATED BEFORE IT IS WALKED - see `commands::validate`. A plan whose graph is wrong
-			// is not a plan to emit with a warning: the runner would read it, wait on a step nobody
-			// emits, or run one before what it reads.
-			if let Err(faults) = verify_model::commands::validate(&ordered) {
-				for fault in &faults {
-					eprintln!("verify-model: {fault}");
-				}
-				eprintln!("verify-model: the plan's dependency graph is not usable, so no plan is emitted");
-				std::process::exit(1);
-			}
-			let mut layers: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-			for _ in 0..ordered.len() {
-				for step in &ordered {
-					let depth = step.requires.iter().map(|id| layers.get(id).copied().map_or(0, |d| d + 1)).max().unwrap_or(0);
-					layers.insert(step.id.clone(), depth);
-				}
-			}
-			ordered.sort_by(|left, right| {
-				let (dl, dr) = (layers.get(&left.id).copied().unwrap_or(0), layers.get(&right.id).copied().unwrap_or(0));
-				// THE SAME NUMBER THE `STEPCOST` LINE WILL CARRY, SEED AND ALL (fixed 2026-09-03).
-				//
-				// The emitter applies `seed_seconds` - the conservative floor for a step nobody has
-				// timed - and this comparator did not, so the plan ORDERED on one number and
-				// PRINTED another. Every gate key is `host`/`host`, whose fixed term is nothing, so
-				// an unmeasured profile row or concurrency gate sorted as the cheapest work in the
-				// plan while printing a cost of hundreds of seconds beside it: cheapest-first put
-				// the guest boots in front of the one-second host suites they were supposed to
-				// follow.
-				let cl = step_cost(&history, &cost, left, &model_hash);
-				let cr = step_cost(&history, &cost, right, &model_hash);
-				dl.cmp(&dr).then(cl.partial_cmp(&cr).unwrap_or(std::cmp::Ordering::Equal)).then(left.id.cmp(&right.id))
-			});
-			for (index, step) in ordered.into_iter().enumerate() {
-				println!("STEP\t{}\t{}\t{}\t{}\t{}", index, step.keys.len(), step.label, step.command, step.note.clone().unwrap_or_default());
-				// ITS OWN LINE, not a seventh field. The runner reads a STEP line into six names and
-				// puts everything after the fifth tab into the last one, so a field appended there
-				// would be glued onto the note. A new marker is skipped by a reader that does not
-				// know it and read by one that does, which is what lets the scheduler arrive later
-				// without a flag day.
-				println!("STEPID\t{index}\t{}", step.id);
-				// WHAT IT CANNOT START BEFORE, and WHAT IT IS EXPECTED TO COST. Both on their own
-				// lines for the reason the id is: a reader that does not know a marker skips it, so
-				// the runner can learn about them without a flag day.
-				//
-				// The cost is an ESTIMATE over the keys this step discharges, which is the only
-				// number available before it has ever run. A budget is a sum of estimates and is not
-				// a timeout: it decides what to START, never what to kill.
-				for required in &step.requires {
-					println!("STEPREQ\t{index}\t{required}");
-				}
-				// MEASURED IF IT HAS BEEN, ESTIMATED IF IT HAS NOT.
-				//
-				// `estimate` sums per-key costs, which for a merged step is the batching's own
-				// arithmetic handed back as a prediction. A step has one duration; once it has been
-				// run under this model, that duration is the answer and the estimate is only the
-				// seed for a step nobody has timed yet.
-				//
-				// AND AN UNMEASURED STEP IS NEVER FREE (corrected 2026-09-02). The estimate is a
-				// floor away from zero for a gate: every gate key is `host`/`host`, whose fixed term
-				// is nothing and whose one key at the default per-key cost rounded to `STEPCOST 0` -
-				// so the profile rows and the concurrency gate, which boot QEMU, were priced as the
-				// cheapest work in the plan and admitted by any budget at all. `seed_seconds` is the
-				// conservative floor M4 asks for, and the round is UP: a sub-second estimate is a
-				// short step, not a free one.
-				println!("STEPCOST\t{index}\t{}", step_cost(&history, &cost, &step, &model_hash).ceil() as u64);
-				// HOW MANY GUEST SLOTS THIS STEP NEEDS AT ONCE - see `Step::guests`. EMITTED FOR
-				// EVERY STEP, because the runner now classifies guest work by this number rather
-				// than by matching the command text, and a number the plan does not carry is a
-				// number the runner reads as zero (corrected 2026-09-02). It used to be emitted only
-				// above one, on the reasoning that "one is what the runner already assumes for
-				// anything that boots" - which was true only while "anything that boots" meant a
-				// command containing `./test.sh --arch `, and it stopped being true the moment a
-				// gate row that boots QEMU through `check.sh` became its own step.
-				println!("STEPGUESTS\t{index}\t{}", step.guests);
-				for key in &step.keys {
-					println!("KEY\t{index}\t{}", key.display());
-				}
-			}
+			emit_steps(&model, verify_model::commands::steps(&plan, &per_target, &model.registry))?;
 			Ok(ExitCode::SUCCESS)
 		}
 		"plan" => {
@@ -1299,6 +1214,100 @@ fn run() -> Result<ExitCode, String> {
 		}
 		other => Err(format!("unknown command '{other}'\n\n{USAGE}")),
 	}
+}
+
+fn emit_steps(model: &Model, mut ordered: Vec<verify_model::commands::Step>) -> Result<(), String> {
+	let cost = verify_model::history::CostModel { whole_suite_tests: model.kernel_tests.declared_ids, ..verify_model::history::CostModel::default() };
+	let history = verify_model::history::History::load(&model.repo_root).unwrap_or_default();
+	let model_hash = model.model_hash();
+	// CHEAPEST FIRST, AMONG THE STEPS WHOSE PREREQUISITES ARE MET.
+	//
+	// A plan that is going to fail runs its cheapest evidence last, which is minutes of
+	// waiting for news that a two-second host suite already had. Ordering by cost alone
+	// would emit a guest before the build it cannot start without, so the sort is by LAYER
+	// first - how deep in the dependency graph a step sits - and by cost inside a layer.
+	//
+	// The id breaks ties, so the emission is stable: a plan that reorders itself between two
+	// identical runs is one nobody can diff.
+	// VALIDATED BEFORE IT IS WALKED - see `commands::validate`. A plan whose graph is wrong
+	// is not a plan to emit with a warning: the runner would read it, wait on a step nobody
+	// emits, or run one before what it reads.
+	if let Err(faults) = verify_model::commands::validate(&ordered) {
+		for fault in &faults {
+			eprintln!("verify-model: {fault}");
+		}
+		eprintln!("verify-model: the plan's dependency graph is not usable, so no plan is emitted");
+		return Err(faults.join("; "));
+	}
+	let mut layers: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+	for _ in 0..ordered.len() {
+		for step in &ordered {
+			let depth = step.requires.iter().map(|id| layers.get(id).copied().map_or(0, |d| d + 1)).max().unwrap_or(0);
+			layers.insert(step.id.clone(), depth);
+		}
+	}
+	ordered.sort_by(|left, right| {
+		let (dl, dr) = (layers.get(&left.id).copied().unwrap_or(0), layers.get(&right.id).copied().unwrap_or(0));
+		// THE SAME NUMBER THE `STEPCOST` LINE WILL CARRY, SEED AND ALL (fixed 2026-09-03).
+		//
+		// The emitter applies `seed_seconds` - the conservative floor for a step nobody has
+		// timed - and this comparator did not, so the plan ORDERED on one number and
+		// PRINTED another. Every gate key is `host`/`host`, whose fixed term is nothing, so
+		// an unmeasured profile row or concurrency gate sorted as the cheapest work in the
+		// plan while printing a cost of hundreds of seconds beside it: cheapest-first put
+		// the guest boots in front of the one-second host suites they were supposed to
+		// follow.
+		let cl = step_cost(&history, &cost, left, &model_hash);
+		let cr = step_cost(&history, &cost, right, &model_hash);
+		dl.cmp(&dr).then(cl.partial_cmp(&cr).unwrap_or(std::cmp::Ordering::Equal)).then(left.id.cmp(&right.id))
+	});
+	for (index, step) in ordered.into_iter().enumerate() {
+		println!("STEP\t{}\t{}\t{}\t{}\t{}", index, step.keys.len(), step.label, step.command, step.note.clone().unwrap_or_default());
+		// ITS OWN LINE, not a seventh field. The runner reads a STEP line into six names and
+		// puts everything after the fifth tab into the last one, so a field appended there
+		// would be glued onto the note. A new marker is skipped by a reader that does not
+		// know it and read by one that does, which is what lets the scheduler arrive later
+		// without a flag day.
+		println!("STEPID\t{index}\t{}", step.id);
+		// WHAT IT CANNOT START BEFORE, and WHAT IT IS EXPECTED TO COST. Both on their own
+		// lines for the reason the id is: a reader that does not know a marker skips it, so
+		// the runner can learn about them without a flag day.
+		//
+		// The cost is an ESTIMATE over the keys this step discharges, which is the only
+		// number available before it has ever run. A budget is a sum of estimates and is not
+		// a timeout: it decides what to START, never what to kill.
+		for required in &step.requires {
+			println!("STEPREQ\t{index}\t{required}");
+		}
+		// MEASURED IF IT HAS BEEN, ESTIMATED IF IT HAS NOT.
+		//
+		// `estimate` sums per-key costs, which for a merged step is the batching's own
+		// arithmetic handed back as a prediction. A step has one duration; once it has been
+		// run under this model, that duration is the answer and the estimate is only the
+		// seed for a step nobody has timed yet.
+		//
+		// AND AN UNMEASURED STEP IS NEVER FREE (corrected 2026-09-02). The estimate is a
+		// floor away from zero for a gate: every gate key is `host`/`host`, whose fixed term
+		// is nothing and whose one key at the default per-key cost rounded to `STEPCOST 0` -
+		// so the profile rows and the concurrency gate, which boot QEMU, were priced as the
+		// cheapest work in the plan and admitted by any budget at all. `seed_seconds` is the
+		// conservative floor M4 asks for, and the round is UP: a sub-second estimate is a
+		// short step, not a free one.
+		println!("STEPCOST\t{index}\t{}", step_cost(&history, &cost, &step, &model_hash).ceil() as u64);
+		// HOW MANY GUEST SLOTS THIS STEP NEEDS AT ONCE - see `Step::guests`. EMITTED FOR
+		// EVERY STEP, because the runner now classifies guest work by this number rather
+		// than by matching the command text, and a number the plan does not carry is a
+		// number the runner reads as zero (corrected 2026-09-02). It used to be emitted only
+		// above one, on the reasoning that "one is what the runner already assumes for
+		// anything that boots" - which was true only while "anything that boots" meant a
+		// command containing `./test.sh --arch `, and it stopped being true the moment a
+		// gate row that boots QEMU through `check.sh` became its own step.
+		println!("STEPGUESTS\t{index}\t{}", step.guests);
+		for key in &step.keys {
+			println!("KEY\t{index}\t{}", key.display());
+		}
+	}
+	Ok(())
 }
 
 fn emit(plan: &Plan, json: bool, explain: bool, quiet: bool, model: &Model) -> Result<(), String> {

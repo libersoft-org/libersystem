@@ -1691,3 +1691,45 @@ fn push_error(errors: &mut Vec<ValidationError>, location: impl Into<String>, me
 
 #[cfg(test)]
 mod tests;
+
+// The production ServiceManager table, shared with the host startup regression.
+pub fn service_manifest_source(manifest: &Manifest) -> String {
+	let mut entries = String::new();
+	let mut plans = String::new();
+	for service in manifest.services.values() {
+		let program = manifest.programs.get(&service.program).expect("validated service program");
+		let restart = match service.restart {
+			Restart::Transparent => "Restart::Transparent",
+			Restart::Escalate => "Restart::Escalate",
+		};
+		let dependencies = service.dependencies.iter().map(|dependency| format!("b\"{dependency}\" as &'static [u8]")).collect::<Vec<_>>().join(", ");
+		let roles = service
+			.roles
+			.iter()
+			.map(|role| {
+				let kind = match role.kind {
+					RoleKind::ServeRoot => "RoleKind::ServeRoot",
+					RoleKind::Client => "RoleKind::Client",
+					RoleKind::Factory => "RoleKind::Factory",
+					RoleKind::Privilege => "RoleKind::Privilege",
+					// The validator refuses a power role outright, so reaching here means that check
+					// was weakened without this generator being told.
+					RoleKind::Power => panic!("services/manifest.toml declares a power role, which the executor has no way to deliver"),
+					RoleKind::Package => "RoleKind::Package",
+					RoleKind::Device => "RoleKind::Device",
+					RoleKind::Payload => "RoleKind::Payload",
+				};
+				let required = role.presence == Presence::Required;
+				format!("Role {{ tag: b\"{}\", kind: {kind}, provider: b\"{}\", source: b\"{}\", required: {required}, exclusive: {}, handed_on: {} }}", role.tag, role.provider, role.source, role.exclusive, role.handed_on)
+			})
+			.collect::<Vec<_>>()
+			.join(", ");
+		entries.push_str(&format!("\tService {{ name: b\"{}\", program: b\"{}\", pinned: {}, restart: {restart}, deps: &[{dependencies}] }},\n", service.name, service.program, program.stage == Stage::Pinned));
+		plans.push_str(&format!("\t&[{roles}],\n"));
+	}
+	// THE PLAN IS INDEXED THE SAME WAY THE MANIFEST IS, deliberately: two arrays over one order
+	// cannot drift the way two tables keyed by name can, and the supervisor already walks services
+	// by index. `ROLES[i]` is what `MANIFEST[i]` must be handed, in the order it must arrive.
+	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst N: usize = {};\nconst MANIFEST: [Service; N] = [\n{entries}];\nconst ROLES: [&[Role]; N] = [\n{plans}];\n", manifest.services.len());
+	generated
+}

@@ -10,6 +10,7 @@ use crate::plan::Plan;
 use crate::registry::Configuration;
 use std::collections::{BTreeMap, BTreeSet};
 
+#[derive(Clone, Debug)]
 pub struct Step {
 	// WHEN TWO STEPS ARE THE SAME WORK. What schedules this one, what its dependencies are stated
 	// in, and what its cost is keyed on - which is a different question from what it DISCHARGES, and

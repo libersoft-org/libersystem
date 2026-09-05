@@ -1013,7 +1013,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 		// M2's format routing indexes ONE by the other, so the alignment has to be real before it
 		// can be relied on.
 		let mut block_entries: Vec<usize> = catalogue.entries.iter().enumerate().filter(|(_, entry)| entry.as_ref().is_some_and(|held| held.kind == driver_protocol::provider::BLOCK)).map(|(index, _)| index).collect();
-		block_entries.sort_by_key(|&slot| catalogue.entries[slot].as_ref().map_or(u32::MAX, address_of));
+		driver_binding::sort_probe_slots(&mut block_entries, &catalogue.entries, |provider| provider.id);
 		for found in block_entries {
 			let minted = mint_connection(catalogue, nodes, found);
 			// ALLOC-OK: one per block provider, and the catalogue that holds them is bounded.
@@ -2448,23 +2448,8 @@ impl Catalogue {
 		// and a FAT BPB cannot tell a removable medium from a USB stick. What differs is where each
 		// one is plugged in, and the boot scan enumerates the bus ONCE, in bus order - so bus:dev:fn
 		// is stable across boots in a way "whichever answered first" never was.
-		let mut best: Option<usize> = None;
-		for slot in 0..MAX_PROVIDERS {
-			let Some(provider) = self.entries[slot].as_ref() else { continue };
-			if provider.kind != kind || provider.handle == 0 {
-				continue;
-			}
-			let better = match best {
-				None => true,
-				Some(previous) => self.entries[previous].as_ref().is_some_and(|held| address_of(provider) < address_of(held)),
-			};
-			if better {
-				best = Some(slot);
-			}
-		}
-		let slot = match best {
-			Some(slot) => slot,
-			None => return 0,
+		let Some(slot) = driver_binding::next_handoff_slot(&self.entries, |provider| provider.kind == kind && provider.handle != 0, |provider| provider.id) else {
+			return 0;
 		};
 		match self.entries[slot].as_mut() {
 			Some(provider) => {
@@ -2625,12 +2610,6 @@ fn outstanding(provider: &Provider) -> u16 {
 	provider.consumers.saturating_add(u16::from(provider.handle != 0))
 }
 
-// One comparable number for a function's place on the bus, so "lowest address first" is one
-// comparison rather than three.
-fn address_of(provider: &Provider) -> u32 {
-	((provider.id.binding.bus as u32) << 16) | ((provider.id.binding.dev as u32) << 8) | provider.id.binding.func as u32
-}
-
 impl Provider {
 	// Whether this provider belongs to that binding - the same function AND the same generation,
 	// because a provider published by a binding that is over is not this binding's.
@@ -2696,7 +2675,7 @@ unsafe fn give_up_with_budget(record: &mut BindingRecord, txn: &mut Attempt, off
 		// because `Stopping` is what "there is a teardown to run" means. Going straight to `Failed`
 		// records a node that never had a device, which is a different story about the same boot.
 		let took_the_device = txn.held.claim != 0;
-		if took_the_device {
+		if took_the_device && record.state != BindingState::Stopping {
 			record.move_to(BindingState::Stopping, Some(cause));
 		}
 		// STEPS 1 TO 3. Where the node lands is decided when the confirmations arrive, so it is
@@ -2794,13 +2773,8 @@ unsafe fn resolve_teardown(node: &mut Node, driver_name: &[u8], now: u64) -> Opt
 
 // GIVE THE ATTEMPT BACK AND TRY AGAIN. Answers false when the teardown did not confirm, which ends
 // the node rather than rebinding over a device that may still be writing to memory.
-unsafe fn retry_or_quarantine(record: &mut BindingRecord, txn: &mut Attempt, offers: &mut Offers, pending: &mut Option<Teardown>, deadline: u64, cause: FailureCause) {
+unsafe fn retry_or_quarantine(txn: &mut Attempt, offers: &mut Offers, pending: &mut Option<Teardown>, deadline: u64, cause: FailureCause) {
 	unsafe {
-		// Through `Stopping` for the same reason `give_up` does it: there is a device to quieten, and
-		// the table has no edge from `Binding` to `Backoff` once one has been taken.
-		if txn.held.claim != 0 {
-			record.move_to(BindingState::Stopping, Some(cause));
-		}
 		let mut teardown = txn.begin_teardown(offers, deadline);
 		teardown.cause = cause;
 		teardown.retrying = true;
@@ -3786,18 +3760,21 @@ enum Step {
 // bindings, and the generation on each is what keeps them apart.
 unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue) -> Step {
 	unsafe {
-		while let Some(event) = node.pop() {
-			// AN EVENT ARRIVING DURING A TEARDOWN BELONGS TO THE TEARDOWN. The node is `Stopping`
-			// and the only two facts it is waiting for are the child's exit and the claim settling;
-			// anything else a dying binding emits is about a binding that is already over.
-			if let Some(teardown) = node.teardown.as_mut() {
-				teardown.pending.note(event);
+		loop {
+			// A Copy event must leave scope before effects can see the admitted payload.
+			let decision = {
+				let Some(popped) = node.pop() else { break };
+				if let Some(teardown) = node.teardown.as_mut() {
+					teardown.pending.note(popped);
+					continue;
+				}
+				driver_binding::reduce_event(node.record.state, popped)
+			};
+			let driver_binding::EventDecision::Admitted { event, next_state, cause, planned_stop } = decision else {
+				print(b"DeviceManager: an event outside its binding phase was refused\n");
 				continue;
-			}
-			// WHETHER THIS WAS A STOP THAT COMPLETED, so the outcome can be stated once the
-			// teardown has answered rather than before it has run - see the `Stopped` arm.
-			let mut planned_stop = false;
-			let cause: FailureCause = match event {
+			};
+			match event {
 				// AN OFFER BEFORE `READY` IS HELD; AN OFFER AFTER IT IS PUBLISHED AT ONCE.
 				//
 				// Driver readiness and provider readiness are different facts. `READY` means the
@@ -3848,7 +3825,6 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// `hung`, NOT `handshake-timeout`. A driver that came up and then went quiet is
 					// a different fact from one that never answered at all, and a reader cannot act
 					// on "it did not answer" without knowing which.
-					FailureCause::Hung
 				}
 				// A CLAIM SETTLING WHEN NO TEARDOWN IS OUTSTANDING. The teardown arm above consumes
 				// these; one arriving here belongs to a teardown that has already been resolved -
@@ -3876,26 +3852,11 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					// unpublished through the handshake enters the catalogue here - in one place,
 					// so a provider offered before `READY` and one offered after it are published
 					// by the same code under the same bound.
-					// EXACTLY ONE TERMINAL FRAME, AND THE STATE TABLE IS WHAT SAYS SO.
-					//
-					// The result of `move_to` was discarded, so a SECOND `READY` on an already-online
-					// binding was acted on in full: the table refused `Online -> Online` silently, and
-					// this went on to publish the offers again, re-arm supervision and report
-					// `Step::Online` a second time. The handshake ends in one `READY` or one `FAILED`;
-					// a driver that sends another is not making a transition, and the refusal the
-					// table already computes is the answer - it just had to be read.
-					// AND REFUSING IT CHANGES NOTHING, WHICH `Step::Again` IS NOT (2026-09-03).
-					//
-					// `Again` means "this candidate may be tried again", and every caller acts on
-					// it: phase one calls `begin_bind`, phase two and the standing loop call
-					// `start_candidate`. On a node that is already `Online` that bind is illegal, and
-					// `start_candidate` reads each refusal as a candidate that failed and advances
-					// the cursor - so a duplicate frame, which must change nothing, could exhaust the
-					// list a later recovery would have chosen from. The rest of the queue is drained
-					// instead, which is what "idempotent" means for an event that carries no fact.
-					if !node.record.state.accepts_terminal_frame() || !node.record.move_to(BindingState::Online, None) {
-						print(b"DeviceManager: a second terminal frame on a binding that is already past its handshake - refused\n");
-						continue;
+					if let Some(next) = next_state {
+						if !node.record.move_to(next, cause) {
+							print(b"DeviceManager: the admitted binding transition was refused\n");
+							continue;
+						}
 					}
 					// THE BRING-UP INCIDENT IS SPENT AND A NEW ONE STARTS WHEN THE RECOVERY DOES.
 					//
@@ -3937,21 +3898,6 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 				// frame and there should not be one: the two are different facts and the protocol
 				// already has a word for each.
 				BindingEvent::Failed { code, .. } => {
-					// AND THE SAME RULE ON THIS SIDE OF THE CHOICE, which is where it was missing.
-					//
-					// `READY` was refused a second time because the state table has no `Online ->
-					// Online` edge; `FAILED` was not, because it does not move to a fixed state - it
-					// computes a cause and goes through the teardown, and the teardown is reachable
-					// from `Online` for the good reason that a driver can crash after coming up. So
-					// `READY` then `FAILED` on one generation took an online binding apart on the
-					// strength of a frame the handshake had already ended. It is a second terminal
-					// frame and it is refused like the other one.
-					// The same on this side of the choice, and for the same reason: see the `READY`
-					// arm above.
-					if !node.record.state.accepts_terminal_frame() {
-						print(b"DeviceManager: a second terminal frame on a binding that is already past its handshake - refused\n");
-						continue;
-					}
 					// A DRIVER THAT SAID WHY. Retryability is read off the code rather than decided
 					// again here: `device-not-responding` and `out-of-memory` are the two a second
 					// attempt can change, and the other three describe a driver that has read its
@@ -3959,67 +3905,24 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 					print(b"DeviceManager: ");
 					print_driver_name(driver_name);
 					print(if code.retryable() { b" reported a retryable failure\n" } else { b" reported a permanent failure\n" });
-					FailureCause::DriverReported(code)
 				}
 				// A PLANNED STOP COMPLETING, which is not a failure and must not be recorded as one.
 				// The node carries the intent it was stopped WITH, and that is what decides where a
 				// confirmed teardown lands - a driver that died goes back round to `Backoff` and
 				// then `Binding`, and an operator's stop that did the same would be a stop that
 				// starts the driver again.
-				BindingEvent::Stopped { .. } => {
-					// SAID AFTER THE TEARDOWN, NOT BEFORE IT. This printed "stopped cleanly" HERE -
-					// before `roll_back` had called `device_release` and learned whether the device
-					// went quiet - so an unconfirmed teardown could announce a clean flush and then
-					// land in `Quarantined`. The answer is recorded and the line is printed below,
-					// once there is something to base it on.
-					planned_stop = true;
-					// AND IT IS NOT `driver-exited` - WHICH IT WAS, AND THE COMMENT KNEW (fixed
-					// 2026-09-01). The previous version returned `DriverExited` and said in as many
-					// words that the cause "renders as 'it exited without saying anything', which is
-					// the opposite of what a STOPPED frame is" - and then returned it anyway,
-					// arguing the cause "only travels so the shared teardown path has one to carry".
-					// It travels further: the shared path captures an incident, prints it and
-					// PERSISTS it, so a clean shutdown left a stored row telling the operator the
-					// driver had crashed. M3 requires a planned stop not to be classified as a crash,
-					// and a comment describing the lie is not the same as not telling it.
-					FailureCause::Stopped
-				}
-				// The process ended, or its channel closed with nothing terminal on it. Both are a
-				// driver that is gone without having said anything.
-				BindingEvent::Exited { .. } | BindingEvent::Closed { .. } => FailureCause::DriverExited,
+				BindingEvent::Stopped { .. } | BindingEvent::Exited { .. } | BindingEvent::Closed { .. } => {}
+
 				BindingEvent::TimedOut { .. } => {
-					// AND A TIMEOUT IS A CLAIM ABOUT THE HANDSHAKE, WHICH IS FALSE ONCE THE
-					// HANDSHAKE HAS ENDED (fixed 2026-09-04). This is the third terminal event and
-					// the only one that did not ask - `READY` and `FAILED` both refuse a frame that
-					// arrives past the handshake, with the reasoning written out twice above, and
-					// the same reasoning applies here more plainly still: a deadline says the driver
-					// did not answer, and a driver that HAS answered makes it untrue.
-					//
-					// The deadline is checked in the central wait and the event is QUEUED; the
-					// driver's `READY` can arrive in the same pass and be processed first. On x86_64
-					// the answer always beat the deadline, so the race was never taken. On an
-					// emulated machine the two land together - measured on aarch64: five drivers
-					// printed `online`, DeviceManager PUBLISHED all five block providers, and then
-					// tore every one of them down for never having reported in. The incident even
-					// says `online` in the same line as the complaint.
-					//
-					// Because that happens inside the boot test, nothing after it ran: 353 of 569
-					// aarch64 kernel-test entries had never recorded a pass and riscv64 had not one,
-					// while x86_64 was green throughout. Two ports that looked unsupported were one
-					// missing guard.
-					if !node.record.state.accepts_terminal_frame() {
-						print(b"DeviceManager: a handshake deadline arrived after the driver had already answered; it is refused\n");
-						continue;
-					}
 					// A DRIVER THAT IS STILL THERE AND HAS NOT ANSWERED, which is the case the
 					// budget exists for: before it, this wait had no end and one silent driver held
 					// the manager - and therefore the boot - for as long as it liked.
 					print(b"DeviceManager: ");
 					print_driver_name(driver_name);
 					print(b" did not report in inside its share of the boot window\n");
-					FailureCause::HandshakeTimeout
 				}
 			};
+			let Some(cause) = cause else { continue };
 			// THE CAPTURE COMES FIRST, BEFORE ANYTHING IS GIVEN BACK. The Domain's counters cannot
 			// be read once the Domain is killed, and the process cannot be asked once it is signalled
 			// - so a capture taken after the rollback is a capture of the rollback.
@@ -4091,13 +3994,19 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			if node.record.state == BindingState::Online {
 				node.incident = Incident::open();
 			}
+			if let Some(next) = next_state {
+				if !node.record.move_to(next, Some(cause)) {
+					print(b"DeviceManager: the admitted binding transition was refused\n");
+					return Step::Done;
+				}
+			}
 			// A PLANNED STOP IS NEVER RETRIED, whatever the cause reads as: the whole point of
 			// asking a driver to stop is that it stays stopped.
 			let planned: bool = node.stop_intent != driver_binding::StopIntent::Fault;
 			let retryable: bool = !planned && cause.retryable() && may_try_again(&node.incident, node.attempt);
 			let deadline: u64 = node.incident.teardown_deadline();
 			if retryable {
-				retry_or_quarantine(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, deadline, cause);
+				retry_or_quarantine(&mut txn, &mut node.offers, &mut node.teardown, deadline, cause);
 			} else {
 				give_up_with(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, deadline, cause, node.stop_intent, driver_name);
 			}

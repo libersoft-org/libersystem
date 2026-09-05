@@ -1,3 +1,9 @@
+// Select the next pending service in this pass whose declared dependencies are ready.
+// ServiceManager supplies its real manifest and states; host regressions supply outcomes.
+pub fn next_startable<'a>(from: usize, count: usize, mut pending: impl FnMut(usize) -> bool, mut dependencies: impl FnMut(usize) -> &'a [&'a [u8]], mut ready: impl FnMut(&[u8]) -> bool) -> Option<usize> {
+	(from..count).find(|&index| pending(index) && dependencies(index).iter().all(|dependency| ready(dependency)))
+}
+
 use alloc::vec;
 use alloc::vec::Vec;
 

@@ -18,6 +18,7 @@ pub mod ownership;
 pub mod plan;
 pub mod registry;
 pub mod shadow;
+pub mod tier;
 pub mod trust;
 
 #[cfg(test)]
@@ -171,6 +172,33 @@ impl Model {
 			}
 		}
 		format!("{:x}", hasher.finalize())
+	}
+
+	// Source facts only: discovery may add or remove compiled variants without changing what
+	// the selector's source declares. In particular a test absent from every binary still counts.
+	pub fn source_model_hash(&self) -> Result<String, String> {
+		let mut hasher = Sha256::new();
+		hasher.update(b"verify-source-model/1\n");
+		hasher.update(selector_source_digest(&self.repo_root)?.as_bytes());
+		hasher.update(self.registry.registry_text.as_bytes());
+		hasher.update(self.registry.configurations_text.as_bytes());
+		for edge in &self.graph.edges {
+			hasher.update(format!("{} {} {}\n", edge.from, edge.kind, edge.to).as_bytes());
+		}
+		for entry in &self.crates {
+			for (feature, members) in &entry.feature_definitions {
+				hasher.update(format!("{} {feature}={}\n", entry.name, members.join("+")).as_bytes());
+			}
+		}
+		for (component, risk) in &self.arch_risk {
+			hasher.update(format!("{component} {} {}\n", risk.any_target, risk.targets.iter().cloned().collect::<Vec<_>>().join("+")).as_bytes());
+		}
+		let source_catalog = Catalog::build(&self.crates, &self.registry, &self.graph, &self.staged, &[]);
+		hasher.update(serde_json::to_vec(&source_catalog).map_err(|error| error.to_string())?);
+		let mut declarations: Vec<_> = kerneltests::scan_source(&self.repo_root)?.into_values().map(|declaration| (declaration.id, declaration.covers)).collect();
+		declarations.sort();
+		hasher.update(serde_json::to_vec(&declarations).map_err(|error| error.to_string())?);
+		Ok(format!("{:x}", hasher.finalize()))
 	}
 
 	// Every tracked file is owned by exactly one component or explicitly marked not code.

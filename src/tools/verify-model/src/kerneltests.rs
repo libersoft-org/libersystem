@@ -196,7 +196,7 @@ fn test_name_from_symbol(symbol: &str) -> Option<String> {
 // runs, and a test with no declaration is not skipped - it is always selected. That way the model
 // is correct from the first commit and gets cheaper as tests are annotated, rather than being
 // wrong until the last one is.
-fn scan_source(repo_root: &Path) -> Result<BTreeMap<String, Declaration>, String> {
+pub fn scan_source(repo_root: &Path) -> Result<BTreeMap<String, Declaration>, String> {
 	let mut declarations = BTreeMap::new();
 	let mut seen = BTreeMap::new();
 	scan_dir(&repo_root.join("src/kernel"), &mut declarations, &mut seen, repo_root)?;
