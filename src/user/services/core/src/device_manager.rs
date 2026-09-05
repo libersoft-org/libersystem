@@ -167,8 +167,9 @@ impl Incident {
 			// off-by-one between them decide whether a machine recovers, and that is not something
 			// to reason about inside a binary nobody can run on a host - which is how the clamp
 			// came to be unconditional and every recovery an hour after boot born already expired.
-			let deadline: u64 = driver_binding::IncidentWindow::deadline(window, BIND_SHARE_OF_WINDOW, BOOT_DEADLINE.load(core::sync::atomic::Ordering::Relaxed), clock());
-			Incident { deadline, teardown_reserve: (window / BIND_SHARE_OF_WINDOW) / TEARDOWN_SHARE_OF_BIND }
+			let now = clock();
+			let deadline: u64 = driver_binding::IncidentWindow::deadline(window, BIND_SHARE_OF_WINDOW, BOOT_DEADLINE.load(core::sync::atomic::Ordering::Relaxed), now);
+			Incident { deadline, teardown_reserve: driver_binding::IncidentWindow::teardown_reserve(deadline, now, TEARDOWN_SHARE_OF_BIND) }
 		}
 	}
 
@@ -5386,10 +5387,15 @@ unsafe fn open_subscription(service: u64, catalogue: &mut Catalogue, nodes: &[No
 		// its own - so the kind is decoded here, from the same bytes.
 		let Some(kind) = subscribed_kind(request) else { return };
 		let Some((producer, consumer)) = channel() else { return };
-		send_blocking(service, &corr.to_le_bytes(), consumer);
-		// EVERYTHING OF THAT KIND NOW, AND EVERYTHING AFTER IT, in one step - see `subscribe_stream`.
-		if !catalogue.subscribe_stream(kind, producer) {
-			return;
+		// Queue the snapshot before releasing its endpoint: bootstrap consumers poll immediately
+		// when the reply arrives. A refused registration closes the producer, so still return the
+		// consumer in that case and let the caller observe the closed stream.
+		let _ = catalogue.subscribe_stream(kind, producer);
+		if !send_blocking(service, &corr.to_le_bytes(), consumer) {
+			// A failed transfer leaves this handle ours. Closing it also makes a registered stream
+			// reapable, so a caller that disappeared cannot occupy a subscriber slot.
+			close(consumer);
+			catalogue.reap_dead_subscribers();
 		}
 	}
 }

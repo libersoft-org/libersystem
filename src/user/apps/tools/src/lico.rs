@@ -904,11 +904,10 @@ impl Manager {
 	// tag set it belongs to is being changed, which is a borrow the compiler is right to refuse:
 	// the names come from the same structure the tagging mutates.
 	//
-	// AS BYTES RATHER THAN STRINGS, and that is a shared-image constraint rather than taste: a
-	// `Vec<String>` here instantiates `RawVec<String>::grow_one` in whichever crate the linker
-	// happens to place it, and the shared-library graph refuses an import with no declared provider.
-	// The same defect hit once with a `Vec<u64>`, and the same answer - do not create the
-	// instantiation.
+	// Append one-element arrays to these byte-vector collections after reserving capacity.
+	// Vec::push would retain a RawVec<Vec<u8>>::grow_one import whose upstream owner can
+	// change between builds, requiring an undeclared shared provider even though no growth
+	// is needed. The operation-planning collections below use the same reserved extension.
 	fn names_of(&self, panel: usize) -> Vec<Vec<u8>> {
 		let mut names: Vec<Vec<u8>> = Vec::new();
 		if names.try_reserve_exact(self.panels[panel].view.len()).is_err() {
@@ -921,7 +920,7 @@ impl Manager {
 				break;
 			}
 			name.extend_from_slice(source);
-			names.push(name);
+			names.extend([name]);
 		}
 		names
 	}
@@ -991,8 +990,8 @@ impl Manager {
 			}
 			owned_uri.extend_from_slice(uri.as_bytes());
 			owned_name.extend_from_slice(name);
-			uris.push(owned_uri);
-			names.push(owned_name);
+			uris.extend([owned_uri]);
+			names.extend([owned_name]);
 			shapes.push((is_dir, size));
 		}
 		let mut sources: Vec<Source> = Vec::new();
@@ -1149,8 +1148,8 @@ impl Manager {
 					return false;
 				}
 				name.extend_from_slice(entry.name.as_bytes());
-				children.push(child);
-				names.push(name);
+				children.extend([child]);
+				names.extend([name]);
 				shapes.push((entry.r#type == FileType::Dir, entry.size));
 			}
 			let mut sources: Vec<Source> = Vec::new();

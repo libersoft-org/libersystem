@@ -1177,6 +1177,28 @@ fn the_first_incident_is_clamped_by_the_boot_and_a_later_one_is_not() {
 }
 
 #[test]
+fn a_late_initial_bind_reserves_teardown_from_its_clamped_window() {
+	// The TCG traffic boot reached its first wait at tick 3174 with deadline 3411 and a reserve
+	// of 333: its spendable deadline was already 3078. The reserve had used the nominal 1000-tick
+	// incident slice even though the boot had granted less. A late bind must split what it got.
+	let opened = 3174;
+	let deadline = IncidentWindow::deadline(3000, 3, 3411, opened);
+	let reserve = IncidentWindow::teardown_reserve(deadline, opened, 3);
+	assert_eq!(deadline, 3411, "the existing absolute boot deadline remains binding");
+	assert_eq!(reserve, 79, "teardown keeps its existing one-third share of the granted time");
+	assert!(deadline - reserve > opened, "a live clamped incident must retain its handshake share");
+	let old_reserve = (3000 / 3) / 3;
+	assert!(deadline - old_reserve <= opened, "the historical reserve arithmetic expires this bind before its first wait");
+
+	// An unclamped incident and a later recovery keep exactly the existing full-slice reserve.
+	for boot_deadline in [0, 400, 10_000] {
+		let deadline = IncidentWindow::deadline(3000, 3, boot_deadline, opened);
+		assert_eq!(deadline, opened + 1000);
+		assert_eq!(IncidentWindow::teardown_reserve(deadline, opened, 3), 333);
+	}
+}
+
+#[test]
 fn a_recovery_long_after_the_boot_is_not_born_already_expired() {
 	// THE DEFECT THIS ARITHMETIC EXISTS TO PREVENT, and it was live until 2026-08-27: the clamp was
 	// unconditional, so an hour after boot every recovery got a deadline in the PAST and every bind

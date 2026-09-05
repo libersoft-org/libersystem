@@ -1012,6 +1012,13 @@ impl IncidentWindow {
 		// bounds was asked for.
 		if boot_deadline > now && boot_deadline < own { boot_deadline } else { own }
 	}
+
+	// Reserve a share of the time this incident actually received. The boot may have clamped its
+	// nominal slice: reserving against that larger slice can spend the whole remaining window
+	// before a late initial bind even waits for READY.
+	pub fn teardown_reserve(deadline: u64, opened: u64, share: u64) -> u64 {
+		if share == 0 { 0 } else { deadline.saturating_sub(opened) / share }
+	}
 }
 
 // ------------------------------------------------------------------ what one bind holds

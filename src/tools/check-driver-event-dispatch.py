@@ -88,6 +88,15 @@ def check(source):
         raise ValueError("production disk probing must use the tested probe derivation")
     if 'driver_binding::next_handoff_slot(&self.entries,|provider|provider.kind==kind&&provider.handle!=0,|provider|provider.id)' not in compact(source):
         raise ValueError("production role handoff must use its own tested derivation")
+    start = source.index('unsafe fn open_subscription(')
+    subscription, _ = block(source, source.index('{', start))
+    if not compact(subscription).endswith(
+        'letSome((producer,consumer))=channel()else{return};'
+        'let_=catalogue.subscribe_stream(kind,producer);'
+        'if!send_blocking(service,&corr.to_le_bytes(),consumer){'
+        'close(consumer);catalogue.reap_dead_subscribers();}}'
+    ):
+        raise ValueError("queue the subscription snapshot before its reply, preserve closed-stream replies, and close failed transfers")
 
 
 def rejected_mutations(source):
@@ -104,6 +113,13 @@ def rejected_mutations(source):
         'arm-local state predicate': source.replace('BindingEvent::TimedOut { .. } => {\n', 'BindingEvent::TimedOut { .. } => {\n if !node.record.state.accepts_terminal_frame() { continue; }\n', 1),
         'arm-local transition': source.replace('node.record.move_to(next, cause)', 'node.record.move_to(BindingState::Online, cause)', 1),
     }
+    snapshot = '\t\tlet _ = catalogue.subscribe_stream(kind, producer);\n'
+    assert source.count(snapshot) == 1
+    reply_at = source.index('\t\tif !send_blocking(service, &corr.to_le_bytes(), consumer) {')
+    _, reply_end = block(source, source.index('{', reply_at))
+    reply = source[reply_at:reply_end] + '\n'
+    mutations['subscription reply before snapshot'] = source.replace(snapshot, '', 1).replace(reply, reply + snapshot, 1)
+    mutations['refused subscription never replies'] = source.replace(snapshot, '\t\tif !catalogue.subscribe_stream(kind, producer) { return; }\n', 1)
     assert call in prefix
     with tempfile.TemporaryDirectory(prefix='liber-dispatch-wiring-') as directory:
         for number, (name, mutant) in enumerate(mutations.items(), 1):
