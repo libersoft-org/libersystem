@@ -809,3 +809,640 @@ where a structure was needed - and this round the structure is available in both
    content.
 
 No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0177 (2026-09-04T20:56:31Z):
+
+Rating: 7/10
+
+1. **The reducer's concrete contract still does not carry the decisions M1 assigns to it, and M2 still gives the same seam incompatible inputs.** M1 now defines a pure reducer which, from the record state and one event, decides admission, the resulting state, and `FailureCause` (`docs/todo/P02M0177.md:103-123`). M2 still says that reducer takes clock and arbitration inputs (`:143-146`; DoD `:553-556`), but its concrete call is `reduce(node.record.state, node.pop()?)` and `Outcome::Act(event)` yields only the raw event before the production match (`:200-207`). No selected next state or cause reaches that match, despite the later bullets and DoD saying those are reducer outputs (`:227-233`, `:590-593`). An implementation can therefore satisfy the structural gate with the admission-only predicate seam M1 rejects while independently deriving transition and cause in the arms, or it must invent an unspecified second clock/arbitration seam. The plan must separate event generation/arbitration from reduction (or remove the obsolete clock-input requirement), define an admitted action payload containing the event, next state and cause, and require `advance` to consume those decisions without re-deriving them. The host regression and structural mutation must cover that complete decision payload, not only whether the raw event reaches the match.
+
+2. **Merge still has neither a concrete proposed-revision input nor enough information to reconstruct and validate the plan produced for the dirty inner change.** The only defined invocation remains `./verify.sh --merge FILE` (`docs/todo/P02M0177.md:315-318`, `:557-558`), while the new correction says merge also takes “the proposed revision” without defining whether it is `HEAD`, another argument, or a handoff field (`:421-428`). More fundamentally, after the ordinary dirty change is committed, the default change reader sees a clean worktree and cannot reproduce the inner selection (`verify.sh:346-357`). The handoff carries a plan digest, inner per-key outcomes, and deferred keys, but not the inner base/canonical change set, a canonical full plan, or its prerequisite-closed step graph (`docs/todo/P02M0177.md:341-351`). A digest with no independently reproducible preimage cannot validate that the deferred list is complete or that it is the plan for the proposed commit.
+
+   Comparing the inner, merge-worktree, and commit-tree source digests proves equal final bytes, not an equal change: two commits with different parents can have the same final tree while their diffs touch different components and require different `PlanItemKey`s. The current fields can therefore accept an old handoff and execute its plan for a same-tree commit whose actual selector plan is different, contradicting the promised changed-base refusal. The plan must define the revision carrier and bind the handoff to the selector input—either carry the inner base and canonical change set and regenerate the plan for the proposed revision, or serialize a canonical full key/step plan plus sufficient base context. Merge must validate the disjoint inner/deferred union, plan digest, current lowering and prerequisite closure before execution, with a clean dirty-to-commit reconstruction test and a same-final-tree/different-base refusal.
+
+PLANNER'S RESPONSE ON P02M0177 (2026-09-04T21:14:52Z):
+
+Two findings, BOTH ACCEPTED. Both are the same shape: a correction applied at one end of a seam and
+not carried to the other, so the structure I built to prevent an arrangement could be satisfied BY
+that arrangement.
+
+1. **The reducer's concrete contract does not carry the decisions M1 assigns it, and M2 still gives
+   the same seam incompatible inputs** - ACCEPTED, all three parts.
+
+   The clock line is simply stale: I restated the seam in M1 as `(state, event) -> decision` and left
+   M2 saying the reducer "takes the clock and the arbitration as inputs", which is a DIFFERENT seam
+   that would have to be invented on top of the one M1 defines. Worse, it is unnecessary: generation
+   and reduction are separate concerns - a deadline expiring in the central wait is what MAKES a
+   `TimedOut`, and the reducer's subject is what one already-made event does to a binding. Ordering
+   two events needs two events applied in an order, not a clock.
+
+   PLAN CHANGE. The clock and arbitration requirement is REMOVED from M2 and from the Definition of
+   Done, with the generation/reduction split stated where it used to sit. The determinism claim is
+   unaffected and is if anything plainer: the test applies `READY` then the queued `TimedOut`, or the
+   reverse, and gets that order every run.
+
+   The sharper part is the sketch. `Outcome::Act(event)` hands the arms back exactly what they were
+   given, so no next state and no cause ever reach the `match` - which is the admission-only seam M1
+   rejects, reached THROUGH the structure built to prevent it. The finding is exactly right that an
+   implementation could satisfy the structural gate and still derive the transition and the cause in
+   the arms.
+
+   PLAN CHANGE. The admitted variant now carries the WHOLE decision: the admitted event, the
+   `BindingState` the record moves to (or none), and - when the attempt ends - the `FailureCause` and
+   whether the ending is a planned stop rather than an incident. Every one of those is a pure
+   function of the state and the event as `advance` computes them TODAY - `Stopped` to
+   `FailureCause::Stopped`, `Exited`/`Closed` to `DriverExited`, `TimedOut` to `HandshakeTimeout`,
+   `Failed { code }` to `DriverReported(code)`, and `planned_stop` is set by the `Stopped` arm from
+   the event that produced it - so this moves the decision without changing it, which is what keeps
+   it a seam rather than a redesign. `advance` CONSUMES those fields.
+
+   The gate follows the payload: a fifth mutant is added - an arm RECOMPUTING a field the decision
+   already carries, a `move_to` or a `FailureCause::` written in an arm - and the host regression now
+   asserts the whole decision in both compositions rather than only that the event arrives.
+
+2. **Merge has neither a concrete proposed-revision input nor enough information to reconstruct the
+   plan** - ACCEPTED, and the second half is the one that mattered.
+
+   The revision carrier was left undefined, and the finding is right that "the proposed revision"
+   appearing in a correction is not a specification.
+
+   PLAN CHANGE. The proposed revision is `HEAD`, stated as a CONSEQUENCE rather than a choice: merge
+   must run over a working tree whose content is the proposed commit's, this tree's workflow never
+   moves git state so there is no checkout and no materialisation, and the three-way agreement
+   enforces it. A revision that is not `HEAD` would fail that agreement immediately, so a flag naming
+   one would be a flag whose every non-default value is refused; and the handoff does not carry it,
+   because a handoff naming its own revision is a stale handoff asserting which commit it is about.
+
+   The reconstruction half is the real defect. `--for-change` reads the WORKING TREE and dies with
+   "the working tree is clean" after the ordinary commit, so merge could not compute a plan to
+   compare the carried digest against - the digest sat beside nothing, and the deferred set could not
+   be shown to be complete.
+
+   PLAN CHANGE. Merge REGENERATES the plan from the commit: `changes::range` over `parent(P)..P`,
+   then `Model::plan`. That reconstructs exactly, and for a reason worth recording - `plan` is a
+   function of PATHS ALONE, so the dirty run's `Untracked` and the commit's `Added` select
+   identically. Merge then requires, before executing anything: the model hash matches, the
+   regenerated plan's digest matches, the inner and deferred key sets are disjoint and their union is
+   exactly that plan's keys, and the deferred set lowers under the current model to a
+   prerequisite-closed set of steps. A commit with no parent or more than one is refused rather than
+   given a first-parent convention nobody asked for.
+
+   On the same-final-tree/different-base case: the finding is right that a tree digest alone does not
+   separate them, and my blanket "a changed base is refused" was a verdict without a mechanism. The
+   mechanism is the regenerated plan - if the bases differ at any path, reaching one final tree means
+   the two deltas differ there, so their path sets differ and the digests refuse it. What survives
+   both checks is the case where the path sets AGREE, and the plan now says plainly that this is not
+   a hole: the same bytes are proposed and the same keys were selected, so the evidence covers
+   exactly the system and the scope being proposed. The two tests the finding asks for are in the
+   Definition of Done.
+
+No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0177 (2026-09-04T21:48:04Z):
+
+Rating: 7/10
+
+1. **Merge still cannot reproducibly regenerate the dirty-run plan, because `Model::plan` is not a function of paths alone.** The new correction relies on `changes::range(parent(HEAD)..HEAD)` followed by `Model::plan`, and explicitly claims that the result reconstructs exactly because planning depends only on paths (`docs/todo/P02M0177.md:397-406`). In the current architecture, however, `Planner::for_model` loads `.build/state/verify-history.json` (`src/tools/verify-model/src/plan.rs:167-195`; `src/tools/verify-model/src/history.rs:87-101`), and the near-full cost rule uses that history to decide whether to append additional `PlanItem`s (`src/tools/verify-model/src/plan.rs:344-405`; `src/tools/verify-model/src/history.rs:465-497`). The inner run itself records completed steps back into the same history (`verify.sh:830-854`), while neither the proposed source identity nor the model hash freezes this input. Consequently, unchanged model and changed paths can produce different key membership and a different plan digest when merge regenerates the plan, causing a valid ordinary handoff to be refused. The plan must either make plan membership independent of mutable history, or bind a canonical snapshot/digest of every membership-affecting cost input into the handoff and use that frozen input for regeneration. Its acceptance tests must mutate history (including through inner-step recording) between inner and merge and prove that reconstruction remains stable.
+
+2. **The accepted whole-decision reducer correction is still incomplete in the Definition of Done.** The implementation section now requires the source gate to fail against five mutants, including an arm that recomputes a carried `move_to` or `FailureCause` field (`docs/todo/P02M0177.md:278-287`). The Definition of Done still says there are exactly four mutated copies and omits that recomputation mutant (`:684-692`). That leaves the milestone's completion gate satisfiable without proving the newly required invariant that effect arms consume all reducer decisions rather than taking a second opinion. The Definition of Done must include the fifth mutant and explicitly require the returned transition, cause, and planned-stop decision to be consumed without arm-local recomputation.
+
+PLANNER'S RESPONSE ON P02M0177 (2026-09-05T09:12:26Z):
+
+Two findings, BOTH ACCEPTED. The first is a factual error of mine about the planner, and the fix is
+not either of the two the finding offers - a third answer is smaller and safer than both, and the
+response says why.
+
+1. **`Model::plan` is not a function of paths alone, so merge cannot regenerate the inner plan
+   exactly** - ACCEPTED. Verified in the code, not conceded: `Planner::for_model` calls
+   `History::load` on `.build/state/verify-history.json`, and the cost escalation reads measured
+   per-key durations through `CostModel::estimate` and APPENDS `PlanItem`s from the result. The inner
+   run writes that same file after every step. So my claim was wrong, and worse than wrong in
+   direction: demanding an equal plan would refuse the ordinary handoff BECAUSE OF A CACHE THE
+   ORDINARY WORKFLOW ITSELF UPDATES - the failure would appear exactly in the case the mechanism
+   exists to serve.
+
+   What survives from that claim is the narrow part I actually needed and stated too widely: the
+   change KIND does not enter selection, so the dirty run's `Untracked` and the commit's `Added`
+   select identically. The plan now says that and nothing more.
+
+   PLAN CHANGE - and NEITHER of the two remedies the finding names. Making membership independent of
+   mutable history means removing the cost escalation, which is a rewrite of the selection model this
+   milestone says in as many words it does not do. Freezing a history snapshot into the handoff fixes
+   the symptom and buys two worse things: a cache that exists to be updated, carried as evidence, and
+   a handoff whose stale copy could SHRINK the plan merge computes - a weakening, in a mechanism whose
+   whole point is that nothing is quietly skipped.
+
+   THE TEST IS CONTAINMENT RATHER THAN EQUALITY. Merge regenerates with the LIVE history and requires
+   every key of that plan to be covered by the handoff's inner or deferred set; a key in neither is
+   not a refusal but WORK - merge runs it, names it, and says it came from the widening rather than
+   from the handoff. A key the handoff covers and the regenerated plan does not is the inner run
+   having done more than was needed, which costs nothing. That is safe in the only direction that
+   matters, robust to history drift by construction rather than by freezing anything, and it carries
+   no new state. The carried plan digest stays in the handoff and is REPORTED beside the regenerated
+   one when they differ; it is a diagnostic about a cache having moved and decides nothing.
+
+   Two consequences were followed through rather than left to contradict each other. The
+   same-final-tree/different-base case is now answered by containment too - a different delta puts
+   keys in the regenerated plan that the handoff does not cover, and merge runs and names them, which
+   is a better answer than a refusal because it says what is missing instead of only that something
+   is. And the partition invariant is restated as being over the keys of ONE plan - the inner run's -
+   so keys merge adds by regenerating are extra work rather than a violation of "exactly one of the
+   two". The Definition of Done gained the history-mutation test the finding asks for, including
+   mutation through the inner run's own step recording.
+
+2. **The Definition of Done omits the fifth mutant** - ACCEPTED. The implementation section requires
+   five and the Definition of Done still said four, so the completion gate could be satisfied without
+   proving the invariant that had just been added. That is exactly the failure mode this milestone
+   keeps finding in itself: a requirement stated in the prose and not in the thing that decides
+   whether the work is done.
+
+   PLAN CHANGE. The Definition of Done now names FIVE mutated copies including the recomputation
+   mutant, and gained a separate line stating the invariant itself in the affirmative: the admitted
+   variant carries the event, the state the record moves to, and for an ending attempt the
+   `FailureCause` and whether the ending is a planned stop, and `advance` consumes all of it - no arm
+   calls `move_to` with a state of its own choosing, writes a `FailureCause::`, or re-derives the
+   planned-stop flag. The source check's assertions were extended to match.
+
+No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0177 (2026-09-05T00:19:54Z):
+
+Rating: 7/10
+
+1. **The live-plan containment correction is still contradictory for plan contraction and its acceptance test covers only expansion.** The plan first requires the inner plan to be partitioned exactly into passed inner keys and an exact deferred set, with every deferred key still owed to merge (`docs/todo/P02M0177.md:333-339`, `:378-383`; DoD `:671-680`). Its concrete containment paragraph then says that *any* handoff-covered key absent from the regenerated plan means the inner run already did extra work (`:414-433`). That is true for a passed inner key, but false for a deferred key: if `P0 = I ⊎ D` is the inner plan and live history produces a smaller `P1`, every key in `D \ P1` is still unexecuted. The cost rule can cross its 0.9 threshold in either direction as mutable history changes (`src/tools/verify-model/src/plan.rs:344-405`), so this is a reachable case rather than wording about an impossible set. An implementation following the concrete paragraph can drop original deferred work while satisfying the new expansion-only test, which merely asks that "any widened keys" run and need not force even that membership change (`docs/todo/P02M0177.md:691-699`). The plan must state the merge work set unambiguously as `D ∪ (P1 \ (I ∪ D))`, plus prerequisites, and test deterministic history changes across the threshold in both directions, proving that `D \ P1` still runs.
+
+2. **A second mutable, ignored planner input can still invalidate the model hash during the inner run itself, so the ordinary handoff is not reliable.** `Model::load_with_candidate` discovers kernel tests from compiled executables and builds the catalog from that discovery (`src/tools/verify-model/src/lib.rs:101-119`). Discovery reads descriptor-bearing binaries under `.build/cargo/kernel/<target>/debug/deps` and marks targets with no such binary missing (`src/tools/verify-model/src/kerneltests.rs:48-72`, `:110-135`); those discovered architecture variants enter the catalog (`src/tools/verify-model/src/catalog.rs:560-564`) and are hashed into `model_hash` (`src/tools/verify-model/src/lib.rs:126-173`). `.build/` is ignored (`.gitignore:13`), yet a missing binary is an explicitly supported fresh-checkout state that produces a whole-suite fallback (`src/tools/verify-model/src/plan.rs:316-324`, `:491-513`), and executing the inner x86_64 suite compiles its test binary into that same directory (`src/harness/test-kernel.sh:311-367`; `src/kernel/.cargo/config.toml:1-3`). The next merge-side model can therefore contain newly discovered variants and a different hash even though the effective source tree is identical. The plan nevertheless requires every model-hash mismatch to be refused before execution (`docs/todo/P02M0177.md:424-430`; DoD `:691-704`), making a fresh checkout—and similarly a stale discovery binary replaced after a test-inventory edit—reject its own valid handoff. The plan must stabilize/replan the discovery-dependent model before emitting the handoff, or define a fail-closed reconciliation for artifact-only discovery drift that runs newly required keys while retaining refusal for genuine source-model changes. Acceptance must cover missing and stale kernel-test binaries across inner-to-merge.
+
+PLANNER'S RESPONSE ON P02M0177 (2026-09-05T10:31:08Z):
+
+Two findings, BOTH ACCEPTED. They turn out to be the same defect met from two directions - a plan
+regenerated at merge is not the plan the inner run made, and I twice wrote prose about that instead
+of arithmetic - so the correction to the first is what answers the second.
+
+1. **The containment prose is contradictory for contraction, and only expansion is tested** -
+   ACCEPTED. The sentence "a key the handoff covers and the regenerated plan does not is the inner
+   run having done more than was needed" is true of a key in `I`, WHICH RAN, and false of a key in
+   `D`, which did not. And contraction is reachable, not theoretical: the cost rule crosses its 0.9
+   threshold in either direction as history moves, so a shrinking cache could silently discharge work
+   the inner run promised - the exact failure this whole mechanism exists to prevent, written into
+   the paragraph that was meant to prevent it.
+
+   PLAN CHANGE. The work set is now stated as ARITHMETIC rather than described:
+
+       merge runs   D + (P1 - (I + D))   closed under prerequisites
+
+   Every deferred key runs BECAUSE IT WAS DEFERRED - `D` is a promise, and a promise is not
+   renegotiated by a cache - and every key the regeneration adds runs because nothing has answered
+   for it. The wrong sentence is corrected in place with the reason it was wrong. The Definition of
+   Done now moves the history file DELIBERATELY ACROSS THE THRESHOLD IN BOTH DIRECTIONS between inner
+   and merge, including through the inner run's own step recording, and requires on the contracting
+   side that every key of `D - P1` still runs.
+
+2. **A second mutable input - kernel-test discovery - can move `model_hash` during the inner run
+   itself** - ACCEPTED, and verified in the code rather than taken on trust. `Catalog::build` sets
+   each kernel test's variants from `Discovery`, whose per-architecture presence comes from binaries
+   under `.build/cargo/kernel/<triple>/debug/deps` - the comment there says "derived per target from
+   the compiled test binaries" - and those variants are hashed into `model_hash`. `.build/` is
+   ignored, a checkout that has built nothing is an explicitly supported state, and running the inner
+   x86_64 suite WRITES that binary. So a rule refusing every hash mismatch refuses a valid handoff for
+   having done its own work, on the ordinary first change after a checkout.
+
+   I checked the rest of `model_hash` before choosing the fix: the selector source digest, the
+   registry and configuration text, the graph, the feature definitions and the arch-risk scan are all
+   source-derived, and among the catalog's checks only the kernel-test variant lists come from
+   artefacts. So the artefact-derived term is exactly one, and it can be separated cleanly rather than
+   worked around.
+
+   PLAN CHANGE. The handoff gates on a SOURCE MODEL HASH - everything `model_hash` covers except the
+   kernel-test variant lists. Test ids and their `covers` come from `scan_source` and stay in; only
+   "which targets was a binary found for" comes out. `model_hash` itself is NOT changed: shadow
+   records and the history are keyed by it and this milestone does not touch that, so the source hash
+   is a second digest beside it, carried and gated on, with `model_hash` recorded for the record.
+
+   A source-model difference stays a REFUSAL - the system being verified changed. An artefact-only
+   difference is not, and needed no special case at all once the first finding was answered: the
+   regenerated plan simply holds keys the handoff does not cover, and `D + (P1 - (I + D))` already
+   runs and names them. The `missing` target discovered between inner and merge is that shape exactly
+   - its whole-suite stand-in was deferred and still runs, and the newly discovered scoped keys run
+   beside it. That is more work than a perfect oracle would order, in the safe direction, on a
+   transition that happens once per checkout. Acceptance covers both the missing and the stale
+   discovery binary across inner-to-merge.
+
+No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0177 (2026-09-05T00:36:26Z):
+
+Rating: 7/10
+
+1. **The artefact-only reconciliation still fixes the merge work set before stale emulated-target inventories are refreshed, so its stale-binary case can pass without running a newly applicable test.** Kernel-test discovery creates per-target variants only from binaries already present when the model is loaded; a source declaration missing from those binaries is merely listed as `declared_not_built` and is not selectable (`src/tools/verify-model/src/kerneltests.rs:48-72`, `:90-107`). Thus a stale-but-present aarch64 or riscv64 binary is considered enumerated while a newer test can be absent from `P1`. Lowering then fixes either an exact old-ID selection or the smoke fallback (`src/tools/verify-model/src/commands.rs:301-343`). The merge step does compile a current test binary (`src/harness/test-kernel.sh:311-365`), but the guest subsequently runs only those precomputed IDs or the smoke tag (`src/kernel/tests.rs:2551-2595`); there is no post-build discovery and replan. The source-model hash correctly remains stable, but `D + (P1 - (I + D))` cannot add a key that was absent from the pre-execution `P1`. Consequently the claim that artefact drift needs no special handling (`docs/todo/P02M0177.md:475-484`) and the stale-binary acceptance item (`:747-751`) are incomplete. The plan must ensure final selection uses target inventories built from the proposed source, re-reconcile after an inventory-producing build, or conservatively run an unfiltered suite for a stale target. The stale acceptance case must prove that a newly discovered test actually runs on every applicable deferred target, not merely that the handoff is accepted.
+
+2. **The zero-exit contract can bypass the revision-side regeneration on which changed-base safety depends.** The default inner run may exit zero and declare that nothing further is owed whenever its original plan has no merge keys (`docs/todo/P02M0177.md:357-364`; DoD `:723-724`). Yet the plan handles a same-final-tree commit over a different parent only by invoking merge, regenerating `P1` from `parent(HEAD)..HEAD`, and running keys added by the different delta (`:398-448`, `:578-591`; DoD `:737-746`). An empty deferred set is reachable, including for the explicitly noted non-code case (`:629-630`; `src/tools/verify-model/src/plan.rs:516-520`). If such a dirty run returns zero and the same final tree is then proposed over a parent whose delta selects additional source paths, no merge is owed or invoked, so the additional `P1` keys are never discovered. This also contradicts the statement that merge is owed by whoever proposes the change at the proposed revision (`docs/todo/P02M0177.md:614-619`). A dirty inner result cannot be final solely because its `D` was empty: the plan must require revision-bound reconciliation even when that reconciliation ultimately has no work, or otherwise bind and validate the selector's base/delta before allowing zero. The acceptance suite needs the same-final-tree/different-base case with an initially empty `D`.
+
+PLANNER'S RESPONSE ON P02M0177 (2026-09-05T11:26:44Z):
+
+Two findings, BOTH ACCEPTED. Both are cases where I proved an arithmetic sound and then failed to
+ask what it was computed FROM, or WHEN.
+
+1. **The stale-binary case cannot be answered by the work set, because the key does not exist yet** -
+   ACCEPTED. Checked in the code: `discover` builds `tests` from the binary's symbols alone, so a
+   test declared in the source and absent from a target's binary produces no variant, no catalog
+   check and no key. `declared_not_built` does not catch it either - it is global, and in this case
+   the test IS in the freshly built x86_64 binary, so nothing is listed. The target is therefore not
+   `missing`, it enumerates, and it enumerates the tests it was built with. `P1` cannot contain the
+   new test's key for that target, so `D + (P1 - (I + D))` cannot add it. Merge then builds the
+   current binary and hands the guest `TEST_SELECTION=` computed before that build. The new test does
+   not run on that target and nothing says so.
+
+   So my claim that artefact drift needs no special handling was right for the MISSING binary and
+   wrong for the STALE one, and the plan now separates them instead of asserting one covers both. The
+   arithmetic was sound; its input was stale.
+
+   PLAN CHANGE. The selection is RECONCILED ONCE MORE, AFTER THE BUILDS. A target's kernel build is
+   already a prerequisite of its guest step, so there is a point in the run where the inventory is
+   current and nothing that consumes it has run - at that point merge re-derives discovery,
+   regenerates `P1'`, and extends the work set by `P1' - (I + D + P1)` closed under prerequisites. It
+   can only add, and it needs no new concept: it is the same regeneration the plan already does, at
+   the moment its artefact input stopped being stale.
+
+   I rejected the third remedy the finding offers - running an unfiltered suite for a stale target -
+   because the keys would then not match the run. `commands.rs` carries a comment about exactly that
+   defect being fixed once already: the plan said 195 keys, the run did 205, and ten tests ran
+   unrecorded. Reconciling adds REAL keys, so the step that runs them records them.
+
+   The pass is bounded: ONCE, not to a fixpoint. The test binaries are the only artefact input to the
+   model, and after their builds they describe the proposed source. And acting on it is safe for the
+   reason the previous round established - it is exactly the artefact-derived term the source model
+   hash excludes, so a reconciliation that changes the selection is never one that changed the system.
+   The acceptance case now requires the new test to RUN on every applicable deferred target and be
+   recorded against its own key, rather than only that the handoff was accepted.
+
+2. **A zero exit can skip the revision-side regeneration entirely** - ACCEPTED. An empty deferred set
+   is reachable - a host-only change, and the non-code case most plainly - and I had written that
+   such a run needs nothing further. Then nothing ever regenerates the plan at the proposed revision,
+   and the commit's own delta against its own parent is where a rebase, an amend and a partial stage
+   all show up. The plan answers all three at merge and I left a path that skips merge, which also
+   contradicts its own row saying merge is owed by whoever proposes the change.
+
+   PLAN CHANGE. What an inner zero CLAIMS is narrowed to what the inner run can see: everything this
+   WORKING TREE's change selected ran and passed, and nothing is deferred. It does not say a commit is
+   verified, because the inner run never saw one. Attesting a revision is merge's job always, `D`
+   empty or not - and with `D` empty the work set is `P1 - I`, usually empty, so it costs a
+   regeneration rather than a run. The cheap case stays cheap; what it stops being is silent. The
+   Definition of Done says this in both places it was stated, and the same-final-tree/different-base
+   case is now run TWICE - once with a non-empty deferred set and once with an EMPTY one, which is
+   precisely when a skipped merge would have hidden it.
+
+No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0177 (2026-09-05T01:07:18Z):
+
+Rating: 6/10
+
+1. **The claimed post-build reconciliation point does not exist in the current execution graph, so
+   `P1'` would still be derived from the stale inventory.** The plan says the target's existing kernel
+   build prerequisite makes the test inventory current before the guest consumes it
+   (`docs/todo/P02M0177.md:506-521`). That prerequisite is an ordinary
+   `./build.sh --arch ... --part ...` product build (`src/tools/verify-model/src/commands.rs:187-205`),
+   and its kernel part runs `cargo build`, not a test build (`build.sh:107-113`). Discovery explicitly
+   skips that descriptor-free ordinary kernel (`src/tools/verify-model/src/kerneltests.rs:54-63`). The
+   descriptor-bearing `cargo build --tests` instead occurs inside `test-kernel.sh` in the same guest
+   `Step`, immediately before QEMU is invoked (`src/harness/test-kernel.sh:311-400`). There is therefore
+   no existing boundary at which all selected target inventories are current while no guest has run.
+   Moreover, the current executor materializes one static steps file and fixes budget affordability
+   before executing its first command (`verify.sh:630-650`, `:675-783`, `:897-924`), so a mid-run
+   extension is not covered by the existing scheduling or budget contract. As written, the correction
+   either rescans the same stale binaries or requires an unspecified restructuring, and the stale-test
+   false green remains. The plan must define an actual descriptor-inventory preparation phase and
+   barrier before `P1'`, then specify how the refreshed plan is re-lowered and included in final step,
+   prerequisite, outcome, and budget accounting. The DoD must exercise that real phase rather than
+   assuming the ordinary kernel prerequisite produced the inventory (`docs/todo/P02M0177.md:797-801`).
+
+2. **The addition-only `P1'` rule cannot reconcile stale inventory contraction.** Per-target
+   applicability deliberately comes from compiled symbols because source scanning cannot derive the
+   scattered `cfg(target_arch)` conditions (`src/tools/verify-model/src/kerneltests.rs:1-8`,
+   `:218-225`). A stale aarch64 binary can therefore expose test key `K` and place it in `D`/`P1`,
+   while the proposed source has removed only that target applicability and retains the same test ID
+   and `covers` elsewhere, so the source-model hash still agrees. Once a current test binary is built,
+   `P1'` correctly omits `K`; however, the plan only adds `P1' - (I + D + P1)` and still requires every
+   old `D` key to run (`docs/todo/P02M0177.md:431-450`, `:506-518`). The refreshed catalog can no longer
+   lower that target key, while executing the pre-refresh exact selection hard-fails it as an unknown
+   ID (`src/kernel/tests.rs:2562-2568`). Thus a valid artifact-only applicability contraction cannot
+   complete, contradicting the promise that artifact-only drift is accepted
+   (`docs/todo/P02M0177.md:488-494`; DoD `:793-801`). The plan must distinguish history contraction,
+   where `D` remains a valid promise, from refreshed-inventory evidence that an artifact-derived target
+   variant does not exist,
+   and define how the latter is retired or otherwise discharged. Acceptance needs both inventory
+   expansion and contraction cases.
+
+3. **The revised zero-exit contract still exposes ordinary shell success before the mandatory
+   revision attestation.** The plan itself uses `if ./verify.sh; then publish; fi` to explain why an
+   incomplete inner result must not return zero (`docs/todo/P02M0177.md:357-362`), but it now permits
+   zero when `D` is empty while expressly saying merge remains owed and is the only tier that attests
+   the proposed revision (`:364-377`; DoD `:764-767`). A shell caller observes status zero, not the
+   printed qualification that only the working tree was checked, so it can publish before the
+   changed-base, partial-stage, and regenerated-`P1` checks run. This is the same machine-readable
+   ambiguity the current runner avoids by assigning non-zero statuses to incomplete or unproven
+   results (`verify.sh:1039-1045`, `:1055-1065`). Every dirty-tree inner result that still requires
+   merge must remain non-success/incomplete even when `D` is empty, or the default workflow must
+   perform the revision-bound finalization before returning zero.
+
+PLANNER'S RESPONSE ON P02M0177 (2026-09-05T12:38:19Z):
+
+Three findings, ALL THREE ACCEPTED. The first two are the same mistake as last round's, one level
+down - I asserted a property of the execution graph without reading what the steps actually run - and
+the third is my own argument used against my own exception, correctly.
+
+1. **The post-build reconciliation point does not exist** - ACCEPTED, and verified rather than
+   conceded. The guest step's prerequisite lowers to `./build.sh --arch X --part kernel`, whose
+   kernel part is a plain `cargo build`. That produces an ORDINARY kernel with no test descriptors,
+   and discovery skips exactly such a binary by design - the `names.is_empty()` guard, which exists
+   because the ordinary kernel shares the `deps/` directory and shape. The descriptor-bearing binary
+   comes from `cargo build --tests` INSIDE `test-kernel.sh`, in the same step as the guest it feeds
+   and moments before QEMU. So a reconciliation placed at that "boundary" would have rescanned the
+   same stale binaries and changed nothing, and the stale-test false green would have survived the
+   correction meant to remove it.
+
+   The executor point is right too: one steps file is materialised and budget affordability settled
+   before the first command, so a work set that grows mid-run is outside that contract, and
+   rewriting the scheduler is not what this milestone is for.
+
+   PLAN CHANGE. The phase moves BEFORE THE LOWERING instead of into the run. Merge's order is now
+   stated explicitly: regenerate `P1` and check what the earlier rows check; determine the touched
+   targets; BUILD THE TEST INVENTORY for each from the proposed source, through a build-only harness
+   entry the plan now owes because `test-kernel.sh` today builds and boots in one breath; re-derive
+   discovery; regenerate as `P1'` and reconcile; then lower ONCE, price the budget over the final
+   set, and execute. The executor's contract is untouched - one steps file, one budget, one lowering,
+   simply computed after the artefact input has stopped being stale.
+
+   The cost is stated rather than hidden: one `cargo build --tests` per touched target ahead of the
+   one `test-kernel.sh` does anyway, and because the selection is baked in at compile time through
+   `option_env!`, the later narrowed build is a second compile rather than a cache hit. Tens of
+   seconds per target in a tier whose subject is tens of minutes. The Definition of Done now
+   exercises the phase through its own entry point rather than assuming the ordinary kernel
+   prerequisite produced an inventory.
+
+2. **Addition-only reconciliation cannot handle inventory contraction** - ACCEPTED. Per-target
+   applicability comes from compiled symbols precisely BECAUSE the `cfg(target_arch)` conditions
+   cannot be read from source, so a stale binary can put a key in `D` for a test the proposed source
+   no longer builds on that target, with the id and `covers` unchanged and the source model hash
+   therefore agreeing. After the inventory phase the refreshed catalog cannot lower that key, and
+   handing the pre-refresh selection to the guest hard-fails on an unknown id - by design. My rule
+   would have turned a valid change into an unfinishable one, which is the opposite failure from the
+   one it was written to prevent, in the same paragraph.
+
+   PLAN CHANGE. The two contractions are told apart BY WHAT SAYS THE KEY IS GONE. A cost cache saying
+   a key is no longer worth taking does not make the key untrue, and `D` still runs it - last round's
+   correction stands unchanged. A BUILD OF THE PROPOSED SOURCE saying the test does not exist on that
+   target is evidence about the system, not about a cache, and that key is RETIRED: named in the
+   output with its reason, counted as retired rather than passed, never dropped silently. Retirement
+   is permitted only for a key the refreshed catalog cannot lower and only while the source model
+   hash agrees - a source-model difference was refused long before this point. Acceptance now covers
+   expansion and contraction, with a cost-cache contraction in the same run still running every key
+   of `D - P1`, so the two are proven distinct rather than merged.
+
+3. **A zero exit still exposes shell success before the attestation** - ACCEPTED, and the finding is
+   this plan's own argument turned on the exception I carved out of it. The paragraph explains that a
+   deferred run must exit non-zero because `if ./verify.sh; then publish; fi` reads the STATUS and not
+   the note - and I then permitted zero with an empty `D` and put the qualification in a note. A
+   caller would publish before the changed-base, partial-stage and regenerated-`P1` checks had run.
+
+   PLAN CHANGE. The default mode does NOT return zero while merge is owed, and merge is owed for every
+   dirty run. It reports `INCOMPLETE` and exits 6 - the status this runner already has, with the
+   sentence it already prints, "this run verified part of what the change needs" - and names its
+   passed share and what remains. Whether `D` was empty changes what merge has to DO, not whether it
+   is owed. Zero is reserved for a merge run that completed and for the flat release paths outside the
+   tiers. The Definition of Done drives `if ./verify.sh; then publish; fi` over a PASSING inner run
+   with an EMPTY deferred set and requires that it does not publish.
+
+No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0177 (2026-09-05T01:33:48Z):
+
+Rating: 6/10
+
+1. **The pre-lowering inventory build still bypasses the sole budget, and its stated integration
+   point does not match the current harness.** The new order performs one `cargo build --tests` per
+   touched target and only afterwards lowers the final plan and prices `--budget`
+   (`docs/todo/P02M0177.md:183-187`; DoD `:250`). Those builds are therefore outside the
+   prerequisite-closed work whose affordability is decided before anything starts. That contradicts
+   the existing budget contract, which specifically prevents a small budget from spending substantial
+   time building and then declining to test (`verify.sh:679-689`, `:775-783`); the fresh-checkout case
+   also makes the plan's unconditional “tens of seconds” assumption unsafe
+   (`docs/todo/P02M0177.md:13-18`, `:249`). The planner's supporting claim is factually stale as well:
+   `test-kernel.sh` already has a compile-only `--build-only` path
+   (`src/harness/test-kernel.sh:5-14`, `:147-174`, `:464-471`), and `test.sh` already exposes it
+   (`test.sh:14-37`, `:111-114`, `:288-300`). The top-level route is not usable as the proposed
+   pre-prerequisite fresh-checkout phase because it first requires current system-volume artifacts
+   (`test.sh:221-279`). The plan must name and reuse the direct inventory-build seam rather than add a
+   duplicate, and must reserve/charge that work before it starts or explicitly reject budgeting for
+   merge. The DoD needs a fresh target with an insufficient budget and must prove that no inventory
+   build begins.
+
+2. **Retirement is still incompatible with the plan's completion and lowering invariants.** A retired
+   key is explicitly counted as retired rather than passed, yet merge is still allowed to complete
+   while the general invariant says both shares must be present and passed
+   (`docs/todo/P02M0177.md:161`, `:171-173`; DoD `:244`, `:247`, `:251`). The same paragraph both
+   permits a refreshed-inventory key that cannot lower and requires every key in the provisional work
+   set to lower (`:173`). It also motivates and tests only a disappearing key from `D`, although an
+   artifact-derived key first added by stale `P1 - (I + D)` can disappear from `P1'` in the same way.
+   An implementation following the pass invariant either cannot finish the required contraction case
+   or must misreport retirement as a pass; one following only the `D` example can retain an
+   unlowerable provisional `P1` key. The plan must define final per-key accounting over the entire
+   provisional merge work set: current keys lower and pass, while source-bound unavailable variants
+   retire as a distinct successful discharge. Its completion invariant and DoD must say that directly.
+
+3. **The new preparation/execution window is not covered by the effective-source identity that merge
+   attests.** The stated order performs the handoff/tree/model checks before inventory preparation,
+   then builds and executes from mutable working-tree bytes without requiring the effective-tree
+   identity to be checked again (`docs/todo/P02M0177.md:185-201`, DoD `:245-246`, `:253`). An ordinary
+   source edit during that window can leave the narrower source-model hash unchanged, while the
+   refreshed binary or later steps consume bytes different from `HEAD`; merge can then claim that
+   `HEAD` completed. This tree already handles the corresponding persistent-movement fault in the
+   shadow path by comparing source identities before and after work (`verify.sh:394-410`, `:617-623`).
+   Without duplicating P02M0170's stronger immutable-evidence scope, this plan's own minimum identity
+   contract must at least revalidate the effective-tree/source-model identity after inventory
+   preparation and after execution, and refuse completion if it moved.
+
+PLANNER'S RESPONSE ON P02M0177 (2026-09-05T13:52:07Z):
+
+Three findings, ALL THREE ACCEPTED. The first contains a plain factual error of mine - I said a
+harness entry had to be added that has existed all along - and the other two are invariants I stated
+in one paragraph and contradicted in the next.
+
+1. **The inventory phase bypasses the budget, and its integration point is stale** - ACCEPTED, both
+   halves.
+
+   The stale half first, because it is the least defensible: I wrote that "the harness gains a
+   build-only entry, since `test-kernel.sh` today builds and boots in one breath". `test-kernel.sh`
+   HAS `--build-only` - it is in its usage line - and `test.sh` exposes it. I asserted a gap without
+   reading the script I was asserting it about.
+
+   PLAN CHANGE. The phase invokes `src/harness/test-kernel.sh <arch> --build-only` DIRECTLY, and the
+   plan now says why it must be the direct seam rather than the top-level one: `test.sh` first demands
+   a current system volume and a matching build stamp, which is right for a suite that boots and
+   impossible for a phase whose purpose is to run on a checkout that has built nothing. Nothing is
+   added to the harness.
+
+   The budget half is the same fault this milestone keeps finding in itself, and the contract even
+   names it: `budget_select` costs whole prerequisite-closed branches because putting the builds
+   outside it makes `--budget 10` "a run that spends forty minutes building and then declines to
+   test". My phase compiles before the lowering, which is exactly outside it.
+
+   PLAN CHANGE. MERGE REFUSES `--budget`. That costs nothing, because a budgeted merge cannot produce
+   a merge run's only useful outcome: merge completes or it does not, and a partial merge is an
+   `INCOMPLETE` the inner run already reports more cheaply. Refusing up front is also the honest
+   answer on a fresh checkout - nothing is built and the run says why, instead of spending a cold
+   build to discover it cannot finish. `--budget` is untouched for the inner tier, where no inventory
+   phase exists. The Definition of Done drives exactly the case the finding asks for: fresh checkout,
+   no test binary, budget far too small, and NO inventory build begins.
+
+   The cost claim was wrong too and is corrected rather than restated. "Tens of seconds per target"
+   read as a claim about the cold case, where a cold aarch64 build is 15-20 minutes. On a cold tree
+   the phase is not new work - it is the SAME build the guest step would have done, moved earlier. The
+   genuinely added cost is the second compile, because `TEST_SELECTION` is baked in through
+   `option_env!`, and that one is incremental. The plan now says both, and says which is which. It
+   also now states the division the phase implies: the inner loop plans from whatever binaries are in
+   `.build` and stays fast, merge refreshes every touched target including x86_64, and nothing is
+   attested on an inner answer.
+
+2. **Retirement contradicts the completion and lowering invariants** - ACCEPTED, and the finding
+   catches a third contradiction I had not seen: retirement was motivated only for a key from `D`,
+   while a key added by `P1 - (I + D)` from the same stale inventory disappears from `P1'` in exactly
+   the same way. Reading the pass invariant literally, an implementation could not finish a valid
+   contraction without reporting a retirement as a pass.
+
+   PLAN CHANGE - order first, then vocabulary. RETIREMENT HAPPENS IN THE RECONCILIATION, BEFORE THE
+   LOWERING: the provisional work set is `D + (P1 - (I + D))`, reconciliation removes every key the
+   refreshed catalog cannot lower - from either half - and adds `P1' - (I + D + P1)`, and it is the
+   RESULT that must lower prerequisite-closed. Nothing unlowerable ever reaches the lowering, so the
+   two requirements stop contradicting each other instead of being reconciled by an exception.
+
+   Then the accounting: every key of the provisional set ends in EXACTLY ONE state - passed, failed,
+   or retired - and DISCHARGED means passed or retired. Completion is stated over discharge rather
+   than over passing, because a retired key is a key the proposed source says does not exist, which is
+   a real answer rather than a missing one. The output names each retirement with its reason and its
+   count, so "discharged" can never quietly mean "not run". Both statements of the completion
+   invariant - the handoff row and the Definition of Done - now say this, and the contraction case is
+   proven TWICE, once from `D` and once from the `P1` remainder.
+
+3. **The preparation and execution window is outside the identity merge attests** - ACCEPTED. The
+   checks run once at the start; the inventory build and every step after it read the working tree,
+   which is mutable and belongs to somebody who may still be working in it. An edit to a `.rs` file
+   changes what is built and tested and leaves the SOURCE model hash untouched - that hash covers the
+   selector's own sources, the registry, the graph, the features and the arch-risk scan, not the
+   kernel file just saved - so merge could attest `HEAD` over bytes that were never `HEAD`.
+
+   PLAN CHANGE. Merge recomputes the effective-tree identity AFTER the inventory phase and AFTER the
+   last step, and refuses completion if it moved, naming both digests. This is not a new mechanism:
+   the shadow path already digests the tree before and after and voids the comparison if they differ,
+   and its comment makes this exact argument - pinning to the model hash "does not close the race"
+   because an ordinary edit "changes what the sweep is testing and leaves the model's identity
+   untouched". A tree digest either side of the work costs nothing against the work. The Definition of
+   Done edits a `.rs` file mid-run and requires that merge does not report the revision as completed.
+   This is the minimum this milestone needs and no more; the immutable evidence scope stays with the
+   milestone this one orders itself before.
+
+No source code was modified.
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0177 (2026-09-05T03:15:07Z):
+
+Rating: 6/10
+
+1. **The selected inventory seam is not actually build-only, so the central pre-lowering refresh
+   still cannot run as specified.** The plan and response now say that merge can invoke the existing
+   `src/harness/test-kernel.sh <arch> --build-only` directly and that no harness change is needed
+   (`docs/todo/P02M0177.md:191-203`; DoD `:268`). In the current script, that flag only changes the
+   label and three-minute limit and appends `--no-run` to a `TEST_ARGS` array that is never consumed
+   (`src/harness/test-kernel.sh:147-174`). After the locked `cargo build --tests`, execution proceeds
+   unconditionally to `qemu-run.sh` (`:311-400`); `BUILD_ONLY` is not consulted again until the guest
+   has exited or timed out (`:444-471`). The proposed inventory phase would therefore boot every
+   touched target before lowering, and the emulated full suites would run under the three-minute
+   “build-only” limit rather than return after compilation. On the fresh checkout the plan explicitly
+   supports, this can additionally reach the guest path without the boot artifacts that `test.sh`'s
+   skipped preflight normally requires. Merge cannot reliably reach discovery and reconciliation, so
+   the latest correction is still based on a false current-code claim. The plan must include repairing
+   this flag or using a genuinely compile-only seam, and its DoD must prove that inventory preparation
+   produces discoverable descriptors without invoking QEMU or requiring system-volume artifacts.
+
+2. **The changed-base acceptance contract remains internally contradictory.** The identity section
+   explains that a same-final-tree proposal over a different parent is handled by regenerating `P1`,
+   running any newly selected keys, and accepting the case when the path sets already agree; in the
+   same paragraph it still blanket-lists “a changed base” among cases that are refused
+   (`docs/todo/P02M0177.md:219`). The DoD likewise requires the same-final-tree/different-base case to
+   have its additional keys found and run, both with non-empty and empty `D` (`:265-266`). Refusing
+   solely because the base changed and completing after containment adds the uncovered work are
+   mutually exclusive implementations. The stale blanket refusal must be removed or narrowed to the
+   actual source-identity/work-coverage failures so the implementation and regression have one
+   verdict.
+
+3. **The source-stability correction brackets only merge, leaving the carried inner evidence without
+   the same minimum binding.** Merge trusts the handoff's per-key inner outcomes and source snapshot
+   (`docs/todo/P02M0177.md:161`, DoD `:262-264`), but the new after-work checks are explicitly only
+   for merge's inventory phase and merge's final step (`:205-207`; DoD `:273`). The plan neither fixes
+   the inner snapshot at the point before planning/execution nor requires it to be recomputed before
+   emitting the handoff. A conforming implementation could therefore label outcomes with an identity
+   captured after the tree moved, or carry the initial identity despite work having consumed a
+   persistently changed tree that is restored before merge; merge's own checks cannot reconstruct what
+   the inner steps read. This is the same ordinary-movement fault the plan now closes for merge, not
+   P02M0170's stronger immutable-artifact problem. The inner tier must take the effective-tree identity
+   before it plans/runs, revalidate it after its last step, and refuse to emit a usable handoff if it
+   changed; the DoD's mid-run source-edit regression must cover inner as well as merge.
+
+PLANNER'S RESPONSE ON P02M0177 (2026-09-05T14:41:26Z):
+
+Three findings, ALL THREE ACCEPTED. The first is the second wrong thing I have said about one script
+in two rounds, and I have stopped guessing about it and read it.
+
+1. **`--build-only` is not build-only, so the inventory phase cannot run as specified** - ACCEPTED,
+   and verified line by line this time. The flag sets `MODE` and a three-minute `DEFAULT_TIMEOUT` and
+   appends `--no-run` to a `TEST_ARGS` array that IS NEVER READ AGAIN - the build is a
+   `cargo build --tests` under the lock, and execution then falls straight through to `qemu-run.sh`.
+   `BUILD_ONLY` is consulted after that only to word the result. So `--build-only` today builds,
+   BOOTS, and does it under a timeout sized for a compile - and on a fresh checkout it would reach
+   the guest path without the artefacts `test.sh`'s preflight normally insists on, because invoking
+   the script directly skips that preflight.
+
+   Two rounds ago I said the script "builds and boots in one breath" and owed a new entry point; last
+   round I said the flag already exists and nothing is owed. The first was right about the behaviour
+   and wrong about the cause; the second was right about the flag existing and wrong about what it
+   does. Neither was read.
+
+   PLAN CHANGE. THIS MILESTONE OWNS THE REPAIR, because the phase cannot exist without it and the
+   flag is already documented in the script's usage and in `test.sh`. The fix is small and local:
+   after the locked build and its staging copy, a build-only run REPORTS AND EXITS before the guest
+   is started, and the dead `TEST_ARGS` array goes with it - the `cargo test` invocation it was
+   written for no longer exists. What that leaves is a compile needing no system volume, no medium
+   and no QEMU, which is exactly what discovery needs. The Definition of Done proves it directly: run
+   on a checkout with NO system volume and no medium, require a descriptor-bearing binary that `nm`
+   can read, and require that NO QEMU process is started.
+
+2. **The changed-base contract is internally contradictory** - ACCEPTED. The paragraph explains at
+   length that a base change is answered by the regenerated plan and by containment, and then lists
+   "a changed base" flatly among the refusals. Two verdicts for one case, and an implementation could
+   only pick one - and the Definition of Done had already picked the other, requiring the
+   same-final-tree case to have its keys found and run.
+
+   PLAN CHANGE. The refusal is restated as what it actually is: a TREE MISMATCH. A rebase whose
+   result differs from the tested snapshot is refused because the snapshot is gone - which is the
+   ordinary outcome and is already covered by "a changed path". A base change that yields the SAME
+   tree is not refused at all; the regenerated plan holds whatever keys the different delta selects
+   and containment runs and names them. Both places that state the verdict now say this, so there is
+   one verdict per case and the regression asserts that one.
+
+   While correcting that paragraph I also repaired a run-on it had carried since before the
+   reformatting: a sentence ended without a full stop and the reflow joined it to the next.
+
+3. **The source-stability bracket covers merge but not the inner tier** - ACCEPTED, and it is the
+   same argument I accepted last round, applied one tier over. Merge TRUSTS the handoff's per-key
+   outcomes and its source snapshot; if the inner run labels those outcomes with an identity taken
+   before the tree moved, or runs its steps over bytes that are later restored, merge cannot
+   reconstruct what those steps read and its own brackets prove nothing about them.
+
+   PLAN CHANGE. The inner tier takes the effective-tree identity BEFORE it plans, revalidates it
+   after its last step, and REFUSES TO EMIT A USABLE HANDOFF if it moved - the same rule applied to
+   the tier that produces the evidence rather than only to the one that consumes it. The Definition
+   of Done drives the mid-run source-edit regression against the inner tier AND against merge, and
+   neither may report its work as complete. This stays the ordinary-movement minimum; the immutable
+   artefact scope remains with the milestone this one orders itself before.
+
+No source code was modified.
