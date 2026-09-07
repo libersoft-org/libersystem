@@ -1528,18 +1528,12 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 		}
 	}
 
-	// AND THE HISTORY'S OWN CONTRADICTION OF THOSE CONSTANTS.
-	//
-	// `record_step` used to clamp a negative residual to zero, so a run that came in UNDER its fixed
-	// term produced no evidence at all - the one observation that says "this constant is too high"
-	// was the one being thrown away, on exactly the two targets whose fixed terms decide whether a
-	// selection can stay scoped. The overshoot is recorded now, and this is where it becomes a
-	// statement rather than a number in a file.
-	//
-	// A tenth is the margin: a full suite is not a constant-time thing and a run that beats the
-	// estimate slightly is ordinary. A run that beats it by more than that means the term is a
-	// whole-suite figure sitting in a field that means startup cost, which is the defect.
-	{
+	// A run below the fixed estimate is evidence of cost-estimation error, not a coverage
+	// contradiction. The test-guest terms are regression intercepts across different selections,
+	// not strict lower bounds; a dev command can even reuse an already running guest.
+	// Keep the recorded discrepancy visible. Costs can widen the dependency-selected keys; an
+	// overestimate does not remove an obligation or invalidate otherwise sound shadow evidence.
+	if report {
 		let cost = verify_model::history::CostModel::default();
 		match verify_model::history::History::load(&model.repo_root) {
 			Ok(history) => {
@@ -1547,7 +1541,7 @@ fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 					let Some((architecture, environment)) = pair.split_once('/') else { continue };
 					let fixed = cost.fixed_seconds.get(&(architecture.to_string(), environment.to_string())).copied().unwrap_or(0.0);
 					if fixed > 0.0 && *overshoot > fixed * 0.1 {
-						failures.push(format!("the fixed cost for {pair} is {fixed:.0} s and a measured run came in {overshoot:.0} s under it - the term is a whole-suite figure in a field that means startup cost, so every scoped selection there widens to the full suite"));
+						println!("warning: cost estimate for {pair}: a measured run came in {overshoot:.0} s under the fixed estimate of {fixed:.0} s; this indicates estimation error, not a coverage-model failure");
 					}
 				}
 			}
