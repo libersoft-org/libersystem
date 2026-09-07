@@ -77,32 +77,9 @@ fn generate_driver_registry(manifest: &Manifest) {
 		));
 		count += 1;
 	}
-	// HOW MANY PROVIDERS THIS IMAGE CAN EVER HOLD, ADDED UP FROM WHAT ITS DRIVERS DECLARE.
-	//
-	// The catalogue was `[Option<Provider>; 32]` - a number chosen in DeviceManager, unrelated to the
-	// registry, and a valid publication past it was CLOSED. So an image whose drivers declare more
-	// than that silently loses the last of them, and one that declares far fewer carries a table it
-	// can never fill. The registry already states the bound per driver (`provides` is a kind and at
-	// most how many), and the sum of those bounds is the only number that can be right: nothing in
-	// the image can publish more, and nothing in this file decides how many a machine may have.
-	//
-	// A CEILING OF ONE where an image declares none, because a zero-length array is a catalogue that
-	// cannot hold the publication a driver added to the manifest after this was generated - the
-	// refusal would then be the array's shape rather than the declaration it is supposed to enforce.
-	// The SAME filter the entries above are emitted under: a development-only driver is not in a
-	// shipping registry, so its declarations are not part of a shipping image's bound either.
-	let declared: usize = manifest.programs.values().filter(|program| development || !program.development).filter_map(|program| program.driver.as_ref()).map(|driver| driver.provides.iter().map(|entry| entry.most as usize).sum::<usize>()).sum();
-	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst DRIVER_REGISTRY: [Entry; {count}] = [\n{entries}];\n// The sum of every `provides` bound this image's registry declares. See build.rs.\nconst MAX_PROVIDERS: usize = {};\n", declared.max(1));
+	// Publication allowances apply to each binding, so a program count cannot bound instances.
+	let generated = format!("// @generated from services/manifest.toml by build.rs - do not edit.\nconst DRIVER_REGISTRY: [Entry; {count}] = [\n{entries}];\n");
 	write_generated("driver_registry.rs", &generated);
-
-	// THE SAME NUMBER, FOR THE SUPERVISOR THAT RECEIVES WHAT THE MANAGER PUBLISHES.
-	//
-	// ServiceManager is its own binary and cannot see DeviceManager's `MAX_PROVIDERS`, so it held a
-	// four-element probe array - a count of disks compiled into the receiving side of a hand-off
-	// whose SENDING side carries its own count. A machine with a fifth block provider had that
-	// provider's probe connection closed, and the loader-selected root volume cannot be found on a
-	// disk nobody probes. One computation above, emitted twice.
-	write_generated("provider_bound.rs", &format!("// @generated from services/manifest.toml by build.rs - do not edit.\n// The sum of every `provides` bound this image's registry declares. See build.rs.\nconst MOST_PROVIDERS: usize = {};\n", declared.max(1)));
 
 	// The names alone, for ServiceManager's status view.
 	//

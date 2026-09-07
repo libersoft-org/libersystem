@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # TWO SUITES OF ONE ARCHITECTURE, AT THE SAME TIME, EACH REPORTING ITS OWN SELECTION.
 #
-# P02M0167's definition of done asks for exactly this and nothing in the tree performed it. The
+# Concurrent selections require this standing proof. The
 # machinery it is about is all there - the selection-specific kernel is compiled and staged under the
 # build lock, the medium is content-addressed on that staged kernel, the loader is staged the same
 # way, and every run's logs are named by its own pid - but each of those was argued for in a comment
@@ -23,6 +23,8 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # shellcheck source=result-logs.sh
 . "$HERE/result-logs.sh"
+
+bash "$REPO_ROOT/src/harness/test-media-generations.sh" || exit 1
 
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
@@ -52,7 +54,7 @@ B_SELECTION="kernel.object.channel.a_returned_message_is_still_charged_to_the_se
 #
 # This started two suites unconditionally. Under `verify.sh --jobs 1` that made two QEMUs run on a
 # machine whose one answer to "how many may run" was one - a second scheduler with a width of two,
-# which is the thing P02M0167's rule exists to forbid. The runner declares the budget it is willing
+# which exceeds the declared concurrency limit. The runner declares the budget it is willing
 # to hand this step; the gate refuses rather than exceeding it, and a budget that cannot hold the
 # overlap is a budget this gate cannot be proved in.
 #
@@ -77,7 +79,7 @@ wait "$b_pid"
 b_status=$?
 
 # AND BOTH HAD TO SUCCEED. A collision in this tree does not produce a wrong answer - the medium
-# builder recomputes its input key and DIES, which is the failure P02M0167 reproduced - so a run that
+# builder recomputes its input key and DIES when a producer replaces an input, so a run that
 # failed is the symptom this gate is looking for and not a reason to skip the rest of it.
 if ((a_status != 0)); then
 	tail -25 "$work/a.log" >&2

@@ -58,7 +58,11 @@ fn system_packages_use_canonical_executable_names() {
 // failed to report in there - which turned out to be the riscv trap-frame register clobber
 // (a trap could corrupt the interrupted thread's t0/x5), not an interrupt-timing issue;
 // with that fixed the chain settles deterministically on riscv64 too.
-tagged_test!(init_package_starts_system_manager, [Boot, Service, VolumeLayout], id = "kernel.boot.init_package_starts_system_manager", covers = ["kernel", "liberfs"]);
+// NetworkService cannot report online until a live NET publication opens a connection and the
+// real virtio-net driver supplies its MAC/MTU. This covers the driver's binding and connection
+// path; DHCP packet exchange is checked separately by the enforcing-controller traffic gate.
+// The routed-volume report requires real file bytes through the block drivers, including USB.
+tagged_test!(init_package_starts_system_manager, [Boot, Service, VolumeLayout], id = "kernel.boot.init_package_starts_system_manager", covers = ["kernel", "liberfs", "bin.device_manager", "bin.virtio_blk", "bin.virtio_net", "bin.xhci"]);
 fn init_package_starts_system_manager() {
 	// The boot chain, end to end: SystemManager starts from the init package, spawns
 	// ServiceManager and delegates the package and the ramdisk to it, and
@@ -105,29 +109,10 @@ fn init_package_starts_system_manager() {
 	// memory volumes (ram and tmp). They NAME THEMSELVES now, so this asserts the set that came up
 	// rather than a count of identical strings - seven anonymous reports could be the same volume
 	// mounted seven times and this suite could not have told the difference.
-	// THE USB VOLUME'S REPORT, WHICH IS STRONGER ON THE TARGET WHERE THE ROUTE WORKS.
-	//
-	// The supervisor tags a provider it actually routed and the instance repeats it, so ` routed`
-	// distinguishes a served stick from the closed stand-in handed over when no controller published
-	// one - and both used to produce the identical line, which is why asserting it proved only that
-	// the instance had started.
-	//
-	// AND ON AARCH64 IT IS NOT ROUTED, WHICH THIS FOUND ON ITS FIRST RUN (2026-09-04). That machine
-	// carries five boot block devices where x86_64 carries four, so the supervisor - which declares
-	// volumes for four - closes the fifth and says `more block providers than there are volumes
-	// declared for them`, and it publishes no `usb-bus` provider at all where x86_64 publishes one.
-	// The stick is present and the driver sees it: `driver.xhci: online (00:06.0, 4 device(s))
-	// (keyboard) (pointer) (storage)`. So the route is genuinely missing there rather than untested,
-	// and this asserts what holds per target instead of asserting nothing anywhere. It is recorded
-	// in the milestone as a defect the oracle found, not as a target this test excuses.
-	// The exception is AARCH64 ALONE, not "everything that is not x86_64" - riscv64 publishes its
-	// `usb-bus` provider and routes the volume exactly as x86_64 does, which its own first green run
-	// showed. Keying the exception wider than the defect would have hidden a working route behind a
-	// broken one.
-	#[cfg(not(target_arch = "aarch64"))]
+	// The USB report requires a successful directory read through the subscribed provider.
+	// The separate lifecycle check below compares actual files from all four routed media.
 	const USB_VOLUME_REPORT: &[u8] = b"StorageService: online (vol://usb) routed";
-	#[cfg(target_arch = "aarch64")]
-	const USB_VOLUME_REPORT: &[u8] = b"StorageService: online (vol://usb)";
+
 	let online_reports: [&[u8]; 23] = [
 		b"LogService: online",
 		b"DeviceManager: online",
@@ -135,15 +120,6 @@ fn init_package_starts_system_manager() {
 		b"StorageService: online (vol://media)",
 		b"StorageService: online (vol://iso)",
 		b"StorageService: online (vol://udf)",
-		// AND THIS ONE SAYS ITS CHANNEL WAS ROUTED, WHICH THE BARE LINE COULD NOT (added 2026-09-04).
-		//
-		// M7's route is DeviceManager publishing the xHCI driver's block provider and the supervisor
-		// handing it to this instance. When no controller published one, the supervisor hands over a
-		// stand-in whose far end is already closed - so the instance answers "not there" instead of
-		// waiting - and BOTH cases produced the identical `online (vol://usb)`. Asserting that line
-		// therefore proved the instance had started and nothing about the route: a boot that lost
-		// the stick entirely passed it. The suffix is present only for a provider the boot actually
-		// routed.
 		USB_VOLUME_REPORT,
 		b"StorageService: online (vol://ram)",
 		b"StorageService: online (vol://tmp)",
@@ -162,7 +138,8 @@ fn init_package_starts_system_manager() {
 		b"SystemGraphService: online",
 		b"Shell: online",
 	];
-	let lifecycle_reports: [&[u8]; 11] = [
+	let lifecycle_reports: [&[u8]; 12] = [
+		b"ServiceManager: routed volumes read correctly",
 		b"WatchdogProbe: online",
 		b"WatchdogProbe: restarted",
 		b"WatchdogProbe: recovered",
@@ -775,4 +752,41 @@ fn system_manager_recovery_survives_a_clean_start() {
 	fault::clear_crash_notify();
 	assert!(!departed, "a SystemManager that ended cleanly is as gone as one that faulted, and must not be reported up");
 	assert_eq!(attempts, 4, "an ending is a failed attempt, so the ladder runs out rather than stopping at the first");
+}
+
+tagged_test!(embedded_root_still_classifies_block_providers, [Boot, Storage], id = "kernel.boot.embedded_root_still_classifies_block_providers", covers = ["bin.storage_service", "liberfs"]);
+fn embedded_root_still_classifies_block_providers() {
+	let package = pkg::Package::parse(init_package_bytes().expect("init package present")).expect("init package parses");
+	let storage = package.lookup(b"storage_service.lsexe").expect("storage service present");
+	let image = StorageHarness::fixture_image(&[]);
+	assert!(StorageHarness::live_volume_with_probes(storage, &image, true), "an embedded root must classify its independent block probes before reporting online");
+}
+
+tagged_test!(no_selected_root_refuses_a_valid_block_volume, [Boot, Storage], id = "kernel.boot.no_selected_root_refuses_a_valid_block_volume", covers = ["bin.storage_service", "liberfs"]);
+fn no_selected_root_refuses_a_valid_block_volume() {
+	use object::channel::{Channel, Message};
+	use object::rights::Rights;
+	let package = pkg::Package::parse(init_package_bytes().expect("init package present")).expect("init package parses");
+	let storage = package.lookup(b"storage_service.lsexe").expect("storage service present");
+	let (boot, boot_user) = Channel::create();
+	let (block, block_user) = Channel::create();
+	let (server, _client) = Channel::create();
+	let _process = spawn_harness(storage, boot_user);
+	let mut request = b"BLOCK".to_vec();
+	request.extend_from_slice(&bootproto::ROOT_NONE.to_le_bytes());
+	request.extend_from_slice(&0u32.to_le_bytes());
+	request.extend_from_slice(&[0u8; 16]);
+	let cap = object::handle::Capability::new(block_user, Rights::ALL);
+	boot.send(Message::new(request, alloc::vec![cap])).expect("root selection bootstrap");
+	send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
+	let mut disk = StorageHarness::build_tiny_fixture();
+	for _ in 0..100_000 {
+		pump_block_stand_in(&block, &mut disk, 512 * 1024);
+		sched::run_until_idle();
+		assert!(boot.recv().is_err(), "RootSelection::None must never report a promoted system volume");
+		if boot.is_peer_closed() {
+			return;
+		}
+	}
+	panic!("a storage instance with no selected root must refuse its otherwise valid disk");
 }

@@ -34,28 +34,13 @@ if offenders="$(printf '%s\n' "$code" | grep -nE '\b(let|&mut)[[:space:]]+(mut[[
 	fail=1
 fi
 
-# The catalogue is what holds providers, and its bound is not the wire's.
-if ! printf '%s\n' "$code" | grep -q 'MAX_PROVIDERS'; then
-	echo "provider-slots: DeviceManager no longer names MAX_PROVIDERS - the catalogue is what bounds providers" >&2
+# A registry allowance is per binding; a program count cannot bound device instances.
+if ! printf '%s\n' "$code" | grep -q 'entries: Vec<Option<Provider>>'; then
+	echo "provider-slots: the catalogue must grow with valid binding publications" >&2
 	fail=1
 fi
-# AND THE NUMBER IS THE REGISTRY'S, NOT THIS FILE'S.
-#
-# Requiring the symbol was all this checked, so `const MAX_PROVIDERS: usize = 32;` written here
-# satisfied it - which is the same fixed-slot defect the numbered locals were, with a larger
-# constant, and the definition of done says the count is bounded by what drivers DECLARE and by
-# nothing compiled into DeviceManager. A definition in this file is that constant coming back.
-if offenders="$(printf '%s\n' "$code" | grep -nE '^[[:space:]]*const[[:space:]]+MAX_PROVIDERS')"; then
-	echo "provider-slots: DeviceManager DEFINES MAX_PROVIDERS:" >&2
-	printf '%s\n' "$offenders" >&2
-	echo "    The bound is the sum of every 'provides' declaration in the registry, emitted by" >&2
-	echo "    build.rs beside the registry itself. A number written here is one the manifest cannot" >&2
-	echo "    move: an image declaring more loses a publication, one declaring fewer carries slots" >&2
-	echo "    it can never fill, and neither is something a reader of the manifest would expect." >&2
-	fail=1
-fi
-if ! grep -q 'MAX_PROVIDERS' "$(dirname "$0")/../user/services/core/build.rs"; then
-	echo "provider-slots: build.rs no longer emits MAX_PROVIDERS - nothing derives the bound from the registry" >&2
+if printf '%s\n' "$code" | grep -q 'MAX_PROVIDERS'; then
+	echo "provider-slots: a generated program count still limits device instances" >&2
 	fail=1
 fi
 # AND THE BOOT HAND-OFF CARRIES NO COUNT OF ITS OWN (2026-09-02).
@@ -98,14 +83,13 @@ if offenders="$(printf '%s\n' "$code" | grep -nE '\b(let|&mut)[[:space:]]+(mut[[
 	echo "    Publish it and mint a connection for the consumer, or let the consumer subscribe." >&2
 	fail=1
 fi
-# AND WHICH PROVIDERS ARE A USB CONTROLLER'S IS ASKED OF THE CATALOGUE, not written into a route.
-if ! printf '%s\n' "$code" | grep -q 'slots_published_beside('; then
-	echo "provider-slots: nothing asks the catalogue which providers a USB controller published" >&2
-	echo "    A 'block' provider published by a binding that also publishes 'usb-bus' is a USB" >&2
-	echo "    volume - that is the origin rule. A driver name in a branch is the hand-written route." >&2
+# The consumer chooses USB origin from the binding shared by block and bus publications.
+if ! grep -q 'same_binding(bus, info)' "$root/user/services/storage/src/service.rs"; then
+	echo "provider-slots: the USB consumer no longer checks the publisher's bus identity" >&2
 	fail=1
 fi
 
 ((fail == 0)) || exit 1
+python3 "$root/tools/check-driver-connections.py" || exit 1
 slots="$(printf '%s\n' "$code" | grep -c 'catalogue.take(' || true)"
 echo "provider-slots: no numbered provider local or block tag in DeviceManager, the hand-off carries its own count, and every route goes through the catalogue ($slots take site(s))"

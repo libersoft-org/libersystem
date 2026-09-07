@@ -80,6 +80,8 @@ pub struct VirtQueue {
 	next_descriptor: u16,
 	used_seen: u16,
 	notify: u64,
+	// An unresolved request still owns its descriptors and scratch frame for this boot.
+	request_failed: bool,
 }
 
 fn direct(physical: u64) -> u64 {
@@ -151,7 +153,7 @@ impl VirtQueue {
 			write16(common + abi::VIRTIO_CFG_QUEUE_SELECT, index);
 			read16(common + abi::VIRTIO_CFG_QUEUE_SIZE)
 		});
-		Some(VirtQueue { desc: direct(desc), avail: direct(avail), used: direct(used), scratch, size, avail_index: 0, next_descriptor: 0, used_seen: 0, notify: notify_base + notify_offset as u64 * notify_multiplier as u64 })
+		Some(VirtQueue { desc: direct(desc), avail: direct(avail), used: direct(used), scratch, size, avail_index: 0, next_descriptor: 0, used_seen: 0, notify: notify_base + notify_offset as u64 * notify_multiplier as u64, request_failed: false })
 	}
 
 	// The physical address of the scratch frame, and its direct-map alias.
@@ -161,6 +163,14 @@ impl VirtQueue {
 
 	pub fn scratch_virtual(&self) -> u64 {
 		direct(self.scratch)
+	}
+
+	pub fn request_available(&self) -> bool {
+		!self.request_failed
+	}
+
+	pub fn fail_requests(&mut self) {
+		self.request_failed = true;
 	}
 
 	// Submit a two-descriptor chain - the request the device READS, and the tail it WRITES - and
@@ -175,9 +185,12 @@ impl VirtQueue {
 	// where in the tail its status byte sits. A queue cannot decide whether four bytes are enough
 	// without knowing what was asked for.
 	pub fn request(&mut self, request_physical: u64, request_len: u32, tail_physical: u64, tail_len: u32) -> Option<u32> {
-		if self.size < 2 {
+		if self.size < 2 || self.request_failed {
 			return None;
 		}
+		// Reopen only after validating the sole completion. Any early return keeps every queue
+		// resource unavailable, so a late answer cannot confirm a later request with a reused id.
+		self.request_failed = true;
 		let head = self.next_descriptor % self.size;
 		let second = (head + 1) % self.size;
 		self.next_descriptor = self.next_descriptor.wrapping_add(2);
@@ -216,6 +229,9 @@ impl VirtQueue {
 			// SAFETY: the used ring's index field, in this queue's own frame.
 			let used = unsafe { read16(self.used + 2) };
 			if used != self.used_seen {
+				if used != self.used_seen.wrapping_add(1) {
+					return None;
+				}
 				// WHICH ELEMENT THE DEVICE JUST WROTE. One chain is in flight per call, so the
 				// completion is the element at the index this driver had not consumed yet.
 				let slot = self.used_seen % self.size;
@@ -240,6 +256,7 @@ impl VirtQueue {
 				if written > tail_len {
 					return None;
 				}
+				self.request_failed = false;
 				return Some(written);
 			}
 			core::hint::spin_loop();

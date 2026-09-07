@@ -330,16 +330,23 @@ pub fn cursor_after_an_attempt(ran: usize, cursor: usize, selection_pending: boo
 	if cursor <= ran { ran + 1 } else { cursor }
 }
 
-// WHAT AN ATTEMPT BUDGET IS AFTER SOMETHING THAT DID NOT SPEND ONE.
-//
-// A candidate whose artifact was missing, and a node parked on a requirement that has since arrived,
-// both leave the node without having run anything - so the automatic budget starts again. An
-// OPERATOR'S single granted attempt is the exception and it is the whole reason this is a function:
-// that grant is expressed as `attempt = MAX - 1` with a flag beside it, so resetting the counter
-// hands the operator the entire automatic budget they were deliberately not given. The flag is spent
-// where an attempt actually ends, not here.
-pub fn budget_after_nothing_ran(retry_once: bool, attempt: u32) -> u32 {
-	if retry_once { attempt } else { 0 }
+// A missing artifact or a dependency wait preserves earlier attempts, including a one-shot grant.
+pub fn budget_after_nothing_ran(_retry_once: bool, attempt: u32) -> u32 {
+	attempt
+}
+
+// Count attempts when admitted, across every candidate in one incident. Missing artifacts and
+// parked dependencies do not call this and cannot replenish either bound.
+pub fn admit_attempt(spent: &mut u32, maximum: u32, now: u64, deadline: u64, reserve: u64) -> bool {
+	if *spent >= maximum || (deadline != 0 && now >= deadline.saturating_sub(reserve)) {
+		return false;
+	}
+	*spent += 1;
+	true
+}
+
+pub fn handshake_expired(state: BindingState, deadline: u64, now: u64) -> bool {
+	state == BindingState::Binding && deadline != 0 && now >= deadline
 }
 
 // WHY A BINDING IS NOT UP.
@@ -1070,6 +1077,13 @@ pub struct Holdings {
 impl Holdings {
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	// A claim syscall returns both handles together; own both before any further fallible step.
+	pub fn claimed(claim: u64, kind: u16, memory: u64) -> Self {
+		let mut held = Self { claim, ..Self::default() };
+		held.hold(kind, memory);
+		held
 	}
 
 	// The four an INSTALLED binding holds. A binding that reached `Online` has no untransferred

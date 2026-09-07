@@ -883,6 +883,7 @@ destination = "libexec/permission_manager.lsexe"
 providers = [
 	"service-util",
 	"base-proto",
+	"device-proto",
 	"process-proto",
 	"security-proto",
 	"ipc-client",
@@ -2424,10 +2425,11 @@ kind = "payload"
 provider = "service_manager"
 
 [[services.roles]]
-tag = "USBBUS"
-kind = "device"
+tag = "CATALOGUE"
+kind = "factory"
 provider = "device_manager"
-presence = "optional"
+source = "SERVE"
+interface = "liber:device@1/provider-catalogue"
 
 [[services.roles]]
 tag = "PROCESS"
@@ -2849,10 +2851,11 @@ state_storage = "vol://usb"
 dependencies = ["log_service", "storage_service", "device_manager"]
 
 [[services.roles]]
-tag = "USBBLOCK"
-kind = "device"
+tag = "CATALOGUE"
+kind = "factory"
 provider = "device_manager"
-presence = "optional"
+source = "SERVE"
+interface = "liber:device@1/provider-catalogue"
 
 [[services.roles]]
 tag = "SERVE"

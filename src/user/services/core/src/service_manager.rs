@@ -44,6 +44,8 @@ use rt::*;
 mod bootstrap;
 #[path = "service_manager/lifecycle.rs"]
 mod lifecycle;
+#[path = "service_manager/provider_checks.rs"]
+mod provider_checks;
 
 use bootstrap::{Kept, bootstrap_serve, bootstrap_system_graph_service, console_report, drive_runtime_drivers, emit_event, launch_from_volume, open_storage_directory, start_service, stop_service};
 use lifecycle::{depends_on_scoped, has_running_dependent, serve_stats_once, shutdown_all, shutdown_order, verify_shutdown_order};
@@ -130,7 +132,6 @@ include!(concat!(env!("OUT_DIR"), "/driver_names.rs"));
 // How many providers this image's registry allows to exist at once - the bound DeviceManager's
 // catalogue is sized by, so the receiving side of the block hand-off is bounded by the same number
 // rather than by a count of disks written here. See `build.rs`.
-include!(concat!(env!("OUT_DIR"), "/provider_bound.rs"));
 
 // The lifecycle state ServiceManager tracks for each service.
 #[derive(Clone, Copy, PartialEq)]
@@ -519,18 +520,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	let mut storage_client: u64 = 0;
 	let mut storage_admin: u64 = 0;
 	let mut block_client: u64 = 0;
-	let mut block2_client: u64 = 0;
-	let mut block3_client: u64 = 0;
 	let mut media_client: u64 = 0;
 	let mut iso_client: u64 = 0;
-	let mut block4_client: u64 = 0;
 	let mut udf_client: u64 = 0;
 	let mut ram_client: u64 = 0;
 	let mut tmp_client: u64 = 0;
 	// The USB stick's block channel, handed up by the xhci driver in DeviceManager's
 	// phase 2 (0 when no mass-storage device is attached), and the usb StorageService
 	// instance's client end minted when that instance bootstraps.
-	let mut block5_client: u64 = 0;
+	let mut usb_online = false;
 	// ONE PROBE CONNECTION PER BLOCK PROVIDER, from DeviceManager - see `mint_connection`.
 	//
 	// SIZED BY THE REGISTRY'S OWN BOUND, NOT BY A NUMBER OF DISKS (2026-09-03). This was four,
@@ -539,7 +537,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// HAS. A fifth had its probe closed here, and the instance that matches the loader's root uuid
 	// can only match it on a disk it was given a connection to, so the paired volume at a later bus
 	// address was unreachable again - the exact defect the probe hand-off exists to remove.
-	let mut probe_blocks: [u64; MOST_PROVIDERS] = [0; MOST_PROVIDERS];
+	let mut probe_blocks: Vec<u64> = Vec::new();
+	let mut role_blocks: Vec<u64> = Vec::new();
 	// M2'S FORMAT TABLE, one byte per block provider in the order the hand-off used. Filled from the
 	// system StorageService instance's own report - it is the only component that may read a
 	// filesystem - and read by the three volume roles below instead of their bus positions.
@@ -551,7 +550,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The xHCI driver's USB bus query channel (the typed `usb` inventory), handed up
 	// with the phase-2 driver channels and granted to the `lsusb` command through
 	// PermissionManager.
-	let mut usbq_client: u64 = 0;
+
 	// WHETHER THIS MACHINE HAS A NETWORK DRIVER BOUND, not a channel to it - see the `NET` tag in
 	// `drive_runtime_drivers`, and `gpu_online` and `snd_online` beside it for the same shape.
 	let mut net_online: bool = false;
@@ -650,7 +649,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		while let Some(i) = service_logic::service_lifecycle::next_startable(cursor, N, |i| state[i] == State::Absent, |i| MANIFEST[i].deps, |dep| index_of(dep).is_some_and(|idx| state[idx] == State::Ready)) {
 			cursor = i + 1;
 			let mut proc_handle: u64 = 0;
-			let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, &mut block_formats, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut block2_client, &mut block3_client, &mut block4_client, &mut block5_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut usbq_client, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
+			let (started, why): (State, Reason) = unsafe { start_service(&package, &mut kept, MANIFEST[i].name, MANIFEST[i].program, MANIFEST[i].pinned, &mut device_manager_domain, &mut probe_blocks, &mut role_blocks, &mut block_formats, policy_admin_server, power, display_ctl, console_input, console_sink, device_manager, live_volume, bootstrap, pkg_handle, pkg_len, &mut registry_far, &mut block_client, &mut media_client, &mut iso_client, &mut udf_client, &mut ram_client, &mut tmp_client, &mut usb_client, &mut net_client, &mut display_client, &mut display_admin, &mut audio_client, &mut audio_admin, &mut time_client, &mut console_client, &mut console_control, &mut storage_client, &mut storage_admin, &mut log_client, &mut device_client, &mut process_client, &mut config_client, &mut raw_keys, &mut input_client, &mut input_admin, &mut input_focus, &mut input_kill, &mut pointer_console, &mut graph_client, &mut perm_client, &mut res_client, &mut session_client, &mut session1, &mut admin_server, &mut admin_server2, &mut stats_server, &mut stats_server2, &procs, &state, &mut proc_handle, &mut channels[i], &mut failure_reason[i], &mut buf) };
 			// ABSENT -> STARTING -> READY OR FAILED. The middle state is brief here because
 			// bring-up waits for the report, but it is the honest name for the window between
 			// a process existing and a service answering, and it is what a later non-blocking
@@ -742,7 +741,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// on process_service, so come up later), so their driver channels are ready.
 			if MANIFEST[i].name == b"storage_service" && started == State::Ready {
 				if let Some(dm) = index_of(b"device_manager") {
-					unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_online, &mut gpu_online, &mut snd_online, &mut input_online, &mut block5_client, &mut usbq_client, &mut usb_pointer_online, &mut raw_keys, &mut buf) };
+					unsafe { drive_runtime_drivers(channels[dm], storage_client, &mut net_online, &mut gpu_online, &mut snd_online, &mut input_online, &mut usb_online, &mut usb_pointer_online, &mut raw_keys, &mut buf) };
 				}
 				// LogService starts before StorageService, so its volume client (the
 				// on-disk journal) is delivered late, like its config client: minted
@@ -822,12 +821,14 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		.iter()
 		.map(|name| {
 			let online = match *name {
-				b"driver.virtio_blk" => block_client != 0,
+				// The offered handles have moved to their volume roles; retained catalogue
+				// positions still record that the boot block providers came online.
+				b"driver.virtio_blk" => block_client != 0 || !role_blocks.is_empty(),
 				b"driver.virtio_net" => net_online,
 				b"driver.virtio_gpu" => gpu_online,
 				b"driver.virtio_snd" => snd_online,
 				b"driver.virtio_input" => input_online,
-				b"driver.xhci" => block5_client != 0,
+				b"driver.xhci" => usb_online,
 				_ => false,
 			};
 			(*name, online)
@@ -848,6 +849,11 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		if state[idx] == State::Failed {
 			sup[idx].failure = Failure::Bootstrap;
 		}
+	}
+
+	if selftest {
+		let valid = unsafe { provider_checks::routed_volumes(storage_client, media_client, iso_client, udf_client, usb_client) };
+		unsafe { send_blocking(bootstrap, if valid { b"ServiceManager: routed volumes read correctly" } else { b"ServiceManager: routed volume read FAILED" }, 0) };
 	}
 
 	// 3. bring up the managed canary and, in a test boot, exercise the restart policy

@@ -1952,3 +1952,58 @@ Covering the 2026-09-03T22:40:55Z findings too, which were repaired without a re
     cargo test --manifest-path src/tools/verify-model/Cargo.toml --offline   122 passed
     ./check.sh --gate verify-model,undeclared-edge,duplicate-edge,component-oracles   passed
     ./check.sh --gate milestone-index,source-hygiene,no-suppression                   clean
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0167 (2026-09-07T21:49:51Z):
+
+Current implementation rating: 6/10
+
+1. **A narrower ownership rule inside a protected subsystem skips that subsystem's risk bar.**
+   Activation checks a risk row only against the owners of its exact `risk.path` and continues when
+   neither name is in `losing` (`src/tools/verify-model/src/main.rs:1050-1067`). The ownership-loss
+   helper now records the successor component (`src/tools/verify-model/src/candidate.rs:162-166`),
+   but adding a successor below the risk path does not change who owns the parent path. A read-only
+   probe using `Model::load_with_candidate`, the real planner, and the production loss helpers added
+   only `src/kernel/mem/frame -> kernel.mem`: the frame-file plan narrowed from 1,300 keys/FULL to
+   411 keys/scoped, `losing` was exactly `kernel.mem`, and the `src/kernel/mem` risk row matched no
+   component. Both resolutions of that parent still returned `kernel`. Once the general threshold
+   is earned, activation therefore has no check for memory's required third target or allocator and
+   page-table groups. The latest correction handles a split at the exact risk path but leaves this
+   ordinary deeper-prefix narrowing outside the stronger bar required by M5
+   (`docs/todo/P02M0167.md:610-653,696-710`).
+
+2. **A complete ownership-and-covers candidate still grades the displaced component's evidence.**
+   The registry correction records the successor, but catalogue coverage loss still records the
+   original component whenever a test stops covering it
+   (`src/tools/verify-model/src/candidate.rs:79-105`). Activation unions both results, evaluates both,
+   and selects the active owner first when applying a risk row
+   (`src/tools/verify-model/src/main.rs:1007-1027,1058-1077`). In a second read-only probe, adding
+   `src/kernel/mem -> kernel.mem` and changing one existing memory test's `covers` from `kernel` to
+   `kernel.mem` produced `losing = {kernel, kernel.mem}`. A frame change produced allocator evidence
+   for `kernel.mem`, while the memory risk bar selected `kernel`. Page-table and allocator changes
+   under this complete subtree ownership cannot supply those groups to `kernel`, because the
+   recorder attributes them to the candidate's actual owner
+   (`src/tools/verify-model/src/shadow.rs:744-754`). Thus the claimed successor-evidence fix still
+   leaves the intended cumulative candidate unable to satisfy its memory bar. The five-change test
+   uses the active model and synthetic change-kind labels, without a candidate or activation
+   evaluation (`src/tools/verify-model/src/tests.rs:2383-2428`), so it does not prove the M5 route
+   that this correction was meant to repair.
+
+3. **Changing one kernel test file still selects nearly the whole kernel instead of its declared
+   tests.** The live `./verify.sh --for src/kernel/test_suites/hardware.rs --plan` selects 1,150 of
+   1,306 runnable keys, widens all three guest selections to their complete suites, and estimates
+   66% of a full run. The source-path block only adds declared tests to the existing selection
+   (`src/tools/verify-model/src/plan.rs:458-488`); it cannot remove the broad kernel coverage already
+   selected through the reverse build dependency. The registry consequently retains the
+   `src/kernel/test_suites` risk row and explicitly describes this as blocked
+   (`src/tools/verify-model/model/registry.toml:418-435`). The latest response acknowledges the gap,
+   but M5 and the definition of done still require the file-local selection and removal of that row
+   (`docs/todo/P02M0167.md:663-675,733-734`).
+
+Verification: all 140 `verify-model` tests passed. The `verify-scheduler`, `verify-model`,
+`component-oracles`, `gate-oracles`, and `gate-result-logs` gates passed. The two candidate probes
+loaded overlays in memory and called the current production library; neither activated a candidate,
+modified canonical inputs, nor wrote evidence. No guest sweep was run. Original audit bytes were
+preserved; only this re-audit was appended.

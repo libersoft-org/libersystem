@@ -206,7 +206,7 @@ fn an_operators_one_attempt_is_not_turned_back_into_the_automatic_budget() {
 	// ran" hands the operator the whole budget the grant exists to withhold. Three places reach this
 	// - a missing artifact, a candidate that could not be started, and a parked node whose
 	// requirement has arrived - and the third was doing the reset unconditionally.
-	assert_eq!(budget_after_nothing_ran(false, 2), 0, "with no operator grant, nothing having run means the automatic budget starts again");
+	assert_eq!(budget_after_nothing_ran(false, 2), 2, "a missing candidate preserves the automatic attempts already spent");
 	assert_eq!(budget_after_nothing_ran(true, 2), 2, "with one, the counter it was set to is kept");
 	assert_eq!(budget_after_nothing_ran(true, 0), 0, "and it is the counter that is kept, not a floor");
 }
@@ -1314,13 +1314,14 @@ fn a_spawn_that_fails_gives_back_the_bootstrap_handle_it_was_holding() {
 	// THE SPAWN STEP, AND THE HANDLE THE AUDIT FOUND. `spawn_prepared_in` returns with the driver's
 	// end of the bootstrap channel still in the caller when it fails, and the rollback had no field
 	// by which to close it: one leaked handle and its accounting on an ordinary failure path.
-	let mut held = Holdings::new();
+	let mut held = Holdings::claimed(0x23, 1, 0x24);
 	held.domain = 0x20;
 	held.channel = 0x21;
 	held.driver_side = 0x22;
 	held.claim = 0x23;
 	let mut ledger = free_ledger();
 	let mut pending = held.begin_teardown(&mut ledger);
+	assert!(ledger.closed_once(0x24), "the MMIO returned by the claim is closed even before spawn succeeds");
 	assert!(ledger.closed_once(0x22), "the driver's end of the bootstrap channel is closed exactly once");
 	assert_eq!(&ledger.released[..ledger.released_n], &[0x23], "and the device is given back");
 	assert_eq!(pending.settle(&mut ledger, 0, 100), Some(Settled::Free), "a confirmed release with no process to wait for settles at once");
@@ -1710,4 +1711,55 @@ fn disk_probes_and_role_handoff_name_the_same_provider_at_every_index() {
 	}
 	assert_eq!(next_handoff_slot(&entries, |entry| entry.1, |entry| entry.0), None);
 	// The gate removes the production probe sort and requires this test to fail.
+}
+
+#[test]
+fn fallback_candidates_share_one_attempt_and_time_budget() {
+	let mut spent = 0;
+	for now in [10, 30, 60] {
+		assert!(crate::admit_attempt(&mut spent, 3, now, 300, 50));
+	}
+	assert!(!crate::admit_attempt(&mut spent, 3, 80, 300, 50));
+	spent = crate::budget_after_nothing_ran(false, spent);
+	assert!(!crate::admit_attempt(&mut spent, 3, 90, 300, 50), "a missing fallback cannot restore an exhausted node");
+	let mut spent = 1;
+	assert!(!crate::admit_attempt(&mut spent, 3, 250, 300, 50), "the teardown reserve cannot be spent by another candidate");
+	assert_eq!(spent, 1);
+	let mut retry = crate::one_more_attempt(0, 1, None, 3).attempt;
+	assert!(crate::admit_attempt(&mut retry, 3, 400, 600, 50));
+	assert!(!crate::admit_attempt(&mut retry, 3, 410, 600, 50));
+}
+
+#[test]
+fn unrelated_timer_wakes_do_not_extend_or_expire_a_handshake() {
+	let deadline = 210;
+	for now in [30, 70, 130, 209] {
+		assert!(!crate::handshake_expired(BindingState::Binding, deadline, now));
+	}
+	assert!(crate::handshake_expired(BindingState::Binding, deadline, 210));
+	assert!(crate::handshake_expired(BindingState::Binding, deadline, 500));
+	assert!(!crate::handshake_expired(BindingState::Online, deadline, 500));
+	assert!(!crate::handshake_expired(BindingState::Stopping, deadline, 500));
+}
+
+#[test]
+fn every_failure_between_the_claim_and_spawn_closes_the_mmio_handle() {
+	for acquired in 0..3 {
+		let mut held = Holdings::claimed(0x10, 1, 0x11);
+		if acquired >= 1 {
+			held.channel = 0x12;
+			held.driver_side = 0x13;
+		}
+		if acquired >= 2 {
+			held.domain = 0x14;
+		}
+		let mut ledger = free_ledger();
+		let mut pending = held.begin_teardown(&mut ledger);
+		assert!(ledger.closed_once(0x11));
+		assert_eq!(pending.settle(&mut ledger, 0, 100), Some(Settled::Free));
+		assert_eq!(&ledger.released[..ledger.released_n], &[0x10]);
+		let mut second = held.begin_teardown(&mut ledger);
+		assert_eq!(second.settle(&mut ledger, 0, 100), Some(Settled::Free));
+		assert!(ledger.closed_once(0x11));
+	}
 }

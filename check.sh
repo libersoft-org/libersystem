@@ -139,6 +139,8 @@ declare -A GATES=(
 	# declaration rots: it is read by people, who believe it.
 	["declared-interfaces"]="tools/check-declared-interfaces.py"
 	["no-fixed-provider-slots"]="tools/check-no-fixed-provider-slots.sh"
+	["provider-routing"]="tools/check-provider-routing.py"
+	["provider-media-order"]="tools/check-provider-media-order.sh"
 	# DeviceManager watched the development agent in a SECOND wait in front of its one wait, and that
 	# set had no catalogue root in it - so the development configuration deadlocked on the first
 	# service to ask the catalogue for a connection, and nothing boots that configuration to notice.

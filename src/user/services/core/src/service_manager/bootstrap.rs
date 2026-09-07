@@ -85,7 +85,7 @@ impl Kept {
 // locals - a block device's channel, the console-input privilege, the bytes a memory volume is
 // sized with. Threading fifty named variables through here would be the ladder again with one more
 // level of indirection.
-pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, external: &mut dyn FnMut(&Role) -> Option<(alloc::vec::Vec<u8>, u64)>, follow: &mut dyn FnMut(&Role) -> [u64; MOST_PROVIDERS]) -> bool {
+pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut Kept, external: &mut dyn FnMut(&Role) -> Option<(alloc::vec::Vec<u8>, u64)>, follow: &mut dyn FnMut(&Role) -> Vec<u64>) -> bool {
 	unsafe {
 		for (slot, role) in ROLES[index].iter().enumerate() {
 			// THE CALLER GETS FIRST REFUSAL ON EVERY ROLE, not only the kinds the plan cannot
@@ -102,9 +102,6 @@ pub(super) unsafe fn deliver_roles(manager_side: u64, index: usize, kept: &mut K
 				}
 				// AS MANY AS THAT MESSAGE SAID. Every other role answers with none.
 				for probe in follow(role) {
-					if probe == 0 {
-						continue;
-					}
 					if !send_blocking(manager_side, b"PROBE", probe) {
 						return false;
 					}
@@ -227,7 +224,7 @@ pub(super) unsafe fn launch_from_volume(process_client: u64, name: &[u8], bootst
 // pointer-event channel (a USB pointing device). Kept for bootstrapping NetworkService,
 // ConsoleService, AudioService, InputService, the usb StorageService instance and
 // PermissionManager's `usb` grant against the drivers.
-pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_online: &mut bool, gpu_online: &mut bool, snd_online: &mut bool, input_online: &mut bool, block5_client: &mut u64, usbq_client: &mut u64, usb_pointer_online: &mut bool, raw_keys: &mut u64, buf: &mut [u8]) {
+pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64, net_online: &mut bool, gpu_online: &mut bool, snd_online: &mut bool, input_online: &mut bool, usb_online: &mut bool, usb_pointer_online: &mut bool, raw_keys: &mut u64, buf: &mut [u8]) {
 	unsafe {
 		if dm_control == 0 {
 			return;
@@ -303,25 +300,15 @@ pub(super) unsafe fn drive_runtime_drivers(dm_control: u64, storage_client: u64,
 						close(handle);
 					}
 				}
-				// THE COUNT TRAVELS WITH THE CONNECTION, and `USBBUS` is matched FIRST because
-				// `USB` is a prefix of it - the same rule `INPUT2` and `INPUT` already follow.
-				//
-				// DeviceManager holds no USB slot any more: the controller's publications stay in
-				// its catalogue and it MINTS a connection for this supervisor at the hand-off. What
-				// arrives is one connection and how many providers of that kind the machine has, so
-				// a second controller is reported rather than described by a variable that does not
-				// exist. This supervisor has one declared consumer for each, which is why it keeps
-				// one - the rest are reachable through the catalogue by whoever subscribes.
 				_ if tag.starts_with(b"USBBUS") => {
-					*usbq_client = handle;
-					if tag.len() > 6 && tag[6] > 1 {
-						print(b"ServiceManager: this machine has more than one USB bus provider; the inventory is served from the first and the rest stay published\n");
+					if handle != 0 {
+						close(handle);
 					}
 				}
 				_ if tag.starts_with(b"USB") => {
-					*block5_client = handle;
-					if tag.len() > 3 && tag[3] > 1 {
-						print(b"ServiceManager: this machine has more than one USB volume provider; the usb mount uses the first and the rest stay published\n");
+					*usb_online = tag.len() > 3 && tag[3] != 0;
+					if handle != 0 {
+						close(handle);
 					}
 				}
 
@@ -359,7 +346,7 @@ const FORMAT_ISO9660: u8 = 2;
 const FORMAT_UDF: u8 = 3;
 const FORMAT_FAT: u8 = 4;
 
-pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut [u64; MOST_PROVIDERS], block_formats: &mut Vec<u8>, policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, block2_client: &mut u64, block3_client: &mut u64, block4_client: &mut u64, block5_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, usbq_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
+pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u8], program: &[u8], pinned: bool, service_domain: &mut u64, probe_blocks: &mut Vec<u64>, role_blocks: &mut Vec<u64>, block_formats: &mut Vec<u8>, policy_admin: u64, power: u64, display_ctl: u64, console_input: u64, console_sink: u64, device_manager: u64, live_volume: u64, up: u64, pkg_handle: u64, pkg_len: usize, registry_far: &mut u64, block_client: &mut u64, media_client: &mut u64, iso_client: &mut u64, udf_client: &mut u64, ram_client: &mut u64, tmp_client: &mut u64, usb_client: &mut u64, net_client: &mut u64, display_client: &mut u64, display_admin: &mut u64, audio_client: &mut u64, audio_admin: &mut u64, time_client: &mut u64, console_client: &mut u64, console_control: &mut u64, storage_client: &mut u64, storage_admin: &mut u64, log_client: &mut u64, device_client: &mut u64, process_client: &mut u64, config_client: &mut u64, raw_keys: &mut u64, input_client: &mut u64, input_admin: &mut u64, input_focus: &mut u64, input_kill: &mut u64, pointer_console: &mut u64, graph_client: &mut u64, perm_client: &mut u64, res_client: &mut u64, session_client: &mut u64, session1: &mut u64, admin_server: &mut u64, admin_server2: &mut u64, stats_server: &mut u64, stats_server2: &mut u64, procs: &[u64; N], state: &[State; N], proc_out: &mut u64, control: &mut u64, failure_out: &mut String, buf: &mut [u8]) -> (State, Reason) {
 	unsafe {
 		let (manager_side, service_side): (u64, u64) = match channel() {
 			Some(pair) => pair,
@@ -445,80 +432,19 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			// serve roots it creates, and a closure holding a reference alongside would be two
 			// borrows of one table.
 			let session_root: u64 = kept.end_of(b"session_service", CAP_SERVE);
-			// Read BEFORE either closure borrows the array: one wants the count, the other takes the
-			// handles, and a closure holding a reference alongside would be two borrows of one thing.
-			//
-			// AND TAKEN ONLY BY THE SERVICE THAT CONSUMES THEM (corrected 2026-09-03). This ran for
-			// EVERY service, while `follow` hands the handles back only for `storage_service`'s
-			// `BLOCK` role - so whichever service started first after DeviceManager populated the
-			// array emptied it and dropped every probe on the floor, unsent and unclosed. That is
-			// not hypothetical ordering: `iso_storage` and `media_storage` precede `storage_service`
-			// in the manifest and are dependency-ready at the same moment, so the system instance
-			// received a probe count of ZERO on every boot and the volume the loader chose could
-			// only ever be found at the first bus address - which is the defect the probe hand-off
-			// exists to remove.
-			// AND ONLY WHERE THE COUNT TRAVELS WITH THEM. The `BLOCK` role answers `LIVEVOL` on a
-			// live boot - the loader chose an EMBEDDED image and there is no block volume to
-			// identify - and that message carries no probe count, so an instance reading it reads no
-			// probes either. Sending them anyway puts four messages in front of the next role and
-			// the bootstrap desyncs, which is what happened the moment the array stopped being
-			// emptied by whichever service started first. They are minted connections, so on that
-			// path they are CLOSED rather than left for a driver to wait on.
-			let probe_handles: [u64; MOST_PROVIDERS] = if name == b"storage_service" {
-				let taken = core::mem::take(probe_blocks);
-				if live_volume != 0 {
-					for handle in taken.iter().filter(|handle| **handle != 0) {
-						close(*handle);
-					}
-					[0; MOST_PROVIDERS]
-				} else {
-					taken
-				}
-			} else {
-				[0; MOST_PROVIDERS]
+			let mut probe_handles = if name == b"storage_service" { core::mem::take(probe_blocks) } else { Vec::new() };
+			let probe_count = probe_handles.len() as u32;
+			// Keep every candidate until its content is known, including provider zero. The root
+			// owns a separately minted probe, so choosing a later root cannot consume the FAT disk.
+			let mut take_format = |want: u8| -> u64 {
+				let Some(at) = block_formats.iter().position(|format| *format == want) else { return 0 };
+				role_blocks.get_mut(at).map_or(0, |handle| core::mem::take(handle))
 			};
-			// SATURATED AT WHAT ONE BYTE OF THE HAND-OFF CAN CARRY. The count travels in the `BLOCK`
-			// message as a single byte, so a machine with more providers than that says the number
-			// it can say rather than wrapping it to a smaller one.
-			let probe_count: u8 = probe_handles.iter().filter(|handle| **handle != 0).count().min(u8::MAX as usize) as u8;
-			// M2: WHICH DISK IS WHICH IS DECIDED BY WHAT IS ON IT, NOT BY WHERE IT SITS (2026-09-04).
-			//
-			// These three were `block2_client`, `block3_client` and `block4_client` - the second,
-			// third and fourth block provider by bus address - and the volume instances trusted the
-			// label. A checked mount refuses a wrong medium but cannot REASSIGN it, so a machine
-			// whose ISO disc sits at a lower address than its FAT medium left BOTH volumes absent:
-			// the media instance found ISO9660 where it wanted FAT and the ISO instance the reverse,
-			// and each simply failed to mount.
-			//
-			// The system instance classified every provider it probed and sent the answer up with
-			// its report; `block_formats[i]` is what is on provider `i`, in the same order these
-			// handles arrived. Format settles the ISO and the UDF outright because only one provider
-			// carries each. FAT is not settled by format - the USB stick is FAT too - but it does
-			// not need to be here: the stick is bound in phase two and arrives as `block5_client`,
-			// so the only FAT candidate among the BOOT providers is the media volume.
-			//
-			// WHERE A PROVIDER COULD NOT BE CLASSIFIED THE POSITION IS USED AND SAID. A silent
-			// fallback would be the old behaviour wearing a new name, and the whole point of this
-			// item is that a wrong assignment is visible.
-			let positional: [u64; 3] = [*block2_client, *block3_client, *block4_client];
-			let by_format = |want: u8, position: usize| -> u64 {
-				// Index 0 of the table is the system volume, which is `block_client` and is not one
-				// of these three; the three arrived as providers 1, 2 and 3.
-				for (at, handle) in positional.iter().enumerate() {
-					if block_formats.get(at + 1).copied() == Some(want) {
-						return *handle;
-					}
-				}
-				if !block_formats.is_empty() {
-					print(
-						b"ServiceManager: no block provider carries the format this volume wants; falling back to its bus position
-",
-					);
-				}
-				positional[position]
-			};
-			let (fat, iso, udf, usb): (u64, u64, u64, u64) = (by_format(FORMAT_FAT, 0), by_format(FORMAT_ISO9660, 1), by_format(FORMAT_UDF, 2), *block5_client);
-			let block: u64 = *block_client;
+			let fat = if name == b"media_storage" { take_format(FORMAT_FAT) } else { 0 };
+			let iso = if name == b"iso_storage" { take_format(FORMAT_ISO9660) } else { 0 };
+			let udf = if name == b"udf_storage" { take_format(FORMAT_UDF) } else { 0 };
+			let block = if name == b"storage_service" && probe_count == 0 { core::mem::take(block_client) } else { 0 };
+
 			let keys: u64 = *raw_keys;
 			let (storage_root, storage_adm): (u64, u64) = (*storage_client, *storage_admin);
 			let pointer_forward: u64 = *pointer_console;
@@ -559,28 +485,7 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				if name == b"udf_storage" && role.tag == b"UDFBLOCK" {
 					return Some((role.tag.to_vec(), udf));
 				}
-				// USB IS THE ONE THAT NEEDS A STAND-IN RATHER THAN NOTHING. With no xhci driver the
-				// other three instances take a zero handle and mount lazily, but this one talks to
-				// its block service during bring-up: handed nothing it would wait, and handed a
-				// channel whose far end is already closed it gets the refusal it can act on. An
-				// absent device and a dead one are the same answer to a caller, which is the point.
-				if name == b"usb_storage" && role.tag == b"USBBLOCK" {
-					if usb != 0 {
-						// A ROUTED PROVIDER SAYS SO IN THE TAG, so the instance's own report can
-						// tell the two apart (added 2026-09-04). Both cases hand over a channel and
-						// both used to produce the identical `online (vol://usb)` line, which is why
-						// the boot's assertion on that line proved only that the instance started -
-						// a stand-in whose far end is already closed satisfies it exactly as well as
-						// a stick does. One byte after the tag is the difference, and it is the
-						// difference M7's route is about.
-						let mut tag: alloc::vec::Vec<u8> = role.tag.to_vec();
-						tag.push(b'*');
-						return Some((tag, usb));
-					}
-					let (dead_server, dead_client): (u64, u64) = channel()?;
-					close(dead_server);
-					return Some((role.tag.to_vec(), dead_client));
-				}
+
 				// THE DISK OR THE IMAGE, IN THE SAME POSITION. A live system serves its volume from a
 				// filesystem image copied into memory and an installed one from the disk, and the
 				// two arrive under different tags in the one place the plan has for them. Sending
@@ -590,7 +495,9 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 					if live_volume != 0 {
 						// The loader's choice was `Embedded`, and there is nothing to check it
 						// against: the image the kernel handed over IS the one the loader verified.
-						return Some((b"LIVEVOL".to_vec(), live_volume));
+						let mut message = b"LIVEVOL".to_vec();
+						message.extend_from_slice(&probe_count.to_le_bytes());
+						return Some((message, live_volume));
 					}
 					// WHAT THE LOADER CHOSE, APPENDED TO THE TAG rather than sent after it.
 					//
@@ -608,7 +515,7 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 					// a sentinel after the last one: a reader looking for a terminator CONSUMES
 					// whatever comes next, and the kernel's own fixtures send `BLOCK` and then
 					// `SERVE` with no probes at all.
-					message.push(probe_count);
+					message.extend_from_slice(&probe_count.to_le_bytes());
 					return Some((message, block));
 				}
 				// A PRIVILEGE IS THE KERNEL'S, HANDED ON. Duplicated rather than transferred,
@@ -719,11 +626,11 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 			// THE PROBE CONNECTIONS, for the one instance whose job is to choose among the disks.
 			// Every other role answers with none. TAKEN, not duplicated: these were minted for this
 			// consumer and nobody else holds them.
-			let mut follow = |role: &Role| -> [u64; MOST_PROVIDERS] {
+			let mut follow = |role: &Role| -> Vec<u64> {
 				if name != b"storage_service" || role.tag != b"BLOCK" {
-					return [0; MOST_PROVIDERS];
+					return Vec::new();
 				}
-				probe_handles
+				core::mem::take(&mut probe_handles)
 			};
 			if !deliver_roles(manager_side, index, kept, &mut external, &mut follow) {
 				return (State::Failed, Reason::BootstrapRefused);
@@ -783,7 +690,7 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 		if name == b"system_graph_service" && !bootstrap_system_graph_service(manager_side, procs, state, *device_client, kept.end_of(b"device_manager", b"SERVE"), graph_client, stats_server) {
 			return (State::Failed, Reason::BootstrapRefused);
 		}
-		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, *usbq_client, *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
+		if name == b"permission_manager" && !bootstrap_permission_manager(manager_side, policy_admin, *storage_admin, *storage_client, *media_client, *iso_client, *udf_client, *usb_client, *ram_client, *tmp_client, kept.end_of(b"device_manager", CAP_SERVE), *log_client, *net_client, *time_client, *config_client, *device_client, *audio_client, *display_admin, *input_admin, *audio_admin, *res_client, *process_client, session_client, session1, perm_client, admin_server2, stats_server2) {
 			return (State::Failed, Reason::BootstrapRefused);
 		}
 		match recv_blocking(manager_side, buf) {
@@ -812,6 +719,18 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 				if name == b"storage_service" && text < len {
 					block_formats.clear();
 					block_formats.extend_from_slice(&buf[text + 1..len]);
+					// The root uses its probe connection. Release unused offered connections once the
+					// table identifies them; retain only the first provider of each declared media role.
+					let mut kept_formats = [false; 5];
+					for (at, handle) in role_blocks.iter_mut().enumerate() {
+						let format = block_formats.get(at).copied().unwrap_or(0) as usize;
+						let wanted = matches!(format, 2 | 3 | 4) && !kept_formats[format];
+						if wanted {
+							kept_formats[format] = true;
+						} else if *handle != 0 {
+							close(core::mem::take(handle));
+						}
+					}
 				}
 				// Relay the service's own report up to SystemManager, in start order, and
 				// keep its report channel as the control channel used to stop it later.
@@ -828,12 +747,9 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 					close(proc as u64);
 					*proc_out = 0;
 				}
-				// DeviceManager sends a follow-up "BLOCK2" message carrying the second disk's
-				// block service channel, then "BLOCK3" and "BLOCK4" for the third and fourth
-				// disks; keep them to bootstrap the media / iso / udf StorageService instances
-				// (each handle is 0 when that disk is absent). The net / gpu / snd / input
-				// driver channels arrive later, in DeviceManager's phase 2, once the volume they
-				// load from is mounted (driven right after StorageService comes up, below).
+				// Keep every offered block connection and its independent probe in publication
+				// order. The system instance classifies them before the media roles are selected.
+				// Drivers loaded from the system volume publish in DeviceManager's phase two.
 				if name == b"device_manager" {
 					// HOW MANY BLOCK PROVIDERS THIS MACHINE HAS, CARRIED RATHER THAN ASSUMED
 					// (2026-09-02). DeviceManager used to send three follow-ups and four probes
@@ -844,44 +760,21 @@ pub(super) unsafe fn start_service(package: &Package, kept: &mut Kept, name: &[u
 						if handle != 0 {
 							close(handle);
 						}
-						if len >= 7 && &buf[..6] == b"BLOCKS" {
-							published = buf[6] as usize;
+						if len >= 10 && &buf[..6] == b"BLOCKS" {
+							published = u32::from_le_bytes(buf[6..10].try_into().unwrap()) as usize;
 						}
 					}
-					// The first arrived with the online report; the rest follow. This supervisor has
-					// three more volumes declared to give them to - the media, ISO and UDF instances
-					// the manifest names - and a provider past that is CLOSED and SAID rather than
-					// silently kept: a handle nobody serves is a channel its driver waits on for
-					// ever.
-					for at in 0..published.saturating_sub(1) {
+					role_blocks.clear();
+					if published != 0 {
+						role_blocks.push(core::mem::take(block_client));
+					}
+					for _ in 0..published.saturating_sub(1) {
 						let Received::Message { handle, .. } = recv_blocking(manager_side, buf) else { break };
-						match at {
-							0 => *block2_client = handle,
-							1 => *block3_client = handle,
-							2 => *block4_client = handle,
-							_ => {
-								if handle != 0 {
-									close(handle);
-								}
-								print(b"ServiceManager: this machine has more block providers than there are volumes declared for them; the extra one is published and unmounted\n");
-							}
-						}
+						role_blocks.push(handle);
 					}
-					// AND ONE PROBE CONNECTION PER BLOCK PROVIDER, in the same order. These are
-					// minted connections rather than the roles' own channels, so the instance that
-					// probes them competes with nobody for a reply. The array is what the system
-					// instance is handed; a machine with more providers than it holds probes the
-					// ones it can and the rest are closed.
-					for at in 0..published {
-						let Received::Message { handle: probe, .. } = recv_blocking(manager_side, buf) else { break };
-						match probe_blocks.get_mut(at) {
-							Some(slot) => *slot = probe,
-							None => {
-								if probe != 0 {
-									close(probe);
-								}
-							}
-						}
+					for _ in 0..published {
+						let Received::Message { handle, .. } = recv_blocking(manager_side, buf) else { break };
+						probe_blocks.push(handle);
 					}
 				}
 				// PermissionManager follows its "online" report with the sandbox proof: the
@@ -1066,7 +959,7 @@ pub(super) unsafe fn bootstrap_system_graph_service(manager_side: u64, procs: &[
 // narrower client to each component it sandboxes. (The grantable permission capability - a
 // connection to the manager's own serve channel - is not passed here: the manager mints that
 // self-connection itself.)
-unsafe fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, storage_admin: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, usbq_client: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, session_client: &mut u64, session1: &mut u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
+unsafe fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, storage_admin: u64, storage_client: u64, media_client: u64, iso_client: u64, udf_client: u64, usb_client: u64, ram_client: u64, tmp_client: u64, catalogue_root: u64, log_client: u64, net_client: u64, time_client: u64, config_client: u64, device_client: u64, audio_client: u64, display_admin: u64, input_admin: u64, audio_admin: u64, resource_client: u64, process_client: u64, session_client: &mut u64, session1: &mut u64, perm_client: &mut u64, admin_server2: &mut u64, stats_server2: &mut u64) -> bool {
 	unsafe {
 		// A fresh StorageService connection for the manager (independent of the shell's),
 		// duplicable so the manager can grant a narrowed copy to a sandboxed component.
@@ -1281,7 +1174,8 @@ unsafe fn bootstrap_permission_manager(manager_side: u64, policy_admin: u64, sto
 		// command (whose manifest grants usb): handed up by DeviceManager in phase 2, held by
 		// the supervisor until here (0 when the driver never came up - the manager simply
 		// cannot grant what it does not hold).
-		if !send_blocking(manager_side, CAP_USBBUS, usbq_client) {
+		let catalogue = service_connect(catalogue_root).unwrap_or(0);
+		if !send_blocking(manager_side, b"CATALOGUE", catalogue) {
 			return false;
 		}
 		// A fresh ProcessService connection the manager drives to load the components it

@@ -33,4 +33,6 @@ count="$(printf '%s\n' "$output" | sed -n 's/^running \([0-9]*\) tests$/\1/p' | 
 [[ -n "$count" ]] || fail "the suite reported no test count at all"
 ((count >= 35)) || fail "only $count test(s) ran, and this suite has more than that - something stopped being compiled in"
 
+python3 "$HERE/check-iommu-completions.py"
+
 echo "virtio-iommu-protocol: $count test(s) - the DMA contract, its fake backend, and the virtio-iommu codec"

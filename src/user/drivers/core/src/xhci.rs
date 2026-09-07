@@ -462,7 +462,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// their text - a report, then the literal `USBBUS`, then `POINTER` - which meant the
 		// manager was parsing strings to decide what a capability was for.
 		common::online(bootstrap, &bind, report.as_bytes(), &[(driver_protocol::provider::BLOCK, blk_client), (driver_protocol::provider::USB_BUS, usbq_client), (driver_protocol::provider::POINTER, ptr_client)]);
-		service_loop(bootstrap, &bind, &mut hc, &mut slots, hids, storage, blk_server, usbq_server, irq);
+		service_loop(bootstrap, &bind, &mut hc, &mut slots, hids, storage, blk_server, usbq_server, ptr_server, irq);
 	}
 }
 
@@ -1014,35 +1014,24 @@ unsafe fn wait_command(hc: &mut Xhci, hids: &mut Hids) -> Option<u32> {
 // unplugged one is torn down. The loop sleeps on the controller's MSI-X
 // interrupt and both channels at once, and the synchronous BOT waits service HID
 // events inline, so typing is never lost behind disk traffic.
-unsafe fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, irq: u64) -> ! {
+unsafe fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots: &mut Slots, mut hids: Hids, mut storage: Option<(UsbDevice, Storage)>, blk_server: u64, usbq: u64, pointer: u64, irq: u64) -> ! {
 	unsafe {
 		post_reports(hc, &mut hids);
 		let mut req: [u8; 16] = [0u8; 16];
+		// These tokens are the positions in this binding's OFFER list. Keep the factory even
+		// with no consumers, so a later storage service or lsusb process can connect again.
+		let mut serving = common::Serving::from_offers(&[(0, blk_server), (1, usbq), (2, pointer)]);
 		loop {
-			// The manager's channel joins the three this loop already waits on.
-			if common::wait_or_answer(bootstrap, bind, &[irq, blk_server, usbq]).is_none() {
-				// AND THE CONTROLLER IS HALTED FIRST, which this did not do.
-				//
-				// The comment here said "the quiesce is the device's own reset path", and that reset
-				// happens at BRING-UP. On a planned stop the controller was left RUNNING - command
-				// ring, event ring and every transfer ring live, all of them DMA - and `STOPPED` was
-				// sent anyway, which certifies the opposite. `halt` clears R/S and waits for HCHalted,
-				// which is the controller's own statement that it has stopped touching memory.
-				// AND THE KERNEL IS TOLD, which passing zero skipped.
-				//
-				// `finish_stop` calls `device_quiesced` only for a caller that has the device's own
-				// capability, and this driver has held it in `DEVICE` since bind - so passing zero
-				// certified the controller quiet to the MANAGER and never made the claim the KERNEL
-				// acts on. The DMA frames and the masked MSI-X vector this controller held stayed
-				// out of circulation for the rest of the boot, which is the state a driver that
-				// could NOT confirm its hardware is supposed to produce, reached by one that did.
+			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &[irq]) else {
 				common::finish_stop(bootstrap, bind, device(), hc.halt());
 				exit();
+			};
+			PTR_SINK.store(serving.first_for(2), Ordering::Relaxed);
+			if matches!(ready, common::ProviderReady::Connected(_)) {
+				continue;
 			}
-			// the interrupt: drain the event ring (HID reports feed the console and
-			// the pointer sink; a port-status change marks the bus for the reconcile
-			// below), acknowledge, and clear the interrupter's pending flag so the
-			// next event edge fires.
+			// Drain hardware events whenever this loop wakes. Synchronous block operations still
+			// service HID events inline; consumer closure does not stop the controller.
 			let mut rescan: bool = false;
 			while let Some((_p, status, control)) = take_event(hc) {
 				if control >> 10 & 0x3f == TRB_EV_PORT_STATUS {
@@ -1056,55 +1045,73 @@ unsafe fn service_loop(bootstrap: u64, bind: &common::Bind, hc: &mut Xhci, slots
 			if rescan {
 				reconcile_ports(hc, slots, &mut hids, &mut storage);
 			}
-			// the block channel: serve every queued request (with an error status while
-			// no mass-storage device is attached, so a client never blocks).
-			loop {
-				match try_recv(blk_server, &mut req) {
-					Polled::Message { len, handle } if len >= 16 => match storage.as_mut() {
-						Some((dev, st)) => serve_block_request(hc, &mut hids, dev, st, blk_server, &req, handle),
-						None => {
-							if handle != 0 {
-								close(handle);
+			let common::ProviderReady::Consumer(at) = ready else { continue };
+			let server = serving.at(at);
+			let closed = match serving.token_at(at) {
+				0 => match try_recv(server, &mut req) {
+					Polled::Message { len, handle } if len >= 16 => {
+						match storage.as_mut() {
+							Some((dev, st)) => serve_block_request(hc, &mut hids, dev, st, server, &req, handle),
+							None => {
+								if handle != 0 {
+									close(handle);
+								}
+								reply_block(server, STATUS_ERR, 0);
 							}
-							reply_block(blk_server, STATUS_ERR, 0);
 						}
-					},
+						false
+					}
 					Polled::Message { handle, .. } => {
 						if handle != 0 {
 							close(handle);
 						}
-						reply_block(blk_server, STATUS_ERR, 0);
+						reply_block(server, STATUS_ERR, 0);
+						false
 					}
-					Polled::Empty => break,
-					Polled::Closed => exit(),
-				}
-			}
-			// the query channel: answer every queued `usb.list` request with the live
-			// inventory of the addressed devices.
-			loop {
-				let mut qreq: [u8; 64] = [0u8; 64];
-				match try_recv_caps(usbq, &mut qreq) {
-					PolledCaps::Message { len, handles } => {
-						let mut api: UsbApi = UsbApi { slots };
-						let mut reply: [u8; 4096] = [0u8; 4096];
-						let mut reply_handle = proto::codec::Handles::new();
-						// EVERY CAPABILITY THE MESSAGE CARRIED - see `rt::recv_caps_blocking` for why the
-						// single-handle receive was the wrong primitive for a typed dispatch.
-						let mut handle = handles;
-						if let Some(n) = usb::dispatch(&mut api, &qreq[..len], &mut handle, &mut reply, &mut reply_handle) {
-							if !send_caps_blocking(usbq, &reply[..n], reply_handle.as_slice()) {
-								for &leftover in reply_handle.as_slice() {
-									close(leftover);
+					Polled::Empty => false,
+					Polled::Closed => true,
+				},
+				1 => {
+					let mut qreq: [u8; 64] = [0u8; 64];
+					match try_recv_caps(server, &mut qreq) {
+						PolledCaps::Message { len, handles } => {
+							let mut api: UsbApi = UsbApi { slots };
+							let mut reply: [u8; 4096] = [0u8; 4096];
+							let mut reply_handle = proto::codec::Handles::new();
+							let mut handle = handles;
+							if let Some(n) = usb::dispatch(&mut api, &qreq[..len], &mut handle, &mut reply, &mut reply_handle) {
+								if !send_caps_blocking(server, &reply[..n], reply_handle.as_slice()) {
+									for &leftover in reply_handle.as_slice() {
+										close(leftover);
+									}
 								}
 							}
+							for &unclaimed in handle.as_slice() {
+								close(unclaimed);
+							}
+							false
 						}
-						for &unclaimed in handle.as_slice() {
-							close(unclaimed);
-						}
+						PolledCaps::Empty => false,
+						PolledCaps::Closed => true,
 					}
-					PolledCaps::Empty => break,
-					PolledCaps::Closed => exit(),
 				}
+				// Pointer consumers receive events and send no requests. Drain unexpected input
+				// with its capabilities, and return the allowance when the peer closes.
+				_ => match try_recv_caps(server, &mut req) {
+					PolledCaps::Message { handles, .. } => {
+						for &handle in handles.as_slice() {
+							close(handle);
+						}
+						false
+					}
+					PolledCaps::Empty => false,
+					PolledCaps::Closed => true,
+				},
+			};
+			if closed {
+				let token = serving.close_at(at);
+				PTR_SINK.store(serving.first_for(2), Ordering::Relaxed);
+				common::disconnected(bootstrap, bind, token);
 			}
 		}
 	}

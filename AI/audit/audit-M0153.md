@@ -1875,3 +1875,76 @@ up - the fix landed and the next task arrived before the response did.
 
 The gate itself boots a guest and is part of the single long run at the end of this job; its result is
 recorded with that run.
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0153 (2026-09-07T21:49:51Z):
+
+Current implementation rating: 6/10
+
+1. **A late completion can confirm a different request after an IOMMU request times out.**
+   `VirtQueue::request` advances and reuses descriptor heads without retaining ownership of requests
+   whose completion was never received (`src/kernel/iommu/virtqueue.rs:177-195,210-247`). The
+   production request queue has 16 descriptors (`src/kernel/iommu/mod.rs:428`), so eight unanswered
+   two-descriptor requests wrap the next head back to zero. If the first request's completion then
+   arrives, the ninth request accepts its matching descriptor id and length even though the ninth
+   request has not completed. `Wire::request` also overwrites the same request/status scratch buffer
+   for every call, returns `Unconfirmed` without disabling further submissions, and reads the zeroed
+   status as success once that unrelated completion is accepted (`src/kernel/iommu/mod.rs:77-112`;
+   `src/dma/src/virtio_iommu.rs:453-460`). A delayed earlier success can consequently be mistaken for
+   a later UNMAP completion, allowing `finish_close` to release an IOVA and authorize frame reuse
+   before that unmap completed (`src/dma/src/lib.rs:1098-1117`). This violates M1/M3's completion
+   contract and hostile case 14. The existing id/length checks do not fix reuse of an unresolved
+   request's identity and storage. Keep unresolved queue resources unavailable, or fail the request
+   queue closed until its state is confirmed.
+
+   Reproduced with the unchanged production `virtqueue.rs` included in a temporary host executable,
+   using allocated host memory for its rings and stubbed frame/timer services: after eight requests
+   returned `None`, supplying only request 1's used entry caused request 9 to return `Some(4)`.
+
+2. **An already-quarantined mapping can disappear from binding accounting while teardown reports
+   a clean release.** `map_failed(Unconfirmed)` records a quarantined mapping but leaves its IOVA in
+   the live `taken` table (`src/dma/src/lib.rs:993-998`). The production quarantined-grant reader
+   counts only `IovaSpace::quarantined_addresses`, so this failed MAP immediately reports zero
+   quarantined grants (`src/kernel/iommu/mod.rs:604-606`). The subsequent revoke visits only
+   `Live`/`Closing` mappings and initializes its success accumulator to true; existing quarantined
+   mappings do not affect `FramesReusable` (`src/dma/src/lib.rs:1170-1206`). The kernel removes the
+   live device/domain association, retains one only when revoke reports failure, then merely logs
+   `destroy_domain` refusing the remaining quarantine and still returns success
+   (`src/kernel/iommu/mod.rs:989-1012,1061-1068`). The claim can consequently become `Free`, with
+   both binding grant counters answering zero while the old domain, quarantined mapping and charged
+   frames remain held. A later binding hides those resources further. This leaves the accepted
+   quarantine/domain-retirement/accounting fixes incomplete against M3/M4's terminal-state and exact
+   restart baseline requirements. The quarantine must participate in both the IOVA count and the
+   revoke/retained-association result.
+
+   A temporary executable using the current public DMA API reproduced: MAP `Err(Unconfirmed)`,
+   one quarantined mapping, one live IOVA, zero quarantined IOVAs; revoke `Ok(FramesReusable)`;
+   domain destruction `Err(Unconfirmed)`, with the quarantined mapping still present.
+
+3. **Faults received in a confirmed teardown's final drain are counted twice.** A real release
+   changes the claim to `Releasing` before detaching (`src/kernel/device.rs:504-515,613-614`).
+   `detach_for_inner` removes `DOMAINS` before its attributed post-revoke drain; the confirmed branch
+   installs no `RETAINED` association (`src/kernel/iommu/mod.rs:989-1012,1030`). A fault delivered
+   there therefore satisfies the `!current`/no-answering-domain condition and increments
+   `ENDED_FAULTS`, even though the DMA ledger has also charged that same event to the ending
+   domain's detached tail (`src/kernel/iommu/mod.rs:1229-1240`;
+   `src/dma/src/lib.rs:1407-1415`). Immediately afterward teardown copies `faults_in(domain)`,
+   including that tail event, into `RETAINED_FAULTS`. `faults_for` then sums the copy and the carry
+   (`src/kernel/iommu/mod.rs:1040-1043,627-635`). One fault during a successful revoke is exposed as
+   two. The carry exclusion added for retained domains misses the confirmed path, so the accepted
+   M4 per-binding fault-accounting correction remains incomplete. The terminal copy and late carry
+   need a boundary that counts each event once.
+
+   Reproduced in a temporary host harness using unchanged copies of `detach_for_inner`,
+   `poll_faults_attributed_with`, and `faults_for`, the current DMA ledger, and stubbed kernel
+   hardware/claim side effects representing `Releasing`: one event generated during detach produced
+   `retained=1`, `carry=(1, 1)`, `exposed=2`.
+
+Verification: read the complete original audit/response history and checked the milestone requirements
+against the current DMA, virtio-IOMMU, buffer, claim, fault-service and dedicated-QEMU-profile paths.
+`src/tools/check-virtio-iommu-protocol.sh` passed all 63 tests. The focused host reproductions above
+exercise failure combinations absent from that suite; they are not guest execution evidence. No QEMU
+run or full build was started. Repository source and milestone requirements were not modified; this
+re-audit is appended after the preserved original audit.

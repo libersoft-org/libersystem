@@ -99,7 +99,7 @@ pub struct Catalog {
 
 // The parts `./build.sh --part` accepts, and what each of them compiles. A build is per
 // architecture and its configuration is the shipping one, because that is the build being checked.
-const BUILD_PARTS: [&str; 7] = ["sdk", "libs", "user", "kernel", "loader", "packages", "volume"];
+pub(crate) const BUILD_PARTS: [&str; 7] = ["sdk", "libs", "user", "kernel", "loader", "packages", "volume"];
 
 // The image conformance suites, mirroring check.sh's FORMATS. They are host work over external
 // tool recipes and do not vary by target.
@@ -123,7 +123,7 @@ const CONFORMANCE_FORMATS: [&str; 11] = ["bmp", "gif", "ico", "icns", "jpeg", "p
 // and inferring it from "the script mentions a log" would catch the ones that write their own.
 pub const GATES_AFTER_A_GUEST: [&str; 1] = ["capability-trace"];
 
-const GATES: [(&str, &str); 72] = [
+const GATES: [(&str, &str); 74] = [
 	("development-gate", "harness.tools"),
 	// No unreachable body in the compiled architecture surface. Its subject is the
 	// kernel, so a kernel change selects it - which is what makes it a rule rather than a list.
@@ -320,6 +320,8 @@ const GATES: [(&str, &str); 72] = [
 	// depended on which driver finished first. Its subject is the crate that holds the manager, so a
 	// change to it selects the gate - and it reads source, so it costs milliseconds.
 	("no-fixed-provider-slots", "services"),
+	("provider-routing", "services"),
+	("provider-media-order", "services"),
 	// One wait in DeviceManager, built rather than written at the call site. A second wait in front
 	// of the one wait deadlocked the development configuration on the first catalogue connection,
 	// and nothing boots that configuration to have noticed. Same subject and same cost as the gate
@@ -483,7 +485,17 @@ pub const PROFILE_ROW_GATES: [&str; 16] = [
 // which is why it has a rule of its own in `GATES_AFTER_A_GUEST`. `concurrent-selection` is not
 // here either - it starts TWO and says so through `gate_concurrent_guests`, which already gives it
 // its own step. The profile rows are covered by `PROFILE_ROW_GATES`.
-pub const GATES_THAT_BOOT_A_GUEST: [&str; 8] = ["implementation-mutations", "perf-anchor", "qemu-arch-profiles", "qemu-numa", "qemu-virtio-iommu-x86_64", "secure-boot", "signed-boot", "smp-core-cap"];
+pub const GATES_THAT_BOOT_A_GUEST: [&str; 9] = [
+	"provider-media-order",
+	"implementation-mutations",
+	"perf-anchor",
+	"qemu-arch-profiles",
+	"qemu-numa",
+	"qemu-virtio-iommu-x86_64",
+	"secure-boot",
+	"signed-boot",
+	"smp-core-cap",
+];
 
 // Whether this gate boots a guest of its own and therefore needs one of the runner's slots.
 pub fn gate_boots_a_guest(gate: &str) -> bool {
@@ -552,7 +564,13 @@ impl Catalog {
 			if UMBRELLA_GATES.contains(&gate) {
 				continue;
 			}
-			catalog.checks.push(Check { id: format!("gate.{gate}"), kind: CheckKind::Gate, covers: vec![subject.to_string()], variants: vec![Variant { architecture: String::from("host"), environment: Environment::Host, configuration: String::from("default") }], command: format!("./check.sh --gate {gate}") });
+			let mut covers = vec![subject.to_string()];
+			// This gate requires a DHCP lease through the real translated NIC: both transmit and
+			// receive must work, beyond the provider connection exercised by the boot-chain test.
+			if gate == "qemu-virtio-iommu-x86_64" {
+				covers.push("bin.virtio_net".to_string());
+			}
+			catalog.checks.push(Check { id: format!("gate.{gate}"), kind: CheckKind::Gate, covers, variants: vec![Variant { architecture: String::from("host"), environment: Environment::Host, configuration: String::from("default") }], command: format!("./check.sh --gate {gate}") });
 		}
 
 		for format in CONFORMANCE_FORMATS {

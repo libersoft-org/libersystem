@@ -43,6 +43,11 @@
 
 extern crate alloc;
 
+#[path = "../../provider_subscription.rs"]
+pub mod provider_subscription;
+use proto::system::ProviderKind;
+use provider_subscription::{ProviderWatch, open_provider};
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use ipc_client::ChannelTransport;
@@ -409,7 +414,8 @@ struct Clients {
 	services: u64,
 	// The xHCI driver's USB bus query client, granted under the `usb` capability for the
 	// `lsusb` overview (0 when the driver never came up).
-	usb: u64,
+	usb_catalogue: u64,
+	usb_providers: ProviderWatch,
 	// The four non-system volume StorageService clients, bundled with `storage` (the system
 	// volume) under the `volumes` capability for the `lsvol` overview.
 	storage_media: u64,
@@ -448,7 +454,7 @@ impl Clients {
 			Capability::Permission => self.permission,
 			Capability::Supervisor => self.supervisor,
 			Capability::Services => self.services,
-			Capability::Usb => self.usb,
+			Capability::Usb => self.usb_catalogue,
 			Capability::Display | Capability::InputKeys | Capability::AudioStream | Capability::AudioCapture => 0,
 			// The `volumes` capability has no single representative client - it is granted as a
 			// bundle of five channels by `grant_volumes`, never through this single-channel path.
@@ -577,6 +583,22 @@ unsafe fn grant_handle(clients: &mut Clients, cap: Capability, component: &str) 
 			let dup = duplicate(minted, GRANT_RIGHTS);
 			close(minted);
 			return if dup >= 0 { dup as u64 } else { 0 };
+		}
+		if cap == Capability::Usb {
+			clients.usb_providers.poll();
+			if clients.usb_providers.channel == 0 {
+				clients.usb_providers = ProviderWatch::subscribe(clients.usb_catalogue, ProviderKind::UsbBus);
+			}
+			for info in &clients.usb_providers.entries {
+				let minted = open_provider(clients.usb_catalogue, info);
+				if minted == 0 {
+					continue;
+				}
+				let narrowed = duplicate(minted, GRANT_RIGHTS);
+				close(minted);
+				return if narrowed > 0 { narrowed as u64 } else { 0 };
+			}
+			return 0;
 		}
 		if cap == Capability::Network {
 			let mut client = network::Client::new(ChannelTransport { chan: clients.network });
@@ -1550,7 +1572,8 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// The xHCI driver's USB bus query channel the manager grants to the governed `lsusb`
 	// command (whose manifest grants usb): the driver serves the typed `usb` inventory on
 	// it; 0 when the driver never came up.
-	let usb: u64 = caps.take(CAP_USBBUS);
+	let usb_catalogue = caps.take(b"CATALOGUE");
+	let usb_providers = ProviderWatch::subscribe(usb_catalogue, ProviderKind::UsbBus);
 	// Mint the manager's self-connection: a dedicated channel pair whose server end is seeded
 	// into the serve set below (so requests on it are dispatched like any other client's) and
 	// whose client end the manager holds as the grantable `permission` capability. The governed
@@ -1558,7 +1581,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// its own - a capability the manager grants to a copy of itself, on a dedicated channel so a
 	// granted tool's queries never race the supervisor's own connection.
 	let (perm_self_server, perm_self_client): (u64, u64) = unsafe { channel() }.unwrap_or_else(|| unsafe { fail_bootstrap(bootstrap, b"channel", b"could not mint self-connection") });
-	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, storage_admin, broker: bootstrap };
+	let mut clients: Clients = Clients { log, storage, network, time, config, device, device_policy, audio, input: 0, graph: 0, resource, process, permission: perm_self_client, supervisor, services, usb_catalogue, usb_providers, storage_media, storage_iso, storage_udf, storage_usb, storage_ram, storage_tmp, display_admin, input_admin, audio_admin, session, storage_admin, broker: bootstrap };
 	let procsvc: u64 = match caps.take(CAP_PROCESS) {
 		0 => unsafe { fail_bootstrap(bootstrap, b"process", b"process client not delivered") },
 		handle => handle,

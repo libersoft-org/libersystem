@@ -26,7 +26,7 @@
 
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 #[derive(Debug, Deserialize)]
@@ -76,61 +76,125 @@ pub struct Candidate {
 // The key is the PlanItemKey's own identity - check, architecture, environment, configuration -
 // because that is the unit the scheduler runs, prices and records. Anything coarser asks whether a
 // check still exists somewhere rather than whether the work it stands for still happens.
-pub fn components_losing_catalogue_coverage(active: &crate::catalog::Catalog, narrowed: &crate::catalog::Catalog) -> std::collections::BTreeSet<String> {
-	let covering = |catalog: &crate::catalog::Catalog| -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
-		let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
-		for check in &catalog.checks {
-			for component in &check.covers {
-				let entry = out.entry(component.clone()).or_default();
-				for variant in &check.variants {
-					entry.insert(format!("{} / {} / {} / {}", check.id, variant.architecture, variant.environment.as_str(), variant.configuration));
-				}
-				// A CHECK WITH NO VARIANTS IS STILL A CHECK, and losing it is still a loss - it would
-				// otherwise be absent from both sides and compare equal.
-				if check.variants.is_empty() {
-					entry.insert(check.id.clone());
-				}
+pub fn components_losing_catalogue_coverage(active: &crate::catalog::Catalog, narrowed: &crate::catalog::Catalog) -> BTreeSet<String> {
+	catalogue_losses(active, narrowed, &BTreeMap::new())
+}
+
+fn catalogue_losses(active: &crate::catalog::Catalog, narrowed: &crate::catalog::Catalog, successors: &BTreeMap<String, BTreeSet<String>>) -> BTreeSet<String> {
+	let mut losing = BTreeSet::new();
+	for check in &active.checks {
+		let after = narrowed.get(&check.id);
+		for component in &check.covers {
+			// Removing a runnable variant still needs evidence even when its covers did not move.
+			if after.is_none_or(|after| check.variants.iter().any(|variant| !after.variants.contains(variant))) {
+				losing.insert(component.clone());
+				continue;
 			}
-		}
-		out
-	};
-	let (before, after) = (covering(active), covering(narrowed));
-	let mut losing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-	for (component, keys) in &before {
-		let kept = after.get(component);
-		if keys.iter().any(|key| kept.is_none_or(|kept| !kept.contains(key))) {
-			losing.insert(component.clone());
+			let Some(after) = after else { continue };
+			if after.covers.contains(component) {
+				continue;
+			}
+			// A test reassigned to a split subtree is graded on that subtree's actual owner.
+			// An arbitrary added covers name is insufficient: ownership must make it a successor.
+			let reassigned: BTreeSet<String> = after.covers.iter().filter(|name| !check.covers.contains(name) && successors.get(component).is_some_and(|names| names.contains(*name))).cloned().collect();
+			if reassigned.is_empty() {
+				losing.insert(component.clone());
+			} else {
+				losing.extend(reassigned);
+			}
 		}
 	}
 	losing
 }
 
-pub fn components_losing_registry_coverage(active: &crate::registry::Registry, narrowed: &crate::registry::Registry, ownership: &crate::ownership::Ownership, narrowed_ownership: &crate::ownership::Ownership) -> std::collections::BTreeSet<String> {
-	let mut losing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-
-	// A COMPONENT THAT OWNS FEWER PATHS IS REACHED BY FEWER CHANGES.
-	let owner_paths = |registry: &crate::registry::Registry| -> std::collections::BTreeMap<String, std::collections::BTreeSet<String>> {
-		let mut out: std::collections::BTreeMap<String, std::collections::BTreeSet<String>> = std::collections::BTreeMap::new();
-		for rule in &registry.ownership {
-			out.entry(rule.component.clone()).or_default().insert(rule.path.clone());
-		}
-		out
-	};
-	let (owned_before, owned_after) = (owner_paths(active), owner_paths(narrowed));
-	for (component, paths) in &owned_before {
-		let kept = owned_after.get(component);
-		if paths.iter().any(|path| kept.is_none_or(|kept| !kept.contains(path))) {
-			losing.insert(component.clone());
+pub fn evidence_components(active: &crate::Model, narrowed: &crate::Model) -> BTreeSet<String> {
+	let ownership = active.ownership();
+	let narrowed_ownership = narrowed.ownership();
+	let mut successors: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+	for path in ownership.rule_paths().into_iter().chain(narrowed_ownership.rule_paths()) {
+		if let crate::ownership::Owner::Component { component: before, .. } = ownership.owner(path)
+			&& let crate::ownership::Owner::Component { component: after, .. } = narrowed_ownership.owner(path)
+			&& before != after
+		{
+			successors.entry(before).or_default().insert(after);
 		}
 	}
+	let mut losing = catalogue_losses(&active.catalog, &narrowed.catalog, &successors);
+	losing.extend(components_losing_registry_coverage(&active.registry, &narrowed.registry, &ownership, &narrowed_ownership));
+	losing
+}
+
+// A risk row protects its entire subtree, including ownership rules added below its root.
+pub fn risk_components(path: &str, losing: &BTreeSet<String>, ownership: &crate::ownership::Ownership, narrowed: &crate::ownership::Ownership) -> BTreeSet<String> {
+	let probes = std::iter::once(path).chain(ownership.rule_paths()).chain(narrowed.rule_paths()).filter(|probe| crate::registry::prefix_match(path, probe).is_some());
+	let mut components = BTreeSet::new();
+	for probe in probes {
+		let owner = match narrowed.owner(probe) {
+			crate::ownership::Owner::NonCode { .. } => ownership.owner(probe),
+			owner => owner,
+		};
+		if let crate::ownership::Owner::Component { component, .. } = owner
+			&& losing.contains(&component)
+		{
+			components.insert(component);
+		}
+	}
+	components
+}
+
+// Called by activation before any canonical file is written, and by the candidate regressions.
+pub fn evidence_failures(active: &crate::Model, narrowed: &crate::Model, hash: &str, store: &crate::trust::Store, log: &crate::shadow::Log) -> Vec<String> {
+	let universe = crate::shadow::Universe::TestGuest;
+	let losing = evidence_components(active, narrowed);
+	let mut unmet = Vec::new();
+	for component in &losing {
+		if let Err(why) = store.evaluate(component, hash, universe, log) {
+			unmet.push(format!("{component}: {why}"));
+		}
+	}
+	let ownership = active.ownership();
+	let narrowed_ownership = narrowed.ownership();
+	let abi = match ownership.owner("src/abi") {
+		crate::ownership::Owner::Component { component, .. } => Some(component),
+		_ => None,
+	};
+	for risk in &active.registry.risk_classes {
+		for component in risk_components(&risk.path, &losing, &ownership, &narrowed_ownership) {
+			let seen = log.clean_architectures_seen(&component, hash, universe);
+			let missing: Vec<&str> = risk.targets.iter().filter(|target| !seen.contains(*target)).map(String::as_str).collect();
+			if !missing.is_empty() {
+				unmet.push(format!("{component}: `{}` requires clean evidence on {} and has none on {}", risk.path, risk.targets.join(", "), missing.join(", ")));
+			}
+			let distinct = log.distinct_evidence_for(&component, hash, universe);
+			if distinct < risk.distinct_changes {
+				unmet.push(format!("{component}: `{}` requires {} distinct changes and has {distinct}", risk.path, risk.distinct_changes));
+			}
+			let groups = log.groups_seen(&component, hash, universe);
+			let absent: Vec<&str> = risk.required_groups.iter().filter(|group| !groups.contains(*group)).map(String::as_str).collect();
+			if !absent.is_empty() {
+				unmet.push(format!("{component}: `{}` requires evidence over change group(s) {} and has none over {}", risk.path, risk.required_groups.join(", "), absent.join(", ")));
+			}
+			if risk.abi_unchanged
+				&& let Some(abi) = abi.as_deref()
+				&& log.evidence_touched(&component, hash, universe, abi)
+			{
+				unmet.push(format!("{component}: `{}` requires the ABI unchanged, and its evidence touched `{abi}`", risk.path));
+			}
+		}
+	}
+	unmet
+}
+
+pub fn components_losing_registry_coverage(active: &crate::registry::Registry, narrowed: &crate::registry::Registry, ownership: &crate::ownership::Ownership, narrowed_ownership: &crate::ownership::Ownership) -> std::collections::BTreeSet<String> {
+	let mut losing: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
 	// AND A RULE THAT IS STILL THERE CAN BE OVERRIDDEN BY A LONGER ONE (added 2026-09-03).
 	//
 	// Both lookups resolve by LONGEST PREFIX, so a candidate narrows a component's reach without
 	// removing or shortening anything of its own: keep `src/kernel/` -> `kernel` and ADD
 	// `src/kernel/mem/` -> something else, and `kernel` still owns every path it declared while
-	// every file under `mem` stops seeding it. The set comparisons above cannot see that - both
-	// registries contain `src/kernel/`, so nothing was lost by their reading - and neither bar ran.
+	// every file under `mem` stops seeding it. Comparing only the declared rule sets cannot see that:
+	// both registries retain `src/kernel/`, although paths below the longer prefix changed owners.
 	//
 	// Asking the resolver instead of comparing rule texts. The path where the change shows is the
 	// path of whichever rule is new or moved, so every rule path in EITHER registry is probed and
@@ -159,6 +223,8 @@ pub fn components_losing_registry_coverage(active: &crate::registry::Registry, n
 	// documentation - the displaced name is the only one there is, and it is asked for. Where they
 	// become UNOWNED the plan fails open to the full suite, which is wider rather than narrower, so
 	// it is not a narrowing at all.
+	probes.extend(ownership.rule_paths());
+	probes.extend(narrowed_ownership.rule_paths());
 	for path in &probes {
 		let crate::ownership::Owner::Component { component, .. } = ownership.owner(path) else { continue };
 		match narrowed_ownership.owner(path) {
@@ -236,7 +302,7 @@ pub fn components_losing_registry_coverage(active: &crate::registry::Registry, n
 		// A path with no row at all falls back to every architecture, which is wider rather than
 		// narrower - so only a row that ANSWERS with fewer targets is a loss.
 		let narrower = after.is_some_and(|(after_build, after_boot)| build.iter().any(|target| !after_build.contains(target)) || boot.iter().any(|target| !after_boot.contains(target)));
-		if narrower && let crate::ownership::Owner::Component { component, .. } = ownership.owner(path) {
+		if narrower && let crate::ownership::Owner::Component { component, .. } = narrowed_ownership.owner(path) {
 			losing.insert(component);
 		}
 	}

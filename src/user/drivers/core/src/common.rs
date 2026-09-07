@@ -541,6 +541,53 @@ pub unsafe fn serve_any_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Ser
 	unsafe { serve_any_or_answer_inner(bootstrap, bind, serving, true) }
 }
 
+pub enum ProviderReady {
+	Connected(usize),
+	Consumer(usize),
+	Device(usize),
+}
+
+// Keep accepting connections while all consumers are gone, alongside a device's IRQs. A newly
+// accepted endpoint is returned before its traffic so a provider can send its initial metadata.
+pub unsafe fn wait_providers_or_answer(bootstrap: u64, bind: &Bind, serving: &mut Serving, devices: &[u64]) -> Option<ProviderReady> {
+	unsafe {
+		loop {
+			match drain_control_into(bootstrap, bind, Some(serving)) {
+				Control::Continue => {}
+				Control::Stop => {
+					STOP_PENDING.store(true, core::sync::atomic::Ordering::Release);
+					return None;
+				}
+				Control::Ended => return None,
+			}
+			if let Some(index) = serving.take_new() {
+				return Some(ProviderReady::Connected(index));
+			}
+			for (index, &end) in serving.as_slice().iter().enumerate() {
+				if poll_ready(end) {
+					return Some(ProviderReady::Consumer(index));
+				}
+			}
+			for (index, &device) in devices.iter().enumerate() {
+				if poll_ready(device) {
+					return Some(ProviderReady::Device(index));
+				}
+			}
+			let mut set = [0u64; MAX_PROVIDER_CLIENTS + 8];
+			let live = serving.as_slice();
+			if live.len() + devices.len() + 1 > set.len() {
+				return None;
+			}
+			set[..live.len()].copy_from_slice(live);
+			set[live.len()..live.len() + devices.len()].copy_from_slice(devices);
+			set[live.len() + devices.len()] = bootstrap;
+			if wait_any(&set[..live.len() + devices.len() + 1], 0) < 0 {
+				return None;
+			}
+		}
+	}
+}
+
 // The two shapes above, with the one thing that differs between them named: whether a `CONNECT` may
 // be ACCEPTED into `serving`. A caller whose set outlives the call may; one whose set is a local may
 // not, because accepting into a set that is about to be dropped loses the endpoint.
@@ -600,6 +647,10 @@ pub struct Serving {
 	// consumer of THAT provider. A driver may publish several, and the manager's count is per
 	// provider - "somebody left" is not an answer it can apply.
 	tokens: [u16; MAX_PROVIDER_CLIENTS],
+	new: [bool; MAX_PROVIDER_CLIENTS],
+	// Publication identity survives an empty client set, so reconnect cannot change its kind.
+	publications: [u16; MAX_PROVIDER_CLIENTS],
+	publication_count: usize,
 	count: usize,
 }
 
@@ -607,11 +658,19 @@ impl Serving {
 	// The first one, which the driver made itself and offered to the manager, under the token it
 	// offered it with.
 	pub fn new(first: u64, token: u16) -> Self {
-		let mut ends = [0u64; MAX_PROVIDER_CLIENTS];
-		ends[0] = first;
-		let mut tokens = [0u16; MAX_PROVIDER_CLIENTS];
-		tokens[0] = token;
-		Self { ends, tokens, count: 1 }
+		Self::from_offers(&[(token, first)])
+	}
+
+	pub fn from_offers(offers: &[(u16, u64)]) -> Self {
+		assert!(offers.len() <= MAX_PROVIDER_CLIENTS);
+		let mut serving = Self { ends: [0; MAX_PROVIDER_CLIENTS], tokens: [0; MAX_PROVIDER_CLIENTS], new: [false; MAX_PROVIDER_CLIENTS], publications: [0; MAX_PROVIDER_CLIENTS], publication_count: offers.len(), count: 0 };
+		for (index, &(token, end)) in offers.iter().enumerate() {
+			serving.publications[index] = token;
+			if end != 0 {
+				serving.accept(end, token);
+			}
+		}
+		serving
 	}
 
 	pub fn as_slice(&self) -> &[u64] {
@@ -620,6 +679,20 @@ impl Serving {
 
 	pub fn at(&self, index: usize) -> u64 {
 		self.ends[index]
+	}
+
+	pub fn token_at(&self, index: usize) -> u16 {
+		self.tokens[index]
+	}
+
+	pub fn first_for(&self, token: u16) -> u64 {
+		self.tokens[..self.count].iter().position(|&current| current == token).map_or(0, |index| self.ends[index])
+	}
+
+	fn take_new(&mut self) -> Option<usize> {
+		let index = self.new[..self.count].iter().position(|&pending| pending)?;
+		self.new[index] = false;
+		Some(index)
 	}
 
 	// A consumer's endpoint has closed: drop it and keep the rest. The order of the others does not
@@ -634,19 +707,22 @@ impl Serving {
 		self.count -= 1;
 		self.ends[index] = self.ends[self.count];
 		self.tokens[index] = self.tokens[self.count];
+		self.new[index] = self.new[self.count];
 		self.ends[self.count] = 0;
 		self.tokens[self.count] = 0;
+		self.new[self.count] = false;
 		token
 	}
 
 	// One more, from a `CONNECT`, under the token that frame named. False when this driver is already
 	// serving as many as it will.
 	fn accept(&mut self, end: u64, token: u16) -> bool {
-		if self.count >= MAX_PROVIDER_CLIENTS {
+		if end == 0 || self.count >= MAX_PROVIDER_CLIENTS || !self.publications[..self.publication_count].contains(&token) {
 			return false;
 		}
 		self.ends[self.count] = end;
 		self.tokens[self.count] = token;
+		self.new[self.count] = true;
 		self.count += 1;
 		true
 	}
@@ -689,6 +765,9 @@ unsafe fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&m
 			// answered, because answering it would tell the manager a generation it has moved on
 			// from is alive.
 			if header.generation != bind.generation {
+				if handle != 0 {
+					close(handle);
+				}
 				continue;
 			}
 			match header.opcode {
@@ -705,6 +784,11 @@ unsafe fn drain_control_into(bootstrap: u64, bind: &Bind, mut serving: Option<&m
 						// consumer learns its connection ended instead of waiting on a server that
 						// will never read it.
 						close(handle);
+						if let Some(token) = token
+							&& !disconnected(bootstrap, bind, token)
+						{
+							return Control::Ended;
+						}
 					}
 				}
 				proto::Opcode::Ping => {

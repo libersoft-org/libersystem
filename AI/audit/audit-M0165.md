@@ -1942,3 +1942,60 @@ Covering the 2026-09-03T22:44:52Z findings too, which were acted on without a re
     cargo test --manifest-path src/user/libs/driver/binding/Cargo.toml --offline   66 passed
     ./test.sh --arch x86_64 --tags boot                                             13 passed (25 s)
     ./check.sh --gate source-hygiene,milestone-index                                clean
+
+
+AUDITOR'S RE-AUDIT ON P02M0165 (2026-09-07T21:50:59Z):
+
+Current implementation rating: 6/10
+
+1. **Shutdown still acknowledges completion without resolving outstanding driver teardowns.**
+   `stop_all` explicitly skips `WaitForTheTeardownToSettle`
+   (`src/user/services/core/src/device_manager.rs:5612-5625`). A stop initiated by shutdown has the
+   same gap: `wait_out_planned_stop` exits when `advance` removes `node.binding` (`:5704-5712`),
+   although that call has only installed a pending teardown and returned `Step::Waiting`
+   (`:3981-4026`). No later shutdown pass feeds its process/claim confirmations into
+   `resolve_teardown`. The caller then sends `DeviceManager: stopped` and exits (`:844-850`).
+   Consequently shutdown never decides whether those teardowns confirmed or must be reported as
+   `Quarantined`, including a teardown already pending when shutdown arrived. M3 explicitly requires
+   the unconfirmed shutdown outcome to be quarantined and reported
+   (`docs/todo/P02M0165.md:128-147`); M4's traversal must complete that outcome, not merely send the
+   stop. The latest implementer response accurately admits that its attempted fix was withdrawn.
+   Its measured regression explains the revert but leaves this requirement unresolved.
+
+2. **The device ledger can report no IOMMU holdings while a quarantined mapping and its domain
+   remain allocated.** This is the M5 accounting consequence of the unresolved DMA defect detailed
+   in this round's P02M0153 re-audit. An unconfirmed map creates a `Quarantined` mapping
+   (`src/dma/src/lib.rs:993-998`), but `revoke_endpoint` subsequently visits only `Live` or `Closing`
+   mappings and can return `FramesReusable` without accounting for that pre-existing quarantine
+   (`:1170-1206`). The kernel has already removed the live device/domain association before that
+   result; it retains an association only for a failed revoke
+   (`src/kernel/iommu/mod.rs:989-1012`). When `destroy_domain` then refuses the still-quarantined
+   mapping, the error is logged but the success result is retained (`:1061-1068`). Both snapshot
+   grant readers consequently return zero because neither association remains (`:593-606`), and
+   `device::snapshot` publishes those zeros (`src/kernel/device.rs:589-595`). A reconstructed
+   DeviceManager therefore cannot recover the outstanding charge. M5 expressly requires the
+   kernel-owned ledger to preserve quarantined holdings across a manager death and reconstruction
+   (`docs/todo/P02M0165.md:184-198,255-259`); the earlier ledger fix is incomplete on this failure
+   sequence.
+
+3. **The named publish/crash/subscribe race still lacks the required proof that an unopened
+   provider's real handle is closed.** `Catalogue::close_channel` performs the concrete close only
+   when the catalogue still owns the offered endpoint
+   (`src/user/services/core/src/device_manager.rs:2215-2220`). The registered race executes
+   `apply_withdrawal` through a `Recorder` whose close callback records only a provider ID
+   (`src/user/libs/driver/binding/src/tests.rs:749-790`); it does not exercise or observe that
+   production handle-table operation. The GPU scenario cannot supply the missing assertion:
+   opening its provider already moved the endpoint out of the catalogue, so this close is a no-op
+   there, as the current harness correctly records (`src/harness/dev-gpu-restart.py:165-173`).
+   Removing the concrete close body would therefore still leave these checks green and leak an
+   unopened provider's handle after its binding ends. M7 requires the named race to establish no
+   leaked handle (`docs/todo/P02M0165.md:293-302,379-387`). The latest response and milestone text
+   acknowledge this exact gap (`:338-346`); recording it does not complete that proof obligation.
+
+Verification: read all original audit material and implementer responses, the complete milestone,
+current manager/driver stop paths, shared heartbeat/state/withdrawal code, ServiceManager's crash
+handling, and the relevant claim/DMA ledger paths. Focused offline host suites passed:
+`driver-binding` 70 tests, `driver-protocol` 26 tests, and `system-manifest` 16 tests.
+`src/tools/check-development-build.sh` passed and built both development-only programs. The
+production shutdown and concrete provider-close gaps above are not exercised by those checks.
+No guest matrix, source edits, or changes to the original audit were performed.

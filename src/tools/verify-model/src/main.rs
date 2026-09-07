@@ -977,119 +977,12 @@ fn run() -> Result<ExitCode, String> {
 			// source map is built first: a candidate that omits one of them from its base records no
 			// digest for a file it replaces, and "the base is unmoved" would be true of a smaller set.
 			candidate.base_is_unmoved(&repo_root, &sources)?;
-			// AND THE EVIDENCE BAR, WHICH NOTHING WAS ASKING FOR.
-			//
-			// Activation checked the base digests and the resulting model hash and never called the
-			// trust evaluation at all - so a candidate could activate a narrowing with NO qualifying
-			// evidence behind it, which is the one thing M5's contract is for. A narrowing takes
-			// coverage AWAY from components: for every component a test stops covering under this
-			// candidate, the shadow log has to have earned that component a certificate UNDER THIS
-			// CANDIDATE'S OWN HASH. Evidence gathered under the current model says nothing about the
-			// narrower one, which is the same argument that makes `expected_hash` load-bearing.
-			{
-				let log = verify_model::shadow::Log::load(&repo_root);
-				let store = verify_model::trust::Store::load(&repo_root);
-				let universe = verify_model::shadow::Universe::TestGuest;
-				// WHAT THIS CANDIDATE NARROWS, COMPUTED FROM THE TWO MODELS (2026-09-03).
-				//
-				// The loop below walked `candidate.covers` - the kernel-test overlay - and nothing
-				// else. `covers` DEFAULTS TO EMPTY and the candidate carries a complete replacement
-				// registry, so a narrowing made through OWNERSHIP, an escalation rule or the graph
-				// visited no entry at all and reached the write path with neither bar applied. The
-				// question is about coverage, so it is asked of coverage: for every component, which
-				// checks cover it now and which cover it under the candidate. A component that loses
-				// one has to have earned that.
-				let narrowed_model = Model::load_with_candidate(&repo_root, Some(&candidate))?;
-				// The comparison is `candidate::components_losing_catalogue_coverage`, where a test can
-				// drive it - and it compares VARIANTS rather than check ids, which is the unit the
-				// scheduler runs and the unit `model_hash` already covers. See that function for what
-				// projecting to the id alone let through.
-				let mut losing: std::collections::BTreeSet<String> = verify_model::candidate::components_losing_catalogue_coverage(&model.catalog, &narrowed_model.catalog);
-				// AND THE REGISTRY NARROWS WITHOUT TOUCHING A SINGLE `covers` LIST (corrected
-				// 2026-09-03). Comparing the two catalogues' `(check, covers)` pairs sees a
-				// narrowing made through the kernel tests' overlay and nothing else, while the
-				// PLAN's width is decided by three more things the candidate replaces wholesale:
-				// which paths a component owns, which escalation edges reach it, and which targets a
-				// path is built and booted on. A candidate that removes an edge, shortens an
-				// ownership prefix or drops a target changes what a change SELECTS while leaving
-				// every `covers` list identical - so `losing` was empty and activation reached the
-				// write path with neither bar applied, which is the bypass this check exists for.
-				//
-				// The comparison is `candidate::components_losing_registry_coverage`, where a test
-				// can drive it: inline here it could only be exercised by activating a candidate,
-				// which is the thing it gates.
-				losing.extend(verify_model::candidate::components_losing_registry_coverage(&model.registry, &narrowed_model.registry, &model.ownership(), &narrowed_model.ownership()));
-				let mut short: Vec<String> = Vec::new();
-				for lost in &losing {
-					// The universe a kernel test is judged in. A narrowing of a guest test is
-					// answered by guest evidence; asking for host evidence about it would be a
-					// bar nothing could ever meet.
-					if let Err(why) = store.evaluate(lost, &candidate.expected_hash, universe, &log) {
-						short.push(format!("{lost}: {why}"));
-					}
-				}
-				if !short.is_empty() {
-					return Err(format!("this candidate narrows coverage of component(s) that have not earned it under its own model hash, so activating it would take away checking nothing has shown to be spare:\n    {}\n  Gather the evidence under {} first; nothing was written.", short.join("\n    "), candidate.expected_hash));
-				}
-				// AND THE SUBSYSTEM'S OWN BAR, WHICH IS THE STRICTER OF THE TWO (2026-09-03).
-				//
-				// `Store::evaluate` is the GENERAL threshold. The definition of done asks for both:
-				// "`trust.rs`'s threshold AND that subsystem's `risk_class.evidence`". The four
-				// fields those rows were split into - required targets, distinct changes, required
-				// change groups, the ABI - were only ever checked against each other for internal
-				// consistency by `self_check_failures`, so a narrowing of `src/kernel/mem` or
-				// `src/kernel/syscall` needed nothing more than the general bar it is explicitly
-				// stronger than.
-				let ownership = model.ownership();
-				let narrowed_ownership = narrowed_model.ownership();
-				let abi_component: Option<String> = match ownership.owner("src/abi") {
-					verify_model::ownership::Owner::Component { component, .. } => Some(component),
-					_ => None,
-				};
-				let mut unmet: Vec<String> = Vec::new();
-				for risk in &model.registry.risk_classes {
-					// WHICHEVER NAME ANSWERS FOR THIS PATH IS THE ONE GRADED (corrected 2026-09-04).
-					// This resolved the risk path through the ACTIVE ownership only, so a candidate
-					// that splits a subsystem out - the case M5's route exists for - put the
-					// successor in `losing` and this loop looked for the displaced name, found it
-					// absent, and skipped the stricter of the two bars entirely. The path is
-					// resolved under both models and the name that is actually reported lost is the
-					// one whose evidence is graded.
-					let named: Vec<String> = [ownership.owner(&risk.path), narrowed_ownership.owner(&risk.path)]
-						.into_iter()
-						.filter_map(|owner| match owner {
-							verify_model::ownership::Owner::Component { component, .. } => Some(component),
-							_ => None,
-						})
-						.collect();
-					let Some(component) = named.into_iter().find(|name| losing.contains(name)) else {
-						continue;
-					};
-					let seen = log.clean_architectures_seen(&component, &candidate.expected_hash, universe);
-					let missing: Vec<&str> = risk.targets.iter().filter(|target| !seen.contains(*target)).map(|target| target.as_str()).collect();
-					if !missing.is_empty() {
-						unmet.push(format!("{}: `{}` requires clean evidence on {} and has none on {}", component, risk.path, risk.targets.join(", "), missing.join(", ")));
-					}
-					let distinct = log.distinct_evidence_for(&component, &candidate.expected_hash, universe);
-					if distinct < risk.distinct_changes {
-						unmet.push(format!("{}: `{}` requires {} distinct changes and has {distinct}", component, risk.path, risk.distinct_changes));
-					}
-					let groups = log.groups_seen(&component, &candidate.expected_hash, universe);
-					let absent: Vec<&str> = risk.required_groups.iter().filter(|group| !groups.contains(*group)).map(|group| group.as_str()).collect();
-					if !absent.is_empty() {
-						unmet.push(format!("{}: `{}` requires evidence over change group(s) {} and has none over {}", component, risk.path, risk.required_groups.join(", "), absent.join(", ")));
-					}
-					if risk.abi_unchanged
-						&& let Some(abi) = abi_component.as_deref()
-						&& log.evidence_touched(&component, &candidate.expected_hash, universe, abi)
-					{
-						unmet.push(format!("{}: `{}` requires the ABI unchanged, and its evidence was gathered over changes that touched `{abi}`", component, risk.path));
-					}
-				}
-				if !unmet.is_empty() {
-					return Err(format!("this candidate narrows a subsystem whose risk class asks for more than the general threshold, and that bar is not met:\n    {}\n  Gather the evidence under {} first; nothing was written.", unmet.join("\n    "), candidate.expected_hash));
-				}
+			let narrowed_model = Model::load_with_candidate(&repo_root, Some(&candidate))?;
+			let unmet = verify_model::candidate::evidence_failures(&model, &narrowed_model, &candidate.expected_hash, &verify_model::trust::Store::load(&repo_root), &verify_model::shadow::Log::load(&repo_root));
+			if !unmet.is_empty() {
+				return Err(format!("this candidate has not met its general trust and subsystem risk requirements:\n    {}\n  Gather the evidence under {} first; nothing was written.", unmet.join("\n    "), candidate.expected_hash));
 			}
+
 			let previous = candidate.materialise(&repo_root, &sources)?;
 			let active = match Model::load(&repo_root) {
 				Ok(active) => active,

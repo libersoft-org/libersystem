@@ -328,9 +328,26 @@ impl<'a> Planner<'a> {
 			booted.extend(ARCHITECTURES.iter().map(|architecture| (*architecture).to_string()));
 		}
 
+		// A declaration file changes the test binary without changing the component it tests.
+		// Keep the full dependency walk for builds. Runtime checks follow production changes plus
+		// the tests declared in changed files. Unknown/deleted helper files keep ordinary reach.
+		let declaration_paths: BTreeSet<&str> = self.kernel_tests.iter().flat_map(|test| test.source_paths.iter().map(String::as_str)).collect();
+		let test_paths: BTreeSet<&str> = paths.iter().filter(|verdict| verdict.outcome == "kernel.tests" && declaration_paths.contains(verdict.path.as_str())).map(|verdict| verdict.path.as_str()).collect();
+		let declared_here: BTreeSet<&str> = self.kernel_tests.iter().filter(|test| test.source_paths.iter().any(|path| test_paths.contains(path.as_str()))).map(|test| test.id.as_str()).collect();
+		let runtime_seeds: BTreeSet<String> = paths.iter().filter(|verdict| seeds.contains(&verdict.outcome) && !test_paths.contains(verdict.path.as_str())).map(|verdict| verdict.outcome.clone()).collect();
+		let runtime_reached = self.graph.affected_with_reasons(&runtime_seeds);
+		let runtime_affected: BTreeSet<String> = runtime_reached.keys().cloned().collect();
+		let runtime_reach = self.graph.affected_by_reach(&runtime_seeds);
+		let only_test_declarations = !test_paths.is_empty() && runtime_seeds.is_empty();
 		let mut items = Vec::new();
 		for check in &self.catalog.checks {
-			let selection = self.select(check, &affected, &reached, &reach, full);
+			let selection = if !full && declared_here.contains(check.id.as_str()) {
+				Some(String::from("a changed file declares this test"))
+			} else if check.kind == CheckKind::Build {
+				self.select(check, &affected, &reached, &reach, full)
+			} else {
+				self.select(check, &runtime_affected, &runtime_reached, &runtime_reach, full)
+			};
 			let Some(reason) = selection else { continue };
 			for variant in &check.variants {
 				if !self.variant_applies(check, variant, &built, &booted) {
@@ -354,7 +371,7 @@ impl<'a> Planner<'a> {
 		// almost nothing and gives the shadow record something complete to compare against. A global
 		// rule cannot express that: it would answer the riscv64 question by also booting the two
 		// targets nobody asked about.
-		if !full && !items.is_empty() {
+		if !full && !only_test_declarations && !items.is_empty() {
 			let cost = crate::history::CostModel { whole_suite_tests: self.declared_ids, ..crate::history::CostModel::default() };
 			let history = &self.history;
 			let mut pairs: BTreeSet<(String, crate::catalog::Environment)> = BTreeSet::new();
@@ -416,7 +433,7 @@ impl<'a> Planner<'a> {
 		// FOUR FIFTHS, measured: a guest run costs a fixed boot plus about half a second per test, so
 		// the saving is proportional to the tests DROPPED. Dropping ten of two hundred saves a few
 		// seconds and costs a nine-kilobyte command line nobody can read in a log.
-		if !full {
+		if !full && !only_test_declarations {
 			let mut selected_by_arch: BTreeMap<String, usize> = BTreeMap::new();
 			for item in items.iter().filter(|item| item.kind == CheckKind::KernelTest) {
 				*selected_by_arch.entry(item.key.architecture.clone()).or_default() += 1;
@@ -443,48 +460,6 @@ impl<'a> Planner<'a> {
 				let already: BTreeSet<PlanItemKey> = items.iter().map(|item| item.key.clone()).collect();
 				items.extend(widened.into_iter().filter(|item| !already.contains(&item.key)));
 				items.sort_by(|left, right| left.key.cmp(&right.key));
-			}
-		}
-
-		// A TEST FILE REACHES THE TESTS IN IT, which is what `src/kernel/test_suites` has promised in
-		// the registry all along and could not deliver.
-		//
-		// The row says "once `covers` is on every test this is derivable rather than declarable, and
-		// this row disappears". `covers` IS on every test - 370 of 370 - and the row stayed, because
-		// discovery threw the source path away: the model knew only that a file under `src/kernel`
-		// had changed, which is the whole kernel. With `source_paths` the question is answerable.
-		//
-		// IT NARROWS THE TESTS AND NOT THE BUILD. Editing a test file changes the kernel binary, so
-		// the kernel is still rebuilt and every target that boots still boots; what stops being
-		// everything is which tests run inside that boot.
-		if !full {
-			let mut declared_here: BTreeSet<String> = BTreeSet::new();
-			for verdict in &paths {
-				for test in &self.kernel_tests {
-					if test.source_paths.iter().any(|source| source == &verdict.path) {
-						declared_here.insert(test.id.clone());
-					}
-				}
-			}
-			if !declared_here.is_empty() {
-				let already: BTreeSet<PlanItemKey> = items.iter().map(|item| item.key.clone()).collect();
-				let mut extra: Vec<PlanItem> = Vec::new();
-				for check in self.catalog.checks.iter().filter(|check| declared_here.contains(&check.id)) {
-					for variant in &check.variants {
-						if !self.variant_applies(check, variant, &built, &booted) {
-							continue;
-						}
-						let key = PlanItemKey { check: check.id.clone(), architecture: variant.architecture.clone(), environment: variant.environment.clone(), configuration: variant.configuration.clone() };
-						if already.contains(&key) {
-							continue;
-						}
-						extra.push(PlanItem { key, kind: check.kind, command: check.command.replace("{arch}", &variant.architecture), reason: String::from("a changed file declares this test") });
-					}
-				}
-				if !extra.is_empty() {
-					items.extend(extra);
-					items.sort_by(|left, right| left.key.cmp(&right.key));
-				}
 			}
 		}
 

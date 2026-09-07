@@ -211,22 +211,38 @@ struct Pointer {
 // buffers the device filled, fold them into the current pointer state, and - once a
 // frame completes (EV_SYN) and the state actually changed - send the normalized
 // position and buttons to InputService (which maps them to the text-cell grid). The
-// send coalesces motion within one interrupt (the latest position wins). Retires if
-// InputService closes its end.
+// send coalesces motion within one interrupt (the latest position wins). Consumer closure returns
+// its allowance while the provider keeps accepting replacements, even with no pointer activity.
 unsafe fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &mut Queue, pool_virt: u64, pool_phys: u64, slots: u16, sink: u64, max_x: i32, max_y: i32) -> ! {
 	unsafe {
 		let bound_x: i32 = if max_x > 0 { max_x } else { REL_RANGE };
 		let bound_y: i32 = if max_y > 0 { max_y } else { REL_RANGE };
 		let mut state: Pointer = Pointer::default();
 		let mut sent: Pointer = Pointer { x: -1, y: -1, buttons: 0 };
+		let mut serving = common::Serving::new(sink, 0);
 		loop {
-			// The manager's channel joins the interrupt this loop already waits on: a pointer
-			// nobody is moving is idle, and idle is not wedged.
-			if common::wait_or_answer(bootstrap, bind, &[irq]).is_none() {
+			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &[irq]) else {
 				common::finish_stop(bootstrap, bind, eventq.capability, common::quiesce_virtio());
 				exit();
+			};
+			if let common::ProviderReady::Consumer(at) = ready {
+				let mut unexpected = [0u8; 16];
+				match try_recv_caps(serving.at(at), &mut unexpected) {
+					PolledCaps::Closed => {
+						let token = serving.close_at(at);
+						common::disconnected(bootstrap, bind, token);
+					}
+					PolledCaps::Message { handles, .. } => {
+						for &handle in handles.as_slice() {
+							close(handle);
+						}
+					}
+					PolledCaps::Empty => {}
+				}
+				continue;
 			}
-			let mut synced: bool = false;
+			let connected = matches!(ready, common::ProviderReady::Connected(_));
+			let mut synced: bool = connected;
 			let mut wheel: i32 = 0;
 			while let Some((id, _len)) = eventq.take_used() {
 				if id < slots {
@@ -240,7 +256,7 @@ unsafe fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &m
 			interrupt_ack(irq);
 			// Send when a frame completed and either the position/buttons changed or the
 			// wheel ticked (the wheel is a momentary delta, not part of the held state).
-			if synced && (state != sent || wheel != 0) {
+			if synced && (connected || state != sent || wheel != 0) {
 				let nx: u16 = normalize(state.x, bound_x);
 				let ny: u16 = normalize(state.y, bound_y);
 				let mut msg: [u8; 6] = [0u8; 6];
@@ -248,9 +264,11 @@ unsafe fn pointer_loop(bootstrap: u64, bind: &common::Bind, irq: u64, eventq: &m
 				msg[2..4].copy_from_slice(&ny.to_le_bytes());
 				msg[4] = state.buttons;
 				msg[5] = wheel.clamp(-127, 127) as i8 as u8;
-				if !send_blocking(sink, &msg, 0) {
-					// InputService dropped its end: there is no consumer, so retire.
-					exit();
+				for at in (0..serving.as_slice().len()).rev() {
+					if !send_blocking(serving.at(at), &msg, 0) {
+						let token = serving.close_at(at);
+						common::disconnected(bootstrap, bind, token);
+					}
 				}
 				sent = state;
 			}

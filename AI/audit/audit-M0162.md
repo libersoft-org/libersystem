@@ -1489,3 +1489,92 @@ written.
     ./build.sh --arch x86_64                                                        built
     ./test.sh --arch x86_64 --tags boot                                             13 passed (26 s)
     ./check.sh --gate source-hygiene,milestone-index                                clean
+
+
+AUDITOR'S RE-AUDIT ON P02M0162 (2026-09-07T21:46:36Z):
+
+Current implementation rating: 5/10
+
+1. **The transaction still leaks the MMIO handle on failures between claiming and spawning.**
+   `SYS_DEVICE_CLAIM` installs two separately charged handles in DeviceManager's table and returns
+   both (`src/kernel/syscall/mod.rs:1232-1238`). `begin_bind` immediately records `grant.claim`, but
+   records `grant.memory` only at `src/user/services/core/src/device_manager.rs:3652`, after the
+   fallible channel creation, Domain creation and spawn (`:3595-3630`). A failure at any of those
+   steps therefore releases the claim while leaving the MMIO handle unreachable by rollback.
+   `Holdings::begin_teardown` closes only recorded resources
+   (`src/user/libs/driver/binding/src/lib.rs:1125-1130`); revocation merely increments the object's
+   generation (`src/kernel/object/mod.rs:150-157`), whereas removing the handle and refunding its
+   accounting require closing its table entry (`src/kernel/object/handle/mod.rs:805-826`). The
+   implementer's claim that every acquired handle is owned by the transaction is incomplete. The
+   spawn-failure test similarly omits the MMIO handle from its constructed holdings
+   (`src/user/libs/driver/binding/src/tests.rs:1313-1327`), so it cannot catch this remaining M1/M7
+   violation of the no-leaked-handle/accounting requirement (`docs/todo/P02M0162.md:398-401`).
+
+2. **The latest fallback-budget fix still permits automatic attempts after the node's budget is
+   spent, and a missing fallback restores both budgets.** Removing the reset in `spend_candidate`
+   does not stop either `Step::NextCandidate` caller from immediately starting another candidate
+   (`src/user/services/core/src/device_manager.rs:584-594,1149-1160`). The attempt counter increments
+   only on a teardown that lands in `Backoff` (`:4033-4050`); after candidate A's third failure it
+   remains 2, and candidate B is spawned with the same displayed attempt number 3. `begin_bind`
+   computes `attempts_left` only to choose the outcome of a later failure, with no admission check
+   against the spent count or absolute deadline (`:3461-3467,3501-3506,3537-3543,3626`). Thus every
+   remaining runnable fallback can add another automatic attempt even after exhaustion.
+
+   Moreover, if that next candidate's artifact is absent, `start_candidate` calls
+   `budget_after_nothing_ran` (`:1255-1272`), whose automatic case still returns zero regardless of
+   earlier attempts (`src/user/libs/driver/binding/src/lib.rs:333-343`). On the concrete sequence
+   `[A exhausts its attempts, B is missing, C exists]`, C receives a new three-attempt counter and
+   `begin_bind` opens a fresh incident at `:3461-3462`. The 2026-09-04 response's assertion that
+   nothing resets the counter at a candidate boundary is therefore false. M5 requires three
+   automatic attempts and one absolute window across the node's entire attempt chain
+   (`docs/todo/P02M0162.md:244-269`).
+
+3. **A silent recovery handshake has no timeout in the standing loop.** The standing loop starts
+   replacement bindings on automatic recovery and operator retry
+   (`src/user/services/core/src/device_manager.rs:541-589`), but its deadlines cover heartbeats,
+   backoffs, planned stops and teardowns only (`:487-532`), and its node wait handles cover pending
+   teardowns only (`:673-686`). `tick_heartbeats` drains a binding's channel on each pass but skips
+   heartbeat/deadline handling unless its state is `Online` (`:5758-5763`). All uses of
+   `Incident::attempt_deadline` and production insertion of `TimedOut` for an unfinished handshake
+   are inside the bring-up-only `pump` (`:2891,2932-2959`). Consequently a replacement process that
+   stays alive but sends no `READY`/`FAILED` remains in `Binding` indefinitely, retaining its claim
+   and resources even after the incident deadline. Other nodes waking the loop do not repair this,
+   because no standing-loop branch checks that deadline. M4/M5 and the silent-driver fault case
+   require the same bounded rollback for a recovery as for the initial bind
+   (`docs/todo/P02M0162.md:181-199,244-269,351-355,374-378`).
+
+4. **The bring-up pump mistakes other nodes' legitimate timer wakes for failed handshakes.**
+   `pump` includes the next heartbeat tick in `soonest`
+   (`src/user/services/core/src/device_manager.rs:2835-2837`) and also includes teardown deadlines
+   (`:2873-2875`). When that timer expires before any binding's own deadline, `wait_any` returns
+   negative, `timed_out` remains false, and the fallback enqueues `TimedOut` on every in-flight
+   node (`:2920-2959`). The only exempt legitimate timer is a parked claim's re-read. For example,
+   with one already-online driver's heartbeat due at tick 30 and another driver's handshake due at
+   tick 200, reaching tick 30 can kill the latter as `handshake-timeout` while it is still within
+   its allowance. This makes supervision of one node cause a false failure on another, contrary to
+   M2/M4 and the per-node deadline contract.
+
+   The individual READY deadline is also recomputed as `clock() + READY_DEADLINE_TICKS` on every
+   query (`:178-192`), including when checking whether the previous wait actually expired
+   (`:2932`). It is never latched at `BIND`. On profiles whose incident slice exceeds two seconds,
+   repeated unrelated activity moves that two-second deadline forward until the absolute incident
+   bound, instead of enforcing M5's two seconds from BIND (`docs/todo/P02M0162.md:244-269`). The
+   blanket timeout fallback is not a correct replacement for a persistent per-attempt deadline.
+
+5. **The backoff fix still blocks all other nodes during both bring-up phases.** Phase one calls
+   `wait_out_backoff` immediately on `Step::Again`
+   (`src/user/services/core/src/device_manager.rs:966-973`), and phase two does the same
+   (`:1140-1142`); that helper calls `sleep_until` on DeviceManager's sole thread (`:3364-3367`).
+   These phases launch multiple bindings before pumping them (`:881-931,1104-1110`), and the pump
+   also supervises already-online drivers (`:2831-2847`). They therefore do have other work to
+   service while one node waits its 100/200 ms backoff. The previous response's justification that
+   the bring-up loops have nothing else to do is incorrect: another node's handshake, exit or
+   heartbeat cannot be handled during those sleeps, and simultaneous failures serialize their
+   delays. M2 explicitly requires one node's backoff not to delay another
+   (`docs/todo/P02M0162.md:86-92,402-403`).
+
+Verification: read the complete original audit and all responses, the milestone requirements, and
+current transaction, state, queue, deadline, supervision and kernel handle paths. Focused offline
+host suites passed: `driver-binding` 70 tests; `system-manifest` 16 tests. These suites exercise the
+shared ledger and state helpers but do not execute the production acquisition or event-loop
+sequences above. No guest matrix or source mutation was performed.

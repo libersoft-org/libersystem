@@ -2250,3 +2250,14 @@ The later responses' supplemental requirements and corrections were checked too:
 The preceding re-audit in this same session also passed all 70 binding tests, the production-manifest startup regression and dispatch mutations, all 18 tier regressions, and the live empty-work inner/merge CLI sequence (6 then 0). Those sources are unchanged by this fix; these are retained session results, not newly repeated runs. No long QEMU suite was necessary for the host-side publication and argument-handling correction. No new exhaustive-release result is claimed.
 
 The M5 completion note now records the template/acquisition fix and regressions. `docs/todo/P02M0177.md` retains 20 checked items and zero open items, and its previously unticked row in `docs/todo/TODO.md` now agrees with that completed state. No valid in-scope finding remains unresolved after these checks.
+
+
+AUDITOR'S RE-AUDIT ON P02M0177 (2026-09-07T20:21:54Z):
+
+Rating: 10/10
+
+Reviewed implementation `90db3e62c6d8bef0ec97656d8c7b7248b08d0290` against the active milestone requirements, original audit, subsequent re-audits and implementer responses, including accepted fixes and rejected findings. No unresolved material issues were found within this milestone's scope.
+
+Fresh validation passed: all 70 driver-binding tests, the generated production-manifest startup regression, dispatch and causal mutation checks, all 18 tier regressions, all 14 guest-verdict/producer regressions, and the scheduler checks. Retained performance receipts, source references, obligation accounting and all 32 signed-boot serial captures were independently checked. Long guest suites and benchmarks were not rerun; their recorded evidence and stated limitations remain the basis for runtime and performance acceptance.
+
+No source code or preceding audit content was modified.

@@ -125,8 +125,8 @@ trap 'rm -rf "$work"' EXIT
 # cases passing there said nothing about the topology the milestone describes - and the bridge is
 # one the fixture is supposed to REFUSE rather than generalize to.
 #
-# `DMA_FIXTURE=1` omits exactly those and keeps the firmware boot medium, the system volume and
-# virtio-net, which is the list M2 gives.
+# `DMA_FIXTURE=1` also omits the system-volume disk: this test kernel enters its suite directly
+# and consumes the archive from the boot medium. The retained endpoint is virtio-net.
 # AND `IOMMU=1` RATHER THAN A CONTROLLER BOLTED ON THROUGH `QEMU_EXTRA` (corrected 2026-09-04).
 #
 # `./test.sh` reaches the runner with `TEST=1`, which selects the UNTRANSLATED profile: the machine

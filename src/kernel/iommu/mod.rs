@@ -62,19 +62,14 @@ pub struct Wire {
 }
 
 impl Transport for Wire {
-	// THIS TRANSPORT CANNOT SAY, AND SAYING SO IS THE ANSWER (corrected 2026-09-03).
-	//
-	// It answered with the event RING SIZE, on the reasoning that the ring bounds what can be in
-	// flight. It bounds something else: this transport keeps ONE event buffer outstanding at a time,
-	// and virtio permits a device with no available buffer to WAIT for one or to drop the event - so
-	// how many records an ended binding left behind is not a function of the ring at all, and a
-	// number that looks derived is worse than one that is admitted to be a policy. The ledger's
-	// `MOST_TAIL_ATTRIBUTIONS` is where that policy is written down.
-	//
-	// `event_capacity` stays on the trait for a transport that genuinely knows - one that posts a
-	// ring of buffers and treats "no buffer available" as an answer rather than a gap.
+	// One event buffer does not bound records held by the controller. Reattachment requires
+	// an observed drain boundary instead of estimating the predecessor's backlog.
 
 	fn request(&mut self, request: &[u8], tail: &mut [u8], status_at: usize) -> Result<(), Fault> {
+		// Check before touching scratch: an earlier timed-out request may still read or write it.
+		if !self.requests.request_available() {
+			return Err(Fault::Unconfirmed);
+		}
 		if request.len() > 2048 || tail.len() > 2048 {
 			return Err(Fault::Malformed);
 		}
@@ -105,6 +100,7 @@ impl Transport for Wire {
 		// rather than the length alone - a probe's status sits after its properties, so "some bytes
 		// arrived" is not the same question as "the status arrived".
 		if (written as usize) <= status_at {
+			self.requests.fail_requests();
 			crate::serial_println!("iommu: the device completed request type {} without writing its status ({written} byte(s), status at {status_at}) - the operation is unconfirmed", request.first().copied().unwrap_or(0));
 			return Err(Fault::Unconfirmed);
 		}
@@ -987,6 +983,11 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	let endpoint = requester_of(bus, dev, func);
 	poll_faults();
 	DOMAINS.lock().retain(|(device, _)| *device != index as u32);
+	// Keep the ending domain answering throughout the final drain and terminal snapshot. That
+	// drain is already in its ledger count; only events after retirement belong in the late carry.
+	if let Some(slot) = RETAINED.lock().get_mut(index) {
+		*slot = Some(domain);
+	}
 	let confirmed = match revoke_endpoint(domain, bus, dev, func) {
 		Ok(dma::Release::FramesReusable) => true,
 		other => {
@@ -1060,9 +1061,16 @@ fn detach_for_inner(index: usize, bus: u8, dev: u8, func: u8) -> bool {
 	// its own revoke raised. See that paragraph.
 	if confirmed {
 		match with(|controller| controller.iommu().destroy_domain(domain)) {
-			Some(Ok(_)) => {}
-			Some(Err(fault)) => crate::serial_println!("iommu: domain {} outlived the endpoint that used it ({fault:?}) - it is retained rather than reused", domain.0),
-			None => {}
+			Some(Ok(_)) => {
+				if let Some(slot) = RETAINED.lock().get_mut(index) {
+					*slot = None;
+				}
+			}
+			Some(Err(fault)) => {
+				crate::serial_println!("iommu: domain {} outlived the endpoint that used it ({fault:?}) - it is retained rather than reused", domain.0);
+				return false;
+			}
+			None => return false,
 		}
 	}
 	confirmed

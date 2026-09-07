@@ -2108,3 +2108,110 @@ milestone goes from two open items to one.
     MEDIA_ORDER=swapped ./test.sh --arch x86_64 --tags boot 13 passed (23 s)
     ./test.sh --arch x86_64 --tags storage                  51 passed (125 s)
     ./check.sh --gate milestone-index,source-hygiene         clean
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0164 (2026-09-07T21:54:54Z):
+
+Current implementation rating: 5/10
+
+1. **The generated provider capacity still rejects valid publications from multiple instances of a
+   driver.** `build.rs` sums each driver program's `provides.most` once and emits nine slots for the
+   shipping catalogue (`src/user/services/core/build.rs:94-105`). The allowance is actually enforced
+   per binding: `publish_all` compares `count_for(binding, kind)` with `most`, and `count_for` explicitly
+   distinguishes two controllers publishing one provider each from one controller publishing two
+   (`src/user/services/core/src/device_manager.rs:2355-2372,2550-2552`). The shipping `virtio_blk`
+   declaration allows one provider per device and matches multiple devices
+   (`src/user/services/manifest.toml:1418-1431`). Ten such valid bindings therefore require ten slots,
+   while the catalogue closes the tenth despite no declaration being exceeded. Moving the constant
+   into generated code did not account for instance multiplicity. This leaves original Finding 5's
+   fix incomplete against M1/M6 and the definition of done's declaration-bound provider count
+   (`docs/todo/P02M0164.md:49-59,420-434,496-505`). No particular architecture's USB failure is assumed
+   to have this cause.
+
+2. **A boot driver waiting for a declared dependency is discarded and cannot resume on publication.**
+   `gate_on_requirements` correctly moves the node to `DependencyPending` and returns false
+   (`src/user/services/core/src/device_manager.rs:3270-3280`), but `launch_boot_drivers` retains the
+   node only inside the true branch (`:903-926`). The initial scan precedes the pump that publishes
+   boot providers (`:931-959`), so a boot entry A requiring a kind produced by boot entry B is dropped
+   before B can publish. Later `settle_dependencies` cannot find A, and phase two explicitly skips
+   boot-critical entries (`:1090-1094`). The comment that any boot-driver requirement would be a
+   cycle is incorrect: validation requires pinned staging and rejects actual orphan/self/cyclic
+   requirements; it permits an acyclic A -> B pair
+   (`src/tools/system-manifest/src/lib.rs:1302-1306,1471-1518`). M6's wait-then-bind contract therefore
+   remains incomplete for valid registry inputs (`docs/todo/P02M0164.md:416-455`).
+
+3. **The migrated network provider permanently spends its consumer allowance when its first
+   consumer exits.** `virtio_net` handles the frame channel closing by setting `service_open = false`
+   and continuing its IRQ/control loop, including heartbeat replies; it sends neither `Disconnect`
+   nor withdrawal and does not exit (`src/user/drivers/core/src/virtio_net.rs:137-179`). The first
+   catalogue open already moved the offered handle and incremented `consumers`, and later opens are
+   refused at the default single-consumer limit
+   (`src/user/services/core/src/device_manager.rs:4675-4699`;
+   `src/user/services/manifest.toml:1524`). Only a `Disconnect` would restore that count (`:2560-2563`).
+   A replacement consumer can therefore discover an apparently live NIC but cannot connect to it.
+   The driver also rejects new `CONNECT` endpoints through `drain_control_into(None)`, so a count
+   correction alone would not make the factory usable
+   (`src/user/drivers/core/src/common.rs:471-481,669-707`). This is the unresolved concurrent-consumer
+   accounting/factory requirement in M1, not a request for multi-interface networking or failover.
+
+4. **The format-routing fix does not run on an embedded-volume boot.** When `live_volume != 0`,
+   ServiceManager closes all block probes and sends `LIVEVOL`
+   (`src/user/services/core/src/service_manager/bootstrap.rs:467-475,589-593`). StorageService's
+   `LIVEVOL` branch produces no classification table; classification exists only in the `BLOCK` arm
+   (`src/user/services/storage/src/service.rs:283-286,351-354`). With that empty table, `by_format`
+   silently falls back to bus position (`src/user/services/core/src/service_manager/bootstrap.rs:503-518`).
+   Thus an embedded boot with media ordered UDF/ISO/FAT still sends UDF to the FAT instance and FAT
+   to the UDF instance. The lazy storage constructors nevertheless report both instances online
+   (`src/user/services/storage/src/service.rs:314-326,385-403`), so a green boot-report check does not
+   prove those media can be read. M2's claimed completion does not cover the required `Embedded`
+   outcome and adverse ordering (`docs/todo/P02M0164.md:143-147,506-518`).
+
+5. **Format selection still assumes the first block device is the system disk and discards later
+   role candidates before classifying them.** ServiceManager retains only the next three role handles
+   and closes all later ones (`src/user/services/core/src/service_manager/bootstrap.rs:851-867`). Its
+   format selector searches only those three and explicitly excludes provider index zero as the
+   presumed system volume (`:503-509`). But `mount_by_uuid` legitimately selects a later root through
+   a separate probe (`src/user/services/storage/src/service.rs:3775-3793`). On the valid order
+   `[FAT, selected LiberFS, ISO, UDF]`, the root mounts but the FAT role falls back to the LiberFS
+   handle, leaving the actual FAT provider at index zero unreachable. With
+   `[LiberFS, unclassified disk, FAT, ISO, UDF]`, the UDF role's usable connection has already been
+   closed; both ISO and UDF are assigned the ISO handle. These are still positional restrictions on
+   M2's format/identity decision, even though all providers now reach the probe list. A source-extracted
+   execution of the current routing closure reproduced both assignments. The ordinary and swapped
+   four-disk, first-root cases work; those resolved cases are not the finding.
+
+6. **The USB consumers remain on one-shot connections, and the new marker is not a served-volume
+   oracle.** DeviceManager still opens only each USB block/bus list's `first()` entry and sends it
+   once (`src/user/services/core/src/device_manager.rs:795-802`). USB StorageService receives the
+   direct `USBBLOCK` role, and PermissionManager takes one `USBBUS` capability; neither subscribes
+   (`src/user/services/core/src/service_manager/bootstrap.rs:567-582`;
+   `src/user/services/core/src/permission_manager.rs:1553`). Other controllers and replacement
+   publications therefore remain unreachable through those consumer seams, as the latest response
+   accepts. Its assertion that the prerequisite oracle is complete is also too strong: `USBBLOCK*`
+   is selected solely from a nonzero handle, and StorageService merely sets `routed = true` and
+   constructs a lazy `FatBacking` before reporting it
+   (`src/user/services/storage/src/service.rs:334-336,393-394`). The boot test matches that report
+   without reading the routed medium (`src/kernel/test_suites/boot.rs:108-147`). A wrong or already
+   closed nonzero provider still satisfies it. The required consumer migration and proof that the
+   boot-routed USB volume is served remain incomplete (`docs/todo/P02M0164.md:290-325`).
+
+7. **Multiple providers matching the selected root UUID are accepted rather than refused.** M2
+   explicitly requires both no match and more than one match to be typed refusals
+   (`docs/todo/P02M0164.md:129-133`). `mount_by_uuid` returns immediately for a matching primary or
+   the first matching probe and never checks whether another provider has that UUID
+   (`src/user/services/storage/src/service.rs:3775-3793`). The loader does not eliminate this case:
+   its `choose_volume` also stops on the first matching UUID
+   (`src/boot/uefi/src/disk.rs:312-335`). Two cloned volumes with the selected UUID can consequently
+   select different physical disks by enumeration order rather than produce the required ambiguity
+   refusal. This is a missing identity check within M2's stated scope.
+
+Verification: read the entire original audit/response history and current milestone, then traced the
+catalogue, registry validation, service bootstrap, consumer, loader and storage paths. The offline
+`system-manifest` suite passed all 16 tests; `no-fixed-provider-slots` and `one-wait` passed. A temporary
+host executable compiled the unchanged production routing closure, with explicit handle/format
+inputs, and reproduced the embedded, non-first-root and fifth-provider assignments above. This is
+selection-logic evidence, not a guest boot. Source searches found `MEDIA_ORDER` only in the QEMU
+runner; no registered gate invokes the swapped setting. The QEMU matrix was not repeated. Only this
+re-audit was appended; original audit text, milestone requirements and source code were preserved.

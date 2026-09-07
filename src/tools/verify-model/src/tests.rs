@@ -1124,22 +1124,18 @@ fn covers_must_be_reachable_from_what_the_test_touches() {
 	assert_eq!(crate::kerneltests::unreachable_covers(&bad, &touched, &model.graph, &nothing_staged), vec![String::from("liberfs")]);
 }
 
-// AND THE BOOT CHAIN IS REACH, which is what fifteen exception lines were about.
-//
-// A kernel test runs in a booted guest, so the staged drivers and services are live before its body
-// runs: a test that asserts a file read over a disk reaches that disk's driver without ever
-// launching it. Reach computed from launches alone refused those declarations - correctly, given
-// what it could see - and the fix is to let it see the boot.
+// Staging a driver is insufficient: the fixture must actually start the production boot chain.
 #[test]
-fn the_boot_chain_is_part_of_what_a_kernel_test_reaches() {
+fn the_boot_chain_is_reachable_only_when_the_test_starts_it() {
 	let model = model();
-	// A test that launches nothing at all, which is most of them.
-	let touched: BTreeSet<String> = BTreeSet::new();
+	let touched: BTreeSet<String> = [String::from("kernel")].into_iter().collect();
 	let test = kernel_test("t", &["bin.virtio_blk"]);
-	let nothing_staged: BTreeSet<String> = BTreeSet::new();
-	assert_eq!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph, &nothing_staged), vec![String::from("bin.virtio_blk")], "with nothing staged there is no boot chain and the declaration is unreachable");
-	assert!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph, &model.staged).is_empty(), "and on a machine whose boot stages that driver, a test asserting its effect reaches it");
-	assert!(model.staged.contains("bin.virtio_blk"), "the staged set is what the manifest stages, read rather than assumed");
+	assert_eq!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph, &model.staged), vec![String::from("bin.virtio_blk")], "staged bytes are not a running driver in a kernel-only fixture");
+	let touched: BTreeSet<String> = [String::from("bin.system_manager")].into_iter().collect();
+	assert!(crate::kerneltests::unreachable_covers(&test, &touched, &model.graph, &model.staged).is_empty(), "a fixture that starts SystemManager reaches its manifest boot chain");
+	let boot = model.kernel_tests.tests.iter().find(|test| test.id == "kernel.boot.init_package_starts_system_manager").expect("the actual boot test is discovered");
+	let touches = model.kernel_tests.touches.get(&boot.name).expect("the boot fixture has derived touches");
+	assert!(touches.contains("bin.system_manager"), "the real source parser follows spawn_system_manager to its program lookup: {touches:?}");
 }
 
 #[test]
@@ -1876,10 +1872,9 @@ fn changing_one_test_file_selects_the_tests_declared_in_it() {
 	// this is the first.
 	let here = "src/kernel/test_suites/hardware.rs";
 	let elsewhere = "src/kernel/test_suites/boot.rs";
-	let declared = KernelTest { source_paths: vec![String::from(here)], name: String::from("declared_here"), id: String::from("kernel.declared_here"), architectures: vec![String::from("x86_64")], covers: vec![String::from("liberfs")] };
-	let other = KernelTest { source_paths: vec![String::from(elsewhere)], name: String::from("declared_elsewhere"), id: String::from("kernel.declared_elsewhere"), architectures: vec![String::from("x86_64")], covers: vec![String::from("liberfs")] };
-	// `covers` deliberately names a component this change does NOT reach, so the only thing that can
-	// put the test in the plan is the declaration - which is the property being asserted.
+	let declared = KernelTest { source_paths: vec![String::from(here)], name: String::from("declared_here"), id: String::from("kernel.declared_here"), architectures: vec![String::from("x86_64")], covers: vec![String::from("kernel")] };
+	let other = KernelTest { source_paths: vec![String::from(elsewhere)], name: String::from("declared_elsewhere"), id: String::from("kernel.declared_elsewhere"), architectures: vec![String::from("x86_64")], covers: vec![String::from("kernel")] };
+	// Both tests cover kernel: the build closure must not pull the unrelated test back in.
 	let model = model_with_suite(vec![declared, other]);
 	let plan = plan_for(&model, &[here]);
 	let selected = keys(&plan);
@@ -1890,6 +1885,29 @@ fn changing_one_test_file_selects_the_tests_declared_in_it() {
 	// AND NOT NOTHING, which is the other half of the row's own sentence. A change to a test file
 	// still rebuilds the kernel, because the kernel is built from it.
 	assert!(selected.iter().any(|key| key.starts_with("build.kernel")), "the kernel is still rebuilt: {selected:?}");
+}
+
+#[test]
+fn a_real_test_source_change_keeps_the_declared_ids_and_all_build_targets() {
+	let model = model();
+	let here = "src/kernel/test_suites/hardware.rs";
+	let plan = plan_for(&model, &[here]);
+	assert!(!plan.full);
+	let expected: BTreeSet<String> = model.kernel_tests.tests.iter().filter(|test| test.source_paths.iter().any(|path| path == here)).map(|test| test.id.clone()).collect();
+	assert!(!expected.is_empty());
+	for architecture in &plan.architectures_booted {
+		let actual: BTreeSet<String> = plan.items.iter().filter(|item| item.kind == crate::catalog::CheckKind::KernelTest && &item.key.architecture == architecture).map(|item| item.key.check.clone()).collect();
+		let runnable: BTreeSet<String> = model.catalog.checks.iter().filter(|check| expected.contains(&check.id) && check.variants.iter().any(|variant| &variant.architecture == architecture)).map(|check| check.id.clone()).collect();
+		assert_eq!(actual, runnable, "only declarations in the changed file run on {architecture}");
+	}
+	assert_eq!(plan.architectures_built.len(), 3, "file-local execution preserves cross-builds");
+	assert!(plan.items.iter().any(|item| item.key.check == "build.kernel"));
+	assert!(!model.registry.risk_classes.iter().any(|risk| risk.path == "src/kernel/test_suites"));
+	let mixed = plan_for(&model, &[here, "src/kernel/device.rs"]);
+	assert!(mixed.full, "adding production code retains conservative kernel verification");
+	assert!(keys(&plan).is_subset(&keys(&mixed)), "a larger change never removes verification");
+	let helper = plan_for(&model, &["src/kernel/test_suites/undeclared_helper.rs"]);
+	assert!(helper.items.iter().filter(|item| item.kind == crate::catalog::CheckKind::KernelTest).count() > plan.items.iter().filter(|item| item.kind == crate::catalog::CheckKind::KernelTest).count(), "an undiscovered helper or deleted file cannot claim file-local reach");
 }
 
 // A model whose kernel suite is exactly what this test writes down.
@@ -2196,6 +2214,27 @@ fn every_separately_runnable_check_is_its_own_step() {
 	let ids: std::collections::BTreeSet<&String> = gates.iter().map(|step| &step.id).collect();
 	assert_eq!(ids.len(), gates.len(), "each gate carries its own StepId, or two of them share a cost that describes neither");
 
+	let builds: Vec<_> = steps.iter().filter(|step| step.id.starts_with("build:")).collect();
+	assert!(!builds.is_empty());
+	assert!(builds.iter().all(|step| step.keys.len() == 1 && !step.command.contains(',')), "each build part has its own measured step");
+	for architecture in crate::registry::ARCHITECTURES {
+		let ordered: Vec<_> = crate::catalog::BUILD_PARTS.iter().filter_map(|part| builds.iter().find(|step| step.keys[0].architecture == architecture && step.keys[0].check == format!("build.{part}"))).collect();
+		for pair in ordered.windows(2) {
+			assert!(pair[1].requires.contains(&pair[0].id), "build parts preserve their producer order");
+		}
+		if let Some(last) = ordered.last() {
+			for guest in steps.iter().filter(|step| step.guests > 0 && (!step.id.starts_with("guest:") || step.keys.iter().any(|key| key.architecture == architecture))) {
+				assert!(guest.requires.contains(&last.id), "{} must wait for selected {architecture} builds", guest.id);
+			}
+		}
+	}
+
+	let development: Vec<_> = steps.iter().filter(|step| step.id.starts_with("dev:")).collect();
+	assert_eq!(development.len(), 4, "the full plan includes every persistent-instance check");
+	for pair in development.windows(2) {
+		assert!(pair[1].requires.contains(&pair[0].id), "checks mutating the same development instance cannot overlap");
+	}
+
 	// AND THE SAME FOR CONFORMANCE SUITES, which were the second batch.
 	for step in steps.iter().filter(|step| step.command.contains("--conformance ")) {
 		assert!(!step.command.contains(','), "a conformance step names one suite: {}", step.command);
@@ -2230,7 +2269,8 @@ fn a_candidate_that_narrows_only_the_registry_is_still_a_narrowing() {
 	assert!(text.contains(&block), "the fixture has to find the rule it is about");
 	let without_the_block = narrowed_from(text.replace(&block, ""));
 	let losing = crate::candidate::components_losing_registry_coverage(&model.registry, &without_the_block, &ownership, &crate::ownership::Ownership::new(&without_the_block, &model.crates));
-	assert!(losing.contains(&owned.component), "a component that owns fewer paths has lost coverage: {losing:?}");
+	let Owner::Component { component: successor, .. } = Ownership::new(&without_the_block, &model.crates).owner(&owned.path) else { panic!("the removed rule falls back to its crate") };
+	assert!(losing.contains(&successor), "the changed ownership is graded on its candidate owner: {losing:?}");
 
 	// AND A RULE THAT IS STILL THERE, OVERRIDDEN BY A LONGER ONE (added 2026-09-03). Both lookups
 	// resolve by longest prefix, so ADDING a rule narrows without removing anything: the owner keeps
@@ -2379,48 +2419,89 @@ fn a_failed_run_never_becomes_a_cost_however_the_models_are_ordered() {
 	assert_eq!(after_failure, unmeasured, "a step that failed at its first instruction is not what running that key costs");
 }
 
+fn subsystem_candidate(active: &Model, path: &str, component: &str, test: &str) -> (crate::candidate::Candidate, Model) {
+	let mut candidate = crate::candidate::Candidate { reason: String::from("exercise a cumulative ownership and covers split"), expected_hash: String::new(), base: Default::default(), registry: format!("{}\n[[ownership]]\npath = \"{path}\"\ncomponent = \"{component}\"\n\n[[architecture]]\npath = \"{path}\"\nbuild = [\"x86_64\", \"aarch64\", \"riscv64\"]\nboot = [\"x86_64\", \"aarch64\", \"riscv64\"]\n", active.registry.registry_text), covers: [(test.to_string(), vec![component.to_string()])].into_iter().collect() };
+	let narrowed = Model::load_with_candidate(&active.repo_root, Some(&candidate)).expect("candidate overlay loads");
+	candidate.expected_hash = narrowed.model_hash();
+	(candidate, narrowed)
+}
+
+// Guest outcomes are fixtures; paths, edits, candidate selection, scopes and both evidence bars
+// use the production implementation. No evidence is written into the workspace's history.
+fn record_candidate_change(narrowed: &Model, root: &Path, paths: &[&str], hash: &str, architectures: &[&str], log: &mut crate::shadow::Log) {
+	let plan = plan_for(narrowed, paths);
+	assert!(!plan.full, "the frozen candidate must actually narrow: {:?}", plan.full_reasons);
+	let selected: Vec<_> = plan.items.iter().map(|item| item.key.clone()).collect();
+	let explicit = paths.iter().map(|path| ((*path).to_string(), String::from("modified"))).collect();
+	for architecture in architectures {
+		let full = crate::shadow::GuestResults { outcomes: narrowed.catalog.checks.iter().filter(|check| check.kind == crate::catalog::CheckKind::KernelTest && check.variants.iter().any(|variant| &variant.architecture == architecture)).map(|check| (check.id.clone(), crate::shadow::Outcome::Passed)).collect(), total_declared: None };
+		let scoped = crate::shadow::GuestResults { outcomes: selected.iter().filter(|key| &key.architecture == architecture && key.environment == crate::catalog::Environment::TestGuest).map(|key| (key.check.clone(), crate::shadow::Outcome::Passed)).collect(), total_declared: None };
+		let comparison = crate::shadow::compare(&selected, &full, architecture, &Default::default());
+		let exec = crate::shadow::compare_exec(&selected, &scoped, &full, architecture);
+		assert_eq!(comparison.verdict, crate::shadow::Verdict::Consistent);
+		assert_eq!(exec.verdict, crate::shadow::Verdict::Consistent, "{}", exec.reason);
+		log.records.push(crate::shadow::Record { universe: crate::shadow::Universe::TestGuest, architecture: (*architecture).to_string(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason, model_hash: hash.to_string(), source_digest: crate::shadow::source_digest(root).expect("source digest"), changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures, at: 0, change_kinds: crate::shadow::change_kinds_for(root, &paths.iter().map(|path| (*path).to_string()).collect::<Vec<_>>(), &explicit), edge_kinds: plan.edge_kinds.clone(), shadow_exec: true, model_self_check: true, component_decisions: plan.component_decisions.clone(), component_scopes: crate::shadow::component_scopes(root, &plan, &explicit, &narrowed.registry) });
+	}
+}
+
+fn change_fixture_file(fixture: &Fixture, path: &str, edit: usize) {
+	let source = std::fs::read_to_string(repo_root().join(path)).expect("real source file");
+	let target = fixture.dir.join(path);
+	std::fs::create_dir_all(target.parent().expect("source directory")).expect("source directory");
+	std::fs::write(target, format!("{source}\n// Distinct fixture edit {edit}.\n")).expect("actual changed content");
+}
+
 #[test]
 fn five_real_changes_through_the_real_planner_reach_the_threshold() {
-	// THE SAME PROPERTY, DRIVEN THROUGH THE PRODUCTION PATH (2026-09-03).
-	//
-	// The fixture above hands `distinct_evidence_for_pair` five digests written by hand, so it
-	// proves the COUNTING and says nothing about whether the planner can produce five distinct
-	// digests for one subsystem - which is the thing the milestone doubted, and the reason it asks
-	// for a planner test rather than a unit one. This runs real paths through `Planner` and takes
-	// the digests from `component_scopes`, which is the function `shadow` records with.
-	//
-	// A MULTI-FILE SUBSYSTEM FIRST. Five different files of `src/kernel/mem`, each a real file with
-	// real content: the plan's decision about the component is the same every time, and the digests
-	// differ because the CHANGES differ.
-	let model = model();
-	let files = ["src/kernel/mem/mod.rs", "src/kernel/mem/tlb.rs", "src/kernel/mem/vapool.rs", "src/kernel/mem/frame/mod.rs", "src/kernel/mem/heap/mod.rs"];
-	let mut digests: BTreeSet<String> = BTreeSet::new();
-	let mut decisions: BTreeSet<String> = BTreeSet::new();
-	for path in files {
-		let plan = plan_for(&model, &[path]);
-		let scopes = crate::shadow::component_scopes(&model.repo_root, &plan, &std::collections::BTreeMap::new(), &model.registry);
-		let (component, scope) = scopes.iter().find(|(component, _)| component.starts_with("kernel")).expect("a kernel component owns src/kernel/mem");
-		assert!(!scope.changed_digest.is_empty(), "{path} produced no change digest, so no evidence about it could ever be distinct");
-		digests.insert(scope.changed_digest.clone());
-		decisions.insert(keys(&plan).into_iter().collect::<Vec<_>>().join(","));
-		let _ = component;
+	let active = model();
+	for (name, owner_path, component, test, paths) in [
+		("memory", "src/kernel/mem", "kernel.mem", "kernel.mem.frame.frame_alloc_distinct", vec!["src/kernel/mem/mod.rs", "src/kernel/mem/tlb.rs", "src/kernel/mem/vapool.rs", "src/kernel/mem/frame/mod.rs", "src/kernel/mem/heap/mod.rs"]),
+		("single-file", "src/kernel/elf.rs", "kernel.elf", "kernel.elf.an_et_exec_segment_may_not_name_the_kernel_half", vec!["src/kernel/elf.rs"; 5]),
+	] {
+		let fixture = Fixture::new(&format!("candidate-changes-{name}"));
+		assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(&fixture.dir).status().expect("git init").success());
+		let (candidate, narrowed) = subsystem_candidate(&active, owner_path, component, test);
+		assert_eq!(crate::candidate::evidence_components(&active, &narrowed), [component.to_string()].into_iter().collect(), "a covers reassignment needs the successor's evidence");
+		let mut log = crate::shadow::Log::default();
+		let mut decisions = BTreeSet::new();
+		for (edit, path) in paths.iter().enumerate() {
+			change_fixture_file(&fixture, path, edit);
+			decisions.insert(keys(&plan_for(&narrowed, &[path])));
+			record_candidate_change(&narrowed, &fixture.dir, &[path], &candidate.expected_hash, &["x86_64", "aarch64"], &mut log);
+		}
+		assert_eq!(decisions.len(), 1, "five distinct changes validate one candidate decision");
+		assert_eq!(log.distinct_evidence_for(component, &candidate.expected_hash, crate::shadow::Universe::TestGuest), 5);
+		assert!(crate::trust::Store::default().evaluate(component, &candidate.expected_hash, crate::shadow::Universe::TestGuest, &log).is_ok());
+		let short = crate::candidate::evidence_failures(&active, &narrowed, &candidate.expected_hash, &Default::default(), &log);
+		if name == "memory" {
+			assert!(short.iter().any(|why| why.contains("src/kernel/mem") && why.contains("riscv64")), "two targets pass the general bar but not memory's stronger bar: {short:?}");
+			record_candidate_change(&narrowed, &fixture.dir, &[paths[4]], &candidate.expected_hash, &["riscv64"], &mut log);
+		} else {
+			assert!(short.is_empty(), "the single-file candidate can qualify: {short:?}");
+		}
+		let unmet = crate::candidate::evidence_failures(&active, &narrowed, &candidate.expected_hash, &Default::default(), &log);
+		assert!(unmet.is_empty(), "candidate evidence passes the same evaluation activation calls: {unmet:?}");
+		assert!(!crate::candidate::evidence_failures(&active, &narrowed, "another-model", &Default::default(), &log).is_empty());
+		let repeated = crate::shadow::Log { schema: 1, records: vec![log.records[0].clone(); 5] };
+		assert_eq!(repeated.distinct_evidence_for(component, &candidate.expected_hash, crate::shadow::Universe::TestGuest), 1);
 	}
-	assert_eq!(digests.len(), 5, "five real changes to one subsystem must produce five distinct digests, or the threshold is unreachable by construction");
-	assert_eq!(decisions.len(), 1, "and they must be the SAME decision, or this fixture is not the deadlock it is about");
+}
 
-	// AND A SINGLE-FILE SUBSYSTEM, which is the case the cheap answer gets wrong: five edits to one
-	// file share one path set, so a digest over paths alone would give one piece of evidence for all
-	// five. The KIND is part of the tuple, and five kinds of change to one path are five changes.
-	let one_file = "src/kernel/elf.rs";
-	let mut single: BTreeSet<String> = BTreeSet::new();
-	for kind in ["modified", "added", "deleted", "renamed", "copied"] {
-		let explicit: std::collections::BTreeMap<String, String> = [(String::from(one_file), String::from(kind))].into_iter().collect();
-		let plan = plan_for(&model, &[one_file]);
-		let scopes = crate::shadow::component_scopes(&model.repo_root, &plan, &explicit, &model.registry);
-		let scope = scopes.values().find(|scope| !scope.changed_digest.is_empty()).expect("the one file's component has a digest");
-		single.insert(scope.changed_digest.clone());
+#[test]
+fn a_deeper_subsystem_split_must_meet_the_parent_risk_bar() {
+	let active = model();
+	let (candidate, narrowed) = subsystem_candidate(&active, "src/kernel/mem/frame", "kernel.mem", "kernel.mem.frame.frame_alloc_distinct");
+	let fixture = Fixture::new("deeper-candidate-risk");
+	assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(&fixture.dir).status().expect("git init").success());
+	let mut log = crate::shadow::Log::default();
+	for edit in 0..5 {
+		change_fixture_file(&fixture, "src/kernel/mem/frame/mod.rs", edit);
+		record_candidate_change(&narrowed, &fixture.dir, &["src/kernel/mem/frame/mod.rs"], &candidate.expected_hash, &["x86_64", "aarch64"], &mut log);
 	}
-	assert_eq!(single.len(), 5, "a single-file subsystem's five kinds of change are five changes, or its risk class can never be narrowed");
+	assert!(crate::trust::Store::default().evaluate("kernel.mem", &candidate.expected_hash, crate::shadow::Universe::TestGuest, &log).is_ok());
+	let unmet = crate::candidate::evidence_failures(&active, &narrowed, &candidate.expected_hash, &Default::default(), &log);
+	assert!(unmet.iter().any(|why| why.contains("src/kernel/mem") && why.contains("riscv64")), "the parent path's unchanged owner must not skip its risk bar: {unmet:?}");
+	assert!(unmet.iter().any(|why| why.contains("src/kernel/mem") && why.contains("page-table")), "allocator-only evidence does not cover the protected subtree's other required group: {unmet:?}");
 }
 
 #[test]

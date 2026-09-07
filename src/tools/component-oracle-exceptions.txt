@@ -3,10 +3,9 @@
 # `component<TAB>reason`. Read by check-component-oracles.sh, which refuses a staged driver or
 # service that has neither a covering test nor a line here.
 #
-# A REASON, NOT A NAME. Two of the four below say "its oracle is somewhere this check cannot see"
-# and two say "there is no oracle" - and the difference is the whole point of writing them down.
-# An exception nobody can enumerate is a gap that reads like a decision; an enumerated one is a gap
-# that reads like a gap, which is what these two are.
+# A staged executable is not evidence that a kernel-test fixture starts it. Functional claims
+# belong only on tests that exercise the real component; development checks are named here because
+# this census reads kernel declarations only.
 
 dev_channel	its oracle is a DEV-GUEST check, not a kernel test: dev-selftest.py drives publication, refusal and rollback through this driver, and that guest cannot share a boot with the suite - qemu-run.sh refuses DEV_PROFILE together with TEST. Covered, elsewhere.
 dev_agent	the same: dev-selftest.py IS the oracle for this agent and runs on the development guest. The check above ranges over kernel tests and cannot see a dev-guest one.
@@ -14,21 +13,6 @@ session_service	NO ORACLE. Nothing in the suite fails when this service breaks. 
 time_service	NO ORACLE. The RTC tests assert what the KERNEL reads off the clock hardware; nothing asserts what this service answers to a client. Same shape as session_service and recorded for the same reason.
 virtio_input	NO ORACLE. This line used to name `kernel.services.input_service_streams_pointer_events`, and that test does not exercise this driver: the pointer device is interactive-only, so the test spawns InputService and - in its own words - "plays the driver itself" by sending raw events on a producer end it keeps. Breaking `virtio_input` cannot make it fail, and nothing else in the suite asserts an effect of it. A change to it selects builds and a smoke boot. Recorded as the gap it is rather than as the coverage it is not.
 
-# AND THE FIFTEEN THAT USED TO BE HERE ARE ANNOTATIONS NOW.
-#
-# They were a finding about the MECHANISM: `verify-model` enforces that `covers X` implies the test's
-# body can REACH X, reach was the forward closure of what the body was seen to LAUNCH, and a test
-# that asserts a driver's effect never launches the driver - DeviceManager binds it at boot and
-# ServiceManager starts the services. So fifteen annotations that were TRUE about failure - break the
-# driver and the test goes red - were refused by the model, correctly, because the model could not
-# see the path.
-#
-# The reach relation now includes the boot chain: a kernel test runs inside a booted guest, so the
-# components the manifest STAGES are live before any test body runs, and `unreachable_covers` seeds
-# reach with them. Each of the fifteen tests carries its `bin.<component>` declaration, so a change
-# to one of those drivers or services selects the test that fails when it breaks rather than builds
-# and a smoke boot. See `kerneltests::unreachable_covers` and
-# `the_boot_chain_is_part_of_what_a_kernel_test_reaches`.
-#
-# What is left below is the real list: components with no oracle at all, and two whose oracle is on
-# a guest this census cannot see. Those are gaps, and they read as gaps.
+virtio_gpu	Its real runtime oracle is dev.gpu-restart, which checks the translated driver after disable/rebind and a displayed frame. The kernel DisplayService restoration fixture supplies its own scanout and does not execute this driver; its former driver covers claim was false.
+virtio_console	NO FUNCTIONAL ORACLE. The ConsoleService channel test exercises ConsoleService and DisplayService with a synthetic scanout; it never starts this driver. The boot observes driver readiness but asserts no virtio-console queue effect, so that is not claimed as functional coverage.
+system_graph_service	NO FUNCTIONAL ORACLE. kernel.kernel.system_graph_reflects_live_state tests kernel graph::collect_from directly and never launches SystemGraphService. Boot readiness alone does not assert the service's generated interface or replies.

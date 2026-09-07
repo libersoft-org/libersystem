@@ -38,6 +38,11 @@
 
 extern crate alloc;
 
+#[path = "../../provider_subscription.rs"]
+pub mod provider_subscription;
+use proto::system::{ProviderInfo, ProviderKind};
+use provider_subscription::{ProviderWatch, open_provider, same_binding, same_provider};
+
 use alloc::string::String;
 use alloc::vec::Vec;
 use fat::FatFs;
@@ -169,6 +174,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 	// Whether this instance's block channel was ROUTED from a live provider - see the `USBBLOCK*`
 	// arm. Only the USB instance can answer anything but `false`.
 	let mut routed: bool = false;
+	let mut usb: Option<UsbProviders> = None;
 	let mut vol: Volume = match unsafe { recv_blocking(bootstrap, &mut buf) } {
 		Received::Message { len, handle } if handle != 0 && len >= 7 + 8 && &buf[..7] == b"RAMDISK" => {
 			let length: usize = u64::from_le_bytes([buf[7], buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14]]) as usize;
@@ -178,7 +184,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			}
 			Volume::new(alloc::boxed::Box::new(ArchiveFs { base, len: length }))
 		}
-		Received::Message { len, handle } if handle != 0 && len >= 5 && &buf[..5] == b"BLOCK" => {
+		Received::Message { len, handle } if len >= 5 && &buf[..5] == b"BLOCK" => {
 			// WHAT THE LOADER CHOSE, carried in this message rather than after it - `kind`, then
 			// `module`, then the uuid, appended to the tag. A boot that published none leaves the
 			// message at its old length and nothing below fires, which is the same answer as
@@ -210,28 +216,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// which is the bound; every announced message is read whether or not it carries a
 			// handle, because the roles that follow are read from the same channel and stopping
 			// early would take the next one for a probe.
-			let mut probes: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
-			let expected: usize = if len >= 5 + 24 + 1 { buf[5 + 24] as usize } else { 0 };
-			for _ in 0..expected {
-				let Received::Message { len, handle } = (unsafe { recv_blocking(bootstrap, &mut buf) }) else { break };
-				if len < 5 || &buf[..5] != b"PROBE" {
-					if handle != 0 {
-						unsafe { close(handle) };
-					}
-					break;
-				}
-				if handle == 0 {
-					continue;
-				}
-				if probes.try_reserve(1).is_err() {
-					unsafe {
-						print(b"StorageService: no room to hold another block probe connection; it is closed and this instance chooses among the ones it has\n");
-						close(handle);
-					}
-					continue;
-				}
-				probes.push(handle);
-			}
+			let expected = if len >= 33 {
+				u32::from_le_bytes(buf[29..33].try_into().unwrap()) as usize
+			} else if len >= 30 {
+				buf[29] as usize
+			} else {
+				0
+			};
+			let probes = unsafe { receive_probes(bootstrap, expected, &mut buf) };
+
 			let probe_count: usize = probes.len();
 			// NOTHING CHOSEN PROMOTES NOTHING, and that is a rule about the KIND before it is one
 			// about the uuid.
@@ -256,7 +249,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 			// its filesystem reads through, and on the case that function exists for - the chosen
 			// volume is not the first block device - that handle is one of these probes. Closing all
 			// of them closed the block channel of the filesystem about to be mounted.
-			let serving: u64 = mounted.as_ref().map_or(0, |&(_, chan)| chan);
+			let serving: u64 = mounted.as_ref().map_or(0, |(_, chan)| *chan);
 			// M2'S NARROWING HALF, ANSWERED BEFORE THE PROBES ARE GIVEN BACK (added 2026-09-04).
 			//
 			// The non-system roles were assigned by BUS POSITION - the second block provider was
@@ -289,12 +282,15 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				unsafe { print(b"StorageService: no room to classify the block providers; the supervisor falls back to bus order and says so\n") };
 			}
 			for probe in probes[..probe_count].iter() {
-				if *probe != serving {
+				if *probe != 0 && *probe != serving {
 					unsafe { close(*probe) };
 				}
 			}
+			if handle != 0 && handle != serving {
+				unsafe { close(handle) };
+			}
 			match mounted {
-				Some((fs, _)) => {
+				Ok((fs, _)) => {
 					// THE MOUNT IS REFUSED ON A MISMATCH, and that is the whole point of carrying
 					// the identity this far. Two LiberFS volumes are told apart by uuid and by
 					// nothing else, so an instance that mounted a volume the loader did not choose
@@ -308,10 +304,27 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 					}
 					Volume::new(alloc::boxed::Box::new(DiskFs { fs }))
 				}
-				None => exit(),
+				Err(reason) => {
+					unsafe {
+						print(match reason {
+							RootMountError::Missing => b"StorageService: selected root volume is missing; refused\n",
+							RootMountError::Ambiguous => b"StorageService: selected root volume is ambiguous; refused\n",
+						})
+					};
+					exit();
+				}
 			}
 		}
-		Received::Message { len, handle } if handle != 0 && len >= 8 && &buf[..8] == b"FATBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None })),
+		Received::Message { len, handle } if len == 9 && &buf[..9] == b"CATALOGUE" => {
+			let mut providers = UsbProviders::new(handle);
+			let mut volume = Volume::new(alloc::boxed::Box::new(FatBacking { chan: 0, name: USB_VOLUME, fs: None }));
+			providers.update(&mut volume);
+			// A routed report certifies a real filesystem read through the subscribed provider.
+			routed = providers.handle != 0 && volume.fs.list_entries(b"").is_ok();
+			usb = Some(providers);
+			volume
+		}
+		Received::Message { len, handle } if len >= 8 && &buf[..8] == b"FATBLOCK" => Volume::new(alloc::boxed::Box::new(FatBacking { chan: handle, name: MEDIA_VOLUME, fs: None })),
 		// NO MOUNT HERE, AND NO `handle != 0` EITHER - the same shape as USBBLOCK below.
 		//
 		// These two mounted the medium at bootstrap and `exit()`ed on any refusal, and the arms
@@ -348,10 +361,20 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// This is seeding, which was retired for disks, and the distinction is the point: on a
 		// disk the archive was a SECOND copy of what the volume already held, and removing that
 		// duplication is what the milestone is for. On read-only media there is no first copy.
-		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"LIVEVOL" => match unsafe { live_volume(handle) } {
-			Some(fs) => Volume::new(alloc::boxed::Box::new(MemFs { fs, name: SYSTEM_VOLUME })),
-			None => exit(),
-		},
+		Received::Message { len, handle } if handle != 0 && len >= 7 && &buf[..7] == b"LIVEVOL" => {
+			let expected = if len == 11 { u32::from_le_bytes(buf[7..11].try_into().unwrap()) as usize } else { 0 };
+			let probes = unsafe { receive_probes(bootstrap, expected, &mut buf) };
+			for probe in probes {
+				block_formats.push(unsafe { classify_block(probe) });
+				if probe != 0 {
+					unsafe { close(probe) };
+				}
+			}
+			match unsafe { live_volume(handle) } {
+				Some(fs) => Volume::new(alloc::boxed::Box::new(MemFs { fs, name: SYSTEM_VOLUME })),
+				None => exit(),
+			}
+		}
 		Received::Message { len, .. } if len >= 6 && &buf[..6] == b"RAMVOL" => match LiberMemFs::mount(MemPolicy::Reserved, mem_capacity(&buf[6..len])) {
 			Ok(fs) => Volume::new(alloc::boxed::Box::new(MemFs { fs, name: RAM_VOLUME })),
 			Err(_) => exit(),
@@ -402,7 +425,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		}
 		send_blocking(bootstrap, &report, 0);
 	}
-	serve_volume(&mut vol, service, admin);
+	serve_volume(&mut vol, service, admin, usb);
 }
 
 #[derive(Clone)]
@@ -1271,7 +1294,51 @@ fn drop_stalled(set: u64, vol: &mut Volume, clients: &mut Vec<Client>, pending: 
 	unsafe { close(chan) };
 }
 
-fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
+struct UsbProviders {
+	catalogue: u64,
+	blocks: ProviderWatch,
+	buses: ProviderWatch,
+	selected: Option<ProviderInfo>,
+	handle: u64,
+}
+
+impl UsbProviders {
+	fn new(catalogue: u64) -> Self {
+		Self { catalogue, blocks: ProviderWatch::subscribe(catalogue, ProviderKind::Block), buses: ProviderWatch::subscribe(catalogue, ProviderKind::UsbBus), selected: None, handle: 0 }
+	}
+
+	fn update(&mut self, volume: &mut Volume) {
+		self.blocks.poll();
+		self.buses.poll();
+		if self.selected.as_ref().is_some_and(|selected| !self.blocks.entries.iter().any(|info| same_provider(info, selected)) || !self.buses.entries.iter().any(|info| same_binding(info, selected))) {
+			volume.fs = alloc::boxed::Box::new(FatBacking { chan: 0, name: USB_VOLUME, fs: None });
+			if self.handle != 0 {
+				unsafe { close(self.handle) };
+			}
+			self.handle = 0;
+			self.selected = None;
+		}
+		if self.selected.is_some() {
+			return;
+		}
+		// Origin is the publishing binding, never a BDF position or a filesystem's own claim.
+		for info in &self.blocks.entries {
+			if !self.buses.entries.iter().any(|bus| same_binding(bus, info)) {
+				continue;
+			}
+			let handle = open_provider(self.catalogue, info);
+			if handle == 0 {
+				continue;
+			}
+			self.handle = handle;
+			self.selected = Some(info.clone());
+			volume.fs = alloc::boxed::Box::new(FatBacking { chan: handle, name: USB_VOLUME, fs: None });
+			break;
+		}
+	}
+}
+
+fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64, mut usb: Option<UsbProviders>) -> ! {
 	// The admin's own `quiet`, for the reason the clients have one.
 	//
 	// The admin channel is never dropped: there is one of it, it is the operator's way in, and
@@ -1295,6 +1362,20 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		exit();
 	}
 	let set: u64 = set as u64;
+
+	let mut provider_members = Vec::new();
+	if let Some(providers) = usb.as_ref() {
+		for channel in [providers.blocks.channel, providers.buses.channel] {
+			if channel == 0 {
+				continue;
+			}
+			let koid = unsafe { waitset_add(set, channel) };
+			if koid <= 0 {
+				exit();
+			}
+			provider_members.push((channel, koid as u64));
+		}
+	}
 
 	let mut clients: Vec<Client> = Vec::new();
 	if !admit_client(set, &mut clients, Client { chan: root, koid: 0, scope: Scope::Full, quiet: false, writer: None }) {
@@ -1394,6 +1475,20 @@ fn serve_volume(vol: &mut Volume, root: u64, mut admin: u64) -> ! {
 		// next chunk cannot run - the service sleeps thirty seconds and gives up on a sender that
 		// was never given the chance to speak. This wait is a guard, not progress.
 		let ready: i64 = unsafe { waitset_wait(set, deadline, WAIT_PERIODIC) };
+		if ready > 0 && provider_members.iter().any(|(_, koid)| *koid == ready as u64) {
+			if let Some(providers) = usb.as_mut() {
+				providers.update(vol);
+				provider_members.retain(|(channel, koid)| {
+					let live = *channel == providers.blocks.channel || *channel == providers.buses.channel;
+					if !live {
+						unsafe { waitset_remove(set, *koid) };
+					}
+					live
+				});
+			}
+			continue;
+		}
+
 		if ready < 0 {
 			// A wait that TIMED OUT is ordinary; one that could not be performed is not, and
 			// retrying it spins the loop at full speed until the deadline serving nobody. The
@@ -2124,7 +2219,7 @@ const READ_WINDOW_MAX: usize = 1024 * 1024;
 //
 // So the ceiling stops being a performance number and becomes a structural one: a client is a
 // member of the set, and the set holds `MAX_WAIT_SET_MEMBERS`. Two are spoken for.
-const MAX_CLIENTS: usize = rt::MAX_WAIT_SET_MEMBERS - 2;
+const MAX_CLIENTS: usize = rt::MAX_WAIT_SET_MEMBERS - 4;
 
 // Admit a client into the table AND into the wait set, or say why not.
 //
@@ -3772,26 +3867,44 @@ unsafe fn classify_block(chan: u64) -> u8 {
 	}
 }
 
-unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Option<(LiberFs<ChannelBlockDevice>, u64)> {
-	unsafe {
-		let first = mount_system_volume(primary);
-		let Some(want) = want else { return first.map(|fs| (fs, primary)) };
-		if first.as_ref().is_some_and(|fs| fs.uuid() == want) {
-			return first.map(|fs| (fs, primary));
+// Probe messages preserve provider positions even if a connection could not be minted.
+unsafe fn receive_probes(bootstrap: u64, expected: usize, buf: &mut [u8]) -> Vec<u64> {
+	let mut probes = Vec::new();
+	for _ in 0..expected {
+		let Received::Message { len, handle } = (unsafe { recv_blocking(bootstrap, buf) }) else { exit() };
+		if len != 5 || &buf[..5] != b"PROBE" {
+			exit();
 		}
-		for &probe in probes {
-			if probe == 0 {
-				continue;
-			}
-			if let Some(fs) = mount_system_volume(probe)
-				&& fs.uuid() == want
-			{
-				print(b"StorageService: the volume the loader chose is not the first block device; serving the one that matches\n");
-				return Some((fs, probe));
-			}
-		}
-		first.map(|fs| (fs, primary))
+		probes.push(handle);
 	}
+	probes
+}
+
+#[derive(Clone, Copy)]
+enum RootMountError {
+	Missing,
+	Ambiguous,
+}
+
+unsafe fn mount_by_uuid(primary: u64, probes: &[u64], want: Option<[u8; 16]>) -> Result<(LiberFs<ChannelBlockDevice>, u64), RootMountError> {
+	// The probe list includes the primary provider through an independent connection. Inspect
+	// that list alone when present so one physical volume is not counted twice.
+	let candidates = if probes.is_empty() { core::slice::from_ref(&primary) } else { probes };
+	let mut selected = None;
+	for &chan in candidates {
+		if chan == 0 {
+			continue;
+		}
+		let Some(fs) = (unsafe { mount_system_volume(chan) }) else { continue };
+		if want.is_some_and(|uuid| fs.uuid() != uuid) {
+			continue;
+		}
+		if selected.is_some() {
+			return Err(RootMountError::Ambiguous);
+		}
+		selected = Some((fs, chan));
+	}
+	selected.ok_or(RootMountError::Missing)
 }
 
 unsafe fn mount_system_volume(block_client: u64) -> Option<LiberFs<ChannelBlockDevice>> {

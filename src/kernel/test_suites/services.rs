@@ -291,7 +291,7 @@ fn input_service_streams_keys_only_with_display_focus() {
 // `Memory` GOES FOR THE REASON THE IMAGE SUITE'S DOES: this test is about a display service
 // restoring a console surface, and it allocates on the way. What it CATCHES is already recorded in
 // `covers` below and is unchanged by this; what moves is only which changes select it.
-tagged_test!(display_service_restores_the_console_surface, [Service, Console, Display], id = "kernel.services.display_service_restores_the_console_surface", covers = ["kernel", "term", "bin.virtio_gpu", "bin.display_service"]);
+tagged_test!(display_service_restores_the_console_surface, [Service, Console, Display], id = "kernel.services.display_service_restores_the_console_surface", covers = ["kernel", "term", "bin.display_service"]);
 fn display_service_restores_the_console_surface() {
 	use object::address_space::AddressSpace;
 	use object::channel::{Channel, Message};
@@ -608,7 +608,7 @@ fn audio_service_closes_streams_after_driver_failure() {
 	run_audio_service_scenario(AudioServiceScenario::DriverFailure);
 }
 
-tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow], id = "kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock", covers = ["kernel", "services", "bin.network_service", "bin.virtio_net"]);
+tagged_test!(dhcp_lease_renews_at_t1_and_restarts_its_clock, [Service, Network, Slow], id = "kernel.services.dhcp_lease_renews_at_t1_and_restarts_its_clock", covers = ["kernel", "services", "bin.network_service"]);
 fn dhcp_lease_renews_at_t1_and_restarts_its_clock() {
 	use object::channel::{Channel, Message};
 	use object::rights::Rights;
@@ -1658,7 +1658,7 @@ fn pty_hosts_a_program() {
 	assert!(captured.windows(b"pty:hello".len()).any(|w| w == b"pty:hello"), "the slave's reply is forwarded back out the master");
 }
 
-tagged_test!(the_console_answers_a_program_through_its_own_channel, [Service, Console, Display], id = "kernel.services.the_console_answers_a_program_through_its_own_channel", covers = ["kernel", "term", "bin.console_service", "bin.virtio_console"]);
+tagged_test!(the_console_answers_a_program_through_its_own_channel, [Service, Console, Display], id = "kernel.services.the_console_answers_a_program_through_its_own_channel", covers = ["kernel", "term", "bin.console_service"]);
 fn the_console_answers_a_program_through_its_own_channel() {
 	use object::channel::{Channel, Message};
 	use object::dma_buffer::DmaBuffer;
@@ -1908,7 +1908,7 @@ fn resource_manager_contains_a_domain() {
 	assert_eq!(summary.as_slice(), b"granted=4 denied=1 regranted=4", "the kernel enforced the Domain's memory budget, contained the over-budget refusal, and honored the runtime raise");
 }
 
-tagged_test!(kernel_reads_file_through_storage_service, [Service, Storage], id = "kernel.services.kernel_reads_file_through_storage_service", covers = ["kernel", "liberfs", "storage", "bin.storage_service", "bin.virtio_blk"]);
+tagged_test!(kernel_reads_file_through_storage_service, [Service, Storage], id = "kernel.services.kernel_reads_file_through_storage_service", covers = ["kernel", "liberfs", "storage", "bin.storage_service"]);
 fn kernel_reads_file_through_storage_service() {
 	// The kernel drives the StorageService as its own client, sending one open request
 	// and a quit sentinel, then reads the returned shared buffer. The bytes must equal

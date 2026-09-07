@@ -537,7 +537,7 @@ tagged_test!(
 	device_manager_reacts_to_a_driver_crash,
 	[Drivers, Process, ArchX86_64],
 	id = "kernel.hardware.device_manager_reacts_to_a_driver_crash",
-	covers = ["kernel", "bin.device_manager"]
+	covers = ["kernel"]
 );
 #[cfg(target_arch = "x86_64")]
 fn device_manager_reacts_to_a_driver_crash() {

@@ -4298,11 +4298,15 @@ impl StorageHarness {
 	//
 	// Returns true if it came up anyway.
 	fn live_volume_comes_up(storage_elf: &[u8], image: &[u8]) -> bool {
+		Self::live_volume_with_probes(storage_elf, image, false)
+	}
+
+	fn live_volume_with_probes(storage_elf: &[u8], image: &[u8], probes: bool) -> bool {
 		use object::channel::{Channel, Message};
 		use object::memory_object::MemoryObject;
 		use object::rights::Rights;
 		let (boot, boot_user) = Channel::create();
-		let (block, _unused) = Channel::create();
+		let (block, block_user) = Channel::create();
 		let (server, client) = Channel::create();
 		let (admin, admin_child) = Channel::create();
 		spawn_harness(storage_elf, boot_user);
@@ -4310,17 +4314,25 @@ impl StorageHarness {
 		copy_into_object(&buffer, image);
 		let mut request = alloc::vec::Vec::with_capacity(7 + 8);
 		request.extend_from_slice(b"LIVEVOL");
-		request.extend_from_slice(&(image.len() as u64).to_le_bytes());
+		if probes {
+			request.extend_from_slice(&1u32.to_le_bytes());
+		} else {
+			request.extend_from_slice(&(image.len() as u64).to_le_bytes());
+		}
 		let cap = object::handle::Capability::new(buffer as alloc::sync::Arc<dyn object::KernelObject>, Rights::READ | Rights::MAP);
 		boot.send(Message::new(request, alloc::vec![cap])).expect("live volume bootstrap");
+		if probes {
+			send_cap(&boot, b"PROBE", block_user, Rights::ALL).expect("live volume probe");
+		}
 		send_cap(&boot, b"ADMIN", admin_child, Rights::ALL).expect("storage admin bootstrap");
 		send_cap(&boot, b"SERVE", server, Rights::ALL).expect("storage serve bootstrap");
 		// As above: the live image arrives as a MemoryObject, so there is no backing to restart from.
-		let mut harness = Self { boot, block, client, admin, disk: alloc::collections::BTreeMap::new(), capacity: image.len() as u64, process: None, backing: Backing::Memory { tag: alloc::vec::Vec::new(), bytes: 0 } };
+		let mut harness = Self { boot, block, client, admin, disk: if probes { Self::build_tiny_fixture() } else { alloc::collections::BTreeMap::new() }, capacity: 512 * 1024, process: None, backing: Backing::Memory { tag: alloc::vec::Vec::new(), bytes: 0 } };
 		for _ in 0..100_000 {
 			harness.pump();
 			if let Ok(report) = harness.boot.recv() {
-				return &report.bytes[..] == b"StorageService: online (vol://system)";
+				let expected: &[u8] = if probes { b"StorageService: online (vol://system)\0\x01" } else { b"StorageService: online (vol://system)" };
+				return &report.bytes[..] == expected;
 			}
 		}
 		false

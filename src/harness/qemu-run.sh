@@ -151,7 +151,11 @@ qemu_prepare_system_disk() {
 	# that the size check then accepted forever.
 	local key
 	key="$(sha256sum "$volume_image" | awk '{print $1}')"
+	local generations="${disk%.img}."
+	disk="${generations}$key.img"
+	media_sweep "$generations" .img "$disk"
 	if [[ -f "$disk" && "$(stat -c%s "$disk")" -eq "$size" && -f "$disk.key" && "$(<"$disk.key")" == "$key" ]]; then
+		printf '%s\n' "$disk"
 		return 0
 	fi
 	local candidate="$disk.$$.candidate"
@@ -163,10 +167,12 @@ qemu_prepare_system_disk() {
 		return 1
 	}
 	sync "$candidate" 2>/dev/null || true
-	# Replace atomically: another runner may be copying the published template now.
+	# The content key is in the path: a different generation cannot replace the template
+	# between preparation and this run taking its writable copy.
 	mv "$candidate" "$disk"
 	printf '%s\n' "$key" >"$disk.key.tmp.$$"
 	mv "$disk.key.tmp.$$" "$disk.key"
+	printf '%s\n' "$disk"
 	return 0
 }
 
@@ -248,7 +254,7 @@ media_sweep() {
 	for stale in "$prefix"*"$ext"; do
 		[[ -f "$stale" && "$stale" != "$keep" ]] || continue
 		[[ -n "$(find "$stale" -mmin +720 -print -quit 2>/dev/null)" ]] || continue
-		if command -v fuser >/dev/null && fuser -s "$stale" 2>/dev/null; then
+		if ! command -v fuser >/dev/null || fuser -s "$stale" 2>/dev/null; then
 			continue
 		fi
 		rm -f "$stale" "$stale.key"
@@ -423,9 +429,10 @@ qemu_prepare_media_images() {
 qemu_prepare_usb_image() {
 	local suffix="$1"
 	local voldir="$QEMU_BOOT_DIR/../volume"
-	USB_DISK="$QEMU_BUILD_DIR/usb-media${suffix}.img"
 	local key candidate
 	key="$(media_key usb "$voldir" mformat mcopy)"
+	USB_DISK="$QEMU_BUILD_DIR/usb-media${suffix}.$key.img"
+	media_sweep "$QEMU_BUILD_DIR/usb-media${suffix}." .img "$USB_DISK"
 	media_current "$USB_DISK" "$key" && return
 	command -v mformat >/dev/null && command -v mcopy >/dev/null || {
 		# A 16 MB file of zeros used to be left here when mtools was absent, and a zeroed image is
@@ -1075,9 +1082,12 @@ qemu_run_x86_64() {
 	[[ "$iommu" == "1" ]] && qemu_args+=(-device "virtio-iommu-pci,boot-bypass=on")
 
 	# System volume disk: carries the LiberFS volume itself.
+	# The DMA test kernel enters its suite directly and reads fixtures from the boot archive.
+	# It needs no storage endpoint participating in the enforcing transition.
+	local dma_fixture="${DMA_FIXTURE:-0}"
 	local volume_image="$QEMU_BUILD_DIR/system-volume-x86_64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${artifact_suffix}.img"
-	if qemu_prepare_system_disk "$volume_image" "$virtio_disk"; then
+	if [[ "$dma_fixture" != "1" ]] && virtio_disk="$(qemu_prepare_system_disk "$volume_image" "$virtio_disk")"; then
 		local run_disk
 		run_disk="$(qemu_run_disk "$virtio_disk")" || {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
@@ -1160,8 +1170,7 @@ qemu_run_x86_64() {
 
 	# THE DEDICATED DMA FIXTURE STOPS HERE, AND EVERY BUS MASTER BELOW IS WHY IT HAS TO EXIST
 	# (added 2026-09-04). `DMA_FIXTURE=1` is the enforcing-IOMMU gate's machine: the firmware boot
-	# medium, the system volume, virtio-net, the controller, and whatever `QEMU_EXTRA` adds - which
-	# for that gate is the IOMMU and two `edu` functions.
+	# medium, virtio-net, the controller, and the two `edu` functions supplied by `QEMU_EXTRA`.
 	#
 	# It exists because the gate used to add those three to the ORDINARY test machine, which brings
 	# a virtio-serial console, an xHCI controller with a hub, a keyboard, a tablet and a USB stick,
@@ -1175,7 +1184,6 @@ qemu_run_x86_64() {
 	#
 	# Omission only. Nothing here changes what the ordinary machine is, so a run without the flag
 	# gets exactly the machine it got before.
-	local dma_fixture="${DMA_FIXTURE:-0}"
 
 	# virtio-serial + virtconsole: mirrors a second console to a file.
 	#
@@ -1405,7 +1413,7 @@ qemu_run_aarch64() {
 	[[ "${COLD:-0}" == "1" ]] && media_suffix="-cold-aarch64"
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-aarch64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
-	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
+	if virtio_disk="$(qemu_prepare_system_disk "$volume_pkg" "$virtio_disk")"; then
 		local run_disk
 		run_disk="$(qemu_run_disk "$virtio_disk")" || {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
@@ -1633,7 +1641,7 @@ qemu_run_riscv64() {
 	[[ "${COLD:-0}" == "1" ]] && media_suffix="-cold-riscv64"
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-riscv64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
-	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
+	if virtio_disk="$(qemu_prepare_system_disk "$volume_pkg" "$virtio_disk")"; then
 		local run_disk
 		run_disk="$(qemu_run_disk "$virtio_disk")" || {
 			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2

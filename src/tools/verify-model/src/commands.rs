@@ -1,9 +1,7 @@
 // A plan is per KEY; a run is per COMMAND, and the two are not the same shape.
 //
-// Two hundred selected kernel tests are one QEMU boot, nine selected builds are three invocations
-// of build.sh, and eleven conformance suites are one call to check.sh. Collapsing them here rather
-// than in the shell keeps `verify.sh` thin enough to be the thing that cannot break - it reads
-// lines and runs them, and every decision that needed the model was already made.
+// Selected kernel tests share a QEMU boot; independently runnable builds, gates and conformance
+// suites keep their own steps. The model lowers those commands so the shell only executes them.
 
 use crate::catalog::{CheckKind, Environment};
 use crate::plan::Plan;
@@ -188,22 +186,17 @@ static DEFAULT_CONFIGURATION: std::sync::LazyLock<Configuration> = std::sync::La
 pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, registry: &crate::registry::Registry) -> Vec<Step> {
 	let mut steps = Vec::new();
 
-	// Builds first, and per architecture rather than per part: build.sh takes a part list, and
-	// nine separate invocations would recompile shared dependencies nine times.
-	let mut parts_by_arch: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
-	let mut build_keys: BTreeMap<&str, Vec<crate::plan::PlanItemKey>> = BTreeMap::new();
-	for item in plan.items.iter().filter(|item| item.kind == CheckKind::Build) {
-		let part = item.key.check.strip_prefix("build.").unwrap_or(&item.key.check);
-		parts_by_arch.entry(&item.key.architecture).or_default().insert(part);
-		build_keys.entry(&item.key.architecture).or_default().push(item.key.clone());
-	}
-	// Kept so a guest step can name the build it cannot start before. A dependency by id survives
-	// the reordering below; an index would not.
+	// Each independently runnable build part gets its own duration and budget decision. Preserve
+	// build.sh's producer order within each target; Cargo reuses unchanged dependencies across calls.
 	let mut build_ids: BTreeMap<String, String> = BTreeMap::new();
-	for (architecture, parts) in &parts_by_arch {
-		let part_names: Vec<String> = parts.iter().map(|part| (*part).to_string()).collect();
-		build_ids.insert((*architecture).to_string(), scoped_id("build", architecture, &part_names));
-		steps.push(Step { id: scoped_id("build", architecture, &part_names), requires: Vec::new(), label: format!("build {architecture}"), command: format!("./build.sh --arch {architecture} --part {}", parts.iter().copied().collect::<Vec<_>>().join(",")), keys: build_keys.get(architecture).cloned().unwrap_or_default(), note: None, guests: 0 });
+	let architectures: BTreeSet<&str> = plan.items.iter().filter(|item| item.kind == CheckKind::Build).map(|item| item.key.architecture.as_str()).collect();
+	for architecture in architectures {
+		for part in crate::catalog::BUILD_PARTS {
+			let Some(item) = plan.items.iter().find(|item| item.kind == CheckKind::Build && item.key.architecture == architecture && item.key.check == format!("build.{part}")) else { continue };
+			let id = scoped_id("build", architecture, &[part.to_string()]);
+			steps.push(Step { id: id.clone(), requires: build_ids.get(architecture).cloned().into_iter().collect(), label: format!("build {architecture} {part}"), command: item.command.clone(), keys: vec![item.key.clone()], note: None, guests: 0 });
+			build_ids.insert(architecture.to_string(), id);
+		}
 	}
 
 	// Host suites, one per crate per configuration. The configuration is in the command because it
@@ -214,8 +207,7 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 		steps.push(Step { id: scoped_id("host", crate_name, &[item.key.configuration.clone()]), requires: Vec::new(), label: format!("host suite {crate_name} ({})", item.key.configuration), command: lower(CheckKind::HostSuite, &item.command, registry.configuration(&item.key.configuration).unwrap_or(&DEFAULT_CONFIGURATION)), keys: vec![item.key.clone()], note: None, guests: 0 });
 	}
 
-	// Gates and conformance suites each collapse into one call, because check.sh takes a list.
-	// TWO GATE STEPS, NOT ONE, AND THE SPLIT IS A DEPENDENCY RATHER THAN A PREFERENCE.
+	// Gates each have a separate step. Gates that consume guest output also require that guest.
 	//
 	// `capability-trace` reads a log only a guest run produces and compares it against the kernel
 	// binary the build just refreshed - so in one merged step, ordered before the guests, it cannot
@@ -294,11 +286,8 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 
 	// One boot per architecture, whatever the selection inside it.
 	//
-	// The note is the honest part. The runner cannot yet be handed an exact test list, so a strict
-	// subset is run as the whole suite - which over-runs rather than under-runs, and says so. This
-	// is also where the milestone's own measurement lands: a boot has a fixed cost that dwarfs the
-	// per-test one - see `CostModel::default` for the current figures - so selecting fewer tests
-	// inside a boot that is happening anyway was never where the saving was.
+	// A target receives its exact selected IDs. The planner already accounts for the fixed boot
+	// cost and decides whether selecting the whole target suite is cheaper.
 	let mut kernel_by_arch: BTreeMap<&str, Vec<crate::plan::PlanItemKey>> = BTreeMap::new();
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::KernelTest) {
 		kernel_by_arch.entry(&item.key.architecture).or_default().push(item.key.clone());
@@ -353,11 +342,23 @@ pub fn steps(plan: &Plan, kernel_tests_per_target: &BTreeMap<String, usize>, reg
 		steps.push(Step { id: scoped_id("gate-after-guest", "host", &names), requires: guest_ids, label: format!("{} gate(s) that read a guest run", names.len()), command: format!("./check.sh --gate {}", names.join(",")), keys: gates_after_guest.iter().map(|item| item.key.clone()).collect(), note: Some(String::from("these read a log a guest run wrote, so they cannot run before one")), guests: 0 });
 	}
 
-	// The development guest last: it needs an instance `./dev.sh up` left running, and qemu-run.sh
-	// refuses to combine DEV_PROFILE with TEST, so it can never share a boot with the suite above.
+	// Development checks mutate the same persistent instance, so each waits for its predecessor.
+	// They retain separate keys and timings while independent guest profiles may run in parallel.
+	let mut previous_dev: Option<String> = None;
 	for item in plan.items.iter().filter(|item| item.kind == CheckKind::DevCheck) {
-		steps.push(Step { id: scoped_id("dev", &item.key.check, &[]), requires: Vec::new(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 1 });
+		let id = scoped_id("dev", &item.key.check, &[]);
+		steps.push(Step { id: id.clone(), requires: previous_dev.into_iter().collect(), label: format!("{} ({})", item.key.check, Environment::DevGuest.as_str()), command: item.command.clone(), keys: vec![item.key.clone()], note: Some(String::from("needs a running development instance: ./dev.sh up")), guests: 1 });
+		previous_dev = Some(id);
 	}
 
+	// Profile and development gates boot through scripts too. Their slot declarations must not
+	// let them run before the selected artifacts exist merely because their command is check.sh.
+	for step in &mut steps {
+		if step.guests > 0 && !step.id.starts_with("guest:") {
+			step.requires.extend(build_ids.values().cloned());
+			step.requires.sort();
+			step.requires.dedup();
+		}
+	}
 	steps
 }

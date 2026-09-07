@@ -352,15 +352,8 @@ pub fn decode_fault(bytes: &[u8], generation: Generation, domain: DomainId) -> R
 
 // The seam between the codec above and a virtqueue. One method wide on purpose.
 pub trait Transport {
-	// HOW MANY EVENT RECORDS THIS TRANSPORT CAN BE HOLDING AT ONCE, when it can say.
-	//
-	// Read by `Backend::fault_queue_capacity`, which bounds how long an ended binding's tail may go
-	// on attributing an endpoint's faults to it - see `DetachedTail`. `None` is the honest answer for
-	// a transport with no way to ask, and every transport in this tree answers it: a driver that
-	// posts ONE event buffer at a time cannot see how many records the device is holding behind it,
-	// and the device may wait for a buffer or drop the event rather than hand them over. A ring size
-	// is not that number, and answering with one is a derivation that reads as a proof (corrected
-	// 2026-09-03). The ledger applies its stated policy bound instead.
+	// Optional transport diagnostic, not a binding-attribution rule. One posted event buffer
+	// cannot bound records retained inside the device; reattachment requires an observed drain.
 	fn event_capacity(&self) -> Option<u64> {
 		None
 	}

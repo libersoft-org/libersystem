@@ -107,8 +107,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		macmsg[..3].copy_from_slice(b"MAC");
 		macmsg[3..9].copy_from_slice(&mac);
 		macmsg[9..11].copy_from_slice(&(mtu as u16).to_le_bytes());
-		send_blocking(frames, &macmsg, 0);
-		move_frames(bootstrap, &bind, &device, irq, frames, &mut rx, &tx, rx_virt, &rx_phys, tx_virt, tx_phys, slot)
+		move_frames(bootstrap, &bind, &device, irq, frames, &mut rx, &tx, rx_virt, &rx_phys, tx_virt, tx_phys, slot, &macmsg)
 	}
 }
 
@@ -134,47 +133,54 @@ unsafe fn transmit_frame(tx: &Queue, tx_virt: u64, tx_phys: u64, slot: u64, fram
 // message: transmit the frame the service handed back. The channel closing
 // (NetworkService gone) leaves us draining the device alone.
 #[allow(clippy::too_many_arguments)]
-unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq: u64, frames: u64, rx: &mut Queue, tx: &Queue, rx_virt: u64, rx_phys: &[u64], tx_virt: u64, tx_phys: u64, slot: u64) -> ! {
+unsafe fn move_frames(bootstrap: u64, bind: &common::Bind, device: &Virtio, irq: u64, frames: u64, rx: &mut Queue, tx: &Queue, rx_virt: u64, rx_phys: &[u64], tx_virt: u64, tx_phys: u64, slot: u64, macmsg: &[u8]) -> ! {
 	unsafe {
 		let mut frame: Vec<u8> = alloc::vec![0u8; (slot - NET_HDR_LEN) as usize];
-		let mut service_open: bool = true;
+		let mut serving = common::Serving::new(frames, 0);
 		loop {
-			// THE MANAGER'S CHANNEL JOINS THE SET THIS LOOP ALREADY WAITS ON, so the ping is
-			// answered by the path being supervised rather than by a second loop that would keep
-			// answering after this one had stopped working.
-			let ready: i64 = if service_open {
-				match common::wait_or_answer(bootstrap, bind, &[irq, frames]) {
-					Some(at) => at as i64,
-					None => {
-						common::finish_stop(bootstrap, bind, rx.capability, common::quiesce_virtio());
-						exit()
-					}
-				}
-			} else {
-				match common::wait_or_answer(bootstrap, bind, &[irq]) {
-					Some(_) => 0,
-					None => {
-						common::finish_stop(bootstrap, bind, rx.capability, common::quiesce_virtio());
-						exit()
-					}
-				}
+			let Some(ready) = common::wait_providers_or_answer(bootstrap, bind, &mut serving, &[irq]) else {
+				common::finish_stop(bootstrap, bind, rx.capability, common::quiesce_virtio());
+				exit();
 			};
-			if ready == 0 {
-				while let Some((id, len)) = rx.take_used() {
-					if id < RX_SLOTS && len as u64 > NET_HDR_LEN {
-						let f: &[u8] = core::slice::from_raw_parts((rx_virt + id as u64 * slot + NET_HDR_LEN) as *const u8, (len as u64 - NET_HDR_LEN) as usize);
-						send_blocking(frames, f, 0);
+			match ready {
+				common::ProviderReady::Connected(at) => {
+					// Each connection starts with its own MAC/MTU frame, including after a consumer
+					// restart. The publication stays live when its last connection goes away.
+					if !send_blocking(serving.at(at), macmsg, 0) {
+						let token = serving.close_at(at);
+						common::disconnected(bootstrap, bind, token);
 					}
-					rx.post_recv(id, rx_phys[id as usize], slot as u32);
 				}
-				rx.notify();
-				let _ = device.read_isr();
-				interrupt_ack(irq);
-			} else if ready == 1 {
-				match recv_blocking(frames, &mut frame) {
-					Received::Message { len, .. } => transmit_frame(tx, tx_virt, tx_phys, slot, &frame[..len]),
-					Received::Closed => service_open = false,
+				common::ProviderReady::Device(0) => {
+					while let Some((id, len)) = rx.take_used() {
+						if id < RX_SLOTS && len as u64 > NET_HDR_LEN {
+							let f: &[u8] = core::slice::from_raw_parts((rx_virt + id as u64 * slot + NET_HDR_LEN) as *const u8, (len as u64 - NET_HDR_LEN) as usize);
+							for at in (0..serving.as_slice().len()).rev() {
+								if !send_blocking(serving.at(at), f, 0) {
+									let token = serving.close_at(at);
+									common::disconnected(bootstrap, bind, token);
+								}
+							}
+						}
+						rx.post_recv(id, rx_phys[id as usize], slot as u32);
+					}
+					rx.notify();
+					let _ = device.read_isr();
+					interrupt_ack(irq);
 				}
+				common::ProviderReady::Consumer(at) => match recv_blocking(serving.at(at), &mut frame) {
+					Received::Message { len, handle } => {
+						if handle != 0 {
+							close(handle);
+						}
+						transmit_frame(tx, tx_virt, tx_phys, slot, &frame[..len]);
+					}
+					Received::Closed => {
+						let token = serving.close_at(at);
+						common::disconnected(bootstrap, bind, token);
+					}
+				},
+				common::ProviderReady::Device(_) => {}
 			}
 		}
 	}
