@@ -163,7 +163,7 @@ qemu_prepare_system_disk() {
 		return 1
 	}
 	sync "$candidate" 2>/dev/null || true
-	rm -f "$disk"
+	# Replace atomically: another runner may be copying the published template now.
 	mv "$candidate" "$disk"
 	printf '%s\n' "$key" >"$disk.key.tmp.$$"
 	mv "$disk.key.tmp.$$" "$disk.key"
@@ -1078,7 +1078,12 @@ qemu_run_x86_64() {
 	local volume_image="$QEMU_BUILD_DIR/system-volume-x86_64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${artifact_suffix}.img"
 	if qemu_prepare_system_disk "$volume_image" "$virtio_disk"; then
-		qemu_attach_virtio_blk qemu_args "$(qemu_run_disk "$virtio_disk")" vblk "$virtio_opts"
+		local run_disk
+		run_disk="$(qemu_run_disk "$virtio_disk")" || {
+			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
+			exit 1
+		}
+		qemu_attach_virtio_blk qemu_args "$run_disk" vblk "$virtio_opts"
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
@@ -1401,7 +1406,12 @@ qemu_run_aarch64() {
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-aarch64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
-		qemu_attach_virtio_blk qemu_args "$(qemu_run_disk "$virtio_disk")" vol0 "disable-legacy=on"
+		local run_disk
+		run_disk="$(qemu_run_disk "$virtio_disk")" || {
+			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
+			exit 1
+		}
+		qemu_attach_virtio_blk qemu_args "$run_disk" vol0 "disable-legacy=on"
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.
@@ -1624,7 +1634,12 @@ qemu_run_riscv64() {
 	local volume_pkg="$QEMU_BUILD_DIR/system-volume-riscv64.img"
 	local virtio_disk="$QEMU_BUILD_DIR/virtio-blk${media_suffix}.img"
 	if qemu_prepare_system_disk "$volume_pkg" "$virtio_disk"; then
-		qemu_attach_virtio_blk qemu_args "$(qemu_run_disk "$virtio_disk")" vol0 ""
+		local run_disk
+		run_disk="$(qemu_run_disk "$virtio_disk")" || {
+			echo "qemu-run: could not create a private system disk from $virtio_disk" >&2
+			exit 1
+		}
+		qemu_attach_virtio_blk qemu_args "$run_disk" vol0 ""
 	fi
 
 	# Media volumes: FAT/ISO/UDF images seeded from volume/ directory.

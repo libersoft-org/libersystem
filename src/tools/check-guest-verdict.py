@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Host regressions for P02M0177 guest verdicts and contested loader production."""
+"""Host regressions for guest verdicts and shared producer acquisition."""
 
 import importlib.util
 import os
@@ -197,6 +197,125 @@ while not (root/'contending').exists(): time.sleep(.005)
         self.assertEqual(self.exercise(), ("test-trust", "pass", True))
         self.assertEqual(self.exercise(shared_target=True), ("test-trust", "pass", False))
         self.assertEqual(self.exercise(old_sequence=True), ("external-release", "fail", False))
+
+
+class SystemDiskAcquisition(unittest.TestCase):
+    def production_function(self, name):
+        import re
+        source = (ROOT / "src/harness/qemu-run.sh").read_text()
+        match = re.search(r"^" + name + r"\(\) \{\n.*?^\}\n", source, re.M | re.S)
+        self.assertIsNotNone(match, name)
+        return match.group(0)
+
+    def contested_copy(self, unlink_before_publish=False):
+        producer = self.production_function("qemu_prepare_system_disk")
+        if unlink_before_publish:
+            publish = '\tmv "$candidate" "$disk"\n'
+            self.assertEqual(producer.count(publish), 1)
+            producer = producer.replace(publish, '\trm -f "$disk"\n' + publish)
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            payload = b"the current system volume\x00\xff"
+            (root / "volume.img").write_bytes(payload)
+            script = ("set -euo pipefail\n" + producer +
+                      self.production_function("qemu_run_disk") +
+                      self.production_function("scratch_sweep") + r'''
+await_file() { while [[ ! -f "$1" ]]; do sleep .005; done; }
+# Both producers finish their candidates before A publishes. B then pauses immediately
+# before its normal rename while A acquires its copy. Only scheduling is controlled.
+sync() {
+    if [[ "$ROLE" == A ]]; then
+        await_file "$FIXTURE/b-ready"
+    else
+        touch "$FIXTURE/b-ready"
+        await_file "$FIXTURE/a-published"
+    fi
+}
+mv() {
+    if [[ "$ROLE" == B && "$2" == "$FIXTURE/disk.img" ]]; then
+        touch "$FIXTURE/b-publish-paused"
+        await_file "$FIXTURE/a-copy-done"
+    fi
+    command mv "$@"
+}
+qemu_prepare_system_disk "$FIXTURE/volume.img" "$FIXTURE/disk.img"
+if [[ "$ROLE" == A ]]; then
+    touch "$FIXTURE/a-published"
+    await_file "$FIXTURE/b-publish-paused"
+    status=0
+    qemu_run_disk "$FIXTURE/disk.img" >"$FIXTURE/private-path" || status=$?
+    touch "$FIXTURE/a-copy-done"
+    exit "$status"
+fi
+''')
+            tasks = [subprocess.Popen(["bash", "-c", script],
+                                     env=dict(os.environ, FIXTURE=temp, ROLE=role),
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                     for role in ("A", "B")]
+            try:
+                results = [task.communicate(timeout=5) for task in tasks]
+                self.assertEqual(tasks[1].returncode, 0, "".join(results[1]))
+                if tasks[0].returncode == 0:
+                    private = Path((root / "private-path").read_text().strip())
+                    self.assertNotEqual(private, root / "disk.img")
+                    self.assertEqual(private.stat().st_size, 128 * 1024 * 1024)
+                    with private.open("rb") as copied:
+                        self.assertEqual(copied.read(len(payload)), payload)
+                else:
+                    self.assertIn("cannot stat", results[0][1])
+                return tasks[0].returncode
+            finally:
+                for task in tasks:
+                    if task.poll() is None:
+                        task.kill()
+                        task.communicate()
+
+    def test_competing_publication_keeps_the_private_disk_acquirable(self):
+        self.assertEqual(self.contested_copy(), 0)
+        self.assertNotEqual(self.contested_copy(unlink_before_publish=True), 0)
+
+    def caller_result(self, architecture, unchecked_substitution=False, acquisition_succeeds=False):
+        import re
+        function = self.production_function("qemu_run_" + architecture)
+        block = re.search(r'^\tif qemu_prepare_system_disk [^\n]*; then\n.*?^\tfi\n', function, re.M | re.S)
+        self.assertIsNotNone(block, architecture)
+        block = block.group(0)
+        if unchecked_substitution:
+            attach = re.search(r'^\t\tqemu_attach_virtio_blk qemu_args "\$run_disk"[^\n]*\n', block, re.M)
+            self.assertIsNotNone(attach, architecture)
+            attach = attach.group(0).replace('"$run_disk"', '"$(qemu_run_disk "$virtio_disk")"')
+            block = block.splitlines(keepends=True)[0] + attach + '\tfi\n'
+        # Execute the actual caller block with acquisition failing. A helper returning failure
+        # inside an unchecked argument substitution does not make the attachment call fail.
+        script = r'''set -euo pipefail
+qemu_prepare_system_disk() { return 0; }
+qemu_run_disk() {
+    if [[ "$COPY_SUCCEEDS" == 1 ]]; then printf '%s\n' 'private disk.img'; return 0; fi
+    echo "fixture: private copy failed" >&2
+    return 1
+}
+qemu_attach_virtio_blk() { printf 'ATTACHED <%s>\n' "$2"; }
+caller() {
+    local volume_image=volume volume_pkg=volume virtio_disk=disk virtio_opts=""
+''' + block + '    echo "CONTINUED"\n}\ncaller\n'
+        return subprocess.run(["bash", "-c", script], env=dict(os.environ, COPY_SUCCEEDS=str(int(acquisition_succeeds))),
+                              capture_output=True, text=True, timeout=5)
+
+    def test_every_architecture_refuses_failed_private_disk_acquisition(self):
+        for architecture in ("x86_64", "aarch64", "riscv64"):
+            with self.subTest(architecture=architecture):
+                success = self.caller_result(architecture, acquisition_succeeds=True)
+                self.assertEqual(success.returncode, 0, success.stdout + success.stderr)
+                self.assertEqual(success.stdout, "ATTACHED <private disk.img>\nCONTINUED\n")
+                result = self.caller_result(architecture)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("fixture: private copy failed", result.stderr)
+                self.assertNotIn("ATTACHED", result.stdout)
+                self.assertNotIn("CONTINUED", result.stdout)
+                mutant = self.caller_result(architecture, unchecked_substitution=True)
+                self.assertEqual(mutant.returncode, 0, mutant.stdout + mutant.stderr)
+                self.assertIn("ATTACHED", mutant.stdout)
+                self.assertIn("CONTINUED", mutant.stdout)
 
 
 class LoaderTimestampIsolation(unittest.TestCase):
