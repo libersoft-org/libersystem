@@ -126,6 +126,42 @@ rc=0
 run_plan "$plan" --budget 30 || rc=$?
 check "and it runs once the budget covers its seed" 1 "$(grep -c 'the seeded step' "$out" || true)"
 
+# Without a conservative host/build seed, the whole dependent closure is unpriced. A normal
+# unbudgeted run still executes it once so subsequent plans can use the recorded measurement.
+plan="$work/unpriced"
+trace="$work/unpriced.trace"
+{
+	printf 'STATUS\tfull\tprepared\n'
+	step 0 unknown "unpriced shared prerequisite" "echo shared >> '$trace'"
+	printf 'STEPUNPRICED\t0\tno current measurement or conservative seed\n'
+	step 1 1 "first priced dependent" "echo first >> '$trace'" "id-0"
+	step 2 1 "second priced dependent" "echo second >> '$trace'" "id-0"
+	step 3 1 "independent priced branch" "echo independent >> '$trace'"
+} >"$plan"
+rc=0
+run_plan "$plan" --budget 3 || rc=$?
+check "unpriced shared prerequisites and both dependents are skipped" 3 "$(grep -c 'SKIPPED (budget)' "$out" || true)"
+check "only the complete priced branch runs" independent "$(cat "$trace")"
+check "the unpriced branch is incomplete" 6 "$rc"
+: >"$trace"
+rc=0
+run_plan "$plan" || rc=$?
+check "unbudgeted execution can measure every branch" 0 "$rc"
+check "the shared prerequisite runs once without a budget" "shared first second independent" "$(tr '\n' ' ' <"$trace" | sed 's/ *$//')"
+# An all-unpriced plan has no defensible numeric minimum.
+sed '/independent priced branch/d; /\t3\t/d' "$plan" >"$work/only-unpriced"
+rc=0
+run_plan "$work/only-unpriced" --budget 9000 || rc=$?
+check "an unknown minimum is stated truthfully" 1 "$(grep -c 'minimum budget is unknown' "$out" || true)"
+check "even a large explicit budget cannot invent a measurement" 3 "$(grep -c 'SKIPPED (budget)' "$out" || true)"
+# This is the plan protocol after the unbudgeted measurement has been loaded by the model.
+sed '/^STEPUNPRICED/d; s/unknown/571/' "$plan" >"$work/measured"
+: >"$trace"
+rc=0
+run_plan "$work/measured" --budget 574 || rc=$?
+check "the measured shared branch is admitted with sufficient budget" 0 "$rc"
+check "the admitted prerequisite still runs once" "shared first second independent" "$(tr '\n' ' ' <"$trace" | sed 's/ *$//')"
+
 # 5. A STEP THAT WANTS MORE GUEST SLOTS THAN `--jobs` HAS IS REFUSED RATHER THAN TRIMMED.
 #    A gate whose subject is overlap and which runs one guest proves nothing and would report a pass.
 plan="$work/slots"

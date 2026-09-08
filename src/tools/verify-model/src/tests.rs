@@ -648,6 +648,33 @@ fn evidence(universe: crate::shadow::Universe, architecture: &str, exec: bool, t
 }
 
 #[test]
+fn shadow_publication_rejects_drift_without_changing_qualifying_evidence() {
+	use crate::shadow::{Log, Universe};
+	let fixture = Fixture::new("shadow-publication");
+	fixture.write(".gitignore", ".build/\n");
+	fixture.write("tracked.rs", "before\n");
+	for args in [vec!["init", "--quiet"], vec!["add", "."], vec!["-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "commit", "--quiet", "-m", "fixture"]] {
+		assert!(std::process::Command::new("git").args(args).current_dir(&fixture.dir).status().unwrap().success());
+	}
+	let source = crate::shadow::source_digest(&fixture.dir).unwrap();
+	// Direct model callers still record immediately. The enclosing shell sweep opts into staging.
+	Log::record(&fixture.dir, None, evidence(Universe::TestGuest, "x86_64", true, "older-tree")).unwrap();
+	let original = std::fs::read(Log::path(&fixture.dir)).unwrap();
+	let pending = fixture.dir.join(".build/pending.json");
+	Log::record(&fixture.dir, Some(&pending), evidence(Universe::TestGuest, "x86_64", true, &source)).unwrap();
+	assert_eq!(Log::load(&fixture.dir).clean_runs_for("audio", "hash-a", Universe::TestGuest), 1, "pending clean evidence gives no credit");
+	assert!(Log::publish(&fixture.dir, &pending, &source, "other-model").is_err());
+	assert!(Log::publish(&fixture.dir, &pending, "other-source", "hash-a").is_err());
+	fixture.write("tracked.rs", "moved during sweep\n");
+	assert!(Log::publish(&fixture.dir, &pending, &source, "hash-a").unwrap_err().contains("source changed"));
+	assert_eq!(std::fs::read(Log::path(&fixture.dir)).unwrap(), original, "a refused sweep must preserve all prior evidence byte-for-byte");
+	assert_eq!(Log::load(&fixture.dir).clean_runs_for("audio", "hash-a", Universe::TestGuest), 1);
+	fixture.write("tracked.rs", "before\n");
+	assert_eq!(Log::publish(&fixture.dir, &pending, &source, "hash-a").unwrap(), 1);
+	assert_eq!(Log::load(&fixture.dir).clean_runs_for("audio", "hash-a", Universe::TestGuest), 2, "only a validated publication makes staged evidence count");
+}
+
+#[test]
 fn five_comparisons_of_one_change_are_one_piece_of_evidence() {
 	// FOUND WHILE TRYING TO EARN THE FIRST REAL CERTIFICATE THIS TOOL HAS EVER GRANTED, 2026-08-14.
 	// Nothing was TRUSTED, the criterion was five clean comparisons on two targets, and the cheapest
@@ -2661,18 +2688,32 @@ fn an_unmeasured_step_is_never_priced_at_zero() {
 
 	// A step that starts a guest is seeded from what this model has already measured about booting
 	// one, per slot it declares - so the row is charged rather than admitted for nothing.
-	let one_guest = bare.max(cost.seed_seconds(1));
+	let one_guest = bare.max(cost.seed_seconds(1).unwrap());
 	assert!(one_guest >= 100.0, "a step that boots a guest is seeded from the model's own measured boots, not from a host gate's per-key default");
-	let two_guests = bare.max(cost.seed_seconds(2));
+	let two_guests = bare.max(cost.seed_seconds(2).unwrap());
 	assert!(two_guests > one_guest, "a step declaring two slots at once is seeded for both of them");
 
-	// And a host step that boots nothing is still not free: a plan of zeros sorts on nothing.
-	assert!(bare.max(cost.seed_seconds(0)) >= 1.0, "an unmeasured host step is priced at a second rather than at nothing");
+	assert_eq!(cost.seed_seconds(0), None, "a host gate may rebuild the entire runtime; an arbitrary positive floor is not conservative");
+}
 
-	// The seed is a FLOOR, not a replacement: a step whose own estimate is larger keeps it.
-	let guest_keys = alloc_keys();
-	let measured_shape = cost.estimate(&history, &guest_keys, None);
-	assert!(measured_shape.max(cost.seed_seconds(0)) > 1.0, "a step the model can price from its own keys keeps that price");
+#[test]
+fn unpriced_host_work_needs_a_current_measurement_and_orders_after_known_work() {
+	let fixture = Fixture::new("unpriced-step");
+	let cost = crate::history::CostModel::default();
+	let mut history = crate::history::History::default();
+	let mut gate = step_for_test("gate:host:targeted-cache", &[]);
+	gate.keys.push(crate::plan::PlanItemKey { check: String::from("gate.targeted-cache"), architecture: String::from("host"), environment: crate::catalog::Environment::Host, configuration: String::from("default") });
+	assert_eq!(cost.scheduled_seconds(&history, &gate, "hash-a"), None);
+	history.record_step_id(Some(&gate.id), &gate.keys, false, 3.0, "hash-a", &cost);
+	assert_eq!(cost.scheduled_seconds(&history, &gate, "hash-a"), None, "an early failure does not measure successful work");
+	history.record_step_id(Some(&gate.id), &gate.keys, true, 571.0, "hash-a", &cost);
+	history.save(&fixture.dir).unwrap();
+	let history = crate::history::History::load(&fixture.dir).unwrap();
+	assert_eq!(cost.scheduled_seconds(&history, &gate, "hash-a"), Some(571.0), "a persisted measurement restores an admissible cost");
+	assert_eq!(cost.scheduled_seconds(&history, &gate, "hash-b"), None, "another model's measurement cannot price this one");
+	let unknown = step_for_test("unknown", &[]);
+	let ordered = crate::commands::order_by_cost(vec![unknown, gate], |step| cost.scheduled_seconds(&history, step, "hash-a").unwrap_or(f64::INFINITY)).unwrap();
+	assert_eq!(ordered.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(), vec!["gate:host:targeted-cache", "unknown"]);
 }
 
 fn alloc_keys() -> Vec<crate::plan::PlanItemKey> {

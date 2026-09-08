@@ -428,6 +428,11 @@ if [[ "$action" == shadow ]]; then
 	# candidate-free: it is a fact about the FILES, which no overlay changes.
 	source_before="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)" || planner_failed "could not digest the tree"
 	model_before="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" model-hash)"
+	# Evidence is private until every comparison has observed this same source/model.
+	mkdir -p "$BUILD_DIR/logs"
+	shadow_dir="$(mktemp -d "$BUILD_DIR/logs/verify-shadow.XXXXXXXX")"
+	pending_records="$shadow_dir/records.json"
+	trap 'rm -f "$pending_records"' EXIT
 	targets="$(printf '%s\n' "$changed" | cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" booted --stdin)" || planner_failed "the planner could not name the targets"
 	[[ -n "$targets" ]] || planner_failed "the plan named no target to sweep"
 	# THE BUILT SET, WHICH IS NOT THE BOOTED SET. A change that boots one target still has to compile
@@ -468,7 +473,7 @@ if [[ "$action" == shadow ]]; then
 		log="$(suite_result_log "$sweep_capture")" || die "the $target sweep did not say which logs it wrote"
 		rm -f "$sweep_capture"
 		[[ -n "$log" ]] || die "no $target guest log to compare against"
-		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --guest-log "$log" --arch "$target" "${scoped_arg[@]}") || shadow_failed=1
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --pending-records "$pending_records" --stdin --guest-log "$log" --arch "$target" "${scoped_arg[@]}") || shadow_failed=1
 	done
 	# The HOST universe, from the same sweep.
 	#
@@ -479,7 +484,7 @@ if [[ "$action" == shadow ]]; then
 	#
 	# Written by the runner rather than scraped: it knows each check's id and its exit status, and a
 	# `total` line so a partial run cannot look like a clean one.
-	host_log="$BUILD_DIR/logs/verify-host-shadow.txt"
+	host_log="$shadow_dir/host-full.txt"
 	mkdir -p "$(dirname "$host_log")"
 	: >"$host_log"
 	host_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- host-checks)" || planner_failed "the planner could not list the host checks"
@@ -504,7 +509,7 @@ if [[ "$action" == shadow ]]; then
 	# command bash could not parse and every dry comparison stayed clean.
 	host_scoped_arg=()
 	if [[ "${shadow_exec:-0}" == "1" ]]; then
-		host_scoped_log="$BUILD_DIR/logs/verify-host-scoped.txt"
+		host_scoped_log="$shadow_dir/host-scoped.txt"
 		: >"$host_scoped_log"
 		host_scoped_total=0
 		# The selection's own keys, lowered the same way the sweep lowers them - `commands` is what
@@ -522,7 +527,7 @@ if [[ "$action" == shadow ]]; then
 		printf 'total %s\n' "$host_scoped_total" >>"$host_scoped_log"
 		host_scoped_arg=(--host-scoped-log "$host_scoped_log")
 	fi
-	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --host-log "$host_log" "${host_scoped_arg[@]}") || shadow_failed=1
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --pending-records "$pending_records" --stdin --host-log "$host_log" "${host_scoped_arg[@]}") || shadow_failed=1
 
 	# The DEV GUEST universe, the third and last producer.
 	#
@@ -530,7 +535,7 @@ if [[ "$action" == shadow ]]; then
 	# asks the catalog which universes may judge a component, so `bin.dev_agent`, `bin.dev_channel`,
 	# `harness.boot` and `proto` each required a certificate that no code path could grant. Two of
 	# those are ordinary components, not development curiosities.
-	dev_log="$BUILD_DIR/logs/verify-dev-shadow.txt"
+	dev_log="$shadow_dir/dev-full.txt"
 	: >"$dev_log"
 	dev_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" dev-checks)" || planner_failed "the planner could not list the dev-guest checks"
 	dev_total=0
@@ -547,7 +552,7 @@ if [[ "$action" == shadow ]]; then
 	# The same sample on the dev path, and this is the universe it would have caught first.
 	dev_scoped_arg=()
 	if [[ "${shadow_exec:-0}" == "1" ]]; then
-		dev_scoped_log="$BUILD_DIR/logs/verify-dev-scoped.txt"
+		dev_scoped_log="$shadow_dir/dev-scoped.txt"
 		: >"$dev_scoped_log"
 		dev_scoped_total=0
 		dev_scoped_ids="$(printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" dev-checks --stdin --scoped))" || planner_failed "the planner could not list the scoped dev checks"
@@ -563,7 +568,7 @@ if [[ "$action" == shadow ]]; then
 		printf 'total %s\n' "$dev_scoped_total" >>"$dev_scoped_log"
 		dev_scoped_arg=(--dev-scoped-log "$dev_scoped_log")
 	fi
-	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --dev-log "$dev_log" "${dev_scoped_arg[@]}") || shadow_failed=1
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --pending-records "$pending_records" --stdin --dev-log "$dev_log" "${dev_scoped_arg[@]}") || shadow_failed=1
 
 	# The BUILD universe, and it costs the sweep nothing it was not already paying.
 	#
@@ -579,7 +584,7 @@ if [[ "$action" == shadow ]]; then
 	# rather than building it again. PER ARCHITECTURE, because a build of x86_64 says nothing about
 	# aarch64, which is what `required_architectures` asks for.
 	for build_arch in $build_targets; do
-		build_log="$BUILD_DIR/logs/verify-build-shadow-$build_arch.txt"
+		build_log="$shadow_dir/build-$build_arch.txt"
 		: >"$build_log"
 		build_ids="$(cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" build-checks)" || planner_failed "the planner could not list the build checks"
 		build_total=0
@@ -631,7 +636,7 @@ if [[ "$action" == shadow ]]; then
 				note "shadow-exec (build, $build_arch): the grouped step built exactly what the selection named"
 			done <<<"$build_steps"
 		fi
-		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --build-log "$build_log" --build-arch "$build_arch" --build-exec "$build_exec") || shadow_failed=1
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --pending-records "$pending_records" --stdin --build-log "$build_log" --build-arch "$build_arch" --build-exec "$build_exec") || shadow_failed=1
 	done
 
 	source_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)"
@@ -642,6 +647,7 @@ if [[ "$action" == shadow ]]; then
     model:  $model_before -> $model_after
     Use ./verify.sh --sweep for a comparison that cannot be overtaken, or leave the tree alone while this runs."
 	fi
+	cargo run --quiet --manifest-path "$PLANNER_MANIFEST" -- "${candidate_arg[@]}" shadow-publish --pending-records "$pending_records" --expected-source "$source_before" || die "the shadow evidence could not be published"
 	[[ -z "${shadow_failed:-}" ]] || die "shadow did not come back Consistent - see the verdict above; a candidate miss must be confirmed before it is charged to the selector"
 	note "shadow: no evidence against the selection, over a tree that did not move"
 	exit 0
@@ -734,8 +740,8 @@ note "$count step(s)"
 # branch does not fit, nothing is started and the minimum is named - a budget that half-builds has
 # spent the time and bought no evidence.
 budget_select() {
-	local budget="$1" total=0 chosen best best_cost add i j
-	local -A picked=() by_id=() closure=()
+	local budget="$1" total=0 chosen best best_cost add i j unknown
+	local -A picked=() by_id=() closure=() unpriced=()
 	for i in "${!step_ids[@]}"; do by_id["${step_ids[$i]}"]=$i; done
 	# EACH CLOSURE COMPUTED ONCE. The first version resolved a step's prerequisites inside the
 	# selection loop, which is that walk once per candidate per round - cubic in the number of steps,
@@ -754,12 +760,20 @@ budget_select() {
 			done
 		done
 		closure[$i]="$seen"
+		for j in $seen; do
+			[[ "${step_unpriced[$j]}" == 1 ]] && unpriced[$i]=1
+		done
 	done
 	while :; do
 		best=""
 		best_cost=0
+		unknown=0
 		for i in "${!step_ids[@]}"; do
 			[[ -n "${picked[$i]:-}" ]] && continue
+			if [[ -n "${unpriced[$i]:-}" ]]; then
+				unknown=1
+				continue
+			fi
 			add=0
 			for j in ${closure[$i]}; do
 				[[ -n "${picked[$j]:-}" ]] && continue
@@ -770,10 +784,15 @@ budget_select() {
 				best_cost="$add"
 			fi
 		done
-		[[ -z "$best" ]] && break
+		if [[ -z "$best" ]]; then
+			if ((unknown == 1 && ${#picked[@]} == 0)); then
+				note "no complete branch has a measured or conservatively seeded cost; the minimum budget is unknown, so nothing was started"
+			fi
+			break
+		fi
 		if ((total + best_cost > budget)); then
 			if ((${#picked[@]} == 0)); then
-				note "the cheapest complete branch costs an estimated ${best_cost}s and the budget is ${budget}s, so nothing was started"
+				note "the cheapest priced complete branch costs an estimated ${best_cost}s and the budget is ${budget}s, so nothing was started"
 			fi
 			break
 		fi
@@ -796,6 +815,7 @@ budget_select() {
 step_ids=()
 step_reqs=()
 step_costs=()
+step_unpriced=()
 # HOW MANY GUESTS A STEP STARTS AT THE SAME TIME, for the few that start more than one.
 #
 # `--jobs` answers "how many QEMUs may run on this machine", and the answer has to be the same
@@ -809,12 +829,14 @@ while IFS=$'\t' read -r marker index rest; do
 	STEPID) step_ids[$index]="$rest" ;;
 	STEPREQ) step_reqs[$index]="${step_reqs[$index]:-} $rest" ;;
 	STEPCOST) step_costs[$index]="$rest" ;;
+	STEPUNPRICED) step_unpriced[$index]=1 ;;
 	STEPGUESTS) step_guests[$index]="$rest" ;;
 	esac
 done <"$steps_file"
 for i in "${!step_ids[@]}"; do
 	step_reqs[$i]="${step_reqs[$i]:-}"
 	step_costs[$i]="${step_costs[$i]:-0}"
+	step_unpriced[$i]="${step_unpriced[$i]:-0}"
 	step_guests[$i]="${step_guests[$i]:-0}"
 done
 
@@ -952,6 +974,7 @@ while IFS=$'\t' read -r -u 3 marker index keys label command note_text; do
 	# did not run.
 	if ((BUDGET_SET == 1)) && [[ " $affordable " != *" $index "* ]]; then
 		note "[$step/$count] SKIPPED (budget): $label - $keys key(s)"
+		[[ "${step_unpriced[$index]}" == 1 ]] && note "        unpriced: no current measurement or conservative seed; an unbudgeted run can measure it"
 		skipped+=("$label")
 		continue
 	fi

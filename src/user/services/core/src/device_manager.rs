@@ -2990,7 +2990,11 @@ unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, catalogue: &mut Catalo
 	}
 }
 
-// Take every frame waiting on this node's channel and queue what each one means.
+// One normal control-channel queue per pass. A concurrent producer can refill every consumed
+// slot, so draining until Empty would let it prevent all other supervision from running.
+const MAX_DRIVER_FRAMES_PER_PASS: usize = 64;
+
+// Queue a bounded batch; any remaining frames stay readable for the central loop's next pass.
 unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 	unsafe {
 		expire_planned_stop(node, clock());
@@ -2999,7 +3003,7 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 		}
 		let Some(binding) = &node.binding else { return };
 		let (channel, generation): (u64, u64) = (binding.channel, node.id.generation);
-		loop {
+		for _ in 0..MAX_DRIVER_FRAMES_PER_PASS {
 			let frame = try_recv_caps(channel, buf);
 			let (len, handles) = match frame {
 				PolledCaps::Message { len, handles } => (len, handles),
@@ -5695,6 +5699,10 @@ unsafe fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 			// So the CHANNEL is read whenever there is a binding to read from, and only the
 			// HEARTBEAT below is gated on the state that heartbeats belong to.
 			if node.binding.is_some() {
+				// Retry a previously refused verdict before fresh traffic can fill the queue again.
+				if node.beat.expiry_pending() && node.push(BindingEvent::Wedged { generation: node.id.generation }) {
+					node.beat.expiry_queued();
+				}
 				drain_channel(node, buf);
 			}
 			if !node.beat.supervised() || node.record.state != BindingState::Online {
@@ -5708,7 +5716,9 @@ unsafe fn tick_heartbeats(nodes: &mut [Node], buf: &mut [u8]) -> u64 {
 				// runs through the same state machine as a crash - the teardown is the same
 				// transaction and the same counter, and only the reason differs.
 				driver_binding::Beat::Wedged => {
-					node.push(BindingEvent::Wedged { generation });
+					if node.push(BindingEvent::Wedged { generation }) {
+						node.beat.expiry_queued();
+					}
 				}
 				driver_binding::Beat::Ask(sequence) => {
 					let mut payload = [0u8; driver_protocol::SEQUENCE_PAYLOAD_LEN];

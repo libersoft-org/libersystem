@@ -732,7 +732,9 @@ unsafe fn serve(root: u64, admin: u64, catalogue: u64, mut providers: u64, mut s
 				state.stop_capture();
 			}
 
-			let driver_first: bool = state.snd != 0 && state.driver_pending != DriverPending::None;
+			// An idle driver's channel can close too. Observe that before a replacement publication
+			// is consumed, or the stale handle makes us discard the provider we could reconnect to.
+			let driver_first: bool = state.snd != 0;
 			let mut waits: Vec<u64> = Vec::with_capacity(driver_first as usize + clients.len() + state.streams.len() + state.captures.len() + 2);
 			if driver_first {
 				waits.push(state.snd);

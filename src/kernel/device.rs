@@ -483,6 +483,13 @@ pub fn claim(index: usize) -> Result<abi::ClaimKey, ClaimError> {
 	// this apart from a device that is merely absent: `endpoint 0xffff could not be probed
 	// (NotMapped) - its reserved regions are unknown, so it is not attached`.
 	if entry.on_bus && crate::iommu::translating() && !crate::iommu::attach_for(index, entry.bus, entry.dev, entry.func, generation) {
+		if crate::iommu::attachment_quarantined(index) {
+			// No handle was published, but an unanswered ATTACH may still own this endpoint.
+			// Keep the attempted generation visible and prevent a replacement claim.
+			slot.state = ClaimState::Quarantined;
+			slot.generation = generation;
+			return Err(ClaimError::Quarantined);
+		}
 		return Err(ClaimError::Refused);
 	}
 	bus_master(entry, true);

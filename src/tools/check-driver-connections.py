@@ -139,6 +139,7 @@ fn an_idle_provider_still_services_device_work_and_stop() {
                 raise SystemExit(f'{name}: expected assertion failure:\n{result.stdout}')
             print(f'driver-connections: rejected {name}')
     subprocess.run([sys.executable, str(ROOT / 'src/tools/check-provider-catalogue.py')], check=True)
+    subprocess.run([sys.executable, str(ROOT / 'src/tools/check-audio-provider-recovery.py')], check=True)
 
 
 if __name__ == '__main__':

@@ -25,7 +25,11 @@ if args[0] == "--candidate":
     assert Path(args[1]).read_text() == "frozen candidate fixture\n"
     args = args[2:]
 command = args[0]
-if command in ("source-digest", "model-hash"):
+if command == os.environ.get("SHADOW_MOVE_IDENTITY"):
+    counter = Path(os.environ["SHADOW_IDENTITY_COUNTER"])
+    print("moved-fixture" if counter.exists() else "stable-fixture")
+    counter.touch()
+elif command in ("source-digest", "model-hash"):
     print("stable-fixture")
 elif command in ("booted", "built"):
     print("x86_64")
@@ -50,6 +54,13 @@ elif command == "shadow":
     assert logs, "a comparison must consume evidence"
     with Path(os.environ["SHADOW_OBSERVED"]).open("a") as output:
         output.write(json.dumps(logs) + "\n")
+    destination = Path(args[args.index("--pending-records") + 1]) if "--pending-records" in args else Path(os.environ["SHADOW_PUBLISHED"])
+    with destination.open("a") as output:
+        output.write("comparison\n")
+elif command == "shadow-publish":
+    assert args[args.index("--expected-source") + 1] == "stable-fixture"
+    pending = Path(args[args.index("--pending-records") + 1])
+    Path(os.environ["SHADOW_PUBLISHED"]).write_text(pending.read_text())
 else:
     raise AssertionError(f"unexpected planner command: {args}")
 '''
@@ -71,7 +82,7 @@ printf '[test-x86_64] RESULT-LOGS %s %s\n' "$run" "$guest"
 
 
 class ShadowLogPaths(unittest.TestCase):
-    def exercise(self, execute, suite_in_run, source=None):
+    def exercise(self, execute, suite_in_run, source=None, move_identity=""):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "src/tools").mkdir(parents=True)
@@ -90,21 +101,27 @@ class ShadowLogPaths(unittest.TestCase):
                 path.write_text(text)
                 path.chmod(0o755)
             observed = root / "observed.jsonl"
+            published = root / "published.txt"
             candidate = root / "candidate.toml"
             candidate.write_text("frozen candidate fixture\n")
             env = dict(os.environ, PATH=f"{root / 'bin'}:{os.environ['PATH']}",
-                       SHADOW_OBSERVED=str(observed), SHADOW_SUITE_IN_RUN=str(int(suite_in_run)))
+                       SHADOW_OBSERVED=str(observed), SHADOW_SUITE_IN_RUN=str(int(suite_in_run)),
+                       SHADOW_PUBLISHED=str(published), SHADOW_MOVE_IDENTITY=move_identity,
+                       SHADOW_IDENTITY_COUNTER=str(root / "identity-counter"))
             result = subprocess.run(["./verify.sh", "--for", "src/kernel/elf.rs",
                                      "--candidate", str(candidate) if execute else candidate.name,
                                      "--shadow-exec" if execute else "--shadow"],
                                     cwd=root, env=env, capture_output=True, text=True, timeout=10)
             logs = [json.loads(line) for line in observed.read_text().splitlines()] if observed.exists() else []
-            return result, logs
+            pending = list((root / ".build/logs").glob("verify-shadow.*/records.json"))
+            self.assertEqual(pending, [], "the enclosing run removes its staged evidence on exit")
+            return result, logs, published.read_text() if published.exists() else ""
 
     def assert_logs(self, execute, suite_in_run):
-        result, logs = self.exercise(execute, suite_in_run)
+        result, logs, published = self.exercise(execute, suite_in_run)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(len(logs), 4, "guest, host, development and build comparisons must all run")
+        self.assertEqual(published.splitlines(), ["comparison"] * 4, "the stable sweep publishes all comparisons")
         evidence = {name: value for comparison in logs for name, value in comparison.items()}
         expected = {"--guest-log", "--host-log", "--dev-log", "--build-log"}
         if execute:
@@ -127,6 +144,16 @@ class ShadowLogPaths(unittest.TestCase):
         for suite_in_run in (False, True):
             with self.subTest(suite_in_run=suite_in_run):
                 self.assert_logs(True, suite_in_run)
+
+    def test_invalidated_sweep_publishes_no_comparison(self):
+        for execute in (False, True):
+            for identity in ("source-digest", "model-hash"):
+                with self.subTest(execute=execute, identity=identity):
+                    result, logs, published = self.exercise(execute, False, move_identity=identity)
+                    self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                    self.assertIn("is void", result.stdout + result.stderr)
+                    self.assertEqual(len(logs), 4, "all comparisons were reached before the final guard")
+                    self.assertEqual(published, "", "a refused sweep gives no persistent clean evidence")
 
 
 if __name__ == "__main__":

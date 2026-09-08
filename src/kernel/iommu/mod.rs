@@ -514,14 +514,26 @@ pub fn requester_of(bus: u8, dev: u8, func: u8) -> dma::EndpointId {
 	dma::EndpointId(((bus as u32) << 8) | ((dev as u32) << 3) | func as u32)
 }
 
+#[derive(Debug)]
+pub struct AttachFailure {
+	fault: Fault,
+	retained: Option<dma::DomainId>,
+}
+
+impl From<Fault> for AttachFailure {
+	fn from(fault: Fault) -> Self {
+		Self { fault, retained: None }
+	}
+}
+
 // Bring one device's endpoint under translation: a domain of its own, attached and confirmed.
 //
 // ONE DOMAIN PER EXCLUSIVE BINDING. Two devices sharing a domain share every mapping in it, which
 // makes "endpoint A cannot reach endpoint B's page" false by construction. `generation` is the
 // binding's, so a reused slot's mappings are stale by arithmetic rather than by bookkeeping.
-pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dma::DomainId, Fault> {
+pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dma::DomainId, AttachFailure> {
 	let endpoint = requester_of(bus, dev, func);
-	with(|controller| {
+	with(|controller| -> Result<_, AttachFailure> {
 		let config = *controller.iommu().backend().config();
 		let iommu = controller.iommu();
 		// THE ENDPOINT IS ASKED BEFORE IT IS ATTACHED, and the domain is built from the answer.
@@ -539,24 +551,24 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 				// after the fact, with the endpoint already translating; now there is nothing to
 				// warn about, because nothing has been built yet.
 				crate::serial_println!("iommu: endpoint {:#x} could not be probed ({reason:?}) - its reserved regions are unknown, so it is not attached", endpoint.0);
-				return Err(reason);
+				return Err(reason.into());
 			}
 		};
 		let mut reserved: alloc::vec::Vec<dma::Reserved> = alloc::vec::Vec::new();
 		// ALLOC-OK: one entry per reserved region this endpoint published, at binding time.
 		if reserved.try_reserve(regions.len()).is_err() {
-			return Err(Fault::NoSpace);
+			return Err(Fault::NoSpace.into());
 		}
 		for region in regions.iter().filter(|r| r.kind == dma::RegionKind::Reserved) {
 			crate::serial_println!("iommu: endpoint {:#x} reserves {:#x}+{:#x} - its domain never allocates there", endpoint.0, region.base, region.len);
 			reserved.push(dma::Reserved { base: region.base, len: region.len });
 		}
 		let domain = iommu.create_domain(config.input_start, config.input_len(), reserved, Generation(generation))?;
-		// A FAILED ATTACH TAKES ITS DOMAIN WITH IT. This returned on the `?` with the domain created,
-		// so every refused bind left one behind and consumed an id - and `next_domain` only advances.
-		if let Err(reason) = iommu.attach(domain, endpoint) {
-			let _ = iommu.destroy_domain(domain);
-			return Err(reason);
+		// A confirmed refusal retires the empty domain. An unanswered ATTACH may have taken
+		// effect, so failed retirement carries its domain back to the binding's quarantine slot.
+		if let Err(fault) = iommu.attach(domain, endpoint) {
+			let retained = iommu.destroy_domain(domain).err().map(|_| domain);
+			return Err(AttachFailure { fault, retained });
 		}
 		// THE DOORBELL IS NOT MAPPED HERE, AND THAT IS THE FIX RATHER THAN THE OMISSION.
 		//
@@ -578,7 +590,7 @@ pub fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dm
 		// a route nobody checked.
 		Ok(domain)
 	})
-	.unwrap_or(Err(Fault::Unconfirmed))
+	.unwrap_or(Err(Fault::Unconfirmed.into()))
 }
 
 // HOW MANY TRANSLATIONS THIS DEVICE'S DOMAIN STILL HOLDS - live and quarantined together, because a
@@ -893,6 +905,9 @@ pub fn map_for_device(domain: dma::DomainId, physical: u64, len: u64, direction:
 // not an error.
 pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8, generation: u64) -> bool {
 	let mut domains = DOMAINS.lock();
+	if attachment_quarantined(index) {
+		return false;
+	}
 	if domains.iter().any(|(device, _)| *device == index as u32) {
 		return true;
 	}
@@ -918,11 +933,19 @@ pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8, generation: u64) -> 
 			crate::serial_println!("iommu: {:02x}:{:02x}.{} attached to domain {}", bus, dev, func, domain.0);
 			true
 		}
-		Err(reason) => {
-			crate::serial_println!("iommu: {:02x}:{:02x}.{} could not be attached ({reason:?}) - it does not master the bus", bus, dev, func);
+		Err(failure) => {
+			if let Some(domain) = failure.retained {
+				// Initialization reserves one slot per device before translation can start.
+				RETAINED.lock()[index] = Some(domain);
+			}
+			crate::serial_println!("iommu: {:02x}:{:02x}.{} could not be attached ({:?}) - it does not master the bus", bus, dev, func, failure.fault);
 			false
 		}
 	}
+}
+
+pub fn attachment_quarantined(index: usize) -> bool {
+	retained_domain_of(index as u32).is_some()
 }
 
 // The device is done. Everything it could reach stops being reachable, or is quarantined.

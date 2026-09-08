@@ -921,14 +921,26 @@ impl<B: Backend> Iommu<B> {
 		// Fault records carry no generation. Refuse a replacement until a bounded drain has
 		// observed the predecessor's queue empty; guessing a tail length can accuse the wrong
 		// binding or hide the first faults of the replacement. A storm causes refusal, not a wait.
-		if self.attribution_lost || self.detached.iter().any(|tail| tail.endpoint == endpoint && !tail.drained) {
+		if self.attribution_lost || self.detached.iter().any(|tail| tail.endpoint == endpoint && !tail.drained) || self.domains.values().any(|state| state.endpoints.contains(&endpoint)) {
 			return Err(Fault::Unconfirmed);
 		}
 		let state = self.domains.get_mut(&domain).ok_or(Fault::UnknownEndpoint)?;
-		let confirmed = self.backend.attach(domain, endpoint)?;
-		state.endpoints.push(endpoint);
-		state.attached_confirmed = true;
-		Ok(confirmed)
+		state.endpoints.try_reserve(1).map_err(|_| Fault::NoSpace)?;
+		match self.backend.attach(domain, endpoint) {
+			Ok(confirmed) => {
+				state.endpoints.push(endpoint);
+				state.attached_confirmed = true;
+				Ok(confirmed)
+			}
+			Err(Fault::Unconfirmed) => {
+				// The request may have attached hardware. Keep ownership without authorizing DMA;
+				// domain retirement needs a confirmed detach even when there are no mappings.
+				state.endpoints.push(endpoint);
+				state.attached_confirmed = false;
+				Err(Fault::Unconfirmed)
+			}
+			Err(reason) => Err(reason),
+		}
 	}
 
 	// Whether this endpoint may be allowed to master the bus: attached, and the attachment confirmed.

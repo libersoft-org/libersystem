@@ -2391,3 +2391,33 @@ only P02M0172's producer paragraph changed among these plans. Scoped `verify.sh 
 zero inner checks and zero deferred checks, then exited 6 (`INCOMPLETE`) because the repository
 requires a post-commit merge even for an empty check set. No commit, merge verification or
 implementation-test result is claimed.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0175 (2026-09-08T17:55:16Z):
+
+Current plan rating: 9/10.
+
+No unresolved or new material findings within this milestone's stated scope. No incomplete
+correction, unjustified rejection or implementation-blocking contradiction was established.
+
+Verification: read the complete current 1438-line plan and all 2393 preceding audit-history lines.
+Checked every work item, acceptance criterion, dependency and completion condition against the
+planner responses, current NetworkService/Stack and IDL code, capability and host-test architecture,
+and P02M0174's producer contract. Rechecked the numeric budgets, listener handoff, stream boundaries,
+family readiness, diagnostic lifecycles, router-order consumption and declared entropy limits.
+Protocol checks included [RFC 9293 section 3.8.3](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.3),
+[RFC 6724](https://www.rfc-editor.org/rfc/rfc6724.html),
+[RFC 7766 section 5](https://www.rfc-editor.org/rfc/rfc7766.html#section-5),
+and [RFC 2131 section 4.1](https://www.rfc-editor.org/rfc/rfc2131.html#section-4.1).
+Previously resolved findings were not repeated as open issues.
+
+This is a plan assessment; generated-wire, runtime and guest acceptance gates remain implementation
+work. Only this re-audit was appended: the plan and every preceding audit byte are unchanged.
+This review made no source-code edits, ran no implementation tests and made no commit; concurrent
+work outside this audit was left untouched.
+
+Consolidated document verification (2026-09-08T17:59:04Z): all four plans match their pre-audit snapshots,
+and every original audit prefix is preserved byte-for-byte. Scoped whitespace checks pass.
+`./verify.sh --for` selected zero inner and zero deferred checks, then exited 6 (`INCOMPLETE`):
+post-commit merge verification remains required. No full revision-verification pass or commit is
+claimed. This re-audit made no source edits; concurrent work outside these four audits was preserved.

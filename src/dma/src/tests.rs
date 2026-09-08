@@ -264,6 +264,15 @@ fn an_attach_that_fails_leaves_the_endpoint_unable_to_master_the_bus() {
 	assert_eq!(iommu.attach(domain, EndpointId(7)).err(), Some(Fault::Unconfirmed));
 	assert!(!iommu.may_master(domain, EndpointId(7)), "a failed attach is not a quiet attach");
 	assert_eq!(iommu.backend().attachments(), 0);
+	assert_eq!(iommu.attached_endpoints(), 1, "an unanswered attachment stays owned even when the fake did not apply it");
+	assert_eq!(iommu.destroy_domain(domain), Err(Fault::Unconfirmed), "absence of mappings cannot confirm an unanswered attachment");
+	let replacement = iommu.create_domain(0x1000, 0x100000, Vec::new(), Generation(2)).unwrap();
+	assert_eq!(iommu.attach(replacement, EndpointId(7)), Err(Fault::Unconfirmed));
+	assert_eq!(iommu.revoke_endpoint(domain, EndpointId(7)), Ok(Release::FramesReusable));
+	iommu.destroy_domain(domain).expect("a confirmed detach releases the uncertain ownership");
+	let mut out = [event(0, 0, 0, Access::Read, Fault::NotMapped)];
+	iommu.drain_faults(&mut out);
+	iommu.attach(replacement, EndpointId(7)).expect("replacement follows confirmed teardown and drain");
 }
 
 #[test]

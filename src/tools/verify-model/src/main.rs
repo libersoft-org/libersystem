@@ -29,6 +29,9 @@ usage: verify-model <command> [options]
   shadow --guest-log F --arch A       compare a full sweep against what a change would have scoped
                                       (add --scoped-log F to also EXECUTE the selection and compare)
   shadow --host-log F | --dev-log F   the same comparison for the host and dev-guest universes
+  shadow --pending-records F         stage comparisons until the enclosing sweep validates them
+  shadow-publish --pending-records F --expected-source D
+                                    publish staged evidence after source/model validation
   level --stdin                       what a scoped answer about this change is worth
   trust [--grant COMPONENT]           what is TRUSTED under the current model, and why not
   changes [--range A..B]              what changed, both sides of every rename, one path per line
@@ -83,6 +86,8 @@ fn run() -> Result<ExitCode, String> {
 	let mut host_scoped_log: Option<String> = None;
 	let mut dev_scoped_log: Option<String> = None;
 	let mut guest_log: Option<String> = None;
+	let mut pending_records: Option<PathBuf> = None;
+	let mut expected_source: Option<String> = None;
 	let mut host_log: Option<String> = None;
 	let mut dev_log: Option<String> = None;
 	// The build universe's log. A full sweep's builds ARE its evidence; this is where they are read
@@ -116,6 +121,14 @@ fn run() -> Result<ExitCode, String> {
 			// Accepted and redundant on purpose: the runner spells the outcome at the call site
 			// either way, so a step's result is readable there rather than implied by an absence.
 			"--passed" => passed = true,
+			"--pending-records" => {
+				index += 1;
+				pending_records = Some(PathBuf::from(arguments.get(index).ok_or("--pending-records needs a path")?));
+			}
+			"--expected-source" => {
+				index += 1;
+				expected_source = Some(arguments.get(index).ok_or("--expected-source needs a digest")?.clone());
+			}
 			"--scoped-log" => {
 				index += 1;
 				scoped_log = Some(arguments.get(index).ok_or("--scoped-log needs a path")?.clone());
@@ -210,7 +223,7 @@ fn run() -> Result<ExitCode, String> {
 		index += 1;
 	}
 	if let Some(first) = positional.first()
-		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash" | "discard-divided-costs" | "candidate-activate")
+		&& matches!(first.as_str(), "plan" | "commands" | "host-suites" | "host-checks" | "dev-checks" | "build-checks" | "build-steps" | "booted" | "built" | "guest-selection" | "changes" | "age" | "record" | "reach" | "level" | "source-digest" | "volume-sources" | "shadow" | "shadow-publish" | "trust" | "catalog" | "graph" | "owner" | "check" | "model-hash" | "discard-divided-costs" | "candidate-activate")
 	{
 		command = positional.remove(0);
 	}
@@ -581,6 +594,13 @@ fn run() -> Result<ExitCode, String> {
 		}
 		// DRY shadow: the scoped set is COMPUTED and never run; the full sweep that already
 		// happened is what it is compared against. One boot, two answers.
+		"shadow-publish" => {
+			let pending = pending_records.as_deref().ok_or("shadow-publish needs --pending-records")?;
+			let source = expected_source.as_deref().ok_or("shadow-publish needs --expected-source")?;
+			let count = verify_model::shadow::Log::publish(&repo_root, pending, source, &model.model_hash())?;
+			println!("shadow: published {count} comparison record(s) after source/model validation");
+			Ok(ExitCode::SUCCESS)
+		}
 		"shadow" => {
 			// The HOST universe, when a host results file is what was given.
 			//
@@ -630,10 +650,7 @@ fn run() -> Result<ExitCode, String> {
 				for key in &comparison.outside_failures {
 					println!("  FAILED (not selected): {key}");
 				}
-				let mut log = verify_model::shadow::Log::load(&repo_root);
-				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) });
-				log.save(&repo_root)?;
+				verify_model::shadow::Log::record(&repo_root, pending_records.as_deref(), verify_model::shadow::Record { universe: verify_model::shadow::Universe::Host, architecture: String::from("host"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: host_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) })?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
 			// THE BUILD UNIVERSE. Same shape as the two branches around it, and the reason it exists
@@ -664,10 +681,7 @@ fn run() -> Result<ExitCode, String> {
 				for key in &comparison.outside_failures {
 					println!("  FAILED (not selected): {key}");
 				}
-				let mut log = verify_model::shadow::Log::load(&repo_root);
-				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: build_exec, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) });
-				log.save(&repo_root)?;
+				verify_model::shadow::Log::record(&repo_root, pending_records.as_deref(), verify_model::shadow::Record { universe: verify_model::shadow::Universe::HostBuild, architecture: build_arch.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: build_exec, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) })?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
 			// The DEV guest universe. Same shape as the host branch: one results file, one record.
@@ -711,10 +725,7 @@ fn run() -> Result<ExitCode, String> {
 				for key in &comparison.outside_failures {
 					println!("  FAILED (not selected): {key}");
 				}
-				let mut log = verify_model::shadow::Log::load(&repo_root);
-				log.schema = 1;
-				log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) });
-				log.save(&repo_root)?;
+				verify_model::shadow::Log::record(&repo_root, pending_records.as_deref(), verify_model::shadow::Record { universe: verify_model::shadow::Universe::DevGuest, architecture: String::from("x86_64"), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: dev_exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) })?;
 				return Ok(if comparison.verdict == verify_model::shadow::Verdict::Consistent { ExitCode::SUCCESS } else { ExitCode::FAILURE });
 			}
 			let guest_log = guest_log.ok_or("shadow needs --guest-log, --host-log or --dev-log")?;
@@ -780,10 +791,7 @@ fn run() -> Result<ExitCode, String> {
 
 			// Filed with what it compared. A record that cannot say which tree and which model it
 			// judged is a record that will be believed about a different system later.
-			let mut log = verify_model::shadow::Log::load(&repo_root);
-			log.schema = 1;
-			log.records.push(verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) });
-			log.save(&repo_root)?;
+			verify_model::shadow::Log::record(&repo_root, pending_records.as_deref(), verify_model::shadow::Record { universe: verify_model::shadow::Universe::TestGuest, architecture: architecture.clone(), verdict: format!("{:?}", comparison.verdict), reason: comparison.reason.clone(), model_hash: model.model_hash(), source_digest: verify_model::shadow::source_digest(&repo_root)?, changed_components: plan.changed_components.clone(), outside_failures: comparison.outside_failures.clone(), at: verify_model::history::now(), change_kinds: verify_model::shadow::change_kinds_for(&repo_root, &paths, &path_change_kinds), edge_kinds: plan.edge_kinds.clone(), shadow_exec: exec_clean, model_self_check: self_check_failures(&model, false).is_empty(), component_decisions: plan.component_decisions.clone(), component_scopes: verify_model::shadow::component_scopes(&repo_root, &plan, &path_change_kinds, &model.registry) })?;
 			// Only Consistent is green, and the other three are green in different wrong ways.
 			// CandidateMiss is the selector's problem; SelectionFailed is the code's and the sweep
 			// found it; Void means the comparison judged nothing at all. Returning 0 for the last
@@ -1114,8 +1122,9 @@ fn emit_steps(model: &Model, steps: Vec<verify_model::commands::Step>) -> Result
 	let history = verify_model::history::History::load(&model.repo_root).unwrap_or_default();
 	let model_hash = model.model_hash();
 	// Use the same measured cost or conservative seed that STEPCOST reports. Validate before
-	// walking the graph, and choose from the ready steps again after every prerequisite.
-	let ordered = verify_model::commands::order_by_cost(steps, |step| step_cost(&history, &cost, step, &model_hash)).map_err(|faults| {
+	// walking the graph, and choose from the ready steps again after every prerequisite. Unpriced
+	// work follows priced ready work; its provisional per-key estimate is not a scheduling cost.
+	let ordered = verify_model::commands::order_by_cost(steps, |step| cost.scheduled_seconds(&history, step, &model_hash).unwrap_or(f64::INFINITY)).map_err(|faults| {
 		for fault in &faults {
 			eprintln!("verify-model: {fault}");
 		}
@@ -1154,7 +1163,13 @@ fn emit_steps(model: &Model, steps: Vec<verify_model::commands::Step>) -> Result
 		// cheapest work in the plan and admitted by any budget at all. `seed_seconds` is the
 		// conservative floor M4 asks for, and the round is UP: a sub-second estimate is a
 		// short step, not a free one.
-		println!("STEPCOST\t{index}\t{}", step_cost(&history, &cost, &step, &model_hash).ceil() as u64);
+		match cost.scheduled_seconds(&history, &step, &model_hash) {
+			Some(seconds) => println!("STEPCOST\t{index}\t{}", seconds.ceil() as u64),
+			None => {
+				println!("STEPCOST\t{index}\tunknown");
+				println!("STEPUNPRICED\t{index}\tno current measurement or conservative seed");
+			}
+		}
 		// HOW MANY GUEST SLOTS THIS STEP NEEDS AT ONCE - see `Step::guests`. EMITTED FOR
 		// EVERY STEP, because the runner now classifies guest work by this number rather
 		// than by matching the command text, and a number the plan does not carry is a
@@ -1250,19 +1265,6 @@ fn join_or_none(items: &[String]) -> String {
 // Split out so a shadow record can say whether the model that made the comparison was consistent at
 // the time. A comparison produced by a model failing its own checks is not evidence about the tree,
 // and the record could not say which it was.
-// WHAT A STEP IS EXPECTED TO COST, in one place because two callers need the SAME answer.
-//
-// The plan orders on it and prints it, and those were two expressions: the printed one applied the
-// conservative floor for an unmeasured step and the ordering one did not, so the cheapest-first
-// order disagreed with the costs printed beside it. Measured if it has been measured under this
-// model; otherwise the estimate over its keys, never below the floor its guest count implies.
-fn step_cost(history: &verify_model::history::History, cost: &verify_model::history::CostModel, step: &verify_model::commands::Step, model_hash: &str) -> f64 {
-	match history.step_seconds(&step.id, model_hash) {
-		Some(seconds) => seconds,
-		None => cost.estimate(history, &step.keys, Some(model_hash)).max(cost.seed_seconds(step.guests)),
-	}
-}
-
 fn self_check_failures(model: &Model, report: bool) -> Vec<String> {
 	let mut failures = Vec::new();
 

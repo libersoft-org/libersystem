@@ -491,9 +491,14 @@ impl<T: Transport> Backend for VirtioIommu<T> {
 		}
 		// FLAGS ZERO, and deliberately so: `VIRTIO_IOMMU_ATTACH_F_BYPASS` attaches an endpoint that
 		// is not translated at all, which is the one thing an enforcing profile must never send.
-		let confirmed = self.send(&encode_attach(domain.0, endpoint.0, 0))?;
-		self.attached.push((domain, endpoint));
-		Ok(confirmed)
+		self.attached.try_reserve(1).map_err(|_| Fault::NoSpace)?;
+		let result = self.send(&encode_attach(domain.0, endpoint.0, 0));
+		if result.is_ok() || result == Err(Fault::Unconfirmed) {
+			// A missing answer does not establish that hardware stayed detached. Retain the
+			// association so destruction must ask for DETACH rather than invent its completion.
+			self.attached.push((domain, endpoint));
+		}
+		result
 	}
 
 	fn detach(&mut self, domain: DomainId, endpoint: EndpointId) -> Result<Confirmed, Fault> {

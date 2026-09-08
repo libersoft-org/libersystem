@@ -1456,6 +1456,7 @@ fn a_ping_that_is_not_answered_inside_its_deadline_wedges_once_and_not_repeatedl
 	beat.asked(5);
 	assert_eq!(beat.tick(14), Beat::Idle, "inside the deadline there is nothing to say");
 	assert_eq!(beat.tick(15), Beat::Wedged, "at it, the driver is wedged");
+	beat.expiry_queued();
 	// ONCE. A node stays wedged for as long as its teardown takes, and a supervisor that queued the
 	// verdict on every pass would queue one per tick of that teardown.
 	assert_eq!(beat.tick(16), Beat::Idle, "and it is not re-declared on the next pass");
@@ -1466,6 +1467,20 @@ fn a_ping_that_is_not_answered_inside_its_deadline_wedges_once_and_not_repeatedl
 	// The NEXT binding on this node arms it again, and the schedule starts over.
 	beat.arm(Some(DEADLINE), 100, PERIOD);
 	assert_eq!(beat.tick(105), Beat::Ask(1), "a fresh binding starts at the first sequence again");
+}
+
+#[test]
+fn a_watchdog_expiry_stays_pending_until_its_event_is_queued() {
+	let mut beat = armed(0);
+	assert_eq!(beat.tick(5), Beat::Ask(1));
+	beat.asked(5);
+	assert_eq!(beat.tick(15), Beat::Wedged);
+	assert_eq!(beat.wake_at(), 15, "the refused verdict must remain runnable");
+	assert!(!beat.answered(1, 16, PERIOD), "a reply cannot cancel a pending expiry");
+	assert_eq!(beat.tick(16), Beat::Wedged, "retry a verdict the queue has not accepted");
+	beat.expiry_queued();
+	assert_eq!(beat.tick(17), Beat::Idle);
+	assert_eq!(beat.wake_at(), 0);
 }
 
 #[test]

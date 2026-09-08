@@ -1245,11 +1245,10 @@ pub struct Heartbeat {
 	// When the next `PING` is due, and when an outstanding one stops being answerable.
 	due: u64,
 	expires: u64,
-	// THE VERDICT HAS BEEN GIVEN. A wedged binding is being torn down; asking it again would queue a
-	// second verdict on every pass of the loop until that finishes, and the schedule this watchdog
-	// was keeping belongs to a binding that is over. Cleared by `arm`, which is what the NEXT
-	// binding on this node calls.
+	// Expiry is final even while the node's event queue cannot accept its verdict. A late reply
+	// cannot revive this watchdog; the next binding starts its own schedule through `arm`.
 	spent: bool,
+	expiry_pending: bool,
 }
 
 // What the watchdog wants done this tick.
@@ -1268,7 +1267,7 @@ impl Heartbeat {
 	// number: a driver always gets one whole period to answer inside the deadline it declared.
 	pub fn arm(&mut self, deadline: Option<u32>, now: u64, period: u32) {
 		match deadline {
-			Some(deadline) if deadline != 0 => *self = Heartbeat { deadline, sequence: 0, awaiting: false, due: now.saturating_add(period as u64), expires: 0, spent: false },
+			Some(deadline) if deadline != 0 => *self = Heartbeat { deadline, sequence: 0, awaiting: false, due: now.saturating_add(period as u64), expires: 0, spent: false, expiry_pending: false },
 			_ => *self = Heartbeat::default(),
 		}
 	}
@@ -1285,8 +1284,15 @@ impl Heartbeat {
 		self.awaiting
 	}
 
+	pub fn expiry_pending(&self) -> bool {
+		self.expiry_pending
+	}
+
 	// The soonest tick this node needs the wait to come back at, or 0 for "nothing to wake for".
 	pub fn wake_at(&self) -> u64 {
+		if self.expiry_pending {
+			return self.expires;
+		}
 		if !self.supervised() || self.spent {
 			return 0;
 		}
@@ -1310,6 +1316,9 @@ impl Heartbeat {
 	// reports whether the send happened, because a channel that has gone is a driver that ended
 	// rather than one that is slow.
 	pub fn tick(&mut self, now: u64) -> Beat {
+		if self.expiry_pending {
+			return Beat::Wedged;
+		}
 		if !self.supervised() || self.spent {
 			return Beat::Idle;
 		}
@@ -1317,11 +1326,11 @@ impl Heartbeat {
 			if now < self.expires {
 				return Beat::Idle;
 			}
-			// ONCE, AND THEN NOTHING. Clearing `awaiting` alone left `due` in the past, so the very
-			// next pass sent another `PING` to a binding that was being torn down - and a supervisor
-			// that keeps asking after its own verdict is one whose verdict meant nothing.
+			// Keep the verdict runnable until the node queue accepts it. A full queue must not
+			// turn a single failed push into a permanently unsupervised online binding.
 			self.awaiting = false;
 			self.spent = true;
+			self.expiry_pending = true;
 			return Beat::Wedged;
 		}
 		if now < self.due {
@@ -1329,6 +1338,11 @@ impl Heartbeat {
 		}
 		self.sequence = self.sequence.wrapping_add(1);
 		Beat::Ask(self.sequence)
+	}
+
+	// Called only after the expiry event has entered the node's ordered queue.
+	pub fn expiry_queued(&mut self) {
+		self.expiry_pending = false;
 	}
 
 	// The `PING` went out: the deadline for answering it starts now.

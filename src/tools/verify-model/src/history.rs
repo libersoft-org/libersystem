@@ -511,13 +511,24 @@ impl CostModel {
 	// starts guests is priced at the slowest boot the model knows, per slot it declares. That
 	// over-prices an x86_64 profile row by a lot, which is the direction a seed is supposed to err
 	// in - the run says INCOMPLETE and names what it skipped, and the first real measurement of that
-	// step replaces the seed for good. Everything else gets one second, because a step that runs at
-	// all is not free and a plan of zeros sorts on nothing.
-	pub fn seed_seconds(&self, guests: usize) -> f64 {
+	// step replaces the seed. Non-guest work has no measured cold-start bound here: a host gate
+	// can rebuild the entire runtime. An arbitrary positive minimum is not a conservative seed.
+	pub fn seed_seconds(&self, guests: usize) -> Option<f64> {
 		if guests == 0 {
-			return 1.0;
+			return None;
 		}
 		let slowest: f64 = self.fixed_seconds.iter().filter(|((_, environment), _)| environment != "host").map(|(_, seconds)| *seconds).fold(0.0, f64::max);
-		slowest.max(1.0) * guests as f64
+		Some(slowest.max(1.0) * guests as f64)
+	}
+
+	// None means unpriced, not zero. The unbudgeted runner can execute this work to measure it;
+	// a budget cannot admit it or its dependents using the generic per-key estimate as a bound.
+	pub fn scheduled_seconds(&self, history: &History, step: &crate::commands::Step, model_hash: &str) -> Option<f64> {
+		if let Some(seconds) = history.step_seconds(&step.id, model_hash) {
+			return Some(seconds);
+		}
+		let measured_keys = !step.keys.is_empty() && step.keys.iter().all(|key| history.get(&key.display()).is_some_and(|record| record.model_hash == model_hash && record.last_status == "passed" && !record.cost_was_divided && record.last_seconds > 0.0));
+		let estimate = self.estimate(history, &step.keys, Some(model_hash));
+		if measured_keys { Some(estimate) } else { self.seed_seconds(step.guests).map(|seed| estimate.max(seed)) }
 	}
 }

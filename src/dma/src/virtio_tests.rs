@@ -299,6 +299,36 @@ fn a_transport_that_never_answers_is_unconfirmed_rather_than_assumed() {
 	assert_eq!(iommu.attach(domain, EndpointId(1)), Err(Fault::Unconfirmed));
 	assert_eq!(iommu.map(domain, DmaAddress(0x1000), 0x2000, 0x1000, Direction::ToDevice), Err(Fault::Unconfirmed));
 	assert_eq!(iommu.unmap(domain, DmaAddress(0x1000), 0x1000), Err(Fault::Unconfirmed));
+	assert_eq!(iommu.domain_destroy(domain), Err(Fault::Unconfirmed), "destruction cannot forget the unanswered attachment");
+	assert_eq!(iommu.transport().sent.last().unwrap()[0], T_DETACH, "retirement must request detach, even when ATTACH's reply never arrived");
+}
+
+#[test]
+fn an_attach_applied_without_a_reply_remains_owned_by_the_backend() {
+	struct AppliedWithoutReply {
+		attached: bool,
+		detaches: usize,
+	}
+	impl Transport for AppliedWithoutReply {
+		fn request(&mut self, request: &[u8], _answer: &mut [u8], _status_at: usize) -> Result<(), Fault> {
+			if request[0] == T_ATTACH {
+				self.attached = true;
+			} else if request[0] == T_DETACH {
+				self.detaches += 1;
+			}
+			Err(Fault::Unconfirmed)
+		}
+		fn take_event(&mut self, _out: &mut [u8]) -> Option<usize> {
+			None
+		}
+	}
+	let config = Config::parse(&config_bytes()).unwrap();
+	let mut backend = VirtioIommu::new(AppliedWithoutReply { attached: false, detaches: 0 }, config, REQUIRED).unwrap();
+	let (domain, _) = backend.domain_create().unwrap();
+	assert_eq!(backend.attach(domain, EndpointId(7)), Err(Fault::Unconfirmed));
+	assert!(backend.transport().attached, "the remote operation happened before its reply was lost");
+	assert_eq!(backend.domain_destroy(domain), Err(Fault::Unconfirmed), "an empty local list cannot prove remote destruction");
+	assert_eq!(backend.transport().detaches, 1, "retirement must account for the possibly applied ATTACH");
 }
 
 #[test]

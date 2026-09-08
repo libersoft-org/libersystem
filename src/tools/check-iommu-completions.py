@@ -9,6 +9,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / 'src/kernel/iommu/mod.rs'
 QUEUE = ROOT / 'src/kernel/iommu/virtqueue.rs'
 BUFFER = ROOT / 'src/kernel/object/dma_buffer/mod.rs'
+DEVICE = ROOT / 'src/kernel/device.rs'
 
 
 def function(source, name):
@@ -22,11 +23,12 @@ def main():
     source = SOURCE.read_text()
     wire = source[source.index('pub struct Wire {'):source.index('\npub struct Controller {')]
     production = '\n'.join(function(source, name) for name in (
-        'attach_for', 'domain_of', 'retained_domain_of', 'faults_for', 'grants_for',
+        'attach_endpoint', 'attach_for', 'attachment_quarantined', 'domain_of', 'retained_domain_of', 'faults_for', 'grants_for',
         'quarantined_grants_for', 'requester_of', 'detach_for_inner', 'poll_faults',
         'poll_faults_attributed', 'poll_faults_attributed_with', 'drain_faults',
         'attribution_trustworthy', 'with', 'map_for_device', 'map_device_buffer',
         'domain_for_generation', 'unmap_for_device'))
+    attach_failure = source[source.index('#[derive(Debug)]\npub struct AttachFailure {'):source.index('// Bring one device\'s endpoint under translation:')]
     prelude = r'''
 extern crate alloc;
 use dma::{Fault, Generation};
@@ -51,7 +53,13 @@ mod mem {
     }
     pub mod heap { pub fn try_arc<T>(value: T) -> Option<alloc::sync::Arc<T>> { Some(alloc::sync::Arc::new(value)) } }
 }
-mod arch { pub mod apic { pub fn ticks() -> u64 { 1 } } }
+mod arch {
+    pub mod apic { pub fn ticks() -> u64 { 1 } }
+    pub mod interrupts { pub fn msi_quarantined_for_device(_: u32) -> u32 { 0 } }
+}
+mod dma_policy {
+    pub fn admit(_: u16, _: u8, _: u8, _: u8) -> dma::BindDecision { dma::BindDecision::Translated }
+}
 struct SpinLock<T>(Mutex<T>);
 impl<T> SpinLock<T> {
     const fn new(value: T) -> Self { Self(Mutex::new(value)) }
@@ -74,15 +82,35 @@ impl Domain {
     fn uncharge_dma(&self, bytes: u64) { self.charged.fetch_sub(bytes as usize, Ordering::SeqCst); }
 }
 mod iommu {
-    pub use super::{map_device_buffer, unmap_for_device};
+    pub use super::{attach_for, attachment_quarantined, map_device_buffer, unmap_for_device};
     pub fn translating() -> bool { true }
 }
 mod device {
+    use super::{SpinLock, Ordering, AtomicUsize};
+    struct Entry { device_type: u16, bus: u8, dev: u8, func: u8, on_bus: bool }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ClaimState { Free, Claimed, Releasing, Quarantined }
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum ClaimError { NoSuchDevice, AlreadyClaimed, Quarantined, Retired, Refused }
+    struct Slot { state: ClaimState, generation: u64, retired: bool, msi_quarantined_at_claim: u32,
+        mmio_unconfirmed_at_claim: u32, mmio_unconfirmed: u32 }
+    static DEVICES: SpinLock<Vec<Entry>> = SpinLock::new(Vec::new());
+    static CLAIMS: SpinLock<Vec<Slot>> = SpinLock::new(Vec::new());
+    pub static MASTERED: AtomicUsize = AtomicUsize::new(0);
+    fn bus_master(_: &Entry, enabled: bool) { if enabled { MASTERED.fetch_add(1, Ordering::SeqCst); } }
+    pub fn setup_claim() {
+        *DEVICES.lock() = vec![Entry { device_type: 1, bus: 0, dev: 0, func: 7, on_bus: true }];
+        *CLAIMS.lock() = vec![Slot { state: ClaimState::Free, generation: 0, retired: false,
+            msi_quarantined_at_claim: 0, mmio_unconfirmed_at_claim: 0, mmio_unconfirmed: 0 }];
+        MASTERED.store(0, Ordering::SeqCst);
+    }
+    pub fn state() -> (ClaimState, u64) { let slots = CLAIMS.lock(); (slots[0].state, slots[0].generation) }
     pub fn binding_of_faulting_endpoint(_: u8, _: u8, _: u8, _: u64) -> Option<(usize, bool)> { Some((0, false)) }
     pub fn contain_faulting_endpoint(_: u8, _: u8, _: u8) -> Option<usize> { None }
     pub fn contain_faulting_endpoint_of_a_live_binding(_: u8, _: u8, _: u8, _: u64) -> Option<usize> { None }
 }
 '''
+    prelude = prelude.replace('mod device {', 'mod device {\n' + function(DEVICE.read_text(), 'claim'))
     queue_fixture = r'''
     pub fn simulated() -> (VirtQueue, u64, u64) {
         fn page() -> u64 { Box::into_raw(Box::new([0u64; 512])) as u64 }
@@ -119,13 +147,6 @@ struct Controller { ledger: dma::Iommu<dma::fake::Fake> }
 impl Controller { fn iommu(&mut self) -> &mut dma::Iommu<dma::fake::Fake> { &mut self.ledger } }
 #[derive(Clone, Copy)]
 pub enum Containment { WhateverFaulted, OnlyLiveBindings }
-fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dma::DomainId, Fault> {
-    with(|controller| {
-        let domain = controller.iommu().create_domain(0x1000, 0x100000, Vec::new(), Generation(generation))?;
-        controller.iommu().attach(domain, requester_of(bus, dev, func))?;
-        Ok(domain)
-    }).unwrap()
-}
 // A real detach queues one report before the final production drain. The hardware side is
 // represented by this fixture; the ledger, drain, association, copy and exposed reader are real.
 fn revoke_endpoint(domain: dma::DomainId, bus: u8, dev: u8, func: u8) -> Result<dma::Release, Fault> {
@@ -172,6 +193,46 @@ fn association_allocation_failure_precedes_every_hardware_attach() {
     assert!(attach_for(0, 0, 0, 7, 1), "an existing association needs no allocation or second attach");
     assert!(FAIL_ASSOCIATION_RESERVE.swap(false, Ordering::SeqCst));
     assert_eq!(with(|controller| controller.iommu().backend().attachments()), Some(1));
+}
+#[test]
+fn an_unanswered_attach_keeps_its_claim_and_domain_quarantined() {
+    setup(false);
+    DOMAINS.lock().clear();
+    *CONTROLLER.lock() = Some(Controller { ledger: dma::Iommu::new(dma::fake::Fake::new(), 8) });
+    device::setup_claim();
+    with(|controller| controller.iommu().backend_mut_for_test().inject(dma::fake::Injection::Attach, Fault::Unconfirmed));
+    assert_eq!(device::claim(0), Err(device::ClaimError::Quarantined));
+    assert_eq!(device::state(), (device::ClaimState::Quarantined, 1));
+    assert_eq!(device::MASTERED.load(Ordering::SeqCst), 0);
+    assert_eq!(domain_of(0), None, "an unresolved endpoint is never published as translated");
+    let retained = retained_domain_of(0).expect("the uncertain attachment keeps its device association");
+    with(|controller| {
+        assert_eq!(controller.iommu().generation_of(retained), Some(Generation(1)));
+        assert_eq!(controller.iommu().attached_endpoints(), 1);
+        assert!(!controller.iommu().may_master(retained, dma::EndpointId(7)));
+        assert_eq!(controller.iommu().destroy_domain(retained), Err(Fault::Unconfirmed));
+    });
+    let calls = with(|controller| controller.iommu().backend().calls().len());
+    assert_eq!(device::claim(0), Err(device::ClaimError::Quarantined));
+    assert!(!attach_for(0, 0, 0, 7, 2));
+    assert_eq!(with(|controller| controller.iommu().backend().calls().len()), calls, "retry touches no hardware while ownership is uncertain");
+}
+#[test]
+fn a_confirmed_attach_refusal_keeps_the_claim_free_for_retry() {
+    setup(false);
+    DOMAINS.lock().clear();
+    *CONTROLLER.lock() = Some(Controller { ledger: dma::Iommu::new(dma::fake::Fake::new(), 8) });
+    device::setup_claim();
+    with(|controller| controller.iommu().backend_mut_for_test().inject(dma::fake::Injection::Attach, Fault::NoSpace));
+    assert_eq!(device::claim(0), Err(device::ClaimError::Refused));
+    assert_eq!(device::state(), (device::ClaimState::Free, 0));
+    assert_eq!(device::MASTERED.load(Ordering::SeqCst), 0);
+    assert_eq!(domain_of(0), None);
+    assert_eq!(retained_domain_of(0), None);
+    assert_eq!(with(|controller| controller.iommu().generation_of(dma::DomainId(1))), Some(None));
+    assert!(device::claim(0).is_ok(), "confirmed refusal leaves no quarantine that blocks retry");
+    assert_eq!(device::state(), (device::ClaimState::Claimed, 1));
+    assert_eq!(device::MASTERED.load(Ordering::SeqCst), 1);
 }
 #[test]
 fn a_successful_teardowns_last_fault_is_counted_once() {
@@ -288,12 +349,12 @@ mod buffers {
             (path / 'dma' / file.name).write_text(dma_source if file.name == 'lib.rs' else file.read_text())
         (path / 'dma/Cargo.toml').write_text('[package]\nname="dma"\nedition="2024"\n[lib]\npath="lib.rs"\n')
         (path / 'Cargo.toml').write_text('[package]\nname="iommu-completion-regressions"\nedition="2024"\n[dependencies]\ndma={path="dma"}\nabi={path="' + str(ROOT / 'src/abi') + '"}\n[lib]\npath="tests.rs"\n')
-        program = prelude + 'mod virtqueue {\n' + QUEUE.read_text() + queue_fixture + wire + lifecycle + production + buffer_fixture
+        program = prelude + 'mod virtqueue {\n' + QUEUE.read_text() + queue_fixture + wire + lifecycle + attach_failure + production + buffer_fixture
         (path / 'tests.rs').write_text(program)
         result = subprocess.run(['cargo', 'test', '--offline', '--quiet', '--manifest-path', str(path / 'Cargo.toml'), '--lib', '--', '--test-threads=1'], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if result.returncode or '6 passed' not in result.stdout:
+        if result.returncode or '8 passed' not in result.stdout:
             raise SystemExit(result.stdout)
-        print('iommu-completions: 6 production attach, queue, teardown and buffer regressions passed')
+        print('iommu-completions: 8 production attach, claim, queue, teardown and buffer regressions passed')
         reservation = re.search(r'\tif domains.try_reserve\(1\).is_err\(\) \{.*?\n\t\}\n', program, re.S).group()
         mutations = {
             'bookkeeping reserved after hardware attach': program.replace(reservation, '').replace('\t\t\tdomains.push((index as u32, domain));', reservation + '\t\t\tdomains.push((index as u32, domain));'),
@@ -302,6 +363,8 @@ mod buffers {
             'double-counted terminal fault': program.replace('\tif let Some(slot) = RETAINED.lock().get_mut(index) {\n\t\t*slot = Some(domain);\n\t}\n', '', 1),
             'forgotten buffer completion': program.replace('\t\tiommu.retain_mapping(id)?;\n', ''),
             'confirmed translated frames held after reset': program.replace('(Some(device), true, false) =>', '(Some(device), true, _) =>'),
+            'unconfirmed attachment association forgotten': program.replace('RETAINED.lock()[index] = Some(domain);', 'let _ = domain;'),
+            'unconfirmed attachment claim left free': program.replace('if crate::iommu::attachment_quarantined(index) {', 'if false {'),
         }
         for name, mutant in mutations.items():
             if mutant == program:

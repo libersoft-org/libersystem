@@ -822,11 +822,55 @@ impl Log {
 	}
 
 	pub fn save(&self, repo_root: &Path) -> Result<(), String> {
-		let path = Self::path(repo_root);
+		self.save_file(&Self::path(repo_root))
+	}
+
+	fn load_file(path: &Path) -> Result<Self, String> {
+		match fs::read_to_string(path) {
+			Ok(text) => serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display())),
+			Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Log { schema: 1, records: Vec::new() }),
+			Err(error) => Err(format!("{}: {error}", path.display())),
+		}
+	}
+
+	fn save_file(&self, path: &Path) -> Result<(), String> {
 		if let Some(parent) = path.parent() {
 			fs::create_dir_all(parent).map_err(|error| format!("{}: {error}", parent.display()))?;
 		}
-		fs::write(&path, serde_json::to_string_pretty(self).map_err(|error| error.to_string())?).map_err(|error| format!("{}: {error}", path.display()))
+		fs::write(path, serde_json::to_string_pretty(self).map_err(|error| error.to_string())?).map_err(|error| format!("{}: {error}", path.display()))
+	}
+
+	// The shell producer stages records until its complete sweep has checked source stability.
+	// Direct comparison callers retain their existing immediate-recording behavior.
+	pub fn record(repo_root: &Path, pending: Option<&Path>, record: Record) -> Result<(), String> {
+		let mut log = match pending {
+			Some(path) => Self::load_file(path)?,
+			None => Self::load(repo_root),
+		};
+		log.schema = 1;
+		log.records.push(record);
+		match pending {
+			Some(path) => log.save_file(path),
+			None => log.save(repo_root),
+		}
+	}
+
+	pub fn publish(repo_root: &Path, pending: &Path, expected_source: &str, model_hash: &str) -> Result<usize, String> {
+		let records = Self::load_file(pending)?.records;
+		if records.is_empty() {
+			return Err(String::from("no pending shadow records to publish"));
+		}
+		if records.iter().any(|record| record.source_digest != expected_source || record.model_hash != model_hash) {
+			return Err(String::from("the pending shadow records describe another source or model; no evidence was published"));
+		}
+		if source_digest(repo_root)? != expected_source {
+			return Err(String::from("the source changed before shadow publication; no evidence was published"));
+		}
+		let count = records.len();
+		let mut log = Self::load(repo_root);
+		log.records.extend(records);
+		log.save(repo_root)?;
+		Ok(count)
 	}
 
 	// Clean records for a component, under the CURRENT model. Evidence produced by a different

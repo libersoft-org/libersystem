@@ -1742,3 +1742,35 @@ only P02M0172's producer paragraph changed among these plans. Scoped `verify.sh 
 zero inner checks and zero deferred checks, then exited 6 (`INCOMPLETE`) because the repository
 requires a post-commit merge even for an empty check set. No commit, merge verification or
 implementation-test result is claimed.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0174 (2026-09-08T17:57:11Z):
+
+Current plan rating: 9/10
+
+No unresolved material findings within this milestone's stated scope. The latest planner's
+clean assessment is supported by this independent review; no incomplete correction, unjustified
+rejection or new material contradiction was established.
+
+Verification: read the complete current M1-M8 plan and the entire audit history, checked the
+planner's responses against the P02M0003/P02M0004 architecture and P02M0080 capacity contract,
+and inspected the actual Stack/NetworkService event, timer, diagnostic and MTU paths, the
+service-logic host-test boundary and QEMU Ethernet transport. Cross-checked the current
+P02M0175 route-selection, PMTU, diagnostic cancellation/send-completion and shared-queue
+contracts. Rechecked the protocol corrections against
+[RFC 4861 section 6.3.6](https://www.rfc-editor.org/rfc/rfc4861.html#section-6.3.6),
+[RFC 4191 section 3.2](https://www.rfc-editor.org/rfc/rfc4191.html#section-3.2),
+[RFC 7559 section 2](https://www.rfc-editor.org/rfc/rfc7559.html#section-2),
+[RFC 3315 section 14](https://www.rfc-editor.org/rfc/rfc3315.html#section-14) and
+[RFC 9777 sections 6.2 and 8.2.1](https://www.rfc-editor.org/rfc/rfc9777.html#section-6.2).
+The owning requirements, bounded integration sequence and acceptance cases remain consistent.
+
+This assessment covers the declared appliance profile and its explicit multi-fragment
+conformance gap. It does not claim implemented IPv6 or executed host/guest gates. This review
+changes only this append; the plan is unchanged and every preceding audit byte is preserved.
+
+Consolidated document verification (2026-09-08T17:59:04Z): all four plans match their pre-audit snapshots,
+and every original audit prefix is preserved byte-for-byte. Scoped whitespace checks pass.
+`./verify.sh --for` selected zero inner and zero deferred checks, then exited 6 (`INCOMPLETE`):
+post-commit merge verification remains required. No full revision-verification pass or commit is
+claimed. This re-audit made no source edits; concurrent work outside these four audits was preserved.
