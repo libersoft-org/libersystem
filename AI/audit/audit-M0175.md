@@ -2478,3 +2478,41 @@ responses were appended produced a valid handoff and exited 6 (`INCOMPLETE`), re
 post-commit merge verification even for an empty check set. No full revision-verification
 pass or implementation-test pass is claimed. This review changed only the four audit appends;
 concurrent changes elsewhere were not modified or reverted, and no commit was made.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0175 (2026-09-08T19:03:55Z):
+
+Current plan rating: 8/10.
+
+1. **The corrected fallback deadlines still have no public invocation or assigned orchestration
+   owner.** M5 requires sequential address attempts, abandoning each nonfinal candidate at three
+   seconds while the final candidate gets 183 seconds (`docs/todo/P02M0175.md:830-855`). M1
+   nevertheless only adds an optional source to the single-endpoint `connect` request
+   (`:246-254`); `fetch` explicitly retains an endpoint plus request bytes (`:191-194`), and
+   M6 returns its ordered address list separately (`:930-933`). Neither the destination candidate
+   set nor an early-attempt deadline/cancellation contract reaches either connection operation.
+   M9's caller migration does not assign this missing coordination to a client helper or service.
+
+   For a resolved list containing a black-holed IPv6 address followed by a working IPv4 address,
+   `connect(ipv6_endpoint)` is indistinguishable from a literal, single-candidate open. Following
+   M2's single-candidate rule (`:502-506`) waits 183 seconds, so M5's required three-second advance
+   cannot occur. The current contract supplies no inherited mechanism:
+   `src/idl/network.lsidl:126-129` separates resolution from single-endpoint connect, and the
+   generated request encodes only the operation, correlation and endpoint
+   (`src/user/libs/protocol/network-proto/src/generated/liber/network/v1.rs:1502-1512`).
+   Its RPC deadline only stops the caller's receive
+   (`src/user/libs/ipc/ipc-client/src/lib.rs:39-52`); it neither transmits an attempt deadline
+   nor cancels the server's TCP attempt. Using that timeout alone to start IPv4 would leave the
+   earlier attempt live, contradicting the sequential policy.
+
+   Complete the earlier timeout correction by choosing who owns the multi-candidate open and
+   stating the semantic input or early-abort mechanism that lets it apply both deadlines. This is
+   a missing part of the existing connect/fallback contract, not a request for another subsystem
+   or duplicated IDL field order. Run the existing two-candidate acceptance case through the chosen
+   public/client path, proving IPv4 starts within three seconds, the earlier attempt is retired
+   before the next starts, and the single/final-candidate schedule remains intact.
+
+Verification: read the complete 1438-line plan and all 2480 preceding audit-history lines, and
+checked the planner's responses against current NetworkService, TCP, IDL/client code and P02M0174's
+shared contracts. Previously resolved findings are not repeated. This is a plan assessment;
+implementation and guest acceptance tests remain planned work. Only this result was appended.
