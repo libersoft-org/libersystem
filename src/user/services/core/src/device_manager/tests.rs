@@ -70,3 +70,89 @@ pub unsafe fn pending_shutdown_outcomes() {
 		debug_write(b"DeviceManager: pending shutdown confirmations and timeout classified\n");
 	}
 }
+
+// Exercise the production Node admission, READY/fault reducer and live policy actions. Empty
+// holdings keep the fixture away from real devices while still traversing the manager's paths.
+pub unsafe fn boot_attempt_budget() {
+	unsafe {
+		let mut node = Node::new(0, &DeviceInfo::default(), Vec::new());
+		let mut catalogue = Catalogue::new();
+		for spent in 1..=MAX_AUTOMATIC_ATTEMPTS {
+			node.incident = Incident { opened: true, deadline: 0, teardown_reserve: 0 };
+			assert!(node.admit_bind_attempt(clock()));
+			node.claim_admitted();
+			node.id = node.id.rebound(spent as u64);
+			node.binding = Some(Binding { domain: 0, process: 0, channel: 0, claim: 0, key: ClaimKey::default() });
+			assert!(node.record.move_to(BindingState::Binding, None));
+			assert!(node.push(BindingEvent::Ready { generation: node.id.generation }));
+			let _ = advance(&mut node, b"budget-fixture", &mut catalogue);
+			assert!(node.record.state == BindingState::Online);
+			if node.attempt != spent {
+				debug_write(b"DeviceManager: READY refunded the boot automatic-attempt budget\n");
+			}
+			assert_eq!(node.attempt, spent, "READY cannot refund this boot's automatic attempts");
+			assert!(!node.incident.opened);
+			// The online fault must replace an expired deadline, without replacing the count.
+			node.incident = Incident { opened: true, deadline: 1, teardown_reserve: 0 };
+			assert!(node.push(BindingEvent::Exited { generation: node.id.generation }));
+			let _ = advance(&mut node, b"budget-fixture", &mut catalogue);
+			assert_eq!(node.attempt, spent, "an online fault opens time, not automatic attempts");
+			assert!(node.incident.opened && (node.incident.deadline == 0 || node.incident.deadline > 1));
+			let _ = advance(&mut node, b"budget-fixture", &mut catalogue);
+			assert!(node.teardown.is_none());
+			assert!(node.record.state == if spent < MAX_AUTOMATIC_ATTEMPTS { BindingState::Backoff } else { BindingState::Failed });
+		}
+		assert_eq!(node.record.attempts, MAX_AUTOMATIC_ATTEMPTS);
+		assert!(!node.has_bind_allowance());
+		assert!(!node.admit_bind_attempt(clock()));
+		apply_policy(&mut node, proto::system::PolicyVerb::Disable, "", &mut catalogue);
+		apply_policy(&mut node, proto::system::PolicyVerb::Enable, "", &mut catalogue);
+		assert_eq!(node.attempt, MAX_AUTOMATIC_ATTEMPTS, "disable/enable cannot replenish the boot budget");
+		assert!(!node.has_bind_allowance());
+
+		for already_spent in [0, 1, MAX_AUTOMATIC_ATTEMPTS] {
+			let mut node = Node::new(0, &DeviceInfo::default(), Vec::new());
+			node.attempt = already_spent;
+			assert!(node.record.record_failure(FailureCause::DriverMissing));
+			apply_policy(&mut node, proto::system::PolicyVerb::Retry, "", &mut catalogue);
+			apply_policy(&mut node, proto::system::PolicyVerb::Disable, "", &mut catalogue);
+			assert!(!node.retry_pending && !node.retry_once && !node.restart_requested, "disable cancels a pending operator request");
+			apply_policy(&mut node, proto::system::PolicyVerb::Enable, "", &mut catalogue);
+			assert_eq!(node.attempt, already_spent);
+			assert!(!node.retry_once && !node.retry_pending, "enable cannot revive a cancelled allowance");
+			assert_eq!(node.has_bind_allowance(), already_spent < MAX_AUTOMATIC_ATTEMPTS);
+			assert!(node.record.record_failure(FailureCause::DriverMissing));
+			apply_policy(&mut node, proto::system::PolicyVerb::Retry, "", &mut catalogue);
+			assert_eq!(node.attempt, already_spent, "an operator grant must preserve automatic spending");
+			assert!(node.retry_once && node.retry_pending && node.has_bind_allowance());
+			node.incident = Incident { opened: true, deadline: 300, teardown_reserve: 50 };
+			assert!(!node.admit_bind_attempt(250), "an operator cannot spend the teardown reserve");
+			assert!(node.retry_pending);
+			assert!(node.admit_bind_attempt(20));
+			node.refund_unclaimed_attempt();
+			assert!(node.retry_pending && !node.finish_operator_attempt(), "a refused claim cannot spend the operator grant");
+			assert_eq!(node.attempt, already_spent);
+			spend_candidate(&mut node);
+			assert!(node.has_bind_allowance(), "an unstarted candidate cannot spend the operator grant");
+			assert!(node.admit_bind_attempt(30));
+			node.claim_admitted();
+			assert_eq!(node.attempt, already_spent);
+			assert_eq!(node.record.attempts, 1);
+			assert!(!node.retry_pending && node.retry_once);
+			assert!(!node.has_bind_allowance() && !node.admit_bind_attempt(40), "the operator grant cannot admit a second attempt");
+			// A retryable failure before READY must stop even when automatic spending is still 0/1.
+			node.incident = Incident { opened: true, deadline: 0, teardown_reserve: 0 };
+			node.id = node.id.rebound(1);
+			node.binding = Some(Binding { domain: 0, process: 0, channel: 0, claim: 0, key: ClaimKey::default() });
+			assert!(node.record.move_to(BindingState::Binding, None));
+			assert!(node.push(BindingEvent::Exited { generation: node.id.generation }));
+			let _ = advance(&mut node, b"operator-budget-fixture", &mut catalogue);
+			assert!(matches!(advance(&mut node, b"operator-budget-fixture", &mut catalogue), Step::NextCandidate));
+			assert!(node.record.state == BindingState::Failed, "a failed operator attempt cannot enter automatic Backoff");
+			assert!(node.finish_operator_attempt(), "the completed operator attempt stops automatic fallback");
+			assert!(!node.finish_operator_attempt());
+			assert_eq!(node.attempt, already_spent);
+		}
+		debug_write(b"DeviceManager: boot attempt budget and one-shot operator retry verified\n");
+	}
+}

@@ -34,17 +34,35 @@ fail() {
 	exit 1
 }
 
-for artifact in .build/boot/system-volume-x86_64.img .build/image .build/cache; do
-	[[ -e "$artifact" ]] || fail "$artifact is not here - build this tree first: ./build.sh --arch x86_64"
-done
+# Copy only inputs of this x86_64 test shape. Other guests create and remove boot/state
+# scratch files while this gate runs; none of those files is an input to the private tree.
+seed_mutation_inputs() {
+	local target=x86_64-unknown-none artifact
+	local boot_inputs=(init-x86_64.pkg volume-x86_64.pkg system-volume-x86_64.img system-volume-x86_64.uuid bootstrap-x86_64)
+	mkdir -p "$REPO/.build/state" "$WORK/.build/boot" "$WORK/.build/state" "$WORK/.build/image/$target" "$WORK/.build/cache/$target"
+	(
+		# Share the staged-image producer's lock while taking artifacts and their hash records.
+		flock 9
+		for artifact in "${boot_inputs[@]}"; do
+			[[ -e "$REPO/.build/boot/$artifact" ]] || fail "$artifact is not here - build this tree first: ./build.sh --arch x86_64"
+		done
+		for artifact in image cache; do
+			[[ -d "$REPO/.build/$artifact/$target" ]] || fail "$artifact/$target is not here - build this tree first: ./build.sh --arch x86_64"
+		done
+		# Explicit source arguments keep missing required inputs fatal. No rsync error is ignored.
+		rsync -a --delete "${boot_inputs[@]/#/$REPO/.build/boot/}" "$WORK/.build/boot/"
+		rsync -a --delete "$REPO/.build/image/$target/" "$WORK/.build/image/$target/"
+		# The staged-image preflight reads these digests; compiler objects and build logs are unused.
+		rsync -a --delete --include='*.sha256' --exclude='*' "$REPO/.build/cache/$target/" "$WORK/.build/cache/$target/"
+	) 9>"$REPO/.build/state/build-$target.lock"
+}
+
+python3 "$HERE/test-mutation-inputs.py"
 
 echo "implementation-mutations: preparing the copy at ${WORK#"$REPO/"}"
 mkdir -p "$WORK"
 rsync -a --delete --exclude '.build' --exclude '.git' --exclude 'states' "$REPO/" "$WORK/"
-for part in boot state image cache; do
-	mkdir -p "$WORK/.build/$part"
-	rsync -a --delete "$REPO/.build/$part/" "$WORK/.build/$part/"
-done
+seed_mutation_inputs
 
 # THE STAMP IS OVER PATHS, so a copy never matches the original's however identical its bytes.
 # Rewriting it here is not a way around the staleness check: the sources under the copy ARE the ones

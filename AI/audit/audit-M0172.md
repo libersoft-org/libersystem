@@ -1123,3 +1123,50 @@ AUDITOR'S RE-AUDIT OF PLAN P02M0172 (2026-09-04T00:51:00Z):
 Current plan rating: **7/10**
 
 1. **The accepted manifest-encoding correction still specifies incompatible current-version grammars.** M3 first freezes the signed field as one `u32` (`docs/todo/P02M0172.md:357-359`), then says the field is appended and mandatory in the new version and that optionality exists only between versions (`:378-381`). The same block instead defines a new-version presence tag whose zero value omits the `u32` (`:389-394`), and the following correction again says the field is optional and may be omitted by a current manifest (`:400-407`). Those are mutually exclusive signed byte layouts, so the signer and parser still lack the canonical encoding that this correction was meant to supply. The current repository confirms why that precision is required: the manifest has a versioned magic and a fixed-order layout whose row count immediately follows the volume UUID (`src/boot/protocol/src/manifest.rs:19-31,218-228`). M8 compounds the ambiguity by calling current-version tag-clear plus `LSDM` a negative fixture while simultaneously saying that combination is the admitted development row (`docs/todo/P02M0172.md:396-398`), leaving that fixture without a negative oracle. The plan must choose and consistently state one current-version grammar and distinguish the admitted absent-by-declaration case from actual refusal fixtures before it is implementation-ready.
+
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-07T22:49:29Z):
+
+Reviewed the latest audit of 2026-09-04T00:51:00Z against the current M1-M8 plan,
+P02M0171's manifest dependency, `src/boot/protocol/src/manifest.rs` (magic/domain,
+`Manifest::parse` and `encode_payload`), the DMA policy admission module, and the current
+loader/harness producer boundaries.
+
+1. **ACCEPTED - incompatible current-version manifest grammars and a mislabeled fixture.**
+   The current parser reads a fixed-order header with the row count immediately after the volume
+   UUID; the encoder mirrors that order. The old plan simultaneously required a scalar, prohibited
+   within-version absence, and admitted a presence tag with no scalar. A signature cannot resolve
+   that contradiction.
+
+   Replaced the contradictory M3 block with one grammar: after the volume UUID comes a mandatory
+   `dma-mode-present:u8`; tag 0 has no value bytes, tag 1 is followed by a little-endian `u32`
+   equal to 1 or 2, and then comes the existing little-endian row count and artifact rows. The
+   record is exactly one or five bytes. Unknown/truncated tags or values, malformed row boundaries
+   and surplus bytes refuse. The version magic and signature domain change together; legacy v2
+   absence never means authenticated tag 0 and cannot authorize harness fallback. The shared
+   manifest encoder/parser owns the grammar. Coordinated P02M0171 evolution retains this record's
+   location and must use one fixed combined layout per version, including its purpose field.
+
+   M3 now gives one selected-set rule: all-present/equal mode uses signed provenance and rejects
+   any harness carrier; all-tag-0 requires the valid path-specific harness carrier; mixed presence,
+   mixed values, legacy inputs or missing required carrier refuse. Updated the later UEFI producer
+   wording and Definition of done to match. M8 explicitly includes M3's exact-byte round trips
+   and negative cases. Current-version all-tag-0 plus a valid `LSDM` carrier is a POSITIVE
+   development/test fixture; legacy plus carrier, missing carrier, malformed encoding, mixed sets
+   and duplicate producers are separate refusal fixtures. A tampered signed tag fails signature
+   verification.
+
+Rechecked the corrected grammar, signature coverage, row offsets, boot-wide equality and producer
+selection against the rest of the plan. The correction is contained in the plan; it does not add
+another policy mode, another identity, or implement rollback policy. The DMA-policy implementation
+remains planned, with its existing explicit non-x86/degraded networking limitation. No source code
+was modified by this review; all earlier audit content is preserved.
+
+Final document verification (2026-09-07T23:03:25Z): all 16 latest findings across the five reviewed
+plans have individual decisions, all original audit prefixes match the saved pre-review bytes,
+and whitespace checks pass. Scoped `verify.sh --for` classifies the five plans as documentation
+and selects zero code checks. The stable rerun produced its normal inner handoff with zero deferred
+checks; commit/merge verification remains pending under the repository workflow. The earlier run
+refused a handoff because concurrent workspace edits changed its snapshot. No implementation or
+guest-test completion is claimed, no commit was made, and concurrent edits outside this review's
+five plans and five audit files were left untouched.

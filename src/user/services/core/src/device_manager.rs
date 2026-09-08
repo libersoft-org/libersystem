@@ -94,9 +94,9 @@ unsafe fn report_boot_window() {
 // the registry allows and by nothing compiled in.
 //
 // So the count TRAVELS. The report carries the first provider as it always did, a `BLOCKS` message
-// says how many follow, and then that many providers and that many probe connections. The bound is
-// `MAX_PROVIDERS`, which `build.rs` sums from every `provides` the manifest declares - the registry's
-// number, reaching the wire without this file holding an opinion about it.
+// says how many follow, and then that many providers and that many probe connections. Each binding
+// is bounded by its manifest declarations; the catalogue and hand-off grow with the bindings on
+// this machine instead of imposing a global program count.
 
 // EVERY NUMBER THAT BOUNDS A BIND, IN ONE PLACE.
 //
@@ -435,6 +435,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		{
 			tests::unopened_provider_withdrawal();
 			tests::pending_shutdown_outcomes();
+			tests::boot_attempt_budget();
 		}
 		// One node per device, for the life of this program - see `launch_boot_drivers`. Both
 		// bring-up phases append to this, and what supervises a driver afterwards reads it.
@@ -455,11 +456,9 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 		// These were four named locals - `block_client`, `block2_client`, `block3_client`,
 		// `block4_client` - each routed by hand, so a second disk had somewhere to go and a fifth
 		// did not, and which volume was which depended on which driver finished first. What is left
-		// is the number of BLOCK tags the hand-off to ServiceManager carries, which is a fact about
-		// that wire: `BLOCK`, `BLOCK2`, `BLOCK3`, `BLOCK4`, feeding the system, media, ISO and UDF
-		// volumes. The CATALOGUE has no such number - it holds `MAX_PROVIDERS` of any kind - so a
-		// fifth disk is published, counted and REPORTED rather than silently dropped into a variable
-		// that does not exist.
+		// is a counted hand-off carrying every block provider and an independent probe connection.
+		// StorageService selects roles from the paired UUID and probed formats. Both lists grow with
+		// the catalogue, so a fifth disk is published and considered just like the first.
 		let mut boot_blocks: Vec<u64> = Vec::new();
 		// A connection to each block provider for whoever has to CHOOSE among them - see
 		// `mint_connection` and the `PROBE` tags below.
@@ -601,7 +600,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 						// cursor still advances, so a later request tries the entry after this one
 						// rather than the same one again; what does not happen is this program
 						// starting it unasked.
-						if core::mem::take(&mut nodes[at].retry_once) {
+						if nodes[at].finish_operator_attempt() {
 							print(b"DeviceManager: the attempt an operator asked for is spent; the next candidate is not started automatically\n");
 						} else if nodes[at].candidate < nodes[at].candidates.len() {
 							start_candidate(&mut nodes[at], recovery.storage, recovery.key_producer, power, console_input, device_privilege, &catalogue, &mut recovery.state);
@@ -1033,7 +1032,7 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 		// connections through `CONNECT`, so the instance that probes them competes with nobody.
 		// Taken first because `take` moves the offered channel and this asks the same binding.
 		// ONE PER PROVIDER THIS MACHINE HAS, not one per slot this program declared. The list grows
-		// to whatever the catalogue holds, which `MAX_PROVIDERS` already bounds.
+		// to whatever the catalogue holds under each binding's declared provider bounds.
 		// IN THE SAME ORDER THE HAND-OFF BELOW USES, WHICH WAS NOT TRUE (fixed 2026-09-04).
 		//
 		// This walked `entries` in SLOT order, which is publication order - slots are filled as
@@ -1186,7 +1185,7 @@ unsafe fn launch_volume_drivers(storage: u64, catalogue: &mut Catalogue, nodes: 
 						// THE SAME RULE IN THE OTHER HANDLER - see `Node::retry_once`. Both advance
 						// the cursor and both start the next entry, so a one-shot honoured in only
 						// one of them is a one-shot that depends on which loop the node was in.
-						if core::mem::take(&mut nodes[at].retry_once) {
+						if nodes[at].finish_operator_attempt() {
 							print(b"DeviceManager: the attempt an operator asked for is spent; the next candidate is not started automatically\n");
 						} else if nodes[at].candidate < nodes[at].candidates.len() {
 							start_candidate(&mut nodes[at], storage, key_producer, power, console_input, device_privilege, catalogue, &mut state);
@@ -1276,7 +1275,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 				}
 				return;
 			}
-			if node.attempt >= MAX_AUTOMATIC_ATTEMPTS || (node.incident.opened && !node.incident.allows_backoff(0)) {
+			if !node.has_bind_allowance() || (node.incident.opened && !node.incident.allows_backoff(0)) {
 				node.retry_at = 0;
 				node.waiting_for_claim = false;
 				let cause = node.record.failure.unwrap_or(FailureCause::HandshakeTimeout);
@@ -1306,7 +1305,7 @@ unsafe fn start_candidate(node: &mut Node, storage: u64, key_producer: u64, powe
 				// candidate a full automatic budget, so one `retry` on a device whose first artifact
 				// is missing opened three attempts on the second. Nothing ran, so the operator's one
 				// attempt is not spent; what must not happen is it turning back into the automatic
-				// budget it was set one below.
+				// budget the operator request must not replace.
 				node.attempt = driver_binding::budget_after_nothing_ran(node.retry_once, node.attempt);
 				continue;
 			};
@@ -1681,7 +1680,7 @@ struct Node {
 	incident: Incident,
 	// Latched when BIND is sent; unrelated wakes cannot extend this attempt.
 	ready_deadline: u64,
-	// How many automatic attempts this incident has spent.
+	// Automatic attempts spent by this node during this boot; a new incident does not refund them.
 	attempt: u32,
 	// The registry candidates left to try, most specific first, and which one is being tried.
 	candidates: Vec<&'static Entry>,
@@ -1742,11 +1741,11 @@ struct Node {
 	stop_intent: driver_binding::StopIntent,
 	// What the last teardown found, if there has been one. Rendered by P02M0166; kept here because
 	// the node outlives the binding it is about, which is the whole reason the node exists.
-	// AN OPERATOR'S `retry` IS ONE ATTEMPT, AND THE ATTEMPT OUTLIVES THE CANDIDATE.
-	//
-	// `PolicyVerb::Retry` grants it by setting `attempt` one below the automatic bound. The count
-	// remains spent across candidates; this flag also stops candidate traversal after that request.
+	// The operator chain stays marked after its one claim, so failure cannot start an automatic
+	// fallback. Its unspent allowance is separate from this boot's automatic attempt counter.
 	retry_once: bool,
+	// The operator allowance has not yet acquired a claim. Missing/refused candidates retain it.
+	retry_pending: bool,
 	incident_report: Option<Diagnostic>,
 	// WHETHER THAT REPORT HAS BEEN WRITTEN SOMEWHERE THAT OUTLIVES THIS PROGRAM. See
 	// `persist_incidents`: held only here, the snapshot died with the manager that took it.
@@ -1861,7 +1860,41 @@ type Heartbeat = driver_binding::Heartbeat;
 
 impl Node {
 	fn new(index: u64, info: &DeviceInfo, candidates: Vec<&'static Entry>) -> Node {
-		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
+		Node { id: BindingId::new(info.bus, info.dev, info.func, 0), index, info: *info, record: BindingRecord::new(), restart_requested: false, retry_at: 0, binding: None, offers: Offers::new(), incident: Incident { opened: false, deadline: 0, teardown_reserve: 0 }, ready_deadline: 0, attempt: 0, candidates, candidate: 0, running: None, spent: None, selection_pending: false, preferred: None, queue: BindingQueue::new(), beat: Heartbeat::default(), matched_rule: 0, granted_resources: 0, stop_intent: driver_binding::StopIntent::default(), last_opcode: 0, last_frame_at: 0, retry_once: false, retry_pending: false, incident_report: None, incident_stored: false, teardown: None, waiting_for_claim: false, stop_deadline: 0, disabled_by_policy: false }
+	}
+
+	// A manual grant is separate from the automatic count and survives only until one claim.
+	fn has_bind_allowance(&self) -> bool {
+		if self.retry_once { self.retry_pending } else { self.attempt < MAX_AUTOMATIC_ATTEMPTS }
+	}
+
+	fn admit_bind_attempt(&mut self, now: u64) -> bool {
+		if self.retry_once {
+			return self.retry_pending && (self.incident.deadline == 0 || now < self.incident.deadline.saturating_sub(self.incident.teardown_reserve));
+		}
+		driver_binding::admit_attempt(&mut self.attempt, MAX_AUTOMATIC_ATTEMPTS, now, self.incident.deadline, self.incident.teardown_reserve)
+	}
+
+	fn refund_unclaimed_attempt(&mut self) {
+		if !self.retry_once {
+			self.attempt -= 1;
+		}
+	}
+
+	fn claim_admitted(&mut self) {
+		if self.retry_once {
+			self.retry_pending = false;
+		}
+		self.record.attempts = self.record.attempts.saturating_add(1);
+	}
+
+	// A pre-claim refusal can try another candidate under the same unspent operator grant.
+	fn finish_operator_attempt(&mut self) -> bool {
+		if self.retry_once && !self.retry_pending {
+			self.retry_once = false;
+			return true;
+		}
+		false
 	}
 
 	// Queue one event for this node.
@@ -3427,7 +3460,7 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// `DriverExited` while sending the initial frames are both classified retryable by the crate -
 		// so ending the node permanently on the first transient shortage was the table's
 		// `Stopping -> Backoff` edge being unreachable from the one place that needed it.
-		let attempts_left: bool = may_try_again(&node.incident, node.attempt);
+		let attempts_left: bool = !node.retry_once && may_try_again(&node.incident, node.attempt);
 		// The backoff this attempt was waiting out is spent; nothing should wake for it again - and
 		// this attempt IS the re-read a parked node was waiting to make, so the park is over
 		// whatever this attempt turns out to be. The arm below sets it again if the claim is still
@@ -3446,8 +3479,8 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 		// life - and `advance` reads `stop_intent != Fault` as "planned", which is never retried.
 		//
 		// The reachable case is a dependency: losing a requirement stores `DependencyLost`, the
-		// requirement returns, `settle_dependencies` asks for a bind and `READY` resets the attempt
-		// counter and the incident - and then a genuine crash an hour later was judged a PLANNED
+		// requirement returns, `settle_dependencies` asks for a bind and `READY` ends the incident
+		// window - and then a genuine crash an hour later was judged a PLANNED
 		// stop. It skipped the retry decision, landed at `DependencyPending` whatever the attempts
 		// said, and the standing loop - finding the requirement present - started it again with the
 		// budget reset. A crash loop with no backoff and no ceiling, which is the one outcome M0162
@@ -3504,11 +3537,11 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			}
 			ClaimReadiness::Terminal(cause) => return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, cause, driver_name, attempts_left)),
 		}
-		if !driver_binding::admit_attempt(&mut node.attempt, MAX_AUTOMATIC_ATTEMPTS, clock(), node.incident.deadline, node.incident.teardown_reserve) {
+		if !node.admit_bind_attempt(clock()) {
 			node.record.record_failure(FailureCause::HandshakeTimeout);
 			return BindStart::CandidateFailed;
 		}
-		let attempts_left = may_try_again(&node.incident, node.attempt);
+		let attempts_left = !node.retry_once && may_try_again(&node.incident, node.attempt);
 		let grant: ClaimGrant = match device_claim(node.index, device_privilege) {
 			Ok(grant) => grant,
 			// WHICH REFUSAL IT WAS. The kernel keeps two apart and this collapsed them into one:
@@ -3518,15 +3551,15 @@ unsafe fn begin_bind(node: &mut Node, info: &DeviceInfo, elf: &[u8], driver_name
 			// did. Everything else here is "somebody else holds it", which is `claim-refused` and is
 			// not worth waiting on either.
 			Err(errno) if errno == abi::ERR_ACCESS_DENIED => {
-				node.attempt -= 1;
+				node.refund_unclaimed_attempt();
 				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::IommuRequired, driver_name, attempts_left));
 			}
 			Err(_) => {
-				node.attempt -= 1;
+				node.refund_unclaimed_attempt();
 				return bind_start_of(give_up_retryable(&mut node.record, &mut txn, &mut node.offers, &mut node.teardown, teardown_deadline, FailureCause::ClaimRefused, driver_name, attempts_left));
 			}
 		};
-		node.record.attempts = node.attempt;
+		node.claim_admitted();
 		txn.held = driver_binding::Holdings::claimed(grant.claim, driver_protocol::ResourceKind::Device as u16, grant.memory);
 		txn.key = grant.key;
 		node.record.generation = grant.key.generation;
@@ -3794,30 +3827,15 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 							continue;
 						}
 					}
-					// THE BRING-UP INCIDENT IS SPENT AND A NEW ONE STARTS WHEN THE RECOVERY DOES.
-					//
-					// Neither counter was reset here, so a crash an hour later was judged against the
-					// incident opened for the ORIGINAL bring-up: expired, so recovery was declared
-					// spent before it began - or, if it had not expired, charged with whatever
-					// attempts the bring-up had already used. A driver that came up is a driver whose
-					// bring-up succeeded, and what follows is a different incident.
-					//
-					// AND OPENING THAT INCIDENT HERE ONLY MOVED THE EXPIRY (corrected 2026-09-04).
-					// `Incident::open` is an ABSOLUTE `now + slice` deadline, so a window opened at
-					// `READY` is spent a few seconds later while the driver is still healthy - and a
-					// crash an hour after that consulted it, found no room for a backoff, and went
-					// straight to `Failed` without one attempt. That is the same defect the paragraph
-					// above describes, one moment along. A recovery chain's window belongs where the
-					// chain starts, which is the crash; the arm in `advance` that ends an ONLINE
-					// binding opens it. Here the counter is reset and the window is simply left to
-					// expire, because nothing reads it while a node is online.
-					node.attempt = 0;
+					// Success ends the incident window, but automatic spending lasts for the boot.
+					// A later online fault opens a fresh window with only the remaining attempts.
 					node.incident.opened = false;
 					node.ready_deadline = 0;
 					// AND THE OPERATOR'S ONE ATTEMPT SUCCEEDED, so there is nothing left to spend.
 					// A flag left set here would stop the FIRST later crash from trying the next
 					// candidate, long after the request that set it was answered.
 					node.retry_once = false;
+					node.retry_pending = false;
 					// The entry this binding is RUNNING - see `Node::entry`. Latched at the bind
 					// commit, so a `select` between the commit and this `READY` cannot publish the
 					// live driver's providers against another candidate's declaration.
@@ -3931,9 +3949,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			// new chain is a binding that had come up.
 			if node.record.state == BindingState::Online {
 				node.incident = Incident::open();
-				// The binding that just failed is the first attempt in this recovery chain,
-				// leaving the same two bounded retries and two backoffs as initial bring-up.
-				node.attempt = 1;
+				// The time window is fresh; previously admitted automatic attempts remain spent.
 			}
 			if let Some(next) = next_state {
 				if !node.record.move_to(next, Some(cause)) {
@@ -3944,7 +3960,7 @@ unsafe fn advance(node: &mut Node, driver_name: &[u8], catalogue: &mut Catalogue
 			// A PLANNED STOP IS NEVER RETRIED, whatever the cause reads as: the whole point of
 			// asking a driver to stop is that it stays stopped.
 			let planned: bool = node.stop_intent != driver_binding::StopIntent::Fault;
-			let retryable: bool = !planned && cause.retryable() && may_try_again(&node.incident, node.attempt);
+			let retryable: bool = !planned && !node.retry_once && cause.retryable() && may_try_again(&node.incident, node.attempt);
 			let deadline: u64 = node.incident.teardown_deadline();
 			if retryable {
 				retry_or_quarantine(&mut txn, &mut node.offers, &mut node.teardown, deadline, cause);
@@ -4177,12 +4193,9 @@ unsafe fn settle_dependencies(nodes: &mut [Node], catalogue: &mut Catalogue) -> 
 				// also exactly what the operator's retry does, which is what the comment above always
 				// claimed this shared with it.
 				BindingState::DependencyPending if met => {
-					// AN OPERATOR'S ONE ATTEMPT IS NOT TURNED BACK INTO THE AUTOMATIC BUDGET HERE
-					// (2026-09-03). A granted retry starts at `MAX_AUTOMATIC_ATTEMPTS - 1` with
-					// `retry_once` set, and a requirement that was missing parks it - so an
-					// unconditional reset handed the operator the whole budget the grant exists to
-					// withhold, and a retryable failure after that bind could take `Step::Again`
-					// repeatedly. The same rule the missing-artifact advance uses.
+					// A returned dependency preserves automatic spending and any unspent operator
+					// allowance. Waking a parked request grants no new attempt and does not change
+					// its one-shot chain marker. Missing-artifact advances follow the same rule.
 					node.attempt = driver_binding::budget_after_nothing_ran(node.retry_once, node.attempt);
 					node.retry_at = 0;
 					node.restart_requested = true;
@@ -4375,6 +4388,13 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				// stops the next one starting, and it is what a stored record restores on the next
 				// boot - see `load_stored_policy` and the check in `begin_bind`.
 				node.disabled_by_policy = true;
+				// Disabling cancels an unstarted operator request. A claimed operator attempt
+				// keeps its chain marker until teardown, so it still cannot retry automatically.
+				node.retry_pending = false;
+				node.restart_requested = false;
+				if node.binding.is_none() && node.teardown.is_none() {
+					node.retry_once = false;
+				}
 				node.stop_intent = driver_binding::StopIntent::OperatorDisable;
 				// A RUNNING BINDING IS STOPPED, NOT RELABELLED - AND `Online` IS NOT THE ONLY ONE
 				// THAT IS RUNNING (2026-09-03).
@@ -4439,7 +4459,8 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				// from. The desire is lifted either way; only a node that actually reached `Unbound`
 				// gets an attempt.
 				if node.record.move_to(BindingState::Unbound, None) {
-					node.attempt = 0;
+					// Enable lifts the policy; it does not grant more automatic attempts.
+					node.finish_operator_attempt();
 					node.incident = Incident::open();
 					// AND THE CURSOR IS REWOUND WHEN THERE IS NOTHING LEFT TO TRY, exactly as
 					// `PolicyVerb::Retry` does it and for the same reason: `start_candidate` returns
@@ -4488,35 +4509,9 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 			// without that rule the two mechanisms meet in the table with nothing said, and whoever
 			// implements it decides for themselves whether an operator can spend the budget again.
 			PolicyVerb::Retry => {
-				// EXACTLY ONE FURTHER ATTEMPT, AND IT IS ACTUALLY OPENED.
-				//
-				// This subtracted from the counter and replaced the incident, and left the record in
-				// `Failed` - so it granted zero attempts, not one: nothing performed the legal
-				// `Failed -> Binding` transition and nothing called a bind path. The standing loop
-				// starts a candidate for a node it finds in `Backoff`, which is where a retry with a
-				// budget belongs; from there the ordinary machinery runs exactly one attempt, because
-				// the incident is fresh and `Retry` does not reset the automatic budget.
-				// EXACTLY ONE, COUNTED FROM THE BOUND RATHER THAN FROM WHATEVER THE COUNTER HOLDS
-				// (corrected 2026-08-31).
-				//
-				// `attempt.saturating_sub(1)` assumed the counter was at the bound, and on the case
-				// this verb exists for it is at ZERO: `Step::NextCandidate` resets `attempt` to 0
-				// every time it advances the cursor, including the advance PAST the final candidate
-				// that records exhaustion. So a retry after exhaustion subtracted one from zero,
-				// saturated at zero, and handed the node the whole automatic budget again - three
-				// further attempts where the operator asked for one, and the comment two lines up
-				// promising it "does not reset the automatic budget" was describing the opposite of
-				// what happened.
-				//
-				// Set rather than decremented: `may_try_again` allows another attempt while
-				// `attempt < MAX_AUTOMATIC_ATTEMPTS`, so leaving exactly one means starting from
-				// one below the bound whatever the counter happened to be.
-				//
-				// THE ARITHMETIC IS THE LIBRARY'S (2026-09-02) - see `driver_binding::one_more_attempt`.
-				// Both of the corrections recorded above were arithmetic mistakes in code no host
-				// test could reach; the rule is one place now, with a test that says "exactly one".
+				// Preserve automatic spending. The pending grant is consumed only after a claim
+				// succeeds; retry_once then keeps failure from opening an automatic chain.
 				let granted = driver_binding::one_more_attempt(node.candidate, node.candidates.len(), node.preferred, MAX_AUTOMATIC_ATTEMPTS);
-				node.attempt = granted.attempt;
 				node.incident = Incident::open();
 				// AND THE CURSOR IS REWOUND WHEN THERE IS NOTHING LEFT TO TRY, which is the case this
 				// granted zero attempts in.
@@ -4539,17 +4534,8 @@ unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifac
 				// the stored-policy load and the live `select` verb set, so a retry consults the same
 				// field rather than inventing which entry was meant.
 				node.candidate = granted.candidate;
-				// AND THE ONE ATTEMPT IS THE WHOLE REQUEST, NOT ONE PER CANDIDATE (corrected
-				// 2026-09-01).
-				//
-				// Setting `attempt` to one below the bound spends the automatic budget for THIS
-				// candidate, and that is as far as a counter can reach: when the attempt fails,
-				// `advance` answers `Step::NextCandidate`, both loop handlers advance the cursor,
-				// reset `attempt` to zero and start the next entry with a full budget. A device with
-				// three candidates therefore answered "try once" with one attempt plus six more. The
-				// flag says the request is spent whatever the cursor does, and the handlers read it
-				// where they would otherwise walk on.
 				node.retry_once = true;
+				node.retry_pending = true;
 				// ASKED FOR, AND THE LOOP PERFORMS IT. A state change alone would not do: `advance`
 				// is event-driven and a node sitting in `Failed` or `Backoff` raises no event, so
 				// nothing would ever start the attempt. The flag is consumed once by the standing

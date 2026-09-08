@@ -1,6 +1,6 @@
 # P02M0177 guest case inventory
 
-The launchers and predicates below cover all eight `GATES_THAT_BOOT_A_GUEST`, all sixteen
+The launchers and predicates below cover all nine `GATES_THAT_BOOT_A_GUEST`, all sixteen
 `PROFILE_ROW_GATES`, and `concurrent-selection` in `verify-model/src/catalog.rs`. Umbrella gates
 run the listed cases serially; only `verify.sh` schedules separate steps. Each case keeps its existing
 post-run assertions. `src/tools/guest-verdict.py` now supplies the named early termination predicates;
@@ -101,6 +101,7 @@ All interrupt rows require their controller identity and at least five delivered
 
 | Gate / case | Launcher and final predicate | Observation and backstop |
 | --- | --- | --- |
+| `provider-media-order` | `MEDIA_ORDER=swapped test.sh --arch x86_64 --tags boot`; suite completion and real routed file reads with FAT and UDF exchanged on the bus | Shared suite predicate/backstop; the boot test checks volume contents, including USB, rather than accepting enumeration order. |
 | `smp-core-cap` | `test.sh` x86_64 smoke with `MAX_CPUS + 8`; suite completion, surplus parked, no unreachable shootdown, no retired pages | Shared suite predicate/backstop; no later assertion remains after suite exit. |
 | `implementation-mutations`: duplicate-rights widening | Isolated mutation tree, `test.sh` with exact capability conformance fixture; failed suite with the widening assertion | `run_mutation` requires expected assertion, not compile error or unrelated failure; existing 900 s outer backstop. |
 | `implementation-mutations`: stale generation | Same, with expected stale-handle assertion | Same. |

@@ -43,8 +43,8 @@ affected - from a derived dependency graph, and this script is one of the things
   ./verify.sh --for src/user/libs/audio/flac --plan
   ./verify.sh --for-change
 
-The three suites share the disk images under .build/boot, so two runs at once fail with a QEMU
-write-lock error naming an image rather than the run that holds it. --arch all runs them in turn.
+Each guest receives private writable images under .build/boot. --arch all runs the suites
+concurrently; a leftover QEMU holding a shared writable image is still refused before launch.
 
 x86_64 runs under KVM; aarch64 and riscv64 are emulated instruction by instruction, so a loaded
 host slows them by far more than it slows x86_64. Measured on 2026-08-08 with the machine at load
@@ -175,7 +175,7 @@ require_no_stray_qemu() {
 	# The question the check means to ask is answerable exactly: a process's open files are in
 	# `/proc/<pid>/fd`, and the images two runs contend over are the shared ones under `.build`. A
 	# gate's private copy in its own temp directory conflicts with nobody and is not looked for.
-	local build holders="" opaque="" pid held target fd
+	local build holders="" opaque="" pid held target fd flags relative owner ancestor parents contents
 	build="$(cd "$BUILD_DIR" && pwd -P)"
 	for pid in $pids; do
 		# Not readable means not answerable - and an unanswered question is reported as one rather
@@ -184,26 +184,50 @@ require_no_stray_qemu() {
 			opaque+="$pid "
 			continue
 		fi
+		# A runner either execs QEMU or remains its parent. The test harness also owns
+		# the inherited run logs, so permit private files owned by this live ancestry.
+		parents=" $pid "
+		ancestor="$pid"
+		while [[ "$ancestor" =~ ^[0-9]+$ && "$ancestor" -gt 1 ]]; do
+			# Snapshot procfs in one read; successive shell reads can see EOF
+			# while the live process updates the generated status contents.
+			contents="$(<"/proc/$ancestor/status")" 2>/dev/null || break
+			[[ "$contents" =~ $'\nPPid:'[[:blank:]]+([0-9]+) ]] || break
+			ancestor="${BASH_REMATCH[1]}"
+			parents+="$ancestor "
+		done
 		held=""
 		for fd in "/proc/$pid/fd"/*; do
 			target="$(readlink "$fd" 2>/dev/null)" || continue
 			[[ "$target" == "$build/"* ]] || continue
-			# AND SHARING A READ-ONLY FIXTURE IS NOT A COLLISION, which is the half this check was
-			# missing once the runner stopped sharing anything writable.
-			#
-			# Every image a guest WRITES is now this run's own copy - the system disk, the ESP, the
-			# console capture, and the USB fixture - and the fixtures it reads are attached
-			# `readonly=on` and keyed by content, so two guests opening one of them is the arrangement
-			# rather than the accident. Refusing on those would refuse exactly the parallelism the
-			# isolation was built for, and the message would name a file that cannot be the reason.
-			#
-			# `usb-media*.img` USED TO BE ON THIS LIST AND WAS NOT READ-ONLY. It is attached writable,
-			# so exempting it exempted the one shared file two guests could actually corrupt for each
-			# other. It is now copied per run like the system disk; the exemption below covers the
-			# per-run copies, whose names carry the pid.
-			case "${target##*/}" in
-			iso-media*.iso | fat-media*.img | udf-media*.udf | usb-media*.[0-9]*.img | libersystem.iso | libersystem-test.*.iso) continue ;;
-			esac
+			# Read-only descriptors cannot contend for QEMU's writable image lock.
+			# Inspect the actual mode: a fixture-looking name alone is no guarantee.
+			flags=""
+			contents="$(<"/proc/$pid/fdinfo/${fd##*/}")" 2>/dev/null || contents=""
+			[[ "$contents" =~ $'\nflags:'[[:blank:]]+([0-7]+) ]] && flags="${BASH_REMATCH[1]}"
+			if [[ "$flags" =~ ^[0-7]+$ ]] && (((8#$flags & 3) == 0)); then
+				continue
+			fi
+
+			# Match qemu-run.sh's private image/firmware/console names and
+			# test-kernel.sh's private log names, including their live owner PID.
+			# Unknown writable paths, templates and another run's files still block.
+			relative="${target#"$build/"}"
+			owner=""
+			if [[ "$relative" =~ ^boot/(virtio-blk|usb-media)[a-z0-9_-]*\.[0-9a-f]{64}\.([0-9]+)\.img$ ]]; then
+				owner="${BASH_REMATCH[2]}"
+			elif [[ "$relative" =~ ^logs/test/(x86_64|aarch64|riscv64)-[0-9]{8}T[0-9]{6}Z-([0-9]+)-(run|guest)\.log$ ]]; then
+				owner="${BASH_REMATCH[2]}"
+			else
+				case "$relative" in
+				boot/esp-x86_64.*.img | boot/esp-aarch64.*.img | boot/esp-riscv64.*.img | boot/ovmf-vars.*.fd | boot/aavmf-vars.*.fd | boot/virtio-console*.out)
+					owner="${relative%.*}"
+					owner="${owner##*.}"
+					[[ "$relative" =~ ^boot/[a-z0-9_-]+\.[0-9]+\.[a-z]+$ ]] || owner=""
+					;;
+				esac
+			fi
+			[[ -n "$owner" && "$parents" == *" $owner "* ]] && continue
 			held="$target"
 			break
 		done

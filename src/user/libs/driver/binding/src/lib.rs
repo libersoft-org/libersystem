@@ -335,8 +335,8 @@ pub fn budget_after_nothing_ran(_retry_once: bool, attempt: u32) -> u32 {
 	attempt
 }
 
-// Count attempts when admitted, across every candidate in one incident. Missing artifacts and
-// parked dependencies do not call this and cannot replenish either bound.
+// Count automatic attempts when admitted, across this node's candidates and incidents in the boot.
+// Missing artifacts and parked dependencies spend nothing; a fresh deadline does not reset spent.
 pub fn admit_attempt(spent: &mut u32, maximum: u32, now: u64, deadline: u64, reserve: u64) -> bool {
 	if *spent >= maximum || (deadline != 0 && now >= deadline.saturating_sub(reserve)) {
 		return false;
@@ -446,7 +446,8 @@ pub struct BindingRecord {
 	// claimed. Every event carries the generation it is about, and one that does not match is
 	// dropped - which is what stops a dying driver from touching its replacement's state.
 	pub generation: u64,
-	// Automatic attempts spent on THIS incident. An operator retry is not one of them.
+	// Actual claimed bind attempts for this node, including operator attempts. The manager keeps
+	// the separate automatic budget; this count includes every attempt that obtained a claim.
 	pub attempts: u32,
 }
 

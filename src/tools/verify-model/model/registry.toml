@@ -105,6 +105,11 @@ component = "harness.tools"
 path = "src/user/services/manifest.toml"
 component = "manifest"
 
+# Shared source included by the two provider-subscription consumers, outside either crate.
+[[ownership]]
+path = "src/user/services/provider_subscription.rs"
+component = "services.provider-subscription"
+
 # The interface definitions every generated protocol crate is produced from. `./gen.sh` passes
 # `idl/*.lsidl` to every one of the sixteen, so one .lsidl reaches all of them.
 [[ownership]]
@@ -525,6 +530,12 @@ from = ["kernel", "services"]
 to = "manifest"
 kind = "generation"
 reason = "build.rs generates manifest.rs, library_paths.rs and program_paths.rs from it"
+
+[[edge]]
+from = ["bin.permission_manager", "bin.storage_service"]
+to = "services.provider-subscription"
+kind = "link.static"
+reason = "both binary roots include ../../provider_subscription.rs through an explicit path module"
 
 # The SDK payload. `component_host` loads `components/liber_component/app.wasm` from the volume at
 # run time; the manifest declares it as a factory file and no linker sees the edge at all. Found by

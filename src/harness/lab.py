@@ -2808,11 +2808,11 @@ def cmd_dev_test(args):
 		dev_owner_conflict(identity)
 	if state != 'ready':
 		die(f'development instance is {state}; scenarios need a ready one (`./dev.sh up`)')
-	# The fixtures are checked against the tree they were made from BEFORE anything is published.
-	# Validation used to check only that the files existed, so a fixture whose staged source had
-	# been rebuilt was published as though it were current and the run's verdict was about bytes
-	# from an older tree.
-	stale = scenario.stale_fixtures()
+	# Check the complete fixture set before any scenario that can publish host files runs.
+	# Terminal-only scenarios consume none of it: a leaf rebuild can legitimately make uname's
+	# generated fixture stale while its shell scenario tests the newly published executable.
+	uses_host_files = any(step['do'] in ('publish', 'fixture') for _, document in documents for step in document['step'])
+	stale = scenario.stale_fixtures() if uses_host_files else []
 	if stale:
 		for complaint in stale:
 			print(f'lab: {complaint}', file=sys.stderr)

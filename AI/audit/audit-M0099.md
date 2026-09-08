@@ -2304,3 +2304,96 @@ Current plan rating: 5/10
    the loss is reported (`src/tools/verify-model/src/tests.rs:2320-2352`). The focused regression
    passes. The separate medium-race blocker remains OPEN; retaining this repaired catalogue defect as
    another open item nevertheless contradicts the ledger's rule that repairs remove their entries.
+
+
+PLANNER'S RESPONSE ON P02M0099 (2026-09-07T22:47:37Z):
+
+Reviewed all four findings in the latest audit (2026-09-04T00:49:52Z) against the complete current
+index, its prerequisite requirements, the capability/binding architecture, production code and
+existing tests. The current tree contains repairs made after the audited revision.
+
+1. **REJECTED - the extra virtio-blk endpoint is no longer an open P02M0153 blocker.** Current
+   `src/harness/qemu-run.sh` guards system-disk preparation and attachment with
+   `dma_fixture != 1`, before the optional-device cutoff. The enforcing gate sets both `IOMMU=1`
+   and `DMA_FIXTURE=1`; `src/kernel/main.rs` enters `test_main` directly in the test build, and
+   P02M0153 M2 explicitly records the removal of the unnecessary disk. The auditor identified a
+   real earlier topology violation, but adding it as OPEN now would reintroduce a repaired blocker.
+   The corrected ledger records the repair and still requires current enforcing-gate evidence for
+   DMA acceptance. It also replaces the stale bounded-attribution allowance with current P02M0153
+   M4's drain-before-replacement contract. The virtio-blk item's positive-operation extension is
+   explicitly separate from the hostile fixture, and its read assertion must name and exercise
+   the added block provider so an embedded-volume fallback cannot pass it.
+
+2. **ACCEPTED - the P02M0165 prerequisite description is stale, with the shutdown-defect subclaim
+   REJECTED against current code.** DisplayService handles and reports `live: false`, and
+   `src/harness/dev-gpu-restart.py` requires that announcement. The concrete close oracle has also
+   since been built: `device_manager/tests.rs::unopened_provider_withdrawal` executes production
+   withdrawal over real kernel channels and asserts peer closure, no stale late subscription,
+   duplicate/old-generation safety and the real withdrawal frame. DeviceManager calls it in a
+   development boot and the restart harness requires its marker. The ledger now describes both
+   actual oracles rather than asserting neither exists.
+
+   Current `settle_shutdown_node` polls the process and claim confirmations before `advance` and
+   uses `wait_any` only as a wakeup. It does not test `ready > 0`; a zero-index/one-handle remainder
+   is not discarded. `stop_all` calls settlement for the applicable nodes under a single overall
+   deadline, and `pending_shutdown_outcomes` checks ready and timeout outcomes through production
+   settlement. The ledger records this repair, retains STOP/drain/quarantine as the inherited
+   contract, and distinguishes the implemented checks from the required passing current guest and
+   watched-fail evidence. It requests no duplicate shutdown implementation.
+
+3. **ACCEPTED - the direct `apply_policy` prerequisite exceeded P02M0166's accepted contract.**
+   P02M0166's definition of done explicitly moves the compositional decisions into `driver-binding`.
+   Production DeviceManager consumes those rules; the registered selection/retry/quarantine sequence
+   test executes their relevant composition. The ordinary `CAP_CONFIG` rejection is independently
+   registered as `kernel.volume_layout.the_reserved_device_policy_namespace_answers_only_its_owner`.
+   Removed the OPEN direct-host-call requirement and the contradictory matrix text saying both
+   P02M0165 and P02M0166 lack their mandatory proofs. P02M0166 remains the operator-policy
+   dependency, discharged for these findings; it does not inherit an unavailable stronger test.
+
+4. **ACCEPTED - catalogue-variant narrowing is repaired and must not remain OPEN.** Current
+   `candidate::evidence_failures` runs before activation writes canonical inputs, and its catalogue
+   comparison retains the full check/architecture/environment/configuration identity. The
+   real-registry regression removes a configuration while keeping its check and asserts lost
+   coverage; the identical-catalogue control asserts no loss. Replaced the old OPEN entry with a
+   dated discharge. Separately updated the medium entry to current P02M0167 M3: content-keyed
+   templates and host overlap/mutation coverage now exist, while its recorded live
+   concurrent-selection/tag proof remains outstanding. Serialized acceptance remains available;
+   catalogue correctness does not establish concurrent guest evidence.
+
+The current prerequisite matrix and ledger were consolidated in place to remove conflicting old
+verdicts while retaining the applicable contracts and dated repair history. The consistency pass
+also reconciled partial NetworkService, InputService, AudioService and DisplayService catalogue
+migrations with current code; retained the shared DisplayService migration owner with P02M0103
+a-wsi; corrected reference-use wording to the repository's Unlicense/no-adaptation rule; and removed
+the misleading PL011 `trivial` note while keeping its existing blockers. No driver, source, protocol
+or prerequisite milestone was implemented or modified.
+
+Validation: the focused `driver-binding` policy-sequence test passed (1/1), and the focused
+`verify-model` real-registry/catalogue-narrowing regression passed (1/1, including the lost-variant
+case). `git diff --check -- docs/todo/P02M0099.md` passed. No new test, source mutation or guest run
+was performed. The index remains non-completable; it is consistent for selecting and planning its
+bounded items, with explicit prerequisites still governing when each can start or close. This
+response is appended after all original audit content, which is preserved byte for byte.
+
+
+Planner verification addendum (2026-09-07T22:50:14Z):
+
+The final cross-plan source review narrowed finding 4's medium-status correction. The statement
+above that content-keyed templates exist is correct, but it must not imply that the whole medium
+producer race has been repaired. `mkimage.sh` still reads shared init/volume packages, manifest and
+fallback bootstrap inputs; its assembly lock excludes their producers and its final key comparison
+only detects their movement. P02M0170 M1/M2 explicitly own the remaining producer-coordinated
+snapshot/acquisition boundary and proof that both concurrent selections succeed. The current
+P02M0099 ledger now retains that OPEN implementation condition together with the live gate, while
+crediting only the repaired kernel/loader and USB/system-template pieces. Serialized acceptance
+also excludes overlapping medium-input production. The ACCEPTED catalogue-variant finding and its
+passing focused regression are unchanged. No existing audit text was edited.
+
+Final document verification (2026-09-07T23:03:25Z): all 16 latest findings across the five reviewed
+plans have individual decisions, all original audit prefixes match the saved pre-review bytes,
+and whitespace checks pass. Scoped `verify.sh --for` classifies the five plans as documentation
+and selects zero code checks. The stable rerun produced its normal inner handoff with zero deferred
+checks; commit/merge verification remains pending under the repository workflow. The earlier run
+refused a handoff because concurrent workspace edits changed its snapshot. No implementation or
+guest-test completion is claimed, no commit was made, and concurrent edits outside this review's
+five plans and five audit files were left untouched.

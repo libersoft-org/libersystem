@@ -1923,3 +1923,137 @@ AUDITOR'S RE-AUDIT OF PLAN P02M0175 (2026-09-04T00:47:54Z):
 startup-only family configuration), but the omitted backlog subcontracts and stale family-state table
 still make their required public and QEMU oracles impossible, with two additional boundary races left
 undefined.
+
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-07T22:48:03Z):
+
+Reviewed the latest audit, dated 2026-09-04T00:47:54Z, against the full milestone plan,
+P02M0174's current L3 contract, the capability/LSIDL architecture, `src/idl/network.lsidl`,
+`src/idl/process.lsidl`, `src/idl/storage.lsidl`, and the actual NetworkService and TCP paths
+in `src/user/services/core/src/network_service.rs` and `src/user/services/core/src/net.rs`.
+The following changes update the implementation plan; they do not implement the feature.
+
+1. **ACCEPTED - listener result and refusal observability were both incomplete.**
+   The current network IDL returns only a channel from `listen`, and `net-capacity` has only
+   clients/sockets/listeners/connections. Neither supplies the missing backlog metadata or refusal
+   reasons. A record containing a capability and inline metadata is already supported, as
+   `process.start-result` demonstrates; another query or protocol abstraction is unnecessary.
+   M1 and M4 now agree on `result<listen-result, error>` carrying the listener `handle<channel>`
+   AND the effective `u16` backlog. M4's cases assert both the returned value and a usable accept
+   capability, including generated encoding/decoding and the first-party client path. Errors publish
+   neither listener nor handle. The capacity field list now explicitly names the monotonic counters
+   `listener-backlog-refusals`, `service-backlog-refusals`, `other-budget-refusals` and
+   `datagrams-dropped`. The first three replace the ambiguous generic budget counter; service-wide
+   backlog, listener backlog, then other budgets determine exactly one admission-refusal reason.
+   The existing separate exhaustion fixtures now have the observable counters they require.
+
+2. **ACCEPTED - SYN-time admission needs a reservation that survives handshake completion.**
+   This is a concrete event-ordering defect, even in a single-threaded service: `passive_open`
+   allocates on SYN, and a later ACK changes `SynRcvd` to `Established`/`pending_accept`. Two
+   SYNs can therefore arrive before either queued count increases. M4 now defines occupied backlog
+   as reserved half-open PLUS established-unaccepted connections, bounded by the effective listener
+   backlog and 64 globally. A new SYN atomically reserves both slots and its TCB/byte/scheduler
+   charges before SYN-ACK publication; duplicate SYNs reuse existing state. The final ACK converts
+   the reservation without adding occupancy. Successful socket-capability handoff releases the slot;
+   a failed handoff retains the queued connection and charge. This distinction is necessary because
+   current `take_accepted` clears the pending flag before `accept_handoff`, whose channel-allocation
+   failure currently frees the connection. Reset, half-open expiry, listener withdrawal and failed
+   initial publication now have explicit release/rollback rules; already accepted sockets retain
+   their independent lifecycle. Retained closing TCBs keep their other charges. Half-open and
+   queued counts expose reservation occupancy without another unbounded reporting structure.
+   The M4/M10 cases now send two distinct SYNs with backlog one before either final ACK, assert
+   only one SYN-ACK and reservation, then assert conversion and reuse after accept. A mixed-family
+   repetition on one dual-stack listener proves shared accounting. Reset, expiry, withdrawal and
+   failed-handoff cases verify release or retention as appropriate.
+
+3. **ACCEPTED - the governing readiness table still contradicted its own required cases.**
+   Current `net_policy` reads configuration only at startup and boot waits for DHCP before online;
+   those are the existing paths M7 replaces. P02M0174 explicitly continues RS indefinitely and
+   admits on-link prefixes from a Router Lifetime zero RA. M7's normative table now makes Ready
+   mean a valid non-tentative unicast address, including a still-valid deprecated address, plus a
+   usable same-family route on that interface; an on-link route suffices. Only Disabled vetoes the
+   whole family. Other sends select against current candidates and report destination-specific
+   source/route failures. Failed requires an explicit configuration failure with no usable pair
+   and no pending recovery; reaching the RS maximum interval never causes it. Without a usable
+   pair IPv6 stays Configuring, and with an on-link pair it may already be Ready while RS continues.
+   Updated the late-RA fixture accordingly: installation enables the off-link send and either
+   makes the family Ready or preserves Ready already obtained from on-link connectivity. The
+   zero-lifetime RA fixture remains an on-link success/off-link refusal with no family failure.
+   Startup-only profile selection and the existing bounded L3 control paths remain the contract.
+
+4. **ACCEPTED - exact-bound completion and truncation were contradictory.**
+   The audit's boundary concern is correct, but its peer-declared body example is not an input the
+   current API has: `tcp-request` carries endpoint/request bytes and `do_tcp` consumes a raw TCP
+   response until FIN or timeout. No HTTP parser or new response-length protocol was added to the
+   plan. M1 now defines the cap as exactly 262144 cumulative delivered response bytes, separately
+   from charged receive storage. COMPLETE requires orderly TCP EOF at or below the cap; TRUNCATED
+   requires an observed in-order byte beyond it, without delivering that byte; reset/timeout before
+   either is FAILED. Reaching the cap alone is not terminal. The receive path preserves bounded,
+   already-accounted credit, respecting window scaling and previously advertised credit, to avoid
+   stalling the evidence needed to decide. Replaced all conflicting terminal/budget wording and
+   corrected the guarded-stream precedent to the existing `volume.list` operation. M10 now has
+   exact-bound and one-over cases, decisive FIN/data arriving together or separately, and exact-bound
+   silence/reset cases, each asserting one terminal, delivered byte count and bounded storage.
+
+The final cross-plan consistency pass also aligned M1's aggregate dual-stack report bounds with
+P02M0174's newly explicit IPv6 maxima plus existing IPv4 state: 17 addresses, 34 routes, 9 routers
+and 5 DNS servers. The neighbour snapshot bound is 1088, covering the current default 1024-entry
+ARP cache plus 64 IPv6 neighbours. A larger configured/populated combined snapshot returns typed
+overflow without partial encoding, silent truncation or cache eviction; ARP's existing configuration
+is preserved. Full combined encodings must fit the 65536-byte reply buffer, and the exact-bound and
+1089-neighbour refusal fixtures are explicit. M3/M10 also consume P02M0174's PMTU-capacity refusal:
+a flow retains and immediately applies its validated smaller transmit limit even if cache insertion
+is refused, with a full-cache/65th-key fixture proving TCP resegmentation and unrelated-flow isolation.
+These are consistency corrections discovered while reconciling the two plans, not additional
+findings attributed to the latest audit.
+
+Re-read the corrected requirements, M1-M10, resource arithmetic, completion criteria and prerequisite
+seams together. Listener results, reservation counts, refusal reasons, family state/send policy and
+fetch terminals now each have one governing rule and matching cases. `git diff --check --
+docs/todo/P02M0175.md` passes. Only this plan and this appended response were modified for this
+milestone; all prior audit bytes are preserved. Runtime and generated-wire tests remain planned
+implementation gates, not claims of tests already performed on unimplemented source.
+
+
+Final consistency addendum (2026-09-07T22:52:32Z):
+
+The final cross-plan review found two further prose inconsistencies and corrected them in the plan.
+M7 previously counted 64 L3 invalidations while P02M0174 now defines a 32-entry table-invalidation
+queue and a separate 32-entry advisory quoted-error queue. M7 now allocates only its 128 pending
+operations plus 160 scheduler entries locally (288), consumes both L3 queues directly without
+another staging queue, and counts their 64 shared entries exactly once for the combined total 352.
+The text preserves the distinct authoritative overflow/resync and advisory overflow/drop rules.
+M1's generic DNS-bound sentence also incorrectly described every excess as a typed refusal despite
+its explicit eight-address successful selection rule. The sentence and adjacent resource-overflow
+summary now distinguish parser/work-bound refusals from retaining the first eight ordered valid
+candidates, with the eight/nine candidate oracle spelled out. Neither change adds source work beyond
+the already planned seam consumption and bounded resolver. Earlier audit and response bytes remain
+unchanged; this addendum is appended. The plan passes its whitespace diff check after these edits.
+
+
+Receive-budget feasibility addendum (2026-09-07T23:02:07Z):
+
+The final resource check identified a missing allocation rule: the existing `TcpConn::closed`
+allocates 65535 receive bytes even for free slots, and `passive_open`/the active handshake grow that
+buffer to 262140 on a window-scaling offer. Sixty-four such base buffers already exceed M4's 2 MB
+cap, so merely adding accounting could never reach its promised backlog-capacity guest oracle.
+M4 now starts each admitted TCB with a charged 16384-byte buffer and gives unused slots no receive
+allocation. Negotiation records the scale without automatic growth; later receive-demand growth
+must be fallible and fully funded before credit is advertised, within the existing unscaled/scaled
+per-flow maxima. Growth refusal preserves the old funded window and existing connections.
+Accounting covers capacity, retained delivery chunks and temporary old/new buffers, and free slots
+release their receive allocation. Sixty-four idle pending connections therefore use 1048576 of the
+2097152 receive bytes; the guest fixture explicitly offers window scaling and completes handshakes
+without data to catch any hidden eager growth. Additional assertions cover failed-growth backpressure
+and release accounting. Existing TCB/backlog/aggregate ceilings are unchanged. This closes a concrete
+feasibility gap in the same admission plan, without expanding networking scope. The plan's whitespace
+check passes, and every earlier audit/response/addendum byte is preserved.
+
+Final document verification (2026-09-07T23:03:25Z): all 16 latest findings across the five reviewed
+plans have individual decisions, all original audit prefixes match the saved pre-review bytes,
+and whitespace checks pass. Scoped `verify.sh --for` classifies the five plans as documentation
+and selects zero code checks. The stable rerun produced its normal inner handoff with zero deferred
+checks; commit/merge verification remains pending under the repository workflow. The earlier run
+refused a handoff because concurrent workspace edits changed its snapshot. No implementation or
+guest-test completion is claimed, no commit was made, and concurrent edits outside this review's
+five plans and five audit files were left untouched.

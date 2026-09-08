@@ -230,6 +230,8 @@ def main():
 		fail("the production pending-shutdown outcome checks did not pass")
 	if "DeviceManager: unopened provider withdrawal closed its real channel" not in boot_log:
 		fail("the production unopened-provider channel-close check did not pass")
+	if "DeviceManager: boot attempt budget and one-shot operator retry verified" not in boot_log:
+		fail("the production boot-attempt budget and operator-retry checks did not pass")
 	if 'dma: every bus-mastering device is translated' not in boot_log:
 		fail('this guest is not the translated machine - its boot printed no clean isolation summary, so a restart here proves nothing about enforcement')
 	if 'dma: DEGRADED ISOLATION' in boot_log or 'dma: ADMITTED UNTRANSLATED AFTER THE ISOLATION SUMMARY' in boot_log:

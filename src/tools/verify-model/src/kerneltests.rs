@@ -438,47 +438,42 @@ fn touch_dir(dir: &Path, out: &mut BTreeMap<String, BTreeSet<String>>, calls: &m
 	Ok(())
 }
 
-// Split a file into function bodies and attribute what each one reaches to its own name. Split on
-// `\nfn ` at column zero, which is where every test function in this tree begins.
+// Function and closing-brace indentation come from the formatted Rust source. Retain enclosing
+// bodies around nested helpers: a local function must not acquire its parent's remaining code.
 pub fn parse_touches(text: &str) -> Vec<(String, BTreeSet<String>, BTreeSet<String>)> {
 	let mut found = Vec::new();
-	// Function starts at ANY indentation. Splitting on a column-zero `\nfn ` missed every test
-	// written inside a `mod tests { ... }`, which is how the object, memory and scheduler suites are
-	// written - and those are most of the kernel's unit tests.
-	let mut current: Option<(String, String)> = None;
+	let mut functions: Vec<(String, usize, String)> = Vec::new();
+	let finish = |function: (String, usize, String)| (function.0, reached_in(&function.2), called_in(&function.2));
 	for line in text.lines() {
 		let trimmed = line.trim_start();
-		// `pub(crate) fn` AND `pub(super) fn` TOO, which this did not recognise.
-		//
-		// It stripped `pub fn ` or `fn ` and nothing else, so a `pub(crate) fn` was not seen as a
-		// declaration at all - its body was appended to the PREVIOUS function's, the name never
-		// entered the call graph, and every test that reached a program through such a helper was
-		// reported as unable to reach it. Silent in both directions: the previous function gained
-		// reaches it does not have, and the helper vanished.
-		//
-		// Found by writing a `pub(crate) fn` helper in `kernel/tests.rs` and watching the gate say
-		// the test calling it could not reach `bin.wasi_host`.
+		let indent = line.len() - trimmed.len();
 		let visibility = trimmed.strip_prefix("pub(crate) ").or_else(|| trimmed.strip_prefix("pub(super) ")).or_else(|| trimmed.strip_prefix("pub ")).unwrap_or(trimmed);
-		let declaration = visibility.strip_prefix("fn ").or_else(|| visibility.strip_prefix("async fn "));
+		let qualified = visibility.strip_prefix("unsafe ").unwrap_or(visibility);
+		let declaration = qualified.strip_prefix("fn ").or_else(|| qualified.strip_prefix("async fn "));
 		if let Some(rest) = declaration
 			&& let Some(name) = rest.split(['(', '<', ' ']).next()
 			&& !name.is_empty()
 			&& name.chars().all(|character| character.is_ascii_alphanumeric() || character == '_')
 		{
-			if let Some((previous, body)) = current.take() {
-				found.push((previous, reached_in(&body), called_in(&body)));
+			while functions.last().is_some_and(|(_, depth, _)| *depth >= indent) {
+				found.push(finish(functions.pop().expect("the current function exists")));
 			}
-			current = Some((name.to_string(), String::new()));
+			let body = trimmed.split_once('{').map_or("", |(_, body)| body);
+			if let Some(body) = body.trim_end().strip_suffix('}') {
+				found.push(finish((name.to_string(), indent, body.to_string())));
+			} else {
+				functions.push((name.to_string(), indent, body.to_string()));
+			}
 			continue;
 		}
-		if let Some((_, body)) = current.as_mut() {
+		if trimmed == "}" && functions.last().is_some_and(|(_, depth, _)| *depth == indent) {
+			found.push(finish(functions.pop().expect("the closing function exists")));
+		} else if let Some((_, _, body)) = functions.last_mut() {
 			body.push_str(line);
 			body.push('\n');
 		}
 	}
-	if let Some((name, body)) = current {
-		found.push((name, reached_in(&body), called_in(&body)));
-	}
+	found.extend(functions.into_iter().map(finish));
 	found
 }
 
@@ -520,6 +515,20 @@ fn reached_in(body: &str) -> BTreeSet<String> {
 		let Some(close) = window[open + 2..].find('"') else { continue };
 		push_program(&window[open + 2..open + 2 + close], &mut reached);
 	}
+	// These fixture helpers launch the literal service/program argument. A dynamic argument is
+	// not attributed to a later string in the body; it needs a literal at the actual call site.
+	for (helper, argument) in [("spawn_service(", 0), ("spawn_service_with_package(", 0), ("launch_volume_program(", 2)] {
+		let mut rest = body;
+		while let Some(index) = rest.find(helper) {
+			rest = &rest[index + helper.len()..];
+			let Some(end) = matching_paren(rest) else { continue };
+			let Some(value) = rest[..end].split(',').nth(argument) else { continue };
+			let value = value.trim();
+			let Some(quoted) = value.strip_prefix("b\"").or_else(|| value.strip_prefix('"')) else { continue };
+			let Some(close) = quoted.find('"') else { continue };
+			push_program(&quoted[..close], &mut reached);
+		}
+	}
 	// `lookup(b"storage_service.lsexe")` - the name starts immediately, so looking for a `b"` AFTER
 	// the marker finds the NEXT call's argument instead. That was the first version of this and it
 	// is why the reachability gate reported that a test launching StorageService could not reach it.
@@ -528,7 +537,8 @@ fn reached_in(body: &str) -> BTreeSet<String> {
 		rest = &rest[index + "lookup(b\"".len()..];
 		let Some(close) = rest.find('"') else { continue };
 		if let Some(stem) = rest[..close].strip_suffix(".lsexe") {
-			push_program(stem, &mut reached);
+			// Volume packages place drivers under drivers/; the component is the executable name.
+			push_program(stem.rsplit('/').next().unwrap_or(stem), &mut reached);
 		}
 	}
 	// `wav::encode::Encoder` - a crate called into directly. Underscores are how Rust spells a

@@ -20,6 +20,7 @@
 
 import contextlib
 import hashlib
+import io
 import json
 import os
 import shutil
@@ -31,6 +32,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -922,6 +924,50 @@ class FixtureSetTest(unittest.TestCase):
 	def test_placeholders_resolve_per_target(self):
 		self.assertTrue(scenario.resolve_path('{fixtures}/uname-shadow', 'aarch64').endswith('fixtures/aarch64/uname-shadow'))
 		self.assertTrue(scenario.resolve_path('{staged}/lib/x.lslib', 'riscv64').endswith('image/riscv64gc-unknown-none-elf/lib/x.lslib'))
+
+	def document(self, name, step):
+		path = os.path.join(self.directory.name, name + '.toml')
+		self.write(path, f'version = 1\nname = "{name}"\n[[step]]\n{step}\n'.encode())
+		return path
+
+	@contextlib.contextmanager
+	def dev_runner(self):
+		# Only the live guest boundary is replaced. Document loading and fixture validation run
+		# through cmd_dev_test against the real temporary files and their recorded digests.
+		with mock.patch.object(lab, 'dev_state', return_value=('ready', {})), \
+			mock.patch.object(lab, 'scenario_lease', return_value=contextlib.nullcontext()), \
+			mock.patch.object(lab, 'LabGuest'), \
+			mock.patch.object(scenario, 'run', return_value=0) as run, \
+			contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+			yield run
+
+	# The performance loop deliberately rebuilds uname before running a terminal-only scenario.
+	# The old unconditional fixture check rejected that scenario although it publishes no fixture.
+	def test_terminal_only_scenarios_do_not_require_generated_fixtures(self):
+		path = self.document('terminal', 'do = "prompt"')
+		self.write(os.path.join(self.staged, 'bin', 'uname'), b'REBUILT-UNAM')
+		with self.dev_runner() as run:
+			lab.cmd_dev_test([path])
+			run.assert_called_once()
+		os.unlink(os.path.join(self.fixtures, 'fixtures.json'))
+		with self.dev_runner() as run:
+			lab.cmd_dev_test([path])
+			run.assert_called_once()
+
+	def test_any_fixture_consuming_document_still_requires_a_current_set(self):
+		terminal = self.document('terminal', 'do = "prompt"')
+		for kind, field in (('publish', 'artifact = "uname"'), ('fixture', 'name = "sample"')):
+			with self.subTest(kind=kind):
+				path = self.document(kind, f'do = "{kind}"\n{field}\nfile = "{{fixtures}}/uname-shadow"')
+				self.write(os.path.join(self.staged, 'bin', 'uname'), b'STAGED-UNAME')
+				with self.dev_runner() as run:
+					lab.cmd_dev_test([terminal, path])
+					self.assertEqual(run.call_count, 2)
+				self.write(os.path.join(self.staged, 'bin', 'uname'), b'REBUILT-UNAM')
+				with self.dev_runner() as run:
+					with self.assertRaises(SystemExit):
+						lab.cmd_dev_test([terminal, path])
+					run.assert_not_called()
 
 	# And every shipped scenario has to load under the new vocabulary.
 	def test_every_shipped_scenario_still_validates(self):

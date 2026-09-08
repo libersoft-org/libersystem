@@ -2007,3 +2007,209 @@ Verification: all 140 `verify-model` tests passed. The `verify-scheduler`, `veri
 loaded overlays in memory and called the current production library; neither activated a candidate,
 modified canonical inputs, nor wrote evidence. No guest sweep was run. Original audit bytes were
 preserved; only this re-audit was appended.
+
+
+## IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0167 (2026-09-08T02:27:40Z):
+
+This response evaluates every numbered finding against the current implementation and the unchanged milestone requirements. REJECTED below means no further change is justified for that finding now, including findings whose original defect was real but has already been corrected. It does not reverse or edit the historical audit.
+
+### Original audit, 2026-08-28 20:29:15 CEST
+
+1. **ACCEPTED in part.** Rechecking the actual fixtures disproved the earlier implementer claim that all staged services run before kernel tests. Six remaining driver/service annotations were false: synthetic scanout, NIC, console and ramdisk fixtures bypassed the named driver, while local kernel graph/crash-state tests bypassed SystemGraphService and DeviceManager. Those claims are removed. The real boot fixture now covers virtio-blk, virtio-net, xHCI and DeviceManager through actual provider use and lifecycle assertions; the enforcing NIC gate additionally covers real DHCP traffic, and GPU coverage remains the existing `dev.gpu-restart` check. Reach now includes staged components only when the fixture actually starts SystemManager. Real direct xHCI and sound-driver assertions are retained. Missing virtio-console/SystemGraphService functional checks are documented honestly, alongside the existing missing-input fixture exception permitted by M2. The required deliberate real-driver/service failures were subsequently exercised in real guests, with intended assertion failures and restored positive runs recorded below.
+2. **REJECTED: already resolved.** Architecture profile gates request the stable IDs they assert through `TEST_SELECTION`; the oracle gate checks that those IDs remain declared.
+3. **REJECTED: already resolved.** Architecture and NUMA profiles have individual catalogue entries and steps, their umbrellas are excluded from planner scheduling, and explicit guest reservations bring them under the outer scheduler's job bound.
+4. **ACCEPTED.** Most staging, log and socket fixes already existed, but USB and system templates still published different generations at the same final path before a run copied them. `qemu-run.sh` now names both templates by their content key and returns the chosen system-template path to every architecture caller. Cleanup retains old generations when live-reader detection is unavailable. A standing host reproduction deliberately delays run A's copy until run B has published and verifies both runs' actual USB/system contents; it runs inside `concurrent-selection` before the live guests. Existing immutable kernel/loader staging, per-run writable copies and `RESULT-LOGS` remain the relevant completed protections. The four development checks now have predecessor prerequisites because they mutate one persistent guest; separate keys and costs remain, while independent guest profiles may still run in parallel.
+5. **REJECTED: already resolved.** Command graph validation rejects duplicate IDs, missing dependencies and cycles. The shell scheduler propagates blocked IDs and records parallel prerequisite completion before admission. The registered scheduler execution matrix passes on the dirty worktree.
+6. **ACCEPTED in part.** Measured `StepId` costs, failure filtering and separate gate/conformance steps already exist. Build parts were still merged, so each selected build part now has its own key, command, duration and budget decision. Per-target producer-order prerequisites preserve build correctness; guest-bearing profiles and gates now also depend on the selected build outputs instead of being admitted before them. Focused graph/step assertions cover the actual lowered commands.
+7. **ACCEPTED in part.** The candidate CLI and shadow route were already present, but the purported five-change proof still used the active model. The replacement test loads real memory and ELF ownership-plus-covers candidate overlays, changes actual source bytes in temporary Git fixtures five times, invokes the candidate planner, production comparison, scope/digest derivation and production activation evaluator, and proves both qualifying and nonqualifying evidence. Guest outcomes in this bounded host test are explicitly fixtures, not claimed QEMU measurements. The exact test-file correction is described in the latest finding 3 below.
+8. **ACCEPTED in part.** Base completeness, pre-write validation and byte-for-byte rollback were already implemented. The remaining trust/risk defects were the deeper-prefix bypass and inconsistent evidence component for a complete split; activation now uses one production evaluator for both bars, grades actual successor ownership, includes deeper ownership prefixes under each protected risk root, and refuses before canonical writes. The new candidate tests exercise that evaluator directly.
+
+### Re-audit, 2026-08-29T16:05:00Z
+
+1. **ACCEPTED in part.** The reported unselected-oracle obligation was valid, but the claim that every listed fixture actually exercised its driver was not. This round removes six false annotations, conditions manifest reach on an actual SystemManager launch, routes real block/network/USB and manager effects through the boot fixture, and retains honest exceptions and existing development oracles. The deliberate driver/service runtime demonstrations were executed as recorded below and substantiate original finding 1.
+2. **ACCEPTED in part.** Kernel/loader staging, FAT/ISO/UDF generations, console captures and sockets were already isolated. This round closes the still-shared USB/system generation boundary and adds the overlapping different-generation content reproduction described in original finding 4; the registered two-selection/two-tag guest proof is included in final verification.
+3. **REJECTED: already resolved.** Each NUMA profile is independently selected, timed and scheduled; the umbrella remains only a direct convenience command.
+
+### Re-audit, 2026-08-29T18:29:58Z
+
+1. **ACCEPTED in part.** The earlier annotations made the plan look corrected while several fixtures still mocked the named driver or service. Their false covers are removed, actual boot-chain effects now carry the corresponding component declarations, and staged reach requires a real SystemManager launch. Missing functional fixtures are recorded as the explicit exceptions M2 permits.
+2. **ACCEPTED in part.** The named staged-build and FAT/ISO/UDF paths are corrected, but the general different-generation isolation obligation still exposed the USB/system publication race. The content-keyed templates and concurrent host reproduction close that remaining boundary.
+3. **REJECTED: already resolved.** NUMA profile commands have distinct catalogue keys, steps and guest reservations.
+
+### Re-audit, 2026-08-29T23:02:31Z
+
+1. **ACCEPTED in part.** Manifest staging alone was an unsound reach assumption for test kernels. Reach now adds the boot chain only for fixtures actually starting SystemManager, false driver/service claims are removed, and genuine boot/provider/development oracles are selected instead.
+2. **REJECTED: already resolved.** Selection-dependent compilation and immutable staging occur under the producer lock; FAT/ISO/UDF final names carry their content keys, and the console capture belongs to the run.
+
+### Re-audit, 2026-08-30T08:40:38Z
+
+1. **REJECTED: already resolved.** The locked build stages the selected kernel; the run executes that immutable artifact instead of launching an unlocked second Cargo compilation against the mutable shared target.
+
+### Re-audit, 2026-08-30T23:31:51Z
+
+1. **REJECTED: already resolved.** The selected kernel and loader inputs are staged before the content-keyed medium is consumed. The live concurrency gate exists to verify the complete boundary, rather than treating a hash-mismatch refusal as a successful run.
+
+### Re-audit, 2026-08-31T01:15:33Z
+
+1. **REJECTED: already resolved.** Run-private immutable kernel and loader inputs protect later medium assembly; the requirement is no longer deferred to another milestone.
+
+### Re-audit, 2026-08-31T19:28:51Z
+
+1. **REJECTED: already resolved in the implementation.** `concurrent-selection` is a registered live proof with two distinct selections and tag sets and validates each run's own reported logs. Its actual positive execution passed in the final verification phase, as recorded below.
+2. **REJECTED: already resolved.** Loader production and run-private staging share the producer lock with the named loader writers; the guest medium reads the staged loader.
+3. **REJECTED: already resolved.** A failed USB copy aborts the run; architecture callers no longer attach the shared template writable as a fallback.
+
+### Re-audit, 2026-08-31T21:15:57Z
+
+1. **REJECTED: already resolved.** The concurrency gate varies both `TEST_SELECTION` and `TEST_TAGS`, then checks each run's selected IDs and result paths.
+2. **REJECTED: already resolved.** The gate is catalogued and declares two guest slots. The outer scheduler reserves those slots and a one-slot budget cannot silently start both guests.
+3. **REJECTED: already resolved.** The build, signed-boot and trust-profile loader writers participate in the same staging lock, and the staged loader is the medium input.
+
+### Re-audit, 2026-09-01T03:15:10Z
+
+1. **REJECTED: already resolved.** Guest admission uses explicit `STEPGUESTS`, rather than literal command text. The concurrency gate consumes two outer-scheduler slots and refuses insufficient allocation; the scheduler matrix executes this accounting.
+
+### Re-audit, 2026-09-01T11:58:45Z
+
+1. **REJECTED: already resolved.** Static graph validation runs before traversal, and the registered prepared-plan scheduler matrix executes shared prerequisites, unknown costs, failed descendants, result precedence and guest reservations.
+
+### Re-audit, 2026-09-01T14:33:49Z
+
+1. **REJECTED: already resolved.** Skipped descendants are recorded in `blocked_ids`, making suppression transitive. The shell matrix covers the build-to-guest-to-dependent chain.
+
+### Re-audit, 2026-09-01T17:16:37Z
+
+1. **REJECTED: already resolved.** Parallel guest completion is collected before evaluating the dependent's prerequisite state, so a failed guest cannot admit its dependent through the old barrier ordering.
+2. **REJECTED: already resolved.** The registered shell matrix now executes the requested scheduler cases and passes on this dirty worktree.
+
+### Re-audit, 2026-09-01T22:54:00Z
+
+1. **REJECTED: already resolved.** Each architecture/NUMA profile lowers to its own command, key and stable step ID, rather than a comma-list gate batch.
+2. **REJECTED: already resolved.** The prepared-plan seam and registered shell execution matrix exist and pass.
+
+### Re-audit, 2026-09-02T03:51:29Z
+
+1. **REJECTED: already resolved.** Profile steps declare their guest counts and participate in the same slot scheduler as ordinary test guests.
+2. **REJECTED: already resolved.** The shell execution matrix exercises dependency deduplication, unmeasured costs, failure precedence and descendants.
+
+### Re-audit, 2026-09-02T12:08:00Z
+
+1. **REJECTED: already resolved.** Admission reserves the declared number of slots for the entire running step, including the two-guest concurrency proof. The shell matrix checks the resulting overlap bound.
+2. **REJECTED: already resolved.** Unmeasured guest-bearing steps receive conservative guest cost seeds, used for both ordering and budget admission rather than being priced as free host work.
+
+### Re-audit, 2026-09-03T03:12:09Z
+
+1. **ACCEPTED in part.** Candidate arguments already reach production shadow selection and execution. The remaining proof gap is corrected by the real candidate/source-edit/production-evaluator regressions described in original finding 7; repeated evidence for one edit still counts once and another frozen model hash receives no credit.
+2. **ACCEPTED in part.** Generic registry-only narrowing and all four risk fields had checks, but deeper ownership and complete split attribution remained wrong. The shared activation evaluator now discovers candidate owners throughout protected subtrees and consistently grades ownership-plus-covers reassignment; the tests show the generic bar passing while the stricter memory targets/groups correctly refuse activation.
+3. **ACCEPTED in part.** Seeded ordering, explicit zero budget, independent gates/conformance and guest classification were already corrected. Builds remained a merged independently runnable unit; they now lower separately with producer prerequisites, and guest-bearing gate/profile admission requires the selected build outputs.
+4. **REJECTED: already resolved.** Failed steps do not become measured durations, change an older successful measurement's model identity, or price unexecuted merged members as fresh successful work. Existing focused history regressions cover both cross-model sequences and one-key failures.
+5. **REJECTED: already resolved.** The scheduler fixture bypasses unrelated trust admission for its prepared keyless plans; the registered gate passes with the current dirty worktree.
+6. **REJECTED: already resolved.** The CLI change serialization emits both rename origin and destination, and the shell consumes that production boundary.
+
+### Re-audit, 2026-09-03T10:37:00Z
+
+1. **ACCEPTED in part.** The earlier registry-only ownership/architecture/edge cases are covered. The remaining protected deeper-prefix and complete-split cases are corrected in `candidate.rs` and exercised through the actual activation evaluator, including genuine candidate evidence.
+2. **REJECTED: already resolved.** A failed run under a new hash clears the usable measured cost rather than relabelling an older duration; a failed single-key run does not become a key cost.
+3. **REJECTED: already resolved.** Ordinary gates and conformance suites already have individual commands, keys, step IDs and measurements. The distinct remaining build batching defect is addressed under original finding 6.
+
+### Re-audit, 2026-09-03T14:35:08Z
+
+1. **REJECTED: already resolved for the reported cases.** Registry comparison detects removed `selects_everything` escalation and effective ownership/architecture changes caused by longer prefixes. The later finding identifies a separate risk-root attribution error, corrected below.
+
+### Re-audit, 2026-09-03T22:40:55Z
+
+1. **REJECTED: already resolved.** Catch-all architecture changes are probed against effective owned paths and attributed to their actual components instead of discarding the empty-root probe as unowned.
+2. **ACCEPTED.** Registry-only successor attribution existed, but the catalogue could still add the displaced name for the same split. Activation now maps a removed cover to an added cover only when effective ownership proves it is a successor, and unions that result with registry losses. The memory/ELF tests use full candidate overlays and demonstrate that qualifying candidate evidence can satisfy the actual evaluator.
+3. **ACCEPTED.** Test declaration edits now retain the ordinary build dependency closure while runtime selection uses the IDs declared in the changed test files. The obsolete test-suite risk row is removed. Unknown/deleted helpers and mixed production changes retain conservative wider selection.
+
+### Re-audit, 2026-09-04T00:26:46Z
+
+1. **ACCEPTED.** The prior `kernel.tests` ownership alone still reached broad kernel runtime coverage through build edges. The planner now separates required build reach from runtime seeds for discovered test-declaration paths, selects the declared IDs directly and suppresses cost-based whole-suite expansion only for a pure declaration-file change. A real-tree regression checks exact IDs on each target and all three build targets; mixed production paths still widen.
+2. **REJECTED: already resolved.** Catalogue loss comparison retains runnable variants as part of coverage. A variant disappearing while its check ID and covers remain unchanged therefore still demands evidence; the focused regression also checks that an identical catalogue produces no loss.
+
+### Re-audit, 2026-09-07T21:49:51Z
+
+1. **ACCEPTED.** Risk membership previously looked only at the protected root. `risk_components` now probes the root plus effective ownership boundaries beneath it in both models and grades every losing candidate owner in that subtree. The deeper `mem/frame` candidate can meet the generic bar with five edits/two targets and is still refused for missing riscv64 and page-table evidence. Disabling deeper probes makes the new regression fail.
+2. **ACCEPTED.** `evidence_components` now builds actual ownership successor relationships and uses them when comparing complete catalogue covers, so a real `kernel.mem`/`kernel.elf` split is graded on the names under which candidate runs record it. Arbitrary replacement cover names do not acquire this exemption. Five real source edits pass through the frozen candidate planner and production evidence evaluator; repeated one-edit evidence and evidence under another candidate hash fail. Restoring displaced-name grading makes the regression fail.
+3. **ACCEPTED.** The exact-declaration runtime selection is implemented in `plan.rs`, while build checks retain full build reach and all required target artifacts. The obsolete risk row is removed. At 2026-09-07T22:44:06Z the refreshed live hardware-file plan selected 43 of 1314 runnable universe keys: 40 declared test variants (16 x86_64, 12 aarch64, 12 riscv64) plus the three kernel builds. Its estimate was 1321 seconds against 14829 seconds, or 9%, instead of the earlier 1150-key whole-target expansion. Restoring the runtime build-edge seed makes the real-source regression fail.
+
+### Focused and integration verification
+
+- Focused candidate, graph/lowering, conditional boot-reach and real-source planner checks passed before the long-test phase. The subsequent complete verify-model suite passed all 144 tests in 28.18 seconds; the actual aggregate `host-tests` gate then passed, including all 144 model tests in 28.53 seconds.
+- The registered `component-oracles`, `gate-oracles`, `gate-result-logs` and `verify-scheduler` host gates passed on the dirty worktree.
+- The concurrent USB/system generation reproduction passed using production preparation helpers; shell syntax checks passed. Temporary mutations restoring fixed USB paths, fixed system paths or deletion without `fuser` each made that reproduction fail, and all mutations were restored.
+- Temporary mutations removing deeper risk probes, restoring displaced-component grading or adding declaration-file build reach back into runtime selection each made its intended regression fail; all mutations were restored.
+- The bounded host fixture outcomes above are not guest measurements. Actual runtime negative controls are recorded next; the registered live concurrent-selection gate and full guest suites subsequently passed; development outcomes and the two broader verification exceptions are recorded below. The restored positive development startup subsequently passed, as recorded below.
+
+### Runtime negative controls executed during the final verification phase
+
+| Actual production mutation and selected oracle | Measured result | Restoration and positive result |
+| --- | --- | --- |
+| `virtio_net.rs` retained its human report and provider `OFFER` but omitted only `READY`; selected `kernel.boot.init_package_starts_system_manager` on x86_64. | Baseline passed one test in 26 seconds. The rebuilt mutant failed the required service-online assertion (exit 35, 56 seconds): NetworkService and five dependents were missing, with 17 reports instead of 23. | Original source bytes were restored and the driver, packages and volume rebuilt. The same selected guest passed one test in 23 seconds. |
+| StorageService's actual `LIVEVOL` branch returned `FORMAT_UNKNOWN` for its probe; selected `kernel.boot.embedded_root_still_classifies_block_providers` on x86_64. | The rebuilt mutant reached the intended embedded-root classification assertion and failed (exit 35, 15 seconds). | Original source bytes were restored and the service, packages and volume rebuilt. The same selected guest passed one test in 13 seconds. |
+| The concrete `Catalogue::close_channel` syscall body was omitted in DeviceManager's development build. | `dev.sh up` failed with exit 1, and its guest serial log contained `DeviceManager: unopened provider withdrawal failed to close its real channel`. This observes the real channel operation left untested by the host Recorder and the already-opened GPU provider. | The mutation was removed, the development instance stopped, and shipping userspace, packages and volume rebuilt successfully. The restored development startup subsequently passed in 156.4 seconds with the real channel-close marker and both other required markers; the subsequent development results and performance timing exception are recorded below. |
+
+NIC evidence is recorded in `/tmp/libersystem-driver-runtime-negative/result.json` and the three guest logs ending `223640Z-2995856`, `223749Z-3002425` and `224042Z-3010818` under `.build/logs/test/`. The temporary NIC wrapper's truncated-output ID check and debug-binary equality check failed; the complete guest log identifies the selected test, and the separate restored positive run establishes the result. Rebuilt binary bytes are not asserted identical. Storage logs are `/tmp/libersystem-storage-guest-negative/negative.log` and `positive.log`; the concrete-close diagnostic is preserved in `/tmp/libersystem-catalogue-mutated-guest.log`, with successful shipping rebuild in `/tmp/libersystem-catalogue-restore-shipping.log`. All three production mutations were removed before the consolidated build.
+
+### Integration checks and a pre-existing report exception
+
+The final run initially exposed stale `guest-verdict` fixtures after the system-template change: they still copied the old fixed pathname, omitted `media_sweep`, and matched the old caller spelling. The fixtures now execute the production helper and caller blocks, consume the returned content-keyed template, and check private-copy success and refusal on each architecture. Deliberately discarding that returned path is rejected, as is unlinking a template before publication. The shared guest inventory also includes the new `provider-media-order` gate. The registered `guest-verdict` recheck passed all 14 host tests in 3.674 seconds (`/tmp/libersystem-guest-verdict-recheck.log`); these are fixture integration results, not additional guest measurements.
+
+`dynamic-report` exited 4 because its tracked measurements predate this work. Of 225 changed rows, 219 contain identical symbol/owner sets and differ only because the report's unpinned sort collation changed from `en_US.UTF-8` to `C.UTF-8`. The remaining symbol and size differences match earlier `lsdev`, `lico`, and `device-proto` changes. Parent commit `90db3e62` and implementation `25ae5e89` have identical tool, protocol/client library, runtime, ABI and report-generator trees, identical declarations for all 75 dynamic tools and all libraries, and identical tracked reports. PermissionManager's new provider declaration is outside this tool-only report. The three report baselines were therefore preserved; refreshing them would include unrelated prior changes. Field-by-field evidence is retained in `/tmp/libersystem-dynamic-report-analysis.md`. This pre-existing failure is excluded from a claim that every broad verification gate passed.
+
+### Final host-model corrections and obligation reconciliation
+
+Final integration verification found and corrected two host-model gaps before accepting the complete gate. The shared `provider_subscription.rs` include now has a narrow owner and explicit static edges to its actual PermissionManager and StorageService consumers. Source reach discovery preserves enclosing function bodies around nested helpers, reads executable literals from the real service-launch helpers, and recognizes driver paths within volume packages. This admits the seven genuine service fixtures and retains the two genuine direct driver fixtures without restoring unconditional staged reach. Two focused regressions check precise consumer selection and function/helper attribution, including uncalled nested helpers and dynamic arguments. The standalone verification-model suite passed all 144 tests in 28.18 seconds. The actual previously failed `./check.sh --gate host-tests` was then rerun and passed with 1860 passing and three ignored Rust tests across its test binaries, including all 144 model tests in 28.53 seconds. Evidence: `/tmp/libersystem-verify-model-final-fixes.log` and `/tmp/libersystem-host-tests-final-fixes.log`. These are corrective reruns; the original failed gate remains recorded as failed in its original execution log.
+
+After the host-model fixes, the model was replanned against the committed job range `90db3e62..25ae5e89` plus the actual dirty paths. Its full plan still requires exactly 186 steps and 1308 unique keys. No key, stable step ID, command, prerequisite, guest reservation or estimated cost changed. Both dependency graphs are acyclic and all prerequisites resolve; the original frozen plan files remain unchanged. The model hash changed from `edb46922…` to `ea75298b…`, so this is an obligation reconciliation, not a relabelling of old outcomes as new trusted evidence. The comparison ran during the final gates and does not assert a clean final source snapshot. Evidence: `/tmp/libersystem-final-reconciled-comparison.json`.
+
+### Actual Node budget and restored development proof
+
+The new development fixture drives production `Node` admission, `advance` for READY and online/pre-READY exits, and `apply_policy` for retry, disable and enable. It checks all three automatic admissions, refuses a fourth after successful bindings and fresh incident windows, and checks one-shot operator grants with zero, one and three automatic attempts already spent. It also checks unclaimed fallback, claim refusal, teardown-reserve refusal and cancellation. The public attempt count includes each actual claim admission. This is the current production budget oracle; the legacy `one_more_attempt` arithmetic test is not used as proof of that behavior.
+
+Temporarily restoring the actual READY counter reset made the third negative-control attempt reach the exact serial diagnostic `DeviceManager: READY refunded the boot automatic-attempt budget`. `dev.sh up` exited 1 after its 60-second shell-readiness timeout. The original source was restored exactly and `dev.sh down` exited 0. The first two attempts stopped before any guest ran because Rust compiler subprocesses for unchanged `request_probe` and `component_host` terminated with SIGSEGV (exit 139). Those are build failures, not budget-oracle evidence. Setting `RUST_MIN_STACK=536870912` for the retry allowed the build to proceed; no production build-tool or toolchain changes were made.
+
+The restored development image then passed startup in 156.4 seconds, reached the shell and emitted all three required success markers: the unopened provider's real channel closed, pending shutdown confirmations and timeout were classified, and the boot attempt budget with one-shot operator retry was verified. The instance was stopped successfully afterward (`dev.sh down`, exit 0). This also completes the restored positive proof for the earlier concrete catalogue-close mutation. The broad guest suites and development GPU, protocol and self-tests subsequently passed; the performance timing exception is recorded in the combined result below.
+
+Evidence: `/tmp/libersystem-budget-runtime-negative-result.json`, `/tmp/libersystem-budget-mutated-guest.log`, `/tmp/libersystem-budget-restored-up.log`, `/tmp/libersystem-budget-restored-guest.log` and `/tmp/libersystem-budget-restored-down.log`. The two pre-guest failures remain separately recorded in `/tmp/libersystem-budget-first-build-failure.log` and `/tmp/libersystem-budget-second-build-failure.log`.
+
+### Mutation-gate input-copy concurrency correction
+
+The consolidated parallel run exposed an additional M3 integration defect in `implementation-mutations`: its private tree recursively copied shared boot and state directories, so another guest removing `virtio-console.3458590.out` made rsync exit 24 before any mutation oracle ran. The copy now admits only the x86 test packages, system image and UUID, bootstrap files, staged image and staged-image hash records. It takes the existing target build lock while acquiring the staged image and its records, creates its own state directory and retains the existing receipt rebasing. Guest captures, staged kernel/loader temporaries and unused compiler caches are not imported. Required inputs and all rsync errors remain fatal.
+
+The gate runs the new executable `test-mutation-inputs.py` within its existing catalogue key. Three short host tests passed in 3.602 seconds: real rsync survives the concurrent deletion of excluded guest scratch; the old recursive copy deterministically fails with the actual vanished-console exit 24; removing the producer lock exposes its absence; and removing the required init package still fails the real copy. Shell syntax and whitespace checks passed. Evidence: `/tmp/libersystem-mutation-input-copy-tests.log`. The original failed gate remains recorded as failed. Its complete corrective rerun then passed: all five actual kernel defects were caught by their respective required assertions, and the executor recorded the original catalogue key as passed. This run included all three copy regressions again (3.552 seconds). Evidence: `/tmp/libersystem-final-mutations-recheck.log`. The prepared executor records execution results and claims no trust attestation.
+
+
+**M3 live-guest admission integration (2026-09-08).** The consolidated parallel run exposed a further real guard defect: `test.sh` refused another scheduled guest solely because QEMU held its own content-keyed, PID-suffixed system disk or inherited per-run log. The guard now checks actual descriptor access flags, admits the runner's precise private image/firmware/console and test-log names only when their owner is QEMU or its live ancestor, and retains refusal for shared writable templates, misleading fixture names, unknown writable paths and another run's ownership. The old filename-only read-only exemptions are removed. Procfs metadata is read as a snapshot; incremental shell reads intermittently lost the running guest's ancestry during the initial check. The unrelated-VM exclusion and unreadable-process uncertainty reporting remain intact.
+
+Three new short host regressions execute the production guard against real `/proc` descriptors, including direct and ancestor ownership, private logs and disks, shared read-only files, genuine shared writable descriptors and other-owner refusal. Negative mutations restore both false private-file refusal and writable-fixture acceptance and are detected. The existing `guest-verdict` gate now passes 17 tests in 4.366 seconds (`/tmp/libersystem-qemu-admission-regression.log`); shell syntax and whitespace checks passed. Seventy successive read-only admission checks against the actual running aarch64 guest also passed after the procfs correction. No guest was launched or stopped by these checks. The initial refused runs remain in the log history. All three aarch64 profiles and the actual concurrent-selection gate subsequently passed their original keys in the corrective runs recorded below.
+
+
+**Scenario fixture dependency correction (2026-09-08).** The first final development run passed GPU restart, then the performance gate was refused because its intentional `uname` rebuild invalidated generated fixtures even though the requested `shell-basics` scenario consumes none. The two subsequent checks were correctly blocked, and the development instance was stopped. This is a pre-existing harness dependency defect exposed by the actual run. `cmd_dev_test` now invokes the existing complete fixture-freshness check when any requested document contains a `publish` or `fixture` step. All requested documents are checked before any scenario starts; consumers of host fixture bytes retain the same refusals. Terminal-only scenarios have no such dependency.
+
+Two new regressions execute the production command, scenario loader and freshness checks, stubbing only guest execution. All 12 focused tests passed; restoring unconditional validation and removing real-fixture validation each failed their intended controls. Independent review found no freshness bypass. The complete `boot-harness` gate and source hygiene subsequently passed under their original catalogue keys (`/tmp/libersystem-final-scenario-recheck.log`). Performance thresholds were not changed.
+
+
+**Protocol negative-fixture correction (2026-09-08).** The first independent protocol run completed 88 of 89 cases; its only failure expected `echo` to be unlaunchable even though an explicit empty permission manifest has made it launchable since 2026-08-01. The same grant exists in the job baseline. The refusal input now names pinned `system_manager`, which has neither an ordinary volume launch path nor a tool permission manifest. The exact expected `ERROR / LAUNCH_REFUSED` result is retained. Only the test input and its explanation changed; the original 88/89 result is preserved in `/tmp/libersystem-final-dev-followups-proto-test.log`. The actual corrective result is included in the combined evidence below.
+
+### Combined final verification
+
+Combined final verification completed for P02M0153, P02M0162, P02M0164, P02M0165 and P02M0167. The frozen full plan contained 186 steps and 1,308 distinct catalogue obligations. Its actual phase logs, corrective reruns and the two independent development commands account for every obligation: **1,306 passed; the pre-existing `dynamic-report` baseline failure and a P02M0104 latency-limit failure remain**. No required check was dropped to obtain that result.
+
+- All 21 three-architecture build steps passed. After the production boot-budget correction, the nine affected user/package/volume steps passed again before remaining broad guest execution. Normal shipping-image and separate x86 test-volume preparation also passed.
+- Full kernel suites passed: x86_64: 382 tests in 192 seconds; aarch64: 370 tests in 2849 seconds; riscv64: 373 tests in 3457 seconds. The host test gate passed 1,860 Rust tests with three declared ignores; all 75 individual host-suite keys, 11 conformance suites, the six capability-model cases, staged-image negative controls, signed/secure boot, architecture/NUMA profiles and core-cap checks passed.
+- The five deliberate kernel mutations failed their required assertions. The IOMMU gate passed all five hostile DMA cases, forced release, real DHCP traffic under enforcement, default translated display boot and explicit no-IOMMU fallback. Swapped-media provider boot passed all 15 tests.
+- The three previously refused aarch64 profiles and actual two-guest concurrent-selection check passed after the private-file guard fix. The final guest-verdict gate passed 17 tests; source and source-history hygiene passed.
+- GPU restart passed twice, including rebind on a new claim generation, withdrawal/republication and actual frame presentation without a fault or reboot. The performance check completed its functional scenario, proportionality and no-cold-path/no-reboot assertions, but exceeded its unchanged timing limits. Its scheduler dependents were correctly blocked. Protocol and self-test were then run as the exact standalone catalogue commands on a fresh ready development instance and passed in order. This is independent execution evidence, not a fabricated successful performance prerequisite. Startup required the real unopened-channel closure, pending shutdown outcomes and per-boot attempt-budget fixtures. Every development instance was stopped successfully afterward.
+
+The `dynamic-report` failure is stale tracked dynamic-tool measurement data, including earlier tool/ABI changes and locale-dependent symbol ordering. The tool/protocol/report-generator input trees are unchanged across this job's committed range; the new PermissionManager dependency is a service and is excluded from that tool report. The baseline files were preserved because updating those unrelated measurements is outside these five milestones. The analysis is `/tmp/libersystem-dynamic-report-analysis.md`.
+
+The latency limits belong to P02M0104 and were not changed: the measured leaf iteration was build 14.5 s / publish 0.7 s / scenario 6.7 s / total 22.1 s, versus limits 3.6 / 0.6 / 2.6 / 6.0 s; the no-change build passed at 0.52 s. The proportionality checks report one object and one executable rebuilt, zero provider recompiles and six unchanged cold-input classes. The build scripts, all 65 library declarations and the conservative 80-directory `uname` dependency closure are unchanged from the job baseline. Existing whole-tree provider validation predates this work, but no old-commit runtime or exact per-function attribution is claimed. This report does not treat the timing failure as a pass or expand these five milestones into P02M0104 performance optimization. Scope analysis is `/tmp/libersystem-perf-scope-analysis.md`.
+
+A fresh run of the two capability trace fixtures passed after normal shipping-image preparation changed the kernel artifact timestamp. The final live-trace gate then matched the checked-in reference and replayed it against the model; no freshness check was weakened. Evidence: `/tmp/libersystem-final-capability-trace-refresh.log`.
+
+Evidence: `/tmp/libersystem-final-outcomes.json` maps every key to its final actual execution and retains initial failures in its phase history. Main execution is `/tmp/libersystem-final-nondev.log`; corrective runs are `/tmp/libersystem-final-{host,profiles,mutations,concurrency}-recheck.log` and `/tmp/libersystem-final-iommu-recheck-2.log`. Development results are `/tmp/libersystem-final-dev-recheck-result.json` and `/tmp/libersystem-final-dev-recheck-checks.log`; independent protocol/self-test commands, readiness and cleanup are `/tmp/libersystem-final-dev-followups-2-result.json`. Initial failures and blocked checks remain in the execution history; no synthetic planner success was recorded.
+
+The current-range/working-tree reconciliation preserved all 186 commands, dependencies, guest reservations and 1,308 obligations; cost estimates reflect the newly measured runs. Source snapshots identified only the reviewed changes; the last DeviceManager edits changed comments only, and the subsequent delta contains only scenario-fixture applicability, its two host regressions and the corrected protocol refusal input. The prepared executor records these executions and explicitly claims no pinned-revision or merge/release trust attestation. Reconciliation and identity evidence are `/tmp/libersystem-final-closure-reconciled-comparison.json` and `/tmp/libersystem-final-closure-code-comparison.json`.
+
+Final closure checks also passed: `milestone-index`, current `source-hygiene` and `git diff --check`. The final development protocol run passed all 89 cases in 93 seconds; the self-test passed three generations, a refused publication without damage, rollback and reset in one boot. The final source comparison confirmed the temporary `uname` edits were restored, and no QEMU guest remained running.

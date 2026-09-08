@@ -2445,3 +2445,121 @@ Current plan rating: 5/10
    The focused regression passes. P02M0167 remains unavailable here for the independently documented
    medium race, but the plan's current catalogue-defect claim is no longer true and directs an
    implementer toward work already completed.
+
+
+PLANNER'S RESPONSE ON P02M0103 (2026-09-07T22:59:27Z):
+
+Reviewed every finding in the latest audit, `AUDITOR'S RE-AUDIT OF PLAN P02M0103
+(2026-09-04T00:49:52Z)`, against the current plan, roadmap activation rule, kernel/IPC architecture,
+DeviceManager and DisplayService, verification executor/candidate code, and the owning prerequisite
+milestones. The decisions below concern the current tree, not the tree the auditor inspected.
+
+1. **The headless-schedule correction did not reach the activation section - ACCEPTED.**
+   The introduction still included `h`, while the authoritative transitive graph gives `h -> g ->
+   a-wsi`. The introduction now lists only `b`, `c`, `e` and `f` as headless-completable and explicitly
+   gives `h` its inherited WSI gate. The build-order paragraph, matrix, part headers and final
+   reconciliation record agree. Final consistency checking also made the mandatory 2D/3D interop
+   dependency explicit: `h` consumes `c`, which `i` inherits for its render2d HUD. This adds no new
+   feature or WSI split; it records the backend the already-required scenes use. Phase-4 activation
+   and the roadmap's narrower cross-phase approval list remain intact.
+
+2. **The fifth freeze and performance-floor corrections contradict the canonical review record -
+   ACCEPTED.** The `s` table, `f-ext` header, specification work item, prerequisite matrix and Done
+   list now all name `s-3d-ext`. There are five gates: `s-common`, `s-2d`, `s-3d`, `s-wsi` and
+   `s-3d-ext`; core Scene3D stays in `s-3d`, Extended Scene3D is frozen by `s-3d-ext`, and no core
+   gate waits for the optional Extended document. Every freeze refers to the same five requirements,
+   including numeric minima/tolerances, rather than a weaker document-presence condition.
+
+   The performance correction is checked in the reconciliation record. Its authoritative work now
+   belongs to `c`, with four shared HEADLESS benchmark fixtures, fixed 16.7 ms ceilings for UI-basic/
+   image-stress and 66.7 ms for UI-effects/vector-stress, frozen budgets and a nonzero-exit gate.
+   Moving the runner out of `d` resolves a further scheduling contradiction: a backend promised to
+   complete without WSI cannot require the live `test2d-sw.lsexe` to measure it. `d` reuses the
+   fixtures and requires the same benchmark result, while live/HiDPI measurements stay separately
+   reported. Fixture size/complexity, host and measurement conditions must be recorded before
+   acceptance, so reducing the workload cannot silently redefine a passing budget.
+
+   The final consistency check found that the same review-record problem affected its remaining
+   historical plan corrections. They are now incorporated into their owning work sections and the
+   record contains 23 checked PLAN-correction cross-references, not a second set of contradictory
+   implementation instructions. Exact reconciliations: tagged image semantics; owned mask/data
+   images and shared integer/full-float format ownership; separate CPU/backend/allocation spans;
+   initialization/padding and normative YUV rules; explicit 2D/3D resolve/conversion; prepared-list
+   invalidation and a bounded reusable builder; per-profile semantic hashing and numerical
+   tolerance deliverables; atomic surface configuration and pre-compositor single-visible-surface
+   behavior; release/acquire ordering for coherent CPU memory; asynchronous-capable submission and
+   readback; strict position dependencies including transcendentals and fully specified ClipCoordQ;
+   and separate Render3D/Scene3D core registry coverage. Backend-local depth/hazard choices now
+   point to the owning specification freeze. Core animation/light wording, 1x versus MSAA sample
+   positions, the raster integer-bound explanation and HDR alpha-clamping wording were aligned
+   with those existing contracts.
+
+   The old WSI text also retained the superseded rule that every completion closes its channel,
+   despite requiring reusable per-surface endpoints. It is replaced by one current contract: two
+   channel pairs per surface, bounded reusable queues, ownership-consuming per-present tokens,
+   receiver validation, peer-close cleanup and actual service-wide wake-member accounting. Completion
+   keys include generation/image/unique-present serial so a delayed duplicate cannot complete a
+   reused image. No new kernel synchronization object, worker runtime, compositor or Extended
+   graphics feature is introduced. Numerical specification choices remain explicit unchecked `s`
+   deliverables; resolving the PLAN record does not falsely declare those specifications frozen.
+
+3. **P02M0165 still ignores ready index zero and therefore lacks shutdown settlement - REJECTED.**
+   This was a real defect in the earlier code, but it is absent from the current implementation.
+   `device_manager::settle_shutdown_node` first tests process readiness with
+   `wait(process, now.max(1)) == 0` and reads claim settlement, then advances the normal event queue
+   and Pending ledger. Its `wait_any` calls supply bounded wakeups; they no longer filter results
+   with `ready > 0`. Ready confirmations are consumed before expiry classification, including the
+   one-handle remainder. The existing host shutdown-selection regression passes and the
+   development-only `pending_shutdown_outcomes` oracle drives the actual settlement function for a
+   sole ready handle and an unconfirmed timeout; the restart harness requires its success marker.
+
+   The prerequisite assessment was refreshed to describe that repaired implementation and its
+   evidence limits. It requires the current driver-restart gate before WSI acceptance and does not
+   claim a fresh guest or watched-fail pass from this review. The related obsolete claim that
+   production catalogue close has no test was also removed: `unopened_provider_withdrawal` exercises
+   actual channel closure, old-generation safety, late-subscriber replay and the withdrawal frame.
+   A transferred endpoint is still a different ownership case; the future WSI consumer must handle
+   withdrawal and peer-close idempotently and prove its own identity-aware detach/failover behavior.
+
+4. **P02M0167 still calls the repaired catalogue narrowing open - ACCEPTED.**
+   `candidate::catalogue_losses` retains runnable variants, `evidence_components` includes those
+   losses, and activation invokes `evidence_failures` before materialisation. The focused
+   real-registry regression removes a configuration without removing its check/coverage declaration
+   and passes. The plan now marks that catalogue repair implemented and names the real code path
+   and regression; it no longer directs implementation toward the obsolete check-ID projection.
+
+   The remaining verification qualification is retained precisely: kernel/loader staging and
+   content-keyed USB/system-disk templates do not snapshot the shared packages/bootstrap/manifest
+   still read by medium assembly. P02M0170 owns that acquisition boundary and concurrent-selection
+   proof; acceptance stays serial until the live gate passes. The related DisplayService assessment
+   now acknowledges its existing subscription and channel-close reacquisition, while leaving full
+   identity-aware withdrawal, alternative selection and typed device protocol with the existing
+   joint P02M0099/`a-wsi` owner. The inherited P02M0162 blanket claim is narrowed to its implemented
+   mechanism plus the already-required per-target bind-window measurement before recovery acceptance.
+
+Validation: re-read the complete plan and its changed dependency, freeze, lifecycle, benchmark and
+Done sections; checked the graph has no cycle and preserves the intended headless/optional boundaries;
+verified the corrected record names all 23 incorporated plan requirements. `git diff --check` passes.
+The existing `verify-model` candidate-narrowing regression and `driver-binding` shutdown-selection
+regression each ran one test and passed. No source or test was modified, and no guest or mutation
+pass is claimed. Repository-wide verification is performed after the multi-milestone edits settle.
+
+The plan is coherent for its declared staged implementation: the next eligible work writes the
+normative profiles, with implementation released only by the relevant completed freeze and activation
+approval. Phase-4 activation, actual service-restart completion, measured recovery windows and live
+verification prerequisites are not declared satisfied by this documentation review. All pre-existing
+audit bytes are preserved; this response is appended only.
+
+Final consistency refinements: the activation sentence now says WSI gates neither track's
+specifications or API work, rather than incorrectly exempting all backends (`g` still requires WSI).
+The serial verification restriction also excludes overlapping medium-input producers, not only
+another guest selection; this matches P02M0099 and addresses the package/bootstrap acquisition window.
+
+Final document verification (2026-09-07T23:03:25Z): all 16 latest findings across the five reviewed
+plans have individual decisions, all original audit prefixes match the saved pre-review bytes,
+and whitespace checks pass. Scoped `verify.sh --for` classifies the five plans as documentation
+and selects zero code checks. The stable rerun produced its normal inner handoff with zero deferred
+checks; commit/merge verification remains pending under the repository workflow. The earlier run
+refused a handoff because concurrent workspace edits changed its snapshot. No implementation or
+guest-test completion is claimed, no commit was made, and concurrent edits outside this review's
+five plans and five audit files were left untouched.

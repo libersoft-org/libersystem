@@ -825,6 +825,18 @@ fn every_fail_open_trigger_selects_everything() {
 	}
 }
 
+#[test]
+fn shared_provider_subscription_changes_reach_both_consumers() {
+	let model = model();
+	let plan = plan_for(&model, &["src/user/services/provider_subscription.rs"]);
+	assert!(!plan.full, "the shared include has precise ownership rather than an unknown-path fallback");
+	for consumer in ["bin.permission_manager", "bin.storage_service"] {
+		assert!(plan.affected_components.iter().any(|component| component == consumer), "the included code changes {consumer}");
+		assert!(plan.items.iter().any(|item| model.catalog.get(&item.key.check).is_some_and(|check| check.covers.iter().any(|covered| covered == consumer))), "the plan selects an actual check for {consumer}");
+	}
+	assert!(!plan.affected_components.iter().any(|component| component == "bin.network_service"), "an unrelated service does not include this file");
+}
+
 // The one outcome that must be impossible: a change that is understood, is not documentation, and
 // selects nothing at all.
 #[test]
@@ -1241,6 +1253,40 @@ fn the_scan_follows_helper_functions() {
 	assert!(direct.is_empty(), "the test itself launches nothing - that is the whole difficulty");
 	let called: BTreeSet<String> = parsed.iter().find(|(name, _, _)| name == "a_test").map(|(_, _, called)| called.clone()).unwrap_or_default();
 	assert!(called.contains("helper"), "and the call to the harness is what has to be followed");
+}
+
+#[test]
+fn service_launch_arguments_and_nested_helpers_keep_their_actual_owner() {
+	let source = r#"
+fn outer() {
+	fn nested() {
+		let elf = program_elf(&package, volume, b"virtio_gpu");
+	}
+	fn short_helper() { let value = 1; }
+	let elf = program_elf(&package, volume, b"display_service");
+	spawn_service(b"log_service");
+	spawn_service_with_package(b"process_service");
+	launch_volume_program(storage, process, "config_service", 7);
+	let sound = package.lookup(b"drivers/virtio_snd.lsexe");
+	spawn_service(dynamic_name);
+	let unrelated = b"virtio_console";
+}
+fn another_test() {
+	let value = 2;
+}
+"#;
+	let parsed = crate::kerneltests::parse_touches(source);
+	let (_, reached, _) = parsed.iter().find(|(name, _, _)| name == "outer").expect("the enclosing function remains present");
+	for component in ["bin.display_service", "bin.log_service", "bin.process_service", "bin.config_service", "bin.virtio_snd"] {
+		assert!(reached.contains(component), "the actual enclosing body reaches {component}: {reached:?}");
+	}
+	assert!(!reached.contains("bin.virtio_gpu"), "an uncalled local helper is not part of the enclosing function's direct launches");
+	assert!(!reached.contains("bin.virtio_console"), "a dynamic helper argument cannot borrow a later literal");
+	let (_, nested, _) = parsed.iter().find(|(name, _, _)| name == "nested").expect("the nested helper remains callable");
+	assert!(nested.contains("bin.virtio_gpu"));
+	assert!(!nested.contains("bin.display_service"), "the helper does not inherit the enclosing remainder");
+	let (_, next, _) = parsed.iter().find(|(name, _, _)| name == "another_test").expect("a separate test remains separate");
+	assert!(!next.contains("bin.display_service"));
 }
 
 // ---------------------------------------------------------------------------------------------

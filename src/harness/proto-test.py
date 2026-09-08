@@ -558,9 +558,9 @@ def group_launch(suite):
 	peer = Peer()
 	suite.check('stopping when nothing was launched is refused', peer.call(LAUNCH_STOP).outcome(), (ERROR, NO_LAUNCH))
 	suite.check('reading output when nothing was launched is refused', peer.call(LAUNCH_OUTPUT).outcome(), (ERROR, NO_LAUNCH))
-	# A component the permission manifest does not cover cannot be launched. That is the
-	# boundary working: the launcher stays the authority, and the agent asks rather than loads.
-	suite.check('an unlaunchable component is refused', peer.call(LAUNCH, launch_payload(b'echo', b'', b'vol://system')).outcome(), (ERROR, LAUNCH_REFUSED))
+	# The pinned supervisor has neither an ordinary volume launch path nor a tool permission
+	# manifest. `echo` does have a declared empty manifest and is correctly launchable.
+	suite.check('an unlaunchable component is refused', peer.call(LAUNCH, launch_payload(b'system_manager', b'', b'vol://system')).outcome(), (ERROR, LAUNCH_REFUSED))
 	suite.check('a name past the launch bound is refused', peer.call(LAUNCH, launch_payload(b'x' * 65, b'', b'vol://system')).outcome(), (ERROR, MALFORMED))
 
 	reply = peer.call(LAUNCH, launch_payload(b'uname', b'', b'vol://system'), timeout=30)

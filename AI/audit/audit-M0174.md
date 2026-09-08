@@ -1378,3 +1378,76 @@ AUDITOR'S RE-AUDIT OF PLAN P02M0174 (2026-09-04T00:47:54Z):
 **Current plan rating: 6/10.** The latest router-order export and RS stop/restart outcomes are
 correctly reconciled, but the RS timing oracle remains ambiguous, the internal route order is not
 total, and central resource bounds remain uninstantiated.
+
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-07T22:49:29Z):
+
+Reviewed the latest audit of 2026-09-04T00:47:54Z against M1-M8, the current single-interface
+`Stack` and NetworkService pump/deadline/capacity code, the `services/logic` host-test boundary,
+P02M0080's elastic-pool contract and P02M0175's consumer/API plan.
+
+1. **ACCEPTED - the subsequent RS timeout formula remained ambiguous.**
+   [RFC 3315 section 14](https://www.rfc-editor.org/rfc/rfc3315.html#section-14), adopted by
+   [RFC 7559 section 2](https://www.rfc-editor.org/rfc/rfc7559.html#section-2), adds jitter based on
+   the previous interval. M4 now states the first, subsequent and cap formulas directly:
+   `IRT + RAND*IRT`, `2*RTprev + RAND*RTprev`, and, only when the computed result exceeds MRT,
+   `MRT + RAND*MRT`. It freezes the uncapped `[1.9,2.1)` factor, capped `[3240,3960)` seconds,
+   checked duration arithmetic and scheduler-tick rounding while retaining indefinite retries.
+   The M8 requirements attached to M4 now include injected-RAND exact results, equality/over-MRT
+   cases, repeated capped retries on a host-controlled clock, and captured early QEMU intervals.
+   These distinguish the incorrect doubled-base jitter without requiring an hour-long guest test.
+
+2. **ACCEPTED - the internal echo route order omitted DIRECT routes.**
+   M5 creates on-link routes, so a router-only tie-break cannot order its own candidates. M5 now
+   selects a live matching route on the source's interface by descending prefix length, DIRECT
+   before VIA, the whole exported router order for two VIA routes, then prefix bytes. DIRECT has
+   no router key and uses the destination as next hop. Duplicate address/route identities update
+   one record, so the ordering is total within the explicitly retained single-interface scope.
+   Added reversed-insertion DIRECT/VIA fixtures and equal-prefix VIA reachability fixtures beside
+   the existing source/route/next-hop oracle. This remains an internal echo helper; it does not
+   move public source/route selection from P02M0175 into this milestone.
+
+3. **ACCEPTED - remotely populated resources had no actual capacities or exact exhaustion oracles.**
+   Current `net.rs` supplies IPv4/ARP and elastic TCP pools, not hidden IPv6 limits to inherit.
+   P02M0175 also claimed eight IPv6 routers without an eight-router producer bound. Added one
+   normative M6 resource table: one active interface; 16 IPv6 unicast addresses, 15 prefixes,
+   32 routes, 8 default routers, 8 advertisers per prefix, 4 RDNSS records, 64 ND neighbours,
+   64 PMTU entries, 32 MLD records, 64 recorded sources per pending MLD response, separate
+   32-entry invalidation and advisory-error queues, and pending-resolution limits of 4 packets
+   per neighbour, 32 overall and 65536 retained bytes. Due timer work is limited to 16 actions
+   per service iteration with a resumable cursor. M5's router limit now names eight directly.
+
+   M6 specifies atomic reservation and rollback, updating existing identities at capacity,
+   expiry/reclamation, refusal counters, separate per-packet/aggregate/byte queue accounting,
+   exactly-once release on send or failure, and retention of a validated per-flow smaller MTU
+   if inserting a new PMTU cache key fails. Table-event overflow has a sticky resync flag cleared
+   only after a consistent snapshot is installed; advisory overflow is counted and dropped in
+   its separate queue. An internal used/limit/counter snapshot gives host and guest fixtures a
+   concrete oracle without moving the public API into this milestone. M2 now fixes its existing
+   extension-walk requirement at 8 headers/256 bytes, and M3 fixes error-rate/burst defaults and
+   PMTU expiry so the flood/expiry gates have numeric expectations. These are appliance policy
+   limits, not claims that the RFCs require those numbers. Existing IPv4 cache configuration and
+   local elastic pools are preserved; P02M0175 sizes aggregate replies for both families.
+
+   M8 now requires capacity/capacity-plus-one, update-at-capacity and reclaim/recovery checks,
+   separate pending count and byte boundaries, resync versus advisory-drop assertions, and
+   timer-fairness/error-emission limits. Corrected the RS refusal oracle as part of this work:
+   a full eight-router list already supplies a default route, so it cannot also be empty and
+   soliciting. The continuing-RS fixture instead fills ND state while the router list is empty;
+   a ninth router is separately refused without disturbing the admitted eight.
+
+The final consistency pass also narrowed the inherited hostile-RA claim: the two-hour rule and
+checked lifetimes do not authenticate RAs or prohibit explicitly infinite protocol lifetimes.
+Rechecked L3 versus transport ownership, dependent resource admission, internal route totality,
+RS recovery, scope, numeric bounds and their positive/refusal tests. The plan is ready to implement
+within its declared appliance profile; multi-fragment reassembly remains its explicit conformance
+gap. No source code was modified by this review; all earlier audit content is preserved.
+
+Final document verification (2026-09-07T23:03:25Z): all 16 latest findings across the five reviewed
+plans have individual decisions, all original audit prefixes match the saved pre-review bytes,
+and whitespace checks pass. Scoped `verify.sh --for` classifies the five plans as documentation
+and selects zero code checks. The stable rerun produced its normal inner handoff with zero deferred
+checks; commit/merge verification remains pending under the repository workflow. The earlier run
+refused a handoff because concurrent workspace edits changed its snapshot. No implementation or
+guest-test completion is claimed, no commit was made, and concurrent edits outside this review's
+five plans and five audit files were left untouched.

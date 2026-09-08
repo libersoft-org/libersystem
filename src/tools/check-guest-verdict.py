@@ -115,6 +115,110 @@ class GuestVerdicts(unittest.TestCase):
             self.assertIn(f"`{case}`", inventory)
 
 
+class ExistingQemuAdmission(unittest.TestCase):
+    """The real guard inspects real open FDs; discovery names only this fixture."""
+
+    def exercise(self, paths, child=False, mutation=None):
+        import re
+        source = (ROOT / "test.sh").read_text()
+        match = re.search(r"^require_no_stray_qemu\(\) \{\n.*?^\}\n", source, re.M | re.S)
+        self.assertIsNotNone(match)
+        guard = match.group(0)
+        if mutation == "reject_private":
+            exemption = '\t\t\t[[ -n "$owner" && "$parents" == *" $owner "* ]] && continue\n'
+            self.assertEqual(guard.count(exemption), 1)
+            guard = guard.replace(exemption, "")
+        elif mutation == "trust_fixture_name":
+            anchor = '\t\t\t[[ "$target" == "$build/"* ]] || continue\n'
+            self.assertEqual(guard.count(anchor), 1)
+            guard = guard.replace(anchor, anchor + '\t\t\t[[ "${target##*/}" == fat-media*.img ]] && continue\n')
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp) / ".build"
+            root.mkdir()
+            descriptors = []
+            task = None
+            try:
+                for name, writable in paths:
+                    path = root / name.format(owner=os.getpid(), wrong_owner=os.getpid() + 10000000, key="a" * 64)
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.write_bytes(b"fixture")
+                    descriptors.append(os.open(path, os.O_RDWR if writable else os.O_RDONLY))
+                pid = os.getpid()
+                if child:
+                    # qemu-run.sh sometimes waits for QEMU, and test-kernel.sh's
+                    # inherited logs belong to an ancestor rather than QEMU itself.
+                    task = subprocess.Popen(["sleep", "30"], pass_fds=descriptors)
+                    pid = task.pid
+                script = r'''
+set -euo pipefail
+pgrep() { printf '%s\n' "$FIXTURE_PID"; }
+die() { printf '%s\n' "$*" >&2; exit 23; }
+note() { printf '%s\n' "$*" >&2; }
+''' + guard + '\nrequire_no_stray_qemu aarch64\n'
+                result = subprocess.run(["bash", "-c", script],
+                                        env=dict(os.environ, BUILD_DIR=str(root), FIXTURE_PID=str(pid)),
+                                        capture_output=True, text=True, timeout=5)
+                if result.returncode:
+                    self.assertEqual(result.returncode, 23, result.stderr)
+                    self.assertIn("already holds this tree's disk images", result.stderr)
+                    self.assertIn(str(pid), result.stderr)
+                return result.returncode
+            finally:
+                if task is not None:
+                    task.terminate()
+                    task.wait(timeout=5)
+                for descriptor in descriptors:
+                    os.close(descriptor)
+
+    def test_private_writable_images_and_inherited_logs_allow_parallel_guests(self):
+        paths = [(name, True) for name in (
+            "boot/virtio-blk-aarch64.{key}.{owner}.img",
+            "boot/virtio-blk-test.{key}.{owner}.img",
+            "boot/usb-media-riscv64.{key}.{owner}.img",
+            "boot/esp-aarch64.{owner}.img",
+            "boot/ovmf-vars.{owner}.fd",
+            "boot/aavmf-vars.{owner}.fd",
+            "boot/virtio-console-test.{owner}.out",
+            "logs/test/aarch64-20260908T003816Z-{owner}-run.log",
+            "logs/test/x86_64-20260908T004126Z-{owner}-guest.log",
+        )]
+        self.assertEqual(self.exercise(paths), 0)
+        self.assertEqual(self.exercise(paths, child=True), 0)
+        self.assertNotEqual(self.exercise(paths, mutation="reject_private"), 0)
+
+    def test_actual_read_only_shared_descriptors_are_safe(self):
+        paths = [(name, False) for name in (
+            "boot/fat-media-aarch64.{key}.img",
+            "boot/iso-media.{key}.iso",
+            "boot/udf-media.{key}.udf",
+            "boot/libersystem.iso",
+            "boot/kernel-aarch64.staged",
+        )]
+        self.assertEqual(self.exercise(paths), 0)
+        self.assertEqual(self.exercise([("../another-project/disk.img", True)]), 0)
+
+    def test_shared_writable_images_still_refuse_even_with_fixture_names(self):
+        for name in (
+            "boot/virtio-blk-aarch64.{key}.img",
+            "boot/usb-media-riscv64.{key}.img",
+            "boot/usb-media-riscv64.123abc.img",
+            "boot/fat-media-aarch64.{key}.img",
+            "boot/libersystem.iso",
+            "boot/esp-aarch64.img",
+            "shared-image-without-extension",
+            "logs/test/shared-run.log",
+            "logs/test/aarch64-20260908T003816Z-{wrong_owner}-run.log",
+            "boot/esp-aarch64.unrecognized.{owner}.img",
+            "boot/virtio-blk-aarch64.{key}.{wrong_owner}.img",
+        ):
+            with self.subTest(path=name):
+                paths = [("logs/test/aarch64-20260908T003816Z-{owner}-run.log", True), (name, True)]
+                self.assertNotEqual(self.exercise(paths), 0)
+        # The former basename exemption would silently allow writable FAT media.
+        self.assertEqual(self.exercise([("boot/fat-media.{key}.img", True)],
+                                       mutation="trust_fixture_name"), 0)
+
+
 class LoaderContention(unittest.TestCase):
     def exercise(self, shared_target=False, old_sequence=False):
         import json
@@ -219,7 +323,8 @@ class SystemDiskAcquisition(unittest.TestCase):
             (root / "volume.img").write_bytes(payload)
             script = ("set -euo pipefail\n" + producer +
                       self.production_function("qemu_run_disk") +
-                      self.production_function("scratch_sweep") + r'''
+                      self.production_function("scratch_sweep") +
+                      self.production_function("media_sweep") + r'''
 await_file() { while [[ ! -f "$1" ]]; do sleep .005; done; }
 # Both producers finish their candidates before A publishes. B then pauses immediately
 # before its normal rename while A acquires its copy. Only scheduling is controlled.
@@ -232,18 +337,19 @@ sync() {
     fi
 }
 mv() {
-    if [[ "$ROLE" == B && "$2" == "$FIXTURE/disk.img" ]]; then
+    if [[ "$ROLE" == B && "$1" == *.candidate ]]; then
         touch "$FIXTURE/b-publish-paused"
         await_file "$FIXTURE/a-copy-done"
     fi
     command mv "$@"
 }
-qemu_prepare_system_disk "$FIXTURE/volume.img" "$FIXTURE/disk.img"
+template="$(qemu_prepare_system_disk "$FIXTURE/volume.img" "$FIXTURE/disk.img")"
 if [[ "$ROLE" == A ]]; then
+    printf '%s\n' "$template" >"$FIXTURE/template-path"
     touch "$FIXTURE/a-published"
     await_file "$FIXTURE/b-publish-paused"
     status=0
-    qemu_run_disk "$FIXTURE/disk.img" >"$FIXTURE/private-path" || status=$?
+    qemu_run_disk "$template" >"$FIXTURE/private-path" || status=$?
     touch "$FIXTURE/a-copy-done"
     exit "$status"
 fi
@@ -256,8 +362,11 @@ fi
                 results = [task.communicate(timeout=5) for task in tasks]
                 self.assertEqual(tasks[1].returncode, 0, "".join(results[1]))
                 if tasks[0].returncode == 0:
+                    import hashlib
+                    template = Path((root / "template-path").read_text().strip())
+                    self.assertEqual(template, root / f"disk.{hashlib.sha256(payload).hexdigest()}.img")
                     private = Path((root / "private-path").read_text().strip())
-                    self.assertNotEqual(private, root / "disk.img")
+                    self.assertNotEqual(private, template)
                     self.assertEqual(private.stat().st_size, 128 * 1024 * 1024)
                     with private.open("rb") as copied:
                         self.assertEqual(copied.read(len(payload)), payload)
@@ -274,12 +383,15 @@ fi
         self.assertEqual(self.contested_copy(), 0)
         self.assertNotEqual(self.contested_copy(unlink_before_publish=True), 0)
 
-    def caller_result(self, architecture, unchecked_substitution=False, acquisition_succeeds=False):
+    def caller_result(self, architecture, unchecked_substitution=False, acquisition_succeeds=False, discard_template=False):
         import re
         function = self.production_function("qemu_run_" + architecture)
-        block = re.search(r'^\tif qemu_prepare_system_disk [^\n]*; then\n.*?^\tfi\n', function, re.M | re.S)
+        block = re.search(r'^\tif [^\n]*qemu_prepare_system_disk [^\n]*; then\n.*?^\tfi\n', function, re.M | re.S)
         self.assertIsNotNone(block, architecture)
         block = block.group(0)
+        if discard_template:
+            block, replacements = re.subn(r'virtio_disk="\$\((qemu_prepare_system_disk [^\n]*?)\)"', r'\1', block)
+            self.assertEqual(replacements, 1)
         if unchecked_substitution:
             attach = re.search(r'^\t\tqemu_attach_virtio_blk qemu_args "\$run_disk"[^\n]*\n', block, re.M)
             self.assertIsNotNone(attach, architecture)
@@ -288,15 +400,19 @@ fi
         # Execute the actual caller block with acquisition failing. A helper returning failure
         # inside an unchecked argument substitution does not make the attachment call fail.
         script = r'''set -euo pipefail
-qemu_prepare_system_disk() { return 0; }
+qemu_prepare_system_disk() { printf '%s\n' 'keyed template.img'; }
 qemu_run_disk() {
+    if [[ "$1" != 'keyed template.img' ]]; then
+        echo "fixture: copied wrong template" >&2
+        return 1
+    fi
     if [[ "$COPY_SUCCEEDS" == 1 ]]; then printf '%s\n' 'private disk.img'; return 0; fi
     echo "fixture: private copy failed" >&2
     return 1
 }
 qemu_attach_virtio_blk() { printf 'ATTACHED <%s>\n' "$2"; }
 caller() {
-    local volume_image=volume volume_pkg=volume virtio_disk=disk virtio_opts=""
+    local volume_image=volume volume_pkg=volume virtio_disk=disk virtio_opts="" dma_fixture=0
 ''' + block + '    echo "CONTINUED"\n}\ncaller\n'
         return subprocess.run(["bash", "-c", script], env=dict(os.environ, COPY_SUCCEEDS=str(int(acquisition_succeeds))),
                               capture_output=True, text=True, timeout=5)
@@ -316,6 +432,11 @@ caller() {
                 self.assertEqual(mutant.returncode, 0, mutant.stdout + mutant.stderr)
                 self.assertIn("ATTACHED", mutant.stdout)
                 self.assertIn("CONTINUED", mutant.stdout)
+                wrong_template = self.caller_result(architecture, discard_template=True, acquisition_succeeds=True)
+                self.assertEqual(wrong_template.returncode, 1, wrong_template.stdout + wrong_template.stderr)
+                self.assertIn("fixture: copied wrong template", wrong_template.stderr)
+                self.assertNotIn("ATTACHED", wrong_template.stdout)
+                self.assertNotIn("CONTINUED", wrong_template.stdout)
 
 
 class LoaderTimestampIsolation(unittest.TestCase):

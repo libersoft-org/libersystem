@@ -237,7 +237,7 @@ or preventing further development of `v1`.
 - [x] [P02M0161 - Every driver family invents its own bring-up wire](P02M0161.md)
 - [x] [P02M0162 - A bind that fails part-way leaves the parts that succeeded](P02M0162.md)
 - [x] [P02M0163 - Discovery holds two kinds of device and the binding unit is an index into that table](P02M0163.md)
-- [ ] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
+- [x] [P02M0164 - One NIC, one disk, one screen: a second of anything has nowhere to go](P02M0164.md)
 - [x] [P02M0165 - A driver that stops answering looks exactly like one that is busy](P02M0165.md)
 - [x] [P02M0166 - Everything that went wrong is reported as `failed`](P02M0166.md)
 - [x] [P02M0167 - The selector answers "everything" to every question, so nobody asks it](P02M0167.md)
