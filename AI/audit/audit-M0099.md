@@ -2397,3 +2397,23 @@ checks; commit/merge verification remains pending under the repository workflow.
 refused a handoff because concurrent workspace edits changed its snapshot. No implementation or
 guest-test completion is claimed, no commit was made, and concurrent edits outside this review's
 five plans and five audit files were left untouched.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0099 (2026-09-08T11:03:33Z):
+
+Current plan rating: 8/10
+
+1. **The executable virtio-blk item does not reconcile its unconditional DMA acceptance with the policies and teardown outcomes it inherits.** Its acceptance requires every device buffer to be a live IOVA in the binding's domain and says teardown returns those mappings (`docs/todo/P02M0099.md:435-442`), without choosing the driver's declared policy or qualifying the target/profile. P02M0172 starts `virtio_blk` as `trusted-untranslated`, then requires a migrated driver to become `iommu-required`; it also states that AArch64 and RISC-V lack enforcement until P02M0173 (`docs/todo/P02M0172.md:54-78`). The item's executable prerequisites omit P02M0173 (`P02M0099.md:418-427`). Thus retaining the trusted mode leaves a valid degraded boot unable to satisfy the universal IOVA assertion, while choosing the required mode prevents those target boots until a prerequisite the item does not name lands. The actual address syscall deliberately returns physical addresses in the degraded case (`src/kernel/syscall/mod.rs:802-819`). Separately, returning mappings unconditionally contradicts both P02M0153's retained quarantine on unconfirmed retirement (`docs/todo/P02M0153.md:189-200`) and this index's own confirmed-versus-quarantined gate (`P02M0099.md:1466-1470`). State the intended DMA policy and acceptance profiles in this item, inherit the enforcing-profile prerequisite where required, and restrict the return-to-baseline assertion to confirmed teardown. This needs a consistent item contract, not another DMA mechanism.
+
+2. **The acceptance ledger still records the live same-architecture selection/tag proof as outstanding after that exact proof passed.** The entry says P02M0167's reconciliation reserves this proof (`docs/todo/P02M0099.md:140-143`). The current prerequisite instead records its successful corrective execution (`docs/todo/P02M0167.md:1312-1319,1336`), and the retained execution log independently confirms it: `/tmp/libersystem-final-concurrency-recheck.log:10-15` reports overlapping x86_64 suites with different `dma`/`domain` selections and tags, both successful with distinct run logs, followed by the passed catalogue key. This is an executed guest result, not merely the host-template test or a COMPLETE status. Discharge that particular evidence condition in the ledger. Keep the separately identified P02M0170 producer/acquisition boundary and mutation proof open: `src/harness/mkimage.sh:736-740` still detects an input change after assembly, and the successful ordinary overlap does not establish stability while producers mutate inputs. Combining the completed proof with that remaining condition misstates what an implementer must still supply.
+
+Verification: read the complete existing audit history and current index, checked the planner's latest source-backed corrections and the cited retained execution evidence. No new guest run or source modification was performed. Existing audit content is preserved verbatim.
+
+
+Re-audit verification correction (2026-09-08T11:08:00Z):
+
+Finding 1 above is withdrawn. The item's explicitly named x86_64 enforcing gate supplies the profile context for its IOVA assertion, and the inherited confirmed-teardown/quarantine contract supplies the release qualification. Three-target build and bind-budget requirements do not independently require successful untranslated block operation. Treating those sentences as a new policy or teardown blocker overstated the evidence and would request clarification already supplied by the governing contract.
+
+Current plan rating: 9/10. Only finding 2 above remains: credit the executed live concurrent-selection proof while retaining the distinct open producer/acquisition condition.
+
+Timestamp correction: the verification correction immediately above was appended at 2026-09-08T11:05:56Z; its 11:08:00Z timestamp was a transcription error.

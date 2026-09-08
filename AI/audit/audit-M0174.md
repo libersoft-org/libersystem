@@ -1451,3 +1451,12 @@ checks; commit/merge verification remains pending under the repository workflow.
 refused a handoff because concurrent workspace edits changed its snapshot. No implementation or
 guest-test completion is claimed, no commit was made, and concurrent edits outside this review's
 five plans and five audit files were left untouched.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0174 (2026-09-08T11:10:57Z):
+
+Current plan rating: 8/10
+
+1. **The frozen quoted-error event omits the information required by the traceroute/probe consumer it is supposed to support.** M6 specifies a typed event containing the error class/code and MTU or pointer, plus the quoted source/destination and ports or ICMP identifier (`docs/todo/P02M0174.md:600-627`). It carries neither the outer ICMPv6 sender address nor the quoted Echo sequence number. The quoted destination is the final probe destination, so it cannot identify the intermediate router that generated Time Exceeded. Nor does an ICMP identifier distinguish successive probes using that identifier. These are existing consumer requirements: the current IPv4 path preserves both the responding address and quoted sequence in `TimeExceeded`/`Unreachable` (`src/user/services/core/src/net.rs:1081-1088`), and `do_probe` sends identifier 1 with an incrementing sequence, matches the returned sequence, and reports the responding hop (`src/user/services/core/src/network_service.rs:1046-1060`). P02M0175 explicitly migrates those probe/traceroute paths and requires IPv6 traceroute errors while consuming this frozen seam (`docs/todo/P02M0175.md:529-530,1270-1272,1309-1314`). Following the specified event shape leaves that consumer unable to report the actual hop, and a delayed error for an earlier same-identifier probe can be assigned to the current one. Preserve the scoped outer sender and quoted probe sequence in the bounded typed event here, and gate two successive same-identifier probes with delayed/reordered errors from different routers. This completes the existing seam; it requires no L3 flow-registration table or public transport implementation in this milestone.
+
+Verification: read the complete prior audit history and all M1-M8 plan text, checked the latest planner corrections against the current service/stack boundaries and the consumer plan, and consulted the primary RFCs for the protocol corrections. No implementation, source mutation or guest run was performed; all previous audit bytes are preserved.

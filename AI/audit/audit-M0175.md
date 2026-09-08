@@ -2057,3 +2057,46 @@ checks; commit/merge verification remains pending under the repository workflow.
 refused a handoff because concurrent workspace edits changed its snapshot. No implementation or
 guest-test completion is claimed, no commit was made, and concurrent edits outside this review's
 five plans and five audit files were left untouched.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0175 (2026-09-08T11:04:06Z):
+
+Current plan rating: 7/10.
+
+Read the complete current plan and all 2,059 lines of preceding audit history, including the latest
+planner response and its addenda. Two material defects remain in the planned behavior:
+
+1. **The event-driven migration still gives caller-initiated ping and traceroute probes no pending
+   state or deadline owner.** M9/M10 require both operations to migrate and work in the dual-stack
+   matrix (`docs/todo/P02M0175.md:1270-1274,1309-1315`), but M7's exhaustive pending partition
+   contains only DNS/SNTP/DHCP (`:1031-1056`), and its scheduler contains per-TCB deadlines plus
+   DHCP, L3 and INTERNAL-UDP, the last expressly restricted to DNS/SNTP (`:1100-1118`). The L3
+   aggregate it consumes covers DAD, RS, ND retry, NUD, prefix/address/router/RDNSS, PMTU and MLD;
+   it supplies no client echo-request/probe timeout (`docs/todo/P02M0174.md:564-567`). This cannot
+   inherit working asynchronous behavior: current `do_ping` and `do_probe` retain their sequence,
+   start time and `PING_TIMEOUT_TICKS` deadline on the blocking helper's stack and pump unrelated
+   events away (`src/user/services/core/src/network_service.rs:998-1023,1037-1065`). Moving those
+   calls into the specified serve loop leaves a silent target's RPC with neither retained
+   correlation state nor a scheduled timeout; keeping those helpers preserves the event-loss and
+   service-blocking behavior M7 exists to remove. Include these existing diagnostic operations in
+   bounded pending-state/deadline accounting and define their retirement/invalidation transitions.
+   Add a silent ping/probe case concurrent with a DNS response and a due TCP/L3 timer, asserting
+   the diagnostic timeout, correct reply matching, released state and continued unrelated progress.
+   This is completion of the existing runtime migration, not a new diagnostic API.
+
+2. **The RFC 8028 restriction overrides the plan's own DIRECT-route semantics.** M1 makes an
+   on-link destination its own next hop (`docs/todo/P02M0175.md:208-219`), and M5 prefers DIRECT
+   over VIA and tests that choice (`:734-769`). The following RFC 8028 rule nevertheless restricts
+   candidate next hops to the selected source prefix's advertisers without first limiting that
+   restriction to traffic needing a router (`:770-792`). With a live router advertising an
+   `A=1,L=1` prefix, a source formed from that prefix and a second host on the same prefix, the
+   correct destination next hop is not an advertiser. Applying the written restriction either
+   removes the valid direct path or substitutes the advertising router, so local TCP/UDP traffic
+   can depend on router forwarding despite an available on-link route. [RFC 8028 section 3.2](https://www.rfc-editor.org/rfc/rfc8028.html#section-3.2)
+   extends default-router selection; [RFC 4861 section 5.2](https://www.rfc-editor.org/rfc/rfc4861.html#section-5.2)
+   first selects the destination itself for an on-link packet and selects a default router only
+   otherwise. State that DIRECT selection bypasses the advertiser restriction; retain the existing
+   restriction and frozen order when choosing a default router. Add an on-link peer fixture while
+   the source prefix has a live advertiser, asserting destination-neighbour resolution and direct
+   delivery without router forwarding. The existing zero-router-lifetime case does not exercise
+   this collision with a live advertiser set.

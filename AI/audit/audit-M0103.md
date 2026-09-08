@@ -2563,3 +2563,60 @@ checks; commit/merge verification remains pending under the repository workflow.
 refused a handoff because concurrent workspace edits changed its snapshot. No implementation or
 guest-test completion is claimed, no commit was made, and concurrent edits outside this review's
 five plans and five audit files were left untouched.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0103 (2026-09-08T11:04:53Z):
+
+Current plan rating: 8/10
+
+Read the complete current plan and complete audit history, and checked the planner's responses against
+the current source. Only the following newly discovered material defect remains reportable.
+
+1. **The clipper's mandatory rule contradicts the mandatory interpolation qualifiers.**
+   Render3D requires `smooth`, `noperspective` and `flat` varyings
+   (`docs/todo/P02M0103.md:1873-1875`), and the shader interpreter must implement all qualifiers
+   (`:2210-2214`). The clipper nevertheless requires a single intersection parameter applied
+   identically to position and ALL varyings (`:2191-2194`). That is incorrect for a
+   `noperspective` attribute when the edge endpoints have different clip-space `w`.
+
+   For example, an edge with `(x, w, attribute)` endpoints `(-2, 1, 0)` and `(0, 2, 1)` crosses the
+   specified left plane `x + w = 0` (`:2199`) at homogeneous edge parameter `t = 1/3`. The new
+   vertex projects to `x/w = -1`, halfway between the original projected endpoints `-2` and `0`.
+   A screen-linear `noperspective` attribute must therefore be `1/2`; the plan's mandated rule
+   assigns `1/3`. Clipping changes the interpolated field over the surviving primitive, producing
+   incorrect colors/UVs and visible changes as an edge crosses a clip plane. `flat` values likewise
+   need the original provoking-vertex value preserved through clipping and fan triangulation,
+   rather than the unconditional interpolation this item specifies.
+
+   Make clipping qualifier-aware in the existing `s-3d` specification and `g` item: retain the
+   homogeneous parameter for position and smooth varyings, derive the projected parameter for
+   `noperspective`, and preserve the original provoking value for `flat`. Add the unequal-`w`
+   clipped-edge case to the already-required interpolation/clipping conformance coverage. This
+   changes no profile scope and needs no additional subsystem.
+
+Verification: exact rational arithmetic confirms the `1/3` versus `1/2` counterexample. The existing
+`verify-model` candidate-narrowing regression and `driver-binding` shutdown-selection regression each
+passed one focused test. No guest or mutation run is claimed. No plan or source was modified.
+
+
+Re-audit addendum (2026-09-08T11:06:58Z); current plan rating remains 8/10.
+
+2. **The prerequisite assessment still calls the completed live concurrent-selection proof
+   outstanding.** The plan describes the live same-architecture selection/tag identity proof as
+   remaining (`docs/todo/P02M0103.md:233-235`) and ties its serial-only restriction to the live gate
+   passing (`:217-220`). P02M0167 now records that the actual two-guest gate passed after the
+   private-file admission fix (`docs/todo/P02M0167.md:1317-1319,1336`). Its retained execution log
+   independently reports two overlapping x86_64 suites with different `dma`/`domain` selections
+   and tags, successful results with distinct run logs, and the passed catalogue key
+   (`/tmp/libersystem-final-concurrency-recheck.log:10-15`). This is the executed proof the plan
+   still says must be supplied, rather than a status label or a host-only test.
+
+   Discharge that particular live-proof condition. Keep the separately identified P02M0170
+   producer/acquisition boundary and its mutation proof open (`docs/todo/P02M0170.md:78-100,124-138`):
+   ordinary overlapping success does not stabilize inputs while producers change them, and
+   `src/harness/mkimage.sh:736-740` still detects movement after assembly. The remaining execution
+   restriction must be justified by that unsatisfied condition, not by absence of the completed
+   selection/tag proof. This finding supplements finding 1 above; neither requires changing source.
+
+The retained prerequisite document and execution log were read directly. No new guest run was made;
+the complete audit prefix, including the earlier re-audit in this turn, is preserved verbatim.
