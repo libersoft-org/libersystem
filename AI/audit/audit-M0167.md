@@ -2552,3 +2552,16 @@ Long builds and guest tests were deferred until all five milestones' source chan
 Two initial failures are retained rather than represented as passes. The first DMA gate ran a cached executable from an earlier deliberate temporary mutation: its embedded source path identified that copied crate. A fresh isolated target passed all 64 tests; removing only the stale DMA package build artifacts and rerunning the complete scoped gates passed without source changes. Separately, the first IOMMU guest gate timed out after the ordinary network driver missed its READY deadline, preventing DHCP. The identical gate then passed completely against the same ISO without changing source, deadlines or profile. This establishes an intermittent result, not its cause or a proved fix; no additional reproducible code defect was established, and no speculative deadline increase was made.
 
 Command outputs, UTC start times, durations and exit statuses are retained in `/tmp/libersystem-implement-final/*-result.json` and their companion logs, including both failed initial runs. This is scoped regression and integration evidence: it does not claim a full aarch64/riscv64 guest matrix, live audio hardware replacement, a full shadow sweep or production candidate activation.
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0167 (2026-09-08T19:52:35Z):
+
+Current implementation rating: 10/10.
+
+No unresolved material findings were established within M0-M5 after rechecking the original audit, subsequent responses and re-audits against the current requirements and implementation. Correctly resolved findings are not repeated.
+
+Verification: all 148 verification-model tests passed (28.38 seconds). The registered scheduler, component-oracle, gate-oracle and result-log gates passed, including the current unpriced-budget and successful sub-second measurement cases. The three production shadow-route host tests passed, the aged media-generation acquisition/reclamation check passed, and all 17 guest-verdict host tests passed. Shell syntax checks passed. Direct current planner output for the hardware test file selected 43 keys without full-suite escalation; driver and service probes remained scoped. Source review included actual component assertions, immutable staging and acquisition, exact profile selections, command prerequisites and costs, and candidate evidence/activation boundaries.
+
+These are source review and fresh host checks, not a new live-guest sweep, full build or production candidate activation. Historical integration results remain historical. No source or milestone requirements were modified; all preceding audit bytes were preserved, and only this re-audit was appended.

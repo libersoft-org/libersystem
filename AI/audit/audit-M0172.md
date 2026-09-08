@@ -1555,3 +1555,78 @@ material defect was established. Correctly resolved findings are not repeated.
 
 This is a plan assessment; implementation and guest gates were not executed. Only this
 re-audit was appended. The plan, source code and all preceding audit content were preserved.
+
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-08T19:53:00Z):
+
+Latest audit reviewed: 2026-09-08T19:00:54Z. It contains zero numbered findings. Its
+unqualified conclusion of no unresolved material findings is REJECTED: independent review found
+an unsupported entry path and residual wording that conflicts with the accepted signed-absence
+contract. These are independent residual findings, not findings attributed to the latest auditor.
+
+1. **ACCEPTED - the plan requires an x86_64 direct-boot path that this project does not have.**
+   `docs/ARCHITECTURES.md` names only UEFI for x86_64, while both other targets also support direct
+   `-kernel` entry. `src/kernel/main.rs::kmain` accepts and checks the loader's `BootInfo` before
+   initializing the machine; it supplies no alternative direct prologue. The x86_64 harness always
+   selects an ISO and OVMF, including its internal test path (`qemu_run_x86_64`). A direct harness
+   invocation still boots UEFI. M2's public x86_64 direct rows and M3's corresponding admission
+   input therefore required unrelated boot architecture work, rather than migrating an existing
+   producer.
+
+   Exact plan changes: M2 now bounds every row to the existing architecture entry paths, removes
+   the x86_64 public direct row, and limits the direct `--no-iommu` row to AArch64/RISC-V. M3 removes
+   the fictitious x86_64 direct carrier and transport row, retains its UEFI `fw_cfg` loader input
+   and kernel relay validation, and distinguishes early direct FDT admission from UEFI `BootInfo`
+   admission. Its shared record text now covers the actual FDT, `fw_cfg` and ESP inputs. M8 places
+   the same-topology UEFI/direct comparison on AArch64 or RISC-V and keeps the x86_64 UEFI relay
+   fixture. The Definition of done follows those paths, and the exclusions explicitly rule out a
+   new x86_64 direct prologue. No carrier, topology or entry mechanism was added.
+
+2. **ACCEPTED - M2's missing-value example still conflates signed absence with missing admission
+   data.** Its blanket refusal for a loader that produced no signed field conflicts with M3's
+   authenticated tag-0 set, which deliberately supplies no signed mode and authorizes the validated
+   harness relay. The existing boot-manifest encoder/parser has a versioned, fixed-order v2 header;
+   M3 correctly owns the prospective tagged grammar. That grammar's signed absence and the mandatory
+   resulting `BootInfo` mode are distinct facts, so the former cannot be another universal refusal.
+
+   Exact plan changes: M2 now refuses a loader that supplies no validated `BootInfo` mode and
+   explicitly preserves the admitted tag-0 plus harness-relay case. M3's shared record explanation
+   also now says that the one-byte asserted provenance belongs to harness inputs; signed manifests
+   use the already specified tagged mode record and acquire `signed` provenance through loader
+   validation. The canonical bytes, equality latch, legacy refusal and positive/refusal fixtures
+   remain the same.
+
+Rechecked the complete current plan, M1-M8, Dependencies and Definition of done against the current
+code and prerequisite contracts. The eight manifest driver rows match the explicit migration table;
+`dma_policy::policy_for` still uses `IOMMU_REQUIRED_TYPES` and an implicit trusted-untranslated
+fallback. The current claim path admits and attaches before enabling bus mastering and mints the
+binding generation, so the planned exact-entry validation and non-mastering `none` path remain
+necessary. `system-manifest::validate_name`, generated registry entries and persisted `select=`
+policy support the chosen single identity and DeviceManager selection authority.
+
+BootInfo remains v2. The x86_64 `fw_cfg` reader leaves its input readable and truncates copies to its
+buffer, confirming why the retained relay fixture requires the full advertised length and canonical
+bytes. The non-x86 per-run ESP, early raw-FDT/BootInfo distinction and loader tree-withholding
+option support their transport and treeless fixtures. The producer-before-admission order remains
+explicit; P02M0171's manifest evolution stays coordinated, and P02M0173 owns the topology and later
+three-row non-x86 transition. The current architecture has ordinary enforcement only on x86_64.
+
+After these bounded corrections, the plan is complete, feasible and internally consistent for
+implementation in its stated dependency order. Its positive and refusal fixtures cover the actual
+entry paths without expanding the milestone into a new boot architecture. All work items and the
+existing TODO row remain unchecked. Only this plan and this audit append were changed; no source
+code or implementation/guest tests were modified or executed. The coordinating review records
+shared scoped document verification after all four responses settle. Every preceding audit byte
+is preserved.
+
+Consolidated four-plan document verification (2026-09-08T19:55:51Z): the latest audits contain one numbered
+finding, accepted and corrected in P02M0175. Independent checks additionally corrected P02M0103's
+application-ABI premise and P02M0172's unsupported x86_64 direct path and missing-mode wording;
+P02M0174 remains unchanged. The complete current plans and shared contracts were rechecked for
+scope, completeness, feasibility and internal consistency. All four original audit prefixes match
+their pre-review snapshots byte-for-byte. Scoped whitespace checks pass and source code is unchanged.
+`./verify.sh --for` over these four plans and four audits selected zero inner and zero deferred code
+checks, then exited 6 (`INCOMPLETE`), requiring post-commit merge verification even for an empty
+check set. No full revision-verification pass, implementation-test pass or commit is claimed.
+Concurrent edits to other audit files were preserved. Final prefix and whitespace checks cover this
+verification append as well.

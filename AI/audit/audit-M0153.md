@@ -2334,3 +2334,14 @@ Long builds and guest tests were deferred until all five milestones' source chan
 Two initial failures are retained rather than represented as passes. The first DMA gate ran a cached executable from an earlier deliberate temporary mutation: its embedded source path identified that copied crate. A fresh isolated target passed all 64 tests; removing only the stale DMA package build artifacts and rerunning the complete scoped gates passed without source changes. Separately, the first IOMMU guest gate timed out after the ordinary network driver missed its READY deadline, preventing DHCP. The identical gate then passed completely against the same ISO without changing source, deadlines or profile. This establishes an intermittent result, not its cause or a proved fix; no additional reproducible code defect was established, and no speculative deadline increase was made.
 
 Command outputs, UTC start times, durations and exit statuses are retained in `/tmp/libersystem-implement-final/*-result.json` and their companion logs, including both failed initial runs. This is scoped regression and integration evidence: it does not claim a full aarch64/riscv64 guest matrix, live audio hardware replacement, a full shadow sweep or production candidate activation.
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0153 (2026-09-08T19:54:23Z):
+
+Current implementation rating: 10/10.
+
+No unresolved material finding was established within M0-M6 after checking the original audit, implementer responses and subsequent findings against the current milestone requirements and production implementation. Correctly resolved findings are not repeated.
+
+Verification: the current `virtio-iommu-protocol` gate passed all 64 DMA/codec tests and eight extracted production attachment, claim, queue, teardown and buffer scenarios, and rejected all eight registered faulty variants. Review covered uncertain completion ownership, domain retirement, retained frame completions and accounting, fault attribution and bounded servicing, MSI failure containment, the portable staging contract, and the enforcing/default/degraded QEMU gate's actual configuration and assertions. An independent second review of the latest unanswered-ATTACH repair found no additional in-scope defect. These are fresh host checks and source review; no new QEMU run or full build was performed, and historical integration results are not presented as fresh execution. The manager's handling of the resulting claim error is reported under P02M0162, which owns its state/cause record. No source code or preceding audit text was changed.

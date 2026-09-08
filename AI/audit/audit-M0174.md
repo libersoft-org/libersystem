@@ -1856,3 +1856,65 @@ protocol rules against [RFC 4861 section 6.3.6](https://www.rfc-editor.org/rfc/r
 This is a plan assessment within the declared appliance profile, including its explicit
 multi-fragment conformance gap; no implementation or host/guest-test completion is claimed.
 The plan and source code were not changed, and every preceding audit byte is preserved.
+
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-08T19:51:03Z):
+
+Reviewed the latest audit, dated 2026-09-08T19:02:01Z, against the complete current M1-M8
+plan, its prerequisite milestones, the architecture and the relevant current source. The latest
+audit has no numbered findings and requests no corrections. Its substantive conclusions are
+addressed individually below; no new material defect was established by this review.
+
+1. **No unresolved material finding within the stated milestone scope - ACCEPTED.**
+   The plan covers the declared L3 appliance profile: typed scoped addresses, bounded parsing and
+   atomic-fragment handling, ICMPv6, the five NUD states, DAD/SLAAC, MLD membership, independent
+   router/address expiry, MTU constraints, bounded state and events, and a controllable acceptance
+   peer. M6 explicitly precedes M3-M5, and M7 supplies M8's peer before P02M0175 extends it.
+   Each resource ceiling has admission, release, observability and exact-bound fixtures. There is
+   no latest-audit correction to apply, so `docs/todo/P02M0174.md` is unchanged.
+
+2. **The architecture and shared-contract assessment is supported - ACCEPTED.**
+   Independently checked `net.rs` (`Event`, `Outcome`, `Stack`, `on_frame`, `on_ipv4`),
+   `network_service.rs` (`net_policy`, startup frame sizing, `pump`, `serve`, and the blocking
+   ping/probe/DNS/TCP helpers), `virtio_net.rs` buffer sizing, the `services` and `service-logic`
+   Cargo manifests, and `qemu_attach_virtio_net` in the harness. They substantiate the current
+   single-event, DHCP-deadline, fixed-buffer and user-netdev constraints described by the plan.
+   The proposed pure-state extraction and central dispatcher therefore fit the existing runtime
+   boundary. Compared P02M0175's consumers against M6: L3 owns tables and candidate enumeration;
+   transports own selection and live-flow correlation; route-scoped PMTU writes follow consumer
+   validation; invalidation overflow requires resync while advisory-error overflow drops/counts;
+   pending packet cancellation and `Sent(operation_token, monotonic_send_time)` carry no separate
+   flow registry. Cancellation applies to any retained consumer packet, including a queued SYN,
+   so the dependent transport fallback correction needs no additional L3 operation. No plan change.
+
+3. **The protocol checks and the limited conformance/completion claim are supported - ACCEPTED.**
+   Rechecked the grouped usable-neighbour ordering against
+   [RFC 4861 section 6.3.6](https://www.rfc-editor.org/rfc/rfc4861.html#section-6.3.6) and
+   [RFC 4191 section 3.2](https://www.rfc-editor.org/rfc/rfc4191.html#section-3.2), and the RS
+   parameters, stopping condition and exact jitter formulas against
+   [RFC 7559 section 2](https://www.rfc-editor.org/rfc/rfc7559.html#section-2) and
+   [RFC 3315 section 14](https://www.rfc-editor.org/rfc/rfc3315.html#section-14).
+   The MLD query merge and compatibility rules match
+   [RFC 9777 sections 6.2 and 8.2.1](https://www.rfc-editor.org/rfc/rfc9777.html#section-6.2).
+   The declared multi-fragment refusal remains a named limit against
+   [RFC 8200 section 5](https://www.rfc-editor.org/rfc/rfc8200.html#section-5), rather than a
+   general IPv6-conformance claim. Scope expansion into reassembly, a public multicast API,
+   multi-NIC selection or the dependent transport migration is not warranted by this clean audit.
+   No plan change; all eight work items and the roadmap row remain open.
+
+Final recheck: the current plan is complete, feasible and internally consistent for its declared
+profile and ready for implementation. This is a plan-readiness conclusion, not an implementation
+or host/guest-test result. No source code or existing audit content was changed. The audit was
+snapshotted before this append, and its original bytes were verified as an unchanged prefix.
+
+Consolidated four-plan document verification (2026-09-08T19:55:51Z): the latest audits contain one numbered
+finding, accepted and corrected in P02M0175. Independent checks additionally corrected P02M0103's
+application-ABI premise and P02M0172's unsupported x86_64 direct path and missing-mode wording;
+P02M0174 remains unchanged. The complete current plans and shared contracts were rechecked for
+scope, completeness, feasibility and internal consistency. All four original audit prefixes match
+their pre-review snapshots byte-for-byte. Scoped whitespace checks pass and source code is unchanged.
+`./verify.sh --for` over these four plans and four audits selected zero inner and zero deferred code
+checks, then exited 6 (`INCOMPLETE`), requiring post-commit merge verification even for an empty
+check set. No full revision-verification pass, implementation-test pass or commit is claimed.
+Concurrent edits to other audit files were preserved. Final prefix and whitespace checks cover this
+verification append as well.

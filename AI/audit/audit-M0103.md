@@ -3017,3 +3017,72 @@ Exact rational checks confirmed the corrected clipping example and 108 surviving
 review of the WSI completion/import lifecycle found no additional material defect. Specification
 freezes, activation and outstanding lifecycle/acquisition prerequisites remain binding; no future
 deliverable is declared complete. No plan or source was changed, and no new guest-test pass is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0103 (2026-09-08T19:50:54Z):
+
+Latest audit reviewed: AUDITOR'S RE-AUDIT dated 2026-09-08T19:02:53Z. It contains
+zero numbered findings and no corrective addendum, so there are no individual corrective
+findings to accept or reject.
+
+REJECTED - the unqualified clean assessment overlooks one factual architecture contradiction.
+The paragraph "Who consumes this API, and who instantiates the backend" called WebAssembly
+components the project's application ABI. `docs/CONCEPT_EN.md` under "Application model:
+native ABI + WebAssembly/WASI host" explicitly defines native typed capability IPC/ABI as
+the default application contract, with Wasm/WASI a recommended host layered on it.
+`docs/DYNAMIC_LINKING.md` independently limits `.lslib` Rust linkage to one system image.
+The missing graphics-specific third-party boundary must not be explained as absence of a
+native application ABI.
+
+ACCEPTED - the independently discovered correction. Exact plan change: replaced that paragraph
+in `docs/todo/P02M0103.md` with the native IPC/default and Wasm/host distinction, cited both
+owning architecture documents, and identified the missing external boundary specifically as
+access to the in-process rendering APIs. The v1 same-image Rust API restriction, separate native
+SDK or Wasm graphics-adapter work, backend composition and activation gates remain applicable.
+This correction requires no new implementation feature or public protocol.
+
+The audit's remaining plan-readiness conclusions are supported by independent verification:
+
+- Read the complete 2628-line pre-edit plan, its requirements and per-part Done gates. The roadmap
+  permits only the stated cross-phase foundations; the five freezes still resolve normative
+  choices before dependent implementation. The dependency graph is acyclic and preserves
+  headless b/c/e/f, WSI-dependent d/g/h/i, h's 2D interop dependency and optional Extended work.
+- Current `src/idl/display.lsidl`, `surface::Mapping`, DisplayService allocation and its wait loop
+  substantiate the planned single-surface/raw-pointer migration, supplier-created image imports,
+  waitable client identities and service-wide admission bound. `sys_memory_object_create` charges
+  the creator's Domain; ObjectInfo has no charged-Domain field. Attenuated channel transfer,
+  bounded ordinary channels and the 256-member non-nesting WaitSet support the proposed design.
+- DisplayService already subscribes and adopts replacements after peer-close but does not yet
+  implement identity-aware withdrawal, alternatives or subscription recovery. Its manifest still
+  says `restart = "escalate"`. The plan correctly owns the remaining consumer work and retains
+  P02M0141's unmet restart prerequisite. `settle_shutdown_node` checks ready confirmations before
+  expiry; existing shutdown and unopened-provider tests support the qualified lifecycle assessment.
+- The retained concurrent-selection log proves the already-discharged live selection/tag result.
+  `mkimage.sh` still compares medium input keys after assembly; producer-safe acquisition and its
+  evidence remain P02M0170 work. The stated execution restriction therefore remains justified.
+  Catalogue-loss comparison and activation's evidence check also match their plan assessment.
+- Shared glyph identity agrees with P02M0136, including face index and rasterisation mode.
+  Image semantics, spans, initialization, YUV conversion, prepared replay, separate Render3D/
+  Scene3D registry coverage and the headless 2D performance floor retain explicit owners and gates.
+  An independent exact-rational check reproduced t=1/3 and projected u=1/2, preserved both smooth
+  and screen-linear fields in 108 surviving-edge cases, and confirmed the 2^45 edge bound fits i64.
+
+Re-read the corrected paragraph and its surrounding contract against the complete plan: no
+additional material omission or contradiction was established. The plan is complete, internally
+consistent and feasible for its declared staged implementation; specification freezes, owner
+activation and outstanding prerequisites still govern when each part can start. This review
+claims no implemented graphics feature or new host/guest acceptance result. Only the plan
+paragraph and this append were changed; every prior audit byte is preserved. Shared scoped
+document verification follows after all four reviews.
+
+Consolidated four-plan document verification (2026-09-08T19:55:51Z): the latest audits contain one numbered
+finding, accepted and corrected in P02M0175. Independent checks additionally corrected P02M0103's
+application-ABI premise and P02M0172's unsupported x86_64 direct path and missing-mode wording;
+P02M0174 remains unchanged. The complete current plans and shared contracts were rechecked for
+scope, completeness, feasibility and internal consistency. All four original audit prefixes match
+their pre-review snapshots byte-for-byte. Scoped whitespace checks pass and source code is unchanged.
+`./verify.sh --for` over these four plans and four audits selected zero inner and zero deferred code
+checks, then exited 6 (`INCOMPLETE`), requiring post-commit merge verification even for an empty
+check set. No full revision-verification pass, implementation-test pass or commit is claimed.
+Concurrent edits to other audit files were preserved. Final prefix and whitespace checks cover this
+verification append as well.

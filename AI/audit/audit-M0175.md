@@ -2516,3 +2516,90 @@ Verification: read the complete 1438-line plan and all 2480 preceding audit-hist
 checked the planner's responses against current NetworkService, TCP, IDL/client code and P02M0174's
 shared contracts. Previously resolved findings are not repeated. This is a plan assessment;
 implementation and guest acceptance tests remain planned work. Only this result was appended.
+
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-08T19:53:33Z):
+
+Latest audit reviewed: AUDITOR'S RE-AUDIT OF PLAN P02M0175 dated 2026-09-08T19:03:55Z.
+It contains one finding, addressed below.
+
+1. **ACCEPTED - the fallback deadlines lacked an invocable contract and orchestration owner.**
+   The current schema and generated connect encoder accept one endpoint; resolve returns its
+   result separately. ChannelTransport sends the encoded request before applying the receive
+   deadline, and timeout sends no cancellation. NetworkService's connect and fetch share the
+   blocking tcp_establish helper, which has no candidate set. Thus neither the current code nor
+   the previous plan could distinguish a nonfinal resolved address from a singleton literal.
+   An RPC receive timeout could leave the first attempt live while a client starts another.
+
+   Exact changes to `docs/todo/P02M0175.md`:
+
+   - M1 now defines one shared open-target for connect/fetch: 1..8 scoped destination addresses,
+     one common port and the existing optional source. Literals use a singleton; resolved names
+     supply the whole returned list. Empty/over-bound and malformed-scope inputs are refused;
+     duplicate addresses collapse before selection. The source is never silently replaced.
+     The generated maximum-request fixture includes eight destinations plus 1024 fetch bytes.
+     Fetch's request description uses this target and prohibits replay after connection success.
+   - M5 assigns the complete sequential open to NetworkService, including current-state ordering,
+     per-candidate revalidation, deterministic failures and terminal request errors. Nonfinal
+     attempts expire at three seconds including neighbour preparation; cleanup precedes the next
+     attempt and an expiry wins over a retransmission at the same instant. The singleton/final
+     candidate receives the full 183-second capped SYN schedule from actual first transmission.
+     With prepared neighbours eight silent candidates take at most 204 seconds; final neighbour
+     preparation adds its existing bounded time. Explicit errors may end earlier. Retired tuples,
+     attempt generations and cancelled L3 tokens cannot affect the next candidate. Success ends
+     fallback, and neither later transport failure nor capability-handoff failure replays it.
+   - M2's duration oracle now starts at actual first SYN transmission and invokes the public
+     connect/fetch contract. M6 explicitly passes the complete resolver result into one open.
+   - M7 retains the open with its one reserved outbound TCB and scheduler entry, charging the
+     existing per-client/service socket and receive budgets before admission. Its bounded fetch
+     request is charged to the transmit budget and moved into the transmit queue on success.
+     Candidate changes reuse that reservation after retirement; no new pending partition or
+     scheduler owner is added. Channel closure cancels an unfinished open. TCP invalidation now
+     distinguishes failure of the current attempt from a new fallback attempt, while invalidation
+     of an explicitly named source fails the entire open.
+   - M9 names network-client, its provider/generated bindings and direct callers in the migration.
+     Name-based callers resolve once and submit one request; literal callers submit a singleton.
+     The existing zero-deadline RPC wait lets the service own the timeout. Cancellation closes
+     the dedicated client channel; an independently cancellable caller can obtain one through
+     existing network.open, without a new broker grant or cancellation RPC.
+   - M10 exercises generated NetworkClient connect and fetch paths plus a QEMU name-based caller:
+     black-holed preferred IPv6 followed by working IPv4 advances by three seconds with no live
+     overlap; late callbacks cannot affect the winner; fetch bytes go only to the successful peer.
+     Silent singleton/two-candidate fixtures assert 183/186 seconds and the 60-second RTO cap.
+     Additional cases cover delayed resolution/cancellation, source invalidation, caller loss,
+     immediate refusal, candidate bounds, single-slot accounting and unrelated service progress.
+     The Definition of done now explicitly requires this public fallback path.
+
+Independent feasibility and consistency recheck: read the full plan, its prerequisite contracts,
+P02M0004/P02M0080 requirements, current network IDL/generated clients, network-client/provider,
+NetworkService/TCP and the IPC implementation. The services/service-logic dependency split supports
+pure host-tested transitions driven by the existing single service loop. P02M0174's generic queued
+packet cancellation and guaranteed Sent(token, monotonic_send_time) apply to SYNs without changing
+that producer seam. Its independent review also confirmed this consumption and the retained budgets.
+The existing 42 pending-operation allowances and 128 TCB plus four-owner scheduler arithmetic remain
+unchanged; candidate state belongs to already-reserved TCBs. The explicit-source rules, singleton
+path, fetch terminal semantics, public framing and existing tool capabilities remain consistent.
+
+The preserved destination tie order follows [RFC 6724 section 6](https://www.rfc-editor.org/rfc/rfc6724.html#section-6).
+The full SYN retry floor and earlier caller abandonment are supported by
+[RFC 9293 section 3.8.3](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.8.3).
+The three-second candidate cutoff is this appliance's declared policy, not an RFC-mandated value.
+
+The corrected plan is ready for implementation after P02M0174 within its stated scope. This is a
+plan-readiness conclusion; generated-wire, host and QEMU acceptance remain implementation work.
+Scoped `git diff --check` passed. The original audit prefix was checked byte-for-byte before this
+append. No source code or roadmap completion status was changed, and no implementation-test pass,
+full verification pass or commit is claimed. Consolidated repository verification is recorded by
+the coordinating review after all four responses are complete.
+
+Consolidated four-plan document verification (2026-09-08T19:55:51Z): the latest audits contain one numbered
+finding, accepted and corrected in P02M0175. Independent checks additionally corrected P02M0103's
+application-ABI premise and P02M0172's unsupported x86_64 direct path and missing-mode wording;
+P02M0174 remains unchanged. The complete current plans and shared contracts were rechecked for
+scope, completeness, feasibility and internal consistency. All four original audit prefixes match
+their pre-review snapshots byte-for-byte. Scoped whitespace checks pass and source code is unchanged.
+`./verify.sh --for` over these four plans and four audits selected zero inner and zero deferred code
+checks, then exited 6 (`INCOMPLETE`), requiring post-commit merge verification even for an empty
+check set. No full revision-verification pass, implementation-test pass or commit is claimed.
+Concurrent edits to other audit files were preserved. Final prefix and whitespace checks cover this
+verification append as well.
