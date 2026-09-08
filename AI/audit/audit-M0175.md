@@ -2193,3 +2193,60 @@ No unresolved material findings within this milestone's stated scope.
 Verification: read the complete audit history and updated plan, and checked the planner's
 responses against the relevant source, prerequisite and shared-interface contracts. This is
 a plan assessment; no implementation or guest-test completion is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-08T14:01:44Z):
+
+Latest audit reviewed: AUDITOR'S RE-AUDIT dated 2026-09-08T13:50:10Z, rating 9/10.
+It contains no numbered findings and no correction requests. There are therefore zero
+individual findings requiring ACCEPTED/REJECTED dispositions; earlier audits and their
+responses were read as history, not substituted for the latest audit.
+
+**ACCEPTED - the latest assessment identifies no unresolved material finding in scope.**
+Independent review of the complete current plan confirms that the previous diagnostic and
+DIRECT-route corrections are present in the governing requirements and their acceptance cases:
+
+- M3/M7/M10 give caller ping/probe operations retained full-tuple correlation, two bounded
+  phases, actual-send timing, cancellation/invalidation and single completion. Current
+  `network_service.rs` still holds that state in blocking `do_ping`/`do_probe` helpers;
+  their removal is explicitly planned. P02M0174 supplies validated Echo/quoted-error metadata,
+  cancellable packet tokens and `Sent(operation_token, monotonic_send_time)`, so this migration
+  needs no unplanned L3 registration or delivery queue. The four fixed scheduler owners agree
+  with the opening requirement: 42 permitted pending operations fit 128 slots, 128 TCB owners
+  plus four fixed owners fit 160 slots, and the two shared 32-entry L3 queues bring the combined
+  storage count to 352 without duplicate accounting. Reserved DHCP capacity and diagnostic
+  silence concurrent with DNS/TCP/L3 progress have explicit host and guest oracles.
+- M5 leaves a selected DIRECT destination as its own next hop, bypasses advertiser filtering,
+  and limits the advertiser rule to default-router choice. This agrees with
+  [RFC 4861 section 5.2](https://www.rfc-editor.org/rfc/rfc4861.html#section-5.2) and
+  [RFC 8028 section 3.2](https://www.rfc-editor.org/rfc/rfc8028.html#section-3.2), independently
+  checked at RFC Editor. M10 tests a live advertiser while local TCP/internal UDP succeeds
+  with router forwarding disabled, plus an off-link control using the frozen router order.
+
+The wider consistency pass checked the actual IPv4-shaped network IDL, TCP allocation/send
+paths and startup configuration against M1-M10. Capability plus metadata results and guarded
+streams already have precedents in `process.lsidl` and `storage.lsidl`; generated maximum-size
+fixtures remain the correct implementation gate. The 16384-byte funded initial receive buffer
+makes the 64-connection backlog oracle fit the 2 MB receive budget, while the reservation and
+failed-handoff rules prevent pre-handle state escaping its caps. Combined IPv4/IPv6 snapshot
+bounds cover P02M0174's tables. Fetch exact-bound EOF/one-extra-byte outcomes, family readiness,
+UDP validation, entropy-profile limits and the `service-logic` host-test boundary remain explicit
+and consistent with the stated requirements and the existing single-NIC architecture.
+
+Plan changes: none. `docs/todo/P02M0175.md` already contains the current corrections and is
+retained unchanged. No additional scope or implementation mechanism is required by this audit.
+The plan is complete and feasible for implementation in its recorded dependency order;
+P02M0174 remains a planned prerequisite, and the generated-wire, host and QEMU gates remain
+work to perform during implementation. This review does not claim their execution or milestone
+completion. Only this response was appended for P02M0175; every preceding audit byte was
+preserved and no source code was modified.
+
+
+Consolidated four-milestone verification (2026-09-08T14:03:50Z): all four latest audits contain zero
+numbered findings; each clean assessment has an independently verified response. All four plans
+remain unchanged, and each original audit prefix matches its pre-review snapshot byte-for-byte.
+Scoped `git diff --check` passes. `./verify.sh --for` over the four plans and four audit paths
+selected zero inner and zero deferred code checks and recorded `inner_complete = true`; it exited
+6 (`INCOMPLETE`) because post-commit merge verification is mandatory even for an empty deferred
+set. No full revision-verification pass, implementation test, new guest run or commit is claimed.
+This paragraph records that result; final preservation and whitespace checks cover its append too.

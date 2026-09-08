@@ -2707,3 +2707,75 @@ No unresolved material findings within this milestone's stated scope.
 Verification: read the complete audit history and updated plan, and checked the planner's
 responses against the relevant source, prerequisite and shared-interface contracts. This is
 a plan assessment; no implementation or guest-test completion is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0103 (2026-09-08T14:02:29Z):
+
+Latest audit reviewed: 2026-09-08T13:50:10Z. Its assessment that no unresolved material
+findings remain within the milestone's stated scope is ACCEPTED after independent verification.
+The latest audit contains zero numbered findings or subsequent addenda, so there are no individual
+ACCEPTED/REJECTED findings to resolve and no corrective plan changes this round.
+`docs/todo/P02M0103.md` remains unchanged; earlier findings already resolved in its authoritative
+sections are not new requests to expand the milestone.
+
+Checked the current plan's requirements, part ordering, profile boundaries and acceptance conditions
+against the roadmap, architecture and relevant implementation:
+
+- Activation and scope agree with `docs/todo/TODO.md` and `docs/CONCEPT_EN.md`: this is a rendering
+  foundation under Phase-4 activation, with only `s`, `a-common` and `b`/`c` separately approvable
+  earlier. The prerequisite matrix, build order, five specification freezes, per-part Done clauses
+  and reconciliation record agree. The declared graph is acyclic; `b`, `c`, `e` and `f` can complete
+  headlessly, `h` inherits WSI through `g`, and `h`/`i` inherit the required 2D backend. Extended
+  features and their fifth freeze do not become core prerequisites.
+- The existing `display.lsidl`, DisplayService and `surface::Mapping` still provide the one-surface,
+  synchronous API, raw mapping and service-allocated images that `a-common`/`a-wsi` explicitly
+  replace. Kernel MemoryObject creation charges the allocating Domain and `ObjectInfo` has no
+  charged-Domain field, matching the plan's supplier sponsorship contract. PermissionManager still
+  binds a task with MANAGE/TRANSFER without WAIT; waitable identity and process-death cleanup remain
+  explicit WSI work. The existing Event is a boolean latch, while the plan uses ordinary bounded
+  channel pairs, receiver-validated present keys and service-wide admission against the 256-member
+  ABI wait limit. It does not assume a nonexistent paired Event or nested WaitSet.
+- DisplayService currently subscribes, adopts an available provider and releases scanout on channel
+  loss, but only reports withdrawal and stops following a closed subscription. The plan correctly
+  assigns the remaining identity-aware detach, alternative selection, subscription recovery and
+  typed display-device protocol to `a-wsi` jointly with P02M0099. Its service-restart prerequisite
+  remains open: P02M0141 records the missing client recovery contract and the manifest still gives
+  DisplayService `restart = "escalate"`. DeviceManager's current `settle_shutdown_node` handles a
+  ready process with `wait(...) == 0` before expiry classification; the old zero-index defect is not
+  reintroduced as a graphics prerequisite repair.
+- The live concurrent-selection result is already discharged in the plan. Re-read the retained
+  `/tmp/libersystem-final-concurrency-recheck.log`, P02M0167's combined closure and the production
+  gate's disjoint selected-ID assertions. That is prior executed evidence, not a new guest run.
+  `mkimage.sh` still checks its input key after assembly while producers are outside its lock,
+  supporting the separate open P02M0170 acquisition/mutation prerequisite and its execution
+  restriction. The current `candidate::catalogue_losses` and activation `evidence_failures` path
+  also match the plan's implemented catalogue-narrowing assessment.
+- The image ownership/conversion rules, immutable in-process DrawList, bounded preparation/replay,
+  numerical freeze requirements, separate Render3D/Scene3D coverage and headless 2D performance gate
+  remain in their owning work sections. The glyph-cache seam agrees with P02M0136, including face
+  index and rasterisation mode. The qualifier-aware clip equations appear consistently in `s-3d`,
+  the shader contract, `g`, `h` and the Done criteria: homogeneous interpolation for `smooth`,
+  projected interpolation for `noperspective`, and unchanged original provoking values for `flat`.
+
+Validation: exact rational arithmetic reproduced the unequal-w example (t=1/3, projected x/w=-1,
+`noperspective` value=1/2) and passed 108 surviving-edge checks for smooth and screen-linear fields.
+A check of the declared immediate prerequisite graph confirmed the transitive and optional boundaries
+above. Rechecked specification, API, backend, lifecycle, conformance and completion sections together;
+no new material omission or contradiction was found within this milestone's scope.
+
+The plan remains complete and feasible for its declared staged work. Its next eligible work is writing
+and freezing the normative specifications; this review does not activate Phase 4, freeze unwritten
+profiles, satisfy service-restart/acquisition prerequisites or claim implemented rendering. No source
+code or source test was changed, and no guest or mutation test was run. This response is appended
+only; every prior audit byte is preserved. Shared documentation verification follows after all four
+responses are present.
+
+
+Consolidated four-milestone verification (2026-09-08T14:03:50Z): all four latest audits contain zero
+numbered findings; each clean assessment has an independently verified response. All four plans
+remain unchanged, and each original audit prefix matches its pre-review snapshot byte-for-byte.
+Scoped `git diff --check` passes. `./verify.sh --for` over the four plans and four audit paths
+selected zero inner and zero deferred code checks and recorded `inner_complete = true`; it exited
+6 (`INCOMPLETE`) because post-commit merge verification is mandatory even for an empty deferred
+set. No full revision-verification pass, implementation test, new guest run or commit is claimed.
+This paragraph records that result; final preservation and whitespace checks cover its append too.

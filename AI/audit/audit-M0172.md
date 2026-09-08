@@ -1266,3 +1266,51 @@ No unresolved material findings within this milestone's stated scope.
 Verification: read the complete audit history and updated plan, and checked the planner's
 responses against the relevant source, prerequisite and shared-interface contracts. This is
 a plan assessment; no implementation or guest-test completion is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-08T14:00:34Z):
+
+Latest audit reviewed: 2026-09-08T13:50:10Z. Its conclusion of no unresolved material
+findings is ACCEPTED after independent verification. This latest audit contains zero numbered
+findings, so there are no individual ACCEPTED/REJECTED findings or corrective plan changes this
+round. `docs/todo/P02M0172.md` remains unchanged.
+
+Read the complete audit history and all M1-M8 requirements, and checked the current architecture,
+implementation boundaries and prerequisite contracts:
+
+- The eight driver names in `src/user/services/manifest.toml` match M1's explicit migration table.
+  `src/kernel/dma_policy/mod.rs::policy_for` still uses `IOMMU_REQUIRED_TYPES` and the permissive
+  fallback, confirming the registry admission change remains necessary. P02M0153 M4 supports the
+  protected virtio-net classification; this plan explicitly owns its refusal and temporary network
+  loss on the degraded profiles.
+- The current `bootproto::manifest` parser/encoder still use the fixed-order v2 header, and
+  `BootInfo` remains version 2. M3 supplies the required future grammar, version/domain change,
+  authenticated presence tag, selected-set equality rule and provenance handoff. Its legacy and
+  mixed-set refusal fixtures are distinct from the positive tag-0 harness case. P02M0171's shared
+  manifest evolution is explicitly coordinated, without importing its rollback implementation.
+- The x86_64 `fw_cfg` reader reselects its input, and the loader/kernel entry already carries
+  `BootInfo`. M3 now correctly treats the matching persistent input and handoff as one relay while
+  refusing independent sources or invalid handoffs. `run.sh` boots its existing x86_64 ISO;
+  `qemu_build_esp` provides the non-x86 staging path; the non-x86 entry prologues distinguish a raw
+  FDT from loader input. The transport table and treeless UEFI fixtures fit those boundaries.
+- `docs/ARCHITECTURES.md` and the harness agree that ordinary enforcement currently exists only
+  on x86_64. The non-x86 development fixtures explicitly use `no-iommu` before P02M0173; that
+  milestone's M7 and Definition of done own the later topology and all three row transitions.
+  The existing manifest name grammar and DeviceManager's persisted named selection also support
+  M4-M5's identity and authority choices without another ID or kernel priority computation.
+
+Rechecked producer-before-admission ordering, mode/policy outcomes, wire encodings, entry identity,
+rebuild coverage and acceptance fixtures together. No new in-scope contradiction or missing material
+requirement was found; the plan is ready for implementation in its stated dependency order. All work
+items remain PLANNED, and non-x86 enforcement remains P02M0173's responsibility. This review ran no
+implementation or guest tests, changed no source code, and preserved every prior audit byte.
+
+
+Consolidated four-milestone verification (2026-09-08T14:03:50Z): all four latest audits contain zero
+numbered findings; each clean assessment has an independently verified response. All four plans
+remain unchanged, and each original audit prefix matches its pre-review snapshot byte-for-byte.
+Scoped `git diff --check` passes. `./verify.sh --for` over the four plans and four audit paths
+selected zero inner and zero deferred code checks and recorded `inner_complete = true`; it exited
+6 (`INCOMPLETE`) because post-commit merge verification is mandatory even for an empty deferred
+set. No full revision-verification pass, implementation test, new guest run or commit is claimed.
+This paragraph records that result; final preservation and whitespace checks cover its append too.

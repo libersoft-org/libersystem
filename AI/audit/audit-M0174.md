@@ -1529,3 +1529,63 @@ No unresolved material findings within this milestone's stated scope.
 Verification: read the complete audit history and updated plan, and checked the planner's
 responses against the relevant source, prerequisite and shared-interface contracts. This is
 a plan assessment; no implementation or guest-test completion is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-08T14:01:56Z):
+
+Reviewed the latest audit, dated 2026-09-08T13:50:10Z, after reading the complete audit
+history and current M1-M8 plan. That audit has no numbered findings or subsequent addendum;
+there are therefore no individual defect findings requiring ACCEPTED/REJECTED decisions.
+
+**Overall assessment - ACCEPTED: no unresolved material findings within the stated scope.**
+This conclusion was checked independently against the current code and the P02M0003,
+P02M0004, P02M0080 and P02M0175 contracts:
+
+- `net.rs::Event`, `Outcome` and `on_icmp`, together with
+  `network_service.rs::do_probe`, confirm why the corrected quoted-error seam needs both
+  the actual responder and Echo sequence. M3/M6 now preserve those fields, interface
+  identity/generation and direct Echo Reply metadata. The delayed/reordered and retired-probe
+  cases are specified, and P02M0175 M3/M7/M10 consumes the same contract.
+- `network_service.rs::pump`, `serve` and `do_dns` still have the single-event and blocking
+  wait limitations recorded by the plan. M6 explicitly owns the prerequisite aggregate timer,
+  bounded event delivery and state-machine integration. Packet cancellation and
+  `Sent(operation_token, monotonic_send_time)` provide the diagnostic owner its required
+  lifecycle outcomes without duplicating transport state in L3. Table invalidations retain
+  loss-safe resync; advisory errors retain separate drop/count semantics; route-qualified PMTU
+  writes remain conditional on consumer validation.
+- `network_service.rs::net_policy` and startup allocation, `virtio_net.rs` and
+  `qemu-run.sh::qemu_attach_virtio_net` confirm the effective-MTU/buffer and user-netdev
+  constraints. M5/M8 distinguish an actually sub-1280 link from an invalid RA MTU option;
+  M7 builds the controllable Ethernet peer before P02M0175 extends it. The `services/logic`
+  crate's prohibition on `rt` dependencies supports the planned pure state-machine tests.
+- Rechecked the explicit RS formulas and successful-route stop condition against
+  [RFC 3315 section 14](https://www.rfc-editor.org/rfc/rfc3315.html#section-14) and
+  [RFC 7559 section 2](https://www.rfc-editor.org/rfc/rfc7559.html#section-2), and the corrected
+  MLD source, query-merge and retransmission rules against
+  [RFC 9777 sections 5.2.14 and 6](https://www.rfc-editor.org/rfc/rfc9777.html#section-5.2.14).
+  The existing plan and its discriminating fixtures agree with those rules. The ICMPv6
+  structural/consumer split is consistent with upper-layer error delivery in
+  [RFC 4443 section 2.4](https://www.rfc-editor.org/rfc/rfc4443.txt).
+
+**Plan changes: none.** `docs/todo/P02M0174.md` already contains the current corrected plan.
+No extra policy layer, flow-registration table, public transport API or fragment reassembler
+is justified by this audit. Rechecked the one-interface resource bounds, reservation/release
+rules, exact-capacity tests, internal DIRECT/VIA ordering, advertiser/address lifetime separation,
+and ownership shared with P02M0175. The plan is complete, feasible, internally consistent and
+ready for implementation within its declared appliance profile. M6 integration, M7's peer and
+M8 execution remain implementation work; the named multi-fragment conformance gap remains explicit.
+
+Validation for this response: the plan was left byte-for-byte unchanged and every pre-existing
+audit byte was preserved. This review performed no source edits, implementation tests, guest runs,
+staging or commits. Repository-wide scoped document verification is recorded by the coordinating
+review after all four milestone responses are appended.
+
+
+Consolidated four-milestone verification (2026-09-08T14:03:50Z): all four latest audits contain zero
+numbered findings; each clean assessment has an independently verified response. All four plans
+remain unchanged, and each original audit prefix matches its pre-review snapshot byte-for-byte.
+Scoped `git diff --check` passes. `./verify.sh --for` over the four plans and four audit paths
+selected zero inner and zero deferred code checks and recorded `inner_complete = true`; it exited
+6 (`INCOMPLETE`) because post-commit merge verification is mandatory even for an empty deferred
+set. No full revision-verification pass, implementation test, new guest run or commit is claimed.
+This paragraph records that result; final preservation and whitespace checks cover its append too.

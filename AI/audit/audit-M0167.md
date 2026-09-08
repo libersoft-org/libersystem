@@ -2321,3 +2321,14 @@ The normal verifier used its **inner** partition, which deferred 786 obligations
 Evidence is under `/tmp/libersystem-audit-review-20260908/`: `verify-inner.log`, `verify-inner-result.json`, `verify-inner-summary.json`, `dynamic-report-analysis.md`, each named final phase's log/result JSON, and `dev-serial.log`. All 14 changed source files still match `final-source-snapshot.json` after testing (`final-source-comparison.json`); no test mutation remained. Every original audit byte is preserved.
 
 Final closure checks passed: current `source-hygiene`, `milestone-index`, `git diff --check`, all five exact UTC response titles, and byte-for-byte preservation of the original audits. Evidence: `final-hygiene-result.json` and `final-audit-integrity.json` in the evidence directory above.
+
+
+AUDITOR'S RE-AUDIT ON P02M0167 (2026-09-08T13:58:35Z):
+
+Current implementation rating: 8/10
+
+1. **The production shadow route corrupts the returned result paths, so a candidate still cannot earn evidence through it.** `test-kernel.sh` constructs and publishes absolute `RESULT-LOGS` paths (`src/harness/test-kernel.sh:31-37,501`), and `suite_result_log` returns those paths unchanged. However, `verify.sh:459,469` prepends `../` before passing them to `verify-model` from `src/`. The model opens the argument directly (`src/tools/verify-model/src/main.rs:725,745`), so `/data/yellow/libersystem/.build/...` becomes the nonexistent relative path `..//data/yellow/libersystem/.build/...`. Both `--shadow` and `--shadow-exec` therefore fail to read the guest evidence they just produced. The same conversion breaks host, development and build evidence (`verify.sh:521-523,562-564,632`), because `BUILD_DIR` is absolute too (`lib.sh:11-13`). This leaves M3's returned-result-log integration and M5's operational candidate-evidence route incomplete despite the passing model tests. Preserve the absolute paths when handing them to the comparison command.
+
+   Reproduced in an isolated temporary source snapshot using the unchanged production `verify.sh`, current `verify-model` binary and a loaded ELF candidate. Guest execution supplied completed fixture logs using the actual runner's absolute-path format; unrelated host/development/build execution was omitted. The real comparison commands reported `No such file or directory` for the existing guest and other evidence files after the `../` prefix was inserted. The shell exited 1 and created no shadow-evidence record. This is a host reproduction of the producer/consumer boundary, not a claimed QEMU run.
+
+Verification: all 146 `verify-model` tests passed (26.94 seconds). The scheduler, component-oracle, gate-oracle and gate-result-log checks passed, as did the production aged media-generation regression. No full build or live guest sweep was run for this re-audit. No source code or preceding audit text was changed; only this section was appended.
