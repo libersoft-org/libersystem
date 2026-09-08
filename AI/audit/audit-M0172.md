@@ -1421,3 +1421,47 @@ responses against the relevant code, architecture and prerequisite contracts. No
 material issue was found within this milestone's scope. This is a plan assessment; no implementation
 or guest-test completion is claimed. Only this re-audit was appended; the plan and source were not
 modified.
+
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-08T16:33:11Z):
+
+Latest audit reviewed: 2026-09-08T16:22:11Z. Its one numbered finding is addressed below.
+
+1. **ACCEPTED - M2 still directs every development producer to emit degraded mode.**
+   Verified the finding against the current M2 matrix, its producer and missing-record rules,
+   M3's carrier fixtures, M6's admission outcomes, and the actual development launch path.
+   `src/harness/lab.py::run_command` launches `run.sh`; the development invocation supplies its
+   environment at `dev-up`, while `qemu_run_x86_64` selects an IOMMU by default on the non-test
+   path and attaches `virtio-iommu-pci`. The plan already requires `enforcing-required` for that
+   development row. The blanket degraded instruction was still normative, so the nearby correct
+   table did not fully resolve the earlier contradiction.
+
+   Exact plan change: replaced M2's statement that test and development records always state
+   degraded mode with a requirement to state the DMA mode selected by their matrix row for that
+   architecture and flag. Retained `harness` provenance and the existing producing paths. This
+   is the only plan edit; it removes the obsolete instruction rather than adding another rule.
+
+   Rechecked the existing oracles: default x86_64 development uses `enforcing-required` and admits
+   an `iommu-required` driver; x86_64 development with `--no-iommu` uses `no-iommu` and refuses it;
+   non-x86 development remains explicitly degraded until P02M0173's gated topology transition.
+   Test mode remains explicitly degraded. Missing/malformed records still refuse everywhere.
+   M3/M8 already require these cases, so no new fixture, carrier or kernel run-mode field is needed.
+
+Final plan re-check covered all M1-M8 requirements, the eight manifest-driver classifications,
+registry identity and selection authority, signed/harness handoff, producer-before-admission
+ordering, non-x86 transition ownership, rebuild closure and Definition of done. The current
+`dma_policy::policy_for` still uses the type list and permissive fallback, and BootInfo remains v2;
+the plan correctly owns their future migration. The corrected producer paragraph now agrees with
+the matrix, per-path rules, development fixtures and admission contract. No additional material
+omission or contradiction was found within scope. The plan is complete and feasible for its stated
+implementation sequence; it does not claim the planned policy or topology work is implemented.
+
+No source code, implementation tests or guest runs were changed or executed. Every preceding audit
+byte is preserved. Shared scoped document verification is performed after all four responses settle.
+
+Consolidated document validation: `git diff --check` passed for the four plans and audits.
+Byte comparisons confirmed that every original audit byte and all source files were preserved;
+only P02M0172's producer paragraph changed among these plans. Scoped `verify.sh --for` selected
+zero inner checks and zero deferred checks, then exited 6 (`INCOMPLETE`) because the repository
+requires a post-commit merge even for an empty check set. No commit, merge verification or
+implementation-test result is claimed.

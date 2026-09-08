@@ -2345,3 +2345,98 @@ responses against current source. The final focused check exercised the producti
 helper and comparison caller fragments with a path-reading fixture; all seven current evidence
 arguments opened successfully, and the temporary negative control failed as expected.
 `bash -n verify.sh` passed. No full verification or live guest sweep is claimed for this re-audit.
+
+
+---
+
+## IMPLEMENTER'S RESPONSE TO RE-AUDIT ON P02M0167 (2026-09-08T16:31:53Z):
+
+All 57 numbered findings in the 25 audit/re-audit sections were checked against the current implementation and M0-M5. REJECTED below means the specific finding no longer warrants a change; it does not claim that the earlier defect was imaginary. Historical execution counts, completion prose and prior responses were not treated as fresh verification.
+
+**2026-09-08T13:58:35Z, finding 1: ACCEPTED.** The production `test-kernel.sh` and `lib.sh` publish absolute paths; the `../` prefix made all seven guest/full/scoped, host/full/scoped, development/full/scoped and build evidence arguments unusable from `src`. `verify.sh` now passes those paths unchanged to the comparison command. The explicit `RESULT-LOGS` choice remains the source of guest evidence, including architectures whose suite output is in the run log.
+
+**Additional M5 path finding: ACCEPTED.** A repository-relative `--candidate` argument was also opened from both the repository root and `src`, so the same production route could fail to reopen its frozen input. The shell parser now resolves relative candidate arguments against its initial working directory once. Absolute arguments are retained. Candidate content, model hashes, trust bars and activation behavior are unchanged.
+
+**Additional M1 exact-selection finding: ACCEPTED.** The NUMA gate still asked for the `numa` tag while asserting a fixed set of profile effects. Both invocation sites now request the nine existing NUMA test IDs through `TEST_SELECTION`. This preserves the topology-report test, which calls `bind_online()` and `report()` in a test boot, plus every allocator/placement assertion. Comparing declarations proved the explicit list equals the complete current nine-test NUMA set. The normal full kernel suite retains those tests; the profile no longer inherits incidental smoke tests or future additions to the tag.
+
+`src/tools/test-shadow-logs.py`, registered in `gate-result-logs`, executes the actual shell route in a temporary tree. Only expensive producers, planner answers and comparison file reads use host fixtures; no QEMU execution or earned production candidate trust is claimed. Two tests cover dry and executable shadow routes, both published suite-log locations, all seven evidence arguments, and relative/absolute candidate inputs. All four route cases pass in approximately 3.4 seconds. Restoring each of the seven old evidence prefixes individually in a temporary script fails with the intended missing-file error. Removing relative-candidate normalization likewise fails while reopening `candidate.toml` from `src`. No production source mutation was left behind.
+
+**Individual dispositions of the earlier numbered findings:**
+
+| Audit timestamp | Finding | Disposition and current evidence |
+| --- | --- | --- |
+| 2026-08-28 20:29:15 CEST | 1 | REJECTED as a further change. The synthetic input test is no longer claimed as a virtio-input oracle. `component-oracle-exceptions.txt` states the missing fixture explicitly, as M2 permits. Real boot/provider assertions and `dev.gpu-restart` retain truthful component coverage; `Model` adds staged reach only for fixtures starting SystemManager. |
+| 2026-08-28 20:29:15 CEST | 2 | REJECTED: `check-qemu-arch-profiles.sh` selects its named assertion IDs using `TEST_SELECTION`; the broad-tag path described is gone. |
+| 2026-08-28 20:29:15 CEST | 3 | REJECTED: `catalog.rs` and `commands::steps` give architecture/NUMA profiles independent keys, commands, costs and guest counts; umbrellas are not scheduled twice. |
+| 2026-08-28 20:29:15 CEST | 4 | REJECTED: the acquisition lifetime gap was already corrected by PID leases and shared sweep locking. `test-kernel.sh`, `qemu-run.sh`, and `result-logs.sh` already provide staged kernel/loader inputs, per-run writable files and explicit result paths. |
+| 2026-08-28 20:29:15 CEST | 5 | REJECTED: `commands::validate` rejects malformed graphs; `verify.sh` records failed/blocked IDs and waits for prerequisite verdicts before admitting dependents. |
+| 2026-08-28 20:29:15 CEST | 6 | REJECTED: the earlier ordering defect is already corrected by `order_by_cost` choosing the cheapest ready step. `commands::steps` already separates build parts, gates and conformance; `History::record_step_id` and `step_seconds` already retain valid whole-step measurements. |
+| 2026-08-28 20:29:15 CEST | 7 | REJECTED: candidate loading and shadow execution exist; `five_real_changes_through_the_real_planner_reach_the_threshold` edits actual temporary source bytes and exercises memory/ELF candidates and the production activation evaluator. The test-suite risk row is gone. |
+| 2026-08-28 20:29:15 CEST | 8 | REJECTED: activation calls `candidate::evidence_failures`, verifies all overwritten base files, validates before materialisation, rereads the canonical model and rolls back on mismatch. No additional activation abstraction is needed. |
+| 2026-08-29T16:05:00Z | 1 | REJECTED: the real boot fixture and gated staged reach select genuine block/network/USB/manager effects; missing fixtures have explicit exceptions rather than false coverage claims. |
+| 2026-08-29T16:05:00Z | 2 | REJECTED: current PID leases preserve selected generations throughout acquisition; the listed kernel, fixture-name, console and socket isolation changes already exist. |
+| 2026-08-29T16:05:00Z | 3 | REJECTED: `commands::steps` emits each NUMA profile separately with its own guest reservation. |
+| 2026-08-29T18:29:58Z | 1 | REJECTED: truthful boot-chain coverage and explicit absent-fixture exceptions replace the obsolete unselectable-oracle claims. |
+| 2026-08-29T18:29:58Z | 2 | REJECTED: PID leases and the common acquisition/sweep lock already close the template race; immutable staging and per-run captures were already implemented. |
+| 2026-08-29T18:29:58Z | 3 | REJECTED: NUMA profiles are independent catalogue steps, not an indivisible umbrella. |
+| 2026-08-29T23:02:31Z | 1 | REJECTED: current `Model` boot-fixture reach and actual component assertions resolve the reported selection omission; inventing coverage for absent fixtures would be incorrect. |
+| 2026-08-29T23:02:31Z | 2 | REJECTED for the stated paths: `test-kernel.sh` stages the selected kernel; FAT/ISO/UDF names carry content identity and console captures carry run identity. The distinct cleanup interval is also already protected by PID leases. |
+| 2026-08-30T08:40:38Z | 1 | REJECTED: the selected kernel is staged under the producer lock and run directly; there is no second unlocked Cargo test compilation of the reported form. |
+| 2026-08-30T23:31:51Z | 1 | REJECTED: the medium consumes staged kernel/loader inputs; the registered concurrency gate checks the complete two-selection/two-tag boundary. |
+| 2026-08-31T01:15:33Z | 1 | REJECTED: the staged medium-input boundary is implemented and no longer merely deferred to another milestone. |
+| 2026-08-31T19:28:51Z | 1 | REJECTED: `check-concurrent-selection.sh` is a registered executable proof with independent selections, tags and result paths. |
+| 2026-08-31T19:28:51Z | 2 | REJECTED: loader production and copying share the producer lock; `LOADER_EFI` points at the run-private staged copy. |
+| 2026-08-31T19:28:51Z | 3 | REJECTED: all three `qemu-run.sh` architecture paths abort failed USB copy acquisition; no shared writable fallback remains. |
+| 2026-08-31T21:15:57Z | 1 | REJECTED: the concurrency gate varies both `TEST_SELECTION` and `TEST_TAGS` and checks each resulting log identity. |
+| 2026-08-31T21:15:57Z | 2 | REJECTED: the catalogue declares two guest slots and `verify.sh` reserves them; one-slot execution refuses this gate. |
+| 2026-08-31T21:15:57Z | 3 | REJECTED: the named loader writers use the shared staging lock; the medium reads the staged loader, not the mutable output. |
+| 2026-09-01T03:15:10Z | 1 | REJECTED: scheduler admission uses `STEPGUESTS`, including two slots for concurrency, rather than command-text classification. |
+| 2026-09-01T11:58:45Z | 1 | REJECTED: graph validation precedes ordering; `check-verify-scheduler.sh` executes the required dependency, budget, verdict and slot cases. |
+| 2026-09-01T14:33:49Z | 1 | REJECTED: `blocked_ids` makes suppression transitive and the existing scheduler test asserts a blocked grandchild. |
+| 2026-09-01T17:16:37Z | 1 | REJECTED: `drain_guests` records parallel completion before the blocker check. |
+| 2026-09-01T17:16:37Z | 2 | REJECTED: the registered prepared-plan shell scheduler matrix exists. |
+| 2026-09-01T22:54:00Z | 1 | REJECTED: architecture/NUMA profile commands, keys and step IDs are separate in `commands::steps`. |
+| 2026-09-01T22:54:00Z | 2 | REJECTED: `LIBER_VERIFY_STEPS` supplies the registered scheduler matrix without invoking real guests. |
+| 2026-09-02T03:51:29Z | 1 | REJECTED: profile guest counts are emitted and used by the outer scheduler. |
+| 2026-09-02T03:51:29Z | 2 | REJECTED: the shell matrix covers shared prerequisites, unknown costs, failure precedence and descendants. |
+| 2026-09-02T12:08:00Z | 1 | REJECTED: `guests_in_flight` sums declared reservations; the scheduler test observes the two-slot/one-slot overlap limit. |
+| 2026-09-02T12:08:00Z | 2 | REJECTED: `step_cost` applies the guest seed and emitted costs round upward; the seeded budget regression does not treat unknown work as free. |
+| 2026-09-03T03:12:09Z | 1 | REJECTED: `candidate_arg` reaches shadow target/selection/build/host/dev queries and comparisons; the real candidate/change regression replaces handmade evidence. |
+| 2026-09-03T03:12:09Z | 2 | REJECTED: `evidence_components`, `risk_components`, and `evidence_failures` cover registry losses, effective successor ownership and all protected risk fields before writes. |
+| 2026-09-03T03:12:09Z | 3 | REJECTED: current ready-step ordering already reconsiders newly eligible work after every prerequisite. Separate runnable units, guest seeds, shared emitted pricing and explicit zero-budget handling already exist. |
+| 2026-09-03T03:12:09Z | 4 | REJECTED: history excludes failed durations and unexecuted merged members; a failure under another model cannot relabel an old successful cost. |
+| 2026-09-03T03:12:09Z | 5 | REJECTED: prepared scheduler execution ends with its own verdict and does not apply unrelated worktree trust admission. |
+| 2026-09-03T03:12:09Z | 6 | REJECTED: the production `changes` command emits both rename paths. |
+| 2026-09-03T10:37:00Z | 1 | REJECTED: effective ownership, architecture and escalation losses are checked independently of direct covers lists in `candidate.rs`. |
+| 2026-09-03T10:37:00Z | 2 | REJECTED: `a_failed_run_never_becomes_a_cost_however_the_models_are_ordered` covers the cross-hash and one-key failure sequences; history implements those exclusions. |
+| 2026-09-03T10:37:00Z | 3 | REJECTED: ordinary gates and conformance suites already lower separately. |
+| 2026-09-03T14:35:08Z | 1 | REJECTED: effective longest-prefix comparison and removed `selects_everything` detection exist, including new overriding prefixes. |
+| 2026-09-03T22:40:55Z | 1 | REJECTED: catch-all architecture changes are evaluated at effective owned paths; empty root ownership does not discard the loss. |
+| 2026-09-03T22:40:55Z | 2 | REJECTED: catalogue/registry loss attribution uses proven successor ownership and the same production evaluator as activation. |
+| 2026-09-03T22:40:55Z | 3 | REJECTED: `Planner` separates build reach from pure test-declaration runtime seeds, selects declared IDs and removes the obsolete risk row. |
+| 2026-09-04T00:26:46Z | 1 | REJECTED: pure declaration-file changes no longer reselect broad kernel runtime coverage or widen their exact IDs; mixed/unknown changes still widen conservatively. |
+| 2026-09-04T00:26:46Z | 2 | REJECTED: catalogue loss comparison preserves complete runnable variants and catches configuration-only narrowing. |
+| 2026-09-07T21:49:51Z | 1 | REJECTED: `risk_components` probes ownership prefixes throughout the protected subtree, including deeper successor rules. |
+| 2026-09-07T21:49:51Z | 2 | REJECTED: `evidence_components` maps reassigned covers through effective successor ownership; the memory/ELF candidate tests grade evidence the candidate actually produces. |
+| 2026-09-07T21:49:51Z | 3 | REJECTED: `a_real_test_source_change_keeps_the_declared_ids_and_all_build_targets` exercises current exact file-local selection and retained three-target builds. |
+| 2026-09-08T11:09:44Z | 1 | REJECTED: `media_sweep` already obtains a PID lease under the common acquisition/sweep lock before selecting or building a generation. The existing aged-generation regression covers the selected-but-not-open interval, live private-copy retention, missing `fuser`, and dead-reader reclamation. |
+| 2026-09-08T11:09:44Z | 2 | REJECTED: `commands::order_by_cost` validates first, then repeatedly chooses the cheapest currently ready step, with stable ID ties. `emit_steps` uses the same `step_cost` as emitted pricing. Existing regressions check newly ready dependents and malformed graphs. |
+
+The original 2026-08-28 findings 4 and 7 and 2026-09-03T03:12:09Z finding 1 are rejected for their stated obsolete mechanisms (newest-log glob, missing candidate implementation and active-model selection). The separately reproduced current producer/consumer pathname defects are accepted and repaired above; the prior responses' operational-completion claims did not overrule the actual shell behavior.
+
+Focused validation before the final phase: shell syntax, registered `gate-result-logs`, `gate-oracles` (22 named IDs), exact NUMA declaration-set comparison and `git diff --check` passed. Builds, the full Rust model suite and live guest runs were deferred until the final phase of the whole job. Consolidated execution results are recorded below.
+
+
+**2026-09-08T15:04:03Z re-audit of the plan: ACCEPTED as focused confirmation.** This additional review reports no unresolved material findings and introduces no finding IDs. Its independent production-helper/caller fixture opened all seven evidence paths, its temporary negative control failed, and shell syntax passed. Those observations agree with the repaired path handling above; its 10/10 plan rating is not treated as full verification, live guest evidence or candidate trust. The consolidated final execution results remain the separate validation record.
+
+**Completion and final verification**
+
+The current M0-M5 runner requirements are complete within the documented exception and trust boundaries. All 146 verification-model tests, the scheduler/result-log/oracle gates and all 17 guest-verdict tests passed. The production shadow-route fixture passed two tests/four route cases; the eight pathname negative controls failed at the intended boundary during focused validation. Each NUMA architecture passed its exact nine-test selection and existing topology, allocation, placement and matrix assertions. The first aarch64/riscv64 attempts refused stale test-volume stamps before guest execution; the full cross-architecture boot build and both reruns then passed. The concurrent-selection gate passed overlapping dma/domain selections with distinct tags, media and logs, plus aged-media acquisition/reclamation. These tests do not activate a frozen candidate or establish production candidate trust.
+
+All long executions were reserved for the final phase after implementation. The fresh normal `./verify.sh` run (started 2026-09-08T15:11:05Z; 4,300.51 seconds) exited 1: **139/141 steps and 520/522 inner obligations passed**. All 75 individual host suites passed **1,862 Rust tests with three declared ignores and no failures**; the aggregate host rerun is not counted twice. All 11 conformance suites, six capability-model configurations at their recorded state counts, seven x86_64 build steps and the **382-test x86_64 kernel suite** passed. Both cross-architecture user/kernel builds and the later complete aarch64/riscv64 boot builds passed.
+
+The two original verifier failures remain visible in the evidence. `development-gate` initially inspected a staged development volume when it required shipping; after `./image.sh --format iso` restored the shipping image, its standalone recheck passed. `dynamic-report` remains an unrelated stale `DYNAMIC_EXECUTABLES.tsv` baseline failure: all **225 generated detailed rows exactly match the prior failed run**, with no changed, missing, extra or duplicate wave/target/tool keys. The tracked report was not regenerated or waived; subsequent aggregate-report comparisons are not claimed to have run after that first failure.
+
+The named scoped guest checks all passed: three NUMA profiles, the 15-test swapped-media boot, concurrent selections, enforcing/default/fallback IOMMU, and development GPU restart. The development instance was stopped and shipping configuration restored. Final milestone-index and source-hygiene checks passed. Final integrity checking found only a whitespace-only expansion of the NUMA selection command substitution after tests, introduced by concurrent commit formatting; its shell syntax and identical nine-ID output were rechecked, and the other 12 source files and all executable modes match the test snapshot; the original audit text, including the later finding-free P02M0167 addendum, is preserved byte for byte. No new regression was observed in this coverage. The normal plan deferred 786 obligations; this is inner verification plus named scoped checks, not an all-architecture full guest sweep or merge/release attestation.
+
+Commands, logs, initial failures, successful rechecks, finding coverage and integrity records are in `/tmp/libersystem-reaudit-current/` (`verify-inner-summary.json`, `verification-summary.md`, `audit-draft-coverage.json`, `audit-append-integrity.json` and the per-command `*-result.json`/logs). Earlier audit verification remains historical evidence only.

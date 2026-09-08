@@ -2350,3 +2350,44 @@ wire, runtime and guest acceptance gates remain implementation work.
 
 Only this re-audit was appended. The plan and source code were not modified, and every preceding
 audit byte was preserved.
+
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-08T16:32:20Z):
+
+Latest audit reviewed: AUDITOR'S RE-AUDIT dated 2026-09-08T16:23:03Z, rating 9/10.
+It contains zero numbered findings and no correction requests; no individual finding therefore
+requires an ACCEPTED/REJECTED disposition.
+
+**ACCEPTED - the assessment identifies no unresolved material defect within this milestone's scope.**
+Revalidated the complete review against the current files: this plan, P02M0174's producer plan,
+and fourteen relevant source, architecture and repository-instruction files remain byte-for-byte
+unchanged since the full re-audit. The complete preceding history and its corrections remain the
+basis of the review; the latest clean assessment was checked against that evidence.
+
+The current network IDL still exposes IPv4 endpoints, while TCP lacks retained transmit payload
+and NetworkService still has blocking startup and diagnostic helpers. M1-M4 and M7-M9 explicitly
+own their replacement. Capability-plus-metadata results in the process IDL, guarded streams in
+the storage IDL, and the existing service-logic split support the proposed implementation without
+an additional public API or runtime dependency.
+
+M5 consumes P02M0174's complete router order for ordinary VIA choices and the advertiser subset,
+with no separate NUD-state rank; DIRECT traffic bypasses default-router selection. Diagnostic
+correlation, actual-send timing, cancellation and deadline ownership agree with the producer
+seam. Resource arithmetic also remains feasible: 42 permitted pending operations fit 128 slots;
+128 TCBs plus four fixed owners fit 160 scheduler slots; the two shared 32-entry L3 queues bring
+the combined count to 352. Sixty-four initial 16384-byte receive buffers fit the 2097152-byte
+aggregate cap. Listener reservation/handoff, fetch terminals, per-family readiness and bounded
+UDP correlation each retain explicit behavior and acceptance cases.
+
+**Exact plan changes: none.** The current plan already contains the required corrections. Its
+work, dependencies and acceptance criteria are complete, consistent and feasible for implementation
+within the stated appliance scope. P02M0174 remains a planned prerequisite; generated-wire, host
+and QEMU gates remain implementation work. Only this response was appended: the plan, source code
+and every preceding audit byte were preserved. No implementation tests or guest runs are claimed.
+
+Consolidated document validation: `git diff --check` passed for the four plans and audits.
+Byte comparisons confirmed that every original audit byte and all source files were preserved;
+only P02M0172's producer paragraph changed among these plans. Scoped `verify.sh --for` selected
+zero inner checks and zero deferred checks, then exited 6 (`INCOMPLETE`) because the repository
+requires a post-commit merge even for an empty check set. No commit, merge verification or
+implementation-test result is claimed.
