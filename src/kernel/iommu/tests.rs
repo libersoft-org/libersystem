@@ -369,7 +369,7 @@ fn a_translated_address_stops_translating_when_its_claim_is_forced_to_end() {
 	// and the release is the production forced one rather than a detach called by hand.
 	let key = crate::device::claim(index).expect("the fixture's function is claimable");
 	assert!(attach_for(index, edu.bus, edu.dev, edu.func, key.generation), "the fixture's endpoint attaches under its claim");
-	let (_mapping, iova) = map_device_buffer(index as u32, key.generation, sentinel.physical, 0x1000).expect("the binding's own generation maps").expect("the fixture is translated, so the map answers with an address");
+	let (mapping, iova) = map_device_buffer(index as u32, key.generation, sentinel.physical, 0x1000).expect("the binding's own generation maps").expect("the fixture is translated, so the map answers with an address");
 
 	// AND IT WORKS FIRST, which is what makes everything after it a claim about a revocation rather
 	// than about an address that never resolved. The device is told to write its buffer into RAM at
@@ -395,6 +395,7 @@ fn a_translated_address_stops_translating_when_its_claim_is_forced_to_end() {
 	let after = edu.transfer(iova.get(), 0x1000, true);
 	assert!(sentinel.intact(), "the ended binding's translated address still reached its frame under the replacement - a forced release left a usable mapping behind");
 	edu.set_bus_master(false);
+	assert_eq!(unmap_for_device(mapping), Ok(dma::Release::FramesReusable), "the frame owner's close retains the old domain's confirmed completion after rebind");
 	crate::serial_println!("iommu-fixture: forced-release case PASSED - a live translated address stopped reaching its frame when its claim was forced to end (transfer completed={after})");
 
 	assert!(detach_for(index, edu.bus, edu.dev, edu.func), "the replacement's endpoint detaches");

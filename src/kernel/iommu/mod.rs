@@ -856,7 +856,7 @@ fn install_doorbell(iommu: &mut dma::Iommu<VirtioIommu<Wire>>, domain: dma::Doma
 }
 
 // Install one translation for a device that is behind the IOMMU, and hand back the address the
-// DEVICE will use. The physical address never leaves this function.
+// device will use. The frame owner must call `unmap_for_device` even if its domain retired first.
 pub fn map_for_device(domain: dma::DomainId, physical: u64, len: u64, direction: dma::Direction) -> Result<(dma::MappingId, dma::DmaAddress), Fault> {
 	with(|controller| {
 		let config = *controller.iommu().backend().config();
@@ -878,6 +878,9 @@ pub fn map_for_device(domain: dma::DomainId, physical: u64, len: u64, direction:
 			}
 		};
 		let address = iommu.address_of(id).ok_or(Fault::NotMapped)?;
+		// The buffer can outlive a forced claim release and the domain it destroys. Preserve this
+		// mapping's terminal completion until that buffer gives its frames back.
+		iommu.retain_mapping(id)?;
 		Ok((id, address))
 	})
 	.unwrap_or(Err(Fault::Unconfirmed))
@@ -1312,14 +1315,15 @@ fn domain_for_generation(index: u32, generation: u64) -> Result<Option<dma::Doma
 	}
 }
 
-// Close one translation. The frames behind it are reusable only when this says `FramesReusable`.
+// Close one translation and consume its frame owner's completion record. The frames behind it are
+// reusable only when this says `FramesReusable`; quarantined records remain held.
 pub fn unmap_for_device(id: dma::MappingId) -> Result<dma::Release, Fault> {
-	// `close` rather than the two phases by hand, because the endpoint revoke reaches the same
+	// Close rather than the two phases by hand, because the endpoint revoke reaches the same
 	// mapping and there is no order between them: a driver that exits drops its device capability
 	// and its DMA buffers in whatever order the process teardown runs them. Whichever arrives second
 	// finds a mapping already taken down, and `close` answers with the verdict the first one reached
 	// instead of reporting a failure that already happened successfully.
-	with(|controller| controller.iommu().close(id)).unwrap_or(Err(Fault::Unconfirmed))
+	with(|controller| controller.iommu().release_mapping(id)).unwrap_or(Err(Fault::Unconfirmed))
 }
 
 // The endpoint is going away. Everything it could reach stops being reachable, or is quarantined.

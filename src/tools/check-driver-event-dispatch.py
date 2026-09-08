@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -91,7 +92,8 @@ def check(source):
     start = source.index('unsafe fn open_subscription(')
     subscription, _ = block(source, source.index('{', start))
     if not compact(subscription).endswith(
-        'letSome((producer,consumer))=channel()else{return};'
+        'letdepth=catalogue.count_of(kind).saturating_add(64)asu64;'
+        'letSome((producer,consumer))=channel_with_depth(depth)else{return};'
         'let_=catalogue.subscribe_stream(kind,producer);'
         'if!send_blocking(service,&corr.to_le_bytes(),consumer){'
         'close(consumer);catalogue.reap_dead_subscribers();}}'
@@ -169,6 +171,7 @@ def main():
         if args.source is None:
             rejected_mutations(source)
             regression_mutations()
+            subprocess.run([sys.executable, str(ROOT / 'src/tools/check-device-manager-progress.py')], check=True)
         print('driver-event-dispatch: passed')
     except (ValueError, OSError) as error:
         parser.exit(1, f'driver-event-dispatch: {error}\n')

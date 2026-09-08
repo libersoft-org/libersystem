@@ -67,7 +67,51 @@ pub unsafe fn pending_shutdown_outcomes() {
 			assert!(matches!(try_recv(peer, &mut bytes), Polled::Closed));
 			close(peer);
 		}
+		planned_stop_deadlines();
 		debug_write(b"DeviceManager: pending shutdown confirmations and timeout classified\n");
+	}
+}
+
+// Exercise real STOPPED decoding before and after expiry through both supervision callers.
+unsafe fn planned_stop_deadlines() {
+	unsafe {
+		for shutdown in [false, true] {
+			for timely in [true, false] {
+				let (control, driver) = channel().expect("stop deadline fixture channel");
+				let mut node = Node::new(0, &DeviceInfo::default(), Vec::new());
+				node.id = node.id.rebound(1);
+				assert!(node.record.move_to(BindingState::Binding, None));
+				assert!(node.record.move_to(BindingState::Stopping, None));
+				node.stop_intent = driver_binding::StopIntent::OperatorDisable;
+				node.binding = Some(Binding { domain: 0, process: 0, channel: control, claim: 0, key: ClaimKey::default() });
+				// Shutdown must apply its earlier overall bound before reading this reply.
+				node.stop_deadline = if timely || shutdown { u64::MAX } else { clock().max(1) };
+				assert!(send_frame(driver, driver_protocol::Opcode::Stopped, node.id.generation, &[], 0, 0));
+				let mut catalogue = Catalogue::new();
+				let mut bytes = [0; 128];
+				if shutdown {
+					let deadline = if timely { clock().saturating_add(100) } else { clock().max(1) };
+					settle_shutdown_node(&mut node, &mut catalogue, &mut bytes, deadline);
+				} else {
+					tick_heartbeats(core::slice::from_mut(&mut node), &mut bytes);
+					// A timely frame may be queued before the outer loop gets to its timer.
+					expire_planned_stop(&mut node, u64::MAX);
+					let _ = advance(&mut node, b"stop-deadline-fixture", &mut catalogue);
+					let _ = advance(&mut node, b"stop-deadline-fixture", &mut catalogue);
+				}
+				assert!(node.binding.is_none() && node.teardown.is_none());
+				assert!(node.record.state == BindingState::Disabled);
+				assert_eq!(node.stop_deadline, 0);
+				let forced = node.incident_report.as_ref().is_some_and(|report| report.cause == FailureCause::Hung);
+				if forced == timely {
+					debug_write(b"DeviceManager: STOPPED deadline ordering misclassified a planned stop\n");
+				}
+				assert_eq!(forced, !timely, "only a STOPPED read before expiry can certify a clean stop");
+				assert_eq!(node.incident_report.is_none(), timely);
+				assert!(matches!(try_recv(driver, &mut bytes), Polled::Closed));
+				close(driver);
+			}
+		}
 	}
 }
 

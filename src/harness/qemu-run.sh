@@ -153,7 +153,7 @@ qemu_prepare_system_disk() {
 	key="$(sha256sum "$volume_image" | awk '{print $1}')"
 	local generations="${disk%.img}."
 	disk="${generations}$key.img"
-	media_sweep "$generations" .img "$disk"
+	media_sweep "$generations" .img "$disk" || return 1
 	if [[ -f "$disk" && "$(stat -c%s "$disk")" -eq "$size" && -f "$disk.key" && "$(<"$disk.key")" == "$key" ]]; then
 		printf '%s\n' "$disk"
 		return 0
@@ -243,22 +243,42 @@ media_current() {
 	[[ -f "$path" && -f "$path.key" && "$(<"$path.key")" == "$key" ]]
 }
 
-# OLD GENERATIONS OF A CONTENT-ADDRESSED FIXTURE, SWEPT.
-#
-# A name that carries its key grows one file per distinct fixture set and nothing else would ever
-# remove them. A file a live guest is READING is never touched: `fuser` answers that, and its absence
-# is answered by keeping the file, which is the safe direction for a sweep. Age is the second guard -
-# a generation younger than twelve hours may be another run's, whether or not it has it open yet.
+# Retain the selected generation for this runner, then sweep old, unused generations.
+# Selection precedes opening the template or starting QEMU, so an open-file check alone misses
+# active readers. The PID lease lasts through exec into QEMU. Acquisition and deletion share a
+# lock so a sweep cannot pass its last reader check just before a runner acquires the generation.
 media_sweep() {
-	local prefix="$1" ext="$2" keep="$3" stale
-	for stale in "$prefix"*"$ext"; do
-		[[ -f "$stale" && "$stale" != "$keep" ]] || continue
-		[[ -n "$(find "$stale" -mmin +720 -print -quit 2>/dev/null)" ]] || continue
-		if ! command -v fuser >/dev/null || fuser -s "$stale" 2>/dev/null; then
-			continue
+	local prefix="$1" ext="$2" keep="$3"
+	(
+		flock -x 9 || exit 1
+		if [[ -n "$keep" ]]; then
+			: >"$keep.lease.$$" || exit 1
 		fi
-		rm -f "$stale" "$stale.key"
-	done
+		local stale key lease owner retained
+		for stale in "$prefix"*"$ext"; do
+			[[ -f "$stale" ]] || continue
+			key="${stale#"$prefix"}"
+			key="${key%"$ext"}"
+			# PID-suffixed private copies belong to scratch_sweep, even before QEMU opens them.
+			[[ "$key" =~ ^[0-9a-f]{64}$ ]] || continue
+			retained=0
+			for lease in "$stale".lease.*; do
+				[[ -f "$lease" ]] || continue
+				owner="${lease##*.}"
+				if [[ ! "$owner" =~ ^[0-9]+$ ]] || kill -0 "$owner" 2>/dev/null; then
+					retained=1
+				else
+					rm -f "$lease"
+				fi
+			done
+			((retained == 0)) || continue
+			[[ -n "$(find "$stale" -mmin +720 -print -quit 2>/dev/null)" ]] || continue
+			if ! command -v fuser >/dev/null || fuser -s "$stale" 2>/dev/null; then
+				continue
+			fi
+			rm -f "$stale" "$stale.key"
+		done
+	) 9>"${prefix}lock"
 }
 
 # Publish a verified candidate: rename first, then record the key. In that order, because a key
@@ -360,7 +380,7 @@ qemu_prepare_media_images() {
 	local fat_key candidate
 	fat_key="$(media_key fat "$voldir" mkfs.exfat mformat mcopy)"
 	FAT_DISK="$QEMU_BUILD_DIR/fat-media${suffix}.$fat_key.img"
-	media_sweep "$QEMU_BUILD_DIR/fat-media${suffix}." .img "$FAT_DISK"
+	media_sweep "$QEMU_BUILD_DIR/fat-media${suffix}." .img "$FAT_DISK" || return 1
 	if ! media_current "$FAT_DISK" "$fat_key"; then
 		candidate="$FAT_DISK.$$.candidate"
 		rm -f "$candidate"
@@ -386,7 +406,7 @@ qemu_prepare_media_images() {
 	local iso_key
 	iso_key="$(media_key iso "$voldir" xorriso genisoimage)"
 	ISO_DISK="$QEMU_BUILD_DIR/iso-media${suffix}.$iso_key.iso"
-	media_sweep "$QEMU_BUILD_DIR/iso-media${suffix}." .iso "$ISO_DISK"
+	media_sweep "$QEMU_BUILD_DIR/iso-media${suffix}." .iso "$ISO_DISK" || return 1
 	if ! media_current "$ISO_DISK" "$iso_key"; then
 		candidate="$ISO_DISK.$$.candidate"
 		rm -f "$candidate"
@@ -406,7 +426,7 @@ qemu_prepare_media_images() {
 	local udf_key
 	udf_key="$(media_key udf "$voldir" mkfs.udf)"
 	UDF_DISK="$QEMU_BUILD_DIR/udf-media${suffix}.$udf_key.udf"
-	media_sweep "$QEMU_BUILD_DIR/udf-media${suffix}." .udf "$UDF_DISK"
+	media_sweep "$QEMU_BUILD_DIR/udf-media${suffix}." .udf "$UDF_DISK" || return 1
 	if ! media_current "$UDF_DISK" "$udf_key" && command -v mkfs.udf >/dev/null; then
 		candidate="$UDF_DISK.$$.candidate"
 		rm -f "$candidate"
@@ -432,7 +452,7 @@ qemu_prepare_usb_image() {
 	local key candidate
 	key="$(media_key usb "$voldir" mformat mcopy)"
 	USB_DISK="$QEMU_BUILD_DIR/usb-media${suffix}.$key.img"
-	media_sweep "$QEMU_BUILD_DIR/usb-media${suffix}." .img "$USB_DISK"
+	media_sweep "$QEMU_BUILD_DIR/usb-media${suffix}." .img "$USB_DISK" || return 1
 	media_current "$USB_DISK" "$key" && return
 	command -v mformat >/dev/null && command -v mcopy >/dev/null || {
 		# A 16 MB file of zeros used to be left here when mtools was absent, and a zeroed image is

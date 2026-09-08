@@ -32,6 +32,14 @@ wait_for() {
 qemu_prepare_usb_image -test >"$work/$generation.format.log" 2>&1
 usb="$USB_DISK"
 system="$(qemu_prepare_system_disk "$work/$generation/system.img" "$QEMU_BUILD_DIR/system.img")"
+if [[ "$generation" == a ]]; then
+	# Cache age says nothing about a new reader. Reuse old templates, then let B sweep before
+	# this run opens either private copy. No file descriptor protects this acquisition interval.
+	touch -d '2 days ago' "$usb" "$system"
+	qemu_prepare_usb_image -test >>"$work/$generation.format.log" 2>&1
+	[[ "$USB_DISK" == "$usb" ]]
+	[[ "$(qemu_prepare_system_disk "$work/$generation/system.img" "$QEMU_BUILD_DIR/system.img")" == "$system" ]]
+fi
 printf '%s\n%s\n' "$usb" "$system" >"$work/$generation.paths"
 touch "$work/$generation.ready"
 # A deliberately waits until B has published both templates before opening its own copies.
@@ -64,11 +72,33 @@ done
 [[ "$(tail -1 "$work/a.paths")" != "$(tail -1 "$work/b.paths")" ]]
 # Without a way to observe live readers, cleanup must retain an old generation.
 source "$work/helpers.sh"
-touch -d '2 days ago' "$work/shared/unobservable.old.img"
+# Once both runner PIDs have exited, the aged generation and its leases can be reclaimed.
+system_template="$(tail -1 "$work/a.paths")"
+private_disk="${system_template%.img}.$$.img"
+touch -d '2 days ago' "$private_disk"
+media_sweep "$work/shared/usb-media-test." .img ""
+media_sweep "$work/shared/system." .img ""
+[[ -f "$private_disk" ]]
+while IFS= read -r template; do
+	[[ ! -f "$template" ]]
+	if compgen -G "$template.lease.*" >/dev/null; then
+		echo "media-generations: an exited runner retained its lease" >&2
+		exit 1
+	fi
+done <"$work/a.paths"
+# Repeated use of one generation must also discard its exited readers' leases.
+system_template="$(tail -1 "$work/b.paths")"
+media_sweep "$work/shared/system." .img "$system_template"
+for lease in "$system_template".lease.*; do
+	[[ "$lease" == "$system_template.lease.$$" ]]
+done
+[[ -f "$system_template" ]]
+unobservable="$work/shared/unobservable.$(printf '%064d' 0).img"
+touch -d '2 days ago' "$unobservable"
 command() {
 	if [[ "$*" == '-v fuser' ]]; then return 1; fi
 	builtin command "$@"
 }
 media_sweep "$work/shared/unobservable." .img ""
-[[ -f "$work/shared/unobservable.old.img" ]]
-echo "media-generations: overlapping USB and system preparations retained their own content"
+[[ -f "$unobservable" ]]
+echo "media-generations: aged USB and system generations survived acquisition and were reclaimed after exit"

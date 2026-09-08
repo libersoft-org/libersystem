@@ -1109,51 +1109,19 @@ fn run() -> Result<ExitCode, String> {
 	}
 }
 
-fn emit_steps(model: &Model, mut ordered: Vec<verify_model::commands::Step>) -> Result<(), String> {
+fn emit_steps(model: &Model, steps: Vec<verify_model::commands::Step>) -> Result<(), String> {
 	let cost = verify_model::history::CostModel { whole_suite_tests: model.kernel_tests.declared_ids, ..verify_model::history::CostModel::default() };
 	let history = verify_model::history::History::load(&model.repo_root).unwrap_or_default();
 	let model_hash = model.model_hash();
-	// CHEAPEST FIRST, AMONG THE STEPS WHOSE PREREQUISITES ARE MET.
-	//
-	// A plan that is going to fail runs its cheapest evidence last, which is minutes of
-	// waiting for news that a two-second host suite already had. Ordering by cost alone
-	// would emit a guest before the build it cannot start without, so the sort is by LAYER
-	// first - how deep in the dependency graph a step sits - and by cost inside a layer.
-	//
-	// The id breaks ties, so the emission is stable: a plan that reorders itself between two
-	// identical runs is one nobody can diff.
-	// VALIDATED BEFORE IT IS WALKED - see `commands::validate`. A plan whose graph is wrong
-	// is not a plan to emit with a warning: the runner would read it, wait on a step nobody
-	// emits, or run one before what it reads.
-	if let Err(faults) = verify_model::commands::validate(&ordered) {
+	// Use the same measured cost or conservative seed that STEPCOST reports. Validate before
+	// walking the graph, and choose from the ready steps again after every prerequisite.
+	let ordered = verify_model::commands::order_by_cost(steps, |step| step_cost(&history, &cost, step, &model_hash)).map_err(|faults| {
 		for fault in &faults {
 			eprintln!("verify-model: {fault}");
 		}
 		eprintln!("verify-model: the plan's dependency graph is not usable, so no plan is emitted");
-		return Err(faults.join("; "));
-	}
-	let mut layers: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
-	for _ in 0..ordered.len() {
-		for step in &ordered {
-			let depth = step.requires.iter().map(|id| layers.get(id).copied().map_or(0, |d| d + 1)).max().unwrap_or(0);
-			layers.insert(step.id.clone(), depth);
-		}
-	}
-	ordered.sort_by(|left, right| {
-		let (dl, dr) = (layers.get(&left.id).copied().unwrap_or(0), layers.get(&right.id).copied().unwrap_or(0));
-		// THE SAME NUMBER THE `STEPCOST` LINE WILL CARRY, SEED AND ALL (fixed 2026-09-03).
-		//
-		// The emitter applies `seed_seconds` - the conservative floor for a step nobody has
-		// timed - and this comparator did not, so the plan ORDERED on one number and
-		// PRINTED another. Every gate key is `host`/`host`, whose fixed term is nothing, so
-		// an unmeasured profile row or concurrency gate sorted as the cheapest work in the
-		// plan while printing a cost of hundreds of seconds beside it: cheapest-first put
-		// the guest boots in front of the one-second host suites they were supposed to
-		// follow.
-		let cl = step_cost(&history, &cost, left, &model_hash);
-		let cr = step_cost(&history, &cost, right, &model_hash);
-		dl.cmp(&dr).then(cl.partial_cmp(&cr).unwrap_or(std::cmp::Ordering::Equal)).then(left.id.cmp(&right.id))
-	});
+		faults.join("; ")
+	})?;
 	for (index, step) in ordered.into_iter().enumerate() {
 		println!("STEP\t{}\t{}\t{}\t{}\t{}", index, step.keys.len(), step.label, step.command, step.note.clone().unwrap_or_default());
 		// ITS OWN LINE, not a seventh field. The runner reads a STEP line into six names and

@@ -1179,3 +1179,79 @@ Current plan rating: **7/10**
 1. **The x86_64 UEFI handoff necessarily presents the pair that the kernel is required to refuse.** M3 now requires the harness to supply the DMA record through `fw_cfg`, the loader to copy it into `BootInfo` with `harness` provenance, and both development invocations to reach admission through that path (`docs/todo/P02M0172.md:526-537,647-675`). This is the same `opt/org.libersystem.dma-mode` file and record used for direct boot (`:431-450,665-669`). The subsequent rule nevertheless makes the kernel refuse whenever both `BootInfo` and the direct carrier's record are present, even with equal values (`:683-689`). Reading a fw_cfg file does not remove it: the current x86 reader reselects the file directory and selected key on every call (`src/kernel/arch/x86_64/fwcfg.rs:55-80`), and the UEFI kernel already reads this machine interface after adopting `BootInfo` (`src/kernel/main.rs:175-200`; `src/kernel/arch/x86_64/mod.rs:164-178`). Thus the required loader input remains visible alongside its own handoff, and the stated duplicate-producer check rejects ordinary x86_64 UEFI test/development boots. Define the check by the trusted boot path so this relay is recognized as one producer, while an independently supplied competing source still refuses, and make the same-image fixtures exercise that rule with fw_cfg still present at kernel entry.
 
 2. **The AArch64 UEFI carrier fixture again requires the enforcing development value before its topology exists.** The new transport gate requires the x86_64 default/`--no-iommu` pair to reach admission carrying `enforcing-required`/`no-iommu`, then requires “the same pair on an AArch64 UEFI row” (`docs/todo/P02M0172.md:671-676`). M2 instead fixes AArch64 development at `no-iommu` for either flag until P02M0173 (`:166-175`), and the architecture-specific admission fixture explicitly assigns this milestone only the degraded pre-transition case (`:507-514`). This matches the current harness: the controller is attached in the x86_64 path (`src/harness/qemu-run.sh:1082`), while AArch64 constructs its current endpoints without that topology (`:1407-1454`). P02M0173 owns the later enforcing flip and its positive admission fixture (`docs/todo/P02M0173.md:160-176,186`). Requiring the same two admitted values on AArch64 here either violates M6's mode/enforcement check or pulls that prerequisite's topology work into this milestone. State the AArch64 carrier fixture's pre-transition value and admission result explicitly, and leave its enforcing positive case with P02M0173 as the existing landing contract requires.
+
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-08T11:22:02Z):
+
+Reviewed both findings in the latest audit (2026-09-08T11:04:17Z) against the milestone's
+registry-owned DMA-policy goal, `docs/ARCHITECTURES.md`, M2's mode/topology matrix,
+P02M0173 M7, and the current kernel, loader, manifest and harness entry paths.
+
+1. **ACCEPTED - the x86_64 UEFI relay was incorrectly classified as two producers.**
+   `src/kernel/arch/x86_64/fwcfg.rs::read_file` reselects the directory and file on every
+   call; reading it does not remove it. The current x86_64 `kmain` receives a loader
+   `BootInfo`, then reads this machine interface for the advisory profile. Therefore a
+   loader relaying the planned DMA file would leave that input visible at kernel entry,
+   and the old unconditional duplicate rule would reject the required development boots.
+
+   Replaced M3's accumulated UEFI-source corrections with one current transport table
+   and trusted-entry-path selection rule. UEFI admission consumes the validated,
+   versioned `BootInfo` extension; direct entry consumes its own early carrier. The
+   non-x86 entry distinction is retained from the original boot argument, before those
+   prologues publish their own `BootInfo`. Later publication is reporting, not another
+   policy producer. Clarified that `harness` provenance includes the loader's validated
+   relay, and that an absent/invalid UEFI handoff cannot fall back to a direct carrier.
+
+   For x86_64 UEFI with `harness` provenance, the expected `fw_cfg` input is revalidated
+   for exact length/record contents and agreement with the handoff, and the matching relay
+   is admitted with the file still present. Missing, malformed or mismatching inputs
+   refuse. Independent assertions still refuse even when equal: signed policy plus a
+   harness input, an x86_64 ESP alternative, or a non-x86 direct FDT policy property beside
+   the UEFI input. The loader checks the latter before a treeless gate withholds its tree.
+   The non-x86 ESP input is fixed at `EFI/BOOT/LSDM` on the loader's own boot filesystem;
+   the x86_64 runner continues to boot its unchanged ISO and uses per-invocation `fw_cfg`.
+   This uses the existing entry contracts and provenance; it adds no relay identity,
+   firmware-variable store or source-precedence mechanism.
+
+   Updated M3's same-image positive and explicit refusal fixtures, M8's carrier gate and
+   the Definition of done. The x86_64 positive leaves `fw_cfg` readable at kernel entry;
+   negatives exercise mismatch, malformed/missing input, absent handoff with a valid raw
+   input, independently supplied equal records and signed-policy competition. The signed
+   manifest grammar, authenticated tag-0 rule and selected-set equality latch are retained.
+
+2. **ACCEPTED - the AArch64 carrier fixture demanded enforcement before its topology exists.**
+   The harness's controller attachment is in its x86_64 path; the current AArch64 path
+   builds endpoints without that topology, as `docs/ARCHITECTURES.md` confirms. M2 and
+   P02M0173 M7 already assign the non-x86 enforcing transition to P02M0173. A transport
+   test cannot override that ownership or M6's mode/enforcement refusal.
+
+   Replaced the ambiguous AArch64 'same pair' fixture in M3 with explicit pre-transition
+   outcomes: default and `--no-iommu` both carry `no-iommu` through their per-run ESP and
+   loader handoff, both refuse `iommu-required`, and both admit declared trusted
+   untranslated drivers with visible degradation. The carrier itself must be accepted;
+   the protected-driver refusal is its expected admission result. Stated the same
+   pre-transition rule for RISC-V and kept the later positive enforcing development gate
+   with P02M0173. M8 now explicitly consumes these pre-transition values. The x86_64 pair
+   continues to exercise enforcing/default versus degraded/`--no-iommu`.
+
+Rechecked all M1-M8 items, the signed-byte grammar, loader/direct ordering, independently
+competing sources, treeless rows, migration consequences and the two-sided P02M0173
+transition for consistency. The corrected plan is feasible within its declared topology
+and scope; registry policy, the explicit temporary non-x86 networking limitation and all
+existing acceptance obligations remain stated. This is a plan review, not an implementation
+or guest-test pass. No source code was edited by this review, and all prior audit bytes
+are preserved. Repository-scoped documentation verification is recorded below after the
+five-plan consistency pass.
+
+
+Final five-plan review verification (2026-09-08T11:26:54Z): all nine latest numbered findings have
+individual decisions (eight ACCEPTED, one REJECTED with the auditor's withdrawal upheld).
+Each original audit prefix was checked byte-for-byte against its pre-review snapshot and is
+unchanged. The corrected plans and shared contracts received a final consistency/feasibility
+review, including the diagnostic actual-send completion seam; scoped whitespace checks pass.
+`./verify.sh --for` over the five requested plan paths selected zero inner checks and zero
+deferred checks, and completed its inner stage (`inner_complete = true`). It returned exit 6,
+`INCOMPLETE`, because this repository requires post-commit merge verification even with no
+deferred checks; no full revision-verification pass is claimed. No source implementation,
+source mutation, new guest run or commit was performed by this review. Concurrent edits outside
+these five plans and five audit files were left untouched.

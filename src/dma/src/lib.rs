@@ -756,6 +756,8 @@ pub struct Mapping {
 	pub direction: Direction,
 	pub generation: Generation,
 	pub state: MappingState,
+	// A frame owner still needs this mapping's completion after its domain retires.
+	retain_on_retire: bool,
 }
 
 // What a completed close permits the caller to do with the frames.
@@ -958,7 +960,7 @@ impl<B: Backend> Iommu<B> {
 			self.domains.get_mut(&domain).expect("the caller holds this domain").space.quarantine(iova).expect("the caller reserved this address");
 			let id = MappingId(self.next_mapping);
 			self.next_mapping += 1;
-			self.mappings.insert(id, Mapping { id, domain, iova, physical, len, direction, generation, state: MappingState::Quarantined });
+			self.mappings.insert(id, Mapping { id, domain, iova, physical, len, direction, generation, state: MappingState::Quarantined, retain_on_retire: false });
 			return reason;
 		}
 		let state = self.domains.get_mut(&domain).expect("the caller holds this domain");
@@ -989,7 +991,7 @@ impl<B: Backend> Iommu<B> {
 			Ok(_confirmed) => {
 				let id = MappingId(self.next_mapping);
 				self.next_mapping += 1;
-				self.mappings.insert(id, Mapping { id, domain, iova, physical, len, direction, generation, state: MappingState::Live });
+				self.mappings.insert(id, Mapping { id, domain, iova, physical, len, direction, generation, state: MappingState::Live, retain_on_retire: false });
 				Ok(id)
 			}
 			// A REFUSAL releases the address - no translation was made, so there is nothing a device
@@ -1018,7 +1020,7 @@ impl<B: Backend> Iommu<B> {
 			Ok(_confirmed) => {
 				let id = MappingId(self.next_mapping);
 				self.next_mapping += 1;
-				self.mappings.insert(id, Mapping { id, domain, iova, physical: address, len, direction, generation, state: MappingState::Live });
+				self.mappings.insert(id, Mapping { id, domain, iova, physical: address, len, direction, generation, state: MappingState::Live, retain_on_retire: false });
 				Ok(id)
 			}
 			Err(reason) => Err(self.map_failed(domain, iova, address, len, direction, generation, reason)),
@@ -1093,6 +1095,23 @@ impl<B: Backend> Iommu<B> {
 		self.finish_close(id)
 	}
 
+	// Register a frame owner's need for the terminal result before publishing its mapping handle.
+	// This keeps only the existing row, not the domain or its IOVA, alive after confirmed retirement.
+	pub fn retain_mapping(&mut self, id: MappingId) -> Result<(), Fault> {
+		self.mappings.get_mut(&id).ok_or(Fault::NotMapped)?.retain_on_retire = true;
+		Ok(())
+	}
+
+	// The frame owner's last reference is gone. Consume a successful completion; an unconfirmed
+	// mapping remains in the quarantine ledger and never becomes reusable by losing its owner.
+	pub fn release_mapping(&mut self, id: MappingId) -> Result<Release, Fault> {
+		let released = self.close(id)?;
+		if released == Release::FramesReusable {
+			self.mappings.remove(&id);
+		}
+		Ok(released)
+	}
+
 	// The endpoint goes away - a clean unbind or a crash. Every translation in the domain comes down
 	// first, then the endpoint leaves, and anything that did not confirm is quarantined. The
 	// lifecycle above this owns the reset and containment policy; what this owes it is a confirmed
@@ -1126,7 +1145,7 @@ impl<B: Backend> Iommu<B> {
 			return Err(Fault::Unconfirmed);
 		}
 		let confirmed = self.backend.domain_destroy(domain)?;
-		self.mappings.retain(|_, m| m.domain != domain);
+		self.mappings.retain(|_, m| m.domain != domain || m.retain_on_retire);
 		self.domains.remove(&domain);
 		Ok(confirmed)
 	}

@@ -386,14 +386,16 @@ impl Drop for DmaBuffer {
 		// driver's address space AND handed to a device, so a stale translation here is the worst
 		// version of the case.
 		//
-		// And a buffer orphaned by a TERMINATION is not retired at all yet: its owner never said
-		// the device was finished with it, and retiring puts the frames back in circulation while a
-		// descriptor may still name them. They wait for the device to be stopped instead.
+		// An untranslated buffer orphaned by termination waits for the device to be stopped: its
+		// owner never said it was finished, and a descriptor may still name those physical frames.
+		// A translated buffer instead requires its own confirmed unmap and invalidation below.
 		// THE TRANSLATION COMES DOWN BEFORE THE FRAMES GO ANYWHERE. Until the unmap and the
 		// invalidation have both completed the device may still resolve this address, so a frame
 		// released here would be one handed to its next owner while a descriptor can still reach it.
 		// An unconfirmed release quarantines: the pages are lost rather than reused.
-		let released = match self.translation.lock().take() {
+		let translation = self.translation.lock().take();
+		let translated = translation.is_some();
+		let released = match translation {
 			Some((id, _)) => match crate::iommu::unmap_for_device(id) {
 				Ok(dma::Release::FramesReusable) => true,
 				_ => {
@@ -410,12 +412,14 @@ impl Drop for DmaBuffer {
 			return;
 		}
 		let frames = core::mem::take(&mut self.frames);
-		let frames = match (self.device, self.orphaned.load(Ordering::Acquire)) {
+		let frames = match (self.device, self.orphaned.load(Ordering::Acquire), translated) {
 			// Held, or - if the table is full - leaked inside `hold`. Either way nothing to retire
 			// here; `release_for` retires the held ones when the device is reset, and the leaked
 			// ones are gone on purpose rather than handed to the next allocator under a live DMA
 			// descriptor. That is why `hold` has nothing to give back.
-			(Some(device), true) => {
+			// A confirmed translated close already proves the device cannot reach these frames.
+			// Holding them for a later reset would strand a buffer that outlived that reset.
+			(Some(device), true, false) => {
 				hold(device, frames);
 				Vec::new()
 			}

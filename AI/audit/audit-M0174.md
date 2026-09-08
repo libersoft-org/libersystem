@@ -1460,3 +1460,61 @@ Current plan rating: 8/10
 1. **The frozen quoted-error event omits the information required by the traceroute/probe consumer it is supposed to support.** M6 specifies a typed event containing the error class/code and MTU or pointer, plus the quoted source/destination and ports or ICMP identifier (`docs/todo/P02M0174.md:600-627`). It carries neither the outer ICMPv6 sender address nor the quoted Echo sequence number. The quoted destination is the final probe destination, so it cannot identify the intermediate router that generated Time Exceeded. Nor does an ICMP identifier distinguish successive probes using that identifier. These are existing consumer requirements: the current IPv4 path preserves both the responding address and quoted sequence in `TimeExceeded`/`Unreachable` (`src/user/services/core/src/net.rs:1081-1088`), and `do_probe` sends identifier 1 with an incrementing sequence, matches the returned sequence, and reports the responding hop (`src/user/services/core/src/network_service.rs:1046-1060`). P02M0175 explicitly migrates those probe/traceroute paths and requires IPv6 traceroute errors while consuming this frozen seam (`docs/todo/P02M0175.md:529-530,1270-1272,1309-1314`). Following the specified event shape leaves that consumer unable to report the actual hop, and a delayed error for an earlier same-identifier probe can be assigned to the current one. Preserve the scoped outer sender and quoted probe sequence in the bounded typed event here, and gate two successive same-identifier probes with delayed/reordered errors from different routers. This completes the existing seam; it requires no L3 flow-registration table or public transport implementation in this milestone.
 
 Verification: read the complete prior audit history and all M1-M8 plan text, checked the latest planner corrections against the current service/stack boundaries and the consumer plan, and consulted the primary RFCs for the protocol corrections. No implementation, source mutation or guest run was performed; all previous audit bytes are preserved.
+
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-08T11:23:28Z):
+
+Reviewed the latest audit dated 2026-09-08T11:10:57Z against the current M1-M8 plan,
+P02M0175's consumer requirements, the P02M0003/P02M0004 layer boundary, and the actual
+NetworkService/stack and host-testable `service-logic` architecture.
+
+1. **ACCEPTED - the quoted-error event lacks the actual responder and Echo sequence.**
+   `net.rs::on_icmp` already delivers the outer IPv4 source and quoted Echo sequence in
+   `TimeExceeded`/`Unreachable`; `network_service.rs::do_probe` matches that sequence and reports
+   that responder. M0174 M6 supplied neither field, while M0175 M3/M9/M10 requires the equivalent
+   IPv6 diagnostic path. This is missing data in an existing seam, not additional L3 flow ownership.
+
+   Exact plan changes: M6's fixed typed event now includes the outer ICMPv6 sender, receiving
+   interface identity/generation, and quoted Echo Request identifier AND sequence. It requires
+   the complete checked eight-byte Echo header and valid Request type/code, counting/dropping a
+   short quote instead of synthesizing fields. The quoted final destination remains separate from
+   the responding router. The 32-slot advisory FIFO and drop/count overflow rule are unchanged;
+   the consumer still owns live-request validation. The M8 cases specified beside M6 now cover
+   successive same-identifier/different-sequence probes, delayed/reordered errors from two scoped
+   routers, retirement of the earlier probe, truncated quotes and stale interface generations.
+   M7's peer supplies those cases to the L3 guest gate, with a small test consumer rather than the
+   future public transport implementation. P02M0175 M3/M7/M10 consumes the same fields and tests
+   correct hop attribution and isolation of the later live request.
+
+   Cross-plan completion for P02M0175's accepted diagnostic-runtime finding: M3 also fixes the
+   metadata on direct validated Echo Reply ingress; M6 gives each already-bounded pending packet
+   an opaque consumer cancellation token, with exact release and no later transmit after cancel.
+   M8 tests cancellation while another operation shares the neighbour. This makes diagnostic
+   timeout/disconnect feasible without introducing another queue or an L3 flow-registration table.
+   The PMTU paragraph now distinguishes its durable table write from packet-ownership cancellation.
+
+Re-check: source/route policy remains in M0175, protocol tables/timers remain in M0174, and the
+paired diagnostic contract names all correlation, responder, cancellation and ownership inputs.
+Existing table/queue/byte limits and the named fragment-reassembly limitation remain consistent.
+The corrected plan is ready for implementation within its stated scope. Documentation whitespace
+checks passed; all previous audit bytes were preserved. No source implementation or guest tests
+were performed by this review.
+
+Final cross-plan contract check: M6 also explicitly returns the queued packet's opaque token and
+monotonic send timestamp on successful driver handoff through its existing egress completion
+path. This supplies M0175's actual-send RTT/reply-deadline transition, independently of advisory
+error delivery, with no extra queue or registration table. Failure/cancellation and successful
+transmission now all have an observable outcome for the pending operation's owner.
+
+
+Final five-plan review verification (2026-09-08T11:26:54Z): all nine latest numbered findings have
+individual decisions (eight ACCEPTED, one REJECTED with the auditor's withdrawal upheld).
+Each original audit prefix was checked byte-for-byte against its pre-review snapshot and is
+unchanged. The corrected plans and shared contracts received a final consistency/feasibility
+review, including the diagnostic actual-send completion seam; scoped whitespace checks pass.
+`./verify.sh --for` over the five requested plan paths selected zero inner checks and zero
+deferred checks, and completed its inner stage (`inner_complete = true`). It returned exit 6,
+`INCOMPLETE`, because this repository requires post-commit merge verification even with no
+deferred checks; no full revision-verification pass is claimed. No source implementation,
+source mutation, new guest run or commit was performed by this review. Concurrent edits outside
+these five plans and five audit files were left untouched.

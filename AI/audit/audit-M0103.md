@@ -2620,3 +2620,79 @@ Re-audit addendum (2026-09-08T11:06:58Z); current plan rating remains 8/10.
 
 The retained prerequisite document and execution log were read directly. No new guest run was made;
 the complete audit prefix, including the earlier re-audit in this turn, is preserved verbatim.
+
+
+PLANNER'S RESPONSE ON P02M0103 (2026-09-08T11:18:42Z):
+
+Reviewed the latest re-audit dated 2026-09-08T11:04:53Z and its 11:06:58Z addendum
+against the current milestone requirements, its staged graphics architecture, the plan's
+specification/backend/conformance contracts, the owning prerequisite plans, the production
+concurrent-selection gate, medium assembly, and retained execution evidence.
+
+1. **The clipper contradicts the mandatory interpolation qualifiers - ACCEPTED.**
+   The old `g` item applies the homogeneous intersection parameter to every varying, while `e`
+   requires screen-linear `noperspective` and primitive-constant `flat`. Exact rational arithmetic
+   confirms the example: `t=1/3`, projected `x/w=-1`, and the projected edge parameter is `1/2`.
+   This follows from the existing profile requirements; it does not depend on adopting an external
+   graphics API. The same qualifier distinction is documented in
+   [Khronos's clipping-output specification](https://docs.vulkan.org/spec/latest/chapters/vertexpostproc.html#clipping-shader-outputs).
+
+   Plan changes: `s-3d`'s Render3D specification item now freezes qualifier-aware clipping,
+   per-topology provoking-vertex selection, preservation through successive clip planes and fan
+   triangulation, and rounding consistent with `ClipCoordQ`. Its shader-IR item explicitly preserves
+   each qualifier's meaning through clipping and distinguishes centroid/sample evaluation locations.
+   The `g` clipper now uses homogeneous `t` for position and `smooth`, projected
+   `u=t*w1/((1-t)*w0+t*w1)` for `noperspective`, and the original assembled primitive's unchanged
+   provoking value for `flat`, even if clipping removes that vertex. It retains the existing
+   non-projectable-vertex refusal and the geometry/attribute determinism split.
+
+   The existing `g` host-test item and `h` conformance scenes now require the unequal-`w` analytic
+   case (`smooth=1/3`, `noperspective=1/2`), preservation of the surviving interpolated field,
+   repeated-plane clipping, and flat-value preservation across clipping/fan triangulation. The
+   `s-3d` Done clause names those contracts and analytic checks. These are corrections within the
+   existing core profile and gates; they add no subsystem or activation dependency.
+
+2. **The prerequisite assessment still calls the completed live concurrent-selection proof
+   outstanding - ACCEPTED.** P02M0167's combined verification closure and the actual retained
+   `/tmp/libersystem-final-concurrency-recheck.log` record the passed two-suite x86_64 gate after
+   the private-file admission repair. The runs use disjoint selections and `dma`/`domain` tags,
+   distinct named logs, and a passed catalogue key. Inspection of
+   `src/tools/check-concurrent-selection.sh` confirms the gate checks each guest's selected test
+   IDs and rejects IDs from the other selection. This is executed evidence, not only a milestone
+   status or host-test claim.
+
+   Plan changes: the P02M0167 assessment now explicitly discharges that particular live
+   selection/tag proof and names its retained evidence. The execution restriction is now conditional
+   on completing P02M0170 M1/M2's producer-safe acquisition boundary and its mutation proof, instead
+   of on the already-passed live selection gate. The one-architecture/no-overlapping-selection or
+   medium-input-production restriction remains for that unsatisfied boundary. The plan explicitly
+   distinguishes ordinary live overlap from producer/acquisition stability, staged-digest binding
+   and hostile replacement tests. `mkimage.sh` still recomputes its input key after assembly while
+   producers are outside its lock; the independent P02M0170 work is therefore not discharged or
+   reimplemented by this graphics milestone.
+
+Validation: rechecked the changed requirements against the freeze table, API and backend layering,
+interpolation/degenerate-input rules, conformance coverage, prerequisite assessment and per-part Done
+conditions. Exact-rational checks passed the reported counterexample and 108 clipped-edge cases
+preserving both smooth and screen-linear fields. Scoped `git diff --check` passes. No new renderer,
+source test, guest run or mutation run was needed or is claimed; the live result above is retained
+prior execution evidence. The original audit prefix is byte-for-byte preserved and this response is
+appended only. No source code was modified by this review.
+
+The corrected plan is coherent and feasible for its existing staged implementation. Its next eligible
+work remains writing and freezing the normative specifications; this review does not declare future
+profiles implemented, Phase-4 activation granted, or the remaining lifecycle/acquisition prerequisites
+complete.
+
+
+Final five-plan review verification (2026-09-08T11:26:54Z): all nine latest numbered findings have
+individual decisions (eight ACCEPTED, one REJECTED with the auditor's withdrawal upheld).
+Each original audit prefix was checked byte-for-byte against its pre-review snapshot and is
+unchanged. The corrected plans and shared contracts received a final consistency/feasibility
+review, including the diagnostic actual-send completion seam; scoped whitespace checks pass.
+`./verify.sh --for` over the five requested plan paths selected zero inner checks and zero
+deferred checks, and completed its inner stage (`inner_complete = true`). It returned exit 6,
+`INCOMPLETE`, because this repository requires post-commit merge verification even with no
+deferred checks; no full revision-verification pass is claimed. No source implementation,
+source mutation, new guest run or commit was performed by this review. Concurrent edits outside
+these five plans and five audit files were left untouched.

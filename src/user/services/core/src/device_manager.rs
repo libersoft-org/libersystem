@@ -559,16 +559,7 @@ pub extern "C" fn __user_main(bootstrap: u64) -> ! {
 				// the work was flushed. `Wedged` is the same event the shutdown path and the
 				// heartbeat watchdog inject, so this takes the one teardown route rather than
 				// inventing a second - what differs is only the reason it was entered.
-				if nodes[at].stop_deadline != 0 && clock() >= nodes[at].stop_deadline {
-					nodes[at].stop_deadline = 0;
-					if nodes[at].record.state == BindingState::Stopping && nodes[at].binding.is_some() {
-						let generation: u64 = nodes[at].id.generation;
-						print(b"DeviceManager: ");
-						print_driver_name(nodes[at].driver_name());
-						print(b" did not answer the stop inside its slice; the teardown is FORCED and nothing here says its work was flushed\n");
-						nodes[at].push(BindingEvent::Wedged { generation });
-					}
-				}
+				expire_planned_stop(&mut nodes[at], clock());
 				// AN OPERATOR'S RETRY, PERFORMED. One attempt, from wherever the node was left -
 				// but never on a node that still HAS a binding.
 				//
@@ -967,6 +958,9 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 				}
 				nodes[at].restart_requested = false;
 				let Some(entry) = nodes[at].candidates.get(nodes[at].candidate).copied() else { continue };
+				if !gate_on_requirements(&mut nodes[at], entry, catalogue) {
+					continue;
+				}
 				let Some(elf) = package.lookup(entry.artifact) else {
 					nodes[at].retry_at = 0;
 					nodes[at].waiting_for_claim = false;
@@ -997,6 +991,9 @@ unsafe fn launch_boot_drivers(package: &Package, catalogue: &mut Catalogue, node
 							continue;
 						}
 						let entry = nodes[at].candidates[nodes[at].candidate];
+						if !gate_on_requirements(&mut nodes[at], entry, catalogue) {
+							continue;
+						}
 						let Some(elf) = package.lookup(entry.artifact) else { continue };
 						let info = nodes[at].info;
 						begin_bind(&mut nodes[at], &info, elf, entry.name, 0, power, console_input, device_privilege);
@@ -2848,18 +2845,28 @@ unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, catalogue: &mut Catalo
 			soonest = beats;
 		}
 		soonest = tick_handshakes(nodes, soonest);
-		// AND A NODE OUTSIDE THIS PHASE'S RANGE CONSUMES ITS OWN EVENTS. Its verdict is not this
-		// loop's to act on - there is no candidate list to advance for a driver another phase bound
-		// - but leaving a wedge queued would mean noticing it and never answering it.
+		// Earlier phases still own live drivers and pending teardowns. Consume their confirmations
+		// through settlement; a Backoff landing retains its retry for the standing recovery loop.
 		for at in 0..in_flight_from {
-			if nodes[at].record.state != BindingState::Online {
+			if nodes[at].record.state != BindingState::Online && !nodes[at].in_flight() {
 				continue;
 			}
 			let name: &[u8] = nodes[at].driver_name();
 			let _ = advance(&mut nodes[at], name, catalogue);
 		}
+		// Draining a channel can queue READY or STOPPED before the wait. Consume that work now;
+		// an admitted STOPPED has already cleared its deadline and cannot wait for another frame.
+		if nodes.iter().skip(in_flight_from).any(|node| !node.queue.is_empty()) {
+			return true;
+		}
+		// A pre-spawn rollback can already have both confirmations and no waitable handles. Its
+		// Domain still belongs to Pending until advance settles it, so run that step before either
+		// ending the phase or waiting on an unrelated driver.
+		if nodes.iter().any(|node| node.teardown.as_ref().is_some_and(|teardown| teardown.pending.exited && teardown.pending.state.is_some())) {
+			return true;
+		}
 		for (at, node) in nodes.iter().enumerate() {
-			if at < in_flight_from || !node.in_flight() || set + 2 > abi::MAX_WAIT_HANDLES {
+			if !node.in_flight() || set + 2 > abi::MAX_WAIT_HANDLES {
 				continue;
 			}
 			// A TEARDOWN'S TWO HANDLES, WHICH IS WHAT MAKES ITS CONFIRMATIONS EVENTS. The Process
@@ -2868,14 +2875,14 @@ unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, catalogue: &mut Catalo
 			// at this point - it was taken out before the rollback - which is why this is checked
 			// first and not inside the binding arm.
 			if let Some(teardown) = &node.teardown {
-				if teardown.pending.process != 0 {
+				if teardown.pending.process != 0 && !teardown.pending.exited {
 					handles[set] = teardown.pending.process;
 					owner[set] = at;
 					is_process[set] = true;
 					kind[set] = WAIT_EXIT;
 					set += 1;
 				}
-				if teardown.pending.claim != 0 && set < abi::MAX_WAIT_HANDLES {
+				if teardown.pending.claim != 0 && teardown.pending.state.is_none() && set < abi::MAX_WAIT_HANDLES {
 					handles[set] = teardown.pending.claim;
 					owner[set] = at;
 					is_process[set] = false;
@@ -2926,7 +2933,7 @@ unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, catalogue: &mut Catalo
 			// Nothing to wake ON, so the deadline IS the wait. Bounded by the kernel's own latched
 			// release deadline rather than by anything here: once it passes, `observe_claim` answers
 			// `Terminal` and the next attempt ends the node instead of parking it again.
-			let Some(due) = parked else { return false };
+			let Some(due) = parked.into_iter().chain(nodes.iter().filter_map(|node| node.teardown.as_ref().map(|teardown| teardown.deadline))).min() else { return false };
 			if due > clock() {
 				sleep_until(soonest);
 			}
@@ -2979,6 +2986,7 @@ unsafe fn pump(nodes: &mut [Node], in_flight_from: usize, catalogue: &mut Catalo
 // Take every frame waiting on this node's channel and queue what each one means.
 unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 	unsafe {
+		expire_planned_stop(node, clock());
 		if driver_binding::handshake_expired(node.record.state, node.ready_deadline, clock()) {
 			node.push(BindingEvent::TimedOut { generation: node.id.generation });
 		}
@@ -3082,7 +3090,15 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 					// planned stop is a state this manager put the node INTO; an unsolicited frame
 					// claiming one is a driver describing a conversation that did not happen.
 					if node.record.state == BindingState::Stopping && node.stop_intent != driver_binding::StopIntent::Fault {
-						node.push(BindingEvent::Stopped { generation });
+						// The receive time decides whether the stop beat its deadline. Expiry must
+						// enter the queue before a late reply, including when draining crossed a tick.
+						expire_planned_stop(node, node.last_frame_at);
+						if node.last_frame_at < node.stop_deadline && node.push(BindingEvent::Stopped { generation }) {
+							// A timely answer is settled even if its queued event is handled later.
+							node.stop_deadline = 0;
+						} else {
+							print(b"DeviceManager: a late or duplicate STOPPED was refused\n");
+						}
 					} else {
 						print(b"DeviceManager: ");
 						print_driver_name(node.driver_name());
@@ -3343,6 +3359,24 @@ fn spend_candidate(node: &mut Node) {
 // heartbeat deadline so a node whose incident carries no reserve is still bounded by something.
 unsafe fn planned_stop_deadline(node: &Node) -> u64 {
 	unsafe { clock().saturating_add(node.incident.teardown_reserve.max(driver_protocol::MAX_HEARTBEAT_DEADLINE as u64)) }
+}
+
+// Latch expiry before reading late acknowledgements. All stop waiters share this event ordering.
+unsafe fn expire_planned_stop(node: &mut Node, now: u64) {
+	unsafe {
+		if node.stop_deadline == 0 || now < node.stop_deadline {
+			return;
+		}
+		if node.record.state == BindingState::Stopping && node.binding.is_some() {
+			if !node.push(BindingEvent::Wedged { generation: node.id.generation }) {
+				return;
+			}
+			print(b"DeviceManager: ");
+			print_driver_name(node.driver_name());
+			print(b" did not answer the stop inside its slice; the teardown is FORCED and nothing here says its work was flushed\n");
+		}
+		node.stop_deadline = 0;
+	}
 }
 
 unsafe fn back_off_until(incident: &Incident, attempt: u32) -> u64 {
@@ -5311,7 +5345,10 @@ unsafe fn open_subscription(service: u64, catalogue: &mut Catalogue, nodes: &[No
 		// argument, and a live stream has to know which kind it is watching to know which frames are
 		// its own - so the kind is decoded here, from the same bytes.
 		let Some(kind) = subscribed_kind(request) else { return };
-		let Some((producer, consumer)) = channel() else { return };
+		// The consumer cannot drain until its endpoint is transferred. Size for the complete
+		// snapshot plus a normal queue's worth of live events, rather than the default 64 total.
+		let depth = catalogue.count_of(kind).saturating_add(64) as u64;
+		let Some((producer, consumer)) = channel_with_depth(depth) else { return };
 		// Queue the snapshot before releasing its endpoint: bootstrap consumers poll immediately
 		// when the reply arrives. A refused registration closes the producer, so still return the
 		// consumer in that case and let the caller observe the closed stream.
@@ -5533,6 +5570,9 @@ unsafe fn stop_all(nodes: &mut [Node], catalogue: &mut Catalogue, intent: driver
 unsafe fn settle_shutdown_node(node: &mut Node, catalogue: &mut Catalogue, buf: &mut [u8], deadline: u64) {
 	unsafe {
 		let name = node.driver_name();
+		if node.stop_deadline != 0 {
+			node.stop_deadline = node.stop_deadline.min(deadline);
+		}
 		loop {
 			let now = clock();
 			if let Some(teardown) = node.teardown.as_mut() {
@@ -5575,10 +5615,8 @@ unsafe fn settle_shutdown_node(node: &mut Node, catalogue: &mut Catalogue, buf: 
 			}
 			let stop_deadline = if node.stop_deadline == 0 { deadline } else { node.stop_deadline.min(deadline) };
 			if clock() >= stop_deadline {
-				print(b"DeviceManager: ");
-				print_driver_name(name);
-				print(b" did not answer the stop inside its slice; the teardown is FORCED and nothing here says its work was flushed\n");
-				node.push(BindingEvent::Wedged { generation: node.id.generation });
+				node.stop_deadline = stop_deadline;
+				expire_planned_stop(node, clock());
 				// The next pass begins its teardown and subsequently classifies its confirmations.
 				continue;
 			}

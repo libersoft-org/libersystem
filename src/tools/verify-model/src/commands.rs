@@ -113,6 +113,21 @@ pub fn validate(steps: &[Step]) -> Result<(), Vec<String>> {
 	if faults.is_empty() { Ok(()) } else { Err(faults) }
 }
 
+// Reconsider readiness after every step: a cheap dependent becomes eligible as soon as its last
+// prerequisite is emitted, even while expensive roots remain. Stable IDs break equal-cost ties.
+pub fn order_by_cost(mut pending: Vec<Step>, cost: impl Fn(&Step) -> f64) -> Result<Vec<Step>, Vec<String>> {
+	validate(&pending)?;
+	let mut ordered = Vec::with_capacity(pending.len());
+	let mut completed = BTreeSet::new();
+	while !pending.is_empty() {
+		let next = pending.iter().enumerate().filter(|(_, step)| step.requires.iter().all(|required| completed.contains(required))).min_by(|(_, left), (_, right)| cost(left).partial_cmp(&cost(right)).unwrap_or(std::cmp::Ordering::Equal).then(left.id.cmp(&right.id))).map(|(index, _)| index).expect("validated dependency graph has a ready step");
+		let step = pending.remove(next);
+		completed.insert(step.id.clone());
+		ordered.push(step);
+	}
+	Ok(ordered)
+}
+
 // A long list is digested rather than spelled. Two hundred selected ids make a nine-kilobyte name,
 // and an identity has to be stable and distinct, not readable.
 fn scoped_id(kind: &str, scope: &str, parts: &[String]) -> String {

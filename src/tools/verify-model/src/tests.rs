@@ -13,7 +13,7 @@ use crate::ownership::{Owner, Ownership};
 use crate::plan::Planner;
 use crate::registry::Registry;
 use crate::{Model, tracked_files};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -2709,6 +2709,34 @@ fn evidence_under_another_model_does_not_qualify_a_candidate() {
 // one outcome a scheduler cannot recover from, so each is asserted here on its own.
 fn step_for_test(id: &str, requires: &[&str]) -> crate::commands::Step {
 	crate::commands::Step { id: id.to_string(), requires: requires.iter().map(|r| (*r).to_string()).collect(), label: id.to_string(), command: String::from("true"), keys: Vec::new(), note: None, guests: 0 }
+}
+
+#[test]
+fn ready_dependents_run_before_more_expensive_roots() {
+	let steps = vec![
+		step_for_test("long-gate", &[]),
+		step_for_test("library", &["sdk"]),
+		step_for_test("package", &["library", "manifest"]),
+		step_for_test("manifest", &[]),
+		step_for_test("sdk", &[]),
+	];
+	let costs = BTreeMap::from([("long-gate", 2075.0), ("library", 1.0), ("package", 1.0), ("manifest", 3.0), ("sdk", 2.0)]);
+	let order = crate::commands::order_by_cost(steps, |step| costs[step.id.as_str()]).unwrap();
+	assert_eq!(order.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(), vec!["sdk", "library", "manifest", "package", "long-gate"]);
+}
+
+#[test]
+fn ready_cost_order_is_stable_and_rejects_invalid_graphs() {
+	let steps = vec![step_for_test("b", &[]), step_for_test("c", &["a"]), step_for_test("a", &[])];
+	let mut reversed = steps.clone();
+	reversed.reverse();
+	for input in [steps, reversed] {
+		let order = crate::commands::order_by_cost(input, |_| 1.0).unwrap();
+		assert_eq!(order.iter().map(|step| step.id.as_str()).collect::<Vec<_>>(), vec!["a", "b", "c"]);
+	}
+	for input in [vec![step_for_test("a", &["missing"])], vec![step_for_test("a", &[]), step_for_test("a", &[])], vec![step_for_test("a", &["b"]), step_for_test("b", &["a"])]] {
+		assert!(crate::commands::order_by_cost(input, |_| panic!("invalid graph must be refused before pricing")).is_err());
+	}
 }
 
 #[test]

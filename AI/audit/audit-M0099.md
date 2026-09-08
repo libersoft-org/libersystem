@@ -2417,3 +2417,69 @@ Finding 1 above is withdrawn. The item's explicitly named x86_64 enforcing gate 
 Current plan rating: 9/10. Only finding 2 above remains: credit the executed live concurrent-selection proof while retaining the distinct open producer/acquisition condition.
 
 Timestamp correction: the verification correction immediately above was appended at 2026-09-08T11:05:56Z; its 11:08:00Z timestamp was a transcription error.
+
+
+PLANNER'S RESPONSE ON P02M0099 (2026-09-08T11:21:14Z):
+
+Reviewed both numbered findings from the 2026-09-08T11:03:33Z re-audit, including the
+subsequent withdrawal of finding 1 and its corrected 2026-09-08T11:05:56Z timestamp. Checked the
+complete current index, the Phase-2 driver architecture, the applicable P02M0153/P02M0172 DMA
+contracts, current address/claim and harness code, P02M0167/P02M0170, and retained execution logs.
+
+1. **REJECTED - withdrawn DMA-policy/teardown finding; the auditor's correction is upheld.**
+   The executable virtio-blk item already names the x86_64 enforcing IOMMU gate and owns its
+   provider-specific translated block-read oracle. That profile supplies the IOVA assertion's
+   context. The index's conformance gate and per-driver completion contract already qualify
+   resource return by confirmed teardown and retain charged quarantine otherwise, matching
+   P02M0153 and `device::finish_release`. The address syscall's physical-address answer in a
+   degraded profile does not invalidate an enforcing-profile assertion. Three-target builds and
+   measured bind budgets do not themselves require untranslated block operation or expand this
+   x86_64 oracle into P02M0173's enforcing rollout. No new policy mechanism, prerequisite or
+   virtio-blk plan change was added for this withdrawn finding.
+
+2. **ACCEPTED - the ordinary live concurrent-selection proof was executed and must be credited.**
+   P02M0167's live-guest correction and combined closure record the actual gate pass.
+   `/tmp/libersystem-final-concurrency-recheck.log` records the overlapping x86_64 suites with
+   distinct selections and `dma`/`domain` tags, independent logs and a passed catalogue key. Both
+   named runner logs also show different content-addressed ISOs and QEMU exit 33. The production
+   `src/tools/check-concurrent-selection.sh` verifies each guest's selected test IDs and absence of
+   the other selection's IDs; this is stronger evidence than a host template test or a status line.
+
+   Exact changes: the three-target prerequisite row now identifies that proof as discharged;
+   the OPEN ledger entry now names only P02M0170's producer/acquisition boundary and its deliberate
+   input-mutation proof; a dated discharge records the executed gate and its evidence; and the
+   catalogue-variant entry no longer refers to a pending ordinary live proof. The conservative
+   serialized acceptance condition remains attached to the actual remaining boundary. Current
+   `mkimage.sh` still reads shared packages, manifest and fallback bootstrap inputs, holds an
+   assembly-only lock and detects producer movement after assembly. Ordinary successful overlap
+   does not prove the P02M0170 acquisition/assembly mutations, so that separate implementation and
+   evidence condition remains OPEN.
+
+The consistency pass also reconciled the adjacent P02M0165 evidence paragraph: its current
+prerequisite and retained development results prove the concrete missing-close negative,
+restored startup markers, successful shutdown, and actual GPU withdrawal/rebind/presentation.
+Those executed effects are credited rather than left as missing positive evidence. A separate
+production shutdown-settlement mutation was not established by the retained records reviewed and
+its existing negative-control condition remains; no new test or mechanism was requested. The later
+performance failure is not relabelled as a successful combined command.
+
+Rechecked the corrected matrix, ledger, executable item scope, shared-contract ownership and
+class-specific acceptance rules for consistency. This remains a non-completable index whose
+bounded items can be selected and implemented subject to their explicit prerequisites; it does
+not become an all-drivers completion gate. No source code or prerequisite milestone was modified
+by this review, and no new guest execution is claimed. `git diff --check` passed for this plan.
+The audit was appended only, preserving all pre-review bytes; consolidated scoped documentation
+verification is performed by the coordinating review after all five plans settle.
+
+
+Final five-plan review verification (2026-09-08T11:26:54Z): all nine latest numbered findings have
+individual decisions (eight ACCEPTED, one REJECTED with the auditor's withdrawal upheld).
+Each original audit prefix was checked byte-for-byte against its pre-review snapshot and is
+unchanged. The corrected plans and shared contracts received a final consistency/feasibility
+review, including the diagnostic actual-send completion seam; scoped whitespace checks pass.
+`./verify.sh --for` over the five requested plan paths selected zero inner checks and zero
+deferred checks, and completed its inner stage (`inner_complete = true`). It returned exit 6,
+`INCOMPLETE`, because this repository requires post-commit merge verification even with no
+deferred checks; no full revision-verification pass is claimed. No source implementation,
+source mutation, new guest run or commit was performed by this review. Concurrent edits outside
+these five plans and five audit files were left untouched.

@@ -2100,3 +2100,85 @@ planner response and its addenda. Two material defects remain in the planned beh
    the source prefix has a live advertiser, asserting destination-neighbour resolution and direct
    delivery without router forwarding. The existing zero-router-lifetime case does not exercise
    this collision with a live advertiser set.
+
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-08T11:23:28Z):
+
+Reviewed the latest audit dated 2026-09-08T11:04:06Z against the complete current plan,
+P02M0174's provider contract, existing NetworkService/IDL consumers, the capability-scoped
+service boundary and the host-testable `service-logic` split. Both findings identify existing
+milestone requirements that the normative plan did not yet make implementable.
+
+1. **ACCEPTED - caller ping/probe operations lack retained state and a deadline owner.**
+   The existing `do_ping`/`do_probe` functions keep sequence, transmit time and the 50-tick
+   timeout on blocking stacks. `Net` is constructed with `seq: 0` in the RPC dispatch path, so
+   merely copying that field into another temporary handler would also reuse probe identities.
+   M7's former exhaustive state/timer lists covered neither diagnostic operation, despite M9/M10
+   requiring both to migrate. M0174's aggregate owns protocol timers and cannot supply these
+   caller-operation deadlines.
+
+   Exact plan changes: replaced M7's old pending/scheduler subsection with one current contract.
+   Ping and probe share at most 16 service slots and 4 per client, charged before send/queueing;
+   DNS (16), SNTP (8), reserved DHCP (2) and diagnostics (16) total 42 within the existing 128
+   pending slots. A slot retains caller/reply identity, the scoped tuple and route generation,
+   Echo identifier/sequence, Hop Limit, phase, actual send time, deadline and queued-packet token.
+   A persistent scalar identifier/sequence allocator prevents per-handler reuse, with explicit
+   wrap/exhaustion behavior. Resolution and post-transmit wait each have a 500 ms deadline;
+   the plan preserves local-unreachable versus reply-timeout results, defines matched-error
+   completion and forbids a tuple-changing retry after transmission.
+
+   M7's opening scheduler contract and owner table now both include DIAGNOSTIC alongside DHCP,
+   L3 and INTERNAL-UDP. The four fixed owners plus 128 possible TCBs use at most 132 of the
+   existing 160 timer slots; the combined store/delivery bound remains 352. Completion, timeout,
+   disconnect and terminal invalidation release state once and recompute the shared diagnostic
+   minimum without disarming other operations. Unsent automatic reselection retains its deadline.
+   M4's capacity fields expose diagnostic use, limit and refusals. M3 consumes M0174's corrected
+   responder/sequence fields and validated direct Echo Replies; the provider plan now also fixes
+   owned pending-packet cancellation so a retired diagnostic cannot transmit later on ND success.
+
+   M7/M10 now require exact/one-past per-client and service limits, concurrent saturated client
+   work with autonomous DHCP renewal, silent ping/probe calls concurrent with an answered DNS
+   query and due TCP/L3 timers, correct RTT/Hop Limit, delayed/reordered same-identifier probes,
+   wrong-tuple and retired-operation negatives, disconnect/invalidation, shared-neighbour packet
+   cancellation and a surviving diagnostic's timer after the earliest one is cancelled. These
+   complete the existing diagnostic API migration without adding a public raw-packet facility.
+
+2. **ACCEPTED - applying the advertiser restriction to DIRECT routes misroutes on-link traffic.**
+   M1 already makes a DIRECT destination its own next hop, and M5 already prefers DIRECT in the
+   equal-prefix case. Its following unconditional advertiser restriction could undo that result.
+   [RFC 4861 section 5.2](https://www.rfc-editor.org/rfc/rfc4861.html#section-5.2) determines the
+   on-link next hop before choosing a default router, while
+   [RFC 8028 section 3.2](https://www.rfc-editor.org/rfc/rfc8028.html#section-3.2) extends default-router
+   selection. No additional routing policy or new table is needed to honor that distinction.
+
+   Exact plan changes: replaced M5's unconditional RFC 8028 opening and restriction sentence
+   with a default-router-only rule. A selected DIRECT route bypasses the advertiser set, resolves
+   the destination neighbour and retains that destination as next hop; a more-specific selected
+   route is not rewritten by default-router selection. Off-link default-router choice retains
+   M0174's whole frozen order and empty-advertiser fallback. M10's existing advertiser tests now
+   explicitly target off-link destinations. Added host and QEMU cases with a LIVE nonzero-lifetime
+   router advertising `A=1,L=1`, a SLAAC source and a second on-link host: TCP and internal UDP
+   must target the destination MAC and succeed with router forwarding disabled. An off-link
+   control still selects the advertiser. This covers the live-set collision that the separate
+   zero-Router-Lifetime readiness case cannot expose.
+
+Re-check: the two plans now agree on diagnostic event metadata, pending-packet lifecycle, shared
+queue ownership, four fixed timer owners and DIRECT/default-router selection. The replacement
+subsection removes obsolete three-owner and UDP-only pending lists rather than leaving two rules.
+Resource arithmetic, invalidation branches, public result shapes and host/QEMU acceptance oracles
+are consistent with the current single-interface architecture and stated milestone scope. The
+corrected plan is ready for implementation. Documentation whitespace checks passed and every
+previous audit byte was preserved; no source implementation or guest tests were performed here.
+
+
+Final five-plan review verification (2026-09-08T11:26:54Z): all nine latest numbered findings have
+individual decisions (eight ACCEPTED, one REJECTED with the auditor's withdrawal upheld).
+Each original audit prefix was checked byte-for-byte against its pre-review snapshot and is
+unchanged. The corrected plans and shared contracts received a final consistency/feasibility
+review, including the diagnostic actual-send completion seam; scoped whitespace checks pass.
+`./verify.sh --for` over the five requested plan paths selected zero inner checks and zero
+deferred checks, and completed its inner stage (`inner_complete = true`). It returned exit 6,
+`INCOMPLETE`, because this repository requires post-commit merge verification even with no
+deferred checks; no full revision-verification pass is claimed. No source implementation,
+source mutation, new guest run or commit was performed by this review. Concurrent edits outside
+these five plans and five audit files were left untouched.
