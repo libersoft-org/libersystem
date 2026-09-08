@@ -2220,3 +2220,14 @@ The normal verifier used its **inner** partition, which deferred 786 obligations
 Evidence is under `/tmp/libersystem-audit-review-20260908/`: `verify-inner.log`, `verify-inner-result.json`, `verify-inner-summary.json`, `dynamic-report-analysis.md`, each named final phase's log/result JSON, and `dev-serial.log`. All 14 changed source files still match `final-source-snapshot.json` after testing (`final-source-comparison.json`); no test mutation remained. Every original audit byte is preserved.
 
 Final closure checks passed: current `source-hygiene`, `milestone-index`, `git diff --check`, all five exact UTC response titles, and byte-for-byte preservation of the original audits. Evidence: `final-hygiene-result.json` and `final-audit-integrity.json` in the evidence directory above.
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0165 (2026-09-08T13:48:41Z):
+
+Current implementation rating: 8/10.
+
+1. **[P2] Disabling a provider still stops it before its live dependents.** M4 requires “A controller being stopped stops its children first” and explicitly includes internally requested teardown (`docs/todo/P02M0165.md:163-165`). The operator disable path immediately calls `begin_operator_stop`, which withdraws that binding and sends its `STOP` (`src/user/services/core/src/device_manager.rs:4388-4408,4460`). Its dependents remain `Online` until the next standing-loop call to `settle_dependencies` (`:546,4197`), which only then discovers the withdrawn requirement and sends their stops (`:4338-4350`). For an online A requiring B, disabling B therefore sends STOP to B before A; B can reset its device and end service while A still has accepted work to drain. The corrected reverse traversal in `stop_all` does not cover this planned teardown entry point. Order the affected dependents before requesting the provider's stop, preserving M3's existing bounded completion and stop intents.
+
+Verification: read the complete audit/response history and milestone, and traced current heartbeat, driver cleanup, planned-stop/deadline, shutdown, dependency, reconstruction, ownership and withdrawal paths. An unchanged extraction of the production operator/dependency stop functions and dependency-depth calculation, using the production binding state library with controlled send effects, reproduced STOP order `[provider, dependent]`; the dependent was still Online when the provider's STOP was sent. Offline suites passed: driver-binding 73 tests and driver-protocol 26 tests. `src/tools/check-development-build.sh` passed for both development-only programs. This was a focused host/source review; no fresh guest run or full verification matrix was performed. No source code or preceding audit text was changed.

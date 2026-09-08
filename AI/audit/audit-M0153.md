@@ -2142,3 +2142,16 @@ The normal verifier used its **inner** partition, which deferred 786 obligations
 Evidence is under `/tmp/libersystem-audit-review-20260908/`: `verify-inner.log`, `verify-inner-result.json`, `verify-inner-summary.json`, `dynamic-report-analysis.md`, each named final phase's log/result JSON, and `dev-serial.log`. All 14 changed source files still match `final-source-snapshot.json` after testing (`final-source-comparison.json`); no test mutation remained. Every original audit byte is preserved.
 
 Final closure checks passed: current `source-hygiene`, `milestone-index`, `git diff --check`, all five exact UTC response titles, and byte-for-byte preservation of the original audits. Evidence: `final-hygiene-result.json` and `final-audit-integrity.json` in the evidence directory above.
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0153 (2026-09-08T13:52:29Z):
+
+Current implementation rating: 9/10
+
+1. **[P2] The attach-record allocation rollback still loses an unconfirmed endpoint outside the retained-domain and claim ledgers.** After hardware attach succeeds, `attach_for` can fail `DOMAINS.try_reserve(1)`. It then attempts revoke, but an unconfirmed result only produces a warning and returns `false`; the domain is never placed in the preallocated `RETAINED` slot (`src/kernel/iommu/mod.rs:914-928`). `device::claim` returns `ClaimError::Refused` before recording the new generation or changing the slot from `Free` (`src/kernel/device.rs:486-492`). There is consequently no claim release to finish this rollback, and neither the live nor retained lookup can recover the still-existing domain. This is an incomplete correction of the original domain-lifecycle finding and contradicts the latest response's claim that unsuccessful retirement retains its association. M3 requires failed reservation rollback to account for attachments and unconfirmed teardown to retain endpoint quarantine (`docs/todo/P02M0153.md:180-184,200-208`); M4 also requires reconstructible endpoint holdings. Preserve the association and unresolved terminal state on this branch, or reserve the bookkeeping before attaching.
+
+   Reproduced with the unchanged production `attach_for` and accounting lookup functions, the current DMA ledger/fake backend, and injected allocation and detach failures: attach returned `false`, the backend retained one attachment, and the domain retained generation 1, while both live and retained device associations were `None` and the exposed grant/quarantine readers returned zero. Bus mastering remains disabled and this path has not installed DMA mappings; this finding does not claim frame exposure or untranslated DMA.
+
+Verification: checked the original audit and response history against the current milestone, DMA contract, transport, claim/buffer lifecycle, fault handling and fixture configuration. `src/tools/check-virtio-iommu-protocol.sh` passed 63 contract/codec tests and five production regressions, and rejected all five deliberate faulty variants. The additional rollback reproduction exercised the omitted failure combination in a temporary host harness. No new QEMU run or full build was performed. Source code and all preceding audit text were preserved.

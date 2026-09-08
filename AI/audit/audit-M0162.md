@@ -1750,3 +1750,14 @@ The normal verifier used its **inner** partition, which deferred 786 obligations
 Evidence is under `/tmp/libersystem-audit-review-20260908/`: `verify-inner.log`, `verify-inner-result.json`, `verify-inner-summary.json`, `dynamic-report-analysis.md`, each named final phase's log/result JSON, and `dev-serial.log`. All 14 changed source files still match `final-source-snapshot.json` after testing (`final-source-comparison.json`); no test mutation remained. Every original audit byte is preserved.
 
 Final closure checks passed: current `source-hygiene`, `milestone-index`, `git diff --check`, all five exact UTC response titles, and byte-for-byte preservation of the original audits. Evidence: `final-hygiene-result.json` and `final-audit-integrity.json` in the evidence directory above.
+
+
+---
+
+AUDITOR'S RE-AUDIT ON P02M0162 (2026-09-08T13:56:24Z):
+
+Current implementation rating: 8/10.
+
+1. **[P2] A READY received after its deadline can still commit the binding if channel draining crosses the deadline.** M5 requires a two-second READY deadline from BIND (`docs/todo/P02M0162.md:274-275`). The implementer's response C claims that a late READY is queued behind the timeout, but `drain_channel` checks expiry only before entering its receive loop (`src/user/services/core/src/device_manager.rs:2987-2992`). It records each frame's receive time at `:3023`, then admits a valid READY unconditionally at `:3044-3046`. If draining begins at tick 199 with deadline 200 and reads READY at tick 201, READY enters the queue first. The subsequent handshake tick appends TimedOut (`:2807-2812`), but `advance` commits READY to Online, clears the deadline and publishes its offers (`:3853-3882`); the production reducer then refuses TimedOut in Online (`src/user/libs/driver/binding/src/lib.rs:580-596`). The configured deadline therefore fails to reject a late handshake in both bring-up and recovery. Check expiry against the recorded per-frame receipt time before admitting READY, while preserving a timely READY's ordering.
+
+Verification: read the complete original audit and response history against the current milestone and implementation. A temporary host harness extracted the current production `drain_channel`, `expire_planned_stop` and `tick_handshakes`, linked the current protocol/queue/reducer libraries, and controlled receive time. Deadline 200/read 199 produced Online; expiry already observed at 200 produced Stopping; start 199/read 201 produced `[Ready, TimedOut]` and incorrectly remained Online. Offline driver-binding (73), driver-protocol (26) and system-manifest (16) tests passed. The `driver-event-dispatch` gate passed, including the production pump/progress scenarios and mutation checks. These focused checks did not include a fresh guest run or full verification matrix. No source code or preceding audit text was changed.
