@@ -109,19 +109,27 @@ weak_matrix() {
 	}
 }
 
+# Every profile asserts these allocator and scheduler effects. Request their exact IDs so a new
+# NUMA or smoke test cannot silently add unrelated work to each profile.
+oracles=(
+	kernel.mem.numa.a_machine_reports_the_topology_it_has_and_invents_none
+	kernel.mem.numa.strict_fails_where_preferred_falls_back
+	kernel.mem.numa.a_contiguous_span_never_crosses_two_nodes
+	kernel.mem.numa.every_frame_returns_to_the_pool_that_owns_its_address
+	kernel.mem.numa.the_reference_model_and_the_allocator_agree_over_a_trace
+	kernel.mem.numa.the_placement_matrix_runs_through_the_real_allocator
+	kernel.smp.numa.only_cores_that_came_up_are_bound_to_a_node
+	kernel.smp.numa.placement_names_a_core_of_the_node_it_was_asked_for
+	kernel.smp.numa.a_thread_placed_on_a_node_runs_on_a_core_of_that_node
+)
+selection="$(
+	IFS=,
+	echo "${oracles[*]}"
+)"
+
 if wanted x86_64; then
 	echo "qemu-numa: booting the two-node profile"
-	# `--tags numa`, NOT `memory,smp`, AND THIS FILE ALREADY KNEW WHY.
-	#
-	# Three of its own assertions name `kernel.mem.numa.*` and `kernel.smp.numa.*`, every one of which
-	# carries `Numa`; the rest are greps over what the BOOT printed and need no test at all. `memory,smp`
-	# ran the whole memory suite to reach seven named tests - and `Memory` is also on the application
-	# suite, so it pulled in `kernel.applications.imgconv_governed_working_set_is_measured`, which is an
-	# image-conversion working-set measurement and takes 1149 seconds on an emulated target.
-	#
-	# The direct-boot ports below already do it this way, and say so in as many words: "The NUMA tests
-	# carry their own tag for exactly this reason." That reasoning was never brought back up here.
-	QEMU_EXTRA="$profile" ./test.sh --arch x86_64 --tags numa --smp 4 >"$work/run.log" 2>&1 || {
+	TEST_SELECTION="$selection" QEMU_EXTRA="$profile" ./test.sh --arch x86_64 --smp 4 >"$work/run.log" 2>&1 || {
 		echo "qemu-numa: the numa tests failed on the two-node profile" >&2
 		tail -20 "$work/run.log" >&2
 		exit 1
@@ -224,9 +232,7 @@ fi
 # direct profile is the one the milestone names, and it is the one where both halves come from the
 # same tree.
 #
-# `--tags numa` rather than the memory suite: a direct boot carries no volume package, so the
-# application tests that need one cannot run there. The NUMA tests carry their own tag for exactly
-# this reason.
+# The same exact selection uses no volume package, which these direct boots do not carry.
 profile_dt="-object memory-backend-ram,id=m0,size=256M -object memory-backend-ram,id=m1,size=256M"
 profile_dt+=" -numa node,nodeid=0,memdev=m0,cpus=0-1 -numa node,nodeid=1,memdev=m1,cpus=2-3"
 profile_dt+=" -numa dist,src=0,dst=1,val=21 -numa dist,src=1,dst=0,val=21"
@@ -237,7 +243,7 @@ for port in aarch64 riscv64; do
 	# target and tighter than the stall detector that decides whether a run is WEDGED (2400s of
 	# silence) - so slow was always reported before wedged could be distinguished. Two authorities
 	# over one window; the harness owns the emulated calibration.
-	UEFI=0 QEMU_EXTRA="$profile_dt" ./test.sh --arch "$port" --tags numa --smp 4 >"$work/$port.log" 2>&1 || {
+	TEST_SELECTION="$selection" UEFI=0 QEMU_EXTRA="$profile_dt" ./test.sh --arch "$port" --smp 4 >"$work/$port.log" 2>&1 || {
 		echo "qemu-numa: the numa tests failed on the two-node $port profile" >&2
 		tail -20 "$work/$port.log" >&2
 		exit 1

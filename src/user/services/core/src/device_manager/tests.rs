@@ -149,8 +149,8 @@ pub unsafe fn boot_attempt_budget() {
 		assert_eq!(node.record.attempts, MAX_AUTOMATIC_ATTEMPTS);
 		assert!(!node.has_bind_allowance());
 		assert!(!node.admit_bind_attempt(clock()));
-		apply_policy(&mut node, proto::system::PolicyVerb::Disable, "", &mut catalogue);
-		apply_policy(&mut node, proto::system::PolicyVerb::Enable, "", &mut catalogue);
+		apply_policy(core::slice::from_mut(&mut node), 0, proto::system::PolicyVerb::Disable, "", &mut catalogue);
+		apply_policy(core::slice::from_mut(&mut node), 0, proto::system::PolicyVerb::Enable, "", &mut catalogue);
 		assert_eq!(node.attempt, MAX_AUTOMATIC_ATTEMPTS, "disable/enable cannot replenish the boot budget");
 		assert!(!node.has_bind_allowance());
 
@@ -158,15 +158,15 @@ pub unsafe fn boot_attempt_budget() {
 			let mut node = Node::new(0, &DeviceInfo::default(), Vec::new());
 			node.attempt = already_spent;
 			assert!(node.record.record_failure(FailureCause::DriverMissing));
-			apply_policy(&mut node, proto::system::PolicyVerb::Retry, "", &mut catalogue);
-			apply_policy(&mut node, proto::system::PolicyVerb::Disable, "", &mut catalogue);
+			apply_policy(core::slice::from_mut(&mut node), 0, proto::system::PolicyVerb::Retry, "", &mut catalogue);
+			apply_policy(core::slice::from_mut(&mut node), 0, proto::system::PolicyVerb::Disable, "", &mut catalogue);
 			assert!(!node.retry_pending && !node.retry_once && !node.restart_requested, "disable cancels a pending operator request");
-			apply_policy(&mut node, proto::system::PolicyVerb::Enable, "", &mut catalogue);
+			apply_policy(core::slice::from_mut(&mut node), 0, proto::system::PolicyVerb::Enable, "", &mut catalogue);
 			assert_eq!(node.attempt, already_spent);
 			assert!(!node.retry_once && !node.retry_pending, "enable cannot revive a cancelled allowance");
 			assert_eq!(node.has_bind_allowance(), already_spent < MAX_AUTOMATIC_ATTEMPTS);
 			assert!(node.record.record_failure(FailureCause::DriverMissing));
-			apply_policy(&mut node, proto::system::PolicyVerb::Retry, "", &mut catalogue);
+			apply_policy(core::slice::from_mut(&mut node), 0, proto::system::PolicyVerb::Retry, "", &mut catalogue);
 			assert_eq!(node.attempt, already_spent, "an operator grant must preserve automatic spending");
 			assert!(node.retry_once && node.retry_pending && node.has_bind_allowance());
 			node.incident = Incident { opened: true, deadline: 300, teardown_reserve: 50 };

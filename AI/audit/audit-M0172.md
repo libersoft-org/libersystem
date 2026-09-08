@@ -1314,3 +1314,110 @@ selected zero inner and zero deferred code checks and recorded `inner_complete =
 6 (`INCOMPLETE`) because post-commit merge verification is mandatory even for an empty deferred
 set. No full revision-verification pass, implementation test, new guest run or commit is claimed.
 This paragraph records that result; final preservation and whitespace checks cover its append too.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0172 (2026-09-08T15:03:32Z):
+
+Current plan rating: 9/10
+
+No unresolved material findings within this milestone's stated scope.
+
+Verification: read the complete updated plan and audit history and independently checked the
+planner's responses against the relevant source and prerequisite contracts. This is a plan
+assessment; no new implementation or guest-test completion is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0172 (2026-09-08T16:10:00Z):
+
+Latest audit reviewed: 2026-09-08T15:03:32Z. It contains zero numbered findings. Its
+unqualified conclusion of no unresolved material findings is REJECTED as written: independent
+review found two remaining contradictions in M2's producer/fixture wording. These are independent
+residual findings, not findings attributed to the latest auditor. The registry-policy design and
+previous M3 corrections remain supported by the architecture and current code.
+
+1. **ACCEPTED - the development handoff fixture required a host-only run mode at admission.**
+   M2 required admission to carry `development` rather than `public`, while its later producer rule
+   explicitly keeps `LIBER_RUN_MODE` on the host and M3 carries only DMA mode and provenance.
+   `src/harness/lab.py:196` constructs the `run.sh` command and `:1161` invokes it with the
+   development environment; this is the boundary that must preserve run mode. The proposed
+   8-byte carrier and `BootInfo` extension need no additional selector.
+
+   Exact plan change: replaced M2's development gate with a check of the actual invocation at
+   both ends. `LIBER_RUN_MODE=development` must survive through `run.sh` to the harness producer;
+   that invocation's guest must reach admission with the matrix's DMA mode and `harness`
+   provenance. Explicitly stated that `development`/`public` remain host-only and are not fields
+   in the admission record. This preserves the end-to-end test without inventing a kernel
+   run-mode field.
+
+2. **ACCEPTED - the non-x86 transition assigned the signed producer to the public direct row.**
+   M2's transition said the signed field supplies both public rows, contradicting its matrix and
+   M3's direct FDT carrier. The current non-x86 prologues distinguish a raw DTB from loader
+   `BootInfo` (`src/kernel/arch/aarch64/boot.rs::decode_boot_arg` and the RISC-V counterpart),
+   and production device/policy initialization precedes publication of the constructed
+   `BootInfo`. A public direct boot therefore uses the early harness assertion already specified
+   by this plan, not a loader-authenticated signed handoff.
+
+   Exact plan change: the transition now names the signed field for public UEFI, and the harness
+   carrier for public direct and development. The explicit `no-iommu` value, absence refusal,
+   three-row transition and P02M0173 ownership are unchanged.
+
+Read the complete plan and audit history and rechecked M1-M8 against the current boundaries.
+`src/user/services/manifest.toml` still has exactly M1's eight driver rows;
+`src/kernel/dma_policy/mod.rs::policy_for` still selects from `IOMMU_REQUIRED_TYPES` and falls
+back to `TrustedUntranslated`. `device::claim` currently enables bus mastering, so the planned
+`none` path and DMA-activation refusals remain required. The manifest name grammar, persisted
+DeviceManager `select=<name>` choice, and generation-bearing `ClaimKey` support M4-M5's existing
+identity and authority decisions without a second ID or kernel priority computation.
+
+The current v2 manifest decoder/encoder and `BootInfo` v2 confirm M3's versioned changes are
+still prospective. Its one-byte/five-byte signed grammar, equality latch, legacy refusal and
+positive authenticated-tag-0 harness case agree. The x86_64 `fw_cfg` reader leaves its input
+readable; the plan accepts the validated relay while rejecting independent sources. The non-x86
+per-run ESP and loader tree-withholding paths support the treeless handoff fixtures.
+`docs/ARCHITECTURES.md` still records enforcement only on x86_64; P02M0173 M7 owns the later
+non-x86 public/development topology and mode transition, including restoration of virtio-net.
+
+After these two bounded wording corrections, the plan is complete, feasible and internally
+consistent for implementation in its stated dependency order. No additional mechanism, backend,
+policy value or acceptance scope was added. Work items remain PLANNED. This review changed only
+`docs/todo/P02M0172.md` and appended this response; no source code, implementation test or guest
+run was performed. Every prior audit byte was preserved. Consolidated documentation verification
+is recorded by the coordinating review.
+
+
+Consolidated four-milestone verification (2026-09-08T16:11:04Z): the latest audits contain one numbered
+finding, accepted and corrected in P02M0174. P02M0172's clean assessment was rejected for two
+independently discovered producer/fixture contradictions, both corrected; the P02M0103 and
+P02M0175 plans remain unchanged. All four responses are appended, and each original audit prefix
+matches its pre-review snapshot byte-for-byte. Rechecked the corrected plans and shared contracts
+for completeness, feasibility and internal consistency. Scoped whitespace checks pass.
+`./verify.sh --for` over the four plans and four audit paths selected zero inner and zero deferred
+code checks and recorded `inner_complete = true`. It exited 6 (`INCOMPLETE`): post-commit merge
+verification remains required even with no deferred checks. No full revision-verification pass,
+source implementation, new guest run or commit is claimed. Final preservation and whitespace
+checks also cover this appended verification record; unrelated working-tree changes are preserved.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0172 (2026-09-08T16:22:11Z):
+
+Current plan rating: **9/10**
+
+1. **M2 still directs every development producer to emit the degraded mode.** The current
+   every-boot-record paragraph says the test and development rows receive records "stating the
+   degraded mode explicitly" (`docs/todo/P02M0172.md:293-295`). This remains an unconditional
+   instruction, although the immediately following value rule correctly assigns
+   `enforcing-required` to default x86_64 development (`:300-303`). The earlier accepted correction
+   to the overgeneralized development value is therefore incomplete. The actual development
+   invocation goes through `run.sh` (`src/harness/lab.py:196-202,1161`), and the non-test x86_64
+   harness defaults to an attached controller (`src/harness/qemu-run.sh:1065-1073,1102`). Following
+   the residual degraded instruction on that boot contradicts M6's controller/mode refusal rule
+   (`docs/todo/P02M0172.md:641-647`) and its existing positive development admission fixture.
+   Remove or qualify only the residual sentence so it requires each row's matrix-selected mode
+   with `harness` provenance. The existing per-row fixtures already supply the required oracle;
+   no new carrier, kernel run-mode field or additional topology work is needed.
+
+Read the complete audit history and current plan, and independently verified the planner's
+responses against the relevant code, architecture and prerequisite contracts. No other unresolved
+material issue was found within this milestone's scope. This is a plan assessment; no implementation
+or guest-test completion is claimed. Only this re-audit was appended; the plan and source were not
+modified.

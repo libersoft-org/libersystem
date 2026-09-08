@@ -2250,3 +2250,103 @@ selected zero inner and zero deferred code checks and recorded `inner_complete =
 6 (`INCOMPLETE`) because post-commit merge verification is mandatory even for an empty deferred
 set. No full revision-verification pass, implementation test, new guest run or commit is claimed.
 This paragraph records that result; final preservation and whitespace checks cover its append too.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0175 (2026-09-08T15:03:32Z):
+
+Current plan rating: 9/10
+
+No additional material findings in this milestone's own plan. The shared router-order defect and
+its correction are recorded in the P02M0174 re-audit; P02M0175 consistently consumes that contract.
+
+Verification: read the complete updated plan and audit history and independently checked the
+planner's responses against the relevant source, shared contracts and primary protocol
+specifications. No implementation or guest-test completion is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0175 (2026-09-08T16:08:58Z):
+
+Latest audit reviewed: AUDITOR'S RE-AUDIT dated 2026-09-08T15:03:32Z, rating 9/10.
+The latest audit contains no numbered finding in this milestone's own plan. Its clean assessment
+and explicit shared-contract cross-reference are addressed separately below.
+
+1. **ACCEPTED - no additional material finding in this milestone's own plan.**
+   Independently read the complete current M1-M10 plan and checked it against the existing
+   capability-based NetworkService architecture, `src/idl/network.lsidl`, the TCP allocation and
+   send paths in `net.rs`, service startup and blocking diagnostic helpers in
+   `network_service.rs`, and the `service-logic` host-test boundary. The current IDL is still
+   IPv4-shaped, TCBs retain no transmit payload, allocation grows before a socket capability
+   exists, and startup still waits for DHCP. M1-M4 and M7-M9 explicitly own those required
+   migrations instead of assuming prerequisite implementation. Existing capability-plus-metadata
+   results and guarded streams in the process/storage IDLs support the planned wire shapes.
+
+   Rechecked the implementation gates and cross-item arithmetic: combined public snapshot bounds
+   cover both families; 64 idle backlog connections at 16384 receive bytes each fit the 2 MB
+   receive cap; the 42 admitted pending operations fit 128 slots; 128 TCB owners plus four fixed
+   timer owners fit 160 scheduler slots; the two shared 32-entry L3 queues are counted once in
+   the 352-slot total. Fetch EOF/one-extra-byte terminals, diagnostic actual-send timing and
+   cancellation, per-family readiness, internal-UDP correlation and entropy-profile limitations
+   remain explicit. These are planned behavior and tests, not claims that the current source
+   already implements them.
+
+   Exact plan changes: none in `docs/todo/P02M0175.md`. Its existing work items and acceptance
+   cases remain applicable, so adding another implementation mechanism is not justified.
+
+2. **ACCEPTED - the shared router-order correction belongs to P02M0174 and this plan consumes it.**
+   The cited standards support the correction: [RFC 4861 section 6.3.6](https://www.rfc-editor.org/rfc/rfc4861.html#section-6.3.6)
+   treats the four usable NUD states as reachable or probably reachable, and
+   [RFC 4191 section 3.2](https://www.rfc-editor.org/rfc/rfc4191.html#section-3.2) applies advertised
+   preference among reachable alternatives. A separate `Reachable` rank would therefore defeat
+   a healthy high-preference `Stale` advertiser without a declared policy exception.
+
+   Reviewed the corrected producer plan: P02M0174 M5 now groups `Reachable`, `Stale`, `Delay`
+   and `Probe` in one class, preserves the lower incomplete/known-unreachable class and ascending
+   address tie-break, and explicitly exports that complete order without consumer NUD sub-ranks.
+   Its M8 fixtures compare high-preference `Stale`/`Delay`/`Probe` against low-preference
+   `Reachable`, reverse insertion/address order, check equal-preference mixed-state address ties,
+   and assert both exported order and the internal equal-prefix VIA echo route/next hop.
+
+   Exact consumer-plan changes: none. P02M0175 M5 already takes the producer order whole for
+   both ordinary equal-prefix VIA routes and the RFC 8028 advertiser subset; it does not copy the
+   producer's obsolete state ranks. Its DIRECT-route bypass and more-specific-route protection
+   remain independent of default-router selection. M10's preference, unreachable-alternative,
+   stable-tie, advertiser-expiry and on-link cases still have consistent outcomes. The precise
+   correction and new state-comparison oracles are recorded once in the owning producer plan.
+
+Final re-check: after the producer correction, the consumer plan is complete, internally
+consistent and feasible for implementation in its recorded dependency order. P02M0174 remains
+a planned prerequisite, and generated-wire, host and QEMU checks remain implementation work.
+`docs/todo/P02M0175.md` is byte-for-byte unchanged; this response is the only edit made for this
+milestone, and every preceding audit byte was preserved. No source code, implementation tests
+or guest runs were changed or executed by this review. Consolidated scoped document verification
+is recorded by the coordinating review.
+
+
+Consolidated four-milestone verification (2026-09-08T16:11:04Z): the latest audits contain one numbered
+finding, accepted and corrected in P02M0174. P02M0172's clean assessment was rejected for two
+independently discovered producer/fixture contradictions, both corrected; the P02M0103 and
+P02M0175 plans remain unchanged. All four responses are appended, and each original audit prefix
+matches its pre-review snapshot byte-for-byte. Rechecked the corrected plans and shared contracts
+for completeness, feasibility and internal consistency. Scoped whitespace checks pass.
+`./verify.sh --for` over the four plans and four audit paths selected zero inner and zero deferred
+code checks and recorded `inner_complete = true`. It exited 6 (`INCOMPLETE`): post-commit merge
+verification remains required even with no deferred checks. No full revision-verification pass,
+source implementation, new guest run or commit is claimed. Final preservation and whitespace
+checks also cover this appended verification record; unrelated working-tree changes are preserved.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0175 (2026-09-08T16:23:03Z):
+
+Current plan rating: 9/10.
+
+No unresolved material findings within this milestone's stated scope. No incomplete correction,
+unjustified rejection or new implementation-blocking contradiction was found.
+
+Verification: read the complete current plan and all 2,335 preceding audit-history lines, and
+independently checked the planner's responses against the milestone requirements, current
+NetworkService/IDL/TCP code, capability and host-test architecture, P02M0174's corrected producer
+contract, and the relevant primary protocol specifications. This is a plan assessment; generated
+wire, runtime and guest acceptance gates remain implementation work.
+
+Only this re-audit was appended. The plan and source code were not modified, and every preceding
+audit byte was preserved.

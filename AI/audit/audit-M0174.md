@@ -1589,3 +1589,111 @@ selected zero inner and zero deferred code checks and recorded `inner_complete =
 6 (`INCOMPLETE`) because post-commit merge verification is mandatory even for an empty deferred
 set. No full revision-verification pass, implementation test, new guest run or commit is claimed.
 This paragraph records that result; final preservation and whitespace checks cover its append too.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0174 (2026-09-08T15:03:32Z):
+
+Current plan rating: 8/10
+
+1. **Medium - the frozen router order overrides advertised preference for routers that remain
+   usable.** M5 ranks `Reachable` ahead of `Stale`/`Delay`/`Probe` before comparing advertised
+   preference (`docs/todo/P02M0174.md:385-396`), and exports that order to every equal-prefix
+   router decision (`:401-409`). This extra split is not the adopted RFC ordering:
+   [RFC 4861 section 6.3.6](https://www.rfc-editor.org/rfc/rfc4861.html#section-6.3.6) treats those
+   four states as reachable or probably reachable, and
+   [RFC 4191 section 3.2](https://www.rfc-editor.org/rfc/rfc4191.html#section-3.2) applies advertised
+   preference among reachable alternatives. A healthy high-preference upstream in `STALE` therefore
+   loses to a low-preference router in `REACHABLE` merely because its recent confirmation aged out.
+   This can break connectivity: RFC 4191 section 4.1 explicitly contemplates low-preference routers
+   without general Internet access or behind restrictive firewalls. The plan declares no configured
+   preference override or appliance exception that justifies this behavior. Group these usable NUD
+   states together before comparing preference, retain the reachable-versus-failed distinction and
+   deterministic address tie-break, and add an M8 case with a high-preference `STALE` router against
+   a low-preference `REACHABLE` router. P02M0175 already consumes this producer-owned order, so the
+   correction belongs here.
+
+Verification: read the complete plan and audit history, checked the planner's responses against
+current source and the P02M0175 consumer, and checked the cited primary protocol specifications.
+No implementation or guest-test completion is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0174 (2026-09-08T16:09:49Z):
+
+Latest audit reviewed: 2026-09-08T15:03:32Z. It contains one numbered finding.
+
+1. **ACCEPTED - the router order overrides advertised preference among usable routers.**
+   Independently checked the current M5 ordering, M4's five-state NUD requirement, M6's
+   retirement path, and P02M0175 M5/M10. The old first key gave `Reachable` a separate rank
+   ahead of `Stale`/`Delay`/`Probe`. [RFC 4861 section 6.3.6](https://www.rfc-editor.org/rfc/rfc4861.html#section-6.3.6)
+   groups those states as reachable or probably reachable; [RFC 4191 section 3.2](https://www.rfc-editor.org/rfc/rfc4191.html#section-3.2)
+   then applies preference among reachable routers. No configured override in this milestone
+   justifies the extra rank. The reported loss of connectivity is a valid possible consequence:
+   [RFC 4191 section 4.1](https://www.rfc-editor.org/rfc/rfc4191.html#section-4.1) allows low-preference
+   routers serving a restricted network. This is a plan defect, not a claim of an existing IPv6
+   implementation failure: `net.rs` currently handles IPv4 and ARP and has no IPv6 router list.
+
+   Exact plan changes in `docs/todo/P02M0174.md`:
+   - Replaced M5's first ordering key with one class containing `Reachable`, `Stale`, `Delay`
+     and `Probe`; `Incomplete` and known unreachable candidates retain the lower class.
+     Advertised high/medium/low preference and the ascending 16-byte link-local address remain
+     the second and third keys. Removed the old normative split instead of appending a rival rule.
+   - Updated the whole-order export paragraph to require both P02M0175 consumers to use that
+     grouped class without adding their own NUD-state rank. M4's transitions, M6's probe-failure
+     retirement, DIRECT routes and link-local control traffic keep their existing contracts.
+   - Added an explicit M8 host fixture with a high-preference `Stale` router versus a
+     low-preference `Reachable` router. It checks exported ordering and the internal echo's
+     equal-prefix VIA route/next hop, with `Delay`/`Probe`, insertion-order and address-order
+     variants. Equal-preference routers in different usable states must resolve by address.
+     Existing unreachable-versus-usable and probe-exhaustion cases remain required.
+
+Rechecked all M1-M8 requirements, dependency order, resource bounds, completion conditions and
+shared interfaces against the current architecture and source. `network_service.rs::pump` still
+returns one ephemeral event, its diagnostic helpers block, and its buffers use the startup MTU;
+M6 explicitly owns the timer/event integration needed by M3-M5. `qemu_attach_virtio_net` still
+builds a user netdev, so M7's controllable peer is correctly a prerequisite of the guest gate.
+The `service-logic` crate excludes `rt`, matching the pure-table host fixtures above. The existing
+single-interface capacities, atomic admission/release, quoted-error metadata, diagnostic send
+completion and separate advisory/resync semantics remain consistent with P02M0175.
+
+The corrected three-key order is total on distinct router identities and its regression fixture
+fails the previous rule. P02M0175 already consumes that order whole for ordinary equal-prefix VIA
+routes and advertiser subsets, so its plan needs no duplicated correction. No new policy layer,
+state table or public API is needed. The plan is complete, feasible and ready for its declared
+implementation sequence, with M6 integration, M7's peer and M8 execution still planned and the
+multi-fragment conformance gap still explicit. No implementation or guest-test pass is claimed.
+Only the plan and this appended response were changed for this milestone; all prior audit bytes
+are preserved. Coordinated document verification is recorded below after all responses are present.
+
+
+Consolidated four-milestone verification (2026-09-08T16:11:04Z): the latest audits contain one numbered
+finding, accepted and corrected in P02M0174. P02M0172's clean assessment was rejected for two
+independently discovered producer/fixture contradictions, both corrected; the P02M0103 and
+P02M0175 plans remain unchanged. All four responses are appended, and each original audit prefix
+matches its pre-review snapshot byte-for-byte. Rechecked the corrected plans and shared contracts
+for completeness, feasibility and internal consistency. Scoped whitespace checks pass.
+`./verify.sh --for` over the four plans and four audit paths selected zero inner and zero deferred
+code checks and recorded `inner_complete = true`. It exited 6 (`INCOMPLETE`): post-commit merge
+verification remains required even with no deferred checks. No full revision-verification pass,
+source implementation, new guest run or commit is claimed. Final preservation and whitespace
+checks also cover this appended verification record; unrelated working-tree changes are preserved.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0174 (2026-09-08T16:23:00Z):
+
+Current plan rating: 9/10
+
+No unresolved material findings within this milestone's stated scope.
+
+Verification: read the complete audit history and all current M1-M8 plan text, independently
+checked the planner's responses against NetworkService/Stack, the host-testable service-logic
+boundary, the QEMU frame transport and the P02M0175 consumer contract, and rechecked the
+protocol corrections against [RFC 4861 section 6.3.6](https://www.rfc-editor.org/rfc/rfc4861.html#section-6.3.6),
+[RFC 4191 section 3.2](https://www.rfc-editor.org/rfc/rfc4191.html#section-3.2),
+[RFC 7559 section 2](https://www.rfc-editor.org/rfc/rfc7559.html#section-2),
+[RFC 3315 section 14](https://www.rfc-editor.org/rfc/rfc3315.html#section-14) and
+[RFC 9777 section 6.2](https://www.rfc-editor.org/rfc/rfc9777.html#section-6.2).
+The current owning requirements, shared interfaces and acceptance cases are consistent; no
+incorrect correction or unjustified scope rejection remains established by this review.
+
+This is a plan assessment, not evidence of implemented IPv6 or executed host/guest gates.
+The plan and source code are unchanged, and this re-audit preserves every prior audit byte.

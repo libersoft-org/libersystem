@@ -159,6 +159,8 @@ while [[ $# -gt 0 ]]; do
 	--candidate)
 		[[ $# -ge 2 ]] || die "--candidate needs the path of a candidate file"
 		candidate_arg=(--candidate "$2")
+		# Shadow queries run from both the repository root and src; keep one input pathname.
+		[[ "$2" == /* ]] || candidate_arg=(--candidate "$PWD/$2")
 		shift 2
 		continue
 		;;
@@ -456,7 +458,7 @@ if [[ "$action" == shadow ]]; then
 				scoped_log="$(suite_result_log "$scoped_capture")" || die "the $target scoped run did not say which logs it wrote"
 				rm -f "$scoped_capture"
 				[[ -n "$scoped_log" ]] || die "no $target scoped guest log to compare against"
-				scoped_arg=(--scoped-log "../$scoped_log")
+				scoped_arg=(--scoped-log "$scoped_log")
 			else
 				note "shadow-exec: the plan selects no guest test on $target, so there is nothing to execute"
 			fi
@@ -466,7 +468,7 @@ if [[ "$action" == shadow ]]; then
 		log="$(suite_result_log "$sweep_capture")" || die "the $target sweep did not say which logs it wrote"
 		rm -f "$sweep_capture"
 		[[ -n "$log" ]] || die "no $target guest log to compare against"
-		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --guest-log "../$log" --arch "$target" "${scoped_arg[@]}") || shadow_failed=1
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --guest-log "$log" --arch "$target" "${scoped_arg[@]}") || shadow_failed=1
 	done
 	# The HOST universe, from the same sweep.
 	#
@@ -518,9 +520,9 @@ if [[ "$action" == shadow ]]; then
 			fi
 		done <<<"$host_scoped_ids"
 		printf 'total %s\n' "$host_scoped_total" >>"$host_scoped_log"
-		host_scoped_arg=(--host-scoped-log "../$host_scoped_log")
+		host_scoped_arg=(--host-scoped-log "$host_scoped_log")
 	fi
-	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --host-log "../$host_log" "${host_scoped_arg[@]}") || shadow_failed=1
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --host-log "$host_log" "${host_scoped_arg[@]}") || shadow_failed=1
 
 	# The DEV GUEST universe, the third and last producer.
 	#
@@ -559,9 +561,9 @@ if [[ "$action" == shadow ]]; then
 			fi
 		done <<<"$dev_scoped_ids"
 		printf 'total %s\n' "$dev_scoped_total" >>"$dev_scoped_log"
-		dev_scoped_arg=(--dev-scoped-log "../$dev_scoped_log")
+		dev_scoped_arg=(--dev-scoped-log "$dev_scoped_log")
 	fi
-	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --dev-log "../$dev_log" "${dev_scoped_arg[@]}") || shadow_failed=1
+	printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --dev-log "$dev_log" "${dev_scoped_arg[@]}") || shadow_failed=1
 
 	# The BUILD universe, and it costs the sweep nothing it was not already paying.
 	#
@@ -629,7 +631,7 @@ if [[ "$action" == shadow ]]; then
 				note "shadow-exec (build, $build_arch): the grouped step built exactly what the selection named"
 			done <<<"$build_steps"
 		fi
-		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --build-log "../$build_log" --build-arch "$build_arch" --build-exec "$build_exec") || shadow_failed=1
+		printf '%s\n' "$changed" | (cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- "${candidate_arg[@]}" shadow --stdin --build-log "$build_log" --build-arch "$build_arch" --build-exec "$build_exec") || shadow_failed=1
 	done
 
 	source_after="$(cd "$SRC_DIR" && cargo run --quiet --manifest-path tools/verify-model/Cargo.toml -- source-digest)"

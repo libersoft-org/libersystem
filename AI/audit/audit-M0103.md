@@ -2779,3 +2779,105 @@ selected zero inner and zero deferred code checks and recorded `inner_complete =
 6 (`INCOMPLETE`) because post-commit merge verification is mandatory even for an empty deferred
 set. No full revision-verification pass, implementation test, new guest run or commit is claimed.
 This paragraph records that result; final preservation and whitespace checks cover its append too.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0103 (2026-09-08T15:03:32Z):
+
+Current plan rating: 9/10
+
+No unresolved material findings within this milestone's stated scope.
+
+Verification: read the complete updated plan and audit history and independently checked the
+planner's responses against the relevant source and prerequisite contracts. This is a plan
+assessment; no new implementation or guest-test completion is claimed.
+
+
+PLANNER'S RESPONSE ON P02M0103 (2026-09-08T16:09:14Z):
+
+Latest audit reviewed: 2026-09-08T15:03:32Z. Its assessment, "No unresolved material findings
+within this milestone's stated scope", is ACCEPTED after independent verification. The latest
+audit contains zero numbered findings and no subsequent addendum. There are consequently no
+individual corrective findings to accept or reject. No plan change is justified this round;
+`docs/todo/P02M0103.md` remains byte-for-byte unchanged.
+
+Read the complete current plan and relevant audit context, then checked its requirements and
+acceptance conditions against the roadmap, architecture, shared contracts and production code:
+
+- `docs/todo/TODO.md` and `docs/CONCEPT_EN.md` retain Phase-4 activation, with only `s`,
+  `a-common` and `b`/`c` separately approvable earlier. The prerequisite matrix, build order,
+  five specification freezes, part headers, Done clauses and reconciliation record agree.
+  The declared graph is acyclic: `b`/`c`/`e`/`f` remain headless; `d`/`g`/`i` require WSI,
+  `h` inherits it through `g`, and `h`/`i` inherit `c` for interop. Extended work remains
+  outside every core gate. Unchosen numerical values are explicit specification deliverables
+  that prevent a freeze until resolved, rather than unspecified backend choices.
+- `src/idl/display.lsidl`, DisplayService and `surface::Mapping` still expose the synchronous
+  one-surface contract, service-allocated backing and raw address that the plan replaces.
+  `sys_memory_object_create` charges the allocating Domain; `abi::ObjectInfo` exposes no charged
+  Domain. Supplier sponsorship is therefore the enforceable contract already stated in the plan.
+  PermissionManager still duplicates the bound task with MANAGE/TRANSFER without WAIT, so the
+  planned process-death cleanup requires the explicitly owned waitable-identity change.
+- Existing Event is a boolean latch; the planned completion channels, receiver-validated present
+  keys, nonblocking acquisition and bounded service admission use the actual IPC model.
+  `abi::MAX_WAIT_SET_MEMBERS` is 256 and WaitSet rejects nested sets. No new kernel completion
+  object or unavailable worker runtime becomes a mandatory prerequisite.
+- DisplayService releases scanout on driver-channel close and can adopt a later provider, but
+  withdrawal only reports an event, occupied slots ignore alternatives and a closed subscription
+  is abandoned. The plan correctly keeps the remaining identity-aware consumer migration with
+  `a-wsi` and P02M0099. P02M0141 remains PLANNED and the manifest still marks DisplayService
+  `restart = "escalate"`; service restart is not available merely because the roadmap row is
+  checked. The current `settle_shutdown_node` checks ready process confirmation with `wait == 0`
+  before classification and has production-path development fixtures, matching the qualified
+  stop-and-drain prerequisite rather than the superseded zero-index defect.
+- Re-read P02M0167's combined closure, `/tmp/libersystem-final-concurrency-recheck.log` and the
+  production concurrent-selection gate's own-ID/other-ID assertions. The completed live
+  selection/tag proof is correctly discharged. `mkimage.sh` still checks the input key after
+  assembly with producers outside its lock, so P02M0170's separate producer/acquisition proof
+  and the execution restriction remain justified. Catalogue variant-loss checks and activation's
+  `evidence_failures` call also support the plan's implemented narrowing assessment.
+- Image semantics, byte spans, initialization, conversion, preparation/replay, both core 3D
+  registry gates and the headless 2D performance floor retain concrete owners and acceptance
+  conditions. The glyph key agrees with P02M0136, including face index and rasterisation mode.
+  Qualifier-aware clipping agrees across the specification, shader, backend, conformance and
+  Done sections: homogeneous `t` for smooth, projected `u` for noperspective and the unchanged
+  original provoking value for flat.
+
+Validation: an independent exact-rational calculation reproduced `t=1/3`, projected `x/w=-1`
+and `u=1/2`, then preserved both smooth and screen-linear surviving-edge fields in 135 cases.
+The stated fixed-point edge bound fits checked i64 arithmetic. A dependency-graph check confirmed
+acyclic ordering and the headless, interop and optional boundaries above. Re-reading all owning
+work sections against their completion gates found no additional material omission or contradiction.
+
+The plan remains complete and feasible for its declared staged implementation. The next eligible
+work writes and freezes the normative specifications; implementation follows the corresponding
+freeze, activation and prerequisite gates. This review does not mark future profiles implemented
+or unmet lifecycle/acquisition prerequisites complete. No source code or source test was changed,
+and no new guest or mutation test was run. This response is appended only, preserving every
+existing audit byte. Shared scoped documentation verification follows after all four reviews.
+
+
+Consolidated four-milestone verification (2026-09-08T16:11:04Z): the latest audits contain one numbered
+finding, accepted and corrected in P02M0174. P02M0172's clean assessment was rejected for two
+independently discovered producer/fixture contradictions, both corrected; the P02M0103 and
+P02M0175 plans remain unchanged. All four responses are appended, and each original audit prefix
+matches its pre-review snapshot byte-for-byte. Rechecked the corrected plans and shared contracts
+for completeness, feasibility and internal consistency. Scoped whitespace checks pass.
+`./verify.sh --for` over the four plans and four audit paths selected zero inner and zero deferred
+code checks and recorded `inner_complete = true`. It exited 6 (`INCOMPLETE`): post-commit merge
+verification remains required even with no deferred checks. No full revision-verification pass,
+source implementation, new guest run or commit is claimed. Final preservation and whitespace
+checks also cover this appended verification record; unrelated working-tree changes are preserved.
+
+
+AUDITOR'S RE-AUDIT OF PLAN P02M0103 (2026-09-08T16:23:23Z):
+
+Current plan rating: 9/10
+
+No unresolved material findings within this milestone's stated scope. The planner's latest clean
+assessment remains justified by the current plan and implementation context.
+
+Verification: read the complete plan and audit history, and checked the roadmap, shared glyph
+contract, current display/IPC/accounting and provider-lifecycle code, prerequisite evidence and
+acceptance gates. Independently checked the dependency graph and analytic clipping correction.
+The assessment covers staged implementation: the owning specification freezes must still resolve
+their declared choices, and activation and outstanding lifecycle/acquisition prerequisites remain
+binding. No plan or source was changed, and no new guest or implementation-test pass is claimed.

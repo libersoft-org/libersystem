@@ -3,6 +3,7 @@
 from pathlib import Path
 import re
 import subprocess
+import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -137,6 +138,7 @@ fn an_idle_provider_still_services_device_work_and_stop() {
             if result.returncode != 101 or 'test result: FAILED' not in result.stdout:
                 raise SystemExit(f'{name}: expected assertion failure:\n{result.stdout}')
             print(f'driver-connections: rejected {name}')
+    subprocess.run([sys.executable, str(ROOT / 'src/tools/check-provider-catalogue.py')], check=True)
 
 
 if __name__ == '__main__':

@@ -892,8 +892,17 @@ pub fn map_for_device(domain: dma::DomainId, physical: u64, len: u64, direction:
 // already attached - the count above this is what decides when that happens, and asking twice is
 // not an error.
 pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8, generation: u64) -> bool {
-	if domain_of(index as u32).is_some() {
+	let mut domains = DOMAINS.lock();
+	if domains.iter().any(|(device, _)| *device == index as u32) {
 		return true;
+	}
+	// Reserve the association before touching hardware. Keep the lock until the row is published
+	// so another attach cannot consume its capacity. A later allocation failure would need a
+	// hardware rollback that might itself remain unconfirmed, leaving an untracked attachment.
+	// ALLOC-OK: one row per exclusive device binding, outside interrupt context.
+	if domains.try_reserve(1).is_err() {
+		crate::serial_println!("iommu: no room to record {:02x}:{:02x}.{} - the endpoint was not attached", bus, dev, func);
+		return false;
 	}
 	// THE GENERATION IS THE BINDING'S, and it now arrives as one. This passed a hardcoded `1` under a
 	// comment saying binding identity was the driver lifecycle's to own and that the constant was a
@@ -903,30 +912,6 @@ pub fn attach_for(index: usize, bus: u8, dev: u8, func: u8, generation: u64) -> 
 	// and could not reach while every binding was generation 1.
 	match attach_endpoint(bus, dev, func, generation) {
 		Ok(domain) => {
-			let mut domains = DOMAINS.lock();
-			// ALLOC-OK: one row per device the boot scan resolved, and this is a binding transition
-			// rather than an interrupt.
-			//
-			// AND A ROW THAT CANNOT BE RECORDED UNDOES THE ATTACH. This returned `false` and walked
-			// away, leaving the endpoint attached in the hardware to a domain nothing knew about -
-			// so `domain_of` answered `None`, the next attempt built a SECOND domain for the same
-			// endpoint, and the first was unreachable for the life of the boot. There is one state
-			// worse than failing to attach, and it is attaching and forgetting.
-			if domains.try_reserve(1).is_err() {
-				drop(domains);
-				let endpoint = requester_of(bus, dev, func);
-				let undone = matches!(with(|controller| controller.iommu().revoke_endpoint(domain, endpoint)), Some(Ok(dma::Release::FramesReusable)));
-				// AND THE DOMAIN GOES WITH IT, on the same rule as the ordinary detach: a rollback
-				// that revoked the endpoint cleanly has nothing left to keep the domain for, and one
-				// that did not leaves it standing. Without this the failed attach left a domain
-				// behind exactly as the normal path did - and this is the path taken when memory is
-				// already short, which is the worst moment to start leaking domain IDs.
-				if undone {
-					let _ = with(|controller| controller.iommu().destroy_domain(domain));
-				}
-				crate::serial_println!("iommu: {:02x}:{:02x}.{} attached and its row could not be recorded - the attach was {}", bus, dev, func, if undone { "undone" } else { "NOT undone, and this endpoint is translating under a domain nothing tracks" });
-				return false;
-			}
 			domains.push((index as u32, domain));
 			// ONE LINE PER ENDPOINT, not one per mapping. Which devices are translated is the state
 			// a reader wants; how many buffers each of them has is noise that would bury it.

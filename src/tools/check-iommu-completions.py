@@ -22,7 +22,7 @@ def main():
     source = SOURCE.read_text()
     wire = source[source.index('pub struct Wire {'):source.index('\npub struct Controller {')]
     production = '\n'.join(function(source, name) for name in (
-        'domain_of', 'retained_domain_of', 'faults_for', 'grants_for',
+        'attach_for', 'domain_of', 'retained_domain_of', 'faults_for', 'grants_for',
         'quarantined_grants_for', 'requester_of', 'detach_for_inner', 'poll_faults',
         'poll_faults_attributed', 'poll_faults_attributed_with', 'drain_faults',
         'attribution_trustworthy', 'with', 'map_for_device', 'map_device_buffer',
@@ -96,7 +96,22 @@ use virtqueue::VirtQueue;
 '''
     lifecycle = r'''
 static CONTROLLER: SpinLock<Option<Controller>> = SpinLock::new(None);
-static DOMAINS: SpinLock<Vec<(u32, dma::DomainId)>> = SpinLock::new(Vec::new());
+static FAIL_ASSOCIATION_RESERVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+struct DomainRows { rows: Vec<(u32, dma::DomainId)> }
+impl std::ops::Deref for DomainRows {
+    type Target = Vec<(u32, dma::DomainId)>;
+    fn deref(&self) -> &Self::Target { &self.rows }
+}
+impl std::ops::DerefMut for DomainRows {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.rows }
+}
+impl DomainRows {
+    fn try_reserve(&mut self, additional: usize) -> Result<(), ()> {
+        if FAIL_ASSOCIATION_RESERVE.swap(false, Ordering::SeqCst) { return Err(()); }
+        self.rows.try_reserve(additional).map_err(|_| ())
+    }
+}
+static DOMAINS: SpinLock<DomainRows> = SpinLock::new(DomainRows { rows: Vec::new() });
 static RETAINED: SpinLock<Vec<Option<dma::DomainId>>> = SpinLock::new(Vec::new());
 static RETAINED_FAULTS: SpinLock<Vec<u64>> = SpinLock::new(Vec::new());
 static ENDED_FAULTS: SpinLock<Vec<(u64, u64)>> = SpinLock::new(Vec::new());
@@ -104,6 +119,13 @@ struct Controller { ledger: dma::Iommu<dma::fake::Fake> }
 impl Controller { fn iommu(&mut self) -> &mut dma::Iommu<dma::fake::Fake> { &mut self.ledger } }
 #[derive(Clone, Copy)]
 pub enum Containment { WhateverFaulted, OnlyLiveBindings }
+fn attach_endpoint(bus: u8, dev: u8, func: u8, generation: u64) -> Result<dma::DomainId, Fault> {
+    with(|controller| {
+        let domain = controller.iommu().create_domain(0x1000, 0x100000, Vec::new(), Generation(generation))?;
+        controller.iommu().attach(domain, requester_of(bus, dev, func))?;
+        Ok(domain)
+    }).unwrap()
+}
 // A real detach queues one report before the final production drain. The hardware side is
 // represented by this fixture; the ledger, drain, association, copy and exposed reader are real.
 fn revoke_endpoint(domain: dma::DomainId, bus: u8, dev: u8, func: u8) -> Result<dma::Release, Fault> {
@@ -123,11 +145,33 @@ fn setup(map_failure: bool) -> dma::DomainId {
         assert_eq!(ledger.map(domain, 0x800000, 4096, dma::Direction::Bidirectional, &requirements), Err(Fault::Unconfirmed));
     }
     *CONTROLLER.lock() = Some(Controller { ledger });
-    *DOMAINS.lock() = vec![(0, domain)];
+    DOMAINS.lock().rows = vec![(0, domain)];
     *RETAINED.lock() = vec![None];
     *RETAINED_FAULTS.lock() = vec![0];
     *ENDED_FAULTS.lock() = vec![(0, 0)];
     domain
+}
+#[test]
+fn association_allocation_failure_precedes_every_hardware_attach() {
+    setup(false);
+    DOMAINS.lock().clear();
+    *CONTROLLER.lock() = Some(Controller { ledger: dma::Iommu::new(dma::fake::Fake::new(), 8) });
+    with(|controller| controller.iommu().backend_mut_for_test().inject(dma::fake::Injection::Detach, Fault::Unconfirmed));
+    FAIL_ASSOCIATION_RESERVE.store(true, Ordering::SeqCst);
+    assert!(!attach_for(0, 0, 0, 7, 1));
+    assert_eq!(domain_of(0), None);
+    assert_eq!(retained_domain_of(0), None);
+    with(|controller| {
+        assert_eq!(controller.iommu().backend().attachments(), 0, "allocation refusal never needs an uncertain hardware rollback");
+        assert!(controller.iommu().backend().calls().is_empty(), "even domain creation follows the bookkeeping reservation");
+    });
+    assert!(attach_for(0, 0, 0, 7, 1));
+    let domain = domain_of(0).expect("a successful attach publishes its reserved association");
+    assert_eq!(with(|controller| controller.iommu().generation_of(domain)), Some(Some(Generation(1))));
+    FAIL_ASSOCIATION_RESERVE.store(true, Ordering::SeqCst);
+    assert!(attach_for(0, 0, 0, 7, 1), "an existing association needs no allocation or second attach");
+    assert!(FAIL_ASSOCIATION_RESERVE.swap(false, Ordering::SeqCst));
+    assert_eq!(with(|controller| controller.iommu().backend().attachments()), Some(1));
 }
 #[test]
 fn a_successful_teardowns_last_fault_is_counted_once() {
@@ -247,10 +291,12 @@ mod buffers {
         program = prelude + 'mod virtqueue {\n' + QUEUE.read_text() + queue_fixture + wire + lifecycle + production + buffer_fixture
         (path / 'tests.rs').write_text(program)
         result = subprocess.run(['cargo', 'test', '--offline', '--quiet', '--manifest-path', str(path / 'Cargo.toml'), '--lib', '--', '--test-threads=1'], cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        if result.returncode or '5 passed' not in result.stdout:
+        if result.returncode or '6 passed' not in result.stdout:
             raise SystemExit(result.stdout)
-        print('iommu-completions: 5 production queue, teardown and buffer regressions passed')
+        print('iommu-completions: 6 production attach, queue, teardown and buffer regressions passed')
+        reservation = re.search(r'\tif domains.try_reserve\(1\).is_err\(\) \{.*?\n\t\}\n', program, re.S).group()
         mutations = {
+            'bookkeeping reserved after hardware attach': program.replace(reservation, '').replace('\t\t\tdomains.push((index as u32, domain));', reservation + '\t\t\tdomains.push((index as u32, domain));'),
             'unresolved queue reuse': program.replace('self.size < 2 || self.request_failed', 'self.size < 2').replace('if !self.requests.request_available()', 'if false'),
             'scratch reuse after timeout': program.replace('if !self.requests.request_available()', 'if false'),
             'double-counted terminal fault': program.replace('\tif let Some(slot) = RETAINED.lock().get_mut(index) {\n\t\t*slot = Some(domain);\n\t}\n', '', 1),

@@ -63,4 +63,5 @@ for gate in "$root"/check-*.sh "$root/../../verify.sh"; do
 done
 
 ((failed == 0)) || exit 1
+python3 "$root/test-shadow-logs.py"
 echo "gate-result-logs: every gate that boots a guest reads the logs that guest named"

@@ -2069,11 +2069,11 @@ impl Offers {
 		Self { kinds: [0; driver_protocol::MAX_INITIAL_OFFERS], tokens: [0; driver_protocol::MAX_INITIAL_OFFERS], handles: [0; driver_protocol::MAX_INITIAL_OFFERS], count: 0 }
 	}
 
-	// Answers false when the bound is reached, so the caller can refuse the frame and close its
+	// Answers false when the bound is reached or a token is repeated, so the caller can close its
 	// handle rather than accumulate. "Any number" is not a bound, and a driver is a separate process
 	// that may be wrong or malicious.
 	fn push(&mut self, kind: u16, token: u16, handle: u64) -> bool {
-		if self.count >= driver_protocol::MAX_INITIAL_OFFERS {
+		if self.count >= driver_protocol::MAX_INITIAL_OFFERS || self.tokens[..self.count].contains(&token) {
 			return false;
 		}
 		self.kinds[self.count] = kind;
@@ -2400,6 +2400,13 @@ impl Catalogue {
 					continue;
 				}
 				offers.handles[index] = 0;
+				// Tokens identify publications across all kinds within one live binding. A later
+				// OFFER must not alias a token already used by its initial or earlier publications.
+				if self.entries.iter().flatten().any(|provider| provider.binding_is(binding) && provider.token == offers.tokens[index]) {
+					print(b"DeviceManager: a binding repeated a live provider token; refused\n");
+					close(handle);
+					continue;
+				}
 				// A KIND THIS ENTRY NEVER DECLARED, OR ONE PAST WHAT IT DECLARED. `system-manifest`
 				// checks the declaration is coherent; this checks the driver honoured it, which is
 				// the half no build-time check can do. A compromised driver advertising itself as a
@@ -3043,7 +3050,13 @@ unsafe fn drain_channel(node: &mut Node, buf: &mut [u8]) {
 				}
 				driver_protocol::Opcode::Ready => {
 					if driver_protocol::decode_ready(header.payload(buf)).is_ok() {
-						node.push(BindingEvent::Ready { generation });
+						// Draining can cross the deadline after its initial check. Receipt decides
+						// admission; a timely READY already queued keeps its position before expiry.
+						if driver_binding::handshake_expired(node.record.state, node.ready_deadline, node.last_frame_at) {
+							node.push(BindingEvent::TimedOut { generation });
+						} else {
+							node.push(BindingEvent::Ready { generation });
+						}
 					}
 				}
 				driver_protocol::Opcode::Failed => {
@@ -4068,9 +4081,10 @@ struct PolicyView<'a> {
 impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 	fn apply(&mut self, index: u32, verb: proto::system::PolicyVerb, artifact: alloc::string::String) -> Result<proto::system::PolicyOutcome, proto::system::Error> {
 		use proto::system::PolicyOutcome;
-		let Some(node) = self.nodes.iter_mut().find(|node| node.index == index as u64) else {
+		let Some(at) = self.nodes.iter().position(|node| node.index == index as u64) else {
 			return Ok(PolicyOutcome::NoSuchDevice);
 		};
+		let node = &self.nodes[at];
 		let decision = decide_policy(node, verb, &artifact);
 		if decision.outcome != PolicyOutcome::Accepted {
 			return Ok(decision.outcome);
@@ -4104,7 +4118,7 @@ impl proto::system::device_policy_admin::Service for PolicyView<'_> {
 			return Ok(PolicyOutcome::NotStored);
 		}
 		// AND NOW THE EFFECT ON THE NODE, which is the half only this program can perform.
-		unsafe { apply_policy(node, verb, artifact.as_str(), self.catalogue) };
+		unsafe { apply_policy(self.nodes, at, verb, artifact.as_str(), self.catalogue) };
 		Ok(PolicyOutcome::Accepted)
 	}
 
@@ -4411,9 +4425,17 @@ unsafe fn begin_operator_stop(node: &mut Node, catalogue: &mut Catalogue) {
 
 // What a verb does to the node itself. The write has already happened; this is the half no other
 // component can perform.
-unsafe fn apply_policy(node: &mut Node, verb: proto::system::PolicyVerb, artifact: &str, catalogue: &mut Catalogue) {
+unsafe fn apply_policy(nodes: &mut [Node], at: usize, verb: proto::system::PolicyVerb, artifact: &str, catalogue: &mut Catalogue) {
 	unsafe {
 		use proto::system::PolicyVerb;
+		if verb == PolicyVerb::Disable && driver_binding::disable_action(nodes[at].record.state, nodes[at].binding.is_some(), nodes[at].teardown.is_some()) == driver_binding::DisableAction::StopTheBinding {
+			// Remove admission first, then ask the affected dependency closure to drain in
+			// reverse order before sending STOP to this provider. Their existing deadlines
+			// and DependencyLost intents remain owned by the standing loop.
+			catalogue.withdraw_binding(nodes[at].id);
+			stop_nodes_that_lost_a_dependency(nodes, catalogue);
+		}
+		let node = &mut nodes[at];
 		match verb {
 			// A DISABLE ON A RUNNING BINDING GOES THROUGH THE TEARDOWN, carrying the intent so it
 			// does not rebind; one on a binding that is not running has nothing to give back.
@@ -5290,7 +5312,10 @@ unsafe fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut Catalo
 			if op == CONNECT_OP && is_root {
 				match channel_pair_for_catalogue(clients) {
 					Some(theirs) => {
-						send_blocking(channel, &[], theirs);
+						if !send_blocking(channel, &[], theirs) {
+							close(theirs);
+							clients.retire(clients.count - 1);
+						}
 					}
 					None => {
 						send_blocking(channel, &[], 0);
@@ -5321,7 +5346,15 @@ unsafe fn serve_catalogue_once(channel: u64, is_root: bool, clients: &mut Catalo
 			// answers `None`, which reads as "the catalogue did not answer" - and the operation this
 			// milestone exists for could not work at all. Nothing had called it in production, so
 			// nothing had found out: AudioService is the first consumer to `open`.
-			send_caps_blocking(channel, &reply[..written], reply_handles.as_slice());
+			if send_caps_blocking(channel, &reply[..written], reply_handles.as_slice()) {
+				return true;
+			}
+		}
+		// Failed transfers leave the handles live here, and Handles does not own them. Closing
+		// an undelivered provider connection lets its driver report Disconnect and refund the
+		// concurrent allowance through the same path as an ordinary consumer departure.
+		for &handle in reply_handles.as_slice() {
+			close(handle);
 		}
 		true
 	}
